@@ -1,0 +1,60 @@
+
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="aiBlue" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#00F2FE" />
+      <stop offset="100%" stop-color="#4FACFE" />
+    </linearGradient>
+    <linearGradient id="aiPurple" x1="0%" y1="100%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#667EEA" />
+      <stop offset="100%" stop-color="#764BA2" />
+    </linearGradient>
+    <linearGradient id="aiAccent" x1="100%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#FF0844" />
+      <stop offset="100%" stop-color="#FFB199" />
+    </linearGradient>
+    <linearGradient id="glass" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.85" />
+      <stop offset="100%" stop-color="#ffffff" stop-opacity="0.1" />
+    </linearGradient>
+
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="20" stdDeviation="24" flood-color="#000000" flood-opacity="0.3" />
+    </filter>
+    <filter id="glow" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="24" result="blur" />
+      <feComposite in="SourceGraphic" in2="blur" operator="over" />
+    </filter>
+  </defs>
+
+  <g transform="translate(512, 512)">
+    <circle cx="0" cy="0" r="340" fill="none" stroke="url(#aiPurple)" stroke-width="80" filter="url(#shadow)" />
+    
+    <path d="M 0 -340 A 340 340 0 0 1 340 0" fill="none" stroke="url(#aiBlue)" stroke-width="80" stroke-linecap="round" filter="url(#shadow)" />
+    <path d="M -340 0 A 340 340 0 0 0 0 340" fill="none" stroke="url(#aiAccent)" stroke-width="80" stroke-linecap="round" filter="url(#shadow)" />
+    
+    <circle cx="0" cy="0" r="220" fill="none" stroke="url(#glass)" stroke-width="6" stroke-dasharray="2 16" stroke-linecap="round" />
+    <circle cx="0" cy="0" r="220" fill="none" stroke="#ffffff" stroke-width="8" stroke-dasharray="160 800" stroke-linecap="round" transform="rotate(30)" />
+    <circle cx="0" cy="0" r="220" fill="none" stroke="url(#aiBlue)" stroke-width="8" stroke-dasharray="60 800" stroke-linecap="round" transform="rotate(-70)" />
+    <circle cx="0" cy="0" r="220" fill="none" stroke="url(#aiAccent)" stroke-width="8" stroke-dasharray="100 800" stroke-linecap="round" transform="rotate(160)" />
+
+    <circle cx="155.56" cy="-155.56" r="28" fill="#ffffff" filter="url(#shadow)" />
+    <circle cx="155.56" cy="-155.56" r="16" fill="url(#aiPurple)" />
+    
+    <circle cx="-190.5" cy="110" r="24" fill="#ffffff" filter="url(#shadow)" />
+    <circle cx="-190.5" cy="110" r="12" fill="url(#aiAccent)" />
+    
+    <circle cx="68" cy="209.2" r="20" fill="#ffffff" filter="url(#shadow)" />
+    <circle cx="68" cy="209.2" r="10" fill="url(#aiBlue)" />
+
+    <circle cx="0" cy="0" r="120" fill="url(#aiPurple)" opacity="0.3" filter="url(#glow)" />
+
+    <path d="M 0 -110 Q 0 0 110 0 Q 0 0 0 110 Q 0 0 -110 0 Q 0 0 0 -110 Z" fill="url(#aiBlue)" filter="url(#shadow)" />
+    <path d="M 0 -80 Q 0 0 80 0 Q 0 0 0 80 Q 0 0 -80 0 Q 0 0 0 -80 Z" fill="url(#aiAccent)" transform="rotate(45)" opacity="0.9" />
+    <path d="M 0 -50 Q 0 0 50 0 Q 0 0 0 50 Q 0 0 -50 0 Q 0 0 0 -50 Z" fill="#ffffff" filter="url(#glow)" />
+    <circle cx="0" cy="0" r="16" fill="#ffffff" filter="url(#glow)" />
+
+    <circle cx="0" cy="0" r="140" fill="url(#glass)" stroke="#ffffff" stroke-width="4" opacity="0.75" filter="url(#shadow)" />
+    <path d="M -99 -99 A 140 140 0 0 1 99 -99 A 120 120 0 0 0 -99 -99 Z" fill="#ffffff" opacity="0.6" />
+  </g>
+</svg>
