@@ -29,7 +29,7 @@ sites.sqlite3
 macOS 通常位于：
 
 ```text
-~/Library/Application Support/xyz.ldopenhub.desktop/sites.sqlite3
+~/Library/Application Support/com.dfeer.openhub.desktop/sites.sqlite3
 ```
 
 数据库启用了 WAL 模式，运行期间还可能出现 `sites.sqlite3-wal` 和 `sites.sqlite3-shm` 文件，这是 SQLite 的正常行为。

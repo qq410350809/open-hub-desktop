@@ -23,7 +23,8 @@
         "fullscreen": false,
         "focus": true,
         "visible": true,
-        "zoomHotkeysEnabled": true
+        "zoomHotkeysEnabled": true,
+        "devtools": true
       }
     ],
     "security": {
