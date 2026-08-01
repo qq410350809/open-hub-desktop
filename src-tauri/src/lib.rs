@@ -3987,6 +3987,98 @@ fn get_system_fonts() -> Vec<String> {
     fonts
 }
 
+#[tauri::command]
+async fn fetch_site_models_json(
+    app: tauri::AppHandle,
+    database: State<'_, Database>,
+    url: String,
+    site_id: Option<String>,
+) -> Result<String, String> {
+    let mut profile_id = None;
+    let mut domain = None;
+    
+    if let Some(id) = site_id {
+        if let Ok(db) = database.0.lock() {
+            if let Ok(row) = db.query_row(
+                "SELECT profile_id, domain FROM site_accounts WHERE site_id = ?1 AND is_valid = 1 LIMIT 1",
+                [&id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            ) {
+                profile_id = Some(row.0);
+                domain = Some(row.1);
+            }
+        }
+    }
+
+    let mut auth_token = None;
+    if let (Some(profile), Some(dom)) = (profile_id, domain) {
+        use tauri::Manager;
+        if let Ok(home_dir) = app.path().home_dir() {
+            if let Ok(Ok(local_values)) = tauri::async_runtime::spawn_blocking(move || {
+                chrome_local_storage::read_local_storage_from_home(&home_dir, &dom, &profile)
+            }).await {
+                if let Some(token) = local_values.get("auth_token").or_else(|| local_values.get("token")) {
+                    auth_token = Some(token.trim_matches('"').to_string());
+                }
+            }
+        }
+    }
+
+    let client = build_http_client(&database, Duration::from_secs(6), 3, "站点模型请求")?;
+    let mut base = url.trim().to_string();
+    if !base.starts_with("http://") && !base.starts_with("https://") {
+        base = format!("https://{base}");
+    }
+    if !base.ends_with('/') {
+        base.push('/');
+    }
+
+    let pricing_url = format!("{base}api/pricing");
+    let mut req1 = client
+        .get(&pricing_url)
+        .header(reqwest::header::ACCEPT, "application/json, text/plain, */*")
+        .header(reqwest::header::USER_AGENT, "OpenHub-Desktop/0.3");
+        
+    if let Some(token) = &auth_token {
+        req1 = req1.bearer_auth(token);
+    }
+
+    if let Ok(res) = req1.send().await {
+        if res.status().is_success() {
+            if let Ok(text) = res.text().await {
+                if !text.trim().is_empty() {
+                    return Ok(text);
+                }
+            }
+        }
+    }
+
+    let v1_url = format!("{base}v1/models");
+    let mut req2 = client
+        .get(&v1_url)
+        .header(reqwest::header::ACCEPT, "application/json, text/plain, */*")
+        .header(reqwest::header::USER_AGENT, "OpenHub-Desktop/0.3");
+
+    if let Some(token) = &auth_token {
+        req2 = req2.bearer_auth(token);
+    }
+
+    let res = req2.send()
+        .await
+        .map_err(|err| format!("HTTP 请求失败: {err}"))?;
+
+    if !res.status().is_success() {
+        return Err(format!("HTTP {} {}", res.status().as_u16(), res.status()));
+    }
+
+    let text = res
+        .text()
+        .await
+        .map_err(|err| format!("读取响应失败: {err}"))?;
+
+    Ok(text)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -4535,6 +4627,7 @@ pub fn run() {
             sync_remote_sites,
             detect_site_system_types,
             get_system_fonts,
+            fetch_site_models_json,
             chrome_session::list_chrome_sessions,
             chrome_session::read_chrome_session,
             chrome_session::open_url_in_chrome_profile

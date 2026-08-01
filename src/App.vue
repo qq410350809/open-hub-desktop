@@ -14,6 +14,7 @@ import PreviewDialog from "./components/PreviewDialog.vue";
 import SettingsPage from "./components/SettingsPage.vue";
 import SyncSitesDialog from "./components/SyncSitesDialog.vue";
 import ChromeSessionDialog from "./components/ChromeSessionDialog.vue";
+import SiteModelsDialog from "./components/SiteModelsDialog.vue";
 
 const store = useStore();
 const { preferences } = usePreferences();
@@ -194,5 +195,6 @@ watch(
   <PreviewDialog />
   <SyncSitesDialog />
   <ChromeSessionDialog />
+  <SiteModelsDialog />
   <SettingsPage />
 </template>

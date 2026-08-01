@@ -37,6 +37,8 @@ export const icons = {
   bookmark: icon('<path d="m19 21-7-4-7 4V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v16z"/>'),
   globe: icon('<circle cx="12" cy="12" r="10"/><path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20"/><path d="M2 12h20"/>'),
   key: icon('<circle cx="8" cy="15" r="4"></circle><path d="m11 12 8-8M15 8l3 3M17 6l2 2"></path>'),
+  cpu: icon('<rect x="4" y="4" width="16" height="16" rx="2"></rect><rect x="9" y="9" width="6" height="6"></rect><path d="M9 1v3M15 1v3M9 20v3M15 20v3M1 9h3M1 15h3M20 9h3M20 15h3"></path>'),
+  sparkles: icon('<path d="m12 3 1.9 4.3L18 9l-4.1 1.7L12 15l-1.9-4.3L6 9l4.1-1.7L12 3zM5 16l1 2.2L8.2 19 6 19.8 5 22l-1-2.2L1.8 19 4 18.2 5 16zM19 15l.8 1.8L21.6 17.5 19.8 18.3 19 20l-.8-1.7L16.4 17.5 18.2 16.8 19 15z"></path>'),
 } as const;
 
 export type IconKey = keyof typeof icons;

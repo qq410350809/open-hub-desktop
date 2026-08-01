@@ -87,6 +87,15 @@ function accountQuota(session: ChromeSessionInfo): string {
           <div class="card-actions">
             <button
               type="button"
+              class="site-models-toggle"
+              :data-models="site.id"
+              title="查看支持的模型"
+              aria-label="查看此站点的支持模型"
+              @click="store.openSiteModelsDialog(site)"
+              v-html="icons.cpu"
+            />
+            <button
+              type="button"
               :data-preview="site.id"
               title="查看详情"
               aria-label="查看站点详情"

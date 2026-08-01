@@ -37,7 +37,7 @@ const feature = ref("all");
 const systemTypeFilter = ref("all");
 
 // 页面状态
-const page = ref<"library" | "settings">("library");
+const page = ref<"library" | "models" | "settings">("library");
 const editingId = ref<string | null>(null);
 const activeTab = ref<"basic" | "features" | "maintenance">("basic");
 
@@ -47,6 +47,7 @@ const linkDialogOpen = ref(false);
 const previewDialogOpen = ref(false);
 const chromeSessionDialogOpen = ref(false);
 const syncDialogOpen = ref(false);
+const siteModelsDialogOpen = ref(false);
 
 // 链接弹窗数据
 const linkDialogKind = ref<SiteLinkKind>("api");
@@ -56,6 +57,9 @@ const linkDialogTrigger = ref<HTMLElement | null>(null);
 // 预览弹窗数据
 const previewSite = ref<SiteRecord | null>(null);
 const previewTrigger = ref<HTMLElement | null>(null);
+
+// 站点模型弹窗数据
+const siteModelsSite = ref<SiteRecord | null>(null);
 
 // Chrome 会话弹窗数据
 const chromeSessionSite = ref<SiteRecord | null>(null);
@@ -189,6 +193,24 @@ function openSettings() {
 
 function closeSettings() {
   page.value = "library";
+}
+
+function openModels() {
+  page.value = "models";
+}
+
+function openLibrary() {
+  page.value = "library";
+}
+
+function openSiteModelsDialog(site: SiteRecord) {
+  siteModelsSite.value = site;
+  siteModelsDialogOpen.value = true;
+}
+
+function closeSiteModelsDialog() {
+  siteModelsDialogOpen.value = false;
+  siteModelsSite.value = null;
 }
 
 function openModal(site?: SiteRecord) {
@@ -837,9 +859,11 @@ export function useStore() {
     previewDialogOpen,
     chromeSessionDialogOpen,
     syncDialogOpen,
+    siteModelsDialogOpen,
     linkDialogKind,
     linkDialogSite,
     previewSite,
+    siteModelsSite,
     chromeSessionSite,
     chromeSessions,
     chromeSessionsLoading,
@@ -875,6 +899,8 @@ export function useStore() {
     setUsageFilter,
     openSettings,
     closeSettings,
+    openModels,
+    openLibrary,
     openModal,
     closeModal,
     openSyncDialog,
@@ -895,6 +921,8 @@ export function useStore() {
     closeLinkDialog,
     openPreview,
     closePreview,
+    openSiteModelsDialog,
+    closeSiteModelsDialog,
     copyAddress,
     analyzeChromeUsage,
     closeChromeSessionDialog,

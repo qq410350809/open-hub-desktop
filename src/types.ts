@@ -134,6 +134,16 @@ export interface RemoteUserInfo {
   accountName: string;
 }
 
+export type ModelCategory = "all" | "openai" | "claude" | "deepseek" | "gemini" | "grok" | "domestic" | "other";
+
+export interface ModelItem {
+  id: string;
+  name: string;
+  category: ModelCategory;
+  vendorName: string;
+  sites: SiteRecord[];
+}
+
 export type ThemePreference = "system" | "light" | "dark";
 export type FontFamilyPreference = string;
 export type FontSizePreference = "small" | "medium" | "large";
