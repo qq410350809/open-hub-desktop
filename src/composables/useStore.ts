@@ -75,6 +75,9 @@ const chromeBrowserSyncElapsedMs = ref(0);
 const chromeUsageScanning = ref(false);
 const chromeUsageScanResult = ref<ChromeUsageScanResult | null>(null);
 const syncingSites = ref(false);
+const syncingModelKeys = ref(false);
+const modelKeySyncCompleted = ref(0);
+const modelKeySyncTotal = ref(0);
 const syncRunState = ref<SyncRunState>("idle");
 const syncLogs = ref<SyncLogEntry[]>([]);
 const syncElapsedMs = ref(0);
@@ -82,7 +85,7 @@ const remoteUser = ref<RemoteUserInfo | null>(null);
 const remoteUserLoading = ref(false);
 const remoteUserError = ref("");
 const syncDialogRunaway = ref(false);
-const syncDialogMode = ref<"remote" | "sessions">("remote");
+const syncDialogMode = ref<"remote" | "sessions" | "models">("remote");
 const syncDialogSiteIds = ref<string[]>([]);
 let chromeSessionRequestId = 0;
 let chromeBrowserSyncRunId = 0;
@@ -252,8 +255,18 @@ function openSyncDialog() {
   if (syncDialogMode.value === "remote") void refreshRemoteUser();
 }
 
+function openModelSyncDialog() {
+  if (syncDialogOpen.value) return;
+  syncRunId += 1;
+  resetSyncLog();
+  syncDialogRunaway.value = false;
+  syncDialogMode.value = "models";
+  syncDialogSiteIds.value = filteredSites.value.map((site) => site.id);
+  syncDialogOpen.value = true;
+}
+
 function closeSyncDialog() {
-  if (syncingSites.value) return;
+  if (syncingSites.value || syncingModelKeys.value) return;
   syncRunId += 1;
   stopSyncTimer();
   syncRunState.value = "idle";
@@ -327,8 +340,25 @@ function receiveSyncProgress(progress: SyncSitesProgress) {
   appendSyncLog(progress);
 }
 
+function receiveNestedChromeSyncProgress(progress: SyncSitesProgress) {
+  if (Math.floor(progress.runId / 10_000) !== syncRunId) return;
+  appendSyncLog({
+    ...progress,
+    stage: `chrome-detail-${progress.runId}-${progress.stage}`,
+    message: `Chrome：${progress.message}`,
+  });
+}
+
+function needsChromeAccountFallback(session: ChromeSessionInfo): boolean {
+  return !session.isValid || Boolean(session.syncError.trim());
+}
+
 async function syncSites() {
-  if (syncingSites.value || (syncDialogMode.value === "remote" && !remoteUser.value)) return;
+  if (
+    syncingSites.value ||
+    syncingModelKeys.value ||
+    (syncDialogMode.value === "remote" && !remoteUser.value)
+  ) return;
   const runaway = syncDialogRunaway.value;
   const mode = syncDialogMode.value;
   const siteIds = [...syncDialogSiteIds.value];
@@ -337,8 +367,12 @@ async function syncSites() {
   syncRunState.value = "syncing";
   startSyncTimer();
   appendSyncLog({ stage: "start", status: "info", message: "同步任务已开始" });
-  syncingSites.value = true;
   remoteUserError.value = "";
+  if (mode === "models") {
+    await syncAllModelKeys(siteIds);
+    return;
+  }
+  syncingSites.value = true;
   try {
     if (mode === "sessions") {
       appendSyncLog({
@@ -359,7 +393,7 @@ async function syncSites() {
         const site = siteMap.get(usageSite.siteId);
         if (site?.systemType.toLocaleLowerCase() !== "newapi") return [];
         return usageSite.sessions
-          .filter((session) => !session.isValid || /cloudflare|返回 html/i.test(session.syncError))
+          .filter(needsChromeAccountFallback)
           .map((session) => ({ site, session }));
       });
       let browserSucceeded = 0;
@@ -369,34 +403,62 @@ async function syncSites() {
           .filter((usageSite) => usageSite.sessions.some((session) => session.isValid))
           .map((usageSite) => usageSite.siteId),
       );
-      for (const [index, candidate] of browserCandidates.entries()) {
-        const stage = `chrome-profile-${candidate.site.id}-${candidate.session.profileId}`;
+      const candidateGroups = new Map<string, Array<(typeof browserCandidates)[number] & { childRunId: number }>>();
+      browserCandidates.forEach((candidate, index) => {
+        const group = candidateGroups.get(candidate.site.id) ?? [];
+        group.push({ ...candidate, childRunId: runId * 10_000 + index + 1 });
+        candidateGroups.set(candidate.site.id, group);
+      });
+      const groupedCandidates = [...candidateGroups.values()];
+      const workerCount = Math.min(3, groupedCandidates.length);
+      let nextGroupIndex = 0;
+      if (browserCandidates.length > 0) {
         appendSyncLog({
-          stage,
-          status: "running",
-          message: `正在通过 Chrome ${candidate.session.profileName} 同步 ${candidate.site.name}`,
+          stage: "chrome-parallel",
+          status: "info",
+          message: `需要 Chrome 回退 ${browserCandidates.length} 个账号，按站点并行处理（并发 ${workerCount}）`,
         });
-        try {
-          await runCommand<ChromeSessionInfo>("sync_site_account_via_chrome", {
-            siteId: candidate.site.id,
-            profileId: candidate.session.profileId,
-            runId: runId * 10_000 + index + 1,
-          });
-          browserSucceeded += 1;
-          if (!candidate.session.isValid) newlyValidated += 1;
-          validSiteIds.add(candidate.site.id);
-          appendSyncLog({
-            stage,
-            status: "success",
-            message: `${candidate.site.name} · Chrome ${candidate.session.profileName} 同步成功`,
-          });
-        } catch (error) {
-          appendSyncLog({
-            stage,
-            status: "error",
-            message: `${candidate.site.name} · Chrome ${candidate.session.profileName} 同步失败：${String(error)}`,
-          });
+      }
+      const workerResults = await Promise.all(Array.from({ length: workerCount }, async () => {
+        let succeeded = 0;
+        let validated = 0;
+        while (nextGroupIndex < groupedCandidates.length) {
+          const group = groupedCandidates[nextGroupIndex++];
+          for (const candidate of group) {
+            const stage = `chrome-profile-${candidate.site.id}-${candidate.session.profileId}`;
+            appendSyncLog({
+              stage,
+              status: "running",
+              message: `正在通过 Chrome ${candidate.session.profileName} 同步 ${candidate.site.name}`,
+            });
+            try {
+              await runCommand<ChromeSessionInfo>("sync_site_account_via_chrome", {
+                siteId: candidate.site.id,
+                profileId: candidate.session.profileId,
+                runId: candidate.childRunId,
+              });
+              succeeded += 1;
+              if (!candidate.session.isValid) validated += 1;
+              validSiteIds.add(candidate.site.id);
+              appendSyncLog({
+                stage,
+                status: "success",
+                message: `${candidate.site.name} · Chrome ${candidate.session.profileName} 同步成功`,
+              });
+            } catch (error) {
+              appendSyncLog({
+                stage,
+                status: "error",
+                message: `${candidate.site.name} · Chrome ${candidate.session.profileName} 同步失败：${String(error)}`,
+              });
+            }
+          }
         }
+        return { succeeded, validated };
+      }));
+      for (const result of workerResults) {
+        browserSucceeded += result.succeeded;
+        newlyValidated += result.validated;
       }
       if (browserCandidates.length > 0) await loadLibrary();
       syncRunState.value = "complete";
@@ -535,6 +597,138 @@ async function syncChromeSession(site: SiteRecord, trigger: HTMLElement) {
   }
 }
 
+interface SyncedSiteModelsResult {
+  models: Array<{ id: string; owned_by?: string; ownedBy?: string }>;
+  source: string;
+  keys: string[];
+}
+
+async function syncAllModelKeys(siteIds = filteredSites.value.map((site) => site.id)) {
+  if (syncingModelKeys.value || syncingSites.value) return;
+  const visibleSiteIds = new Set(siteIds);
+  const siteMap = new Map(sites.value.map((site) => [site.id, site]));
+  const targets = usageSites.value
+    .flatMap((usageSite) => {
+      if (!visibleSiteIds.has(usageSite.siteId)) return [];
+      const site = siteMap.get(usageSite.siteId);
+      if (!site) return [];
+      return usageSite.sessions
+        .filter((session) => session.isValid)
+        .map((session) => ({ site, session }));
+    })
+    .filter((target, index, items) =>
+      items.findIndex((candidate) =>
+        candidate.site.id === target.site.id &&
+        candidate.session.profileId === target.session.profileId,
+      ) === index,
+    );
+  if (targets.length === 0) {
+    appendSyncLog({
+      stage: "models-empty",
+      status: "info",
+      message: "当前列表没有可同步 Key 与模型的合法账号",
+    });
+    syncRunState.value = "complete";
+    stopSyncTimer();
+    showToast("当前列表没有可同步 Key 的账号", true);
+    return;
+  }
+
+  appendSyncLog({
+    stage: "models-scope",
+    status: "info",
+    message: `已锁定当前列表中的 ${siteIds.length} 个在用存活站点，共 ${targets.length} 个账号`,
+  });
+  syncingModelKeys.value = true;
+  modelKeySyncCompleted.value = 0;
+  modelKeySyncTotal.value = targets.length;
+  let succeeded = 0;
+  let failed = 0;
+  let keyCount = 0;
+  let modelCount = 0;
+  const modelsBySite = new Map<string, SyncedSiteModelsResult[]>();
+  try {
+    for (const { site, session } of targets) {
+      const stage = `models-${site.id}-${session.profileId}`;
+      const accountLabel = session.username || session.accountName || session.profileName;
+      appendSyncLog({
+        stage,
+        status: "running",
+        message: `正在同步 ${site.name} · ${accountLabel} 的 Key 与模型`,
+      });
+      try {
+        let baseUrl = site.apiBaseUrl.trim();
+        if (!baseUrl.endsWith("/")) baseUrl += "/";
+        const result = await runCommand<SyncedSiteModelsResult>("fetch_site_models_json", {
+          url: baseUrl,
+          siteId: site.id,
+          profileId: session.profileId,
+        });
+        const siteResults = modelsBySite.get(site.id) ?? [];
+        siteResults.push(result);
+        modelsBySite.set(site.id, siteResults);
+        keyCount += result.keys?.length ?? 0;
+        modelCount += result.models?.length ?? 0;
+        succeeded += 1;
+        appendSyncLog({
+          stage,
+          status: "success",
+          message: `${site.name} · ${accountLabel} 同步成功：${result.keys?.length ?? 0} 个 Key，${result.models?.length ?? 0} 个模型`,
+        });
+      } catch (error) {
+        failed += 1;
+        appendSyncLog({
+          stage,
+          status: "error",
+          message: `${site.name} · ${accountLabel} 同步失败：${String(error)}`,
+        });
+      } finally {
+        modelKeySyncCompleted.value += 1;
+      }
+    }
+
+    for (const [siteId, results] of modelsBySite) {
+      const models = results
+        .flatMap((result) => result.models ?? [])
+        .filter((model, index, items) =>
+          items.findIndex((candidate) => candidate.id === model.id) === index,
+        );
+      if (models.length === 0) continue;
+      const apiSource = results.find((result) =>
+        ["newapi-key", "sub2api-key"].includes(result.source),
+      )?.source ?? results[0]?.source ?? "models";
+      localStorage.setItem(`openhub_models_${siteId}`, JSON.stringify({ models, apiSource }));
+    }
+    await loadLibrary();
+    syncRunState.value = "complete";
+    appendSyncLog({
+      stage: "models-complete",
+      status: failed > 0 ? "error" : "success",
+      message: failed > 0
+        ? `模型同步完成：${succeeded} 个账号成功，${failed} 个失败，共 ${keyCount} 个 Key、${modelCount} 个模型`
+        : `模型同步完成：${succeeded} 个账号，共 ${keyCount} 个 Key、${modelCount} 个模型`,
+    });
+    stopSyncTimer();
+    showToast(
+      failed > 0
+        ? `模型同步完成：${succeeded} 个账号成功，${failed} 个失败，共 ${keyCount} 个 Key、${modelCount} 个模型`
+        : `模型同步完成：${succeeded} 个账号，共 ${keyCount} 个 Key、${modelCount} 个模型`,
+      failed > 0,
+    );
+  } catch (error) {
+    syncRunState.value = "error";
+    appendSyncLog({
+      stage: "models-failed",
+      status: "error",
+      message: `模型同步失败：${String(error)}`,
+    });
+    stopSyncTimer();
+    showToast(`模型同步失败：${String(error)}`, true);
+  } finally {
+    syncingModelKeys.value = false;
+  }
+}
+
 async function toggleRunaway(site: SiteRecord) {
   const wasRunaway = site.isRunaway;
   try {
@@ -654,7 +848,7 @@ function closeChromeSessionDialog() {
 
 function canSyncAccountViaChrome(session: ChromeSessionInfo): boolean {
   return chromeSessionSite.value?.systemType.toLocaleLowerCase() === "newapi"
-    && (!session.isValid || /cloudflare|返回 html/i.test(session.syncError));
+    && needsChromeAccountFallback(session);
 }
 
 function stopChromeBrowserSyncTimer() {
@@ -874,6 +1068,9 @@ export function useStore() {
     chromeBrowserSyncLogs,
     chromeBrowserSyncElapsedMs,
     syncingSites,
+    syncingModelKeys,
+    modelKeySyncCompleted,
+    modelKeySyncTotal,
     syncRunState,
     syncLogs,
     syncElapsedMs,
@@ -904,16 +1101,19 @@ export function useStore() {
     openModal,
     closeModal,
     openSyncDialog,
+    openModelSyncDialog,
     closeSyncDialog,
     refreshRemoteUser,
     openRemoteLogin,
     syncSites,
     receiveSyncProgress,
+    receiveNestedChromeSyncProgress,
     saveSite,
     importSite,
     deleteSite,
     togglePersonal,
     syncChromeSession,
+    syncAllModelKeys,
     toggleRunaway,
     openExternal,
     openExternalInChromeProfile,

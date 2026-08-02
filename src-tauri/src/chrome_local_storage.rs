@@ -6,13 +6,14 @@ use std::{
 
 const LEVELDB_TABLE_MAGIC: u64 = 0xdb47_7524_8b80_fb57;
 const LOG_BLOCK_SIZE: usize = 32 * 1024;
-const STORAGE_KEYS: [&str; 6] = [
+const STORAGE_KEYS: [&str; 7] = [
     "user",
     "quota_display_type",
     "quota_per_unit",
     "status",
     "auth_token",
     "auth_user",
+    "0v0_token",
 ];
 
 #[derive(Debug, Clone)]

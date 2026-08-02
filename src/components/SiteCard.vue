@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed } from "vue";
 import { icons } from "../icons";
-import { formatRateLimit, logoText } from "../utils";
+import { formatDate, formatRateLimit, logoText } from "../utils";
 import { useStore } from "../composables/useStore";
 import TagList from "./TagList.vue";
 import type { ChromeSessionInfo, SiteRecord } from "../types";
@@ -18,6 +18,16 @@ const personalMode = computed(() => store.usageFilter.value === "personal");
 const accountSessions = computed(() =>
   (store.chromeUsageAccounts.value[props.site.id] ?? []).filter((session) => session.isValid),
 );
+const displayedUpdatedAt = computed(() => {
+  if (!personalMode.value) return props.site.updatedAt;
+  return accountSessions.value.reduce((latest, session) => {
+    if (!session.accountUpdatedAt) return latest;
+    if (!latest) return session.accountUpdatedAt;
+    return new Date(session.accountUpdatedAt).getTime() > new Date(latest).getTime()
+      ? session.accountUpdatedAt
+      : latest;
+  }, "") || props.site.updatedAt;
+});
 
 const extensionDetails = computed(() =>
   props.site.extensionLinks
@@ -152,6 +162,9 @@ function accountQuota(session: ChromeSessionInfo): string {
             />
           </div>
         </div>
+        <time class="site-updated-at" :datetime="displayedUpdatedAt">
+          更新时间 {{ formatDate(displayedUpdatedAt) }}
+        </time>
         <div v-if="!personalMode" class="meta-chips">
           <span class="level-chip">LV{{ site.registrationLimit }}</span>
           <span v-if="site.requiresInviteCode" class="invite-chip">邀请码</span>
@@ -186,7 +199,7 @@ function accountQuota(session: ChromeSessionInfo): string {
               :title="session.checkinError || (session.checkedInToday ? '今日已签到' : '今日未签到')"
             >{{ session.checkinError ? "签到异常" : (session.checkedInToday ? "已签到" : "未签到") }}</span>
           </strong>
-          <small>邮箱（站点用户名）</small>
+          <small>{{ session.apiKeyCount ?? 0 }} 个 Key · {{ session.apiModelCount ?? 0 }} 个模型</small>
         </div>
         <div class="usage-account-quota" :class="{ 'has-error': session.syncError }">
           <strong :title="session.syncError || `剩余额度：${accountQuota(session)}`">{{ accountQuota(session) }}</strong>

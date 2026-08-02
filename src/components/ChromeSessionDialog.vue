@@ -102,8 +102,17 @@ async function syncViaChrome(session: ChromeSessionInfo) {
         </header>
 
         <div class="chrome-session-list">
-          <div v-if="store.chromeSessionsLoading.value" class="chrome-session-state">
-            正在读取 Chrome 账号会话…
+          <div
+            v-if="store.chromeSessionsLoading.value"
+            class="chrome-session-state is-loading"
+            role="status"
+            aria-live="polite"
+          >
+            <span class="chrome-session-loading-icon" v-html="icons.restore" />
+            <strong>正在匹配 Chrome 账号</strong>
+            <p>
+              正在扫描本机 Chrome 配置，并查找「{{ store.chromeSessionSite.value?.name || "当前站点" }}」的有效登录会话，请稍候。
+            </p>
           </div>
           <div v-else-if="store.chromeSessionsError.value" class="chrome-session-state error">
             {{ store.chromeSessionsError.value }}

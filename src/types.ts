@@ -64,6 +64,8 @@ export interface ChromeSessionInfo {
   profileName: string;
   accountName: string;
   username: string;
+  apiKeyCount: number;
+  apiModelCount: number;
   remaining: number | null;
   used: number | null;
   total: number | null;

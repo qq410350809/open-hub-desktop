@@ -10,11 +10,18 @@ const closeBtnRef = ref<HTMLButtonElement>();
 const logListRef = ref<HTMLOListElement>();
 const isTauri = "__TAURI_INTERNALS__" in window;
 let unlistenProgress: (() => void) | undefined;
+let unlistenChromeProgress: (() => void) | undefined;
 
 const scopeLabel = computed(() =>
-  store.syncDialogMode.value === "sessions"
+  store.syncDialogMode.value === "models"
+    ? `当前列表中的 ${store.syncDialogSiteIds.value.length} 个在用存活站点`
+    : store.syncDialogMode.value === "sessions"
     ? `当前列表中的 ${store.syncDialogSiteIds.value.length} 个在用站点`
     : store.syncDialogRunaway.value ? "跑路站点" : "存活站点",
+);
+
+const dialogTitle = computed(() =>
+  store.syncDialogMode.value === "models" ? "模型同步" : "同步站点",
 );
 
 const runStateLabel = computed(() => {
@@ -36,11 +43,16 @@ onMounted(async () => {
   unlistenProgress = await listen<SyncSitesProgress>("sync-sites-progress", (event) => {
     store.receiveSyncProgress(event.payload);
   });
+  unlistenChromeProgress = await listen<SyncSitesProgress>("chrome-account-sync-progress", (event) => {
+    store.receiveNestedChromeSyncProgress(event.payload);
+  });
 });
 
 onUnmounted(() => {
   unlistenProgress?.();
+  unlistenChromeProgress?.();
   unlistenProgress = undefined;
+  unlistenChromeProgress = undefined;
 });
 
 watch(
@@ -89,16 +101,17 @@ function onBackdropClick(event: MouseEvent) {
       >
         <header class="link-dialog-header">
           <div>
-            <h2 id="sync-sites-title">同步站点</h2>
+            <h2 id="sync-sites-title">{{ dialogTitle }}</h2>
             <p v-if="store.syncDialogMode.value === 'remote'">验证 Chrome 登录状态后同步{{ scopeLabel }}</p>
-            <p v-else>并行同步{{ scopeLabel }}的 Chrome 会话</p>
+            <p v-else-if="store.syncDialogMode.value === 'sessions'">并行同步{{ scopeLabel }}的 Chrome 会话</p>
+            <p v-else>同步{{ scopeLabel }}所有账号的 Key 与模型</p>
           </div>
           <button
             ref="closeBtnRef"
             class="close-button"
             type="button"
-            aria-label="关闭同步站点窗口"
-            :disabled="store.syncingSites.value"
+            :aria-label="`关闭${dialogTitle}窗口`"
+            :disabled="store.syncingSites.value || store.syncingModelKeys.value"
             @click="close"
             v-html="icons.close"
           />
@@ -154,11 +167,40 @@ function onBackdropClick(event: MouseEvent) {
             </div>
 
             <div class="sync-scope-row">
-              <span class="sync-scope-icon" v-html="store.syncDialogRunaway.value ? icons.flag : icons.globe" />
+              <span
+                class="sync-scope-icon"
+                v-html="store.syncDialogMode.value === 'models'
+                  ? icons.cpu
+                  : store.syncDialogRunaway.value ? icons.flag : icons.globe"
+              />
               <div>
                 <strong>本次同步范围</strong>
                 <p v-if="store.syncDialogMode.value === 'remote'">{{ scopeLabel }} · 同名远端记录会更新，本地在用状态会保留</p>
-                <p v-else>{{ scopeLabel }} · 仅更新这些站点的本地账号缓存</p>
+                <p v-else-if="store.syncDialogMode.value === 'sessions'">{{ scopeLabel }} · 仅更新这些站点的本地账号缓存</p>
+                <p v-else>{{ scopeLabel }} · 仅同步这些站点下合法账号的 Key 与模型</p>
+              </div>
+            </div>
+
+            <div
+              v-if="store.syncDialogMode.value === 'models' && store.syncingModelKeys.value"
+              class="model-sync-loading"
+              role="status"
+              aria-live="polite"
+            >
+              <span class="model-sync-loading-icon" v-html="icons.restore" />
+              <div class="model-sync-loading-content">
+                <header>
+                  <strong>正在同步 Key 与模型</strong>
+                  <span>
+                    {{ store.modelKeySyncCompleted.value }}/{{ store.modelKeySyncTotal.value }} 个账号
+                  </span>
+                </header>
+                <p>正在读取账号 Key，并验证在线模型列表，请稍候。</p>
+                <progress
+                  aria-label="Key 与模型同步进度"
+                  :max="store.modelKeySyncTotal.value || 1"
+                  :value="store.modelKeySyncCompleted.value"
+                />
               </div>
             </div>
 
@@ -194,7 +236,7 @@ function onBackdropClick(event: MouseEvent) {
           </template>
         </div>
 
-        <footer v-if="store.syncDialogMode.value === 'sessions' || store.remoteUser.value" class="sync-sites-footer">
+        <footer v-if="store.syncDialogMode.value !== 'remote' || store.remoteUser.value" class="sync-sites-footer">
           <template v-if="store.syncRunState.value === 'idle'">
             <button
               v-if="store.syncDialogMode.value === 'remote'"
@@ -207,8 +249,9 @@ function onBackdropClick(event: MouseEvent) {
               <span>重新获取</span>
             </button>
             <button class="primary-button" type="button" @click="store.syncSites()">
-              <span v-html="icons.restore" />
-              <span>{{ store.syncDialogMode.value === 'sessions' ? '同步当前列表' : `同步${scopeLabel}` }}</span>
+              <span v-html="store.syncDialogMode.value === 'models' ? icons.cpu : icons.restore" />
+              <span v-if="store.syncDialogMode.value === 'models'">同步 Key 与模型</span>
+              <span v-else>{{ store.syncDialogMode.value === 'sessions' ? '同步当前列表' : `同步${scopeLabel}` }}</span>
             </button>
           </template>
           <template v-else>
@@ -225,11 +268,11 @@ function onBackdropClick(event: MouseEvent) {
             <button
               class="primary-button"
               type="button"
-              :disabled="store.syncingSites.value"
-              :aria-busy="store.syncingSites.value"
+              :disabled="store.syncingSites.value || store.syncingModelKeys.value"
+              :aria-busy="store.syncingSites.value || store.syncingModelKeys.value"
               @click="close"
             >
-              <span v-if="store.syncingSites.value">同步中…</span>
+              <span v-if="store.syncingSites.value || store.syncingModelKeys.value">同步中…</span>
               <span v-else-if="store.syncRunState.value === 'detecting'">关闭（后台继续）</span>
               <span v-else>完成</span>
             </button>

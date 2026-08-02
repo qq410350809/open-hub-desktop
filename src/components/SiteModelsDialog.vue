@@ -8,11 +8,24 @@ import { logoText } from "../utils";
 interface LiveModelItem {
   id: string;
   owned_by?: string;
-  model_ratio?: number;
-  completion_ratio?: number;
-  model_price?: number;
-  quota_type?: number;
-  group?: string;
+  ownedBy?: string;
+}
+
+type ModelApiSource = "newapi-key" | "sub2api-key" | "pricing" | "models" | "none";
+
+interface SiteModelsResult {
+  models: LiveModelItem[];
+  source: ModelApiSource;
+  keys: string[];
+}
+
+interface LiveAccountKeys {
+  profileId: string;
+  profileName: string;
+  accountName: string;
+  username: string;
+  keys: string[];
+  error: string;
 }
 
 const isTauri = "__TAURI_INTERNALS__" in window;
@@ -22,76 +35,26 @@ const searchQuery = ref("");
 const liveFetching = ref(false);
 const liveError = ref("");
 const liveModels = ref<LiveModelItem[]>([]);
-const apiSource = ref<"pricing" | "models" | "none">("none");
+const liveAccountKeys = ref<LiveAccountKeys[]>([]);
+const apiSource = ref<ModelApiSource>("none");
+const sessionKeysBySite = new Map<string, LiveAccountKeys[]>();
+const keyFetchCompletedSites = new Set<string>();
+let liveFetchRequestId = 0;
 
 const site = computed(() => store.siteModelsSite.value);
+const liveKeyCount = computed(() =>
+  liveAccountKeys.value.reduce((total, account) => total + account.keys.length, 0),
+);
 
 const logo = computed(() =>
   site.value ? logoText(site.value.apiBaseUrl, site.value.name) : "",
 );
 
-const parsedModels = computed(() => {
-  if (!site.value) return [];
-
-  const text = [
-    site.value.name,
-    site.value.description,
-    site.value.systemType,
-    ...site.value.tags,
-  ]
-    .join(" ")
-    .toLowerCase();
-
-  const list: Array<{ id: string; name: string; vendor: string }> = [];
-
-  const modelMap: Array<{ id: string; name: string; vendor: string; kw: string[] }> = [
-    { id: "gpt-4o", name: "GPT-4o", vendor: "OpenAI", kw: ["gpt-4o", "gpt-4", "gpt"] },
-    { id: "gpt-4o-mini", name: "GPT-4o Mini", vendor: "OpenAI", kw: ["mini", "nano"] },
-    { id: "o1-o3", name: "OpenAI o1 / o3", vendor: "OpenAI", kw: ["o1", "o3"] },
-    { id: "claude-3-5-sonnet", name: "Claude 3.5 Sonnet", vendor: "Anthropic", kw: ["claude-3.5", "sonnet", "claude"] },
-    { id: "claude-opus", name: "Claude Opus", vendor: "Anthropic", kw: ["opus"] },
-    { id: "claude-code", name: "Claude Code", vendor: "Anthropic", kw: ["claude code", "claudecode"] },
-    { id: "deepseek-v3", name: "DeepSeek-V3 / V4", vendor: "DeepSeek", kw: ["deepseek", "deepseek-v3", "deepseek-v4"] },
-    { id: "deepseek-r1", name: "DeepSeek-R1", vendor: "DeepSeek", kw: ["deepseek-r1", "r1"] },
-    { id: "gemini-1-5-pro", name: "Gemini 1.5 / 2.5 Pro", vendor: "Google", kw: ["gemini", "gemini-1.5", "gemini-2.5"] },
-    { id: "gemini-flash", name: "Gemini Flash", vendor: "Google", kw: ["flash"] },
-    { id: "grok-2", name: "Grok 2 / Grok 3", vendor: "xAI", kw: ["grok"] },
-    { id: "qwen-max", name: "Qwen / 通义千问", vendor: "阿里", kw: ["qwen", "通义千问"] },
-    { id: "glm-4", name: "GLM-4 / 智谱", vendor: "智谱AI", kw: ["glm"] },
-    { id: "kimi", name: "Kimi / Moonshot", vendor: "月之暗面", kw: ["kimi", "moonshot"] },
-    { id: "minimax", name: "MiniMax", vendor: "MiniMax", kw: ["minimax", "abab"] },
-    { id: "mimo", name: "MiMo", vendor: "小米", kw: ["mimo"] },
-    { id: "codex", name: "Codex", vendor: "OpenAI", kw: ["codex"] },
-  ];
-
-  for (const item of modelMap) {
-    if (item.kw.some((k) => text.includes(k))) {
-      list.push({ id: item.id, name: item.name, vendor: item.vendor });
-    }
-  }
-
-  for (const tag of site.value.tags) {
-    if (!list.some((m) => m.name.toLowerCase().includes(tag.toLowerCase()))) {
-      list.push({ id: tag.toLowerCase(), name: tag, vendor: "标签" });
-    }
-  }
-
-  return list;
-});
-
-const filteredModels = computed(() => {
-  const q = searchQuery.value.trim().toLowerCase();
-  if (!q) return parsedModels.value;
-  return parsedModels.value.filter(
-    (m) => m.name.toLowerCase().includes(q) || m.vendor.toLowerCase().includes(q) || m.id.toLowerCase().includes(q),
-  );
-});
-
 const filteredLiveModels = computed(() => {
   const q = searchQuery.value.trim().toLowerCase();
   if (!q) return liveModels.value;
   return liveModels.value.filter(
-    (m) => m.id.toLowerCase().includes(q) || (m.owned_by && m.owned_by.toLowerCase().includes(q)) || (m.group && m.group.toLowerCase().includes(q)),
+    (m) => m.id.toLowerCase().includes(q) || (m.owned_by && m.owned_by.toLowerCase().includes(q)),
   );
 });
 
@@ -102,12 +65,37 @@ watch(
       nextTick(() => closeBtnRef.value?.focus());
       document.body.classList.add("modal-open");
       liveModels.value = [];
+      liveAccountKeys.value = site.value ? (sessionKeysBySite.get(site.value.id) ?? []) : [];
       liveError.value = "";
       searchQuery.value = "";
       apiSource.value = "none";
-      // 打开弹窗自动请求 /api/pricing 接口
-      fetchLiveModels();
+      let hasCache = false;
+      if (site.value) {
+        try {
+          const cached = localStorage.getItem(`openhub_models_${site.value.id}`);
+          if (cached) {
+            const data = JSON.parse(cached);
+            if (data && Array.isArray(data.models)) {
+              liveModels.value = data.models;
+              apiSource.value = data.apiSource || "none";
+              hasCache = true;
+            }
+          }
+        } catch (e) {}
+      }
+
+      if (!hasCache) {
+        void fetchLiveModels();
+      } else if (
+        site.value &&
+        ["newapi-key", "sub2api-key"].includes(apiSource.value) &&
+        !keyFetchCompletedSites.has(site.value.id)
+      ) {
+        void fetchLiveModels(false);
+      }
     } else {
+      liveFetchRequestId += 1;
+      liveFetching.value = false;
       document.body.classList.remove("modal-open");
     }
   },
@@ -115,6 +103,38 @@ watch(
 
 function close() {
   store.closeSiteModelsDialog();
+}
+
+function processAndCacheModels(
+  rawList: any[],
+  source: ModelApiSource,
+  accounts: LiveAccountKeys[] = [],
+) {
+  const parsed = rawList
+    .map((item: any) => ({
+      id: typeof item === "string" ? item : String(item.model_name || item.id || item.name || item.model || item),
+      owned_by: item.owner || item.owned_by || item.ownedBy || undefined,
+    }))
+    .filter((item, index, items) =>
+      items.findIndex((candidate) => candidate.id === item.id) === index,
+    );
+  parsed.sort((a, b) => a.id.localeCompare(b.id));
+  liveModels.value = parsed;
+  liveAccountKeys.value = accounts.map((account) => ({
+    ...account,
+    keys: [...new Set(account.keys.map((key) => String(key).trim()).filter(Boolean))],
+  }));
+  apiSource.value = source;
+  if (site.value) {
+    sessionKeysBySite.set(site.value.id, liveAccountKeys.value);
+    keyFetchCompletedSites.add(site.value.id);
+    if (parsed.length > 0) {
+      localStorage.setItem(`openhub_models_${site.value.id}`, JSON.stringify({
+        models: parsed,
+        apiSource: source
+      }));
+    }
+  }
 }
 
 function onBackdropClick(event: MouseEvent) {
@@ -125,53 +145,134 @@ async function copyModelId(modelId: string) {
   await store.copyAddress(modelId, "模型标识");
 }
 
-async function fetchLiveModels() {
-  if (!site.value) return;
+async function copyApiKey(key: string, index: number, accountName: string) {
+  await store.copyAddress(key, `${accountName} API Key ${index + 1}`);
+}
+
+async function fetchLiveModels(clearModels = true) {
+  const requestedSite = site.value;
+  if (!requestedSite) {
+    liveFetching.value = false;
+    return;
+  }
+  const requestId = ++liveFetchRequestId;
+  let requestFinished = false;
+  const requestIsCurrent = () => requestId === liveFetchRequestId;
+  const finishRequest = () => {
+    if (requestFinished) return;
+    requestFinished = true;
+    window.clearTimeout(timeoutId);
+    if (requestIsCurrent()) liveFetching.value = false;
+  };
+  const timeoutId = window.setTimeout(() => {
+    if (!requestIsCurrent()) return;
+    liveFetchRequestId += 1;
+    liveFetching.value = false;
+    liveError.value = "模型与 Key 获取超时，请检查站点或 Chrome 验证状态后重试。";
+  }, 120_000);
   liveFetching.value = true;
   liveError.value = "";
-  liveModels.value = [];
-  apiSource.value = "none";
+  liveAccountKeys.value = [];
+  sessionKeysBySite.delete(requestedSite.id);
+  keyFetchCompletedSites.delete(requestedSite.id);
+  if (clearModels) {
+    liveModels.value = [];
+    apiSource.value = "none";
+  }
 
-  let baseUrl = site.value.apiBaseUrl.trim();
+  let baseUrl = requestedSite.apiBaseUrl.trim();
   if (!baseUrl.endsWith("/")) baseUrl += "/";
 
   // 1. 如果在 Tauri 桌面端运行，优先调用 Rust reqwest 后端命令（无 CORS / 无 Webview 限制）
   if (isTauri) {
     try {
-      const jsonStr = await invoke<string>("fetch_site_models_json", { url: baseUrl, siteId: site.value.id });
-      if (!jsonStr || !jsonStr.trim()) {
-        throw new Error("接口返回了空数据，该站点可能未公开模型列表。");
-      }
-      
-      let json;
-      try {
-        json = JSON.parse(jsonStr);
-      } catch (parseErr) {
-        console.error("JSON Parse Error:", parseErr, "Response:", jsonStr.substring(0, 100));
-        throw new Error("接口返回的数据格式不是标准 JSON，可能遇到了网页拦截、人机验证或 502 错误。");
+      const sessions = (store.chromeUsageAccounts.value[requestedSite.id] ?? [])
+        .filter((session) => session.isValid);
+      const results: SiteModelsResult[] = [];
+      const accounts: LiveAccountKeys[] = [];
+      const accountErrors: string[] = [];
+
+      if (sessions.length > 0) {
+        for (const session of sessions) {
+          try {
+            const result = await invoke<SiteModelsResult>("fetch_site_models_json", {
+              url: baseUrl,
+              siteId: requestedSite.id,
+              profileId: session.profileId,
+            });
+            if (!requestIsCurrent()) {
+              finishRequest();
+              return;
+            }
+            results.push(result);
+            accounts.push({
+              profileId: session.profileId,
+              profileName: session.profileName,
+              accountName: session.accountName,
+              username: session.username,
+              keys: result.keys ?? [],
+              error: "",
+            });
+          } catch (error) {
+            const message = String(error);
+            accountErrors.push(`${session.accountName || session.profileName}：${message}`);
+            accounts.push({
+              profileId: session.profileId,
+              profileName: session.profileName,
+              accountName: session.accountName,
+              username: session.username,
+              keys: [],
+              error: message,
+            });
+          }
+        }
+      } else {
+        const result = await invoke<SiteModelsResult>("fetch_site_models_json", {
+          url: baseUrl,
+          siteId: requestedSite.id,
+          profileId: null,
+        });
+        if (!requestIsCurrent()) {
+          finishRequest();
+          return;
+        }
+        results.push(result);
+        if ((result.keys ?? []).length > 0) {
+          accounts.push({
+            profileId: "",
+            profileName: "当前会话",
+            accountName: "当前会话",
+            username: "",
+            keys: result.keys,
+            error: "",
+          });
+        }
       }
 
-      const rawList = Array.isArray(json?.data) ? json.data : Array.isArray(json) ? json : [];
-      if (rawList.length > 0) {
-        liveModels.value = rawList.map((item: any) => ({
-          id: String(item.model_name || item.id || item.name || item.model || item),
-          owned_by: item.owner || item.owned_by || undefined,
-          model_ratio: typeof item.model_ratio === "number" ? item.model_ratio : undefined,
-          completion_ratio: typeof item.completion_ratio === "number" ? item.completion_ratio : undefined,
-          model_price: typeof item.model_price === "number" ? item.model_price : undefined,
-          quota_type: typeof item.quota_type === "number" ? item.quota_type : undefined,
-          group: item.group ? String(item.group) : Array.isArray(item.enable_groups) ? item.enable_groups.join(",") : undefined,
-        }));
-        apiSource.value = rawList[0]?.model_name !== undefined ? "pricing" : "models";
-        liveFetching.value = false;
-        return;
-      } else {
-         throw new Error("接口返回的模型列表为空，该站点可能没有配置模型或接口无权限。");
+      const models = results.flatMap((result) => result.models ?? []);
+      const accountKeyCount = accounts.reduce((total, account) => total + account.keys.length, 0);
+      if (models.length === 0 && accountKeyCount === 0) {
+        throw new Error("接口返回了空数据，该站点可能未公开模型列表。");
       }
+      const source = results.find((result) =>
+        ["newapi-key", "sub2api-key"].includes(result.source),
+      )?.source ?? results[0]?.source ?? "models";
+      processAndCacheModels(models, source, accounts);
+      finishRequest();
+      await store.loadLibrary();
+      if (!requestIsCurrent()) return;
+      if (models.length === 0) {
+        liveError.value = "Key 已同步，但模型接口未返回可用模型。";
+      } else if (accountErrors.length > 0) {
+        liveError.value = `部分账号 Key 同步失败：${accountErrors.join("；")}`;
+      }
+      return;
     } catch (err: any) {
       console.warn("Tauri fetch_site_models_json 请求失败", err);
-      liveError.value = String(err?.message || err || "接口拉取失败");
-      liveFetching.value = false;
+      if (requestIsCurrent()) {
+        liveError.value = String(err?.message || err || "接口拉取失败");
+      }
+      finishRequest();
       return; // Tauri 环境下请求失败直接返回，不再走浏览器的 Web fetch 降级（因为浏览器大概率也会跨域失败）
     }
   }
@@ -180,21 +281,16 @@ async function fetchLiveModels() {
   try {
     const pricingUrl = `${baseUrl}api/pricing`;
     const res = await fetch(pricingUrl, { signal: AbortSignal.timeout(6000) });
+    if (!requestIsCurrent()) {
+      finishRequest();
+      return;
+    }
     if (res.ok) {
       const json = await res.json();
       const rawList = Array.isArray(json?.data) ? json.data : Array.isArray(json) ? json : [];
       if (rawList.length > 0) {
-        liveModels.value = rawList.map((item: any) => ({
-          id: String(item.model_name || item.id || item.name || item.model || item),
-          owned_by: item.owner || item.owned_by || undefined,
-          model_ratio: typeof item.model_ratio === "number" ? item.model_ratio : undefined,
-          completion_ratio: typeof item.completion_ratio === "number" ? item.completion_ratio : undefined,
-          model_price: typeof item.model_price === "number" ? item.model_price : undefined,
-          quota_type: typeof item.quota_type === "number" ? item.quota_type : undefined,
-          group: item.group ? String(item.group) : Array.isArray(item.enable_groups) ? item.enable_groups.join(",") : undefined,
-        }));
-        apiSource.value = "pricing";
-        liveFetching.value = false;
+        processAndCacheModels(rawList, "pricing");
+        finishRequest();
         return;
       }
     }
@@ -205,26 +301,26 @@ async function fetchLiveModels() {
   try {
     const v1Url = `${baseUrl}v1/models`;
     const res = await fetch(v1Url, { signal: AbortSignal.timeout(6000) });
+    if (!requestIsCurrent()) {
+      finishRequest();
+      return;
+    }
     if (res.ok) {
       const json = await res.json();
       const rawList = Array.isArray(json?.data) ? json.data : Array.isArray(json) ? json : [];
       if (rawList.length > 0) {
-        liveModels.value = rawList.map((item: any) => ({
-          id: typeof item === "string" ? item : String(item.id || item.name || item),
-          owned_by: item.owned_by ? String(item.owned_by) : undefined,
-        }));
-        apiSource.value = "models";
-        liveFetching.value = false;
+        processAndCacheModels(rawList, "models");
+        finishRequest();
         return;
       }
     }
     liveError.value = "接口未返回有效数据。";
   } catch (err: any) {
-    if (!liveError.value) {
+    if (requestIsCurrent() && !liveError.value) {
       liveError.value = err?.message || "无法拉取在线模型，接口可能需要 API Key 或存在网络限制（如跨域 CORS）";
     }
   } finally {
-    liveFetching.value = false;
+    finishRequest();
   }
 }
 </script>
@@ -270,8 +366,8 @@ async function fetchLiveModels() {
             <span v-html="icons.search" />
             <input
               v-model="searchQuery"
-              type="search"
-              placeholder="搜索模型标识、分组或厂商…"
+              type="text"
+              placeholder="搜索模型标识或厂商…"
             />
           </label>
 
@@ -279,20 +375,65 @@ async function fetchLiveModels() {
             type="button"
             class="fetch-live-btn"
             :disabled="liveFetching"
-            @click="fetchLiveModels"
+            @click="fetchLiveModels()"
           >
             <span v-html="icons.restore" />
-            <span>{{ liveFetching ? '获取中…' : '刷新 /api/pricing' }}</span>
+            <span>{{ liveFetching ? '获取中…' : '刷新模型' }}</span>
           </button>
         </div>
 
         <div class="dialog-body">
+          <section
+            v-if="liveAccountKeys.length > 0 || liveModels.length > 0"
+            class="site-api-keys"
+            aria-label="可用 API Key"
+          >
+            <header>
+              <span v-html="icons.key" />
+              <strong>可用 Key</strong>
+              <small>{{ liveKeyCount }} 个</small>
+            </header>
+            <div class="site-api-key-list">
+              <div
+                v-for="account in liveAccountKeys"
+                :key="account.profileId || account.accountName"
+                class="site-api-key-account"
+              >
+                <div class="site-api-key-account-header">
+                  <span v-html="icons.user" />
+                  <strong :title="account.accountName || account.profileName">
+                    {{ account.accountName || account.profileName }}<span v-if="account.username">（{{ account.username }}）</span>
+                  </strong>
+                  <small>{{ account.keys.length }} 个</small>
+                </div>
+                <div v-for="(key, index) in account.keys" :key="key" class="site-api-key-row">
+                  <code :title="key">{{ key }}</code>
+                  <button
+                    type="button"
+                    class="copy-icon-btn"
+                    :aria-label="`复制 ${account.accountName || account.profileName} 的 API Key ${index + 1}`"
+                    title="复制 Key"
+                    @click="copyApiKey(key, index, account.accountName || account.profileName)"
+                  >
+                    <span v-html="icons.copy" />
+                  </button>
+                </div>
+                <p v-if="account.keys.length === 0" class="site-api-key-empty" :title="account.error">
+                  {{ account.error ? "Key 同步失败" : "此账号没有可用 Key" }}
+                </p>
+              </div>
+              <p v-if="liveAccountKeys.length === 0" class="site-api-key-empty">未读取到可用 Key</p>
+            </div>
+          </section>
+
           <!-- 在线接口获取到的模型 (NewAPI /api/pricing 或 /v1/models) -->
           <div v-if="liveModels.length > 0" class="models-section">
             <div class="section-title">
               <span class="live-dot" />
               <span>
                 在线接口模型列表
+                <small v-if="apiSource === 'newapi-key'">（通过 NewAPI Key 获取，共 {{ filteredLiveModels.length }} 个）</small>
+                <small v-else-if="apiSource === 'sub2api-key'">（通过 Sub2API Key 获取，共 {{ filteredLiveModels.length }} 个）</small>
                 <small v-if="apiSource === 'pricing'">（源自 NewAPI /api/pricing，共 {{ filteredLiveModels.length }} 个）</small>
                 <small v-else-if="apiSource === 'models'">（源自 /v1/models，共 {{ filteredLiveModels.length }} 个）</small>
               </span>
@@ -307,18 +448,8 @@ async function fetchLiveModels() {
               >
                 <div class="model-item-info">
                   <strong>{{ model.id }}</strong>
-                  <div class="model-sub-meta">
-                    <span v-if="model.quota_type === 1" class="ratio-badge price">
-                      按次: ${{ model.model_price ?? 0 }}
-                    </span>
-                    <span v-else-if="model.model_ratio !== undefined" class="ratio-badge">
-                      倍率: {{ model.model_ratio }}x
-                      <template v-if="model.completion_ratio"> (补全: {{ model.completion_ratio }}x)</template>
-                    </span>
-                    <span v-if="model.group" class="group-badge">
-                      {{ model.group }}
-                    </span>
-                    <small v-if="model.owned_by">by {{ model.owned_by }}</small>
+                  <div v-if="model.owned_by" class="model-sub-meta">
+                    <small>by {{ model.owned_by }}</small>
                   </div>
                 </div>
                 <button type="button" class="copy-icon-btn" title="复制模型标识">
@@ -330,7 +461,7 @@ async function fetchLiveModels() {
 
           <div v-else-if="liveFetching" class="loading-models-banner">
             <span v-html="icons.restore" class="spin-icon" />
-            <span>正在向 {{ site?.name }} 请求 /api/pricing 获取实时模型列表…</span>
+            <span>正在读取 {{ site?.name }} 的账号 Key 与实时模型列表…</span>
           </div>
 
           <div v-if="liveError" class="live-error-banner">

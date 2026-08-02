@@ -19,6 +19,7 @@ const REMOTE_USER_URL: &str = "https://ldoh.105117.xyz/api/ld/user";
 const REMOTE_SITES_URL: &str = "https://ldoh.105117.xyz/api/sites";
 const REMOTE_SESSION_COOKIE: &str = "ld_auth_session";
 const NETWORK_PROXY_KEY: &str = "network_proxy";
+const ZERO_V_ZERO_CONSOLE_URL: &str = "https://0v0.club/";
 
 struct Database(std::sync::Mutex<Connection>);
 
@@ -331,6 +332,8 @@ impl Database {
                     profile_name TEXT NOT NULL,
                     account_name TEXT NOT NULL,
                     username TEXT NOT NULL DEFAULT '',
+                    api_key_count INTEGER NOT NULL DEFAULT 0,
+                    api_model_count INTEGER NOT NULL DEFAULT 0,
                     remaining REAL,
                     used REAL,
                     total REAL,
@@ -408,6 +411,8 @@ fn migrate_legacy_favorites_to_personal(connection: &Connection) -> Result<(), S
 fn ensure_site_account_columns(connection: &Connection) -> Result<(), String> {
     for (name, definition) in [
         ("username", "TEXT NOT NULL DEFAULT ''"),
+        ("api_key_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("api_model_count", "INTEGER NOT NULL DEFAULT 0"),
         ("remaining", "REAL"),
         ("used", "REAL"),
         ("total", "REAL"),
@@ -445,7 +450,8 @@ fn read_cached_usage_sites(
     let mut statement = connection
         .prepare(
             "SELECT site_id, profile_id, domain, cookie_count, cookie_names, profile_name, account_name,
-                    username, remaining, used, total, unit, is_valid, sync_error,
+                    username, api_key_count, api_model_count,
+                    remaining, used, total, unit, is_valid, sync_error,
                     checkin_enabled,
                     CASE WHEN checkin_date = date('now', 'localtime') THEN checked_in_today ELSE 0 END,
                     checkin_error, updated_at
@@ -466,16 +472,18 @@ fn read_cached_usage_sites(
                     profile_name: row.get(5)?,
                     account_name: row.get(6)?,
                     username: row.get(7)?,
-                    remaining: row.get(8)?,
-                    used: row.get(9)?,
-                    total: row.get(10)?,
-                    unit: row.get(11)?,
-                    is_valid: row.get::<_, i64>(12)? != 0,
-                    sync_error: row.get(13)?,
-                    checkin_enabled: row.get::<_, i64>(14)? != 0,
-                    checked_in_today: row.get::<_, i64>(15)? != 0,
-                    checkin_error: row.get(16)?,
-                    account_updated_at: row.get(17)?,
+                    api_key_count: row.get::<_, i64>(8)?.max(0) as usize,
+                    api_model_count: row.get::<_, i64>(9)?.max(0) as usize,
+                    remaining: row.get(10)?,
+                    used: row.get(11)?,
+                    total: row.get(12)?,
+                    unit: row.get(13)?,
+                    is_valid: row.get::<_, i64>(14)? != 0,
+                    sync_error: row.get(15)?,
+                    checkin_enabled: row.get::<_, i64>(16)? != 0,
+                    checked_in_today: row.get::<_, i64>(17)? != 0,
+                    checkin_error: row.get(18)?,
+                    account_updated_at: row.get(19)?,
                 },
             ))
         })
@@ -794,7 +802,30 @@ fn canonical_system_type(value: &str) -> String {
     match compact.as_str() {
         "sub2api" => "Sub2API".into(),
         "newapi" => "NewAPI".into(),
+        "0v0" | "zerovzero" => "0v0".into(),
         _ => String::new(),
+    }
+}
+
+fn is_zero_v_zero_site(name: &str, api_base_url: &str, system_type: &str) -> bool {
+    system_type.trim().eq_ignore_ascii_case("0v0")
+        || name.trim().eq_ignore_ascii_case("0v0")
+        || Url::parse(api_base_url)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+            .is_some_and(|host| {
+                matches!(
+                    host.as_str(),
+                    "0v0.club" | "docs.0v0.club" | "docs.0v0.xyz" | "api.0v0.club"
+                )
+            })
+}
+
+fn account_base_url(name: &str, api_base_url: &str, system_type: &str) -> String {
+    if is_zero_v_zero_site(name, api_base_url, system_type) {
+        ZERO_V_ZERO_CONSOLE_URL.into()
+    } else {
+        api_base_url.to_string()
     }
 }
 
@@ -861,6 +892,7 @@ fn infer_remote_system_type(site: &serde_json::Map<String, serde_json::Value>) -
 struct EndpointProbe {
     status: reqwest::StatusCode,
     is_json: bool,
+    is_challenge: bool,
 }
 
 #[derive(Debug)]
@@ -875,6 +907,12 @@ impl DiscoveryResponse {
         EndpointProbe {
             status: self.status,
             is_json: serde_json::from_str::<serde_json::Value>(&self.body).is_ok(),
+            is_challenge: shield_page_response(
+                self.status,
+                &self.content_type,
+                false,
+                self.body.as_bytes(),
+            ),
         }
     }
 
@@ -1068,6 +1106,40 @@ fn endpoint_probe_exists(probe: EndpointProbe) -> bool {
             && (probe.status.is_success() || probe.status == reqwest::StatusCode::FORBIDDEN))
 }
 
+fn shield_page_response(
+    status: reqwest::StatusCode,
+    content_type: &str,
+    security_gateway_header: bool,
+    body: &[u8],
+) -> bool {
+    if serde_json::from_slice::<serde_json::Value>(body).is_ok() {
+        return false;
+    }
+    let first = body
+        .iter()
+        .copied()
+        .find(|byte| !byte.is_ascii_whitespace());
+    let looks_html = content_type.contains("text/html") || first == Some(b'<');
+    if !looks_html && !security_gateway_header {
+        return false;
+    }
+    let lower = String::from_utf8_lossy(&body[..body.len().min(200_000)]).to_ascii_lowercase();
+    security_gateway_header
+        || matches!(status.as_u16(), 403 | 429 | 503)
+        || [
+            "cf-chl-",
+            "challenge-platform",
+            "cloudflare ray id",
+            "just a moment",
+            "attention required",
+            "acw_sc__v2",
+            "acw_tc",
+            "cdn_sec_tc",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker))
+}
+
 fn system_type_from_probes(
     newapi_probe: Option<EndpointProbe>,
     sub2api_probe: Option<EndpointProbe>,
@@ -1100,22 +1172,210 @@ async fn probe_endpoint(
         .await
         .ok()?;
     let status = response.status();
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let security_gateway_header = response.headers().contains_key("x-tengine-error")
+        || response
+            .headers()
+            .get(reqwest::header::SERVER)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.eq_ignore_ascii_case("ESA"))
+        || response
+            .headers()
+            .get_all(reqwest::header::SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .any(|value| {
+                let lower = value.to_ascii_lowercase();
+                lower.starts_with("acw_") || lower.starts_with("cdn_sec_")
+            });
     let body = response.bytes().await.ok()?;
+    let is_json = serde_json::from_slice::<serde_json::Value>(&body).is_ok();
     Some(EndpointProbe {
         status,
-        is_json: serde_json::from_slice::<serde_json::Value>(&body).is_ok(),
+        is_json,
+        is_challenge: shield_page_response(status, &content_type, security_gateway_header, &body),
     })
 }
 
+async fn probe_site_system_type_details(
+    client: &reqwest::Client,
+    base_url: &str,
+) -> (Option<String>, bool) {
+    let newapi_job = tauri::async_runtime::spawn({
+        let client = client.clone();
+        let base_url = base_url.to_string();
+        async move { probe_endpoint(&client, &base_url, "/api/status").await }
+    });
+    let sub2api_job = tauri::async_runtime::spawn({
+        let client = client.clone();
+        let base_url = base_url.to_string();
+        async move { probe_endpoint(&client, &base_url, "/setup/status").await }
+    });
+    let newapi_probe = newapi_job.await.ok().flatten();
+    let sub2api_probe = sub2api_job.await.ok().flatten();
+    let challenge = newapi_probe.is_some_and(|probe| probe.is_challenge)
+        || sub2api_probe.is_some_and(|probe| probe.is_challenge);
+    (
+        system_type_from_probes(newapi_probe, sub2api_probe).map(str::to_string),
+        challenge,
+    )
+}
+
 async fn probe_site_system_type(client: &reqwest::Client, base_url: &str) -> Option<String> {
-    let newapi_probe = probe_endpoint(client, base_url, "/api/status").await;
-    let sub2api_probe = probe_endpoint(client, base_url, "/setup/status").await;
-    system_type_from_probes(newapi_probe, sub2api_probe).map(str::to_string)
+    probe_site_system_type_details(client, base_url).await.0
+}
+
+fn chrome_system_probe_script(marker: &str) -> String {
+    let marker = serde_json::to_string(marker).unwrap_or_else(|_| "\"\"".into());
+    r#"(() => {
+  const token = __OPENHUB_MARKER__;
+  const pending = "__OPENHUB_PENDING__";
+  if (!/^https?:$/.test(window.location.protocol)) return pending;
+  const previous = window.__openHubSystemProbe;
+  if (previous && previous.token === token) {
+    return previous.result ? JSON.stringify(previous.result) : pending;
+  }
+  const bridge = { token, result: null };
+  window.__openHubSystemProbe = bridge;
+  const probe = async (path) => {
+    try {
+      const response = await fetch(path, {
+        method: "GET",
+        credentials: "include",
+        cache: "no-store",
+        headers: { Accept: "application/json" },
+        signal: AbortSignal.timeout(12000)
+      });
+      const text = await response.text();
+      let isJson = false;
+      try { JSON.parse(text); isJson = true; } catch (_) {}
+      return { status: response.status, isJson };
+    } catch (_) {
+      return null;
+    }
+  };
+  Promise.all([probe("/api/status"), probe("/setup/status")])
+    .then(([newapi, sub2api]) => { bridge.result = { ok: true, newapi, sub2api }; })
+    .catch((error) => { bridge.result = { ok: false, error: String(error) }; });
+  return pending;
+})()"#
+        .replace("__OPENHUB_MARKER__", &marker)
+}
+
+fn parse_chrome_system_probe(value: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(value).ok()?;
+    if value.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+        return None;
+    }
+    let parse = |name: &str| {
+        let value = value.get(name)?;
+        Some(EndpointProbe {
+            status: reqwest::StatusCode::from_u16(value.get("status")?.as_u64()?.try_into().ok()?)
+                .ok()?,
+            is_json: value.get("isJson")?.as_bool()?,
+            is_challenge: false,
+        })
+    };
+    system_type_from_probes(parse("newapi"), parse("sub2api")).map(str::to_string)
+}
+
+async fn probe_site_system_type_via_chrome(
+    base_url: &str,
+    profile_ids: &[String],
+) -> Option<String> {
+    let marker = format!(
+        "openhub-system-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    );
+    let script = chrome_system_probe_script(&marker);
+    let existing_attempt = tauri::async_runtime::spawn_blocking({
+        let base_url = base_url.to_string();
+        let script = script.clone();
+        move || {
+            chrome_session::run_javascript_in_existing_chrome_tab(
+                &base_url,
+                &script,
+                Duration::from_secs(15),
+            )
+        }
+    })
+    .await
+    .ok()?;
+    if let Ok(Some(value)) = existing_attempt {
+        if let Some(system_type) = parse_chrome_system_probe(&value) {
+            return Some(system_type);
+        }
+    }
+
+    let profile_id = profile_ids.first()?.clone();
+    let mut target_url = Url::parse(base_url).ok()?.join("/api/status").ok()?;
+    target_url.set_fragment(Some(&marker));
+    let background_attempt = tauri::async_runtime::spawn_blocking({
+        let target_url = target_url.to_string();
+        let marker = marker.clone();
+        move || {
+            chrome_session::run_javascript_in_background_chrome_profile(
+                &target_url,
+                &profile_id,
+                &marker,
+                &script,
+                Duration::from_secs(20),
+            )
+        }
+    })
+    .await
+    .ok()?;
+    background_attempt
+        .ok()
+        .and_then(|value| parse_chrome_system_probe(&value))
+}
+
+fn cached_profile_ids_for_sites(
+    database: &Database,
+    site_ids: &HashSet<String>,
+) -> Result<HashMap<String, Vec<String>>, String> {
+    if site_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    let mut statement = connection
+        .prepare(
+            "SELECT site_id, profile_id FROM site_accounts
+             WHERE TRIM(profile_id) <> ''
+             ORDER BY site_id, is_valid DESC, updated_at DESC, profile_id",
+        )
+        .map_err(|error| error.to_string())?;
+    let mut profiles = HashMap::<String, Vec<String>>::new();
+    for row in statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|error| error.to_string())?
+    {
+        let (site_id, profile_id) = row.map_err(|error| error.to_string())?;
+        if !site_ids.contains(&site_id) {
+            continue;
+        }
+        let entry = profiles.entry(site_id).or_default();
+        if !entry.contains(&profile_id) {
+            entry.push(profile_id);
+        }
+    }
+    Ok(profiles)
 }
 
 async fn probe_site_system_types(
     client: &reqwest::Client,
     targets: Vec<(String, String)>,
+    profile_ids: HashMap<String, Vec<String>>,
 ) -> HashMap<String, String> {
     let jobs = targets
         .into_iter()
@@ -1123,15 +1383,34 @@ async fn probe_site_system_types(
         .map(|(site_id, base_url)| {
             let client = client.clone();
             tauri::async_runtime::spawn(async move {
-                let system_type = probe_site_system_type(&client, &base_url).await;
-                (site_id, system_type)
+                let (system_type, challenge) =
+                    probe_site_system_type_details(&client, &base_url).await;
+                (site_id, base_url, system_type, challenge)
             })
         })
         .collect::<Vec<_>>();
 
     let mut detected = HashMap::new();
+    let mut challenge_targets = Vec::new();
     for job in jobs {
-        if let Ok((site_id, Some(system_type))) = job.await {
+        if let Ok((site_id, base_url, system_type, challenge)) = job.await {
+            if let Some(system_type) = system_type {
+                detected.insert(site_id, system_type);
+            } else if challenge {
+                challenge_targets.push((site_id, base_url));
+            }
+        }
+    }
+    for (site_id, base_url) in challenge_targets {
+        if let Some(system_type) = probe_site_system_type_via_chrome(
+            &base_url,
+            profile_ids
+                .get(&site_id)
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
+        )
+        .await
+        {
             detected.insert(site_id, system_type);
         }
     }
@@ -1598,7 +1877,19 @@ fn json_string(value: &serde_json::Value, pointers: &[&str]) -> String {
 }
 
 fn api_error_message(value: &serde_json::Value, fallback: &str) -> String {
-    let message = json_string(value, &["/message", "/msg", "/error", "/data/message"]);
+    let message = json_string(
+        value,
+        &[
+            "/message",
+            "/msg",
+            "/error/message",
+            "/error/msg",
+            "/error",
+            "/detail",
+            "/data/message",
+            "/data/error/message",
+        ],
+    );
     if message.is_empty() {
         fallback.to_string()
     } else {
@@ -1745,13 +2036,69 @@ fn parse_sub2api_local_account(
     })
 }
 
+fn zero_v_zero_token(values: &HashMap<String, String>) -> Option<String> {
+    values
+        .get("0v0_token")
+        .map(|value| local_scalar(value))
+        .filter(|value| !value.is_empty())
+}
+
+fn parse_zero_v_zero_self(value: &serde_json::Value) -> Result<SiteAccountSnapshot, String> {
+    if value.get("success").and_then(serde_json::Value::as_bool) != Some(true)
+        || !value
+            .pointer("/data")
+            .is_some_and(serde_json::Value::is_object)
+    {
+        return Err(api_error_message(value, "0v0 返回的账号数据无效"));
+    }
+    let username = json_string(value, &["/data/username", "/data/display_name"]);
+    let has_id = value.pointer("/data/id").is_some_and(|id| {
+        id.as_u64().is_some_and(|id| id > 0) || id.as_str().is_some_and(|id| !id.trim().is_empty())
+    });
+    if username.is_empty() && !has_id {
+        return Err("0v0 账号响应缺少用户标识".into());
+    }
+    let quota = json_number(value, "/data/quota").unwrap_or(0.0);
+    let used_quota = json_number(value, "/data/used_quota").unwrap_or(0.0);
+    Ok(SiteAccountSnapshot {
+        username,
+        remaining: Some(quota / 500_000.0),
+        used: Some(used_quota / 500_000.0),
+        total: Some((quota + used_quota) / 500_000.0),
+        unit: "USD".into(),
+    })
+}
+
+fn apply_zero_v_zero_stats(
+    account: &mut SiteAccountSnapshot,
+    value: &serde_json::Value,
+) -> Result<(), String> {
+    if value.get("success").and_then(serde_json::Value::as_bool) != Some(true)
+        || !value
+            .pointer("/data")
+            .is_some_and(serde_json::Value::is_object)
+    {
+        return Err(api_error_message(value, "0v0 返回的额度统计无效"));
+    }
+    let remaining = json_number(value, "/data/total_quota")
+        .ok_or_else(|| "0v0 额度统计缺少 total_quota".to_string())?;
+    let used = json_number(value, "/data/used_quota").unwrap_or(0.0);
+    account.remaining = Some(remaining / 500_000.0);
+    account.used = Some(used / 500_000.0);
+    account.total = Some((remaining + used) / 500_000.0);
+    account.unit = "USD".into();
+    Ok(())
+}
+
 fn has_local_account_session(system_type: &str, values: &HashMap<String, String>) -> bool {
     let has_newapi = parse_newapi_local_account(values).is_ok();
     let has_sub2api = parse_sub2api_local_account(values).is_ok();
+    let has_zero_v_zero = zero_v_zero_token(values).is_some();
     match system_type.trim().to_ascii_lowercase().as_str() {
         "newapi" => has_newapi,
         "sub2api" => has_sub2api,
-        _ => has_newapi || has_sub2api,
+        "0v0" => has_zero_v_zero,
+        _ => has_newapi || has_sub2api || has_zero_v_zero,
     }
 }
 
@@ -1773,11 +2120,15 @@ fn infer_system_type_from_local_accounts<'a>(
 ) -> &'static str {
     let mut has_newapi = false;
     let mut has_sub2api = false;
+    let mut has_zero_v_zero = false;
     for values in accounts {
         has_newapi |= parse_newapi_local_account(values).is_ok();
         has_sub2api |= parse_sub2api_local_account(values).is_ok();
+        has_zero_v_zero |= zero_v_zero_token(values).is_some();
     }
-    if has_newapi {
+    if has_zero_v_zero {
+        "0v0"
+    } else if has_newapi {
         "NewAPI"
     } else if has_sub2api {
         "Sub2API"
@@ -1819,6 +2170,13 @@ fn has_newapi_refresh_cookie_name<'a>(names: impl IntoIterator<Item = &'a str>) 
     names
         .into_iter()
         .any(|name| name.trim() == "new_api_refresh")
+}
+
+fn is_any_router_site(base_url: &str) -> bool {
+    Url::parse(base_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+        .is_some_and(|host| host == "anyrouter.top" || host.ends_with(".anyrouter.top"))
 }
 
 fn cookie_header_has_name(cookie_header: &str, expected_name: &str) -> bool {
@@ -1916,7 +2274,7 @@ async fn request_json(
     let response = request
         .send()
         .await
-        .map_err(|error| format!("{label}请求失败：{error}"))?;
+        .map_err(|error| format!("{label}请求失败：{error:#}"))?;
     let status = response.status();
     let content_type = response
         .headers()
@@ -2153,9 +2511,12 @@ async fn fetch_site_account(
     let inferred_type;
     let system_type = if matches!(
         system_type.trim().to_ascii_lowercase().as_str(),
-        "newapi" | "sub2api"
+        "newapi" | "sub2api" | "0v0"
     ) {
         system_type
+    } else if zero_v_zero_token(local_values).is_some() {
+        inferred_type = "0v0".to_string();
+        &inferred_type
     } else if parse_newapi_local_account(local_values).is_ok() {
         inferred_type = "NewAPI".to_string();
         &inferred_type
@@ -2168,6 +2529,70 @@ async fn fetch_site_account(
             .unwrap_or_default();
         &inferred_type
     };
+    if system_type.eq_ignore_ascii_case("0v0") {
+        if !local_error.is_empty() {
+            return Err(local_error.to_string());
+        }
+        let token = zero_v_zero_token(local_values)
+            .ok_or_else(|| "Chrome Local Storage 中没有 0v0_token".to_string())?;
+        let base_url =
+            Url::parse(ZERO_V_ZERO_CONSOLE_URL).map_err(|_| "0v0 控制台地址无效".to_string())?;
+        let self_url = base_url
+            .join("/api/user/self")
+            .map_err(|_| "无法生成 0v0 账号接口地址".to_string())?;
+        let stats_url = base_url
+            .join("/api/user/stats")
+            .map_err(|_| "无法生成 0v0 额度接口地址".to_string())?;
+        let self_job = tauri::async_runtime::spawn({
+            let client = client.clone();
+            let token = token.clone();
+            let user_agent = user_agent.to_string();
+            async move {
+                request_json(
+                    chrome_request_headers(
+                        client.get(self_url),
+                        ZERO_V_ZERO_CONSOLE_URL,
+                        &user_agent,
+                    )
+                    .bearer_auth(token),
+                    "0v0 账号接口",
+                )
+                .await
+            }
+        });
+        let stats_job = tauri::async_runtime::spawn({
+            let client = client.clone();
+            let user_agent = user_agent.to_string();
+            async move {
+                request_json(
+                    chrome_request_headers(
+                        client.get(stats_url),
+                        ZERO_V_ZERO_CONSOLE_URL,
+                        &user_agent,
+                    )
+                    .bearer_auth(token),
+                    "0v0 额度接口",
+                )
+                .await
+            }
+        });
+        let self_value = self_job
+            .await
+            .map_err(|error| format!("0v0 账号同步任务失败：{error}"))??;
+        let mut account = parse_zero_v_zero_self(&self_value)?;
+        let sync_error = match stats_job.await {
+            Ok(Ok(value)) => apply_zero_v_zero_stats(&mut account, &value).err(),
+            Ok(Err(error)) => Some(error),
+            Err(error) => Some(format!("0v0 额度同步任务失败：{error}")),
+        }
+        .unwrap_or_default();
+        return Ok(SiteAccountRefresh {
+            account,
+            is_valid: true,
+            sync_error,
+            checkin: CheckinSnapshot::default(),
+        });
+    }
     if system_type.eq_ignore_ascii_case("NewAPI") {
         let local_account = parse_newapi_local_account(local_values).ok();
         let cookie_header = match cookie_header {
@@ -2210,6 +2635,31 @@ async fn fetch_site_account(
             cookie_header: cookie_header.clone(),
             user_id,
         };
+        if is_any_router_site(base_url) {
+            return match local_account {
+                Some(account) => Ok(SiteAccountRefresh {
+                    account,
+                    is_valid: true,
+                    sync_error: "Any Router 传统 NewAPI 会话需要通过 Chrome 获取远程账号数据"
+                        .into(),
+                    checkin: previous_checkin,
+                }),
+                None => Err("Any Router 本地 user 数据无效".into()),
+            };
+        }
+        let checkin = if should_checkin {
+            refresh_newapi_checkin(
+                client,
+                base_url,
+                &auth,
+                user_agent,
+                current_month,
+                previous_checkin,
+            )
+            .await
+        } else {
+            CheckinSnapshot::default()
+        };
         let endpoint = Url::parse(base_url)
             .map_err(|_| "站点 API 地址无效".to_string())?
             .join("/api/user/self")
@@ -2229,24 +2679,11 @@ async fn fetch_site_account(
                         account,
                         is_valid: true,
                         sync_error: error,
-                        checkin: previous_checkin,
+                        checkin,
                     }),
                     None => Err(format!("账号接口失败：{error}")),
                 }
             }
-        };
-        let checkin = if should_checkin {
-            refresh_newapi_checkin(
-                client,
-                base_url,
-                &auth,
-                user_agent,
-                current_month,
-                previous_checkin,
-            )
-            .await
-        } else {
-            CheckinSnapshot::default()
         };
         return Ok(SiteAccountRefresh {
             account: remote,
@@ -2290,16 +2727,16 @@ async fn fetch_site_account(
         .map_err(|_| "站点 API 地址无效".to_string())?
         .join(endpoint)
         .map_err(|_| "无法生成账号接口地址".to_string())?;
-    let request =
-        chrome_request_headers(client.get(url), base_url, user_agent).bearer_auth(&auth_token);
-    let account = request_json(request, "账号接口")
-        .await
-        .and_then(|value| parse_sub2api_account(&value));
     let checkin = if should_checkin {
         refresh_sub2api_checkin(client, base_url, &auth_token, user_agent, previous_checkin).await
     } else {
         CheckinSnapshot::default()
     };
+    let request =
+        chrome_request_headers(client.get(url), base_url, user_agent).bearer_auth(&auth_token);
+    let account = request_json(request, "账号接口")
+        .await
+        .and_then(|value| parse_sub2api_account(&value));
     match account {
         Ok(account) => Ok(SiteAccountRefresh {
             account,
@@ -2352,13 +2789,21 @@ async fn mark_sites_with_chrome_sessions(
                 let name = row.get::<_, String>(1)?;
                 let checkin_url = row.get::<_, String>(2)?;
                 let api_base_url = row.get::<_, String>(3)?;
-                let system_type = row.get::<_, String>(4)?;
+                let stored_system_type = row.get::<_, String>(4)?;
+                let system_type = if is_zero_v_zero_site(&name, &api_base_url, &stored_system_type)
+                {
+                    "0v0".to_string()
+                } else {
+                    stored_system_type
+                };
+                let api_base_url = account_base_url(&name, &api_base_url, &system_type);
                 let mut urls = Vec::with_capacity(4);
                 if !api_base_url.trim().is_empty() {
                     let account_paths: &[&str] =
                         match system_type.trim().to_ascii_lowercase().as_str() {
                             "newapi" => &["/api/user/auth/refresh", "/api/user/self"],
                             "sub2api" => &["/api/v1/auth/me"],
+                            "0v0" => &["/api/user/self", "/api/user/stats"],
                             _ => &[],
                         };
                     for account_url in account_paths
@@ -2424,10 +2869,16 @@ async fn mark_sites_with_chrome_sessions(
         ),
     );
     let probe_client = build_http_client(&database, Duration::from_secs(8), 3, "站点类型探测")?;
+    let probe_site_ids = targets
+        .iter()
+        .map(|(site_id, _, _, _, _)| site_id.clone())
+        .collect::<HashSet<_>>();
+    let probe_profile_ids = cached_profile_ids_for_sites(&database, &probe_site_ids)?;
     let probed_types = probe_site_system_types(
         &probe_client,
         targets
             .iter()
+            .filter(|(_, _, _, _, system_type)| !system_type.eq_ignore_ascii_case("0v0"))
             .map(|(id, _, urls, api_base_url, _)| {
                 let base_url = if api_base_url.trim().is_empty() {
                     urls.first().cloned().unwrap_or_default()
@@ -2437,15 +2888,19 @@ async fn mark_sites_with_chrome_sessions(
                 (id.clone(), base_url)
             })
             .collect(),
+        probe_profile_ids,
     )
     .await;
     for (site_id, _, urls, api_base_url, system_type) in &mut targets {
-        if let Some(probed_type) = probed_types.get(site_id) {
-            *system_type = probed_type.clone();
+        if !system_type.eq_ignore_ascii_case("0v0") {
+            if let Some(probed_type) = probed_types.get(site_id) {
+                *system_type = probed_type.clone();
+            }
         }
         let account_paths: &[&str] = match system_type.trim().to_ascii_lowercase().as_str() {
             "newapi" => &["/api/user/self", "/api/user/auth/refresh"],
             "sub2api" => &["/api/v1/auth/me"],
+            "0v0" => &["/api/user/self", "/api/user/stats"],
             _ => &[],
         };
         for account_url in account_paths
@@ -2594,6 +3049,10 @@ async fn mark_sites_with_chrome_sessions(
 
     let mut locally_inferred_types = HashMap::new();
     for (site_id, _, _, _, system_type) in &mut targets {
+        if system_type.eq_ignore_ascii_case("0v0") {
+            locally_inferred_types.insert(site_id.clone(), "0v0".into());
+            continue;
+        }
         if matches!(
             system_type.trim().to_ascii_lowercase().as_str(),
             "newapi" | "sub2api"
@@ -2699,6 +3158,8 @@ async fn mark_sites_with_chrome_sessions(
                 profile_name: profile.name.clone(),
                 account_name: profile.account_name.clone(),
                 username: String::new(),
+                api_key_count: 0,
+                api_model_count: 0,
                 remaining: None,
                 used: None,
                 total: None,
@@ -2744,6 +3205,17 @@ async fn mark_sites_with_chrome_sessions(
                 } else {
                     format!("{} · {}", session.profile_name, session.account_name)
                 };
+                let has_refresh_cookie =
+                    has_newapi_refresh_cookie_name(session.cookie_names.iter().map(String::as_str));
+                let auth_label = if system_type.eq_ignore_ascii_case("NewAPI") {
+                    if has_refresh_cookie {
+                        "刷新令牌认证"
+                    } else {
+                        "传统会话认证"
+                    }
+                } else {
+                    "本地会话认证"
+                };
                 let site_name = site_name.clone();
                 let progress_stage = format!("chrome-account-{site_index}-{session_index}");
                 emit_optional_sync_progress(
@@ -2751,7 +3223,7 @@ async fn mark_sites_with_chrome_sessions(
                     run_id,
                     &progress_stage,
                     "running",
-                    format!("正在同步 {site_name} · Chrome {profile_label}"),
+                    format!("正在同步 {site_name} · Chrome {profile_label}（{auth_label}）"),
                 );
                 let site_id = site.site_id.clone();
                 let should_checkin = checkin_site_ids.contains(&site.site_id);
@@ -2761,8 +3233,6 @@ async fn mark_sites_with_chrome_sessions(
                     .cloned()
                     .unwrap_or_default();
                 let cookie_home_dir = home_dir.clone();
-                let has_refresh_cookie =
-                    has_newapi_refresh_cookie_name(session.cookie_names.iter().map(String::as_str));
                 let cookie_endpoint = if has_refresh_cookie {
                     "/api/user/auth/refresh"
                 } else {
@@ -2902,6 +3372,39 @@ async fn mark_sites_with_chrome_sessions(
     let transaction = connection
         .transaction()
         .map_err(|error| error.to_string())?;
+    let cached_api_counts = {
+        let mut statement = transaction
+            .prepare(
+                "SELECT site_id, profile_id, MAX(api_key_count), MAX(api_model_count)
+                 FROM site_accounts
+                 GROUP BY site_id, profile_id",
+            )
+            .map_err(|error| error.to_string())?;
+        let counts = statement
+            .query_map([], |row| {
+                Ok((
+                    (row.get::<_, String>(0)?, row.get::<_, String>(1)?),
+                    (
+                        row.get::<_, i64>(2)?.max(0) as usize,
+                        row.get::<_, i64>(3)?.max(0) as usize,
+                    ),
+                ))
+            })
+            .map_err(|error| error.to_string())?
+            .collect::<Result<HashMap<_, _>, _>>()
+            .map_err(|error| error.to_string())?;
+        counts
+    };
+    for site in &mut matched_sites {
+        for session in &mut site.sessions {
+            let (key_count, model_count) = cached_api_counts
+                .get(&(site.site_id.clone(), session.profile_id.clone()))
+                .copied()
+                .unwrap_or_default();
+            session.api_key_count = key_count;
+            session.api_model_count = model_count;
+        }
+    }
     let newly_marked = 0_usize;
     if let Some(site_id) = &requested_site_id {
         transaction
@@ -2926,12 +3429,13 @@ async fn mark_sites_with_chrome_sessions(
                 .execute(
                     "INSERT INTO site_accounts (
                         site_id, profile_id, domain, cookie_count, cookie_names,
-                        profile_name, account_name, username, remaining, used, total,
-                        unit, is_valid, sync_error, checkin_enabled, checked_in_today,
-                        checkin_error, checkin_date, updated_at
+                        profile_name, account_name, username, api_key_count, api_model_count,
+                        remaining, used, total, unit, is_valid, sync_error,
+                        checkin_enabled, checked_in_today, checkin_error,
+                        checkin_date, updated_at
                      ) VALUES (
-                        ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
-                        ?12, ?13, ?14, ?15, ?16, ?17, date('now', 'localtime'), CURRENT_TIMESTAMP
+                        ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                        ?13, ?14, ?15, ?16, ?17, ?18, ?19, date('now', 'localtime'), CURRENT_TIMESTAMP
                      )",
                     params![
                         site.site_id,
@@ -2942,6 +3446,8 @@ async fn mark_sites_with_chrome_sessions(
                         session.profile_name,
                         session.account_name,
                         session.username,
+                        session.api_key_count as i64,
+                        session.api_model_count as i64,
                         session.remaining,
                         session.used,
                         session.total,
@@ -2979,7 +3485,10 @@ fn chrome_account_bridge_script(
     user_id: Option<&str>,
     current_month: &str,
     marker: &str,
+    use_refresh_auth: bool,
     should_checkin: bool,
+    is_any_router: bool,
+    allow_challenge_navigation: bool,
 ) -> String {
     let user_id =
         serde_json::to_string(user_id.unwrap_or_default()).unwrap_or_else(|_| "\"\"".into());
@@ -2988,10 +3497,28 @@ fn chrome_account_bridge_script(
     r#"(() => {
   const token = __OPENHUB_MARKER__;
   const legacyUserId = __OPENHUB_USER_ID__;
+  const useRefreshAuth = __OPENHUB_USE_REFRESH_AUTH__;
   const shouldCheckin = __OPENHUB_SHOULD_CHECKIN__;
+  const isAnyRouter = __OPENHUB_IS_ANY_ROUTER__;
+  const allowChallengeNavigation = __OPENHUB_ALLOW_CHALLENGE_NAVIGATION__;
+  const requestTimeout = isAnyRouter ? 12000 : 30000;
   const pending = "__OPENHUB_PENDING__";
   if (window.location.protocol !== "http:" && window.location.protocol !== "https:") {
     return pending;
+  }
+  if (legacyUserId) {
+    try {
+      let storedUser = localStorage.getItem("user") || "null";
+      for (let depth = 0; depth < 2 && typeof storedUser === "string"; depth += 1) {
+        storedUser = JSON.parse(storedUser);
+      }
+      const storedUserId = storedUser?.id ?? storedUser?.data?.id ?? "";
+      if (String(storedUserId) !== String(legacyUserId)) {
+        return "__OPENHUB_PROFILE_MISMATCH__";
+      }
+    } catch (_) {
+      return "__OPENHUB_PROFILE_MISMATCH__";
+    }
   }
   const previous = window.__openHubAccountSync;
   if (previous && previous.token === token) {
@@ -3027,39 +3554,123 @@ fn chrome_account_bridge_script(
     value && (value.message || value.msg || value.error) || fallback;
   (async () => {
     const headers = { "Accept": "application/json" };
-    const refreshResponse = await readResponse(await fetch("/api/user/auth/refresh", {
-      method: "POST", credentials: "include", cache: "no-store", headers,
-      signal: AbortSignal.timeout(30000)
-    }));
-    if (refreshResponse.challenge) {
-      bridge.state = "challenge";
-      bridge.started = Date.now();
-      window.location.assign(`/#${token}`);
-      return;
-    }
-    const accessToken = refreshResponse.data?.data?.access_token ||
-      refreshResponse.data?.data?.accessToken || refreshResponse.data?.data?.token ||
-      refreshResponse.data?.access_token || refreshResponse.data?.accessToken ||
-      refreshResponse.data?.token || "";
-    if (accessToken) {
+    if (useRefreshAuth) {
+      const refreshResponse = await readResponse(await fetch("/api/user/auth/refresh", {
+        method: "POST", credentials: "include", cache: "no-store", headers,
+        signal: AbortSignal.timeout(requestTimeout)
+      }));
+      if (refreshResponse.challenge) {
+        if (!allowChallengeNavigation) {
+          bridge.result = { ok: false, error: "Cloudflare 验证仍需要浏览器交互" };
+          return;
+        }
+        bridge.state = "challenge";
+        bridge.started = Date.now();
+        window.location.assign(`/#${token}`);
+        return;
+      }
+      const accessToken = refreshResponse.data?.data?.access_token ||
+        refreshResponse.data?.data?.accessToken || refreshResponse.data?.data?.token ||
+        refreshResponse.data?.access_token || refreshResponse.data?.accessToken ||
+        refreshResponse.data?.token || "";
+      if (!accessToken) {
+        bridge.result = {
+          ok: false,
+          error: messageOf(
+            refreshResponse.data,
+            refreshResponse.error || `刷新认证接口 HTTP ${refreshResponse.status}`
+          )
+        };
+        return;
+      }
       headers.Authorization = `Bearer ${accessToken}`;
     } else if (legacyUserId) {
       headers["New-Api-User"] = legacyUserId;
     } else {
       bridge.result = {
         ok: false,
-        error: messageOf(
-          refreshResponse.data,
-          refreshResponse.error || `刷新认证接口 HTTP ${refreshResponse.status}`
-        )
+        error: "传统 NewAPI 会话缺少用户 ID"
       };
       return;
     }
+    let checkinEnabled = false;
+    let checkedInToday = false;
+    let checkinError = "";
+    if (shouldCheckin) {
+      try {
+        if (isAnyRouter) {
+          checkinEnabled = true;
+          const postResponse = await readResponse(await fetch("/api/user/sign_in", {
+            method: "POST", credentials: "include", cache: "no-store", headers,
+            signal: AbortSignal.timeout(requestTimeout)
+          }));
+          const postMessage = messageOf(postResponse.data, postResponse.error || "");
+          const alreadyChecked = /已(?:经)?签到|already (?:signed|checked)/i.test(String(postMessage));
+          if (postResponse.challenge) {
+            checkinError = "Cloudflare 拦截了 Any Router 签到请求";
+          } else if (
+            alreadyChecked ||
+            (postResponse.status >= 200 && postResponse.status < 300 && (
+              postResponse.data?.success === true || postResponse.data?.code === 0 ||
+              postResponse.data?.code === "0"
+            ))
+          ) {
+            checkedInToday = true;
+          } else {
+            checkinError = postMessage || `Any Router 签到接口 HTTP ${postResponse.status}`;
+          }
+        } else {
+          const checkinUrl = `/api/user/checkin?month=${encodeURIComponent(__OPENHUB_MONTH__)}`;
+          const checkinResponse = await readResponse(await fetch(checkinUrl, {
+            method: "GET", credentials: "include", cache: "no-store", headers,
+            signal: AbortSignal.timeout(requestTimeout)
+          }));
+          if (checkinResponse.challenge) {
+            checkinError = "Cloudflare 拦截了签到状态请求";
+          } else if (checkinResponse.error || checkinResponse.status < 200 || checkinResponse.status >= 300) {
+            checkinError = messageOf(
+              checkinResponse.data,
+              checkinResponse.error || `签到状态接口 HTTP ${checkinResponse.status}`
+            );
+          } else if (checkinResponse.data && checkinResponse.data.success === true) {
+            checkinEnabled = checkinResponse.data.data?.enabled === true;
+            checkedInToday = checkinResponse.data.data?.stats?.checked_in_today === true;
+            if (checkinEnabled && !checkedInToday) {
+              const postResponse = await readResponse(await fetch("/api/user/checkin", {
+                method: "POST", credentials: "include", cache: "no-store", headers,
+                signal: AbortSignal.timeout(requestTimeout)
+              }));
+              if (postResponse.challenge) {
+                checkinError = "Cloudflare 拦截了签到请求";
+              } else if (
+                postResponse.error || postResponse.status < 200 || postResponse.status >= 300 ||
+                !postResponse.data || postResponse.data.success !== true
+              ) {
+                checkinError = messageOf(
+                  postResponse.data,
+                  postResponse.error || `签到接口 HTTP ${postResponse.status}`
+                );
+              } else {
+                checkedInToday = true;
+              }
+            }
+          } else {
+            checkinError = messageOf(checkinResponse.data, "签到状态数据无效");
+          }
+        }
+      } catch (error) {
+        checkinError = String(error && error.message || error);
+      }
+    }
     const selfResponse = await readResponse(await fetch("/api/user/self", {
       method: "GET", credentials: "include", cache: "no-store", headers,
-      signal: AbortSignal.timeout(30000)
+      signal: AbortSignal.timeout(requestTimeout)
     }));
     if (selfResponse.challenge) {
+      if (!allowChallengeNavigation) {
+        bridge.result = { ok: false, error: "Cloudflare 验证仍需要浏览器交互" };
+        return;
+      }
       bridge.state = "challenge";
       bridge.started = Date.now();
       if (window.location.pathname !== "/api/user/self") {
@@ -3073,53 +3684,6 @@ fn chrome_account_bridge_script(
         error: messageOf(selfResponse.data, selfResponse.error || `账号接口 HTTP ${selfResponse.status}`)
       };
       return;
-    }
-
-    let checkinEnabled = false;
-    let checkedInToday = false;
-    let checkinError = "";
-    if (shouldCheckin) {
-      try {
-        const checkinUrl = `/api/user/checkin?month=${encodeURIComponent(__OPENHUB_MONTH__)}`;
-        const checkinResponse = await readResponse(await fetch(checkinUrl, {
-          method: "GET", credentials: "include", cache: "no-store", headers,
-          signal: AbortSignal.timeout(30000)
-        }));
-        if (checkinResponse.challenge) {
-          checkinError = "Cloudflare 拦截了签到状态请求";
-        } else if (checkinResponse.error || checkinResponse.status < 200 || checkinResponse.status >= 300) {
-          checkinError = messageOf(
-            checkinResponse.data,
-            checkinResponse.error || `签到状态接口 HTTP ${checkinResponse.status}`
-          );
-        } else if (checkinResponse.data && checkinResponse.data.success === true) {
-          checkinEnabled = checkinResponse.data.data?.enabled === true;
-          checkedInToday = checkinResponse.data.data?.stats?.checked_in_today === true;
-          if (checkinEnabled && !checkedInToday) {
-            const postResponse = await readResponse(await fetch("/api/user/checkin", {
-              method: "POST", credentials: "include", cache: "no-store", headers,
-              signal: AbortSignal.timeout(30000)
-            }));
-            if (postResponse.challenge) {
-              checkinError = "Cloudflare 拦截了签到请求";
-            } else if (
-              postResponse.error || postResponse.status < 200 || postResponse.status >= 300 ||
-              !postResponse.data || postResponse.data.success !== true
-            ) {
-              checkinError = messageOf(
-                postResponse.data,
-                postResponse.error || `签到接口 HTTP ${postResponse.status}`
-              );
-            } else {
-              checkedInToday = true;
-            }
-          }
-        } else {
-          checkinError = messageOf(checkinResponse.data, "签到状态数据无效");
-        }
-      } catch (error) {
-        checkinError = String(error && error.message || error);
-      }
     }
     bridge.result = {
       ok: true,
@@ -3140,8 +3704,41 @@ fn chrome_account_bridge_script(
 })()"#
         .replace("__OPENHUB_USER_ID__", &user_id)
         .replace("__OPENHUB_MONTH__", &current_month)
+        .replace(
+            "__OPENHUB_USE_REFRESH_AUTH__",
+            if use_refresh_auth { "true" } else { "false" },
+        )
         .replace("__OPENHUB_SHOULD_CHECKIN__", if should_checkin { "true" } else { "false" })
+        .replace("__OPENHUB_IS_ANY_ROUTER__", if is_any_router { "true" } else { "false" })
+        .replace(
+            "__OPENHUB_ALLOW_CHALLENGE_NAVIGATION__",
+            if allow_challenge_navigation {
+                "true"
+            } else {
+                "false"
+            },
+        )
         .replace("__OPENHUB_MARKER__", &marker)
+}
+
+fn parse_chrome_account_bridge_result(
+    value: &str,
+) -> Result<(SiteAccountSnapshot, ChromeBridgeAccountResult), String> {
+    let result = serde_json::from_str::<ChromeBridgeAccountResult>(value)
+        .map_err(|error| format!("Chrome 返回的账号数据格式无效：{error}"))?;
+    if !result.ok {
+        return Err(if result.error.is_empty() {
+            "Chrome 账号请求失败".into()
+        } else {
+            format!("Chrome 账号请求失败：{}", result.error)
+        });
+    }
+    let account = result
+        .account
+        .as_ref()
+        .ok_or_else(|| "Chrome 返回结果缺少账号数据".to_string())
+        .and_then(parse_newapi_account)?;
+    Ok((account, result))
 }
 
 #[tauri::command]
@@ -3226,6 +3823,7 @@ async fn sync_site_account_via_chrome(
     );
 
     let base_url = Url::parse(&api_base_url).map_err(|_| "站点 API 地址无效")?;
+    let is_any_router = is_any_router_site(base_url.as_str());
     let origin = base_url.origin().ascii_serialization();
     if origin == "null" {
         return Err("站点 API 地址缺少有效来源".into());
@@ -3267,82 +3865,277 @@ async fn sync_site_account_via_chrome(
         "local-account",
         "success",
         if has_refresh_cookie {
-            "已确认 NewAPI 刷新会话"
+            "认证策略：NewAPI 刷新令牌（new_api_refresh → Bearer Token）"
         } else {
-            "已确认本地 NewAPI 账号"
+            "认证策略：传统 NewAPI 会话（session Cookie + New-Api-User）"
         },
     );
 
-    let marker = format!(
-        "openhub-sync-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| "系统时间异常")?
-            .as_nanos()
-    );
-    let mut browser_url = if !checkin_url.trim().is_empty() {
-        Url::parse(&checkin_url).unwrap_or_else(|_| base_url.clone())
+    let silent_timeout = if has_refresh_cookie {
+        Duration::from_secs(35)
+    } else if is_any_router {
+        Duration::from_secs(12)
     } else {
-        base_url
-            .join("/console/personal")
-            .map_err(|_| "无法生成 Chrome 验证地址")?
+        Duration::from_secs(20)
     };
-    if browser_url.origin() != base_url.origin() {
-        browser_url = base_url
-            .join("/console/personal")
-            .map_err(|_| "无法生成 Chrome 验证地址")?;
-    }
-    browser_url.set_fragment(Some(&marker));
-    let javascript = chrome_account_bridge_script(
-        user_id.as_deref(),
-        &current_month,
-        &marker,
-        supports_checkin,
-    );
-    emit_chrome_account_progress(
-        &app,
-        run_id,
-        "chrome-request",
-        "running",
-        "正在打开 Chrome 并请求账号接口；如出现验证，请在浏览器中完成",
-    );
-    let bridge_result = tauri::async_runtime::spawn_blocking({
-        let browser_url = browser_url.to_string();
-        let profile_id = profile_id.clone();
-        let marker = marker.clone();
-        move || {
-            chrome_session::run_javascript_in_chrome_profile(
-                &browser_url,
-                &profile_id,
-                &marker,
-                &javascript,
-                Duration::from_secs(120),
-            )
+    let background_timeout = if has_refresh_cookie {
+        Duration::from_secs(35)
+    } else if is_any_router {
+        Duration::from_secs(20)
+    } else {
+        Duration::from_secs(25)
+    };
+    let visible_timeout = if has_refresh_cookie {
+        Duration::from_secs(120)
+    } else if is_any_router {
+        Duration::from_secs(45)
+    } else {
+        Duration::from_secs(60)
+    };
+
+    let mut resolved_account = None;
+    if user_id.is_some() {
+        let silent_marker = format!(
+            "openhub-silent-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|_| "系统时间异常")?
+                .as_nanos()
+        );
+        let silent_javascript = chrome_account_bridge_script(
+            user_id.as_deref(),
+            &current_month,
+            &silent_marker,
+            has_refresh_cookie,
+            supports_checkin,
+            is_any_router,
+            false,
+        );
+        emit_chrome_account_progress(
+            &app,
+            run_id,
+            "browser-bypass",
+            "running",
+            "正在尝试复用已打开的同账号 Chrome 页面，不切换窗口",
+        );
+        let silent_attempt = tauri::async_runtime::spawn_blocking({
+            let base_url = base_url.to_string();
+            move || {
+                chrome_session::run_javascript_in_existing_chrome_tab(
+                    &base_url,
+                    &silent_javascript,
+                    silent_timeout,
+                )
+            }
+        })
+        .await;
+        match silent_attempt {
+            Ok(Ok(Some(value))) => match parse_chrome_account_bridge_result(&value) {
+                Ok(parsed) => {
+                    emit_chrome_account_progress(
+                        &app,
+                        run_id,
+                        "browser-bypass",
+                        "success",
+                        "已通过现有 Chrome 页面静默获取账号数据",
+                    );
+                    resolved_account = Some(parsed);
+                }
+                Err(error) => emit_chrome_account_progress(
+                    &app,
+                    run_id,
+                    "browser-bypass",
+                    "success",
+                    format!("现有页面静默请求未通过，继续尝试后台 Chrome：{error}"),
+                ),
+            },
+            Ok(Ok(None)) => emit_chrome_account_progress(
+                &app,
+                run_id,
+                "browser-bypass",
+                "success",
+                "没有找到已打开的同账号站点页面，继续尝试后台 Chrome",
+            ),
+            Ok(Err(error)) => emit_chrome_account_progress(
+                &app,
+                run_id,
+                "browser-bypass",
+                "success",
+                format!("现有页面静默请求不可用，继续尝试后台 Chrome：{error}"),
+            ),
+            Err(error) => emit_chrome_account_progress(
+                &app,
+                run_id,
+                "browser-bypass",
+                "success",
+                format!("现有页面静默任务失败，继续尝试后台 Chrome：{error}"),
+            ),
         }
-    })
-    .await
-    .map_err(|error| format!("Chrome 同步任务失败：{error}"))??;
-    emit_chrome_account_progress(
-        &app,
-        run_id,
-        "chrome-request",
-        "success",
-        "Chrome 已返回账号接口数据",
-    );
-    let result = serde_json::from_str::<ChromeBridgeAccountResult>(&bridge_result)
-        .map_err(|error| format!("Chrome 返回的账号数据格式无效：{error}"))?;
-    if !result.ok {
-        return Err(if result.error.is_empty() {
-            "Chrome 账号请求失败".into()
-        } else {
-            format!("Chrome 账号请求失败：{}", result.error)
-        });
+    } else {
+        emit_chrome_account_progress(
+            &app,
+            run_id,
+            "browser-bypass",
+            "info",
+            "本地账号缺少可核验的用户 ID，跳过静默请求以避免串用 Chrome 账号",
+        );
     }
-    let account = result
-        .account
-        .as_ref()
-        .ok_or_else(|| "Chrome 返回结果缺少账号数据".to_string())
-        .and_then(parse_newapi_account)?;
+
+    if resolved_account.is_none() {
+        let marker = format!(
+            "openhub-background-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|_| "系统时间异常")?
+                .as_nanos()
+        );
+        let mut browser_url = if !checkin_url.trim().is_empty() {
+            Url::parse(&checkin_url).unwrap_or_else(|_| base_url.clone())
+        } else {
+            base_url
+                .join("/console/personal")
+                .map_err(|_| "无法生成 Chrome 验证地址")?
+        };
+        if browser_url.origin() != base_url.origin() {
+            browser_url = base_url
+                .join("/console/personal")
+                .map_err(|_| "无法生成 Chrome 验证地址")?;
+        }
+        browser_url.set_fragment(Some(&marker));
+        let javascript = chrome_account_bridge_script(
+            user_id.as_deref(),
+            &current_month,
+            &marker,
+            has_refresh_cookie,
+            supports_checkin,
+            is_any_router,
+            true,
+        );
+        emit_chrome_account_progress(
+            &app,
+            run_id,
+            "browser-background",
+            "running",
+            "正在后台打开对应 Chrome 账号并尝试自动通过验证",
+        );
+        let background_attempt = tauri::async_runtime::spawn_blocking({
+            let browser_url = browser_url.to_string();
+            let profile_id = profile_id.clone();
+            let marker = marker.clone();
+            move || {
+                chrome_session::run_javascript_in_background_chrome_profile(
+                    &browser_url,
+                    &profile_id,
+                    &marker,
+                    &javascript,
+                    background_timeout,
+                )
+            }
+        })
+        .await;
+        match background_attempt {
+            Ok(Ok(value)) => match parse_chrome_account_bridge_result(&value) {
+                Ok(parsed) => {
+                    emit_chrome_account_progress(
+                        &app,
+                        run_id,
+                        "browser-background",
+                        "success",
+                        "后台 Chrome 已完成账号请求，临时标签已关闭",
+                    );
+                    resolved_account = Some(parsed);
+                }
+                Err(error) => emit_chrome_account_progress(
+                    &app,
+                    run_id,
+                    "browser-background",
+                    "success",
+                    format!("后台请求仍需人工验证，将显示 Chrome：{error}"),
+                ),
+            },
+            Ok(Err(error)) => emit_chrome_account_progress(
+                &app,
+                run_id,
+                "browser-background",
+                "success",
+                format!("后台请求未完成，将显示 Chrome：{error}"),
+            ),
+            Err(error) => emit_chrome_account_progress(
+                &app,
+                run_id,
+                "browser-background",
+                "success",
+                format!("后台 Chrome 任务失败，将显示浏览器：{error}"),
+            ),
+        }
+    }
+
+    let (account, result) = match resolved_account {
+        Some(parsed) => parsed,
+        None => {
+            let marker = format!(
+                "openhub-sync-{}",
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_err(|_| "系统时间异常")?
+                    .as_nanos()
+            );
+            let mut browser_url = if !checkin_url.trim().is_empty() {
+                Url::parse(&checkin_url).unwrap_or_else(|_| base_url.clone())
+            } else {
+                base_url
+                    .join("/console/personal")
+                    .map_err(|_| "无法生成 Chrome 验证地址")?
+            };
+            if browser_url.origin() != base_url.origin() {
+                browser_url = base_url
+                    .join("/console/personal")
+                    .map_err(|_| "无法生成 Chrome 验证地址")?;
+            }
+            browser_url.set_fragment(Some(&marker));
+            let javascript = chrome_account_bridge_script(
+                user_id.as_deref(),
+                &current_month,
+                &marker,
+                has_refresh_cookie,
+                supports_checkin,
+                is_any_router,
+                true,
+            );
+            emit_chrome_account_progress(
+                &app,
+                run_id,
+                "chrome-request",
+                "running",
+                "静默请求未能完成，正在打开 Chrome；如出现验证，请在浏览器中完成",
+            );
+            let bridge_result = tauri::async_runtime::spawn_blocking({
+                let browser_url = browser_url.to_string();
+                let profile_id = profile_id.clone();
+                let marker = marker.clone();
+                move || {
+                    chrome_session::run_javascript_in_chrome_profile(
+                        &browser_url,
+                        &profile_id,
+                        &marker,
+                        &javascript,
+                        visible_timeout,
+                    )
+                }
+            })
+            .await
+            .map_err(|error| format!("Chrome 同步任务失败：{error}"))??;
+            let parsed = parse_chrome_account_bridge_result(&bridge_result)?;
+            emit_chrome_account_progress(
+                &app,
+                run_id,
+                "chrome-request",
+                "success",
+                "Chrome 已返回账号接口数据",
+            );
+            parsed
+        }
+    };
 
     emit_chrome_account_progress(
         &app,
@@ -3609,7 +4402,12 @@ async fn detect_site_system_types(
         format!("已转入后台，并发检测 {} 个站点类型", targets.len()),
     );
     let client = build_http_client(&database, Duration::from_secs(8), 3, "站点类型探测")?;
-    let detected = probe_site_system_types(&client, targets).await;
+    let target_site_ids = targets
+        .iter()
+        .map(|(site_id, _)| site_id.clone())
+        .collect::<HashSet<_>>();
+    let profile_ids = cached_profile_ids_for_sites(&database, &target_site_ids)?;
+    let detected = probe_site_system_types(&client, targets, profile_ids).await;
     let detected_count = detected.len();
     let mut connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
     let transaction = connection
@@ -3987,43 +4785,540 @@ fn get_system_fonts() -> Vec<String> {
     fonts
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SiteModelItem {
+    id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    owned_by: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SiteModelsResult {
+    models: Vec<SiteModelItem>,
+    source: String,
+    keys: Vec<String>,
+}
+
+fn json_array_at<'a>(
+    value: &'a serde_json::Value,
+    pointers: &[&str],
+) -> Option<&'a Vec<serde_json::Value>> {
+    pointers
+        .iter()
+        .find_map(|pointer| value.pointer(pointer).and_then(serde_json::Value::as_array))
+}
+
+fn parse_site_models(value: &serde_json::Value) -> Vec<SiteModelItem> {
+    let Some(items) = json_array_at(
+        value,
+        &[
+            "",
+            "/data",
+            "/data/items",
+            "/data/models",
+            "/models",
+            "/items",
+            "/result/data",
+            "/result/models",
+        ],
+    ) else {
+        return Vec::new();
+    };
+    let mut models = items
+        .iter()
+        .filter_map(|item| {
+            let (id, owned_by) = match item {
+                serde_json::Value::String(id) => (id.trim().to_string(), None),
+                serde_json::Value::Object(_) => (
+                    json_string(item, &["/model_name", "/id", "/name", "/model", "/slug"]),
+                    Some(json_string(
+                        item,
+                        &["/owner", "/owned_by", "/ownedBy", "/vendor"],
+                    ))
+                    .filter(|value| !value.is_empty()),
+                ),
+                _ => return None,
+            };
+            (!id.is_empty()).then_some(SiteModelItem { id, owned_by })
+        })
+        .collect::<Vec<_>>();
+    models.sort_by(|left, right| left.id.cmp(&right.id));
+    models.dedup_by(|left, right| left.id == right.id);
+    models
+}
+
+fn api_key_is_enabled(item: &serde_json::Value) -> bool {
+    if item.get("enabled").and_then(json_boolish) == Some(false)
+        || item.get("is_active").and_then(json_boolish) == Some(false)
+    {
+        return false;
+    }
+    if let Some(status) = item.get("status") {
+        match status {
+            serde_json::Value::Bool(false) => return false,
+            serde_json::Value::Number(number) if number.as_i64() == Some(0) => return false,
+            serde_json::Value::String(value)
+                if matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "disabled" | "inactive" | "expired" | "revoked" | "0" | "false"
+                ) =>
+            {
+                return false;
+            }
+            _ => {}
+        }
+    }
+    let expires_at = ["/expired_time", "/expires_at", "/expire_at", "/expiration"]
+        .iter()
+        .find_map(|pointer| json_number(item, pointer));
+    if let Some(expires_at) = expires_at {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+        if expires_at > 0.0 && expires_at < now {
+            return false;
+        }
+    }
+    true
+}
+
+fn normalize_api_key_value(value: &str) -> Option<String> {
+    let value = value
+        .strip_prefix("Bearer ")
+        .unwrap_or(value)
+        .trim()
+        .to_string();
+    (value.len() >= 8
+        && !value.chars().any(char::is_whitespace)
+        && !value.contains('*')
+        && !value.contains("...")
+        && !value.contains('…'))
+    .then_some(value)
+}
+
+fn parse_api_keys(value: &serde_json::Value) -> Vec<String> {
+    let Some(items) = json_array_at(
+        value,
+        &[
+            "",
+            "/data",
+            "/data/items",
+            "/data/keys",
+            "/keys",
+            "/items",
+            "/result/items",
+            "/result/keys",
+        ],
+    ) else {
+        return Vec::new();
+    };
+    let mut keys = Vec::new();
+    for item in items.iter().filter(|item| api_key_is_enabled(item)) {
+        let (value, prefix) = match item {
+            serde_json::Value::String(value) => (value.trim().to_string(), String::new()),
+            serde_json::Value::Object(_) => (
+                json_string(
+                    item,
+                    &[
+                        "/key",
+                        "/api_key",
+                        "/apiKey",
+                        "/plain_key",
+                        "/plainKey",
+                        "/secret_key",
+                        "/secretKey",
+                        "/token",
+                        "/secret",
+                        "/value",
+                    ],
+                ),
+                json_string(item, &["/key_prefix", "/keyPrefix", "/prefix"]),
+            ),
+            _ => continue,
+        };
+        let Some(value) = normalize_api_key_value(&value) else {
+            continue;
+        };
+        keys.push(value.clone());
+        if !prefix.is_empty() && !value.starts_with(&prefix) {
+            keys.push(format!("{prefix}{value}"));
+        }
+    }
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+fn parse_newapi_token_ids(value: &serde_json::Value) -> Vec<String> {
+    let Some(items) = json_array_at(
+        value,
+        &["", "/data", "/data/items", "/items", "/result/items"],
+    ) else {
+        return Vec::new();
+    };
+    let mut ids = items
+        .iter()
+        .filter(|item| api_key_is_enabled(item))
+        .filter_map(|item| {
+            let id = json_string(item, &["/id", "/token_id", "/tokenId"]);
+            (!id.is_empty()
+                && id.len() <= 64
+                && id.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
+                }))
+            .then_some(id)
+        })
+        .collect::<Vec<_>>();
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
+fn parse_revealed_api_key(value: &serde_json::Value) -> Option<String> {
+    let key = json_string(
+        value,
+        &[
+            "/data/key",
+            "/data/api_key",
+            "/data/apiKey",
+            "/data/secret_key",
+            "/data/secretKey",
+            "/data",
+            "/key",
+            "/api_key",
+            "/apiKey",
+            "/secret_key",
+            "/secretKey",
+        ],
+    );
+    normalize_api_key_value(&key)
+}
+
+async fn reveal_newapi_keys(
+    client: &reqwest::Client,
+    base_url: &Url,
+    auth: &NewApiAuth,
+    user_agent: &str,
+    token_list: &serde_json::Value,
+) -> Result<Vec<String>, String> {
+    let mut keys = parse_api_keys(token_list);
+    if !keys.is_empty() {
+        return Ok(keys);
+    }
+    let token_ids = parse_newapi_token_ids(token_list);
+    if token_ids.is_empty() {
+        return Err("/api/token 没有返回可用令牌 ID".into());
+    }
+    let mut errors = Vec::new();
+    for token_id in token_ids {
+        let endpoint = base_url
+            .join(&format!("/api/token/{token_id}/key"))
+            .map_err(|_| "无法生成完整 Key 接口地址".to_string())?;
+        let request = apply_newapi_auth(
+            chrome_request_headers(client.post(endpoint), base_url.as_str(), user_agent),
+            auth,
+        );
+        match request_json(request, "NewAPI 完整 Key 接口").await {
+            Ok(value) => {
+                if let Some(key) = parse_revealed_api_key(&value) {
+                    keys.push(key);
+                } else {
+                    errors.push(format!("令牌 {token_id} 没有返回完整 Key"));
+                }
+            }
+            Err(error) => errors.push(format!("令牌 {token_id}：{error}")),
+        }
+    }
+    keys.sort();
+    keys.dedup();
+    if keys.is_empty() {
+        Err(errors
+            .last()
+            .cloned()
+            .unwrap_or_else(|| "没有取得可用的完整 Key".into()))
+    } else {
+        Ok(keys)
+    }
+}
+
+async fn fetch_models_with_keys(
+    client: &reqwest::Client,
+    base_url: &Url,
+    keys: Vec<String>,
+    visible_keys: Vec<String>,
+    user_agent: &str,
+    source: &str,
+    newapi_user_id: Option<&str>,
+) -> Result<SiteModelsResult, String> {
+    if keys.is_empty() {
+        return Err("Key 接口没有返回可用 Key".into());
+    }
+    let models_url = base_url
+        .join("/v1/models")
+        .map_err(|_| "无法生成 /v1/models 地址".to_string())?;
+    let mut errors = Vec::new();
+    for key in keys {
+        let mut candidates = vec![key.clone()];
+        if !key.starts_with("sk-") {
+            candidates.push(format!("sk-{key}"));
+        }
+        for candidate in candidates {
+            let mut request = chrome_request_headers(
+                client.get(models_url.clone()),
+                base_url.as_str(),
+                user_agent,
+            )
+            .bearer_auth(&candidate);
+            if let Some(user_id) = newapi_user_id {
+                request = request.header("new-api-user", user_id);
+            }
+            match request_json(request, "模型接口").await {
+                Ok(value) => {
+                    let models = parse_site_models(&value);
+                    if !models.is_empty() {
+                        return Ok(SiteModelsResult {
+                            models,
+                            source: source.into(),
+                            keys: visible_keys,
+                        });
+                    }
+                    errors.push("模型接口返回空列表".to_string());
+                }
+                Err(error) => errors.push(error),
+            }
+        }
+    }
+    Err(errors
+        .last()
+        .cloned()
+        .unwrap_or_else(|| "现有 Key 均无法获取模型".into()))
+}
+
+fn chrome_models_bridge_script(
+    system_type: &str,
+    legacy_user_id: Option<&str>,
+    marker: &str,
+) -> String {
+    let system_type = serde_json::to_string(system_type).unwrap_or_else(|_| "\"\"".into());
+    let user_id =
+        serde_json::to_string(legacy_user_id.unwrap_or_default()).unwrap_or_else(|_| "\"\"".into());
+    let marker = serde_json::to_string(marker).unwrap_or_else(|_| "\"\"".into());
+    r#"(() => {
+  const bridgeToken = __OPENHUB_MARKER__;
+  const systemType = __OPENHUB_SYSTEM_TYPE__.toLowerCase();
+  const legacyUserId = __OPENHUB_USER_ID__;
+  const pending = "__OPENHUB_PENDING__";
+  if (!/^https?:$/.test(window.location.protocol)) return pending;
+  if (legacyUserId) {
+    try {
+      let storedUser = localStorage.getItem("user") || "null";
+      for (let depth = 0; depth < 2 && typeof storedUser === "string"; depth += 1) {
+        storedUser = JSON.parse(storedUser);
+      }
+      const storedUserId = storedUser?.id ?? storedUser?.data?.id ?? "";
+      if (String(storedUserId) !== String(legacyUserId)) {
+        return "__OPENHUB_PROFILE_MISMATCH__";
+      }
+    } catch (_) {
+      return "__OPENHUB_PROFILE_MISMATCH__";
+    }
+  }
+  const previous = window.__openHubModelsSync;
+  if (previous && previous.token === bridgeToken) {
+    if (previous.result) return JSON.stringify(previous.result);
+    return pending;
+  }
+  const bridge = { token: bridgeToken, result: null };
+  window.__openHubModelsSync = bridge;
+  const scalar = (value) => {
+    if (!value) return "";
+    try { const parsed = JSON.parse(value); return typeof parsed === "string" ? parsed : value; }
+    catch (_) { return value; }
+  };
+  const readJson = async (path, options) => {
+    const response = await fetch(path, { credentials: "include", cache: "no-store", signal: AbortSignal.timeout(30000), ...options });
+    const text = await response.text();
+    let data = null;
+    try { data = JSON.parse(text); } catch (_) {}
+    return { ok: response.ok, status: response.status, data };
+  };
+  const arrays = (value, paths) => {
+    for (const path of paths) {
+      let current = value;
+      for (const part of path) current = current && current[part];
+      if (Array.isArray(current)) return current;
+    }
+    return [];
+  };
+  const activeKeyItems = (value) => arrays(value, [[], ["data"], ["data","items"], ["data","keys"], ["keys"], ["items"], ["result","items"], ["result","keys"]])
+    .filter((item) => item && item.enabled !== false && item.is_active !== false && ![0, "0", "disabled", "inactive", "expired", "revoked"].includes(item.status));
+  const extractKeys = (value) => activeKeyItems(value)
+    .flatMap((item) => {
+      const key = String(typeof item === "string" ? item : item.key || item.api_key || item.apiKey || item.plain_key || item.plainKey || item.secret_key || item.secretKey || item.token || item.secret || item.value || "").replace(/^Bearer\s+/i, "").trim();
+      const prefix = typeof item === "object" && item ? String(item.key_prefix || item.keyPrefix || item.prefix || "") : "";
+      return prefix && !key.startsWith(prefix) ? [key, `${prefix}${key}`] : [key];
+    })
+    .filter((key) => key.length >= 8 && !/\s|\*|…|\.\.\./.test(key));
+  const extractTokenIds = (value) => activeKeyItems(value)
+    .map((item) => typeof item === "object" && item ? item.id ?? item.token_id ?? item.tokenId ?? "" : "")
+    .map((id) => String(id))
+    .filter((id) => id.length > 0 && id.length <= 64 && /^[A-Za-z0-9_-]+$/.test(id));
+  const extractRevealedKey = (value) => {
+    const key = String(value?.data?.key || value?.data?.api_key || value?.data?.apiKey || value?.data?.secret_key || value?.data?.secretKey ||
+      (typeof value?.data === "string" ? value.data : "") || value?.key || value?.api_key || value?.apiKey || value?.secret_key || value?.secretKey || "")
+      .replace(/^Bearer\s+/i, "").trim();
+    return key.length >= 8 && !/\s|\*|…|\.\.\./.test(key) ? key : "";
+  };
+  const extractModels = (value) => arrays(value, [[], ["data"], ["data","items"], ["data","models"], ["models"], ["items"], ["result","data"], ["result","models"]])
+    .map((item) => typeof item === "string" ? { id: item } : {
+      id: String(item && (item.model_name || item.id || item.name || item.model || item.slug) || ""),
+      ownedBy: item && (item.owner || item.owned_by || item.vendor) || undefined
+    })
+    .filter((item) => item.id);
+  let visibleKeys = [];
+  (async () => {
+    const headers = { Accept: "application/json, text/plain, */*" };
+    let keyPath = "/api/token/?p=1&size=20";
+    let source = "newapi-key";
+    let dashboardAccessToken = "";
+    if (systemType === "sub2api") {
+      keyPath = "/api/v1/keys?page=1";
+      source = "sub2api-key";
+      const authToken = scalar(localStorage.getItem("auth_token"));
+      if (!authToken) throw new Error("Chrome Local Storage 中没有 auth_token");
+      dashboardAccessToken = authToken;
+      headers.Authorization = `Bearer ${authToken}`;
+    } else if (legacyUserId) {
+      headers["New-Api-User"] = legacyUserId;
+    }
+    let keyResponse = await readJson(keyPath, { method: "GET", headers });
+    if (systemType !== "sub2api" && (!keyResponse.ok || extractKeys(keyResponse.data).length === 0)) {
+      const refreshResponse = await readJson("/api/user/auth/refresh", { method: "POST", headers: { Accept: "application/json" } });
+      const accessToken = refreshResponse.data?.data?.access_token || refreshResponse.data?.data?.accessToken ||
+        refreshResponse.data?.data?.token || refreshResponse.data?.access_token || refreshResponse.data?.accessToken || refreshResponse.data?.token || "";
+      if (accessToken) {
+        dashboardAccessToken = accessToken;
+        headers.Authorization = `Bearer ${accessToken}`;
+        keyResponse = await readJson(keyPath, { method: "GET", headers });
+      }
+    }
+    const keys = extractKeys(keyResponse.data);
+    if (systemType !== "sub2api" && !keys.length) {
+      for (const tokenId of extractTokenIds(keyResponse.data)) {
+        const revealResponse = await readJson(`/api/token/${encodeURIComponent(tokenId)}/key`, { method: "POST", headers });
+        const revealedKey = extractRevealedKey(revealResponse.data);
+        if (revealResponse.ok && revealedKey) keys.push(revealedKey);
+      }
+    }
+    visibleKeys = [...new Set(keys)];
+    if (dashboardAccessToken) keys.push(dashboardAccessToken);
+    if (!keys.length) throw new Error(`${keyPath} 没有返回可用 Key（HTTP ${keyResponse.status}）`);
+    let lastStatus = 0;
+    let lastError = "";
+    for (const key of keys) {
+      const candidates = key.startsWith("sk-") || key.includes(".") ? [key] : [key, `sk-${key}`];
+      for (const candidate of candidates) {
+        const modelHeaders = { Accept: "application/json", Authorization: `Bearer ${candidate}` };
+        if (legacyUserId) modelHeaders["New-Api-User"] = legacyUserId;
+        const response = await readJson("/v1/models", { method: "GET", headers: modelHeaders });
+        lastStatus = response.status;
+        lastError = response.data?.error?.message || response.data?.message || response.data?.msg || response.data?.detail || "";
+        const models = extractModels(response.data);
+        if (response.ok && models.length) {
+          bridge.result = { ok: true, models, source, keys: visibleKeys };
+          return;
+        }
+      }
+    }
+    throw new Error(`/v1/models 未返回模型（HTTP ${lastStatus}${lastError ? `：${lastError}` : ""}）`);
+  })().catch((error) => {
+    bridge.result = { ok: false, error: error && error.message || String(error), keys: visibleKeys };
+  });
+  return pending;
+})()"#
+        .replace("__OPENHUB_SYSTEM_TYPE__", &system_type)
+        .replace("__OPENHUB_USER_ID__", &user_id)
+        .replace("__OPENHUB_MARKER__", &marker)
+}
+
+fn parse_chrome_models_result(value: &str) -> Result<SiteModelsResult, String> {
+    let value = serde_json::from_str::<serde_json::Value>(value)
+        .map_err(|error| format!("Chrome 模型数据无法解析：{error}"))?;
+    if value.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+        return Err(api_error_message(&value, "Chrome 没有返回模型"));
+    }
+    let models = parse_site_models(&value);
+    if models.is_empty() {
+        return Err("Chrome 返回的模型列表为空".into());
+    }
+    Ok(SiteModelsResult {
+        models,
+        source: json_string(&value, &["/source"]),
+        keys: parse_api_keys(&value),
+    })
+}
+
+fn parse_chrome_models_keys(value: &str) -> Vec<String> {
+    serde_json::from_str::<serde_json::Value>(value)
+        .map(|value| parse_api_keys(&value))
+        .unwrap_or_default()
+}
+
+fn merge_api_keys(target: &mut Vec<String>, keys: impl IntoIterator<Item = String>) {
+    target.extend(keys);
+    target.sort();
+    target.dedup();
+}
+
+fn cache_profile_api_counts(
+    database: &Database,
+    site_id: Option<&str>,
+    profile_id: Option<&str>,
+    result: SiteModelsResult,
+) -> Result<SiteModelsResult, String> {
+    let should_cache_keys =
+        !result.keys.is_empty() || matches!(result.source.as_str(), "newapi-key" | "sub2api-key");
+    if let (Some(site_id), Some(profile_id)) = (site_id, profile_id) {
+        let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+        if should_cache_keys {
+            connection
+                .execute(
+                    "UPDATE site_accounts
+                     SET api_key_count = ?1, api_model_count = ?2
+                     WHERE site_id = ?3 AND profile_id = ?4",
+                    params![
+                        result.keys.len() as i64,
+                        result.models.len() as i64,
+                        site_id,
+                        profile_id
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
+        } else {
+            connection
+                .execute(
+                    "UPDATE site_accounts
+                     SET api_model_count = ?1
+                     WHERE site_id = ?2 AND profile_id = ?3",
+                    params![result.models.len() as i64, site_id, profile_id],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(result)
+}
+
 #[tauri::command]
 async fn fetch_site_models_json(
     app: tauri::AppHandle,
     database: State<'_, Database>,
     url: String,
     site_id: Option<String>,
-) -> Result<String, String> {
-    let mut profile_id = None;
-    let mut domain = None;
-    
-    if let Some(id) = site_id {
-        if let Ok(db) = database.0.lock() {
-            if let Ok(row) = db.query_row(
-                "SELECT profile_id, domain FROM site_accounts WHERE site_id = ?1 AND is_valid = 1 LIMIT 1",
-                [&id],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-            ) {
-                profile_id = Some(row.0);
-                domain = Some(row.1);
-            }
-        }
-    }
-
-    let mut auth_token = None;
-    if let (Some(profile), Some(dom)) = (profile_id, domain) {
-        use tauri::Manager;
-        if let Ok(home_dir) = app.path().home_dir() {
-            if let Ok(Ok(local_values)) = tauri::async_runtime::spawn_blocking(move || {
-                chrome_local_storage::read_local_storage_from_home(&home_dir, &dom, &profile)
-            }).await {
-                if let Some(token) = local_values.get("auth_token").or_else(|| local_values.get("token")) {
-                    auth_token = Some(token.trim_matches('"').to_string());
-                }
-            }
-        }
-    }
-
+    profile_id: Option<String>,
+) -> Result<SiteModelsResult, String> {
     let client = build_http_client(&database, Duration::from_secs(6), 3, "站点模型请求")?;
     let mut base = url.trim().to_string();
     if !base.starts_with("http://") && !base.starts_with("https://") {
@@ -4032,65 +5327,443 @@ async fn fetch_site_models_json(
     if !base.ends_with('/') {
         base.push('/');
     }
-
-    let pricing_url = format!("{base}api/pricing");
-    let mut req1 = client
-        .get(&pricing_url)
-        .header(reqwest::header::ACCEPT, "application/json, text/plain, */*")
-        .header(reqwest::header::USER_AGENT, "OpenHub-Desktop/0.3");
-        
-    if let Some(token) = &auth_token {
-        req1 = req1.bearer_auth(token);
+    let base_url = Url::parse(&base).map_err(|_| "站点 API 地址无效".to_string())?;
+    let user_agent = chrome_session::chrome_user_agent();
+    let (system_type, mut profile_ids) = if let Some(site_id) = site_id.as_deref() {
+        let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+        let system_type = connection
+            .query_row(
+                "SELECT system_type FROM directory_sites WHERE id = ?1",
+                [site_id],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap_or_default();
+        let mut statement = connection
+            .prepare("SELECT profile_id FROM site_accounts WHERE site_id = ?1 AND is_valid = 1 GROUP BY profile_id ORDER BY max(updated_at) DESC")
+            .map_err(|error| error.to_string())?;
+        let profile_ids = statement
+            .query_map([site_id], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        (system_type, profile_ids)
+    } else {
+        (String::new(), Vec::new())
+    };
+    let requested_profile_id = profile_id.clone();
+    if let Some(requested_profile_id) = requested_profile_id.as_deref() {
+        profile_ids.retain(|candidate| candidate == requested_profile_id);
     }
+    let home_dir = app
+        .path()
+        .home_dir()
+        .map_err(|error| format!("无法定位用户目录：{error}"))?;
+    let origin = base_url.origin().ascii_serialization();
+    let local_targets = site_id
+        .as_ref()
+        .map(|site_id| {
+            profile_ids
+                .iter()
+                .map(|profile_id| chrome_local_storage::LocalStorageTarget {
+                    site_id: site_id.clone(),
+                    profile_id: profile_id.clone(),
+                    origin: origin.clone(),
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let local_matches = if local_targets.is_empty() {
+        Vec::new()
+    } else {
+        let local_home = home_dir.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            chrome_local_storage::read_local_storage_from_home(&local_home, &local_targets)
+        })
+        .await
+        .map_err(|error| format!("读取 Chrome Local Storage 任务失败：{error}"))?
+    };
+    let local_values = local_matches
+        .into_iter()
+        .map(|item| (item.profile_id, item.values))
+        .collect::<HashMap<_, _>>();
+    let mut errors = Vec::new();
+    let mut discovered_keys = Vec::new();
 
-    if let Ok(res) = req1.send().await {
-        if res.status().is_success() {
-            if let Ok(text) = res.text().await {
-                if !text.trim().is_empty() {
-                    return Ok(text);
+    for profile_id in &profile_ids {
+        let values = local_values.get(profile_id).cloned().unwrap_or_default();
+        let inferred_type = if system_type.trim().is_empty() {
+            if parse_newapi_local_account(&values).is_ok() {
+                "NewAPI"
+            } else if parse_sub2api_local_account(&values).is_ok() {
+                "Sub2API"
+            } else {
+                ""
+            }
+        } else {
+            system_type.as_str()
+        };
+        if inferred_type.eq_ignore_ascii_case("NewAPI") {
+            let Some(user_id) = newapi_user_id(&values) else {
+                errors.push(format!("{profile_id}：NewAPI 本地 user 缺少用户 ID"));
+                continue;
+            };
+            let token_url = base_url
+                .join("/api/token/?p=1&size=20")
+                .map_err(|_| "无法生成 /api/token 地址")?;
+            let cookie_home = home_dir.clone();
+            let cookie_target = token_url.to_string();
+            let cookie_profile = profile_id.clone();
+            let cookie_header = tauri::async_runtime::spawn_blocking(move || {
+                chrome_session::read_chrome_cookie_header_from_home(
+                    &cookie_home,
+                    &cookie_target,
+                    &cookie_profile,
+                )
+            })
+            .await
+            .map_err(|error| format!("读取 Chrome Cookie 任务失败：{error}"))?;
+            match cookie_header {
+                Ok(cookie_header) => {
+                    let model_user_id = user_id.clone();
+                    let auth = NewApiAuth::Legacy {
+                        cookie_header,
+                        user_id,
+                    };
+                    let request = apply_newapi_auth(
+                        chrome_request_headers(
+                            client.get(token_url),
+                            base_url.as_str(),
+                            &user_agent,
+                        ),
+                        &auth,
+                    );
+                    match request_json(request, "NewAPI Key 接口").await {
+                        Ok(value) => {
+                            match reveal_newapi_keys(&client, &base_url, &auth, &user_agent, &value)
+                                .await
+                            {
+                                Ok(keys) => {
+                                    merge_api_keys(&mut discovered_keys, keys.iter().cloned());
+                                    match fetch_models_with_keys(
+                                        &client,
+                                        &base_url,
+                                        keys.clone(),
+                                        keys,
+                                        &user_agent,
+                                        "newapi-key",
+                                        Some(&model_user_id),
+                                    )
+                                    .await
+                                    {
+                                        Ok(result) => {
+                                            return cache_profile_api_counts(
+                                                &database,
+                                                site_id.as_deref(),
+                                                requested_profile_id.as_deref(),
+                                                result,
+                                            )
+                                        }
+                                        Err(error) => errors.push(format!("{profile_id}：{error}")),
+                                    }
+                                }
+                                Err(error) => errors.push(format!("{profile_id}：{error}")),
+                            }
+                        }
+                        Err(error) => errors.push(format!("{profile_id}：{error}")),
+                    }
                 }
+                Err(error) => errors.push(format!("{profile_id}：{error}")),
+            }
+        } else if inferred_type.eq_ignore_ascii_case("Sub2API") {
+            let auth_token = values
+                .get("auth_token")
+                .map(|value| local_scalar(value))
+                .filter(|value| !value.is_empty());
+            let Some(auth_token) = auth_token else {
+                errors.push(format!("{profile_id}：Sub2API 本地数据中没有 auth_token"));
+                continue;
+            };
+            let keys_url = base_url
+                .join("/api/v1/keys?page=1")
+                .map_err(|_| "无法生成 /api/v1/keys 地址")?;
+            let dashboard_token = auth_token.clone();
+            let request =
+                chrome_request_headers(client.get(keys_url), base_url.as_str(), &user_agent)
+                    .bearer_auth(&auth_token);
+            match request_json(request, "Sub2API Key 接口").await {
+                Ok(value) => {
+                    let visible_keys = parse_api_keys(&value);
+                    merge_api_keys(&mut discovered_keys, visible_keys.iter().cloned());
+                    let mut keys = visible_keys.clone();
+                    keys.push(dashboard_token);
+                    match fetch_models_with_keys(
+                        &client,
+                        &base_url,
+                        keys,
+                        visible_keys,
+                        &user_agent,
+                        "sub2api-key",
+                        None,
+                    )
+                    .await
+                    {
+                        Ok(result) => {
+                            return cache_profile_api_counts(
+                                &database,
+                                site_id.as_deref(),
+                                requested_profile_id.as_deref(),
+                                result,
+                            )
+                        }
+                        Err(error) => errors.push(format!("{profile_id}：{error}")),
+                    }
+                }
+                Err(error) => errors.push(format!("{profile_id}：{error}")),
             }
         }
     }
 
-    let v1_url = format!("{base}v1/models");
-    let mut req2 = client
-        .get(&v1_url)
-        .header(reqwest::header::ACCEPT, "application/json, text/plain, */*")
-        .header(reqwest::header::USER_AGENT, "OpenHub-Desktop/0.3");
-
-    if let Some(token) = &auth_token {
-        req2 = req2.bearer_auth(token);
+    for profile_id in &profile_ids {
+        let values = local_values.get(profile_id).cloned().unwrap_or_default();
+        let inferred_type = if system_type.trim().is_empty() {
+            if parse_sub2api_local_account(&values).is_ok() {
+                "Sub2API"
+            } else {
+                "NewAPI"
+            }
+        } else {
+            system_type.as_str()
+        };
+        let legacy_user_id = newapi_user_id(&values);
+        if legacy_user_id.is_some() {
+            let marker = format!(
+                "openhub-models-silent-{}",
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            );
+            let script =
+                chrome_models_bridge_script(inferred_type, legacy_user_id.as_deref(), &marker);
+            let silent_base_url = base_url.to_string();
+            match tauri::async_runtime::spawn_blocking(move || {
+                chrome_session::run_javascript_in_existing_chrome_tab(
+                    &silent_base_url,
+                    &script,
+                    Duration::from_secs(35),
+                )
+            })
+            .await
+            .map_err(|error| format!("Chrome 静默模型同步任务失败：{error}"))?
+            {
+                Ok(Some(value)) => {
+                    merge_api_keys(&mut discovered_keys, parse_chrome_models_keys(&value));
+                    match parse_chrome_models_result(&value) {
+                        Ok(result) => {
+                            return cache_profile_api_counts(
+                                &database,
+                                site_id.as_deref(),
+                                requested_profile_id.as_deref(),
+                                result,
+                            )
+                        }
+                        Err(error) => errors.push(format!("{profile_id} 静默请求：{error}")),
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => errors.push(format!("{profile_id} 静默请求：{error}")),
+            }
+        }
+        let background_marker = format!(
+            "openhub-models-background-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        let background_script = chrome_models_bridge_script(
+            inferred_type,
+            legacy_user_id.as_deref(),
+            &background_marker,
+        );
+        let background_url = base_url
+            .join(&format!("/#{}", background_marker))
+            .map_err(|_| "无法生成 Chrome 后台模型同步地址")?
+            .to_string();
+        let background_profile = profile_id.clone();
+        let background_marker_for_task = background_marker.clone();
+        match tauri::async_runtime::spawn_blocking(move || {
+            chrome_session::run_javascript_in_background_chrome_profile(
+                &background_url,
+                &background_profile,
+                &background_marker_for_task,
+                &background_script,
+                Duration::from_secs(35),
+            )
+        })
+        .await
+        .map_err(|error| format!("Chrome 后台模型同步任务失败：{error}"))?
+        {
+            Ok(value) => {
+                merge_api_keys(&mut discovered_keys, parse_chrome_models_keys(&value));
+                match parse_chrome_models_result(&value) {
+                    Ok(result) => {
+                        return cache_profile_api_counts(
+                            &database,
+                            site_id.as_deref(),
+                            requested_profile_id.as_deref(),
+                            result,
+                        )
+                    }
+                    Err(error) => errors.push(format!("{profile_id} 后台请求：{error}")),
+                }
+            }
+            Err(error) => errors.push(format!("{profile_id} 后台请求：{error}")),
+        }
+        let marker = format!(
+            "openhub-models-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        let script = chrome_models_bridge_script(inferred_type, legacy_user_id.as_deref(), &marker);
+        let target_url = base_url
+            .join(&format!("/#{}", marker))
+            .map_err(|_| "无法生成 Chrome 模型同步地址")?
+            .to_string();
+        let bridge_profile = profile_id.clone();
+        let bridge_marker = marker.clone();
+        match tauri::async_runtime::spawn_blocking(move || {
+            chrome_session::run_javascript_in_chrome_profile(
+                &target_url,
+                &bridge_profile,
+                &bridge_marker,
+                &script,
+                Duration::from_secs(45),
+            )
+        })
+        .await
+        .map_err(|error| format!("Chrome 模型同步任务失败：{error}"))?
+        {
+            Ok(value) => {
+                merge_api_keys(&mut discovered_keys, parse_chrome_models_keys(&value));
+                match parse_chrome_models_result(&value) {
+                    Ok(result) => {
+                        return cache_profile_api_counts(
+                            &database,
+                            site_id.as_deref(),
+                            requested_profile_id.as_deref(),
+                            result,
+                        )
+                    }
+                    Err(error) => errors.push(format!("{profile_id}：{error}")),
+                }
+            }
+            Err(error) => errors.push(format!("{profile_id}：{error}")),
+        }
     }
 
-    let res = req2.send()
-        .await
-        .map_err(|err| format!("HTTP 请求失败: {err}"))?;
-
-    if !res.status().is_success() {
-        return Err(format!("HTTP {} {}", res.status().as_u16(), res.status()));
+    let pricing_url = base_url
+        .join("/api/pricing")
+        .map_err(|_| "无法生成 /api/pricing 地址")?;
+    match request_json(
+        chrome_request_headers(client.get(pricing_url), base_url.as_str(), &user_agent),
+        "公开模型接口",
+    )
+    .await
+    {
+        Ok(value) => {
+            let models = parse_site_models(&value);
+            if !models.is_empty() {
+                return cache_profile_api_counts(
+                    &database,
+                    site_id.as_deref(),
+                    requested_profile_id.as_deref(),
+                    SiteModelsResult {
+                        models,
+                        source: "pricing".into(),
+                        keys: discovered_keys.clone(),
+                    },
+                );
+            }
+            errors.push("/api/pricing 返回空模型列表".into());
+        }
+        Err(error) => errors.push(error),
     }
 
-    let text = res
-        .text()
-        .await
-        .map_err(|err| format!("读取响应失败: {err}"))?;
-
-    Ok(text)
+    let models_url = base_url
+        .join("/v1/models")
+        .map_err(|_| "无法生成 /v1/models 地址")?;
+    match request_json(
+        chrome_request_headers(client.get(models_url), base_url.as_str(), &user_agent),
+        "无鉴权模型接口",
+    )
+    .await
+    {
+        Ok(value) => {
+            let models = parse_site_models(&value);
+            if !models.is_empty() {
+                return cache_profile_api_counts(
+                    &database,
+                    site_id.as_deref(),
+                    requested_profile_id.as_deref(),
+                    SiteModelsResult {
+                        models,
+                        source: "models".into(),
+                        keys: discovered_keys,
+                    },
+                );
+            }
+            errors.push("/v1/models 返回空模型列表".into());
+        }
+        Err(error) => errors.push(error),
+    }
+    if !discovered_keys.is_empty() {
+        let source = if system_type.eq_ignore_ascii_case("Sub2API") {
+            "sub2api-key"
+        } else {
+            "newapi-key"
+        };
+        return cache_profile_api_counts(
+            &database,
+            site_id.as_deref(),
+            requested_profile_id.as_deref(),
+            SiteModelsResult {
+                models: Vec::new(),
+                source: source.into(),
+                keys: discovered_keys,
+            },
+        );
+    }
+    errors.dedup();
+    if errors.is_empty() {
+        Err("站点没有返回可用模型".into())
+    } else {
+        Err(format!(
+            "获取模型失败：{}",
+            errors.into_iter().take(4).collect::<Vec<_>>().join("；")
+        ))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        chrome_account_bridge_script, cookie_header_has_name, discovered_json_bool,
-        discovered_json_string, has_account_session_candidate, has_newapi_refresh_cookie_name,
-        html_icon_href, html_meta_description, html_title, infer_remote_system_type,
-        infer_system_type_from_local_accounts, migrate_legacy_favorites_to_personal,
-        normalize_import_base_url, normalize_network_proxy, normalize_remote_url,
-        parse_newapi_checkin_status, parse_newapi_local_account, parse_sub2api_account,
-        parse_sub2api_checkin_status, parse_sub2api_local_account, read_cached_usage_sites,
-        site_matches_requested_scope, sub2api_response_succeeded, system_type_from_probes,
-        EndpointProbe,
+        account_base_url, api_error_message, apply_zero_v_zero_stats, cache_profile_api_counts,
+        chrome_account_bridge_script, chrome_models_bridge_script, chrome_system_probe_script,
+        cookie_header_has_name, discovered_json_bool, discovered_json_string,
+        has_account_session_candidate, has_newapi_refresh_cookie_name, html_icon_href,
+        html_meta_description, html_title, infer_remote_system_type,
+        infer_system_type_from_local_accounts, is_any_router_site,
+        migrate_legacy_favorites_to_personal, normalize_import_base_url, normalize_network_proxy,
+        normalize_remote_url, parse_api_keys, parse_chrome_models_keys, parse_chrome_models_result,
+        parse_newapi_checkin_status, parse_newapi_local_account, parse_newapi_token_ids,
+        parse_revealed_api_key, parse_site_models, parse_sub2api_account,
+        parse_sub2api_checkin_status, parse_sub2api_local_account, parse_zero_v_zero_self,
+        read_cached_usage_sites, shield_page_response, site_matches_requested_scope,
+        sub2api_response_succeeded, system_type_from_probes, zero_v_zero_token, Database,
+        EndpointProbe, SiteModelItem, SiteModelsResult,
     };
     use rusqlite::{params, Connection};
     use std::collections::{HashMap, HashSet};
@@ -4231,6 +5904,8 @@ mod tests {
                     profile_name TEXT NOT NULL,
                     account_name TEXT NOT NULL,
                     username TEXT NOT NULL DEFAULT '',
+                    api_key_count INTEGER NOT NULL DEFAULT 0,
+                    api_model_count INTEGER NOT NULL DEFAULT 0,
                     remaining REAL,
                     used REAL,
                     total REAL,
@@ -4291,8 +5966,45 @@ mod tests {
         assert_eq!(cached[0].sessions.len(), 2);
         assert_eq!(cached[0].sessions[0].profile_id, "Default");
         assert_eq!(cached[0].sessions[0].cookie_names, ["session", "token"]);
+        assert_eq!(cached[0].sessions[0].api_key_count, 0);
+        assert_eq!(cached[0].sessions[0].api_model_count, 0);
         assert_eq!(cached[1].site_id, "site-b");
         assert_eq!(cached[1].sessions[0].cookie_count, 3);
+    }
+
+    #[test]
+    fn caches_only_the_profile_api_counts() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE site_accounts (
+                    site_id TEXT NOT NULL,
+                    profile_id TEXT NOT NULL,
+                    api_key_count INTEGER NOT NULL DEFAULT 0,
+                    api_model_count INTEGER NOT NULL DEFAULT 0
+                 );
+                 INSERT INTO site_accounts (site_id, profile_id) VALUES ('site-a', 'Default');",
+            )
+            .unwrap();
+        let database = Database(std::sync::Mutex::new(connection));
+        let result = SiteModelsResult {
+            models: vec![SiteModelItem {
+                id: "gpt-5".into(),
+                owned_by: None,
+            }],
+            source: "newapi-key".into(),
+            keys: vec!["sk-one".into(), "sk-two".into()],
+        };
+        cache_profile_api_counts(&database, Some("site-a"), Some("Default"), result).unwrap();
+        let connection = database.0.lock().unwrap();
+        let counts = connection
+            .query_row(
+                "SELECT api_key_count, api_model_count FROM site_accounts WHERE site_id = 'site-a' AND profile_id = 'Default'",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .unwrap();
+        assert_eq!(counts, (2, 1));
     }
 
     #[test]
@@ -4448,6 +6160,53 @@ mod tests {
     }
 
     #[test]
+    fn extracts_zero_v_zero_account_and_stats_without_exposing_the_token() {
+        let values = HashMap::from([("0v0_token".into(), r#""secret-token""#.into())]);
+        assert_eq!(zero_v_zero_token(&values).as_deref(), Some("secret-token"));
+
+        let self_value = serde_json::json!({
+            "success": true,
+            "data": {
+                "id": 871,
+                "username": "zero-user",
+                "quota": 10_000_000,
+                "used_quota": 2_500_000
+            }
+        });
+        let mut account = parse_zero_v_zero_self(&self_value).unwrap();
+        assert_eq!(account.username, "zero-user");
+        assert_eq!(account.remaining, Some(20.0));
+        assert_eq!(account.used, Some(5.0));
+        assert_eq!(account.total, Some(25.0));
+
+        let stats = serde_json::json!({
+            "success": true,
+            "data": { "total_quota": 25_000_000, "used_quota": 1_000_000 }
+        });
+        apply_zero_v_zero_stats(&mut account, &stats).unwrap();
+        assert_eq!(account.remaining, Some(50.0));
+        assert_eq!(account.used, Some(2.0));
+        assert_eq!(account.total, Some(52.0));
+        assert_eq!(account.unit, "USD");
+    }
+
+    #[test]
+    fn maps_zero_v_zero_document_and_api_domains_to_the_console() {
+        assert_eq!(
+            account_base_url("0v0", "https://docs.0v0.club/", ""),
+            "https://0v0.club/"
+        );
+        assert_eq!(
+            account_base_url("Other", "https://api.0v0.club/v1", ""),
+            "https://0v0.club/"
+        );
+        assert_eq!(
+            account_base_url("Other", "https://example.com/", "NewAPI"),
+            "https://example.com/"
+        );
+    }
+
+    #[test]
     fn sub2api_local_account_requires_auth_user_and_defaults_missing_balance_to_zero() {
         let token_only = HashMap::from([("auth_token".into(), r#""secret""#.into())]);
         assert!(parse_sub2api_local_account(&token_only).is_err());
@@ -4455,6 +6214,128 @@ mod tests {
         let valid = HashMap::from([("auth_user".into(), r#"{"username":"ass120"}"#.into())]);
         let account = parse_sub2api_local_account(&valid).unwrap();
         assert_eq!(account.remaining, Some(0.0));
+    }
+
+    #[test]
+    fn extracts_enabled_api_keys_from_newapi_and_sub2api_responses() {
+        let newapi = serde_json::json!({
+            "success": true,
+            "data": {
+                "items": [
+                    { "key": "sk-newapi-enabled", "status": 1 },
+                    { "key": "sk-newapi-disabled", "status": 0 },
+                    { "key": "sk-newapi-expired", "status": 1, "expired_time": 1 }
+                ]
+            }
+        });
+        assert_eq!(parse_api_keys(&newapi), ["sk-newapi-enabled"]);
+
+        let sub2api = serde_json::json!({
+            "data": {
+                "keys": [
+                    { "api_key": "sk-sub2api-enabled", "is_active": true },
+                    { "apiKey": "sk-sub2api-disabled", "is_active": false },
+                    { "secret_key": "raw-key-value", "key_prefix": "sub2-" },
+                    { "key": "sk-****masked" }
+                ]
+            }
+        });
+        assert_eq!(
+            parse_api_keys(&sub2api),
+            ["raw-key-value", "sk-sub2api-enabled", "sub2-raw-key-value"]
+        );
+
+        let masked_newapi = serde_json::json!({
+            "data": {
+                "items": [
+                    { "id": 567, "key": "sk-****masked", "status": 1 },
+                    { "id": 568, "key": "sk-****disabled", "status": 0 }
+                ]
+            }
+        });
+        assert!(parse_api_keys(&masked_newapi).is_empty());
+        assert_eq!(parse_newapi_token_ids(&masked_newapi), ["567"]);
+        assert_eq!(
+            parse_revealed_api_key(&serde_json::json!({
+                "success": true,
+                "data": "sk-newapi-revealed"
+            })),
+            Some("sk-newapi-revealed".into())
+        );
+    }
+
+    #[test]
+    fn extracts_openai_style_api_error_messages() {
+        let value = serde_json::json!({
+            "error": {
+                "message": "令牌无效",
+                "type": "invalid_request_error"
+            }
+        });
+        assert_eq!(api_error_message(&value, "请求失败"), "令牌无效");
+    }
+
+    #[test]
+    fn normalizes_nested_and_root_model_lists_without_duplicates() {
+        let nested = serde_json::json!({
+            "data": {
+                "models": [
+                    { "id": "gpt-5", "owned_by": "openai" },
+                    { "model_name": "claude-sonnet", "owner": "anthropic" },
+                    { "id": "gpt-5", "owned_by": "duplicate" }
+                ]
+            }
+        });
+        let models = parse_site_models(&nested);
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].id, "claude-sonnet");
+        assert_eq!(models[1].id, "gpt-5");
+
+        let root = serde_json::json!(["qwen-max", { "name": "deepseek-v3" }]);
+        assert_eq!(
+            parse_site_models(&root)
+                .into_iter()
+                .map(|model| model.id)
+                .collect::<Vec<_>>(),
+            ["deepseek-v3", "qwen-max"]
+        );
+    }
+
+    #[test]
+    fn chrome_models_bridge_keeps_keys_inside_the_same_origin_script() {
+        let script = chrome_models_bridge_script("NewAPI", Some("10288"), "openhub-models-123");
+
+        assert!(script.contains("keyPath = \"/api/token/?p=1&size=20\""));
+        assert!(script.contains("keyPath = \"/api/v1/keys?page=1\""));
+        assert!(!script.contains("keyPath = \"/api/token?p=0&size=100\""));
+        assert!(!script.contains("keyPath = \"/v1/keys\""));
+        assert!(script.contains("`/api/token/${encodeURIComponent(tokenId)}/key`"));
+        assert!(script.contains(
+            "`/api/token/${encodeURIComponent(tokenId)}/key`, { method: \"POST\", headers }"
+        ));
+        assert!(!script.contains(
+            "`/api/token/${encodeURIComponent(tokenId)}/key`, { method: \"GET\", headers }"
+        ));
+        assert!(script.contains("readJson(\"/v1/models\""));
+        assert!(script.contains("readJson(\"/api/user/auth/refresh\""));
+        assert!(script.contains("return \"__OPENHUB_PROFILE_MISMATCH__\""));
+        assert!(!script.contains("http://"));
+        assert!(!script.contains("https://"));
+
+        let result = parse_chrome_models_result(
+            r#"{"ok":true,"source":"newapi-key","keys":["sk-model-key"],"models":[{"id":"gpt-5","ownedBy":"openai"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(result.source, "newapi-key");
+        assert_eq!(result.keys, ["sk-model-key"]);
+        assert_eq!(result.models[0].id, "gpt-5");
+
+        assert_eq!(
+            parse_chrome_models_keys(
+                r#"{"ok":false,"error":"模型接口 HTTP 401","keys":["sk-partial-key"]}"#,
+            ),
+            ["sk-partial-key"]
+        );
     }
 
     #[test]
@@ -4507,7 +6388,13 @@ mod tests {
 
     #[test]
     fn classifies_site_system_probes_and_rejects_html_fallbacks() {
-        let probe = |status, is_json| Some(EndpointProbe { status, is_json });
+        let probe = |status, is_json| {
+            Some(EndpointProbe {
+                status,
+                is_json,
+                is_challenge: false,
+            })
+        };
         assert_eq!(
             system_type_from_probes(probe(reqwest::StatusCode::OK, true), None),
             Some("NewAPI")
@@ -4547,15 +6434,53 @@ mod tests {
     }
 
     #[test]
+    fn recognizes_security_gateway_pages_without_treating_regular_html_as_a_shield() {
+        assert!(shield_page_response(
+            reqwest::StatusCode::OK,
+            "text/html; charset=utf-8",
+            true,
+            b"compressed gateway response",
+        ));
+        assert!(shield_page_response(
+            reqwest::StatusCode::FORBIDDEN,
+            "text/html",
+            false,
+            b"<!doctype html><title>Just a moment</title>",
+        ));
+        assert!(!shield_page_response(
+            reqwest::StatusCode::OK,
+            "text/html",
+            false,
+            b"<!doctype html><title>API console</title>",
+        ));
+    }
+
+    #[test]
+    fn chrome_system_probe_requests_both_status_endpoints_in_parallel() {
+        let script = chrome_system_probe_script("openhub-system-123");
+        assert!(script.contains("Promise.all([probe(\"/api/status\"), probe(\"/setup/status\")])"));
+        assert_eq!(script.matches("AbortSignal.timeout(12000)").count(), 1);
+        assert!(!script.contains("http://"));
+        assert!(!script.contains("https://"));
+    }
+
+    #[test]
     fn chrome_account_bridge_uses_only_fixed_same_origin_endpoints() {
-        let script =
-            chrome_account_bridge_script(Some("10288"), "2026-08", "openhub-sync-123", true);
+        let script = chrome_account_bridge_script(
+            Some("10288"),
+            "2026-08",
+            "openhub-sync-123",
+            true,
+            true,
+            false,
+            true,
+        );
 
         assert!(script.contains("fetch(\"/api/user/auth/refresh\""));
         assert!(script.contains("fetch(\"/api/user/self\""));
         assert!(script.contains("`/api/user/checkin?month=${encodeURIComponent(\"2026-08\")}`"));
         assert!(script.contains("fetch(\"/api/user/checkin\""));
-        assert_eq!(script.matches("fetch(").count(), 4);
+        assert_eq!(script.matches("fetch(").count(), 5);
         assert!(!script.contains("http://"));
         assert!(!script.contains("https://"));
         assert!(script.contains("window.location.protocol !== \"http:\""));
@@ -4565,9 +6490,47 @@ mod tests {
         assert!(script.contains("bridge.state = \"challenge\""));
         assert!(script.contains("window.location.assign(`/api/user/self#${token}`)"));
         assert!(script.contains("const shouldCheckin = true"));
-        assert_eq!(script.matches("AbortSignal.timeout(30000)").count(), 4);
+        assert!(script.contains("const useRefreshAuth = true"));
+        assert!(script.contains("const isAnyRouter = false"));
+        assert!(script.contains("const allowChallengeNavigation = true"));
+        assert!(script.contains("return \"__OPENHUB_PROFILE_MISMATCH__\""));
+        assert!(
+            script.find("const checkinResponse").unwrap()
+                < script.find("fetch(\"/api/user/self\"").unwrap()
+        );
+        assert!(script.contains("const requestTimeout = isAnyRouter ? 12000 : 30000"));
+        assert_eq!(
+            script
+                .matches("AbortSignal.timeout(requestTimeout)")
+                .count(),
+            5
+        );
         assert!(!script.contains("account: accessToken"));
         assert!(!script.contains("if (Date.now() - previous.started < 3000) return pending;"));
+    }
+
+    #[test]
+    fn any_router_bridge_uses_only_the_site_specific_checkin_endpoint() {
+        let script = chrome_account_bridge_script(
+            Some("10288"),
+            "2026-08",
+            "openhub-sync-anyrouter",
+            false,
+            true,
+            true,
+            false,
+        );
+
+        assert!(script.contains("const useRefreshAuth = false"));
+        assert!(script.contains("const isAnyRouter = true"));
+        assert!(script.contains("if (isAnyRouter)"));
+        assert!(script.contains("fetch(\"/api/user/sign_in\""));
+        assert!(script.contains("method: \"POST\""));
+        assert_eq!(script.matches("fetch(").count(), 5);
+        assert!(is_any_router_site("https://anyrouter.top/"));
+        assert!(is_any_router_site("https://api.anyrouter.top/v1"));
+        assert!(!is_any_router_site("https://not-anyrouter.example/"));
+        assert!(script.contains("已(?:经)?签到|already (?:signed|checked)"));
     }
 
     #[test]
@@ -4575,7 +6538,8 @@ mod tests {
         let user_id = "10288\"; window.injected = true; //";
         let month = "2026-08\nnext";
         let marker = "openhub-sync-\"quoted";
-        let script = chrome_account_bridge_script(Some(user_id), month, marker, false);
+        let script =
+            chrome_account_bridge_script(Some(user_id), month, marker, false, false, false, false);
 
         assert!(script.contains(&format!(
             "const legacyUserId = {}",
@@ -4590,6 +6554,7 @@ mod tests {
             serde_json::to_string(marker).unwrap()
         )));
         assert!(script.contains("const shouldCheckin = false"));
+        assert!(script.contains("const allowChallengeNavigation = false"));
         assert!(!script.contains("const legacyUserId = \"10288\"; window.injected"));
     }
 }

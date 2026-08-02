@@ -24,6 +24,8 @@ pub struct ChromeSessionInfo {
     pub(crate) profile_name: String,
     pub(crate) account_name: String,
     pub(crate) username: String,
+    pub(crate) api_key_count: usize,
+    pub(crate) api_model_count: usize,
     pub(crate) remaining: Option<f64>,
     pub(crate) used: Option<f64>,
     pub(crate) total: Option<f64>,
@@ -180,6 +182,7 @@ pub async fn open_url_in_chrome_profile(url: String, profile_id: String) -> Resu
 const CHROME_BRIDGE_TAB_NOT_FOUND: &str = "__OPENHUB_TAB_NOT_FOUND__";
 const CHROME_BRIDGE_PENDING: &str = "__OPENHUB_PENDING__";
 const CHROME_BRIDGE_TAB_PENDING_PREFIX: &str = "__OPENHUB_TAB_PENDING__:";
+const CHROME_BRIDGE_PROFILE_MISMATCH: &str = "__OPENHUB_PROFILE_MISMATCH__";
 
 fn chrome_tab_id_from_pending(value: &str) -> Option<&str> {
     value
@@ -206,6 +209,131 @@ fn is_transient_chrome_automation_error(error: &str) -> bool {
 }
 
 #[cfg(target_os = "macos")]
+pub(crate) fn run_javascript_in_existing_chrome_tab(
+    target_url: &str,
+    javascript: &str,
+    timeout: Duration,
+) -> Result<Option<String>, String> {
+    let target_url = validated_external_url(target_url)?;
+    let target_origin = target_url.origin().ascii_serialization();
+    if target_origin == "null" {
+        return Err("Chrome 静默请求地址缺少有效来源".into());
+    }
+
+    const SCRIPT: &str = r#"
+on run argv
+    set targetOrigin to item 1 of argv
+    set sourceCode to item 2 of argv
+    set targetTabId to item 3 of argv
+    if application "Google Chrome" is not running then return "__OPENHUB_TAB_NOT_FOUND__"
+    tell application "Google Chrome"
+        set browserWindowCount to count of windows
+        repeat with windowIndex from 1 to browserWindowCount
+            try
+                set browserTabCount to count of tabs of window windowIndex
+                repeat with tabIndex from 1 to browserTabCount
+                    try
+                        set browserTab to tab tabIndex of window windowIndex
+                        set currentTabId to id of browserTab as text
+                        if (targetTabId is "") or (currentTabId is equal to targetTabId) then
+                            set tabOrigin to execute browserTab javascript "window.location.origin"
+                            if tabOrigin is equal to targetOrigin then
+                                set scriptResult to execute browserTab javascript sourceCode
+                                if scriptResult is not "__OPENHUB_PROFILE_MISMATCH__" then
+                                    if scriptResult is missing value or scriptResult is "__OPENHUB_PENDING__" then return "__OPENHUB_TAB_PENDING__:" & currentTabId
+                                    return scriptResult as text
+                                end if
+                            end if
+                        end if
+                    on error errorMessage number errorNumber
+                        if errorNumber is not -1719 and errorNumber is not -1728 then
+                            error errorMessage number errorNumber
+                        end if
+                    end try
+                end repeat
+            on error errorMessage number errorNumber
+                if errorNumber is not -1719 and errorNumber is not -1728 then
+                    error errorMessage number errorNumber
+                end if
+            end try
+        end repeat
+    end tell
+    return "__OPENHUB_TAB_NOT_FOUND__"
+end run
+"#;
+
+    let started = Instant::now();
+    let mut target_tab_id = String::new();
+    while started.elapsed() < timeout {
+        let output = Command::new("/usr/bin/osascript")
+            .args([
+                "-e",
+                SCRIPT,
+                "--",
+                &target_origin,
+                javascript,
+                &target_tab_id,
+            ])
+            .output()
+            .map_err(|error| format!("无法调用 Chrome 静默自动化：{error}"))?;
+        if !output.status.success() {
+            let error = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            if error.contains("JavaScript from Apple Events")
+                || error.contains("Apple Events 的 JavaScript")
+            {
+                return Err(
+                    "Chrome 已关闭 Apple Events JavaScript；请在 Chrome 的“视图 → 开发者”菜单中开启后重试"
+                        .into(),
+                );
+            }
+            if error.contains("-1743")
+                || error.contains("not authorized to send Apple events")
+                || error.contains("不允许发送 Apple 事件")
+            {
+                return Err(
+                    "macOS 未允许 OpenHub 控制 Chrome；请在“系统设置 → 隐私与安全性 → 自动化”中授权后重试"
+                        .into(),
+                );
+            }
+            if is_transient_chrome_automation_error(&error) {
+                thread::sleep(Duration::from_millis(300));
+                continue;
+            }
+            return Err(if error.is_empty() {
+                "Chrome 静默自动化执行失败".into()
+            } else {
+                format!("Chrome 静默自动化执行失败：{error}")
+            });
+        }
+        let result = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if result == CHROME_BRIDGE_TAB_NOT_FOUND {
+            return Ok(None);
+        }
+        if let Some(tab_id) = chrome_tab_id_from_pending(&result) {
+            target_tab_id = tab_id.to_string();
+            thread::sleep(Duration::from_millis(300));
+            continue;
+        }
+        if !matches!(result.as_str(), "" | CHROME_BRIDGE_PENDING)
+            && result != CHROME_BRIDGE_PROFILE_MISMATCH
+        {
+            return Ok(Some(result));
+        }
+        thread::sleep(Duration::from_millis(300));
+    }
+    Err("等待已打开的 Chrome 页面返回数据超时".into())
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn run_javascript_in_existing_chrome_tab(
+    _target_url: &str,
+    _javascript: &str,
+    _timeout: Duration,
+) -> Result<Option<String>, String> {
+    Ok(None)
+}
+
+#[cfg(target_os = "macos")]
 pub(crate) fn run_javascript_in_chrome_profile(
     target_url: &str,
     profile_id: &str,
@@ -213,6 +341,35 @@ pub(crate) fn run_javascript_in_chrome_profile(
     javascript: &str,
     timeout: Duration,
 ) -> Result<String, String> {
+    validate_chrome_bridge_marker(marker)?;
+    let existing_tab_ids = chrome_tab_ids();
+    open_url_in_chrome_profile_blocking_with_mode(target_url, profile_id, false)?;
+    let target_tab_id =
+        wait_for_new_chrome_tab(&existing_tab_ids, target_url, Duration::from_secs(8));
+    run_javascript_in_marked_chrome_tab(marker, javascript, target_tab_id.as_deref(), timeout)
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn run_javascript_in_background_chrome_profile(
+    target_url: &str,
+    profile_id: &str,
+    marker: &str,
+    javascript: &str,
+    timeout: Duration,
+) -> Result<String, String> {
+    validate_chrome_bridge_marker(marker)?;
+    let existing_tab_ids = chrome_tab_ids();
+    open_url_in_chrome_profile_blocking_with_mode(target_url, profile_id, true)?;
+    let target_tab_id =
+        wait_for_new_chrome_tab(&existing_tab_ids, target_url, Duration::from_secs(8));
+    let result =
+        run_javascript_in_marked_chrome_tab(marker, javascript, target_tab_id.as_deref(), timeout);
+    close_chrome_bridge_tabs(target_tab_id.as_deref(), marker);
+    result
+}
+
+#[cfg(target_os = "macos")]
+fn validate_chrome_bridge_marker(marker: &str) -> Result<(), String> {
     if marker.is_empty()
         || !marker
             .chars()
@@ -220,8 +377,16 @@ pub(crate) fn run_javascript_in_chrome_profile(
     {
         return Err("Chrome 同步标识无效".into());
     }
-    open_url_in_chrome_profile_blocking(target_url, profile_id)?;
+    Ok(())
+}
 
+#[cfg(target_os = "macos")]
+fn run_javascript_in_marked_chrome_tab(
+    marker: &str,
+    javascript: &str,
+    initial_tab_id: Option<&str>,
+    timeout: Duration,
+) -> Result<String, String> {
     const SCRIPT: &str = r#"
 on run argv
     set targetMarker to item 1 of argv
@@ -238,7 +403,6 @@ on run argv
                         set tabUrl to URL of browserTab
                         set currentTabId to id of browserTab as text
                         if ((targetTabId is not "") and (currentTabId is equal to targetTabId)) or (tabUrl contains targetMarker) then
-                            if loading of browserTab then return "__OPENHUB_TAB_PENDING__:" & currentTabId
                             set scriptResult to execute browserTab javascript sourceCode
                             if scriptResult is missing value or scriptResult is "__OPENHUB_PENDING__" then return "__OPENHUB_TAB_PENDING__:" & currentTabId
                             return scriptResult as text
@@ -261,7 +425,7 @@ end run
 "#;
 
     let started = Instant::now();
-    let mut target_tab_id = String::new();
+    let mut target_tab_id = initial_tab_id.unwrap_or_default().to_string();
     while started.elapsed() < timeout {
         let output = Command::new("/usr/bin/osascript")
             .args(["-e", SCRIPT, "--", marker, javascript, &target_tab_id])
@@ -313,6 +477,110 @@ end run
     Err("等待 Chrome 返回账号数据超时；请完成页面验证后重试".into())
 }
 
+#[cfg(target_os = "macos")]
+fn chrome_tabs() -> Vec<(String, String)> {
+    const SCRIPT: &str = r#"
+if application "Google Chrome" is not running then return ""
+set tabLines to ""
+tell application "Google Chrome"
+    repeat with windowIndex from 1 to (count of windows)
+        try
+            repeat with tabIndex from 1 to (count of tabs of window windowIndex)
+                try
+                    set browserTab to tab tabIndex of window windowIndex
+                    set tabLines to tabLines & (id of browserTab as text) & tab & (URL of browserTab) & linefeed
+                end try
+            end repeat
+        end try
+    end repeat
+end tell
+return tabLines
+"#;
+    let Ok(output) = Command::new("/usr/bin/osascript")
+        .args(["-e", SCRIPT])
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let (id, url) = line.split_once('\t')?;
+            (!id.is_empty() && id.chars().all(|character| character.is_ascii_digit()))
+                .then(|| (id.to_string(), url.to_string()))
+        })
+        .collect()
+}
+
+#[cfg(target_os = "macos")]
+fn chrome_tab_ids() -> HashSet<String> {
+    chrome_tabs().into_iter().map(|(id, _)| id).collect()
+}
+
+#[cfg(target_os = "macos")]
+fn wait_for_new_chrome_tab(
+    existing_tab_ids: &HashSet<String>,
+    target_url: &str,
+    timeout: Duration,
+) -> Option<String> {
+    let target_origin = validated_external_url(target_url)
+        .ok()?
+        .origin()
+        .ascii_serialization();
+    let started = Instant::now();
+    while started.elapsed() < timeout {
+        if let Some(id) = chrome_tabs().into_iter().find_map(|(id, url)| {
+            if existing_tab_ids.contains(&id) {
+                return None;
+            }
+            Url::parse(&url)
+                .ok()
+                .is_some_and(|url| url.origin().ascii_serialization() == target_origin)
+                .then_some(id)
+        }) {
+            return Some(id);
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn close_chrome_bridge_tabs(target_tab_id: Option<&str>, marker: &str) {
+    const SCRIPT: &str = r#"
+on run argv
+    set targetTabId to item 1 of argv
+    set targetMarker to item 2 of argv
+    if application "Google Chrome" is not running then return
+    tell application "Google Chrome"
+        repeat with windowIndex from (count of windows) to 1 by -1
+            try
+                repeat with tabIndex from (count of tabs of window windowIndex) to 1 by -1
+                    try
+                        set browserTab to tab tabIndex of window windowIndex
+                        set currentTabId to id of browserTab as text
+                        if ((targetTabId is not "") and (currentTabId is equal to targetTabId)) or ((URL of browserTab) contains targetMarker) then close browserTab
+                    end try
+                end repeat
+            end try
+        end repeat
+    end tell
+end run
+"#;
+    let _ = Command::new("/usr/bin/osascript")
+        .args([
+            "-e",
+            SCRIPT,
+            "--",
+            target_tab_id.unwrap_or_default(),
+            marker,
+        ])
+        .output();
+}
+
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn run_javascript_in_chrome_profile(
     _target_url: &str,
@@ -324,13 +592,37 @@ pub(crate) fn run_javascript_in_chrome_profile(
     Err("当前仅支持在 macOS 上通过 Chrome 同步账号".into())
 }
 
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn run_javascript_in_background_chrome_profile(
+    _target_url: &str,
+    _profile_id: &str,
+    _marker: &str,
+    _javascript: &str,
+    _timeout: Duration,
+) -> Result<String, String> {
+    Err("当前仅支持在 macOS 上通过 Chrome 同步账号".into())
+}
+
 #[cfg(target_os = "macos")]
 fn open_url_in_chrome_profile_blocking(url: &str, profile_id: &str) -> Result<(), String> {
+    open_url_in_chrome_profile_blocking_with_mode(url, profile_id, false)
+}
+
+#[cfg(target_os = "macos")]
+fn open_url_in_chrome_profile_blocking_with_mode(
+    url: &str,
+    profile_id: &str,
+    background: bool,
+) -> Result<(), String> {
     if !is_safe_profile_dir(profile_id) {
         return Err("Chrome Profile 标识无效".into());
     }
     let parsed = validated_external_url(url)?;
-    let status = Command::new("/usr/bin/open")
+    let mut command = Command::new("/usr/bin/open");
+    if background {
+        command.arg("-g");
+    }
+    let status = command
         .args(["-na", "Google Chrome", "--args"])
         .arg(format!("--profile-directory={profile_id}"))
         .arg(parsed.as_str())
@@ -387,6 +679,8 @@ fn list_chrome_sessions_from_home(
             profile_name: profile.name,
             account_name: profile.account_name,
             username: String::new(),
+            api_key_count: 0,
+            api_model_count: 0,
             remaining: None,
             used: None,
             total: None,
@@ -582,6 +876,8 @@ pub(crate) fn site_sessions_from_home(
                                 profile_name: profile.name.clone(),
                                 account_name: profile.account_name.clone(),
                                 username: String::new(),
+                                api_key_count: 0,
+                                api_model_count: 0,
                                 remaining: None,
                                 used: None,
                                 total: None,

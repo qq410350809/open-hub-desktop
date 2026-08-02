@@ -143,7 +143,22 @@ watch(
           </label>
           <div class="header-actions">
             <button
+              v-if="store.usageFilter.value === 'personal' && store.runawayFilter.value === 'active'"
               class="secondary-button sync-button"
+              :class="{ 'is-syncing': store.syncingModelKeys.value }"
+              :disabled="store.syncingModelKeys.value || store.syncingSites.value"
+              data-tooltip="同步当前列表内所有账号的 Key 与模型"
+              @click="store.openModelSyncDialog()"
+            >
+              <span v-html="icons.cpu" />
+              <span v-if="store.syncingModelKeys.value">
+                {{ store.modelKeySyncCompleted.value }}/{{ store.modelKeySyncTotal.value }}
+              </span>
+              <span v-else>模型同步</span>
+            </button>
+            <button
+              class="secondary-button sync-button"
+              :disabled="store.syncingModelKeys.value"
               :data-tooltip="store.usageFilter.value === 'personal'
                 ? '同步当前列表内在用站点的 Chrome 会话'
                 : '根据当前存活/跑路状态，从 ldoh 同步站点'"

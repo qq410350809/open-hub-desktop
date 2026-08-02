@@ -7,7 +7,10 @@ export function escapeHtml(value: unknown): string {
 
 export function formatDate(value: string): string {
   if (!value) return "未知";
-  const date = new Date(value);
+  const normalized = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(value)
+    ? `${value.replace(" ", "T")}Z`
+    : value;
+  const date = new Date(normalized);
   if (Number.isNaN(date.getTime())) return value;
   return new Intl.DateTimeFormat("zh-CN", {
     year: "numeric",

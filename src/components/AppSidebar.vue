@@ -34,6 +34,7 @@ const systemTypeOptions = [
   { value: "all", text: "全部系统类型" },
   { value: "newapi", text: "NewAPI" },
   { value: "sub2api", text: "Sub2API" },
+  { value: "0v0", text: "0v0" },
   { value: "unknown", text: "未知类型" },
 ];
 
