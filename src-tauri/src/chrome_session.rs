@@ -26,6 +26,9 @@ pub struct ChromeSessionInfo {
     pub(crate) username: String,
     pub(crate) api_key_count: usize,
     pub(crate) api_model_count: usize,
+    pub(crate) api_counts_synced: bool,
+    pub(crate) api_sync_error: String,
+    pub(crate) has_access_token: bool,
     pub(crate) remaining: Option<f64>,
     pub(crate) used: Option<f64>,
     pub(crate) total: Option<f64>,
@@ -36,6 +39,10 @@ pub struct ChromeSessionInfo {
     pub(crate) checked_in_today: bool,
     pub(crate) checkin_error: String,
     pub(crate) account_updated_at: String,
+    #[serde(skip)]
+    pub(crate) newapi_token: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub(crate) newapi_user_id: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -208,6 +215,15 @@ fn is_transient_chrome_automation_error(error: &str) -> bool {
         || error.contains("应用程序没有运行")
 }
 
+pub(crate) fn is_blocking_chrome_automation_error(error: &str) -> bool {
+    error.contains("Chrome 已关闭 Apple Events JavaScript")
+        || error.contains("JavaScript from Apple Events")
+        || error.contains("Apple Events 的 JavaScript")
+        || error.contains("macOS 未允许 OpenHub 控制 Chrome")
+        || error.contains("not authorized to send Apple events")
+        || error.contains("不允许发送 Apple 事件")
+}
+
 #[cfg(target_os = "macos")]
 pub(crate) fn run_javascript_in_existing_chrome_tab(
     target_url: &str,
@@ -234,11 +250,15 @@ on run argv
                 repeat with tabIndex from 1 to browserTabCount
                     try
                         set browserTab to tab tabIndex of window windowIndex
-                        set currentTabId to id of browserTab as text
+                        set currentTabId to (id of browserTab) as text
                         if (targetTabId is "") or (currentTabId is equal to targetTabId) then
-                            set tabOrigin to execute browserTab javascript "window.location.origin"
+                            with timeout of 3 seconds
+                                set tabOrigin to execute browserTab javascript "window.location.origin"
+                            end timeout
                             if tabOrigin is equal to targetOrigin then
-                                set scriptResult to execute browserTab javascript sourceCode
+                                with timeout of 3 seconds
+                                    set scriptResult to execute browserTab javascript sourceCode
+                                end timeout
                                 if scriptResult is not "__OPENHUB_PROFILE_MISMATCH__" then
                                     if scriptResult is missing value or scriptResult is "__OPENHUB_PENDING__" then return "__OPENHUB_TAB_PENDING__:" & currentTabId
                                     return scriptResult as text
@@ -294,6 +314,9 @@ end run
                     "macOS 未允许 OpenHub 控制 Chrome；请在“系统设置 → 隐私与安全性 → 自动化”中授权后重试"
                         .into(),
                 );
+            }
+            if error.contains("-1712") || error.contains("AppleEvent已超时") {
+                return Err("Chrome 标签页响应 AppleEvent 超时".into());
             }
             if is_transient_chrome_automation_error(&error) {
                 thread::sleep(Duration::from_millis(300));
@@ -401,9 +424,11 @@ on run argv
                     try
                         set browserTab to tab tabIndex of window windowIndex
                         set tabUrl to URL of browserTab
-                        set currentTabId to id of browserTab as text
+                        set currentTabId to (id of browserTab) as text
                         if ((targetTabId is not "") and (currentTabId is equal to targetTabId)) or (tabUrl contains targetMarker) then
-                            set scriptResult to execute browserTab javascript sourceCode
+                            with timeout of 3 seconds
+                                set scriptResult to execute browserTab javascript sourceCode
+                            end timeout
                             if scriptResult is missing value or scriptResult is "__OPENHUB_PENDING__" then return "__OPENHUB_TAB_PENDING__:" & currentTabId
                             return scriptResult as text
                         end if
@@ -450,6 +475,9 @@ end run
                         .into(),
                 );
             }
+            if error.contains("-1712") || error.contains("AppleEvent已超时") {
+                return Err("Chrome 标签页响应 AppleEvent 超时".into());
+            }
             if is_transient_chrome_automation_error(&error) {
                 thread::sleep(Duration::from_millis(500));
                 continue;
@@ -488,7 +516,7 @@ tell application "Google Chrome"
             repeat with tabIndex from 1 to (count of tabs of window windowIndex)
                 try
                     set browserTab to tab tabIndex of window windowIndex
-                    set tabLines to tabLines & (id of browserTab as text) & tab & (URL of browserTab) & linefeed
+                    set tabLines to tabLines & ((id of browserTab) as text) & tab & (URL of browserTab) & linefeed
                 end try
             end repeat
         end try
@@ -561,7 +589,7 @@ on run argv
                 repeat with tabIndex from (count of tabs of window windowIndex) to 1 by -1
                     try
                         set browserTab to tab tabIndex of window windowIndex
-                        set currentTabId to id of browserTab as text
+                        set currentTabId to (id of browserTab) as text
                         if ((targetTabId is not "") and (currentTabId is equal to targetTabId)) or ((URL of browserTab) contains targetMarker) then close browserTab
                     end try
                 end repeat
@@ -681,6 +709,9 @@ fn list_chrome_sessions_from_home(
             username: String::new(),
             api_key_count: 0,
             api_model_count: 0,
+            api_counts_synced: false,
+            api_sync_error: String::new(),
+            has_access_token: false,
             remaining: None,
             used: None,
             total: None,
@@ -691,6 +722,8 @@ fn list_chrome_sessions_from_home(
             checked_in_today: false,
             checkin_error: String::new(),
             account_updated_at: String::new(),
+            newapi_token: String::new(),
+            newapi_user_id: String::new(),
         });
     }
 
@@ -878,6 +911,9 @@ pub(crate) fn site_sessions_from_home(
                                 username: String::new(),
                                 api_key_count: 0,
                                 api_model_count: 0,
+                                api_counts_synced: false,
+                                api_sync_error: String::new(),
+                                has_access_token: false,
                                 remaining: None,
                                 used: None,
                                 total: None,
@@ -888,6 +924,8 @@ pub(crate) fn site_sessions_from_home(
                                 checked_in_today: false,
                                 checkin_error: String::new(),
                                 account_updated_at: String::new(),
+                                newapi_token: String::new(),
+                                newapi_user_id: String::new(),
                             });
                             matched_profiles.insert(profile.id.clone());
                         }

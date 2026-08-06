@@ -6,7 +6,6 @@ import { usePreferences } from "../composables/usePreferences";
 import { useTheme } from "../composables/useTheme";
 import type { ThemePreference } from "../types";
 import { invoke } from "@tauri-apps/api/core";
-import { runCommand } from "../composables/useLibrary";
 import CustomSelect from "./CustomSelect.vue";
 
 const store = useStore();
@@ -15,11 +14,6 @@ const { setThemePreference } = useTheme();
 
 const closeBtnRef = ref<HTMLButtonElement>();
 const systemFonts = ref<string[]>([]);
-const proxyUrl = ref("");
-const proxyLoading = ref(false);
-const proxySaving = ref(false);
-const proxySaved = ref(false);
-const proxyError = ref("");
 const fontOptions = computed(() => {
   const options = [
     { value: "system", text: "系统默认" },
@@ -46,48 +40,12 @@ const loadSystemFonts = async () => {
   }
 };
 
-const loadNetworkProxy = async () => {
-  proxyLoading.value = true;
-  proxyError.value = "";
-  try {
-    proxyUrl.value = await runCommand<string>("get_network_proxy");
-    proxySaved.value = true;
-  } catch (error) {
-    proxyError.value = String(error);
-  } finally {
-    proxyLoading.value = false;
-  }
-};
-
-const saveNetworkProxy = async () => {
-  if (proxySaving.value) return;
-  proxySaving.value = true;
-  proxySaved.value = false;
-  proxyError.value = "";
-  try {
-    proxyUrl.value = await runCommand<string>("set_network_proxy", {
-      proxyUrl: proxyUrl.value,
-    });
-    proxySaved.value = true;
-  } catch (error) {
-    proxyError.value = String(error);
-  } finally {
-    proxySaving.value = false;
-  }
-};
-
-function onProxyInput() {
-  proxySaved.value = false;
-  proxyError.value = "";
-}
-
 watch(
   () => store.page.value,
   (page) => {
     if (page === "settings") {
       nextTick(() => closeBtnRef.value?.focus());
       loadSystemFonts();
-      void loadNetworkProxy();
     }
   },
 );
@@ -268,47 +226,6 @@ function onBackdropClick(event: MouseEvent) {
                       <span v-html="icons.bookmark" /><span>在用</span>
                     </button>
                   </div>
-                </div>
-              </div>
-            </section>
-
-            <!-- 网络 -->
-            <section class="settings-section">
-              <div class="settings-section-title">
-                <span v-html="icons.globe" />
-                <div>
-                  <h2>网络</h2>
-                  <p>HTTP 请求连接方式</p>
-                </div>
-              </div>
-              <div class="settings-rows">
-                <div class="settings-row settings-proxy-row">
-                  <div>
-                    <strong>网络代理</strong>
-                    <small>应用于用户验证、站点同步和站点类型检测；留空为直连</small>
-                  </div>
-                  <div class="proxy-control">
-                    <input
-                      v-model="proxyUrl"
-                      type="url"
-                      inputmode="url"
-                      autocomplete="off"
-                      spellcheck="false"
-                      placeholder="http://127.0.0.1:7890"
-                      aria-label="网络代理地址"
-                      :disabled="proxyLoading || proxySaving"
-                      @input="onProxyInput"
-                      @keydown.enter="saveNetworkProxy"
-                    />
-                    <button
-                      class="secondary-button"
-                      type="button"
-                      :disabled="proxyLoading || proxySaving"
-                      @click="saveNetworkProxy"
-                    >{{ proxySaving ? "保存中…" : "保存" }}</button>
-                  </div>
-                  <p v-if="proxyError" class="proxy-status is-error" role="alert">{{ proxyError }}</p>
-                  <p v-else-if="proxySaved" class="proxy-status">代理配置已生效</p>
                 </div>
               </div>
             </section>

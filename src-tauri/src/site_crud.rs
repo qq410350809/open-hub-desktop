@@ -1,0 +1,566 @@
+use crate::db::*;
+use crate::models::*;
+use crate::site_ops::*;
+use rusqlite::{params, Connection, OptionalExtension};
+use std::time::Duration;
+use tauri::State;
+
+pub(crate) fn read_site(connection: &Connection, id: &str) -> Result<Option<SiteRecord>, String> {
+    let mut stmt = connection
+        .prepare(
+            "SELECT id, name, description, registration_limit, icon, api_base_url, system_type,
+                supports_immersive_translation, supports_ldc, supports_checkin, supports_nsfw,
+                checkin_url, checkin_note, benefit_url, rate_limit, status_url,
+                is_only_maintainer_visible, requires_invite_code, is_runaway, is_fake_charity,
+                has_pending_report, is_personal, use_system_proxy, favorite, hidden, updated_at
+         FROM directory_sites WHERE id = ?1",
+        )
+        .map_err(|e| e.to_string())?;
+
+    let mut site_iter = stmt
+        .query_map([id], |row| {
+            Ok(SiteRecord {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                description: row.get(2)?,
+                registration_limit: row.get(3)?,
+                icon: row.get(4)?,
+                api_base_url: row.get(5)?,
+                system_type: row.get(6)?,
+                supports_immersive_translation: row.get::<_, i64>(7)? != 0,
+                supports_ldc: row.get::<_, i64>(8)? != 0,
+                supports_checkin: row.get::<_, i64>(9)? != 0,
+                supports_nsfw: row.get::<_, i64>(10)? != 0,
+                checkin_url: row.get(11)?,
+                checkin_note: row.get(12)?,
+                benefit_url: row.get(13)?,
+                rate_limit: row.get(14)?,
+                status_url: row.get(15)?,
+                is_only_maintainer_visible: row.get::<_, i64>(16)? != 0,
+                requires_invite_code: row.get::<_, i64>(17)? != 0,
+                is_runaway: row.get::<_, i64>(18)? != 0,
+                is_fake_charity: row.get::<_, i64>(19)? != 0,
+                has_pending_report: row.get::<_, i64>(20)? != 0,
+                is_personal: row.get::<_, i64>(21)? != 0,
+                use_system_proxy: row.get::<_, i64>(22)? != 0,
+                favorite: row.get::<_, i64>(23)? != 0,
+                hidden: row.get::<_, i64>(24)? != 0,
+                updated_at: row.get(25)?,
+                tags: vec![],
+                maintainers: vec![],
+                extension_links: vec![],
+            })
+        })
+        .map_err(|e| e.to_string())?;
+
+    let mut site = match site_iter.next() {
+        Some(Ok(s)) => s,
+        _ => return Ok(None),
+    };
+
+    let mut stmt_tags = connection
+        .prepare("SELECT tag FROM site_tags WHERE site_id = ?1")
+        .unwrap();
+    site.tags = stmt_tags
+        .query_map([id], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+
+    let mut stmt_maint = connection.prepare("SELECT name, maintainer_id, username, profile_url FROM site_maintainers WHERE site_id = ?1").unwrap();
+    site.maintainers = stmt_maint
+        .query_map([id], |r| {
+            Ok(Maintainer {
+                name: r.get(0)?,
+                id: r.get(1)?,
+                username: r.get(2)?,
+                profile_url: r.get(3)?,
+            })
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+
+    let mut stmt_ext = connection
+        .prepare("SELECT label, url FROM site_extensions WHERE site_id = ?1")
+        .unwrap();
+    site.extension_links = stmt_ext
+        .query_map([id], |r| {
+            Ok(ExtensionLink {
+                label: r.get(0)?,
+                url: r.get(1)?,
+            })
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+
+    Ok(Some(site))
+}
+
+#[tauri::command]
+pub fn list_library(database: State<'_, Database>) -> Result<LibraryData, String> {
+    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    let mut statement = connection
+        .prepare(
+            "SELECT id, name, description, registration_limit, icon, api_base_url, system_type,
+                supports_immersive_translation, supports_ldc, supports_checkin, supports_nsfw,
+                checkin_url, checkin_note, benefit_url, rate_limit, status_url,
+                is_only_maintainer_visible, requires_invite_code, is_runaway, is_fake_charity,
+                has_pending_report, is_personal, use_system_proxy, favorite, hidden, updated_at
+         FROM directory_sites
+         ORDER BY is_personal DESC, datetime(updated_at) DESC, rowid DESC",
+        )
+        .map_err(|e| e.to_string())?;
+
+    let mut sites: Vec<SiteRecord> = statement
+        .query_map([], |row| {
+            Ok(SiteRecord {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                description: row.get(2)?,
+                registration_limit: row.get(3)?,
+                icon: row.get(4)?,
+                api_base_url: row.get(5)?,
+                system_type: row.get(6)?,
+                supports_immersive_translation: row.get::<_, i64>(7)? != 0,
+                supports_ldc: row.get::<_, i64>(8)? != 0,
+                supports_checkin: row.get::<_, i64>(9)? != 0,
+                supports_nsfw: row.get::<_, i64>(10)? != 0,
+                checkin_url: row.get(11)?,
+                checkin_note: row.get(12)?,
+                benefit_url: row.get(13)?,
+                rate_limit: row.get(14)?,
+                status_url: row.get(15)?,
+                is_only_maintainer_visible: row.get::<_, i64>(16)? != 0,
+                requires_invite_code: row.get::<_, i64>(17)? != 0,
+                is_runaway: row.get::<_, i64>(18)? != 0,
+                is_fake_charity: row.get::<_, i64>(19)? != 0,
+                has_pending_report: row.get::<_, i64>(20)? != 0,
+                is_personal: row.get::<_, i64>(21)? != 0,
+                use_system_proxy: row.get::<_, i64>(22)? != 0,
+                favorite: row.get::<_, i64>(23)? != 0,
+                hidden: row.get::<_, i64>(24)? != 0,
+                updated_at: row.get(25)?,
+                tags: vec![],
+                maintainers: vec![],
+                extension_links: vec![],
+            })
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+
+    let mut stmt = connection
+        .prepare("SELECT site_id, tag FROM site_tags")
+        .unwrap();
+    for row in stmt
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+        .unwrap()
+    {
+        if let Ok((site_id, tag)) = row {
+            if let Some(s) = sites.iter_mut().find(|s| s.id == site_id) {
+                s.tags.push(tag);
+            }
+        }
+    }
+
+    let mut stmt = connection
+        .prepare("SELECT site_id, name, maintainer_id, username, profile_url FROM site_maintainers")
+        .unwrap();
+    for row in stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                Maintainer {
+                    name: r.get(1)?,
+                    id: r.get(2)?,
+                    username: r.get(3)?,
+                    profile_url: r.get(4)?,
+                },
+            ))
+        })
+        .unwrap()
+    {
+        if let Ok((site_id, m)) = row {
+            if let Some(s) = sites.iter_mut().find(|s| s.id == site_id) {
+                s.maintainers.push(m);
+            }
+        }
+    }
+
+    let mut stmt = connection
+        .prepare("SELECT site_id, label, url FROM site_extensions")
+        .unwrap();
+    for row in stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                ExtensionLink {
+                    label: r.get(1)?,
+                    url: r.get(2)?,
+                },
+            ))
+        })
+        .unwrap()
+    {
+        if let Ok((site_id, ext)) = row {
+            if let Some(s) = sites.iter_mut().find(|s| s.id == site_id) {
+                s.extension_links.push(ext);
+            }
+        }
+    }
+
+    let payload: SeedPayload =
+        serde_json::from_str(SEED_JSON).map_err(|error| error.to_string())?;
+    let usage_sites = read_cached_usage_sites(&connection)?;
+    Ok(LibraryData {
+        sites,
+        suggested_tags: payload.tags,
+        usage_sites,
+    })
+}
+
+#[tauri::command]
+pub fn create_site(
+    database: State<'_, Database>,
+    mut input: SiteRecord,
+) -> Result<SiteRecord, String> {
+    input.id = generated_id();
+    input.favorite = false;
+    input.hidden = false;
+    let input = normalize_site(input)?;
+    let mut connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+
+    let transaction = connection.transaction().map_err(|e| e.to_string())?;
+    insert_site_transaction(&transaction, &input)?;
+    transaction.commit().map_err(|e| e.to_string())?;
+
+    read_site(&connection, &input.id)?.ok_or_else(|| "创建站点失败".into())
+}
+
+#[tauri::command]
+pub async fn import_site(
+    database: State<'_, Database>,
+    site_url: String,
+) -> Result<SiteRecord, String> {
+    let base_url = normalize_import_base_url(&site_url)?;
+    let canonical_url = base_url.to_string();
+    {
+        let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+        let existing = connection
+            .query_row(
+                "SELECT name FROM directory_sites
+                 WHERE RTRIM(api_base_url, '/') = RTRIM(?1, '/') LIMIT 1",
+                [&canonical_url],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if let Some(name) = existing {
+            return Err(format!("站点「{name}」已经存在"));
+        }
+    }
+
+    let client = build_http_client(&database, Duration::from_secs(12), 5, "站点资料采集")?;
+    let root_job = tauri::async_runtime::spawn(fetch_discovery_resource(
+        client.clone(),
+        base_url.clone(),
+        "text/html,application/xhtml+xml,application/json;q=0.8,*/*;q=0.5",
+    ));
+    let newapi_job = tauri::async_runtime::spawn(fetch_discovery_resource(
+        client.clone(),
+        base_url
+            .join("/api/status")
+            .map_err(|error| error.to_string())?,
+        "application/json",
+    ));
+    let sub2api_job = tauri::async_runtime::spawn(fetch_discovery_resource(
+        client,
+        base_url
+            .join("/setup/status")
+            .map_err(|error| error.to_string())?,
+        "application/json",
+    ));
+    let root_response = root_job.await.ok().flatten();
+    let newapi_response = newapi_job.await.ok().flatten();
+    let sub2api_response = sub2api_job.await.ok().flatten();
+    if root_response.is_none() && newapi_response.is_none() && sub2api_response.is_none() {
+        return Err("无法连接该站点，请检查 URL 或网络代理后重试".into());
+    }
+
+    let newapi_probe = newapi_response
+        .as_ref()
+        .map(DiscoveryResponse::endpoint_probe);
+    let sub2api_probe = sub2api_response
+        .as_ref()
+        .map(DiscoveryResponse::endpoint_probe);
+    let system_type = system_type_from_probes(newapi_probe, sub2api_probe)
+        .unwrap_or_default()
+        .to_string();
+    let newapi_json = newapi_response.as_ref().and_then(DiscoveryResponse::json);
+    let sub2api_json = sub2api_response.as_ref().and_then(DiscoveryResponse::json);
+    let status_sources = match system_type.as_str() {
+        "NewAPI" => newapi_json.iter().collect::<Vec<_>>(),
+        "Sub2API" => sub2api_json.iter().collect::<Vec<_>>(),
+        _ => Vec::new(),
+    };
+    let first_status_string = |keys: &[&str]| {
+        status_sources
+            .iter()
+            .map(|value| discovered_json_string(value, keys))
+            .find(|value| !value.is_empty())
+            .unwrap_or_default()
+    };
+    let html = root_response
+        .as_ref()
+        .filter(|response| {
+            response.content_type.contains("html")
+                || response.body.to_ascii_lowercase().contains("<html")
+        })
+        .map(|response| response.body.as_str())
+        .unwrap_or_default();
+    let page_title = html_title(html);
+    let title_is_challenge = ["just a moment", "attention required", "cloudflare"]
+        .iter()
+        .any(|marker| page_title.to_ascii_lowercase().contains(marker));
+    let host_name = base_url
+        .host_str()
+        .unwrap_or("未命名站点")
+        .trim_start_matches("www.")
+        .to_string();
+    let name = first_status_string(&["name", "site_name", "siteName", "system_name", "systemName"]);
+    let name = if name.is_empty() && !page_title.is_empty() && !title_is_challenge {
+        page_title
+    } else if name.is_empty() {
+        host_name
+    } else {
+        name
+    };
+    let description = first_status_string(&[
+        "description",
+        "site_description",
+        "siteDescription",
+        "system_description",
+        "systemDescription",
+    ]);
+    let description = if description.is_empty() && !title_is_challenge {
+        html_meta_description(html)
+    } else {
+        description
+    };
+    let discovered_icon =
+        first_status_string(&["logo", "logo_url", "logoUrl", "icon", "icon_url", "iconUrl"]);
+    let discovered_icon = if discovered_icon.is_empty() {
+        html_icon_href(html)
+    } else {
+        discovered_icon
+    };
+    let icon = if discovered_icon.is_empty() {
+        base_url
+            .join("/favicon.ico")
+            .map(|url| url.to_string())
+            .unwrap_or_default()
+    } else {
+        resolve_discovered_url(&base_url, &discovered_icon)
+    };
+    let supports_checkin = status_sources.iter().any(|value| {
+        discovered_json_bool(
+            value,
+            &[
+                "checkin_enabled",
+                "checkinEnabled",
+                "enable_checkin",
+                "enableCheckin",
+            ],
+        )
+    });
+    let checkin_url = if supports_checkin && system_type == "NewAPI" {
+        base_url
+            .join("/console/personal")
+            .map(|url| url.to_string())
+            .unwrap_or_default()
+    } else if supports_checkin && system_type == "Sub2API" {
+        base_url
+            .join("/dashboard")
+            .map(|url| url.to_string())
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    let mut site = SiteRecord {
+        id: generated_id(),
+        name: name.chars().take(100).collect(),
+        description: description.chars().take(800).collect(),
+        icon,
+        api_base_url: canonical_url,
+        system_type,
+        supports_checkin,
+        checkin_url,
+        use_system_proxy: false,
+        ..SiteRecord::default()
+    };
+    site = normalize_site(site)?;
+
+    let mut connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
+    let duplicate = transaction
+        .query_row(
+            "SELECT name FROM directory_sites
+             WHERE RTRIM(api_base_url, '/') = RTRIM(?1, '/') LIMIT 1",
+            [&site.api_base_url],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    if let Some(name) = duplicate {
+        return Err(format!("站点「{name}」已经存在"));
+    }
+    insert_site_transaction(&transaction, &site)?;
+    transaction.commit().map_err(|error| error.to_string())?;
+    read_site(&connection, &site.id)?.ok_or_else(|| "导入站点失败".into())
+}
+
+#[tauri::command]
+pub fn update_site(
+    database: State<'_, Database>,
+    id: String,
+    mut input: SiteRecord,
+) -> Result<SiteRecord, String> {
+    input.id = id.clone();
+    let mut input = normalize_site(input)?;
+    let mut connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+
+    let old_site = read_site(&connection, &id)?.ok_or_else(|| "找不到要更新的站点".to_string())?;
+    input.favorite = old_site.favorite;
+    input.hidden = old_site.hidden;
+
+    // We don't need to preserve created_at from input since insert_site_transaction handles it via COALESCE and updated_at is mapped correctly?
+    // Wait, insert_site_transaction sets created_at to COALESCE(NULLIF(?24, ''), CURRENT_TIMESTAMP) which is updated_at.
+    // In fact, if we use INSERT OR REPLACE, it deletes the old row and creates a new one! This implies we lose created_at and we lose favorite/hidden unless we preserve them.
+    // Yes! That's why I fetched old_site and mapped them back.
+    // BUT we need to use a proper UPDATE or manually map all fields.
+    // Let's rewrite insert_site_transaction into a pure UPDATE if it exists, to preserve created_at if we can.
+    // Wait! Since we already do a transaction, let's just use an UPDATE statement for update_site!
+    let transaction = connection.transaction().map_err(|e| e.to_string())?;
+    transaction.execute(
+        "UPDATE directory_sites SET
+            name=?1, description=?2, registration_limit=?3, icon=?4, api_base_url=?5,
+            supports_immersive_translation=?6, supports_ldc=?7, supports_checkin=?8, supports_nsfw=?9,
+            checkin_url=?10, checkin_note=?11, benefit_url=?12, rate_limit=?13, status_url=?14,
+            is_only_maintainer_visible=?15, requires_invite_code=?16, is_runaway=?17, is_fake_charity=?18,
+            has_pending_report=?19, is_personal=?20, use_system_proxy=?21,
+            updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE id=?22",
+        params![
+            input.name, input.description, input.registration_limit, input.icon, input.api_base_url,
+            input.supports_immersive_translation, input.supports_ldc, input.supports_checkin, input.supports_nsfw,
+            input.checkin_url, input.checkin_note, input.benefit_url, input.rate_limit, input.status_url,
+            input.is_only_maintainer_visible, input.requires_invite_code, input.is_runaway, input.is_fake_charity,
+            input.has_pending_report, input.is_personal, input.use_system_proxy, id
+        ],
+    ).map_err(|e| e.to_string())?;
+
+    transaction
+        .execute("DELETE FROM site_tags WHERE site_id = ?1", [&id])
+        .map_err(|error| error.to_string())?;
+    for tag in &input.tags {
+        transaction
+            .execute(
+                "INSERT INTO site_tags (site_id, tag) VALUES (?1, ?2)",
+                params![id, tag],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+
+    transaction
+        .execute("DELETE FROM site_maintainers WHERE site_id = ?1", [&id])
+        .map_err(|error| error.to_string())?;
+    for maintainer in &input.maintainers {
+        transaction.execute(
+            "INSERT INTO site_maintainers (site_id, name, maintainer_id, username, profile_url) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![id, maintainer.name, maintainer.id, maintainer.username, maintainer.profile_url],
+        ).map_err(|error| error.to_string())?;
+    }
+
+    transaction
+        .execute("DELETE FROM site_extensions WHERE site_id = ?1", [&id])
+        .map_err(|error| error.to_string())?;
+    for ext in &input.extension_links {
+        transaction
+            .execute(
+                "INSERT INTO site_extensions (site_id, label, url) VALUES (?1, ?2, ?3)",
+                params![id, ext.label, ext.url],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+
+    transaction.commit().map_err(|e| e.to_string())?;
+
+    read_site(&connection, &input.id)?.ok_or_else(|| "读取更新后的站点失败".into())
+}
+
+#[tauri::command]
+pub fn delete_site(database: State<'_, Database>, id: String) -> Result<(), String> {
+    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    let changed = connection
+        .execute("DELETE FROM directory_sites WHERE id = ?1", [id])
+        .map_err(|error| error.to_string())?;
+    if changed == 0 {
+        return Err("找不到要删除的站点".into());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn toggle_personal(database: State<'_, Database>, id: String) -> Result<SiteRecord, String> {
+    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    let changed = connection
+        .execute(
+            &format!(
+                "UPDATE directory_sites
+                 SET is_personal = CASE is_personal WHEN 0 THEN 1 ELSE 0 END,
+                     favorite = 0, updated_at = {NOW_SQL}
+                 WHERE id = ?1"
+            ),
+            [&id],
+        )
+        .map_err(|error| error.to_string())?;
+    if changed == 0 {
+        return Err("找不到该站点".into());
+    }
+    read_site(&connection, &id)?.ok_or_else(|| "读取站点失败".into())
+}
+
+#[tauri::command]
+pub fn toggle_hidden(database: State<'_, Database>, id: String) -> Result<SiteRecord, String> {
+    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    let changed = connection
+        .execute(
+            "UPDATE directory_sites SET hidden = CASE hidden WHEN 0 THEN 1 ELSE 0 END WHERE id = ?1",
+            [&id],
+        )
+        .map_err(|error| error.to_string())?;
+    if changed == 0 {
+        return Err("找不到该站点".into());
+    }
+    read_site(&connection, &id)?.ok_or_else(|| "读取站点失败".into())
+}
+
+#[tauri::command]
+pub fn toggle_runaway(database: State<'_, Database>, id: String) -> Result<SiteRecord, String> {
+    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    let changed = connection
+        .execute(
+            &format!("UPDATE directory_sites SET is_runaway = CASE is_runaway WHEN 0 THEN 1 ELSE 0 END, updated_at = {NOW_SQL} WHERE id = ?1"),
+            [&id],
+        )
+        .map_err(|error| error.to_string())?;
+    if changed == 0 {
+        return Err("找不到该站点".into());
+    }
+    read_site(&connection, &id)?.ok_or_else(|| "读取站点失败".into())
+}

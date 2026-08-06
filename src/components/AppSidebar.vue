@@ -53,7 +53,7 @@ function toggleSidebar() {
       </span>
     </div>
 
-    <section class="toolbar" aria-label="站点筛选">
+    <section v-if="store.page.value === 'library'" class="toolbar" aria-label="站点筛选">
       <CustomSelect
         class="tag-select"
         :options="tagOptions"

@@ -182,7 +182,7 @@ const capabilities = computed(() => [
         :title="site.isRunaway ? '恢复存活' : '标记为跑路'"
         :aria-label="site.isRunaway ? '恢复存活' : '标记为跑路'"
         @click="store.toggleRunaway(site)"
-        v-html="site.isRunaway ? icons.restore : icons.flag"
+        v-html="site.isRunaway ? icons.heartPulse : icons.flag"
       />
     </div>
   </article>

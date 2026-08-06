@@ -13,16 +13,12 @@ let unlistenProgress: (() => void) | undefined;
 let unlistenChromeProgress: (() => void) | undefined;
 
 const scopeLabel = computed(() =>
-  store.syncDialogMode.value === "models"
-    ? `当前列表中的 ${store.syncDialogSiteIds.value.length} 个在用存活站点`
-    : store.syncDialogMode.value === "sessions"
+  store.syncDialogMode.value === "sessions"
     ? `当前列表中的 ${store.syncDialogSiteIds.value.length} 个在用站点`
     : store.syncDialogRunaway.value ? "跑路站点" : "存活站点",
 );
 
-const dialogTitle = computed(() =>
-  store.syncDialogMode.value === "models" ? "模型同步" : "同步站点",
-);
+const dialogTitle = "同步站点";
 
 const runStateLabel = computed(() => {
   switch (store.syncRunState.value) {
@@ -35,20 +31,33 @@ const runStateLabel = computed(() => {
 });
 
 function formatElapsed(milliseconds: number) {
+  if (milliseconds < 1000) {
+    return `+${milliseconds}ms`;
+  }
   return `+${(milliseconds / 1000).toFixed(1)}s`;
 }
 
-onMounted(async () => {
+let isDialogMounted = true;
+
+onMounted(() => {
   if (!isTauri) return;
-  unlistenProgress = await listen<SyncSitesProgress>("sync-sites-progress", (event) => {
+  isDialogMounted = true;
+  listen<SyncSitesProgress>("sync-sites-progress", (event) => {
     store.receiveSyncProgress(event.payload);
+  }).then((unlisten) => {
+    if (!isDialogMounted) unlisten();
+    else unlistenProgress = unlisten;
   });
-  unlistenChromeProgress = await listen<SyncSitesProgress>("chrome-account-sync-progress", (event) => {
+  listen<SyncSitesProgress>("chrome-account-sync-progress", (event) => {
     store.receiveNestedChromeSyncProgress(event.payload);
+  }).then((unlisten) => {
+    if (!isDialogMounted) unlisten();
+    else unlistenChromeProgress = unlisten;
   });
 });
 
 onUnmounted(() => {
+  isDialogMounted = false;
   unlistenProgress?.();
   unlistenChromeProgress?.();
   unlistenProgress = undefined;
@@ -103,8 +112,7 @@ function onBackdropClick(event: MouseEvent) {
           <div>
             <h2 id="sync-sites-title">{{ dialogTitle }}</h2>
             <p v-if="store.syncDialogMode.value === 'remote'">验证 Chrome 登录状态后同步{{ scopeLabel }}</p>
-            <p v-else-if="store.syncDialogMode.value === 'sessions'">并行同步{{ scopeLabel }}的 Chrome 会话</p>
-            <p v-else>同步{{ scopeLabel }}所有账号的 Key 与模型</p>
+            <p v-else-if="store.syncDialogMode.value === 'sessions'">先同步余额与账号，再同步这些站点的 Key 与模型</p>
           </div>
           <button
             ref="closeBtnRef"
@@ -169,20 +177,17 @@ function onBackdropClick(event: MouseEvent) {
             <div class="sync-scope-row">
               <span
                 class="sync-scope-icon"
-                v-html="store.syncDialogMode.value === 'models'
-                  ? icons.cpu
-                  : store.syncDialogRunaway.value ? icons.flag : icons.globe"
+                v-html="store.syncDialogRunaway.value ? icons.flag : icons.globe"
               />
               <div>
                 <strong>本次同步范围</strong>
                 <p v-if="store.syncDialogMode.value === 'remote'">{{ scopeLabel }} · 同名远端记录会更新，本地在用状态会保留</p>
-                <p v-else-if="store.syncDialogMode.value === 'sessions'">{{ scopeLabel }} · 仅更新这些站点的本地账号缓存</p>
-                <p v-else>{{ scopeLabel }} · 仅同步这些站点下合法账号的 Key 与模型</p>
+                <p v-else-if="store.syncDialogMode.value === 'sessions'">{{ scopeLabel }} · 完成账号同步后自动更新 Key 与模型</p>
               </div>
             </div>
 
             <div
-              v-if="store.syncDialogMode.value === 'models' && store.syncingModelKeys.value"
+              v-if="store.syncDialogMode.value === 'sessions' && store.syncingModelKeys.value"
               class="model-sync-loading"
               role="status"
               aria-live="polite"
@@ -249,9 +254,8 @@ function onBackdropClick(event: MouseEvent) {
               <span>重新获取</span>
             </button>
             <button class="primary-button" type="button" @click="store.syncSites()">
-              <span v-html="store.syncDialogMode.value === 'models' ? icons.cpu : icons.restore" />
-              <span v-if="store.syncDialogMode.value === 'models'">同步 Key 与模型</span>
-              <span v-else>{{ store.syncDialogMode.value === 'sessions' ? '同步当前列表' : `同步${scopeLabel}` }}</span>
+              <span v-html="icons.restore" />
+              <span>{{ store.syncDialogMode.value === 'sessions' ? '同步当前列表' : `同步${scopeLabel}` }}</span>
             </button>
           </template>
           <template v-else>

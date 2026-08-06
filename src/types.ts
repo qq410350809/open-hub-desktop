@@ -44,7 +44,6 @@ export interface SiteRecord {
   isFakeCharity: boolean;
   hasPendingReport: boolean;
   isPersonal: boolean;
-
   favorite: boolean;
   hidden: boolean;
   updatedAt: string;
@@ -66,6 +65,9 @@ export interface ChromeSessionInfo {
   username: string;
   apiKeyCount: number;
   apiModelCount: number;
+  apiCountsSynced: boolean;
+  apiSyncError: string;
+  hasAccessToken: boolean;
   remaining: number | null;
   used: number | null;
   total: number | null;
@@ -76,6 +78,7 @@ export interface ChromeSessionInfo {
   checkedInToday: boolean;
   checkinError: string;
   accountUpdatedAt: string;
+  newapiUserId?: string;
 }
 
 export interface ChromeSessionValue {
@@ -126,6 +129,35 @@ export interface SyncLogEntry {
   stage: string;
   status: SyncProgressStatus;
   message: string;
+}
+
+export interface CharityFeedItem {
+  id: string;
+  title: string;
+  link: string;
+  author: string;
+  publishedAt: string;
+  summary: string;
+  categories: string[];
+  isNew: boolean;
+}
+
+export interface CharityFeedResult {
+  feedId: string;
+  feedName: string;
+  items: CharityFeedItem[];
+  fetchedAt: string;
+  changed: boolean;
+  newCount: number;
+  updatedCount: number;
+  initialized: boolean;
+  sourceProfileName: string;
+  sourceAccountName: string;
+}
+
+export interface CharityFeedTag {
+  id: string;
+  name: string;
 }
 
 export interface RemoteUserInfo {
@@ -189,3 +221,109 @@ export const emptySite = (): SiteRecord => ({
   hidden: false,
   updatedAt: "",
 });
+
+export interface ProxySubscription {
+  id: string;
+  name: string;
+  url: string;
+  nodeCount: number;
+  lastError: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ProxyNode {
+  id: string;
+  subscriptionNames: string[];
+  name: string;
+  proxyType: string;
+  server: string;
+  port: number;
+  cipher: string;
+  udp: boolean;
+  latencyMs: number | null;
+  testStatus: string;
+  testedAt: string;
+  countryCode: string;
+  countryName: string;
+  classification: string;
+  primaryIp: string;
+  updatedAt: string;
+}
+
+export interface ProxyPoolState {
+  subscriptions: ProxySubscription[];
+  nodes: ProxyNode[];
+  activeNodeId: string;
+  activeNode: ProxyNode | null;
+  enabled: boolean;
+  ignoreAddresses: string;
+  speedTestUrl: string;
+  runtimeAvailable: boolean;
+  runtimePath: string;
+  runtimeError: string;
+  nodeCount: number;
+  subscriptionCount: number;
+  invalidNodeCount: number;
+}
+
+export interface ProxyPoolRefreshResult {
+  subscription: ProxySubscription;
+  added: number;
+  total: number;
+  discarded: number;
+}
+
+export interface ProxySourceProgress {
+  sourceId: string;
+  stage: "queued" | "fetching" | "parsing" | "saving" | "done" | "error";
+  status: string;
+  message: string;
+  completed: number;
+  total: number;
+  added: number;
+  discarded: number;
+}
+
+export interface ProxyNodeTestProgress {
+  nodeId: string;
+  phase: "started" | "completed";
+  latencyMs: number | null;
+  status: string;
+  completed: number;
+  total: number;
+}
+
+export interface ProxyIpNodeAnalysis {
+  nodeId: string;
+  nodeName: string;
+  server: string;
+  resolvedIps: string[];
+  primaryIp: string;
+  classification: string;
+  countryCode: string;
+  countryName: string;
+  error: string;
+}
+
+export interface ProxyIpGroup {
+  key: string;
+  label: string;
+  classification: string;
+  countryCode: string;
+  countryName: string;
+  nodeIds: string[];
+  nodeCount: number;
+}
+
+export interface ProxyIpAnalysis {
+  analyzedAt: string;
+  geoipAvailable: boolean;
+  geoipDatabasePath: string;
+  totalNodes: number;
+  resolvedNodes: number;
+  unresolvedNodes: number;
+  uniqueIps: number;
+  nodes: ProxyIpNodeAnalysis[];
+  groups: ProxyIpGroup[];
+}

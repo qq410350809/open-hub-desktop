@@ -15,6 +15,8 @@ import SettingsPage from "./components/SettingsPage.vue";
 import SyncSitesDialog from "./components/SyncSitesDialog.vue";
 import ChromeSessionDialog from "./components/ChromeSessionDialog.vue";
 import SiteModelsDialog from "./components/SiteModelsDialog.vue";
+import CharityMonitorPage from "./components/CharityMonitorPage.vue";
+import ProxyPoolPage from "./components/ProxyPoolPage.vue";
 
 const store = useStore();
 const { preferences } = usePreferences();
@@ -85,6 +87,7 @@ function onKeydown(event: KeyboardEvent) {
     else if (store.linkDialogOpen.value) store.closeLinkDialog();
     else if (store.modalOpen.value) store.closeModal();
     else if (store.page.value === "settings") store.closeSettings();
+    else if (store.page.value === "charity" || store.page.value === "proxy") store.openLibrary();
   }
 }
 
@@ -99,7 +102,8 @@ onMounted(async () => {
   document.addEventListener("scroll", onScroll, { capture: true, passive: true });
   window.addEventListener("resize", onScroll, { passive: true });
   document.addEventListener("keydown", onKeydown);
-  await store.loadLibrary();
+  await Promise.all([store.loadLibrary(), store.loadProxyPool()]);
+  store.startCharityMonitor();
 });
 
 onUnmounted(() => {
@@ -111,6 +115,7 @@ onUnmounted(() => {
   document.removeEventListener("scroll", onScroll, { capture: true });
   window.removeEventListener("resize", onScroll);
   document.removeEventListener("keydown", onKeydown);
+  store.stopCharityMonitor();
 });
 
 watch(
@@ -128,57 +133,118 @@ watch(
     <AppSidebar />
 
     <div class="app-workspace">
-      <header class="app-header">
-        <div class="header-inner">
-          <label class="search-box">
-            <span v-html="icons.search" />
-            <input
-              id="search-input"
-              v-model="store.query.value"
-              type="search"
-              placeholder="搜索站点、API 地址或标签…"
-              autocomplete="off"
-            />
-            <kbd>⌘ K</kbd>
-          </label>
-          <div class="header-actions">
-            <button
-              v-if="store.usageFilter.value === 'personal' && store.runawayFilter.value === 'active'"
-              class="secondary-button sync-button"
-              :class="{ 'is-syncing': store.syncingModelKeys.value }"
-              :disabled="store.syncingModelKeys.value || store.syncingSites.value"
-              data-tooltip="同步当前列表内所有账号的 Key 与模型"
-              @click="store.openModelSyncDialog()"
-            >
-              <span v-html="icons.cpu" />
-              <span v-if="store.syncingModelKeys.value">
-                {{ store.modelKeySyncCompleted.value }}/{{ store.modelKeySyncTotal.value }}
-              </span>
-              <span v-else>模型同步</span>
-            </button>
-            <button
-              class="secondary-button sync-button"
-              :disabled="store.syncingModelKeys.value"
-              :data-tooltip="store.usageFilter.value === 'personal'
-                ? '同步当前列表内在用站点的 Chrome 会话'
-                : '根据当前存活/跑路状态，从 ldoh 同步站点'"
-              @click="store.openSyncDialog()"
-            >
-              <span v-html="icons.restore" /><span>同步站点</span>
-            </button>
-            <button
-              v-if="store.runawayFilter.value === 'active'"
-              class="primary-button"
-              id="add-site"
-              @click="store.openModal()"
-            >
-              <span v-html="icons.plus" /><span>添加站点</span>
-            </button>
-          </div>
+      <nav class="workspace-tabs" aria-label="主要模块" role="tablist">
+        <div class="workspace-tab-list">
+          <button
+            id="library-tab"
+            type="button"
+            role="tab"
+            aria-controls="library-panel"
+            :aria-selected="store.page.value === 'library'"
+            :tabindex="store.page.value === 'library' ? 0 : -1"
+            :class="{ active: store.page.value === 'library' }"
+            @click="store.openLibrary()"
+          >
+            <span v-html="icons.database" />
+            <strong>站点库</strong>
+            <small>{{ store.sites.value.length }}</small>
+          </button>
+          <button
+            id="charity-tab"
+            type="button"
+            role="tab"
+            aria-controls="charity-panel"
+            :aria-selected="store.page.value === 'charity'"
+            :tabindex="store.page.value === 'charity' ? 0 : -1"
+            :class="{ active: store.page.value === 'charity' }"
+            @click="store.openCharityMonitor()"
+          >
+            <span v-html="icons.heartPulse" />
+            <strong>公益监听</strong>
+            <i v-if="store.charityFeedUnreadCount.value">{{ Math.min(store.charityFeedUnreadCount.value, 99) }}</i>
+          </button>
+          <button
+            id="proxy-tab"
+            type="button"
+            role="tab"
+            aria-controls="proxy-panel"
+            :aria-selected="store.page.value === 'proxy'"
+            :tabindex="store.page.value === 'proxy' ? 0 : -1"
+            :class="{ active: store.page.value === 'proxy' }"
+            @click="store.openProxyPool()"
+          >
+            <span v-html="icons.wifi" />
+            <strong>代理池</strong>
+            <small>{{ store.proxyPool.value.nodeCount }}</small>
+          </button>
         </div>
-      </header>
+      </nav>
 
-      <SiteGrid />
+      <div class="workspace-view">
+        <section
+          v-if="store.page.value === 'library'"
+          id="library-panel"
+          class="library-page"
+          role="tabpanel"
+          aria-labelledby="library-tab"
+        >
+          <header class="app-header">
+            <div class="header-inner">
+              <label class="search-box">
+                <span v-html="icons.search" />
+                <input
+                  id="search-input"
+                  v-model="store.query.value"
+                  type="search"
+                  placeholder="搜索站点、API 地址或标签…"
+                  autocomplete="off"
+                />
+                <kbd>⌘ K</kbd>
+              </label>
+              <div class="header-actions">
+                <button
+                  class="secondary-button sync-button"
+                  :disabled="store.syncingModelKeys.value"
+                  :data-tooltip="store.usageFilter.value === 'personal'
+                    ? '同步当前列表内在用站点的 Chrome 会话'
+                    : '根据当前存活/跑路状态，从 ldoh 同步站点'"
+                  @click="store.openSyncDialog()"
+                >
+                  <span v-html="icons.restore" /><span>同步站点</span>
+                </button>
+                <button
+                  v-if="store.runawayFilter.value === 'active'"
+                  class="primary-button"
+                  id="add-site"
+                  @click="store.openModal()"
+                >
+                  <span v-html="icons.plus" /><span>添加站点</span>
+                </button>
+              </div>
+            </div>
+          </header>
+
+          <SiteGrid />
+        </section>
+        <div
+          v-else-if="store.page.value === 'charity'"
+          id="charity-panel"
+          class="charity-panel"
+          role="tabpanel"
+          aria-labelledby="charity-tab"
+        >
+          <CharityMonitorPage />
+        </div>
+        <div
+          v-else-if="store.page.value === 'proxy'"
+          id="proxy-panel"
+          class="proxy-panel"
+          role="tabpanel"
+          aria-labelledby="proxy-tab"
+        >
+          <ProxyPoolPage />
+        </div>
+      </div>
     </div>
   </div>
 

@@ -138,10 +138,9 @@ function accountQuota(session: ChromeSessionInfo): string {
               title="同步会话"
               aria-label="同步会话"
               @click="store.syncChromeSession(site, $event.currentTarget as HTMLElement)"
-              v-html="icons.restore"
+              v-html="icons.sessionImport"
             />
             <button
-              v-if="!personalMode"
               class="runaway-toggle"
               :class="{ 'is-runaway': site.isRunaway }"
               type="button"
@@ -149,7 +148,7 @@ function accountQuota(session: ChromeSessionInfo): string {
               :title="site.isRunaway ? '恢复存活' : '标记为跑路'"
               :aria-label="site.isRunaway ? '恢复存活' : '标记为跑路'"
               @click="store.toggleRunaway(site)"
-              v-html="site.isRunaway ? icons.restore : icons.flag"
+              v-html="site.isRunaway ? icons.heartPulse : icons.flag"
             />
             <button
               v-if="!personalMode"
@@ -189,17 +188,41 @@ function accountQuota(session: ChromeSessionInfo): string {
       >
         <span class="usage-account-icon" v-html="icons.user" />
         <div class="usage-account-identity">
-          <strong :title="session.username ? `${accountIdentity(session)}（${session.username}）` : accountIdentity(session)">
+          <strong :title="session.username ? `${accountIdentity(session)}（${session.newapiUserId ? session.newapiUserId + ':' : ''}${session.username}）` : accountIdentity(session)">
             <span>{{ accountIdentity(session) }}</span>
-            <span v-if="session.username" class="usage-account-username">（{{ session.username }}）</span>
+            <span v-if="session.username" class="usage-account-username">（{{ session.newapiUserId ? session.newapiUserId + ':' : '' }}{{ session.username }}）</span>
+          </strong>
+          <small>
+            <span
+              v-if="site.systemType.toLowerCase() === 'newapi'"
+              class="usage-account-token"
+              :class="{ 'has-token': session.hasAccessToken }"
+              :title="session.hasAccessToken ? '此账号已缓存 NewAPI 访问令牌' : '此账号尚未取得 NewAPI 访问令牌'"
+            >{{ session.hasAccessToken ? "有访问令牌" : "无访问令牌" }}</span>
             <span
               v-if="session.checkinEnabled || session.checkinError"
               class="usage-account-checkin"
               :class="{ 'is-checked': session.checkedInToday, 'has-error': session.checkinError }"
               :title="session.checkinError || (session.checkedInToday ? '今日已签到' : '今日未签到')"
             >{{ session.checkinError ? "签到异常" : (session.checkedInToday ? "已签到" : "未签到") }}</span>
-          </strong>
-          <small>{{ session.apiKeyCount ?? 0 }} 个 Key · {{ session.apiModelCount ?? 0 }} 个模型</small>
+            <span v-if="session.apiCountsSynced && !session.apiSyncError">
+              {{ session.apiKeyCount ?? 0 }} 个 Key · {{ session.apiModelCount ?? 0 }} 个模型
+            </span>
+            <button
+              v-else-if="session.apiSyncError"
+              class="usage-account-api-action is-error"
+              type="button"
+              :title="`${session.apiSyncError}\n点击重新同步`"
+              @click="store.syncChromeSession(site, $event.currentTarget as HTMLElement)"
+            >Key 与模型同步失败，点击重试</button>
+            <button
+              v-else
+              class="usage-account-api-action"
+              type="button"
+              title="点击同步 Key 与模型"
+              @click="store.syncChromeSession(site, $event.currentTarget as HTMLElement)"
+            >Key 与模型未同步，点击同步</button>
+          </small>
         </div>
         <div class="usage-account-quota" :class="{ 'has-error': session.syncError }">
           <strong :title="session.syncError || `剩余额度：${accountQuota(session)}`">{{ accountQuota(session) }}</strong>
