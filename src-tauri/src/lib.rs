@@ -276,6 +276,46 @@ mod tests {
     }
 
     #[test]
+    fn resets_stale_checkin_state_when_local_date_changes() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute(
+                "CREATE TABLE site_accounts (
+                    checked_in_today INTEGER NOT NULL DEFAULT 0,
+                    checkin_error TEXT NOT NULL DEFAULT '',
+                    checkin_date TEXT NOT NULL DEFAULT ''
+                )",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO site_accounts (checked_in_today, checkin_error, checkin_date)
+                 VALUES (1, '昨天的签到错误', date('now', 'localtime', '-1 day'))",
+                [],
+            )
+            .unwrap();
+
+        assert_eq!(reset_expired_checkin_states(&connection).unwrap(), 1);
+        let state: (i64, String, String) = connection
+            .query_row(
+                "SELECT checked_in_today, checkin_error, checkin_date FROM site_accounts",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(state.0, 0);
+        assert!(state.1.is_empty());
+        assert_eq!(
+            state.2,
+            connection
+                .query_row("SELECT date('now', 'localtime')", [], |row| row
+                    .get::<_, String>(0))
+                .unwrap()
+        );
+    }
+
+    #[test]
     fn caches_only_the_profile_api_counts() {
         let connection = Connection::open_in_memory().unwrap();
         connection
@@ -871,9 +911,34 @@ pub fn run() {
             let database = Database::open(&app_data_dir.join("sites.sqlite3"))
                 .map_err(std::io::Error::other)?;
             let proxy_runtime = proxy_pool::ProxyRuntime::new(app_data_dir.join("proxy-runtime"));
-            proxy_pool::restore_saved_proxy(&database, &proxy_runtime);
+            let charity_runtime = charity_monitor::CharityMonitorRuntime::new();
             app.manage(database);
             app.manage(proxy_runtime);
+            app.manage(charity_runtime);
+
+            // 启动阶段禁止阻塞 UI 线程：
+            // 1) 恢复代理在后台
+            // 2) 公益监听延后启动
+            let restore_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                let result = tauri::async_runtime::spawn_blocking({
+                    let restore_handle = restore_handle.clone();
+                    move || {
+                        let database = restore_handle.state::<crate::models::Database>();
+                        let runtime = restore_handle.state::<crate::proxy_pool::ProxyRuntime>();
+                        proxy_pool::restore_saved_proxy(&database, &runtime);
+                    }
+                })
+                .await;
+                if let Err(error) = result {
+                    eprintln!("OpenHub 后台恢复代理失败：{error}");
+                }
+                // 代理恢复后再启动公益监听，避免启动瞬间抢锁/抢内核。
+                // 前端 onMounted 会 request_charity_round，循环启动后立刻消费 force。
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                charity_monitor::start_charity_monitor(restore_handle);
+            });
 
             Ok(())
         })
@@ -884,6 +949,8 @@ pub fn run() {
             site_crud::update_site,
             site_crud::delete_site,
             site_crud::toggle_personal,
+            site_crud::toggle_pending,
+            site_crud::cycle_usage_state,
             site_crud::toggle_hidden,
             site_crud::toggle_runaway,
             proxy_pool::get_proxy_pool_state,
@@ -912,7 +979,15 @@ pub fn run() {
             chrome_session::list_chrome_sessions,
             chrome_session::read_chrome_session,
             chrome_session::open_url_in_chrome_profile,
-            charity_monitor::fetch_charity_feed
+            charity_monitor::get_charity_feed,
+            charity_monitor::fetch_charity_feed,
+            charity_monitor::mark_charity_feed_read,
+            charity_monitor::get_charity_unread_total,
+            charity_monitor::get_charity_sync_logs,
+            charity_monitor::clear_charity_sync_logs,
+            charity_monitor::set_charity_monitor_visible,
+            charity_monitor::request_charity_round,
+            charity_monitor::refresh_all_charity_feeds
         ])
         .run(tauri::generate_context!())
         .expect("error while running Tauri application");

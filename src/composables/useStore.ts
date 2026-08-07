@@ -10,7 +10,7 @@ import { useCharityMonitor } from "./useCharityMonitor";
 import { useProxyPool } from "./useProxyPool";
 
 export function useStore() {
-  const { sites, suggestedTags, loading, loadLibrary } = useLibrary();
+  const { sites, suggestedTags, loading, loadLibrary, startDailyRefresh, stopDailyRefresh } = useLibrary();
   const { preferences, updatePreferences } = usePreferences();
   const { showToast } = useToast();
 
@@ -44,6 +44,8 @@ export function useStore() {
     ...proxy,
     // 通用
     loadLibrary,
+    startDailyRefresh,
+    stopDailyRefresh,
     updatePreferences,
     showToast,
   };

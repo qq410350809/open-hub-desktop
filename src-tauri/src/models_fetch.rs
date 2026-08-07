@@ -866,6 +866,59 @@ pub async fn fetch_site_models_json(
             }
 
             let mut auth = auth.unwrap();
+
+            // 有访问令牌（access token）直接使用：先直接同步模型列表，
+            // 不再先经过 /api/token 获取 Key。只有直接同步失败才回落到 Key 接口。
+            if let NewApiAuth::Token {
+                access_token,
+                user_id,
+            } = &auth
+            {
+                if !access_token.is_empty() {
+                    let direct_models_url = base_url
+                        .join("/v1/models")
+                        .map_err(|_| "无法生成 /v1/models 地址".to_string())?;
+                    let mut direct_errors = Vec::new();
+                    for candidate in [access_token.clone(), format!("sk-{access_token}")] {
+                        let mut request = chrome_request_headers(
+                            client.get(direct_models_url.clone()),
+                            base_url.as_str(),
+                            &user_agent,
+                        )
+                        .bearer_auth(&candidate);
+                        if !user_id.is_empty() {
+                            request = request.header("new-api-user", user_id);
+                        }
+                        match request_json(request, "NewAPI 模型接口").await {
+                            Ok(value) => {
+                                let models = parse_site_models(&value);
+                                if !models.is_empty() {
+                                    merge_api_keys(&mut discovered_keys, [access_token.clone()]);
+                                    return cache_profile_api_counts(
+                                        &database,
+                                        site_id.as_deref(),
+                                        requested_profile_id.as_deref(),
+                                        SiteModelsResult {
+                                            models,
+                                            source: "newapi-key".into(),
+                                            keys: vec![access_token.clone()],
+                                        },
+                                    );
+                                }
+                                direct_errors.push("访问令牌获取的模型列表为空".to_string());
+                            }
+                            Err(error) => direct_errors.push(error),
+                        }
+                    }
+                    if !direct_errors.is_empty() {
+                        errors.push(format!(
+                            "{profile_id}：直接使用访问令牌同步失败（{}），回落到 Key 接口",
+                            direct_errors.last().cloned().unwrap_or_default()
+                        ));
+                    }
+                }
+            }
+
             let mut request = apply_newapi_auth(
                 chrome_request_headers(
                     client.get(token_url.clone()),
@@ -988,6 +1041,46 @@ pub async fn fetch_site_models_json(
                 errors.push(format!("{profile_id}：Sub2API 本地数据中没有 auth_token"));
                 continue;
             };
+            // 已有访问秘钥（auth_token）优先直接使用：用它同步模型列表，
+            // 不再通过 /api/v1/keys 获取 Key。只有直接同步失败才回落到 Key 接口。
+            let direct_models_url = base_url
+                .join("/v1/models")
+                .map_err(|_| "无法生成 /v1/models 地址".to_string())?;
+            let mut direct_errors = Vec::new();
+            for candidate in [auth_token.clone(), format!("sk-{auth_token}")] {
+                let request = chrome_request_headers(
+                    client.get(direct_models_url.clone()),
+                    base_url.as_str(),
+                    &user_agent,
+                )
+                .bearer_auth(&candidate);
+                match request_json(request, "Sub2API 模型接口").await {
+                    Ok(value) => {
+                        let models = parse_site_models(&value);
+                        if !models.is_empty() {
+                            merge_api_keys(&mut discovered_keys, [auth_token.clone()]);
+                            return cache_profile_api_counts(
+                                &database,
+                                site_id.as_deref(),
+                                requested_profile_id.as_deref(),
+                                SiteModelsResult {
+                                    models,
+                                    source: "sub2api-key".into(),
+                                    keys: vec![auth_token.clone()],
+                                },
+                            );
+                        }
+                        direct_errors.push("访问秘钥获取的模型列表为空".to_string());
+                    }
+                    Err(error) => direct_errors.push(error),
+                }
+            }
+            if !direct_errors.is_empty() {
+                errors.push(format!(
+                    "{profile_id}：直接使用访问秘钥同步失败（{}），回落到 Key 接口",
+                    direct_errors.last().cloned().unwrap_or_default()
+                ));
+            }
             let keys_url = base_url
                 .join("/api/v1/keys?page=1")
                 .map_err(|_| "无法生成 /api/v1/keys 地址")?;
@@ -1042,6 +1135,18 @@ pub async fn fetch_site_models_json(
         } else {
             system_type.as_str()
         };
+        // 类型已有明确值（Sub2API/0v0）：不走 Chrome 兜底。
+        // Sub2API 靠 auth_token 直连接口，Chrome 兜底脚本同样需要 auth_token；
+        // 本地没有就直接报错跳过，避免无意义地弹出浏览器。
+        if matches!(
+            inferred_type.trim().to_ascii_lowercase().as_str(),
+            "sub2api" | "0v0"
+        ) {
+            errors.push(format!(
+                "{profile_id}：{inferred_type} 不通过 Chrome 兜底，已在前面按类型直连"
+            ));
+            continue;
+        }
         let legacy_user_id = newapi_user_id(&values);
         if legacy_user_id.is_some() {
             let marker = format!(

@@ -57,6 +57,7 @@ const capabilities = computed(() => [
     :class="{
       'is-runaway': site.isRunaway,
       'is-personal': site.isPersonal,
+      'is-pending': site.isPending,
     }"
     :data-id="site.id"
   >
@@ -74,7 +75,7 @@ const capabilities = computed(() => [
           <span v-if="rateLimit" class="rate-chip" :title="`速率限制：${rateLimit}`">{{ rateLimit }}</span>
         </div>
       </div>
-      <TagList :tags="site.tags" :is-personal="site.isPersonal" />
+      <TagList :tags="site.tags" :is-personal="site.isPersonal" :is-pending="site.isPending" />
     </div>
 
     <div class="site-row-tools">
@@ -165,14 +166,14 @@ const capabilities = computed(() => [
         v-html="icons.edit"
       />
       <button
-        class="personal-toggle"
-        :class="{ active: site.isPersonal }"
+        class="usage-state-toggle"
+        :class="{ 'is-personal': site.isPersonal, 'is-pending': site.isPending }"
         type="button"
-        :data-personal="site.id"
-        :title="site.isPersonal ? '取消在用' : '标记为在用'"
-        :aria-label="site.isPersonal ? '取消在用' : '标记为在用'"
-        @click="store.togglePersonal(site)"
-        v-html="icons.bookmark"
+        :data-usage-state="site.id"
+        :title="site.isPersonal ? '当前：在用，点击切换为待定' : site.isPending ? '当前：待定，点击切换为未在用' : '当前：未在用，点击切换为在用'"
+        :aria-label="site.isPersonal ? '当前：在用，点击切换为待定' : site.isPending ? '当前：待定，点击切换为未在用' : '当前：未在用，点击切换为在用'"
+        @click="store.cycleUsageState(site)"
+        v-html="site.isPending ? icons.clock : icons.bookmark"
       />
       <button
         class="runaway-toggle"

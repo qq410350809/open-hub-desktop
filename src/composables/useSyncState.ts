@@ -6,9 +6,7 @@ import { useUIState } from "./useUIState";
 import { useChromeSession } from "./useChromeSession";
 import { useSiteActions } from "./useSiteActions";
 import type {
-  ChromeSessionInfo,
   RemoteUserInfo,
-  SiteRecord,
   SyncLogEntry,
   SyncProgressStatus,
   SyncRunState,
@@ -150,8 +148,15 @@ function openSyncDialog() {
   syncRunId += 1;
   resetSyncLog();
   syncDialogRunaway.value = runawayFilter.value === "runaway";
-  syncDialogMode.value = usageFilter.value === "personal" ? "sessions" : "remote";
-  syncDialogSiteIds.value = filteredSites.value.map((site) => site.id);
+  // 在用/待定走 Chrome 会话同步；待定需要全库比对，不能只扫当前筛选结果。
+  syncDialogMode.value =
+    usageFilter.value === "personal" || usageFilter.value === "pending"
+      ? "sessions"
+      : "remote";
+  syncDialogSiteIds.value =
+    usageFilter.value === "personal" || usageFilter.value === "pending"
+      ? sites.value.map((site) => site.id)
+      : filteredSites.value.map((site) => site.id);
   syncDialogOpen.value = true;
   if (syncDialogMode.value === "remote") void refreshRemoteUser();
 }
@@ -348,7 +353,6 @@ async function syncSites() {
   if (syncingSites.value || syncingModelKeys.value || (syncDialogMode.value === "remote" && !remoteUser.value)) return;
   const runaway = syncDialogRunaway.value;
   const mode = syncDialogMode.value;
-  const siteIds = [...syncDialogSiteIds.value];
   const runId = ++syncRunId;
   resetSyncLog();
   syncRunState.value = "syncing";
@@ -358,70 +362,28 @@ async function syncSites() {
   syncingSites.value = true;
   try {
     if (mode === "sessions") {
-      appendSyncLog({ stage: "scope", status: "info", message: `已锁定当前列表中的 ${siteIds.length} 个在用站点` });
-      if (siteIds.length === 0) {
-        appendSyncLog({ stage: "accounts", status: "info", message: "当前列表没有需要同步的在用站点" });
-        syncRunState.value = "complete";
-        stopSyncTimer();
-        return;
-      }
-      const accountResult = await analyzeChromeUsage(false, undefined, runId, siteIds);
-      if (!accountResult) throw new Error("当前列表的 Chrome 会话同步失败");
-      const siteMap = new Map(sites.value.map((site) => [site.id, site]));
-      const browserCandidates = accountResult.sites.flatMap((usageSite) => {
-        const site = siteMap.get(usageSite.siteId);
-        if (site?.systemType.toLocaleLowerCase() !== "newapi") return [];
-        return usageSite.sessions.filter((s) => !s.isValid || Boolean(s.syncError.trim())).map((session) => ({ site, session }));
+      appendSyncLog({
+        stage: "scope",
+        status: "info",
+        message: "只提取浏览器会话数据：有 Cookie/本地数据即比对本地站点；不做站点类型检测",
       });
-      let browserSucceeded = 0;
-      let newlyValidated = 0;
-      const validSiteIds = new Set(accountResult.sites.filter((usageSite) => usageSite.sessions.some((session) => session.isValid)).map((usageSite) => usageSite.siteId));
-      const candidateGroups = new Map<string, Array<{ site: SiteRecord; session: ChromeSessionInfo; childRunId: number }>>();
-      browserCandidates.forEach((candidate, index) => {
-        const group = candidateGroups.get(candidate.site.id) ?? [];
-        group.push({ ...candidate, childRunId: runId * 10_000 + index + 1 });
-        candidateGroups.set(candidate.site.id, group);
+      // 不传 siteIds：扫描全部本地站点。待定=有浏览器会话数据且未在用。
+      const accountResult = await analyzeChromeUsage(false, undefined, runId, undefined, true);
+      if (!accountResult) throw new Error("Chrome 会话提取失败");
+      appendSyncLog({
+        stage: "pending-mark",
+        status: accountResult.newlyMarked > 0 ? "success" : "info",
+        message:
+          accountResult.newlyMarked > 0
+            ? `提取完成：浏览器有会话 ${accountResult.detected} 个站点，新标注待定 ${accountResult.newlyMarked} 个`
+            : `提取完成：浏览器有会话 ${accountResult.detected} 个站点，无新增待定`,
       });
-      const groupedCandidates = [...candidateGroups.values()];
-      const workerCount = Math.min(3, groupedCandidates.length);
-      let nextGroupIndex = 0;
-      if (browserCandidates.length > 0) {
-        appendSyncLog({ stage: "chrome-parallel", status: "info", message: `需要 Chrome 回退 ${browserCandidates.length} 个账号，按站点并行处理（并发 ${workerCount}）` });
-      }
-      const workerResults = await Promise.all(Array.from({ length: workerCount }, async () => {
-        let succeeded = 0;
-        let validated = 0;
-        while (nextGroupIndex < groupedCandidates.length) {
-          const group = groupedCandidates[nextGroupIndex++];
-          for (const candidate of group) {
-            const stage = `chrome-profile-${candidate.site.id}-${candidate.session.profileId}`;
-            appendSyncLog({ stage, status: "running", message: `正在通过 Chrome ${candidate.session.profileName} 同步 ${candidate.site.name}` });
-            try {
-              await runCommand<ChromeSessionInfo>("sync_site_account_via_chrome", { siteId: candidate.site.id, profileId: candidate.session.profileId, runId: candidate.childRunId });
-              succeeded += 1;
-              if (!candidate.session.isValid) validated += 1;
-              validSiteIds.add(candidate.site.id);
-              appendSyncLog({ stage, status: "success", message: `${candidate.site.name} · Chrome ${candidate.session.profileName} 同步成功` });
-            } catch (error) {
-              appendSyncLog({ stage, status: "error", message: `${candidate.site.name} · Chrome ${candidate.session.profileName} 同步失败：${String(error)}` });
-            }
-          }
-        }
-        return { succeeded, validated };
-      }));
-      for (const result of workerResults) { browserSucceeded += result.succeeded; newlyValidated += result.validated; }
-      if (browserCandidates.length > 0) await loadLibrary();
-      const accountSyncFailed = browserSucceeded < browserCandidates.length;
-      appendSyncLog({ stage: "accounts", status: browserSucceeded === browserCandidates.length ? "success" : "error", message: `会话同步完成：${validSiteIds.size} 个站点、${accountResult.accounts + newlyValidated} 个账号${browserCandidates.length ? `，Chrome 验证 ${browserSucceeded}/${browserCandidates.length}` : accountResult.warnings ? `，${accountResult.warnings} 个警告` : ""}` });
-      appendSyncLog({ stage: "models-start", status: "info", message: "余额与账号同步结束，开始同步当前账号的 Key 与模型" });
-      const modelSummary = await syncAllModelKeys(siteIds, { allowDuringSiteSync: true, finalize: false });
       syncRunState.value = "complete";
       stopSyncTimer();
       showToast(
-        modelSummary.failed > 0 || accountSyncFailed
-          ? `会话同步完成${accountSyncFailed ? "，部分账号同步失败" : ""}，模型同步成功 ${modelSummary.succeeded} 个账号，失败 ${modelSummary.failed} 个`
-          : `会话同步完成，模型同步成功 ${modelSummary.succeeded} 个账号，共 ${modelSummary.keyCount} 个 Key、${modelSummary.modelCount} 个模型`,
-        modelSummary.failed > 0 || accountSyncFailed,
+        accountResult.newlyMarked > 0
+          ? `会话提取完成：新待定 ${accountResult.newlyMarked} 个（有会话 ${accountResult.detected}）`
+          : `会话提取完成：有会话 ${accountResult.detected} 个站点，无新增待定`,
       );
       return;
     }

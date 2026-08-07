@@ -95,6 +95,11 @@ pub(crate) fn normalize_site(mut site: SiteRecord) -> Result<SiteRecord, String>
         }
     }
 
+    // 在用优先：同时勾选时保留在用，清除待定。
+    if site.is_personal {
+        site.is_pending = false;
+    }
+
     Ok(site)
 }
 

@@ -891,20 +891,28 @@ pub(crate) fn site_sessions_from_home(
                     continue;
                 }
                 found_cookie_database = true;
-                match query_profile_cookies(&cookie_path, &profile.name, &url, &domain) {
-                    Ok((_, cookies)) => {
+                // 待定/会话探测：只要该域名下有 Cookie 就算有浏览器会话。
+                // 不按 path / top_frame 过滤，避免漏掉登录态。
+                match query_profile_domain_has_cookies(&cookie_path, &profile.name, &domain) {
+                    Ok(has_cookies) => {
                         successful_queries += 1;
-                        if !cookies.is_empty() {
-                            let mut cookie_names = cookies
-                                .iter()
-                                .map(|cookie| cookie.name.clone())
-                                .collect::<Vec<_>>();
-                            cookie_names.sort();
-                            cookie_names.dedup();
+                        if has_cookies {
+                            let cookie_names =
+                                query_profile_cookies(&cookie_path, &profile.name, &url, &domain)
+                                    .map(|(_, cookies)| {
+                                        let mut names = cookies
+                                            .into_iter()
+                                            .map(|cookie| cookie.name)
+                                            .collect::<Vec<_>>();
+                                        names.sort();
+                                        names.dedup();
+                                        names
+                                    })
+                                    .unwrap_or_default();
                             sessions.push(ChromeSessionInfo {
                                 profile_id: profile.id.clone(),
                                 domain: domain.clone(),
-                                cookie_count: cookies.len(),
+                                cookie_count: cookie_names.len().max(1),
                                 cookie_names,
                                 profile_name: profile.name.clone(),
                                 account_name: profile.account_name.clone(),
@@ -954,6 +962,39 @@ pub(crate) fn site_sessions_from_home(
 }
 
 #[cfg(target_os = "macos")]
+fn query_profile_domain_has_cookies(
+    cookie_path: &Path,
+    profile_name: &str,
+    domain: &str,
+) -> Result<bool, String> {
+    let connection = Connection::open_with_flags(
+        cookie_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| {
+        format!(
+            "无法读取 Chrome Profile「{}」的 Cookies：{error}",
+            profile_name
+        )
+    })?;
+    let dotted_domain = format!(".{domain}");
+    let count: i64 = connection
+        .query_row(
+            "SELECT COUNT(1)
+             FROM cookies
+             WHERE host_key = ?1
+                OR host_key = ?2
+                OR (
+                  substr(host_key, 1, 1) = '.'
+                  AND (?1 = substr(host_key, 2) OR ?1 LIKE '%.' || substr(host_key, 2))
+                )",
+            [domain, dotted_domain.as_str()],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("无法查询 Chrome Cookies：{error}"))?;
+    Ok(count > 0)
+}
+
 fn query_profile_cookies(
     cookie_path: &Path,
     profile_name: &str,
@@ -984,8 +1025,7 @@ fn query_profile_cookies(
         .prepare(
             "SELECT host_key, name, value, encrypted_value, path, expires_utc, is_secure
              FROM cookies
-             WHERE top_frame_site_key = ''
-               AND (
+             WHERE (
                  host_key = ?1
                  OR host_key = ?2
                  OR (

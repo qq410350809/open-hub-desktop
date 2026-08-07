@@ -19,6 +19,7 @@ const statusText = computed(() => {
   if (!site.value) return "";
   let text = site.value.isRunaway ? "已跑路" : "存活";
   if (site.value.isPersonal) text = `在用 (${text})`;
+  else if (site.value.isPending) text = `待定 (${text})`;
   return text;
 });
 
@@ -256,7 +257,7 @@ async function openProfile(url: string) {
               </div>
               <div>
                 <dt>在用状态</dt>
-                <dd>{{ site.isPersonal ? "在用" : "未在用" }}</dd>
+                <dd>{{ site.isPersonal ? "在用" : site.isPending ? "待定" : "未在用" }}</dd>
               </div>
               <div>
                 <dt>信息可见范围</dt>

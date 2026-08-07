@@ -174,6 +174,57 @@ export async function runCommand<T>(
     return structuredClone(browserProxyPool) as T;
   }
   if (command === "cancel_proxy_node_tests") return false as T;
+  if (command === "get_charity_feed") {
+    return {
+      feedId: String(args.feedId || "1515"),
+      feedName: "公益推广",
+      items: [],
+      fetchedAt: "",
+      changed: false,
+      newCount: 0,
+      updatedCount: 0,
+      initialized: false,
+      sourceProfileName: "",
+      sourceAccountName: "",
+      status: "local",
+      message: "",
+      usedNodeId: "",
+      usedNodeName: "",
+      unreadCount: 0,
+      skipped: false,
+      totalCount: 0,
+      offset: Number(args.offset || 0),
+      limit: Number(args.limit || 20),
+      hasMore: false,
+    } as T;
+  }
+  if (command === "fetch_charity_feed") {
+    return {
+      feedId: String(args.feedId || "1515"),
+      feedName: "公益推广",
+      items: [],
+      fetchedAt: new Date().toISOString(),
+      changed: false,
+      newCount: 0,
+      updatedCount: 0,
+      initialized: true,
+      sourceProfileName: "",
+      sourceAccountName: "",
+      status: "skipped",
+      message: "浏览器模式无代理节点，已跳过",
+      usedNodeId: "",
+      usedNodeName: "",
+      unreadCount: 0,
+      skipped: true,
+    } as T;
+  }
+  if (command === "mark_charity_feed_read") return 0 as T;
+  if (command === "get_charity_unread_total") return 0 as T;
+  if (command === "get_charity_sync_logs") return [] as T;
+  if (command === "clear_charity_sync_logs") return undefined as T;
+  if (command === "set_charity_monitor_visible") return undefined as T;
+  if (command === "request_charity_round") return undefined as T;
+
   if (command === "detect_site_system_types") return 0 as T;
   if (command === "create_site") {
     const site = {
@@ -217,6 +268,32 @@ export async function runCommand<T>(
   if (command === "toggle_personal") {
     const site = browserData!.sites.find((item) => item.id === args.id)!;
     site.isPersonal = !site.isPersonal;
+    if (site.isPersonal) site.isPending = false;
+    site.updatedAt = new Date().toISOString();
+    return site as T;
+  }
+  if (command === "toggle_pending") {
+    const site = browserData!.sites.find((item) => item.id === args.id)!;
+    site.isPending = !site.isPending;
+    if (site.isPending) site.isPersonal = false;
+    site.updatedAt = new Date().toISOString();
+    return site as T;
+  }
+  if (command === "cycle_usage_state") {
+    const site = browserData!.sites.find((item) => item.id === args.id)!;
+    if (site.isPersonal) {
+      // 在用 → 待定
+      site.isPersonal = false;
+      site.isPending = true;
+    } else if (site.isPending) {
+      // 待定 → 未在用
+      site.isPersonal = false;
+      site.isPending = false;
+    } else {
+      // 未在用 → 在用
+      site.isPersonal = true;
+      site.isPending = false;
+    }
     site.updatedAt = new Date().toISOString();
     return site as T;
   }
@@ -234,6 +311,7 @@ const sites = ref<SiteRecord[]>([]);
 const suggestedTags = ref<string[]>([]);
 const usageSites = ref<ChromeUsageSite[]>([]);
 const loading = ref(false);
+let dailyRefreshTimer: number | null = null;
 
 async function loadLibrary() {
   loading.value = true;
@@ -247,6 +325,45 @@ async function loadLibrary() {
   }
 }
 
+function scheduleDailyRefresh() {
+  if (dailyRefreshTimer !== null) {
+    window.clearTimeout(dailyRefreshTimer);
+  }
+
+  const now = new Date();
+  const nextMidnight = new Date(now);
+  nextMidnight.setHours(24, 0, 0, 0);
+  // 留出 1 秒，确保本地日期已经切换。只重新读取 SQLite，
+  // 不会触发任何网络同步，因此不会打断正在进行的任务。
+  const delay = Math.max(1000, nextMidnight.getTime() - now.getTime() + 1000);
+  dailyRefreshTimer = window.setTimeout(async () => {
+    try {
+      await loadLibrary();
+    } finally {
+      scheduleDailyRefresh();
+    }
+  }, delay);
+}
+
+function startDailyRefresh() {
+  scheduleDailyRefresh();
+}
+
+function stopDailyRefresh() {
+  if (dailyRefreshTimer !== null) {
+    window.clearTimeout(dailyRefreshTimer);
+    dailyRefreshTimer = null;
+  }
+}
+
 export function useLibrary() {
-  return { sites, suggestedTags, usageSites, loading, loadLibrary };
+  return {
+    sites,
+    suggestedTags,
+    usageSites,
+    loading,
+    loadLibrary,
+    startDailyRefresh,
+    stopDailyRefresh,
+  };
 }

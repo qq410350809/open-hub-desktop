@@ -4,7 +4,7 @@ use crate::chrome_session;
 use crate::db::*;
 use crate::models::*;
 use crate::site_ops::*;
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 use serde_json;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -18,7 +18,10 @@ pub async fn mark_sites_with_chrome_sessions(
     site_id: Option<String>,
     site_ids: Option<Vec<String>>,
     run_id: Option<u64>,
+    extract_only: Option<bool>,
 ) -> Result<ChromeUsageScanResult, String> {
+    // extract_only=true：只提取浏览器是否有会话数据并标注待定，不探测站点类型、不刷新账号接口。
+    let extract_only = extract_only.unwrap_or(false);
     let site_id_was_supplied = site_id.is_some();
     let requested_site_id = site_id
         .map(|value| value.trim().to_string())
@@ -37,8 +40,7 @@ pub async fn mark_sites_with_chrome_sessions(
             .prepare(
                 "SELECT id, name, checkin_url, api_base_url, system_type
                  FROM directory_sites
-                 WHERE is_personal = 1
-                   AND (TRIM(checkin_url) <> '' OR TRIM(api_base_url) <> '')",
+                 WHERE TRIM(checkin_url) <> '' OR TRIM(api_base_url) <> ''",
             )
             .map_err(|error| error.to_string())?;
         let rows = statement
@@ -101,6 +103,18 @@ pub async fn mark_sites_with_chrome_sessions(
             })
             .collect::<Vec<_>>()
     };
+    let personal_site_ids = {
+        let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+        let mut statement = connection
+            .prepare("SELECT id FROM directory_sites WHERE is_personal = 1")
+            .map_err(|error| error.to_string())?;
+        let ids = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?
+            .collect::<Result<HashSet<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        ids
+    };
     let checkin_site_ids = {
         let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
         let mut statement = connection
@@ -116,45 +130,9 @@ pub async fn mark_sites_with_chrome_sessions(
             .map_err(|error| error.to_string())?;
         site_ids
     };
-    emit_optional_sync_progress(
-        &app,
-        run_id,
-        "site-type-probe",
-        "running",
-        format!(
-            "正在通过 /api/status 与 /setup/status 检测 {} 个站点类型",
-            targets.len()
-        ),
-    );
-    let probe_client = build_http_client(&database, Duration::from_secs(8), 3, "站点类型探测")?;
-    let probe_site_ids = targets
-        .iter()
-        .map(|(site_id, _, _, _, _)| site_id.clone())
-        .collect::<HashSet<_>>();
-    let probe_profile_ids = cached_profile_ids_for_sites(&database, &probe_site_ids)?;
-    let probed_types = probe_site_system_types(
-        &probe_client,
-        targets
-            .iter()
-            .filter(|(_, _, _, _, system_type)| !system_type.eq_ignore_ascii_case("0v0"))
-            .map(|(id, _, urls, api_base_url, _)| {
-                let base_url = if api_base_url.trim().is_empty() {
-                    urls.first().cloned().unwrap_or_default()
-                } else {
-                    api_base_url.clone()
-                };
-                (id.clone(), base_url)
-            })
-            .collect(),
-        probe_profile_ids,
-    )
-    .await;
-    for (site_id, _, urls, api_base_url, system_type) in &mut targets {
-        if !system_type.eq_ignore_ascii_case("0v0") {
-            if let Some(probed_type) = probed_types.get(site_id) {
-                *system_type = probed_type.clone();
-            }
-        }
+    // 提取会话只比对浏览器数据，不做 /api/status 站点类型检测。
+    // 已有 system_type 仅用于在用账号刷新路径，不影响待定标注。
+    for (_, _, urls, api_base_url, system_type) in &mut targets {
         let account_paths: &[&str] = match system_type.trim().to_ascii_lowercase().as_str() {
             "newapi" => &["/api/user/self", "/api/user/auth/refresh"],
             "sub2api" => &["/api/v1/auth/me"],
@@ -171,30 +149,12 @@ pub async fn mark_sites_with_chrome_sessions(
             }
         }
     }
-    persist_site_system_types(&database, &probed_types)?;
-    emit_optional_sync_progress(
-        &app,
-        run_id,
-        "site-type-probe",
-        "success",
-        format!(
-            "status 类型检测完成：确认 {} 个，{} 个待本地账号数据补充",
-            probed_types
-                .values()
-                .filter(|system_type| !system_type.is_empty())
-                .count(),
-            targets
-                .iter()
-                .filter(|(_, _, _, _, system_type)| system_type.is_empty())
-                .count()
-        ),
-    );
     emit_optional_sync_progress(
         &app,
         run_id,
         "chrome-scan",
         "running",
-        format!("开始扫描 {} 个在用站点的 Chrome 账号", targets.len()),
+        format!("开始提取 {} 个本地站点的 Chrome 会话数据", targets.len()),
     );
     let (current_month, previous_checkins) = {
         let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
@@ -247,6 +207,13 @@ pub async fn mark_sites_with_chrome_sessions(
         .map_err(|error| format!("分析 Chrome 会话任务失败：{error}"))?
         .unwrap_or_default()
     };
+    // 待定判定用“浏览器里是否有该站点会话”，不能用后面的账号候选强过滤。
+    // Cookie 命中 或 后续 Local Storage 命中 都算有会话。
+    let mut browser_session_site_ids = matched_sites
+        .iter()
+        .filter(|site| !site.sessions.is_empty())
+        .map(|site| site.site_id.clone())
+        .collect::<HashSet<_>>();
     let profiles = tauri::async_runtime::spawn_blocking({
         let home_dir = home_dir.clone();
         move || chrome_session::profile_identities_from_home(&home_dir)
@@ -327,18 +294,20 @@ pub async fn mark_sites_with_chrome_sessions(
             locally_inferred_types.insert(site_id.clone(), inferred.into());
         }
     }
-    persist_site_system_types(&database, &locally_inferred_types)?;
-    if !locally_inferred_types.is_empty() {
-        emit_optional_sync_progress(
-            &app,
-            run_id,
-            "site-type-local",
-            "success",
-            format!(
-                "已通过 Chrome Local Storage 补充 {} 个站点类型",
-                locally_inferred_types.len()
-            ),
-        );
+    if !extract_only {
+        persist_site_system_types(&database, &locally_inferred_types)?;
+        if !locally_inferred_types.is_empty() {
+            emit_optional_sync_progress(
+                &app,
+                run_id,
+                "site-type-local",
+                "success",
+                format!(
+                    "已通过 Chrome Local Storage 补充 {} 个站点类型",
+                    locally_inferred_types.len()
+                ),
+            );
+        }
     }
 
     let account_targets = targets
@@ -436,19 +405,35 @@ pub async fn mark_sites_with_chrome_sessions(
             });
     }
 
+    // Local Storage 里能解析出账号的，也视为浏览器有会话（即使 Cookie 查询因 path/分区漏掉）。
+    for ((site_id, _), (values, error)) in &local_storage {
+        if error.is_empty() && has_local_account_session("", values) {
+            browser_session_site_ids.insert(site_id.clone());
+        }
+    }
+    // 再补一层：只要 Cookie 扫描到任意该域会话，就保留（不依赖 new_api_refresh / local account）。
+    for site in &matched_sites {
+        if !site.sessions.is_empty() {
+            browser_session_site_ids.insert(site.site_id.clone());
+        }
+    }
+
     let candidate_sites = matched_sites.len();
     let candidate_accounts = matched_sites
         .iter()
         .map(|site| site.sessions.len())
         .sum::<usize>();
+    let browser_session_count = browser_session_site_ids.len();
     emit_optional_sync_progress(
         &app,
         run_id,
         "chrome-scan",
         "success",
-        format!("Chrome 扫描完成：识别 {candidate_sites} 个站点、{candidate_accounts} 个账号候选"),
+        format!(
+            "Chrome 扫描完成：浏览器会话站点 {browser_session_count} 个，账号候选 {candidate_sites} 个 / {candidate_accounts} 个会话"
+        ),
     );
-    if !matched_sites.is_empty() {
+    if !extract_only && !matched_sites.is_empty() {
         let chrome_user_agent = chrome_session::chrome_user_agent();
         let mut jobs = Vec::new();
         // All requests use the global proxy-pool mode; site-specific proxy settings were removed
@@ -466,6 +451,10 @@ pub async fn mark_sites_with_chrome_sessions(
             }
         }
         for (site_index, site) in matched_sites.iter().enumerate() {
+            // 额度/签到接口只刷新“在用”站点，避免全库会话比对时打爆外部接口。
+            if !personal_site_ids.contains(&site.site_id) {
+                continue;
+            }
             let Some((base_url, system_type, site_name)) = account_targets.get(&site.site_id)
             else {
                 continue;
@@ -646,12 +635,10 @@ pub async fn mark_sites_with_chrome_sessions(
         }
     }
 
-    let detected = matched_sites
-        .iter()
-        .filter(|site| site.sessions.iter().any(|session| session.is_valid))
-        .count();
+    let detected = browser_session_site_ids.len();
     let accounts = matched_sites
         .iter()
+        .filter(|site| personal_site_ids.contains(&site.site_id))
         .flat_map(|site| &site.sessions)
         .filter(|session| session.is_valid)
         .count();
@@ -699,73 +686,182 @@ pub async fn mark_sites_with_chrome_sessions(
             session.api_model_count = model_count;
         }
     }
-    let newly_marked = 0_usize;
-    if let Some(site_id) = &requested_site_id {
-        transaction
-            .execute("DELETE FROM site_accounts WHERE site_id = ?1", [site_id])
-            .map_err(|error| error.to_string())?;
-    } else if has_site_scope {
-        for site_id in &requested_site_ids {
+    let mut newly_marked = 0_usize;
+    if !extract_only {
+        if let Some(site_id) = &requested_site_id {
             transaction
                 .execute("DELETE FROM site_accounts WHERE site_id = ?1", [site_id])
                 .map_err(|error| error.to_string())?;
-        }
-    } else {
-        transaction
-            .execute("DELETE FROM site_accounts", [])
-            .map_err(|error| error.to_string())?;
-    }
-    for site in &matched_sites {
-        for session in &site.sessions {
-            let cookie_names =
-                serde_json::to_string(&session.cookie_names).map_err(|error| error.to_string())?;
+        } else if has_site_scope {
+            for site_id in &requested_site_ids {
+                transaction
+                    .execute("DELETE FROM site_accounts WHERE site_id = ?1", [site_id])
+                    .map_err(|error| error.to_string())?;
+            }
+        } else {
             transaction
-                .execute(
-                    "INSERT INTO site_accounts (
-                        site_id, profile_id, domain, cookie_count, cookie_names,
-                        profile_name, account_name, username, api_key_count, api_model_count,
-                        remaining, used, total, unit, is_valid, sync_error,
-                        checkin_enabled, checked_in_today, checkin_error,
-                        checkin_date, updated_at, newapi_token, newapi_user_id
-                     ) VALUES (
-                        ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                        ?13, ?14, ?15, ?16, ?17, ?18, ?19, date('now', 'localtime'), CURRENT_TIMESTAMP,
-                        ?20, ?21
-                     )",
-                    params![
-                        site.site_id,
-                        session.profile_id,
-                        session.domain,
-                        session.cookie_count as i64,
-                        cookie_names,
-                        session.profile_name,
-                        session.account_name,
-                        session.username,
-                        session.api_key_count as i64,
-                        session.api_model_count as i64,
-                        session.remaining,
-                        session.used,
-                        session.total,
-                        session.unit,
-                        session.is_valid,
-                        session.sync_error,
-                        session.checkin_enabled,
-                        session.checked_in_today,
-                        session.checkin_error,
-                        session.newapi_token.clone(),
-                        session.newapi_user_id.clone(),
-                    ],
-                )
+                .execute("DELETE FROM site_accounts", [])
                 .map_err(|error| error.to_string())?;
         }
+        for site in &matched_sites {
+            if !personal_site_ids.contains(&site.site_id) {
+                continue;
+            }
+            for session in &site.sessions {
+                let cookie_names = serde_json::to_string(&session.cookie_names)
+                    .map_err(|error| error.to_string())?;
+                transaction
+                    .execute(
+                        "INSERT INTO site_accounts (
+                            site_id, profile_id, domain, cookie_count, cookie_names,
+                            profile_name, account_name, username, api_key_count, api_model_count,
+                            remaining, used, total, unit, is_valid, sync_error,
+                            checkin_enabled, checked_in_today, checkin_error,
+                            checkin_date, updated_at, newapi_token, newapi_user_id
+                         ) VALUES (
+                            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                            ?13, ?14, ?15, ?16, ?17, ?18, ?19, date('now', 'localtime'), CURRENT_TIMESTAMP,
+                            ?20, ?21
+                         )",
+                        params![
+                            site.site_id,
+                            session.profile_id,
+                            session.domain,
+                            session.cookie_count as i64,
+                            cookie_names,
+                            session.profile_name,
+                            session.account_name,
+                            session.username,
+                            session.api_key_count as i64,
+                            session.api_model_count as i64,
+                            session.remaining,
+                            session.used,
+                            session.total,
+                            session.unit,
+                            session.is_valid,
+                            session.sync_error,
+                            session.checkin_enabled,
+                            session.checked_in_today,
+                            session.checkin_error,
+                            session.newapi_token.clone(),
+                            session.newapi_user_id.clone(),
+                        ],
+                    )
+                    .map_err(|error| error.to_string())?;
+            }
+        }
     }
+    // 会话比对：浏览器有该站点会话、但本地未标记“在用” → 标为“待定”。
+    // 用 browser_session_site_ids（Cookie/LocalStorage 原始命中），
+    // 不要用后面被账号候选规则滤掉的 matched_sites。
+    let session_site_ids = browser_session_site_ids;
+
+    let scope_site_ids: Option<HashSet<String>> = if let Some(site_id) = &requested_site_id {
+        Some(HashSet::from([site_id.clone()]))
+    } else if has_site_scope {
+        Some(requested_site_ids.clone())
+    } else {
+        None
+    };
+
+    if let Some(scope) = &scope_site_ids {
+        for site_id in scope {
+            let is_personal: i64 = transaction
+                .query_row(
+                    "SELECT is_personal FROM directory_sites WHERE id = ?1",
+                    [site_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| error.to_string())?
+                .unwrap_or(0);
+            if is_personal != 0 {
+                transaction
+                    .execute(
+                        "UPDATE directory_sites SET is_pending = 0 WHERE id = ?1 AND is_pending <> 0",
+                        [site_id],
+                    )
+                    .map_err(|error| error.to_string())?;
+                continue;
+            }
+            if session_site_ids.contains(site_id) {
+                let changed = transaction
+                    .execute(
+                        "UPDATE directory_sites
+                         SET is_pending = 1, favorite = 0, updated_at = CURRENT_TIMESTAMP
+                         WHERE id = ?1 AND is_personal = 0 AND is_pending = 0",
+                        [site_id],
+                    )
+                    .map_err(|error| error.to_string())?;
+                newly_marked += changed as usize;
+            } else {
+                // 作用域内已无浏览器会话：清掉旧待定
+                transaction
+                    .execute(
+                        "UPDATE directory_sites SET is_pending = 0 WHERE id = ?1 AND is_pending <> 0",
+                        [site_id],
+                    )
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+    } else {
+        for site_id in &session_site_ids {
+            let changed = transaction
+                .execute(
+                    "UPDATE directory_sites
+                     SET is_pending = 1, favorite = 0, updated_at = CURRENT_TIMESTAMP
+                     WHERE id = ?1 AND is_personal = 0 AND is_pending = 0",
+                    [site_id],
+                )
+                .map_err(|error| error.to_string())?;
+            newly_marked += changed as usize;
+        }
+        // 全库：在用清待定；不在会话集合里的旧待定也清掉，避免脏数据。
+        transaction
+            .execute(
+                "UPDATE directory_sites SET is_pending = 0 WHERE is_personal = 1 AND is_pending <> 0",
+                [],
+            )
+            .map_err(|error| error.to_string())?;
+        if !session_site_ids.is_empty() {
+            let placeholders = session_site_ids
+                .iter()
+                .enumerate()
+                .map(|(index, _)| format!("?{}", index + 1))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "UPDATE directory_sites
+                 SET is_pending = 0
+                 WHERE is_pending <> 0
+                   AND is_personal = 0
+                   AND id NOT IN ({placeholders})"
+            );
+            let params = session_site_ids
+                .iter()
+                .map(|id| id.as_str())
+                .collect::<Vec<_>>();
+            transaction
+                .execute(&sql, rusqlite::params_from_iter(params))
+                .map_err(|error| error.to_string())?;
+        } else {
+            // 一个会话都没扫到时，不批量清待定，避免误伤（例如 Chrome 暂时不可读）。
+        }
+    }
+
     transaction.commit().map_err(|error| error.to_string())?;
     emit_optional_sync_progress(
         &app,
         run_id,
         "chrome-cache",
         "success",
-        format!("Chrome 账号缓存已写入 SQLite：{accounts} 个账号，{warnings} 个警告"),
+        if extract_only {
+            format!("浏览器会话提取完成：有会话 {detected} 个站点，新待定 {newly_marked} 个")
+        } else {
+            format!(
+                "Chrome 账号缓存已写入 SQLite：{accounts} 个账号，{warnings} 个警告；新待定 {newly_marked} 个"
+            )
+        },
     );
 
     Ok(ChromeUsageScanResult {

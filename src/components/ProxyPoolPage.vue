@@ -2,34 +2,39 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, watch } from "vue";
 import { icons } from "../icons";
 import { useStore } from "../composables/useStore";
+import { usePreferences } from "../composables/usePreferences";
 import type { ProxyNode, ProxySubscription } from "../types";
 
 const store = useStore();
+const { preferences, updatePreferences } = usePreferences();
 const speedTestPresets = [
-  { label: "Cloudflare · 204", value: "https://cp.cloudflare.com/generate_204" },
-  { label: "Microsoft · HTTPS", value: "https://www.msftconnecttest.com/connecttest.txt" },
-  { label: "Microsoft · HTTP", value: "http://www.msftconnecttest.com/connecttest.txt" },
+  { label: "Google · generate_204", value: "http://www.gstatic.com/generate_204" },
+  { label: "Google · HTTPS 204", value: "https://www.gstatic.com/generate_204" },
   { label: "Apple · Captive Portal", value: "http://captive.apple.com/hotspot-detect.html" },
+  { label: "Microsoft · HTTP", value: "http://www.msftconnecttest.com/connecttest.txt" },
+  { label: "Cloudflare · 204", value: "https://cp.cloudflare.com/generate_204" },
 ];
 const sourceName = ref("");
 const sourceLinks = ref("");
 const editingId = ref("");
 const selectedSource = ref("all");
-// 6000+ 节点默认只展示 ≤500ms 的可用节点，避免全量渲染卡死。
-const latencyFilter = ref<"500" | "1000" | "2000">("500");
+// 6000+ 节点默认只展示 ≤1000ms 的可用节点，避免全量渲染卡死。
+const latencyFilter = ref<"500" | "1000" | "2000" | "error" | "all">("1000");
 const latencyFilterOptions = [
   { value: "500", label: "≤ 500ms" },
   { value: "1000", label: "≤ 1000ms" },
   { value: "2000", label: "≤ 2000ms" },
+  { value: "error", label: "失败/超时" },
+  { value: "all", label: "全部(限流显示)" },
 ] as const;
 const settingsOpen = ref(false);
 const ignoreAddresses = ref("");
 const speedTestUrl = ref("");
-const speedTestPreset = ref("https://cp.cloudflare.com/generate_204");
+const speedTestPreset = ref("http://www.gstatic.com/generate_204");
 const message = ref("");
 const importDialogOpen = ref(false);
 const deleteConfirmId = ref("");
-const nodeViewMode = ref<"list" | "ip">("list");
+const nodeViewMode = ref<"list" | "ip">(preferences.proxyNodeViewMode === "country" ? "ip" : "list");
 const collapsedGroups = ref<Set<string>>(new Set());
 const cancelConfirmOpen = ref(false);
 
@@ -44,6 +49,38 @@ let liveRebuildTimer = 0;
 const rawNodeCount = computed(() => store.proxyPool.value.subscriptions
   .reduce((sum, item) => sum + item.nodeCount, 0));
 const duplicateCount = computed(() => Math.max(0, rawNodeCount.value - store.proxyPool.value.nodeCount));
+const switchingNode = computed(() => store.proxyPool.value.nodes.find(
+  (node) => node.id === store.proxyPoolSwitchingNodeId.value,
+) || null);
+// 状态栏/概览显示“代理模式 / 直连”模式标签，切换时给出明确的过渡状态。
+const runtimeStatusText = computed(() => {
+  if (store.proxyPoolSwitchingNodeId.value) return "正在切换代理…";
+  const node = store.proxyPool.value.activeNode;
+  if (node?.name) return `代理模式 · ${node.name}`;
+  return store.proxyPool.value.runtimeAvailable ? "直连" : "代理核心不可用";
+});
+const runtimeStatusTitle = computed(() => {
+  if (store.proxyPoolSwitchingNodeId.value) {
+    const node = switchingNode.value;
+    return node ? `正在切换到「${node.name}」…` : "正在切换代理节点…";
+  }
+  const node = store.proxyPool.value.activeNode;
+  if (node?.name) return `${node.name} · ${endpoint(node)}`;
+  return store.proxyPool.value.runtimeError || "当前未启用代理，外部接口直接连接";
+});
+const summaryModeLabel = computed(() => {
+  if (store.proxyPoolSwitchingNodeId.value) return "正在切换…";
+  return store.proxyPool.value.activeNode ? "代理模式" : "直连";
+});
+const summaryEndpointText = computed(() => {
+  if (store.proxyPoolSwitchingNodeId.value) {
+    const node = switchingNode.value;
+    return node ? `正在切换到「${node.name}」…` : "正在切换代理节点…";
+  }
+  const node = store.proxyPool.value.activeNode;
+  if (node?.name) return `${node.name} · ${endpoint(node)}`;
+  return "当前外部请求不使用代理节点";
+});
 
 function nodeSortRank(node: ProxyNode) {
   if (node.testStatus === "error" || node.testStatus === "invalid") return 2;
@@ -75,21 +112,27 @@ function resetProgressiveRender() {
 }
 
 function rebuildDisplayNodes() {
-  const maxLatency = Number(latencyFilter.value);
+  const filter = latencyFilter.value;
   const sourceName = selectedSource.value === "all"
     ? ""
     : (store.proxyPool.value.subscriptions.find((item) => item.id === selectedSource.value)?.name ?? "");
   const next = store.proxyPool.value.nodes
     .filter((node) => {
       if (sourceName && !node.subscriptionNames.includes(sourceName)) return false;
-      // 仅展示已测通且延迟在阈值内的节点。
+      if (filter === "all") return node.testStatus !== "invalid";
+      if (filter === "error") {
+        return node.testStatus === "error" || node.testStatus === "invalid" || (node.testStatus === "success" && (node.latencyMs == null));
+      }
+      const maxLatency = Number(filter);
+      // 默认只展示已测通且延迟在阈值内的节点。
       if (node.latencyMs == null || node.testStatus !== "success") return false;
       if (node.latencyMs > maxLatency) return false;
       return true;
     })
     .sort(compareNodes);
-  displayNodes.value = next;
-  displayNodeIds.value = new Set(next.map((node) => node.id));
+  // all 模式也做硬上限，避免 6000+ 一次渲染卡死；靠“继续加载”翻阅。
+  displayNodes.value = filter === "all" ? next.slice(0, 3000) : next;
+  displayNodeIds.value = new Set(displayNodes.value.map((node) => node.id));
   resetProgressiveRender();
 }
 
@@ -249,8 +292,13 @@ function resetSource() { editingId.value = ""; sourceName.value = ""; sourceLink
 async function submitSource() {
   message.value = "";
   try {
-    await store.saveProxySubscription(sourceName.value, sourceLinks.value, editingId.value || undefined);
-    resetSource(); message.value = "导入完成，重复节点已自动合并";
+    // 先写入来源地址并显示在列表，再看解析进度。
+    importDialogOpen.value = true;
+    const result = await store.saveProxySubscription(sourceName.value, sourceLinks.value, editingId.value || undefined);
+    resetSource();
+    message.value = result.discarded > 0
+      ? `导入完成：${result.total} 个节点，过滤 ${result.discarded} 个非法节点`
+      : `导入完成：${result.total} 个节点，新增 ${result.added}`;
   } catch { /* store error */ }
 }
 async function removeSource(source: ProxySubscription) {
@@ -326,6 +374,22 @@ function isGroupTesting(groupKey: string) {
 function isBatchTesting() {
   return store.proxyPoolBusyId.value.startsWith("test-");
 }
+function selectedSourceName() {
+  if (selectedSource.value === "all") return "";
+  return store.proxyPool.value.subscriptions.find((item) => item.id === selectedSource.value)?.name ?? "";
+}
+function selectedSourceLabel() {
+  return selectedSourceName() || "全部来源";
+}
+function nodesForSelectedSource() {
+  const sourceName = selectedSourceName();
+  if (!sourceName) return store.proxyPool.value.nodes;
+  return store.proxyPool.value.nodes.filter((node) => node.subscriptionNames.includes(sourceName));
+}
+function testableNodesForSelectedSource() {
+  // 测速按“选中渠道的全部节点”执行，不限制当前延迟显示阈值。
+  return nodesForSelectedSource();
+}
 function requestCancelTest() {
   if (isBatchTesting()) cancelConfirmOpen.value = true;
 }
@@ -334,8 +398,12 @@ async function confirmCancelTest() {
   message.value = "正在取消测速任务…";
   try {
     const cancelled = await store.cancelProxyNodeTests();
-    if (!cancelled) message.value = "测速任务已经结束";
-  } catch { /* store error */ }
+    message.value = cancelled
+      ? (isBatchTesting() ? "已请求取消，正在停止当前测速…" : "测速任务已取消")
+      : "测速任务已经结束或不在测速中";
+  } catch (error) {
+    message.value = `取消请求已发送（${String(error)}）`;
+  }
 }
 function testResultMessage(scope: string, result: Awaited<ReturnType<typeof store.testAllProxyNodes>>) {
   if (result.cancelled) return `${scope}已取消：完成 ${result.completed}/${result.total}`;
@@ -343,8 +411,28 @@ function testResultMessage(scope: string, result: Awaited<ReturnType<typeof stor
 }
 async function testAll() {
   message.value = "";
-  const result = await store.testAllProxyNodes();
-  message.value = testResultMessage("批量测速", result);
+  const sourceName = selectedSourceName();
+  if (!sourceName) {
+    message.value = "正在装载节点并并行测速…";
+    const result = await store.testAllProxyNodes();
+    message.value = testResultMessage("全部来源测速", result);
+    return;
+  }
+  const nodes = testableNodesForSelectedSource();
+  if (!nodes.length) {
+    message.value = `${selectedSourceLabel()}当前没有可测速节点`;
+    return;
+  }
+  message.value = `正在装载 ${nodes.length} 个节点并并行测速…`;
+  const result = await store.testProxyNodes(
+    nodes.map((node) => node.id),
+    `test-source-${selectedSource.value}`,
+  );
+  // 全失败时自动切到“失败/超时”，避免 ≤1000ms 过滤把结果藏成空白列表。
+  if (!result.cancelled && result.succeeded === 0 && result.failed > 0 && ["500","1000","2000"].includes(latencyFilter.value)) {
+    latencyFilter.value = "error";
+  }
+  message.value = testResultMessage(`${selectedSourceLabel()}测速`, result);
 }
 async function testGroup(group: { key: string; countryName: string; nodes: ProxyNode[] }) {
   message.value = "";
@@ -370,7 +458,12 @@ async function cleanInvalid() {
 }
 function openCountryGroups() {
   nodeViewMode.value = "ip";
+  updatePreferences({ proxyNodeViewMode: "country" });
   message.value = `已按导入时的国家信息分组：${ipGroups.value.length} 个地区`;
+}
+function openNormalList() {
+  nodeViewMode.value = "list";
+  updatePreferences({ proxyNodeViewMode: "list" });
 }
 function countryFlag(code: string) {
   if (!/^[A-Z]{2}$/.test(code)) return code === "LOCAL" ? "⌂" : "🌐";
@@ -409,10 +502,51 @@ function protocolLabel(value: string) {
     hysteria: "Hy",
     hysteria2: "Hy2",
     tuic: "TUIC",
+    anytls: "AnyTLS",
   };
   return labels[value] ?? value;
 }
 function endpoint(node: ProxyNode) { return `${node.server}:${node.port}`; }
+function nodeCountryLabel(node: ProxyNode) {
+  if (node.countryName && node.countryName !== "未知地区") return node.countryName;
+  if (node.countryCode && node.countryCode !== "ZZ") return node.countryCode;
+  return "";
+}
+function nodeSourceLabel(node: ProxyNode) {
+  if (!node.subscriptionNames?.length) return "未分来源";
+  if (node.subscriptionNames.length === 1) return node.subscriptionNames[0];
+  return `${node.subscriptionNames[0]} +${node.subscriptionNames.length - 1}`;
+}
+function nodeDetailTitle(node: ProxyNode) {
+  const lines = [
+    node.name,
+    `协议：${protocolLabel(node.proxyType)}${node.udp ? " · UDP" : ""}`,
+    `地址：${endpoint(node)}`,
+    node.primaryIp ? `IP：${node.primaryIp}` : "",
+    nodeCountryLabel(node) ? `地区：${nodeCountryLabel(node)}${node.countryCode && node.countryCode !== "ZZ" ? ` (${node.countryCode})` : ""}` : "",
+    `来源：${node.subscriptionNames.join(" / ") || "未分来源"}`,
+    node.latencyMs != null ? `延迟：${node.latencyMs}ms` : "延迟：未测速",
+    node.id === store.proxyPool.value.activeNodeId ? "状态：使用中" : "",
+  ].filter(Boolean);
+  return lines.join("\n");
+}
+function sourceProgress(sourceId: string) {
+  return store.proxySourceProgress.value[sourceId] || null;
+}
+function sourceProgressText(sourceId: string) {
+  const progress = sourceProgress(sourceId);
+  if (!progress) return "";
+  if (progress.stage === "saving" && progress.total > 0) {
+    return `${progress.message}（${progress.completed}/${progress.total}）`;
+  }
+  return progress.message;
+}
+function isSourceParsing(sourceId: string) {
+  const progress = sourceProgress(sourceId);
+  return Boolean(progress && progress.stage !== "done" && progress.stage !== "error" && (
+    store.proxyPoolBusyId.value === sourceId || store.proxyPoolBusyId.value === "all" || progress.status === "running"
+  ));
+}
 
 onMounted(() => {
   syncSettings();
@@ -464,17 +598,17 @@ watch(
       <div class="proxy-header-actions">
         <div
           class="proxy-runtime-status"
-          :class="{ active: store.proxyPool.value.enabled }"
-          :title="store.proxyPool.value.activeNode?.name || (store.proxyPool.value.runtimeError || '当前直连')"
+          :class="{ active: store.proxyPool.value.enabled, switching: Boolean(store.proxyPoolSwitchingNodeId.value) }"
+          :title="runtimeStatusTitle"
         >
           <i />
-          <span>{{ store.proxyPool.value.activeNode?.name || (store.proxyPool.value.runtimeAvailable ? "当前直连" : "代理核心不可用") }}</span>
+          <span>{{ runtimeStatusText }}</span>
         </div>
         <button
           v-if="store.proxyPool.value.activeNodeId"
           class="secondary-button proxy-direct-button"
           type="button"
-          :disabled="store.proxyPoolBusyId.value === 'clear'"
+          :disabled="store.proxyPoolBusyId.value === 'clear' || Boolean(store.proxyPoolSwitchingNodeId.value)"
           @click="direct"
         >
           <span v-html="icons.wifiOff" />
@@ -493,8 +627,8 @@ watch(
         <div><strong>{{ store.proxyPool.value.nodeCount }}</strong><span>去重节点</span></div>
         <div><strong>{{ duplicateCount }}</strong><span>已合并重复</span></div>
         <div class="proxy-summary-endpoint">
-          <strong>{{ store.proxyPool.value.activeNode?.name || "直连" }}</strong>
-          <span>{{ store.proxyPool.value.activeNode ? endpoint(store.proxyPool.value.activeNode) : "当前外部请求不使用代理节点" }}</span>
+          <strong>{{ summaryModeLabel }}</strong>
+          <span>{{ summaryEndpointText }}</span>
         </div>
       </section>
 
@@ -533,7 +667,11 @@ watch(
         <div class="proxy-node-toolbar">
           <div class="proxy-node-heading">
             <strong>代理节点</strong>
-            <span>显示 {{ renderedNodes.length }}/{{ filteredNodes.length }} · ≤{{ latencyFilter }}ms · 共 {{ store.proxyPool.value.nodeCount }}</span>
+            <span>
+              显示 {{ renderedNodes.length }}/{{ filteredNodes.length }}
+              · {{ latencyFilter === 'all' ? '全部' : (latencyFilter === 'error' ? '失败/超时' : ('≤' + latencyFilter + 'ms')) }}
+              · 共 {{ store.proxyPool.value.nodeCount }}
+            </span>
           </div>
           <div class="proxy-node-filters">
             <select class="proxy-source-select" v-model="selectedSource" aria-label="筛选导入来源">
@@ -552,19 +690,23 @@ watch(
               class="secondary-button"
               :class="{ danger: isBatchTesting() }"
               type="button"
-              :disabled="!store.proxyPool.value.nodes.length || (Boolean(store.proxyPoolBusyId.value) && !isBatchTesting()) || (store.testingNodeIds.value.size > 0 && !isBatchTesting())"
+              :disabled="!testableNodesForSelectedSource().length || (Boolean(store.proxyPoolBusyId.value) && !isBatchTesting()) || (store.testingNodeIds.value.size > 0 && !isBatchTesting())"
               @click="isBatchTesting() ? requestCancelTest() : testAll()"
+              :title="selectedSource === 'all' ? '测速全部来源节点' : `只测速当前选中来源：${selectedSourceLabel()}`"
             >
               <span v-html="isBatchTesting() ? icons.close : icons.pulse" />
-              <span>{{ isBatchTesting() ? (store.proxyTestCancelling.value ? "正在取消…" : `取消测速 ${store.proxyTestProgress.value.completed}/${store.proxyTestProgress.value.total}`) : "批量测速" }}</span>
-            </button>
-            <button class="secondary-button" type="button" :disabled="store.proxyPoolBusyId.value === 'all' || !store.proxyPool.value.subscriptions.length" @click="refreshAll">
-              <span v-html="icons.restore" /><span>刷新来源</span>
+              <span>{{
+                isBatchTesting()
+                  ? (store.proxyTestCancelling.value
+                    ? "正在取消…"
+                    : `取消测速 ${store.proxyTestProgress.value.completed}/${store.proxyTestProgress.value.total}`)
+                  : (selectedSource === "all" ? "批量测速" : "测速此来源")
+              }}</span>
             </button>
             <button class="secondary-button" type="button" :disabled="!store.proxyPool.value.nodes.length" @click="openCountryGroups">
               <span v-html="icons.globe" /><span>{{ nodeViewMode === "ip" ? "刷新分组" : "国家分组" }}</span>
             </button>
-            <button v-if="nodeViewMode === 'ip'" class="secondary-button" type="button" @click="nodeViewMode = 'list'">
+            <button v-if="nodeViewMode === 'ip'" class="secondary-button" type="button" @click="openNormalList()">
               <span v-html="icons.rows" /><span>普通列表</span>
             </button>
             <button v-if="store.proxyPool.value.invalidNodeCount > 0" class="secondary-button danger" type="button" :disabled="store.proxyPoolBusyId.value === 'delete-invalid'" @click="cleanInvalid">
@@ -579,30 +721,44 @@ watch(
             class="proxy-node-tile"
             :class="{
               active: node.id === store.proxyPool.value.activeNodeId,
+              switching: node.id === store.proxyPoolSwitchingNodeId.value,
               disabled: !store.proxyPool.value.runtimeAvailable || Boolean(store.proxyPoolBusyId.value),
             }"
             role="button"
             :tabindex="store.proxyPool.value.runtimeAvailable ? 0 : -1"
-            :title="`${node.subscriptionNames.join(' / ')} · ${endpoint(node)}`"
+            :title="nodeDetailTitle(node)"
             @click="selectNode(node)"
             @keydown.enter.prevent="selectNode(node)"
             @keydown.space.prevent="selectNode(node)"
           >
             <div class="proxy-node-tile-head">
-              <strong>{{ node.name }}</strong>
+              <div class="proxy-node-tile-title">
+                <strong>{{ node.name }}</strong>
+                <small>{{ endpoint(node) }}</small>
+              </div>
               <button
                 class="proxy-tile-latency"
                 :class="latencyClass(node)"
                 type="button"
                 :disabled="Boolean(store.proxyPoolBusyId.value) || store.testingNodeIds.value.has(node.id)"
-                title="重新测速"
                 @click.stop="testNode(node)"
               ><span v-if="store.testingNodeIds.value.has(node.id)" class="proxy-node-loading" v-html="icons.restore" /><template v-else>{{ latencyText(node) }}</template></button>
+            </div>
+            <div class="proxy-node-tile-meta">
+              <span v-if="nodeCountryLabel(node)" class="proxy-node-region">
+                {{ countryFlag(node.countryCode) }} {{ nodeCountryLabel(node) }}
+              </span>
+              <span class="proxy-node-source">{{ nodeSourceLabel(node) }}</span>
+              <span v-if="node.primaryIp || ipAnalysisByNode.get(node.id)?.primaryIp" class="proxy-node-ip">
+                {{ node.primaryIp || ipAnalysisByNode.get(node.id)?.primaryIp }}
+              </span>
             </div>
             <div class="proxy-node-tile-tags">
               <span>{{ protocolLabel(node.proxyType) }}</span>
               <span v-if="node.udp">UDP</span>
-              <i v-if="node.id === store.proxyPool.value.activeNodeId">使用中</i>
+              <span v-if="node.cipher">{{ node.cipher }}</span>
+              <i v-if="node.id === store.proxyPoolSwitchingNodeId.value" class="switching">切换中…</i>
+              <i v-else-if="node.id === store.proxyPool.value.activeNodeId">使用中</i>
             </div>
           </article>
         </div>
@@ -650,24 +806,38 @@ watch(
                 class="proxy-node-tile"
                 :class="{
                   active: node.id === store.proxyPool.value.activeNodeId,
+                  switching: node.id === store.proxyPoolSwitchingNodeId.value,
                   disabled: !store.proxyPool.value.runtimeAvailable || Boolean(store.proxyPoolBusyId.value),
                 }"
                 role="button"
                 :tabindex="store.proxyPool.value.runtimeAvailable ? 0 : -1"
-                :title="`${node.subscriptionNames.join(' / ')} · ${endpoint(node)}`"
+                :title="nodeDetailTitle(node)"
                 @click="selectNode(node)"
                 @keydown.enter.prevent="selectNode(node)"
                 @keydown.space.prevent="selectNode(node)"
               >
                 <div class="proxy-node-tile-head">
-                  <strong>{{ node.name }}</strong>
-                  <button class="proxy-tile-latency" :class="latencyClass(node)" type="button" :disabled="Boolean(store.proxyPoolBusyId.value) || store.testingNodeIds.value.has(node.id)" title="重新测速" @click.stop="testNode(node)"><span v-if="store.testingNodeIds.value.has(node.id)" class="proxy-node-loading" v-html="icons.restore" /><template v-else>{{ latencyText(node) }}</template></button>
+                  <div class="proxy-node-tile-title">
+                    <strong>{{ node.name }}</strong>
+                    <small>{{ endpoint(node) }}</small>
+                  </div>
+                  <button class="proxy-tile-latency" :class="latencyClass(node)" type="button" :disabled="Boolean(store.proxyPoolBusyId.value) || store.testingNodeIds.value.has(node.id)" @click.stop="testNode(node)"><span v-if="store.testingNodeIds.value.has(node.id)" class="proxy-node-loading" v-html="icons.restore" /><template v-else>{{ latencyText(node) }}</template></button>
+                </div>
+                <div class="proxy-node-tile-meta">
+                  <span v-if="nodeCountryLabel(node)" class="proxy-node-region">
+                    {{ countryFlag(node.countryCode) }} {{ nodeCountryLabel(node) }}
+                  </span>
+                  <span class="proxy-node-source">{{ nodeSourceLabel(node) }}</span>
+                  <span v-if="node.primaryIp || ipAnalysisByNode.get(node.id)?.primaryIp" class="proxy-node-ip">
+                    {{ node.primaryIp || ipAnalysisByNode.get(node.id)?.primaryIp }}
+                  </span>
                 </div>
                 <div class="proxy-node-tile-tags">
                   <span>{{ protocolLabel(node.proxyType) }}</span>
                   <span v-if="node.udp">UDP</span>
-                  <span v-if="ipAnalysisByNode.get(node.id)?.primaryIp" class="proxy-node-ip">{{ ipAnalysisByNode.get(node.id)?.primaryIp }}</span>
-                  <i v-if="node.id === store.proxyPool.value.activeNodeId">使用中</i>
+                  <span v-if="node.cipher">{{ node.cipher }}</span>
+                  <i v-if="node.id === store.proxyPoolSwitchingNodeId.value" class="switching">切换中…</i>
+                  <i v-else-if="node.id === store.proxyPool.value.activeNodeId">使用中</i>
                 </div>
               </article>
             </div>
@@ -689,7 +859,11 @@ watch(
           <strong>{{
             !store.proxyPool.value.nodes.length
               ? "导入链接后，去重节点会显示在这里"
-              : "当前 ≤" + latencyFilter + "ms 范围内没有节点，可先批量测速或放宽阈值"
+              : (latencyFilter === 'error'
+                ? '当前来源没有失败节点'
+                : (latencyFilter === 'all'
+                  ? '当前来源没有节点'
+                  : ('当前 ≤' + latencyFilter + 'ms 范围内没有节点，可切换“失败/超时”或放宽阈值')))
           }}</strong>
         </div>
       </section>
@@ -730,14 +904,60 @@ watch(
             <div><button v-if="editingId" class="secondary-button" type="button" @click="resetSource">取消编辑</button><button class="primary-button" type="submit" :disabled="Boolean(store.proxyPoolBusyId.value)">{{ editingId ? "保存并导入" : "导入代理" }}</button></div>
           </form>
           <div v-if="store.proxyPool.value.subscriptions.length" class="proxy-import-list-heading">
-            <strong>已导入来源</strong><span>{{ store.proxyPool.value.subscriptions.length }} 个</span>
+            <div class="proxy-import-list-title">
+              <strong>已导入来源</strong>
+              <span>{{ store.proxyPool.value.subscriptions.length }} 个</span>
+            </div>
+            <button
+              class="secondary-button proxy-import-refresh-all"
+              type="button"
+              :disabled="store.proxyPoolBusyId.value === 'all' || !store.proxyPool.value.subscriptions.length"
+              @click="refreshAll"
+            >
+              <span :class="{ 'is-spinning': store.proxyPoolBusyId.value === 'all' }" v-html="icons.restore" />
+              <span>{{ store.proxyPoolBusyId.value === 'all' ? '刷新中…' : '刷新全部' }}</span>
+            </button>
           </div>
           <div class="proxy-subscription-list">
-            <article v-for="source in store.proxyPool.value.subscriptions" :key="source.id" class="proxy-subscription-card" :class="{ selected: selectedSource === source.id }" @click="selectedSource = selectedSource === source.id ? 'all' : source.id">
-              <header><div><strong>{{ source.name }}</strong><span>{{ source.nodeCount }} 个原始节点</span></div><i :class="{ error: source.lastError }" /></header>
-              <p>{{ source.url }}</p><small v-if="source.lastError">{{ source.lastError }}</small>
-              <footer v-if="deleteConfirmId !== source.id"><button class="text-button" type="button" @click.stop="editSource(source)">编辑</button><button class="text-button" type="button" :disabled="store.proxyPoolBusyId.value === source.id" @click.stop="refreshSource(source)">刷新</button><button class="text-button danger" type="button" @click.stop="removeSource(source)">删除</button></footer>
-              <footer v-else class="proxy-delete-confirm"><span>确定删除？</span><button class="text-button" type="button" @click.stop="cancelRemoveSource">取消</button><button class="text-button danger" type="button" :disabled="store.proxyPoolBusyId.value === source.id" @click.stop="removeSource(source)">确认删除</button></footer>
+            <article
+              v-for="source in store.proxyPool.value.subscriptions"
+              :key="source.id"
+              class="proxy-subscription-card"
+              :class="{
+                selected: selectedSource === source.id,
+                parsing: isSourceParsing(source.id),
+                error: Boolean(source.lastError) || sourceProgress(source.id)?.stage === 'error',
+              }"
+              @click="selectedSource = selectedSource === source.id ? 'all' : source.id"
+            >
+              <header>
+                <div>
+                  <strong>{{ source.name }}</strong>
+                  <span>{{ source.nodeCount }} 个原始节点</span>
+                </div>
+                <i :class="{ error: source.lastError || sourceProgress(source.id)?.stage === 'error', spin: isSourceParsing(source.id) }" />
+              </header>
+              <p>{{ source.url }}</p>
+              <div v-if="isSourceParsing(source.id) || sourceProgress(source.id)?.stage === 'done' || sourceProgress(source.id)?.stage === 'error' || source.lastError" class="proxy-source-progress">
+                <div class="proxy-source-progress-track" v-if="isSourceParsing(source.id)">
+                  <i :style="{ width: sourceProgress(source.id)?.total ? `${Math.min(100, Math.round(((sourceProgress(source.id)?.completed || 0) / (sourceProgress(source.id)?.total || 1)) * 100))}%` : (sourceProgress(source.id)?.stage === 'fetching' ? '35%' : sourceProgress(source.id)?.stage === 'parsing' ? '60%' : '80%') }" />
+                </div>
+                <small :class="{ error: source.lastError || sourceProgress(source.id)?.stage === 'error' }">
+                  {{ source.lastError || sourceProgressText(source.id) }}
+                </small>
+              </div>
+              <footer v-if="deleteConfirmId !== source.id">
+                <button class="text-button" type="button" @click.stop="editSource(source)">编辑</button>
+                <button class="text-button" type="button" :disabled="store.proxyPoolBusyId.value === source.id || store.proxyPoolBusyId.value === 'all'" @click.stop="refreshSource(source)">
+                  {{ isSourceParsing(source.id) ? "解析中" : "刷新" }}
+                </button>
+                <button class="text-button danger" type="button" @click.stop="removeSource(source)">删除</button>
+              </footer>
+              <footer v-else class="proxy-delete-confirm">
+                <span>确定删除？</span>
+                <button class="text-button" type="button" @click.stop="cancelRemoveSource">取消</button>
+                <button class="text-button danger" type="button" :disabled="store.proxyPoolBusyId.value === source.id" @click.stop="removeSource(source)">确认删除</button>
+              </footer>
             </article>
             <div v-if="!store.proxyPool.value.subscriptions.length" class="proxy-side-empty">粘贴订阅地址或节点链接开始导入</div>
           </div>

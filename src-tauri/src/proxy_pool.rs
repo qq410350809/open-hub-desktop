@@ -24,8 +24,14 @@ const DEFAULT_RUNTIME_PROXY_PORT: u16 = 17890;
 const DEFAULT_RUNTIME_CONTROLLER_PORT: u16 = 19090;
 const RUNTIME_SECRET: &str = "openhub-local-proxy-runtime";
 const RUNTIME_GROUP: &str = "OpenHub";
-const BATCH_PROXY_TEST_TIMEOUT_MS: &str = "3000";
-const BATCH_PROXY_TEST_CONCURRENCY: usize = 50;
+// 对齐 Clash Verge Rev（src/services/delay.ts::checkListDelay）：
+// - 默认 timeout 10000
+// - 实际并发 min(请求并发, 节点数, 10)
+// - 固定测速 URL，对已装载节点并行 /proxies/{name}/delay
+const BATCH_PROXY_TEST_TIMEOUT_MS: &str = "10000";
+const BATCH_PROXY_TEST_CONCURRENCY: usize = 10;
+// 选中来源通常远小于此值；全量测速时按块装载，避免一次灌入 6000+
+const BATCH_PROXY_TEST_NODE_CHUNK: usize = 120;
 
 #[derive(Debug, Clone)]
 struct ParsedNode {
@@ -72,8 +78,20 @@ struct ProxyTestLease<'a> {
     cancellation: CancellationToken,
 }
 
+struct TemporaryRuntimeDirectory(PathBuf);
+
+impl Drop for TemporaryRuntimeDirectory {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
 impl ProxyRuntime {
     pub(crate) fn new(directory: PathBuf) -> Self {
+        Self::new_with_ports(directory, 0, 0)
+    }
+
+    fn new_with_ports(directory: PathBuf, proxy_port: u16, controller_port: u16) -> Self {
         Self {
             directory,
             inner: Mutex::new(RuntimeState {
@@ -81,8 +99,8 @@ impl ProxyRuntime {
                 config_hash: String::new(),
                 engine_path: String::new(),
                 last_error: String::new(),
-                proxy_port: 0,
-                controller_port: 0,
+                proxy_port,
+                controller_port,
             }),
             active_test: Mutex::new(None),
             next_test_id: AtomicU64::new(1),
@@ -95,7 +113,7 @@ impl ProxyRuntime {
             .lock()
             .map_err(|_| "测速任务状态锁定失败")?;
         if active.is_some() {
-            return Err("已有代理测速任务正在进行".into());
+            return Err("已有代理测速任务正在进行，请等待上一任务结束".into());
         }
         let id = self.next_test_id.fetch_add(1, Ordering::Relaxed);
         let cancellation = CancellationToken::new();
@@ -114,10 +132,11 @@ impl ProxyRuntime {
         let active = self
             .active_test
             .lock()
-            .map_err(|_| "测速任务状态锁定失败")?;
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let Some(test) = active.as_ref() else {
             return Ok(false);
         };
+        // 批量测速使用独立 Mihomo 运行时；这里只发取消信号，绝不停止用户全局代理。
         test.cancellation.cancel();
         Ok(true)
     }
@@ -327,7 +346,7 @@ fn load_state(database: &Database, runtime: &ProxyRuntime) -> Result<ProxyPoolSt
     };
     let speed_test_url = {
         let value = meta(PROXY_SPEED_TEST_URL_KEY)?;
-        if value.trim().is_empty() || is_legacy_google_speed_test_url(&value) {
+        if value.trim().is_empty() || is_slow_or_blocked_speed_test_url(&value) {
             DEFAULT_PROXY_SPEED_TEST_URL.to_string()
         } else {
             value
@@ -877,6 +896,27 @@ fn parse_vmess(line: &str) -> Option<ParsedNode> {
         .filter(|item| !item.trim().is_empty())
         .unwrap_or("VMess")
         .to_string();
+    let network = source
+        .get("net")
+        .and_then(JsonValue::as_str)
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .unwrap_or("tcp")
+        .to_ascii_lowercase();
+    let host = source
+        .get("host")
+        .and_then(JsonValue::as_str)
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .unwrap_or_default()
+        .to_string();
+    let path = source
+        .get("path")
+        .and_then(JsonValue::as_str)
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .unwrap_or("/")
+        .to_string();
     let mut object = json!({
         "name": name,
         "type": "vmess",
@@ -884,26 +924,205 @@ fn parse_vmess(line: &str) -> Option<ParsedNode> {
         "port": port,
         "uuid": source.get("id").and_then(JsonValue::as_str).unwrap_or_default(),
         "alterId": source.get("aid").and_then(|item| item.as_i64().or_else(|| item.as_str()?.parse().ok())).unwrap_or(0),
-        "cipher": source.get("scy").and_then(JsonValue::as_str).unwrap_or("auto"),
+        "cipher": source.get("scy").and_then(JsonValue::as_str).filter(|item| !item.trim().is_empty()).unwrap_or("auto"),
+        "network": network,
         "udp": true
     });
-    if source
+    match network.as_str() {
+        "ws" => {
+            let mut ws_opts = json!({ "path": path });
+            if !host.is_empty() {
+                ws_opts["headers"] = json!({ "Host": host });
+            }
+            object["ws-opts"] = ws_opts;
+        }
+        "h2" | "http" => {
+            let mut opts = json!({ "path": [path] });
+            if !host.is_empty() {
+                opts["host"] = json!([host]);
+            }
+            object["h2-opts"] = opts;
+        }
+        "grpc" => {
+            object["grpc-opts"] = json!({
+                "grpc-service-name": path.trim_start_matches('/'),
+            });
+        }
+        _ => {}
+    }
+    let tls = source
         .get("tls")
         .and_then(JsonValue::as_str)
-        .is_some_and(|item| !item.is_empty() && item != "none")
-    {
+        .map(str::trim)
+        .unwrap_or_default();
+    if !tls.is_empty() && !tls.eq_ignore_ascii_case("none") {
         object["tls"] = JsonValue::Bool(true);
-        if let Some(sni) = source.get("sni").and_then(JsonValue::as_str) {
+        let sni = source
+            .get("sni")
+            .and_then(JsonValue::as_str)
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .unwrap_or(host.as_str());
+        if !sni.is_empty() {
             object["servername"] = json!(sni);
+        }
+        if let Some(alpn) = source.get("alpn").and_then(JsonValue::as_str) {
+            let values = alpn
+                .split(',')
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .collect::<Vec<_>>();
+            if !values.is_empty() {
+                object["alpn"] = json!(values);
+            }
         }
     }
     node_from_json(object)
 }
 
+fn split_userinfo_host_port(value: &str) -> Option<(String, String, String, i64)> {
+    // 支持 user:pass@host:port / user@host:port
+    let (userinfo, hostport) = value.rsplit_once('@')?;
+    let (server, port_text) = hostport.rsplit_once(':')?;
+    let port = port_text.parse::<i64>().ok()?;
+    if !(1..=65535).contains(&port) || server.trim().is_empty() {
+        return None;
+    }
+    let (username, password) = match userinfo.split_once(':') {
+        Some((user, pass)) => (user.to_string(), pass.to_string()),
+        None => (userinfo.to_string(), String::new()),
+    };
+    Some((username, password, server.trim().to_string(), port))
+}
+
+fn parse_encoded_userinfo_host_port(encoded: &str) -> Option<(String, String, String, i64)> {
+    let decoded = decode_base64(encoded).and_then(|bytes| String::from_utf8(bytes).ok())?;
+    split_userinfo_host_port(decoded.trim())
+}
+
+fn parse_ssocks(line: &str) -> Option<ParsedNode> {
+    // iGG 等订阅常见：ssocks://base64(user:pass@host:port)?remarks=名称&method=auto
+    let rest = line.strip_prefix("ssocks://")?;
+    let (payload, query) = rest
+        .split_once('?')
+        .map(|(left, right)| (left, right))
+        .unwrap_or((rest, ""));
+    let (username, password, server, port) = parse_encoded_userinfo_host_port(payload)?;
+    let params = url::form_urlencoded::parse(query.as_bytes())
+        .into_owned()
+        .collect::<HashMap<_, _>>();
+    let name = params
+        .get("remarks")
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("Socks5")
+        .to_string();
+    node_from_json(json!({
+        "name": name,
+        "type": "socks5",
+        "server": server,
+        "port": port,
+        "username": username,
+        "password": password,
+        "udp": true
+    }))
+}
+
+fn parse_https_or_http_proxy_uri(line: &str) -> Option<ParsedNode> {
+    // 兼容两类：
+    // 1) 标准 http(s)://user:pass@host:port#name
+    // 2) iGG 风格 https://base64(user:pass@host:port)#name
+    let lower = line.to_ascii_lowercase();
+    let is_https = lower.starts_with("https://");
+    let is_http = lower.starts_with("http://");
+    if !is_https && !is_http {
+        return None;
+    }
+
+    // 优先尝试 base64 主体（无标准 host/port 时）
+    if let Some(rest) = line
+        .strip_prefix("https://")
+        .or_else(|| line.strip_prefix("http://"))
+        .or_else(|| line.strip_prefix("HTTPS://"))
+        .or_else(|| line.strip_prefix("HTTP://"))
+    {
+        let (payload, fragment) = rest
+            .split_once('#')
+            .map(|(left, right)| (left, Some(right)))
+            .unwrap_or((rest, None));
+        // 没有 @ 且没有明显 host:port，基本就是 base64 包一层
+        if !payload.contains('@') {
+            if let Some((username, password, server, port)) =
+                parse_encoded_userinfo_host_port(payload)
+            {
+                let name = fragment
+                    .and_then(|value| {
+                        percent_encoding::percent_decode_str(value)
+                            .decode_utf8()
+                            .ok()
+                    })
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| {
+                        format!(
+                            "{} {server}:{port}",
+                            if is_https { "HTTPS" } else { "HTTP" }
+                        )
+                    });
+                return node_from_json(json!({
+                    "name": name,
+                    "type": "http",
+                    "server": server,
+                    "port": port,
+                    "username": username,
+                    "password": password,
+                    "tls": is_https
+                }));
+            }
+        }
+    }
+
+    let url = Url::parse(line).ok()?;
+    let server = url.host_str()?.to_string();
+    let port = url
+        .port()
+        .or_else(|| if is_https { Some(443) } else { Some(80) })? as i64;
+    let fallback = format!(
+        "{} {server}:{port}",
+        if is_https { "HTTPS" } else { "HTTP" }
+    );
+    let name = decoded_fragment(&url, &fallback);
+    node_from_json(json!({
+        "name": name,
+        "type": "http",
+        "server": server,
+        "port": port,
+        "username": url.username(),
+        "password": url.password().unwrap_or_default(),
+        "tls": is_https
+    }))
+}
+
 fn parse_uri_node(line: &str) -> Option<ParsedNode> {
+    let line = line.trim();
+    if line.is_empty() {
+        return None;
+    }
     if line.starts_with("vmess://") {
         return parse_vmess(line);
     }
+    if line.starts_with("ssocks://") {
+        return parse_ssocks(line);
+    }
+    if line.starts_with("http://")
+        || line.starts_with("https://")
+        || line.starts_with("HTTP://")
+        || line.starts_with("HTTPS://")
+    {
+        return parse_https_or_http_proxy_uri(line);
+    }
+
     let url = Url::parse(line).ok()?;
     let scheme = url.scheme().to_ascii_lowercase();
     let server = url.host_str()?.to_string();
@@ -917,6 +1136,12 @@ fn parse_uri_node(line: &str) -> Option<ParsedNode> {
             "password": url.username(), "sni": query.get("sni").or_else(|| query.get("peer")).map(|v| v.as_ref()).unwrap_or(&server),
             "skip-cert-verify": query.get("allowInsecure").is_some_and(|v| v == "1" || v == "true"), "udp": true
         }),
+        "anytls" => json!({
+            "name": name, "type": "anytls", "server": server, "port": port,
+            "password": url.username(),
+            "sni": query.get("sni").map(|v| v.as_ref()).unwrap_or(&server),
+            "udp": true
+        }),
         "vless" => json!({
             "name": name, "type": "vless", "server": server, "port": port,
             "uuid": url.username(), "tls": query.get("security").is_some_and(|v| v == "tls" || v == "reality"),
@@ -926,10 +1151,26 @@ fn parse_uri_node(line: &str) -> Option<ParsedNode> {
             "name": name, "type": "hysteria2", "server": server, "port": port,
             "password": url.username(), "sni": query.get("sni").map(|v| v.as_ref()).unwrap_or(&server), "udp": true
         }),
-        "http" | "https" => json!({
-            "name": name, "type": "http", "server": server, "port": port,
-            "username": url.username(), "password": url.password().unwrap_or_default(), "tls": scheme == "https"
-        }),
+        "tuic" => {
+            // tuic://uuid:password@host:port?alpn=h3&congestion_control=bbr#name
+            let password = url.password().unwrap_or_default().to_string();
+            let uuid = url.username().to_string();
+            json!({
+                "name": name,
+                "type": "tuic",
+                "server": server,
+                "port": port,
+                "uuid": uuid,
+                "password": password,
+                "alpn": query.get("alpn").map(|v| v.as_ref()).unwrap_or("h3"),
+                "congestion-controller": query
+                    .get("congestion_control")
+                    .or_else(|| query.get("congestion-controller"))
+                    .map(|v| v.as_ref())
+                    .unwrap_or("bbr"),
+                "udp": true
+            })
+        }
         "socks" | "socks5" => json!({
             "name": name, "type": "socks5", "server": server, "port": port,
             "username": url.username(), "password": url.password().unwrap_or_default(), "udp": true
@@ -1070,15 +1311,22 @@ fn basic_node_config_error(value: &JsonValue) -> Option<String> {
         }
         "vmess" | "vless" => required_text(value, "uuid").is_empty(),
         "trojan" | "anytls" => required_text(value, "password").is_empty(),
+        "tuic" => {
+            required_text(value, "uuid").is_empty() || required_text(value, "password").is_empty()
+        }
         "hysteria2" => {
             required_text(value, "password").is_empty() && required_text(value, "auth").is_empty()
         }
+        "http" | "socks5" => false,
         _ => false,
     };
     missing.then(|| format!("{proxy_type} 节点缺少必要的认证或加密参数"))
 }
 
-fn runtime_nodes(database: &Database) -> Result<(Vec<RuntimeNode>, String), String> {
+fn runtime_nodes(
+    database: &Database,
+    only_ids: Option<&HashSet<String>>,
+) -> Result<(Vec<RuntimeNode>, String), String> {
     let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
     let active = connection
         .query_row(
@@ -1096,6 +1344,13 @@ fn runtime_nodes(database: &Database) -> Result<(Vec<RuntimeNode>, String), Stri
         .map_err(|error| error.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| error.to_string())?;
+    let rows = if let Some(only_ids) = only_ids {
+        rows.into_iter()
+            .filter(|(id, _)| only_ids.contains(id) || (!active.is_empty() && id == &active))
+            .collect::<Vec<_>>()
+    } else {
+        rows
+    };
     let mut nodes = Vec::new();
     let mut invalid = Vec::new();
     for (id, raw) in rows {
@@ -1106,6 +1361,26 @@ fn runtime_nodes(database: &Database) -> Result<(Vec<RuntimeNode>, String), Stri
         if let Some(error) = basic_node_config_error(&config) {
             invalid.push((id, error));
         } else {
+            // Mihomo 控制器接口按 name 定位节点。
+            // 用稳定 id 作为运行时 name，避免中文/空格/| 等展示名导致 delay 接口失败。
+            let mut config = config;
+            if let Some(object) = config.as_object_mut() {
+                object.insert("name".into(), JsonValue::String(id.clone()));
+                // 测速时禁止节点再套一层代理，否则变成双重代理，结果会大面积失败/畸高。
+                for key in ["dialer-proxy", "proxy", "interface-name", "routing-mark"] {
+                    object.remove(key);
+                }
+                // 很多订阅节点依赖跳过证书校验；缺省时补上，避免 delay 全失败。
+                let tls_on = object.get("tls").and_then(|v| v.as_bool()).unwrap_or(false)
+                    || object
+                        .get("type")
+                        .and_then(|v| v.as_str())
+                        .map(|t| matches!(t, "trojan" | "hysteria2" | "tuic"))
+                        .unwrap_or(false);
+                if tls_on && !object.contains_key("skip-cert-verify") {
+                    object.insert("skip-cert-verify".into(), JsonValue::Bool(true));
+                }
+            }
             nodes.push(RuntimeNode { id, config });
         }
     }
@@ -1136,6 +1411,43 @@ fn stop_child(state: &mut RuntimeState) {
     state.config_hash.clear();
 }
 
+fn runtime_process_exists(marker: &str) -> bool {
+    Command::new("pgrep")
+        .args(["-f", marker])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn kill_stale_runtime_processes(runtime: &ProxyRuntime) {
+    // 崩溃/热重载可能留下 Mihomo 占用控制端口。先 TERM，超时后 KILL，并确认端口进程退出。
+    let marker = runtime.directory.display().to_string();
+    if marker.trim().is_empty() {
+        return;
+    }
+    let _ = Command::new("pkill")
+        .args(["-TERM", "-f", &marker])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_millis(800) && runtime_process_exists(&marker) {
+        std::thread::sleep(Duration::from_millis(40));
+    }
+    if runtime_process_exists(&marker) {
+        let _ = Command::new("pkill")
+            .args(["-KILL", "-f", &marker])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_millis(500) && runtime_process_exists(&marker) {
+        std::thread::sleep(Duration::from_millis(30));
+    }
+}
+
 fn port_is_available(port: u16) -> bool {
     TcpListener::bind(("127.0.0.1", port)).is_ok()
 }
@@ -1145,11 +1457,21 @@ fn choose_runtime_ports(state: &RuntimeState) -> Result<(u16, u16), String> {
     if state.proxy_port > 0 && state.controller_port > 0 {
         candidates.push((state.proxy_port, state.controller_port));
     }
-    candidates.push((DEFAULT_RUNTIME_PROXY_PORT, DEFAULT_RUNTIME_CONTROLLER_PORT));
+    let base_proxy = if state.proxy_port > 0 {
+        state.proxy_port
+    } else {
+        DEFAULT_RUNTIME_PROXY_PORT
+    };
+    let base_controller = if state.controller_port > 0 {
+        state.controller_port
+    } else {
+        DEFAULT_RUNTIME_CONTROLLER_PORT
+    };
+    candidates.push((base_proxy, base_controller));
     for offset in 1..=32 {
         candidates.push((
-            DEFAULT_RUNTIME_PROXY_PORT.saturating_add(offset * 2),
-            DEFAULT_RUNTIME_CONTROLLER_PORT.saturating_add(offset * 2),
+            base_proxy.saturating_add(offset * 2),
+            base_controller.saturating_add(offset * 2),
         ));
     }
 
@@ -1216,18 +1538,40 @@ fn runtime_config(nodes: &[RuntimeNode], proxy_port: u16, controller_port: u16) 
         .iter()
         .filter_map(|node| node.get("name").and_then(JsonValue::as_str))
         .collect::<Vec<_>>();
+    // 测速内核必须“单层代理”：
+    // - 节点出站直连远端，不走系统代理 / 不套 dialer-proxy
+    // - 控制器请求也 no_proxy
+    // - 关闭 IPv6，避免先走坏掉的 v6 导致 delay 全超时
     json!({
         "mixed-port": proxy_port,
         "external-controller": format!("127.0.0.1:{controller_port}"),
         "secret": RUNTIME_SECRET,
         "allow-lan": false,
         "bind-address": "127.0.0.1",
-        "mode": "global",
+        "mode": "rule",
         "log-level": "warning",
-        "ipv6": true,
+        "ipv6": false,
+        "unified-delay": true,
+        "tcp-concurrent": true,
+        "find-process-mode": "off",
+        "dns": {
+            "enable": true,
+            "ipv6": false,
+            "use-system-hosts": true,
+            "enhanced-mode": "redir-host",
+            "default-nameserver": ["8.8.8.8", "1.1.1.1"],
+            "nameserver": ["8.8.8.8", "1.1.1.1", "system"]
+        },
         "proxies": configs,
         "proxy-groups": [{ "name": RUNTIME_GROUP, "type": "select", "proxies": names }],
-        "rules": [format!("MATCH,{RUNTIME_GROUP}")]
+        // delay API 本身按节点直测；规则主要用于 mixed-port 出站，避免环回套娃。
+        "rules": [
+            "IP-CIDR,127.0.0.0/8,DIRECT,no-resolve",
+            "IP-CIDR,10.0.0.0/8,DIRECT,no-resolve",
+            "IP-CIDR,172.16.0.0/12,DIRECT,no-resolve",
+            "IP-CIDR,192.168.0.0/16,DIRECT,no-resolve",
+            format!("MATCH,{RUNTIME_GROUP}")
+        ]
     })
 }
 
@@ -1240,12 +1584,75 @@ fn proxy_error_index(output: &str) -> Option<usize> {
     (!digits.is_empty()).then(|| digits.parse().ok()).flatten()
 }
 
+fn run_mihomo_test_config(
+    engine: &PathBuf,
+    validation_dir: &PathBuf,
+    config_path: &PathBuf,
+    cancelled: Option<&CancellationToken>,
+) -> Result<std::process::Output, String> {
+    use std::io::Read;
+    let mut child = Command::new(engine)
+        .arg("-t")
+        .arg("-d")
+        .arg(validation_dir)
+        .arg("-f")
+        .arg(config_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env_remove("http_proxy")
+        .env_remove("https_proxy")
+        .env_remove("HTTP_PROXY")
+        .env_remove("HTTPS_PROXY")
+        .env_remove("ALL_PROXY")
+        .env_remove("all_proxy")
+        .env_remove("SOCKS_PROXY")
+        .env_remove("socks_proxy")
+        .env("NO_PROXY", "*")
+        .env("no_proxy", "*")
+        .spawn()
+        .map_err(|error| format!("无法验证 Mihomo 配置：{error}"))?;
+    let started = Instant::now();
+    loop {
+        if cancelled.is_some_and(|token| token.is_cancelled()) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("测速已取消".into());
+        }
+        match child.try_wait().map_err(|error| error.to_string())? {
+            Some(status) => {
+                let mut stdout = Vec::new();
+                let mut stderr = Vec::new();
+                if let Some(mut out) = child.stdout.take() {
+                    let _ = out.read_to_end(&mut stdout);
+                }
+                if let Some(mut err) = child.stderr.take() {
+                    let _ = err.read_to_end(&mut stderr);
+                }
+                return Ok(std::process::Output {
+                    status,
+                    stdout,
+                    stderr,
+                });
+            }
+            None => {
+                if started.elapsed() > Duration::from_secs(12) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err("Mihomo 配置验证超时".into());
+                }
+                std::thread::sleep(Duration::from_millis(40));
+            }
+        }
+    }
+}
+
 fn validate_runtime_nodes(
     engine: &PathBuf,
     runtime: &ProxyRuntime,
     mut nodes: Vec<RuntimeNode>,
     proxy_port: u16,
     controller_port: u16,
+    cancelled: Option<&CancellationToken>,
 ) -> Result<(Vec<RuntimeNode>, Vec<(String, String)>), String> {
     let validation_dir = runtime.directory.join("validate");
     let _ = fs::remove_dir_all(&validation_dir);
@@ -1254,6 +1661,9 @@ fn validate_runtime_nodes(
     let config_path = validation_dir.join("config.yaml");
     let mut invalid = Vec::new();
     for _ in 0..128 {
+        if cancelled.is_some_and(|token| token.is_cancelled()) {
+            return Err("测速已取消".into());
+        }
         if nodes.is_empty() {
             return Err("所有代理节点配置均无效".into());
         }
@@ -1263,14 +1673,7 @@ fn validate_runtime_nodes(
                 .map_err(|error| error.to_string())?,
         )
         .map_err(|error| format!("无法写入代理验证配置：{error}"))?;
-        let output = Command::new(engine)
-            .arg("-t")
-            .arg("-d")
-            .arg(&validation_dir)
-            .arg("-f")
-            .arg(&config_path)
-            .output()
-            .map_err(|error| format!("无法验证 Mihomo 配置：{error}"))?;
+        let output = run_mihomo_test_config(engine, &validation_dir, &config_path, cancelled)?;
         if output.status.success() {
             let _ = fs::remove_dir_all(&validation_dir);
             return Ok((nodes, invalid));
@@ -1300,33 +1703,70 @@ fn validate_runtime_nodes(
     Err("无效代理节点过多，已停止配置验证".into())
 }
 
-fn ensure_runtime(database: &Database, runtime: &ProxyRuntime) -> Result<(), String> {
-    let (nodes, initial_hash) = runtime_nodes(database)?;
+fn ensure_runtime(
+    database: &Database,
+    runtime: &ProxyRuntime,
+    only_ids: Option<&HashSet<String>>,
+    cancelled: Option<&CancellationToken>,
+) -> Result<(), String> {
+    let (nodes, initial_hash) = runtime_nodes(database, only_ids)?;
     if nodes.is_empty() {
         return Err("代理池中没有配置有效的节点".into());
     }
     let engine =
         find_mihomo_binary().ok_or("未找到 Mihomo 内核，请先安装 Clash Verge 或 Clash Party")?;
-    let mut state = runtime
-        .inner
-        .lock()
-        .map_err(|_| "代理内核运行状态锁定失败")?;
-    let running = if let Some(child) = state.child.as_mut() {
-        child
-            .try_wait()
-            .map_err(|error| error.to_string())?
-            .is_none()
-    } else {
-        false
-    };
-    if running && state.config_hash == initial_hash {
-        return Ok(());
+
+    // 复用已运行实例时只短暂持锁，随后释放再 wait。
+    {
+        let mut state = runtime
+            .inner
+            .lock()
+            .map_err(|_| "代理内核运行状态锁定失败")?;
+        let running = if let Some(child) = state.child.as_mut() {
+            child
+                .try_wait()
+                .map_err(|error| error.to_string())?
+                .is_none()
+        } else {
+            false
+        };
+        if running && state.config_hash == initial_hash {
+            let port = state.controller_port;
+            drop(state);
+            return wait_runtime_ready(port, nodes.len(), cancelled);
+        }
+        stop_child(&mut state);
+    }
+    kill_stale_runtime_processes(runtime);
+    if cancelled.is_some_and(|token| token.is_cancelled()) {
+        return Err("测速已取消".into());
     }
 
-    stop_child(&mut state);
-    let (proxy_port, controller_port) = choose_runtime_ports(&state)?;
-    let (nodes, invalid) =
-        validate_runtime_nodes(&engine, runtime, nodes, proxy_port, controller_port)?;
+    let (proxy_port, controller_port) = {
+        let state = runtime
+            .inner
+            .lock()
+            .map_err(|_| "代理内核运行状态锁定失败")?;
+        choose_runtime_ports(&state)?
+    };
+
+    // 大批量测速时跳过 mihomo -t 全量校验（极慢且会卡死取消）；
+    // 仅依赖基础字段过滤 + 启动失败日志剔除。
+    let (nodes, invalid) = if nodes.len() > 80 {
+        (nodes, Vec::new())
+    } else {
+        validate_runtime_nodes(
+            &engine,
+            runtime,
+            nodes,
+            proxy_port,
+            controller_port,
+            cancelled,
+        )?
+    };
+    if cancelled.is_some_and(|token| token.is_cancelled()) {
+        return Err("测速已取消".into());
+    }
     if !invalid.is_empty() {
         let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
         let active = connection
@@ -1339,16 +1779,19 @@ fn ensure_runtime(database: &Database, runtime: &ProxyRuntime) -> Result<(), Str
             .map_err(|error| error.to_string())?
             .unwrap_or_default();
         for (id, _error) in &invalid {
-            connection.execute(
-                "UPDATE proxy_pool_nodes SET latency_ms=NULL, test_status='invalid', tested_at=CURRENT_TIMESTAMP WHERE id=?1",
-                [id],
-            ).map_err(|error| error.to_string())?;
+            connection
+                .execute(
+                    "UPDATE proxy_pool_nodes SET latency_ms=NULL, test_status='invalid', tested_at=CURRENT_TIMESTAMP WHERE id=?1",
+                    [id],
+                )
+                .map_err(|error| error.to_string())?;
             if id == &active {
                 write_meta(&connection, ACTIVE_PROXY_NODE_KEY, "")?;
                 write_meta(&connection, NETWORK_PROXY_KEY, "")?;
             }
         }
     }
+
     let hash = stable_id(&[&serde_json::to_string(
         &nodes.iter().map(|node| &node.config).collect::<Vec<_>>(),
     )
@@ -1368,26 +1811,58 @@ fn ensure_runtime(database: &Database, runtime: &ProxyRuntime) -> Result<(), Str
     let error_log = log_file
         .try_clone()
         .map_err(|error| format!("无法初始化代理内核日志：{error}"))?;
-    let child = Command::new(&engine)
-        .arg("-d")
-        .arg(&runtime.directory)
-        .arg("-f")
-        .arg(&config_path)
-        .stdout(Stdio::from(log_file))
-        .stderr(Stdio::from(error_log))
-        .spawn()
-        .map_err(|error| format!("无法启动 Mihomo：{error}"))?;
-    state.child = Some(child);
-    state.engine_path = engine.display().to_string();
-    state.config_hash = hash;
-    state.proxy_port = proxy_port;
-    state.controller_port = controller_port;
-    state.last_error.clear();
+
+    // 启动进程只短暂持锁；等待就绪必须在锁外，否则 cancel 永远抢不到锁。
+    {
+        let mut state = runtime
+            .inner
+            .lock()
+            .map_err(|_| "代理内核运行状态锁定失败")?;
+        if cancelled.is_some_and(|token| token.is_cancelled()) {
+            stop_child(&mut state);
+            return Err("测速已取消".into());
+        }
+        // 若取消线程已清进程，确保干净后再 spawn。
+        stop_child(&mut state);
+        // 清除继承到的 HTTP(S)_PROXY，防止内核出站先被系统/终端代理再套一层。
+        let child = Command::new(&engine)
+            .arg("-d")
+            .arg(&runtime.directory)
+            .arg("-f")
+            .arg(&config_path)
+            .stdout(Stdio::from(log_file))
+            .stderr(Stdio::from(error_log))
+            .env_remove("http_proxy")
+            .env_remove("https_proxy")
+            .env_remove("HTTP_PROXY")
+            .env_remove("HTTPS_PROXY")
+            .env_remove("ALL_PROXY")
+            .env_remove("all_proxy")
+            .env_remove("SOCKS_PROXY")
+            .env_remove("socks_proxy")
+            .env("NO_PROXY", "*")
+            .env("no_proxy", "*")
+            .spawn()
+            .map_err(|error| format!("无法启动 Mihomo：{error}"))?;
+        state.child = Some(child);
+        state.engine_path = engine.display().to_string();
+        state.config_hash = hash;
+        state.proxy_port = proxy_port;
+        state.controller_port = controller_port;
+        state.last_error.clear();
+    }
+
     let address = SocketAddr::from(([127, 0, 0, 1], controller_port));
     let started = Instant::now();
-    while started.elapsed() < Duration::from_secs(6) {
-        if TcpStream::connect_timeout(&address, Duration::from_millis(150)).is_ok() {
-            return Ok(());
+    while started.elapsed() < Duration::from_secs(8) {
+        if cancelled.is_some_and(|token| token.is_cancelled()) {
+            if let Ok(mut state) = runtime.inner.lock() {
+                stop_child(&mut state);
+            }
+            return Err("测速已取消".into());
+        }
+        if TcpStream::connect_timeout(&address, Duration::from_millis(120)).is_ok() {
+            return wait_runtime_ready(controller_port, nodes.len(), cancelled);
         }
         let startup_log =
             fs::read_to_string(runtime.directory.join("runtime.log")).unwrap_or_default();
@@ -1405,24 +1880,34 @@ fn ensure_runtime(database: &Database, runtime: &ProxyRuntime) -> Result<(), Str
                 .collect::<Vec<_>>()
                 .join("；");
             let message = format!("Mihomo 启动失败：{detail}");
-            state.last_error = message.clone();
-            stop_child(&mut state);
+            if let Ok(mut state) = runtime.inner.lock() {
+                state.last_error = message.clone();
+                stop_child(&mut state);
+            }
             return Err(message);
         }
-        if started.elapsed() >= Duration::from_millis(800)
+        if started.elapsed() >= Duration::from_millis(500)
             && startup_log.contains("Initial configuration complete")
         {
-            return Ok(());
+            // 端口可能稍晚才 listen，继续等 TCP；但若已能连上上面分支会返回。
         }
-        if let Some(child) = state.child.as_mut() {
-            if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
-                let message = format!("Mihomo 启动失败：{status}");
-                state.last_error = message.clone();
-                state.child = None;
-                return Err(message);
+        // 子进程是否已退出
+        if let Ok(mut state) = runtime.inner.lock() {
+            if let Some(child) = state.child.as_mut() {
+                if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
+                    let message = format!("Mihomo 启动失败：{status}");
+                    state.last_error = message.clone();
+                    state.child = None;
+                    return Err(message);
+                }
+            } else {
+                // 取消线程可能已清掉 child
+                if cancelled.is_some_and(|token| token.is_cancelled()) {
+                    return Err("测速已取消".into());
+                }
             }
         }
-        std::thread::sleep(Duration::from_millis(120));
+        std::thread::sleep(Duration::from_millis(80));
     }
     let log = fs::read_to_string(runtime.directory.join("runtime.log")).unwrap_or_default();
     let detail = log
@@ -1439,19 +1924,94 @@ fn ensure_runtime(database: &Database, runtime: &ProxyRuntime) -> Result<(), Str
     } else {
         format!("Mihomo 启动超时：{detail}")
     };
-    state.last_error = message.clone();
-    stop_child(&mut state);
+    if let Ok(mut state) = runtime.inner.lock() {
+        state.last_error = message.clone();
+        stop_child(&mut state);
+    }
     Err(message)
 }
 
 fn controller_client() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(15))
         .pool_max_idle_per_host(BATCH_PROXY_TEST_CONCURRENCY)
         .pool_idle_timeout(Duration::from_secs(30))
         .no_proxy()
         .build()
         .map_err(|error| error.to_string())
+}
+
+fn wait_runtime_ready(
+    controller_port: u16,
+    expected_nodes: usize,
+    cancelled: Option<&CancellationToken>,
+) -> Result<(), String> {
+    // TCP 通了不代表 proxies 已注册完；首次测速全失败多半卡在这里。
+    tauri::async_runtime::block_on(async move {
+        let client = controller_client()?;
+        let started = Instant::now();
+        let deadline = Duration::from_secs(8);
+        let mut last_error = "控制器尚未就绪".to_string();
+        while started.elapsed() < deadline {
+            if let Some(token) = cancelled {
+                if token.is_cancelled() {
+                    return Err("测速已取消".into());
+                }
+            }
+            let version_ok = client
+                .get(controller_url(controller_port, "/version"))
+                .bearer_auth(RUNTIME_SECRET)
+                .timeout(Duration::from_millis(400))
+                .send()
+                .await
+                .ok()
+                .filter(|response| response.status().is_success())
+                .is_some();
+            if !version_ok {
+                last_error = "Mihomo /version 未就绪".into();
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+            let proxies_url = controller_url(controller_port, "/proxies");
+            match client
+                .get(proxies_url)
+                .bearer_auth(RUNTIME_SECRET)
+                .timeout(Duration::from_millis(800))
+                .send()
+                .await
+            {
+                Ok(response) if response.status().is_success() => {
+                    let count = response
+                        .json::<JsonValue>()
+                        .await
+                        .ok()
+                        .and_then(|value| value.get("proxies")?.as_object().map(|obj| obj.len()))
+                        .unwrap_or(0);
+                    // 小批量要求接近完整注册；大批量只要控制器可用且已有部分节点即可开始测速，
+                    // 否则 500+ 节点要等很久，首轮还容易全失败。
+                    // builtins 通常 6~10 个；业务节点名用 id。
+                    let min_required = if expected_nodes <= 40 {
+                        expected_nodes.saturating_add(6)
+                    } else {
+                        expected_nodes.min(40).saturating_add(6)
+                    };
+                    if expected_nodes == 0 || count >= min_required {
+                        tokio::time::sleep(Duration::from_millis(120)).await;
+                        return Ok(());
+                    }
+                    last_error = format!("proxies 仅 {count} 个，等待至少 {min_required} 个就绪(目标 {expected_nodes})");
+                }
+                Ok(response) => {
+                    last_error = format!("读取 /proxies 失败：HTTP {}", response.status().as_u16());
+                }
+                Err(error) => {
+                    last_error = format!("读取 /proxies 失败：{error}");
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(120)).await;
+        }
+        Err(format!("Mihomo 测速就绪超时：{last_error}"))
+    })
 }
 
 async fn test_controller_proxy_delay(
@@ -1467,9 +2027,9 @@ async fn test_controller_proxy_delay(
         .append_pair("timeout", BATCH_PROXY_TEST_TIMEOUT_MS)
         .append_pair("url", &target);
     let response = client
-        .get(endpoint)
+        .get(endpoint.clone())
         .bearer_auth(RUNTIME_SECRET)
-        .timeout(Duration::from_millis(3200))
+        .timeout(Duration::from_millis(12000))
         .send()
         .await
         .ok()?;
@@ -1527,7 +2087,7 @@ pub(crate) fn restore_saved_proxy(database: &Database, runtime: &ProxyRuntime) {
         }
         return;
     }
-    if let Err(error) = ensure_runtime(database, runtime) {
+    if let Err(error) = ensure_runtime(database, runtime, None, None) {
         if let Ok(connection) = database.0.lock() {
             let _ = write_meta(&connection, ACTIVE_PROXY_NODE_KEY, "");
             let _ = write_meta(&connection, NETWORK_PROXY_KEY, "");
@@ -1635,7 +2195,13 @@ pub async fn refresh_proxy_subscription(
     runtime: State<'_, ProxyRuntime>,
     id: String,
 ) -> Result<ProxyPoolRefreshResult, String> {
-    let emit_progress = |stage: &str, status: &str, message: String, completed: usize, total: usize, added: usize, discarded: usize| {
+    let emit_progress = |stage: &str,
+                         status: &str,
+                         message: String,
+                         completed: usize,
+                         total: usize,
+                         added: usize,
+                         discarded: usize| {
         let _ = app.emit(
             "proxy-source-progress",
             ProxySourceProgress {
@@ -1676,7 +2242,8 @@ pub async fn refresh_proxy_subscription(
                     .map(|url| url.scheme().to_string())
                     .as_deref(),
                 Some("http") | Some("https")
-            ) {
+            )
+        {
             "正在下载订阅内容…".into()
         } else {
             "正在读取本地节点链接…".into()
@@ -1725,15 +2292,7 @@ pub async fn refresh_proxy_subscription(
             );
             parse_subscription(&body)
         } else {
-            emit_progress(
-                "parsing",
-                "running",
-                "正在解析节点链接…".into(),
-                0,
-                0,
-                0,
-                0,
-            );
+            emit_progress("parsing", "running", "正在解析节点链接…".into(), 0, 0, 0, 0);
             parse_subscription(&source)
         }
     }
@@ -1941,13 +2500,11 @@ pub async fn refresh_proxy_subscription(
             write_meta(&transaction, NETWORK_PROXY_KEY, "")?;
         }
     }
-    transaction
-        .commit()
-        .map_err(|error| error.to_string())?;
+    transaction.commit().map_err(|error| error.to_string())?;
     drop(connection);
 
     // 配置变更后异步重启运行时，不阻塞导入完成反馈。
-    let _ = ensure_runtime(&database, &runtime);
+    let _ = ensure_runtime(&database, &runtime, None, None);
 
     let subscription = {
         let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
@@ -1976,4 +2533,781 @@ pub async fn refresh_proxy_subscription(
         total,
         discarded,
     })
+}
+
+fn is_slow_or_blocked_speed_test_url(value: &str) -> bool {
+    // Cloudflare generate_204 在不少节点上极慢/失败，不适合作为默认测速。
+    matches!(
+        value.trim(),
+        "https://cp.cloudflare.com/generate_204"
+            | "http://cp.cloudflare.com/generate_204"
+            | "https://cloudflare.com/cdn-cgi/trace"
+    )
+}
+
+fn speed_test_candidates(configured: &str) -> Vec<String> {
+    let configured = configured.trim();
+    let configured = if configured.is_empty() || is_slow_or_blocked_speed_test_url(configured) {
+        DEFAULT_PROXY_SPEED_TEST_URL
+    } else {
+        configured
+    };
+    // 批量测速只打用户选定/默认地址，避免每个节点串多个 fallback 把结果拖成“假慢”。
+    vec![configured.to_string()]
+}
+
+fn normalize_ignore_addresses(value: &str) -> String {
+    let mut items = value
+        .split(|character: char| character == ',' || character == '\n' || character == ';')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    for required in [
+        "localhost",
+        "127.0.0.1",
+        "::1",
+        ".local",
+        "10.0.0.0/8",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+    ] {
+        if !items.iter().any(|item| item.eq_ignore_ascii_case(required)) {
+            items.push(required.to_string());
+        }
+    }
+    items.join(",")
+}
+
+pub(crate) fn list_fast_proxy_nodes(
+    database: &Database,
+    max_latency_ms: i64,
+) -> Result<Vec<(String, String, i64)>, String> {
+    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    let mut statement = connection
+        .prepare(
+            "SELECT id, name, latency_ms
+             FROM proxy_pool_nodes
+             WHERE test_status = 'success'
+               AND latency_ms IS NOT NULL
+               AND latency_ms > 0
+               AND latency_ms <= ?1
+             ORDER BY latency_ms ASC, name COLLATE NOCASE",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([max_latency_ms], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    Ok(rows)
+}
+
+/// 仅供公益监听等后台任务使用：只临时切换 Mihomo 出口节点，
+/// 不写 ACTIVE_PROXY_NODE_KEY / NETWORK_PROXY_KEY，绝不覆盖用户手动开启的全局代理。
+pub(crate) async fn activate_proxy_node_transient(
+    database: &Database,
+    runtime: &ProxyRuntime,
+    node_id: &str,
+) -> Result<(), String> {
+    let runtime_name = {
+        let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+        connection
+            .query_row(
+                "SELECT id FROM proxy_pool_nodes WHERE id=?1",
+                [node_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .ok_or("代理节点不存在")?
+    };
+    // ensure_runtime 内部可能 thread::sleep，必须 block_in_place，避免堵死 async worker / UI。
+    let only = HashSet::from([runtime_name.clone()]);
+    tokio::task::block_in_place(|| ensure_runtime(database, runtime, Some(&only), None))?;
+    select_runtime_node(runtime, &runtime_name).await?;
+    Ok(())
+}
+
+/// 恢复 Mihomo 出口到用户手动开启的全局代理节点；若全局代理未开启则不动。
+/// 全程不写全局代理状态。
+pub(crate) async fn restore_proxy_node_transient(
+    database: &Database,
+    runtime: &ProxyRuntime,
+) -> Result<(), String> {
+    let active_id = read_meta(database, ACTIVE_PROXY_NODE_KEY)?;
+    if active_id.trim().is_empty() {
+        return Ok(());
+    }
+    let runtime_name = {
+        let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+        connection
+            .query_row(
+                "SELECT id FROM proxy_pool_nodes WHERE id=?1",
+                [active_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .ok_or("全局代理节点不存在")?
+    };
+    // 先确保内核在跑，再切回用户节点
+    let only = HashSet::from([runtime_name.clone()]);
+    tokio::task::block_in_place(|| ensure_runtime(database, runtime, Some(&only), None))?;
+    select_runtime_node(runtime, &runtime_name).await
+}
+
+/// 返回当前 Mihomo 混合端口地址，供后台任务显式走代理（不依赖全局代理设置）。
+pub(crate) fn runtime_proxy_url_pub(runtime: &ProxyRuntime) -> String {
+    runtime_proxy_url(runtime)
+}
+
+#[tauri::command]
+pub fn set_proxy_pool_settings(
+    database: State<'_, Database>,
+    runtime: State<'_, ProxyRuntime>,
+    ignore_addresses: String,
+    speed_test_url: String,
+) -> Result<ProxyPoolState, String> {
+    let speed_test_url = speed_test_url.trim();
+    let parsed = Url::parse(speed_test_url).map_err(|_| "测速地址格式无效".to_string())?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err("测速地址必须是 HTTP(S) 地址".into());
+    }
+    let ignore = normalize_ignore_addresses(&ignore_addresses);
+    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    write_meta(&connection, PROXY_IGNORE_KEY, &ignore)?;
+    write_meta(&connection, PROXY_SPEED_TEST_URL_KEY, speed_test_url)?;
+    drop(connection);
+    load_state(&database, &runtime)
+}
+
+#[tauri::command]
+pub async fn set_active_proxy_node(
+    database: State<'_, Database>,
+    runtime: State<'_, ProxyRuntime>,
+    node_id: String,
+) -> Result<ProxyPoolState, String> {
+    let runtime_name = {
+        let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+        connection
+            .query_row(
+                "SELECT id FROM proxy_pool_nodes WHERE id=?1",
+                [&node_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .ok_or("代理节点不存在")?
+    };
+    let only = HashSet::from([runtime_name.clone()]);
+    ensure_runtime(&database, &runtime, Some(&only), None)?;
+    select_runtime_node(&runtime, &runtime_name).await?;
+    let proxy_url = runtime_proxy_url(&runtime);
+    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    write_meta(&connection, ACTIVE_PROXY_NODE_KEY, &node_id)?;
+    write_meta(&connection, NETWORK_PROXY_KEY, &proxy_url)?;
+    drop(connection);
+    load_state(&database, &runtime)
+}
+
+#[tauri::command]
+pub fn clear_active_proxy_node(
+    database: State<'_, Database>,
+    runtime: State<'_, ProxyRuntime>,
+) -> Result<ProxyPoolState, String> {
+    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    write_meta(&connection, ACTIVE_PROXY_NODE_KEY, "")?;
+    write_meta(&connection, NETWORK_PROXY_KEY, "")?;
+    drop(connection);
+    load_state(&database, &runtime)
+}
+
+#[tauri::command]
+pub fn delete_invalid_proxy_nodes(
+    database: State<'_, Database>,
+    runtime: State<'_, ProxyRuntime>,
+) -> Result<ProxyPoolState, String> {
+    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    connection
+        .execute(
+            "DELETE FROM proxy_pool_nodes WHERE test_status = 'invalid'",
+            [],
+        )
+        .map_err(|error| error.to_string())?;
+    drop(connection);
+    if let Ok(mut state) = runtime.inner.lock() {
+        state.config_hash.clear();
+    }
+    load_state(&database, &runtime)
+}
+
+#[tauri::command]
+pub async fn test_proxy_node(
+    database: State<'_, Database>,
+    runtime: State<'_, ProxyRuntime>,
+    node_id: String,
+) -> Result<ProxyNode, String> {
+    // 单节点测速使用独立内核，不切换、不停止用户手动开启的全局代理。
+    let test_id = runtime.next_test_id.fetch_add(1, Ordering::Relaxed);
+    let test_directory = runtime.directory.join(format!("single-test-{test_id}"));
+    let _test_directory_cleanup = TemporaryRuntimeDirectory(test_directory.clone());
+    let port_offset = ((test_id % 100) as u16).saturating_mul(2);
+    let test_runtime = ProxyRuntime::new_with_ports(
+        test_directory,
+        37890u16.saturating_add(port_offset),
+        39090u16.saturating_add(port_offset),
+    );
+    let only = HashSet::from([node_id.clone()]);
+    tokio::task::block_in_place(|| ensure_runtime(&database, &test_runtime, Some(&only), None))?;
+    let controller_port = runtime_controller_port(&test_runtime)?;
+    let configured = {
+        let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+        let exists = connection
+            .query_row(
+                "SELECT 1 FROM proxy_pool_nodes WHERE id=?1",
+                [&node_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .is_some();
+        if !exists {
+            return Err("代理节点不存在".into());
+        }
+        connection
+            .query_row(
+                "SELECT value FROM app_meta WHERE key=?1",
+                [PROXY_SPEED_TEST_URL_KEY],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .filter(|item| !item.is_empty() && !is_slow_or_blocked_speed_test_url(item))
+            .unwrap_or_else(|| DEFAULT_PROXY_SPEED_TEST_URL.to_string())
+    };
+    let client = controller_client()?;
+    let mut latency = None;
+    let mut attempted = Vec::new();
+    for target in speed_test_candidates(&configured) {
+        attempted.push(target.clone());
+        latency =
+            test_controller_proxy_delay(client.clone(), controller_port, node_id.clone(), target)
+                .await;
+        if latency.is_some() {
+            break;
+        }
+    }
+    let status = if latency.is_some() {
+        "success"
+    } else {
+        "error"
+    };
+    let error_message = if latency.is_some() {
+        None
+    } else {
+        Some(format!("测速失败，已尝试 {} 个测速地址", attempted.len()))
+    };
+    {
+        let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+        connection
+            .execute(
+                "UPDATE proxy_pool_nodes SET latency_ms=?2, test_status=?3, tested_at=CURRENT_TIMESTAMP WHERE id=?1",
+                params![node_id, latency, status],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    drop(test_runtime);
+    let state = load_state(&database, &runtime)?;
+    let node = state
+        .nodes
+        .into_iter()
+        .find(|item| item.id == node_id)
+        .ok_or("测速后读取节点失败")?;
+    if let Some(error) = error_message {
+        Err(error)
+    } else {
+        Ok(node)
+    }
+}
+
+async fn run_proxy_node_pool(
+    app: &AppHandle,
+    database: &Database,
+    runtime: &ProxyRuntime,
+    requested_node_ids: Option<HashSet<String>>,
+) -> Result<ProxyPoolState, String> {
+    // 测速策略（对齐 Clash Verge Rev DelayManager.checkListDelay）：
+    // 1) 只测请求集合（选中来源/指定节点/全部）
+    // 2) 待测节点装入 Mihomo 后并行 delay，不在节点之间重启内核
+    // 3) 并发上限 10（与 Verge 前端 actualConcurrency 一致）
+    // 4) 固定测速 URL；每条代理独立拨号计时
+    // 5) 测速使用独立 Mihomo 运行时，不覆盖或重启用户的全局代理出口
+    let configured = {
+        let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+        connection
+            .query_row(
+                "SELECT value FROM app_meta WHERE key=?1",
+                [PROXY_SPEED_TEST_URL_KEY],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .filter(|item| !item.is_empty() && !is_slow_or_blocked_speed_test_url(item))
+            .unwrap_or_else(|| DEFAULT_PROXY_SPEED_TEST_URL.to_string())
+    };
+    let nodes = {
+        let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+        let mut statement = connection
+            .prepare("SELECT id, test_status FROM proxy_pool_nodes")
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        rows
+    };
+    let testable_nodes = nodes
+        .into_iter()
+        .filter(|(id, status)| {
+            status != "invalid"
+                && requested_node_ids
+                    .as_ref()
+                    .map(|requested| requested.contains(id))
+                    .unwrap_or(true)
+        })
+        .collect::<Vec<_>>();
+    let total = testable_nodes.len();
+    if total == 0 {
+        return Err("没有可测速的代理节点".into());
+    }
+
+    let targets = speed_test_candidates(&configured);
+    let client = controller_client()?;
+    let test_lease = runtime.start_proxy_test()?;
+    let cancellation = test_lease.cancellation.clone();
+    // 独立目录 + 独立端口范围：避免与全局代理、热重载残留进程争抢端口。
+    let test_directory = runtime
+        .directory
+        .join(format!("speed-test-{}", test_lease.id));
+    let _test_directory_cleanup = TemporaryRuntimeDirectory(test_directory.clone());
+    let port_offset = ((test_lease.id % 100) as u16).saturating_mul(2);
+    let speed_runtime = ProxyRuntime::new_with_ports(
+        test_directory,
+        27890u16.saturating_add(port_offset),
+        29090u16.saturating_add(port_offset),
+    );
+
+    let mut completed = 0usize;
+    let mut succeeded = 0usize;
+    let mut cancelled = false;
+    let mut pending_writes: Vec<(String, Option<i64>)> = Vec::with_capacity(64);
+    let mut last_flush = Instant::now();
+    let flush_writes = |pending: &mut Vec<(String, Option<i64>)>| -> Result<(), String> {
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+        let tx = connection
+            .unchecked_transaction()
+            .map_err(|error| error.to_string())?;
+        for (id, delay) in pending.drain(..) {
+            if let Some(delay) = delay {
+                tx.execute(
+                    "UPDATE proxy_pool_nodes SET latency_ms=?2, test_status='success', tested_at=CURRENT_TIMESTAMP WHERE id=?1",
+                    params![id, delay],
+                )
+                .map_err(|error| error.to_string())?;
+            } else {
+                tx.execute(
+                    "UPDATE proxy_pool_nodes SET latency_ms=NULL, test_status='error', tested_at=CURRENT_TIMESTAMP WHERE id=?1",
+                    [&id],
+                )
+                .map_err(|error| error.to_string())?;
+            }
+        }
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(())
+    };
+
+    for chunk in testable_nodes.chunks(BATCH_PROXY_TEST_NODE_CHUNK) {
+        if cancellation.is_cancelled() {
+            cancelled = true;
+            break;
+        }
+        let chunk_ids = chunk
+            .iter()
+            .map(|(id, _)| id.clone())
+            .collect::<HashSet<_>>();
+        // 大列表才分块装载；块内并行 delay，块与块之间才切换配置。
+        // ensure_runtime 含同步等待/子进程，必须 block_in_place，否则会堵死 async worker 导致取消无响应。
+        if let Err(error) = tokio::task::block_in_place(|| {
+            ensure_runtime(
+                database,
+                &speed_runtime,
+                Some(&chunk_ids),
+                Some(&cancellation),
+            )
+        }) {
+            if cancellation.is_cancelled() || error.contains("已取消") {
+                cancelled = true;
+                break;
+            }
+            // 块装载失败时，把该块记为 error 并继续，避免整次测速全挂。
+            for (id, _) in chunk {
+                completed += 1;
+                pending_writes.push((id.clone(), None));
+                let _ = app.emit(
+                    "proxy-node-test-progress",
+                    ProxyNodeTestProgress {
+                        node_id: id.clone(),
+                        phase: "completed".to_string(),
+                        latency_ms: None,
+                        status: "error".to_string(),
+                        completed,
+                        total,
+                    },
+                );
+            }
+            eprintln!("OpenHub 测速分块装载失败：{error}");
+            if pending_writes.len() >= 40 || last_flush.elapsed() >= Duration::from_millis(100) {
+                flush_writes(&mut pending_writes)?;
+                last_flush = Instant::now();
+            }
+            continue;
+        }
+        let controller_port = match runtime_controller_port(&speed_runtime) {
+            Ok(port) => port,
+            Err(error) => {
+                for (id, _) in chunk {
+                    completed += 1;
+                    pending_writes.push((id.clone(), None));
+                    let _ = app.emit(
+                        "proxy-node-test-progress",
+                        ProxyNodeTestProgress {
+                            node_id: id.clone(),
+                            phase: "completed".to_string(),
+                            latency_ms: None,
+                            status: "error".to_string(),
+                            completed,
+                            total,
+                        },
+                    );
+                }
+                eprintln!("OpenHub 测速读取控制器失败：{error}");
+                continue;
+            }
+        };
+        if let Err(error) = tokio::task::block_in_place(|| {
+            wait_runtime_ready(controller_port, chunk.len(), Some(&cancellation))
+        }) {
+            // 用户取消也会走到这里：立即结束，不要把整块标成 error。
+            if cancellation.is_cancelled() || error.contains("已取消") {
+                cancelled = true;
+                break;
+            }
+            for (id, _) in chunk {
+                completed += 1;
+                pending_writes.push((id.clone(), None));
+                let _ = app.emit(
+                    "proxy-node-test-progress",
+                    ProxyNodeTestProgress {
+                        node_id: id.clone(),
+                        phase: "completed".to_string(),
+                        latency_ms: None,
+                        status: "error".to_string(),
+                        completed,
+                        total,
+                    },
+                );
+            }
+            eprintln!("OpenHub 测速等待内核就绪失败：{error}");
+            continue;
+        }
+
+        let mut results = stream::iter(chunk.to_vec())
+            .map(|(id, _status)| {
+                let client = client.clone();
+                let targets = targets.clone();
+                let app = app.clone();
+                let cancellation = cancellation.clone();
+                async move {
+                    if cancellation.is_cancelled() {
+                        return (id, None, true);
+                    }
+                    let _ = app.emit(
+                        "proxy-node-test-progress",
+                        ProxyNodeTestProgress {
+                            node_id: id.clone(),
+                            phase: "started".to_string(),
+                            status: "testing".to_string(),
+                            total,
+                            ..Default::default()
+                        },
+                    );
+                    // 与 Clash 相同：固定测速 URL + 独立 delay。
+                    // 并行由 buffer_unordered 控制，不在这里串行化。
+                    if cancellation.is_cancelled() {
+                        return (id, None, true);
+                    }
+                    let target = targets
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| DEFAULT_PROXY_SPEED_TEST_URL.to_string());
+                    let request =
+                        test_controller_proxy_delay(client, controller_port, id.clone(), target);
+                    let cancelled = cancellation.cancelled();
+                    pin_mut!(request, cancelled);
+                    match future::select(request, cancelled).await {
+                        future::Either::Left((delay, _)) => (id, delay, false),
+                        future::Either::Right((_, _)) => (id, None, true),
+                    }
+                }
+            })
+            // Clash Verge: actualConcurrency = min(concurrency, names.length, 10)
+            .buffer_unordered(std::cmp::min(BATCH_PROXY_TEST_CONCURRENCY, chunk.len()).max(1));
+
+        while let Some((id, delay, node_cancelled)) = results.next().await {
+            if node_cancelled || cancellation.is_cancelled() {
+                cancelled = true;
+                let _ = app.emit(
+                    "proxy-node-test-progress",
+                    ProxyNodeTestProgress {
+                        node_id: id,
+                        phase: "completed".to_string(),
+                        latency_ms: None,
+                        status: "cancelled".to_string(),
+                        completed,
+                        total,
+                    },
+                );
+                // 一旦取消：丢掉剩余 in-flight future，尽快返回前端。
+                drop(results);
+                break;
+            }
+            completed += 1;
+            let status = if delay.is_some() { "success" } else { "error" };
+            if delay.is_some() {
+                succeeded += 1;
+            }
+            pending_writes.push((id.clone(), delay));
+            if pending_writes.len() >= 40 || last_flush.elapsed() >= Duration::from_millis(100) {
+                flush_writes(&mut pending_writes)?;
+                last_flush = Instant::now();
+            }
+            let _ = app.emit(
+                "proxy-node-test-progress",
+                ProxyNodeTestProgress {
+                    node_id: id,
+                    phase: "completed".to_string(),
+                    latency_ms: delay,
+                    status: status.to_string(),
+                    completed,
+                    total,
+                },
+            );
+        }
+        if cancellation.is_cancelled() {
+            cancelled = true;
+            break;
+        }
+    }
+
+    flush_writes(&mut pending_writes)?;
+    // 先停止独立测速内核，再释放任务 lease；全局代理进程从未被触碰。
+    drop(speed_runtime);
+    drop(test_lease);
+    let state = load_state(database, runtime)?;
+    // 即使全部失败也返回状态，让前端能看到每个节点的 error；
+    // 避免只丢一句总错误、无法继续排查。
+    let _ = succeeded;
+    let _ = cancelled;
+    Ok(state)
+}
+
+#[tauri::command]
+pub fn cancel_proxy_node_tests(runtime: State<'_, ProxyRuntime>) -> Result<bool, String> {
+    // 前端只关心“是否发出取消”；不要因内部状态抛异常。
+    match runtime.cancel_proxy_test() {
+        Ok(v) => Ok(v),
+        Err(error) => {
+            eprintln!("OpenHub 取消测速内部警告：{error}");
+            Ok(false)
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn test_all_proxy_nodes(
+    app: AppHandle,
+    database: State<'_, Database>,
+    runtime: State<'_, ProxyRuntime>,
+) -> Result<ProxyPoolState, String> {
+    run_proxy_node_pool(&app, &database, &runtime, None).await
+}
+
+#[tauri::command]
+pub async fn test_proxy_nodes(
+    app: AppHandle,
+    database: State<'_, Database>,
+    runtime: State<'_, ProxyRuntime>,
+    node_ids: Vec<String>,
+) -> Result<ProxyPoolState, String> {
+    let requested = node_ids
+        .into_iter()
+        .filter(|id| !id.trim().is_empty())
+        .collect::<HashSet<_>>();
+    if requested.is_empty() {
+        return Err("请选择需要测速的节点".into());
+    }
+    run_proxy_node_pool(&app, &database, &runtime, Some(requested)).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn proxy_test_task_can_be_cancelled_and_released() {
+        let runtime = ProxyRuntime::new(std::env::temp_dir().join("openhub-proxy-cancel-test"));
+        let lease = runtime.start_proxy_test().unwrap();
+        assert!(runtime.start_proxy_test().is_err());
+        assert!(runtime.cancel_proxy_test().unwrap());
+        assert!(lease.cancellation.is_cancelled());
+        drop(lease);
+        assert!(!runtime.cancel_proxy_test().unwrap());
+        assert!(runtime.start_proxy_test().is_ok());
+    }
+
+    #[test]
+    fn deduplicates_nodes_without_using_display_name() {
+        let first = parse_subscription("proxies:\n  - name: HK A\n    type: ss\n    server: hk.example.com\n    port: 443\n    cipher: aes-128-gcm\n    password: secret\n").unwrap();
+        let second = parse_subscription("proxies:\n  - name: Another name\n    type: ss\n    server: hk.example.com\n    port: 443\n    cipher: aes-128-gcm\n    password: secret\n").unwrap();
+        assert_eq!(first[0].id, second[0].id);
+    }
+
+    #[test]
+    fn keeps_different_credentials_as_different_nodes() {
+        let first = parse_subscription("proxies:\n  - name: A\n    type: ss\n    server: hk.example.com\n    port: 443\n    cipher: aes-128-gcm\n    password: secret-a\n").unwrap();
+        let second = parse_subscription("proxies:\n  - name: B\n    type: ss\n    server: hk.example.com\n    port: 443\n    cipher: aes-128-gcm\n    password: secret-b\n").unwrap();
+        assert_ne!(first[0].id, second[0].id);
+    }
+
+    #[test]
+    fn rejects_incomplete_shadowsocks_nodes_before_runtime_start() {
+        let node = parse_subscription(
+            "proxies:\n  - name: bad\n    type: ss\n    server: hk.example.com\n    port: 443\n",
+        )
+        .unwrap();
+        assert!(basic_node_config_error(&node[0].raw_json).is_some());
+    }
+
+    #[test]
+    fn rejects_proxy_nodes_with_out_of_range_ports() {
+        let node = parse_subscription("proxies:\n  - name: bad-port\n    type: http\n    server: example.com\n    port: 70000\n").unwrap();
+        assert!(basic_node_config_error(&node[0].raw_json).is_some());
+    }
+
+    #[test]
+    fn parses_vmess_websocket_options() {
+        // host/path/net must be preserved; otherwise delay test always fails.
+        let line = "vmess://eyJwb3J0Ijo4MDAsInBzIjoiSEstd3MiLCJ0bHMiOiIiLCJpZCI6InV1aWQtMSIsImFpZCI6IjIiLCJ2IjoiMiIsImhvc3QiOiJiY2UuYmRzdGF0aWMuY29tIiwidHlwZSI6Im5vbmUiLCJwYXRoIjoiLyIsIm5ldCI6IndzIiwiYWRkIjoiaGtnNC5pZ2NhY2hlcy5jb20ifQ==";
+        let node = parse_uri_node(line).expect("vmess parse");
+        assert_eq!(node.proxy_type, "vmess");
+        assert_eq!(
+            node.raw_json.get("network").and_then(|v| v.as_str()),
+            Some("ws")
+        );
+        assert_eq!(
+            node.raw_json
+                .pointer("/ws-opts/path")
+                .and_then(|v| v.as_str()),
+            Some("/")
+        );
+        assert_eq!(
+            node.raw_json
+                .pointer("/ws-opts/headers/Host")
+                .and_then(|v| v.as_str()),
+            Some("bce.bdstatic.com")
+        );
+    }
+
+    #[test]
+    fn parses_ssocks_and_base64_https_proxy_uris() {
+        use base64::{engine::general_purpose, Engine as _};
+        // ssocks / https base64 payload = base64("user:pass@host.example.com:1080") etc.
+        let body = [
+            "ssocks://dXNlcjpwYXNzQGhvc3QuZXhhbXBsZS5jb206MTA4MA==?remarks=HK-Socks&method=auto",
+            "https://dXNlcjpwYXNzQGhvc3QuZXhhbXBsZS5jb206ODQ0Mw==#HK-HTTPS",
+            "anytls://secret@any.example.com:443#AnyTLS-Node",
+            "tuic://uuid-1:pass-1@tuic.example.com:8443?alpn=h3&congestion_control=bbr#TUIC-Node",
+            "vmess://eyJwb3J0Ijo0NDMsInBzIjoiVk0iLCJhZGQiOiJ2bS5leGFtcGxlLmNvbSIsImlkIjoidXVpZC0yIiwiYWlkIjowLCJzY3kiOiJhdXRvIiwidGxzIjoiIn0=",
+        ]
+        .join("\n");
+        let encoded = general_purpose::STANDARD.encode(body.as_bytes());
+        let nodes = parse_subscription(&encoded).unwrap();
+        assert!(nodes.len() >= 5, "got {}", nodes.len());
+        assert!(nodes
+            .iter()
+            .any(|n| n.proxy_type == "socks5" && n.name.contains("HK-Socks")));
+        assert!(nodes
+            .iter()
+            .any(|n| n.proxy_type == "http" && n.name.contains("HK-HTTPS")));
+        assert!(nodes.iter().any(|n| n.proxy_type == "anytls"));
+        assert!(nodes.iter().any(|n| n.proxy_type == "tuic"));
+        assert!(nodes.iter().any(|n| n.proxy_type == "vmess"));
+    }
+
+    #[test]
+    fn local_addresses_are_always_ignored() {
+        let value = normalize_ignore_addresses("example.com");
+        assert!(value.contains("127.0.0.1"));
+        assert!(value.contains("192.168.0.0/16"));
+    }
+
+    #[test]
+    fn speed_test_uses_selected_or_default_url() {
+        let list = speed_test_candidates("https://cp.cloudflare.com/generate_204");
+        assert_eq!(list, vec![DEFAULT_PROXY_SPEED_TEST_URL.to_string()]);
+        let list = speed_test_candidates("http://www.gstatic.com/generate_204");
+        assert_eq!(
+            list,
+            vec!["http://www.gstatic.com/generate_204".to_string()]
+        );
+    }
+
+    #[test]
+    fn controller_paths_do_not_contain_double_slashes() {
+        let mut endpoint = Url::parse(&controller_url(19090, "/proxies/")).unwrap();
+        append_controller_path(&mut endpoint, &["NodeA", "delay"]).unwrap();
+        assert!(!endpoint.path().contains("//"));
+        assert!(endpoint.path().ends_with("/proxies/NodeA/delay"));
+    }
+
+    #[test]
+    fn extracts_zero_based_mihomo_proxy_error_index() {
+        assert_eq!(proxy_error_index("proxy 0: missing password"), Some(0));
+        assert_eq!(proxy_error_index("no index here"), None);
+    }
+
+    #[test]
+    fn reads_country_from_available_geoip_database() {
+        let Some(path) = find_geoip_database(&ProxyRuntime::new(
+            std::env::temp_dir().join("openhub-geoip-test"),
+        )) else {
+            return;
+        };
+        let reader = Reader::open_readfile(path).unwrap();
+        let country = geoip_country(&reader, "89.160.20.128".parse().unwrap()).unwrap();
+        assert_eq!(country.0, "SE");
+    }
 }

@@ -413,6 +413,7 @@ async function analyzeChromeUsage(
   siteId?: string,
   runId?: number,
   siteIds?: string[],
+  extractOnly = false,
 ): Promise<ChromeUsageScanResult | null> {
   if (chromeUsageScanning.value) return chromeUsageScanResult.value;
   if (chromeSessionDialogOpen.value) {
@@ -430,6 +431,7 @@ async function analyzeChromeUsage(
         ...(siteId ? { siteId } : {}),
         ...(siteIds ? { siteIds } : {}),
         ...(runId ? { runId } : {}),
+        extractOnly,
       },
     );
     chromeUsageScanResult.value = result;
@@ -438,12 +440,12 @@ async function analyzeChromeUsage(
       appendChromeBrowserSyncLog({
         stage: "scan-running",
         status: "success",
-        message: `扫描完成：${result.detected} 个站点、${result.accounts} 个合法账号${result.warnings ? `，${result.warnings} 个警告` : ""}`,
+        message: `扫描完成：${result.detected} 个站点、${result.accounts} 个合法账号${result.newlyMarked ? `，新待定 ${result.newlyMarked} 个` : ""}${result.warnings ? `，${result.warnings} 个警告` : ""}`,
       });
     }
     if (notify) {
       showToast(
-        `账号缓存已更新：${result.detected} 个站点、${result.accounts} 个合法账号${result.warnings ? `，${result.warnings} 个警告` : ""}`,
+        `账号缓存已更新：${result.detected} 个站点、${result.accounts} 个合法账号${result.newlyMarked ? `，新待定 ${result.newlyMarked} 个` : ""}${result.warnings ? `，${result.warnings} 个警告` : ""}`,
       );
     }
     return result;

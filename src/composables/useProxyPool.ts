@@ -1,6 +1,6 @@
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { computed, ref } from "vue";
-import type { ProxyIpAnalysis, ProxyNode, ProxyNodeTestProgress, ProxyPoolRefreshResult, ProxyPoolState } from "../types";
+import type { ProxyIpAnalysis, ProxyNode, ProxyNodeTestProgress, ProxyPoolRefreshResult, ProxyPoolState, ProxySourceProgress } from "../types";
 import { runCommand } from "./useLibrary";
 
 const isTauri = "__TAURI_INTERNALS__" in window;
@@ -17,11 +17,17 @@ const proxyPool = ref<ProxyPoolState>(emptyState());
 const proxyPoolLoading = ref(false);
 const proxyPoolError = ref("");
 const proxyPoolBusyId = ref("");
+// 节点切换是独立状态，不再占用全局 busy，避免整片节点卡片变灰。
+const proxyPoolSwitchingNodeId = ref("");
+let desiredProxyNodeId = "";
+let activationWorker: Promise<void> | null = null;
+let lastActivationError: unknown = null;
 const testingNodeIds = ref<Set<string>>(new Set());
 const proxyTestProgress = ref({ completed: 0, total: 0 });
 const proxyTestCancelling = ref(false);
 const proxyTestCancelRequested = ref(false);
 const proxyNodesRevision = ref(0);
+const proxySourceProgress = ref<Record<string, ProxySourceProgress>>({});
 
 function bumpProxyNodesRevision() {
   proxyNodesRevision.value += 1;
@@ -53,18 +59,44 @@ async function analyzeProxyNodes() {
 }
 
 async function saveProxySubscription(name: string, url: string, id?: string) {
-  proxyPoolBusyId.value = id || "new";
   proxyPoolError.value = "";
-  try {
-    const subscription = await runCommand<{ id: string }>("save_proxy_subscription", { id: id || null, name, url });
-    await refreshProxySubscription(subscription.id);
-    return subscription;
-  } catch (error) {
-    proxyPoolError.value = String(error);
-    throw error;
-  } finally {
-    proxyPoolBusyId.value = "";
-  }
+  // 先保存来源并立刻刷新列表，让地址先出现；再异步解析节点。
+  const subscription = await runCommand<{ id: string; name?: string; url?: string; nodeCount?: number; lastError?: string; createdAt?: string; updatedAt?: string }>(
+    "save_proxy_subscription",
+    { id: id || null, name, url },
+  );
+  const now = new Date().toISOString();
+  const existing = proxyPool.value.subscriptions.find((item) => item.id === subscription.id);
+  const nextSub = {
+    id: subscription.id,
+    name: subscription.name || name,
+    url: subscription.url || url,
+    nodeCount: subscription.nodeCount ?? existing?.nodeCount ?? 0,
+    lastError: subscription.lastError ?? "",
+    createdAt: subscription.createdAt || existing?.createdAt || now,
+    updatedAt: subscription.updatedAt || now,
+  };
+  proxyPool.value = {
+    ...proxyPool.value,
+    subscriptions: [nextSub, ...proxyPool.value.subscriptions.filter((item) => item.id !== nextSub.id)],
+    subscriptionCount: 0, // temp, fixed below
+  };
+  proxyPool.value.subscriptionCount = proxyPool.value.subscriptions.length;
+  proxySourceProgress.value = {
+    ...proxySourceProgress.value,
+    [nextSub.id]: {
+      sourceId: nextSub.id,
+      stage: "queued",
+      status: "running",
+      message: "来源已保存，准备解析…",
+      completed: 0,
+      total: 0,
+      added: 0,
+      discarded: 0,
+    },
+  };
+  const result = await refreshProxySubscription(nextSub.id);
+  return result;
 }
 
 async function deleteProxySubscription(id: string) {
@@ -84,17 +116,82 @@ async function deleteProxySubscription(id: string) {
 async function refreshProxySubscription(id: string) {
   proxyPoolBusyId.value = id;
   proxyPoolError.value = "";
+  proxySourceProgress.value = {
+    ...proxySourceProgress.value,
+    [id]: {
+      sourceId: id,
+      stage: "queued",
+      status: "running",
+      message: "准备刷新…",
+      completed: 0,
+      total: 0,
+      added: 0,
+      discarded: 0,
+    },
+  };
+  let unlisten: UnlistenFn | undefined;
+  if (isTauri) {
+    try {
+      unlisten = await listen<ProxySourceProgress>("proxy-source-progress", ({ payload }) => {
+        if (payload.sourceId !== id) return;
+        proxySourceProgress.value = {
+          ...proxySourceProgress.value,
+          [id]: payload,
+        };
+        // 解析过程中同步更新来源卡片上的错误/数量提示。
+        const index = proxyPool.value.subscriptions.findIndex((item) => item.id === id);
+        if (index >= 0) {
+          const current = proxyPool.value.subscriptions[index];
+          proxyPool.value.subscriptions[index] = {
+            ...current,
+            lastError: payload.stage === "error" ? payload.message : "",
+            nodeCount: payload.stage === "done" ? payload.total : current.nodeCount,
+            updatedAt: new Date().toISOString(),
+          };
+        }
+      });
+    } catch {
+      /* progress is best-effort */
+    }
+  }
   try {
     const result = await runCommand<ProxyPoolRefreshResult>("refresh_proxy_subscription", { id });
     await loadProxyPool();
+    proxySourceProgress.value = {
+      ...proxySourceProgress.value,
+      [id]: {
+        sourceId: id,
+        stage: "done",
+        status: "success",
+        message: `解析完成：${result.total} 个节点，新增 ${result.added}，过滤 ${result.discarded}`,
+        completed: result.total,
+        total: result.total,
+        added: result.added,
+        discarded: result.discarded,
+      },
+    };
     return result;
   } catch (error) {
     const message = String(error);
     await loadProxyPool();
     proxyPoolError.value = message;
+    proxySourceProgress.value = {
+      ...proxySourceProgress.value,
+      [id]: {
+        sourceId: id,
+        stage: "error",
+        status: "error",
+        message,
+        completed: 0,
+        total: 0,
+        added: 0,
+        discarded: 0,
+      },
+    };
     throw error;
   } finally {
-    proxyPoolBusyId.value = "";
+    unlisten?.();
+    if (proxyPoolBusyId.value === id) proxyPoolBusyId.value = "";
   }
 }
 
@@ -103,11 +200,18 @@ async function refreshAllProxySubscriptions() {
   if (!ids.length) return { succeeded: 0, failed: 0, discarded: 0 };
   proxyPoolBusyId.value = "all";
   proxyPoolError.value = "";
-  const results = await Promise.allSettled(ids.map((id) => runCommand<ProxyPoolRefreshResult>("refresh_proxy_subscription", { id })));
-  await loadProxyPool();
-  const failed = results.filter((result) => result.status === "rejected").length;
-  const discarded = results.reduce((sum, result) => sum + (result.status === "fulfilled" ? result.value.discarded : 0), 0);
-  if (failed) proxyPoolError.value = `${failed} 个导入源刷新失败，请查看左侧错误信息`;
+  let failed = 0;
+  let discarded = 0;
+  // 串行刷新，保证每个来源卡片都能看到完整进度，也避免同时压垮网络。
+  for (const id of ids) {
+    try {
+      const result = await refreshProxySubscription(id);
+      discarded += result.discarded;
+    } catch {
+      failed += 1;
+    }
+  }
+  if (failed) proxyPoolError.value = `${failed} 个导入源刷新失败，请查看来源卡片错误信息`;
   proxyPoolBusyId.value = "";
   return { succeeded: ids.length - failed, failed, discarded };
 }
@@ -123,18 +227,35 @@ async function saveProxyPoolSettings(ignoreAddresses: string, speedTestUrl: stri
   }
 }
 
-async function activateProxyNode(nodeId: string) {
-  proxyPoolBusyId.value = nodeId;
-  proxyPoolError.value = "";
-  try {
-    proxyPool.value = await runCommand<ProxyPoolState>("set_active_proxy_node", { nodeId });
-    bumpProxyNodesRevision();
-  } catch (error) {
-    proxyPoolError.value = String(error);
-    throw error;
-  } finally {
-    proxyPoolBusyId.value = "";
+async function runProxyActivationQueue() {
+  while (desiredProxyNodeId) {
+    // latest-wins：切换过程中继续点其他节点时，只执行最后一次选择，避免并发重配 Mihomo。
+    const nodeId = desiredProxyNodeId;
+    desiredProxyNodeId = "";
+    proxyPoolSwitchingNodeId.value = nodeId;
+    proxyPoolError.value = "";
+    lastActivationError = null;
+    try {
+      proxyPool.value = await runCommand<ProxyPoolState>("set_active_proxy_node", { nodeId });
+      bumpProxyNodesRevision();
+    } catch (error) {
+      lastActivationError = error;
+      proxyPoolError.value = String(error);
+    }
   }
+}
+
+async function activateProxyNode(nodeId: string) {
+  desiredProxyNodeId = nodeId;
+  proxyPoolSwitchingNodeId.value = nodeId;
+  if (!activationWorker) {
+    activationWorker = runProxyActivationQueue().finally(() => {
+      activationWorker = null;
+      proxyPoolSwitchingNodeId.value = "";
+    });
+  }
+  await activationWorker;
+  if (lastActivationError) throw lastActivationError;
 }
 
 async function clearActiveProxyNode() {
@@ -256,16 +377,33 @@ async function runProxyNodeBatch(nodeIds: string[] | null, busyId: string) {
     }
   }
   try {
-    proxyPool.value = nodeIds
-      ? await runCommand<ProxyPoolState>("test_proxy_nodes", { nodeIds })
-      : await runCommand<ProxyPoolState>("test_all_proxy_nodes");
+    const runBatch = async () => nodeIds
+      ? runCommand<ProxyPoolState>("test_proxy_nodes", { nodeIds })
+      : runCommand<ProxyPoolState>("test_all_proxy_nodes");
+    try {
+      proxyPool.value = await runBatch();
+    } catch (error) {
+      const msg = String(error);
+      // 上一轮取消后 lease 可能尚未完全释放，短暂重试一次。
+      if (msg.includes("已有代理测速任务正在进行")) {
+        await new Promise((r) => setTimeout(r, 300));
+        proxyPool.value = await runBatch();
+      } else {
+        throw error;
+      }
+    }
     // 最终整表替换后再重建一次列表；测速过程中只做原地字段更新。
     bumpProxyNodesRevision();
   } catch (error) {
     commandFailed = true;
     const errorMessage = String(error);
-    await loadProxyPool();
-    proxyPoolError.value = errorMessage;
+    // 用户已取消时，不要把取消过程中的内核中断当红色失败。
+    if (proxyTestCancelRequested.value || errorMessage.includes("测速已取消")) {
+      commandFailed = false;
+    } else {
+      await loadProxyPool();
+      proxyPoolError.value = errorMessage;
+    }
   } finally {
     if (rafId) {
       window.cancelAnimationFrame(rafId);
@@ -305,20 +443,26 @@ async function testProxyNodes(nodeIds: string[], busyId = "test-selection") {
 }
 
 async function cancelProxyNodeTests() {
-  if (!proxyPoolBusyId.value.startsWith("test-")) return false;
+  // 取消必须瞬时响应：只发信号，不阻塞在测速主命令上。
   proxyTestCancelRequested.value = true;
   proxyTestCancelling.value = true;
   try {
-    const cancelled = await runCommand<boolean>("cancel_proxy_node_tests");
-    if (!cancelled) proxyTestCancelRequested.value = false;
-    return cancelled;
+    await runCommand<boolean>("cancel_proxy_node_tests");
   } catch (error) {
-    proxyTestCancelRequested.value = false;
-    proxyPoolError.value = String(error);
-    throw error;
-  } finally {
-    proxyTestCancelling.value = false;
+    console.error("cancel_proxy_node_tests failed", error);
   }
+
+  // 最多等 1.5s 看 busy 是否被 finally 清掉；超时强制解锁 UI。
+  const deadline = Date.now() + 1500;
+  while (Date.now() < deadline && proxyPoolBusyId.value.startsWith("test-")) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  if (proxyPoolBusyId.value.startsWith("test-")) {
+    testingNodeIds.value = new Set();
+    proxyPoolBusyId.value = "";
+  }
+  proxyTestCancelling.value = false;
+  return true;
 }
 
 const proxyPoolActive = computed(() => proxyPool.value.enabled);
@@ -339,7 +483,7 @@ async function deleteInvalidProxyNodes() {
 
 export function useProxyPool() {
   return {
-    proxyPool, proxyPoolLoading, proxyPoolError, proxyPoolBusyId, testingNodeIds, proxyTestProgress, proxyTestCancelling, proxyNodesRevision, proxyPoolActive,
+    proxyPool, proxyPoolLoading, proxyPoolError, proxyPoolBusyId, proxyPoolSwitchingNodeId, testingNodeIds, proxyTestProgress, proxyTestCancelling, proxyNodesRevision, proxySourceProgress, proxyPoolActive,
     loadProxyPool, saveProxySubscription, deleteProxySubscription, refreshProxySubscription,
     refreshAllProxySubscriptions, saveProxyPoolSettings, activateProxyNode, clearActiveProxyNode,
     analyzeProxyNodes,

@@ -34,6 +34,7 @@ interface FormState {
   supportsLdc: boolean;
   supportsNsfw: boolean;
   isPersonal: boolean;
+  isPending: boolean;
   isRunaway: boolean;
   checkinUrl: string;
   benefitUrl: string;
@@ -56,6 +57,7 @@ const form = reactive<FormState>({
   supportsLdc: false,
   supportsNsfw: false,
   isPersonal: false,
+  isPending: false,
   isRunaway: false,
   checkinUrl: "",
   benefitUrl: "",
@@ -79,6 +81,7 @@ function resetForm(site?: SiteRecord) {
   form.supportsLdc = value.supportsLdc;
   form.supportsNsfw = value.supportsNsfw;
   form.isPersonal = value.isPersonal;
+  form.isPending = value.isPending;
   form.isRunaway = value.isRunaway;
   form.checkinUrl = value.checkinUrl;
   form.benefitUrl = value.benefitUrl;
@@ -203,6 +206,7 @@ async function handleSubmit() {
     supportsLdc: form.supportsLdc,
     supportsNsfw: form.supportsNsfw,
     isPersonal: form.isPersonal,
+    isPending: form.isPending && !form.isPersonal,
     isRunaway: form.isRunaway,
     checkinUrl: form.checkinUrl.trim(),
     benefitUrl: form.benefitUrl.trim(),
@@ -442,9 +446,24 @@ function onBackdropClick(event: MouseEvent) {
             <section class="tab-panel" :class="{ active: activeTab === 'maintenance' }" data-panel="maintenance">
               <h3 class="section-title">站点状态</h3>
               <label class="check-card">
-                <input v-model="form.isPersonal" name="isPersonal" type="checkbox" />
+                <input
+                  v-model="form.isPersonal"
+                  name="isPersonal"
+                  type="checkbox"
+                  @change="form.isPersonal && (form.isPending = false)"
+                />
                 <i></i>
                 <span><strong>标记为在用</strong><small>我正在使用该站点</small></span>
+              </label>
+              <label class="check-card">
+                <input
+                  v-model="form.isPending"
+                  name="isPending"
+                  type="checkbox"
+                  @change="form.isPending && (form.isPersonal = false)"
+                />
+                <i></i>
+                <span><strong>标记为待定</strong><small>浏览器有会话，但尚未确认在用</small></span>
               </label>
               <label class="check-card runaway-check">
                 <input v-model="form.isRunaway" name="isRunaway" type="checkbox" />

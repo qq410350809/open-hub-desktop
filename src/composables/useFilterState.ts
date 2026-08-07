@@ -28,7 +28,8 @@ const filteredSites: ComputedRef<SiteRecord[]> = computed(() => {
       if (runawayFilter.value === "active" && site.isRunaway) return false;
       if (runawayFilter.value === "runaway" && !site.isRunaway) return false;
       if (usageFilter.value === "personal" && !site.isPersonal) return false;
-      if (usageFilter.value === "unused" && site.isPersonal) return false;
+      if (usageFilter.value === "pending" && !site.isPending) return false;
+      if (usageFilter.value === "unused" && (site.isPersonal || site.isPending)) return false;
       if (tag.value !== "all" && !site.tags.includes(tag.value)) return false;
       if (level.value !== "all" && site.registrationLimit !== Number(level.value)) return false;
       if (!matchesFeature(site, feature.value)) return false;
@@ -56,6 +57,7 @@ const filteredSites: ComputedRef<SiteRecord[]> = computed(() => {
     .sort(
       (a, b) =>
         Number(b.isPersonal) - Number(a.isPersonal) ||
+        Number(b.isPending) - Number(a.isPending) ||
         new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime(),
     );
 });
@@ -63,6 +65,7 @@ const filteredSites: ComputedRef<SiteRecord[]> = computed(() => {
 const activeCount: ComputedRef<number> = computed(() => sites.value.filter((site) => !site.isRunaway).length);
 const runawayCount: ComputedRef<number> = computed(() => sites.value.filter((site) => site.isRunaway).length);
 const personalCount: ComputedRef<number> = computed(() => sites.value.filter((site) => site.isPersonal).length);
+const pendingCount: ComputedRef<number> = computed(() => sites.value.filter((site) => site.isPending).length);
 
 const hasFilters: ComputedRef<boolean> = computed(
   () =>
@@ -116,6 +119,7 @@ export function useFilterState() {
     activeCount,
     runawayCount,
     personalCount,
+    pendingCount,
     hasFilters,
     clearFilters,
     setRunawayFilter,

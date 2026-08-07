@@ -55,6 +55,20 @@ async function togglePersonal(site: SiteRecord) {
   await loadLibrary();
 }
 
+async function togglePending(site: SiteRecord) {
+  await runCommand<SiteRecord>("toggle_pending", { id: site.id });
+  await loadLibrary();
+}
+
+async function cycleUsageState(site: SiteRecord) {
+  try {
+    await runCommand<SiteRecord>("cycle_usage_state", { id: site.id });
+    await loadLibrary();
+  } catch (error) {
+    showToast(`状态更新失败：${String(error)}`, true);
+  }
+}
+
 async function toggleRunaway(site: SiteRecord) {
   const wasRunaway = site.isRunaway;
   try {
@@ -121,6 +135,8 @@ export function useSiteActions() {
     importSite,
     deleteSite,
     togglePersonal,
+    togglePending,
+    cycleUsageState,
     toggleRunaway,
     openExternal,
     openExternalInChromeProfile,

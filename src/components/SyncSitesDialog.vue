@@ -12,11 +12,12 @@ const isTauri = "__TAURI_INTERNALS__" in window;
 let unlistenProgress: (() => void) | undefined;
 let unlistenChromeProgress: (() => void) | undefined;
 
-const scopeLabel = computed(() =>
-  store.syncDialogMode.value === "sessions"
-    ? `当前列表中的 ${store.syncDialogSiteIds.value.length} 个在用站点`
-    : store.syncDialogRunaway.value ? "跑路站点" : "存活站点",
-);
+const scopeLabel = computed(() => {
+  if (store.syncDialogMode.value === "sessions") {
+    return "全部本地站点（只提取浏览器会话数据）";
+  }
+  return store.syncDialogRunaway.value ? "跑路站点" : "存活站点";
+});
 
 const dialogTitle = "同步站点";
 
@@ -112,7 +113,7 @@ function onBackdropClick(event: MouseEvent) {
           <div>
             <h2 id="sync-sites-title">{{ dialogTitle }}</h2>
             <p v-if="store.syncDialogMode.value === 'remote'">验证 Chrome 登录状态后同步{{ scopeLabel }}</p>
-            <p v-else-if="store.syncDialogMode.value === 'sessions'">先同步余额与账号，再同步这些站点的 Key 与模型</p>
+            <p v-else-if="store.syncDialogMode.value === 'sessions'">只提取浏览器会话数据；有数据即标注待定，不做站点类型检测</p>
           </div>
           <button
             ref="closeBtnRef"
@@ -182,7 +183,7 @@ function onBackdropClick(event: MouseEvent) {
               <div>
                 <strong>本次同步范围</strong>
                 <p v-if="store.syncDialogMode.value === 'remote'">{{ scopeLabel }} · 同名远端记录会更新，本地在用状态会保留</p>
-                <p v-else-if="store.syncDialogMode.value === 'sessions'">{{ scopeLabel }} · 完成账号同步后自动更新 Key 与模型</p>
+                <p v-else-if="store.syncDialogMode.value === 'sessions'">{{ scopeLabel }} · 待定仍按上方存活/跑路筛选查看</p>
               </div>
             </div>
 
@@ -255,7 +256,7 @@ function onBackdropClick(event: MouseEvent) {
             </button>
             <button class="primary-button" type="button" @click="store.syncSites()">
               <span v-html="icons.restore" />
-              <span>{{ store.syncDialogMode.value === 'sessions' ? '同步当前列表' : `同步${scopeLabel}` }}</span>
+              <span>{{ store.syncDialogMode.value === 'sessions' ? '开始提取会话' : `同步${scopeLabel}` }}</span>
             </button>
           </template>
           <template v-else>

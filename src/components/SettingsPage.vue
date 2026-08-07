@@ -1,51 +1,22 @@
 <script setup lang="ts">
-import { ref, watch, nextTick, computed } from "vue";
+import { ref, watch, nextTick } from "vue";
 import { icons } from "../icons";
 import { useStore } from "../composables/useStore";
 import { usePreferences } from "../composables/usePreferences";
 import { useTheme } from "../composables/useTheme";
-import type { ThemePreference } from "../types";
-import { invoke } from "@tauri-apps/api/core";
-import CustomSelect from "./CustomSelect.vue";
+import type { ThemePreference, ProxyNodeViewModePreference } from "../types";
 
 const store = useStore();
 const { preferences, updatePreferences } = usePreferences();
 const { setThemePreference } = useTheme();
 
 const closeBtnRef = ref<HTMLButtonElement>();
-const systemFonts = ref<string[]>([]);
-const fontOptions = computed(() => {
-  const options = [
-    { value: "system", text: "系统默认" },
-    { value: "serif", text: "衬线体" },
-    { value: "mono", text: "等宽体" }
-  ];
-  for (const font of systemFonts.value) {
-    if (font !== "system" && font !== "serif" && font !== "mono") {
-      options.push({ value: font, text: font });
-    }
-  }
-  if (!options.some(o => o.value === preferences.fontFamily)) {
-    options.push({ value: preferences.fontFamily, text: preferences.fontFamily });
-  }
-  return options;
-});
-
-const loadSystemFonts = async () => {
-  if (systemFonts.value.length > 0) return;
-  try {
-    systemFonts.value = await invoke<string[]>("get_system_fonts");
-  } catch (e) {
-    console.error("Failed to load system fonts", e);
-  }
-};
 
 watch(
   () => store.page.value,
   (page) => {
     if (page === "settings") {
       nextTick(() => closeBtnRef.value?.focus());
-      loadSystemFonts();
     }
   },
 );
@@ -58,6 +29,9 @@ function onBackdropClick(event: MouseEvent) {
   if (event.target === event.currentTarget) close();
 }
 
+function setProxyNodeViewMode(mode: ProxyNodeViewModePreference) {
+  updatePreferences({ proxyNodeViewMode: mode });
+}
 </script>
 
 <template>
@@ -77,7 +51,7 @@ function onBackdropClick(event: MouseEvent) {
         <header class="settings-header">
           <div>
             <h1 id="settings-title">设置</h1>
-            <p>应用偏好</p>
+            <p>按模块分组的应用偏好</p>
           </div>
           <button
             ref="closeBtnRef"
@@ -97,7 +71,7 @@ function onBackdropClick(event: MouseEvent) {
                 <span v-html="icons.monitor" />
                 <div>
                   <h2>外观</h2>
-                  <p>界面主题与显示方式</p>
+                  <p>界面主题</p>
                 </div>
               </div>
               <div class="settings-rows">
@@ -127,62 +101,23 @@ function onBackdropClick(event: MouseEvent) {
                     >暗黑</button>
                   </div>
                 </div>
-                <div class="settings-row">
-                  <div>
-                    <strong>显示字体</strong>
-                    <small>应用程序全局字体</small>
-                  </div>
-                  <div class="preference-segment" id="font-preference" role="group" aria-label="显示字体" style="width: 220px;">
-                    <CustomSelect
-                      :options="fontOptions"
-                      :modelValue="preferences.fontFamily"
-                      @update:modelValue="val => updatePreferences({ fontFamily: val })"
-                    />
-                  </div>
-                </div>
-                <div class="settings-row">
-                  <div>
-                    <strong>字体大小</strong>
-                    <small>全局基础字体缩放</small>
-                  </div>
-                  <div class="preference-segment" id="fontsize-preference" role="group" aria-label="字体大小">
-                    <button
-                      type="button"
-                      :class="{ active: preferences.fontSize === 'small' }"
-                      data-size-choice="small"
-                      @click="updatePreferences({ fontSize: 'small' })"
-                    >较小</button>
-                    <button
-                      type="button"
-                      :class="{ active: preferences.fontSize === 'medium' }"
-                      data-size-choice="medium"
-                      @click="updatePreferences({ fontSize: 'medium' })"
-                    >标准</button>
-                    <button
-                      type="button"
-                      :class="{ active: preferences.fontSize === 'large' }"
-                      data-size-choice="large"
-                      @click="updatePreferences({ fontSize: 'large' })"
-                    >较大</button>
-                  </div>
-                </div>
               </div>
             </section>
 
-            <!-- 浏览偏好 -->
+            <!-- 站点库 -->
             <section class="settings-section">
               <div class="settings-section-title">
-                <span v-html="icons.settings" />
+                <span v-html="icons.database" />
                 <div>
-                  <h2>浏览偏好</h2>
-                  <p>启动状态与可见范围</p>
+                  <h2>站点库</h2>
+                  <p>启动时的默认筛选范围</p>
                 </div>
               </div>
               <div class="settings-rows">
                 <div class="settings-row">
                   <div>
                     <strong>默认存活状态</strong>
-                    <small>设置启动时显示的站点状态</small>
+                    <small>打开站点库时优先显示的状态</small>
                   </div>
                   <div class="preference-segment" id="runaway-preference" role="group" aria-label="默认存活状态">
                     <button
@@ -206,7 +141,7 @@ function onBackdropClick(event: MouseEvent) {
                 <div class="settings-row">
                   <div>
                     <strong>默认使用范围</strong>
-                    <small>设置启动时显示的站点范围</small>
+                    <small>打开站点库时优先显示的范围</small>
                   </div>
                   <div class="preference-segment" id="usage-preference" role="group" aria-label="默认使用范围">
                     <button
@@ -224,6 +159,51 @@ function onBackdropClick(event: MouseEvent) {
                       @click="updatePreferences({ defaultUsageFilter: 'personal' })"
                     >
                       <span v-html="icons.bookmark" /><span>在用</span>
+                    </button>
+                    <button
+                      type="button"
+                      :class="{ active: preferences.defaultUsageFilter === 'pending' }"
+                      data-usage-choice="pending"
+                      @click="updatePreferences({ defaultUsageFilter: 'pending' })"
+                    >
+                      <span v-html="icons.sessionImport" /><span>待定</span>
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </section>
+
+            <!-- 代理池 -->
+            <section class="settings-section">
+              <div class="settings-section-title">
+                <span v-html="icons.wifi" />
+                <div>
+                  <h2>代理池</h2>
+                  <p>节点列表的默认展示方式</p>
+                </div>
+              </div>
+              <div class="settings-rows">
+                <div class="settings-row">
+                  <div>
+                    <strong>节点列表显示</strong>
+                    <small>进入代理池时默认使用普通列表或国家分组</small>
+                  </div>
+                  <div class="preference-segment" id="proxy-node-view-preference" role="group" aria-label="节点列表显示">
+                    <button
+                      type="button"
+                      :class="{ active: preferences.proxyNodeViewMode === 'list' }"
+                      data-proxy-view-choice="list"
+                      @click="setProxyNodeViewMode('list')"
+                    >
+                      <span v-html="icons.rows" /><span>普通列表</span>
+                    </button>
+                    <button
+                      type="button"
+                      :class="{ active: preferences.proxyNodeViewMode === 'country' }"
+                      data-proxy-view-choice="country"
+                      @click="setProxyNodeViewMode('country')"
+                    >
+                      <span v-html="icons.globe" /><span>国家分组</span>
                     </button>
                   </div>
                 </div>

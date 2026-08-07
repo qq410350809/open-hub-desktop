@@ -24,6 +24,7 @@ impl Database {
                 "
                 PRAGMA foreign_keys = ON;
                 PRAGMA journal_mode = WAL;
+                PRAGMA busy_timeout = 5000;
 
                 CREATE TABLE IF NOT EXISTS directory_sites (
                     id TEXT PRIMARY KEY,
@@ -48,6 +49,7 @@ impl Database {
                     is_fake_charity INTEGER NOT NULL,
                     has_pending_report INTEGER NOT NULL,
                     is_personal INTEGER NOT NULL,
+                    is_pending INTEGER NOT NULL DEFAULT 0,
                     use_system_proxy INTEGER NOT NULL DEFAULT 0,
                     favorite INTEGER NOT NULL DEFAULT 0,
                     hidden INTEGER NOT NULL DEFAULT 0,
@@ -134,6 +136,12 @@ impl Database {
                     published_at TEXT NOT NULL DEFAULT '',
                     summary TEXT NOT NULL DEFAULT '',
                     categories TEXT NOT NULL DEFAULT '[]',
+                    reply_count INTEGER NOT NULL DEFAULT 0,
+                    views INTEGER NOT NULL DEFAULT 0,
+                    like_count INTEGER NOT NULL DEFAULT 0,
+                    last_activity_at TEXT NOT NULL DEFAULT '',
+                    pinned INTEGER NOT NULL DEFAULT 0,
+                    posters TEXT NOT NULL DEFAULT '[]',
                     first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     last_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     PRIMARY KEY (feed_id, guid)
@@ -145,6 +153,21 @@ impl Database {
                 CREATE INDEX IF NOT EXISTS idx_site_accounts_site ON site_accounts(site_id);
                 CREATE INDEX IF NOT EXISTS idx_site_model_cache_site ON site_model_cache(site_id);
                                 CREATE INDEX IF NOT EXISTS idx_charity_feed_seen ON charity_feed_items(feed_id, last_seen_at);
+                CREATE INDEX IF NOT EXISTS idx_charity_feed_published ON charity_feed_items(feed_id, published_at DESC);
+
+                CREATE TABLE IF NOT EXISTS charity_sync_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                    feed_id TEXT NOT NULL,
+                    feed_name TEXT NOT NULL DEFAULT '',
+                    stage TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT '',
+                    message TEXT NOT NULL DEFAULT '',
+                    node_name TEXT NOT NULL DEFAULT '',
+                    duration_ms INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE INDEX IF NOT EXISTS idx_charity_sync_logs_created
+                    ON charity_sync_logs(created_at DESC, id DESC);
 
                 CREATE TABLE IF NOT EXISTS proxy_subscriptions (
                     id TEXT PRIMARY KEY,
@@ -207,7 +230,9 @@ impl Database {
 
         ensure_site_account_columns(&connection)?;
         ensure_charity_feed_schema(&connection)?;
+        ensure_charity_sync_log_columns(&connection)?;
         ensure_proxy_pool_node_columns(&connection)?;
+        reset_expired_checkin_states(&connection)?;
 
         let has_system_type: i64 = connection
             .query_row(
@@ -241,6 +266,22 @@ impl Database {
                 .map_err(|error| error.to_string())?;
         }
 
+        let has_is_pending: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('directory_sites') WHERE name='is_pending'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if has_is_pending == 0 {
+            connection
+                .execute(
+                    "ALTER TABLE directory_sites ADD COLUMN is_pending INTEGER NOT NULL DEFAULT 0",
+                    [],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+
         seed_database(&mut connection)?;
         migrate_legacy_favorites_to_personal(&connection)?;
         connection
@@ -258,6 +299,21 @@ impl Database {
             .map_err(|error| error.to_string())?;
         Ok(Self(std::sync::Mutex::new(connection)))
     }
+}
+
+/// 将跨天的签到缓存归零。签到状态只对 `checkin_date` 当天有效，
+/// 不能把昨天的成功状态带到今天；同时清理昨天遗留的错误提示。
+pub(crate) fn reset_expired_checkin_states(connection: &Connection) -> Result<usize, String> {
+    connection
+        .execute(
+            "UPDATE site_accounts
+             SET checked_in_today = 0,
+                 checkin_error = '',
+                 checkin_date = date('now', 'localtime')
+             WHERE COALESCE(checkin_date, '') <> date('now', 'localtime')",
+            [],
+        )
+        .map_err(|error| error.to_string())
 }
 
 pub(crate) fn migrate_legacy_favorites_to_personal(connection: &Connection) -> Result<(), String> {
@@ -317,13 +373,16 @@ pub(crate) fn ensure_charity_feed_schema(connection: &Connection) -> Result<(), 
         .map_err(|error| error.to_string())?
         > 0;
     if has_feed_id {
+        // execute 只能跑单条 SQL；多条索引语句必须用 execute_batch。
         connection
-            .execute(
+            .execute_batch(
                 "CREATE INDEX IF NOT EXISTS idx_charity_feed_seen
-                 ON charity_feed_items(feed_id, last_seen_at)",
-                [],
+                 ON charity_feed_items(feed_id, last_seen_at);
+                 CREATE INDEX IF NOT EXISTS idx_charity_feed_published
+                 ON charity_feed_items(feed_id, published_at DESC);",
             )
             .map_err(|error| error.to_string())?;
+        ensure_charity_feed_metric_columns(connection)?;
         return Ok(());
     }
     connection
@@ -339,6 +398,12 @@ pub(crate) fn ensure_charity_feed_schema(connection: &Connection) -> Result<(), 
                published_at TEXT NOT NULL DEFAULT '',
                summary TEXT NOT NULL DEFAULT '',
                categories TEXT NOT NULL DEFAULT '[]',
+               reply_count INTEGER NOT NULL DEFAULT 0,
+               views INTEGER NOT NULL DEFAULT 0,
+               like_count INTEGER NOT NULL DEFAULT 0,
+               last_activity_at TEXT NOT NULL DEFAULT '',
+               pinned INTEGER NOT NULL DEFAULT 0,
+               posters TEXT NOT NULL DEFAULT '[]',
                first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                last_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                PRIMARY KEY (feed_id, guid)
@@ -348,14 +413,64 @@ pub(crate) fn ensure_charity_feed_schema(connection: &Connection) -> Result<(), 
              SELECT '1515', guid, title, link, author, published_at, summary, categories, first_seen_at, last_seen_at
              FROM charity_feed_items_legacy;
              DROP TABLE charity_feed_items_legacy;
-             CREATE INDEX idx_charity_feed_seen ON charity_feed_items(feed_id, last_seen_at);",
+             CREATE INDEX idx_charity_feed_seen ON charity_feed_items(feed_id, last_seen_at);
+             CREATE INDEX IF NOT EXISTS idx_charity_feed_published ON charity_feed_items(feed_id, published_at DESC);",
         )
         .map_err(|error| error.to_string())
+}
+
+pub(crate) fn ensure_charity_feed_metric_columns(connection: &Connection) -> Result<(), String> {
+    for (name, definition) in [
+        ("reply_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("views", "INTEGER NOT NULL DEFAULT 0"),
+        ("like_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("last_activity_at", "TEXT NOT NULL DEFAULT ''"),
+        ("pinned", "INTEGER NOT NULL DEFAULT 0"),
+        ("posters", "TEXT NOT NULL DEFAULT '[]'"),
+    ] {
+        let exists = connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('charity_feed_items') WHERE name = ?1",
+                [name],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| error.to_string())?
+            > 0;
+        if !exists {
+            connection
+                .execute(
+                    &format!("ALTER TABLE charity_feed_items ADD COLUMN {name} {definition}"),
+                    [],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+fn ensure_charity_sync_log_columns(connection: &Connection) -> Result<(), String> {
+    let has_duration: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('charity_sync_logs') WHERE name='duration_ms'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if has_duration == 0 {
+        connection
+            .execute_batch(
+                "ALTER TABLE charity_sync_logs ADD COLUMN duration_ms INTEGER NOT NULL DEFAULT 0;",
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 pub(crate) fn read_cached_usage_sites(
     connection: &Connection,
 ) -> Result<Vec<chrome_session::ChromeSiteSessionMatch>, String> {
+    // 运行中跨过午夜时也要即时归零，不能只依赖应用启动时的迁移。
+    reset_expired_checkin_states(connection)?;
     let mut statement = connection
         .prepare(
             "SELECT sa.site_id, sa.profile_id, sa.domain, sa.cookie_count, sa.cookie_names,
@@ -530,21 +645,21 @@ pub(crate) fn insert_site_transaction(
             supports_immersive_translation, supports_ldc, supports_checkin, supports_nsfw,
             checkin_url, checkin_note, benefit_url, rate_limit, status_url,
             is_only_maintainer_visible, requires_invite_code, is_runaway, is_fake_charity,
-            has_pending_report, is_personal, use_system_proxy, favorite, hidden, created_at, updated_at
+            has_pending_report, is_personal, is_pending, use_system_proxy, favorite, hidden, created_at, updated_at
         ) VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7,
             ?8, ?9, ?10, ?11,
             ?12, ?13, ?14, ?15, ?16,
             ?17, ?18, ?19, ?20,
-            ?21, ?22, ?23, ?24, ?25,
-            COALESCE(NULLIF(?26, ''), CURRENT_TIMESTAMP), COALESCE(NULLIF(?26, ''), CURRENT_TIMESTAMP)
+            ?21, ?22, ?23, ?24, ?25, ?26,
+            COALESCE(NULLIF(?27, ''), CURRENT_TIMESTAMP), COALESCE(NULLIF(?27, ''), CURRENT_TIMESTAMP)
         )",
         params![
             site.id, site.name, site.description, site.registration_limit, site.icon, site.api_base_url, site.system_type,
             site.supports_immersive_translation, site.supports_ldc, site.supports_checkin, site.supports_nsfw,
             site.checkin_url, site.checkin_note, site.benefit_url, site.rate_limit, site.status_url,
             site.is_only_maintainer_visible, site.requires_invite_code, site.is_runaway, site.is_fake_charity,
-            site.has_pending_report, site.is_personal, site.use_system_proxy, site.favorite, site.hidden, site.updated_at
+            site.has_pending_report, site.is_personal, site.is_pending, site.use_system_proxy, site.favorite, site.hidden, site.updated_at
         ],
     ).map_err(|error| error.to_string())?;
 

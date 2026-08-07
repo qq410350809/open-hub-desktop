@@ -12,7 +12,7 @@ pub(crate) fn read_site(connection: &Connection, id: &str) -> Result<Option<Site
                 supports_immersive_translation, supports_ldc, supports_checkin, supports_nsfw,
                 checkin_url, checkin_note, benefit_url, rate_limit, status_url,
                 is_only_maintainer_visible, requires_invite_code, is_runaway, is_fake_charity,
-                has_pending_report, is_personal, use_system_proxy, favorite, hidden, updated_at
+                has_pending_report, is_personal, is_pending, use_system_proxy, favorite, hidden, updated_at
          FROM directory_sites WHERE id = ?1",
         )
         .map_err(|e| e.to_string())?;
@@ -42,10 +42,11 @@ pub(crate) fn read_site(connection: &Connection, id: &str) -> Result<Option<Site
                 is_fake_charity: row.get::<_, i64>(19)? != 0,
                 has_pending_report: row.get::<_, i64>(20)? != 0,
                 is_personal: row.get::<_, i64>(21)? != 0,
-                use_system_proxy: row.get::<_, i64>(22)? != 0,
-                favorite: row.get::<_, i64>(23)? != 0,
-                hidden: row.get::<_, i64>(24)? != 0,
-                updated_at: row.get(25)?,
+                is_pending: row.get::<_, i64>(22)? != 0,
+                use_system_proxy: row.get::<_, i64>(23)? != 0,
+                favorite: row.get::<_, i64>(24)? != 0,
+                hidden: row.get::<_, i64>(25)? != 0,
+                updated_at: row.get(26)?,
                 tags: vec![],
                 maintainers: vec![],
                 extension_links: vec![],
@@ -107,9 +108,9 @@ pub fn list_library(database: State<'_, Database>) -> Result<LibraryData, String
                 supports_immersive_translation, supports_ldc, supports_checkin, supports_nsfw,
                 checkin_url, checkin_note, benefit_url, rate_limit, status_url,
                 is_only_maintainer_visible, requires_invite_code, is_runaway, is_fake_charity,
-                has_pending_report, is_personal, use_system_proxy, favorite, hidden, updated_at
+                has_pending_report, is_personal, is_pending, use_system_proxy, favorite, hidden, updated_at
          FROM directory_sites
-         ORDER BY is_personal DESC, datetime(updated_at) DESC, rowid DESC",
+         ORDER BY is_personal DESC, is_pending DESC, datetime(updated_at) DESC, rowid DESC",
         )
         .map_err(|e| e.to_string())?;
 
@@ -138,10 +139,11 @@ pub fn list_library(database: State<'_, Database>) -> Result<LibraryData, String
                 is_fake_charity: row.get::<_, i64>(19)? != 0,
                 has_pending_report: row.get::<_, i64>(20)? != 0,
                 is_personal: row.get::<_, i64>(21)? != 0,
-                use_system_proxy: row.get::<_, i64>(22)? != 0,
-                favorite: row.get::<_, i64>(23)? != 0,
-                hidden: row.get::<_, i64>(24)? != 0,
-                updated_at: row.get(25)?,
+                is_pending: row.get::<_, i64>(22)? != 0,
+                use_system_proxy: row.get::<_, i64>(23)? != 0,
+                favorite: row.get::<_, i64>(24)? != 0,
+                hidden: row.get::<_, i64>(25)? != 0,
+                updated_at: row.get(26)?,
                 tags: vec![],
                 maintainers: vec![],
                 extension_links: vec![],
@@ -452,15 +454,15 @@ pub fn update_site(
             supports_immersive_translation=?6, supports_ldc=?7, supports_checkin=?8, supports_nsfw=?9,
             checkin_url=?10, checkin_note=?11, benefit_url=?12, rate_limit=?13, status_url=?14,
             is_only_maintainer_visible=?15, requires_invite_code=?16, is_runaway=?17, is_fake_charity=?18,
-            has_pending_report=?19, is_personal=?20, use_system_proxy=?21,
+            has_pending_report=?19, is_personal=?20, is_pending=?21, use_system_proxy=?22,
             updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
-         WHERE id=?22",
+         WHERE id=?23",
         params![
             input.name, input.description, input.registration_limit, input.icon, input.api_base_url,
             input.supports_immersive_translation, input.supports_ldc, input.supports_checkin, input.supports_nsfw,
             input.checkin_url, input.checkin_note, input.benefit_url, input.rate_limit, input.status_url,
             input.is_only_maintainer_visible, input.requires_invite_code, input.is_runaway, input.is_fake_charity,
-            input.has_pending_report, input.is_personal, input.use_system_proxy, id
+            input.has_pending_report, input.is_personal, input.is_pending, input.use_system_proxy, id
         ],
     ).map_err(|e| e.to_string())?;
 
@@ -523,6 +525,68 @@ pub fn toggle_personal(database: State<'_, Database>, id: String) -> Result<Site
             &format!(
                 "UPDATE directory_sites
                  SET is_personal = CASE is_personal WHEN 0 THEN 1 ELSE 0 END,
+                     is_pending = CASE
+                       WHEN is_personal = 0 THEN 0
+                       ELSE is_pending
+                     END,
+                     favorite = 0, updated_at = {NOW_SQL}
+                 WHERE id = ?1"
+            ),
+            [&id],
+        )
+        .map_err(|error| error.to_string())?;
+    if changed == 0 {
+        return Err("找不到该站点".into());
+    }
+    read_site(&connection, &id)?.ok_or_else(|| "读取站点失败".into())
+}
+
+fn next_usage_state(is_personal: bool, is_pending: bool) -> (bool, bool) {
+    // 单按钮按“未在用 → 在用 → 待定 → 未在用”循环。
+    // 如果历史数据出现两个标记同时为 true，以 is_personal 优先并归零，
+    // 这样写回时可以自动恢复互斥约束。
+    if is_personal {
+        (false, true)
+    } else if is_pending {
+        (false, false)
+    } else {
+        (true, false)
+    }
+}
+
+#[tauri::command]
+pub fn cycle_usage_state(database: State<'_, Database>, id: String) -> Result<SiteRecord, String> {
+    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    let site = read_site(&connection, &id)?.ok_or_else(|| "找不到该站点".to_string())?;
+    let (is_personal, is_pending) = next_usage_state(site.is_personal, site.is_pending);
+
+    connection
+        .execute(
+            &format!(
+                "UPDATE directory_sites
+                 SET is_personal = ?1, is_pending = ?2, favorite = 0, updated_at = {NOW_SQL}
+                 WHERE id = ?3"
+            ),
+            params![is_personal, is_pending, id],
+        )
+        .map_err(|error| error.to_string())?;
+
+    read_site(&connection, &site.id)?.ok_or_else(|| "读取站点失败".into())
+}
+
+#[tauri::command]
+pub fn toggle_pending(database: State<'_, Database>, id: String) -> Result<SiteRecord, String> {
+    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    // 待定与在用互斥：标为待定时清除在用；取消待定仅清待定。
+    let changed = connection
+        .execute(
+            &format!(
+                "UPDATE directory_sites
+                 SET is_pending = CASE is_pending WHEN 0 THEN 1 ELSE 0 END,
+                     is_personal = CASE
+                       WHEN is_pending = 0 THEN 0
+                       ELSE is_personal
+                     END,
                      favorite = 0, updated_at = {NOW_SQL}
                  WHERE id = ?1"
             ),
@@ -563,4 +627,30 @@ pub fn toggle_runaway(database: State<'_, Database>, id: String) -> Result<SiteR
         return Err("找不到该站点".into());
     }
     read_site(&connection, &id)?.ok_or_else(|| "读取站点失败".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::next_usage_state;
+
+    #[test]
+    fn cycles_unused_to_personal() {
+        assert_eq!(next_usage_state(false, false), (true, false));
+    }
+
+    #[test]
+    fn cycles_personal_to_pending() {
+        assert_eq!(next_usage_state(true, false), (false, true));
+    }
+
+    #[test]
+    fn cycles_pending_to_unused() {
+        assert_eq!(next_usage_state(false, true), (false, false));
+    }
+
+    #[test]
+    fn repairs_invalid_dual_state_by_preferring_personal() {
+        // 异常双标记时按 is_personal 优先，进入“在用 → 待定”
+        assert_eq!(next_usage_state(true, true), (false, true));
+    }
 }

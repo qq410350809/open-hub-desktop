@@ -1,14 +1,13 @@
 import { reactive, watch } from "vue";
-import type { Preferences, ThemePreference, FontFamilyPreference, FontSizePreference } from "../types";
+import type { Preferences, ThemePreference, ProxyNodeViewModePreference } from "../types";
 
 const PREFERENCES_KEY = "ldoh:preferences";
 
 const defaultPreferences: Preferences = {
   theme: "system",
-  fontFamily: "system",
-  fontSize: "medium",
   defaultRunawayFilter: "active",
   defaultUsageFilter: "all",
+  proxyNodeViewMode: "list",
   sidebarCollapsed: false,
 };
 
@@ -18,6 +17,7 @@ function loadPreferences(): Preferences {
       localStorage.getItem(PREFERENCES_KEY) ?? "{}",
     ) as Partial<Preferences>;
     const legacyTheme = localStorage.getItem("ldoh:theme");
+    const proxyNodeViewMode = saved.proxyNodeViewMode === "country" ? "country" : "list";
     return {
       theme: ["system", "light", "dark"].includes(String(saved.theme))
         ? (saved.theme as ThemePreference)
@@ -26,10 +26,9 @@ function loadPreferences(): Preferences {
           : legacyTheme === "light"
             ? "light"
             : defaultPreferences.theme,
-      fontFamily: (saved.fontFamily as FontFamilyPreference) || "system",
-      fontSize: (saved.fontSize as FontSizePreference) || "medium",
       defaultRunawayFilter: saved.defaultRunawayFilter ?? "active",
       defaultUsageFilter: saved.defaultUsageFilter ?? "all",
+      proxyNodeViewMode: proxyNodeViewMode as ProxyNodeViewModePreference,
       sidebarCollapsed: Boolean(saved.sidebarCollapsed),
     };
   } catch {

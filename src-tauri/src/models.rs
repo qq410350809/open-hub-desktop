@@ -17,7 +17,7 @@ pub(crate) const PROXY_SPEED_TEST_URL_KEY: &str = "proxy_speed_test_url";
 pub(crate) const PROXY_RUNTIME_URL: &str = "http://127.0.0.1:17890";
 pub(crate) const DEFAULT_PROXY_IGNORE: &str =
     "localhost,127.0.0.1,::1,.local,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16";
-pub(crate) const DEFAULT_PROXY_SPEED_TEST_URL: &str = "https://cp.cloudflare.com/generate_204";
+pub(crate) const DEFAULT_PROXY_SPEED_TEST_URL: &str = "http://www.gstatic.com/generate_204";
 pub(crate) const ZERO_V_ZERO_CONSOLE_URL: &str = "https://0v0.club/";
 
 pub(crate) struct Database(pub(crate) std::sync::Mutex<Connection>);
@@ -74,6 +74,7 @@ pub(crate) struct SiteRecord {
     pub(crate) is_fake_charity: bool,
     pub(crate) has_pending_report: bool,
     pub(crate) is_personal: bool,
+    pub(crate) is_pending: bool,
     #[serde(skip)]
     pub(crate) use_system_proxy: bool,
 
@@ -110,6 +111,7 @@ impl Default for SiteRecord {
             is_fake_charity: false,
             has_pending_report: false,
             is_personal: false,
+            is_pending: false,
             use_system_proxy: false,
             favorite: false,
             hidden: false,

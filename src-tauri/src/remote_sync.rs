@@ -292,7 +292,7 @@ pub async fn sync_remote_sites(
 
         let existing = transaction
             .query_row(
-                "SELECT favorite, hidden, is_personal, use_system_proxy, system_type FROM directory_sites WHERE id = ?1",
+                "SELECT favorite, hidden, is_personal, is_pending, use_system_proxy, system_type FROM directory_sites WHERE id = ?1",
                 [&site.id],
                 |row| {
                     Ok((
@@ -300,16 +300,20 @@ pub async fn sync_remote_sites(
                         row.get::<_, i64>(1)? != 0,
                         row.get::<_, i64>(2)? != 0,
                         row.get::<_, i64>(3)? != 0,
-                        row.get::<_, String>(4)?,
+                        row.get::<_, i64>(4)? != 0,
+                        row.get::<_, String>(5)?,
                     ))
                 },
             )
             .optional()
             .map_err(|error| error.to_string())?;
-        if let Some((favorite, hidden, is_personal, use_system_proxy, system_type)) = existing {
+        if let Some((favorite, hidden, is_personal, is_pending, use_system_proxy, system_type)) =
+            existing
+        {
             site.favorite = favorite;
             site.hidden = hidden;
             site.is_personal = is_personal;
+            site.is_pending = is_pending && !is_personal;
             site.use_system_proxy = use_system_proxy;
             if site.system_type.trim().is_empty() {
                 site.system_type = system_type;
@@ -318,6 +322,7 @@ pub async fn sync_remote_sites(
         } else {
             site.favorite = false;
             site.hidden = false;
+            site.is_pending = false;
             site.use_system_proxy = false;
             added += 1;
         }

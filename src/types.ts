@@ -44,6 +44,7 @@ export interface SiteRecord {
   isFakeCharity: boolean;
   hasPendingReport: boolean;
   isPersonal: boolean;
+  isPending: boolean;
   favorite: boolean;
   hidden: boolean;
   updatedAt: string;
@@ -140,6 +141,12 @@ export interface CharityFeedItem {
   summary: string;
   categories: string[];
   isNew: boolean;
+  replyCount: number;
+  views: number;
+  likeCount: number;
+  lastActivityAt: string;
+  pinned: boolean;
+  posters: string[];
 }
 
 export interface CharityFeedResult {
@@ -153,6 +160,41 @@ export interface CharityFeedResult {
   initialized: boolean;
   sourceProfileName: string;
   sourceAccountName: string;
+  status?: string;
+  message?: string;
+  usedNodeId?: string;
+  usedNodeName?: string;
+  unreadCount?: number;
+  skipped?: boolean;
+  totalCount?: number;
+  offset?: number;
+  limit?: number;
+  hasMore?: boolean;
+}
+
+export interface CharitySyncProgress {
+  feedId: string;
+  feedName: string;
+  stage: string;
+  status: string;
+  message: string;
+  usedNodeId: string;
+  usedNodeName: string;
+  newCount: number;
+  updatedCount: number;
+  unreadCount: number;
+}
+
+export interface CharitySyncLogEntry {
+  id: number;
+  at: string;
+  feedId: string;
+  feedName: string;
+  stage: string;
+  status: string;
+  message: string;
+  nodeName: string;
+  durationMs?: number;
 }
 
 export interface CharityFeedTag {
@@ -179,15 +221,13 @@ export interface ModelItem {
 }
 
 export type ThemePreference = "system" | "light" | "dark";
-export type FontFamilyPreference = string;
-export type FontSizePreference = "small" | "medium" | "large";
+export type ProxyNodeViewModePreference = "list" | "country";
 
 export interface Preferences {
   theme: ThemePreference;
-  fontFamily: FontFamilyPreference;
-  fontSize: FontSizePreference;
   defaultRunawayFilter: string;
   defaultUsageFilter: string;
+  proxyNodeViewMode: ProxyNodeViewModePreference;
   sidebarCollapsed: boolean;
 }
 
@@ -217,6 +257,7 @@ export const emptySite = (): SiteRecord => ({
   isFakeCharity: false,
   hasPendingReport: false,
   isPersonal: false,
+  isPending: false,
   favorite: false,
   hidden: false,
   updatedAt: "",

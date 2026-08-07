@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, onUnmounted, computed, watch } from "vue";
+import { onMounted, onUnmounted, computed } from "vue";
 import { icons } from "./icons";
 import { useStore } from "./composables/useStore";
 import { usePreferences } from "./composables/usePreferences";
@@ -7,6 +7,7 @@ import { useTheme } from "./composables/useTheme";
 import { useToast } from "./composables/useToast";
 import { useTooltip } from "./composables/useTooltip";
 import AppSidebar from "./components/AppSidebar.vue";
+import CustomSelect from "./components/CustomSelect.vue";
 import SiteGrid from "./components/SiteGrid.vue";
 import SiteFormModal from "./components/SiteFormModal.vue";
 import LinkDialog from "./components/LinkDialog.vue";
@@ -19,6 +20,33 @@ import CharityMonitorPage from "./components/CharityMonitorPage.vue";
 import ProxyPoolPage from "./components/ProxyPoolPage.vue";
 
 const store = useStore();
+
+const tagOptions = computed(() => [
+  { value: "all", text: "全部标签" },
+  ...store.allTags.value.map((tag) => ({ value: tag, text: tag })),
+]);
+const levelOptions = [
+  { value: "all", text: "全部等级" },
+  { value: "0", text: "LV0" },
+  { value: "1", text: "LV1" },
+  { value: "2", text: "LV2" },
+  { value: "3", text: "LV3" },
+];
+const featureOptions = [
+  { value: "all", text: "全部功能" },
+  { value: "checkin", text: "支持签到" },
+  { value: "translation", text: "沉浸式翻译" },
+  { value: "ldc", text: "支持 LDC" },
+  { value: "nsfw", text: "支持 NSFW" },
+  { value: "invite", text: "需要邀请码" },
+];
+const systemTypeOptions = [
+  { value: "all", text: "全部系统类型" },
+  { value: "newapi", text: "NewAPI" },
+  { value: "sub2api", text: "Sub2API" },
+  { value: "0v0", text: "0v0" },
+  { value: "unknown", text: "未知类型" },
+];
 const { preferences } = usePreferences();
 const { applyTheme } = useTheme();
 const { message, isError, visible } = useToast();
@@ -39,28 +67,6 @@ const {
 
 const sidebarCollapsed = computed(() => preferences.sidebarCollapsed);
 
-function applyFont() {
-  const root = document.documentElement;
-  // Font Family
-  if (preferences.fontFamily === 'serif') {
-    root.style.setProperty('--font', 'Georgia, "Times New Roman", Times, serif');
-  } else if (preferences.fontFamily === 'mono') {
-    root.style.setProperty('--font', 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace');
-  } else if (preferences.fontFamily === 'system') {
-    root.style.setProperty('--font', '-apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", "Segoe UI", sans-serif');
-  } else {
-    root.style.setProperty('--font', `"${preferences.fontFamily}", -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif`);
-  }
-
-  // Font Size
-  if (preferences.fontSize === 'small') {
-    root.style.setProperty('--base-font-size', '13px');
-  } else if (preferences.fontSize === 'large') {
-    root.style.setProperty('--base-font-size', '15px');
-  } else {
-    root.style.setProperty('--base-font-size', '14px');
-  }
-}
 
 function onKeydown(event: KeyboardEvent) {
   // ⌘K 聚焦搜索
@@ -81,7 +87,8 @@ function onKeydown(event: KeyboardEvent) {
   }
   // Escape 关闭弹窗
   if (event.key === "Escape") {
-    if (store.syncDialogOpen.value) store.closeSyncDialog();
+    if (store.charitySyncLogOpen.value) store.closeCharitySyncLog();
+    else if (store.syncDialogOpen.value) store.closeSyncDialog();
     else if (store.chromeSessionDialogOpen.value) store.closeChromeSessionDialog();
     else if (store.previewDialogOpen.value) store.closePreview();
     else if (store.linkDialogOpen.value) store.closeLinkDialog();
@@ -93,7 +100,7 @@ function onKeydown(event: KeyboardEvent) {
 
 onMounted(async () => {
   applyTheme();
-  applyFont();
+
   document.addEventListener("pointerover", onPointerOver);
   document.addEventListener("pointerout", onPointerOut);
   document.addEventListener("focusin", onFocusIn);
@@ -103,6 +110,7 @@ onMounted(async () => {
   window.addEventListener("resize", onScroll, { passive: true });
   document.addEventListener("keydown", onKeydown);
   await Promise.all([store.loadLibrary(), store.loadProxyPool()]);
+  store.startDailyRefresh();
   store.startCharityMonitor();
 });
 
@@ -116,16 +124,9 @@ onUnmounted(() => {
   window.removeEventListener("resize", onScroll);
   document.removeEventListener("keydown", onKeydown);
   store.stopCharityMonitor();
+  store.stopDailyRefresh();
 });
 
-watch(
-  () => preferences.fontFamily,
-  applyFont
-);
-watch(
-  () => preferences.fontSize,
-  applyFont
-);
 </script>
 
 <template>
@@ -133,63 +134,19 @@ watch(
     <AppSidebar />
 
     <div class="app-workspace">
-      <nav class="workspace-tabs" aria-label="主要模块" role="tablist">
-        <div class="workspace-tab-list">
-          <button
-            id="library-tab"
-            type="button"
-            role="tab"
-            aria-controls="library-panel"
-            :aria-selected="store.page.value === 'library'"
-            :tabindex="store.page.value === 'library' ? 0 : -1"
-            :class="{ active: store.page.value === 'library' }"
-            @click="store.openLibrary()"
-          >
-            <span v-html="icons.database" />
-            <strong>站点库</strong>
-            <small>{{ store.sites.value.length }}</small>
-          </button>
-          <button
-            id="charity-tab"
-            type="button"
-            role="tab"
-            aria-controls="charity-panel"
-            :aria-selected="store.page.value === 'charity'"
-            :tabindex="store.page.value === 'charity' ? 0 : -1"
-            :class="{ active: store.page.value === 'charity' }"
-            @click="store.openCharityMonitor()"
-          >
-            <span v-html="icons.heartPulse" />
-            <strong>公益监听</strong>
-            <i v-if="store.charityFeedUnreadCount.value">{{ Math.min(store.charityFeedUnreadCount.value, 99) }}</i>
-          </button>
-          <button
-            id="proxy-tab"
-            type="button"
-            role="tab"
-            aria-controls="proxy-panel"
-            :aria-selected="store.page.value === 'proxy'"
-            :tabindex="store.page.value === 'proxy' ? 0 : -1"
-            :class="{ active: store.page.value === 'proxy' }"
-            @click="store.openProxyPool()"
-          >
-            <span v-html="icons.wifi" />
-            <strong>代理池</strong>
-            <small>{{ store.proxyPool.value.nodeCount }}</small>
-          </button>
-        </div>
-      </nav>
-
       <div class="workspace-view">
         <section
           v-if="store.page.value === 'library'"
           id="library-panel"
           class="library-page"
-          role="tabpanel"
-          aria-labelledby="library-tab"
+          aria-labelledby="library-nav"
         >
-          <header class="app-header">
+          <header class="app-header library-header">
             <div class="header-inner">
+              <div class="library-heading">
+                <strong>站点库</strong>
+                <span>{{ store.filteredSites.value.length }} / {{ store.sites.value.length }}</span>
+              </div>
               <label class="search-box">
                 <span v-html="icons.search" />
                 <input
@@ -205,8 +162,8 @@ watch(
                 <button
                   class="secondary-button sync-button"
                   :disabled="store.syncingModelKeys.value"
-                  :data-tooltip="store.usageFilter.value === 'personal'
-                    ? '同步当前列表内在用站点的 Chrome 会话'
+                  :data-tooltip="store.usageFilter.value === 'personal' || store.usageFilter.value === 'pending'
+                    ? '只提取浏览器会话数据（有数据即标待定，不检测站点类型）'
                     : '根据当前存活/跑路状态，从 ldoh 同步站点'"
                   @click="store.openSyncDialog()"
                 >
@@ -222,6 +179,87 @@ watch(
                 </button>
               </div>
             </div>
+
+            <div class="library-filters" aria-label="站点筛选">
+              <div class="library-filter-selects">
+                <CustomSelect
+                  class="library-select"
+                  :options="tagOptions"
+                  :model-value="store.tag.value"
+                  @update:model-value="store.tag.value = $event"
+                  aria-label="标签筛选"
+                />
+                <CustomSelect
+                  class="library-select"
+                  :options="levelOptions"
+                  :model-value="store.level.value"
+                  @update:model-value="store.level.value = $event"
+                  aria-label="等级筛选"
+                />
+                <CustomSelect
+                  class="library-select"
+                  :options="featureOptions"
+                  :model-value="store.feature.value"
+                  @update:model-value="store.feature.value = $event"
+                  aria-label="功能筛选"
+                />
+                <CustomSelect
+                  class="library-select"
+                  :options="systemTypeOptions"
+                  :model-value="store.systemTypeFilter.value"
+                  @update:model-value="store.systemTypeFilter.value = $event"
+                  aria-label="系统类型筛选"
+                />
+              </div>
+              <div class="library-filter-segments">
+                <div class="filter-segment surface is-usage" role="group" aria-label="使用状态">
+                  <button
+                    id="all-usage-filter"
+                    type="button"
+                    :class="{ active: store.usageFilter.value === 'all' }"
+                    :aria-pressed="store.usageFilter.value === 'all'"
+                    @click="store.setUsageFilter('all')"
+                  >全部</button>
+                  <button
+                    id="personal-filter"
+                    type="button"
+                    :class="{ active: store.usageFilter.value === 'personal' }"
+                    :aria-pressed="store.usageFilter.value === 'personal'"
+                    @click="store.setUsageFilter('personal')"
+                  >在用</button>
+                  <button
+                    id="pending-filter"
+                    type="button"
+                    :class="{ active: store.usageFilter.value === 'pending' }"
+                    :aria-pressed="store.usageFilter.value === 'pending'"
+                    @click="store.setUsageFilter('pending')"
+                  >待定</button>
+                </div>
+                <div class="filter-segment surface is-runaway" role="group" aria-label="站点状态">
+                  <button
+                    id="active-filter"
+                    type="button"
+                    :class="{ active: store.runawayFilter.value === 'active' }"
+                    :aria-pressed="store.runawayFilter.value === 'active'"
+                    @click="store.setRunawayFilter('active')"
+                  >存活</button>
+                  <button
+                    id="runaway-filter"
+                    type="button"
+                    :class="{ active: store.runawayFilter.value === 'runaway' }"
+                    :aria-pressed="store.runawayFilter.value === 'runaway'"
+                    @click="store.setRunawayFilter('runaway')"
+                  >跑路</button>
+                </div>
+                <button
+                  v-if="store.hasFilters.value"
+                  class="text-button library-clear-filters"
+                  id="clear-filter-header"
+                  type="button"
+                  @click="store.clearFilters()"
+                >清除筛选</button>
+              </div>
+            </div>
           </header>
 
           <SiteGrid />
@@ -230,8 +268,7 @@ watch(
           v-else-if="store.page.value === 'charity'"
           id="charity-panel"
           class="charity-panel"
-          role="tabpanel"
-          aria-labelledby="charity-tab"
+          aria-labelledby="charity-nav"
         >
           <CharityMonitorPage />
         </div>
@@ -239,8 +276,7 @@ watch(
           v-else-if="store.page.value === 'proxy'"
           id="proxy-panel"
           class="proxy-panel"
-          role="tabpanel"
-          aria-labelledby="proxy-tab"
+          aria-labelledby="proxy-nav"
         >
           <ProxyPoolPage />
         </div>

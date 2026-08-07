@@ -4,6 +4,7 @@ import { ref, watch, nextTick, onMounted, onUnmounted } from "vue";
 const props = defineProps<{
   tags: string[];
   isPersonal?: boolean;
+  isPending?: boolean;
 }>();
 
 const listRef = ref<HTMLElement>();
@@ -79,6 +80,7 @@ watch(() => props.tags, () => nextTick(layout), { deep: true });
 <template>
   <div ref="listRef" class="tag-list">
     <span v-if="isPersonal" class="tag-chip tag-personal">在用</span>
+    <span v-else-if="isPending" class="tag-chip tag-pending">待定</span>
     <span
       v-for="tag in tags.filter((t) => t.trim().toUpperCase() !== 'UNKNOWN' && t.trim() !== '未知')"
       :key="tag"
