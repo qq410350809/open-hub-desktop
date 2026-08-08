@@ -70,6 +70,9 @@ pub(crate) struct ProxyRuntime {
     inner: Mutex<RuntimeState>,
     active_test: Mutex<Option<ActiveProxyTest>>,
     next_test_id: AtomicU64,
+    // 全局代理内核“重启/选节点”的串行锁：用户切换与公益监听等后台任务
+    // 互斥操作同一 Mihomo，避免互相杀进程/覆盖选择导致切换卡死。
+    runtime_op_lock: tokio::sync::Mutex<()>,
 }
 
 struct ProxyTestLease<'a> {
@@ -104,6 +107,7 @@ impl ProxyRuntime {
             }),
             active_test: Mutex::new(None),
             next_test_id: AtomicU64::new(1),
+            runtime_op_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -2609,29 +2613,32 @@ pub(crate) fn list_fast_proxy_nodes(
     Ok(rows)
 }
 
-/// 仅供公益监听等后台任务使用：只临时切换 Mihomo 出口节点，
-/// 不写 ACTIVE_PROXY_NODE_KEY / NETWORK_PROXY_KEY，绝不覆盖用户手动开启的全局代理。
-pub(crate) async fn activate_proxy_node_transient(
+/// 供公益监听整轮同步使用：一次性把全部待轮询快节点装入全局内核，
+/// 后续每个节点只需 API 切换出口，不再反复重启 Mihomo。
+pub(crate) async fn prepare_proxy_nodes_transient(
+    database: &Database,
+    runtime: &ProxyRuntime,
+    node_ids: &[String],
+) -> Result<(), String> {
+    let _guard = runtime.runtime_op_lock.lock().await;
+    let only = node_ids.iter().cloned().collect::<HashSet<_>>();
+    tokio::task::block_in_place(|| ensure_runtime(database, runtime, Some(&only), None))?;
+    Ok(())
+}
+
+/// 仅通过 Mihomo 控制器切换出口；若节点已不在当前内核配置中（例如用户
+/// 刚切换过节点），则回退为装载单个节点后重试，避免后台任务整体失败。
+pub(crate) async fn select_proxy_node_transient(
     database: &Database,
     runtime: &ProxyRuntime,
     node_id: &str,
 ) -> Result<(), String> {
-    let runtime_name = {
-        let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
-        connection
-            .query_row(
-                "SELECT id FROM proxy_pool_nodes WHERE id=?1",
-                [node_id],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(|error| error.to_string())?
-            .ok_or("代理节点不存在")?
-    };
-    // ensure_runtime 内部可能 thread::sleep，必须 block_in_place，避免堵死 async worker / UI。
-    let only = HashSet::from([runtime_name.clone()]);
-    tokio::task::block_in_place(|| ensure_runtime(database, runtime, Some(&only), None))?;
-    select_runtime_node(runtime, &runtime_name).await?;
+    let _guard = runtime.runtime_op_lock.lock().await;
+    if select_runtime_node(runtime, node_id).await.is_err() {
+        let only = HashSet::from([node_id.to_string()]);
+        tokio::task::block_in_place(|| ensure_runtime(database, runtime, Some(&only), None))?;
+        select_runtime_node(runtime, node_id).await?;
+    }
     Ok(())
 }
 
@@ -2657,10 +2664,15 @@ pub(crate) async fn restore_proxy_node_transient(
             .map_err(|error| error.to_string())?
             .ok_or("全局代理节点不存在")?
     };
-    // 先确保内核在跑，再切回用户节点
-    let only = HashSet::from([runtime_name.clone()]);
-    tokio::task::block_in_place(|| ensure_runtime(database, runtime, Some(&only), None))?;
-    select_runtime_node(runtime, &runtime_name).await
+    let _guard = runtime.runtime_op_lock.lock().await;
+    // 当前内核已加载该节点时直接切回，避免无谓重启；
+    // 否则（例如用户刚切换过节点）再装载并选择。
+    if select_runtime_node(runtime, &runtime_name).await.is_err() {
+        let only = HashSet::from([runtime_name.clone()]);
+        tokio::task::block_in_place(|| ensure_runtime(database, runtime, Some(&only), None))?;
+        select_runtime_node(runtime, &runtime_name).await?;
+    }
+    Ok(())
 }
 
 /// 返回当前 Mihomo 混合端口地址，供后台任务显式走代理（不依赖全局代理设置）。
@@ -2707,7 +2719,9 @@ pub async fn set_active_proxy_node(
             .ok_or("代理节点不存在")?
     };
     let only = HashSet::from([runtime_name.clone()]);
-    ensure_runtime(&database, &runtime, Some(&only), None)?;
+    // 与后台任务的出口切换互斥，避免竞态；ensure_runtime 含同步等待，必须 block_in_place。
+    let _guard = runtime.runtime_op_lock.lock().await;
+    tokio::task::block_in_place(|| ensure_runtime(&database, &runtime, Some(&only), None))?;
     select_runtime_node(&runtime, &runtime_name).await?;
     let proxy_url = runtime_proxy_url(&runtime);
     let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;

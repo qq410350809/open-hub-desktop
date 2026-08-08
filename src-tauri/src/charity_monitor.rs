@@ -1375,6 +1375,33 @@ async fn sync_feed_with_fast_nodes(
         rotate_fast_nodes(&fast_nodes, offset)
     };
 
+    // 一次性把全部快节点装入内核，之后每个节点只做 API 出口切换，
+    // 不再“每试一个节点就重启一次 Mihomo”，避免长时间占用代理内核。
+    let fast_node_ids = fast_nodes
+        .iter()
+        .map(|(id, _, _)| id.clone())
+        .collect::<Vec<_>>();
+    if let Err(error) =
+        proxy_pool::prepare_proxy_nodes_transient(database, runtime, &fast_node_ids).await
+    {
+        let message = format!("装载快节点失败：{error}");
+        finish_charity_sync_log(
+            app,
+            database,
+            log_id,
+            source,
+            stage,
+            "failed",
+            &message,
+            "",
+            duration_ms(),
+            0,
+            0,
+            0,
+        );
+        return Err(message);
+    }
+
     let mut errors = Vec::new();
     for (node_id, node_name, latency_ms) in &fast_nodes {
         if cancellation.is_cancelled() {
@@ -1389,7 +1416,7 @@ async fn sync_feed_with_fast_nodes(
             ));
         }
         if let Err(error) =
-            proxy_pool::activate_proxy_node_transient(database, runtime, node_id).await
+            proxy_pool::select_proxy_node_transient(database, runtime, node_id).await
         {
             errors.push(format!("{node_name}: 切换代理失败：{error}"));
             continue;
