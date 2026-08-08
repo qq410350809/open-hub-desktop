@@ -3,6 +3,7 @@ import { computed, onMounted, ref } from "vue";
 import type { EChartsOption } from "../echarts";
 import EChart from "./EChart.vue";
 import QuickRangeDropdown from "./QuickRangeDropdown.vue";
+import { icons } from "../icons";
 import { useStore } from "../composables/useStore";
 import {
   bucketModelTotals,
@@ -490,38 +491,60 @@ onMounted(() => {
         </div>
         <div class="tt-kpis">
           <div class="tt-kpi tt-kpi-hero">
-            <span class="tt-kpi-label">TOKEN 总数</span>
-            <strong class="tt-kpi-value">{{ formatCompact(bucketTotal.total) }}</strong>
-            <span class="tt-kpi-sub">输入 {{ formatCompact(rangeSplits.input) }} · 输出 {{ formatCompact(rangeSplits.output) }}</span>
+            <div class="tt-kpi-ic ic-indigo" v-html="icons.chart"></div>
+            <div class="tt-kpi-body">
+              <span class="tt-kpi-label">TOKEN 总数</span>
+              <strong class="tt-kpi-value">{{ formatCompact(bucketTotal.total) }}</strong>
+              <div class="tt-kpi-splits">
+                <span><i class="dot in"></i>输入 {{ formatCompact(rangeSplits.input) }}</span>
+                <span><i class="dot out"></i>输出 {{ formatCompact(rangeSplits.output) }}</span>
+                <span><i class="dot cache"></i>缓存 {{ formatCompact(rangeSplits.cache) }}</span>
+              </div>
+            </div>
           </div>
           <div class="tt-kpi">
-            <span class="tt-kpi-label">日均 Tokens</span>
-            <strong class="tt-kpi-value">{{ formatCompact(dailyAverage) }}</strong>
-            <span class="tt-kpi-sub">按 {{ formatTokens(activeDays) }} 个活跃天</span>
+            <div class="tt-kpi-ic ic-orange" v-html="icons.flame"></div>
+            <div class="tt-kpi-body">
+              <span class="tt-kpi-label">日均 Tokens</span>
+              <strong class="tt-kpi-value">{{ formatCompact(dailyAverage) }}</strong>
+              <span class="tt-kpi-sub">按 {{ formatTokens(activeDays) }} 个活跃天</span>
+            </div>
           </div>
           <div class="tt-kpi">
-            <span class="tt-kpi-label">对话数</span>
-            <strong class="tt-kpi-value">{{ formatTokens(bucketTotal.conversations) }}</strong>
-            <span class="tt-kpi-sub">区间累计轮次</span>
+            <div class="tt-kpi-ic ic-blue" v-html="icons.activity"></div>
+            <div class="tt-kpi-body">
+              <span class="tt-kpi-label">对话数</span>
+              <strong class="tt-kpi-value">{{ formatTokens(bucketTotal.conversations) }}</strong>
+              <span class="tt-kpi-sub">区间累计轮次</span>
+            </div>
           </div>
           <div class="tt-kpi">
-            <span class="tt-kpi-label">缓存命中率</span>
-            <strong class="tt-kpi-value">{{ formatRate(cacheHitRate) }}</strong>
-            <span class="tt-kpi-sub">缓存 {{ formatCompact(rangeSplits.cache) }}</span>
+            <div class="tt-kpi-ic ic-teal" v-html="icons.database"></div>
+            <div class="tt-kpi-body">
+              <span class="tt-kpi-label">缓存命中率</span>
+              <strong class="tt-kpi-value">{{ formatRate(cacheHitRate) }}</strong>
+              <span class="tt-kpi-sub">缓存 {{ formatCompact(rangeSplits.cache) }}</span>
+            </div>
           </div>
           <div class="tt-kpi">
-            <span class="tt-kpi-label">估算成本</span>
-            <strong class="tt-kpi-value">{{ estimatedCost > 0 ? formatCost(estimatedCost) : "—" }}</strong>
-            <span class="tt-kpi-sub">会话单价外推</span>
+            <div class="tt-kpi-ic ic-purple" v-html="icons.card"></div>
+            <div class="tt-kpi-body">
+              <span class="tt-kpi-label">估算成本</span>
+              <strong class="tt-kpi-value">{{ estimatedCost > 0 ? formatCost(estimatedCost) : "—" }}</strong>
+              <span class="tt-kpi-sub">会话单价外推</span>
+            </div>
           </div>
           <div class="tt-kpi">
-            <span class="tt-kpi-label">活跃天数</span>
-            <strong class="tt-kpi-value">{{ formatTokens(activeDays) }}<small>天</small></strong>
-            <span class="tt-kpi-sub">跨度 {{ formatTokens(rangeDays) }} 天 · 连续 {{ formatTokens(streakDays) }} 天</span>
+            <div class="tt-kpi-ic ic-green" v-html="icons.calendar"></div>
+            <div class="tt-kpi-body">
+              <span class="tt-kpi-label">活跃天数</span>
+              <strong class="tt-kpi-value">{{ formatTokens(activeDays) }}<small>天</small></strong>
+              <span class="tt-kpi-sub">跨度 {{ formatTokens(rangeDays) }} 天 · 连续 {{ formatTokens(streakDays) }} 天</span>
+            </div>
           </div>
         </div>
 
-                <!-- 图表区：趋势 + 热力图 -->
+                        <!-- 图表区：趋势 + 热力图 -->
         <div class="tt-charts">
           <section class="tt-card tt-card-chart">
             <header class="tt-card-head">
