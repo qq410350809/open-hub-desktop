@@ -475,7 +475,7 @@ onMounted(() => {
           <div class="tt-kpi tt-kpi-hero">
             <span class="tt-kpi-label">TOKEN 总数</span>
             <strong class="tt-kpi-value">{{ formatCompact(bucketTotal.total) }}</strong>
-            <span class="tt-kpi-sub">区间 {{ rangeLabel }} · 估算 {{ estimatedCost > 0 ? formatCost(estimatedCost) : "—" }}</span>
+            <span class="tt-kpi-sub">所选区间 {{ rangeLabel }}</span>
           </div>
           <div class="tt-kpi">
             <span class="tt-kpi-label">对话数</span>
