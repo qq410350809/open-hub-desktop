@@ -1,5 +1,5 @@
 import { ref } from "vue";
-import type { RawLogReport, TokenStatsReport, TokenUsageReport } from "../types";
+import type { RawLogReport, RequestHealthReport, TokenStatsReport, TokenUsageReport } from "../types";
 import { runCommand } from "./useLibrary";
 
 const tokenStats = ref<TokenStatsReport | null>(null);
@@ -17,6 +17,11 @@ const tokenUsageError = ref("");
 const rawLogs = ref<RawLogReport | null>(null);
 const rawLogsLoading = ref(false);
 const rawLogsError = ref("");
+
+// 请求健康（大模型请求成功/失败）
+const requestHealth = ref<RequestHealthReport | null>(null);
+const requestHealthLoading = ref(false);
+const requestHealthError = ref("");
 
 function toLocalDate(value: Date): string {
   const year = value.getFullYear();
@@ -195,6 +200,19 @@ async function loadTokenRawLogs() {
   }
 }
 
+async function loadRequestHealth() {
+  requestHealthLoading.value = true;
+  requestHealthError.value = "";
+  try {
+    requestHealth.value = await runCommand<RequestHealthReport>("get_token_request_health");
+  } catch (error) {
+    requestHealthError.value = String(error);
+    requestHealth.value = null;
+  } finally {
+    requestHealthLoading.value = false;
+  }
+}
+
 export function useTokenStats() {
   return {
     tokenStats,
@@ -208,6 +226,9 @@ export function useTokenStats() {
     rawLogs,
     rawLogsLoading,
     rawLogsError,
+    requestHealth,
+    requestHealthLoading,
+    requestHealthError,
     quickRanges,
     isCurrentRange,
     applyQuickRange,
@@ -216,6 +237,7 @@ export function useTokenStats() {
     loadTokenStats,
     loadTokenUsage,
     loadTokenRawLogs,
+    loadRequestHealth,
     setQuickRange,
   };
 }

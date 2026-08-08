@@ -285,18 +285,33 @@ function formatDetailTime(label: string): string {
   }
 }
 
-// —— 请求健康时间线：按趋势粒度聚合「请求量 + 缓存命中率」——
+// —— 请求健康时间线：按趋势粒度聚合「请求量 + 大模型请求失败率（+ 缓存命中率兜底）」——
 const healthTimeline = computed(() => {
-  const map = new Map<string, { label: string; requests: number; cacheRead: number; cacheWrite: number; fresh: number }>();
+  const map = new Map<string, {
+    label: string; requests: number; success: number; failed: number;
+    cacheRead: number; cacheWrite: number; fresh: number;
+  }>();
+  const init = (key: string, label: string) => {
+    if (!map.has(key)) map.set(key, { label, requests: 0, success: 0, failed: 0, cacheRead: 0, cacheWrite: 0, fresh: 0 });
+    return map.get(key)!;
+  };
+  // token 用量桶：请求量（conversation）+ 缓存信号
   for (const bucket of filteredBuckets.value) {
     const { key, label } = bucketKeyFor(trendGranularity.value, bucket.timestamp);
     if (!key) continue;
-    const cur = map.get(key) || { label, requests: 0, cacheRead: 0, cacheWrite: 0, fresh: 0 };
+    const cur = init(key, label);
     cur.requests += bucket.conversationCount || 0;
     cur.cacheRead += bucket.cachedInputTokens || 0;
     cur.cacheWrite += bucket.cacheCreationInputTokens || 0;
     cur.fresh += bucket.inputTokens || 0;
-    map.set(key, cur);
+  }
+  // 请求健康（大模型请求成功/失败）：合并到同一粒度
+  for (const hb of store.requestHealth.value?.buckets ?? []) {
+    const { key, label } = bucketKeyFor(trendGranularity.value, hb.hour);
+    if (!key) continue;
+    const cur = init(key, label);
+    cur.success += hb.success;
+    cur.failed += hb.failed;
   }
   return [...map.values()].sort((a, b) => a.label.localeCompare(b.label));
 });
@@ -372,14 +387,18 @@ const trendChartOption = computed<EChartsOption>(() => {
 });
 
 // —— ECharts「请求健康时间线」option ——
-// 请求量（柱，按当前趋势粒度聚合）+ 缓存命中率（线，作为健康度信号）
+// 请求量（柱，按当前趋势粒度聚合）+ 大模型请求失败率（线）
+// 无请求健康数据时回退展示缓存命中率
 const healthTimelineOption = computed<EChartsOption>(() => {
   const dark = document.documentElement.dataset.theme === "dark";
   const axisColor = dark ? "#a3a3a3" : "#737373";
-  const lineColor = dark ? "#2dd4bf" : "#0d9488";
   const barColor = dark ? "#6366f1" : "#a5b4fc";
   const isHourly = trendGranularity.value === "hour";
   const items = healthTimeline.value;
+  const hasHealth = items.some((it) => it.success + it.failed > 0);
+  // 健康信号：优先大模型请求失败率；无数据则回退缓存命中率
+  const lineColor = hasHealth ? (dark ? "#f87171" : "#dc2626") : (dark ? "#2dd4bf" : "#0d9488");
+  const lineName = hasHealth ? "失败率" : "缓存命中率";
   const labels = items.map((item) => {
     if (isHourly) {
       const m = item.label.match(/^(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2})$/);
@@ -387,20 +406,28 @@ const healthTimelineOption = computed<EChartsOption>(() => {
     }
     return item.label;
   });
-  const rateOf = (it: { cacheRead: number; cacheWrite: number; fresh: number }) => {
+  const cacheHitOf = (it: { cacheRead: number; cacheWrite: number; fresh: number }) => {
     const total = it.cacheRead + it.cacheWrite + it.fresh;
     return total > 0 ? it.cacheRead / total : null;
   };
-  const requestData = items.map((it) => it.requests || 0);
-  const rateData = items.map((it) => {
-    const rate = rateOf(it);
-    return rate == null ? null : Number((rate * 100).toFixed(1));
+  const requestData = items.map((it) => it.success + it.failed || 0);
+  const lineData = items.map((it) => {
+    const total = it.success + it.failed;
+    if (total <= 0) return null;
+    return hasHealth
+      ? Number(((it.failed / total) * 100).toFixed(1))
+      : (() => { const r = cacheHitOf(it); return r == null ? null : Number((r * 100).toFixed(1)); })();
   });
   const table = items.map((it) => ({
     label: it.label,
-    requests: it.requests || 0,
-    rate: rateOf(it),
+    requests: it.success + it.failed,
+    success: it.success,
+    failed: it.failed,
+    healthRate: it.success + it.failed > 0 ? it.failed / (it.success + it.failed) : null,
+    cacheRate: cacheHitOf(it),
   }));
+  const hasAnyFail = items.some((it) => it.failed > 0);
+  const maxFailPct = hasAnyFail ? Math.max(10, ...lineData.filter((v): v is number => v != null).map((v) => Math.ceil(v))) : 100;
   return {
     grid: { left: 8, right: 8, top: 22, bottom: 18 },
     tooltip: {
@@ -413,8 +440,13 @@ const healthTimelineOption = computed<EChartsOption>(() => {
         const idx = list[0]?.dataIndex ?? -1;
         const row = table[idx];
         if (!row) return "";
-        const rateTxt = row.rate == null ? "—" : `${(row.rate * 100).toFixed(1)}%`;
-        return `<b>${row.label}</b><br/>请求量 <b style="color:#6366f1">${formatTokens(row.requests)}</b><br/>缓存命中 <b style="color:${lineColor}">${rateTxt}</b>`;
+        const head = `<b>${row.label}</b><br/>请求量 <b style="color:#6366f1">${formatTokens(row.requests)}</b>`;
+        if (row.healthRate != null) {
+          const rateTxt = `${(row.healthRate * 100).toFixed(1)}%`;
+          return `${head}<br/>成功 <b style="color:#10b981">${formatTokens(row.success)}</b> · 失败 <b style="color:${lineColor}">${formatTokens(row.failed)}</b><br/>失败率 <b style="color:${lineColor}">${rateTxt}</b>`;
+        }
+        const cacheTxt = row.cacheRate == null ? "—" : `${(row.cacheRate * 100).toFixed(1)}%`;
+        return `${head}<br/>缓存命中 <b style="color:${lineColor}">${cacheTxt}</b>`;
       },
     },
     legend: {
@@ -423,7 +455,7 @@ const healthTimelineOption = computed<EChartsOption>(() => {
       itemWidth: 14,
       itemHeight: 8,
       textStyle: { color: axisColor, fontSize: 11 },
-      data: ["请求量", "缓存命中率"],
+      data: ["请求量", lineName],
     },
     xAxis: {
       type: "category",
@@ -448,10 +480,10 @@ const healthTimelineOption = computed<EChartsOption>(() => {
       },
       {
         type: "value",
-        name: "命中率",
+        name: lineName,
         nameTextStyle: { color: dark ? "#737373" : "#a3a3a3", fontSize: 10, padding: [0, 0, 0, -2] },
         min: 0,
-        max: 100,
+        max: hasAnyFail ? maxFailPct : 100,
         splitLine: { show: false },
         axisLabel: {
           color: lineColor,
@@ -470,10 +502,10 @@ const healthTimelineOption = computed<EChartsOption>(() => {
         emphasis: { focus: "series" },
       },
       {
-        name: "缓存命中率",
+        name: lineName,
         type: "line",
         yAxisIndex: 1,
-        data: rateData,
+        data: lineData,
         smooth: true,
         showSymbol: false,
         lineStyle: { width: 2, color: lineColor },
@@ -482,8 +514,8 @@ const healthTimelineOption = computed<EChartsOption>(() => {
           color: {
             type: "linear", x: 0, y: 0, x2: 0, y2: 1,
             colorStops: [
-              { offset: 0, color: dark ? "rgba(45,212,191,.25)" : "rgba(13,148,136,.18)" },
-              { offset: 1, color: "rgba(13,148,136,0)" },
+              { offset: 0, color: dark ? (hasHealth ? "rgba(248,113,113,.25)" : "rgba(45,212,191,.25)") : (hasHealth ? "rgba(220,38,38,.15)" : "rgba(13,148,136,.18)") },
+              { offset: 1, color: dark ? (hasHealth ? "rgba(248,113,113,0)" : "rgba(45,212,191,0)") : (hasHealth ? "rgba(220,38,38,0)" : "rgba(13,148,136,0)") },
             ],
           },
         },
@@ -497,10 +529,11 @@ const modalTitle = computed(() => "用量明细");
 function refreshAll() {
   store.refreshTokenStats();
   void store.loadTokenUsage();
+  void store.loadRequestHealth();
 }
 
 onMounted(() => {
-  void Promise.all([store.loadTokenUsage(), store.loadTokenStats()]);
+  void Promise.all([store.loadTokenUsage(), store.loadTokenStats(), store.loadRequestHealth()]);
 });
 </script>
 
@@ -621,7 +654,7 @@ onMounted(() => {
             <header class="tt-card-head">
               <div>
                 <h2>请求健康时间线</h2>
-                <p>HEALTH · 按{{ trendUnitLabel() }} · 请求量 + 缓存命中率</p>
+                <p>HEALTH · 按{{ trendUnitLabel() }} · 请求量 + 大模型请求失败率</p>
               </div>
             </header>
             <div class="tt-card-body tt-chart-body">
