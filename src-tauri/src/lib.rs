@@ -991,7 +991,8 @@ pub fn run() {
             charity_monitor::refresh_all_charity_feeds,
             token_stats::get_token_stats,
             token_stats::get_token_usage,
-            token_stats::get_token_raw_logs
+            token_stats::get_token_raw_logs,
+            token_stats::get_token_request_health
         ])
         .run(tauri::generate_context!())
         .expect("error while running Tauri application");

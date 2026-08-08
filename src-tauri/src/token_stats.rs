@@ -1,7 +1,8 @@
 use crate::models::{
-    RawConversation, RawLogReport, RawRequest, RawSession, TokenStatsReport, TokenUsageBucket,
-    TokenUsageReport,
+    RawConversation, RawLogReport, RawRequest, RawSession, RequestHealthBucket, RequestHealthReport,
+    TokenStatsReport, TokenUsageBucket, TokenUsageReport,
 };
+use std::collections::BTreeMap;
 use serde_json::Value as JsonValue;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -706,3 +707,83 @@ mod tests {
         assert_eq!(report.summary.productive_rate, 0.0);
     }
 }
+
+
+/// 从 Codex rollout 提取大模型请求健康：task_started（成功请求）与 task_complete.error（失败）。
+/// 按 ISO 小时聚合，供「请求健康时间线」展示失败比例。
+fn collect_codex_request_health(dir: &Path, map: &mut BTreeMap<String, (i64, i64)>) {
+    let Ok(entries) = fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_codex_request_health(&path, map);
+        } else if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| name.starts_with("rollout-") && name.ends_with(".jsonl"))
+            .unwrap_or(false)
+        {
+            let Ok(text) = fs::read_to_string(&path) else { continue };
+            for line in text.lines() {
+                let Ok(value) = serde_json::from_str::<JsonValue>(line) else { continue };
+                if value.get("type").and_then(JsonValue::as_str) != Some("event_msg") {
+                    continue;
+                }
+                let Some(payload) = value.get("payload") else { continue };
+                let Some(p_type) = payload.get("type").and_then(JsonValue::as_str) else {
+                    continue;
+                };
+                let ts = value
+                    .get("timestamp")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or("");
+                if ts.len() < 13 {
+                    continue;
+                }
+                // 失败：task_complete 带 error 对象
+                let is_failure = p_type == "task_complete"
+                    && payload.get("error").map(|e| e.is_object()).unwrap_or(false);
+                let is_success = p_type == "task_started";
+                if !is_failure && !is_success {
+                    continue;
+                }
+                let hour = format!("{}:00.000Z", &ts[..13]);
+                let entry = map.entry(hour).or_insert((0, 0));
+                if is_failure {
+                    entry.1 += 1;
+                } else {
+                    entry.0 += 1;
+                }
+            }
+        }
+    }
+}
+
+/// 读取大模型请求健康数据（Codex rollout：task_started / task_complete.error），
+/// 供「请求健康时间线」展示每时段请求量与失败比例。
+#[tauri::command]
+pub async fn get_token_request_health() -> Result<RequestHealthReport, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let home = std::env::var_os("HOME").ok_or("无法定位用户目录")?;
+        let mut map = BTreeMap::new();
+        let root = PathBuf::from(&home).join(".codex").join("sessions");
+        if root.is_dir() {
+            collect_codex_request_health(&root, &mut map);
+        }
+        let buckets = map
+            .into_iter()
+            .map(|(hour, (success, failed))| RequestHealthBucket {
+                hour,
+                success,
+                failed,
+            })
+            .collect::<Vec<_>>();
+        Ok(RequestHealthReport {
+            available: !buckets.is_empty(),
+            buckets,
+        })
+    })
+    .await
+    .map_err(|error| format!("请求健康读取失败：{error}"))?
+}
+

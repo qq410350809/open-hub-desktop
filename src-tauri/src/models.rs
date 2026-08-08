@@ -591,6 +591,23 @@ pub(crate) struct TokenUsageReport {
     pub(crate) end_date: String,
 }
 
+
+// —— 请求健康：大模型请求成功/失败计数（来自 Codex rollout 的 task_started/task_complete.error）——
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, rename_all(serialize = "camelCase", deserialize = "snake_case"))]
+pub(crate) struct RequestHealthBucket {
+    pub(crate) hour: String,
+    pub(crate) success: i64,
+    pub(crate) failed: i64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, rename_all(serialize = "camelCase", deserialize = "snake_case"))]
+pub(crate) struct RequestHealthReport {
+    pub(crate) available: bool,
+    pub(crate) buckets: Vec<RequestHealthBucket>,
+}
+
 // —— 原始日志解析：会话 / 对话 / 请求 三级 ——
 // 会话 = 会话文件（Claude jsonl / Codex rollout）
 // 对话 = 每次用户提问轮（一个 user 消息 + 其后 assistant 消息）
