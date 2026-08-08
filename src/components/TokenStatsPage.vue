@@ -151,31 +151,23 @@ const streakDays = computed(() => {
   }
   return streak;
 });
-const rolling = computed(() => {
-  const map = dailyMap.value;
-  const today = parseLocal(toLocalDate(new Date()));
-  const result = { last7: 0, last30: 0, avg30: 0, convs30: 0, active30: 0 };
-  for (const [key, stat] of map) {
-    const diff = Math.round((today.getTime() - parseLocal(key).getTime()) / 86_400_000);
-    if (diff < 0 || diff >= 30) continue;
-    result.last30 += stat.total;
-    result.convs30 += stat.sessions;
-    result.active30 += 1;
-    if (diff < 7) result.last7 += stat.total;
-  }
-  result.avg30 = result.active30 ? result.last30 / result.active30 : 0;
-  return result;
+// —— 所选日期区间统计 ——
+const rangeLabel = computed(() => {
+  const from = store.tokenStatsFrom.value;
+  const to = store.tokenStatsTo.value;
+  if (!from && !to) return "全部";
+  return `${from || "…"} ~ ${to || "…"}`;
 });
-
-// 本日 token 数（按当前日期）
-const todayTokens = computed(() => {
-  const today = toLocalDate(new Date());
-  return dailyMap.value.get(today)?.total ?? 0;
+const rangeDays = computed(() => {
+  const from = store.tokenStatsFrom.value;
+  const to = store.tokenStatsTo.value;
+  if (!from || !to) return activeDays.value;
+  return Math.max(1, Math.round((parseLocal(to).getTime() - parseLocal(from).getTime()) / 86_400_000) + 1);
 });
-// 本日对话数
-const todayConversations = computed(() => {
-  const today = toLocalDate(new Date());
-  return dailyMap.value.get(today)?.sessions ?? 0;
+// 日均 Tokens（区间总量 / 区间活跃天数）
+const dailyAverage = computed(() => {
+  const days = Math.max(1, activeDays.value);
+  return bucketTotal.value.total / days;
 });
 
 const cacheHitRate = computed(() => {
@@ -483,17 +475,22 @@ onMounted(() => {
           <div class="tt-kpi tt-kpi-hero">
             <span class="tt-kpi-label">TOKEN 总数</span>
             <strong class="tt-kpi-value">{{ formatCompact(bucketTotal.total) }}</strong>
-            <span class="tt-kpi-sub">估算成本 {{ estimatedCost > 0 ? formatCost(estimatedCost) : "—" }}</span>
-          </div>
-          <div class="tt-kpi tt-kpi-today">
-            <span class="tt-kpi-label">本日 TOKEN</span>
-            <strong class="tt-kpi-value">{{ formatCompact(todayTokens) }}</strong>
-            <span class="tt-kpi-sub">今日对话 {{ formatTokens(todayConversations) }} · {{ toLocalDate(new Date()) }}</span>
+            <span class="tt-kpi-sub">区间 {{ rangeLabel }} · 估算 {{ estimatedCost > 0 ? formatCost(estimatedCost) : "—" }}</span>
           </div>
           <div class="tt-kpi">
-            <span class="tt-kpi-label">对话</span>
+            <span class="tt-kpi-label">对话数</span>
             <strong class="tt-kpi-value">{{ formatTokens(bucketTotal.conversations) }}</strong>
-            <span class="tt-kpi-sub">近30天 {{ formatTokens(rolling.convs30) }}</span>
+            <span class="tt-kpi-sub">区间内对话轮次</span>
+          </div>
+          <div class="tt-kpi">
+            <span class="tt-kpi-label">估算成本</span>
+            <strong class="tt-kpi-value">{{ estimatedCost > 0 ? formatCost(estimatedCost) : "—" }}</strong>
+            <span class="tt-kpi-sub">基于会话单价外推</span>
+          </div>
+          <div class="tt-kpi">
+            <span class="tt-kpi-label">日均 Tokens</span>
+            <strong class="tt-kpi-value">{{ formatCompact(dailyAverage) }}</strong>
+            <span class="tt-kpi-sub">区间总量 / {{ formatTokens(activeDays) }} 活跃天</span>
           </div>
           <div class="tt-kpi">
             <span class="tt-kpi-label">缓存命中率</span>
@@ -503,21 +500,11 @@ onMounted(() => {
           <div class="tt-kpi">
             <span class="tt-kpi-label">活跃天数</span>
             <strong class="tt-kpi-value">{{ formatTokens(activeDays) }}<small>天</small></strong>
-            <span class="tt-kpi-sub">连续活跃 {{ formatTokens(streakDays) }} 天</span>
-          </div>
-          <div class="tt-kpi">
-            <span class="tt-kpi-label">近7天</span>
-            <strong class="tt-kpi-value">{{ formatCompact(rolling.last7) }}</strong>
-            <span class="tt-kpi-sub">近30天 {{ formatCompact(rolling.last30) }}</span>
-          </div>
-          <div class="tt-kpi">
-            <span class="tt-kpi-label">日均 Tokens</span>
-            <strong class="tt-kpi-value">{{ formatCompact(rolling.avg30) }}</strong>
-            <span class="tt-kpi-sub">平均 / 活跃天</span>
+            <span class="tt-kpi-sub">区间跨度 {{ formatTokens(rangeDays) }} 天 · 连续 {{ formatTokens(streakDays) }} 天</span>
           </div>
         </div>
 
-        <!-- 图表区：趋势 + 热力图 -->
+                <!-- 图表区：趋势 + 热力图 -->
         <div class="tt-charts">
           <section class="tt-card tt-card-chart">
             <header class="tt-card-head">
