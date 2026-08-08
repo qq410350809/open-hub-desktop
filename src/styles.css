@@ -3671,19 +3671,87 @@ kbd { padding: 3px 7px; border: 1px solid var(--line); border-radius: var(--r-xs
 /* 页面布局：KPI 行 + 图表 + 分布 + 明细入口 */
 .tt-kpis {
   min-width: 0;
+  margin-bottom: 12px;
+}
+.tt-hero {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  padding: 20px 24px;
+  border: 1px solid color-mix(in srgb, var(--oai-accent) 32%, var(--oai-border));
+  border-radius: 16px;
+  background: linear-gradient(135deg, color-mix(in srgb, var(--oai-accent) 16%, var(--oai-card)), var(--oai-card));
+  box-shadow: 0 1px 3px rgba(0,0,0,.05);
+}
+.tt-hero-main {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.tt-hero-main .tt-kpi-label {
+  font-size: 12px;
+}
+.tt-hero-value {
+  color: var(--oai-accent-strong);
+  font-size: 46px;
+  font-weight: 800;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -.02em;
+}
+.tt-hero-splits {
+  display: flex;
+  gap: 16px;
+  align-items: center;
+}
+.tt-hero-split {
+  min-width: 108px;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 10px 16px;
+  border-left: 1px solid var(--oai-border);
+}
+.tt-hero-split:first-child { border-left: none; }
+.tt-hero-split strong {
+  color: var(--oai-text);
+  font-size: 18px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+.tt-split-k {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--oai-muted);
+  font-size: 11.5px;
+  font-weight: 600;
+}
+.tt-split-k .dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 3px;
+}
+.tt-split-k .dot.in { background: #6366f1; }
+.tt-split-k .dot.out { background: #10b981; }
+.tt-split-k .dot.cache { background: #f59e0b; }
+
+/* 指标卡网格（5 个） */
+.tt-kpis-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  grid-template-columns: repeat(5, 1fr);
   gap: 12px;
 }
 .tt-kpi {
   position: relative;
   min-width: 0;
-  height: 120px;
-  min-height: 120px;
+  height: 118px;
   padding: 16px;
   display: flex;
   align-items: center;
-  gap: 14px;
+  gap: 12px;
   border: 1px solid var(--oai-border);
   border-radius: 14px;
   background: var(--oai-card);
@@ -3693,6 +3761,7 @@ kbd { padding: 3px 7px; border: 1px solid var(--line); border-radius: var(--r-xs
 .tt-kpi:hover {
   border-color: color-mix(in srgb, var(--oai-accent) 40%, var(--oai-border));
   box-shadow: 0 4px 14px rgba(0,0,0,.06);
+  transform: translateY(-1px);
 }
 .tt-kpi-ic {
   flex: 0 0 auto;
@@ -3710,14 +3779,12 @@ kbd { padding: 3px 7px; border: 1px solid var(--line); border-radius: var(--r-xs
 .tt-kpi-ic.ic-teal { background: #e6f7f4; color: #0d9488; }
 .tt-kpi-ic.ic-purple { background: #f0eaff; color: #7c3aed; }
 .tt-kpi-ic.ic-green { background: #e7f7ec; color: #16a34a; }
-.tt-kpi-ic.ic-indigo { background: #eef0fe; color: #4f46e5; }
 :root[data-theme="dark"] .tt-kpi-ic { background: var(--oai-soft); color: var(--oai-accent); }
 :root[data-theme="dark"] .tt-kpi-ic.ic-orange { background: #3a2a12; color: #f59e0b; }
 :root[data-theme="dark"] .tt-kpi-ic.ic-blue { background: #14263f; color: #60a5fa; }
 :root[data-theme="dark"] .tt-kpi-ic.ic-teal { background: #122b2a; color: #2dd4bf; }
 :root[data-theme="dark"] .tt-kpi-ic.ic-purple { background: #251a3d; color: #a78bfa; }
 :root[data-theme="dark"] .tt-kpi-ic.ic-green { background: #122a1c; color: #4ade80; }
-:root[data-theme="dark"] .tt-kpi-ic.ic-indigo { background: #1c1f3a; color: #818cf8; }
 .tt-kpi-body {
   min-width: 0;
   display: flex;
@@ -3725,28 +3792,36 @@ kbd { padding: 3px 7px; border: 1px solid var(--line); border-radius: var(--r-xs
   align-items: flex-start;
   gap: 2px;
 }
-.tt-kpi-splits {
-  margin-top: 6px;
-  display: flex;
-  flex-wrap: wrap;
-  gap: 4px 12px;
-}
-.tt-kpi-splits span {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
+.tt-kpi-label {
   color: var(--oai-muted);
-  font-size: 11.5px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+}
+.tt-kpi-value {
+  max-width: 100%;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: var(--oai-text);
+  font-size: 24px;
+  font-weight: 800;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -.02em;
+  line-height: 1.1;
+}
+.tt-kpi-value small {
+  margin-left: 3px;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--oai-muted);
+}
+.tt-kpi-sub {
+  color: var(--oai-faint);
+  font-size: 11px;
   font-variant-numeric: tabular-nums;
 }
-.tt-kpi-splits .dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 3px;
-}
-.tt-kpi-splits .dot.in { background: #6366f1; }
-.tt-kpi-splits .dot.out { background: #10b981; }
-.tt-kpi-splits .dot.cache { background: #f59e0b; }
 .tt-kpi-head {
   margin-bottom: 12px;
   display: flex;
@@ -3766,48 +3841,16 @@ kbd { padding: 3px 7px; border: 1px solid var(--line); border-radius: var(--r-xs
   font-weight: 700;
   font-variant-numeric: tabular-nums;
 }
-.tt-kpi-hero {
-  grid-column: span 2;
-  height: 120px;
-  background: linear-gradient(135deg, color-mix(in srgb, var(--oai-accent) 14%, var(--oai-card)), var(--oai-card));
-  border-color: color-mix(in srgb, var(--oai-accent) 30%, var(--oai-border));
+
+/* 响应式：窄屏下面指标卡折行 */
+@media (max-width: 1100px) {
+  .tt-kpis-grid { grid-template-columns: repeat(3, 1fr); }
 }
-.tt-kpi-hero .tt-kpi-ic {
-  width: 52px;
-  height: 52px;
-}
-.tt-kpi-hero .tt-kpi-value {
-  font-size: 34px;
-}
-.tt-kpi-label {
-  color: var(--oai-muted);
-  font-size: 11px;
-  font-weight: 600;
-  letter-spacing: .04em;
-  text-transform: uppercase;
-}
-.tt-kpi-value {
-  max-width: 100%;
-  overflow: hidden;
-  white-space: nowrap;
-  text-overflow: ellipsis;
-  color: var(--oai-text);
-  font-size: 26px;
-  font-weight: 800;
-  font-variant-numeric: tabular-nums;
-  letter-spacing: -.02em;
-  line-height: 1.1;
-}
-.tt-kpi-value small {
-  margin-left: 3px;
-  font-size: 13px;
-  font-weight: 700;
-  color: var(--oai-muted);
-}
-.tt-kpi-sub {
-  color: var(--oai-faint);
-  font-size: 11px;
-  font-variant-numeric: tabular-nums;
+@media (max-width: 720px) {
+  .tt-kpis-grid { grid-template-columns: repeat(2, 1fr); }
+  .tt-hero { flex-direction: column; align-items: flex-start; }
+  .tt-hero-splits { width: 100%; justify-content: space-between; gap: 8px; }
+  .tt-hero-split { min-width: 0; flex: 1; padding: 8px 10px; }
 }
 
 .tt-charts {

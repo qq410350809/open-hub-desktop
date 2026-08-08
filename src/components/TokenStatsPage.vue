@@ -490,18 +490,28 @@ onMounted(() => {
           <strong class="tt-kpi-range-val">{{ rangeLabel }}</strong>
         </div>
         <div class="tt-kpis">
-          <div class="tt-kpi tt-kpi-hero">
-            <div class="tt-kpi-ic ic-indigo" v-html="icons.chart"></div>
-            <div class="tt-kpi-body">
+          <div class="tt-hero">
+            <div class="tt-hero-main">
               <span class="tt-kpi-label">TOKEN 总数</span>
-              <strong class="tt-kpi-value">{{ formatCompact(bucketTotal.total) }}</strong>
-              <div class="tt-kpi-splits">
-                <span><i class="dot in"></i>输入 {{ formatCompact(rangeSplits.input) }}</span>
-                <span><i class="dot out"></i>输出 {{ formatCompact(rangeSplits.output) }}</span>
-                <span><i class="dot cache"></i>缓存 {{ formatCompact(rangeSplits.cache) }}</span>
+              <strong class="tt-hero-value">{{ formatCompact(bucketTotal.total) }}</strong>
+            </div>
+            <div class="tt-hero-splits">
+              <div class="tt-hero-split">
+                <span class="tt-split-k"><i class="dot in"></i>输入</span>
+                <strong>{{ formatCompact(rangeSplits.input) }}</strong>
+              </div>
+              <div class="tt-hero-split">
+                <span class="tt-split-k"><i class="dot out"></i>输出</span>
+                <strong>{{ formatCompact(rangeSplits.output) }}</strong>
+              </div>
+              <div class="tt-hero-split">
+                <span class="tt-split-k"><i class="dot cache"></i>缓存</span>
+                <strong>{{ formatCompact(rangeSplits.cache) }}</strong>
               </div>
             </div>
           </div>
+        </div>
+        <div class="tt-kpis tt-kpis-grid">
           <div class="tt-kpi">
             <div class="tt-kpi-ic ic-orange" v-html="icons.flame"></div>
             <div class="tt-kpi-body">
