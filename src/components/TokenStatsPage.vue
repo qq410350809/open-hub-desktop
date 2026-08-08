@@ -6,11 +6,11 @@ import QuickRangeDropdown from "./QuickRangeDropdown.vue";
 import { icons } from "../icons";
 import { useStore } from "../composables/useStore";
 import {
-  bucketKeyFor,
   bucketModelTotals,
   bucketSourceTotals,
   bucketTotals,
   buildDailyMapFromBuckets,
+  buildHealthHeatmap,
   buildTrendDetailFromBuckets,
   buildTrendFromBuckets,
   mergeModelTotals,
@@ -285,36 +285,20 @@ function formatDetailTime(label: string): string {
   }
 }
 
-// —— 请求健康时间线：按趋势粒度聚合「请求量 + 大模型请求失败率（+ 缓存命中率兜底）」——
-const healthTimeline = computed(() => {
-  const map = new Map<string, {
-    label: string; requests: number; success: number; failed: number;
-    cacheRead: number; cacheWrite: number; fresh: number;
-  }>();
-  const init = (key: string, label: string) => {
-    if (!map.has(key)) map.set(key, { label, requests: 0, success: 0, failed: 0, cacheRead: 0, cacheWrite: 0, fresh: 0 });
-    return map.get(key)!;
-  };
-  // token 用量桶：请求量（conversation）+ 缓存信号
-  for (const bucket of filteredBuckets.value) {
-    const { key, label } = bucketKeyFor(trendGranularity.value, bucket.timestamp);
-    if (!key) continue;
-    const cur = init(key, label);
-    cur.requests += bucket.conversationCount || 0;
-    cur.cacheRead += bucket.cachedInputTokens || 0;
-    cur.cacheWrite += bucket.cacheCreationInputTokens || 0;
-    cur.fresh += bucket.inputTokens || 0;
-  }
-  // 请求健康（大模型请求成功/失败）：合并到同一粒度
-  for (const hb of store.requestHealth.value?.buckets ?? []) {
-    const { key, label } = bucketKeyFor(trendGranularity.value, hb.hour);
-    if (!key) continue;
-    const cur = init(key, label);
-    cur.success += hb.success;
-    cur.failed += hb.failed;
-  }
-  return [...map.values()].sort((a, b) => a.label.localeCompare(b.label));
-});
+// 请求健康方块 tooltip：日期 + 请求量 + 失败数 + 失败率
+function dayTitle(day: { date: string; requests: number; failed: number; rate: number | null }) {
+  const rateTxt = day.rate == null ? "无数据" : `${(day.rate * 100).toFixed(1)}%`;
+  return `${day.date} · ${formatTokens(day.requests)} 次请求 · 失败 ${formatTokens(day.failed)} · 失败率 ${rateTxt}`;
+}
+
+// —— 请求健康热力图：按天聚合大模型请求失败率，GitHub 小方块形式 ——
+const healthHeatmap = computed(() =>
+  buildHealthHeatmap(
+    store.requestHealth.value?.buckets ?? [],
+    store.tokenStatsFrom.value || undefined,
+    store.tokenStatsTo.value || undefined,
+  ),
+);
 
 // —— ECharts 折线图 option（使用趋势）——
 const trendChartOption = computed<EChartsOption>(() => {
@@ -381,144 +365,6 @@ const trendChartOption = computed<EChartsOption>(() => {
         itemStyle: { color: "#10b981", borderColor: dark ? "#171717" : "#ffffff", borderWidth: 1.5 },
         areaStyle: { color: { type: "linear", x: 0, y: 0, x2: 0, y2: 1, colorStops: [{ offset: 0, color: areaTop }, { offset: 1, color: "rgba(16,185,129,0)" }] } },
         emphasis: { focus: "series" },
-      },
-    ],
-  };
-});
-
-// —— ECharts「请求健康时间线」option ——
-// 请求量（柱，按当前趋势粒度聚合）+ 大模型请求失败率（线）
-// 无请求健康数据时回退展示缓存命中率
-const healthTimelineOption = computed<EChartsOption>(() => {
-  const dark = document.documentElement.dataset.theme === "dark";
-  const axisColor = dark ? "#a3a3a3" : "#737373";
-  const barColor = dark ? "#6366f1" : "#a5b4fc";
-  const isHourly = trendGranularity.value === "hour";
-  const items = healthTimeline.value;
-  const hasHealth = items.some((it) => it.success + it.failed > 0);
-  // 健康信号：优先大模型请求失败率；无数据则回退缓存命中率
-  const lineColor = hasHealth ? (dark ? "#f87171" : "#dc2626") : (dark ? "#2dd4bf" : "#0d9488");
-  const lineName = hasHealth ? "失败率" : "缓存命中率";
-  const labels = items.map((item) => {
-    if (isHourly) {
-      const m = item.label.match(/^(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2})$/);
-      return m ? m[2] : item.label;
-    }
-    return item.label;
-  });
-  const cacheHitOf = (it: { cacheRead: number; cacheWrite: number; fresh: number }) => {
-    const total = it.cacheRead + it.cacheWrite + it.fresh;
-    return total > 0 ? it.cacheRead / total : null;
-  };
-  const requestData = items.map((it) => it.success + it.failed || 0);
-  const lineData = items.map((it) => {
-    const total = it.success + it.failed;
-    if (total <= 0) return null;
-    return hasHealth
-      ? Number(((it.failed / total) * 100).toFixed(1))
-      : (() => { const r = cacheHitOf(it); return r == null ? null : Number((r * 100).toFixed(1)); })();
-  });
-  const table = items.map((it) => ({
-    label: it.label,
-    requests: it.success + it.failed,
-    success: it.success,
-    failed: it.failed,
-    healthRate: it.success + it.failed > 0 ? it.failed / (it.success + it.failed) : null,
-    cacheRate: cacheHitOf(it),
-  }));
-  const hasAnyFail = items.some((it) => it.failed > 0);
-  const maxFailPct = hasAnyFail ? Math.max(10, ...lineData.filter((v): v is number => v != null).map((v) => Math.ceil(v))) : 100;
-  return {
-    grid: { left: 8, right: 8, top: 22, bottom: 18 },
-    tooltip: {
-      trigger: "axis",
-      backgroundColor: dark ? "#1f1f1f" : "#ffffff",
-      borderColor: dark ? "#333333" : "#e5e5e5",
-      textStyle: { color: dark ? "#d4d4d4" : "#737373", fontSize: 12 },
-      formatter: (params: unknown) => {
-        const list = params as { dataIndex: number }[];
-        const idx = list[0]?.dataIndex ?? -1;
-        const row = table[idx];
-        if (!row) return "";
-        const head = `<b>${row.label}</b><br/>请求量 <b style="color:#6366f1">${formatTokens(row.requests)}</b>`;
-        if (row.healthRate != null) {
-          const rateTxt = `${(row.healthRate * 100).toFixed(1)}%`;
-          return `${head}<br/>成功 <b style="color:#10b981">${formatTokens(row.success)}</b> · 失败 <b style="color:${lineColor}">${formatTokens(row.failed)}</b><br/>失败率 <b style="color:${lineColor}">${rateTxt}</b>`;
-        }
-        const cacheTxt = row.cacheRate == null ? "—" : `${(row.cacheRate * 100).toFixed(1)}%`;
-        return `${head}<br/>缓存命中 <b style="color:${lineColor}">${cacheTxt}</b>`;
-      },
-    },
-    legend: {
-      right: 4,
-      top: 0,
-      itemWidth: 14,
-      itemHeight: 8,
-      textStyle: { color: axisColor, fontSize: 11 },
-      data: ["请求量", lineName],
-    },
-    xAxis: {
-      type: "category",
-      data: labels,
-      boundaryGap: true,
-      axisLine: { lineStyle: { color: dark ? "#2a2a2a" : "#e5e5e5" } },
-      axisTick: { show: false },
-      axisLabel: {
-        color: axisColor,
-        fontSize: 10,
-        hideOverlap: true,
-        interval: "auto",
-      },
-    },
-    yAxis: [
-      {
-        type: "value",
-        name: "请求",
-        nameTextStyle: { color: dark ? "#737373" : "#a3a3a3", fontSize: 10, padding: [0, 0, 0, -2] },
-        splitLine: { lineStyle: { color: dark ? "#222222" : "#f0f0f0" } },
-        axisLabel: { color: axisColor, fontSize: 10 },
-      },
-      {
-        type: "value",
-        name: lineName,
-        nameTextStyle: { color: dark ? "#737373" : "#a3a3a3", fontSize: 10, padding: [0, 0, 0, -2] },
-        min: 0,
-        max: hasAnyFail ? maxFailPct : 100,
-        splitLine: { show: false },
-        axisLabel: {
-          color: lineColor,
-          fontSize: 10,
-          formatter: (v: number) => `${v}%`,
-        },
-      },
-    ],
-    series: [
-      {
-        name: "请求量",
-        type: "bar",
-        data: requestData,
-        barMaxWidth: 18,
-        itemStyle: { color: barColor, borderRadius: [3, 3, 0, 0] },
-        emphasis: { focus: "series" },
-      },
-      {
-        name: lineName,
-        type: "line",
-        yAxisIndex: 1,
-        data: lineData,
-        smooth: true,
-        showSymbol: false,
-        lineStyle: { width: 2, color: lineColor },
-        itemStyle: { color: lineColor },
-        areaStyle: {
-          color: {
-            type: "linear", x: 0, y: 0, x2: 0, y2: 1,
-            colorStops: [
-              { offset: 0, color: dark ? (hasHealth ? "rgba(248,113,113,.25)" : "rgba(45,212,191,.25)") : (hasHealth ? "rgba(220,38,38,.15)" : "rgba(13,148,136,.18)") },
-              { offset: 1, color: dark ? (hasHealth ? "rgba(248,113,113,0)" : "rgba(45,212,191,0)") : (hasHealth ? "rgba(220,38,38,0)" : "rgba(13,148,136,0)") },
-            ],
-          },
-        },
       },
     ],
   };
@@ -653,13 +499,39 @@ onMounted(() => {
           <section class="tt-card tt-card-heat">
             <header class="tt-card-head">
               <div>
-                <h2>请求健康时间线</h2>
-                <p>HEALTH · 按{{ trendUnitLabel() }} · 请求量 + 大模型请求失败率</p>
+                <h2>请求健康热力图</h2>
+                <p>HEALTH · 每日大模型请求失败率{{ healthHeatmap.overallRate != null ? " · 总体 " + (healthHeatmap.overallRate * 100).toFixed(1) + "%" : "" }}</p>
               </div>
             </header>
-            <div class="tt-card-body tt-chart-body">
-              <EChart v-if="healthTimeline.length" :option="healthTimelineOption" height="240px" />
-              <div v-else class="tt-table-empty">该范围内没有请求数据</div>
+            <div class="tt-card-body tt-heatmap-wrap">
+              <div v-if="healthHeatmap.weeks.length" class="tt-heatmap">
+                <div class="tt-heatmap-months">
+                  <template v-for="m in healthHeatmap.months" :key="m.label">
+                    <span :style="{ gridColumn: 'span ' + m.span }">{{ m.label }}</span>
+                  </template>
+                </div>
+                <div class="tt-heatmap-weeks">
+                  <div v-for="(week, wi) in healthHeatmap.weeks" :key="wi" class="tt-heatmap-week">
+                    <div
+                      v-for="(day, di) in week.days"
+                      :key="di"
+                      class="tt-heatmap-cell"
+                      :class="[
+                        day.level ? 'lv' + day.level : '',
+                        { 'is-future': day.isFuture },
+                      ]"
+                      :title="dayTitle(day)"
+                    ></div>
+                  </div>
+                </div>
+                <div class="tt-heatmap-legend">
+                  <span>无数据</span>
+                  <span class="tt-heatmap-cell"></span>
+                  <span v-for="l in 4" :key="l" class="tt-heatmap-cell lv" :class="'lv' + l"></span>
+                  <span>失败率低 → 高</span>
+                </div>
+              </div>
+              <div v-else class="tt-table-empty">该范围内没有请求健康数据</div>
             </div>
           </section>
         </div>

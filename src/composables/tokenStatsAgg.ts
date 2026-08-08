@@ -344,6 +344,118 @@ export function buildHeatmap(dailyMap: Map<string, DailyStat>, today = new Date(
   };
 }
 
+// —— 请求健康热力图：按天聚合大模型请求失败率，用层级着色 ——
+export interface HealthHeatmapDay {
+  date: string;
+  requests: number;
+  failed: number;
+  rate: number | null; // 0~1，null 表示无数据
+  level: number;       // 0=无数据 1=低失败 2=中 3=高 4=极高
+  isFuture: boolean;
+}
+export interface HealthHeatmapData {
+  weeks: { days: HealthHeatmapDay[] }[];
+  months: { label: string; span: number }[];
+  startLabel: string;
+  endLabel: string;
+  totalRequests: number;
+  totalFailed: number;
+  overallRate: number | null;
+}
+
+interface HealthInput {
+  hour: string;
+  success: number;
+  failed: number;
+}
+
+export function buildHealthHeatmap(
+  buckets: HealthInput[],
+  from?: string,
+  to?: string,
+  today = new Date(),
+): HealthHeatmapData {
+  // 按本地日期聚合成功/失败
+  const byDay = new Map<string, { requests: number; failed: number }>();
+  for (const b of buckets) {
+    const day = localDateOf(b.hour);
+    if (!day) continue;
+    if (from && day < from) continue;
+    if (to && day > to) continue;
+    const cur = byDay.get(day) || { requests: 0, failed: 0 };
+    cur.requests += (b.success || 0) + (b.failed || 0);
+    cur.failed += b.failed || 0;
+    byDay.set(day, cur);
+  }
+
+  let start: Date;
+  if (byDay.size) {
+    start = parseLocal([...byDay.keys()].sort()[0]);
+  } else {
+    start = new Date(today);
+    start.setDate(start.getDate() - 89);
+  }
+  start = startOfWeek(start);
+
+  const rateOf = (requests: number, failed: number) =>
+    requests > 0 ? failed / requests : null;
+  const levelOf = (rate: number | null) => {
+    if (rate == null) return 0;
+    if (rate <= 0.02) return 1;
+    if (rate <= 0.08) return 2;
+    if (rate <= 0.2) return 3;
+    return 4;
+  };
+
+  const weeks: { days: HealthHeatmapDay[] }[] = [];
+  let totalRequests = 0;
+  let totalFailed = 0;
+  const cursor = new Date(start);
+  while (cursor <= today && weeks.length < WEEKS_CAP) {
+    const days: HealthHeatmapDay[] = [];
+    for (let index = 0; index < 7; index += 1) {
+      const date = toLocalDate(cursor);
+      const agg = byDay.get(date);
+      const requests = agg?.requests ?? 0;
+      const failed = agg?.failed ?? 0;
+      const rate = rateOf(requests, failed);
+      totalRequests += requests;
+      totalFailed += failed;
+      days.push({
+        date,
+        requests,
+        failed,
+        rate,
+        level: levelOf(rate),
+        isFuture: cursor.getTime() > today.getTime(),
+      });
+      cursor.setDate(cursor.getDate() + 1);
+    }
+    weeks.push({ days });
+  }
+
+  const months: { label: string; span: number }[] = [];
+  for (const week of weeks) {
+    const label = week.days[0].date.slice(0, 7);
+    const last = months[months.length - 1];
+    if (last && last.label === label) {
+      last.span += 1;
+    } else {
+      months.push({ label, span: 1 });
+    }
+  }
+
+  return {
+    weeks,
+    months,
+    startLabel: weeks[0]?.days[0].date ?? "",
+    endLabel: toLocalDate(today),
+    totalRequests,
+    totalFailed,
+    overallRate: rateOf(totalRequests, totalFailed),
+  };
+}
+
 // —— 过滤 unknown / 空模型来源 ——
 export function isKnownModel(model?: string) {
   const value = (model || "").trim().toLowerCase();

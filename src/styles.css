@@ -4458,6 +4458,7 @@ kbd { padding: 3px 7px; border: 1px solid var(--line); border-radius: var(--r-xs
 .tt-muted { color: var(--oai-faint); font-size: 12px; }
 
 /* 热力图 */
+.tt-heatmap-wrap { padding: 8px 10px 14px; min-height: 120px; }
 .tt-heatmap { min-width: 0; overflow-x: auto; overscroll-behavior: contain; }
 .tt-heatmap-months {
   display: grid;
@@ -4483,14 +4484,14 @@ kbd { padding: 3px 7px; border: 1px solid var(--line); border-radius: var(--r-xs
   border-radius: 3px;
   background: var(--oai-soft);
 }
-.tt-heatmap-cell.lv1 { background: #d1fae5; }
-.tt-heatmap-cell.lv2 { background: #6ee7b7; }
-.tt-heatmap-cell.lv3 { background: #10b981; }
-.tt-heatmap-cell.lv4 { background: #047857; }
-:root[data-theme="dark"] .tt-heatmap-cell.lv1 { background: #064e3b; }
-:root[data-theme="dark"] .tt-heatmap-cell.lv2 { background: #065f46; }
-:root[data-theme="dark"] .tt-heatmap-cell.lv3 { background: #059669; }
-:root[data-theme="dark"] .tt-heatmap-cell.lv4 { background: #34d399; }
+.tt-heatmap-cell.lv1 { background: #fecaca; }
+.tt-heatmap-cell.lv2 { background: #f87171; }
+.tt-heatmap-cell.lv3 { background: #ef4444; }
+.tt-heatmap-cell.lv4 { background: #b91c1c; }
+:root[data-theme="dark"] .tt-heatmap-cell.lv1 { background: #7f1d1d; }
+:root[data-theme="dark"] .tt-heatmap-cell.lv2 { background: #991b1b; }
+:root[data-theme="dark"] .tt-heatmap-cell.lv3 { background: #dc2626; }
+:root[data-theme="dark"] .tt-heatmap-cell.lv4 { background: #fca5a5; }
 .tt-heatmap-cell.is-future { background: transparent; }
 .tt-heatmap-legend {
   display: inline-flex;
