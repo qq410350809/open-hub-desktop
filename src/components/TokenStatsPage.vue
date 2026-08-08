@@ -152,12 +152,6 @@ const streakDays = computed(() => {
   return streak;
 });
 // —— 所选日期区间统计 ——
-const rangeLabel = computed(() => {
-  const from = store.tokenStatsFrom.value;
-  const to = store.tokenStatsTo.value;
-  if (!from && !to) return "全部";
-  return `${from || "…"} ~ ${to || "…"}`;
-});
 const rangeDays = computed(() => {
   const from = store.tokenStatsFrom.value;
   const to = store.tokenStatsTo.value;
@@ -168,6 +162,19 @@ const rangeDays = computed(() => {
 const dailyAverage = computed(() => {
   const days = Math.max(1, activeDays.value);
   return bucketTotal.value.total / days;
+});
+
+// 区间 Token 拆分（输入 / 输出 / 缓存）
+const rangeSplits = computed(() => {
+  let input = 0;
+  let output = 0;
+  let cache = 0;
+  for (const stat of dailyMap.value.values()) {
+    input += stat.input;
+    output += stat.output;
+    cache += stat.cache;
+  }
+  return { input, output, cache };
 });
 
 const cacheHitRate = computed(() => {
@@ -475,7 +482,7 @@ onMounted(() => {
           <div class="tt-kpi tt-kpi-hero">
             <span class="tt-kpi-label">TOKEN 总数</span>
             <strong class="tt-kpi-value">{{ formatCompact(bucketTotal.total) }}</strong>
-            <span class="tt-kpi-sub">所选区间 {{ rangeLabel }}</span>
+            <span class="tt-kpi-sub">输入 {{ formatCompact(rangeSplits.input) }} · 输出 {{ formatCompact(rangeSplits.output) }}</span>
           </div>
           <div class="tt-kpi">
             <span class="tt-kpi-label">对话数</span>
@@ -495,7 +502,7 @@ onMounted(() => {
           <div class="tt-kpi">
             <span class="tt-kpi-label">缓存命中率</span>
             <strong class="tt-kpi-value">{{ formatRate(cacheHitRate) }}</strong>
-            <span class="tt-kpi-sub">输入缓存占比</span>
+            <span class="tt-kpi-sub">输入缓存占比 · 缓存 {{ formatCompact(rangeSplits.cache) }}</span>
           </div>
           <div class="tt-kpi">
             <span class="tt-kpi-label">活跃天数</span>
