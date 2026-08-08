@@ -3,6 +3,7 @@ import { computed } from "vue";
 import { icons } from "../icons";
 import { useStore } from "../composables/useStore";
 import { usePreferences } from "../composables/usePreferences";
+import { formatCompact, localDateOf, toLocalDate } from "../composables/tokenStatsAgg";
 
 const store = useStore();
 const { preferences, updatePreferences } = usePreferences();
@@ -36,7 +37,32 @@ const navItems = computed(() => [
       : "",
     onClick: () => store.openProxyPool(),
   },
+  {
+    id: "tokenstats",
+    label: "Token 统计",
+    icon: icons.chart,
+    active: store.page.value === "tokenstats",
+    badge: todayTokenBadge.value,
+    onClick: () => store.openTokenStats(),
+  },
 ]);
+
+// 今天消耗的 token 数（用于侧边栏菜单徽标）
+const todayTokenTotal = computed(() => {
+  const buckets = store.tokenUsage.value?.buckets ?? [];
+  const today = toLocalDate(new Date());
+  let total = 0;
+  for (const bucket of buckets) {
+    if (localDateOf(bucket.timestamp) === today) {
+      total += bucket.totalTokens || 0;
+    }
+  }
+  return total;
+});
+// 徽标文案：0 不显示
+const todayTokenBadge = computed(() =>
+  todayTokenTotal.value > 0 ? formatCompact(todayTokenTotal.value) : "",
+);
 
 function toggleSidebar() {
   updatePreferences({ sidebarCollapsed: !preferences.sidebarCollapsed });

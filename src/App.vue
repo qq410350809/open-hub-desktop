@@ -18,6 +18,7 @@ import ChromeSessionDialog from "./components/ChromeSessionDialog.vue";
 import SiteModelsDialog from "./components/SiteModelsDialog.vue";
 import CharityMonitorPage from "./components/CharityMonitorPage.vue";
 import ProxyPoolPage from "./components/ProxyPoolPage.vue";
+import TokenStatsPage from "./components/TokenStatsPage.vue";
 
 const store = useStore();
 
@@ -94,7 +95,7 @@ function onKeydown(event: KeyboardEvent) {
     else if (store.linkDialogOpen.value) store.closeLinkDialog();
     else if (store.modalOpen.value) store.closeModal();
     else if (store.page.value === "settings") store.closeSettings();
-    else if (store.page.value === "charity" || store.page.value === "proxy") store.openLibrary();
+    else if (store.page.value === "charity" || store.page.value === "proxy" || store.page.value === "tokenstats") store.openLibrary();
   }
 }
 
@@ -109,7 +110,7 @@ onMounted(async () => {
   document.addEventListener("scroll", onScroll, { capture: true, passive: true });
   window.addEventListener("resize", onScroll, { passive: true });
   document.addEventListener("keydown", onKeydown);
-  await Promise.all([store.loadLibrary(), store.loadProxyPool()]);
+  await Promise.all([store.loadLibrary(), store.loadProxyPool(), store.loadTokenUsage()]);
   store.startDailyRefresh();
   store.startCharityMonitor();
 });
@@ -279,6 +280,14 @@ onUnmounted(() => {
           aria-labelledby="proxy-nav"
         >
           <ProxyPoolPage />
+        </div>
+        <div
+          v-else-if="store.page.value === 'tokenstats'"
+          id="token-stats-panel"
+          class="token-stats-panel"
+          aria-labelledby="tokenstats-nav"
+        >
+          <TokenStatsPage />
         </div>
       </div>
     </div>

@@ -1,6 +1,7 @@
 use crate::chrome_session;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
 use std::collections::HashSet;
 use tauri::Emitter;
 
@@ -449,4 +450,203 @@ pub(crate) struct ProxyIpAnalysis {
     pub(crate) unique_ips: usize,
     pub(crate) nodes: Vec<ProxyIpNodeAnalysis>,
     pub(crate) groups: Vec<ProxyIpGroup>,
+}
+
+// —— Token 统计（数据来源：tokentracker CLI，见 token_stats.rs）——
+// CLI `sessions` 输出键为 snake_case，而 app 前端约定 camelCase，
+// 因此这里序列化走 camelCase、反序列化走 snake_case 双向映射。
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, rename_all(serialize = "camelCase", deserialize = "snake_case"))]
+pub(crate) struct TokenStatsReport {
+    pub(crate) available: bool,
+    pub(crate) sessions: Vec<TokenSession>,
+    pub(crate) session_count: i64,
+    pub(crate) summary: TokenSummary,
+    pub(crate) by_model: Vec<TokenModelStat>,
+    pub(crate) subagents: Vec<TokenSubagentStat>,
+    pub(crate) provenance: JsonValue,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, rename_all(serialize = "camelCase", deserialize = "snake_case"))]
+pub(crate) struct TokenSessionTokens {
+    pub(crate) input_tokens: i64,
+    pub(crate) cached_input_tokens: i64,
+    pub(crate) cache_creation_input_tokens: i64,
+    pub(crate) output_tokens: i64,
+    pub(crate) reasoning_output_tokens: i64,
+    pub(crate) total_tokens: i64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, rename_all(serialize = "camelCase", deserialize = "snake_case"))]
+pub(crate) struct TokenSession {
+    pub(crate) version: i64,
+    pub(crate) session_hash: String,
+    pub(crate) source: String,
+    pub(crate) project_key: String,
+    pub(crate) model: String,
+    pub(crate) started_at: String,
+    pub(crate) ended_at: String,
+    pub(crate) active_ms: i64,
+    pub(crate) turns: i64,
+    pub(crate) edit_turns: i64,
+    pub(crate) retry_turns: i64,
+    pub(crate) subagent_calls: i64,
+    pub(crate) subagent_types: JsonValue,
+    pub(crate) tokens: TokenSessionTokens,
+    pub(crate) provenance: JsonValue,
+    pub(crate) duration_ms: i64,
+    pub(crate) total_tokens: i64,
+    pub(crate) cost_usd: f64,
+    pub(crate) productive: bool,
+    pub(crate) first_pass: bool,
+    pub(crate) one_shot: bool,
+    pub(crate) tokens_per_edit: Option<f64>,
+    pub(crate) cost_per_edit: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, rename_all(serialize = "camelCase", deserialize = "snake_case"))]
+pub(crate) struct TokenSummary {
+    pub(crate) sessions: i64,
+    pub(crate) productive_sessions: i64,
+    pub(crate) one_shot_sessions: i64,
+    pub(crate) edit_turns: i64,
+    pub(crate) retries: i64,
+    pub(crate) total_tokens: i64,
+    pub(crate) cost_usd: f64,
+    pub(crate) edit_tokens: i64,
+    pub(crate) edit_cost_usd: f64,
+    pub(crate) productive_rate: f64,
+    pub(crate) one_shot_rate: Option<f64>,
+    pub(crate) edit_sessions: i64,
+    pub(crate) first_pass_sessions: i64,
+    pub(crate) edit_session_rate: f64,
+    pub(crate) first_pass_rate: Option<f64>,
+    pub(crate) tokens_per_edit: Option<f64>,
+    pub(crate) cost_per_edit: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, rename_all(serialize = "camelCase", deserialize = "snake_case"))]
+pub(crate) struct TokenModelStat {
+    pub(crate) model: String,
+    pub(crate) sessions: i64,
+    pub(crate) productive_sessions: i64,
+    pub(crate) one_shot_sessions: i64,
+    pub(crate) edit_turns: i64,
+    pub(crate) retries: i64,
+    pub(crate) total_tokens: i64,
+    pub(crate) cost_usd: f64,
+    pub(crate) edit_tokens: i64,
+    pub(crate) edit_cost_usd: f64,
+    pub(crate) productive_rate: f64,
+    pub(crate) one_shot_rate: Option<f64>,
+    pub(crate) edit_sessions: i64,
+    pub(crate) first_pass_sessions: i64,
+    pub(crate) edit_session_rate: f64,
+    pub(crate) first_pass_rate: Option<f64>,
+    pub(crate) tokens_per_edit: Option<f64>,
+    pub(crate) cost_per_edit: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, rename_all(serialize = "camelCase", deserialize = "snake_case"))]
+pub(crate) struct TokenSubagentStat {
+    pub(crate) name: String,
+    pub(crate) calls: i64,
+    pub(crate) sessions: i64,
+    pub(crate) total_tokens: f64,
+    pub(crate) cost_usd: f64,
+}
+
+// —— Token 用量小时桶（数据来源：~/.tokentracker/tracker/cursors.json 的 hourly.buckets）——
+// tokentracker 仪表盘的汇总数据来自这里（覆盖所有工具的每小时用量），
+// 而 `sessions` 子命令只聚合 Claude/Codex 会话日志。
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, rename_all(serialize = "camelCase", deserialize = "snake_case"))]
+pub(crate) struct TokenUsageBucket {
+    pub(crate) source: String,
+    pub(crate) model: String,
+    pub(crate) timestamp: String,
+    pub(crate) total_tokens: i64,
+    pub(crate) billable_total_tokens: i64,
+    pub(crate) input_tokens: i64,
+    pub(crate) cached_input_tokens: i64,
+    pub(crate) cache_creation_input_tokens: i64,
+    pub(crate) output_tokens: i64,
+    pub(crate) reasoning_output_tokens: i64,
+    pub(crate) conversation_count: i64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, rename_all(serialize = "camelCase", deserialize = "snake_case"))]
+pub(crate) struct TokenUsageReport {
+    pub(crate) available: bool,
+    pub(crate) buckets: Vec<TokenUsageBucket>,
+    pub(crate) start_date: String,
+    pub(crate) end_date: String,
+}
+
+// —— 原始日志解析：会话 / 对话 / 请求 三级 ——
+// 会话 = 会话文件（Claude jsonl / Codex rollout）
+// 对话 = 每次用户提问轮（一个 user 消息 + 其后 assistant 消息）
+// 请求 = 每条消息（user 或 assistant）
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, rename_all(serialize = "camelCase", deserialize = "snake_case"))]
+pub(crate) struct RawSession {
+    pub(crate) id: String,
+    pub(crate) source: String,
+    pub(crate) project: String,
+    pub(crate) started_at: String,
+    pub(crate) ended_at: String,
+    pub(crate) message_count: i64,
+    pub(crate) conversation_count: i64,
+    pub(crate) model: String,
+    pub(crate) total_tokens: i64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, rename_all(serialize = "camelCase", deserialize = "snake_case"))]
+pub(crate) struct RawConversation {
+    pub(crate) id: String,
+    pub(crate) session_id: String,
+    pub(crate) source: String,
+    pub(crate) project: String,
+    pub(crate) index: i64,
+    pub(crate) started_at: String,
+    pub(crate) ended_at: String,
+    pub(crate) request_count: i64,
+    pub(crate) model: String,
+    pub(crate) total_tokens: i64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, rename_all(serialize = "camelCase", deserialize = "snake_case"))]
+pub(crate) struct RawRequest {
+    pub(crate) id: String,
+    pub(crate) session_id: String,
+    pub(crate) conversation_id: String,
+    pub(crate) source: String,
+    pub(crate) timestamp: String,
+    pub(crate) role: String,
+    pub(crate) model: String,
+    pub(crate) input_tokens: i64,
+    pub(crate) cache_read_tokens: i64,
+    pub(crate) cache_creation_tokens: i64,
+    pub(crate) output_tokens: i64,
+    pub(crate) total_tokens: i64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, rename_all(serialize = "camelCase", deserialize = "snake_case"))]
+pub(crate) struct RawLogReport {
+    pub(crate) available: bool,
+    pub(crate) sessions: Vec<RawSession>,
+    pub(crate) conversations: Vec<RawConversation>,
+    pub(crate) requests: Vec<RawRequest>,
 }

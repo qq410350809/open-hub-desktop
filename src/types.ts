@@ -368,3 +368,148 @@ export interface ProxyIpAnalysis {
   nodes: ProxyIpNodeAnalysis[];
   groups: ProxyIpGroup[];
 }
+
+// —— Token 统计（数据来源：tokentracker CLI）——
+export interface TokenSessionTokens {
+  inputTokens: number;
+  cachedInputTokens: number;
+  cacheCreationInputTokens: number;
+  outputTokens: number;
+  reasoningOutputTokens: number;
+  totalTokens: number;
+}
+
+export interface TokenSession {
+  version: number;
+  sessionHash: string;
+  source: string;
+  projectKey: string;
+  model: string;
+  startedAt: string;
+  endedAt: string;
+  activeMs: number;
+  turns: number;
+  editTurns: number;
+  retryTurns: number;
+  subagentCalls: number;
+  subagentTypes: Record<string, number>;
+  tokens: TokenSessionTokens;
+  provenance: Record<string, unknown>;
+  durationMs: number;
+  totalTokens: number;
+  costUsd: number;
+  productive: boolean;
+  firstPass: boolean;
+  oneShot: boolean;
+  tokensPerEdit: number | null;
+  costPerEdit: number | null;
+}
+
+export interface TokenSummary {
+  sessions: number;
+  productiveSessions: number;
+  oneShotSessions: number;
+  editTurns: number;
+  retries: number;
+  totalTokens: number;
+  costUsd: number;
+  editTokens: number;
+  editCostUsd: number;
+  productiveRate: number;
+  oneShotRate: number | null;
+  editSessions: number;
+  firstPassSessions: number;
+  editSessionRate: number;
+  firstPassRate: number | null;
+  tokensPerEdit: number | null;
+  costPerEdit: number | null;
+}
+
+export interface TokenModelStat extends TokenSummary {
+  model: string;
+}
+
+export interface TokenSubagentStat {
+  name: string;
+  calls: number;
+  sessions: number;
+  totalTokens: number;
+  costUsd: number;
+}
+
+export interface TokenStatsReport {
+  available: boolean;
+  sessions: TokenSession[];
+  sessionCount: number;
+  summary: TokenSummary;
+  byModel: TokenModelStat[];
+  subagents: TokenSubagentStat[];
+  provenance: Record<string, unknown>;
+}
+
+// —— Token 用量小时桶（tokentracker cursors.json hourly.buckets）——
+export interface TokenUsageBucket {
+  source: string;
+  model: string;
+  timestamp: string;
+  totalTokens: number;
+  billableTotalTokens: number;
+  inputTokens: number;
+  cachedInputTokens: number;
+  cacheCreationInputTokens: number;
+  outputTokens: number;
+  reasoningOutputTokens: number;
+  conversationCount: number;
+}
+
+export interface TokenUsageReport {
+  available: boolean;
+  buckets: TokenUsageBucket[];
+  startDate: string;
+  endDate: string;
+}
+
+// —— 原始日志解析：会话 / 对话 / 请求 ——
+export interface RawSession {
+  id: string;
+  source: string;
+  project: string;
+  startedAt: string;
+  endedAt: string;
+  messageCount: number;
+  conversationCount: number;
+  model: string;
+  totalTokens: number;
+}
+export interface RawConversation {
+  id: string;
+  sessionId: string;
+  source: string;
+  project: string;
+  index: number;
+  startedAt: string;
+  endedAt: string;
+  requestCount: number;
+  model: string;
+  totalTokens: number;
+}
+export interface RawRequest {
+  id: string;
+  sessionId: string;
+  conversationId: string;
+  source: string;
+  timestamp: string;
+  role: string;
+  model: string;
+  inputTokens: number;
+  cacheReadTokens: number;
+  cacheCreationTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+}
+export interface RawLogReport {
+  available: boolean;
+  sessions: RawSession[];
+  conversations: RawConversation[];
+  requests: RawRequest[];
+}

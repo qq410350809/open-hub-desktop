@@ -225,6 +225,43 @@ export async function runCommand<T>(
   if (command === "set_charity_monitor_visible") return undefined as T;
   if (command === "request_charity_round") return undefined as T;
 
+  if (command === "get_token_stats") {
+    return {
+      available: true,
+      sessions: [],
+      sessionCount: 0,
+      summary: {
+        sessions: 0, productiveSessions: 0, oneShotSessions: 0, editTurns: 0, retries: 0,
+        totalTokens: 0, costUsd: 0, editTokens: 0, editCostUsd: 0, productiveRate: 0,
+        oneShotRate: null, editSessions: 0, firstPassSessions: 0, editSessionRate: 0,
+        firstPassRate: null, tokensPerEdit: null, costPerEdit: null,
+      },
+      byModel: [],
+      subagents: [],
+      provenance: {},
+    } as T;
+  }
+  if (command === "get_token_usage") {
+    const buckets: any[] = [];
+    const now = Date.now();
+    let i = 0;
+    for (let d = 0; d < 3; d++) {
+      for (let h = 8; h < 23; h++) {
+        const total = 3000000 + ((i*7919) % 5000000);
+        buckets.push({ source: "claude", model: "claude-sonnet-4",
+          timestamp: new Date(now - d*86400000 - h*3600000).toISOString(),
+          totalTokens: total, billableTotalTokens: Math.floor(total*0.6),
+          inputTokens: Math.floor(total*0.5), cachedInputTokens: Math.floor(total*0.25),
+          cacheCreationInputTokens: Math.floor(total*0.05), outputTokens: Math.floor(total*0.15),
+          reasoningOutputTokens: Math.floor(total*0.05), conversationCount: (i%3)+1 });
+        i++;
+      }
+    }
+    return { available: true, buckets, startDate: "", endDate: "" } as T;
+  }
+  if (command === "get_token_raw_logs") {
+    return { available: false, sessions: [], conversations: [], requests: [] } as T;
+  }
   if (command === "detect_site_system_types") return 0 as T;
   if (command === "create_site") {
     const site = {

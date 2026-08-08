@@ -11,6 +11,7 @@ mod remote_sync;
 mod site_crud;
 mod site_ops;
 mod system_detect;
+mod token_stats;
 
 use models::*;
 
@@ -987,7 +988,10 @@ pub fn run() {
             charity_monitor::clear_charity_sync_logs,
             charity_monitor::set_charity_monitor_visible,
             charity_monitor::request_charity_round,
-            charity_monitor::refresh_all_charity_feeds
+            charity_monitor::refresh_all_charity_feeds,
+            token_stats::get_token_stats,
+            token_stats::get_token_usage,
+            token_stats::get_token_raw_logs
         ])
         .run(tauri::generate_context!())
         .expect("error while running Tauri application");

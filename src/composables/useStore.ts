@@ -8,6 +8,7 @@ import { useSyncState } from "./useSyncState";
 import { useSiteActions } from "./useSiteActions";
 import { useCharityMonitor } from "./useCharityMonitor";
 import { useProxyPool } from "./useProxyPool";
+import { useTokenStats } from "./useTokenStats";
 
 export function useStore() {
   const { sites, suggestedTags, loading, loadLibrary, startDailyRefresh, stopDailyRefresh } = useLibrary();
@@ -21,6 +22,7 @@ export function useStore() {
   const actions = useSiteActions();
   const charity = useCharityMonitor();
   const proxy = useProxyPool();
+  const tokenStats = useTokenStats();
 
   return {
     // 数据
@@ -42,6 +44,8 @@ export function useStore() {
     ...charity,
     // Clash 代理池
     ...proxy,
+    // Token 统计
+    ...tokenStats,
     // 通用
     loadLibrary,
     startDailyRefresh,
