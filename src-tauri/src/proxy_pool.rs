@@ -2508,7 +2508,9 @@ pub async fn refresh_proxy_subscription(
     drop(connection);
 
     // 配置变更后异步重启运行时，不阻塞导入完成反馈。
-    let _ = ensure_runtime(&database, &runtime, None, None);
+    // ensure_runtime 内部 block_on 等待内核就绪，须 block_in_place 才不触发
+    // async worker 上的运行时嵌套 panic。
+    let _ = tokio::task::block_in_place(|| ensure_runtime(&database, &runtime, None, None));
 
     let subscription = {
         let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
