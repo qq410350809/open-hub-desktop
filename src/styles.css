@@ -3678,7 +3678,8 @@ kbd { padding: 3px 7px; border: 1px solid var(--line); border-radius: var(--r-xs
 .tt-kpi {
   position: relative;
   min-width: 0;
-  min-height: 104px;
+  height: 120px;
+  min-height: 120px;
   padding: 16px;
   display: flex;
   align-items: center;
@@ -3767,6 +3768,7 @@ kbd { padding: 3px 7px; border: 1px solid var(--line); border-radius: var(--r-xs
 }
 .tt-kpi-hero {
   grid-column: span 2;
+  height: 120px;
   background: linear-gradient(135deg, color-mix(in srgb, var(--oai-accent) 14%, var(--oai-card)), var(--oai-card));
   border-color: color-mix(in srgb, var(--oai-accent) 30%, var(--oai-border));
 }
