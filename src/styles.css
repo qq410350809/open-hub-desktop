@@ -3689,9 +3689,32 @@ kbd { padding: 3px 7px; border: 1px solid var(--line); border-radius: var(--r-xs
   background: var(--oai-card);
   box-shadow: 0 1px 2px rgba(0,0,0,.04);
 }
+.tt-kpi-head {
+  margin-bottom: 12px;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+.tt-kpi-range {
+  color: var(--oai-faint);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: .05em;
+  text-transform: uppercase;
+}
+.tt-kpi-range-val {
+  color: var(--oai-accent-strong);
+  font-size: 13px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
 .tt-kpi-hero {
+  grid-column: span 2;
   background: linear-gradient(135deg, var(--oai-accent-soft), var(--oai-card));
   border-color: color-mix(in srgb, var(--oai-accent) 30%, var(--oai-border));
+}
+.tt-kpi-hero .tt-kpi-value {
+  font-size: 40px;
 }
 .tt-kpi-label {
   color: var(--oai-muted);

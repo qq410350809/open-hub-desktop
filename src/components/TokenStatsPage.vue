@@ -152,6 +152,12 @@ const streakDays = computed(() => {
   return streak;
 });
 // —— 所选日期区间统计 ——
+const rangeLabel = computed(() => {
+  const from = store.tokenStatsFrom.value;
+  const to = store.tokenStatsTo.value;
+  if (!from && !to) return "全部";
+  return `${from || "…"} ~ ${to || "…"}`;
+});
 const rangeDays = computed(() => {
   const from = store.tokenStatsFrom.value;
   const to = store.tokenStatsTo.value;
@@ -478,6 +484,10 @@ onMounted(() => {
 
       <template v-else-if="store.tokenUsage.value">
         <!-- KPI 指标卡 -->
+        <div class="tt-kpi-head">
+          <span class="tt-kpi-range">统计区间</span>
+          <strong class="tt-kpi-range-val">{{ rangeLabel }}</strong>
+        </div>
         <div class="tt-kpis">
           <div class="tt-kpi tt-kpi-hero">
             <span class="tt-kpi-label">TOKEN 总数</span>
@@ -485,29 +495,29 @@ onMounted(() => {
             <span class="tt-kpi-sub">输入 {{ formatCompact(rangeSplits.input) }} · 输出 {{ formatCompact(rangeSplits.output) }}</span>
           </div>
           <div class="tt-kpi">
-            <span class="tt-kpi-label">对话数</span>
-            <strong class="tt-kpi-value">{{ formatTokens(bucketTotal.conversations) }}</strong>
-            <span class="tt-kpi-sub">区间内对话轮次</span>
-          </div>
-          <div class="tt-kpi">
-            <span class="tt-kpi-label">估算成本</span>
-            <strong class="tt-kpi-value">{{ estimatedCost > 0 ? formatCost(estimatedCost) : "—" }}</strong>
-            <span class="tt-kpi-sub">基于会话单价外推</span>
-          </div>
-          <div class="tt-kpi">
             <span class="tt-kpi-label">日均 Tokens</span>
             <strong class="tt-kpi-value">{{ formatCompact(dailyAverage) }}</strong>
-            <span class="tt-kpi-sub">区间总量 / {{ formatTokens(activeDays) }} 活跃天</span>
+            <span class="tt-kpi-sub">按 {{ formatTokens(activeDays) }} 个活跃天</span>
+          </div>
+          <div class="tt-kpi">
+            <span class="tt-kpi-label">对话数</span>
+            <strong class="tt-kpi-value">{{ formatTokens(bucketTotal.conversations) }}</strong>
+            <span class="tt-kpi-sub">区间累计轮次</span>
           </div>
           <div class="tt-kpi">
             <span class="tt-kpi-label">缓存命中率</span>
             <strong class="tt-kpi-value">{{ formatRate(cacheHitRate) }}</strong>
-            <span class="tt-kpi-sub">输入缓存占比 · 缓存 {{ formatCompact(rangeSplits.cache) }}</span>
+            <span class="tt-kpi-sub">缓存 {{ formatCompact(rangeSplits.cache) }}</span>
+          </div>
+          <div class="tt-kpi">
+            <span class="tt-kpi-label">估算成本</span>
+            <strong class="tt-kpi-value">{{ estimatedCost > 0 ? formatCost(estimatedCost) : "—" }}</strong>
+            <span class="tt-kpi-sub">会话单价外推</span>
           </div>
           <div class="tt-kpi">
             <span class="tt-kpi-label">活跃天数</span>
             <strong class="tt-kpi-value">{{ formatTokens(activeDays) }}<small>天</small></strong>
-            <span class="tt-kpi-sub">区间跨度 {{ formatTokens(rangeDays) }} 天 · 连续 {{ formatTokens(streakDays) }} 天</span>
+            <span class="tt-kpi-sub">跨度 {{ formatTokens(rangeDays) }} 天 · 连续 {{ formatTokens(streakDays) }} 天</span>
           </div>
         </div>
 
