@@ -31,7 +31,7 @@ function toLocalDate(value: Date): string {
  *  -3 昨日（仅昨天）
  *   0 本月（1 号至今）
  *  -1 全部（不限日期）
- *  >0 近 N 天（含今天，回推 N 天）
+ *  >0 近 N 天（含今天，共 N 天，即今天往前 N-1 天）
  */
 function setQuickRange(days: number) {
   if (days === -1) {
@@ -72,7 +72,7 @@ function setQuickRange(days: number) {
     const offset = (from.getDay() + 6) % 7;
     from.setDate(from.getDate() - offset);
   } else {
-    from.setDate(from.getDate() - days);
+    from.setDate(from.getDate() - (days - 1));
   }
 
   tokenStatsFrom.value = toLocalDate(from);
@@ -147,7 +147,7 @@ function isCurrentRange(days: number) {
     const offset = (from.getDay() + 6) % 7;
     from.setDate(from.getDate() - offset);
   } else {
-    from.setDate(from.getDate() - days);
+    from.setDate(from.getDate() - (days - 1));
   }
 
   return (
