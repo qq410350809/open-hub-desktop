@@ -109,7 +109,7 @@ export type TrendGranularity =
   | "day"    // ≤ 92 天 → 逐日
   | "month"; // > 92 天 → 逐月
 
-function bucketKeyFor(granularity: TrendGranularity, iso: string): { key: string; label: string } {
+export function bucketKeyFor(granularity: TrendGranularity, iso: string): { key: string; label: string } {
   const date = new Date(iso);
   if (Number.isNaN(date.getTime())) return { key: iso, label: iso };
   const day = toLocalDate(date);

@@ -6,11 +6,11 @@ import QuickRangeDropdown from "./QuickRangeDropdown.vue";
 import { icons } from "../icons";
 import { useStore } from "../composables/useStore";
 import {
+  bucketKeyFor,
   bucketModelTotals,
   bucketSourceTotals,
   bucketTotals,
   buildDailyMapFromBuckets,
-  buildHeatmap,
   buildTrendDetailFromBuckets,
   buildTrendFromBuckets,
   mergeModelTotals,
@@ -285,7 +285,21 @@ function formatDetailTime(label: string): string {
   }
 }
 
-const heatmap = computed(() => buildHeatmap(dailyMap.value));
+// —— 请求健康时间线：按趋势粒度聚合「请求量 + 缓存命中率」——
+const healthTimeline = computed(() => {
+  const map = new Map<string, { label: string; requests: number; cacheRead: number; cacheWrite: number; fresh: number }>();
+  for (const bucket of filteredBuckets.value) {
+    const { key, label } = bucketKeyFor(trendGranularity.value, bucket.timestamp);
+    if (!key) continue;
+    const cur = map.get(key) || { label, requests: 0, cacheRead: 0, cacheWrite: 0, fresh: 0 };
+    cur.requests += bucket.conversationCount || 0;
+    cur.cacheRead += bucket.cachedInputTokens || 0;
+    cur.cacheWrite += bucket.cacheCreationInputTokens || 0;
+    cur.fresh += bucket.inputTokens || 0;
+    map.set(key, cur);
+  }
+  return [...map.values()].sort((a, b) => a.label.localeCompare(b.label));
+});
 
 // —— ECharts 折线图 option（使用趋势）——
 const trendChartOption = computed<EChartsOption>(() => {
@@ -357,86 +371,127 @@ const trendChartOption = computed<EChartsOption>(() => {
   };
 });
 
-// —— ECharts 热力图 option（活跃热力图）——
-const heatmapOption = computed<EChartsOption>(() => {
+// —— ECharts「请求健康时间线」option ——
+// 请求量（柱，按当前趋势粒度聚合）+ 缓存命中率（线，作为健康度信号）
+const healthTimelineOption = computed<EChartsOption>(() => {
   const dark = document.documentElement.dataset.theme === "dark";
-  const world = heatmap.value;
-  const cells: number[] = [];
-  for (const week of world.weeks) {
-    for (const day of week.days) {
-      cells.push(day.tokens);
+  const axisColor = dark ? "#a3a3a3" : "#737373";
+  const lineColor = dark ? "#2dd4bf" : "#0d9488";
+  const barColor = dark ? "#6366f1" : "#a5b4fc";
+  const isHourly = trendGranularity.value === "hour";
+  const items = healthTimeline.value;
+  const labels = items.map((item) => {
+    if (isHourly) {
+      const m = item.label.match(/^(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2})$/);
+      return m ? m[2] : item.label;
     }
-  }
-  const maxTokens = Math.max(1, ...cells);
-  // 构造热力图数据 [x, y, value]：x=第几周，y=星期几(0=一 ~ 6=日)，value=tokens
-  const data: [number, number, number][] = [];
-  const days = ["一", "二", "三", "四", "五", "六", "日"];
-  world.weeks.forEach((week, wIndex) => {
-    week.days.forEach((day, dIndex) => {
-      data.push([wIndex, dIndex, day.tokens]);
-    });
+    return item.label;
   });
-  const colors: [number, string][] = [
-    [0, dark ? "#1f1f1f" : "#f0f0f0"],
-    [0.2, dark ? "#064e3b" : "#d1fae5"],
-    [0.45, dark ? "#065f46" : "#6ee7b7"],
-    [0.7, dark ? "#059669" : "#10b981"],
-    [1, dark ? "#34d399" : "#047857"],
-  ];
+  const rateOf = (it: { cacheRead: number; cacheWrite: number; fresh: number }) => {
+    const total = it.cacheRead + it.cacheWrite + it.fresh;
+    return total > 0 ? it.cacheRead / total : null;
+  };
+  const requestData = items.map((it) => it.requests || 0);
+  const rateData = items.map((it) => {
+    const rate = rateOf(it);
+    return rate == null ? null : Number((rate * 100).toFixed(1));
+  });
+  const table = items.map((it) => ({
+    label: it.label,
+    requests: it.requests || 0,
+    rate: rateOf(it),
+  }));
   return {
-    grid: { left: 6, right: 6, top: 6, bottom: 16 },
+    grid: { left: 8, right: 8, top: 22, bottom: 18 },
     tooltip: {
-      trigger: "item",
+      trigger: "axis",
       backgroundColor: dark ? "#1f1f1f" : "#ffffff",
       borderColor: dark ? "#333333" : "#e5e5e5",
       textStyle: { color: dark ? "#d4d4d4" : "#737373", fontSize: 12 },
-      formatter: (p: unknown) => {
-        const item = p as { value: [number, number, number] };
-        const [x, y, tokens] = item.value;
-        const day = world.weeks[x]?.days[y];
-        const label = day ? `${day.date} · 周${days[y]}` : "—";
-        return `${label}<br/><b style="color:#10b981">${formatTokens(tokens)}</b> Tokens`;
+      formatter: (params: unknown) => {
+        const list = params as { dataIndex: number }[];
+        const idx = list[0]?.dataIndex ?? -1;
+        const row = table[idx];
+        if (!row) return "";
+        const rateTxt = row.rate == null ? "—" : `${(row.rate * 100).toFixed(1)}%`;
+        return `<b>${row.label}</b><br/>请求量 <b style="color:#6366f1">${formatTokens(row.requests)}</b><br/>缓存命中 <b style="color:${lineColor}">${rateTxt}</b>`;
       },
+    },
+    legend: {
+      right: 4,
+      top: 0,
+      itemWidth: 14,
+      itemHeight: 8,
+      textStyle: { color: axisColor, fontSize: 11 },
+      data: ["请求量", "缓存命中率"],
     },
     xAxis: {
       type: "category",
-      data: world.weeks.map((_, i) => String(i)),
-      splitArea: { show: false },
-      axisLine: { show: false },
+      data: labels,
+      boundaryGap: true,
+      axisLine: { lineStyle: { color: dark ? "#2a2a2a" : "#e5e5e5" } },
       axisTick: { show: false },
-      axisLabel: { show: false },
+      axisLabel: {
+        color: axisColor,
+        fontSize: 10,
+        hideOverlap: true,
+        interval: "auto",
+      },
     },
-    yAxis: {
-      type: "category",
-      data: days,
-      splitArea: { show: false },
-      axisLine: { show: false },
-      axisTick: { show: false },
-      axisLabel: { color: dark ? "#a3a3a3" : "#737373", fontSize: 10 },
-    },
-    visualMap: {
-      min: 0,
-      max: maxTokens,
-      calculable: false,
-      orient: "horizontal",
-      left: "center",
-      bottom: 0,
-      itemWidth: 12,
-      itemHeight: 8,
-      text: ["多", "少"],
-      textStyle: { color: dark ? "#a3a3a3" : "#808080", fontSize: 10 },
-      inRange: { color: colors.map((c) => c[1]) },
-    },
+    yAxis: [
+      {
+        type: "value",
+        name: "请求",
+        nameTextStyle: { color: dark ? "#737373" : "#a3a3a3", fontSize: 10, padding: [0, 0, 0, -2] },
+        splitLine: { lineStyle: { color: dark ? "#222222" : "#f0f0f0" } },
+        axisLabel: { color: axisColor, fontSize: 10 },
+      },
+      {
+        type: "value",
+        name: "命中率",
+        nameTextStyle: { color: dark ? "#737373" : "#a3a3a3", fontSize: 10, padding: [0, 0, 0, -2] },
+        min: 0,
+        max: 100,
+        splitLine: { show: false },
+        axisLabel: {
+          color: lineColor,
+          fontSize: 10,
+          formatter: (v: number) => `${v}%`,
+        },
+      },
+    ],
     series: [
       {
-        type: "heatmap",
-        data,
-        itemStyle: { borderColor: dark ? "#0a0a0a" : "#ffffff", borderWidth: 2, borderRadius: 2 },
-        emphasis: { itemStyle: { shadowBlur: 6, shadowColor: "rgba(16,185,129,0.5)" } },
+        name: "请求量",
+        type: "bar",
+        data: requestData,
+        barMaxWidth: 18,
+        itemStyle: { color: barColor, borderRadius: [3, 3, 0, 0] },
+        emphasis: { focus: "series" },
+      },
+      {
+        name: "缓存命中率",
+        type: "line",
+        yAxisIndex: 1,
+        data: rateData,
+        smooth: true,
+        showSymbol: false,
+        lineStyle: { width: 2, color: lineColor },
+        itemStyle: { color: lineColor },
+        areaStyle: {
+          color: {
+            type: "linear", x: 0, y: 0, x2: 0, y2: 1,
+            colorStops: [
+              { offset: 0, color: dark ? "rgba(45,212,191,.25)" : "rgba(13,148,136,.18)" },
+              { offset: 1, color: "rgba(13,148,136,0)" },
+            ],
+          },
+        },
       },
     ],
   };
 });
+
 const modalTitle = computed(() => "用量明细");
 
 function refreshAll() {
@@ -565,12 +620,13 @@ onMounted(() => {
           <section class="tt-card tt-card-heat">
             <header class="tt-card-head">
               <div>
-                <h2>活跃热力图</h2>
-                <p>ACTIVITY · {{ heatmap.startLabel }} ~ {{ heatmap.endLabel }}</p>
+                <h2>请求健康时间线</h2>
+                <p>HEALTH · 按{{ trendUnitLabel() }} · 请求量 + 缓存命中率</p>
               </div>
             </header>
             <div class="tt-card-body tt-chart-body">
-              <EChart :option="heatmapOption" height="150px" />
+              <EChart v-if="healthTimeline.length" :option="healthTimelineOption" height="240px" />
+              <div v-else class="tt-table-empty">该范围内没有请求数据</div>
             </div>
           </section>
         </div>
