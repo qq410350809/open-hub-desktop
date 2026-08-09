@@ -219,6 +219,7 @@ impl CharityNodeQueue {
     }
 
     fn push_back(&mut self, node: CharityNodeRef) {
+        // 已拉黑节点不允许再入队
         self.nodes.push_back(node);
     }
 
@@ -226,6 +227,12 @@ impl CharityNodeQueue {
         self.nodes.is_empty()
     }
 
+    /// 从本轮公益队列中剔除指定节点（可清掉残留重复项）。
+    fn remove_id(&mut self, node_id: &str) -> usize {
+        let before = self.nodes.len();
+        self.nodes.retain(|node| node.id != node_id);
+        before.saturating_sub(self.nodes.len())
+    }
 }
 
 pub(crate) struct CharityMonitorRuntime {
@@ -1371,9 +1378,21 @@ fn finish_cancelled_feed_sync(
 }
 
 
+fn is_http_forbidden_error(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("http 403")
+        || lower.contains("status: 403")
+        || lower.contains("status 403")
+        || lower.contains("(403)")
+        || lower.contains(" 403 ")
+        || lower.contains("403 forbidden")
+        || lower.ends_with("403")
+        || lower.contains("error code: 403")
+}
+
 fn ban_ttl_for_error(error: &str) -> Duration {
     let lower = error.to_ascii_lowercase();
-    if lower.contains("http 403") || lower.contains("403") {
+    if is_http_forbidden_error(error) {
         CHARITY_BAN_FORBIDDEN
     } else if lower.contains("timeout")
         || lower.contains("timed out")
@@ -1387,6 +1406,21 @@ fn ban_ttl_for_error(error: &str) -> Duration {
         CHARITY_BAN_DEFAULT
     }
 }
+
+/// 失败节点：公益黑名单 + 从共享/本地队列剔除（不删代理池）。
+fn eject_node_from_charity_candidate(
+    monitor: &CharityMonitorRuntime,
+    queue: &Arc<Mutex<CharityNodeQueue>>,
+    node: &CharityNodeRef,
+    error: &str,
+) {
+    let ttl = ban_ttl_for_error(error);
+    monitor.ban_node(&node.id, ttl);
+    if let Ok(mut q) = queue.lock() {
+        let _ = q.remove_id(&node.id);
+    }
+}
+
 
 fn build_charity_node_queue(
     database: &Database,
@@ -1609,8 +1643,8 @@ async fn sync_feed_with_fast_nodes(
         if let Err(error) =
             proxy_pool::select_proxy_node_transient(database, runtime, &node.id).await
         {
-            monitor_state.ban_node(&node.id, CHARITY_BAN_DEFAULT);
             let message = format!("{}: 切换代理失败：{error}", node.name);
+            eject_node_from_charity_candidate(&monitor_state, &queue, &node, &message);
             let dur = attempt_started.elapsed().as_millis() as i64;
             finish_charity_sync_log(
                 app, database, log_id, source, stage, "failed", &message, &node.name, dur, 0, 0, 0,
@@ -1645,8 +1679,8 @@ async fn sync_feed_with_fast_nodes(
 
         let remaining = feed_budget();
         if remaining.is_zero() {
-            monitor_state.ban_node(&node.id, CHARITY_BAN_TIMEOUT);
             let message = format!("{}: 标签同步超时", node.name);
+            eject_node_from_charity_candidate(&monitor_state, &queue, &node, &message);
             let dur = attempt_started.elapsed().as_millis() as i64;
             finish_charity_sync_log(
                 app, database, log_id, source, stage, "failed", &message, &node.name, dur, 0, 0, 0,
@@ -1702,8 +1736,11 @@ async fn sync_feed_with_fast_nodes(
                     });
                     match persist_result {
                         Ok(mut result) => {
-                            if let Ok(mut q) = queue.lock() {
-                                q.push_back(node.clone());
+                            // 成功才回队尾；若期间被其它标签 403 拉黑则不再入队
+                            if !monitor_state.is_banned(&node.id) {
+                                if let Ok(mut q) = queue.lock() {
+                                    q.push_back(node.clone());
+                                }
                             }
                             result.used_node_id = node.id.clone();
                             result.used_node_name = node.name.clone();
@@ -1753,8 +1790,13 @@ async fn sync_feed_with_fast_nodes(
                     }
                 }
                 Err(error) => {
-                    monitor_state.ban_node(&node.id, ban_ttl_for_error(&error));
-                    let message = format!("{}: {error}", node.name);
+                    let raw = format!("{}: {error}", node.name);
+                    eject_node_from_charity_candidate(&monitor_state, &queue, &node, &raw);
+                    let message = if is_http_forbidden_error(&raw) {
+                        format!("{}: HTTP 403，已从公益队列剔除", node.name)
+                    } else {
+                        raw
+                    };
                     let dur = attempt_started.elapsed().as_millis() as i64;
                     finish_charity_sync_log(
                         app, database, log_id, source, stage, "failed", &message, &node.name, dur, 0, 0, 0,
@@ -1764,13 +1806,18 @@ async fn sync_feed_with_fast_nodes(
             },
             Err(error) => {
                 let cancelled = is_charity_sync_cancelled(&error);
-                if !cancelled {
-                    monitor_state.ban_node(&node.id, ban_ttl_for_error(&error));
-                }
-                let message = if error.contains(':') {
+                let raw = if error.contains(':') {
                     error
                 } else {
                     format!("{}: {error}", node.name)
+                };
+                if !cancelled {
+                    eject_node_from_charity_candidate(&monitor_state, &queue, &node, &raw);
+                }
+                let message = if !cancelled && is_http_forbidden_error(&raw) {
+                    format!("{}: HTTP 403，已从公益队列剔除", node.name)
+                } else {
+                    raw
                 };
                 let dur = attempt_started.elapsed().as_millis() as i64;
                 let status = if cancelled { "cancelled" } else { "failed" };
@@ -2293,6 +2340,23 @@ mod tests {
         // 空 id 忽略，避免误伤
         runtime.ban_node("", Duration::from_secs(60));
         assert!(!runtime.is_banned(""));
+    }
+
+    #[test]
+    fn http_403_is_forbidden_and_ejects_from_queue() {
+        assert!(is_http_forbidden_error("公益站标签请求失败（HTTP 403）"));
+        assert!(is_http_forbidden_error("unexpected status 403 Forbidden"));
+        assert!(!is_http_forbidden_error("timeout after 8s"));
+        assert_eq!(ban_ttl_for_error("HTTP 403"), CHARITY_BAN_FORBIDDEN);
+
+        let mut queue = CharityNodeQueue::from_nodes(vec![
+            CharityNodeRef { id: "a".into(), name: "A".into(), latency_ms: 10 },
+            CharityNodeRef { id: "b".into(), name: "B".into(), latency_ms: 20 },
+            CharityNodeRef { id: "a".into(), name: "A2".into(), latency_ms: 11 },
+        ]);
+        assert_eq!(queue.remove_id("a"), 2);
+        assert_eq!(queue.pop_front().unwrap().id, "b");
+        assert!(queue.is_empty());
     }
 
     #[test]
