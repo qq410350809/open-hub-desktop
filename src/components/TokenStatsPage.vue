@@ -311,11 +311,10 @@ function healthCellTitle(cell: {
   successRate: number | null;
   pad?: boolean;
 }) {
-  if (cell.pad && !cell.label) return "占位（排满网格）";
-  const prefix = cell.pad ? `${cell.label} · 自动补全（区间外）` : cell.label;
-  if (cell.requests <= 0) return `${prefix} · 无请求数据`;
+  if (!cell.label) return "—";
+  if (cell.requests <= 0) return `${cell.label} · 无请求数据`;
   const rateTxt = cell.successRate == null ? "—" : `${(cell.successRate * 100).toFixed(1)}%`;
-  return `${prefix} · 成功 ${formatTokens(cell.success)} · 失败 ${formatTokens(cell.failed)} · 成功率 ${rateTxt}`;
+  return `${cell.label} · 成功 ${formatTokens(cell.success)} · 失败 ${formatTokens(cell.failed)} · 成功率 ${rateTxt}`;
 }
 
 // —— 请求健康时间线：与左侧趋势同粒度完整节点 ——
@@ -402,7 +401,7 @@ const healthDisplayCells = computed<HealthDisplayCell[]>(() => {
         requests,
         successRate,
         level: healthLevelOf(successRate),
-        pad: true,
+        pad: false, // 有具体时间的补全节点按普通节点展示
       };
     });
     const lack = padCount - mapped.length;
