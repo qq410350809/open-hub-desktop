@@ -539,7 +539,7 @@ onBeforeUnmount(() => {
                 <span class="tt-kpi-label">缓存命中率</span>
               </div>
               <strong class="tt-kpi-value tt-kpi-value-md">{{ formatRate(cacheHitRate) }}</strong>
-              <span class="tt-kpi-sub">缓存 {{ formatCompact(rangeSplits.cache) }} · 命中占比</span>
+              <span class="tt-kpi-sub">命中占比</span>
             </div>
           </div>
           <div class="tt-kpi">
