@@ -320,12 +320,10 @@ function healthCellTitle(cell: {
       ? `${cell.label} · 对话 ${formatTokens(dialogues)} · 无请求`
       : `${cell.label} · 无请求`;
   }
-  const rateTxt = cell.successRate == null ? "样本不足" : `${(cell.successRate * 100).toFixed(1)}%`;
+  const rateTxt = cell.successRate == null ? "—" : `${(cell.successRate * 100).toFixed(1)}%`;
   const dialoguePart = dialogues > 0 ? ` · 对话 ${formatTokens(dialogues)}` : "";
-  const failPart = cell.success + cell.failed > 0
-    ? ` · 成功 ${formatTokens(cell.success)} · 失败 ${formatTokens(cell.failed)} · 成功率 ${rateTxt}`
-    : ` · 成功率 ${rateTxt}`;
-  return `${cell.label}${dialoguePart} · 请求 ${formatTokens(cell.requests)}${failPart}`;
+  // 成功 = 请求 - 已知失败（与色阶同一口径），避免成功+失败与请求对不上
+  return `${cell.label}${dialoguePart} · 请求 ${formatTokens(cell.requests)} · 成功 ${formatTokens(cell.success)} · 失败 ${formatTokens(cell.failed)} · 成功率 ${rateTxt}`;
 }
 
 // —— 请求健康时间线：与左侧趋势同粒度完整节点 ——
@@ -429,13 +427,17 @@ const healthDisplayCells = computed<HealthDisplayCell[]>(() => {
     const mapped = preceding.map((p) => {
       const hit = map.get(p.key);
       const dialogues = hit?.dialogues ?? 0;
-      const success = hit?.success ?? 0;
-      const failed = hit?.failed ?? 0;
+      const rawSuccess = hit?.success ?? 0;
+      const rawFailed = hit?.failed ?? 0;
       const extractedRequests = hit?.requests ?? 0;
-      const sampleRequests = success + failed;
+      const sampleRequests = rawSuccess + rawFailed;
       const usageRequests = hit?.usage ?? 0;
       const requests = extractedRequests > 0 ? extractedRequests : (usageRequests > 0 ? usageRequests : sampleRequests);
-      const successRate = sampleRequests > 0 ? success / sampleRequests : null;
+      const failed = Math.max(0, Math.min(rawFailed, requests > 0 ? requests : rawFailed));
+      const success = requests > 0 ? Math.max(0, requests - failed) : rawSuccess;
+      const successRate = requests > 0
+        ? success / requests
+        : (sampleRequests > 0 ? rawSuccess / sampleRequests : null);
       return {
         key: `pre-${p.key}`,
         label: p.label,
@@ -694,7 +696,7 @@ onBeforeUnmount(() => {
             <header class="tt-card-head tt-health-head">
               <div>
                 <h2>请求健康时间线</h2>
-                <p>对话=用户发起 turns；请求=多工具 API 调用（Codex/Claude/OpenCode/Mimo/Zcode/Antigravity）；成功率基于可观测样本。</p>
+                <p>对话=用户发起；请求=多工具 API 调用；成功率=(请求−已知失败)/请求（用户取消不计失败）。</p>
               </div>
               <div class="tt-health-summary">
                 <div class="tt-health-rate-label">成功率</div>

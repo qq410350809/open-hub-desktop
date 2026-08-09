@@ -654,19 +654,27 @@ export function buildHealthTimeline(
   const cells: HealthTimelineCell[] = keys.map(({ key, label }) => {
     const health = healthMap.get(key);
     const dialogues = health?.dialogues ?? 0;
-    const success = health?.success ?? 0;
-    const failed = health?.failed ?? 0;
+    const rawSuccess = health?.success ?? 0;
+    const rawFailed = health?.failed ?? 0;
     const extractedRequests = health?.requests ?? 0;
-    const sampleRequests = success + failed;
     const usageRequests = usageMap.get(key) || 0;
     // 展示请求量优先级：
     // 1) 后端多工具提取的真实 API 请求数
     // 2) 仅当完全没有提取数据时，才用 usage 估算兜底
     // 3) 成功失败样本合计
+    const sampleRequests = rawSuccess + rawFailed;
     const requests = extractedRequests > 0
       ? extractedRequests
       : (!hasExtracted && usageRequests > 0 ? usageRequests : sampleRequests);
-    const successRate = sampleRequests > 0 ? success / sampleRequests : null;
+
+    // 成功率口径：以请求为底，已知失败扣减。
+    // 避免 Codex token_count 与 task_complete 样本混用导致 成功+失败 ≠ 请求、成功率被严重压低。
+    const failed = Math.max(0, Math.min(rawFailed, requests > 0 ? requests : rawFailed));
+    const success = requests > 0 ? Math.max(0, requests - failed) : rawSuccess;
+    const successRate = requests > 0
+      ? success / requests
+      : (sampleRequests > 0 ? rawSuccess / sampleRequests : null);
+
     if (requests > 0) activeCount += 1;
     totalDialogues += dialogues;
     totalSuccess += success;

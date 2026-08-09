@@ -783,6 +783,36 @@ fn json_i64(value: &JsonValue, key: &str) -> i64 {
         .unwrap_or(0)
 }
 
+/// 用户主动取消 / 中断：计请求，但不算模型失败（避免健康格子被误标红）
+fn is_user_cancelled_error(err: &JsonValue) -> bool {
+    let mut parts: Vec<String> = Vec::new();
+    fn walk(v: &JsonValue, out: &mut Vec<String>) {
+        match v {
+            JsonValue::String(s) => out.push(s.to_ascii_lowercase()),
+            JsonValue::Object(map) => {
+                for (k, val) in map {
+                    out.push(k.to_ascii_lowercase());
+                    walk(val, out);
+                }
+            }
+            JsonValue::Array(arr) => {
+                for val in arr {
+                    walk(val, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    walk(err, &mut parts);
+    let blob = parts.join(" ");
+    blob.contains("cancel")
+        || blob.contains("aborted")
+        || blob.contains("abort")
+        || blob.contains("interrupted")
+        || blob.contains("user_cancelled")
+        || blob.contains("cancelled_by_user")
+}
+
 fn bump(
     map: &mut BTreeMap<String, HealthAgg>,
     hour: String,
@@ -913,13 +943,14 @@ fn collect_codex_activity(
             };
             match p_type {
                 "user_message" => record(map, sources, "codex", hour, 1, 0, 0, 0),
+                // token_count ≈ 一次模型请求；成功率用「请求 - 已知失败」推算，不再用 task_complete 成功样本
                 "token_count" => record(map, sources, "codex", hour, 0, 1, 0, 0),
                 "task_complete" => {
-                    let failed = payload.get("error").map(|e| !e.is_null()).unwrap_or(false);
-                    if failed {
-                        record(map, sources, "codex", hour, 0, 0, 0, 1);
-                    } else {
-                        record(map, sources, "codex", hour, 0, 0, 1, 0);
+                    if let Some(err) = payload.get("error").filter(|e| !e.is_null()) {
+                        if !is_user_cancelled_error(err) {
+                            // 仅计真实失败样本（429/5xx 等），不额外计请求（请求已由 token_count 覆盖）
+                            record(map, sources, "codex", hour, 0, 0, 0, 1);
+                        }
                     }
                 }
                 _ => {}
@@ -1094,18 +1125,25 @@ fn collect_sqlite_message_activity(
             }
         }
 
-        let has_error = value.get("error").map(|e| !e.is_null()).unwrap_or(false);
-        if has_error {
+        let err = value.get("error").filter(|e| !e.is_null());
+        if let Some(err) = err {
             if filter {
                 allowed_sessions.insert(session_id.clone());
             }
-            record(map, sources, source, hour, 0, 1, 0, 1);
+            if is_user_cancelled_error(err) {
+                // 用户取消：计请求，不算失败
+                record(map, sources, source, hour, 0, 1, 0, 0);
+            } else {
+                // 真实失败：请求 + 失败（success 由前端用 requests-failed 推导展示）
+                record(map, sources, source, hour, 0, 1, 0, 1);
+            }
             continue;
         }
         if assistant_tokens_positive(&value) {
             if filter {
                 allowed_sessions.insert(session_id.clone());
             }
+            // 有 token 的 assistant = 成功请求
             record(map, sources, source, hour, 0, 1, 1, 0);
         }
     }
