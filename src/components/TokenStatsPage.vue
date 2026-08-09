@@ -547,7 +547,7 @@ onBeforeUnmount(() => {
               <span class="tt-kpi-label">日均 Tokens</span>
             </div>
             <strong class="tt-kpi-value">{{ formatCompact(dailyAverage) }}</strong>
-            <span class="tt-kpi-sub">按 {{ formatTokens(activeDays) }} 个活跃天</span>
+            <span class="tt-kpi-sub">跨度 {{ formatTokens(rangeDays) }} 天 · 连续 {{ formatTokens(streakDays) }} 天</span>
           </div>
           <div class="tt-kpi">
             <div class="tt-kpi-top">
@@ -569,14 +569,6 @@ onBeforeUnmount(() => {
             </div>
             <strong class="tt-kpi-value">{{ estimatedCost > 0 ? formatCost(estimatedCost) : "—" }}</strong>
             <span class="tt-kpi-sub">会话单价外推</span>
-          </div>
-          <div class="tt-kpi">
-            <div class="tt-kpi-top">
-              <span class="tt-kpi-ic ic-green" v-html="icons.calendar"></span>
-              <span class="tt-kpi-label">活跃天数</span>
-            </div>
-            <strong class="tt-kpi-value">{{ formatTokens(activeDays) }}<small>天</small></strong>
-            <span class="tt-kpi-sub">跨度 {{ formatTokens(rangeDays) }} 天 · 连续 {{ formatTokens(streakDays) }} 天</span>
           </div>
         </div>
 
