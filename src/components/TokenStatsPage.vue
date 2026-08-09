@@ -372,11 +372,12 @@ type HealthDisplayCell = {
 // 若节点过多则只保留末尾 capacity 个（仍保证选中区间的最后部分在网格末端）
 // 全量健康桶按当前粒度聚合（含所选区间之外），供前置补全取值
 const healthBucketMap = computed(() => {
-  const map = new Map<string, { success: number; failed: number; usage: number }>();
+  const map = new Map<string, { requests: number; success: number; failed: number; usage: number }>();
   for (const b of store.requestHealth.value?.buckets ?? []) {
     const { key } = bucketKeyFor(trendGranularity.value, b.hour);
     if (!key) continue;
-    const cur = map.get(key) || { success: 0, failed: 0, usage: 0 };
+    const cur = map.get(key) || { requests: 0, success: 0, failed: 0, usage: 0 };
+    cur.requests += b.requests || 0;
     cur.success += b.success || 0;
     cur.failed += b.failed || 0;
     map.set(key, cur);
@@ -384,7 +385,7 @@ const healthBucketMap = computed(() => {
   for (const b of store.tokenUsage.value?.buckets ?? []) {
     const { key } = bucketKeyFor(trendGranularity.value, b.timestamp);
     if (!key) continue;
-    const cur = map.get(key) || { success: 0, failed: 0, usage: 0 };
+    const cur = map.get(key) || { requests: 0, success: 0, failed: 0, usage: 0 };
     cur.usage += estimateRequestCount({
       conversationCount: b.conversationCount || 0,
       outputTokens: b.outputTokens || 0,
@@ -415,10 +416,11 @@ const healthDisplayCells = computed<HealthDisplayCell[]>(() => {
       const hit = map.get(p.key);
       const success = hit?.success ?? 0;
       const failed = hit?.failed ?? 0;
-      const healthRequests = success + failed;
+      const extractedRequests = hit?.requests ?? 0;
+      const sampleRequests = success + failed;
       const usageRequests = hit?.usage ?? 0;
-      const requests = usageRequests > 0 ? usageRequests : healthRequests;
-      const successRate = healthRequests > 0 ? success / healthRequests : null;
+      const requests = extractedRequests > 0 ? extractedRequests : (usageRequests > 0 ? usageRequests : sampleRequests);
+      const successRate = sampleRequests > 0 ? success / sampleRequests : null;
       return {
         key: `pre-${p.key}`,
         label: p.label,
@@ -626,9 +628,9 @@ onBeforeUnmount(() => {
             </div>
             <strong class="tt-kpi-value">{{ formatTokens(bucketTotal.conversations) }}</strong>
             <span class="tt-kpi-sub">
-              请求约 {{ formatTokens(healthTimeline.totalRequests) }}
+              请求 {{ formatTokens(healthTimeline.totalRequests) }}
               <template v-if="healthTimeline.totalSuccess + healthTimeline.totalFailed > 0">
-                · 样本失败 {{ formatTokens(healthTimeline.totalFailed) }}
+                · 失败 {{ formatTokens(healthTimeline.totalFailed) }}
               </template>
             </span>
           </div>
@@ -664,7 +666,7 @@ onBeforeUnmount(() => {
             <header class="tt-card-head tt-health-head">
               <div>
                 <h2>请求健康时间线</h2>
-                <p>请求量按全工具用量估算；成功率基于可观测失败样本（目前主要来自 Codex）。</p>
+                <p>请求数提取自 Codex token_count 与 Claude assistant usage；成功率基于可观测成功/失败样本。</p>
               </div>
               <div class="tt-health-summary">
                 <div class="tt-health-rate-label">成功率</div>
@@ -672,8 +674,8 @@ onBeforeUnmount(() => {
                   {{ healthTimeline.successRate != null ? (healthTimeline.successRate * 100).toFixed(1) + "%" : "—" }}
                 </div>
                 <div class="tt-health-counts">
-                  <span class="ok">● 样本成功 {{ formatTokens(healthTimeline.totalSuccess) }}</span>
-                  <span class="bad">● 样本失败 {{ formatTokens(healthTimeline.totalFailed) }}</span>
+                  <span class="ok">● 成功 {{ formatTokens(healthTimeline.totalSuccess) }}</span>
+                  <span class="bad">● 失败 {{ formatTokens(healthTimeline.totalFailed) }}</span>
                 </div>
               </div>
             </header>

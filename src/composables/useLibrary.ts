@@ -273,7 +273,8 @@ export async function runCommand<T>(
         const ts = hour.toISOString().slice(0, 13); // YYYY-MM-DDTHH
         const success = 5 + ((d * 31 + h * 7) % 12);
         const failed = (d + h) % 5 === 0 ? 1 + (h % 3) : 0;
-        buckets.push({ hour: `${ts}:00:00.000Z`, success, failed });
+        const requests = success + failed + ((d + h) % 4); // mock extracted request count
+        buckets.push({ hour: `${ts}:00:00.000Z`, requests, success, failed });
       }
     }
     return { available: true, buckets } as T;

@@ -472,8 +472,9 @@ export interface TokenUsageReport {
 // —— 请求健康：大模型请求成功/失败计数（来自 Codex rollout 的 task_started/task_complete.error）——
 export interface RequestHealthBucket {
   hour: string;          // ISO 小时 (YYYY-MM-DDTHH:00:00.000Z)
-  success: number;
-  failed: number;
+  requests: number;      // 提取的真实 API 请求数
+  success: number;       // 可观测成功样本
+  failed: number;        // 可观测失败样本
 }
 export interface RequestHealthReport {
   available: boolean;

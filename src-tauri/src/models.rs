@@ -597,7 +597,11 @@ pub(crate) struct TokenUsageReport {
 #[serde(default, rename_all(serialize = "camelCase", deserialize = "snake_case"))]
 pub(crate) struct RequestHealthBucket {
     pub(crate) hour: String,
+    /// 提取到的真实 API 请求数（Codex token_count / Claude assistant usage 等）
+    pub(crate) requests: i64,
+    /// 可观测成功样本（目前主要 Codex task_complete 无 error / Claude 非 API error）
     pub(crate) success: i64,
+    /// 可观测失败样本
     pub(crate) failed: i64,
 }
 

@@ -709,73 +709,159 @@ mod tests {
 }
 
 
-/// 从 Codex rollout 提取大模型请求健康：task_started（成功请求）与 task_complete.error（失败）。
-/// 按 ISO 小时聚合，供「请求健康时间线」展示失败比例。
-fn collect_codex_request_health(dir: &Path, map: &mut BTreeMap<String, (i64, i64)>) {
+/// 小时桶累加器：requests / success / failed
+#[derive(Clone, Default)]
+struct HealthAgg {
+    requests: i64,
+    success: i64,
+    failed: i64,
+}
+
+fn hour_key_from_ts(ts: &str) -> Option<String> {
+    if ts.len() < 13 {
+        return None;
+    }
+    // 统一到整点 ISO：YYYY-MM-DDTHH:00:00.000Z
+    Some(format!("{}:00:00.000Z", &ts[..13]))
+}
+
+fn bump(map: &mut BTreeMap<String, HealthAgg>, hour: String, requests: i64, success: i64, failed: i64) {
+    let entry = map.entry(hour).or_default();
+    entry.requests += requests;
+    entry.success += success;
+    entry.failed += failed;
+}
+
+/// Codex：
+/// - 真实请求数：event_msg.token_count（每次模型调用后的计量事件，最接近 API 请求）
+/// - 失败样本：event_msg.task_complete.error
+/// - 成功样本：event_msg.task_complete 且无 error
+fn collect_codex_request_health(dir: &Path, map: &mut BTreeMap<String, HealthAgg>) {
     let Ok(entries) = fs::read_dir(dir) else { return };
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
             collect_codex_request_health(&path, map);
-        } else if path
+            continue;
+        }
+        let is_rollout = path
             .file_name()
             .and_then(|name| name.to_str())
             .map(|name| name.starts_with("rollout-") && name.ends_with(".jsonl"))
-            .unwrap_or(false)
-        {
-            let Ok(text) = fs::read_to_string(&path) else { continue };
-            for line in text.lines() {
-                let Ok(value) = serde_json::from_str::<JsonValue>(line) else { continue };
-                if value.get("type").and_then(JsonValue::as_str) != Some("event_msg") {
-                    continue;
-                }
-                let Some(payload) = value.get("payload") else { continue };
-                let Some(p_type) = payload.get("type").and_then(JsonValue::as_str) else {
-                    continue;
-                };
-                let ts = value
-                    .get("timestamp")
-                    .and_then(JsonValue::as_str)
-                    .unwrap_or("");
-                if ts.len() < 13 {
-                    continue;
-                }
-                // 失败：task_complete 带 error 对象
-                let is_failure = p_type == "task_complete"
-                    && payload.get("error").map(|e| e.is_object()).unwrap_or(false);
-                let is_success = p_type == "task_started";
-                if !is_failure && !is_success {
-                    continue;
-                }
-                let hour = format!("{}:00:00.000Z", &ts[..13]); // 2026-08-03T03 → 2026-08-03T03:00:00.000Z
-                let entry = map.entry(hour).or_insert((0, 0));
-                if is_failure {
-                    entry.1 += 1;
+            .unwrap_or(false);
+        if !is_rollout {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(&path) else { continue };
+        for line in text.lines() {
+            let Ok(value) = serde_json::from_str::<JsonValue>(line) else { continue };
+            if value.get("type").and_then(JsonValue::as_str) != Some("event_msg") {
+                continue;
+            }
+            let Some(payload) = value.get("payload") else { continue };
+            let Some(p_type) = payload.get("type").and_then(JsonValue::as_str) else { continue };
+            let ts = value.get("timestamp").and_then(JsonValue::as_str).unwrap_or("");
+            let Some(hour) = hour_key_from_ts(ts) else { continue };
+
+            if p_type == "token_count" {
+                // 一次 token_count ≈ 一次模型请求计量
+                bump(map, hour, 1, 0, 0);
+                continue;
+            }
+            if p_type == "task_complete" {
+                let failed = payload.get("error").map(|e| e.is_object()).unwrap_or(false);
+                if failed {
+                    bump(map, hour, 0, 0, 1);
                 } else {
-                    entry.0 += 1;
+                    bump(map, hour, 0, 1, 0);
                 }
             }
         }
     }
 }
 
-/// 读取大模型请求健康数据（Codex rollout：task_started / task_complete.error），
-/// 供「请求健康时间线」展示每时段请求量与失败比例。
+/// Claude：
+/// - 真实请求数：type=assistant 且 message.usage 有 token（>0）
+/// - 失败样本：isApiErrorMessage=true 或 error 字段存在
+/// - 成功样本：有 usage 且非 API error
+fn collect_claude_request_health(dir: &Path, map: &mut BTreeMap<String, HealthAgg>) {
+    let Ok(entries) = fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_claude_request_health(&path, map);
+            continue;
+        }
+        let is_jsonl = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.eq_ignore_ascii_case("jsonl"))
+            .unwrap_or(false);
+        if !is_jsonl {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(&path) else { continue };
+        for line in text.lines() {
+            let Ok(value) = serde_json::from_str::<JsonValue>(line) else { continue };
+            if value.get("type").and_then(JsonValue::as_str) != Some("assistant") {
+                continue;
+            }
+            let ts = value.get("timestamp").and_then(JsonValue::as_str).unwrap_or("");
+            let Some(hour) = hour_key_from_ts(ts) else { continue };
+            let is_api_error = value
+                .get("isApiErrorMessage")
+                .and_then(JsonValue::as_bool)
+                .unwrap_or(false)
+                || value.get("error").is_some();
+            let usage = value.get("message").and_then(|m| m.get("usage"));
+            let usage_tokens = usage
+                .map(|u| {
+                    let num = |k: &str| u.get(k).and_then(JsonValue::as_f64).unwrap_or(0.0) as i64;
+                    num("input_tokens")
+                        + num("output_tokens")
+                        + num("cache_read_input_tokens")
+                        + num("cache_creation_input_tokens")
+                })
+                .unwrap_or(0);
+
+            if is_api_error {
+                // API 错误本身也是一次请求尝试
+                bump(map, hour, 1, 0, 1);
+                continue;
+            }
+            if usage_tokens > 0 {
+                bump(map, hour, 1, 1, 0);
+            }
+        }
+    }
+}
+
+/// 读取大模型请求健康数据：
+/// - 请求数：Codex token_count + Claude assistant(usage>0) + Claude API error
+/// - 成功/失败样本：Codex task_complete / Claude API error 与非 error usage
 #[tauri::command]
 pub async fn get_token_request_health() -> Result<RequestHealthReport, String> {
     tauri::async_runtime::spawn_blocking(|| {
         let home = std::env::var_os("HOME").ok_or("无法定位用户目录")?;
+        let home = PathBuf::from(home);
         let mut map = BTreeMap::new();
-        let root = PathBuf::from(&home).join(".codex").join("sessions");
-        if root.is_dir() {
-            collect_codex_request_health(&root, &mut map);
+
+        let codex_root = home.join(".codex").join("sessions");
+        if codex_root.is_dir() {
+            collect_codex_request_health(&codex_root, &mut map);
         }
+        let claude_root = home.join(".claude").join("projects");
+        if claude_root.is_dir() {
+            collect_claude_request_health(&claude_root, &mut map);
+        }
+
         let buckets = map
             .into_iter()
-            .map(|(hour, (success, failed))| RequestHealthBucket {
+            .map(|(hour, agg)| RequestHealthBucket {
                 hour,
-                success,
-                failed,
+                requests: agg.requests,
+                success: agg.success,
+                failed: agg.failed,
             })
             .collect::<Vec<_>>();
         Ok(RequestHealthReport {

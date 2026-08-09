@@ -508,6 +508,7 @@ export interface HealthTimelineData {
 
 interface HealthInput {
   hour: string;
+  requests?: number; // 后端提取的真实 API 请求数
   success: number;
   failed: number;
 }
@@ -571,12 +572,13 @@ export function buildHealthTimeline(
   to?: string,
   usageBuckets: HealthUsageInput[] = [],
 ): HealthTimelineData {
-  // health: success/failed
-  const healthMap = new Map<string, { label: string; success: number; failed: number }>();
+  // health: extracted requests + success/failed samples
+  const healthMap = new Map<string, { label: string; requests: number; success: number; failed: number }>();
   for (const b of buckets) {
     const { key, label } = bucketKeyFor(granularity, b.hour);
     if (!key) continue;
-    const cur = healthMap.get(key) || { label, success: 0, failed: 0 };
+    const cur = healthMap.get(key) || { label, requests: 0, success: 0, failed: 0 };
+    cur.requests += b.requests || 0;
     cur.success += b.success || 0;
     cur.failed += b.failed || 0;
     healthMap.set(key, cur);
@@ -640,11 +642,17 @@ export function buildHealthTimeline(
     const health = healthMap.get(key);
     const success = health?.success ?? 0;
     const failed = health?.failed ?? 0;
-    const healthRequests = success + failed;
+    const extractedRequests = health?.requests ?? 0;
+    const sampleRequests = success + failed;
     const usageRequests = usageMap.get(key) || 0;
-    // 展示请求量：usage 优先（覆盖全工具）；没有 usage 时回退 health
-    const requests = usageRequests > 0 ? usageRequests : healthRequests;
-    const successRate = healthRequests > 0 ? success / healthRequests : null;
+    // 展示请求量优先级：
+    // 1) 后端提取的真实 API 请求数（Codex token_count / Claude usage）
+    // 2) usage 估算
+    // 3) 成功失败样本合计
+    const requests = extractedRequests > 0
+      ? extractedRequests
+      : (usageRequests > 0 ? usageRequests : sampleRequests);
+    const successRate = sampleRequests > 0 ? success / sampleRequests : null;
     if (requests > 0) activeCount += 1;
     totalSuccess += success;
     totalFailed += failed;
