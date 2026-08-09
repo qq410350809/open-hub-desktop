@@ -196,6 +196,8 @@ const CHARITY_SUCCESS_COOLDOWN: Duration = Duration::from_secs(10 * 60);
 /// 其它失败默认拉黑。
 const CHARITY_BAN_DEFAULT: Duration = Duration::from_secs(15 * 60);
 const CHARITY_PAGE_SIZE: usize = 20;
+/// 列表一次可取的最大条数（渐进渲染用全量，不再后端分页）。
+const CHARITY_PAGE_LIMIT_MAX: usize = 2000;
 /// 定时触发：每 5 分钟一次，对齐到本地时区「分钟为 5 的整数倍、秒为 00」
 /// 例如 12:00:00 / 12:05:00 / 12:10:00 …
 const CHARITY_SCHEDULE_EVERY_MINUTES: u32 = 5;
@@ -1076,7 +1078,7 @@ fn load_all_feed_items_from_db(
     limit: usize,
     keyword: &str,
 ) -> Result<CharityFeedResult, String> {
-    let limit = limit.clamp(1, 50);
+    let limit = limit.clamp(1, CHARITY_PAGE_LIMIT_MAX);
     let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
     let key_pat = format!("%{}%", keyword.trim());
     let has_key = !keyword.trim().is_empty();
@@ -1352,7 +1354,7 @@ fn load_feed_items_from_db(
     limit: usize,
     keyword: &str,
 ) -> Result<CharityFeedResult, String> {
-    let limit = limit.clamp(1, 50);
+    let limit = limit.clamp(1, CHARITY_PAGE_LIMIT_MAX);
     let keys = feed_meta_keys(source.id);
     // 单次加锁完成 meta + count + page，避免切标签时多次抢锁卡死。
     let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;

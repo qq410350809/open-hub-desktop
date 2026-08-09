@@ -407,25 +407,25 @@ onUnmounted(() => {
       </section>
 
       <div
-        v-if="store.charityFeedItems.value.length && store.charityFeedHasMore.value"
-        class="charity-load-more"
+        v-if="store.charityFeedItems.value.length"
+        class="charity-pager"
       >
         <button
-          class="secondary-button"
           type="button"
-          :disabled="store.charityFeedLoadingMore.value || store.charityFeedLoading.value"
-          @click="store.loadMoreCharityFeed()"
-        >
-          <span
-            :class="{ 'is-spinning': store.charityFeedLoadingMore.value }"
-            v-html="icons.restore"
-          />
-          <span>{{
-            store.charityFeedLoadingMore.value
-              ? "加载中…"
-              : `加载更多（${store.charityFeedDisplayedCount.value}/${store.charityFeedTotalCount.value}）`
-          }}</span>
-        </button>
+          :disabled="store.charityFeedCurrentPage.value <= 1 || store.charityFeedLoading.value"
+          @click="store.goCharityPage(store.charityFeedCurrentPage.value - 1)"
+        >‹ 上一页</button>
+        <span>
+          第 {{ store.charityFeedCurrentPage.value }} / {{ store.charityFeedTotalPages.value }} 页
+        </span>
+        <button
+          type="button"
+          :disabled="
+            store.charityFeedCurrentPage.value >= store.charityFeedTotalPages.value ||
+            store.charityFeedLoading.value
+          "
+          @click="store.goCharityPage(store.charityFeedCurrentPage.value + 1)"
+        >下一页 ›</button>
       </div>
 
       <div

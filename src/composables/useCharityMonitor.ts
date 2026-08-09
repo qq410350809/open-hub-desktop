@@ -41,6 +41,9 @@ const initialized = ref(false);
 const totalCount = ref(0);
 const hasMore = ref(false);
 const nextOffset = ref(0);
+/** 当前页码（后端分页，UI 与 Token 明细列表一致）。 */
+const currentPage = ref(1);
+const totalPages = computed(() => Math.max(1, Math.ceil(totalCount.value / PAGE_SIZE)));
 const syncLog = shallowRef<CharitySyncLogEntry[]>([]);
 const syncLogOpen = ref(false);
 const refreshAllBusy = ref(false);
@@ -149,11 +152,11 @@ async function loadCharitySyncLogs() {
   }
 }
 
-async function queryLocalFeed(feedId = selectedTagId.value, offset = 0, append = false) {
+async function queryLocalFeed(feedId = selectedTagId.value, page = currentPage.value) {
   const seq = ++loadSeq;
-  if (append) loadingMore.value = true;
-  else loading.value = true;
+  loading.value = true;
   try {
+    const offset = Math.max(0, (page - 1) * PAGE_SIZE);
     const result = await runCommand<CharityFeedResult>("get_charity_feed", {
       feedId,
       offset,
@@ -161,18 +164,24 @@ async function queryLocalFeed(feedId = selectedTagId.value, offset = 0, append =
       keyword: searchKeyword.value.trim() || undefined,
     });
     if (seq !== loadSeq || feedId !== selectedTagId.value) return result;
-    applyLocalPage(result, append ? "append" : "replace");
+    applyLocalPage(result, "replace");
+    const pageCount = Math.max(1, Math.ceil(totalCount.value / PAGE_SIZE));
+    currentPage.value = Math.min(page, pageCount);
     void refreshUnreadTotal();
     return result;
   } catch (cause) {
     if (seq === loadSeq && feedId === selectedTagId.value) error.value = String(cause);
     throw cause;
   } finally {
-    if (seq === loadSeq) {
-      loading.value = false;
-      loadingMore.value = false;
-    }
+    if (seq === loadSeq) loading.value = false;
   }
+}
+
+/** 明细列表翻页（与 Token 明细一致：上一页 / 下一页）。 */
+function goCharityPage(page: number) {
+  const next = Math.min(Math.max(1, page), totalPages.value);
+  if (next === currentPage.value || loading.value) return;
+  void queryLocalFeed(selectedTagId.value, next);
 }
 
 function scheduleLocalReload(feedId = selectedTagId.value) {
@@ -183,7 +192,7 @@ function scheduleLocalReload(feedId = selectedTagId.value) {
   if (reloadTimer != null) window.clearTimeout(reloadTimer);
   reloadTimer = window.setTimeout(() => {
     reloadTimer = null;
-    void queryLocalFeed(selectedTagId.value, 0, false);
+    void queryLocalFeed(selectedTagId.value, currentPage.value);
   }, 300);
 }
 
@@ -196,14 +205,9 @@ function setSearchKeyword(value: string) {
     totalCount.value = 0;
     hasMore.value = false;
     nextOffset.value = 0;
-    loadingMore.value = false;
-    void queryLocalFeed(selectedTagId.value, 0, false);
+    currentPage.value = 1;
+    void queryLocalFeed(selectedTagId.value, 1);
   }, 260);
-}
-
-async function loadMoreCharityFeed() {
-  if (!hasMore.value || loading.value || loadingMore.value) return;
-  await queryLocalFeed(selectedTagId.value, nextOffset.value, true);
 }
 
 /**
@@ -232,7 +236,7 @@ async function refreshCharityFeed() {
   } finally {
     manualSyncing = false;
     refreshAllBusy.value = false;
-    await queryLocalFeed(selectedTagId.value, 0, false);
+    await queryLocalFeed(selectedTagId.value, currentPage.value);
     if (syncLogOpen.value) void loadCharitySyncLogs();
   }
 }
@@ -249,13 +253,14 @@ async function selectTag(tagId: string) {
   totalCount.value = 0;
   hasMore.value = false;
   nextOffset.value = 0;
+  currentPage.value = 1;
   unreadCount.value = 0;
   updatedCount.value = 0;
   statusMessage.value = "";
   error.value = "";
   usedNodeName.value = "";
   loadingMore.value = false;
-  await queryLocalFeed(tagId, 0, false);
+  await queryLocalFeed(tagId, 1);
   void markCharityFeedRead();
 }
 
@@ -334,7 +339,7 @@ async function startCharityMonitor() {
   document.addEventListener("visibilitychange", onVisibilityChange);
   const visible = document.visibilityState === "visible";
   void runCommand("set_charity_monitor_visible", { visible }).catch(() => undefined);
-  void queryLocalFeed(selectedTagId.value, 0, false);
+  void queryLocalFeed(selectedTagId.value, 1);
   void refreshUnreadTotal();
   // 不在启动时 request_charity_round：定时 = 每 5 分钟整点秒；临时 = 按钮。
 }
@@ -415,11 +420,13 @@ export function useCharityMonitor() {
     charityFeedTotalCount: totalCount,
     charityFeedDisplayedCount: displayedCount,
     charityFeedHasMore: hasMore,
+    charityFeedCurrentPage: currentPage,
+    charityFeedTotalPages: totalPages,
     charitySyncLog: syncLog,
     charitySyncLogOpen: syncLogOpen,
     charitySyncLogLoading: syncLogLoading,
+    goCharityPage,
     loadCharityFeedLocal: queryLocalFeed,
-    loadMoreCharityFeed,
     refreshCharityFeed,
     selectTag,
     setSearchKeyword,

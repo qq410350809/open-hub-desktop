@@ -1754,18 +1754,31 @@ kbd { padding: 3px 7px; border: 1px solid var(--line); border-radius: var(--r-xs
   letter-spacing: .04em;
 }
 
-.charity-load-more {
-  padding: 4px 0 18px;
+.charity-pager {
+  padding: 14px 0 18px;
   display: flex;
+  align-items: center;
   justify-content: center;
+  gap: 14px;
+  color: var(--faint);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
 }
-.charity-load-more .secondary-button {
-  min-height: 38px;
-  height: 38px;
-  padding: 0 16px;
-  gap: 8px;
+.charity-pager button {
+  min-width: 72px;
+  height: 30px;
+  padding: 0 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text);
+  font-size: 11.5px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: border-color .15s var(--ease), color .15s var(--ease);
 }
-.charity-load-more .is-spinning { animation: sync-sites-spin .85s linear infinite; }
+.charity-pager button:hover:not(:disabled) { border-color: color-mix(in srgb,var(--brand) 60%,var(--line)); color: var(--brand-deep); }
+.charity-pager button:disabled { opacity: .4; cursor: not-allowed; }
 
 @media (max-width: 980px) {
   .charity-monitor-header { padding: 14px 18px; }
