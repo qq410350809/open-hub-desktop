@@ -524,16 +524,45 @@ export function healthLevelOf(successRate: number | null, hasRequests = true): n
   return 5;
 }
 
+/**
+ * 估算 API 请求次数。
+ * tokentracker hourly.buckets 只有 conversation_count，没有 request_count；
+ * 用 output/reasoning 规模把“对话轮”放大成更接近真实请求量的估计值。
+ */
+export function estimateRequestCount(input: {
+  conversationCount?: number;
+  outputTokens?: number;
+  reasoningOutputTokens?: number;
+  totalTokens?: number;
+}): number {
+  const conversations = Math.max(0, Number(input.conversationCount || 0));
+  if (conversations <= 0) {
+    // 没有 conversation 时，用输出规模兜底（极少见）
+    const out = Math.max(0, Number(input.outputTokens || 0) + Number(input.reasoningOutputTokens || 0));
+    return out > 0 ? Math.max(1, Math.round(out / 800)) : 0;
+  }
+  const out = Math.max(0, Number(input.outputTokens || 0) + Number(input.reasoningOutputTokens || 0));
+  // 经验：每次请求大约 600~1200 output tokens；按 800 估算每轮对话对应请求数
+  const byOutput = out > 0 ? Math.round(out / 800) : 0;
+  // 至少不少于对话数，避免低估；同时给一个温和上限，避免极端值爆炸
+  const est = Math.max(conversations, byOutput);
+  return Math.min(est, conversations * 12);
+}
+
 export interface HealthUsageInput {
   timestamp: string;
-  requests?: number; // conversationCount / request count
+  conversationCount?: number;
+  outputTokens?: number;
+  reasoningOutputTokens?: number;
+  totalTokens?: number;
+  requests?: number; // 若外部已估算可直接传
 }
 
 /**
  * 按趋势粒度生成与左侧图表一一对应的完整节点。
- * - 请求量优先取 token usage（全工具）
+ * - 请求量优先取 token usage 估算（全工具；由 conversation+output 估算）
  * - 成功/失败取 request health（目前主要来自 Codex task 事件）
- * - 有请求但无失败样本 => 视为健康，不再显示“无数据”
+ * - 成功率只在有 health 样本时计算；有请求但无样本 => 视为健康
  */
 export function buildHealthTimeline(
   buckets: HealthInput[],
@@ -553,12 +582,15 @@ export function buildHealthTimeline(
     healthMap.set(key, cur);
   }
 
-  // usage activity: requests/conversations
+  // usage activity: estimated request count from token usage
   const usageMap = new Map<string, number>();
   for (const b of usageBuckets) {
     const { key } = bucketKeyFor(granularity, b.timestamp);
     if (!key) continue;
-    usageMap.set(key, (usageMap.get(key) || 0) + (b.requests || 0));
+    const req = b.requests != null
+      ? Number(b.requests || 0)
+      : estimateRequestCount(b);
+    usageMap.set(key, (usageMap.get(key) || 0) + req);
   }
 
   // 区间：优先顶部选择；否则取 usage/health 并集跨度

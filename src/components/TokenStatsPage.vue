@@ -16,6 +16,7 @@ import {
   buildTrendDetailFromBuckets,
   healthLevelOf,
   buildTrendFromBuckets,
+  estimateRequestCount,
   mergeModelTotals,
   formatCompact,
   formatCost,
@@ -330,7 +331,10 @@ const healthTimeline = computed(() =>
     // 用全量 usage（含区间外）作为请求活跃度底图，避免大量误显示“无数据”
     (store.tokenUsage.value?.buckets ?? []).map((b) => ({
       timestamp: b.timestamp,
-      requests: b.conversationCount || 0,
+      conversationCount: b.conversationCount || 0,
+      outputTokens: b.outputTokens || 0,
+      reasoningOutputTokens: b.reasoningOutputTokens || 0,
+      totalTokens: b.totalTokens || 0,
     })),
   ),
 );
@@ -381,7 +385,12 @@ const healthBucketMap = computed(() => {
     const { key } = bucketKeyFor(trendGranularity.value, b.timestamp);
     if (!key) continue;
     const cur = map.get(key) || { success: 0, failed: 0, usage: 0 };
-    cur.usage += b.conversationCount || 0;
+    cur.usage += estimateRequestCount({
+      conversationCount: b.conversationCount || 0,
+      outputTokens: b.outputTokens || 0,
+      reasoningOutputTokens: b.reasoningOutputTokens || 0,
+      totalTokens: b.totalTokens || 0,
+    });
     map.set(key, cur);
   }
   return map;
@@ -617,9 +626,9 @@ onBeforeUnmount(() => {
             </div>
             <strong class="tt-kpi-value">{{ formatTokens(bucketTotal.conversations) }}</strong>
             <span class="tt-kpi-sub">
-              请求 {{ formatTokens(healthTimeline.totalRequests) }}
-              <template v-if="healthTimeline.totalRequests > 0">
-                · 成功 {{ formatTokens(healthTimeline.totalSuccess) }}
+              请求约 {{ formatTokens(healthTimeline.totalRequests) }}
+              <template v-if="healthTimeline.totalSuccess + healthTimeline.totalFailed > 0">
+                · 样本失败 {{ formatTokens(healthTimeline.totalFailed) }}
               </template>
             </span>
           </div>
@@ -655,7 +664,7 @@ onBeforeUnmount(() => {
             <header class="tt-card-head tt-health-head">
               <div>
                 <h2>请求健康时间线</h2>
-                <p>展示所选活动窗口内的请求成功与失败分布。</p>
+                <p>请求量按全工具用量估算；成功率基于可观测失败样本（目前主要来自 Codex）。</p>
               </div>
               <div class="tt-health-summary">
                 <div class="tt-health-rate-label">成功率</div>
@@ -663,8 +672,8 @@ onBeforeUnmount(() => {
                   {{ healthTimeline.successRate != null ? (healthTimeline.successRate * 100).toFixed(1) + "%" : "—" }}
                 </div>
                 <div class="tt-health-counts">
-                  <span class="ok">● {{ formatTokens(healthTimeline.totalSuccess) }}</span>
-                  <span class="bad">● {{ formatTokens(healthTimeline.totalFailed) }}</span>
+                  <span class="ok">● 样本成功 {{ formatTokens(healthTimeline.totalSuccess) }}</span>
+                  <span class="bad">● 样本失败 {{ formatTokens(healthTimeline.totalFailed) }}</span>
                 </div>
               </div>
             </header>
