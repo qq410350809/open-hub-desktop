@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import type { EChartsOption } from "../echarts";
 import EChart from "./EChart.vue";
 import QuickRangeDropdown from "./QuickRangeDropdown.vue";
@@ -300,13 +300,21 @@ function formatDetailTime(label: string): string {
 }
 
 // 请求健康时间线 cell tooltip
-function healthCellTitle(cell: { label: string; requests: number; success: number; failed: number; successRate: number | null }) {
+function healthCellTitle(cell: {
+  label: string;
+  requests: number;
+  success: number;
+  failed: number;
+  successRate: number | null;
+  pad?: boolean;
+}) {
+  if (cell.pad) return "占位（排满网格，不在所选区间）";
   if (cell.requests <= 0) return `${cell.label} · 无请求数据`;
   const rateTxt = cell.successRate == null ? "—" : `${(cell.successRate * 100).toFixed(1)}%`;
   return `${cell.label} · 成功 ${formatTokens(cell.success)} · 失败 ${formatTokens(cell.failed)} · 成功率 ${rateTxt}`;
 }
 
-// —— 请求健康时间线：与左侧趋势同粒度、同节点数（含空节点）——
+// —— 请求健康时间线：与左侧趋势同粒度完整节点 ——
 const healthTimeline = computed(() =>
   buildHealthTimeline(
     store.requestHealth.value?.buckets ?? [],
@@ -315,6 +323,58 @@ const healthTimeline = computed(() =>
     store.tokenStatsTo.value || undefined,
   ),
 );
+
+// 网格：上→下、左→右（列优先），排满容器；所选区间落在末尾
+const HEALTH_ROWS = 7;
+const HEALTH_CELL = 12; // px
+const HEALTH_GAP = 4;   // px
+const healthGridRef = ref<HTMLElement | null>(null);
+const healthCols = ref(24);
+let healthRo: ResizeObserver | null = null;
+
+function measureHealthGrid() {
+  const el = healthGridRef.value;
+  if (!el) return;
+  const width = el.clientWidth || el.getBoundingClientRect().width;
+  if (width <= 0) return;
+  const cols = Math.max(1, Math.floor((width + HEALTH_GAP) / (HEALTH_CELL + HEALTH_GAP)));
+  if (cols !== healthCols.value) healthCols.value = cols;
+}
+
+type HealthDisplayCell = {
+  key: string;
+  label: string;
+  success: number;
+  failed: number;
+  requests: number;
+  successRate: number | null;
+  level: number;
+  pad?: boolean;
+};
+
+// 列优先展示：先填满一列（上→下），再下一列（左→右）
+// capacity = rows * cols 排满；若节点不足则前置占位，保证所选区间在末尾
+// 若节点过多则只保留末尾 capacity 个（仍保证选中区间的最后部分在网格末端）
+const healthDisplayCells = computed<HealthDisplayCell[]>(() => {
+  const source = healthTimeline.value.cells;
+  const capacity = HEALTH_ROWS * Math.max(1, healthCols.value);
+  let body: HealthDisplayCell[] = source.map((c) => ({ ...c, pad: false }));
+  if (body.length > capacity) {
+    body = body.slice(body.length - capacity);
+  }
+  const padCount = Math.max(0, capacity - body.length);
+  const pads: HealthDisplayCell[] = Array.from({ length: padCount }, (_, i) => ({
+    key: `pad-${i}`,
+    label: "",
+    success: 0,
+    failed: 0,
+    requests: 0,
+    successRate: null,
+    level: 0,
+    pad: true,
+  }));
+  return [...pads, ...body];
+});
 
 // —— ECharts 折线图 option（使用趋势）——
 const trendChartOption = computed<EChartsOption>(() => {
@@ -394,8 +454,28 @@ function refreshAll() {
   void store.loadRequestHealth();
 }
 
+
+watch(
+  () => [healthTimeline.value.nodeCount, store.tokenStatsFrom.value, store.tokenStatsTo.value, trendGranularity.value],
+  () => nextTick(() => measureHealthGrid()),
+);
+
 onMounted(() => {
   void Promise.all([store.loadTokenUsage(), store.loadTokenStats(), store.loadRequestHealth()]);
+  nextTick(() => {
+    measureHealthGrid();
+    if (typeof ResizeObserver !== "undefined" && healthGridRef.value) {
+      healthRo = new ResizeObserver(() => measureHealthGrid());
+      healthRo.observe(healthGridRef.value);
+    }
+    window.addEventListener("resize", measureHealthGrid);
+  });
+});
+
+onBeforeUnmount(() => {
+  healthRo?.disconnect();
+  healthRo = null;
+  window.removeEventListener("resize", measureHealthGrid);
 });
 </script>
 
@@ -531,25 +611,37 @@ onMounted(() => {
             </header>
             <div class="tt-card-body tt-health-body">
               <div v-if="healthTimeline.cells.length" class="tt-health-timeline">
-                <div class="tt-health-grid">
+                <div
+                  ref="healthGridRef"
+                  class="tt-health-grid"
+                  :style="{ gridTemplateRows: `repeat(${HEALTH_ROWS}, ${HEALTH_CELL}px)` }"
+                >
                   <div
-                    v-for="cell in healthTimeline.cells"
+                    v-for="cell in healthDisplayCells"
                     :key="cell.key"
                     class="tt-health-cell"
-                    :class="'lv' + cell.level"
+                    :class="[
+                      'lv' + cell.level,
+                      { 'is-pad': cell.pad },
+                    ]"
                     :title="healthCellTitle(cell)"
                   ></div>
                 </div>
                 <div class="tt-health-legend">
                   <span>不健康</span>
-                  <span class="tt-health-cell lv0"></span>
                   <span class="tt-health-cell lv1"></span>
                   <span class="tt-health-cell lv2"></span>
                   <span class="tt-health-cell lv3"></span>
                   <span class="tt-health-cell lv4"></span>
                   <span class="tt-health-cell lv5"></span>
                   <span>健康</span>
-                  <span class="tt-health-meta">· 节点 {{ healthTimeline.nodeCount }} · 有数据 {{ healthTimeline.activeCount }}</span>
+                  <span class="tt-health-cell lv0"></span>
+                  <span>无数据</span>
+                  <span class="tt-health-meta">
+                    · 区间节点 {{ healthTimeline.nodeCount }}
+                    · 网格 {{ HEALTH_ROWS }}×{{ healthCols }}
+                    · 有数据 {{ healthTimeline.activeCount }}
+                  </span>
                 </div>
               </div>
               <div v-else class="tt-table-empty">该范围内没有请求健康数据</div>
