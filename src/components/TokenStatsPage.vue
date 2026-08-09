@@ -10,7 +10,7 @@ import {
   bucketSourceTotals,
   bucketTotals,
   buildDailyMapFromBuckets,
-  buildHealthHeatmap,
+  buildHealthTimeline,
   buildTrendDetailFromBuckets,
   buildTrendFromBuckets,
   mergeModelTotals,
@@ -299,19 +299,18 @@ function formatDetailTime(label: string): string {
   }
 }
 
-// 请求健康方块 tooltip：日期 + 请求量 + 失败数 + 失败率
-function dayTitle(day: { date: string; requests: number; failed: number; rate: number | null; isFuture?: boolean; outOfRange?: boolean }) {
-  if (day.outOfRange) return `${day.date} · 不在所选区间`;
-  if (day.isFuture) return `${day.date} · 未来日期`;
-  if (day.requests <= 0) return `${day.date} · 无请求数据`;
-  const rateTxt = day.rate == null ? "—" : `${(day.rate * 100).toFixed(1)}%`;
-  return `${day.date} · ${formatTokens(day.requests)} 次请求 · 失败 ${formatTokens(day.failed)} · 失败率 ${rateTxt}`;
+// 请求健康时间线 cell tooltip
+function healthCellTitle(cell: { label: string; requests: number; success: number; failed: number; successRate: number | null }) {
+  if (cell.requests <= 0) return `${cell.label} · 无请求数据`;
+  const rateTxt = cell.successRate == null ? "—" : `${(cell.successRate * 100).toFixed(1)}%`;
+  return `${cell.label} · 成功 ${formatTokens(cell.success)} · 失败 ${formatTokens(cell.failed)} · 成功率 ${rateTxt}`;
 }
 
-// —— 请求健康热力图：按天聚合大模型请求失败率，GitHub 小方块形式 ——
-const healthHeatmap = computed(() =>
-  buildHealthHeatmap(
+// —— 请求健康时间线：与左侧趋势同粒度、同节点数（含空节点）——
+const healthTimeline = computed(() =>
+  buildHealthTimeline(
     store.requestHealth.value?.buckets ?? [],
+    trendGranularity.value,
     store.tokenStatsFrom.value || undefined,
     store.tokenStatsTo.value || undefined,
   ),
@@ -514,47 +513,43 @@ onMounted(() => {
           </section>
 
           <section class="tt-card tt-card-heat">
-            <header class="tt-card-head">
+            <header class="tt-card-head tt-health-head">
               <div>
-                <h2>请求健康热力图</h2>
-                <p>
-                  HEALTH · {{ healthHeatmap.startLabel }} ~ {{ healthHeatmap.endLabel }}
-                  · 区间 {{ healthHeatmap.rangeDays }} 天
-                  · 有请求 {{ healthHeatmap.activeDays }} 天
-                  {{ healthHeatmap.overallRate != null ? " · 失败率 " + (healthHeatmap.overallRate * 100).toFixed(1) + "%" : "" }}
-                </p>
+                <h2>请求健康时间线</h2>
+                <p>展示所选活动窗口内的请求成功与失败分布。</p>
+              </div>
+              <div class="tt-health-summary">
+                <div class="tt-health-rate-label">成功率</div>
+                <div class="tt-health-rate-value">
+                  {{ healthTimeline.successRate != null ? (healthTimeline.successRate * 100).toFixed(1) + "%" : "—" }}
+                </div>
+                <div class="tt-health-counts">
+                  <span class="ok">● {{ formatTokens(healthTimeline.totalSuccess) }}</span>
+                  <span class="bad">● {{ formatTokens(healthTimeline.totalFailed) }}</span>
+                </div>
               </div>
             </header>
-            <div class="tt-card-body tt-heatmap-wrap">
-              <div v-if="healthHeatmap.weeks.length" class="tt-heatmap">
-                <div class="tt-heatmap-months">
-                  <template v-for="m in healthHeatmap.months" :key="m.label">
-                    <span :style="{ gridColumn: 'span ' + m.span }">{{ m.label }}</span>
-                  </template>
+            <div class="tt-card-body tt-health-body">
+              <div v-if="healthTimeline.cells.length" class="tt-health-timeline">
+                <div class="tt-health-grid">
+                  <div
+                    v-for="cell in healthTimeline.cells"
+                    :key="cell.key"
+                    class="tt-health-cell"
+                    :class="'lv' + cell.level"
+                    :title="healthCellTitle(cell)"
+                  ></div>
                 </div>
-                <div class="tt-heatmap-weeks">
-                  <div v-for="(week, wi) in healthHeatmap.weeks" :key="wi" class="tt-heatmap-week">
-                    <div
-                      v-for="(day, di) in week.days"
-                      :key="di"
-                      class="tt-heatmap-cell"
-                      :class="[
-                        day.level ? 'lv' + day.level : '',
-                        {
-                          'is-future': day.isFuture,
-                          'is-out': day.outOfRange,
-                          'is-empty': !day.outOfRange && !day.isFuture && day.level === 0,
-                        },
-                      ]"
-                      :title="dayTitle(day)"
-                    ></div>
-                  </div>
-                </div>
-                <div class="tt-heatmap-legend">
-                  <span>无数据</span>
-                  <span class="tt-heatmap-cell"></span>
-                  <span v-for="l in 4" :key="l" class="tt-heatmap-cell lv" :class="'lv' + l"></span>
-                  <span>失败率低 → 高</span>
+                <div class="tt-health-legend">
+                  <span>不健康</span>
+                  <span class="tt-health-cell lv0"></span>
+                  <span class="tt-health-cell lv1"></span>
+                  <span class="tt-health-cell lv2"></span>
+                  <span class="tt-health-cell lv3"></span>
+                  <span class="tt-health-cell lv4"></span>
+                  <span class="tt-health-cell lv5"></span>
+                  <span>健康</span>
+                  <span class="tt-health-meta">· 节点 {{ healthTimeline.nodeCount }} · 有数据 {{ healthTimeline.activeCount }}</span>
                 </div>
               </div>
               <div v-else class="tt-table-empty">该范围内没有请求健康数据</div>

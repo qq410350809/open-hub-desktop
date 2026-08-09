@@ -426,26 +426,27 @@ export function buildHeatmap(dailyMap: Map<string, DailyStat>, today = new Date(
   };
 }
 
-// —— 请求健康热力图：按天聚合大模型请求失败率，用层级着色 ——
-export interface HealthHeatmapDay {
-  date: string;
-  requests: number;
+// —— 请求健康时间线：按所选区间完整节点展示成功/失败分布 ——
+export interface HealthTimelineCell {
+  key: string;
+  label: string;
+  success: number;
   failed: number;
-  rate: number | null; // 0~1，null 表示无数据
-  level: number;       // 0=无数据 1=低失败 2=中 3=高 4=极高
-  isFuture: boolean;
-  outOfRange?: boolean; // 周网格补齐、不在顶部区间内
+  requests: number;
+  successRate: number | null; // 0~1，null=无数据
+  level: number; // 0=无数据 1=很差 2=差 3=中 4=好 5=很好
 }
-export interface HealthHeatmapData {
-  weeks: { days: HealthHeatmapDay[] }[];
-  months: { label: string; span: number }[];
+
+export interface HealthTimelineData {
+  cells: HealthTimelineCell[];
   startLabel: string;
   endLabel: string;
-  totalRequests: number;
+  totalSuccess: number;
   totalFailed: number;
-  overallRate: number | null;
-  rangeDays: number;   // 顶部区间内的日历天数（含无数据日）
-  activeDays: number;  // 区间内有请求的天数
+  totalRequests: number;
+  successRate: number | null;
+  nodeCount: number;
+  activeCount: number;
 }
 
 interface HealthInput {
@@ -454,37 +455,66 @@ interface HealthInput {
   failed: number;
 }
 
-export function buildHealthHeatmap(
+/** 成功率 → 色阶：0 无数据；1 红(不健康) … 5 绿(健康) */
+export function healthLevelOf(successRate: number | null): number {
+  if (successRate == null) return 0;
+  if (successRate < 0.5) return 1;
+  if (successRate < 0.7) return 2;
+  if (successRate < 0.85) return 3;
+  if (successRate < 0.95) return 4;
+  return 5;
+}
+
+/**
+ * 按趋势粒度生成与左侧图表一一对应的完整节点。
+ * 无请求数据的节点仍保留（level=0 深灰空位）。
+ */
+export function buildHealthTimeline(
   buckets: HealthInput[],
+  granularity: TrendGranularity,
   from?: string,
   to?: string,
-  today = new Date(),
-): HealthHeatmapData {
-  // 按本地日期聚合成功/失败
-  const byDay = new Map<string, { requests: number; failed: number }>();
+): HealthTimelineData {
+  // 先按粒度聚合成功/失败
+  const map = new Map<string, { label: string; success: number; failed: number }>();
   for (const b of buckets) {
-    const day = localDateOf(b.hour);
-    if (!day) continue;
-    const cur = byDay.get(day) || { requests: 0, failed: 0 };
-    cur.requests += (b.success || 0) + (b.failed || 0);
+    const { key, label } = bucketKeyFor(granularity, b.hour);
+    if (!key) continue;
+    const cur = map.get(key) || { label, success: 0, failed: 0 };
+    cur.success += b.success || 0;
     cur.failed += b.failed || 0;
-    byDay.set(day, cur);
+    map.set(key, cur);
   }
 
-  // 区间起止：优先顶部选择；否则用数据跨度；都没有时回退近 90 天
+  // 区间：优先顶部选择；否则用健康数据跨度
   let startDay = from || "";
   let endDay = to || "";
   if (!startDay || !endDay) {
-    const days = [...byDay.keys()].sort();
-    if (days.length) {
-      startDay = startDay || days[0];
-      endDay = endDay || days[days.length - 1];
-    } else {
-      const d = new Date(today);
-      d.setDate(d.getDate() - 89);
-      startDay = startDay || toLocalDate(d);
-      endDay = endDay || toLocalDate(today);
+    let min = "";
+    let max = "";
+    for (const b of buckets) {
+      const day = localDateOf(b.hour);
+      if (!day) continue;
+      if (!min || day < min) min = day;
+      if (!max || day > max) max = day;
     }
+    if (min && max) {
+      startDay = startDay || min;
+      endDay = endDay || max;
+    }
+  }
+  if (!startDay || !endDay) {
+    return {
+      cells: [],
+      startLabel: "",
+      endLabel: "",
+      totalSuccess: 0,
+      totalFailed: 0,
+      totalRequests: 0,
+      successRate: null,
+      nodeCount: 0,
+      activeCount: 0,
+    };
   }
   if (startDay > endDay) {
     const tmp = startDay;
@@ -492,85 +522,57 @@ export function buildHealthHeatmap(
     endDay = tmp;
   }
 
-  // 周网格仅用于排版：从区间起点所在周一开始，到区间终点所在周日结束
-  // 区间内无数据的日期仍会以空格子体现（level=0），不会被省略
-  let start = startOfWeek(parseLocal(startDay));
-  let end = startOfWeek(parseLocal(endDay));
-  end.setDate(end.getDate() + 6);
-
-  // 限制最多 WEEKS_CAP 周（保留最近）
-  const maxSpan = (WEEKS_CAP - 1) * 7 * 86_400_000;
-  if (end.getTime() - start.getTime() > maxSpan) {
-    start = new Date(end.getTime() - maxSpan);
-    start = startOfWeek(start);
-  }
-
-  const rateOf = (requests: number, failed: number) =>
-    requests > 0 ? failed / requests : null;
-  const levelOf = (rate: number | null) => {
-    if (rate == null) return 0;
-    if (rate <= 0.02) return 1;
-    if (rate <= 0.08) return 2;
-    if (rate <= 0.2) return 3;
-    return 4;
-  };
-
-  const weeks: { days: HealthHeatmapDay[] }[] = [];
-  let totalRequests = 0;
+  const keys = buildRangeKeys(startDay, endDay, granularity);
+  let totalSuccess = 0;
   let totalFailed = 0;
-  let rangeDays = 0;
-  let activeDays = 0;
-  const cursor = new Date(start);
-  while (cursor.getTime() <= end.getTime() && weeks.length < WEEKS_CAP) {
-    const days: HealthHeatmapDay[] = [];
-    for (let index = 0; index < 7; index += 1) {
-      const date = toLocalDate(cursor);
-      const inRange = date >= startDay && date <= endDay;
-      const isFuture = cursor.getTime() > today.getTime();
-      const agg = byDay.get(date);
-      const requests = inRange ? (agg?.requests ?? 0) : 0;
-      const failed = inRange ? (agg?.failed ?? 0) : 0;
-      const rate = inRange ? rateOf(requests, failed) : null;
-      if (inRange && !isFuture) {
-        rangeDays += 1;
-        totalRequests += requests;
-        totalFailed += failed;
-        if (requests > 0) activeDays += 1;
-      }
-      days.push({
-        date,
-        requests,
-        failed,
-        rate,
-        // 区间内无数据：level=0 灰色空格子仍然显示；区间外补齐格 / 未来日：透明
-        level: inRange && !isFuture ? levelOf(rate) : 0,
-        isFuture,          // 真正的未来日
-        outOfRange: !inRange, // 仅用于周网格补齐
-      });
-      cursor.setDate(cursor.getDate() + 1);
+  let activeCount = 0;
+  const cells: HealthTimelineCell[] = keys.map(({ key, label }) => {
+    const hit = map.get(key);
+    const success = hit?.success ?? 0;
+    const failed = hit?.failed ?? 0;
+    const requests = success + failed;
+    const successRate = requests > 0 ? success / requests : null;
+    if (requests > 0) {
+      totalSuccess += success;
+      totalFailed += failed;
+      activeCount += 1;
     }
-    weeks.push({ days });
-  }
+    return {
+      key,
+      label,
+      success,
+      failed,
+      requests,
+      successRate,
+      level: healthLevelOf(successRate),
+    };
+  });
 
-  const months: { label: string; span: number }[] = [];
-  for (const week of weeks) {
-    const label = week.days[0].date.slice(0, 7);
-    const last = months[months.length - 1];
-    if (last && last.label === label) last.span += 1;
-    else months.push({ label, span: 1 });
-  }
-
+  const totalRequests = totalSuccess + totalFailed;
   return {
-    weeks,
-    months,
+    cells,
     startLabel: startDay,
     endLabel: endDay,
-    totalRequests,
+    totalSuccess,
     totalFailed,
-    overallRate: rateOf(totalRequests, totalFailed),
-    rangeDays,
-    activeDays,
+    totalRequests,
+    successRate: totalRequests > 0 ? totalSuccess / totalRequests : null,
+    nodeCount: cells.length,
+    activeCount,
   };
+}
+
+// 兼容旧名（若仍有引用）
+export type HealthHeatmapDay = HealthTimelineCell;
+export type HealthHeatmapData = HealthTimelineData;
+export function buildHealthHeatmap(
+  buckets: HealthInput[],
+  from?: string,
+  to?: string,
+  _today = new Date(),
+): HealthTimelineData {
+  // 旧签名无粒度：默认按日
+  return buildHealthTimeline(buckets, "day", from, to);
 }
 
 // —— 过滤 unknown / 空模型来源 ——
