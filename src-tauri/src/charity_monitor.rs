@@ -185,6 +185,8 @@ const CHARITY_PREPARE_NODE_LIMIT: usize = 40;
 const CHARITY_BAN_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// 403/站点拒绝：拉黑更久。
 const CHARITY_BAN_FORBIDDEN: Duration = Duration::from_secs(2 * 60 * 60);
+/// 成功节点冷却：防止同一节点短时间内被并行标签再次复用触发 403 风控。
+const CHARITY_SUCCESS_COOLDOWN: Duration = Duration::from_secs(10 * 60);
 /// 其它失败默认拉黑。
 const CHARITY_BAN_DEFAULT: Duration = Duration::from_secs(15 * 60);
 const CHARITY_PAGE_SIZE: usize = 20;
@@ -1733,12 +1735,9 @@ async fn sync_feed_with_fast_nodes(
                     });
                     match persist_result {
                         Ok(mut result) => {
-                            // 成功才回队尾；若期间被其它标签 403 拉黑则不再入队
-                            if !monitor_state.is_banned(&node.id) {
-                                if let Ok(mut q) = queue.lock() {
-                                    q.push_back(node.clone());
-                                }
-                            }
+                            // 成功节点不回队尾：同一节点短时间内不重复请求（避免 403 风控）。
+                            // 加冷却后，本轮与下轮都不会立刻复用它；由建队时的黑名单过滤跳过。
+                            monitor_state.ban_node(&node.id, CHARITY_SUCCESS_COOLDOWN);
                             result.used_node_id = node.id.clone();
                             result.used_node_name = node.name.clone();
                             result.status = "success".into();
