@@ -48,16 +48,6 @@ function liveDurationMs(entry: { status: string; at: string; durationMs?: number
   return Math.max(0, Date.now() - started);
 }
 
-const sourceLabel = computed(() => {
-  if (store.charityFeedUsedNodeName.value) return store.charityFeedUsedNodeName.value;
-  if (store.charityFeedSourceProfileName.value) {
-    return `Chrome ${store.charityFeedSourceProfileName.value}${
-      store.charityFeedSourceAccountName.value ? ` · ${store.charityFeedSourceAccountName.value}` : ""
-    }`;
-  }
-  return "本地库";
-});
-
 const selectedLabel = computed(
   () => store.currentFeedName.value || store.selectedTagId.value || "公益监听",
 );
@@ -108,20 +98,6 @@ function formatRelativeActivity(value?: string, fallback?: string) {
   return formatPublishedAt(raw);
 }
 
-
-function formatFetchedAt(value: string) {
-  if (!value) return "尚未同步";
-  const normalized = value.includes("T") ? value : value.replace(" ", "T") + "Z";
-  const date = new Date(normalized);
-  if (Number.isNaN(date.getTime())) return value;
-  return new Intl.DateTimeFormat("zh-CN", {
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-  }).format(date);
-}
 
 function formatLogTime(value: string) {
   if (!value) return "--:--:--";
@@ -216,7 +192,7 @@ onUnmounted(() => {
       <div>
         <span class="charity-monitor-eyebrow">LINUX.DO · {{ selectedLabel }}</span>
         <h1>公益监听</h1>
-        <p>定时同步：每 5 分钟（:00/:05/:10… 秒 00）；过程见“同步日志”。</p>
+        <p>定时同步：每 5 分钟（:00/:05/:10…）。</p>
       </div>
       <div class="charity-header-actions">
         <button
@@ -280,27 +256,18 @@ onUnmounted(() => {
           </div>
         </div>
         <div class="charity-summary-stats">
-          <div class="charity-summary-stat">
+          <div class="charity-summary-stat" title="今天发布的帖子数">
             <strong>{{ store.charityFeedTodayCount.value }}</strong>
             <span>今日帖子</span>
           </div>
-          <div class="charity-summary-stat">
-            <strong>{{ pageLabel }}</strong>
-            <span>当前共 {{ store.charityFeedTotalCount.value }} 条</span>
+          <div class="charity-summary-stat" title="当前标签帖子总数">
+            <strong>{{ store.charityFeedTotalCount.value }}</strong>
+            <span>共 {{ pageLabel.split(" / ")[0] }} 条</span>
           </div>
-          <div class="charity-summary-stat">
+          <div class="charity-summary-stat" title="未读新帖">
             <strong>{{ store.charityFeedSelectedUnreadCount.value }}</strong>
             <span>未读</span>
           </div>
-          <div class="charity-summary-stat">
-            <strong>{{ store.charityFeedUpdatedCount.value }}</strong>
-            <span>同步变更</span>
-          </div>
-        </div>
-        <div class="charity-toolbar-meta">
-          <span title="数据来源"><small>来源</small>{{ sourceLabel }}</span>
-          <span title="上次同步"><small>同步于</small>{{ formatFetchedAt(store.charityFeedLastFetchedAt.value) }}</span>
-          <span title="同步状态"><small>状态</small>{{ store.charityFeedStatusMessage.value || (store.charityFeedError.value ? "异常" : "正常") }}</span>
         </div>
       </section>
 

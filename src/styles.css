@@ -1258,8 +1258,9 @@ kbd { padding: 3px 7px; border: 1px solid var(--line); border-radius: var(--r-xs
 .charity-summary-stats {
   grid-area: stats;
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 140px));
   gap: 8px;
+  justify-content: end;
 }
 .charity-summary-stat {
   min-width: 0;
