@@ -1,23 +1,28 @@
 //! 中文原生菜单。
-//! 覆盖 macOS 菜单栏与文本编辑右键菜单（撤销/剪切/拷贝/粘贴/全选等系统菜单项），
-//! 这些系统项由本应用的 Edit 菜单提供文本，改为中文后右键菜单即为中文。
+//! 1) 覆盖 macOS 菜单栏；
+//! 2) 编辑菜单中文项供系统快捷键/部分文本菜单复用；
+//! 3) 页面内右键由前端中文菜单接管（WKWebView 默认英文菜单不可完全本地化）。
 
 use tauri::menu::{AboutMetadata, IsMenuItem, Menu, PredefinedMenuItem, Submenu};
+use tauri::Manager;
 
 type DynItem<'a, R> = &'a dyn IsMenuItem<R>;
 
-/// 安装中文菜单到应用。
+/// 安装中文菜单到应用与主窗口。
 pub fn install_chinese_menu<R: tauri::Runtime>(app: &tauri::App<R>) -> tauri::Result<()> {
     // macOS 会把菜单栏第一个子菜单固定显示为应用名，标题写什么都会被系统替换。
     let about =
         PredefinedMenuItem::about(app, Some("关于 OpenHub"), Some(AboutMetadata::default())).ok();
     let sep = PredefinedMenuItem::separator(app).ok();
+    let services = PredefinedMenuItem::services(app, Some("服务")).ok();
     let hide = PredefinedMenuItem::hide(app, Some("隐藏 OpenHub")).ok();
     let hide_others = PredefinedMenuItem::hide_others(app, Some("隐藏其他")).ok();
     let show_all = PredefinedMenuItem::show_all(app, Some("全部显示")).ok();
     let quit = PredefinedMenuItem::quit(app, Some("退出 OpenHub")).ok();
     let app_items: Vec<DynItem<'_, R>> = vec![
         about.as_ref().map(|i| i as DynItem<'_, R>),
+        sep.as_ref().map(|i| i as DynItem<'_, R>),
+        services.as_ref().map(|i| i as DynItem<'_, R>),
         sep.as_ref().map(|i| i as DynItem<'_, R>),
         hide.as_ref().map(|i| i as DynItem<'_, R>),
         hide_others.as_ref().map(|i| i as DynItem<'_, R>),
@@ -37,7 +42,7 @@ pub fn install_chinese_menu<R: tauri::Runtime>(app: &tauri::App<R>) -> tauri::Re
         .collect();
     let file_menu = Submenu::with_items(app, "文件", true, &file_items)?;
 
-    // 编辑菜单是文本输入区域右键菜单的数据来源。
+    // 编辑菜单是文本输入区域系统菜单/快捷键的数据来源之一。
     let undo = PredefinedMenuItem::undo(app, Some("撤销")).ok();
     let redo = PredefinedMenuItem::redo(app, Some("重做")).ok();
     let cut = PredefinedMenuItem::cut(app, Some("剪切")).ok();
@@ -80,6 +85,12 @@ pub fn install_chinese_menu<R: tauri::Runtime>(app: &tauri::App<R>) -> tauri::Re
         app,
         &[&app_menu, &file_menu, &edit_menu, &view_menu, &window_menu],
     )?;
-    app.set_menu(menu)?;
+    app.set_menu(menu.clone())?;
+
+    // 同步挂到主窗口，避免部分场景只读窗口菜单。
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.set_menu(menu);
+    }
+
     Ok(())
 }

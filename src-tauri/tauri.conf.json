@@ -56,6 +56,9 @@
     "macOS": {
       "minimumSystemVersion": "10.13",
       "signingIdentity": "-"
-    }
+    },
+    "resources": [
+      "resources/zh-Hans.lproj"
+    ]
   }
 }

@@ -905,6 +905,20 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
+            #[cfg(target_os = "macos")]
+            {
+                // 让系统/WebKit 优先走简体中文资源（对部分系统菜单项生效）。
+                let _ = std::process::Command::new("defaults")
+                    .args([
+                        "write",
+                        "com.dfeer.openhub.desktop",
+                        "AppleLanguages",
+                        "-array",
+                        "zh-Hans",
+                        "en",
+                    ])
+                    .status();
+            }
             app_menu::install_chinese_menu(app)?;
             let app_data_dir = app
                 .path()

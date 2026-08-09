@@ -6,6 +6,7 @@ import { usePreferences } from "./composables/usePreferences";
 import { useTheme } from "./composables/useTheme";
 import { useToast } from "./composables/useToast";
 import { useTooltip } from "./composables/useTooltip";
+import { useContextMenu } from "./composables/useContextMenu";
 import AppSidebar from "./components/AppSidebar.vue";
 import CustomSelect from "./components/CustomSelect.vue";
 import SiteGrid from "./components/SiteGrid.vue";
@@ -65,6 +66,13 @@ const {
   onPointerDown,
   onScroll,
 } = useTooltip();
+const {
+  visible: contextMenuVisible,
+  left: contextMenuLeft,
+  top: contextMenuTop,
+  items: contextMenuItems,
+  runAction: runContextMenuAction,
+} = useContextMenu();
 
 const sidebarCollapsed = computed(() => preferences.sidebarCollapsed);
 
@@ -323,4 +331,28 @@ onUnmounted(() => {
   <ChromeSessionDialog />
   <SiteModelsDialog />
   <SettingsPage />
+
+  <!-- 中文右键菜单：覆盖 WKWebView 默认英文菜单 -->
+  <div
+    v-if="contextMenuVisible"
+    class="oh-context-menu"
+    role="menu"
+    :style="{ left: contextMenuLeft + 'px', top: contextMenuTop + 'px' }"
+    @contextmenu.prevent
+  >
+    <template v-for="item in contextMenuItems" :key="item.id">
+      <div v-if="item.separator" class="oh-context-menu-sep" role="separator"></div>
+      <button
+        v-else
+        type="button"
+        class="oh-context-menu-item"
+        role="menuitem"
+        :disabled="!item.enabled"
+        @click="runContextMenuAction(item.id)"
+      >
+        <span>{{ item.label }}</span>
+        <kbd v-if="item.accelerator">{{ item.accelerator }}</kbd>
+      </button>
+    </template>
+  </div>
 </template>
