@@ -191,6 +191,9 @@ const CHARITY_PREPARE_NODE_LIMIT: usize = 40;
 const CHARITY_BAN_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// 403/站点拒绝：拉黑更久。
 const CHARITY_BAN_FORBIDDEN: Duration = Duration::from_secs(2 * 60 * 60);
+/// 传输层（error sending request / 连接不上节点）与 403 同级拉黑，
+/// 避免半小时后又把明显连不通的节点捞回来反复浪费。
+const CHARITY_BAN_UNREACHABLE: Duration = Duration::from_secs(2 * 60 * 60);
 /// 成功节点冷却：防止同一节点短时间内被并行标签再次复用触发 403 风控。
 const CHARITY_SUCCESS_COOLDOWN: Duration = Duration::from_secs(10 * 60);
 /// 其它失败默认拉黑。
@@ -1575,17 +1578,29 @@ fn is_http_forbidden_error(error: &str) -> bool {
         || lower.contains("error code: 403")
 }
 
+fn is_transport_error(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("error sending request")
+        || lower.contains("i/o timeout")
+        || lower.contains("timeout")
+        || lower.contains("timed out")
+        || lower.contains("deadline")
+        || lower.contains("connection")
+        || lower.contains("connection reset")
+        || lower.contains("connect error")
+        || lower.contains("连接失败")
+        || lower.contains("无法建立连接")
+        || lower.contains("连接被重置")
+}
+
 fn ban_ttl_for_error(error: &str) -> Duration {
     let lower = error.to_ascii_lowercase();
     if is_http_forbidden_error(error) {
         CHARITY_BAN_FORBIDDEN
-    } else if lower.contains("timeout")
-        || lower.contains("timed out")
-        || lower.contains("deadline")
-        || lower.contains("error sending request")
-        || lower.contains("connection")
-        || lower.contains("连接")
-    {
+    } else if is_transport_error(error) {
+        // 连节点/代理出口都不可达：预计短期不会恢复，提高拉黑时长。
+        CHARITY_BAN_UNREACHABLE
+    } else if lower.contains("超时") {
         CHARITY_BAN_TIMEOUT
     } else {
         CHARITY_BAN_DEFAULT
@@ -1973,6 +1988,8 @@ async fn sync_feed_with_fast_nodes(
                     eject_node_from_charity_candidate(&monitor_state, &queue, &node, &raw);
                     let message = if is_http_forbidden_error(&raw) {
                         format!("{}: HTTP 403，已从公益队列剔除", node.name)
+                    } else if is_transport_error(&raw) {
+                        format!("{}: 节点连接失败（已从公益队列剔除）：{}", node.name, raw)
                     } else {
                         raw
                     };
@@ -1996,6 +2013,8 @@ async fn sync_feed_with_fast_nodes(
                 }
                 let message = if !cancelled && is_http_forbidden_error(&raw) {
                     format!("{}: HTTP 403，已从公益队列剔除", node.name)
+                } else if !cancelled && is_transport_error(&raw) {
+                    format!("{}: 节点连接失败（已从公益队列剔除）：{}", node.name, raw)
                 } else {
                     raw
                 };
@@ -2684,6 +2703,14 @@ mod tests {
         assert!(is_http_forbidden_error("unexpected status 403 Forbidden"));
         assert!(!is_http_forbidden_error("timeout after 8s"));
         assert_eq!(ban_ttl_for_error("HTTP 403"), CHARITY_BAN_FORBIDDEN);
+        assert!(is_transport_error(
+            "error sending request for url (https://linux.do/tag/1980)"
+        ));
+        assert!(is_transport_error("connection reset by peer"));
+        assert_eq!(
+            ban_ttl_for_error("error sending request for url (https://linux.do)"),
+            CHARITY_BAN_UNREACHABLE
+        );
 
         let mut queue = CharityNodeQueue::from_nodes(vec![
             CharityNodeRef { id: "a".into(), name: "A".into(), latency_ms: 10 },
