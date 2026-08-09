@@ -592,16 +592,29 @@ pub(crate) struct TokenUsageReport {
 }
 
 
-// —— 请求健康：大模型请求成功/失败计数（来自 Codex rollout 的 task_started/task_complete.error）——
+// —— 请求/对话活动：多工具直读原始日志后的小时桶 ——
+// 对话 = 用户发起 turns；请求 = 模型 API 调用；success/failed 仅为可观测样本
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, rename_all(serialize = "camelCase", deserialize = "snake_case"))]
 pub(crate) struct RequestHealthBucket {
     pub(crate) hour: String,
-    /// 提取到的真实 API 请求数（Codex token_count / Claude assistant usage 等）
+    /// 用户发起的对话 turns（排除 tool_result / 自动触发）
+    pub(crate) dialogues: i64,
+    /// 提取到的真实 API 请求数（多工具）
     pub(crate) requests: i64,
-    /// 可观测成功样本（目前主要 Codex task_complete 无 error / Claude 非 API error）
+    /// 可观测成功样本
     pub(crate) success: i64,
     /// 可观测失败样本
+    pub(crate) failed: i64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, rename_all(serialize = "camelCase", deserialize = "snake_case"))]
+pub(crate) struct RequestHealthSourceSummary {
+    pub(crate) source: String,
+    pub(crate) dialogues: i64,
+    pub(crate) requests: i64,
+    pub(crate) success: i64,
     pub(crate) failed: i64,
 }
 
@@ -610,6 +623,8 @@ pub(crate) struct RequestHealthBucket {
 pub(crate) struct RequestHealthReport {
     pub(crate) available: bool,
     pub(crate) buckets: Vec<RequestHealthBucket>,
+    /// 分工具汇总（便于对账；UI 可先不展示）
+    pub(crate) by_source: Vec<RequestHealthSourceSummary>,
 }
 
 // —— 原始日志解析：会话 / 对话 / 请求 三级 ——

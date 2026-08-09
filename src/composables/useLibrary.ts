@@ -263,7 +263,7 @@ export async function runCommand<T>(
     return { available: false, sessions: [], conversations: [], requests: [] } as T;
   }
   if (command === "get_token_request_health") {
-    // dev mock：模拟近 10 天逐小时请求健康（少量失败）
+    // dev mock：模拟近 10 天逐小时 对话/请求健康（少量失败）
     const buckets: any[] = [];
     const now = new Date();
     const dayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
@@ -271,13 +271,22 @@ export async function runCommand<T>(
       for (let h = 0; h < 24; h++) {
         const hour = new Date(dayStart.getTime() - d * 86400000 + h * 3600000);
         const ts = hour.toISOString().slice(0, 13); // YYYY-MM-DDTHH
+        const dialogues = 1 + ((d * 5 + h) % 4); // 用户发起 turns
         const success = 5 + ((d * 31 + h * 7) % 12);
         const failed = (d + h) % 5 === 0 ? 1 + (h % 3) : 0;
         const requests = success + failed + ((d + h) % 4); // mock extracted request count
-        buckets.push({ hour: `${ts}:00:00.000Z`, requests, success, failed });
+        buckets.push({ hour: `${ts}:00:00.000Z`, dialogues, requests, success, failed });
       }
     }
-    return { available: true, buckets } as T;
+    return {
+      available: true,
+      buckets,
+      bySource: [
+        { source: "codex", dialogues: 120, requests: 800, success: 700, failed: 20 },
+        { source: "claude", dialogues: 80, requests: 600, success: 580, failed: 10 },
+        { source: "mimo", dialogues: 90, requests: 900, success: 880, failed: 5 },
+      ],
+    } as T;
   }
   if (command === "detect_site_system_types") return 0 as T;
   if (command === "create_site") {

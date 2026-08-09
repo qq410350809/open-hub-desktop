@@ -1,12 +1,15 @@
 use crate::models::{
     RawConversation, RawLogReport, RawRequest, RawSession, RequestHealthBucket, RequestHealthReport,
-    TokenStatsReport, TokenUsageBucket, TokenUsageReport,
+    RequestHealthSourceSummary, TokenStatsReport, TokenUsageBucket, TokenUsageReport,
 };
-use std::collections::BTreeMap;
+use rusqlite::{Connection, OpenFlags};
 use serde_json::Value as JsonValue;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, UNIX_EPOCH};
 
 /// 探测 tokentracker CLI 可执行文件，顺序：
 /// 1) OPENHUB_TOKENTRACKER_PATH 环境变量显式指定
@@ -709,39 +712,167 @@ mod tests {
 }
 
 
-/// 小时桶累加器：requests / success / failed
+/// 小时桶累加器：dialogues / requests / success / failed
 #[derive(Clone, Default)]
 struct HealthAgg {
+    dialogues: i64,
     requests: i64,
     success: i64,
     failed: i64,
 }
 
 fn hour_key_from_ts(ts: &str) -> Option<String> {
-    if ts.len() < 13 {
+    // 接受:
+    // - 2026-08-06T04:59:44.123Z
+    // - 2026-08-06T04:59:44Z
+    // - 2026-08-06T04:59:44+08:00
+    let cleaned = ts.trim();
+    if cleaned.len() < 13 {
         return None;
     }
-    // 统一到整点 ISO：YYYY-MM-DDTHH:00:00.000Z
-    Some(format!("{}:00:00.000Z", &ts[..13]))
+    // 取到小时：YYYY-MM-DDTHH
+    let prefix = &cleaned[..13];
+    if !(prefix.as_bytes().get(4) == Some(&b'-')
+        && prefix.as_bytes().get(7) == Some(&b'-')
+        && prefix.as_bytes().get(10) == Some(&b'T'))
+    {
+        return None;
+    }
+    Some(format!("{prefix}:00:00.000Z"))
 }
 
-fn bump(map: &mut BTreeMap<String, HealthAgg>, hour: String, requests: i64, success: i64, failed: i64) {
+fn hour_key_from_millis(ms: i64) -> Option<String> {
+    if ms <= 0 {
+        return None;
+    }
+    let secs = ms / 1000;
+    let t = UNIX_EPOCH + Duration::from_secs(secs as u64);
+    let datetime = t.duration_since(UNIX_EPOCH).ok()?;
+    // 手动格式化为 UTC ISO 小时，避免额外 chrono 依赖
+    // 使用简易算法：基于 unix 秒
+    let total_secs = datetime.as_secs() as i64;
+    let days = total_secs.div_euclid(86_400);
+    let tod = total_secs.rem_euclid(86_400);
+    let hour = tod / 3600;
+    let (y, m, d) = civil_from_days(days);
+    Some(format!("{y:04}-{m:02}-{d:02}T{hour:02}:00:00.000Z"))
+}
+
+/// Howard Hinnant civil_from_days (UTC)
+fn civil_from_days(days: i64) -> (i32, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y as i32, m as u32, d as u32)
+}
+
+fn json_i64(value: &JsonValue, key: &str) -> i64 {
+    value
+        .get(key)
+        .and_then(|v| v.as_f64().or_else(|| v.as_i64().map(|n| n as f64)))
+        .map(|n| n as i64)
+        .unwrap_or(0)
+}
+
+fn bump(
+    map: &mut BTreeMap<String, HealthAgg>,
+    hour: String,
+    dialogues: i64,
+    requests: i64,
+    success: i64,
+    failed: i64,
+) {
     let entry = map.entry(hour).or_default();
+    entry.dialogues += dialogues;
     entry.requests += requests;
     entry.success += success;
     entry.failed += failed;
 }
 
-/// Codex：
-/// - 真实请求数：event_msg.token_count（每次模型调用后的计量事件，最接近 API 请求）
-/// - 失败样本：event_msg.task_complete.error
-/// - 成功样本：event_msg.task_complete 且无 error
-fn collect_codex_request_health(dir: &Path, map: &mut BTreeMap<String, HealthAgg>) {
-    let Ok(entries) = fs::read_dir(dir) else { return };
+fn bump_source(
+    sources: &mut BTreeMap<String, HealthAgg>,
+    source: &str,
+    dialogues: i64,
+    requests: i64,
+    success: i64,
+    failed: i64,
+) {
+    let entry = sources.entry(source.to_string()).or_default();
+    entry.dialogues += dialogues;
+    entry.requests += requests;
+    entry.success += success;
+    entry.failed += failed;
+}
+
+fn record(
+    map: &mut BTreeMap<String, HealthAgg>,
+    sources: &mut BTreeMap<String, HealthAgg>,
+    source: &str,
+    hour: String,
+    dialogues: i64,
+    requests: i64,
+    success: i64,
+    failed: i64,
+) {
+    bump(map, hour, dialogues, requests, success, failed);
+    bump_source(sources, source, dialogues, requests, success, failed);
+}
+
+fn open_readonly_sqlite(path: &Path) -> Option<Connection> {
+    Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()
+}
+
+fn walk_jsonl_files(dir: &Path, on_file: &mut dyn FnMut(&Path)) {
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&current) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let is_jsonl = path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| ext.eq_ignore_ascii_case("jsonl"))
+                .unwrap_or(false);
+            if is_jsonl {
+                on_file(&path);
+            }
+        }
+    }
+}
+
+/// Codex:
+/// - 对话: event_msg.user_message
+/// - 请求: event_msg.token_count
+/// - 成功/失败样本: task_complete 无/有 error
+fn collect_codex_activity(
+    dir: &Path,
+    map: &mut BTreeMap<String, HealthAgg>,
+    sources: &mut BTreeMap<String, HealthAgg>,
+) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            collect_codex_request_health(&path, map);
+            collect_codex_activity(&path, map, sources);
             continue;
         }
         let is_rollout = path
@@ -752,62 +883,104 @@ fn collect_codex_request_health(dir: &Path, map: &mut BTreeMap<String, HealthAgg
         if !is_rollout {
             continue;
         }
-        let Ok(text) = fs::read_to_string(&path) else { continue };
-        for line in text.lines() {
-            let Ok(value) = serde_json::from_str::<JsonValue>(line) else { continue };
+        let Ok(file) = fs::File::open(&path) else {
+            continue;
+        };
+        for line in BufReader::new(file).lines().flatten() {
+            let Ok(value) = serde_json::from_str::<JsonValue>(&line) else {
+                continue;
+            };
             if value.get("type").and_then(JsonValue::as_str) != Some("event_msg") {
                 continue;
             }
-            let Some(payload) = value.get("payload") else { continue };
-            let Some(p_type) = payload.get("type").and_then(JsonValue::as_str) else { continue };
-            let ts = value.get("timestamp").and_then(JsonValue::as_str).unwrap_or("");
-            let Some(hour) = hour_key_from_ts(ts) else { continue };
-
-            if p_type == "token_count" {
-                // 一次 token_count ≈ 一次模型请求计量
-                bump(map, hour, 1, 0, 0);
+            // 兼容 payload / msg 两种结构
+            let payload = value
+                .get("payload")
+                .or_else(|| value.get("msg"))
+                .cloned()
+                .unwrap_or(JsonValue::Null);
+            let Some(p_type) = payload.get("type").and_then(JsonValue::as_str) else {
                 continue;
-            }
-            if p_type == "task_complete" {
-                let failed = payload.get("error").map(|e| e.is_object()).unwrap_or(false);
-                if failed {
-                    bump(map, hour, 0, 0, 1);
-                } else {
-                    bump(map, hour, 0, 1, 0);
+            };
+            let ts = value
+                .get("timestamp")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("");
+            let Some(hour) = hour_key_from_ts(ts) else {
+                continue;
+            };
+            match p_type {
+                "user_message" => record(map, sources, "codex", hour, 1, 0, 0, 0),
+                "token_count" => record(map, sources, "codex", hour, 0, 1, 0, 0),
+                "task_complete" => {
+                    let failed = payload.get("error").map(|e| !e.is_null()).unwrap_or(false);
+                    if failed {
+                        record(map, sources, "codex", hour, 0, 0, 0, 1);
+                    } else {
+                        record(map, sources, "codex", hour, 0, 0, 1, 0);
+                    }
                 }
+                _ => {}
             }
         }
     }
 }
 
-/// Claude：
-/// - 真实请求数：type=assistant 且 message.usage 有 token（>0）
-/// - 失败样本：isApiErrorMessage=true 或 error 字段存在
-/// - 成功样本：有 usage 且非 API error
-fn collect_claude_request_health(dir: &Path, map: &mut BTreeMap<String, HealthAgg>) {
-    let Ok(entries) = fs::read_dir(dir) else { return };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_claude_request_health(&path, map);
-            continue;
-        }
-        let is_jsonl = path
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .map(|ext| ext.eq_ignore_ascii_case("jsonl"))
-            .unwrap_or(false);
-        if !is_jsonl {
-            continue;
-        }
-        let Ok(text) = fs::read_to_string(&path) else { continue };
-        for line in text.lines() {
-            let Ok(value) = serde_json::from_str::<JsonValue>(line) else { continue };
-            if value.get("type").and_then(JsonValue::as_str) != Some("assistant") {
+fn claude_user_is_human(content: &JsonValue) -> bool {
+    match content {
+        JsonValue::String(text) => !text.trim().is_empty(),
+        JsonValue::Array(items) => items.iter().any(|item| {
+            matches!(
+                item.get("type").and_then(JsonValue::as_str),
+                Some("text") | Some("image")
+            ) || item.get("text").and_then(JsonValue::as_str).is_some()
+        }),
+        _ => false,
+    }
+}
+
+/// Claude:
+/// - 对话: type=user 且含 text/image；排除仅 tool_result
+/// - 请求: type=assistant 且 usage>0；API error 计 request+failed
+fn collect_claude_activity(
+    dir: &Path,
+    map: &mut BTreeMap<String, HealthAgg>,
+    sources: &mut BTreeMap<String, HealthAgg>,
+) {
+    walk_jsonl_files(dir, &mut |path| {
+        let Ok(file) = fs::File::open(path) else {
+            return;
+        };
+        for line in BufReader::new(file).lines().flatten() {
+            let Ok(value) = serde_json::from_str::<JsonValue>(&line) else {
+                continue;
+            };
+            let Some(type_name) = value.get("type").and_then(JsonValue::as_str) else {
+                continue;
+            };
+            let ts = value
+                .get("timestamp")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("");
+            let Some(hour) = hour_key_from_ts(ts) else {
+                continue;
+            };
+
+            if type_name == "user" {
+                let content = value
+                    .get("message")
+                    .and_then(|m| m.get("content"))
+                    .cloned()
+                    .unwrap_or(JsonValue::Null);
+                if claude_user_is_human(&content) {
+                    record(map, sources, "claude", hour, 1, 0, 0, 0);
+                }
                 continue;
             }
-            let ts = value.get("timestamp").and_then(JsonValue::as_str).unwrap_or("");
-            let Some(hour) = hour_key_from_ts(ts) else { continue };
+
+            if type_name != "assistant" {
+                continue;
+            }
             let is_api_error = value
                 .get("isApiErrorMessage")
                 .and_then(JsonValue::as_bool)
@@ -816,60 +989,321 @@ fn collect_claude_request_health(dir: &Path, map: &mut BTreeMap<String, HealthAg
             let usage = value.get("message").and_then(|m| m.get("usage"));
             let usage_tokens = usage
                 .map(|u| {
-                    let num = |k: &str| u.get(k).and_then(JsonValue::as_f64).unwrap_or(0.0) as i64;
-                    num("input_tokens")
-                        + num("output_tokens")
-                        + num("cache_read_input_tokens")
-                        + num("cache_creation_input_tokens")
+                    json_i64(u, "input_tokens")
+                        + json_i64(u, "output_tokens")
+                        + json_i64(u, "cache_read_input_tokens")
+                        + json_i64(u, "cache_creation_input_tokens")
                 })
                 .unwrap_or(0);
-
             if is_api_error {
-                // API 错误本身也是一次请求尝试
-                bump(map, hour, 1, 0, 1);
+                record(map, sources, "claude", hour, 0, 1, 0, 1);
+            } else if usage_tokens > 0 {
+                record(map, sources, "claude", hour, 0, 1, 1, 0);
+            }
+        }
+    });
+}
+
+fn assistant_tokens_positive(data: &JsonValue) -> bool {
+    let Some(tokens) = data.get("tokens") else {
+        return false;
+    };
+    json_i64(tokens, "input")
+        + json_i64(tokens, "output")
+        + json_i64(tokens, "reasoning")
+        + json_i64(tokens, "total")
+        > 0
+}
+
+fn collect_sqlite_message_activity(
+    db_path: &Path,
+    source: &str,
+    map: &mut BTreeMap<String, HealthAgg>,
+    sources: &mut BTreeMap<String, HealthAgg>,
+    // None = 不过滤 provider；Some(set) = 仅这些 provider 的 assistant 计请求，
+    // 且对话只统计“至少有一次匹配 provider assistant”的 session 内 user。
+    provider_allow: Option<&HashSet<&str>>,
+) {
+    let Some(conn) = open_readonly_sqlite(db_path) else {
+        return;
+    };
+    // 先找正宗 session（Mimo 需要）
+    let mut allowed_sessions: Option<HashSet<String>> = None;
+    if let Some(allow) = provider_allow {
+        let mut sessions = HashSet::new();
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT session_id, data FROM message WHERE json_extract(data, '$.role') = 'assistant'",
+        ) {
+            let rows = stmt.query_map([], |row| {
+                let sid: String = row.get(0)?;
+                let data: String = row.get(1)?;
+                Ok((sid, data))
+            });
+            if let Ok(rows) = rows {
+                for row in rows.flatten() {
+                    let (sid, data) = row;
+                    if let Ok(value) = serde_json::from_str::<JsonValue>(&data) {
+                        let provider = value
+                            .get("providerID")
+                            .or_else(|| value.get("providerId"))
+                            .and_then(JsonValue::as_str)
+                            .unwrap_or("")
+                            .to_ascii_lowercase();
+                        if allow.contains(provider.as_str()) && assistant_tokens_positive(&value) {
+                            sessions.insert(sid);
+                        }
+                    }
+                }
+            }
+        }
+        allowed_sessions = Some(sessions);
+    }
+
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT session_id, time_created, data FROM message",
+    ) else {
+        return;
+    };
+    let rows = stmt.query_map([], |row| {
+        let sid: String = row.get(0)?;
+        let time_created: i64 = row.get(1)?;
+        let data: String = row.get(2)?;
+        Ok((sid, time_created, data))
+    });
+    let Ok(rows) = rows else {
+        return;
+    };
+    for row in rows.flatten() {
+        let (session_id, time_created, data) = row;
+        let Ok(value) = serde_json::from_str::<JsonValue>(&data) else {
+            continue;
+        };
+        let role = value
+            .get("role")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("");
+        // 优先 message.time.completed/created，其次 time_created 列
+        let hour = value
+            .get("time")
+            .and_then(|t| {
+                t.get("completed")
+                    .or_else(|| t.get("created"))
+                    .and_then(JsonValue::as_i64)
+            })
+            .and_then(hour_key_from_millis)
+            .or_else(|| hour_key_from_millis(time_created));
+        let Some(hour) = hour else {
+            continue;
+        };
+
+        if role == "user" {
+            if let Some(sessions) = &allowed_sessions {
+                if !sessions.contains(&session_id) {
+                    continue;
+                }
+            }
+            record(map, sources, source, hour, 1, 0, 0, 0);
+            continue;
+        }
+
+        if role != "assistant" {
+            continue;
+        }
+        if let Some(allow) = provider_allow {
+            let provider = value
+                .get("providerID")
+                .or_else(|| value.get("providerId"))
+                .and_then(JsonValue::as_str)
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if !allow.contains(provider.as_str()) {
                 continue;
             }
-            if usage_tokens > 0 {
-                bump(map, hour, 1, 1, 0);
-            }
+        }
+        let has_error = value.get("error").map(|e| !e.is_null()).unwrap_or(false);
+        if has_error {
+            // 错误本身也是一次请求尝试
+            record(map, sources, source, hour, 0, 1, 0, 1);
+            continue;
+        }
+        if assistant_tokens_positive(&value) {
+            record(map, sources, source, hour, 0, 1, 1, 0);
         }
     }
 }
 
-/// 读取大模型请求健康数据：
-/// - 请求数：Codex token_count + Claude assistant(usage>0) + Claude API error
-/// - 成功/失败样本：Codex task_complete / Claude API error 与非 error usage
+/// Antigravity transcript.jsonl
+fn collect_antigravity_activity(
+    root: &Path,
+    map: &mut BTreeMap<String, HealthAgg>,
+    sources: &mut BTreeMap<String, HealthAgg>,
+) {
+    walk_jsonl_files(root, &mut |path| {
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+        if name != "transcript.jsonl" {
+            return;
+        }
+        let Ok(file) = fs::File::open(path) else {
+            return;
+        };
+        for line in BufReader::new(file).lines().flatten() {
+            let Ok(value) = serde_json::from_str::<JsonValue>(&line) else {
+                continue;
+            };
+            let type_name = value.get("type").and_then(JsonValue::as_str).unwrap_or("");
+            let source_name = value.get("source").and_then(JsonValue::as_str).unwrap_or("");
+            let ts = value
+                .get("created_at")
+                .or_else(|| value.get("timestamp"))
+                .and_then(JsonValue::as_str)
+                .unwrap_or("");
+            let Some(hour) = hour_key_from_ts(ts) else {
+                continue;
+            };
+            match type_name {
+                "USER_INPUT" if source_name == "USER_EXPLICIT" => {
+                    record(map, sources, "antigravity", hour, 1, 0, 0, 0);
+                }
+                "PLANNER_RESPONSE" => {
+                    record(map, sources, "antigravity", hour, 0, 1, 1, 0);
+                }
+                "ERROR_MESSAGE" => {
+                    record(map, sources, "antigravity", hour, 0, 1, 0, 1);
+                }
+                _ => {}
+            }
+        }
+    });
+}
+
+/// 读取多工具对话/请求健康数据
 #[tauri::command]
 pub async fn get_token_request_health() -> Result<RequestHealthReport, String> {
     tauri::async_runtime::spawn_blocking(|| {
         let home = std::env::var_os("HOME").ok_or("无法定位用户目录")?;
         let home = PathBuf::from(home);
         let mut map = BTreeMap::new();
+        let mut sources = BTreeMap::new();
 
+        // P0: Codex
         let codex_root = home.join(".codex").join("sessions");
         if codex_root.is_dir() {
-            collect_codex_request_health(&codex_root, &mut map);
+            collect_codex_activity(&codex_root, &mut map, &mut sources);
         }
+
+        // P0: Claude
         let claude_root = home.join(".claude").join("projects");
         if claude_root.is_dir() {
-            collect_claude_request_health(&claude_root, &mut map);
+            collect_claude_activity(&claude_root, &mut map, &mut sources);
         }
+
+        // P0: OpenCode
+        let opencode_db = home.join(".local").join("share").join("opencode").join("opencode.db");
+        if opencode_db.is_file() {
+            collect_sqlite_message_activity(&opencode_db, "opencode", &mut map, &mut sources, None);
+        }
+
+        // P0: Mimo（仅 providerID=mimo/xiaomi，避免 anthropic 镜像双计）
+        let mimo_db = home.join(".local").join("share").join("mimocode").join("mimocode.db");
+        if mimo_db.is_file() {
+            let allow = HashSet::from(["mimo", "xiaomi"]);
+            collect_sqlite_message_activity(
+                &mimo_db,
+                "mimo",
+                &mut map,
+                &mut sources,
+                Some(&allow),
+            );
+        }
+
+        // P0: Zcode
+        let zcode_db = home.join(".zcode").join("cli").join("db").join("db.sqlite");
+        if zcode_db.is_file() {
+            collect_sqlite_message_activity(&zcode_db, "zcode", &mut map, &mut sources, None);
+        }
+
+        // P0: Antigravity
+        let gemini_root = home.join(".gemini");
+        if gemini_root.is_dir() {
+            collect_antigravity_activity(&gemini_root, &mut map, &mut sources);
+        }
+
+        // 注意：kilo/goose/craft/workbuddy/copilot 暂不进时间线（P1 降级，无可靠事件时间）
 
         let buckets = map
             .into_iter()
             .map(|(hour, agg)| RequestHealthBucket {
                 hour,
+                dialogues: agg.dialogues,
                 requests: agg.requests,
                 success: agg.success,
                 failed: agg.failed,
             })
             .collect::<Vec<_>>();
+
+        let by_source = sources
+            .into_iter()
+            .map(|(source, agg)| RequestHealthSourceSummary {
+                source,
+                dialogues: agg.dialogues,
+                requests: agg.requests,
+                success: agg.success,
+                failed: agg.failed,
+            })
+            .collect::<Vec<_>>();
+
         Ok(RequestHealthReport {
             available: !buckets.is_empty(),
             buckets,
+            by_source,
         })
     })
     .await
     .map_err(|error| format!("请求健康读取失败：{error}"))?
 }
 
+
+#[cfg(test)]
+mod activity_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn hour_key_normalizes_variants() {
+        assert_eq!(
+            hour_key_from_ts("2026-08-06T04:59:44.123Z").as_deref(),
+            Some("2026-08-06T04:00:00.000Z")
+        );
+        assert_eq!(
+            hour_key_from_ts("2026-08-06T04:59:44Z").as_deref(),
+            Some("2026-08-06T04:00:00.000Z")
+        );
+        assert_eq!(
+            hour_key_from_ts("2026-08-06T04:59:44+08:00").as_deref(),
+            Some("2026-08-06T04:00:00.000Z")
+        );
+    }
+
+    #[test]
+    fn claude_user_is_human_filters_tool_result() {
+        let tool_only = json!([{"type": "tool_result", "content": "ok"}]);
+        assert!(!claude_user_is_human(&tool_only));
+
+        let text = json!([{"type": "text", "text": "hello"}]);
+        assert!(claude_user_is_human(&text));
+
+        let plain = json!("hello");
+        assert!(claude_user_is_human(&plain));
+    }
+
+    #[test]
+    fn assistant_tokens_positive_reads_nested() {
+        let value = json!({"tokens": {"input": 10, "output": 0, "reasoning": 0}});
+        assert!(assistant_tokens_positive(&value));
+        let empty = json!({"tokens": {"input": 0, "output": 0}});
+        assert!(!assistant_tokens_positive(&empty));
+    }
+}

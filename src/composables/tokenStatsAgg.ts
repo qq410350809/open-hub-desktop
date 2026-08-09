@@ -486,10 +486,11 @@ export function buildHeatmap(dailyMap: Map<string, DailyStat>, today = new Date(
 export interface HealthTimelineCell {
   key: string;
   label: string;
+  dialogues: number;         // 用户发起 turns
   success: number;
   failed: number;
-  requests: number;          // 展示用请求量：优先 usage 对话/请求量，其次 success+failed
-  usageRequests: number;     // token usage 侧请求/对话量
+  requests: number;          // 展示用请求量：优先后端提取，其次 usage 估算
+  usageRequests: number;     // token usage 侧估算请求量（仅兜底）
   successRate: number | null; // 0~1，null=无健康样本
   level: number; // 0=无请求 1=很差 2=差 3=中 4=好 5=很好/默认健康
 }
@@ -498,16 +499,20 @@ export interface HealthTimelineData {
   cells: HealthTimelineCell[];
   startLabel: string;
   endLabel: string;
+  totalDialogues: number;
   totalSuccess: number;
   totalFailed: number;
   totalRequests: number;
   successRate: number | null;
   nodeCount: number;
   activeCount: number;
+  /** 是否有后端真实提取数据（有则 KPI/时间线不再被 usage 估算主导） */
+  hasExtracted: boolean;
 }
 
 interface HealthInput {
   hour: string;
+  dialogues?: number; // 用户发起 turns
   requests?: number; // 后端提取的真实 API 请求数
   success: number;
   failed: number;
@@ -561,8 +566,9 @@ export interface HealthUsageInput {
 
 /**
  * 按趋势粒度生成与左侧图表一一对应的完整节点。
- * - 请求量优先取 token usage 估算（全工具；由 conversation+output 估算）
- * - 成功/失败取 request health（目前主要来自 Codex task 事件）
+ * - 请求量优先取后端多工具提取（Codex/Claude/OpenCode/Mimo/Zcode/Antigravity）
+ * - 仅当完全没有提取数据时，才用 token usage 估算兜底
+ * - 对话数取后端 dialogues（用户发起 turns）
  * - 成功率只在有 health 样本时计算；有请求但无样本 => 视为健康
  */
 export function buildHealthTimeline(
@@ -572,17 +578,21 @@ export function buildHealthTimeline(
   to?: string,
   usageBuckets: HealthUsageInput[] = [],
 ): HealthTimelineData {
-  // health: extracted requests + success/failed samples
-  const healthMap = new Map<string, { label: string; requests: number; success: number; failed: number }>();
+  // health: extracted dialogues/requests + success/failed samples
+  const healthMap = new Map<string, { label: string; dialogues: number; requests: number; success: number; failed: number }>();
+  let extractedTotal = 0;
   for (const b of buckets) {
     const { key, label } = bucketKeyFor(granularity, b.hour);
     if (!key) continue;
-    const cur = healthMap.get(key) || { label, requests: 0, success: 0, failed: 0 };
-    cur.requests += b.requests || 0;
+    const cur = healthMap.get(key) || { label, dialogues: 0, requests: 0, success: 0, failed: 0 };
+    cur.dialogues += Number(b.dialogues || 0);
+    cur.requests += Number(b.requests || 0);
     cur.success += b.success || 0;
     cur.failed += b.failed || 0;
     healthMap.set(key, cur);
+    extractedTotal += Number(b.requests || 0) + Number(b.dialogues || 0);
   }
+  const hasExtracted = extractedTotal > 0;
 
   // usage activity: estimated request count from token usage
   const usageMap = new Map<string, number>();
@@ -619,12 +629,14 @@ export function buildHealthTimeline(
       cells: [],
       startLabel: "",
       endLabel: "",
+      totalDialogues: 0,
       totalSuccess: 0,
       totalFailed: 0,
       totalRequests: 0,
       successRate: null,
       nodeCount: 0,
       activeCount: 0,
+      hasExtracted: false,
     };
   }
   if (startDay > endDay) {
@@ -634,32 +646,36 @@ export function buildHealthTimeline(
   }
 
   const keys = buildRangeKeys(startDay, endDay, granularity);
+  let totalDialogues = 0;
   let totalSuccess = 0;
   let totalFailed = 0;
   let totalRequests = 0;
   let activeCount = 0;
   const cells: HealthTimelineCell[] = keys.map(({ key, label }) => {
     const health = healthMap.get(key);
+    const dialogues = health?.dialogues ?? 0;
     const success = health?.success ?? 0;
     const failed = health?.failed ?? 0;
     const extractedRequests = health?.requests ?? 0;
     const sampleRequests = success + failed;
     const usageRequests = usageMap.get(key) || 0;
     // 展示请求量优先级：
-    // 1) 后端提取的真实 API 请求数（Codex token_count / Claude usage）
-    // 2) usage 估算
+    // 1) 后端多工具提取的真实 API 请求数
+    // 2) 仅当完全没有提取数据时，才用 usage 估算兜底
     // 3) 成功失败样本合计
     const requests = extractedRequests > 0
       ? extractedRequests
-      : (usageRequests > 0 ? usageRequests : sampleRequests);
+      : (!hasExtracted && usageRequests > 0 ? usageRequests : sampleRequests);
     const successRate = sampleRequests > 0 ? success / sampleRequests : null;
     if (requests > 0) activeCount += 1;
+    totalDialogues += dialogues;
     totalSuccess += success;
     totalFailed += failed;
     totalRequests += requests;
     return {
       key,
       label,
+      dialogues,
       success,
       failed,
       requests,
@@ -674,12 +690,14 @@ export function buildHealthTimeline(
     cells,
     startLabel: startDay,
     endLabel: endDay,
+    totalDialogues,
     totalSuccess,
     totalFailed,
     totalRequests,
     successRate: healthTotal > 0 ? totalSuccess / healthTotal : null,
     nodeCount: cells.length,
     activeCount,
+    hasExtracted,
   };
 }
 

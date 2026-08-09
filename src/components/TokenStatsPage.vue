@@ -306,6 +306,7 @@ function formatDetailTime(label: string): string {
 // 请求健康时间线 cell tooltip
 function healthCellTitle(cell: {
   label: string;
+  dialogues?: number;
   requests: number;
   success: number;
   failed: number;
@@ -313,12 +314,18 @@ function healthCellTitle(cell: {
   pad?: boolean;
 }) {
   if (!cell.label) return "—";
-  if (cell.requests <= 0) return `${cell.label} · 无请求`;
+  const dialogues = cell.dialogues || 0;
+  if (cell.requests <= 0) {
+    return dialogues > 0
+      ? `${cell.label} · 对话 ${formatTokens(dialogues)} · 无请求`
+      : `${cell.label} · 无请求`;
+  }
   const rateTxt = cell.successRate == null ? "样本不足" : `${(cell.successRate * 100).toFixed(1)}%`;
+  const dialoguePart = dialogues > 0 ? ` · 对话 ${formatTokens(dialogues)}` : "";
   const failPart = cell.success + cell.failed > 0
     ? ` · 成功 ${formatTokens(cell.success)} · 失败 ${formatTokens(cell.failed)} · 成功率 ${rateTxt}`
     : ` · 成功率 ${rateTxt}`;
-  return `${cell.label} · 请求 ${formatTokens(cell.requests)}${failPart}`;
+  return `${cell.label}${dialoguePart} · 请求 ${formatTokens(cell.requests)}${failPart}`;
 }
 
 // —— 请求健康时间线：与左侧趋势同粒度完整节点 ——
@@ -359,6 +366,7 @@ function measureHealthGrid() {
 type HealthDisplayCell = {
   key: string;
   label: string;
+  dialogues: number;
   success: number;
   failed: number;
   requests: number;
@@ -372,27 +380,33 @@ type HealthDisplayCell = {
 // 若节点过多则只保留末尾 capacity 个（仍保证选中区间的最后部分在网格末端）
 // 全量健康桶按当前粒度聚合（含所选区间之外），供前置补全取值
 const healthBucketMap = computed(() => {
-  const map = new Map<string, { requests: number; success: number; failed: number; usage: number }>();
+  const map = new Map<string, { dialogues: number; requests: number; success: number; failed: number; usage: number }>();
+  let extracted = 0;
   for (const b of store.requestHealth.value?.buckets ?? []) {
     const { key } = bucketKeyFor(trendGranularity.value, b.hour);
     if (!key) continue;
-    const cur = map.get(key) || { requests: 0, success: 0, failed: 0, usage: 0 };
+    const cur = map.get(key) || { dialogues: 0, requests: 0, success: 0, failed: 0, usage: 0 };
+    cur.dialogues += Number(b.dialogues || 0);
     cur.requests += b.requests || 0;
     cur.success += b.success || 0;
     cur.failed += b.failed || 0;
+    extracted += cur.dialogues + cur.requests;
     map.set(key, cur);
   }
-  for (const b of store.tokenUsage.value?.buckets ?? []) {
-    const { key } = bucketKeyFor(trendGranularity.value, b.timestamp);
-    if (!key) continue;
-    const cur = map.get(key) || { requests: 0, success: 0, failed: 0, usage: 0 };
-    cur.usage += estimateRequestCount({
-      conversationCount: b.conversationCount || 0,
-      outputTokens: b.outputTokens || 0,
-      reasoningOutputTokens: b.reasoningOutputTokens || 0,
-      totalTokens: b.totalTokens || 0,
-    });
-    map.set(key, cur);
+  // usage 估算仅作完全无提取数据时的兜底（前置补全节点也遵循同一规则）
+  if (extracted <= 0) {
+    for (const b of store.tokenUsage.value?.buckets ?? []) {
+      const { key } = bucketKeyFor(trendGranularity.value, b.timestamp);
+      if (!key) continue;
+      const cur = map.get(key) || { dialogues: 0, requests: 0, success: 0, failed: 0, usage: 0 };
+      cur.usage += estimateRequestCount({
+        conversationCount: b.conversationCount || 0,
+        outputTokens: b.outputTokens || 0,
+        reasoningOutputTokens: b.reasoningOutputTokens || 0,
+        totalTokens: b.totalTokens || 0,
+      });
+      map.set(key, cur);
+    }
   }
   return map;
 });
@@ -414,6 +428,7 @@ const healthDisplayCells = computed<HealthDisplayCell[]>(() => {
     const map = healthBucketMap.value;
     const mapped = preceding.map((p) => {
       const hit = map.get(p.key);
+      const dialogues = hit?.dialogues ?? 0;
       const success = hit?.success ?? 0;
       const failed = hit?.failed ?? 0;
       const extractedRequests = hit?.requests ?? 0;
@@ -424,6 +439,7 @@ const healthDisplayCells = computed<HealthDisplayCell[]>(() => {
       return {
         key: `pre-${p.key}`,
         label: p.label,
+        dialogues,
         success,
         failed,
         requests,
@@ -436,6 +452,7 @@ const healthDisplayCells = computed<HealthDisplayCell[]>(() => {
     const extras = Array.from({ length: Math.max(0, lack) }, (_, i) => ({
       key: `pad-${i}`,
       label: "",
+      dialogues: 0,
       success: 0,
       failed: 0,
       requests: 0,
@@ -626,11 +643,14 @@ onBeforeUnmount(() => {
               <span class="tt-kpi-ic ic-blue" v-html="icons.activity"></span>
               <span class="tt-kpi-label">对话数</span>
             </div>
-            <strong class="tt-kpi-value">{{ formatTokens(bucketTotal.conversations) }}</strong>
+            <strong class="tt-kpi-value">{{ formatTokens(healthTimeline.totalDialogues) }}</strong>
             <span class="tt-kpi-sub">
               请求 {{ formatTokens(healthTimeline.totalRequests) }}
               <template v-if="healthTimeline.totalSuccess + healthTimeline.totalFailed > 0">
                 · 失败 {{ formatTokens(healthTimeline.totalFailed) }}
+              </template>
+              <template v-else>
+                · 用户发起
               </template>
             </span>
           </div>
@@ -666,7 +686,7 @@ onBeforeUnmount(() => {
             <header class="tt-card-head tt-health-head">
               <div>
                 <h2>请求健康时间线</h2>
-                <p>请求数提取自 Codex token_count 与 Claude assistant usage；成功率基于可观测成功/失败样本。</p>
+                <p>对话=用户发起 turns；请求=多工具 API 调用（Codex/Claude/OpenCode/Mimo/Zcode/Antigravity）；成功率基于可观测样本。</p>
               </div>
               <div class="tt-health-summary">
                 <div class="tt-health-rate-label">成功率</div>

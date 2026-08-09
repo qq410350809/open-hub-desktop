@@ -469,16 +469,27 @@ export interface TokenUsageReport {
   endDate: string;
 }
 
-// —— 请求健康：大模型请求成功/失败计数（来自 Codex rollout 的 task_started/task_complete.error）——
+// —— 请求/对话活动：多工具直读后的小时桶 ——
 export interface RequestHealthBucket {
   hour: string;          // ISO 小时 (YYYY-MM-DDTHH:00:00.000Z)
-  requests: number;      // 提取的真实 API 请求数
+  dialogues: number;     // 用户发起 turns（排除 tool_result / 自动触发）
+  requests: number;      // 真实 API 请求数（多工具）
   success: number;       // 可观测成功样本
   failed: number;        // 可观测失败样本
 }
+
+export interface RequestHealthSourceSummary {
+  source: string;
+  dialogues: number;
+  requests: number;
+  success: number;
+  failed: number;
+}
+
 export interface RequestHealthReport {
   available: boolean;
   buckets: RequestHealthBucket[];
+  bySource?: RequestHealthSourceSummary[];
 }
 
 // —— 原始日志解析：会话 / 对话 / 请求 ——
