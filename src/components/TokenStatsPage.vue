@@ -326,8 +326,8 @@ const healthTimeline = computed(() =>
 
 // 网格：上→下、左→右（列优先），排满容器；所选区间落在末尾
 const HEALTH_ROWS = 7;
-const HEALTH_CELL = 12; // px
-const HEALTH_GAP = 4;   // px
+const HEALTH_CELL = 11; // px
+const HEALTH_GAP = 3;   // px
 const healthGridRef = ref<HTMLElement | null>(null);
 const healthCols = ref(24);
 let healthRo: ResizeObserver | null = null;
@@ -395,7 +395,7 @@ const trendChartOption = computed<EChartsOption>(() => {
   const areaTop = dark ? "rgba(52,211,153,0.22)" : "rgba(16,185,129,0.18)";
 
   return {
-    grid: { left: 8, right: 14, top: 12, bottom: 6, containLabel: true },
+    grid: { left: 6, right: 10, top: 8, bottom: 2, containLabel: true },
     tooltip: {
       trigger: "axis",
       backgroundColor: dark ? "#1f1f1f" : "#ffffff",
@@ -585,7 +585,7 @@ onBeforeUnmount(() => {
               </div>
             </header>
             <div class="tt-card-body tt-chart-body">
-              <EChart v-if="trendSeries.length" :option="trendChartOption" height="240px" />
+              <EChart v-if="trendSeries.length" :option="trendChartOption" height="180px" />
               <div v-else class="tt-table-empty">该范围内没有趋势数据</div>
             </div>
           </section>
