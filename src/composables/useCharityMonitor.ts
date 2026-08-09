@@ -32,6 +32,8 @@ const statusMessage = ref("");
 const lastFetchedAt = ref("");
 const unreadCount = ref(0);
 const totalUnreadCount = ref(0);
+/** 今天发布的帖子数（非未读，用于侧边栏菜单徽标）。 */
+const todayCount = ref(0);
 const updatedCount = ref(0);
 const usedNodeName = ref("");
 const initialized = ref(false);
@@ -96,6 +98,19 @@ function applyLocalPage(result: CharityFeedResult, mode: "replace" | "append") {
 async function refreshUnreadTotal() {
   try {
     totalUnreadCount.value = await runCommand<number>("get_charity_unread_total");
+  } catch {
+    /* ignore */
+  }
+  try {
+    todayCount.value = await runCommand<number>("get_charity_today_count");
+  } catch {
+    /* ignore */
+  }
+}
+
+async function refreshTodayCount() {
+  try {
+    todayCount.value = await runCommand<number>("get_charity_today_count");
   } catch {
     /* ignore */
   }
@@ -364,6 +379,8 @@ export function useCharityMonitor() {
     charityFeedStatusMessage: statusMessage,
     charityFeedLastFetchedAt: lastFetchedAt,
     charityFeedUnreadCount: sidebarUnread,
+    charityFeedTodayCount: todayCount,
+    refreshTodayCount,
     charityFeedSelectedUnreadCount: unreadCount,
     charityFeedUpdatedCount: updatedCount,
     charityFeedSourceProfileName: ref(""),

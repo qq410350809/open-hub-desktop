@@ -1928,6 +1928,65 @@ pub async fn mark_charity_feed_read(
     })
 }
 
+/// 今天发布的公益帖子数 = published_at 落在「本地时区今天 00:00 ~ 明天 00:00」。
+/// published_at 为 UTC ISO 字符串，统一用 unixepoch() 解析后按 UTC 秒区间比较，避免 T/空格格式差异。
+#[tauri::command]
+pub async fn get_charity_today_count(database: State<'_, Database>) -> Result<usize, String> {
+    tokio::task::block_in_place(|| {
+        let (utc_start, utc_end) = local_day_utc_range_secs();
+        let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+        let count = connection
+            .query_row(
+                "SELECT COUNT(*) FROM charity_feed_items
+                 WHERE published_at IS NOT NULL
+                   AND unixepoch(published_at) >= ?1
+                   AND unixepoch(published_at) < ?2",
+                params![utc_start, utc_end],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(count.max(0) as usize)
+    })
+}
+
+/// 本地时区今天 00:00 与明天 00:00 对应的 UTC 秒区间。
+/// 不新增 chrono 依赖：用 /bin/date 读取时区偏移 ±HHMM，再以 UTC epoch 换算。
+fn local_day_utc_range_secs() -> (i64, i64) {
+    let offset = local_utc_offset_secs();
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|dur| dur.as_secs() as i64)
+        .unwrap_or(0);
+    let local_now = now_secs + offset;
+    let local_today_start = local_now - local_now.rem_euclid(86_400);
+    let utc_start = local_today_start - offset;
+    (utc_start, utc_start + 86_400)
+}
+
+/// 读取本地时区相对 UTC 的偏移秒数（如 +0800 → 28800；失败回退 0）。
+fn local_utc_offset_secs() -> i64 {
+    if let Ok(output) = std::process::Command::new("/bin/date")
+        .arg("+%z")
+        .output()
+    {
+        if output.status.success() {
+            let text = String::from_utf8_lossy(&output.stdout);
+            let value = text.trim();
+            if value.len() == 5 && (value.starts_with('+') || value.starts_with('-')) {
+                if let (Ok(hour), Ok(minute)) =
+                    (value[1..3].parse::<i64>(), value[3..5].parse::<i64>())
+                {
+                    let sign = if value.starts_with('-') { -1 } else { 1 };
+                    if hour < 24 && minute < 60 {
+                        return sign * (hour * 3600 + minute * 60);
+                    }
+                }
+            }
+        }
+    }
+    0
+}
+
 #[tauri::command]
 pub async fn get_charity_unread_total(database: State<'_, Database>) -> Result<usize, String> {
     tokio::task::block_in_place(|| {

@@ -22,8 +22,9 @@ const navItems = computed(() => [
     label: "公益监听",
     icon: icons.heartPulse,
     active: store.page.value === "charity",
-    badge: store.charityFeedUnreadCount.value
-      ? String(Math.min(store.charityFeedUnreadCount.value, 99))
+    // 菜单徽标：今日发布的帖子数（非未读）
+    badge: store.charityFeedTodayCount.value
+      ? String(Math.min(store.charityFeedTodayCount.value, 99))
       : "",
     onClick: () => store.openCharityMonitor(),
   },
