@@ -128,6 +128,62 @@ export function bucketKeyFor(granularity: TrendGranularity, iso: string): { key:
 }
 
 /** 根据顶部时间区间 + 粒度，生成完整节点（无数据也保留空节点） */
+/** 从某个节点向前回溯 count 个节点（不含自身），用于网格前置自动补全 */
+export function buildPrecedingKeys(
+  endKeyOrLabel: string,
+  count: number,
+  granularity: TrendGranularity,
+): { key: string; label: string }[] {
+  if (count <= 0 || !endKeyOrLabel) return [];
+  const out: { key: string; label: string }[] = [];
+
+  if (granularity === "hour") {
+    // endKey: YYYY-MM-DD-HH  or label YYYY-MM-DD HH:00
+    let day = "";
+    let hh = 0;
+    const m1 = endKeyOrLabel.match(/^(\d{4}-\d{2}-\d{2})-(\d{2})$/);
+    const m2 = endKeyOrLabel.match(/^(\d{4}-\d{2}-\d{2})[ T](\d{2})(?::\d{2})?$/);
+    if (m1) { day = m1[1]; hh = Number(m1[2]); }
+    else if (m2) { day = m2[1]; hh = Number(m2[2]); }
+    else return [];
+    const cursor = parseLocal(day);
+    cursor.setHours(hh, 0, 0, 0);
+    for (let i = 0; i < count; i++) {
+      cursor.setHours(cursor.getHours() - 1);
+      const d = toLocalDate(cursor);
+      const h = String(cursor.getHours()).padStart(2, "0");
+      out.push({ key: `${d}-${h}`, label: `${d} ${h}:00` });
+    }
+    return out.reverse();
+  }
+
+  if (granularity === "month") {
+    // YYYY-MM
+    const m = endKeyOrLabel.match(/^(\d{4})-(\d{2})/);
+    if (!m) return [];
+    let y = Number(m[1]);
+    let mon = Number(m[2]);
+    for (let i = 0; i < count; i++) {
+      mon -= 1;
+      if (mon < 1) { mon = 12; y -= 1; }
+      const label = `${y}-${String(mon).padStart(2, "0")}`;
+      out.push({ key: label, label });
+    }
+    return out.reverse();
+  }
+
+  // day: YYYY-MM-DD
+  const day = endKeyOrLabel.slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) return [];
+  const cursor = parseLocal(day);
+  for (let i = 0; i < count; i++) {
+    cursor.setDate(cursor.getDate() - 1);
+    const d = toLocalDate(cursor);
+    out.push({ key: d, label: d });
+  }
+  return out.reverse();
+}
+
 export function buildRangeKeys(
   from: string,
   to: string,

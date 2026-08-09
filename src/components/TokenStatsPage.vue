@@ -11,6 +11,7 @@ import {
   bucketTotals,
   buildDailyMapFromBuckets,
   buildHealthTimeline,
+  buildPrecedingKeys,
   buildTrendDetailFromBuckets,
   buildTrendFromBuckets,
   mergeModelTotals,
@@ -308,7 +309,10 @@ function healthCellTitle(cell: {
   successRate: number | null;
   pad?: boolean;
 }) {
-  if (cell.pad) return "占位（排满网格，不在所选区间）";
+  if (cell.pad) {
+    if (cell.label) return `${cell.label} · 自动补全（不在所选区间）· 无请求数据`;
+    return "占位（排满网格）";
+  }
   if (cell.requests <= 0) return `${cell.label} · 无请求数据`;
   const rateTxt = cell.successRate == null ? "—" : `${(cell.successRate * 100).toFixed(1)}%`;
   return `${cell.label} · 成功 ${formatTokens(cell.success)} · 失败 ${formatTokens(cell.failed)} · 成功率 ${rateTxt}`;
@@ -362,17 +366,37 @@ const healthDisplayCells = computed<HealthDisplayCell[]>(() => {
   if (body.length > capacity) {
     body = body.slice(body.length - capacity);
   }
+
+  // 前置自动补全：按当前粒度向前延伸真实时间节点（无数据=0），保证网格排满且有具体值
   const padCount = Math.max(0, capacity - body.length);
-  const pads: HealthDisplayCell[] = Array.from({ length: padCount }, (_, i) => ({
-    key: `pad-${i}`,
-    label: "",
-    success: 0,
-    failed: 0,
-    requests: 0,
-    successRate: null,
-    level: 0,
-    pad: true,
-  }));
+  let pads: HealthDisplayCell[] = [];
+  if (padCount > 0) {
+    const anchor = body[0]?.key || body[0]?.label || healthTimeline.value.startLabel || "";
+    const preceding = buildPrecedingKeys(anchor, padCount, trendGranularity.value);
+    // 若回溯不足（极端情况），剩余用空占位补齐
+    const mapped = preceding.map((p) => ({
+      key: `pre-${p.key}`,
+      label: p.label,
+      success: 0,
+      failed: 0,
+      requests: 0,
+      successRate: null as number | null,
+      level: 0,
+      pad: true,
+    }));
+    const lack = padCount - mapped.length;
+    const extras = Array.from({ length: Math.max(0, lack) }, (_, i) => ({
+      key: `pad-${i}`,
+      label: "",
+      success: 0,
+      failed: 0,
+      requests: 0,
+      successRate: null as number | null,
+      level: 0,
+      pad: true,
+    }));
+    pads = [...extras, ...mapped];
+  }
   return [...pads, ...body];
 });
 
