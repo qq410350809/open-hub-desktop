@@ -200,14 +200,22 @@ async function loadTokenRawLogs() {
   }
 }
 
-async function loadRequestHealth() {
-  requestHealthLoading.value = true;
+async function loadRequestHealth(refresh = false) {
+  // 已有数据时后台刷新，不清空，避免对话数闪回 0
+  const keepExisting = !!requestHealth.value && !refresh;
+  if (!keepExisting) {
+    requestHealthLoading.value = true;
+  }
   requestHealthError.value = "";
   try {
-    requestHealth.value = await runCommand<RequestHealthReport>("get_token_request_health");
+    requestHealth.value = await runCommand<RequestHealthReport>("get_token_request_health", {
+      refresh,
+    });
   } catch (error) {
     requestHealthError.value = String(error);
-    requestHealth.value = null;
+    if (!keepExisting) {
+      requestHealth.value = null;
+    }
   } finally {
     requestHealthLoading.value = false;
   }

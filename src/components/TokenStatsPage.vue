@@ -540,7 +540,7 @@ const modalTitle = computed(() => "用量明细");
 function refreshAll() {
   store.refreshTokenStats();
   void store.loadTokenUsage();
-  void store.loadRequestHealth();
+  void store.loadRequestHealth(true);
 }
 
 
@@ -643,14 +643,22 @@ onBeforeUnmount(() => {
               <span class="tt-kpi-ic ic-blue" v-html="icons.activity"></span>
               <span class="tt-kpi-label">对话数</span>
             </div>
-            <strong class="tt-kpi-value">{{ formatTokens(healthTimeline.totalDialogues) }}</strong>
+            <strong class="tt-kpi-value">
+              <template v-if="store.requestHealthLoading.value && !store.requestHealth.value">…</template>
+              <template v-else>{{ formatTokens(healthTimeline.totalDialogues) }}</template>
+            </strong>
             <span class="tt-kpi-sub">
-              请求 {{ formatTokens(healthTimeline.totalRequests) }}
-              <template v-if="healthTimeline.totalSuccess + healthTimeline.totalFailed > 0">
-                · 失败 {{ formatTokens(healthTimeline.totalFailed) }}
+              <template v-if="store.requestHealthLoading.value && !store.requestHealth.value">
+                正在扫描多工具日志…
               </template>
               <template v-else>
-                · 用户发起
+                请求 {{ formatTokens(healthTimeline.totalRequests) }}
+                <template v-if="healthTimeline.totalSuccess + healthTimeline.totalFailed > 0">
+                  · 失败 {{ formatTokens(healthTimeline.totalFailed) }}
+                </template>
+                <template v-else>
+                  · 用户发起
+                </template>
               </template>
             </span>
           </div>

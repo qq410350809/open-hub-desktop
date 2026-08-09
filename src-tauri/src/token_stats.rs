@@ -9,7 +9,9 @@ use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, UNIX_EPOCH};
+use std::sync::{Mutex, OnceLock};
+use std::thread;
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 /// 探测 tokentracker CLI 可执行文件，顺序：
 /// 1) OPENHUB_TOKENTRACKER_PATH 环境变量显式指定
@@ -1027,41 +1029,7 @@ fn collect_sqlite_message_activity(
     let Some(conn) = open_readonly_sqlite(db_path) else {
         return;
     };
-    // 先找正宗 session（Mimo 需要）
-    let mut allowed_sessions: Option<HashSet<String>> = None;
-    if let Some(allow) = provider_allow {
-        let mut sessions = HashSet::new();
-        if let Ok(mut stmt) = conn.prepare(
-            "SELECT session_id, data FROM message WHERE json_extract(data, '$.role') = 'assistant'",
-        ) {
-            let rows = stmt.query_map([], |row| {
-                let sid: String = row.get(0)?;
-                let data: String = row.get(1)?;
-                Ok((sid, data))
-            });
-            if let Ok(rows) = rows {
-                for row in rows.flatten() {
-                    let (sid, data) = row;
-                    if let Ok(value) = serde_json::from_str::<JsonValue>(&data) {
-                        let provider = value
-                            .get("providerID")
-                            .or_else(|| value.get("providerId"))
-                            .and_then(JsonValue::as_str)
-                            .unwrap_or("")
-                            .to_ascii_lowercase();
-                        if allow.contains(provider.as_str()) && assistant_tokens_positive(&value) {
-                            sessions.insert(sid);
-                        }
-                    }
-                }
-            }
-        }
-        allowed_sessions = Some(sessions);
-    }
-
-    let Ok(mut stmt) = conn.prepare(
-        "SELECT session_id, time_created, data FROM message",
-    ) else {
+    let Ok(mut stmt) = conn.prepare("SELECT session_id, time_created, data FROM message") else {
         return;
     };
     let rows = stmt.query_map([], |row| {
@@ -1073,6 +1041,12 @@ fn collect_sqlite_message_activity(
     let Ok(rows) = rows else {
         return;
     };
+
+    // 单次扫描：provider 过滤场景下先缓存 user，等确认 session 合法后再回放
+    let mut pending_users: Vec<(String, String)> = Vec::new(); // (session_id, hour)
+    let mut allowed_sessions = HashSet::<String>::new();
+    let filter = provider_allow.is_some();
+
     for row in rows.flatten() {
         let (session_id, time_created, data) = row;
         let Ok(value) = serde_json::from_str::<JsonValue>(&data) else {
@@ -1082,7 +1056,6 @@ fn collect_sqlite_message_activity(
             .get("role")
             .and_then(JsonValue::as_str)
             .unwrap_or("");
-        // 优先 message.time.completed/created，其次 time_created 列
         let hour = value
             .get("time")
             .and_then(|t| {
@@ -1097,18 +1070,18 @@ fn collect_sqlite_message_activity(
         };
 
         if role == "user" {
-            if let Some(sessions) = &allowed_sessions {
-                if !sessions.contains(&session_id) {
-                    continue;
-                }
+            if filter {
+                pending_users.push((session_id, hour));
+            } else {
+                record(map, sources, source, hour, 1, 0, 0, 0);
             }
-            record(map, sources, source, hour, 1, 0, 0, 0);
             continue;
         }
 
         if role != "assistant" {
             continue;
         }
+
         if let Some(allow) = provider_allow {
             let provider = value
                 .get("providerID")
@@ -1120,14 +1093,28 @@ fn collect_sqlite_message_activity(
                 continue;
             }
         }
+
         let has_error = value.get("error").map(|e| !e.is_null()).unwrap_or(false);
         if has_error {
-            // 错误本身也是一次请求尝试
+            if filter {
+                allowed_sessions.insert(session_id.clone());
+            }
             record(map, sources, source, hour, 0, 1, 0, 1);
             continue;
         }
         if assistant_tokens_positive(&value) {
+            if filter {
+                allowed_sessions.insert(session_id.clone());
+            }
             record(map, sources, source, hour, 0, 1, 1, 0);
+        }
+    }
+
+    if filter {
+        for (session_id, hour) in pending_users {
+            if allowed_sessions.contains(&session_id) {
+                record(map, sources, source, hour, 1, 0, 0, 0);
+            }
         }
     }
 }
@@ -1179,87 +1166,174 @@ fn collect_antigravity_activity(
     });
 }
 
-/// 读取多工具对话/请求健康数据
-#[tauri::command]
-pub async fn get_token_request_health() -> Result<RequestHealthReport, String> {
-    tauri::async_runtime::spawn_blocking(|| {
-        let home = std::env::var_os("HOME").ok_or("无法定位用户目录")?;
-        let home = PathBuf::from(home);
-        let mut map = BTreeMap::new();
-        let mut sources = BTreeMap::new();
+/// 进程内缓存：避免每次进入 Token 页都全量扫 Codex/Claude/Mimo 等日志。
+struct ActivityCache {
+    report: RequestHealthReport,
+    fetched_at: Instant,
+}
 
-        // P0: Codex
-        let codex_root = home.join(".codex").join("sessions");
-        if codex_root.is_dir() {
-            collect_codex_activity(&codex_root, &mut map, &mut sources);
+fn activity_cache() -> &'static Mutex<Option<ActivityCache>> {
+    static CACHE: OnceLock<Mutex<Option<ActivityCache>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
+
+const ACTIVITY_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+
+fn merge_activity(
+    into_map: &mut BTreeMap<String, HealthAgg>,
+    into_sources: &mut BTreeMap<String, HealthAgg>,
+    from_map: BTreeMap<String, HealthAgg>,
+    from_sources: BTreeMap<String, HealthAgg>,
+) {
+    for (hour, agg) in from_map {
+        let entry = into_map.entry(hour).or_default();
+        entry.dialogues += agg.dialogues;
+        entry.requests += agg.requests;
+        entry.success += agg.success;
+        entry.failed += agg.failed;
+    }
+    for (source, agg) in from_sources {
+        let entry = into_sources.entry(source).or_default();
+        entry.dialogues += agg.dialogues;
+        entry.requests += agg.requests;
+        entry.success += agg.success;
+        entry.failed += agg.failed;
+    }
+}
+
+fn build_activity_report() -> RequestHealthReport {
+    let home = match std::env::var_os("HOME") {
+        Some(h) => PathBuf::from(h),
+        None => {
+            return RequestHealthReport {
+                available: false,
+                buckets: vec![],
+                by_source: vec![],
+            };
         }
+    };
 
-        // P0: Claude
-        let claude_root = home.join(".claude").join("projects");
-        if claude_root.is_dir() {
-            collect_claude_activity(&claude_root, &mut map, &mut sources);
+    // 各工具并行采集，缩短首次进入等待
+    let codex_root = home.join(".codex").join("sessions");
+    let claude_root = home.join(".claude").join("projects");
+    let opencode_db = home.join(".local").join("share").join("opencode").join("opencode.db");
+    let mimo_db = home.join(".local").join("share").join("mimocode").join("mimocode.db");
+    let zcode_db = home.join(".zcode").join("cli").join("db").join("db.sqlite");
+    let gemini_root = home.join(".gemini");
+
+    let handles = [
+        thread::spawn(move || {
+            let mut map = BTreeMap::new();
+            let mut sources = BTreeMap::new();
+            if codex_root.is_dir() {
+                collect_codex_activity(&codex_root, &mut map, &mut sources);
+            }
+            (map, sources)
+        }),
+        thread::spawn(move || {
+            let mut map = BTreeMap::new();
+            let mut sources = BTreeMap::new();
+            if claude_root.is_dir() {
+                collect_claude_activity(&claude_root, &mut map, &mut sources);
+            }
+            (map, sources)
+        }),
+        thread::spawn(move || {
+            let mut map = BTreeMap::new();
+            let mut sources = BTreeMap::new();
+            if opencode_db.is_file() {
+                collect_sqlite_message_activity(&opencode_db, "opencode", &mut map, &mut sources, None);
+            }
+            (map, sources)
+        }),
+        thread::spawn(move || {
+            let mut map = BTreeMap::new();
+            let mut sources = BTreeMap::new();
+            if mimo_db.is_file() {
+                let allow = HashSet::from(["mimo", "xiaomi"]);
+                collect_sqlite_message_activity(&mimo_db, "mimo", &mut map, &mut sources, Some(&allow));
+            }
+            (map, sources)
+        }),
+        thread::spawn(move || {
+            let mut map = BTreeMap::new();
+            let mut sources = BTreeMap::new();
+            if zcode_db.is_file() {
+                collect_sqlite_message_activity(&zcode_db, "zcode", &mut map, &mut sources, None);
+            }
+            (map, sources)
+        }),
+        thread::spawn(move || {
+            let mut map = BTreeMap::new();
+            let mut sources = BTreeMap::new();
+            if gemini_root.is_dir() {
+                collect_antigravity_activity(&gemini_root, &mut map, &mut sources);
+            }
+            (map, sources)
+        }),
+    ];
+
+    let mut map = BTreeMap::new();
+    let mut sources = BTreeMap::new();
+    for handle in handles {
+        if let Ok((part_map, part_sources)) = handle.join() {
+            merge_activity(&mut map, &mut sources, part_map, part_sources);
         }
+    }
 
-        // P0: OpenCode
-        let opencode_db = home.join(".local").join("share").join("opencode").join("opencode.db");
-        if opencode_db.is_file() {
-            collect_sqlite_message_activity(&opencode_db, "opencode", &mut map, &mut sources, None);
-        }
-
-        // P0: Mimo（仅 providerID=mimo/xiaomi，避免 anthropic 镜像双计）
-        let mimo_db = home.join(".local").join("share").join("mimocode").join("mimocode.db");
-        if mimo_db.is_file() {
-            let allow = HashSet::from(["mimo", "xiaomi"]);
-            collect_sqlite_message_activity(
-                &mimo_db,
-                "mimo",
-                &mut map,
-                &mut sources,
-                Some(&allow),
-            );
-        }
-
-        // P0: Zcode
-        let zcode_db = home.join(".zcode").join("cli").join("db").join("db.sqlite");
-        if zcode_db.is_file() {
-            collect_sqlite_message_activity(&zcode_db, "zcode", &mut map, &mut sources, None);
-        }
-
-        // P0: Antigravity
-        let gemini_root = home.join(".gemini");
-        if gemini_root.is_dir() {
-            collect_antigravity_activity(&gemini_root, &mut map, &mut sources);
-        }
-
-        // 注意：kilo/goose/craft/workbuddy/copilot 暂不进时间线（P1 降级，无可靠事件时间）
-
-        let buckets = map
-            .into_iter()
-            .map(|(hour, agg)| RequestHealthBucket {
-                hour,
-                dialogues: agg.dialogues,
-                requests: agg.requests,
-                success: agg.success,
-                failed: agg.failed,
-            })
-            .collect::<Vec<_>>();
-
-        let by_source = sources
-            .into_iter()
-            .map(|(source, agg)| RequestHealthSourceSummary {
-                source,
-                dialogues: agg.dialogues,
-                requests: agg.requests,
-                success: agg.success,
-                failed: agg.failed,
-            })
-            .collect::<Vec<_>>();
-
-        Ok(RequestHealthReport {
-            available: !buckets.is_empty(),
-            buckets,
-            by_source,
+    let buckets = map
+        .into_iter()
+        .map(|(hour, agg)| RequestHealthBucket {
+            hour,
+            dialogues: agg.dialogues,
+            requests: agg.requests,
+            success: agg.success,
+            failed: agg.failed,
         })
+        .collect::<Vec<_>>();
+
+    let by_source = sources
+        .into_iter()
+        .map(|(source, agg)| RequestHealthSourceSummary {
+            source,
+            dialogues: agg.dialogues,
+            requests: agg.requests,
+            success: agg.success,
+            failed: agg.failed,
+        })
+        .collect::<Vec<_>>();
+
+    RequestHealthReport {
+        available: !buckets.is_empty(),
+        buckets,
+        by_source,
+    }
+}
+
+/// 读取多工具对话/请求健康数据。
+/// - refresh=true 强制重扫；否则 5 分钟进程内缓存，避免首次后反复等待。
+#[tauri::command]
+pub async fn get_token_request_health(refresh: Option<bool>) -> Result<RequestHealthReport, String> {
+    let force = refresh.unwrap_or(false);
+    tauri::async_runtime::spawn_blocking(move || {
+        if !force {
+            if let Ok(guard) = activity_cache().lock() {
+                if let Some(cache) = guard.as_ref() {
+                    if cache.fetched_at.elapsed() < ACTIVITY_CACHE_TTL {
+                        return Ok(cache.report.clone());
+                    }
+                }
+            }
+        }
+
+        let report = build_activity_report();
+        if let Ok(mut guard) = activity_cache().lock() {
+            *guard = Some(ActivityCache {
+                report: report.clone(),
+                fetched_at: Instant::now(),
+            });
+        }
+        Ok(report)
     })
     .await
     .map_err(|error| format!("请求健康读取失败：{error}"))?
