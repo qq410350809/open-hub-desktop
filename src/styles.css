@@ -3672,33 +3672,59 @@ kbd { padding: 3px 7px; border: 1px solid var(--line); border-radius: var(--r-xs
 .tt-kpis {
   min-width: 0;
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(168px, 1fr));
+  /* 主卡占 2 列，其余 4 卡各 1 列 => 6 列体系 */
+  grid-template-columns: repeat(6, minmax(0, 1fr));
   gap: 12px;
+  align-items: stretch;
 }
 .tt-kpi {
   position: relative;
   min-width: 0;
-  height: 118px;
+  min-height: 124px;
   padding: 14px 16px;
   display: flex;
   flex-direction: column;
   justify-content: space-between;
-  gap: 6px;
+  gap: 8px;
   border: 1px solid var(--oai-border);
   border-radius: 14px;
   background: var(--oai-card);
   box-shadow: 0 1px 2px rgba(0,0,0,.04);
   transition: border-color .15s ease, box-shadow .15s ease, transform .15s ease;
+  overflow: hidden;
 }
 .tt-kpi:hover {
   border-color: color-mix(in srgb, var(--oai-accent) 40%, var(--oai-border));
   box-shadow: 0 4px 14px rgba(0,0,0,.06);
   transform: translateY(-1px);
 }
+/* 主卡：TOKEN 总数 + 缓存命中率合并，占两列 */
+.tt-kpi-total {
+  grid-column: span 2;
+  display: grid;
+  grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr);
+  gap: 0 16px;
+  align-items: stretch;
+  background:
+    linear-gradient(135deg, color-mix(in srgb, #6366f1 8%, var(--oai-card)), var(--oai-card) 55%);
+}
+.tt-kpi-total-main,
+.tt-kpi-total-side {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  gap: 8px;
+}
+.tt-kpi-total-side {
+  padding-left: 16px;
+  border-left: 1px solid var(--oai-border);
+}
 .tt-kpi-top {
   display: flex;
   align-items: center;
   gap: 8px;
+  min-width: 0;
 }
 .tt-kpi-ic {
   flex: 0 0 auto;
@@ -3737,15 +3763,22 @@ kbd { padding: 3px 7px; border: 1px solid var(--line); border-radius: var(--r-xs
 }
 .tt-kpi-value {
   max-width: 100%;
-  overflow: hidden;
+  min-width: 0;
+  overflow: visible;           /* 修复被裁切成“半个数字” */
   white-space: nowrap;
-  text-overflow: ellipsis;
   color: var(--oai-text);
-  font-size: 30px;
+  font-size: 28px;
   font-weight: 800;
   font-variant-numeric: tabular-nums;
-  letter-spacing: -.02em;
+  letter-spacing: -.03em;
   line-height: 1.05;
+}
+.tt-kpi-value-lg {
+  font-size: 34px;
+  letter-spacing: -.04em;
+}
+.tt-kpi-value-md {
+  font-size: 30px;
 }
 .tt-kpi-value small {
   margin-left: 3px;
@@ -3764,7 +3797,7 @@ kbd { padding: 3px 7px; border: 1px solid var(--line); border-radius: var(--r-xs
 .tt-kpi-splits {
   display: flex;
   flex-wrap: wrap;
-  gap: 3px 10px;
+  gap: 4px 12px;
 }
 .tt-kpi-splits span {
   display: inline-flex;
@@ -3802,6 +3835,29 @@ kbd { padding: 3px 7px; border: 1px solid var(--line); border-radius: var(--r-xs
   font-size: 13px;
   font-weight: 700;
   font-variant-numeric: tabular-nums;
+}
+
+/* 响应式：主卡仍优先更宽 */
+@media (max-width: 1280px) {
+  .tt-kpis { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  .tt-kpi-total { grid-column: span 2; }
+}
+@media (max-width: 960px) {
+  .tt-kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .tt-kpi-total { grid-column: span 2; }
+}
+@media (max-width: 640px) {
+  .tt-kpis { grid-template-columns: 1fr; }
+  .tt-kpi-total {
+    grid-column: span 1;
+    grid-template-columns: 1fr;
+  }
+  .tt-kpi-total-side {
+    padding-left: 0;
+    padding-top: 10px;
+    border-left: 0;
+    border-top: 1px solid var(--oai-border);
+  }
 }
 
 .tt-charts {
@@ -4648,14 +4704,11 @@ kbd { padding: 3px 7px; border: 1px solid var(--line); border-radius: var(--r-xs
 .tt-empty .is-spinning { animation: sync-sites-spin .9s linear infinite; color: var(--oai-accent); font-size: 22px; }
 
 @media (max-width: 1280px) {
-  .tt-kpis { grid-template-columns: repeat(3, minmax(0,1fr)); }
   .tt-charts { grid-template-columns: minmax(0, 1fr); }
 }
 @media (max-width: 1100px) {
-  .tt-kpis { grid-template-columns: repeat(3, minmax(0,1fr)); }
 }
 @media (max-width: 700px) {
-  .tt-kpis { grid-template-columns: repeat(2, minmax(0,1fr)); }
   .tt-dist { grid-template-columns: minmax(0,1fr); }
   .tt-modal-backdrop { padding: 10px; }
   .tt-modal { width: calc(100vw - 20px); max-height: calc(100vh - 20px); }

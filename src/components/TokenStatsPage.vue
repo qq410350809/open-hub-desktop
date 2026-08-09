@@ -521,15 +521,25 @@ onBeforeUnmount(() => {
         </div>
         <div class="tt-kpis">
           <div class="tt-kpi tt-kpi-total">
-            <div class="tt-kpi-top">
-              <span class="tt-kpi-ic ic-indigo" v-html="icons.chart"></span>
-              <span class="tt-kpi-label">TOKEN 总数</span>
+            <div class="tt-kpi-total-main">
+              <div class="tt-kpi-top">
+                <span class="tt-kpi-ic ic-indigo" v-html="icons.chart"></span>
+                <span class="tt-kpi-label">TOKEN 总数</span>
+              </div>
+              <strong class="tt-kpi-value tt-kpi-value-lg">{{ formatCompact(bucketTotal.total) }}</strong>
+              <div class="tt-kpi-splits">
+                <span><i class="dot in"></i>输入 {{ formatCompact(rangeSplits.input) }}</span>
+                <span><i class="dot out"></i>输出 {{ formatCompact(rangeSplits.output) }}</span>
+                <span><i class="dot cache"></i>缓存 {{ formatCompact(rangeSplits.cache) }}</span>
+              </div>
             </div>
-            <strong class="tt-kpi-value">{{ formatCompact(bucketTotal.total) }}</strong>
-            <div class="tt-kpi-splits">
-              <span><i class="dot in"></i>输入 {{ formatCompact(rangeSplits.input) }}</span>
-              <span><i class="dot out"></i>输出 {{ formatCompact(rangeSplits.output) }}</span>
-              <span><i class="dot cache"></i>缓存 {{ formatCompact(rangeSplits.cache) }}</span>
+            <div class="tt-kpi-total-side">
+              <div class="tt-kpi-top">
+                <span class="tt-kpi-ic ic-teal" v-html="icons.database"></span>
+                <span class="tt-kpi-label">缓存命中率</span>
+              </div>
+              <strong class="tt-kpi-value tt-kpi-value-md">{{ formatRate(cacheHitRate) }}</strong>
+              <span class="tt-kpi-sub">缓存 {{ formatCompact(rangeSplits.cache) }} · 命中占比</span>
             </div>
           </div>
           <div class="tt-kpi">
@@ -547,14 +557,6 @@ onBeforeUnmount(() => {
             </div>
             <strong class="tt-kpi-value">{{ formatTokens(bucketTotal.conversations) }}</strong>
             <span class="tt-kpi-sub">区间累计轮次</span>
-          </div>
-          <div class="tt-kpi">
-            <div class="tt-kpi-top">
-              <span class="tt-kpi-ic ic-teal" v-html="icons.database"></span>
-              <span class="tt-kpi-label">缓存命中率</span>
-            </div>
-            <strong class="tt-kpi-value">{{ formatRate(cacheHitRate) }}</strong>
-            <span class="tt-kpi-sub">缓存 {{ formatCompact(rangeSplits.cache) }}</span>
           </div>
           <div class="tt-kpi">
             <div class="tt-kpi-top">
