@@ -1,4 +1,5 @@
 mod account_sync;
+pub mod app_menu;
 mod charity_monitor;
 mod chrome_local_storage;
 mod chrome_session;
@@ -904,6 +905,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
+            app_menu::install_chinese_menu(app)?;
             let app_data_dir = app
                 .path()
                 .app_data_dir()
