@@ -747,7 +747,7 @@ fn collect_codex_request_health(dir: &Path, map: &mut BTreeMap<String, (i64, i64
                 if !is_failure && !is_success {
                     continue;
                 }
-                let hour = format!("{}:00.000Z", &ts[..13]);
+                let hour = format!("{}:00:00.000Z", &ts[..13]); // 2026-08-03T03 → 2026-08-03T03:00:00.000Z
                 let entry = map.entry(hour).or_insert((0, 0));
                 if is_failure {
                     entry.1 += 1;

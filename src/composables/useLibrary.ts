@@ -270,10 +270,10 @@ export async function runCommand<T>(
     for (let d = 0; d < 10; d++) {
       for (let h = 0; h < 24; h++) {
         const hour = new Date(dayStart.getTime() - d * 86400000 + h * 3600000);
-        const ts = hour.toISOString().slice(0, 13);
+        const ts = hour.toISOString().slice(0, 13); // YYYY-MM-DDTHH
         const success = 5 + ((d * 31 + h * 7) % 12);
         const failed = (d + h) % 5 === 0 ? 1 + (h % 3) : 0;
-        buckets.push({ hour: `${ts}:00.000Z`, success, failed });
+        buckets.push({ hour: `${ts}:00:00.000Z`, success, failed });
       }
     }
     return { available: true, buckets } as T;
