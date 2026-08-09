@@ -175,8 +175,8 @@ pub(crate) struct CharityRefreshAllResult {
 
 /// 公益同步只使用延迟 ≤500ms 的测速成功节点作为候选。
 const CHARITY_FAST_NODE_MAX_LATENCY_MS: i64 = 500;
-/// 单标签同步总预算：超时后换结果/结束，避免拖成几十分钟。
-const CHARITY_FEED_TIMEOUT: Duration = Duration::from_secs(60);
+/// 单次请求（一个节点）的最大耗时；失败/超时后换下一节点。
+const CHARITY_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// 单标签最多尝试节点数（队列头取、失败剔除候选）。
 const CHARITY_MAX_NODE_ATTEMPTS: usize = 8;
 /// 装入 Mihomo 的候选上限，避免一次装载几百节点导致极慢。
@@ -1468,7 +1468,6 @@ async fn sync_feed_with_fast_nodes(
     } else {
         "后台轮询"
     };
-    let feed_budget = || CHARITY_FEED_TIMEOUT.saturating_sub(feed_started_at.elapsed());
     let feed_duration_ms = || feed_started_at.elapsed().as_millis() as i64;
 
     if cancellation.is_cancelled() {
@@ -1484,7 +1483,7 @@ async fn sync_feed_with_fast_nodes(
         guard = monitor_state.proxy_sync_lock.lock() => guard,
     };
 
-    if feed_budget().is_zero() || cancellation.is_cancelled() {
+    if cancellation.is_cancelled() {
         return Err(format!("{CHARITY_SYNC_CANCELLED_PREFIX}：{}", source.name));
     }
 
@@ -1611,9 +1610,6 @@ async fn sync_feed_with_fast_nodes(
             let _ = proxy_pool::restore_proxy_node_transient(database, runtime).await;
             return Err(format!("{CHARITY_SYNC_CANCELLED_PREFIX}：{}", source.name));
         }
-        if feed_budget().is_zero() {
-            break;
-        }
 
         let Some(node) = queue.lock().ok().and_then(|mut q| q.pop_front()) else {
             break;
@@ -1677,33 +1673,15 @@ async fn sync_feed_with_fast_nodes(
             }
         }
 
-        let remaining = feed_budget();
-        if remaining.is_zero() {
-            let message = format!("{}: 标签同步超时", node.name);
-            eject_node_from_charity_candidate(&monitor_state, &queue, &node, &message);
-            let dur = attempt_started.elapsed().as_millis() as i64;
-            finish_charity_sync_log(
-                app, database, log_id, source, stage, "failed", &message, &node.name, dur, 0, 0, 0,
-            );
-            last_error = message;
-            break;
-        }
-
-        // 请求阶段：单次发起 fetch，并行 500ms 心跳刷新 duration/节点进度
+        let remaining = CHARITY_REQUEST_TIMEOUT;
+        // 请求阶段：单次发起 fetch，每次请求最多 CHARITY_REQUEST_TIMEOUT
         let fetch_future = fetch_topic_body(app, client.clone(), source);
         tokio::pin!(fetch_future);
         let fetch_result = loop {
             if cancellation.is_cancelled() {
                 break Err(format!("{CHARITY_SYNC_CANCELLED_PREFIX}：{}", source.name));
             }
-            let left = feed_budget();
-            if left.is_zero() {
-                break Err(format!(
-                    "{}: 请求超时（标签 {}s 预算用尽）",
-                    node.name,
-                    CHARITY_FEED_TIMEOUT.as_secs()
-                ));
-            }
+            let left = remaining;
             let tick = left.min(Duration::from_millis(500));
             tokio::select! {
                 _ = cancellation.cancelled() => {
@@ -1861,18 +1839,7 @@ async fn sync_feed_with_fast_nodes(
         has_more: false,
     });
     local.status = "error".into();
-    local.message = if feed_budget().is_zero() {
-        format!(
-            "{} 同步超时（{}s）：{}",
-            source.name,
-            CHARITY_FEED_TIMEOUT.as_secs(),
-            if last_error.is_empty() {
-                "候选节点均未在时限内成功".into()
-            } else {
-                last_error.clone()
-            }
-        )
-    } else if last_error.is_empty() {
+    local.message = if last_error.is_empty() {
         format!(
             "{} 同步失败：≤{}ms 候选节点均不可用",
             source.name, CHARITY_FAST_NODE_MAX_LATENCY_MS

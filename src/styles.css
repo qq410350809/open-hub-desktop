@@ -1299,7 +1299,7 @@ kbd { padding: 3px 7px; border: 1px solid var(--line); border-radius: var(--r-xs
   min-width: 0;
   padding: 12px 14px;
   display: grid;
-  grid-template-columns: 108px minmax(88px,140px) minmax(120px,180px) minmax(0,1fr) 76px;
+  grid-template-columns: 18px 100px minmax(88px,140px) minmax(120px,180px) minmax(0,1fr) 76px;
   gap: 8px 14px;
   align-items: center;
   border: 1px solid var(--line);
@@ -1307,6 +1307,37 @@ kbd { padding: 3px 7px; border: 1px solid var(--line); border-radius: var(--r-xs
   background: var(--surface);
   box-shadow: var(--shadow-xs);
   font-size: 11.5px;
+  cursor: pointer;
+  user-select: none;
+}
+.charity-sync-log-list li:hover { border-color: color-mix(in srgb, var(--brand) 30%, var(--line)); }
+.charity-sync-log-list li.is-expanded {
+  border-color: color-mix(in srgb, var(--brand) 45%, var(--line));
+  background: color-mix(in srgb, var(--brand-soft) 22%, var(--surface));
+}
+.charity-sync-log-list .log-expand-arrow {
+  color: var(--faint);
+  font-size: 10px;
+  line-height: 1;
+  text-align: center;
+}
+.charity-sync-log-list .log-detail {
+  grid-column: 1 / -1;
+  margin-top: 2px;
+  padding: 10px 12px;
+  border-radius: var(--r-sm);
+  background: color-mix(in srgb, #000 6%, var(--surface-soft));
+  border: 1px solid var(--line);
+  overflow: hidden;
+}
+.charity-sync-log-list .log-detail pre {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  line-height: 1.65;
 }
 .charity-sync-log-list time {
   color: var(--faint);

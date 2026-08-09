@@ -7,6 +7,19 @@ const store = useStore();
 
 /** 进行中任务耗时前端本地跳动（不依赖后端每秒写库）。 */
 const nowTick = ref(Date.now());
+const expandedLogId = ref<number | null>(null);
+
+function toggleLogDetail(id: number) {
+  expandedLogId.value = expandedLogId.value === id ? null : id;
+}
+
+function logDetailText(entry: { message?: string; nodeName?: string; durationMs?: number | null; status: string; at: string }) {
+  const lines: string[] = [];
+  if (entry.message) lines.push(entry.message);
+  if (entry.nodeName) lines.push(`节点：${entry.nodeName}`);
+  lines.push(`耗时：${formatDuration(liveDurationMs(entry))}`);
+  return lines.join("\n");
+}
 let tickTimer: number | null = null;
 
 function ensureTickTimer() {
@@ -448,9 +461,12 @@ onUnmounted(() => {
               <li
                 v-for="entry in store.charitySyncLog.value"
                 :key="entry.id"
-                :class="[`is-${entry.status}`]"
-                :title="entry.message"
+                :class="[`is-${entry.status}`, { 'is-expanded': expandedLogId === entry.id }]"
+                @click="toggleLogDetail(entry.id)"
               >
+                <span class="log-expand-arrow" aria-hidden="true">{{
+                  expandedLogId === entry.id ? "▾" : "▸"
+                }}</span>
                 <time>{{ formatLogTime(entry.at) }}</time>
                 <strong class="log-feed">{{ entry.feedName || entry.feedId }}</strong>
                 <span class="log-stage">
@@ -461,6 +477,9 @@ onUnmounted(() => {
                 <span class="log-duration" :class="{ 'is-live': entry.status === 'running' }">
                   {{ formatDuration(liveDurationMs(entry)) }}
                 </span>
+                <div v-if="expandedLogId === entry.id" class="log-detail" @click.stop>
+                  <pre>{{ logDetailText(entry) }}</pre>
+                </div>
               </li>
             </ol>
           </div>
