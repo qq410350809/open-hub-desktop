@@ -10,9 +10,11 @@ import {
   bucketSourceTotals,
   bucketTotals,
   buildDailyMapFromBuckets,
+  bucketKeyFor,
   buildHealthTimeline,
   buildPrecedingKeys,
   buildTrendDetailFromBuckets,
+  healthLevelOf,
   buildTrendFromBuckets,
   mergeModelTotals,
   formatCompact,
@@ -309,13 +311,11 @@ function healthCellTitle(cell: {
   successRate: number | null;
   pad?: boolean;
 }) {
-  if (cell.pad) {
-    if (cell.label) return `${cell.label} · 自动补全（不在所选区间）· 无请求数据`;
-    return "占位（排满网格）";
-  }
-  if (cell.requests <= 0) return `${cell.label} · 无请求数据`;
+  if (cell.pad && !cell.label) return "占位（排满网格）";
+  const prefix = cell.pad ? `${cell.label} · 自动补全（区间外）` : cell.label;
+  if (cell.requests <= 0) return `${prefix} · 无请求数据`;
   const rateTxt = cell.successRate == null ? "—" : `${(cell.successRate * 100).toFixed(1)}%`;
-  return `${cell.label} · 成功 ${formatTokens(cell.success)} · 失败 ${formatTokens(cell.failed)} · 成功率 ${rateTxt}`;
+  return `${prefix} · 成功 ${formatTokens(cell.success)} · 失败 ${formatTokens(cell.failed)} · 成功率 ${rateTxt}`;
 }
 
 // —— 请求健康时间线：与左侧趋势同粒度完整节点 ——
@@ -359,6 +359,20 @@ type HealthDisplayCell = {
 // 列优先展示：先填满一列（上→下），再下一列（左→右）
 // capacity = rows * cols 排满；若节点不足则前置占位，保证所选区间在末尾
 // 若节点过多则只保留末尾 capacity 个（仍保证选中区间的最后部分在网格末端）
+// 全量健康桶按当前粒度聚合（含所选区间之外），供前置补全取值
+const healthBucketMap = computed(() => {
+  const map = new Map<string, { success: number; failed: number }>();
+  for (const b of store.requestHealth.value?.buckets ?? []) {
+    const { key } = bucketKeyFor(trendGranularity.value, b.hour);
+    if (!key) continue;
+    const cur = map.get(key) || { success: 0, failed: 0 };
+    cur.success += b.success || 0;
+    cur.failed += b.failed || 0;
+    map.set(key, cur);
+  }
+  return map;
+});
+
 const healthDisplayCells = computed<HealthDisplayCell[]>(() => {
   const source = healthTimeline.value.cells;
   const capacity = HEALTH_ROWS * Math.max(1, healthCols.value);
@@ -367,23 +381,30 @@ const healthDisplayCells = computed<HealthDisplayCell[]>(() => {
     body = body.slice(body.length - capacity);
   }
 
-  // 前置自动补全：按当前粒度向前延伸真实时间节点（无数据=0），保证网格排满且有具体值
+  // 前置自动补全：向前延伸真实时间节点，并填入对应时间点的真实成功/失败值
   const padCount = Math.max(0, capacity - body.length);
   let pads: HealthDisplayCell[] = [];
   if (padCount > 0) {
     const anchor = body[0]?.key || body[0]?.label || healthTimeline.value.startLabel || "";
     const preceding = buildPrecedingKeys(anchor, padCount, trendGranularity.value);
-    // 若回溯不足（极端情况），剩余用空占位补齐
-    const mapped = preceding.map((p) => ({
-      key: `pre-${p.key}`,
-      label: p.label,
-      success: 0,
-      failed: 0,
-      requests: 0,
-      successRate: null as number | null,
-      level: 0,
-      pad: true,
-    }));
+    const map = healthBucketMap.value;
+    const mapped = preceding.map((p) => {
+      const hit = map.get(p.key);
+      const success = hit?.success ?? 0;
+      const failed = hit?.failed ?? 0;
+      const requests = success + failed;
+      const successRate = requests > 0 ? success / requests : null;
+      return {
+        key: `pre-${p.key}`,
+        label: p.label,
+        success,
+        failed,
+        requests,
+        successRate,
+        level: healthLevelOf(successRate),
+        pad: true,
+      };
+    });
     const lack = padCount - mapped.length;
     const extras = Array.from({ length: Math.max(0, lack) }, (_, i) => ({
       key: `pad-${i}`,
