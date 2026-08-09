@@ -8,11 +8,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
-use std::thread;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 /// 探测 tokentracker CLI 可执行文件，顺序：
@@ -1074,8 +1073,6 @@ fn hour_key_from_millis(ms: i64) -> Option<String> {
     let secs = ms / 1000;
     let t = UNIX_EPOCH + Duration::from_secs(secs as u64);
     let datetime = t.duration_since(UNIX_EPOCH).ok()?;
-    // 手动格式化为 UTC ISO 小时，避免额外 chrono 依赖
-    // 使用简易算法：基于 unix 秒
     let total_secs = datetime.as_secs() as i64;
     let days = total_secs.div_euclid(86_400);
     let tod = total_secs.rem_euclid(86_400);
@@ -1189,97 +1186,47 @@ fn open_readonly_sqlite(path: &Path) -> Option<Connection> {
     .ok()
 }
 
-fn walk_jsonl_files(dir: &Path, on_file: &mut dyn FnMut(&Path)) {
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(current) = stack.pop() {
-        let Ok(entries) = fs::read_dir(&current) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-                continue;
-            }
-            let is_jsonl = path
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .map(|ext| ext.eq_ignore_ascii_case("jsonl"))
-                .unwrap_or(false);
-            if is_jsonl {
-                on_file(&path);
-            }
-        }
-    }
-}
+// ---------------------------------------------------------------------------
+// 逐行事件处理器（全量与增量共用同一套口径）
+// ---------------------------------------------------------------------------
 
-/// Codex:
-/// - 对话: event_msg.user_message
-/// - 请求: event_msg.token_count
-/// - 成功/失败样本: task_complete 无/有 error
-fn collect_codex_activity(
-    dir: &Path,
+fn codex_on_line(
+    value: &JsonValue,
     map: &mut BTreeMap<String, HealthAgg>,
     sources: &mut BTreeMap<String, HealthAgg>,
 ) {
-    let Ok(entries) = fs::read_dir(dir) else {
+    if value.get("type").and_then(JsonValue::as_str) != Some("event_msg") {
+        return;
+    }
+    // 兼容 payload / msg 两种结构
+    let payload = value
+        .get("payload")
+        .or_else(|| value.get("msg"))
+        .cloned()
+        .unwrap_or(JsonValue::Null);
+    let Some(p_type) = payload.get("type").and_then(JsonValue::as_str) else {
         return;
     };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_codex_activity(&path, map, sources);
-            continue;
-        }
-        let is_rollout = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .map(|name| name.starts_with("rollout-") && name.ends_with(".jsonl"))
-            .unwrap_or(false);
-        if !is_rollout {
-            continue;
-        }
-        let Ok(file) = fs::File::open(&path) else {
-            continue;
-        };
-        for line in BufReader::new(file).lines().flatten() {
-            let Ok(value) = serde_json::from_str::<JsonValue>(&line) else {
-                continue;
-            };
-            if value.get("type").and_then(JsonValue::as_str) != Some("event_msg") {
-                continue;
-            }
-            // 兼容 payload / msg 两种结构
-            let payload = value
-                .get("payload")
-                .or_else(|| value.get("msg"))
-                .cloned()
-                .unwrap_or(JsonValue::Null);
-            let Some(p_type) = payload.get("type").and_then(JsonValue::as_str) else {
-                continue;
-            };
-            let ts = value
-                .get("timestamp")
-                .and_then(JsonValue::as_str)
-                .unwrap_or("");
-            let Some(hour) = hour_key_from_ts(ts) else {
-                continue;
-            };
-            match p_type {
-                "user_message" => record(map, sources, "codex", hour, 1, 0, 0, 0),
-                // token_count ≈ 一次模型请求；成功率用「请求 - 已知失败」推算，不再用 task_complete 成功样本
-                "token_count" => record(map, sources, "codex", hour, 0, 1, 0, 0),
-                "task_complete" => {
-                    if let Some(err) = payload.get("error").filter(|e| !e.is_null()) {
-                        if !is_user_cancelled_error(err) {
-                            // 仅计真实失败样本（429/5xx 等），不额外计请求（请求已由 token_count 覆盖）
-                            record(map, sources, "codex", hour, 0, 0, 0, 1);
-                        }
-                    }
+    let ts = value
+        .get("timestamp")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("");
+    let Some(hour) = hour_key_from_ts(ts) else {
+        return;
+    };
+    match p_type {
+        "user_message" => record(map, sources, "codex", hour, 1, 0, 0, 0),
+        // token_count ≈ 一次模型请求；成功率用「请求 - 已知失败」推算，不再用 task_complete 成功样本
+        "token_count" => record(map, sources, "codex", hour, 0, 1, 0, 0),
+        "task_complete" => {
+            if let Some(err) = payload.get("error").filter(|e| !e.is_null()) {
+                if !is_user_cancelled_error(err) {
+                    // 仅计真实失败样本（429/5xx 等），不额外计请求（请求已由 token_count 覆盖）
+                    record(map, sources, "codex", hour, 0, 0, 0, 1);
                 }
-                _ => {}
             }
         }
+        _ => {}
     }
 }
 
@@ -1296,69 +1243,88 @@ fn claude_user_is_human(content: &JsonValue) -> bool {
     }
 }
 
-/// Claude:
-/// - 对话: type=user 且含 text/image；排除仅 tool_result
-/// - 请求: type=assistant 且 usage>0；API error 计 request+failed
-fn collect_claude_activity(
-    dir: &Path,
+fn claude_on_line(
+    value: &JsonValue,
     map: &mut BTreeMap<String, HealthAgg>,
     sources: &mut BTreeMap<String, HealthAgg>,
 ) {
-    walk_jsonl_files(dir, &mut |path| {
-        let Ok(file) = fs::File::open(path) else {
-            return;
-        };
-        for line in BufReader::new(file).lines().flatten() {
-            let Ok(value) = serde_json::from_str::<JsonValue>(&line) else {
-                continue;
-            };
-            let Some(type_name) = value.get("type").and_then(JsonValue::as_str) else {
-                continue;
-            };
-            let ts = value
-                .get("timestamp")
-                .and_then(JsonValue::as_str)
-                .unwrap_or("");
-            let Some(hour) = hour_key_from_ts(ts) else {
-                continue;
-            };
+    let Some(type_name) = value.get("type").and_then(JsonValue::as_str) else {
+        return;
+    };
+    let ts = value
+        .get("timestamp")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("");
+    let Some(hour) = hour_key_from_ts(ts) else {
+        return;
+    };
 
-            if type_name == "user" {
-                let content = value
-                    .get("message")
-                    .and_then(|m| m.get("content"))
-                    .cloned()
-                    .unwrap_or(JsonValue::Null);
-                if claude_user_is_human(&content) {
-                    record(map, sources, "claude", hour, 1, 0, 0, 0);
-                }
-                continue;
-            }
-
-            if type_name != "assistant" {
-                continue;
-            }
-            let is_api_error = value
-                .get("isApiErrorMessage")
-                .and_then(JsonValue::as_bool)
-                .unwrap_or(false)
-                || value.get("error").is_some();
-            let usage = value.get("message").and_then(|m| m.get("usage"));
-            let usage_tokens = usage
-                .map(|u| {
-                    json_i64(u, "input_tokens")
-                        + json_i64(u, "output_tokens")
-                        + json_i64(u, "cache_read_input_tokens")
-                        + json_i64(u, "cache_creation_input_tokens")
-                })
-                .unwrap_or(0);
-            if is_api_error {
-                record(map, sources, "claude", hour, 0, 1, 0, 1);
-            } else if usage_tokens > 0 {
-                record(map, sources, "claude", hour, 0, 1, 1, 0);
-            }
+    if type_name == "user" {
+        let content = value
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .cloned()
+            .unwrap_or(JsonValue::Null);
+        if claude_user_is_human(&content) {
+            record(map, sources, "claude", hour, 1, 0, 0, 0);
         }
-    });
+        return;
+    }
+
+    if type_name != "assistant" {
+        return;
+    }
+    let is_api_error = value
+        .get("isApiErrorMessage")
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(false)
+        || value.get("error").is_some();
+    let usage = value.get("message").and_then(|m| m.get("usage"));
+    let usage_tokens = usage
+        .map(|u| {
+            json_i64(u, "input_tokens")
+                + json_i64(u, "output_tokens")
+                + json_i64(u, "cache_read_input_tokens")
+                + json_i64(u, "cache_creation_input_tokens")
+        })
+        .unwrap_or(0);
+    if is_api_error {
+        record(map, sources, "claude", hour, 0, 1, 0, 1);
+    } else if usage_tokens > 0 {
+        record(map, sources, "claude", hour, 0, 1, 1, 0);
+    }
+}
+
+fn antigravity_on_line(
+    value: &JsonValue,
+    map: &mut BTreeMap<String, HealthAgg>,
+    sources: &mut BTreeMap<String, HealthAgg>,
+) {
+    let type_name = value.get("type").and_then(JsonValue::as_str).unwrap_or("");
+    let source_name = value
+        .get("source")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("");
+    let ts = value
+        .get("created_at")
+        .or_else(|| value.get("timestamp"))
+        .and_then(JsonValue::as_str)
+        .unwrap_or("");
+    let Some(hour) = hour_key_from_ts(ts) else {
+        return;
+    };
+    match type_name {
+        "USER_INPUT" if source_name == "USER_EXPLICIT" => {
+            record(map, sources, "antigravity", hour, 1, 0, 0, 0);
+        }
+        "PLANNER_RESPONSE" => {
+            record(map, sources, "antigravity", hour, 0, 1, 1, 0);
+        }
+        "ERROR_MESSAGE" => {
+            record(map, sources, "antigravity", hour, 0, 1, 0, 1);
+        }
+        _ => {}
+    }
 }
 
 fn assistant_tokens_positive(data: &JsonValue) -> bool {
@@ -1372,22 +1338,204 @@ fn assistant_tokens_positive(data: &JsonValue) -> bool {
         > 0
 }
 
-fn collect_sqlite_message_activity(
+fn message_hour(value: &JsonValue, time_created: i64) -> Option<String> {
+    value
+        .get("time")
+        .and_then(|t| {
+            t.get("completed")
+                .or_else(|| t.get("created"))
+                .and_then(JsonValue::as_i64)
+        })
+        .and_then(hour_key_from_millis)
+        .or_else(|| hour_key_from_millis(time_created))
+}
+
+// ---------------------------------------------------------------------------
+// 增量游标
+// ---------------------------------------------------------------------------
+
+/// JSONL 文件游标：文件未重写时只读新增字节。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct FileCursor {
+    inode: u64,
+    size: u64,
+    mtime_ms: u64,
+    offset: u64,
+}
+
+type FileCursorMap = BTreeMap<String, FileCursor>;
+
+/// SQLite 消息游标：只处理 time_created 大于上次游标的新消息。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct SqliteCursor {
+    max_time_created: i64,
+    #[serde(default)]
+    allowed_sessions: HashSet<String>,
+    /// (time_created, hour)；当 session 之后出现正规 assistant 时才回放
+    #[serde(default)]
+    session_users: BTreeMap<String, Vec<(i64, String)>>,
+}
+
+#[cfg(unix)]
+fn metadata_ino(meta: &fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    meta.ino()
+}
+
+#[cfg(not(unix))]
+fn metadata_ino(_meta: &fs::Metadata) -> u64 {
+    0
+}
+
+fn scan_jsonl_file_incremental(
+    path: &Path,
+    cursors: &mut FileCursorMap,
+    on_line: &mut dyn FnMut(&JsonValue),
+) {
+    let key = path.to_string_lossy().to_string();
+    let Ok(meta) = fs::metadata(path) else {
+        return;
+    };
+    let inode = metadata_ino(&meta);
+    let size = meta.len();
+    let mtime_ms = meta
+        .modified()
+        .ok()
+        .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+        .map(|value| value.as_millis() as u64)
+        .unwrap_or(0);
+
+    let start = match cursors.get(&key) {
+        Some(prev) if prev.inode == inode && size >= prev.offset => prev.offset,
+        _ => 0, // 新文件 / 重写 / 截断：从头读（极少见，可接受偶发重复）
+    };
+
+    let Ok(file) = fs::File::open(path) else {
+        return;
+    };
+    let mut reader = BufReader::new(file);
+    if start > 0 && reader.seek(SeekFrom::Start(start)).is_err() {
+        return;
+    }
+    for line in reader.lines().flatten() {
+        if let Ok(value) = serde_json::from_str::<JsonValue>(&line) {
+            on_line(&value);
+        }
+    }
+    cursors.insert(
+        key,
+        FileCursor {
+            inode,
+            size,
+            mtime_ms,
+            offset: size,
+        },
+    );
+}
+
+fn collect_jsonl_incremental(
+    root: &Path,
+    predicate: &dyn Fn(&Path) -> bool,
+    cursors: &mut FileCursorMap,
+    on_line: &mut dyn FnMut(&JsonValue),
+) {
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&current) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !predicate(&path) {
+                continue;
+            }
+            scan_jsonl_file_incremental(&path, cursors, on_line);
+        }
+    }
+}
+
+fn collect_codex_activity_incremental(
+    dir: &Path,
+    map: &mut BTreeMap<String, HealthAgg>,
+    sources: &mut BTreeMap<String, HealthAgg>,
+    cursors: &mut FileCursorMap,
+) {
+    collect_jsonl_incremental(
+        dir,
+        &|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.starts_with("rollout-") && name.ends_with(".jsonl"))
+                .unwrap_or(false)
+        },
+        cursors,
+        &mut |value| codex_on_line(value, map, sources),
+    );
+}
+
+fn collect_claude_activity_incremental(
+    dir: &Path,
+    map: &mut BTreeMap<String, HealthAgg>,
+    sources: &mut BTreeMap<String, HealthAgg>,
+    cursors: &mut FileCursorMap,
+) {
+    collect_jsonl_incremental(
+        dir,
+        &|path| {
+            path.extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| ext.eq_ignore_ascii_case("jsonl"))
+                .unwrap_or(false)
+        },
+        cursors,
+        &mut |value| claude_on_line(value, map, sources),
+    );
+}
+
+fn collect_antigravity_activity_incremental(
+    root: &Path,
+    map: &mut BTreeMap<String, HealthAgg>,
+    sources: &mut BTreeMap<String, HealthAgg>,
+    cursors: &mut FileCursorMap,
+) {
+    collect_jsonl_incremental(
+        root,
+        &|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name == "transcript.jsonl")
+                .unwrap_or(false)
+        },
+        cursors,
+        &mut |value| antigravity_on_line(value, map, sources),
+    );
+}
+
+fn collect_sqlite_message_activity_incremental(
     db_path: &Path,
     source: &str,
     map: &mut BTreeMap<String, HealthAgg>,
-    sources: &mut BTreeMap<String, HealthAgg>,
-    // None = 不过滤 provider；Some(set) = 仅这些 provider 的 assistant 计请求，
-    // 且对话只统计“至少有一次匹配 provider assistant”的 session 内 user。
+    sources_map: &mut BTreeMap<String, HealthAgg>,
     provider_allow: Option<&HashSet<&str>>,
+    cursor: &mut SqliteCursor,
 ) {
     let Some(conn) = open_readonly_sqlite(db_path) else {
         return;
     };
-    let Ok(mut stmt) = conn.prepare("SELECT session_id, time_created, data FROM message") else {
+    let filter = provider_allow.is_some();
+    let since = cursor.max_time_created;
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT session_id, time_created, data FROM message WHERE time_created > ?1 ORDER BY time_created ASC",
+    ) else {
         return;
     };
-    let rows = stmt.query_map([], |row| {
+    let rows = stmt.query_map([since], |row| {
         let sid: String = row.get(0)?;
         let time_created: i64 = row.get(1)?;
         let data: String = row.get(2)?;
@@ -1397,150 +1545,145 @@ fn collect_sqlite_message_activity(
         return;
     };
 
-    // 单次扫描：provider 过滤场景下先缓存 user，等确认 session 合法后再回放
-    let mut pending_users: Vec<(String, String)> = Vec::new(); // (session_id, hour)
-    let mut allowed_sessions = HashSet::<String>::new();
-    let filter = provider_allow.is_some();
-
+    let mut new_rows: Vec<(String, i64, JsonValue)> = Vec::new();
+    let mut max_tc = since;
     for row in rows.flatten() {
-        let (session_id, time_created, data) = row;
-        let Ok(value) = serde_json::from_str::<JsonValue>(&data) else {
-            continue;
-        };
-        let role = value.get("role").and_then(JsonValue::as_str).unwrap_or("");
-        let hour = value
-            .get("time")
-            .and_then(|t| {
-                t.get("completed")
-                    .or_else(|| t.get("created"))
-                    .and_then(JsonValue::as_i64)
-            })
-            .and_then(hour_key_from_millis)
-            .or_else(|| hour_key_from_millis(time_created));
-        let Some(hour) = hour else {
-            continue;
-        };
+        let (sid, tc, data) = row;
+        if tc > max_tc {
+            max_tc = tc;
+        }
+        if let Ok(value) = serde_json::from_str::<JsonValue>(&data) {
+            new_rows.push((sid, tc, value));
+        }
+    }
+    if new_rows.is_empty() {
+        return;
+    }
+    cursor.max_time_created = max_tc;
 
-        if role == "user" {
-            if filter {
-                pending_users.push((session_id, hour));
-            } else {
-                record(map, sources, source, hour, 1, 0, 0, 0);
+    if filter {
+        // 1) 先扩充“正规 session”集合：本轮新增的正规 assistant 所在 session
+        let mut newly_allowed: Vec<String> = Vec::new();
+        for (sid, _, value) in &new_rows {
+            if value.get("role").and_then(JsonValue::as_str) != Some("assistant") {
+                continue;
             }
-            continue;
-        }
-
-        if role != "assistant" {
-            continue;
-        }
-
-        if let Some(allow) = provider_allow {
             let provider = value
                 .get("providerID")
                 .or_else(|| value.get("providerId"))
                 .and_then(JsonValue::as_str)
                 .unwrap_or("")
                 .to_ascii_lowercase();
-            if !allow.contains(provider.as_str()) {
+            let allowed_provider = provider_allow
+                .map(|allow| allow.contains(provider.as_str()))
+                .unwrap_or(false);
+            if allowed_provider {
+                if cursor.allowed_sessions.insert(sid.clone()) {
+                    newly_allowed.push(sid.clone());
+                }
+            }
+        }
+        // 2) 回放之前暂存的 user（这些 session 现在确认是正规会话）
+        for sid in newly_allowed {
+            if let Some(users) = cursor.session_users.remove(&sid) {
+                for (_, hour) in users {
+                    record(map, sources_map, source, hour, 1, 0, 0, 0);
+                }
+            }
+        }
+        // 3) 处理本轮新消息
+        for (sid, tc, value) in &new_rows {
+            let role = value.get("role").and_then(JsonValue::as_str).unwrap_or("");
+            let Some(hour) = message_hour(value, *tc) else {
+                continue;
+            };
+            if role == "user" {
+                if cursor.allowed_sessions.contains(sid) {
+                    record(map, sources_map, source, hour, 1, 0, 0, 0);
+                } else {
+                    let users = cursor.session_users.entry(sid.clone()).or_default();
+                    if users.len() < 100_000 {
+                        users.push((*tc, hour));
+                    }
+                }
                 continue;
             }
-        }
-
-        let err = value.get("error").filter(|e| !e.is_null());
-        if let Some(err) = err {
-            if filter {
-                allowed_sessions.insert(session_id.clone());
+            if role != "assistant" {
+                continue;
             }
-            if is_user_cancelled_error(err) {
-                // 用户取消：计请求，不算失败
-                record(map, sources, source, hour, 0, 1, 0, 0);
-            } else {
-                // 真实失败：请求 + 失败（success 由前端用 requests-failed 推导展示）
-                record(map, sources, source, hour, 0, 1, 0, 1);
+            let provider = value
+                .get("providerID")
+                .or_else(|| value.get("providerId"))
+                .and_then(JsonValue::as_str)
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            let allowed_provider = provider_allow
+                .map(|allow| allow.contains(provider.as_str()))
+                .unwrap_or(false);
+            if !allowed_provider {
+                continue;
             }
-            continue;
-        }
-        if assistant_tokens_positive(&value) {
-            if filter {
-                allowed_sessions.insert(session_id.clone());
+            let err = value.get("error").filter(|e| !e.is_null());
+            if let Some(err) = err {
+                if is_user_cancelled_error(err) {
+                    // 用户取消：计请求，不算失败
+                    record(map, sources_map, source, hour, 0, 1, 0, 0);
+                } else {
+                    // 真实失败：请求 + 失败
+                    record(map, sources_map, source, hour, 0, 1, 0, 1);
+                }
+                continue;
             }
-            // 有 token 的 assistant = 成功请求
-            record(map, sources, source, hour, 0, 1, 1, 0);
+            if assistant_tokens_positive(value) {
+                record(map, sources_map, source, hour, 0, 1, 1, 0);
+            }
         }
-    }
-
-    if filter {
-        for (session_id, hour) in pending_users {
-            if allowed_sessions.contains(&session_id) {
-                record(map, sources, source, hour, 1, 0, 0, 0);
+    } else {
+        for (_, tc, value) in &new_rows {
+            let role = value.get("role").and_then(JsonValue::as_str).unwrap_or("");
+            let Some(hour) = message_hour(value, *tc) else {
+                continue;
+            };
+            if role == "user" {
+                record(map, sources_map, source, hour, 1, 0, 0, 0);
+                continue;
+            }
+            if role != "assistant" {
+                continue;
+            }
+            let err = value.get("error").filter(|e| !e.is_null());
+            if let Some(err) = err {
+                if is_user_cancelled_error(err) {
+                    record(map, sources_map, source, hour, 0, 1, 0, 0);
+                } else {
+                    record(map, sources_map, source, hour, 0, 1, 0, 1);
+                }
+                continue;
+            }
+            if assistant_tokens_positive(value) {
+                record(map, sources_map, source, hour, 0, 1, 1, 0);
             }
         }
     }
 }
 
-/// Antigravity transcript.jsonl
-fn collect_antigravity_activity(
-    root: &Path,
-    map: &mut BTreeMap<String, HealthAgg>,
-    sources: &mut BTreeMap<String, HealthAgg>,
-) {
-    walk_jsonl_files(root, &mut |path| {
-        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if name != "transcript.jsonl" {
-            return;
-        }
-        let Ok(file) = fs::File::open(path) else {
-            return;
-        };
-        for line in BufReader::new(file).lines().flatten() {
-            let Ok(value) = serde_json::from_str::<JsonValue>(&line) else {
-                continue;
-            };
-            let type_name = value.get("type").and_then(JsonValue::as_str).unwrap_or("");
-            let source_name = value
-                .get("source")
-                .and_then(JsonValue::as_str)
-                .unwrap_or("");
-            let ts = value
-                .get("created_at")
-                .or_else(|| value.get("timestamp"))
-                .and_then(JsonValue::as_str)
-                .unwrap_or("");
-            let Some(hour) = hour_key_from_ts(ts) else {
-                continue;
-            };
-            match type_name {
-                "USER_INPUT" if source_name == "USER_EXPLICIT" => {
-                    record(map, sources, "antigravity", hour, 1, 0, 0, 0);
-                }
-                "PLANNER_RESPONSE" => {
-                    record(map, sources, "antigravity", hour, 0, 1, 1, 0);
-                }
-                "ERROR_MESSAGE" => {
-                    record(map, sources, "antigravity", hour, 0, 1, 0, 1);
-                }
-                _ => {}
-            }
-        }
-    });
-}
+// ---------------------------------------------------------------------------
+// 活动结果持久化（增量游标 + 累计报告）
+// ---------------------------------------------------------------------------
 
-/// 请求活动结果缓存：Tokentracker 的 cursor 状态是新鲜度基准，
-/// OpenHub 只缓存解析结果，不复制原始日志。
+/// 请求活动结果缓存 v2：自维护 per-source 增量游标。
+/// OpenHub 只缓存解析结果与游标，不复制原始日志。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 struct ActivityCacheEnvelope {
     version: u32,
-    cursor_exists: bool,
-    cursor_size: u64,
-    cursor_modified_ms: u64,
-    cursor_updated_at: String,
+    file_cursors: BTreeMap<String, FileCursorMap>,
+    sqlite_cursors: BTreeMap<String, SqliteCursor>,
     report: RequestHealthReport,
 }
 
 struct ActivityCache {
     report: RequestHealthReport,
-    fingerprint: (bool, u64, u64, String),
     fetched_at: Instant,
 }
 
@@ -1559,31 +1702,23 @@ fn activity_cache_path() -> Option<PathBuf> {
     })
 }
 
-fn read_persisted_activity_cache(
-    fingerprint: &(bool, u64, u64, String),
-) -> Option<RequestHealthReport> {
-    let path = activity_cache_path()?;
-    let text = fs::read_to_string(path).ok()?;
-    let envelope = serde_json::from_str::<ActivityCacheEnvelope>(&text).ok()?;
-    if envelope.version != 1 {
-        return None;
+fn read_persisted_activity_cache() -> ActivityCacheEnvelope {
+    let Some(path) = activity_cache_path() else {
+        return ActivityCacheEnvelope::default();
+    };
+    let Ok(text) = fs::read_to_string(path) else {
+        return ActivityCacheEnvelope::default();
+    };
+    let Ok(envelope) = serde_json::from_str::<ActivityCacheEnvelope>(&text) else {
+        return ActivityCacheEnvelope::default();
+    };
+    if envelope.version != 2 {
+        return ActivityCacheEnvelope::default();
     }
-    let current = (
-        envelope.cursor_exists,
-        envelope.cursor_size,
-        envelope.cursor_modified_ms,
-        envelope.cursor_updated_at,
-    );
-    if &current != fingerprint {
-        return None;
-    }
-    Some(envelope.report)
+    envelope
 }
 
-fn write_persisted_activity_cache(
-    report: &RequestHealthReport,
-    fingerprint: &(bool, u64, u64, String),
-) {
+fn write_persisted_activity_cache(envelope: &ActivityCacheEnvelope) {
     let Some(path) = activity_cache_path() else {
         return;
     };
@@ -1593,15 +1728,7 @@ fn write_persisted_activity_cache(
     if fs::create_dir_all(parent).is_err() {
         return;
     }
-    let envelope = ActivityCacheEnvelope {
-        version: 1,
-        cursor_exists: fingerprint.0,
-        cursor_size: fingerprint.1,
-        cursor_modified_ms: fingerprint.2,
-        cursor_updated_at: fingerprint.3.clone(),
-        report: report.clone(),
-    };
-    let Ok(json) = serde_json::to_vec(&envelope) else {
+    let Ok(json) = serde_json::to_vec(envelope) else {
         return;
     };
     let tmp = path.with_extension("json.tmp");
@@ -1610,128 +1737,32 @@ fn write_persisted_activity_cache(
     }
 }
 
-fn merge_activity(
-    into_map: &mut BTreeMap<String, HealthAgg>,
-    into_sources: &mut BTreeMap<String, HealthAgg>,
-    from_map: BTreeMap<String, HealthAgg>,
-    from_sources: BTreeMap<String, HealthAgg>,
-) {
-    for (hour, agg) in from_map {
-        let entry = into_map.entry(hour).or_default();
-        entry.dialogues += agg.dialogues;
-        entry.requests += agg.requests;
-        entry.success += agg.success;
-        entry.failed += agg.failed;
+fn report_to_maps(
+    report: &RequestHealthReport,
+) -> (BTreeMap<String, HealthAgg>, BTreeMap<String, HealthAgg>) {
+    let mut map: BTreeMap<String, HealthAgg> = BTreeMap::new();
+    let mut sources: BTreeMap<String, HealthAgg> = BTreeMap::new();
+    for bucket in &report.buckets {
+        let entry = map.entry(bucket.hour.clone()).or_default();
+        entry.dialogues += bucket.dialogues;
+        entry.requests += bucket.requests;
+        entry.success += bucket.success;
+        entry.failed += bucket.failed;
     }
-    for (source, agg) in from_sources {
-        let entry = into_sources.entry(source).or_default();
-        entry.dialogues += agg.dialogues;
-        entry.requests += agg.requests;
-        entry.success += agg.success;
-        entry.failed += agg.failed;
+    for summary in &report.by_source {
+        let entry = sources.entry(summary.source.clone()).or_default();
+        entry.dialogues += summary.dialogues;
+        entry.requests += summary.requests;
+        entry.success += summary.success;
+        entry.failed += summary.failed;
     }
+    (map, sources)
 }
 
-fn build_activity_report() -> RequestHealthReport {
-    let home = match std::env::var_os("HOME") {
-        Some(h) => PathBuf::from(h),
-        None => {
-            return RequestHealthReport {
-                available: false,
-                buckets: vec![],
-                by_source: vec![],
-            };
-        }
-    };
-
-    // 各工具并行采集，缩短首次进入等待
-    let codex_root = home.join(".codex").join("sessions");
-    let claude_root = home.join(".claude").join("projects");
-    let opencode_db = home
-        .join(".local")
-        .join("share")
-        .join("opencode")
-        .join("opencode.db");
-    let mimo_db = home
-        .join(".local")
-        .join("share")
-        .join("mimocode")
-        .join("mimocode.db");
-    let zcode_db = home.join(".zcode").join("cli").join("db").join("db.sqlite");
-    let gemini_root = home.join(".gemini");
-
-    let handles = [
-        thread::spawn(move || {
-            let mut map = BTreeMap::new();
-            let mut sources = BTreeMap::new();
-            if codex_root.is_dir() {
-                collect_codex_activity(&codex_root, &mut map, &mut sources);
-            }
-            (map, sources)
-        }),
-        thread::spawn(move || {
-            let mut map = BTreeMap::new();
-            let mut sources = BTreeMap::new();
-            if claude_root.is_dir() {
-                collect_claude_activity(&claude_root, &mut map, &mut sources);
-            }
-            (map, sources)
-        }),
-        thread::spawn(move || {
-            let mut map = BTreeMap::new();
-            let mut sources = BTreeMap::new();
-            if opencode_db.is_file() {
-                collect_sqlite_message_activity(
-                    &opencode_db,
-                    "opencode",
-                    &mut map,
-                    &mut sources,
-                    None,
-                );
-            }
-            (map, sources)
-        }),
-        thread::spawn(move || {
-            let mut map = BTreeMap::new();
-            let mut sources = BTreeMap::new();
-            if mimo_db.is_file() {
-                let allow = HashSet::from(["mimo", "xiaomi"]);
-                collect_sqlite_message_activity(
-                    &mimo_db,
-                    "mimo",
-                    &mut map,
-                    &mut sources,
-                    Some(&allow),
-                );
-            }
-            (map, sources)
-        }),
-        thread::spawn(move || {
-            let mut map = BTreeMap::new();
-            let mut sources = BTreeMap::new();
-            if zcode_db.is_file() {
-                collect_sqlite_message_activity(&zcode_db, "zcode", &mut map, &mut sources, None);
-            }
-            (map, sources)
-        }),
-        thread::spawn(move || {
-            let mut map = BTreeMap::new();
-            let mut sources = BTreeMap::new();
-            if gemini_root.is_dir() {
-                collect_antigravity_activity(&gemini_root, &mut map, &mut sources);
-            }
-            (map, sources)
-        }),
-    ];
-
-    let mut map = BTreeMap::new();
-    let mut sources = BTreeMap::new();
-    for handle in handles {
-        if let Ok((part_map, part_sources)) = handle.join() {
-            merge_activity(&mut map, &mut sources, part_map, part_sources);
-        }
-    }
-
+fn maps_to_report(
+    map: BTreeMap<String, HealthAgg>,
+    sources: BTreeMap<String, HealthAgg>,
+) -> RequestHealthReport {
     let buckets = map
         .into_iter()
         .map(|(hour, agg)| RequestHealthBucket {
@@ -1742,7 +1773,6 @@ fn build_activity_report() -> RequestHealthReport {
             failed: agg.failed,
         })
         .collect::<Vec<_>>();
-
     let by_source = sources
         .into_iter()
         .map(|(source, agg)| RequestHealthSourceSummary {
@@ -1753,7 +1783,6 @@ fn build_activity_report() -> RequestHealthReport {
             failed: agg.failed,
         })
         .collect::<Vec<_>>();
-
     RequestHealthReport {
         available: !buckets.is_empty(),
         buckets,
@@ -1762,43 +1791,127 @@ fn build_activity_report() -> RequestHealthReport {
 }
 
 /// 读取多工具对话/请求健康数据。
-/// - refresh=true 强制重扫；否则 5 分钟进程内缓存，避免首次后反复等待。
+/// - refresh=false：自维护增量游标，只扫描新增行/新消息（快）
+/// - refresh=true：清空游标全量重建（慢但兜底修复）
 #[tauri::command]
 pub async fn get_token_request_health(
     refresh: Option<bool>,
 ) -> Result<RequestHealthReport, String> {
     let force = refresh.unwrap_or(false);
     tauri::async_runtime::spawn_blocking(move || {
-        let fingerprint = cursors_file_state();
         if !force {
             if let Ok(guard) = activity_cache().lock() {
                 if let Some(cache) = guard.as_ref() {
-                    if cache.fingerprint == fingerprint
-                        && cache.fetched_at.elapsed() < ACTIVITY_CACHE_TTL
-                    {
+                    if cache.fetched_at.elapsed() < ACTIVITY_CACHE_TTL {
                         return Ok(cache.report.clone());
                     }
                 }
             }
-            if let Some(report) = read_persisted_activity_cache(&fingerprint) {
-                if let Ok(mut guard) = activity_cache().lock() {
-                    *guard = Some(ActivityCache {
-                        report: report.clone(),
-                        fingerprint: fingerprint.clone(),
-                        fetched_at: Instant::now(),
-                    });
-                }
-                return Ok(report);
-            }
         }
 
-        let report = build_activity_report();
-        let final_fingerprint = cursors_file_state();
-        write_persisted_activity_cache(&report, &final_fingerprint);
+        let home = std::env::var_os("HOME").ok_or("无法定位用户目录")?;
+        let home = PathBuf::from(home);
+
+        let mut envelope = read_persisted_activity_cache();
+        if force {
+            // 全量重建：清空报告与游标，由增量路径从头扫描并重填游标
+            envelope.report = RequestHealthReport::default();
+            envelope.file_cursors.clear();
+            envelope.sqlite_cursors.clear();
+        }
+        let (mut map, mut sources) = report_to_maps(&envelope.report);
+
+        let codex_root = home.join(".codex").join("sessions");
+        if codex_root.is_dir() {
+            let cursors = envelope
+                .file_cursors
+                .entry("codex".to_string())
+                .or_default();
+            collect_codex_activity_incremental(&codex_root, &mut map, &mut sources, cursors);
+        }
+        let claude_root = home.join(".claude").join("projects");
+        if claude_root.is_dir() {
+            let cursors = envelope
+                .file_cursors
+                .entry("claude".to_string())
+                .or_default();
+            collect_claude_activity_incremental(&claude_root, &mut map, &mut sources, cursors);
+        }
+
+        let opencode_db = home
+            .join(".local")
+            .join("share")
+            .join("opencode")
+            .join("opencode.db");
+        if opencode_db.is_file() {
+            let cursor = envelope
+                .sqlite_cursors
+                .entry("opencode".to_string())
+                .or_default();
+            collect_sqlite_message_activity_incremental(
+                &opencode_db,
+                "opencode",
+                &mut map,
+                &mut sources,
+                None,
+                cursor,
+            );
+        }
+
+        let mimo_db = home
+            .join(".local")
+            .join("share")
+            .join("mimocode")
+            .join("mimocode.db");
+        if mimo_db.is_file() {
+            let allow = HashSet::from(["mimo", "xiaomi"]);
+            let cursor = envelope
+                .sqlite_cursors
+                .entry("mimo".to_string())
+                .or_default();
+            collect_sqlite_message_activity_incremental(
+                &mimo_db,
+                "mimo",
+                &mut map,
+                &mut sources,
+                Some(&allow),
+                cursor,
+            );
+        }
+
+        let zcode_db = home.join(".zcode").join("cli").join("db").join("db.sqlite");
+        if zcode_db.is_file() {
+            let cursor = envelope
+                .sqlite_cursors
+                .entry("zcode".to_string())
+                .or_default();
+            collect_sqlite_message_activity_incremental(
+                &zcode_db,
+                "zcode",
+                &mut map,
+                &mut sources,
+                None,
+                cursor,
+            );
+        }
+
+        let gemini_root = home.join(".gemini");
+        if gemini_root.is_dir() {
+            let cursors = envelope
+                .file_cursors
+                .entry("antigravity".to_string())
+                .or_default();
+            collect_antigravity_activity_incremental(&gemini_root, &mut map, &mut sources, cursors);
+        }
+
+        // 注意：kilo/goose/craft/workbuddy/copilot 暂不进活动时间线（无可靠事件时间）
+
+        let report = maps_to_report(map, sources);
+        envelope.report = report.clone();
+        write_persisted_activity_cache(&envelope);
         if let Ok(mut guard) = activity_cache().lock() {
             *guard = Some(ActivityCache {
                 report: report.clone(),
-                fingerprint: final_fingerprint,
                 fetched_at: Instant::now(),
             });
         }
@@ -1807,7 +1920,6 @@ pub async fn get_token_request_health(
     .await
     .map_err(|error| format!("请求健康读取失败：{error}"))?
 }
-
 #[cfg(test)]
 mod activity_tests {
     use super::*;
@@ -1847,5 +1959,146 @@ mod activity_tests {
         assert!(assistant_tokens_positive(&value));
         let empty = json!({"tokens": {"input": 0, "output": 0}});
         assert!(!assistant_tokens_positive(&empty));
+    }
+
+    #[test]
+    fn jsonl_incremental_only_reads_new_bytes() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("openhub-tt-jsonl-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let file = dir.join("rollout-test-1.jsonl");
+        let mut map: BTreeMap<String, HealthAgg> = BTreeMap::new();
+        let mut sources: BTreeMap<String, HealthAgg> = BTreeMap::new();
+        let mut cursors = FileCursorMap::new();
+
+        let line1 = r#"{"type":"event_msg","timestamp":"2026-08-03T09:10:00.000Z","payload":{"type":"user_message"}}"#;
+        let mut f = fs::File::create(&file).unwrap();
+        writeln!(f, "{line1}").unwrap();
+        drop(f);
+        collect_codex_activity_incremental(&dir, &mut map, &mut sources, &mut cursors);
+        assert_eq!(map.values().map(|a| a.dialogues).sum::<i64>(), 1);
+
+        // 追加新行，第二次只应新增这一条
+        let line2 = r#"{"type":"event_msg","timestamp":"2026-08-03T09:11:00.000Z","payload":{"type":"token_count"}}"#;
+        let mut f = fs::OpenOptions::new().append(true).open(&file).unwrap();
+        writeln!(f, "{line2}").unwrap();
+        drop(f);
+        collect_codex_activity_incremental(&dir, &mut map, &mut sources, &mut cursors);
+        assert_eq!(map.values().map(|a| a.dialogues).sum::<i64>(), 1);
+        assert_eq!(map.values().map(|a| a.requests).sum::<i64>(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sqlite_cursor_only_counts_new_rows() {
+        let db_path =
+            std::env::temp_dir().join(format!("openhub-tt-sqlite-{}.db", std::process::id()));
+        let _ = fs::remove_file(&db_path);
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE message (session_id TEXT, time_created INTEGER, data TEXT);",
+        )
+        .unwrap();
+
+        let mut map: BTreeMap<String, HealthAgg> = BTreeMap::new();
+        let mut sources: BTreeMap<String, HealthAgg> = BTreeMap::new();
+        let mut cursor = SqliteCursor::default();
+
+        let insert = |conn: &Connection, sid: &str, tc: i64, role: &str| {
+            let data = format!(
+                r#"{{"role":"{role}","tokens":{{"input":10,"output":5}},"time":{{"created":{tc}}}}}"#
+            );
+            conn.execute(
+                "INSERT INTO message (session_id, time_created, data) VALUES (?1, ?2, ?3)",
+                rusqlite::params![sid, tc, data],
+            )
+            .unwrap();
+        };
+        insert(&conn, "s1", 1000, "user");
+        insert(&conn, "s1", 2000, "assistant");
+        collect_sqlite_message_activity_incremental(
+            &db_path,
+            "opencode",
+            &mut map,
+            &mut sources,
+            None,
+            &mut cursor,
+        );
+        assert_eq!(map.values().map(|a| a.dialogues).sum::<i64>(), 1);
+        assert_eq!(map.values().map(|a| a.requests).sum::<i64>(), 1);
+
+        // 再插新行，只统计新增
+        insert(&conn, "s2", 3000, "user");
+        collect_sqlite_message_activity_incremental(
+            &db_path,
+            "opencode",
+            &mut map,
+            &mut sources,
+            None,
+            &mut cursor,
+        );
+        assert_eq!(map.values().map(|a| a.dialogues).sum::<i64>(), 2);
+        assert_eq!(map.values().map(|a| a.requests).sum::<i64>(), 1);
+        let _ = fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn mimo_cursor_replays_users_when_session_becomes_allowed() {
+        let db_path =
+            std::env::temp_dir().join(format!("openhub-tt-mimo-{}.db", std::process::id()));
+        let _ = fs::remove_file(&db_path);
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE message (session_id TEXT, time_created INTEGER, data TEXT);",
+        )
+        .unwrap();
+        let mut map: BTreeMap<String, HealthAgg> = BTreeMap::new();
+        let mut sources: BTreeMap<String, HealthAgg> = BTreeMap::new();
+        let mut cursor = SqliteCursor::default();
+        let allow = HashSet::from(["mimo", "xiaomi"]);
+
+        let insert = |conn: &Connection, sid: &str, tc: i64, data: &str| {
+            conn.execute(
+                "INSERT INTO message (session_id, time_created, data) VALUES (?1, ?2, ?3)",
+                rusqlite::params![sid, tc, data],
+            )
+            .unwrap();
+        };
+
+        // 第一批：只有 user（session 尚未确认是 mimo）
+        insert(
+            &conn,
+            "s1",
+            1000,
+            r#"{"role":"user","time":{"created":1000}}"#,
+        );
+        collect_sqlite_message_activity_incremental(
+            &db_path,
+            "mimo",
+            &mut map,
+            &mut sources,
+            Some(&allow),
+            &mut cursor,
+        );
+        assert_eq!(map.values().map(|a| a.dialogues).sum::<i64>(), 0);
+
+        // 第二批：出现 mimo assistant，之前的 user 应被回放计入
+        insert(
+            &conn,
+            "s1",
+            2000,
+            r#"{"role":"assistant","providerID":"mimo","tokens":{"input":10,"output":5},"time":{"created":2000}}"#,
+        );
+        collect_sqlite_message_activity_incremental(
+            &db_path,
+            "mimo",
+            &mut map,
+            &mut sources,
+            Some(&allow),
+            &mut cursor,
+        );
+        assert_eq!(map.values().map(|a| a.dialogues).sum::<i64>(), 1);
+        assert_eq!(map.values().map(|a| a.requests).sum::<i64>(), 1);
+        let _ = fs::remove_file(&db_path);
     }
 }

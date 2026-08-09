@@ -561,10 +561,11 @@ onMounted(() => {
   // 同步结束后只刷新发生变化的结果，避免首屏被全量扫描阻塞。
   void Promise.all([store.loadTokenUsage(), store.loadTokenStats()]);
   void store.syncTokenTracker()
-    .then((report) => Promise.all([
+    .then(() => Promise.all([
       store.loadTokenUsage(),
       store.loadTokenStats(),
-      store.loadRequestHealth(report.changed),
+      // 后台同步后走增量刷新：只扫新增行，不强制全量重建
+      store.loadRequestHealth(false),
     ]))
     .catch(() => store.loadRequestHealth(false));
   nextTick(() => {
