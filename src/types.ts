@@ -147,6 +147,8 @@ export interface CharityFeedItem {
   lastActivityAt: string;
   pinned: boolean;
   posters: string[];
+  feedIds?: string[];
+  feedNames?: string[];
 }
 
 export interface CharityFeedResult {

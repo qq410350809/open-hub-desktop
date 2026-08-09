@@ -1568,6 +1568,23 @@ kbd { padding: 3px 7px; border: 1px solid var(--line); border-radius: var(--r-xs
   flex-direction: column;
   gap: 7px;
 }
+.charity-topic-feed-tags {
+  display: inline-flex;
+  gap: 4px;
+  margin-left: 8px;
+  vertical-align: middle;
+  flex-wrap: wrap;
+}
+.charity-topic-feed-tag {
+  padding: 2px 7px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--brand) 35%, var(--line));
+  background: color-mix(in srgb, var(--brand-soft) 40%, var(--surface));
+  color: var(--brand-deep);
+  font-size: 10.5px;
+  font-weight: 700;
+  white-space: nowrap;
+}
 .charity-topic-title-row {
   min-width: 0;
   display: flex;

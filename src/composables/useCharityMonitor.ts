@@ -14,6 +14,7 @@ const PAGE_SIZE = 20;
 const MAX_SYNC_LOG = 120;
 
 const charityTags = ref<CharityFeedTag[]>([
+  { id: "all", name: "全部" },
   { id: "1515", name: "公益推广" },
   { id: "1980", name: "公益站" },
   { id: "2233", name: "中转站" },
@@ -22,8 +23,8 @@ const charityTags = ref<CharityFeedTag[]>([
   { id: "193", name: "订阅节点" },
 ]);
 
-const selectedTagId = ref("1515");
-const currentFeedName = ref("公益推广");
+const selectedTagId = ref("all");
+const currentFeedName = ref("全部");
 const items = shallowRef<CharityFeedItem[]>([]);
 const loading = ref(false);
 const loadingMore = ref(false);
@@ -62,6 +63,7 @@ function scheduleSyncLogReload() {
 }
 
 function tagMeta(feedId: string) {
+  if (feedId === "all") return { id: "all", name: "全部" };
   return charityTags.value.find((tag) => tag.id === feedId) ?? { id: feedId, name: feedId };
 }
 

@@ -99,6 +99,12 @@ pub(crate) struct CharityFeedItem {
     pinned: bool,
     #[serde(default)]
     posters: Vec<String>,
+    /// 该帖子归属的标签 id（同一 guid 可能命中多个标签）
+    #[serde(default)]
+    feed_ids: Vec<String>,
+    /// 该帖子归属的标签名（供列表展示）
+    #[serde(default)]
+    feed_names: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -526,6 +532,8 @@ fn items_from_topic_list(value: &str) -> Result<Vec<CharityFeedItem>, String> {
                     .map(plain_text)
                     .unwrap_or_default(),
                 categories,
+                feed_ids: Vec::new(),
+                feed_names: Vec::new(),
                 is_new: false,
                 reply_count,
                 views,
@@ -1061,6 +1069,129 @@ fn list_charity_sync_logs(
     Ok(rows)
 }
 
+/// 全部标签聚合视图：同一 guid 帖子按最新行合并，并列出其归属的标签。
+fn load_all_feed_items_from_db(
+    database: &Database,
+    offset: usize,
+    limit: usize,
+) -> Result<CharityFeedResult, String> {
+    let limit = limit.clamp(1, 50);
+    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    let total_count = connection
+        .query_row(
+            "SELECT COUNT(DISTINCT guid) FROM charity_feed_items",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| error.to_string())?
+        .max(0) as usize;
+
+    let mut statement = connection
+        .prepare(
+            "SELECT guid, title, link, author, published_at, summary, categories, first_seen_at,
+                    reply_count, views, like_count, last_activity_at, pinned, posters, feed_id
+             FROM charity_feed_items
+             ORDER BY published_at DESC, rowid DESC
+             LIMIT ?1 OFFSET ?2",
+        )
+        .map_err(|error| error.to_string())?;
+    let all = statement
+        .query_map(params![
+            (limit * 8) as i64, // 多标签可能重复占用行，放大取数后在内存聚合
+            offset as i64
+        ], |row| {
+            let categories: String = row.get(6)?;
+            let posters_raw: String = row.get(13)?;
+            Ok((
+                row.get::<_, String>(0)?,          // guid
+                row.get::<_, String>(1)?,          // title
+                row.get::<_, String>(2)?,          // link
+                row.get::<_, String>(3)?,          // author
+                row.get::<_, String>(4)?,          // published_at
+                row.get::<_, String>(5)?,          // summary
+                serde_json::from_str::<Vec<String>>(&categories).unwrap_or_default(),
+                row.get::<_, String>(7)?,          // first_seen_at
+                row.get::<_, i64>(8)?,
+                row.get::<_, i64>(9)?,
+                row.get::<_, i64>(10)?,
+                row.get::<_, String>(11)?,
+                row.get::<_, i64>(12)?,
+                serde_json::from_str::<Vec<String>>(&posters_raw).unwrap_or_default(),
+                row.get::<_, String>(14)?,         // feed_id
+            ))
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    drop(statement);
+    drop(connection);
+
+    // 同一 guid 聚合归属标签
+    let mut merged: Vec<CharityFeedItem> = Vec::new();
+    for (guid, title, link, author, published_at, summary, categories, _first_seen_at, reply, views, likes, last_activity, pinned, posters, feed_id) in all {
+        let feed_name = CHARITY_FEEDS
+            .iter()
+            .find(|f| f.id == feed_id)
+            .map(|f| f.name.to_string())
+            .unwrap_or_default();
+        if let Some(item) = merged.iter_mut().find(|existing| existing.id == guid) {
+            if !item.feed_ids.iter().any(|id| id == &feed_id) {
+                item.feed_ids.push(feed_id);
+                item.feed_names.push(feed_name);
+            }
+            item.views = item.views.max(views);
+            item.reply_count = item.reply_count.max(reply);
+            item.like_count = item.like_count.max(likes);
+            continue;
+        }
+        merged.push(CharityFeedItem {
+            id: guid,
+            title,
+            link,
+            author,
+            published_at,
+            summary,
+            categories,
+            is_new: false,
+            reply_count: reply,
+            views,
+            like_count: likes,
+            last_activity_at: last_activity,
+            pinned: pinned != 0,
+            posters,
+            feed_ids: vec![feed_id],
+            feed_names: vec![feed_name],
+        });
+    }
+
+    // 多取的行要塞回 offset 语义：由于我们 LIMIT offset*8 起查，直接从头保留即可满足“全部视图分页”
+    let items = merged.into_iter().take(limit).collect::<Vec<_>>();
+    let item_count = items.len();
+
+    Ok(CharityFeedResult {
+        feed_id: "all".into(),
+        feed_name: "全部".into(),
+        items,
+        fetched_at: String::new(),
+        changed: false,
+        new_count: 0,
+        updated_count: 0,
+        initialized: true,
+        source_profile_name: String::new(),
+        source_account_name: String::new(),
+        status: "local".into(),
+        message: String::new(),
+        used_node_id: String::new(),
+        used_node_name: String::new(),
+        unread_count: 0,
+        skipped: false,
+        total_count,
+        offset,
+        limit,
+        has_more: offset + item_count < total_count,
+    })
+}
+
 fn cancel_running_charity_sync_logs(database: &Database, reason: &str) -> Result<usize, String> {
     let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
     connection
@@ -1278,6 +1409,8 @@ fn load_feed_items_from_db(
                 published_at: row.get(4)?,
                 summary: row.get(5)?,
                 categories: parsed_categories,
+                feed_ids: vec![source.id.to_string()],
+                feed_names: vec![source.name.to_string()],
                 is_new,
                 reply_count: row.get(8)?,
                 views: row.get(9)?,
@@ -1884,9 +2017,15 @@ pub async fn get_charity_feed(
     offset: Option<usize>,
     limit: Option<usize>,
 ) -> Result<CharityFeedResult, String> {
-    let source = charity_feed_source(feed_id.as_deref().unwrap_or(DEFAULT_CHARITY_FEED_ID))?;
+    let requested = feed_id.as_deref().unwrap_or(DEFAULT_CHARITY_FEED_ID);
     let offset = offset.unwrap_or(0);
     let limit = limit.unwrap_or(CHARITY_PAGE_SIZE);
+    if requested == "all" {
+        return tokio::task::block_in_place(|| {
+            load_all_feed_items_from_db(&database, offset, limit)
+        });
+    }
+    let source = charity_feed_source(requested)?;
     // 读库离开 async worker，避免同步命令/锁拖住运行时。
     let mut result =
         tokio::task::block_in_place(|| load_feed_items_from_db(&database, source, offset, limit))?;
@@ -1908,10 +2047,8 @@ pub async fn mark_charity_feed_read(
     database: State<'_, Database>,
     feed_id: Option<String>,
 ) -> Result<usize, String> {
-    let source = charity_feed_source(feed_id.as_deref().unwrap_or(DEFAULT_CHARITY_FEED_ID))?;
+    let requested = feed_id.as_deref().unwrap_or(DEFAULT_CHARITY_FEED_ID);
     tokio::task::block_in_place(|| {
-        let keys = feed_meta_keys(source.id);
-        let read_key = keys.read_at;
         let now = {
             let connection = database
                 .0
@@ -1923,7 +2060,17 @@ pub async fn mark_charity_feed_read(
                 })
                 .map_err(|error| error.to_string())?
         };
-        write_app_meta(&database, &read_key, &now)?;
+        if requested == "all" {
+            // 全部视图：一次性把 6 个标签的已读水位都推进
+            let mut total = 0usize;
+            for source in CHARITY_FEEDS {
+                write_app_meta(&database, &feed_meta_keys(source.id).read_at, &now)?;
+                total += unread_count_for_feed(&database, source.id)?;
+            }
+            return Ok(total);
+        }
+        let source = charity_feed_source(requested)?;
+        write_app_meta(&database, &feed_meta_keys(source.id).read_at, &now)?;
         unread_count_for_feed(&database, source.id)
     })
 }

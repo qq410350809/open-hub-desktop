@@ -349,6 +349,14 @@ onUnmounted(() => {
                 ></span>
                 <h2 :title="item.title">{{ item.title }}</h2>
                 <span v-if="item.isNew" class="charity-new-badge">NEW</span>
+                <span
+                  v-if="store.selectedTagId.value === 'all' && item.feedNames?.length"
+                  class="charity-topic-feed-tags"
+                >
+                  <span v-for="name in item.feedNames" :key="name" class="charity-topic-feed-tag">{{
+                    name
+                  }}</span>
+                </span>
               </div>
               <div class="charity-topic-meta" v-if="item.categories.length">
                 <span
