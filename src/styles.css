@@ -1159,65 +1159,109 @@ kbd { padding: 3px 7px; border: 1px solid var(--line); border-radius: var(--r-xs
   color: var(--brand-deep);
 }
 
-.charity-monitor-summary {
+.charity-toolbar {
   min-width: 0;
-  padding: 14px 16px;
+  margin-bottom: 14px;
+  padding: 12px 14px;
   display: grid;
-  gap: 14px;
+  grid-template-columns: auto minmax(0, 1fr);
+  grid-template-areas:
+    "filter stats"
+    "meta   stats";
+  gap: 10px 16px;
+  align-items: center;
   border: 1px solid var(--line);
   border-radius: var(--r-lg);
   background: var(--surface);
   box-shadow: var(--shadow-xs);
 }
-.charity-summary-main {
+.charity-toolbar-filter {
+  grid-area: filter;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  white-space: nowrap;
+}
+.charity-tag-label {
+  color: var(--faint);
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: .03em;
+}
+.charity-tag-select {
+  min-width: 128px;
+  max-width: 220px;
+  height: 34px;
+  padding: 0 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-md);
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 650;
+  outline: none;
+  cursor: pointer;
+}
+.charity-tag-select:focus-visible { border-color: color-mix(in srgb, var(--brand) 60%, var(--line)); box-shadow: 0 0 0 3px var(--brand-glow); }
+.charity-summary-stats {
+  grid-area: stats;
   display: grid;
-  grid-template-columns: repeat(3, minmax(0,1fr));
-  gap: 10px;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
 }
 .charity-summary-stat {
   min-width: 0;
-  padding: 10px 12px;
+  padding: 8px 12px;
   border: 1px solid var(--line-soft);
   border-radius: var(--r-md);
   background: var(--surface-soft);
 }
 .charity-summary-stat strong {
   display: block;
+  overflow: hidden;
   color: var(--text);
-  font-size: 18px;
+  font-size: 17px;
   font-weight: 750;
   font-variant-numeric: tabular-nums;
   letter-spacing: -.02em;
+  white-space: nowrap;
+  text-overflow: ellipsis;
 }
 .charity-summary-stat span {
   display: block;
-  margin-top: 4px;
+  margin-top: 3px;
+  overflow: hidden;
   color: var(--muted);
-  font-size: 11px;
+  font-size: 10.5px;
+  white-space: nowrap;
+  text-overflow: ellipsis;
 }
-.charity-summary-meta {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0,1fr));
-  gap: 10px 14px;
-}
-.charity-summary-meta > div {
+.charity-toolbar-meta {
+  grid-area: meta;
   min-width: 0;
   display: flex;
-  flex-direction: column;
-  gap: 3px;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
 }
-.charity-summary-meta small {
+.charity-toolbar-meta > span {
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 5px;
+  color: var(--muted);
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+.charity-toolbar-meta small {
   color: var(--faint);
   font-size: 10px;
   letter-spacing: .02em;
 }
-.charity-summary-meta strong {
+.charity-toolbar-meta > span:last-child {
   overflow: hidden;
-  color: var(--text);
-  white-space: nowrap;
   text-overflow: ellipsis;
-  font-size: 12px;
-  font-weight: 650;
 }
 
 .charity-sync-log-backdrop {
@@ -1675,7 +1719,8 @@ kbd { padding: 3px 7px; border: 1px solid var(--line); border-radius: var(--r-xs
 @media (max-width: 980px) {
   .charity-monitor-header { padding: 14px 18px; }
   .charity-monitor-scroll { padding: 18px 18px 36px; }
-  .charity-summary-main, .charity-summary-meta { grid-template-columns: 1fr 1fr; }
+  .charity-toolbar { grid-template-columns: 1fr; grid-template-areas: "filter" "stats" "meta"; }
+  .charity-summary-stats { grid-template-columns: repeat(2, minmax(0,1fr)); }
   .charity-sync-log-backdrop { padding: 10px; }
   .charity-sync-log-dialog { width: calc(100vw - 20px); max-height: calc(100vh - 20px); }
   .charity-sync-log-header { min-height: 68px; padding: 13px 12px 13px 16px; }
@@ -1694,7 +1739,7 @@ kbd { padding: 3px 7px; border: 1px solid var(--line); border-radius: var(--r-xs
   .charity-monitor-header { flex-direction: column; align-items: stretch; min-height: 0; gap: 12px; }
   .charity-header-actions { width: 100%; justify-content: stretch; }
   .charity-header-actions .secondary-button, .charity-tag-picker { flex: 1 1 auto; }
-  .charity-summary-main, .charity-summary-meta { grid-template-columns: 1fr; }
+  .charity-summary-stats { grid-template-columns: 1fr 1fr; }
   .charity-monitor-header > div:first-child { text-align: left; }
   .charity-refresh-button { align-self: flex-start; }
   .charity-monitor-scroll { padding: 14px 14px 32px; }

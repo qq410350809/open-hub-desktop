@@ -215,23 +215,10 @@ onUnmounted(() => {
     <header class="charity-monitor-header">
       <div>
         <span class="charity-monitor-eyebrow">LINUX.DO · {{ selectedLabel }}</span>
-        <h1>公益监听 · {{ selectedLabel }}</h1>
-        <p>界面只读本地库。定时同步：每 5 分钟（:00/:05/:10… 秒 00）；临时同步点“立即刷新全部”。过程见“同步日志”。</p>
+        <h1>公益监听</h1>
+        <p>定时同步：每 5 分钟（:00/:05/:10… 秒 00）；过程见“同步日志”。</p>
       </div>
       <div class="charity-header-actions">
-        <div class="charity-tag-picker">
-          <label class="charity-tag-label" for="charity-tag-select">标签</label>
-          <select
-            id="charity-tag-select"
-            class="charity-tag-select"
-            :value="store.selectedTagId.value"
-            @change="store.selectTag(($event.target as HTMLSelectElement).value)"
-          >
-            <option v-for="tag in store.charityTags.value" :key="tag.id" :value="tag.id">
-              {{ tag.name }}
-            </option>
-          </select>
-        </div>
         <button
           class="secondary-button"
           type="button"
@@ -258,30 +245,43 @@ onUnmounted(() => {
     </header>
 
     <div class="charity-monitor-scroll">
-      <section class="charity-monitor-summary" aria-label="当前标签概览">
-        <div class="charity-summary-main">
+      <!-- 筛选 + 统计整合为一块工具条 -->
+      <section class="charity-toolbar" aria-label="筛选与统计">
+        <div class="charity-toolbar-filter">
+          <label class="charity-tag-label" for="charity-tag-select">标签</label>
+          <select
+            id="charity-tag-select"
+            class="charity-tag-select"
+            :value="store.selectedTagId.value"
+            @change="store.selectTag(($event.target as HTMLSelectElement).value)"
+          >
+            <option v-for="tag in store.charityTags.value" :key="tag.id" :value="tag.id">
+              {{ tag.name }}
+            </option>
+          </select>
+        </div>
+        <div class="charity-summary-stats">
+          <div class="charity-summary-stat">
+            <strong>{{ store.charityFeedTodayCount.value }}</strong>
+            <span>今日帖子</span>
+          </div>
           <div class="charity-summary-stat">
             <strong>{{ pageLabel }}</strong>
-            <span>已加载 / 本地总数</span>
+            <span>当前共 {{ store.charityFeedTotalCount.value }} 条</span>
           </div>
           <div class="charity-summary-stat">
             <strong>{{ store.charityFeedSelectedUnreadCount.value }}</strong>
-            <span>本标签未读</span>
+            <span>未读</span>
           </div>
           <div class="charity-summary-stat">
             <strong>{{ store.charityFeedUpdatedCount.value }}</strong>
-            <span>最近同步变更</span>
+            <span>同步变更</span>
           </div>
         </div>
-        <div class="charity-summary-meta">
-          <div>
-            <small>数据来源</small>
-            <strong>{{ sourceLabel }}</strong>
-          </div>
-          <div>
-            <small>上次同步</small>
-            <strong>{{ formatFetchedAt(store.charityFeedLastFetchedAt.value) }}</strong>
-          </div>
+        <div class="charity-toolbar-meta">
+          <span title="数据来源"><small>来源</small>{{ sourceLabel }}</span>
+          <span title="上次同步"><small>同步于</small>{{ formatFetchedAt(store.charityFeedLastFetchedAt.value) }}</span>
+          <span title="同步状态"><small>状态</small>{{ store.charityFeedStatusMessage.value || (store.charityFeedError.value ? "异常" : "正常") }}</span>
         </div>
       </section>
 
