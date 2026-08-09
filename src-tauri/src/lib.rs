@@ -990,6 +990,7 @@ pub fn run() {
             charity_monitor::request_charity_round,
             charity_monitor::refresh_all_charity_feeds,
             token_stats::get_token_stats,
+            token_stats::sync_token_tracker,
             token_stats::get_token_usage,
             token_stats::get_token_raw_logs,
             token_stats::get_token_request_health

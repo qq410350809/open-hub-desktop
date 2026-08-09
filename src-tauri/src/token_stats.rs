@@ -1,8 +1,10 @@
 use crate::models::{
-    RawConversation, RawLogReport, RawRequest, RawSession, RequestHealthBucket, RequestHealthReport,
-    RequestHealthSourceSummary, TokenStatsReport, TokenUsageBucket, TokenUsageReport,
+    RawConversation, RawLogReport, RawRequest, RawSession, RequestHealthBucket,
+    RequestHealthReport, RequestHealthSourceSummary, TokenStatsReport, TokenTrackerSyncReport,
+    TokenUsageBucket, TokenUsageReport,
 };
 use rusqlite::{Connection, OpenFlags};
+use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
@@ -80,8 +82,8 @@ fn run_tokentracker_sessions(
         });
     }
 
-    let stdout =
-        String::from_utf8(output.stdout).map_err(|error| format!("tokentracker 输出编码异常：{error}"))?;
+    let stdout = String::from_utf8(output.stdout)
+        .map_err(|error| format!("tokentracker 输出编码异常：{error}"))?;
     serde_json::from_str(&stdout).map_err(|error| format!("tokentracker 输出解析失败：{error}"))
 }
 
@@ -102,11 +104,145 @@ pub async fn get_token_stats(
     .map_err(|error| format!("Token 统计任务执行失败：{error}"))?
 }
 
+/// Tokentracker 本地增量同步的进程内协调器。
+/// OpenHub 只触发本地解析，不调用上传/发布流程；同步锁仍由 tokentracker 自己负责。
+struct TokenTrackerSyncCache {
+    report: TokenTrackerSyncReport,
+    finished_at: Instant,
+}
+
+fn tokentracker_sync_cache() -> &'static Mutex<Option<TokenTrackerSyncCache>> {
+    static CACHE: OnceLock<Mutex<Option<TokenTrackerSyncCache>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
+
+fn tokentracker_sync_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+const TOKENTRACKER_SYNC_TTL: Duration = Duration::from_secs(8);
+
+fn cursors_file_state() -> (bool, u64, u64, String) {
+    let Some(path) = cursors_json_path() else {
+        return (false, 0, 0, String::new());
+    };
+    let Ok(metadata) = fs::metadata(&path) else {
+        return (false, 0, 0, String::new());
+    };
+    let size = metadata.len();
+    let modified_ms = metadata
+        .modified()
+        .ok()
+        .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|value| value.as_millis() as u64)
+        .unwrap_or(0);
+    let updated_at = fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<JsonValue>(&text).ok())
+        .and_then(|value| {
+            value
+                .get("updatedAt")
+                .and_then(JsonValue::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or_default();
+    (true, size, modified_ms, updated_at)
+}
+
+fn run_tokentracker_local_sync() -> Result<TokenTrackerSyncReport, String> {
+    let binary = find_tokentracker_binary().ok_or_else(|| {
+        "未找到 tokentracker CLI，无法执行本地增量同步。请先安装 tokentracker-cli，或设置 OPENHUB_TOKENTRACKER_PATH".to_string()
+    })?;
+    let before = cursors_file_state();
+    let started = Instant::now();
+
+    // 当前 tokentracker 版本中，--auto --background 会跳过云端上传；
+    // --all-local-sources 让已安装的本地工具都参与增量检查。
+    let output = Command::new(&binary)
+        .arg("sync")
+        .arg("--auto")
+        .arg("--background")
+        .arg("--all-local-sources")
+        .env("CI", "1")
+        .output()
+        .map_err(|error| format!("启动 tokentracker 本地同步失败：{error}"))?;
+
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if detail.is_empty() {
+            format!("tokentracker 本地同步失败：{}", output.status)
+        } else {
+            format!("tokentracker 本地同步失败：{detail}")
+        });
+    }
+
+    let after = cursors_file_state();
+    let changed = before != after;
+    let updated_at = if !after.3.is_empty() {
+        after.3.clone()
+    } else {
+        chrono_like_now_iso()
+    };
+    Ok(TokenTrackerSyncReport {
+        available: true,
+        changed,
+        skipped: !changed,
+        elapsed_ms: started.elapsed().as_millis() as i64,
+        updated_at,
+        message: if changed {
+            "Tokentracker 已完成本地增量同步".to_string()
+        } else {
+            "本地数据没有变化，已复用 Tokentracker 增量游标".to_string()
+        },
+    })
+}
+
+fn chrono_like_now_iso() -> String {
+    // 不新增 chrono 依赖；这里仅作为无 cursors.updatedAt 时的状态时间。
+    String::new()
+}
+
+/// 触发 tokentracker 本地增量同步。
+#[tauri::command]
+pub async fn sync_token_tracker(force: Option<bool>) -> Result<TokenTrackerSyncReport, String> {
+    let force = force.unwrap_or(false);
+    tauri::async_runtime::spawn_blocking(move || {
+        if !force {
+            if let Ok(guard) = tokentracker_sync_cache().lock() {
+                if let Some(cache) = guard.as_ref() {
+                    if cache.finished_at.elapsed() < TOKENTRACKER_SYNC_TTL {
+                        return Ok(TokenTrackerSyncReport {
+                            ..cache.report.clone()
+                        });
+                    }
+                }
+            }
+        }
+
+        let _guard = tokentracker_sync_lock()
+            .lock()
+            .map_err(|_| "Tokentracker 同步锁异常".to_string())?;
+        let report = run_tokentracker_local_sync()?;
+        if let Ok(mut cache) = tokentracker_sync_cache().lock() {
+            *cache = Some(TokenTrackerSyncCache {
+                report: report.clone(),
+                finished_at: Instant::now(),
+            });
+        }
+        Ok(report)
+    })
+    .await
+    .map_err(|error| format!("Tokentracker 同步任务执行失败：{error}"))?
+}
+
 /// tokentracker 的用量原始存储：~/.tokentracker/tracker/cursors.json
 /// 仪表盘汇总数据来自其 hourly.buckets（覆盖所有工具的每小时用量）。
 fn cursors_json_path() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from).map(|home| {
-        home.join(".tokentracker").join("tracker").join("cursors.json")
+        home.join(".tokentracker")
+            .join("tracker")
+            .join("cursors.json")
     })
 }
 
@@ -118,8 +254,8 @@ fn read_cursors_buckets() -> Result<Vec<TokenUsageBucket>, String> {
             path.display()
         )
     })?;
-    let value: JsonValue =
-        serde_json::from_str(&text).map_err(|error| format!("tokentracker 用量数据解析失败：{error}"))?;
+    let value: JsonValue = serde_json::from_str(&text)
+        .map_err(|error| format!("tokentracker 用量数据解析失败：{error}"))?;
     let buckets = value
         .get("hourly")
         .and_then(|hourly| hourly.get("buckets"))
@@ -199,13 +335,19 @@ fn parse_claude_file(
     conversations: &mut Vec<RawConversation>,
     requests: &mut Vec<RawRequest>,
 ) {
-    let Ok(text) = fs::read_to_string(path) else { return };
+    let Ok(text) = fs::read_to_string(path) else {
+        return;
+    };
     let session_id = path
         .file_stem()
         .map(|name| name.to_string_lossy().to_string())
         .unwrap_or_default();
     let number = |field: &JsonValue, key: &str| -> i64 {
-        field.get(key).and_then(JsonValue::as_f64).map(|value| value as i64).unwrap_or(0)
+        field
+            .get(key)
+            .and_then(JsonValue::as_f64)
+            .map(|value| value as i64)
+            .unwrap_or(0)
     };
     let mut model = String::new();
     let mut first_ts = String::new();
@@ -216,8 +358,14 @@ fn parse_claude_file(
     let mut current: Option<(RawConversation, String)> = None;
 
     for line in text.lines() {
-        let Ok(value) = serde_json::from_str::<JsonValue>(line) else { continue };
-        if value.get("isSidechain").and_then(JsonValue::as_bool).unwrap_or(false) {
+        let Ok(value) = serde_json::from_str::<JsonValue>(line) else {
+            continue;
+        };
+        if value
+            .get("isSidechain")
+            .and_then(JsonValue::as_bool)
+            .unwrap_or(false)
+        {
             continue;
         }
         let kind = value.get("type").and_then(JsonValue::as_str).unwrap_or("");
@@ -229,7 +377,11 @@ fn parse_claude_file(
             .and_then(JsonValue::as_str)
             .unwrap_or("")
             .to_string();
-        let uuid = value.get("uuid").and_then(JsonValue::as_str).unwrap_or("").to_string();
+        let uuid = value
+            .get("uuid")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("")
+            .to_string();
         let msg_model = value
             .get("message")
             .and_then(|message| message.get("model"))
@@ -266,8 +418,12 @@ fn parse_claude_file(
         }
 
         // assistant：提取真实 API 请求的 token 用量
-        let usage = value.get("message").and_then(|message| message.get("usage"));
-        let Some(usage) = usage.filter(|u| u.is_object()) else { continue };
+        let usage = value
+            .get("message")
+            .and_then(|message| message.get("usage"));
+        let Some(usage) = usage.filter(|u| u.is_object()) else {
+            continue;
+        };
         let input = number(usage, "input_tokens");
         let cache_read = number(usage, "cache_read_input_tokens");
         let cache_creation = number(usage, "cache_creation_input_tokens");
@@ -325,7 +481,9 @@ fn parse_claude_file(
 
 /// 解析一个 Codex rollout 文件为会话（Codex rollout 无逐请求 token 用量，只统计会话结构）。
 fn parse_codex_file(path: &Path, sessions: &mut Vec<RawSession>) {
-    let Ok(text) = fs::read_to_string(path) else { return };
+    let Ok(text) = fs::read_to_string(path) else {
+        return;
+    };
     let session_id = path
         .file_stem()
         .map(|name| name.to_string_lossy().to_string())
@@ -335,19 +493,32 @@ fn parse_codex_file(path: &Path, sessions: &mut Vec<RawSession>) {
     let mut message_count = 0i64;
 
     for line in text.lines() {
-        let Ok(value) = serde_json::from_str::<JsonValue>(line) else { continue };
+        let Ok(value) = serde_json::from_str::<JsonValue>(line) else {
+            continue;
+        };
         if value.get("type").and_then(JsonValue::as_str) != Some("response_item") {
             continue;
         }
         let payload = value.get("payload");
-        if payload.and_then(|p| p.get("type")).and_then(JsonValue::as_str) != Some("message") {
+        if payload
+            .and_then(|p| p.get("type"))
+            .and_then(JsonValue::as_str)
+            != Some("message")
+        {
             continue;
         }
-        let role = payload.and_then(|p| p.get("role")).and_then(JsonValue::as_str).unwrap_or("");
+        let role = payload
+            .and_then(|p| p.get("role"))
+            .and_then(JsonValue::as_str)
+            .unwrap_or("");
         if role != "user" && role != "assistant" {
             continue;
         }
-        let ts = value.get("timestamp").and_then(JsonValue::as_str).unwrap_or("").to_string();
+        let ts = value
+            .get("timestamp")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("")
+            .to_string();
         if first_ts.is_empty() {
             first_ts = ts.clone();
         }
@@ -368,7 +539,9 @@ fn parse_codex_file(path: &Path, sessions: &mut Vec<RawSession>) {
 }
 
 fn collect_codex_files(dir: &Path, sessions: &mut Vec<RawSession>) {
-    let Ok(entries) = fs::read_dir(dir) else { return };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
@@ -469,7 +642,13 @@ mod tests {
         let mut sessions = Vec::new();
         let mut conversations = Vec::new();
         let mut requests = Vec::new();
-        parse_claude_file(&path, "OpenHub", &mut sessions, &mut conversations, &mut requests);
+        parse_claude_file(
+            &path,
+            "OpenHub",
+            &mut sessions,
+            &mut conversations,
+            &mut requests,
+        );
 
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, "session-abc");
@@ -542,14 +721,38 @@ mod tests {
                 source: parts[0].to_string(),
                 model: parts[1].to_string(),
                 timestamp: parts[2].to_string(),
-                total_tokens: totals.get("total_tokens").and_then(JsonValue::as_f64).unwrap() as i64,
-                billable_total_tokens: totals.get("billable_total_tokens").and_then(JsonValue::as_f64).unwrap() as i64,
-                input_tokens: totals.get("input_tokens").and_then(JsonValue::as_f64).unwrap() as i64,
-                cached_input_tokens: totals.get("cached_input_tokens").and_then(JsonValue::as_f64).unwrap() as i64,
-                cache_creation_input_tokens: totals.get("cache_creation_input_tokens").and_then(JsonValue::as_f64).unwrap() as i64,
-                output_tokens: totals.get("output_tokens").and_then(JsonValue::as_f64).unwrap() as i64,
-                reasoning_output_tokens: totals.get("reasoning_output_tokens").and_then(JsonValue::as_f64).unwrap() as i64,
-                conversation_count: totals.get("conversation_count").and_then(JsonValue::as_f64).unwrap() as i64,
+                total_tokens: totals
+                    .get("total_tokens")
+                    .and_then(JsonValue::as_f64)
+                    .unwrap() as i64,
+                billable_total_tokens: totals
+                    .get("billable_total_tokens")
+                    .and_then(JsonValue::as_f64)
+                    .unwrap() as i64,
+                input_tokens: totals
+                    .get("input_tokens")
+                    .and_then(JsonValue::as_f64)
+                    .unwrap() as i64,
+                cached_input_tokens: totals
+                    .get("cached_input_tokens")
+                    .and_then(JsonValue::as_f64)
+                    .unwrap() as i64,
+                cache_creation_input_tokens: totals
+                    .get("cache_creation_input_tokens")
+                    .and_then(JsonValue::as_f64)
+                    .unwrap() as i64,
+                output_tokens: totals
+                    .get("output_tokens")
+                    .and_then(JsonValue::as_f64)
+                    .unwrap() as i64,
+                reasoning_output_tokens: totals
+                    .get("reasoning_output_tokens")
+                    .and_then(JsonValue::as_f64)
+                    .unwrap() as i64,
+                conversation_count: totals
+                    .get("conversation_count")
+                    .and_then(JsonValue::as_f64)
+                    .unwrap() as i64,
             });
         }
         assert_eq!(parsed.len(), 2);
@@ -712,7 +915,6 @@ mod tests {
         assert_eq!(report.summary.productive_rate, 0.0);
     }
 }
-
 
 /// 小时桶累加器：dialogues / requests / success / failed
 #[derive(Clone, Default)]
@@ -1083,10 +1285,7 @@ fn collect_sqlite_message_activity(
         let Ok(value) = serde_json::from_str::<JsonValue>(&data) else {
             continue;
         };
-        let role = value
-            .get("role")
-            .and_then(JsonValue::as_str)
-            .unwrap_or("");
+        let role = value.get("role").and_then(JsonValue::as_str).unwrap_or("");
         let hour = value
             .get("time")
             .and_then(|t| {
@@ -1164,10 +1363,7 @@ fn collect_antigravity_activity(
     sources: &mut BTreeMap<String, HealthAgg>,
 ) {
     walk_jsonl_files(root, &mut |path| {
-        let name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("");
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
         if name != "transcript.jsonl" {
             return;
         }
@@ -1179,7 +1375,10 @@ fn collect_antigravity_activity(
                 continue;
             };
             let type_name = value.get("type").and_then(JsonValue::as_str).unwrap_or("");
-            let source_name = value.get("source").and_then(JsonValue::as_str).unwrap_or("");
+            let source_name = value
+                .get("source")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("");
             let ts = value
                 .get("created_at")
                 .or_else(|| value.get("timestamp"))
@@ -1204,9 +1403,22 @@ fn collect_antigravity_activity(
     });
 }
 
-/// 进程内缓存：避免每次进入 Token 页都全量扫 Codex/Claude/Mimo 等日志。
+/// 请求活动结果缓存：Tokentracker 的 cursor 状态是新鲜度基准，
+/// OpenHub 只缓存解析结果，不复制原始日志。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct ActivityCacheEnvelope {
+    version: u32,
+    cursor_exists: bool,
+    cursor_size: u64,
+    cursor_modified_ms: u64,
+    cursor_updated_at: String,
+    report: RequestHealthReport,
+}
+
 struct ActivityCache {
     report: RequestHealthReport,
+    fingerprint: (bool, u64, u64, String),
     fetched_at: Instant,
 }
 
@@ -1216,6 +1428,65 @@ fn activity_cache() -> &'static Mutex<Option<ActivityCache>> {
 }
 
 const ACTIVITY_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+
+fn activity_cache_path() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from).map(|home| {
+        home.join(".tokentracker")
+            .join("tracker")
+            .join("openhub-activity-cache.json")
+    })
+}
+
+fn read_persisted_activity_cache(
+    fingerprint: &(bool, u64, u64, String),
+) -> Option<RequestHealthReport> {
+    let path = activity_cache_path()?;
+    let text = fs::read_to_string(path).ok()?;
+    let envelope = serde_json::from_str::<ActivityCacheEnvelope>(&text).ok()?;
+    if envelope.version != 1 {
+        return None;
+    }
+    let current = (
+        envelope.cursor_exists,
+        envelope.cursor_size,
+        envelope.cursor_modified_ms,
+        envelope.cursor_updated_at,
+    );
+    if &current != fingerprint {
+        return None;
+    }
+    Some(envelope.report)
+}
+
+fn write_persisted_activity_cache(
+    report: &RequestHealthReport,
+    fingerprint: &(bool, u64, u64, String),
+) {
+    let Some(path) = activity_cache_path() else {
+        return;
+    };
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let envelope = ActivityCacheEnvelope {
+        version: 1,
+        cursor_exists: fingerprint.0,
+        cursor_size: fingerprint.1,
+        cursor_modified_ms: fingerprint.2,
+        cursor_updated_at: fingerprint.3.clone(),
+        report: report.clone(),
+    };
+    let Ok(json) = serde_json::to_vec(&envelope) else {
+        return;
+    };
+    let tmp = path.with_extension("json.tmp");
+    if fs::write(&tmp, json).is_ok() {
+        let _ = fs::rename(tmp, path);
+    }
+}
 
 fn merge_activity(
     into_map: &mut BTreeMap<String, HealthAgg>,
@@ -1254,8 +1525,16 @@ fn build_activity_report() -> RequestHealthReport {
     // 各工具并行采集，缩短首次进入等待
     let codex_root = home.join(".codex").join("sessions");
     let claude_root = home.join(".claude").join("projects");
-    let opencode_db = home.join(".local").join("share").join("opencode").join("opencode.db");
-    let mimo_db = home.join(".local").join("share").join("mimocode").join("mimocode.db");
+    let opencode_db = home
+        .join(".local")
+        .join("share")
+        .join("opencode")
+        .join("opencode.db");
+    let mimo_db = home
+        .join(".local")
+        .join("share")
+        .join("mimocode")
+        .join("mimocode.db");
     let zcode_db = home.join(".zcode").join("cli").join("db").join("db.sqlite");
     let gemini_root = home.join(".gemini");
 
@@ -1280,7 +1559,13 @@ fn build_activity_report() -> RequestHealthReport {
             let mut map = BTreeMap::new();
             let mut sources = BTreeMap::new();
             if opencode_db.is_file() {
-                collect_sqlite_message_activity(&opencode_db, "opencode", &mut map, &mut sources, None);
+                collect_sqlite_message_activity(
+                    &opencode_db,
+                    "opencode",
+                    &mut map,
+                    &mut sources,
+                    None,
+                );
             }
             (map, sources)
         }),
@@ -1289,7 +1574,13 @@ fn build_activity_report() -> RequestHealthReport {
             let mut sources = BTreeMap::new();
             if mimo_db.is_file() {
                 let allow = HashSet::from(["mimo", "xiaomi"]);
-                collect_sqlite_message_activity(&mimo_db, "mimo", &mut map, &mut sources, Some(&allow));
+                collect_sqlite_message_activity(
+                    &mimo_db,
+                    "mimo",
+                    &mut map,
+                    &mut sources,
+                    Some(&allow),
+                );
             }
             (map, sources)
         }),
@@ -1351,23 +1642,41 @@ fn build_activity_report() -> RequestHealthReport {
 /// 读取多工具对话/请求健康数据。
 /// - refresh=true 强制重扫；否则 5 分钟进程内缓存，避免首次后反复等待。
 #[tauri::command]
-pub async fn get_token_request_health(refresh: Option<bool>) -> Result<RequestHealthReport, String> {
+pub async fn get_token_request_health(
+    refresh: Option<bool>,
+) -> Result<RequestHealthReport, String> {
     let force = refresh.unwrap_or(false);
     tauri::async_runtime::spawn_blocking(move || {
+        let fingerprint = cursors_file_state();
         if !force {
             if let Ok(guard) = activity_cache().lock() {
                 if let Some(cache) = guard.as_ref() {
-                    if cache.fetched_at.elapsed() < ACTIVITY_CACHE_TTL {
+                    if cache.fingerprint == fingerprint
+                        && cache.fetched_at.elapsed() < ACTIVITY_CACHE_TTL
+                    {
                         return Ok(cache.report.clone());
                     }
                 }
             }
+            if let Some(report) = read_persisted_activity_cache(&fingerprint) {
+                if let Ok(mut guard) = activity_cache().lock() {
+                    *guard = Some(ActivityCache {
+                        report: report.clone(),
+                        fingerprint: fingerprint.clone(),
+                        fetched_at: Instant::now(),
+                    });
+                }
+                return Ok(report);
+            }
         }
 
         let report = build_activity_report();
+        let final_fingerprint = cursors_file_state();
+        write_persisted_activity_cache(&report, &final_fingerprint);
         if let Ok(mut guard) = activity_cache().lock() {
             *guard = Some(ActivityCache {
                 report: report.clone(),
+                fingerprint: final_fingerprint,
                 fetched_at: Instant::now(),
             });
         }
@@ -1376,7 +1685,6 @@ pub async fn get_token_request_health(refresh: Option<bool>) -> Result<RequestHe
     .await
     .map_err(|error| format!("请求健康读取失败：{error}"))?
 }
-
 
 #[cfg(test)]
 mod activity_tests {

@@ -539,7 +539,12 @@ const trendChartOption = computed<EChartsOption>(() => {
 
 const modalTitle = computed(() => "用量明细");
 
-function refreshAll() {
+async function refreshAll() {
+  try {
+    await store.syncTokenTracker(true);
+  } catch {
+    // 保留现有缓存数据，错误由同步状态区域展示。
+  }
   store.refreshTokenStats();
   void store.loadTokenUsage();
   void store.loadRequestHealth(true);
@@ -552,7 +557,16 @@ watch(
 );
 
 onMounted(() => {
-  void Promise.all([store.loadTokenUsage(), store.loadTokenStats(), store.loadRequestHealth()]);
+  // 先显示已有本地 cursor/cache，再后台触发 Tokentracker 增量同步；
+  // 同步结束后只刷新发生变化的结果，避免首屏被全量扫描阻塞。
+  void Promise.all([store.loadTokenUsage(), store.loadTokenStats()]);
+  void store.syncTokenTracker()
+    .then((report) => Promise.all([
+      store.loadTokenUsage(),
+      store.loadTokenStats(),
+      store.loadRequestHealth(report.changed),
+    ]))
+    .catch(() => store.loadRequestHealth(false));
   nextTick(() => {
     measureHealthGrid();
     if (typeof ResizeObserver !== "undefined" && healthGridRef.value) {
@@ -576,21 +590,31 @@ onBeforeUnmount(() => {
       <div>
         <span class="token-stats-eyebrow">TOKEN TRACKER</span>
         <h1>Token 统计</h1>
-        <p>数据来自本机 tokentracker CLI 的本地会话日志。</p>
+        <p>数据来自 Tokentracker 本地增量状态，今日数据会在后台同步更新。</p>
       </div>
       <div class="token-stats-actions">
         <QuickRangeDropdown />
         <button
           class="tt-btn"
           type="button"
-          :disabled="store.tokenStatsLoading.value || store.tokenUsageLoading.value"
-          title="强制重读本地用量数据后刷新"
+          :disabled="store.tokenStatsLoading.value || store.tokenUsageLoading.value || store.tokenTrackerSyncing.value"
+          title="同步 Tokentracker 本地增量数据后刷新"
           @click="refreshAll"
         >
-          <span :class="{ 'is-spinning': store.tokenStatsLoading.value }">↻</span>
-          <span>{{ store.tokenStatsLoading.value ? "读取中…" : "刷新" }}</span>
+          <span :class="{ 'is-spinning': store.tokenStatsLoading.value || store.tokenTrackerSyncing.value }">↻</span>
+          <span>{{ store.tokenTrackerSyncing.value ? "同步中…" : (store.tokenStatsLoading.value ? "读取中…" : "刷新") }}</span>
         </button>
       </div>
+      <span
+        v-if="store.tokenTrackerSyncing.value"
+        class="tt-sync-status"
+        role="status"
+      >正在复用 Tokentracker 增量数据…</span>
+      <span
+        v-else-if="store.tokenTrackerSyncError.value"
+        class="tt-sync-status is-error"
+        :title="store.tokenTrackerSyncError.value"
+      >同步失败，显示本地缓存</span>
     </header>
 
     <div class="token-stats-scroll">

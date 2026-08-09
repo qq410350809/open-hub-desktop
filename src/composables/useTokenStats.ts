@@ -1,5 +1,11 @@
 import { ref } from "vue";
-import type { RawLogReport, RequestHealthReport, TokenStatsReport, TokenUsageReport } from "../types";
+import type {
+  RawLogReport,
+  RequestHealthReport,
+  TokenStatsReport,
+  TokenTrackerSyncReport,
+  TokenUsageReport,
+} from "../types";
 import { runCommand } from "./useLibrary";
 
 const tokenStats = ref<TokenStatsReport | null>(null);
@@ -22,6 +28,12 @@ const rawLogsError = ref("");
 const requestHealth = ref<RequestHealthReport | null>(null);
 const requestHealthLoading = ref(false);
 const requestHealthError = ref("");
+
+// Tokentracker 本地增量同步状态。同步只更新本地 cursor，不参与云端上传。
+const tokenTrackerSyncing = ref(false);
+const tokenTrackerSyncError = ref("");
+const tokenTrackerSyncReport = ref<TokenTrackerSyncReport | null>(null);
+let tokenTrackerSyncPromise: Promise<TokenTrackerSyncReport> | null = null;
 
 function toLocalDate(value: Date): string {
   const year = value.getFullYear();
@@ -174,6 +186,29 @@ function refreshTokenStats() {
   void loadTokenStats(tokenStatsFrom.value, tokenStatsTo.value, true);
 }
 
+async function syncTokenTracker(force = false): Promise<TokenTrackerSyncReport> {
+  if (tokenTrackerSyncPromise) {
+    return tokenTrackerSyncPromise;
+  }
+  tokenTrackerSyncing.value = true;
+  tokenTrackerSyncError.value = "";
+  const promise = runCommand<TokenTrackerSyncReport>("sync_token_tracker", { force })
+    .then((report) => {
+      tokenTrackerSyncReport.value = report;
+      return report;
+    })
+    .catch((error) => {
+      tokenTrackerSyncError.value = String(error);
+      throw error;
+    })
+    .finally(() => {
+      tokenTrackerSyncing.value = false;
+      tokenTrackerSyncPromise = null;
+    });
+  tokenTrackerSyncPromise = promise;
+  return promise;
+}
+
 async function loadTokenUsage() {
   tokenUsageLoading.value = true;
   tokenUsageError.value = "";
@@ -237,6 +272,10 @@ export function useTokenStats() {
     requestHealth,
     requestHealthLoading,
     requestHealthError,
+    tokenTrackerSyncing,
+    tokenTrackerSyncError,
+    tokenTrackerSyncReport,
+    syncTokenTracker,
     quickRanges,
     isCurrentRange,
     applyQuickRange,

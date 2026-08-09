@@ -469,6 +469,15 @@ export interface TokenUsageReport {
   endDate: string;
 }
 
+export interface TokenTrackerSyncReport {
+  available: boolean;
+  changed: boolean;
+  skipped: boolean;
+  elapsedMs: number;
+  updatedAt: string;
+  message: string;
+}
+
 // —— 请求/对话活动：多工具直读后的小时桶 ——
 export interface RequestHealthBucket {
   hour: string;          // ISO 小时 (YYYY-MM-DDTHH:00:00.000Z)

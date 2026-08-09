@@ -241,6 +241,16 @@ export async function runCommand<T>(
       provenance: {},
     } as T;
   }
+  if (command === "sync_token_tracker") {
+    return {
+      available: true,
+      changed: false,
+      skipped: true,
+      elapsedMs: 8,
+      updatedAt: new Date().toISOString(),
+      message: "开发模式已复用本地 Tokentracker 数据",
+    } as T;
+  }
   if (command === "get_token_usage") {
     const buckets: any[] = [];
     const now = Date.now();

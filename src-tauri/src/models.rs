@@ -457,7 +457,10 @@ pub(crate) struct ProxyIpAnalysis {
 // 因此这里序列化走 camelCase、反序列化走 snake_case 双向映射。
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default, rename_all(serialize = "camelCase", deserialize = "snake_case"))]
+#[serde(
+    default,
+    rename_all(serialize = "camelCase", deserialize = "snake_case")
+)]
 pub(crate) struct TokenStatsReport {
     pub(crate) available: bool,
     pub(crate) sessions: Vec<TokenSession>,
@@ -469,7 +472,10 @@ pub(crate) struct TokenStatsReport {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default, rename_all(serialize = "camelCase", deserialize = "snake_case"))]
+#[serde(
+    default,
+    rename_all(serialize = "camelCase", deserialize = "snake_case")
+)]
 pub(crate) struct TokenSessionTokens {
     pub(crate) input_tokens: i64,
     pub(crate) cached_input_tokens: i64,
@@ -480,7 +486,10 @@ pub(crate) struct TokenSessionTokens {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default, rename_all(serialize = "camelCase", deserialize = "snake_case"))]
+#[serde(
+    default,
+    rename_all(serialize = "camelCase", deserialize = "snake_case")
+)]
 pub(crate) struct TokenSession {
     pub(crate) version: i64,
     pub(crate) session_hash: String,
@@ -508,7 +517,10 @@ pub(crate) struct TokenSession {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default, rename_all(serialize = "camelCase", deserialize = "snake_case"))]
+#[serde(
+    default,
+    rename_all(serialize = "camelCase", deserialize = "snake_case")
+)]
 pub(crate) struct TokenSummary {
     pub(crate) sessions: i64,
     pub(crate) productive_sessions: i64,
@@ -530,7 +542,10 @@ pub(crate) struct TokenSummary {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default, rename_all(serialize = "camelCase", deserialize = "snake_case"))]
+#[serde(
+    default,
+    rename_all(serialize = "camelCase", deserialize = "snake_case")
+)]
 pub(crate) struct TokenModelStat {
     pub(crate) model: String,
     pub(crate) sessions: i64,
@@ -553,7 +568,10 @@ pub(crate) struct TokenModelStat {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default, rename_all(serialize = "camelCase", deserialize = "snake_case"))]
+#[serde(
+    default,
+    rename_all(serialize = "camelCase", deserialize = "snake_case")
+)]
 pub(crate) struct TokenSubagentStat {
     pub(crate) name: String,
     pub(crate) calls: i64,
@@ -567,7 +585,10 @@ pub(crate) struct TokenSubagentStat {
 // 而 `sessions` 子命令只聚合 Claude/Codex 会话日志。
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default, rename_all(serialize = "camelCase", deserialize = "snake_case"))]
+#[serde(
+    default,
+    rename_all(serialize = "camelCase", deserialize = "snake_case")
+)]
 pub(crate) struct TokenUsageBucket {
     pub(crate) source: String,
     pub(crate) model: String,
@@ -583,7 +604,10 @@ pub(crate) struct TokenUsageBucket {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default, rename_all(serialize = "camelCase", deserialize = "snake_case"))]
+#[serde(
+    default,
+    rename_all(serialize = "camelCase", deserialize = "snake_case")
+)]
 pub(crate) struct TokenUsageReport {
     pub(crate) available: bool,
     pub(crate) buckets: Vec<TokenUsageBucket>,
@@ -591,11 +615,28 @@ pub(crate) struct TokenUsageReport {
     pub(crate) end_date: String,
 }
 
+// —— Tokentracker 本地同步状态 ——
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(
+    default,
+    rename_all(serialize = "camelCase", deserialize = "snake_case")
+)]
+pub(crate) struct TokenTrackerSyncReport {
+    pub(crate) available: bool,
+    pub(crate) changed: bool,
+    pub(crate) skipped: bool,
+    pub(crate) elapsed_ms: i64,
+    pub(crate) updated_at: String,
+    pub(crate) message: String,
+}
 
 // —— 请求/对话活动：多工具直读原始日志后的小时桶 ——
 // 对话 = 用户发起 turns；请求 = 模型 API 调用；success/failed 仅为可观测样本
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default, rename_all(serialize = "camelCase", deserialize = "snake_case"))]
+#[serde(
+    default,
+    rename_all(serialize = "camelCase", deserialize = "snake_case")
+)]
 pub(crate) struct RequestHealthBucket {
     pub(crate) hour: String,
     /// 用户发起的对话 turns（排除 tool_result / 自动触发）
@@ -609,7 +650,10 @@ pub(crate) struct RequestHealthBucket {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default, rename_all(serialize = "camelCase", deserialize = "snake_case"))]
+#[serde(
+    default,
+    rename_all(serialize = "camelCase", deserialize = "snake_case")
+)]
 pub(crate) struct RequestHealthSourceSummary {
     pub(crate) source: String,
     pub(crate) dialogues: i64,
@@ -619,7 +663,10 @@ pub(crate) struct RequestHealthSourceSummary {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default, rename_all(serialize = "camelCase", deserialize = "snake_case"))]
+#[serde(
+    default,
+    rename_all(serialize = "camelCase", deserialize = "snake_case")
+)]
 pub(crate) struct RequestHealthReport {
     pub(crate) available: bool,
     pub(crate) buckets: Vec<RequestHealthBucket>,
@@ -633,7 +680,10 @@ pub(crate) struct RequestHealthReport {
 // 请求 = 每条消息（user 或 assistant）
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default, rename_all(serialize = "camelCase", deserialize = "snake_case"))]
+#[serde(
+    default,
+    rename_all(serialize = "camelCase", deserialize = "snake_case")
+)]
 pub(crate) struct RawSession {
     pub(crate) id: String,
     pub(crate) source: String,
@@ -647,7 +697,10 @@ pub(crate) struct RawSession {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default, rename_all(serialize = "camelCase", deserialize = "snake_case"))]
+#[serde(
+    default,
+    rename_all(serialize = "camelCase", deserialize = "snake_case")
+)]
 pub(crate) struct RawConversation {
     pub(crate) id: String,
     pub(crate) session_id: String,
@@ -662,7 +715,10 @@ pub(crate) struct RawConversation {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default, rename_all(serialize = "camelCase", deserialize = "snake_case"))]
+#[serde(
+    default,
+    rename_all(serialize = "camelCase", deserialize = "snake_case")
+)]
 pub(crate) struct RawRequest {
     pub(crate) id: String,
     pub(crate) session_id: String,
@@ -679,7 +735,10 @@ pub(crate) struct RawRequest {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default, rename_all(serialize = "camelCase", deserialize = "snake_case"))]
+#[serde(
+    default,
+    rename_all(serialize = "camelCase", deserialize = "snake_case")
+)]
 pub(crate) struct RawLogReport {
     pub(crate) available: bool,
     pub(crate) sessions: Vec<RawSession>,
