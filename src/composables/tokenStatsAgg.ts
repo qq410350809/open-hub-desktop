@@ -127,9 +127,76 @@ export function bucketKeyFor(granularity: TrendGranularity, iso: string): { key:
   }
 }
 
+/** 根据顶部时间区间 + 粒度，生成完整节点（无数据也保留空节点） */
+export function buildRangeKeys(
+  from: string,
+  to: string,
+  granularity: TrendGranularity,
+): { key: string; label: string }[] {
+  if (!from || !to || from > to) return [];
+  const keys: { key: string; label: string }[] = [];
+  if (granularity === "hour") {
+    const cursor = parseLocal(from);
+    const end = parseLocal(to);
+    end.setHours(23, 0, 0, 0);
+    while (cursor.getTime() <= end.getTime()) {
+      const day = toLocalDate(cursor);
+      const hh = String(cursor.getHours()).padStart(2, "0");
+      keys.push({ key: `${day}-${hh}`, label: `${day} ${hh}:00` });
+      cursor.setHours(cursor.getHours() + 1);
+    }
+    return keys;
+  }
+  if (granularity === "month") {
+    let y = Number(from.slice(0, 4));
+    let m = Number(from.slice(5, 7));
+    const ey = Number(to.slice(0, 4));
+    const em = Number(to.slice(5, 7));
+    while (y < ey || (y === ey && m <= em)) {
+      const label = `${y}-${String(m).padStart(2, "0")}`;
+      keys.push({ key: label, label });
+      m += 1;
+      if (m > 12) {
+        m = 1;
+        y += 1;
+      }
+    }
+    return keys;
+  }
+  // day
+  const cursor = parseLocal(from);
+  const end = parseLocal(to);
+  while (cursor.getTime() <= end.getTime()) {
+    const day = toLocalDate(cursor);
+    keys.push({ key: day, label: day });
+    cursor.setDate(cursor.getDate() + 1);
+  }
+  return keys;
+}
+
+function resolveTrendSpan(
+  buckets: UsageBucketLike[],
+  from?: string,
+  to?: string,
+): { from: string; to: string } | null {
+  if (from && to) return { from, to };
+  let min = "";
+  let max = "";
+  for (const bucket of buckets) {
+    const day = localDateOf(bucket.timestamp);
+    if (!day) continue;
+    if (!min || day < min) min = day;
+    if (!max || day > max) max = day;
+  }
+  if (!min || !max) return null;
+  return { from: min, to: max };
+}
+
 export function buildTrendFromBuckets(
   buckets: UsageBucketLike[],
   granularity: TrendGranularity,
+  from?: string,
+  to?: string,
 ): { label: string; value: number }[] {
   const map = new Map<string, { label: string; value: number }>();
   for (const bucket of buckets) {
@@ -139,7 +206,12 @@ export function buildTrendFromBuckets(
     current.value += bucket.totalTokens || 0;
     map.set(key, current);
   }
-  return [...map.values()].sort((a, b) => a.label.localeCompare(b.label));
+  const span = resolveTrendSpan(buckets, from, to);
+  if (!span) return [];
+  return buildRangeKeys(span.from, span.to, granularity).map(({ key, label }) => ({
+    label,
+    value: map.get(key)?.value ?? 0,
+  }));
 }
 
 export interface TrendDetailItem {
@@ -156,6 +228,8 @@ export interface TrendDetailItem {
 export function buildTrendDetailFromBuckets(
   buckets: UsageBucketLike[],
   granularity: TrendGranularity,
+  from?: string,
+  to?: string,
 ): TrendDetailItem[] {
   const map = new Map<string, TrendDetailItem>();
   for (const bucket of buckets) {
@@ -173,7 +247,15 @@ export function buildTrendDetailFromBuckets(
     current.sessions += bucket.conversationCount || 0;
     map.set(key, current);
   }
-  return [...map.values()].sort((a, b) => a.label.localeCompare(b.label));
+  const span = resolveTrendSpan(buckets, from, to);
+  if (!span) return [];
+  return buildRangeKeys(span.from, span.to, granularity).map(({ key, label }) => {
+    const current = map.get(key);
+    return current || {
+      label,
+      total: 0, input: 0, output: 0, cache: 0, reasoning: 0, sessions: 0,
+    };
+  });
 }
 
 export function buildChartGeometry2(
@@ -352,6 +434,7 @@ export interface HealthHeatmapDay {
   rate: number | null; // 0~1，null 表示无数据
   level: number;       // 0=无数据 1=低失败 2=中 3=高 4=极高
   isFuture: boolean;
+  outOfRange?: boolean; // 周网格补齐、不在顶部区间内
 }
 export interface HealthHeatmapData {
   weeks: { days: HealthHeatmapDay[] }[];
@@ -361,6 +444,8 @@ export interface HealthHeatmapData {
   totalRequests: number;
   totalFailed: number;
   overallRate: number | null;
+  rangeDays: number;   // 顶部区间内的日历天数（含无数据日）
+  activeDays: number;  // 区间内有请求的天数
 }
 
 interface HealthInput {
@@ -380,22 +465,45 @@ export function buildHealthHeatmap(
   for (const b of buckets) {
     const day = localDateOf(b.hour);
     if (!day) continue;
-    if (from && day < from) continue;
-    if (to && day > to) continue;
     const cur = byDay.get(day) || { requests: 0, failed: 0 };
     cur.requests += (b.success || 0) + (b.failed || 0);
     cur.failed += b.failed || 0;
     byDay.set(day, cur);
   }
 
-  let start: Date;
-  if (byDay.size) {
-    start = parseLocal([...byDay.keys()].sort()[0]);
-  } else {
-    start = new Date(today);
-    start.setDate(start.getDate() - 89);
+  // 区间起止：优先顶部选择；否则用数据跨度；都没有时回退近 90 天
+  let startDay = from || "";
+  let endDay = to || "";
+  if (!startDay || !endDay) {
+    const days = [...byDay.keys()].sort();
+    if (days.length) {
+      startDay = startDay || days[0];
+      endDay = endDay || days[days.length - 1];
+    } else {
+      const d = new Date(today);
+      d.setDate(d.getDate() - 89);
+      startDay = startDay || toLocalDate(d);
+      endDay = endDay || toLocalDate(today);
+    }
   }
-  start = startOfWeek(start);
+  if (startDay > endDay) {
+    const tmp = startDay;
+    startDay = endDay;
+    endDay = tmp;
+  }
+
+  // 周网格仅用于排版：从区间起点所在周一开始，到区间终点所在周日结束
+  // 区间内无数据的日期仍会以空格子体现（level=0），不会被省略
+  let start = startOfWeek(parseLocal(startDay));
+  let end = startOfWeek(parseLocal(endDay));
+  end.setDate(end.getDate() + 6);
+
+  // 限制最多 WEEKS_CAP 周（保留最近）
+  const maxSpan = (WEEKS_CAP - 1) * 7 * 86_400_000;
+  if (end.getTime() - start.getTime() > maxSpan) {
+    start = new Date(end.getTime() - maxSpan);
+    start = startOfWeek(start);
+  }
 
   const rateOf = (requests: number, failed: number) =>
     requests > 0 ? failed / requests : null;
@@ -410,24 +518,34 @@ export function buildHealthHeatmap(
   const weeks: { days: HealthHeatmapDay[] }[] = [];
   let totalRequests = 0;
   let totalFailed = 0;
+  let rangeDays = 0;
+  let activeDays = 0;
   const cursor = new Date(start);
-  while (cursor <= today && weeks.length < WEEKS_CAP) {
+  while (cursor.getTime() <= end.getTime() && weeks.length < WEEKS_CAP) {
     const days: HealthHeatmapDay[] = [];
     for (let index = 0; index < 7; index += 1) {
       const date = toLocalDate(cursor);
+      const inRange = date >= startDay && date <= endDay;
+      const isFuture = cursor.getTime() > today.getTime();
       const agg = byDay.get(date);
-      const requests = agg?.requests ?? 0;
-      const failed = agg?.failed ?? 0;
-      const rate = rateOf(requests, failed);
-      totalRequests += requests;
-      totalFailed += failed;
+      const requests = inRange ? (agg?.requests ?? 0) : 0;
+      const failed = inRange ? (agg?.failed ?? 0) : 0;
+      const rate = inRange ? rateOf(requests, failed) : null;
+      if (inRange && !isFuture) {
+        rangeDays += 1;
+        totalRequests += requests;
+        totalFailed += failed;
+        if (requests > 0) activeDays += 1;
+      }
       days.push({
         date,
         requests,
         failed,
         rate,
-        level: levelOf(rate),
-        isFuture: cursor.getTime() > today.getTime(),
+        // 区间内无数据：level=0 灰色空格子仍然显示；区间外补齐格 / 未来日：透明
+        level: inRange && !isFuture ? levelOf(rate) : 0,
+        isFuture,          // 真正的未来日
+        outOfRange: !inRange, // 仅用于周网格补齐
       });
       cursor.setDate(cursor.getDate() + 1);
     }
@@ -438,21 +556,20 @@ export function buildHealthHeatmap(
   for (const week of weeks) {
     const label = week.days[0].date.slice(0, 7);
     const last = months[months.length - 1];
-    if (last && last.label === label) {
-      last.span += 1;
-    } else {
-      months.push({ label, span: 1 });
-    }
+    if (last && last.label === label) last.span += 1;
+    else months.push({ label, span: 1 });
   }
 
   return {
     weeks,
     months,
-    startLabel: weeks[0]?.days[0].date ?? "",
-    endLabel: toLocalDate(today),
+    startLabel: startDay,
+    endLabel: endDay,
     totalRequests,
     totalFailed,
     overallRate: rateOf(totalRequests, totalFailed),
+    rangeDays,
+    activeDays,
   };
 }
 

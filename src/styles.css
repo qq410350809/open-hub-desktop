@@ -4492,7 +4492,9 @@ kbd { padding: 3px 7px; border: 1px solid var(--line); border-radius: var(--r-xs
 :root[data-theme="dark"] .tt-heatmap-cell.lv2 { background: #991b1b; }
 :root[data-theme="dark"] .tt-heatmap-cell.lv3 { background: #dc2626; }
 :root[data-theme="dark"] .tt-heatmap-cell.lv4 { background: #fca5a5; }
-.tt-heatmap-cell.is-future { background: transparent; }
+.tt-heatmap-cell.is-empty { background: var(--oai-soft); box-shadow: inset 0 0 0 1px var(--oai-border); }
+.tt-heatmap-cell.is-out,
+.tt-heatmap-cell.is-future { background: transparent; box-shadow: none; }
 .tt-heatmap-legend {
   display: inline-flex;
   align-items: center;

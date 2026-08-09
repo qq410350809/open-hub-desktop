@@ -255,9 +255,23 @@ const projectUsage = computed<ProjectUsageItem[]>(() => {
   return [...groups.values()].sort((a, b) => b.totalTokens - a.totalTokens).slice(0, 20);
 });
 
-const trendSeries = computed(() => buildTrendFromBuckets(filteredBuckets.value, trendGranularity.value));
-// 明细列表与图表同粒度、同 key，保证一一对应
-const trendDetail = computed(() => buildTrendDetailFromBuckets(filteredBuckets.value, trendGranularity.value));
+const trendSeries = computed(() =>
+  buildTrendFromBuckets(
+    filteredBuckets.value,
+    trendGranularity.value,
+    store.tokenStatsFrom.value || undefined,
+    store.tokenStatsTo.value || undefined,
+  ),
+);
+// 明细列表与图表同粒度、同 key，保证一一对应（含空节点）
+const trendDetail = computed(() =>
+  buildTrendDetailFromBuckets(
+    filteredBuckets.value,
+    trendGranularity.value,
+    store.tokenStatsFrom.value || undefined,
+    store.tokenStatsTo.value || undefined,
+  ),
+);
 function trendUnitLabel() {
   switch (trendGranularity.value) {
     case "hour": return "逐小时";
@@ -286,8 +300,11 @@ function formatDetailTime(label: string): string {
 }
 
 // 请求健康方块 tooltip：日期 + 请求量 + 失败数 + 失败率
-function dayTitle(day: { date: string; requests: number; failed: number; rate: number | null }) {
-  const rateTxt = day.rate == null ? "无数据" : `${(day.rate * 100).toFixed(1)}%`;
+function dayTitle(day: { date: string; requests: number; failed: number; rate: number | null; isFuture?: boolean; outOfRange?: boolean }) {
+  if (day.outOfRange) return `${day.date} · 不在所选区间`;
+  if (day.isFuture) return `${day.date} · 未来日期`;
+  if (day.requests <= 0) return `${day.date} · 无请求数据`;
+  const rateTxt = day.rate == null ? "—" : `${(day.rate * 100).toFixed(1)}%`;
   return `${day.date} · ${formatTokens(day.requests)} 次请求 · 失败 ${formatTokens(day.failed)} · 失败率 ${rateTxt}`;
 }
 
@@ -484,7 +501,7 @@ onMounted(() => {
             <header class="tt-card-head">
               <div>
                 <h2>使用趋势</h2>
-                <p>TREND · 按{{ trendUnitLabel() }}罗列 · 已按时间区间自适应</p>
+                <p>TREND · 按{{ trendUnitLabel() }} · 区间完整节点 {{ trendSeries.length }} 个（无数据也保留）</p>
               </div>
               <div class="tt-head-actions">
                 <button type="button" class="tt-link-btn" @click="openDetail('daily')">明细 ▾</button>
@@ -500,7 +517,12 @@ onMounted(() => {
             <header class="tt-card-head">
               <div>
                 <h2>请求健康热力图</h2>
-                <p>HEALTH · 每日大模型请求失败率{{ healthHeatmap.overallRate != null ? " · 总体 " + (healthHeatmap.overallRate * 100).toFixed(1) + "%" : "" }}</p>
+                <p>
+                  HEALTH · {{ healthHeatmap.startLabel }} ~ {{ healthHeatmap.endLabel }}
+                  · 区间 {{ healthHeatmap.rangeDays }} 天
+                  · 有请求 {{ healthHeatmap.activeDays }} 天
+                  {{ healthHeatmap.overallRate != null ? " · 失败率 " + (healthHeatmap.overallRate * 100).toFixed(1) + "%" : "" }}
+                </p>
               </div>
             </header>
             <div class="tt-card-body tt-heatmap-wrap">
@@ -518,7 +540,11 @@ onMounted(() => {
                       class="tt-heatmap-cell"
                       :class="[
                         day.level ? 'lv' + day.level : '',
-                        { 'is-future': day.isFuture },
+                        {
+                          'is-future': day.isFuture,
+                          'is-out': day.outOfRange,
+                          'is-empty': !day.outOfRange && !day.isFuture && day.level === 0,
+                        },
                       ]"
                       :title="dayTitle(day)"
                     ></div>
