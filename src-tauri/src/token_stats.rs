@@ -236,14 +236,132 @@ pub async fn sync_token_tracker(force: Option<bool>) -> Result<TokenTrackerSyncR
     .map_err(|error| format!("Tokentracker 同步任务执行失败：{error}"))?
 }
 
+/// Tokentracker 本地读模型：queue.jsonl。
+/// Tokentracker 自己的界面读取 queue.jsonl，并按 source/model/hour_start 保留最新累计行；
+/// OpenHub 必须复用同一口径，不能只读 hourly.buckets，否则会漏掉历史修正后的 Codex 数据。
+fn queue_json_path() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from).map(|home| {
+        home.join(".tokentracker")
+            .join("tracker")
+            .join("queue.jsonl")
+    })
+}
+
 /// tokentracker 的用量原始存储：~/.tokentracker/tracker/cursors.json
-/// 仪表盘汇总数据来自其 hourly.buckets（覆盖所有工具的每小时用量）。
+/// 作为 queue.jsonl 不可用时的兼容 fallback。
 fn cursors_json_path() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from).map(|home| {
         home.join(".tokentracker")
             .join("tracker")
             .join("cursors.json")
     })
+}
+
+fn queue_number(value: &JsonValue, key: &str) -> i64 {
+    value
+        .get(key)
+        .and_then(|value| value.as_f64().or_else(|| value.as_i64().map(|n| n as f64)))
+        .map(|value| value as i64)
+        .unwrap_or(0)
+}
+
+/// 与 tokentracker local-api.normalizeQueueRow 对齐的历史兼容修正：
+/// 旧版 Codex queue 行把 cached input 包含在 input_tokens 中，
+/// 需要减掉 cached_input_tokens 才能得到纯输入 Token。
+fn normalize_queue_row(mut row: JsonValue) -> JsonValue {
+    let source = row
+        .get("source")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("")
+        .to_string();
+    let input = queue_number(&row, "input_tokens");
+    let cached = queue_number(&row, "cached_input_tokens");
+    let output = queue_number(&row, "output_tokens");
+    let total = queue_number(&row, "total_tokens");
+    let is_legacy_codex = source.eq_ignore_ascii_case("codex")
+        && cached > 0
+        && input >= cached
+        && total == input + output;
+    if is_legacy_codex {
+        if let Some(object) = row.as_object_mut() {
+            object.insert("input_tokens".to_string(), JsonValue::from(input - cached));
+        }
+    }
+    // queue rows use billable_total_tokens for the dashboard headline. Cursor
+    // sources from older versions may have written zero even though total_tokens
+    // is present; normalize them exactly as tokentracker does.
+    let total_for_billing = queue_number(&row, "total_tokens");
+    if source.eq_ignore_ascii_case("cursor")
+        && queue_number(&row, "billable_total_tokens") < total_for_billing
+    {
+        if let Some(object) = row.as_object_mut() {
+            object.insert(
+                "billable_total_tokens".to_string(),
+                JsonValue::from(total_for_billing),
+            );
+        }
+    }
+    row
+}
+
+/// 读取 Tokentracker queue.jsonl 的最新累计行。
+/// queue 是 append-only，每次同步会重新写入被触碰的累计桶，不能直接相加。
+fn read_queue_buckets() -> Result<Vec<TokenUsageBucket>, String> {
+    let path = queue_json_path().ok_or("无法定位用户目录")?;
+    let text = fs::read_to_string(&path)
+        .map_err(|error| format!("无法读取 tokentracker 队列（{}）：{error}", path.display()))?;
+    let mut latest = BTreeMap::<String, JsonValue>::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(row) = serde_json::from_str::<JsonValue>(line) else {
+            // 与 Tokentracker dashboard 一致：单条损坏/半写入行不影响其他数据。
+            continue;
+        };
+        let source = row.get("source").and_then(JsonValue::as_str).unwrap_or("");
+        let model = row.get("model").and_then(JsonValue::as_str).unwrap_or("");
+        let hour = row
+            .get("hour_start")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("");
+        if source.is_empty() || model.is_empty() || hour.is_empty() {
+            continue;
+        }
+        let key = format!("{source}|{model}|{hour}");
+        latest.insert(key, normalize_queue_row(row));
+    }
+
+    let buckets = latest
+        .into_values()
+        .map(|row| TokenUsageBucket {
+            source: row
+                .get("source")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("")
+                .to_string(),
+            model: row
+                .get("model")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("")
+                .to_string(),
+            timestamp: row
+                .get("hour_start")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("")
+                .to_string(),
+            total_tokens: queue_number(&row, "total_tokens"),
+            billable_total_tokens: queue_number(&row, "billable_total_tokens"),
+            input_tokens: queue_number(&row, "input_tokens"),
+            cached_input_tokens: queue_number(&row, "cached_input_tokens"),
+            cache_creation_input_tokens: queue_number(&row, "cache_creation_input_tokens"),
+            output_tokens: queue_number(&row, "output_tokens"),
+            reasoning_output_tokens: queue_number(&row, "reasoning_output_tokens"),
+            conversation_count: queue_number(&row, "conversation_count"),
+        })
+        .collect::<Vec<_>>();
+    Ok(buckets)
 }
 
 fn read_cursors_buckets() -> Result<Vec<TokenUsageBucket>, String> {
@@ -294,12 +412,16 @@ fn read_cursors_buckets() -> Result<Vec<TokenUsageBucket>, String> {
     Ok(out)
 }
 
-/// 读取 tokentracker 全部工具的小时用量桶（cursors.json），
-/// 供 Token 统计页做汇总/趋势/热力图/每日细目使用。
+/// 读取 tokentracker 全部工具的用量桶。
+/// 主路径复用 queue.jsonl（与 Tokentracker 自己的界面一致），
+/// cursors.json 仅作为兼容 fallback。
 #[tauri::command]
 pub async fn get_token_usage() -> Result<TokenUsageReport, String> {
     tauri::async_runtime::spawn_blocking(|| {
-        let buckets = read_cursors_buckets()?;
+        let buckets = match read_queue_buckets() {
+            Ok(buckets) if !buckets.is_empty() => buckets,
+            _ => read_cursors_buckets()?,
+        };
         let mut start_date = String::new();
         let mut end_date = String::new();
         for bucket in &buckets {
