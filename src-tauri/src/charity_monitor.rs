@@ -225,6 +225,7 @@ impl CharityNodeQueue {
     fn is_empty(&self) -> bool {
         self.nodes.is_empty()
     }
+
 }
 
 pub(crate) struct CharityMonitorRuntime {
@@ -936,6 +937,49 @@ fn update_charity_sync_log(
     );
 }
 
+/// 进行中任务心跳：刷新 duration / 文案 / 节点名，供前端看到进度跳动。
+fn touch_running_charity_sync_log(
+    database: &Database,
+    id: i64,
+    message: &str,
+    node_name: &str,
+    duration_ms: i64,
+) {
+    let Ok(connection) = database.0.lock() else {
+        return;
+    };
+    let _ = connection.execute(
+        "UPDATE charity_sync_logs
+         SET message = ?1, node_name = ?2, duration_ms = ?3
+         WHERE id = ?4 AND status = 'running'",
+        params![message, node_name, duration_ms, id],
+    );
+}
+
+fn emit_running_progress(
+    app: &AppHandle,
+    source: CharityFeedSource,
+    stage: &str,
+    message: &str,
+    node_name: &str,
+) {
+    emit_charity_progress(
+        app,
+        CharitySyncProgress {
+            feed_id: source.id.into(),
+            feed_name: source.name.into(),
+            stage: stage.into(),
+            status: "running".into(),
+            message: message.into(),
+            used_node_id: String::new(),
+            used_node_name: node_name.into(),
+            new_count: 0,
+            updated_count: 0,
+            unread_count: 0,
+        },
+    );
+}
+
 fn emit_charity_progress(app: &AppHandle, progress: CharitySyncProgress) {
     let _ = app.emit("charity-sync-progress", progress);
 }
@@ -1298,6 +1342,7 @@ fn is_charity_sync_cancelled(error: &str) -> bool {
     error.starts_with(CHARITY_SYNC_CANCELLED_PREFIX)
 }
 
+#[allow(dead_code)]
 fn finish_cancelled_feed_sync(
     app: &AppHandle,
     database: &Database,
@@ -1383,83 +1428,46 @@ async fn sync_feed_with_fast_nodes(
     shared_queue: Option<Arc<Mutex<CharityNodeQueue>>>,
     nodes_prepared: bool,
 ) -> Result<CharityFeedResult, String> {
-    let started_at = Instant::now();
+    let feed_started_at = Instant::now();
     let stage_label = if stage == "manual" {
         "手动刷新"
     } else {
         "后台轮询"
     };
-    // 每个标签每次同步只落一条日志：开始插入 running，结束时更新同一条记录。
-    let log_id = append_charity_sync_log(
-        database,
-        source.id,
-        source.name,
-        stage,
-        "running",
-        &format!("{stage_label}开始：{}", source.name),
-        "",
-    );
-    emit_charity_progress(
-        app,
-        CharitySyncProgress {
-            feed_id: source.id.into(),
-            feed_name: source.name.into(),
-            stage: stage.into(),
-            status: "running".into(),
-            message: format!("{stage_label}开始：{}", source.name),
-            used_node_id: String::new(),
-            used_node_name: String::new(),
-            new_count: 0,
-            updated_count: 0,
-            unread_count: 0,
-        },
-    );
-    let duration_ms = || started_at.elapsed().as_millis() as i64;
+    let feed_budget = || CHARITY_FEED_TIMEOUT.saturating_sub(feed_started_at.elapsed());
+    let feed_duration_ms = || feed_started_at.elapsed().as_millis() as i64;
 
     if cancellation.is_cancelled() {
-        return Err(finish_cancelled_feed_sync(
-            app,
-            database,
-            log_id,
-            source,
-            stage,
-            duration_ms(),
-        ));
+        return Err(format!("{CHARITY_SYNC_CANCELLED_PREFIX}：{}", source.name));
     }
 
-    // 代理轮询：linux.do 必须走代理，不做直连。
-    // 全局代理出口唯一，用锁把“切换+请求”串行化，避免并行标签互相覆盖出口。
+    // 代理轮询：linux.do 必须走代理。出口唯一，串行切换。
     let monitor_state = app.state::<CharityMonitorRuntime>();
     let _guard = tokio::select! {
         _ = cancellation.cancelled() => {
-            return Err(finish_cancelled_feed_sync(
-                app,
-                database,
-                log_id,
-                source,
-                stage,
-                duration_ms(),
-            ));
+            return Err(format!("{CHARITY_SYNC_CANCELLED_PREFIX}：{}", source.name));
         }
         guard = monitor_state.proxy_sync_lock.lock() => guard,
     };
 
-    // 标签级 60s 总预算：到点立即结束，避免拖成几十分钟。
-    if started_at.elapsed() >= CHARITY_FEED_TIMEOUT || cancellation.is_cancelled() {
-        return Err(finish_cancelled_feed_sync(
-            app,
-            database,
-            log_id,
-            source,
-            stage,
-            duration_ms(),
-        ));
+    if feed_budget().is_zero() || cancellation.is_cancelled() {
+        return Err(format!("{CHARITY_SYNC_CANCELLED_PREFIX}：{}", source.name));
     }
 
     let proxy_url = proxy_pool::runtime_proxy_url_pub(runtime);
     let client = match build_mihomo_client(&proxy_url) {
         Ok(client) => client,
         Err(error) => {
+            // 无可用客户端：记一条失败任务
+            let log_id = append_charity_sync_log(
+                database,
+                source.id,
+                source.name,
+                stage,
+                "running",
+                &format!("{stage_label}失败：无法初始化代理客户端"),
+                "",
+            );
             finish_charity_sync_log(
                 app,
                 database,
@@ -1469,7 +1477,7 @@ async fn sync_feed_with_fast_nodes(
                 "failed",
                 &error,
                 "",
-                duration_ms(),
+                feed_duration_ms(),
                 0,
                 0,
                 0,
@@ -1478,7 +1486,6 @@ async fn sync_feed_with_fast_nodes(
         }
     };
 
-    // 共享队列：整轮一次构建；手动单标签则本地构建。
     let queue = if let Some(shared) = shared_queue.clone() {
         shared
     } else {
@@ -1487,32 +1494,37 @@ async fn sync_feed_with_fast_nodes(
         }) {
             Ok(nodes) => nodes,
             Err(error) => {
-                finish_charity_sync_log(
-                    app,
+                let log_id = append_charity_sync_log(
                     database,
-                    log_id,
-                    source,
+                    source.id,
+                    source.name,
                     stage,
-                    "failed",
-                    &error,
+                    "running",
+                    &format!("{stage_label}失败：读取候选节点"),
                     "",
-                    duration_ms(),
-                    0,
-                    0,
-                    0,
+                );
+                finish_charity_sync_log(
+                    app, database, log_id, source, stage, "failed", &error, "", feed_duration_ms(), 0, 0, 0,
                 );
                 return Err(error);
             }
         };
         if nodes.is_empty() {
-            let mut local = tokio::task::block_in_place(|| {
+            let message =
+                format!("无 ≤{CHARITY_FAST_NODE_MAX_LATENCY_MS}ms 可用公益候选节点，本轮跳过");
+            let log_id = append_charity_sync_log(
+                database,
+                source.id,
+                source.name,
+                stage,
+                "running",
+                &format!("{stage_label}跳过：{}", source.name),
+                "",
+            );
+            let local = tokio::task::block_in_place(|| {
                 load_feed_items_from_db(database, source, 0, CHARITY_PAGE_SIZE)
             })?;
-            local.status = "skipped".into();
-            local.skipped = true;
-            local.message =
-                format!("无 ≤{CHARITY_FAST_NODE_MAX_LATENCY_MS}ms 可用公益候选节点，本轮跳过");
-            let _ = write_feed_sync_meta(database, source.id, "skipped", &local.message, "", 0);
+            let _ = write_feed_sync_meta(database, source.id, "skipped", &message, "", 0);
             finish_charity_sync_log(
                 app,
                 database,
@@ -1520,13 +1532,17 @@ async fn sync_feed_with_fast_nodes(
                 source,
                 stage,
                 "skipped",
-                &local.message,
+                &message,
                 "",
-                duration_ms(),
+                feed_duration_ms(),
                 0,
                 0,
                 local.unread_count,
             );
+            let mut local = local;
+            local.status = "skipped".into();
+            local.skipped = true;
+            local.message = message;
             return Ok(local);
         }
         if !nodes_prepared {
@@ -1535,19 +1551,17 @@ async fn sync_feed_with_fast_nodes(
                 proxy_pool::prepare_proxy_nodes_transient(database, runtime, &ids).await
             {
                 let message = format!("装载快节点失败：{error}");
-                finish_charity_sync_log(
-                    app,
+                let log_id = append_charity_sync_log(
                     database,
-                    log_id,
-                    source,
+                    source.id,
+                    source.name,
                     stage,
-                    "failed",
-                    &message,
+                    "running",
+                    &format!("{stage_label}失败：装载节点"),
                     "",
-                    duration_ms(),
-                    0,
-                    0,
-                    0,
+                );
+                finish_charity_sync_log(
+                    app, database, log_id, source, stage, "failed", &message, "", feed_duration_ms(), 0, 0, 0,
                 );
                 return Err(message);
             }
@@ -1555,101 +1569,129 @@ async fn sync_feed_with_fast_nodes(
         Arc::new(Mutex::new(CharityNodeQueue::from_nodes(nodes)))
     };
 
-    // 队列可能在其它标签失败后被掏空
-    {
-        let empty = queue
-            .lock()
-            .map(|q| q.is_empty())
-            .unwrap_or(true);
-        if empty {
-            let mut local = tokio::task::block_in_place(|| {
-                load_feed_items_from_db(database, source, 0, CHARITY_PAGE_SIZE)
-            })?;
-            local.status = "skipped".into();
-            local.skipped = true;
-            local.message = "公益候选节点队列已空，本轮跳过".into();
-            let _ = write_feed_sync_meta(database, source.id, "skipped", &local.message, "", 0);
-            finish_charity_sync_log(
-                app,
-                database,
-                log_id,
-                source,
-                stage,
-                "skipped",
-                &local.message,
-                "",
-                duration_ms(),
-                0,
-                0,
-                local.unread_count,
-            );
-            return Ok(local);
-        }
-    }
+    let mut last_error = String::new();
+    let mut attempts = 0usize;
 
-    let mut errors = Vec::new();
-    for attempt in 0..CHARITY_MAX_NODE_ATTEMPTS {
-        if cancellation.is_cancelled() || started_at.elapsed() >= CHARITY_FEED_TIMEOUT {
+    while attempts < CHARITY_MAX_NODE_ATTEMPTS {
+        if cancellation.is_cancelled() {
             let _ = proxy_pool::restore_proxy_node_transient(database, runtime).await;
-            if cancellation.is_cancelled() {
-                return Err(finish_cancelled_feed_sync(
-                    app,
-                    database,
-                    log_id,
-                    source,
-                    stage,
-                    duration_ms(),
-                ));
-            }
+            return Err(format!("{CHARITY_SYNC_CANCELLED_PREFIX}：{}", source.name));
+        }
+        if feed_budget().is_zero() {
             break;
         }
 
         let Some(node) = queue.lock().ok().and_then(|mut q| q.pop_front()) else {
             break;
         };
-        // 二次确认黑名单（其它标签可能刚 ban 掉）
         if monitor_state.is_banned(&node.id) {
             continue;
         }
+        attempts += 1;
+
+        // —— 关键：选定节点后立刻新建「进行中」任务，节点名立刻可见 ——
+        let attempt_started = Instant::now();
+        let running_msg = format!(
+            "{stage_label}进行中：{} · {}（{}ms）· 第{}次",
+            source.name, node.name, node.latency_ms, attempts
+        );
+        let log_id = append_charity_sync_log(
+            database,
+            source.id,
+            source.name,
+            stage,
+            "running",
+            &running_msg,
+            &node.name,
+        );
+        emit_running_progress(app, source, stage, &running_msg, &node.name);
 
         if let Err(error) =
             proxy_pool::select_proxy_node_transient(database, runtime, &node.id).await
         {
-            // 切换失败：短期拉黑并剔除本轮队列（不回队尾）
             monitor_state.ban_node(&node.id, CHARITY_BAN_DEFAULT);
-            errors.push(format!("{}: 切换代理失败：{error}", node.name));
-            continue;
+            let message = format!("{}: 切换代理失败：{error}", node.name);
+            let dur = attempt_started.elapsed().as_millis() as i64;
+            finish_charity_sync_log(
+                app, database, log_id, source, stage, "failed", &message, &node.name, dur, 0, 0, 0,
+            );
+            last_error = message;
+            continue; // 失败任务已结束，下一节点开新任务
         }
 
-        // 给运行时一点时间应用出口。
-        tokio::select! {
-            _ = cancellation.cancelled() => {
-                let _ = proxy_pool::restore_proxy_node_transient(database, runtime).await;
-                return Err(finish_cancelled_feed_sync(
-                    app, database, log_id, source, stage, duration_ms(),
-                ));
+        // 出口切换后短暂等待，同时心跳
+        {
+            let mut waited = Duration::from_millis(0);
+            while waited < Duration::from_millis(80) {
+                if cancellation.is_cancelled() {
+                    let dur = attempt_started.elapsed().as_millis() as i64;
+                    let message = format!("{CHARITY_SYNC_CANCELLED_PREFIX}：{}", source.name);
+                    finish_charity_sync_log(
+                        app, database, log_id, source, stage, "cancelled", &message, &node.name, dur, 0, 0, 0,
+                    );
+                    let _ = proxy_pool::restore_proxy_node_transient(database, runtime).await;
+                    return Err(message);
+                }
+                let slice = Duration::from_millis(40);
+                tokio::time::sleep(slice).await;
+                waited += slice;
+                let dur = attempt_started.elapsed().as_millis() as i64;
+                if let Some(id) = log_id {
+                    touch_running_charity_sync_log(database, id, &running_msg, &node.name, dur);
+                }
+                emit_running_progress(app, source, stage, &running_msg, &node.name);
             }
-            _ = tokio::time::sleep(Duration::from_millis(80)) => {}
         }
 
-        let remaining = CHARITY_FEED_TIMEOUT.saturating_sub(started_at.elapsed());
+        let remaining = feed_budget();
         if remaining.is_zero() {
             monitor_state.ban_node(&node.id, CHARITY_BAN_TIMEOUT);
-            errors.push(format!("{}: 标签同步超时", node.name));
+            let message = format!("{}: 标签同步超时", node.name);
+            let dur = attempt_started.elapsed().as_millis() as i64;
+            finish_charity_sync_log(
+                app, database, log_id, source, stage, "failed", &message, &node.name, dur, 0, 0, 0,
+            );
+            last_error = message;
             break;
         }
 
-        let fetch_result = tokio::select! {
-            _ = cancellation.cancelled() => {
-                let _ = proxy_pool::restore_proxy_node_transient(database, runtime).await;
-                return Err(finish_cancelled_feed_sync(
-                    app, database, log_id, source, stage, duration_ms(),
+        // 请求阶段：单次发起 fetch，并行 500ms 心跳刷新 duration/节点进度
+        let fetch_future = fetch_topic_body(app, client.clone(), source);
+        tokio::pin!(fetch_future);
+        let fetch_result = loop {
+            if cancellation.is_cancelled() {
+                break Err(format!("{CHARITY_SYNC_CANCELLED_PREFIX}：{}", source.name));
+            }
+            let left = feed_budget();
+            if left.is_zero() {
+                break Err(format!(
+                    "{}: 请求超时（标签 {}s 预算用尽）",
+                    node.name,
+                    CHARITY_FEED_TIMEOUT.as_secs()
                 ));
             }
-            _ = tokio::time::sleep(remaining) => {
-                Err(format!("{}: 请求超时（标签 60s 预算用尽）", node.name))
+            let tick = left.min(Duration::from_millis(500));
+            tokio::select! {
+                _ = cancellation.cancelled() => {
+                    break Err(format!("{CHARITY_SYNC_CANCELLED_PREFIX}：{}", source.name));
+                }
+                result = &mut fetch_future => {
+                    break result;
+                }
+                _ = tokio::time::sleep(tick) => {
+                    let dur = attempt_started.elapsed().as_millis() as i64;
+                    let msg = format!(
+                        "{stage_label}进行中：{} · {} · 已用 {:.1}s",
+                        source.name,
+                        node.name,
+                        dur as f64 / 1000.0
+                    );
+                    if let Some(id) = log_id {
+                        touch_running_charity_sync_log(database, id, &msg, &node.name, dur);
+                    }
+                    emit_running_progress(app, source, stage, &msg, &node.name);
+                }
             }
-            result = fetch_topic_body(app, client.clone(), source) => result.map_err(|e| e),
         };
 
         match fetch_result {
@@ -1660,7 +1702,6 @@ async fn sync_feed_with_fast_nodes(
                     });
                     match persist_result {
                         Ok(mut result) => {
-                            // 成功：节点回队尾，供后续标签复用（粘性轮转）。
                             if let Ok(mut q) = queue.lock() {
                                 q.push_back(node.clone());
                             }
@@ -1669,9 +1710,7 @@ async fn sync_feed_with_fast_nodes(
                             result.status = "success".into();
                             result.message = format!(
                                 "已通过 {}（{}ms，第{}次尝试）同步",
-                                node.name,
-                                node.latency_ms,
-                                attempt + 1
+                                node.name, node.latency_ms, attempts
                             );
                             let _ = write_feed_sync_meta(
                                 database,
@@ -1681,8 +1720,8 @@ async fn sync_feed_with_fast_nodes(
                                 &node.name,
                                 result.updated_count + result.new_count,
                             );
-                            let _ =
-                                proxy_pool::restore_proxy_node_transient(database, runtime).await;
+                            let _ = proxy_pool::restore_proxy_node_transient(database, runtime).await;
+                            let dur = attempt_started.elapsed().as_millis() as i64;
                             finish_charity_sync_log(
                                 app,
                                 database,
@@ -1692,7 +1731,7 @@ async fn sync_feed_with_fast_nodes(
                                 "success",
                                 &result.message,
                                 &node.name,
-                                duration_ms(),
+                                dur,
                                 result.new_count,
                                 result.updated_count,
                                 result.unread_count,
@@ -1700,26 +1739,52 @@ async fn sync_feed_with_fast_nodes(
                             return Ok(result);
                         }
                         Err(error) => {
-                            // 入库失败通常不是节点问题，放回队列尾部再试其它路径意义有限，记错后继续。
+                            // 入库失败：节点未必坏，回队尾；本任务标失败，再开新任务
                             if let Ok(mut q) = queue.lock() {
                                 q.push_back(node.clone());
                             }
-                            errors.push(format!("{}: 入库失败：{error}", node.name));
+                            let message = format!("{}: 入库失败：{error}", node.name);
+                            let dur = attempt_started.elapsed().as_millis() as i64;
+                            finish_charity_sync_log(
+                                app, database, log_id, source, stage, "failed", &message, &node.name, dur, 0, 0, 0,
+                            );
+                            last_error = message;
                         }
                     }
                 }
                 Err(error) => {
-                    // 解析失败也可能是脏响应，按失败拉黑本轮。
                     monitor_state.ban_node(&node.id, ban_ttl_for_error(&error));
-                    errors.push(format!("{}: {error}", node.name));
+                    let message = format!("{}: {error}", node.name);
+                    let dur = attempt_started.elapsed().as_millis() as i64;
+                    finish_charity_sync_log(
+                        app, database, log_id, source, stage, "failed", &message, &node.name, dur, 0, 0, 0,
+                    );
+                    last_error = message;
                 }
             },
             Err(error) => {
-                // 超时/403/网络错误：剔除公益候选（短 TTL 黑名单），不回队尾，不删代理池。
-                monitor_state.ban_node(&node.id, ban_ttl_for_error(&error));
-                errors.push(format!("{}: {error}", node.name));
+                let cancelled = is_charity_sync_cancelled(&error);
+                if !cancelled {
+                    monitor_state.ban_node(&node.id, ban_ttl_for_error(&error));
+                }
+                let message = if error.contains(':') {
+                    error
+                } else {
+                    format!("{}: {error}", node.name)
+                };
+                let dur = attempt_started.elapsed().as_millis() as i64;
+                let status = if cancelled { "cancelled" } else { "failed" };
+                finish_charity_sync_log(
+                    app, database, log_id, source, stage, status, &message, &node.name, dur, 0, 0, 0,
+                );
+                if cancelled {
+                    let _ = proxy_pool::restore_proxy_node_transient(database, runtime).await;
+                    return Err(message);
+                }
+                last_error = message;
             }
         }
+        // 失败已完结；循环继续 = 自动起新任务试下一节点
     }
 
     let _ = proxy_pool::restore_proxy_node_transient(database, runtime).await;
@@ -1749,49 +1814,27 @@ async fn sync_feed_with_fast_nodes(
         has_more: false,
     });
     local.status = "error".into();
-    let timeout_hit = started_at.elapsed() >= CHARITY_FEED_TIMEOUT;
-    local.message = if timeout_hit {
+    local.message = if feed_budget().is_zero() {
         format!(
-            "{} 同步超时（{}s 预算）：{}",
+            "{} 同步超时（{}s）：{}",
             source.name,
             CHARITY_FEED_TIMEOUT.as_secs(),
-            errors
-                .last()
-                .cloned()
-                .unwrap_or_else(|| "候选节点均未在时限内成功".into())
+            if last_error.is_empty() {
+                "候选节点均未在时限内成功".into()
+            } else {
+                last_error.clone()
+            }
+        )
+    } else if last_error.is_empty() {
+        format!(
+            "{} 同步失败：≤{}ms 候选节点均不可用",
+            source.name, CHARITY_FAST_NODE_MAX_LATENCY_MS
         )
     } else {
-        errors.last().cloned().unwrap_or_else(|| {
-            format!(
-                "{} 同步失败：≤{}ms 候选节点均不可用",
-                source.name, CHARITY_FAST_NODE_MAX_LATENCY_MS
-            )
-        })
+        last_error
     };
-    let last_node = errors
-        .iter()
-        .rev()
-        .find_map(|error| {
-            error
-                .split_once(':')
-                .map(|(node, _)| node.trim().to_string())
-        })
-        .unwrap_or_default();
     let _ = write_feed_sync_meta(database, source.id, "error", &local.message, "", 0);
-    finish_charity_sync_log(
-        app,
-        database,
-        log_id,
-        source,
-        stage,
-        "failed",
-        &local.message,
-        &last_node,
-        duration_ms(),
-        0,
-        0,
-        local.unread_count,
-    );
+    // 各节点失败已分别记日志；这里不再追加空节点总失败行，避免“节点—”污染。
     Err(local.message.clone())
 }
 

@@ -1363,6 +1363,18 @@ kbd { padding: 3px 7px; border: 1px solid var(--line); border-radius: var(--r-xs
   text-align: right;
   font-weight: 650;
 }
+.charity-sync-log-list .log-duration.is-live {
+  color: var(--brand-deep);
+  font-variant-numeric: tabular-nums;
+}
+.charity-sync-log-list li.is-running {
+  border-color: color-mix(in srgb, var(--brand) 35%, var(--line));
+  background: color-mix(in srgb, var(--brand-soft) 35%, var(--surface));
+}
+.charity-sync-log-list li.is-running .log-node {
+  color: var(--brand-deep);
+  font-weight: 650;
+}
 
 .charity-monitor-error {
   margin: 4px 0 16px;

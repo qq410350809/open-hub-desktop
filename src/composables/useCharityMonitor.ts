@@ -48,6 +48,16 @@ let started = false;
 let loadSeq = 0;
 let reloadTimer: number | null = null;
 let manualSyncing = false;
+let syncLogReloadTimer: number | null = null;
+
+function scheduleSyncLogReload() {
+  if (!syncLogOpen.value) return;
+  if (syncLogReloadTimer != null) return;
+  syncLogReloadTimer = window.setTimeout(() => {
+    syncLogReloadTimer = null;
+    void loadCharitySyncLogs();
+  }, 400);
+}
 
 function tagMeta(feedId: string) {
   return charityTags.value.find((tag) => tag.id === feedId) ?? { id: feedId, name: feedId };
@@ -228,9 +238,29 @@ async function ensureEventBridge() {
   if (!isTauri || eventUnlisten) return;
   try {
     eventUnlisten = await listen<CharitySyncProgress>("charity-sync-progress", ({ payload }) => {
-      // 同步过程只写后端日志；弹窗打开时刷新日志，主界面不展示“同步中”
-      if (syncLogOpen.value) {
-        void loadCharitySyncLogs();
+      // running：先本地补丁节点名/文案，再拉库，保证“节点立刻显示、耗时持续刷新”
+      if (payload.status === "running" && syncLogOpen.value) {
+        const node = payload.usedNodeName || "";
+        const rows = syncLog.value.slice();
+        let hit = false;
+        for (let i = 0; i < rows.length; i++) {
+          const row = rows[i];
+          if (row.status === "running" && row.feedId === payload.feedId) {
+            rows[i] = {
+              ...row,
+              message: payload.message || row.message,
+              nodeName: node || row.nodeName,
+              stage: payload.stage || row.stage,
+            };
+            hit = true;
+            break;
+          }
+        }
+        if (hit) syncLog.value = rows;
+        // 节流拉库：仍定期对齐真实 id/多任务列表
+        scheduleSyncLogReload();
+      } else if (syncLogOpen.value) {
+        scheduleSyncLogReload();
       }
       if (payload.status !== "running") {
         scheduleLocalReload(payload.feedId);

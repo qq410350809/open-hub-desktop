@@ -1,9 +1,39 @@
 <script setup lang="ts">
-import { computed, onMounted } from "vue";
+import { computed, onMounted, onUnmounted, ref } from "vue";
 import { icons } from "../icons";
 import { useStore } from "../composables/useStore";
 
 const store = useStore();
+
+/** 进行中任务耗时前端本地跳动（不依赖后端每秒写库）。 */
+const nowTick = ref(Date.now());
+let tickTimer: number | null = null;
+
+function ensureTickTimer() {
+  const hasRunning = store.charitySyncLog.value.some((e) => e.status === "running");
+  if (hasRunning && tickTimer == null) {
+    tickTimer = window.setInterval(() => {
+      nowTick.value = Date.now();
+    }, 250);
+  } else if (!hasRunning && tickTimer != null) {
+    window.clearInterval(tickTimer);
+    tickTimer = null;
+  }
+}
+
+function liveDurationMs(entry: { status: string; at: string; durationMs?: number | null }) {
+  if (entry.status !== "running") {
+    return entry.durationMs ?? 0;
+  }
+  // 触发依赖 nowTick，使 running 行每 250ms 重算
+  void nowTick.value;
+  const raw = entry.at || "";
+  const normalized = raw.includes("T") ? raw : raw.replace(" ", "T");
+  const withZone = /Z$|[+-]\d{2}:?\d{2}$/.test(normalized) ? normalized : `${normalized}Z`;
+  const started = new Date(withZone).getTime();
+  if (!Number.isFinite(started)) return entry.durationMs ?? 0;
+  return Math.max(0, Date.now() - started);
+}
 
 const sourceLabel = computed(() => {
   if (store.charityFeedUsedNodeName.value) return store.charityFeedUsedNodeName.value;
@@ -152,6 +182,18 @@ onMounted(() => {
   window.setTimeout(() => {
     void store.markCharityFeedRead();
   }, 400);
+  // 日志弹窗打开时保持 tick，让 running 耗时跳动
+  tickTimer = window.setInterval(() => {
+    nowTick.value = Date.now();
+    ensureTickTimer();
+  }, 250);
+});
+
+onUnmounted(() => {
+  if (tickTimer != null) {
+    window.clearInterval(tickTimer);
+    tickTimer = null;
+  }
 });
 </script>
 
@@ -415,8 +457,10 @@ onMounted(() => {
                   <i>{{ stageText(entry.stage) }}</i>
                   <em>{{ statusText(entry.status) }}</em>
                 </span>
-                <span class="log-node">{{ entry.nodeName || "—" }}</span>
-                <span class="log-duration">{{ formatDuration(entry.durationMs) }}</span>
+                <span class="log-node">{{ entry.nodeName || "排队/切换中…" }}</span>
+                <span class="log-duration" :class="{ 'is-live': entry.status === 'running' }">
+                  {{ formatDuration(liveDurationMs(entry)) }}
+                </span>
               </li>
             </ol>
           </div>
