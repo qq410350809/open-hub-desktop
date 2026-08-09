@@ -4594,17 +4594,17 @@ kbd { padding: 3px 7px; border: 1px solid var(--line); border-radius: var(--r-xs
   box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--oai-border) 55%, transparent);
   opacity: .45;
 }
-.tt-health-cell.lv0 { background: #3f3f46; }
-.tt-health-cell.lv1 { background: #ef4444; } /* 不健康 */
-.tt-health-cell.lv2 { background: #f97316; }
-.tt-health-cell.lv3 { background: #eab308; }
-.tt-health-cell.lv4 { background: #84cc16; }
-.tt-health-cell.lv5 { background: #22c55e; } /* 健康 */
+.tt-health-cell.lv0 { background: #3f3f46; } /* 无数据 */
+.tt-health-cell.lv1 { background: #ef4444; } /* <70% 严重 */
+.tt-health-cell.lv2 { background: #f97316; } /* 70~85% 较差 */
+.tt-health-cell.lv3 { background: #eab308; } /* 85~95% 亚健康 */
+.tt-health-cell.lv4 { background: #a3e635; } /* 95~99% 轻微 */
+.tt-health-cell.lv5 { background: #22c55e; } /* ≥99% 健康 */
 :root:not([data-theme="dark"]) .tt-health-cell.lv0 { background: #d4d4d8; }
 :root:not([data-theme="dark"]) .tt-health-cell.lv1 { background: #ef4444; }
 :root:not([data-theme="dark"]) .tt-health-cell.lv2 { background: #f97316; }
-:root:not([data-theme="dark"]) .tt-health-cell.lv3 { background: #eab308; }
-:root:not([data-theme="dark"]) .tt-health-cell.lv4 { background: #84cc16; }
+:root:not([data-theme="dark"]) .tt-health-cell.lv3 { background: #ca8a04; }
+:root:not([data-theme="dark"]) .tt-health-cell.lv4 { background: #65a30d; }
 :root:not([data-theme="dark"]) .tt-health-cell.lv5 { background: #16a34a; }
 .tt-health-legend {
   margin-top: 8px;

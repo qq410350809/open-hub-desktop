@@ -518,36 +518,50 @@ interface HealthInput {
   failed: number;
 }
 
-/** 成功率/失败数 → 色阶：0 无活动；1 红(不健康) … 5 绿(健康) */
+/**
+ * 请求健康色阶（以失败率为主，绝对失败数为辅）：
+ * 0 无活动
+ * 1 红  严重（成功率 < 70%，或只有失败）
+ * 2 橙  较差（70% ~ 85%）
+ * 3 黄  亚健康（85% ~ 95%）
+ * 4 浅绿 轻微异常（95% ~ 99%，或成功率很高但仍有失败）
+ * 5 绿  健康（≥ 99%，且失败可忽略）
+ *
+ * 不再用「失败次数 ≥ N 就标红」——否则 100 次请求里 9 次失败（91%）会被误判成全红。
+ */
 export function healthLevelOf(
   successRate: number | null,
-  hasRequests = true,
+  hasActivity = true,
   failed = 0,
+  requests = 0,
 ): number {
   const failedCount = Math.max(0, Number(failed || 0));
-  // 无请求也无失败 → 空档
-  if (!hasRequests && failedCount <= 0) return 0;
-  // 仅有失败样本（请求未记上）→ 直接不健康，避免被画成“无数据”
-  if (!hasRequests && failedCount > 0) return 1;
-  // 有请求但没有成功率样本：无失败按健康；有失败按失败强度
-  if (successRate == null) {
-    if (failedCount <= 0) return 5;
-    if (failedCount >= 5) return 1;
-    if (failedCount >= 3) return 2;
-    if (failedCount >= 2) return 3;
-    return 4;
-  }
-  // 有明确失败时，不允许显示最健康绿，避免“9 次失败仍接近全绿”
-  if (failedCount > 0) {
-    if (successRate < 0.5 || failedCount >= 8) return 1;
-    if (successRate < 0.75 || failedCount >= 4) return 2;
-    if (successRate < 0.9 || failedCount >= 2) return 3;
-    return 4;
-  }
-  if (successRate < 0.5) return 1;
-  if (successRate < 0.7) return 2;
-  if (successRate < 0.85) return 3;
-  if (successRate < 0.95) return 4;
+  const requestCount = Math.max(0, Number(requests || 0));
+  const active = hasActivity || requestCount > 0 || failedCount > 0;
+
+  if (!active) return 0;
+
+  // 只有失败、没有请求样本：视为该时段请求全部失败
+  if (requestCount <= 0 && failedCount > 0) return 1;
+  if (requestCount <= 0) return failedCount > 0 ? 1 : 0;
+
+  // 统一用失败率；若外部没给 successRate，则按 failed/requests 推
+  let rate =
+    successRate == null
+      ? Math.max(0, Math.min(1, (requestCount - Math.min(failedCount, requestCount)) / requestCount))
+      : Math.max(0, Math.min(1, successRate));
+
+  // 无失败 → 健康
+  if (failedCount <= 0) return 5;
+
+  // 有失败时按成功率分档（SLO 直觉）
+  if (rate < 0.7) return 1;   // 严重：超过三成失败
+  if (rate < 0.85) return 2;  // 较差
+  if (rate < 0.95) return 3;  // 亚健康：5%~15% 失败
+  if (rate < 0.99) return 4;  // 轻微：1%~5% 失败
+
+  // ≥ 99%：通常仍算健康；若失败绝对数很大（高流量毛刺）降一档提示
+  if (failedCount >= 20) return 4;
   return 5;
 }
 
@@ -713,7 +727,7 @@ export function buildHealthTimeline(
       requests,
       usageRequests,
       successRate,
-      level: healthLevelOf(successRate, requests > 0 || failed > 0, failed),
+      level: healthLevelOf(successRate, requests > 0 || failed > 0, failed, requests),
     };
   });
 

@@ -451,7 +451,7 @@ const healthDisplayCells = computed<HealthDisplayCell[]>(() => {
         failed,
         requests,
         successRate,
-        level: healthLevelOf(successRate, requests > 0 || failed > 0, failed),
+        level: healthLevelOf(successRate, requests > 0 || failed > 0, failed, requests),
         pad: false,
       };
     });
@@ -731,7 +731,7 @@ onBeforeUnmount(() => {
             <header class="tt-card-head tt-health-head">
               <div>
                 <h2>请求健康时间线</h2>
-                <p>对话=用户发起；请求=多工具 API 调用；有失败会降色（用户取消不计失败）。</p>
+                <p>色阶按成功率：≥99% 绿 · 95–99% 浅绿 · 85–95% 黄 · 70–85% 橙 · &lt;70% 红（用户取消不计失败）。</p>
               </div>
               <div class="tt-health-summary">
                 <div class="tt-health-rate-label">成功率</div>
@@ -763,13 +763,13 @@ onBeforeUnmount(() => {
                   ></div>
                 </div>
                 <div class="tt-health-legend">
-                  <span>不健康</span>
-                  <span class="tt-health-cell lv1"></span>
-                  <span class="tt-health-cell lv2"></span>
-                  <span class="tt-health-cell lv3"></span>
-                  <span class="tt-health-cell lv4"></span>
-                  <span class="tt-health-cell lv5"></span>
-                  <span>健康</span>
+                  <span>差</span>
+                  <span class="tt-health-cell lv1" title="成功率 &lt; 70%"></span>
+                  <span class="tt-health-cell lv2" title="70% ~ 85%"></span>
+                  <span class="tt-health-cell lv3" title="85% ~ 95%"></span>
+                  <span class="tt-health-cell lv4" title="95% ~ 99%"></span>
+                  <span class="tt-health-cell lv5" title="≥ 99%"></span>
+                  <span>优</span>
                   <span class="tt-health-cell lv0"></span>
                   <span>无数据</span>
                   <span class="tt-health-meta">
