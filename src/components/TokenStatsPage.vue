@@ -312,9 +312,12 @@ function healthCellTitle(cell: {
   pad?: boolean;
 }) {
   if (!cell.label) return "—";
-  if (cell.requests <= 0) return `${cell.label} · 无请求数据`;
-  const rateTxt = cell.successRate == null ? "—" : `${(cell.successRate * 100).toFixed(1)}%`;
-  return `${cell.label} · 成功 ${formatTokens(cell.success)} · 失败 ${formatTokens(cell.failed)} · 成功率 ${rateTxt}`;
+  if (cell.requests <= 0) return `${cell.label} · 无请求`;
+  const rateTxt = cell.successRate == null ? "样本不足" : `${(cell.successRate * 100).toFixed(1)}%`;
+  const failPart = cell.success + cell.failed > 0
+    ? ` · 成功 ${formatTokens(cell.success)} · 失败 ${formatTokens(cell.failed)} · 成功率 ${rateTxt}`
+    : ` · 成功率 ${rateTxt}`;
+  return `${cell.label} · 请求 ${formatTokens(cell.requests)}${failPart}`;
 }
 
 // —— 请求健康时间线：与左侧趋势同粒度完整节点 ——
@@ -324,6 +327,11 @@ const healthTimeline = computed(() =>
     trendGranularity.value,
     store.tokenStatsFrom.value || undefined,
     store.tokenStatsTo.value || undefined,
+    // 用全量 usage（含区间外）作为请求活跃度底图，避免大量误显示“无数据”
+    (store.tokenUsage.value?.buckets ?? []).map((b) => ({
+      timestamp: b.timestamp,
+      requests: b.conversationCount || 0,
+    })),
   ),
 );
 
@@ -360,13 +368,20 @@ type HealthDisplayCell = {
 // 若节点过多则只保留末尾 capacity 个（仍保证选中区间的最后部分在网格末端）
 // 全量健康桶按当前粒度聚合（含所选区间之外），供前置补全取值
 const healthBucketMap = computed(() => {
-  const map = new Map<string, { success: number; failed: number }>();
+  const map = new Map<string, { success: number; failed: number; usage: number }>();
   for (const b of store.requestHealth.value?.buckets ?? []) {
     const { key } = bucketKeyFor(trendGranularity.value, b.hour);
     if (!key) continue;
-    const cur = map.get(key) || { success: 0, failed: 0 };
+    const cur = map.get(key) || { success: 0, failed: 0, usage: 0 };
     cur.success += b.success || 0;
     cur.failed += b.failed || 0;
+    map.set(key, cur);
+  }
+  for (const b of store.tokenUsage.value?.buckets ?? []) {
+    const { key } = bucketKeyFor(trendGranularity.value, b.timestamp);
+    if (!key) continue;
+    const cur = map.get(key) || { success: 0, failed: 0, usage: 0 };
+    cur.usage += b.conversationCount || 0;
     map.set(key, cur);
   }
   return map;
@@ -391,8 +406,10 @@ const healthDisplayCells = computed<HealthDisplayCell[]>(() => {
       const hit = map.get(p.key);
       const success = hit?.success ?? 0;
       const failed = hit?.failed ?? 0;
-      const requests = success + failed;
-      const successRate = requests > 0 ? success / requests : null;
+      const healthRequests = success + failed;
+      const usageRequests = hit?.usage ?? 0;
+      const requests = usageRequests > 0 ? usageRequests : healthRequests;
+      const successRate = healthRequests > 0 ? success / healthRequests : null;
       return {
         key: `pre-${p.key}`,
         label: p.label,
@@ -400,8 +417,8 @@ const healthDisplayCells = computed<HealthDisplayCell[]>(() => {
         failed,
         requests,
         successRate,
-        level: healthLevelOf(successRate),
-        pad: false, // 有具体时间的补全节点按普通节点展示
+        level: healthLevelOf(successRate, requests > 0),
+        pad: false,
       };
     });
     const lack = padCount - mapped.length;

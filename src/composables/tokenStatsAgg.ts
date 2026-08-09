@@ -488,9 +488,10 @@ export interface HealthTimelineCell {
   label: string;
   success: number;
   failed: number;
-  requests: number;
-  successRate: number | null; // 0~1，null=无数据
-  level: number; // 0=无数据 1=很差 2=差 3=中 4=好 5=很好
+  requests: number;          // 展示用请求量：优先 usage 对话/请求量，其次 success+failed
+  usageRequests: number;     // token usage 侧请求/对话量
+  successRate: number | null; // 0~1，null=无健康样本
+  level: number; // 0=无请求 1=很差 2=差 3=中 4=好 5=很好/默认健康
 }
 
 export interface HealthTimelineData {
@@ -511,9 +512,11 @@ interface HealthInput {
   failed: number;
 }
 
-/** 成功率 → 色阶：0 无数据；1 红(不健康) … 5 绿(健康) */
-export function healthLevelOf(successRate: number | null): number {
-  if (successRate == null) return 0;
+/** 成功率 → 色阶：0 无请求；1 红(不健康) … 5 绿(健康) */
+export function healthLevelOf(successRate: number | null, hasRequests = true): number {
+  if (!hasRequests) return 0;
+  // 有请求但没有失败样本时，按健康展示（避免大量误报“无数据”）
+  if (successRate == null) return 5;
   if (successRate < 0.5) return 1;
   if (successRate < 0.7) return 2;
   if (successRate < 0.85) return 3;
@@ -521,39 +524,57 @@ export function healthLevelOf(successRate: number | null): number {
   return 5;
 }
 
+export interface HealthUsageInput {
+  timestamp: string;
+  requests?: number; // conversationCount / request count
+}
+
 /**
  * 按趋势粒度生成与左侧图表一一对应的完整节点。
- * 无请求数据的节点仍保留（level=0 深灰空位）。
+ * - 请求量优先取 token usage（全工具）
+ * - 成功/失败取 request health（目前主要来自 Codex task 事件）
+ * - 有请求但无失败样本 => 视为健康，不再显示“无数据”
  */
 export function buildHealthTimeline(
   buckets: HealthInput[],
   granularity: TrendGranularity,
   from?: string,
   to?: string,
+  usageBuckets: HealthUsageInput[] = [],
 ): HealthTimelineData {
-  // 先按粒度聚合成功/失败
-  const map = new Map<string, { label: string; success: number; failed: number }>();
+  // health: success/failed
+  const healthMap = new Map<string, { label: string; success: number; failed: number }>();
   for (const b of buckets) {
     const { key, label } = bucketKeyFor(granularity, b.hour);
     if (!key) continue;
-    const cur = map.get(key) || { label, success: 0, failed: 0 };
+    const cur = healthMap.get(key) || { label, success: 0, failed: 0 };
     cur.success += b.success || 0;
     cur.failed += b.failed || 0;
-    map.set(key, cur);
+    healthMap.set(key, cur);
   }
 
-  // 区间：优先顶部选择；否则用健康数据跨度
+  // usage activity: requests/conversations
+  const usageMap = new Map<string, number>();
+  for (const b of usageBuckets) {
+    const { key } = bucketKeyFor(granularity, b.timestamp);
+    if (!key) continue;
+    usageMap.set(key, (usageMap.get(key) || 0) + (b.requests || 0));
+  }
+
+  // 区间：优先顶部选择；否则取 usage/health 并集跨度
   let startDay = from || "";
   let endDay = to || "";
   if (!startDay || !endDay) {
     let min = "";
     let max = "";
-    for (const b of buckets) {
-      const day = localDateOf(b.hour);
-      if (!day) continue;
+    const consider = (iso: string) => {
+      const day = localDateOf(iso);
+      if (!day) return;
       if (!min || day < min) min = day;
       if (!max || day > max) max = day;
-    }
+    };
+    for (const b of usageBuckets) consider(b.timestamp);
+    for (const b of buckets) consider(b.hour);
     if (min && max) {
       startDay = startDay || min;
       endDay = endDay || max;
@@ -581,30 +602,34 @@ export function buildHealthTimeline(
   const keys = buildRangeKeys(startDay, endDay, granularity);
   let totalSuccess = 0;
   let totalFailed = 0;
+  let totalRequests = 0;
   let activeCount = 0;
   const cells: HealthTimelineCell[] = keys.map(({ key, label }) => {
-    const hit = map.get(key);
-    const success = hit?.success ?? 0;
-    const failed = hit?.failed ?? 0;
-    const requests = success + failed;
-    const successRate = requests > 0 ? success / requests : null;
-    if (requests > 0) {
-      totalSuccess += success;
-      totalFailed += failed;
-      activeCount += 1;
-    }
+    const health = healthMap.get(key);
+    const success = health?.success ?? 0;
+    const failed = health?.failed ?? 0;
+    const healthRequests = success + failed;
+    const usageRequests = usageMap.get(key) || 0;
+    // 展示请求量：usage 优先（覆盖全工具）；没有 usage 时回退 health
+    const requests = usageRequests > 0 ? usageRequests : healthRequests;
+    const successRate = healthRequests > 0 ? success / healthRequests : null;
+    if (requests > 0) activeCount += 1;
+    totalSuccess += success;
+    totalFailed += failed;
+    totalRequests += requests;
     return {
       key,
       label,
       success,
       failed,
       requests,
+      usageRequests,
       successRate,
-      level: healthLevelOf(successRate),
+      level: healthLevelOf(successRate, requests > 0),
     };
   });
 
-  const totalRequests = totalSuccess + totalFailed;
+  const healthTotal = totalSuccess + totalFailed;
   return {
     cells,
     startLabel: startDay,
@@ -612,7 +637,7 @@ export function buildHealthTimeline(
     totalSuccess,
     totalFailed,
     totalRequests,
-    successRate: totalRequests > 0 ? totalSuccess / totalRequests : null,
+    successRate: healthTotal > 0 ? totalSuccess / healthTotal : null,
     nodeCount: cells.length,
     activeCount,
   };
