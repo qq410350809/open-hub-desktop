@@ -243,7 +243,7 @@ async function ensureEventBridge() {
 }
 
 function requestCharityRound() {
-  // 主动请求后台立即执行一轮同步（打开应用 / 回到前台）
+  // 仅显式临时触发（立即刷新按钮 / 调试），不在打开应用或回前台时自动跑。
   void runCommand("request_charity_round").catch(() => undefined);
 }
 
@@ -251,10 +251,10 @@ function onVisibilityChange() {
   const visible = document.visibilityState === "visible";
   void runCommand("set_charity_monitor_visible", { visible }).catch(() => undefined);
   if (visible) {
+    // 回前台只刷新本地展示，不触发同步；定时由后端每 5 分钟对齐点负责。
     scheduleLocalReload(selectedTagId.value);
     void refreshUnreadTotal();
     if (syncLogOpen.value) void loadCharitySyncLogs();
-    requestCharityRound();
   }
 }
 
@@ -267,8 +267,7 @@ async function startCharityMonitor() {
   void runCommand("set_charity_monitor_visible", { visible }).catch(() => undefined);
   void queryLocalFeed(selectedTagId.value, 0, false);
   void refreshUnreadTotal();
-  // 打开应用即触发一轮同步（后台循环在 force_round 时即使隐藏也会执行）
-  requestCharityRound();
+  // 不在启动时 request_charity_round：定时 = 每 5 分钟整点秒；临时 = 按钮。
 }
 
 function stopCharityMonitor() {

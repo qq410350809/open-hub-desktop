@@ -161,7 +161,7 @@ onMounted(() => {
       <div>
         <span class="charity-monitor-eyebrow">LINUX.DO · {{ selectedLabel }}</span>
         <h1>公益监听 · {{ selectedLabel }}</h1>
-        <p>界面只读本地库。后台定时同步过程请点“同步日志”查看。</p>
+        <p>界面只读本地库。定时同步：每 5 分钟（:00/:05/:10… 秒 00）；临时同步点“立即刷新全部”。过程见“同步日志”。</p>
       </div>
       <div class="charity-header-actions">
         <div class="charity-tag-picker">
@@ -190,7 +190,7 @@ onMounted(() => {
           class="secondary-button charity-refresh-button"
           type="button"
           :disabled="store.charityFeedRefreshAllBusy.value"
-          title="取消全部未完成历史任务，并立即刷新所有标签"
+          title="临时触发：取消未完成任务并立即同步全部标签（定时仍为每 5 分钟对齐点）"
           @click="store.refreshCharityFeed()"
         >
           <span

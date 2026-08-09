@@ -188,8 +188,11 @@ const CHARITY_BAN_FORBIDDEN: Duration = Duration::from_secs(2 * 60 * 60);
 /// 其它失败默认拉黑。
 const CHARITY_BAN_DEFAULT: Duration = Duration::from_secs(15 * 60);
 const CHARITY_PAGE_SIZE: usize = 20;
-const CHARITY_POLL_INTERVAL: Duration = Duration::from_secs(5 * 60);
-const CHARITY_HIDDEN_POLL_INTERVAL: Duration = Duration::from_secs(15 * 60);
+/// 定时触发：每 5 分钟一次，对齐到本地时区「分钟为 5 的整数倍、秒为 00」
+/// 例如 12:00:00 / 12:05:00 / 12:10:00 …
+const CHARITY_SCHEDULE_EVERY_MINUTES: u32 = 5;
+/// 调度循环最小检查间隔，避免空转。
+const CHARITY_SCHEDULER_TICK: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone)]
 struct CharityNodeRef {
@@ -296,12 +299,12 @@ impl CharityMonitorRuntime {
     }
 
     pub(crate) fn set_visible(&self, visible: bool) {
-        // 仅记录可见性，用于前台 5 分钟 / 后台 15 分钟降频。
+        // 仅记录前台可见性（UI/诊断用）；定时触发不再依赖可见性。
         self.visible.store(visible, Ordering::Relaxed);
     }
 
     pub(crate) fn request_round(&self) {
-        // 打开应用或回到前台时请求立刻补一轮；由调度循环消费。
+        // 仅由“立即刷新”等显式按钮触发临时同步；调度循环消费 force_round。
         self.force_round.store(true, Ordering::Relaxed);
     }
 
@@ -1980,6 +1983,71 @@ pub async fn refresh_all_charity_feeds(
     })
 }
 
+
+/// 读取本地时分秒（macOS/Linux 用 /bin/date；失败时退回 UTC 近似，保证调度不中断）。
+fn local_hms() -> (u32, u32, u32) {
+    if let Ok(output) = std::process::Command::new("/bin/date")
+        .arg("+%H:%M:%S")
+        .output()
+    {
+        if output.status.success() {
+            let text = String::from_utf8_lossy(&output.stdout);
+            let parts = text.trim().split(':').collect::<Vec<_>>();
+            if parts.len() == 3 {
+                if let (Ok(h), Ok(m), Ok(s)) = (
+                    parts[0].parse::<u32>(),
+                    parts[1].parse::<u32>(),
+                    parts[2].parse::<u32>(),
+                ) {
+                    if h < 24 && m < 60 && s < 60 {
+                        return (h, m, s);
+                    }
+                }
+            }
+        }
+    }
+    // fallback: UTC
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let tod = (secs % 86_400) as u32;
+    (tod / 3600, (tod % 3600) / 60, tod % 60)
+}
+
+/// 距离下一个「分钟 % interval == 0 且秒为 00」还有多少秒。
+/// 例如 interval=5：
+/// - 12:03:10 → 110s 后到 12:05:00
+/// - 12:05:00 已到点 → 300s 后到 12:10:00（当前点由调度循环消费后才会再算）
+/// - 12:05:01 → 299s 后到 12:10:00
+/// - 12:59:50 → 10s 后到 13:00:00
+fn seconds_until_next_aligned_run(
+    hour: u32,
+    minute: u32,
+    second: u32,
+    interval_minutes: u32,
+) -> u64 {
+    let interval = interval_minutes.max(1) as i64;
+    let interval_secs = interval * 60;
+    let now_secs = hour as i64 * 3600 + minute as i64 * 60 + second as i64;
+    // 下一个对齐点：ceil 到 interval 边界；若刚好在边界（秒=0 且分钟对齐）则跳到下一格，
+    // 避免同一触发点被重复消费。调度侧在到点后会先跑一轮再重新计算。
+    let rem = now_secs.rem_euclid(interval_secs);
+    let delta = if rem == 0 {
+        // 整点秒：若 second==0 表示正好在边界；调度等待时用 >0 推到下一格。
+        // 但 start 循环在 force 为空时会 sleep delta，若 delta=interval 合理。
+        interval_secs
+    } else {
+        interval_secs - rem
+    };
+    delta as u64
+}
+
+fn seconds_until_next_scheduled_run() -> u64 {
+    let (h, m, s) = local_hms();
+    seconds_until_next_aligned_run(h, m, s, CHARITY_SCHEDULE_EVERY_MINUTES).max(1)
+}
+
 pub(crate) fn start_charity_monitor(app: AppHandle) {
     let monitor = app.state::<CharityMonitorRuntime>();
     if monitor.running.swap(true, Ordering::SeqCst) {
@@ -1991,19 +2059,60 @@ pub(crate) fn start_charity_monitor(app: AppHandle) {
         tokio::task::block_in_place(|| abandon_running_charity_sync_logs(&database));
     }
     tauri::async_runtime::spawn(async move {
-        // 短延迟：给代理 restore / 前端 force_round 一点时间；真正首轮由 force 或可见性触发。
+        // 启动后稍等：给代理 restore 一点时间；不自动跑首轮，等下一个 :00/:05/:10… 或按钮临时触发。
         tokio::time::sleep(Duration::from_secs(1)).await;
         loop {
             let monitor = app.state::<CharityMonitorRuntime>();
-            let visible = monitor.visible.load(Ordering::Relaxed);
-            // 注意：只有真正开始同步才消费 force_round，避免同步中请求被 swap 掉后丢失。
+            // 临时触发（立即刷新按钮）优先，否则等到下一个 5 分钟对齐点（秒 00）。
             let force = monitor.force_round.load(Ordering::Relaxed);
-            if visible || force {
-                let Some(cancellation) = monitor.try_begin_sync() else {
+            if !force {
+                let mut wait_secs = seconds_until_next_scheduled_run();
+                while wait_secs > 0 {
+                    if app
+                        .state::<CharityMonitorRuntime>()
+                        .force_round
+                        .load(Ordering::Relaxed)
+                    {
+                        break;
+                    }
+                    let step = wait_secs.min(CHARITY_SCHEDULER_TICK.as_secs().max(1));
+                    tokio::time::sleep(Duration::from_secs(step)).await;
+                    wait_secs = wait_secs.saturating_sub(step);
+                    // 接近触发点时用实时时钟重算，避免 sleep 漂移跨过对齐点。
+                    if wait_secs <= 5 {
+                        let recomputed = seconds_until_next_scheduled_run();
+                        // 若重算突然变大，说明已跨过对齐点，应立刻进入一轮。
+                        if recomputed > 30 && wait_secs <= 5 {
+                            wait_secs = 0;
+                            break;
+                        }
+                        wait_secs = recomputed.min(wait_secs);
+                    }
+                }
+            }
+
+            // 到点或按钮触发：若上一轮仍在跑，等它结束（按钮 cancel 会释放）。
+            let Some(cancellation) = (loop {
+                let monitor = app.state::<CharityMonitorRuntime>();
+                if let Some(token) = monitor.try_begin_sync() {
+                    break Some(token);
+                }
+                if monitor.force_round.load(Ordering::Relaxed) {
+                    // 立即刷新会 cancel 旧轮；稍等后重试拿锁。
                     tokio::time::sleep(Duration::from_millis(200)).await;
                     continue;
-                };
-                let _ = monitor.force_round.swap(false, Ordering::Relaxed);
+                }
+                // 定时到点但上轮未结束：跳过本点，等下一个 5 分钟对齐点，避免堆积。
+                break None;
+            }) else {
+                continue;
+            };
+
+            let forced = app
+                .state::<CharityMonitorRuntime>()
+                .force_round
+                .swap(false, Ordering::Relaxed);
+            let stage = if forced { "manual" } else { "poll" };
                 // 每轮：重建 ≤500ms 候选队列 → 一次装载 → 标签并行（出口锁串行）→ 失败节点仅公益拉黑。
                 let database = app.state::<Database>();
                 let runtime = app.state::<ProxyRuntime>();
@@ -2078,7 +2187,7 @@ pub(crate) fn start_charity_monitor(app: AppHandle) {
                             &database,
                             &runtime,
                             source,
-                            "poll",
+                            stage,
                             &cancellation,
                             Some(shared_queue),
                             true,
@@ -2111,28 +2220,7 @@ pub(crate) fn start_charity_monitor(app: AppHandle) {
                 // 整轮结束：恢复用户全局代理出口；队列自然丢弃，下轮重建。
                 let _ = proxy_pool::restore_proxy_node_transient(&database, &runtime).await;
                 app.state::<CharityMonitorRuntime>().end_sync();
-            }
 
-            let wait = if app
-                .state::<CharityMonitorRuntime>()
-                .visible
-                .load(Ordering::Relaxed)
-            {
-                CHARITY_POLL_INTERVAL
-            } else {
-                CHARITY_HIDDEN_POLL_INTERVAL
-            };
-            let steps = (wait.as_secs().max(1)) as usize;
-            for _ in 0..steps {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                if app
-                    .state::<CharityMonitorRuntime>()
-                    .force_round
-                    .load(Ordering::Relaxed)
-                {
-                    break;
-                }
-            }
         }
     });
 }
@@ -2184,6 +2272,24 @@ mod tests {
         assert_eq!(queue.pop_front().unwrap().id, "b");
         assert_eq!(queue.pop_front().unwrap().id, "a");
         assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn schedules_every_five_minutes_on_the_clock() {
+        // 12:03:10 → 1 分 50 秒后到 12:05:00
+        assert_eq!(seconds_until_next_aligned_run(12, 3, 10, 5), 110);
+        // 12:05:00 正好对齐 → 下一格 12:10:00
+        assert_eq!(seconds_until_next_aligned_run(12, 5, 0, 5), 300);
+        // 12:05:01 → 12:10:00
+        assert_eq!(seconds_until_next_aligned_run(12, 5, 1, 5), 299);
+        // 12:04:59 → 1 秒到 12:05:00
+        assert_eq!(seconds_until_next_aligned_run(12, 4, 59, 5), 1);
+        // 12:00:00 → 12:05:00
+        assert_eq!(seconds_until_next_aligned_run(12, 0, 0, 5), 300);
+        // 12:59:50 → 10 秒到 13:00:00
+        assert_eq!(seconds_until_next_aligned_run(12, 59, 50, 5), 10);
+        // 23:58:00 → 2 分钟到 00:00:00
+        assert_eq!(seconds_until_next_aligned_run(23, 58, 0, 5), 120);
     }
 
     #[test]
