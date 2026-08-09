@@ -316,6 +316,21 @@ impl CharityMonitorRuntime {
         }
     }
 
+    /// 当前仍在生效的公益黑名单/冷却节点 id（403、超时、成功冷却等）。
+    fn active_banned_ids(&self) -> Vec<String> {
+        let mut bans = match self.charity_ban_until.lock() {
+            Ok(guard) => guard,
+            Err(_) => return Vec::new(),
+        };
+        let now = Instant::now();
+        let active = bans
+            .iter()
+            .filter_map(|(id, until)| if *until > now { Some(id.clone()) } else { None })
+            .collect::<Vec<_>>();
+        bans.retain(|_, until| *until > now);
+        active
+    }
+
     pub(crate) fn set_visible(&self, visible: bool) {
         // 仅记录前台可见性（UI/诊断用）；定时触发不再依赖可见性。
         self.visible.store(visible, Ordering::Relaxed);
@@ -2272,6 +2287,7 @@ pub(crate) struct CharityProxyPoolSummary {
 #[tauri::command]
 pub async fn get_charity_proxy_pool_summary(
     database: State<'_, Database>,
+    monitor: State<'_, CharityMonitorRuntime>,
 ) -> Result<CharityProxyPoolSummary, String> {
     tokio::task::block_in_place(|| {
         let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
@@ -2294,9 +2310,54 @@ pub async fn get_charity_proxy_pool_summary(
             )
             .map_err(|error| error.to_string())?
             .max(0) as usize;
+
+        // 扣除当前仍被公益拉黑/冷却中的节点（403、超时、成功冷却）。
+        // 只影响公益候选展示，不修改代理池本身。
+        let banned = monitor.active_banned_ids();
+        if banned.is_empty() {
+            return Ok(CharityProxyPoolSummary {
+                valid_count,
+                candidate_count,
+            });
+        }
+        let placeholders = banned.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let mut params = banned
+            .iter()
+            .map(|id| rusqlite::types::Value::Text(id.clone()))
+            .collect::<Vec<_>>();
+        let valid_after = connection
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM proxy_pool_nodes
+                     WHERE test_status = 'success' AND latency_ms IS NOT NULL AND latency_ms > 0
+                       AND id IN ({placeholders})"
+                ),
+                rusqlite::params_from_iter(params.iter()),
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| error.to_string())?
+            .max(0) as usize;
+        let mut candidate_params = Vec::with_capacity(params.len() + 1);
+        candidate_params.push(rusqlite::types::Value::Integer(
+            CHARITY_FAST_NODE_MAX_LATENCY_MS,
+        ));
+        candidate_params.append(&mut params);
+        let candidate_after = connection
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM proxy_pool_nodes
+                     WHERE test_status = 'success' AND latency_ms IS NOT NULL AND latency_ms > 0
+                       AND latency_ms <= ?1
+                       AND id IN ({placeholders})"
+                ),
+                rusqlite::params_from_iter(candidate_params.iter()),
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| error.to_string())?
+            .max(0) as usize;
         Ok(CharityProxyPoolSummary {
-            valid_count,
-            candidate_count,
+            valid_count: valid_count.saturating_sub(valid_after),
+            candidate_count: candidate_count.saturating_sub(candidate_after),
         })
     })
 }
