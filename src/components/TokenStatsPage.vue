@@ -325,7 +325,7 @@ const healthTimeline = computed(() =>
 );
 
 // 网格：上→下、左→右（列优先），排满容器；所选区间落在末尾
-const HEALTH_ROWS = 7;
+const HEALTH_ROWS = 6;
 const HEALTH_CELL = 11; // px
 const HEALTH_GAP = 3;   // px
 const healthGridRef = ref<HTMLElement | null>(null);
