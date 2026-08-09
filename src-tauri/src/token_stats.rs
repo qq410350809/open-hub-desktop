@@ -1692,7 +1692,7 @@ fn activity_cache() -> &'static Mutex<Option<ActivityCache>> {
     CACHE.get_or_init(|| Mutex::new(None))
 }
 
-const ACTIVITY_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+const ACTIVITY_CACHE_TTL: Duration = Duration::from_secs(15);
 
 fn activity_cache_path() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from).map(|home| {

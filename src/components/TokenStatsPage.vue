@@ -312,18 +312,21 @@ function healthCellTitle(cell: {
   failed: number;
   successRate: number | null;
   pad?: boolean;
-}) {
+}): string {
+  if (!cell.label && cell.pad) return "空档";
   if (!cell.label) return "—";
   const dialogues = cell.dialogues || 0;
-  if (cell.requests <= 0) {
+  const dialoguePart = dialogues > 0 ? ` · 对话 ${formatTokens(dialogues)}` : "";
+  if (cell.requests <= 0 && cell.failed <= 0) {
     return dialogues > 0
-      ? `${cell.label} · 对话 ${formatTokens(dialogues)} · 无请求`
+      ? `${cell.label}${dialoguePart} · 无请求`
       : `${cell.label} · 无请求`;
   }
   const rateTxt = cell.successRate == null ? "—" : `${(cell.successRate * 100).toFixed(1)}%`;
-  const dialoguePart = dialogues > 0 ? ` · 对话 ${formatTokens(dialogues)}` : "";
-  // 成功 = 请求 - 已知失败（与色阶同一口径），避免成功+失败与请求对不上
-  return `${cell.label}${dialoguePart} · 请求 ${formatTokens(cell.requests)} · 成功 ${formatTokens(cell.success)} · 失败 ${formatTokens(cell.failed)} · 成功率 ${rateTxt}`;
+  const failPart = cell.failed > 0
+    ? ` · ⚠ 失败 ${formatTokens(cell.failed)}`
+    : ` · 失败 ${formatTokens(cell.failed)}`;
+  return `${cell.label}${dialoguePart} · 请求 ${formatTokens(cell.requests)} · 成功 ${formatTokens(cell.success)}${failPart} · 成功率 ${rateTxt}`;
 }
 
 // —— 请求健康时间线：与左侧趋势同粒度完整节点 ——
@@ -433,11 +436,13 @@ const healthDisplayCells = computed<HealthDisplayCell[]>(() => {
       const sampleRequests = rawSuccess + rawFailed;
       const usageRequests = hit?.usage ?? 0;
       const requests = extractedRequests > 0 ? extractedRequests : (usageRequests > 0 ? usageRequests : sampleRequests);
-      const failed = Math.max(0, Math.min(rawFailed, requests > 0 ? requests : rawFailed));
-      const success = requests > 0 ? Math.max(0, requests - failed) : rawSuccess;
+      const failed = Math.max(0, rawFailed);
+      const success = requests > 0
+        ? Math.max(0, requests - Math.min(failed, requests))
+        : rawSuccess;
       const successRate = requests > 0
         ? success / requests
-        : (sampleRequests > 0 ? rawSuccess / sampleRequests : null);
+        : (failed > 0 ? 0 : (sampleRequests > 0 ? rawSuccess / sampleRequests : null));
       return {
         key: `pre-${p.key}`,
         label: p.label,
@@ -446,7 +451,7 @@ const healthDisplayCells = computed<HealthDisplayCell[]>(() => {
         failed,
         requests,
         successRate,
-        level: healthLevelOf(successRate, requests > 0),
+        level: healthLevelOf(successRate, requests > 0 || failed > 0, failed),
         pad: false,
       };
     });
@@ -559,7 +564,12 @@ watch(
 onMounted(() => {
   // 先显示已有本地 cursor/cache，再后台触发 Tokentracker 增量同步；
   // 同步结束后只刷新发生变化的结果，避免首屏被全量扫描阻塞。
-  void Promise.all([store.loadTokenUsage(), store.loadTokenStats()]);
+  // 请求健康立即增量读取，避免等 token 同步完才看到最近失败。
+  void Promise.all([
+    store.loadTokenUsage(),
+    store.loadTokenStats(),
+    store.loadRequestHealth(false),
+  ]);
   void store.syncTokenTracker()
     .then(() => Promise.all([
       store.loadTokenUsage(),
@@ -721,7 +731,7 @@ onBeforeUnmount(() => {
             <header class="tt-card-head tt-health-head">
               <div>
                 <h2>请求健康时间线</h2>
-                <p>对话=用户发起；请求=多工具 API 调用；成功率=(请求−已知失败)/请求（用户取消不计失败）。</p>
+                <p>对话=用户发起；请求=多工具 API 调用；有失败会降色（用户取消不计失败）。</p>
               </div>
               <div class="tt-health-summary">
                 <div class="tt-health-rate-label">成功率</div>

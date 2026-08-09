@@ -518,11 +518,32 @@ interface HealthInput {
   failed: number;
 }
 
-/** 成功率 → 色阶：0 无请求；1 红(不健康) … 5 绿(健康) */
-export function healthLevelOf(successRate: number | null, hasRequests = true): number {
-  if (!hasRequests) return 0;
-  // 有请求但没有失败样本时，按健康展示（避免大量误报“无数据”）
-  if (successRate == null) return 5;
+/** 成功率/失败数 → 色阶：0 无活动；1 红(不健康) … 5 绿(健康) */
+export function healthLevelOf(
+  successRate: number | null,
+  hasRequests = true,
+  failed = 0,
+): number {
+  const failedCount = Math.max(0, Number(failed || 0));
+  // 无请求也无失败 → 空档
+  if (!hasRequests && failedCount <= 0) return 0;
+  // 仅有失败样本（请求未记上）→ 直接不健康，避免被画成“无数据”
+  if (!hasRequests && failedCount > 0) return 1;
+  // 有请求但没有成功率样本：无失败按健康；有失败按失败强度
+  if (successRate == null) {
+    if (failedCount <= 0) return 5;
+    if (failedCount >= 5) return 1;
+    if (failedCount >= 3) return 2;
+    if (failedCount >= 2) return 3;
+    return 4;
+  }
+  // 有明确失败时，不允许显示最健康绿，避免“9 次失败仍接近全绿”
+  if (failedCount > 0) {
+    if (successRate < 0.5 || failedCount >= 8) return 1;
+    if (successRate < 0.75 || failedCount >= 4) return 2;
+    if (successRate < 0.9 || failedCount >= 2) return 3;
+    return 4;
+  }
   if (successRate < 0.5) return 1;
   if (successRate < 0.7) return 2;
   if (successRate < 0.85) return 3;
@@ -569,7 +590,7 @@ export interface HealthUsageInput {
  * - 请求量优先取后端多工具提取（Codex/Claude/OpenCode/Mimo/Zcode/Antigravity）
  * - 仅当完全没有提取数据时，才用 token usage 估算兜底
  * - 对话数取后端 dialogues（用户发起 turns）
- * - 成功率只在有 health 样本时计算；有请求但无样本 => 视为健康
+ * - 成功率=(请求−已知失败)/请求；有失败必降色，不允许被大量成功完全稀释成全绿
  */
 export function buildHealthTimeline(
   buckets: HealthInput[],
@@ -669,13 +690,16 @@ export function buildHealthTimeline(
 
     // 成功率口径：以请求为底，已知失败扣减。
     // 避免 Codex token_count 与 task_complete 样本混用导致 成功+失败 ≠ 请求、成功率被严重压低。
-    const failed = Math.max(0, Math.min(rawFailed, requests > 0 ? requests : rawFailed));
-    const success = requests > 0 ? Math.max(0, requests - failed) : rawSuccess;
+    // 失败可独立存在（例如失败发生在无 token_count 的边界小时），不能被当成“无数据”。
+    const failed = Math.max(0, rawFailed);
+    const success = requests > 0
+      ? Math.max(0, requests - Math.min(failed, requests))
+      : rawSuccess;
     const successRate = requests > 0
       ? success / requests
-      : (sampleRequests > 0 ? rawSuccess / sampleRequests : null);
+      : (failed > 0 ? 0 : (sampleRequests > 0 ? rawSuccess / sampleRequests : null));
 
-    if (requests > 0) activeCount += 1;
+    if (requests > 0 || failed > 0) activeCount += 1;
     totalDialogues += dialogues;
     totalSuccess += success;
     totalFailed += failed;
@@ -689,7 +713,7 @@ export function buildHealthTimeline(
       requests,
       usageRequests,
       successRate,
-      level: healthLevelOf(successRate, requests > 0),
+      level: healthLevelOf(successRate, requests > 0 || failed > 0, failed),
     };
   });
 
