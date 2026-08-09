@@ -555,7 +555,12 @@ onBeforeUnmount(() => {
               <span class="tt-kpi-label">对话数</span>
             </div>
             <strong class="tt-kpi-value">{{ formatTokens(bucketTotal.conversations) }}</strong>
-            <span class="tt-kpi-sub">区间累计轮次</span>
+            <span class="tt-kpi-sub">
+              请求 {{ formatTokens(healthTimeline.totalRequests) }}
+              <template v-if="healthTimeline.totalRequests > 0">
+                · 成功 {{ formatTokens(healthTimeline.totalSuccess) }}
+              </template>
+            </span>
           </div>
           <div class="tt-kpi">
             <div class="tt-kpi-top">
