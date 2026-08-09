@@ -1074,23 +1074,39 @@ fn load_all_feed_items_from_db(
     database: &Database,
     offset: usize,
     limit: usize,
+    keyword: &str,
 ) -> Result<CharityFeedResult, String> {
     let limit = limit.clamp(1, 50);
     let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
-    let total_count = connection
-        .query_row(
-            "SELECT COUNT(DISTINCT guid) FROM charity_feed_items",
-            [],
-            |row| row.get::<_, i64>(0),
-        )
-        .map_err(|error| error.to_string())?
-        .max(0) as usize;
+    let key_pat = format!("%{}%", keyword.trim());
+    let has_key = !keyword.trim().is_empty();
+    let total_count = if has_key {
+        connection
+            .query_row(
+                "SELECT COUNT(DISTINCT guid) FROM charity_feed_items
+                 WHERE title LIKE ?1 OR author LIKE ?1 OR categories LIKE ?1",
+                [&key_pat],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| error.to_string())?
+            .max(0) as usize
+    } else {
+        connection
+            .query_row(
+                "SELECT COUNT(DISTINCT guid) FROM charity_feed_items",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| error.to_string())?
+            .max(0) as usize
+    };
 
     let mut statement = connection
         .prepare(
             "SELECT guid, title, link, author, published_at, summary, categories, first_seen_at,
                     reply_count, views, like_count, last_activity_at, pinned, posters, feed_id
              FROM charity_feed_items
+             WHERE (?3 = '' OR title LIKE ?3 OR author LIKE ?3 OR categories LIKE ?3)
              ORDER BY published_at DESC, rowid DESC
              LIMIT ?1 OFFSET ?2",
         )
@@ -1098,7 +1114,8 @@ fn load_all_feed_items_from_db(
     let all = statement
         .query_map(params![
             (limit * 8) as i64, // 多标签可能重复占用行，放大取数后在内存聚合
-            offset as i64
+            offset as i64,
+            key_pat
         ], |row| {
             let categories: String = row.get(6)?;
             let posters_raw: String = row.get(13)?;
@@ -1333,6 +1350,7 @@ fn load_feed_items_from_db(
     source: CharityFeedSource,
     offset: usize,
     limit: usize,
+    keyword: &str,
 ) -> Result<CharityFeedResult, String> {
     let limit = limit.clamp(1, 50);
     let keys = feed_meta_keys(source.id);
@@ -1354,14 +1372,28 @@ fn load_feed_items_from_db(
     let last_message = read_meta(&keys.last_message)?;
     let last_node = read_meta(&keys.last_node)?;
     let last_updated = read_meta(&keys.last_updated)?.parse::<usize>().unwrap_or(0);
-    let total_count = connection
-        .query_row(
-            "SELECT COUNT(*) FROM charity_feed_items WHERE feed_id = ?1",
-            [source.id],
-            |row| row.get::<_, i64>(0),
-        )
-        .map_err(|error| error.to_string())?
-        .max(0) as usize;
+    let key_pat = format!("%{}%", keyword.trim());
+    let has_key = !keyword.trim().is_empty();
+    let total_count = if has_key {
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM charity_feed_items
+                 WHERE feed_id = ?1 AND (title LIKE ?2 OR author LIKE ?2 OR categories LIKE ?2)",
+                params![source.id, key_pat],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| error.to_string())?
+            .max(0) as usize
+    } else {
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM charity_feed_items WHERE feed_id = ?1",
+                [source.id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| error.to_string())?
+            .max(0) as usize
+    };
     let unread_count = if read_at.trim().is_empty() {
         0usize
     } else {
@@ -1380,13 +1412,13 @@ fn load_feed_items_from_db(
             "SELECT guid, title, link, author, published_at, summary, categories, first_seen_at,
                     reply_count, views, like_count, last_activity_at, pinned, posters
              FROM charity_feed_items
-             WHERE feed_id = ?1
+             WHERE feed_id = ?1 AND (?4 = '' OR title LIKE ?4 OR author LIKE ?4 OR categories LIKE ?4)
              ORDER BY published_at DESC, rowid DESC
              LIMIT ?2 OFFSET ?3",
         )
         .map_err(|error| error.to_string())?;
     let items = statement
-        .query_map(params![source.id, limit as i64, offset as i64], |row| {
+        .query_map(params![source.id, limit as i64, offset as i64, key_pat], |row| {
             let categories: String = row.get(6)?;
             let first_seen_at: String = row.get(7)?;
             let posters_raw: String = row.get(13)?;
@@ -1687,7 +1719,7 @@ async fn sync_feed_with_fast_nodes(
                 "",
             );
             let local = tokio::task::block_in_place(|| {
-                load_feed_items_from_db(database, source, 0, CHARITY_PAGE_SIZE)
+                load_feed_items_from_db(database, source, 0, CHARITY_PAGE_SIZE, "")
             })?;
             let _ = write_feed_sync_meta(database, source.id, "skipped", &message, "", 0);
             finish_charity_sync_log(
@@ -1970,7 +2002,7 @@ async fn sync_feed_with_fast_nodes(
 
     let _ = proxy_pool::restore_proxy_node_transient(database, runtime).await;
     let mut local = tokio::task::block_in_place(|| {
-        load_feed_items_from_db(database, source, 0, CHARITY_PAGE_SIZE)
+        load_feed_items_from_db(database, source, 0, CHARITY_PAGE_SIZE, "")
     })
     .unwrap_or(CharityFeedResult {
         feed_id: source.id.into(),
@@ -2016,19 +2048,22 @@ pub async fn get_charity_feed(
     feed_id: Option<String>,
     offset: Option<usize>,
     limit: Option<usize>,
+    keyword: Option<String>,
 ) -> Result<CharityFeedResult, String> {
     let requested = feed_id.as_deref().unwrap_or(DEFAULT_CHARITY_FEED_ID);
     let offset = offset.unwrap_or(0);
     let limit = limit.unwrap_or(CHARITY_PAGE_SIZE);
+    let keyword = keyword.unwrap_or_default();
     if requested == "all" {
         return tokio::task::block_in_place(|| {
-            load_all_feed_items_from_db(&database, offset, limit)
+            load_all_feed_items_from_db(&database, offset, limit, &keyword)
         });
     }
     let source = charity_feed_source(requested)?;
     // 读库离开 async worker，避免同步命令/锁拖住运行时。
-    let mut result =
-        tokio::task::block_in_place(|| load_feed_items_from_db(&database, source, offset, limit))?;
+    let mut result = tokio::task::block_in_place(|| {
+        load_feed_items_from_db(&database, source, offset, limit, &keyword)
+    })?;
     if let Ok(errors) = runtime.last_errors.lock() {
         if let Some(message) = errors.get(source.id) {
             if result.message.is_empty() {
@@ -2157,7 +2192,7 @@ pub async fn fetch_charity_feed(
     // 手动刷新与后台轮询互斥，避免打开页面时和定时任务抢锁卡死。
     let Some(cancellation) = monitor.try_begin_sync() else {
         let mut local = tokio::task::block_in_place(|| {
-            load_feed_items_from_db(&database, source, 0, CHARITY_PAGE_SIZE)
+            load_feed_items_from_db(&database, source, 0, CHARITY_PAGE_SIZE, "")
         })?;
         local.message = "后台同步进行中，已返回本地数据".into();
         local.status = if local.status.is_empty() {
@@ -2211,7 +2246,7 @@ pub async fn fetch_charity_feed(
     }
     // 无论成功失败，UI 应以本地库为准；同步错误通过 status/message 元数据体现。
     let mut local = tokio::task::block_in_place(|| {
-        load_feed_items_from_db(&database, source, 0, CHARITY_PAGE_SIZE)
+        load_feed_items_from_db(&database, source, 0, CHARITY_PAGE_SIZE, "")
     })?;
     if let Err(error) = sync_result {
         if local.message.is_empty() {

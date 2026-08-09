@@ -259,6 +259,25 @@ onUnmounted(() => {
               {{ tag.name }}
             </option>
           </select>
+          <div class="charity-search-box">
+            <span class="charity-search-icon" v-html="icons.search" aria-hidden="true" />
+            <input
+              id="charity-search-input"
+              class="charity-search-input"
+              type="search"
+              :value="store.searchKeyword.value"
+              placeholder="搜索标题 / 作者 / 分类…"
+              @input="store.setSearchKeyword(($event.target as HTMLInputElement).value)"
+            />
+            <button
+              v-if="store.searchKeyword.value"
+              class="charity-search-clear"
+              type="button"
+              aria-label="清空搜索"
+              @click="store.setSearchKeyword(''); ($event.target as HTMLButtonElement).closest('.charity-search-box')?.querySelector('input')?.focus()"
+              v-html="icons.close"
+            />
+          </div>
         </div>
         <div class="charity-summary-stats">
           <div class="charity-summary-stat">

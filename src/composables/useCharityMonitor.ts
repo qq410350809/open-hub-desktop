@@ -45,6 +45,8 @@ const syncLog = shallowRef<CharitySyncLogEntry[]>([]);
 const syncLogOpen = ref(false);
 const refreshAllBusy = ref(false);
 const syncLogLoading = ref(false);
+/** 搜索关键词（后端全量 LIKE：标题/作者/分类）。 */
+const searchKeyword = ref("");
 
 let eventUnlisten: UnlistenFn | undefined;
 let started = false;
@@ -52,6 +54,7 @@ let loadSeq = 0;
 let reloadTimer: number | null = null;
 let manualSyncing = false;
 let syncLogReloadTimer: number | null = null;
+let searchDebounceTimer: number | null = null;
 
 function scheduleSyncLogReload() {
   if (!syncLogOpen.value) return;
@@ -155,6 +158,7 @@ async function queryLocalFeed(feedId = selectedTagId.value, offset = 0, append =
       feedId,
       offset,
       limit: PAGE_SIZE,
+      keyword: searchKeyword.value.trim() || undefined,
     });
     if (seq !== loadSeq || feedId !== selectedTagId.value) return result;
     applyLocalPage(result, append ? "append" : "replace");
@@ -181,6 +185,20 @@ function scheduleLocalReload(feedId = selectedTagId.value) {
     reloadTimer = null;
     void queryLocalFeed(selectedTagId.value, 0, false);
   }, 300);
+}
+
+function setSearchKeyword(value: string) {
+  searchKeyword.value = value;
+  if (searchDebounceTimer != null) window.clearTimeout(searchDebounceTimer);
+  searchDebounceTimer = window.setTimeout(() => {
+    searchDebounceTimer = null;
+    items.value = [];
+    totalCount.value = 0;
+    hasMore.value = false;
+    nextOffset.value = 0;
+    loadingMore.value = false;
+    void queryLocalFeed(selectedTagId.value, 0, false);
+  }, 260);
 }
 
 async function loadMoreCharityFeed() {
@@ -221,6 +239,10 @@ async function refreshCharityFeed() {
 
 async function selectTag(tagId: string) {
   if (tagId === selectedTagId.value) return;
+  // 切换标签时清空搜索，避免跨标签残留过滤条件
+  if (searchKeyword.value.trim()) {
+    searchKeyword.value = "";
+  }
   selectedTagId.value = tagId;
   currentFeedName.value = tagMeta(tagId).name;
   items.value = [];
@@ -371,6 +393,7 @@ export function useCharityMonitor() {
   return {
     charityTags,
     selectedTagId,
+    searchKeyword,
     currentFeedName,
     charityFeedItems: items,
     charityFeedLoading: loading,
@@ -399,6 +422,7 @@ export function useCharityMonitor() {
     loadMoreCharityFeed,
     refreshCharityFeed,
     selectTag,
+    setSearchKeyword,
     startCharityMonitor,
     stopCharityMonitor,
     markCharityFeedRead,
