@@ -1001,6 +1001,7 @@ pub fn run() {
             charity_monitor::mark_charity_feed_read,
             charity_monitor::get_charity_unread_total,
             charity_monitor::get_charity_today_count,
+            charity_monitor::get_charity_proxy_pool_summary,
             charity_monitor::get_charity_sync_logs,
             charity_monitor::clear_charity_sync_logs,
             charity_monitor::set_charity_monitor_visible,

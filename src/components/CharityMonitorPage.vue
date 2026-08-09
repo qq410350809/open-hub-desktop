@@ -420,7 +420,15 @@ onUnmounted(() => {
           <header class="charity-sync-log-header">
             <div>
               <h2 id="charity-sync-log-title">同步日志</h2>
-              <p>后台轮询与手动刷新记录会持久保存，重启后仍可查看。</p>
+              <p>
+                后台轮询与手动刷新记录会持久保存。
+                <span v-if="store.charityProxyPoolSummary.value" class="charity-pool-summary">
+                  池中有效节点
+                  <strong>{{ store.charityProxyPoolSummary.value.validCount }}</strong>
+                  · ≤500ms 候选
+                  <strong>{{ store.charityProxyPoolSummary.value.candidateCount }}</strong>
+                </span>
+              </p>
             </div>
             <div class="charity-sync-log-actions">
               <button

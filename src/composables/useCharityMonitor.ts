@@ -50,6 +50,8 @@ const refreshAllBusy = ref(false);
 const syncLogLoading = ref(false);
 /** 搜索关键词（后端全量 LIKE：标题/作者/分类）。 */
 const searchKeyword = ref("");
+/** 公益同步候选代理池概览（有效节点/≤500ms 候选）。 */
+const proxyPoolSummary = ref<{ validCount: number; candidateCount: number } | null>(null);
 
 let eventUnlisten: UnlistenFn | undefined;
 let started = false;
@@ -124,7 +126,19 @@ async function refreshTodayCount() {
   }
 }
 
+async function refreshProxyPoolSummary() {
+  try {
+    proxyPoolSummary.value = await runCommand<{
+      validCount: number;
+      candidateCount: number;
+    }>("get_charity_proxy_pool_summary");
+  } catch {
+    /* ignore */
+  }
+}
+
 async function loadCharitySyncLogs() {
+  void refreshProxyPoolSummary();
   syncLogLoading.value = true;
   try {
     const rows = await runCommand<CharitySyncLogEntry[]>("get_charity_sync_logs", {
@@ -411,6 +425,7 @@ export function useCharityMonitor() {
     charityFeedUnreadCount: sidebarUnread,
     charityFeedTodayCount: todayCount,
     refreshTodayCount,
+    charityProxyPoolSummary: proxyPoolSummary,
     charityFeedSelectedUnreadCount: unreadCount,
     charityFeedUpdatedCount: updatedCount,
     charityFeedSourceProfileName: ref(""),

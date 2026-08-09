@@ -2259,6 +2259,48 @@ pub async fn fetch_charity_feed(
     Ok(local)
 }
 
+/// 公益同步用代理池概览：有效节点数 / ≤500ms 候选数。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CharityProxyPoolSummary {
+    /// 测速成功且延迟有效的节点数
+    pub(crate) valid_count: usize,
+    /// 当前公益候选阈值（≤500ms）内的节点数
+    pub(crate) candidate_count: usize,
+}
+
+#[tauri::command]
+pub async fn get_charity_proxy_pool_summary(
+    database: State<'_, Database>,
+) -> Result<CharityProxyPoolSummary, String> {
+    tokio::task::block_in_place(|| {
+        let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+        let valid_count = connection
+            .query_row(
+                "SELECT COUNT(*) FROM proxy_pool_nodes
+                 WHERE test_status = 'success' AND latency_ms IS NOT NULL AND latency_ms > 0",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| error.to_string())?
+            .max(0) as usize;
+        let candidate_count = connection
+            .query_row(
+                "SELECT COUNT(*) FROM proxy_pool_nodes
+                 WHERE test_status = 'success' AND latency_ms IS NOT NULL AND latency_ms > 0
+                   AND latency_ms <= ?1",
+                [CHARITY_FAST_NODE_MAX_LATENCY_MS],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| error.to_string())?
+            .max(0) as usize;
+        Ok(CharityProxyPoolSummary {
+            valid_count,
+            candidate_count,
+        })
+    })
+}
+
 #[tauri::command]
 pub async fn get_charity_sync_logs(
     database: State<'_, Database>,

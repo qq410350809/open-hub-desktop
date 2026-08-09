@@ -1359,6 +1359,14 @@ kbd { padding: 3px 7px; border: 1px solid var(--line); border-radius: var(--r-xs
   letter-spacing: -.01em;
 }
 .charity-sync-log-header p {
+.charity-sync-log-header .charity-pool-summary {
+  margin-left: 10px;
+  color: var(--muted);
+}
+.charity-sync-log-header .charity-pool-summary strong {
+  color: var(--brand-deep);
+  font-variant-numeric: tabular-nums;
+}
   margin: 4px 0 0;
   overflow: hidden;
   color: var(--faint);
