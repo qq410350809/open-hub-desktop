@@ -84,8 +84,8 @@ function setQuickRange(days: number) {
   tokenStatsTo.value = toLocalDate(to);
 }
 
-// 默认「全部」：热力图/趋势需要较长数据跨度
-setQuickRange(-1);
+// 默认「今日」
+setQuickRange(-2);
 
 async function loadTokenStats(from?: string, to?: string, refresh = false) {
   tokenStatsLoading.value = true;
