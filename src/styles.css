@@ -3672,8 +3672,8 @@ kbd { padding: 3px 7px; border: 1px solid var(--line); border-radius: var(--r-xs
 .tt-kpis {
   min-width: 0;
   display: grid;
-  /* 主卡占 2 列，其余 4 卡各 1 列 => 6 列体系 */
-  grid-template-columns: repeat(6, minmax(0, 1fr));
+  /* 自适应：主卡更宽，其余卡片自动填满 */
+  grid-template-columns: minmax(280px, 1.6fr) repeat(auto-fit, minmax(160px, 1fr));
   gap: 12px;
   align-items: stretch;
 }
@@ -3698,9 +3698,9 @@ kbd { padding: 3px 7px; border: 1px solid var(--line); border-radius: var(--r-xs
   box-shadow: 0 4px 14px rgba(0,0,0,.06);
   transform: translateY(-1px);
 }
-/* 主卡：TOKEN 总数 + 缓存命中率合并，占两列 */
+/* 主卡：TOKEN 总数 + 缓存命中率合并（首列更宽） */
 .tt-kpi-total {
-  grid-column: span 2;
+  grid-column: 1 / 2;
   display: grid;
   grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr);
   gap: 0 16px;
@@ -3837,19 +3837,24 @@ kbd { padding: 3px 7px; border: 1px solid var(--line); border-radius: var(--r-xs
   font-variant-numeric: tabular-nums;
 }
 
-/* 响应式：主卡仍优先更宽 */
-@media (max-width: 1280px) {
-  .tt-kpis { grid-template-columns: repeat(4, minmax(0, 1fr)); }
-  .tt-kpi-total { grid-column: span 2; }
+/* 响应式：自动换行填满，主卡始终优先占满可用宽度 */
+@media (max-width: 1100px) {
+  .tt-kpis {
+    grid-template-columns: minmax(240px, 1.4fr) repeat(auto-fit, minmax(150px, 1fr));
+  }
 }
-@media (max-width: 960px) {
-  .tt-kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .tt-kpi-total { grid-column: span 2; }
+@media (max-width: 860px) {
+  .tt-kpis {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .tt-kpi-total {
+    grid-column: 1 / -1;
+  }
 }
 @media (max-width: 640px) {
   .tt-kpis { grid-template-columns: 1fr; }
   .tt-kpi-total {
-    grid-column: span 1;
+    grid-column: 1 / -1;
     grid-template-columns: 1fr;
   }
   .tt-kpi-total-side {
