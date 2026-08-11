@@ -172,10 +172,10 @@ pub(crate) struct CharityRefreshAllResult {
 /// 公益同步只使用延迟 ≤500ms 的测速成功节点作为候选。
 const CHARITY_FAST_NODE_MAX_LATENCY_MS: i64 = 500;
 /// 单次请求（一个节点）的最大耗时；失败/超时后换下一节点。
-const CHARITY_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
-/// 每个标签每轮最多尝试两个节点。公益监听每 5 分钟触发一次，必须给整轮设置
-/// 明确上限，不能让单个标签扫完整个代理池并饿死其它标签。
-const CHARITY_MAX_NODE_ATTEMPTS: usize = 2;
+const CHARITY_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// 每个标签每轮最多尝试 5 个节点。共享队列每次弹出不同节点，
+/// 5 次尝试最多消耗 5 个节点/标签，整轮 6 标签最多 30 次请求，仍在可接受范围。
+const CHARITY_MAX_NODE_ATTEMPTS: usize = 5;
 /// 装入 Mihomo 的候选上限，避免一次装载几百节点导致极慢。
 const CHARITY_PREPARE_NODE_LIMIT: usize = 40;
 /// 超时/网络失败：仅移出公益候选，短时拉黑（不删代理池）。
