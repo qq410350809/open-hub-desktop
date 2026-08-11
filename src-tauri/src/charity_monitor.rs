@@ -1503,13 +1503,17 @@ fn rotate_fast_nodes(nodes: &[(String, String, i64)], offset: usize) -> Vec<(Str
 
 fn build_mihomo_client(proxy_url: &str) -> Result<reqwest::Client, String> {
     let proxy = reqwest::Proxy::all(proxy_url).map_err(|_| "Mihomo 混合端口地址无效")?;
+    // 关键：每次请求后关闭连接（pool_max_idle_per_host=0），强制下一次请求新建
+    // CONNECT 隧道。否则 reqwest 会复用上一条隧道，Mihomo 出口仍停留在上一个
+    // 节点——日志显示换了节点，实际出口 IP 没变，同一 IP 被连续请求触发 429。
     // Linux.do 当前的 Cloudflare 路径对 HTTP/1.1 出口会高概率返回 403；
-    // Cargo 已显式启用 reqwest/http2，这里保留 ALPN 协商并复用连接。
+    // Cargo 已显式启用 reqwest/http2，这里保留 ALPN 协商。
     reqwest::Client::builder()
         .timeout(CHARITY_REQUEST_TIMEOUT)
         .connect_timeout(Duration::from_secs(8))
         .http2_adaptive_window(true)
         .pool_idle_timeout(Duration::from_secs(60))
+        .pool_max_idle_per_host(0)
         .tcp_keepalive(Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::limited(5))
         .proxy(proxy)
