@@ -221,6 +221,11 @@ onUnmounted(() => {
     </header>
 
     <div class="charity-monitor-scroll">
+      <div v-if="store.charityFeedSyncing.value" class="charity-monitor-status">
+        <span class="is-spinning" v-html="icons.restore" />
+        <span>正在后台同步 6 个标签，完成后自动刷新列表…</span>
+      </div>
+
       <!-- 筛选 + 统计整合为一块工具条 -->
       <section class="charity-toolbar" aria-label="筛选与统计">
         <div class="charity-toolbar-filter">

@@ -1511,6 +1511,18 @@ kbd { padding: 3px 7px; border: 1px solid var(--line); border-radius: var(--r-xs
   font-weight: 650;
 }
 
+.charity-monitor-status {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  padding: 8px 14px;
+  margin-bottom: 10px;
+  font-size: 13px;
+  color: var(--text-muted, inherit);
+  background: var(--surface-2, rgba(127, 127, 127, 0.08));
+  border-radius: 10px;
+}
+
 .charity-monitor-error {
   margin: 4px 0 16px;
   padding: 13px 15px;

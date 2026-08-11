@@ -48,12 +48,15 @@ const syncLog = shallowRef<CharitySyncLogEntry[]>([]);
 const syncLogOpen = ref(false);
 const refreshAllBusy = ref(false);
 const syncLogLoading = ref(false);
+/** 后端整轮同步是否正在进行（由 charity-sync-progress 事件驱动）。 */
+const syncing = ref(false);
 /** 搜索关键词（后端全量 LIKE：标题/作者/分类）。 */
 const searchKeyword = ref("");
 /** 公益同步候选代理池概览（有效节点/≤500ms 候选）。 */
 const proxyPoolSummary = ref<{ validCount: number; candidateCount: number } | null>(null);
 
 let eventUnlisten: UnlistenFn | undefined;
+let menuRefreshUnlisten: UnlistenFn | undefined;
 let started = false;
 let loadSeq = 0;
 let reloadTimer: number | null = null;
@@ -232,6 +235,7 @@ async function refreshCharityFeed() {
   if (manualSyncing) return;
   manualSyncing = true;
   refreshAllBusy.value = true;
+  syncing.value = true;
   try {
     const result = await runCommand<{
       cancelledActiveRound: boolean;
@@ -294,8 +298,17 @@ async function markCharityFeedRead() {
 
 async function ensureEventBridge() {
   if (!isTauri || eventUnlisten) return;
+  // 菜单栏“文件 → 刷新”触发与页面按钮相同的全量刷新逻辑。
+  try {
+    menuRefreshUnlisten = await listen("menu-refresh-requested", () => {
+      void refreshCharityFeed();
+    });
+  } catch {
+    menuRefreshUnlisten = undefined;
+  }
   try {
     eventUnlisten = await listen<CharitySyncProgress>("charity-sync-progress", ({ payload }) => {
+      syncing.value = payload.status === "running";
       // running：先本地补丁节点名/文案，再拉库，保证“节点立刻显示、耗时持续刷新”
       if (payload.status === "running" && syncLogOpen.value) {
         const node = payload.usedNodeName || "";
@@ -366,6 +379,8 @@ function stopCharityMonitor() {
   }
   eventUnlisten?.();
   eventUnlisten = undefined;
+  menuRefreshUnlisten?.();
+  menuRefreshUnlisten = undefined;
   started = false;
   void runCommand("set_charity_monitor_visible", { visible: false }).catch(() => undefined);
 }
@@ -417,7 +432,7 @@ export function useCharityMonitor() {
     charityFeedItems: items,
     charityFeedLoading: loading,
     charityFeedLoadingMore: loadingMore,
-    charityFeedSyncing: computed(() => false),
+    charityFeedSyncing: syncing,
     charityFeedRefreshAllBusy: refreshAllBusy,
     charityFeedError: error,
     charityFeedStatusMessage: statusMessage,
