@@ -1981,6 +1981,11 @@ async fn sync_feed_with_fast_nodes(
                                     &node.name,
                                     result.updated_count + result.new_count,
                                 );
+                                // 成功节点回队尾：下一次请求从队列弹出另一个节点，
+                                // 同一节点不会被 6 个标签连续请求（本轮内基本不会轮回到）。
+                                if let Ok(mut q) = queue.lock() {
+                                    q.push_back(node.clone());
+                                }
                                 let _ = proxy_pool::restore_proxy_node_transient(database, runtime)
                                     .await;
                                 let dur = attempt_started.elapsed().as_millis() as i64;
@@ -2605,8 +2610,10 @@ pub(crate) fn start_charity_monitor(app: AppHandle) {
                 .force_round
                 .swap(false, Ordering::Relaxed);
             let stage = if forced { "manual" } else { "poll" };
-            // 每轮：重建 ≤500ms 候选 → 一次装载 → 每标签独立候选队列。
-            // 网络尝试通过 proxy_sync_lock 公平串行，避免共享队列被首个标签耗尽。
+            // 每轮：重建 ≤500ms 候选 → 一次装载 → 整轮共享一个队列。
+            // 每次请求弹出不同的节点（成功节点回队尾，本轮内不重复使用），
+            // 避免同一节点被 6 个标签连续请求触发 Cloudflare 403。
+            // 网络尝试通过 proxy_sync_lock 公平串行，配合每标签尝试上限防止饿死。
             let database = app.state::<Database>();
             let runtime = app.state::<ProxyRuntime>();
             let round_nodes =
@@ -2646,13 +2653,12 @@ pub(crate) fn start_charity_monitor(app: AppHandle) {
             }
 
             let mut handles = Vec::with_capacity(CHARITY_FEEDS.len());
+            let shared_queue = Arc::new(Mutex::new(CharityNodeQueue::from_nodes(round_nodes)));
             for source in CHARITY_FEEDS {
                 let app = app.clone();
                 let source = *source;
                 let cancellation = cancellation.clone();
-                let feed_queue = Arc::new(Mutex::new(CharityNodeQueue::from_nodes(
-                    round_nodes.clone(),
-                )));
+                let shared_queue = shared_queue.clone();
                 handles.push(tauri::async_runtime::spawn(async move {
                     let database = app.state::<Database>();
                     let runtime = app.state::<ProxyRuntime>();
@@ -2663,7 +2669,7 @@ pub(crate) fn start_charity_monitor(app: AppHandle) {
                         source,
                         stage,
                         &cancellation,
-                        Some(feed_queue),
+                        Some(shared_queue),
                         true,
                     )
                     .await;
