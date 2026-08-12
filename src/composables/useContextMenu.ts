@@ -14,7 +14,7 @@ type EditableTarget =
   | HTMLTextAreaElement
   | (HTMLElement & { isContentEditable: true });
 
-const MENU_WIDTH = 196;
+const MENU_WIDTH = 220;
 const MENU_PAD = 8;
 
 function isEditable(el: EventTarget | null): el is EditableTarget {
@@ -49,8 +49,7 @@ function closestEditable(target: EventTarget | null): EditableTarget | null {
 }
 
 function selectionText(): string {
-  const value = window.getSelection()?.toString() ?? "";
-  return value;
+  return window.getSelection()?.toString() ?? "";
 }
 
 function canUndo(el: EditableTarget | null): boolean {
@@ -167,12 +166,24 @@ export function useContextMenu() {
       items.value = [
         { id: "copy", label: "拷贝", enabled: true, accelerator: "⌘C" },
         { id: "sep-1", label: "", enabled: false, separator: true },
+        { id: "reload", label: "强制刷新", enabled: true, accelerator: "⌘⇧R" },
         { id: "select-all", label: "全选", enabled: true, accelerator: "⌘A" },
       ];
       return;
     }
 
-    items.value = [{ id: "select-all", label: "全选", enabled: true, accelerator: "⌘A" }];
+    items.value = [
+      { id: "reload", label: "强制刷新", enabled: true, accelerator: "⌘⇧R" },
+      { id: "sep-1", label: "", enabled: false, separator: true },
+      { id: "nav-library", label: "站点库", enabled: true },
+      { id: "nav-modelparams", label: "模型参数", enabled: true },
+      { id: "nav-charity", label: "公益监听", enabled: true },
+      { id: "nav-proxy", label: "代理池", enabled: true },
+      { id: "nav-tokenstats", label: "Token 统计", enabled: true },
+      { id: "nav-settings", label: "设置", enabled: true },
+      { id: "sep-2", label: "", enabled: false, separator: true },
+      { id: "select-all", label: "全选", enabled: true, accelerator: "⌘A" },
+    ];
   }
 
   async function onContextMenu(event: MouseEvent) {
@@ -269,6 +280,21 @@ export function useContextMenu() {
         } else {
           document.execCommand("selectAll");
         }
+        break;
+      }
+      case "reload": {
+        window.dispatchEvent(new CustomEvent("oh-menu-reload"));
+        break;
+      }
+      case "nav-library":
+      case "nav-modelparams":
+      case "nav-charity":
+      case "nav-proxy":
+      case "nav-tokenstats":
+      case "nav-settings": {
+        window.dispatchEvent(
+          new CustomEvent("oh-menu-navigate", { detail: { page: id.replace("nav-", "") } }),
+        );
         break;
       }
       default:

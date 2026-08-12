@@ -609,6 +609,58 @@ end run
         .output();
 }
 
+#[cfg(target_os = "macos")]
+fn close_openhub_sync_tabs() -> Result<(), String> {
+    const SCRIPT: &str = r##"
+if application "Google Chrome" is not running then return
+set targetMarkers to {"#openhub-sync-", "#openhub-models-", "#openhub-background-", "#openhub-silent-"}
+tell application "Google Chrome"
+    repeat with windowIndex from (count of windows) to 1 by -1
+        try
+            repeat with tabIndex from (count of tabs of window windowIndex) to 1 by -1
+                try
+                    set browserTab to tab tabIndex of window windowIndex
+                    set tabUrl to URL of browserTab
+                    repeat with targetMarker in targetMarkers
+                        if tabUrl contains (targetMarker as text) then
+                            close browserTab
+                            exit repeat
+                        end if
+                    end repeat
+                end try
+            end repeat
+        end try
+    end repeat
+end tell
+"##;
+    let output = Command::new("/usr/bin/osascript")
+        .args(["-e", SCRIPT])
+        .output()
+        .map_err(|error| format!("无法调用 Chrome 标签清理自动化：{error}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let error = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Err(if error.is_empty() {
+            "Chrome 标签清理自动化执行失败".into()
+        } else {
+            format!("Chrome 标签清理自动化执行失败：{error}")
+        })
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn close_openhub_sync_tabs() -> Result<(), String> {
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn close_chrome_sync_tabs() -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(close_openhub_sync_tabs)
+        .await
+        .map_err(|error| format!("清理 Chrome 同步标签任务失败：{error}"))?
+}
+
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn run_javascript_in_chrome_profile(
     _target_url: &str,

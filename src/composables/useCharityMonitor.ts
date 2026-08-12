@@ -15,13 +15,59 @@ const MAX_SYNC_LOG = 120;
 
 const charityTags = ref<CharityFeedTag[]>([
   { id: "all", name: "全部" },
-  { id: "1515", name: "公益推广" },
-  { id: "1980", name: "公益站" },
-  { id: "2233", name: "中转站" },
-  { id: "2234", name: "开源推广" },
-  { id: "1514", name: "高级推广" },
-  { id: "193", name: "订阅节点" },
 ]);
+
+/** 是否正在加载/保存标签源 */
+const charitySourcesLoading = ref(false);
+
+async function loadCharitySources() {
+  try {
+    const sources = await runCommand<CharityFeedTag[]>("list_charity_sources");
+    if (Array.isArray(sources)) {
+      charityTags.value = [
+        { id: "all", name: "全部" },
+        ...sources,
+      ];
+    }
+  } catch {
+    /* 加载失败保持现有标签不变 */
+  }
+}
+
+async function addCharitySource(id: string, name: string, jsonUrl?: string) {
+  charitySourcesLoading.value = true;
+  try {
+    await runCommand("add_charity_source", { id, name, jsonUrl: jsonUrl || null });
+    await loadCharitySources();
+  } finally {
+    charitySourcesLoading.value = false;
+  }
+}
+
+async function updateCharitySource(id: string, opts: { name?: string; jsonUrl?: string; enabled?: boolean }) {
+  charitySourcesLoading.value = true;
+  try {
+    await runCommand("update_charity_source", { id, ...opts });
+    await loadCharitySources();
+  } finally {
+    charitySourcesLoading.value = false;
+  }
+}
+
+async function removeCharitySource(id: string) {
+  charitySourcesLoading.value = true;
+  try {
+    await runCommand("remove_charity_source", { id });
+    // 如果当前选中的标签被删除，切回全部
+    if (selectedTagId.value === id) {
+      selectedTagId.value = "all";
+      currentFeedName.value = "全部";
+    }
+    await loadCharitySources();
+  } finally {
+    charitySourcesLoading.value = false;
+  }
+}
 
 const selectedTagId = ref("all");
 const currentFeedName = ref("全部");
@@ -362,6 +408,7 @@ function onVisibilityChange() {
 async function startCharityMonitor() {
   if (started) return;
   started = true;
+  await loadCharitySources();
   await ensureEventBridge();
   document.addEventListener("visibilitychange", onVisibilityChange);
   const visible = document.visibilityState === "visible";
@@ -426,6 +473,7 @@ const displayedCount = computed(() => items.value.length);
 export function useCharityMonitor() {
   return {
     charityTags,
+    charitySourcesLoading,
     selectedTagId,
     searchKeyword,
     currentFeedName,
@@ -468,5 +516,9 @@ export function useCharityMonitor() {
     toggleCharitySyncLog,
     closeCharitySyncLog,
     requestCharityRound,
+    loadCharitySources,
+    addCharitySource,
+    updateCharitySource,
+    removeCharitySource,
   };
 }

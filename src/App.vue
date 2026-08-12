@@ -2,6 +2,8 @@
 import { onMounted, onUnmounted, computed } from "vue";
 import { icons } from "./icons";
 import { useStore } from "./composables/useStore";
+import { isTauri, runCommand } from "./composables/useLibrary";
+import { SYSTEM_TYPES } from "./types";
 import { usePreferences } from "./composables/usePreferences";
 import { useTheme } from "./composables/useTheme";
 import { useToast } from "./composables/useToast";
@@ -20,6 +22,7 @@ import SiteModelsDialog from "./components/SiteModelsDialog.vue";
 import CharityMonitorPage from "./components/CharityMonitorPage.vue";
 import ProxyPoolPage from "./components/ProxyPoolPage.vue";
 import TokenStatsPage from "./components/TokenStatsPage.vue";
+import ModelCatalogPage from "./components/ModelCatalogPage.vue";
 
 const store = useStore();
 
@@ -44,9 +47,7 @@ const featureOptions = [
 ];
 const systemTypeOptions = [
   { value: "all", text: "全部系统类型" },
-  { value: "newapi", text: "NewAPI" },
-  { value: "sub2api", text: "Sub2API" },
-  { value: "0v0", text: "0v0" },
+  ...SYSTEM_TYPES,
   { value: "unknown", text: "未知类型" },
 ];
 const { preferences } = usePreferences();
@@ -103,7 +104,31 @@ function onKeydown(event: KeyboardEvent) {
     else if (store.linkDialogOpen.value) store.closeLinkDialog();
     else if (store.modalOpen.value) store.closeModal();
     else if (store.page.value === "settings") store.closeSettings();
-    else if (store.page.value === "charity" || store.page.value === "proxy" || store.page.value === "tokenstats") store.openLibrary();
+    else if (["modelparams", "charity", "proxy", "tokenstats"].includes(store.page.value)) store.openLibrary();
+  }
+}
+
+function onMenuReload() {
+  // 右键“强制刷新”：类似 F5，重新加载整个页面。
+  window.location.reload();
+}
+
+function onMenuNavigate(event: Event) {
+  const detail = (event as CustomEvent<{ page?: string }>).detail;
+  const page = detail?.page;
+  if (page === "library") store.openLibrary();
+  else if (page === "modelparams") store.openModelParams();
+  else if (page === "charity") store.openCharityMonitor();
+  else if (page === "proxy") store.openProxyPool();
+  else if (page === "tokenstats") store.openTokenStats();
+  else if (page === "settings") store.openSettings();
+}
+
+async function showDesktopWindow() {
+  try {
+    await runCommand("show_main_window");
+  } catch (error) {
+    store.showToast(String(error), true);
   }
 }
 
@@ -118,7 +143,15 @@ onMounted(async () => {
   document.addEventListener("scroll", onScroll, { capture: true, passive: true });
   window.addEventListener("resize", onScroll, { passive: true });
   document.addEventListener("keydown", onKeydown);
-  await Promise.all([store.loadLibrary(), store.loadProxyPool(), store.loadTokenUsage()]);
+  window.addEventListener("oh-menu-reload", onMenuReload);
+  window.addEventListener("oh-menu-navigate", onMenuNavigate);
+  // 查询定时器立即启动，只读 SQLite，不等待其他页面数据初始化。
+  store.startTokenDatabaseRefresh();
+  await Promise.all([
+    store.loadLibrary(),
+    store.loadProxyPool(),
+    store.initializeModelCatalog(),
+  ]);
   store.startDailyRefresh();
   store.startCharityMonitor();
 });
@@ -132,14 +165,25 @@ onUnmounted(() => {
   document.removeEventListener("scroll", onScroll, { capture: true });
   window.removeEventListener("resize", onScroll);
   document.removeEventListener("keydown", onKeydown);
+  window.removeEventListener("oh-menu-reload", onMenuReload);
+  window.removeEventListener("oh-menu-navigate", onMenuNavigate);
   store.stopCharityMonitor();
   store.stopDailyRefresh();
+  store.stopTokenDatabaseRefresh();
+  store.stopModelCatalogEvents();
 });
 
 </script>
 
 <template>
   <div class="app-layout" :class="{ 'sidebar-collapsed': sidebarCollapsed }">
+    <div v-if="!isTauri" class="lightweight-banner" role="status">
+      <span class="lightweight-banner-icon" v-html="icons.globe" />
+      <span class="lightweight-banner-text">轻量模式：正在通过浏览器访问本地内核</span>
+      <button type="button" class="secondary-button lightweight-banner-button" @click="showDesktopWindow">
+        打开桌面窗口
+      </button>
+    </div>
     <AppSidebar />
 
     <div class="app-workspace">
@@ -152,9 +196,34 @@ onUnmounted(() => {
         >
           <header class="app-header library-header">
             <div class="header-inner">
-              <div class="library-heading">
-                <strong>站点库</strong>
-                <span>{{ store.filteredSites.value.length }} / {{ store.sites.value.length }}</span>
+              <div class="library-primary-nav">
+                <div class="library-heading">
+                  <strong>站点库</strong>
+                  <span>{{ store.filteredSites.value.length }} / {{ store.sites.value.length }}</span>
+                </div>
+                <div class="filter-segment surface library-usage-switch" role="group" aria-label="站点库视图">
+                  <button
+                    id="all-usage-filter"
+                    type="button"
+                    :class="{ active: store.usageFilter.value === 'all' }"
+                    :aria-pressed="store.usageFilter.value === 'all'"
+                    @click="store.setUsageFilter('all')"
+                  >全部</button>
+                  <button
+                    id="personal-filter"
+                    type="button"
+                    :class="{ active: store.usageFilter.value === 'personal' }"
+                    :aria-pressed="store.usageFilter.value === 'personal'"
+                    @click="store.setUsageFilter('personal')"
+                  >在用</button>
+                  <button
+                    id="pending-filter"
+                    type="button"
+                    :class="{ active: store.usageFilter.value === 'pending' }"
+                    :aria-pressed="store.usageFilter.value === 'pending'"
+                    @click="store.setUsageFilter('pending')"
+                  >待定</button>
+                </div>
               </div>
               <label class="search-box">
                 <span v-html="icons.search" />
@@ -170,13 +239,14 @@ onUnmounted(() => {
               <div class="header-actions">
                 <button
                   class="secondary-button sync-button"
-                  :disabled="store.syncingModelKeys.value"
-                  :data-tooltip="store.usageFilter.value === 'personal' || store.usageFilter.value === 'pending'
-                    ? '只提取浏览器会话数据（有数据即标待定，不检测站点类型）'
-                    : '根据当前存活/跑路状态，从 ldoh 同步站点'"
+                  :disabled="store.syncingSites.value || store.syncingModelKeys.value"
+                  :data-tooltip="store.usageFilter.value === 'all'
+                    ? '根据当前存活/跑路状态，从 ldoh 同步站点'
+                    : `同步当前${store.usageFilter.value === 'pending' ? '待定' : '在用'}站点的账号额度`"
                   @click="store.openSyncDialog()"
                 >
-                  <span v-html="icons.restore" /><span>同步站点</span>
+                  <span v-html="store.usageFilter.value === 'all' ? icons.restore : icons.activity" />
+                  <span>{{ store.usageFilter.value === 'all' ? '同步站点' : '额度同步' }}</span>
                 </button>
                 <button
                   v-if="store.runawayFilter.value === 'active'"
@@ -221,29 +291,6 @@ onUnmounted(() => {
                 />
               </div>
               <div class="library-filter-segments">
-                <div class="filter-segment surface is-usage" role="group" aria-label="使用状态">
-                  <button
-                    id="all-usage-filter"
-                    type="button"
-                    :class="{ active: store.usageFilter.value === 'all' }"
-                    :aria-pressed="store.usageFilter.value === 'all'"
-                    @click="store.setUsageFilter('all')"
-                  >全部</button>
-                  <button
-                    id="personal-filter"
-                    type="button"
-                    :class="{ active: store.usageFilter.value === 'personal' }"
-                    :aria-pressed="store.usageFilter.value === 'personal'"
-                    @click="store.setUsageFilter('personal')"
-                  >在用</button>
-                  <button
-                    id="pending-filter"
-                    type="button"
-                    :class="{ active: store.usageFilter.value === 'pending' }"
-                    :aria-pressed="store.usageFilter.value === 'pending'"
-                    @click="store.setUsageFilter('pending')"
-                  >待定</button>
-                </div>
                 <div class="filter-segment surface is-runaway" role="group" aria-label="站点状态">
                   <button
                     id="active-filter"
@@ -273,6 +320,14 @@ onUnmounted(() => {
 
           <SiteGrid />
         </section>
+        <div
+          v-else-if="store.page.value === 'modelparams'"
+          id="model-params-panel"
+          class="model-params-panel"
+          aria-labelledby="modelparams-nav"
+        >
+          <ModelCatalogPage />
+        </div>
         <div
           v-else-if="store.page.value === 'charity'"
           id="charity-panel"

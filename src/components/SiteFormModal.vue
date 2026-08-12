@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, reactive, watch, computed, nextTick } from "vue";
 import { icons } from "../icons";
-import { emptySite, type Maintainer, type ExtensionLink, type SiteRecord } from "../types";
+import { emptySite, SYSTEM_TYPES, type Maintainer, type ExtensionLink, type SiteRecord, type SiteUsageState } from "../types";
 import { useStore } from "../composables/useStore";
 import CustomSelect from "./CustomSelect.vue";
 
@@ -12,6 +12,11 @@ const registrationLevelOptions = [
   { value: 3, text: "LV3" },
 ];
 
+const systemTypeOptions = [
+  { value: "", text: "未知类型" },
+  ...SYSTEM_TYPES,
+];
+
 const store = useStore();
 
 const activeTab = ref<"basic" | "features" | "maintenance">("basic");
@@ -20,10 +25,17 @@ const errorMessage = ref("");
 const nameInputRef = ref<HTMLInputElement>();
 const importUrlInputRef = ref<HTMLInputElement>();
 const importUrl = ref("");
+const importUsageState = ref<SiteUsageState>("all");
+const importUsageOptions: Array<{ value: SiteUsageState; text: string; description: string }> = [
+  { value: "all", text: "全部", description: "仅加入站点库，不标记使用状态" },
+  { value: "personal", text: "在用", description: "导入后直接加入在用站点" },
+  { value: "pending", text: "待定", description: "导入后加入待确认站点" },
+];
 
 interface FormState {
   name: string;
   apiBaseUrl: string;
+  systemType: string;
   description: string;
   registrationLimit: number;
   rateLimit: string;
@@ -47,6 +59,7 @@ interface FormState {
 const form = reactive<FormState>({
   name: "",
   apiBaseUrl: "",
+  systemType: "",
   description: "",
   registrationLimit: 0,
   rateLimit: "",
@@ -71,6 +84,7 @@ function resetForm(site?: SiteRecord) {
   const value = site ?? emptySite();
   form.name = value.name;
   form.apiBaseUrl = value.apiBaseUrl;
+  form.systemType = value.systemType;
   form.description = value.description;
   form.registrationLimit = value.registrationLimit;
   form.rateLimit = value.rateLimit;
@@ -101,6 +115,9 @@ watch(
     if (open) {
       resetForm(store.editingSite.value ?? undefined);
       importUrl.value = "";
+      importUsageState.value = ["personal", "pending"].includes(store.usageFilter.value)
+        ? store.usageFilter.value as SiteUsageState
+        : "all";
       activeTab.value = "basic";
       errorMessage.value = "";
       nextTick(() => {
@@ -196,6 +213,7 @@ async function handleSubmit() {
     ...existing,
     name: form.name.trim(),
     apiBaseUrl: form.apiBaseUrl.trim(),
+    systemType: form.systemType,
     description: form.description.trim(),
     registrationLimit: Number(form.registrationLimit),
     rateLimit: form.rateLimit.trim(),
@@ -236,7 +254,12 @@ async function handleImport() {
 
   saving.value = true;
   try {
-    await store.importSite(importUrl.value.trim());
+    const importedSite = await store.importSite(importUrl.value.trim(), importUsageState.value);
+    const expectedPersonal = importUsageState.value === "personal";
+    const expectedPending = importUsageState.value === "pending";
+    if (importedSite.isPersonal !== expectedPersonal || importedSite.isPending !== expectedPending) {
+      throw new Error("站点已导入，但归类状态写入异常");
+    }
   } catch (error) {
     errorMessage.value = String(error).replace(/^Error:\s*/, "");
   } finally {
@@ -319,6 +342,16 @@ function onBackdropClick(event: MouseEvent) {
                   />
                 </label>
                 <label class="field">
+                  <span>站点类型</span>
+                  <CustomSelect
+                    :options="systemTypeOptions"
+                    :model-value="form.systemType"
+                    @update:model-value="val => form.systemType = String(val)"
+                    aria-label="站点类型"
+                  />
+                  <small>手动指定站点使用的系统类型</small>
+                </label>
+                <label class="field field-wide">
                   <span>API BASE URL <b>*</b></span>
                   <input
                     v-model="form.apiBaseUrl"
@@ -557,7 +590,22 @@ function onBackdropClick(event: MouseEvent) {
                 />
               </div>
             </label>
-            <p v-if="saving" class="import-progress" role="status">正在采集站点资料…</p>
+            <fieldset class="import-usage-field" :disabled="saving">
+              <legend>导入到</legend>
+              <div class="preference-segment import-usage-segment" role="radiogroup" aria-label="导入站点状态">
+                <button
+                  v-for="option in importUsageOptions"
+                  :key="option.value"
+                  type="button"
+                  role="radio"
+                  :class="{ active: importUsageState === option.value }"
+                  :aria-checked="importUsageState === option.value"
+                  @click="importUsageState = option.value"
+                >{{ option.text }}</button>
+              </div>
+              <small>{{ importUsageOptions.find(option => option.value === importUsageState)?.description }}</small>
+            </fieldset>
+            <p v-if="saving" class="import-progress" role="status">正在采集站点资料并归入“{{ importUsageOptions.find(option => option.value === importUsageState)?.text }}”…</p>
           </div>
 
           <p class="form-error">{{ errorMessage }}</p>

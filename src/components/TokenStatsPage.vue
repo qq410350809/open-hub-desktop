@@ -3,6 +3,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue"
 import type { EChartsOption } from "../echarts";
 import EChart from "./EChart.vue";
 import QuickRangeDropdown from "./QuickRangeDropdown.vue";
+import AppTable, { type AppTableColumn } from "./AppTable.vue";
 import { icons } from "../icons";
 import { useStore } from "../composables/useStore";
 import {
@@ -53,6 +54,7 @@ const modal = ref<ModalKind | null>(null);
 const modalOpen = ref(false);
 function openModal(kind: ModalKind) {
   modal.value = kind;
+  detailPage.value = 1;
   modalOpen.value = true;
 }
 function closeModal() {
@@ -70,24 +72,50 @@ function openDetail(tab: "daily" | "projects") {
   modal.value = tab; // 复用 modal 弹窗（daily/projects）
   modalOpen.value = true;
 }
-function totalPages(listLength: number) {
-  return Math.max(1, Math.ceil(listLength / PAGE_SIZE));
-}
-function paginate<T>(list: T[]): T[] {
-  const start = (detailPage.value - 1) * PAGE_SIZE;
-  return list.slice(start, start + PAGE_SIZE);
-}
-function detailPrev() { if (detailPage.value > 1) detailPage.value--; }
-function detailNext(total: number) { if (detailPage.value < totalPages(total)) detailPage.value++; }
 function switchDetailTab(tab: "daily" | "projects") {
   detailTab.value = tab;
   detailPage.value = 1;
 }
 
-// sessions 仅用于：项目用量表 + 会话成本估算（来自 Claude/Codex 会话日志）
+const dailyColumns: AppTableColumn[] = [
+  { key: "label", title: "时间", width: "minmax(120px,1fr)" },
+  { key: "total", title: "总计", width: "90px", align: "right", sortable: true },
+  { key: "input", title: "输入", width: "90px", align: "right", sortable: true },
+  { key: "output", title: "输出", width: "90px", align: "right", sortable: true },
+  { key: "cache", title: "缓存", width: "90px", align: "right", sortable: true },
+  { key: "reasoning", title: "推理", width: "90px", align: "right", sortable: true },
+  { key: "sessions", title: "对话", width: "90px", align: "right", sortable: true },
+];
+
+const projectColumns: AppTableColumn[] = [
+  { key: "project", title: "项目", width: "minmax(120px,1fr)" },
+  { key: "totalTokens", title: "总计", width: "90px", align: "right", sortable: true },
+  { key: "input", title: "输入", width: "90px", align: "right", sortable: true },
+  { key: "output", title: "输出", width: "90px", align: "right", sortable: true },
+  { key: "cache", title: "缓存", width: "90px", align: "right", sortable: true },
+  { key: "reasoning", title: "推理", width: "90px", align: "right", sortable: true },
+  { key: "sessions", title: "对话", width: "90px", align: "right", sortable: true },
+  { key: "costUsd", title: "成本", width: "100px", align: "right", sortable: true },
+];
+
+const sourceColumns: AppTableColumn[] = [
+  { key: "source", title: "工具", width: "minmax(120px,1fr)" },
+  { key: "totalTokens", title: "总计", width: "90px", align: "right", sortable: true },
+  { key: "inputTokens", title: "输入", width: "90px", align: "right", sortable: true },
+  { key: "outputTokens", title: "输出", width: "90px", align: "right", sortable: true },
+  { key: "cacheTokens", title: "缓存", width: "90px", align: "right", sortable: true },
+  { key: "reasoningTokens", title: "推理", width: "90px", align: "right", sortable: true },
+  { key: "conversations", title: "对话", width: "90px", align: "right", sortable: true },
+  { key: "costUsd", title: "成本", width: "100px", align: "right", sortable: true },
+  { key: "share", title: "占比", width: "70px", align: "right" },
+];
+
+const modelColumns: AppTableColumn[] = sourceColumns;
+
+// sessions 仅用于项目用量表；顶部成本改用覆盖全部工具的小时桶逐模型定价。
 const sessions = computed(() => store.tokenStats.value?.sessions ?? []);
 
-// —— 供应商品牌色（复刻 tokentracker UsageOverview 配色）——
+// —— 供应商品牌色 ——
 const PROVIDER_COLORS: Record<string, string> = {
   claude: "#d97757",
   codex: "#3b82f6",
@@ -100,6 +128,8 @@ const PROVIDER_COLORS: Record<string, string> = {
   antigravity: "#ff6900",
   zed: "#14b8a6",
   cursor: "#8b5cf6",
+  catpawai: "#ec4899",
+  "command-code": "#10b981",
 };
 function providerColor(source: string, index: number) {
   return PROVIDER_COLORS[source.toLowerCase()] || `hsl(${150 + index * 40}, 60%, 45%)`;
@@ -109,6 +139,7 @@ const sourceNameMap: Record<string, string> = {
   claude: "Claude",
   codex: "Codex",
   cursor: "Cursor",
+  catpawai: "CatPawAI",
   gemini: "Gemini",
   opencode: "OpenCode",
   kiro: "Kiro",
@@ -117,16 +148,17 @@ const sourceNameMap: Record<string, string> = {
   goose: "Goose",
   antigravity: "Antigravity",
   zed: "Zed",
+  "command-code": "Command Code",
 };
 function sourceLabel(source: string) {
-  return sourceNameMap[source] || source || "未知来源";
+  return sourceNameMap[source.toLowerCase()] || source || "未知来源";
 }
 
 function shareOf(value: number, total: number) {
   return total > 0 ? Math.min(100, (value / total) * 100) : 0;
 }
 
-// —— 小时用量桶（覆盖所有工具，来自 cursors.json hourly.buckets）——
+// —— 小时用量桶（OpenHub 自有采集 + CatPawAI 本地 SQLite）——
 const allBuckets = computed(() => store.tokenUsage.value?.buckets ?? []);
 const filteredBuckets = computed(() => {
   const buckets = allBuckets.value;
@@ -201,17 +233,32 @@ const cacheHitRate = computed(() => {
   return total > 0 ? cacheRead / total : null;
 });
 
-// 成本估算：用会话数据的实际单价（cost/token）外推到全部工具的 token 用量
-const costPerToken = computed(() => {
-  let tokens = 0;
-  let cost = 0;
-  for (const session of sessions.value) {
-    tokens += session.totalTokens || 0;
-    cost += session.costUsd || 0;
+// 成本只汇总数据源明确上报的金额，不对缺少价格的数据进行猜测。
+const costSummary = computed(() => {
+  let costUsd = 0;
+  let pricedTokens = 0;
+  let totalTokens = 0;
+  for (const bucket of filteredBuckets.value) {
+    const tokens = Math.max(0, bucket.totalTokens || 0);
+    totalTokens += tokens;
+    costUsd += Math.max(0, bucket.costUsd || 0);
+    if (bucket.pricingAvailable) pricedTokens += tokens;
   }
-  return tokens > 0 ? cost / tokens : 0;
+  return {
+    costUsd,
+    pricedTokens,
+    totalTokens,
+    coverage: totalTokens > 0 ? pricedTokens / totalTokens : null,
+  };
 });
-const estimatedCost = computed(() => bucketTotal.value.total * costPerToken.value);
+const estimatedCost = computed(() => costSummary.value.costUsd);
+const costCaption = computed(() => {
+  const { coverage, pricedTokens, totalTokens } = costSummary.value;
+  if (totalTokens <= 0) return "按模型分项估算";
+  if (pricedTokens <= 0 || coverage == null) return "暂无匹配定价";
+  if (coverage >= 0.9995) return "来源上报成本 · 全部覆盖";
+  return `来源上报成本 · 覆盖 ${(coverage * 100).toFixed(1)}%`;
+});
 
 const totalTokensAll = computed(() => bucketTotal.value.total);
 const bySource = computed(() => bucketSourceTotals(filteredBuckets.value));
@@ -229,24 +276,51 @@ type ProjectUsageItem = {
   cache: number;
   reasoning: number;
   costUsd: number;
+  estimatedTokens: number;
 };
 const projectUsage = computed<ProjectUsageItem[]>(() => {
   const groups = new Map<
     string,
-    { project: string; sessions: number; totalTokens: number; input: number; output: number; cache: number; reasoning: number; costUsd: number }
+    { project: string; sessions: number; totalTokens: number; input: number; output: number; cache: number; reasoning: number; costUsd: number; estimatedTokens: number }
   >();
-  for (const session of sessions.value) {
-    // UUID 形态的项目名无法识别（Claude Code 缺失 cwd 上下文时产生），归并为"其他"
-    const rawKey = session.projectKey || "未知项目";
-    const key = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(rawKey)
+  const normalizeProject = (rawKey?: string) => {
+    const value = rawKey?.trim() || "未知项目";
+    // UUID 形态的项目名无法识别（Claude Code 缺失 cwd 上下文时产生），归并为“其他”。
+    return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value)
       ? "其他"
-      : rawKey;
-    const current =
-      groups.get(key) ||
-      {
-        project: key, sessions: 0, totalTokens: 0,
-        input: 0, output: 0, cache: 0, reasoning: 0, costUsd: 0,
-      };
+      : value;
+  };
+  const ensureGroup = (rawKey?: string) => {
+    const key = normalizeProject(rawKey);
+    const current = groups.get(key) || {
+      project: key, sessions: 0, totalTokens: 0,
+      input: 0, output: 0, cache: 0, reasoning: 0, costUsd: 0, estimatedTokens: 0,
+    };
+    groups.set(key, current);
+    return current;
+  };
+
+  // CatPawAI 桶自带 workspace 项目维度，直接按当前前端日期范围精确聚合。
+  // 记录这些来源后，跳过同来源 sessions，避免项目维度重复统计。
+  const projectBucketSources = new Set<string>();
+  for (const bucket of filteredBuckets.value) {
+    if (!bucket.projectKey?.trim()) continue;
+    projectBucketSources.add(bucket.source.toLowerCase());
+    const current = ensureGroup(bucket.projectKey);
+    current.sessions += bucket.conversationCount || 0;
+    current.totalTokens += bucket.totalTokens || 0;
+    current.input += bucket.inputTokens || 0;
+    current.output += bucket.outputTokens || 0;
+    current.cache += (bucket.cachedInputTokens || 0) + (bucket.cacheCreationInputTokens || 0);
+    current.reasoning += bucket.reasoningOutputTokens || 0;
+    current.costUsd += bucket.costUsd || 0;
+    current.estimatedTokens += bucket.estimatedTokens || 0;
+  }
+
+  // 对没有项目桶的兼容来源，使用会话数据补充项目维度。
+  for (const session of sessions.value) {
+    if (projectBucketSources.has((session.source || "").toLowerCase())) continue;
+    const current = ensureGroup(session.projectKey);
     current.sessions += 1;
     current.totalTokens += session.totalTokens || 0;
     current.input += session.tokens?.inputTokens || 0;
@@ -254,7 +328,8 @@ const projectUsage = computed<ProjectUsageItem[]>(() => {
     current.cache += (session.tokens?.cachedInputTokens || 0) + (session.tokens?.cacheCreationInputTokens || 0);
     current.reasoning += session.tokens?.reasoningOutputTokens || 0;
     current.costUsd += session.costUsd || 0;
-    groups.set(key, current);
+    const usageKind = String(session.provenance?.tokenUsage || "");
+    if (usageKind.includes("estimated")) current.estimatedTokens += session.totalTokens || 0;
   }
   return [...groups.values()].sort((a, b) => b.totalTokens - a.totalTokens).slice(0, 20);
 });
@@ -382,7 +457,6 @@ type HealthDisplayCell = {
 // 全量健康桶按当前粒度聚合（含所选区间之外），供前置补全取值
 const healthBucketMap = computed(() => {
   const map = new Map<string, { dialogues: number; requests: number; success: number; failed: number; usage: number }>();
-  let extracted = 0;
   for (const b of store.requestHealth.value?.buckets ?? []) {
     const { key } = bucketKeyFor(trendGranularity.value, b.hour);
     if (!key) continue;
@@ -391,23 +465,21 @@ const healthBucketMap = computed(() => {
     cur.requests += b.requests || 0;
     cur.success += b.success || 0;
     cur.failed += b.failed || 0;
-    extracted += cur.dialogues + cur.requests;
     map.set(key, cur);
   }
-  // usage 估算仅作完全无提取数据时的兜底（前置补全节点也遵循同一规则）
-  if (extracted <= 0) {
-    for (const b of store.tokenUsage.value?.buckets ?? []) {
-      const { key } = bucketKeyFor(trendGranularity.value, b.timestamp);
-      if (!key) continue;
-      const cur = map.get(key) || { dialogues: 0, requests: 0, success: 0, failed: 0, usage: 0 };
-      cur.usage += estimateRequestCount({
-        conversationCount: b.conversationCount || 0,
-        outputTokens: b.outputTokens || 0,
-        reasoningOutputTokens: b.reasoningOutputTokens || 0,
-        totalTokens: b.totalTokens || 0,
-      });
-      map.set(key, cur);
-    }
+  // usage 对每个时间节点独立兜底。即使其他日期已有真实请求数据，
+  // 当前日期只要存在 Token 活动，也不应该被显示成“无数据”。
+  for (const b of store.tokenUsage.value?.buckets ?? []) {
+    const { key } = bucketKeyFor(trendGranularity.value, b.timestamp);
+    if (!key) continue;
+    const cur = map.get(key) || { dialogues: 0, requests: 0, success: 0, failed: 0, usage: 0 };
+    cur.usage += estimateRequestCount({
+      conversationCount: b.conversationCount || 0,
+      outputTokens: b.outputTokens || 0,
+      reasoningOutputTokens: b.reasoningOutputTokens || 0,
+      totalTokens: b.totalTokens || 0,
+    });
+    map.set(key, cur);
   }
   return map;
 });
@@ -546,13 +618,11 @@ const modalTitle = computed(() => "用量明细");
 
 async function refreshAll() {
   try {
-    await store.syncTokenTracker(true);
+    await store.syncTokenCollector(true);
   } catch {
     // 保留现有缓存数据，错误由同步状态区域展示。
   }
-  store.refreshTokenStats();
-  void store.loadTokenUsage();
-  void store.loadRequestHealth(true);
+  await store.refreshTokenDatabaseView(true);
 }
 
 
@@ -562,22 +632,7 @@ watch(
 );
 
 onMounted(() => {
-  // 先显示已有本地 cursor/cache，再后台触发 Tokentracker 增量同步；
-  // 同步结束后只刷新发生变化的结果，避免首屏被全量扫描阻塞。
-  // 请求健康立即增量读取，避免等 token 同步完才看到最近失败。
-  void Promise.all([
-    store.loadTokenUsage(),
-    store.loadTokenStats(),
-    store.loadRequestHealth(false),
-  ]);
-  void store.syncTokenTracker()
-    .then(() => Promise.all([
-      store.loadTokenUsage(),
-      store.loadTokenStats(),
-      // 后台同步后走增量刷新：只扫新增行，不强制全量重建
-      store.loadRequestHealth(false),
-    ]))
-    .catch(() => store.loadRequestHealth(false));
+  // 全局查询定时器已维护数据库快照；页面挂载只负责图表布局。
   nextTick(() => {
     measureHealthGrid();
     if (typeof ResizeObserver !== "undefined" && healthGridRef.value) {
@@ -601,30 +656,30 @@ onBeforeUnmount(() => {
       <div>
         <span class="token-stats-eyebrow">TOKEN TRACKER</span>
         <h1>Token 统计</h1>
-        <p>数据来自 Tokentracker 本地增量状态，今日数据会在后台同步更新。</p>
+        <p>后台增量采集本地日志写入数据库，页面只查询数据库快照。</p>
       </div>
       <div class="token-stats-actions">
         <QuickRangeDropdown />
         <button
           class="tt-btn"
           type="button"
-          :disabled="store.tokenStatsLoading.value || store.tokenUsageLoading.value || store.tokenTrackerSyncing.value"
-          title="同步 Tokentracker 本地增量数据后刷新"
+          :disabled="store.tokenStatsLoading.value || store.tokenUsageLoading.value || store.tokenCollectorSyncing.value"
+          title="立即采集本地 Token 日志并刷新数据库"
           @click="refreshAll"
         >
-          <span :class="{ 'is-spinning': store.tokenStatsLoading.value || store.tokenTrackerSyncing.value }">↻</span>
-          <span>{{ store.tokenTrackerSyncing.value ? "同步中…" : (store.tokenStatsLoading.value ? "读取中…" : "刷新") }}</span>
+          <span :class="{ 'is-spinning': store.tokenStatsLoading.value || store.tokenCollectorSyncing.value }">↻</span>
+          <span>{{ store.tokenCollectorSyncing.value ? "同步中…" : (store.tokenStatsLoading.value ? "读取中…" : "刷新") }}</span>
         </button>
       </div>
       <span
-        v-if="store.tokenTrackerSyncing.value"
+        v-if="store.tokenCollectorSyncing.value"
         class="tt-sync-status"
         role="status"
-      >正在复用 Tokentracker 增量数据…</span>
+      >正在采集本地日志并写入数据库…</span>
       <span
-        v-else-if="store.tokenTrackerSyncError.value"
+        v-else-if="store.tokenCollectorSyncError.value"
         class="tt-sync-status is-error"
-        :title="store.tokenTrackerSyncError.value"
+        :title="store.tokenCollectorSyncError.value"
       >同步失败，显示本地缓存</span>
     </header>
 
@@ -632,7 +687,7 @@ onBeforeUnmount(() => {
       <div v-if="store.tokenUsageError.value" class="tt-error" role="alert">
         <strong>无法读取 Token 统计</strong>
         <p>{{ store.tokenUsageError.value }}</p>
-        <p>依赖本机 tokentracker CLI：<code>npm i -g tokentracker-cli</code>，或设置 <code>OPENHUB_TOKENTRACKER_PATH</code>。</p>
+        <p>OpenHub 会直接读取 Codex、Claude、Command Code、Antigravity、OpenCode、MiMo、ZCode 与 CatPawAI 的本地日志；请确认相关工具已产生可读取记录。</p>
       </div>
 
       <template v-if="store.tokenUsageLoading.value && !store.tokenUsage.value">
@@ -657,6 +712,7 @@ onBeforeUnmount(() => {
                 <span><i class="dot in"></i>输入 {{ formatCompact(rangeSplits.input) }}</span>
                 <span><i class="dot out"></i>输出 {{ formatCompact(rangeSplits.output) }}</span>
               </div>
+              <span class="tt-kpi-sub">本地日志统计</span>
             </div>
             <div class="tt-kpi-total-side">
               <div class="tt-kpi-top">
@@ -704,8 +760,8 @@ onBeforeUnmount(() => {
               <span class="tt-kpi-ic ic-purple" v-html="icons.card"></span>
               <span class="tt-kpi-label">估算成本</span>
             </div>
-            <strong class="tt-kpi-value">{{ estimatedCost > 0 ? formatCost(estimatedCost) : "—" }}</strong>
-            <span class="tt-kpi-sub">会话单价外推</span>
+            <strong class="tt-kpi-value">{{ costSummary.pricedTokens > 0 ? formatCost(estimatedCost) : "—" }}</strong>
+            <span class="tt-kpi-sub">{{ costCaption }}</span>
           </div>
         </div>
 
@@ -837,7 +893,13 @@ onBeforeUnmount(() => {
     <!-- 详情弹窗 -->
     <Transition name="tt-modal-fade">
       <div v-if="modalOpen" class="tt-modal-backdrop" @click.self="closeModal">
-        <div class="tt-modal" role="dialog" aria-modal="true" :aria-label="modalTitle">
+        <div
+          class="tt-modal"
+          :class="{ 'tt-modal-wide': modal === 'sources' || modal === 'models' }"
+          role="dialog"
+          aria-modal="true"
+          :aria-label="modalTitle"
+        >
           <header class="tt-modal-head">
             <div>
               <h2>{{ modalTitle }}</h2>
@@ -857,96 +919,103 @@ onBeforeUnmount(() => {
 
               <div v-if="detailTab === 'daily'">
                 <div class="tt-list-meta">按当前趋势粒度 · {{ trendUnitLabel() }}</div>
-                <div class="tt-table tt-daily" role="table">
-                  <div class="tt-table-row tt-table-head" role="row">
-                    <span class="tt-col-date">时间</span>
-                    <span class="tt-col-num">总计</span>
-                    <span class="tt-col-num">输入</span>
-                    <span class="tt-col-num">输出</span>
-                    <span class="tt-col-num">缓存</span>
-                    <span class="tt-col-num">推理</span>
-                    <span class="tt-col-num">对话</span>
-                  </div>
-                  <div v-for="(item, idx) in paginate(trendDetail)" :key="item.label + idx" class="tt-table-row" role="row">
-                    <span class="tt-col-date">{{ formatDetailTime(item.label) }}</span>
-                    <span class="tt-col-num">{{ formatCompact(item.total) }}</span>
-                    <span class="tt-col-num">{{ formatCompact(item.input) }}</span>
-                    <span class="tt-col-num">{{ formatCompact(item.output) }}</span>
-                    <span class="tt-col-num">{{ formatCompact(item.cache) }}</span>
-                    <span class="tt-col-num">{{ formatCompact(item.reasoning) }}</span>
-                    <span class="tt-col-num">{{ formatTokens(item.sessions) }}</span>
-                  </div>
-                  <div v-if="!trendDetail.length" class="tt-table-empty">该范围内没有明细数据</div>
-                </div>
-                <div class="tt-pager">
-                  <button type="button" :disabled="detailPage <= 1" @click="detailPrev">‹ 上一页</button>
-                  <span>第 {{ detailPage }} / {{ totalPages(trendDetail.length) }} 页</span>
-                  <button type="button" :disabled="detailPage >= totalPages(trendDetail.length)" @click="detailNext(trendDetail.length)">下一页 ›</button>
-                </div>
+                <AppTable
+                  :rows="trendDetail"
+                  :columns="dailyColumns"
+                  :row-key="(item: any) => item.label"
+                  :page="detailPage"
+                  :page-size="PAGE_SIZE"
+                  empty-text="该范围内没有明细数据"
+                  @update:page="detailPage = $event"
+                >
+                  <template #cell-label="{ row }">{{ formatDetailTime(row.label) }}</template>
+                  <template #cell-total="{ row }">{{ formatCompact(row.total) }}</template>
+                  <template #cell-input="{ row }">{{ formatCompact(row.input) }}</template>
+                  <template #cell-output="{ row }">{{ formatCompact(row.output) }}</template>
+                  <template #cell-cache="{ row }">{{ formatCompact(row.cache) }}</template>
+                  <template #cell-reasoning="{ row }">{{ formatCompact(row.reasoning) }}</template>
+                  <template #cell-sessions="{ row }">{{ formatTokens(row.sessions) }}</template>
+                </AppTable>
               </div>
 
               <div v-else>
-                <div class="tt-table tt-projects" role="table">
-                  <div class="tt-table-row tt-table-head" role="row">
-                    <span>项目</span>
-                    <span class="tt-col-num">总计</span>
-                    <span class="tt-col-num">输入</span>
-                    <span class="tt-col-num">输出</span>
-                    <span class="tt-col-num">缓存</span>
-                    <span class="tt-col-num">推理</span>
-                    <span class="tt-col-num">对话</span>
-                    <span class="tt-col-num">成本</span>
-                  </div>
-                  <div v-for="item in paginate(projectUsage)" :key="item.project" class="tt-table-row" role="row">
-                    <span :title="item.project">{{ item.project }}</span>
-                    <span class="tt-col-num">{{ formatCompact(item.totalTokens) }}</span>
-                    <span class="tt-col-num">{{ formatCompact(item.input) }}</span>
-                    <span class="tt-col-num">{{ formatCompact(item.output) }}</span>
-                    <span class="tt-col-num">{{ formatCompact(item.cache) }}</span>
-                    <span class="tt-col-num">{{ formatCompact(item.reasoning) }}</span>
-                    <span class="tt-col-num">{{ formatTokens(item.sessions) }}</span>
-                    <span class="tt-col-num">{{ formatCost(item.costUsd) }}</span>
-                  </div>
-                  <div v-if="!projectUsage.length" class="tt-table-empty">该范围内没有项目数据</div>
-                </div>
-                <div class="tt-pager">
-                  <button type="button" :disabled="detailPage <= 1" @click="detailPrev">‹ 上一页</button>
-                  <span>第 {{ detailPage }} / {{ totalPages(projectUsage.length) }} 页</span>
-                  <button type="button" :disabled="detailPage >= totalPages(projectUsage.length)" @click="detailNext(projectUsage.length)">下一页 ›</button>
-                </div>
+                <AppTable
+                  :rows="projectUsage"
+                  :columns="projectColumns"
+                  :row-key="(item: any) => item.project"
+                  :page="detailPage"
+                  :page-size="PAGE_SIZE"
+                  empty-text="该范围内没有项目数据"
+                  @update:page="detailPage = $event"
+                >
+                  <template #cell-project="{ row }" :title="row.project">{{ row.project }}</template>
+                  <template #cell-totalTokens="{ row }">{{ formatCompact(row.totalTokens) }}</template>
+                  <template #cell-input="{ row }">{{ formatCompact(row.input) }}</template>
+                  <template #cell-output="{ row }">{{ formatCompact(row.output) }}</template>
+                  <template #cell-cache="{ row }">{{ formatCompact(row.cache) }}</template>
+                  <template #cell-reasoning="{ row }">{{ formatCompact(row.reasoning) }}</template>
+                  <template #cell-sessions="{ row }">{{ formatTokens(row.sessions) }}</template>
+                  <template #cell-costUsd="{ row }">{{ formatCost(row.costUsd) }}</template>
+                </AppTable>
               </div>
             </div>
 
-            <!-- 工具明细 -->
+            <!-- 工具明细：完整 Token 用量列表 -->
             <div v-else-if="modal === 'sources'">
-              <div class="tt-provider-list">
-                <div v-for="(item, index) in bySource" :key="item.source" class="tt-provider">
-                  <span class="tt-provider-dot" :style="{ background: providerColor(item.source, index) }"></span>
-                  <span class="tt-provider-name">{{ sourceLabel(item.source) }}</span>
-                  <span class="tt-provider-bar">
-                    <i :style="{ width: `${shareOf(item.totalTokens, totalTokensAll)}%`, background: providerColor(item.source, index) }"></i>
+              <div class="tt-list-meta">所选时间区间 · 点击列头排序</div>
+              <AppTable
+                :rows="bySource"
+                :columns="sourceColumns"
+                :row-key="(item: any) => item.source"
+                :page="detailPage"
+                :page-size="PAGE_SIZE"
+                empty-text="该范围内没有工具数据"
+                @update:page="detailPage = $event"
+              >
+                <template #cell-source="{ row }">
+                  <span class="tt-dimension-name" :title="sourceLabel(row.source)">
+                    <i class="tt-provider-dot" :style="{ background: providerColor(row.source, 0) }"></i>
+                    <b>{{ sourceLabel(row.source) }}</b>
                   </span>
-                  <span class="tt-provider-pct">{{ shareOf(item.totalTokens, totalTokensAll).toFixed(2) }}%</span>
-                  <span class="tt-provider-val">{{ formatCompact(item.totalTokens) }}</span>
-                </div>
-                <div v-if="!bySource.length" class="tt-muted">该范围内没有数据</div>
-              </div>
+                </template>
+                <template #cell-totalTokens="{ row }">{{ formatCompact(row.totalTokens) }}</template>
+                <template #cell-inputTokens="{ row }">{{ formatCompact(row.inputTokens) }}</template>
+                <template #cell-outputTokens="{ row }">{{ formatCompact(row.outputTokens) }}</template>
+                <template #cell-cacheTokens="{ row }">{{ formatCompact(row.cacheTokens) }}</template>
+                <template #cell-reasoningTokens="{ row }">{{ formatCompact(row.reasoningTokens) }}</template>
+                <template #cell-conversations="{ row }">{{ formatTokens(row.conversations) }}</template>
+                <template #cell-costUsd="{ row }">{{ row.costUsd > 0 ? formatCost(row.costUsd) : "—" }}</template>
+                <template #cell-share="{ row }">{{ shareOf(row.totalTokens, totalTokensAll).toFixed(2) }}%</template>
+              </AppTable>
             </div>
 
-            <!-- 模型明细 -->
+            <!-- 模型明细：完整 Token 用量列表 -->
             <div v-else-if="modal === 'models'">
-              <div class="tt-provider-list">
-                <div v-for="(model, index) in byModel" :key="model.model" class="tt-provider">
-                  <span class="tt-provider-dot" :style="{ background: providerColor(model.model, index) }"></span>
-                  <span class="tt-provider-name" :title="model.model">{{ model.model || "未知模型" }}</span>
-                  <span class="tt-provider-bar">
-                    <i :style="{ width: `${shareOf(model.totalTokens, totalTokensAll)}%`, background: providerColor(model.model, index) }"></i>
+              <div class="tt-list-meta">所选时间区间 · 同系列模型归并 · 点击列头排序</div>
+              <AppTable
+                :rows="byModel"
+                :columns="modelColumns"
+                :row-key="(item: any) => item.model"
+                :page="detailPage"
+                :page-size="PAGE_SIZE"
+                empty-text="该范围内没有模型数据"
+                @update:page="detailPage = $event"
+              >
+                <template #cell-source="{ row }">
+                  <span class="tt-dimension-name" :title="row.model || '未知模型'">
+                    <i class="tt-provider-dot" :style="{ background: providerColor(row.model, 0) }"></i>
+                    <b>{{ row.model || "未知模型" }}</b>
                   </span>
-                  <span class="tt-provider-pct">{{ shareOf(model.totalTokens, totalTokensAll).toFixed(2) }}%</span>
-                  <span class="tt-provider-val">{{ formatCompact(model.totalTokens) }}</span>
-                </div>
-                <div v-if="!byModel.length" class="tt-muted">暂无模型数据</div>
-              </div>
+                </template>
+                <template #cell-totalTokens="{ row }">{{ formatCompact(row.totalTokens) }}</template>
+                <template #cell-inputTokens="{ row }">{{ formatCompact(row.inputTokens) }}</template>
+                <template #cell-outputTokens="{ row }">{{ formatCompact(row.outputTokens) }}</template>
+                <template #cell-cacheTokens="{ row }">{{ formatCompact(row.cacheTokens) }}</template>
+                <template #cell-reasoningTokens="{ row }">{{ formatCompact(row.reasoningTokens) }}</template>
+                <template #cell-conversations="{ row }">{{ formatTokens(row.conversations) }}</template>
+                <template #cell-costUsd="{ row }">{{ row.costUsd > 0 ? formatCost(row.costUsd) : "—" }}</template>
+                <template #cell-share="{ row }">{{ shareOf(row.totalTokens, totalTokensAll).toFixed(2) }}%</template>
+              </AppTable>
             </div>
           </div>
         </div>

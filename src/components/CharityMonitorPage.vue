@@ -2,8 +2,66 @@
 import { computed, onMounted, onUnmounted, ref } from "vue";
 import { icons } from "../icons";
 import { useStore } from "../composables/useStore";
+import AppTable, { type AppTableColumn } from "./AppTable.vue";
 
 const store = useStore();
+
+/** 标签管理弹窗状态 */
+const tagManagerOpen = ref(false);
+const newTagId = ref("");
+const newTagName = ref("");
+const newTagUrl = ref("");
+const tagManagerError = ref("");
+
+function openTagManager() {
+  tagManagerOpen.value = true;
+  tagManagerError.value = "";
+  document.body.classList.add("modal-open");
+}
+
+function closeTagManager() {
+  tagManagerOpen.value = false;
+  newTagId.value = "";
+  newTagName.value = "";
+  newTagUrl.value = "";
+  tagManagerError.value = "";
+  document.body.classList.remove("modal-open");
+}
+
+async function handleAddTag() {
+  const id = newTagId.value.trim();
+  const name = newTagName.value.trim();
+  if (!id || !name) {
+    tagManagerError.value = "标签 ID 和名称不能为空";
+    return;
+  }
+  try {
+    tagManagerError.value = "";
+    await store.addCharitySource(id, name, newTagUrl.value.trim() || undefined);
+    newTagId.value = "";
+    newTagName.value = "";
+    newTagUrl.value = "";
+  } catch (cause) {
+    tagManagerError.value = String(cause);
+  }
+}
+
+async function handleToggleTag(id: string, enabled: boolean) {
+  try {
+    await store.updateCharitySource(id, { enabled });
+  } catch (cause) {
+    tagManagerError.value = String(cause);
+  }
+}
+
+async function handleRemoveTag(id: string, name: string) {
+  if (!confirm(`确定删除标签「${name}」吗？已抓取的帖子不会被删除。`)) return;
+  try {
+    await store.removeCharitySource(id);
+  } catch (cause) {
+    tagManagerError.value = String(cause);
+  }
+}
 
 /** 进行中任务耗时前端本地跳动（不依赖后端每秒写库）。 */
 const nowTick = ref(Date.now());
@@ -96,6 +154,19 @@ function formatRelativeActivity(value?: string, fallback?: string) {
   const days = Math.floor(hours / 24);
   if (days < 30) return `${days} 天`;
   return formatPublishedAt(raw);
+}
+
+const topicColumns: AppTableColumn[] = [
+  { key: "title", title: "话题", width: "minmax(220px,1fr)" },
+  { key: "author", title: "作者", width: "120px" },
+  { key: "publishedAt", title: "创建时间", width: "120px" },
+  { key: "replyCount", title: "回复", width: "70px", align: "right", sortable: true },
+  { key: "views", title: "浏览量", width: "80px", align: "right", sortable: true },
+  { key: "lastActivityAt", title: "活动", width: "110px" },
+];
+
+function topicRowClass(row: { isNew?: boolean; pinned?: boolean }) {
+  return [row.isNew && "is-new", row.pinned && "is-pinned"].filter(Boolean).join(" ");
 }
 
 
@@ -223,7 +294,7 @@ onUnmounted(() => {
     <div class="charity-monitor-scroll">
       <div v-if="store.charityFeedSyncing.value" class="charity-monitor-status">
         <span class="is-spinning" v-html="icons.restore" />
-        <span>正在后台同步 6 个标签，完成后自动刷新列表…</span>
+        <span>正在后台同步 {{ store.charityTags.value.filter(t => t.id !== "all" && t.enabled !== false).length }} 个标签，完成后自动刷新列表…</span>
       </div>
 
       <!-- 筛选 + 统计整合为一块工具条 -->
@@ -237,9 +308,16 @@ onUnmounted(() => {
             @change="store.selectTag(($event.target as HTMLSelectElement).value)"
           >
             <option v-for="tag in store.charityTags.value" :key="tag.id" :value="tag.id">
-              {{ tag.name }}
+              {{ tag.name }}{{ tag.enabled === false ? ' (已禁用)' : '' }}
             </option>
           </select>
+          <button
+            class="charity-tag-manage-button"
+            type="button"
+            title="管理监听标签"
+            @click="openTagManager()"
+            v-html="icons.settings"
+          />
           <div class="charity-search-box">
             <span class="charity-search-icon" v-html="icons.search" aria-hidden="true" />
             <input
@@ -299,83 +377,65 @@ onUnmounted(() => {
         class="charity-topic-list"
         aria-label="最近公益帖子"
       >
-        <div class="charity-topic-table" role="table">
-          <div class="charity-topic-header" role="row">
-            <span class="col-topic" role="columnheader">话题</span>
-            <span class="col-author" role="columnheader">作者</span>
-            <span class="col-created" role="columnheader">创建时间</span>
-            <span class="col-replies" role="columnheader">回复</span>
-            <span class="col-views" role="columnheader">浏览量</span>
-            <span class="col-activity" role="columnheader">活动</span>
-          </div>
+        <button
+          v-if="store.charityFeedSelectedUnreadCount.value > 0"
+          class="charity-new-topics-banner"
+          type="button"
+          @click="store.markCharityFeedRead()"
+        >
+          查看 {{ store.charityFeedSelectedUnreadCount.value }} 个新的或更新的话题
+        </button>
 
-          <button
-            v-if="store.charityFeedSelectedUnreadCount.value > 0"
-            class="charity-new-topics-banner"
-            type="button"
-            @click="store.markCharityFeedRead()"
-          >
-            查看 {{ store.charityFeedSelectedUnreadCount.value }} 个新的或更新的话题
-          </button>
-
-          <article
-            v-for="item in store.charityFeedItems.value"
-            :key="item.id"
-            class="charity-topic-row"
-            :class="{ 'is-new': item.isNew, 'is-pinned': item.pinned }"
-            role="row"
-            tabindex="0"
-            @click="store.openExternal(item.link)"
-            @keydown.enter.prevent="store.openExternal(item.link)"
-            @keydown.space.prevent="store.openExternal(item.link)"
-          >
-            <div class="col-topic" role="cell">
+        <AppTable
+          :rows="store.charityFeedItems.value"
+          :columns="topicColumns"
+          :row-key="(item: any) => item.id"
+          :loading="store.charityFeedLoading.value"
+          empty-text="本地暂无公益帖子"
+          :page="store.charityFeedCurrentPage.value"
+          :page-size="20"
+          :total="store.charityFeedTotalPages.value * 20"
+          manual-pagination
+          :show-pagination="false"
+          :row-class="topicRowClass"
+          clickable
+          @row-click="(item: any) => store.openExternal(item.link)"
+        >
+          <template #cell-title="{ row }">
+            <div class="charity-topic-cell">
               <div class="charity-topic-title-row">
                 <span
-                  v-if="item.pinned"
+                  v-if="row.pinned"
                   class="charity-topic-pin"
                   title="置顶"
                   aria-hidden="true"
                   v-html="icons.pin"
                 ></span>
-                <h2 :title="item.title">{{ item.title }}</h2>
-                <span v-if="item.isNew" class="charity-new-badge">NEW</span>
+                <h2 :title="row.title">{{ row.title }}</h2>
+                <span v-if="row.isNew" class="charity-new-badge">NEW</span>
                 <span
-                  v-if="store.selectedTagId.value === 'all' && item.feedNames?.length"
+                  v-if="store.selectedTagId.value === 'all' && row.feedNames?.length"
                   class="charity-topic-feed-tags"
                 >
-                  <span v-for="name in item.feedNames" :key="name" class="charity-topic-feed-tag">{{
-                    name
-                  }}</span>
+                  <span v-for="name in row.feedNames" :key="name" class="charity-topic-feed-tag">{{ name }}</span>
                 </span>
               </div>
-              <div class="charity-topic-meta" v-if="item.categories.length">
+              <div class="charity-topic-meta" v-if="row.categories.length">
                 <span
-                  v-for="category in item.categories.slice(0, 3)"
+                  v-for="category in row.categories.slice(0, 3)"
                   :key="category"
                   class="charity-topic-tag"
                   :class="{ 'is-announcement': /公告|置顶|官方/.test(category) }"
                 >{{ category }}</span>
               </div>
             </div>
-
-            <div class="col-author" role="cell" :title="item.author || '未知作者'">
-              <span>{{ item.author || '—' }}</span>
-            </div>
-            <div class="col-created" role="cell" :title="item.publishedAt || '创建时间未知'">
-              <time :datetime="item.publishedAt">{{ formatPublishedAt(item.publishedAt) }}</time>
-            </div>
-            <div class="col-replies" role="cell" title="回复数">
-              <strong>{{ formatCompactCount(item.replyCount) }}</strong>
-            </div>
-            <div class="col-views" role="cell" title="浏览量">
-              <strong>{{ formatCompactCount(item.views) }}</strong>
-            </div>
-            <div class="col-activity" role="cell" title="最近活动">
-              <span>{{ formatRelativeActivity(item.lastActivityAt, item.publishedAt) }}</span>
-            </div>
-          </article>
-        </div>
+          </template>
+          <template #cell-author="{ row }">{{ row.author || '—' }}</template>
+          <template #cell-publishedAt="{ row }"><time :datetime="row.publishedAt">{{ formatPublishedAt(row.publishedAt) }}</time></template>
+          <template #cell-replyCount="{ row }"><strong>{{ formatCompactCount(row.replyCount) }}</strong></template>
+          <template #cell-views="{ row }"><strong>{{ formatCompactCount(row.views) }}</strong></template>
+          <template #cell-lastActivityAt="{ row }">{{ formatRelativeActivity(row.lastActivityAt, row.publishedAt) }}</template>
+        </AppTable>
       </section>
 
       <div
@@ -408,6 +468,102 @@ onUnmounted(() => {
         <strong>本地暂无公益帖子</strong>
       </div>
     </div>
+
+    <Teleport to="body">
+      <div
+        v-if="tagManagerOpen"
+        class="charity-sync-log-backdrop"
+        @click="closeTagManager()"
+      >
+        <section
+          class="charity-sync-log-dialog charity-tag-manager-dialog"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="charity-tag-manager-title"
+          @click.stop
+        >
+          <header class="charity-sync-log-header">
+            <div>
+              <h2 id="charity-tag-manager-title">管理监听标签</h2>
+              <p>添加或移除 Linux.do 标签，标签 ID 即 Linux.do 标签编号。</p>
+            </div>
+            <div class="charity-sync-log-actions">
+              <button
+                class="close-button"
+                type="button"
+                aria-label="关闭"
+                @click="closeTagManager()"
+                v-html="icons.close"
+              />
+            </div>
+          </header>
+
+          <div class="charity-sync-log-body charity-tag-manager-body">
+            <div v-if="tagManagerError" class="charity-tag-manager-error">{{ tagManagerError }}</div>
+
+            <div class="charity-tag-add-row">
+              <input
+                v-model="newTagId"
+                class="charity-tag-input"
+                type="text"
+                placeholder="标签 ID（如 1515）"
+              />
+              <input
+                v-model="newTagName"
+                class="charity-tag-input charity-tag-name-input"
+                type="text"
+                placeholder="显示名称（如 公益推广）"
+              />
+              <input
+                v-model="newTagUrl"
+                class="charity-tag-input charity-tag-url-input"
+                type="text"
+                placeholder="自定义 URL（可选，留空自动生成）"
+              />
+              <button
+                class="primary-button"
+                type="button"
+                :disabled="store.charitySourcesLoading.value"
+                @click="handleAddTag()"
+              >
+                <span v-html="icons.plus" />
+                <span>添加</span>
+              </button>
+            </div>
+
+            <ol class="charity-tag-list">
+              <li
+                v-for="tag in store.charityTags.value.filter(t => t.id !== 'all')"
+                :key="tag.id"
+                :class="{ 'is-disabled': tag.enabled === false }"
+              >
+                <label class="charity-tag-toggle">
+                  <input
+                    type="checkbox"
+                    :checked="tag.enabled !== false"
+                    @change="handleToggleTag(tag.id, ($event.target as HTMLInputElement).checked)"
+                  />
+                </label>
+                <span class="charity-tag-id">{{ tag.id }}</span>
+                <span class="charity-tag-name-display">{{ tag.name }}</span>
+                <button
+                  class="charity-tag-remove-button"
+                  type="button"
+                  title="删除标签"
+                  :disabled="store.charitySourcesLoading.value"
+                  @click="handleRemoveTag(tag.id, tag.name)"
+                  v-html="icons.trash"
+                />
+              </li>
+            </ol>
+
+            <div v-if="store.charityTags.value.filter(t => t.id !== 'all').length === 0" class="charity-sync-log-empty">
+              暂无监听标签
+            </div>
+          </div>
+        </section>
+      </div>
+    </Teleport>
 
     <Teleport to="body">
       <div

@@ -2,6 +2,7 @@ use crate::chrome_local_storage;
 use crate::chrome_session;
 use crate::db::*;
 use crate::models::*;
+use crate::platform_detect::{is_newapi, is_sub2api, is_zero_v_zero};
 use crate::site_ops::*;
 use rusqlite::{params, OptionalExtension};
 use serde_json;
@@ -255,11 +256,14 @@ pub(crate) fn has_local_account_session(
     let has_newapi = parse_newapi_local_account(values).is_ok();
     let has_sub2api = parse_sub2api_local_account(values).is_ok();
     let has_zero_v_zero = zero_v_zero_token(values).is_some();
-    match system_type.trim().to_ascii_lowercase().as_str() {
-        "newapi" => has_newapi,
-        "sub2api" => has_sub2api,
-        "0v0" => has_zero_v_zero,
-        _ => has_newapi || has_sub2api || has_zero_v_zero,
+    if is_newapi(system_type) {
+        has_newapi
+    } else if is_sub2api(system_type) {
+        has_sub2api
+    } else if is_zero_v_zero(system_type) {
+        has_zero_v_zero
+    } else {
+        has_newapi || has_sub2api || has_zero_v_zero
     }
 }
 
@@ -272,7 +276,7 @@ pub(crate) fn has_account_session_candidate(
         return true;
     }
     let system_type = system_type.trim().to_ascii_lowercase();
-    (system_type.is_empty() || system_type == "newapi")
+    (system_type.is_empty() || is_newapi(&system_type))
         && has_newapi_refresh_cookie_name(cookie_names.iter().map(String::as_str))
 }
 
@@ -290,9 +294,9 @@ pub(crate) fn infer_system_type_from_local_accounts<'a>(
     if has_zero_v_zero {
         "0v0"
     } else if has_newapi {
-        "NewAPI"
+        "new-api"
     } else if has_sub2api {
-        "Sub2API"
+        "sub2api"
     } else {
         ""
     }
@@ -730,27 +734,25 @@ pub(crate) async fn fetch_site_account(
         CheckinSnapshot::default()
     };
     let inferred_type;
-    let system_type = if matches!(
-        system_type.trim().to_ascii_lowercase().as_str(),
-        "newapi" | "sub2api" | "0v0"
-    ) {
-        system_type
-    } else if zero_v_zero_token(local_values).is_some() {
-        inferred_type = "0v0".to_string();
-        &inferred_type
-    } else if parse_newapi_local_account(local_values).is_ok() {
-        inferred_type = "NewAPI".to_string();
-        &inferred_type
-    } else if parse_sub2api_local_account(local_values).is_ok() {
-        inferred_type = "Sub2API".to_string();
-        &inferred_type
-    } else {
-        inferred_type = probe_site_system_type(client, base_url)
-            .await
-            .unwrap_or_default();
-        &inferred_type
-    };
-    if system_type.eq_ignore_ascii_case("0v0") {
+    let system_type =
+        if is_newapi(system_type) || is_sub2api(system_type) || is_zero_v_zero(system_type) {
+            system_type
+        } else if zero_v_zero_token(local_values).is_some() {
+            inferred_type = "0v0".to_string();
+            &inferred_type
+        } else if parse_newapi_local_account(local_values).is_ok() {
+            inferred_type = "new-api".to_string();
+            &inferred_type
+        } else if parse_sub2api_local_account(local_values).is_ok() {
+            inferred_type = "sub2api".to_string();
+            &inferred_type
+        } else {
+            inferred_type = probe_site_system_type(client, base_url)
+                .await
+                .unwrap_or_default();
+            &inferred_type
+        };
+    if is_zero_v_zero(system_type) {
         if !local_error.is_empty() {
             return Err(local_error.to_string());
         }
@@ -816,7 +818,7 @@ pub(crate) async fn fetch_site_account(
             newapi_user_id: String::new(),
         });
     }
-    if system_type.eq_ignore_ascii_case("NewAPI") {
+    if is_newapi(system_type) {
         let local_account = parse_newapi_local_account(local_values).ok();
         let base_url_parsed = Url::parse(base_url).map_err(|_| "站点 API 地址无效".to_string())?;
 
@@ -826,6 +828,19 @@ pub(crate) async fn fetch_site_account(
                 let cached_auth = NewApiAuth::Token {
                     access_token: cached_token.clone(),
                     user_id: cached_newapi_user_id.clone().unwrap_or_default(),
+                };
+                let checkin = if should_checkin {
+                    refresh_newapi_checkin(
+                        client,
+                        base_url,
+                        &cached_auth,
+                        user_agent,
+                        current_month,
+                        previous_checkin,
+                    )
+                    .await
+                } else {
+                    CheckinSnapshot::default()
                 };
                 let endpoint = base_url_parsed
                     .join("/api/user/self")
@@ -842,19 +857,6 @@ pub(crate) async fn fetch_site_account(
                 match cached_result {
                     Ok(value) => match parse_newapi_account(&value) {
                         Ok(remote) => {
-                            let checkin = if should_checkin {
-                                refresh_newapi_checkin(
-                                    client,
-                                    base_url,
-                                    &cached_auth,
-                                    user_agent,
-                                    current_month,
-                                    previous_checkin,
-                                )
-                                .await
-                            } else {
-                                CheckinSnapshot::default()
-                            };
                             return Ok(SiteAccountRefresh {
                                 account: remote,
                                 is_valid: true,
@@ -870,7 +872,7 @@ pub(crate) async fn fetch_site_account(
                                     account,
                                     is_valid: true,
                                     sync_error: error,
-                                    checkin: previous_checkin,
+                                    checkin: checkin.clone(),
                                     newapi_token: cached_token.clone(),
                                     newapi_user_id: cached_newapi_user_id
                                         .clone()
@@ -889,7 +891,7 @@ pub(crate) async fn fetch_site_account(
                                 account,
                                 is_valid: false,
                                 sync_error: message,
-                                checkin: previous_checkin,
+                                checkin: checkin.clone(),
                                 newapi_token: cached_token.clone(),
                                 newapi_user_id: cached_newapi_user_id.clone().unwrap_or_default(),
                             }),
@@ -902,7 +904,7 @@ pub(crate) async fn fetch_site_account(
                                 account,
                                 is_valid: true,
                                 sync_error: error,
-                                checkin: previous_checkin,
+                                checkin: checkin.clone(),
                                 newapi_token: cached_token.clone(),
                                 newapi_user_id: cached_newapi_user_id.clone().unwrap_or_default(),
                             }),
@@ -1009,15 +1011,49 @@ pub(crate) async fn fetch_site_account(
             }
         }
 
-        // ── Step 4: 用永久 API Token 请求所有后续接口 ──
-        let auth = if !api_token.is_empty() {
-            NewApiAuth::Token {
-                access_token: api_token,
-                user_id: user_id.clone(),
-            }
+        // ── Step 4: 后续签到、self 与 Key 管理接口只允许使用访问令牌 ──
+        let access_token = if !api_token.is_empty() {
+            api_token
+        } else if let NewApiAuth::Token { access_token, .. } = &temp_auth {
+            access_token.clone()
         } else {
-            // 没拿到永久 token，退回临时 auth（Cookie 或 refresh token）
-            temp_auth
+            let message = "未取得 NewAPI 访问令牌，停止账号接口同步".to_string();
+            return match local_account {
+                Some(account) => Ok(SiteAccountRefresh {
+                    account,
+                    is_valid: false,
+                    sync_error: message,
+                    checkin: previous_checkin,
+                    newapi_token: String::new(),
+                    newapi_user_id: user_id,
+                }),
+                None => Err(message),
+            };
+        };
+        let auth = NewApiAuth::Token {
+            access_token,
+            user_id: user_id.clone(),
+        };
+        let (newapi_token, newapi_user_id) = match &auth {
+            NewApiAuth::Token {
+                access_token,
+                user_id,
+            } => (access_token.clone(), user_id.clone()),
+            _ => (String::new(), String::new()),
+        };
+
+        let checkin = if should_checkin {
+            refresh_newapi_checkin(
+                client,
+                base_url,
+                &auth,
+                user_agent,
+                current_month,
+                previous_checkin,
+            )
+            .await
+        } else {
+            CheckinSnapshot::default()
         };
 
         let endpoint = base_url_parsed
@@ -1038,44 +1074,23 @@ pub(crate) async fn fetch_site_account(
             Ok((account, response_user_id))
         });
 
-        let checkin = if should_checkin {
-            refresh_newapi_checkin(
-                client,
-                base_url,
-                &auth,
-                user_agent,
-                current_month,
-                previous_checkin,
-            )
-            .await
-        } else {
-            CheckinSnapshot::default()
-        };
-
         let (remote, response_user_id) = match remote_result {
             Ok(result) => result,
             Err(error) => {
                 return match local_account {
                     Some(account) => Ok(SiteAccountRefresh {
                         account,
-                        is_valid: true,
+                        is_valid: !access_token_was_rejected(&error),
                         sync_error: error,
                         checkin,
-                        newapi_token: String::new(),
-                        newapi_user_id: String::new(),
+                        newapi_token: newapi_token.clone(),
+                        newapi_user_id: newapi_user_id.clone(),
                     }),
                     None => Err(format!("账号接口失败：{error}")),
                 }
             }
         };
 
-        let (newapi_token, newapi_user_id) = match &auth {
-            NewApiAuth::Token {
-                access_token,
-                user_id,
-            } => (access_token.clone(), user_id.clone()),
-            _ => (String::new(), String::new()),
-        };
         let newapi_user_id = if newapi_user_id.is_empty() {
             response_user_id
         } else {
@@ -1112,18 +1127,17 @@ pub(crate) async fn fetch_site_account(
             })
         }
     };
-    let endpoint = match system_type.trim().to_ascii_lowercase().as_str() {
-        "sub2api" => "/api/v1/auth/me",
-        _ => {
-            return Ok(SiteAccountRefresh {
-                account: local_account,
-                is_valid: true,
-                sync_error: "站点类型未识别，未请求账号接口".into(),
-                checkin: previous_checkin,
-                newapi_token: String::new(),
-                newapi_user_id: String::new(),
-            })
-        }
+    let endpoint = if is_sub2api(system_type) {
+        "/api/v1/auth/me"
+    } else {
+        return Ok(SiteAccountRefresh {
+            account: local_account,
+            is_valid: true,
+            sync_error: "站点类型未识别，未请求账号接口".into(),
+            checkin: previous_checkin,
+            newapi_token: String::new(),
+            newapi_user_id: String::new(),
+        });
     };
     let url = Url::parse(base_url)
         .map_err(|_| "站点 API 地址无效".to_string())?
@@ -1274,6 +1288,26 @@ pub(crate) fn chrome_account_bridge_script(
       };
       return;
     }
+    let apiToken = activeAccessToken;
+    let userId = legacyUserId || "";
+    try {
+      const tokenResponse = await readResponse(await fetch("/api/user/token", {
+        method: "GET", credentials: "include", cache: "no-store", headers,
+        signal: AbortSignal.timeout(requestTimeout)
+      }));
+      if (!tokenResponse.challenge && !tokenResponse.error && tokenResponse.status >= 200 && tokenResponse.status < 300) {
+        const permanentToken = tokenResponse.data?.data?.token || tokenResponse.data?.data?.access_token ||
+          tokenResponse.data?.data?.accessToken || tokenResponse.data?.token ||
+          tokenResponse.data?.access_token || tokenResponse.data?.accessToken ||
+          (typeof tokenResponse.data?.data === "string" ? tokenResponse.data.data : "");
+        if (permanentToken) apiToken = permanentToken;
+      }
+    } catch (_) {}
+    if (!apiToken) {
+      bridge.result = { ok: false, error: "未取得 NewAPI 访问令牌，停止账号接口同步" };
+      return;
+    }
+    headers.Authorization = `Bearer ${apiToken}`;
     let checkinEnabled = false;
     let checkedInToday = false;
     let checkinError = "";
@@ -1281,7 +1315,7 @@ pub(crate) fn chrome_account_bridge_script(
       try {
         const checkinUrl = `/api/user/checkin?month=${encodeURIComponent(__OPENHUB_MONTH__)}`;
         const checkinResponse = await readResponse(await fetch(checkinUrl, {
-          method: "GET", credentials: "include", cache: "no-store", headers,
+          method: "GET", credentials: "omit", cache: "no-store", headers,
           signal: AbortSignal.timeout(requestTimeout)
         }));
         if (checkinResponse.challenge) {
@@ -1296,7 +1330,7 @@ pub(crate) fn chrome_account_bridge_script(
           checkedInToday = checkinResponse.data.data?.stats?.checked_in_today === true;
           if (checkinEnabled && !checkedInToday) {
             const postResponse = await readResponse(await fetch("/api/user/checkin", {
-              method: "POST", credentials: "include", cache: "no-store", headers,
+              method: "POST", credentials: "omit", cache: "no-store", headers,
               signal: AbortSignal.timeout(requestTimeout)
             }));
             if (postResponse.challenge) {
@@ -1321,7 +1355,7 @@ pub(crate) fn chrome_account_bridge_script(
       }
     }
     const selfResponse = await readResponse(await fetch("/api/user/self", {
-      method: "GET", credentials: "include", cache: "no-store", headers,
+      method: "GET", credentials: "omit", cache: "no-store", headers,
       signal: AbortSignal.timeout(requestTimeout)
     }));
     if (selfResponse.challenge) {
@@ -1343,28 +1377,8 @@ pub(crate) fn chrome_account_bridge_script(
       };
       return;
     }
-    // 调用 /api/user/token 获取永久 API Token
-    let apiToken = "";
-    let userId = "";
-    try {
-      const userIdRaw = selfResponse.data?.data?.id || selfResponse.data?.data?.userId || "";
-      userId = String(userIdRaw);
-      const tokenResponse = await readResponse(await fetch("/api/user/token", {
-        method: "GET", credentials: "include", cache: "no-store", headers,
-        signal: AbortSignal.timeout(requestTimeout)
-      }));
-      if (!tokenResponse.challenge && !tokenResponse.error && tokenResponse.status >= 200 && tokenResponse.status < 300) {
-        apiToken = tokenResponse.data?.data?.token || tokenResponse.data?.data?.access_token ||
-          tokenResponse.data?.data?.accessToken || tokenResponse.data?.token ||
-          tokenResponse.data?.access_token || tokenResponse.data?.accessToken || "";
-        if (!apiToken && typeof tokenResponse.data?.data === "string") {
-          apiToken = tokenResponse.data.data;
-        }
-      }
-    } catch (_) {}
-    if (!apiToken && activeAccessToken) {
-      apiToken = activeAccessToken;
-    }
+    const responseUserId = selfResponse.data?.data?.id || selfResponse.data?.data?.userId || "";
+    if (responseUserId) userId = String(responseUserId);
     bridge.result = {
       ok: true,
       account: selfResponse.data,
@@ -1513,7 +1527,7 @@ pub async fn sync_site_account_via_chrome(
     } else {
         format!("{profile_name} · {account_name}")
     };
-    if !system_type.eq_ignore_ascii_case("NewAPI") {
+    if !is_newapi(&system_type) {
         return Err("当前仅对 NewAPI 账号提供 Chrome 同步".into());
     }
 
@@ -1601,6 +1615,19 @@ pub async fn sync_site_account_via_chrome(
                 };
                 if let Ok(endpoint) = base_url.join("/api/user/self") {
                     let user_agent = chrome_session::chrome_user_agent();
+                    let checkin = if supports_checkin {
+                        refresh_newapi_checkin(
+                            &client,
+                            base_url.as_str(),
+                            &cached_auth,
+                            &user_agent,
+                            &current_month,
+                            CheckinSnapshot::default(),
+                        )
+                        .await
+                    } else {
+                        CheckinSnapshot::default()
+                    };
                     let cached_result = request_json(
                         apply_newapi_auth(
                             chrome_request_headers(
@@ -1631,9 +1658,9 @@ pub async fn sync_site_account_via_chrome(
                                         error: String::new(),
                                         api_token: cached_token.clone(),
                                         user_id: cached_uid.clone().unwrap_or_default(),
-                                        checkin_enabled: supports_checkin,
-                                        checked_in_today: false,
-                                        checkin_error: String::new(),
+                                        checkin_enabled: checkin.enabled,
+                                        checked_in_today: checkin.checked_in_today,
+                                        checkin_error: checkin.error,
                                         account: None,
                                     },
                                 ));

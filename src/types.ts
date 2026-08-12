@@ -50,6 +50,8 @@ export interface SiteRecord {
   updatedAt: string;
 }
 
+export type SiteUsageState = "all" | "personal" | "pending";
+
 export interface LibraryData {
   sites: SiteRecord[];
   suggestedTags: string[];
@@ -202,6 +204,9 @@ export interface CharitySyncLogEntry {
 export interface CharityFeedTag {
   id: string;
   name: string;
+  jsonUrl?: string;
+  enabled?: boolean;
+  sortOrder?: number;
 }
 
 export interface RemoteUserInfo {
@@ -232,6 +237,35 @@ export interface Preferences {
   proxyNodeViewMode: ProxyNodeViewModePreference;
   sidebarCollapsed: boolean;
 }
+
+// —— 系统类型（与 Rust 侧 platform_detect::canonical_platform 保持一致）——
+export const SYSTEM_TYPES: { value: string; text: string }[] = [
+  { value: "openai", text: "OpenAI" },
+  { value: "codex", text: "Codex" },
+  { value: "claude", text: "Claude" },
+  { value: "gemini", text: "Gemini" },
+  { value: "gemini-cli", text: "Gemini CLI" },
+  { value: "antigravity", text: "Antigravity" },
+  { value: "cliproxyapi", text: "CliproxyAPI" },
+  { value: "anyrouter", text: "AnyRouter" },
+  { value: "done-hub", text: "Done Hub" },
+  { value: "one-hub", text: "One Hub" },
+  { value: "veloera", text: "Veloera" },
+  { value: "new-api", text: "NewAPI" },
+  { value: "sub2api", text: "Sub2API" },
+  { value: "one-api", text: "One API" },
+  { value: "0v0", text: "0v0" },
+];
+
+/** 去除空白/中划线/下划线并转小写，用于跨新旧命名比较。 */
+export function normalizeSystemType(raw: string): string {
+  return raw.trim().toLocaleLowerCase().replace(/[\s_\-]/g, "");
+}
+
+/** 已知系统类型的规范化值集合（用于"未知类型"过滤）。 */
+export const KNOWN_SYSTEM_TYPES: ReadonlySet<string> = new Set(
+  SYSTEM_TYPES.map((item) => normalizeSystemType(item.value)),
+);
 
 export const emptySite = (): SiteRecord => ({
   id: "",
@@ -371,7 +405,7 @@ export interface ProxyIpAnalysis {
   groups: ProxyIpGroup[];
 }
 
-// —— Token 统计（数据来源：tokentracker CLI）——
+// —— Token 统计（OpenHub 自有本地采集器）——
 export interface TokenSessionTokens {
   inputTokens: number;
   cachedInputTokens: number;
@@ -449,10 +483,12 @@ export interface TokenStatsReport {
   provenance: Record<string, unknown>;
 }
 
-// —— Token 用量小时桶（tokentracker cursors.json hourly.buckets）——
+// —— Token 用量半小时桶（OpenHub 直接读取各工具本地日志）——
 export interface TokenUsageBucket {
   source: string;
   model: string;
+  /** 支持项目维度的数据源由 OpenHub 直接填充。 */
+  projectKey?: string;
   timestamp: string;
   totalTokens: number;
   billableTotalTokens: number;
@@ -462,6 +498,10 @@ export interface TokenUsageBucket {
   outputTokens: number;
   reasoningOutputTokens: number;
   conversationCount: number;
+  costUsd: number;
+  pricingAvailable: boolean;
+  /** 根据本地可见会话上下文估算、而非来源直接上报的 Token 数。 */
+  estimatedTokens: number;
 }
 
 export interface TokenUsageReport {
@@ -469,9 +509,10 @@ export interface TokenUsageReport {
   buckets: TokenUsageBucket[];
   startDate: string;
   endDate: string;
+  pricingSource: string;
 }
 
-export interface TokenTrackerSyncReport {
+export interface TokenCollectorSyncReport {
   available: boolean;
   changed: boolean;
   skipped: boolean;
@@ -546,4 +587,78 @@ export interface RawLogReport {
   sessions: RawSession[];
   conversations: RawConversation[];
   requests: RawRequest[];
+}
+
+export interface LightweightState {
+  running: boolean;
+  port: number;
+  enabled: boolean;
+  url: string;
+}
+
+export interface ModelCatalogSourceStatus {
+  source: string;
+  url: string;
+  fetchedAt: string;
+  recordCount: number;
+}
+
+export interface ModelCatalogItem {
+  canonicalKey: string;
+  displayName: string;
+  manufacturer: string;
+  mode: string;
+  contextLength: number;
+  maxInputTokens: number;
+  maxOutputTokens: number;
+  inputCostPerToken: number;
+  outputCostPerToken: number;
+  cacheReadCostPerToken: number;
+  cacheWriteCostPerToken: number;
+  imageCost: number;
+  audioInputCostPerToken: number;
+  audioOutputCostPerToken: number;
+  requestCost: number;
+  capabilities: string[];
+}
+
+export interface ModelCatalogSnapshot {
+  models: ModelCatalogItem[];
+  total: number;
+  lastSyncedAt: string;
+  syncedToday: boolean;
+  sources: ModelCatalogSourceStatus[];
+}
+
+export interface ModelCatalogEntryDetail {
+  source: string;
+  sourceModelId: string;
+  channel: string;
+  mode: string;
+  displayName: string;
+  contextLength: number;
+  maxInputTokens: number;
+  maxOutputTokens: number;
+  inputCostPerToken: number;
+  outputCostPerToken: number;
+  cacheReadCostPerToken: number;
+  cacheWriteCostPerToken: number;
+  imageCost: number;
+  audioInputCostPerToken: number;
+  audioOutputCostPerToken: number;
+  requestCost: number;
+  raw: unknown;
+}
+
+export interface ModelCatalogDetail {
+  model: ModelCatalogItem;
+  pricing: Record<string, number>;
+  entries: ModelCatalogEntryDetail[];
+}
+
+export interface ModelCatalogSyncResult {
+  synced: boolean;
+  skipped: boolean;
+  message: string;
+  snapshot: ModelCatalogSnapshot;
 }

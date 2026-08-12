@@ -1,5 +1,6 @@
 use crate::chrome_session;
 use crate::models::*;
+use crate::platform_detect;
 use serde_json;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -104,20 +105,11 @@ pub(crate) fn normalize_site(mut site: SiteRecord) -> Result<SiteRecord, String>
 }
 
 pub(crate) fn canonical_system_type(value: &str) -> String {
-    let compact = value
-        .trim()
-        .to_ascii_lowercase()
-        .replace(['-', '_', ' '], "");
-    match compact.as_str() {
-        "sub2api" => "Sub2API".into(),
-        "newapi" => "NewAPI".into(),
-        "0v0" | "zerovzero" => "0v0".into(),
-        _ => String::new(),
-    }
+    platform_detect::canonical_platform(value)
 }
 
 pub(crate) fn is_zero_v_zero_site(name: &str, api_base_url: &str, system_type: &str) -> bool {
-    system_type.trim().eq_ignore_ascii_case("0v0")
+    platform_detect::is_zero_v_zero(system_type)
         || name.trim().eq_ignore_ascii_case("0v0")
         || Url::parse(api_base_url)
             .ok()
@@ -136,6 +128,13 @@ pub(crate) fn account_base_url(name: &str, api_base_url: &str, system_type: &str
     } else {
         api_base_url.to_string()
     }
+}
+
+/// 仅基于 URL 中明确出现的产品名提供高置信度提示。
+/// 不把通用的 `api`、`new-api` 等模糊命名当成类型依据，避免误判。
+pub(crate) fn system_type_hint_from_url(value: &str) -> Option<&'static str> {
+    platform_detect::detect_platform_by_url_hint(value)
+        .or_else(|| platform_detect::low_priority_url_hint(value))
 }
 
 pub(crate) fn infer_remote_system_type(
@@ -187,13 +186,16 @@ pub(crate) fn infer_remote_system_type(
         .filter_map(|key| site.get(*key).and_then(serde_json::Value::as_str))
         .map(str::to_ascii_lowercase)
         .collect::<Vec<_>>();
+    // 路径特征（/console、/profile、/dashboard）优先，域名产品名仅作兜底。
     if urls.iter().any(|url| url.contains("/console/")) {
-        "NewAPI".into()
+        "new-api".into()
     } else if urls
         .iter()
         .any(|url| url.contains("/profile") || url.contains("/dashboard"))
     {
-        "Sub2API".into()
+        "sub2api".into()
+    } else if let Some(system_type) = urls.iter().find_map(|url| system_type_hint_from_url(url)) {
+        system_type.into()
     } else {
         String::new()
     }
@@ -208,25 +210,11 @@ pub(crate) struct EndpointProbe {
 
 #[derive(Debug)]
 pub(crate) struct DiscoveryResponse {
-    pub(crate) status: reqwest::StatusCode,
     pub(crate) content_type: String,
     pub(crate) body: String,
 }
 
 impl DiscoveryResponse {
-    pub(crate) fn endpoint_probe(&self) -> EndpointProbe {
-        EndpointProbe {
-            status: self.status,
-            is_json: serde_json::from_str::<serde_json::Value>(&self.body).is_ok(),
-            is_challenge: shield_page_response(
-                self.status,
-                &self.content_type,
-                false,
-                self.body.as_bytes(),
-            ),
-        }
-    }
-
     pub(crate) fn json(&self) -> Option<serde_json::Value> {
         serde_json::from_str(&self.body).ok()
     }
@@ -261,7 +249,6 @@ pub(crate) async fn fetch_discovery_resource(
         .send()
         .await
         .ok()?;
-    let status = response.status();
     let content_type = response
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
@@ -270,11 +257,7 @@ pub(crate) async fn fetch_discovery_resource(
         .to_ascii_lowercase();
     let bytes = response.bytes().await.ok()?;
     let body = String::from_utf8_lossy(&bytes[..bytes.len().min(1_048_576)]).into_owned();
-    Some(DiscoveryResponse {
-        status,
-        content_type,
-        body,
-    })
+    Some(DiscoveryResponse { content_type, body })
 }
 
 pub(crate) fn json_data_object(
@@ -456,9 +439,9 @@ pub(crate) fn system_type_from_probes(
     sub2api_probe: Option<EndpointProbe>,
 ) -> Option<&'static str> {
     if newapi_probe.is_some_and(endpoint_probe_exists) {
-        Some("NewAPI")
+        Some("new-api")
     } else if sub2api_probe.is_some_and(endpoint_probe_exists) {
-        Some("Sub2API")
+        Some("sub2api")
     } else if newapi_probe.is_some_and(|probe| probe.status == reqwest::StatusCode::NOT_FOUND)
         && sub2api_probe.is_some_and(|probe| probe.status == reqwest::StatusCode::NOT_FOUND)
     {
@@ -468,73 +451,13 @@ pub(crate) fn system_type_from_probes(
     }
 }
 
-pub(crate) async fn probe_endpoint(
-    client: &reqwest::Client,
-    base_url: &str,
-    path: &str,
-) -> Option<EndpointProbe> {
-    let url = Url::parse(base_url).ok()?.join(path).ok()?;
-    let response = client
-        .get(url)
-        .header(reqwest::header::ACCEPT, "application/json")
-        .header(reqwest::header::USER_AGENT, "OpenHub-Desktop/0.3")
-        .timeout(Duration::from_secs(6))
-        .send()
-        .await
-        .ok()?;
-    let status = response.status();
-    let content_type = response
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    let security_gateway_header = response.headers().contains_key("x-tengine-error")
-        || response
-            .headers()
-            .get(reqwest::header::SERVER)
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| value.eq_ignore_ascii_case("ESA"))
-        || response
-            .headers()
-            .get_all(reqwest::header::SET_COOKIE)
-            .iter()
-            .filter_map(|value| value.to_str().ok())
-            .any(|value| {
-                let lower = value.to_ascii_lowercase();
-                lower.starts_with("acw_") || lower.starts_with("cdn_sec_")
-            });
-    let body = response.bytes().await.ok()?;
-    let is_json = serde_json::from_slice::<serde_json::Value>(&body).is_ok();
-    Some(EndpointProbe {
-        status,
-        is_json,
-        is_challenge: shield_page_response(status, &content_type, security_gateway_header, &body),
-    })
-}
-
 pub(crate) async fn probe_site_system_type_details(
     client: &reqwest::Client,
     base_url: &str,
 ) -> (Option<String>, bool) {
-    let newapi_job = tauri::async_runtime::spawn({
-        let client = client.clone();
-        let base_url = base_url.to_string();
-        async move { probe_endpoint(&client, &base_url, "/api/status").await }
-    });
-    let sub2api_job = tauri::async_runtime::spawn({
-        let client = client.clone();
-        let base_url = base_url.to_string();
-        async move { probe_endpoint(&client, &base_url, "/setup/status").await }
-    });
-    let newapi_probe = newapi_job.await.ok().flatten();
-    let sub2api_probe = sub2api_job.await.ok().flatten();
-    let challenge = newapi_probe.is_some_and(|probe| probe.is_challenge)
-        || sub2api_probe.is_some_and(|probe| probe.is_challenge);
-    (
-        system_type_from_probes(newapi_probe, sub2api_probe).map(str::to_string),
-        challenge,
-    )
+    // 移植自 metapi 的 detectPlatform 流水线：URL 提示 → title 提示 → 端点探测。
+    let detection = platform_detect::detect_platform(client, base_url).await;
+    (detection.platform, detection.challenge)
 }
 
 pub(crate) async fn probe_site_system_type(
@@ -602,6 +525,9 @@ pub(crate) async fn probe_site_system_type_via_chrome(
     base_url: &str,
     profile_ids: &[String],
 ) -> Option<String> {
+    if let Some(system_type) = system_type_hint_from_url(base_url) {
+        return Some(system_type.into());
+    }
     let marker = format!(
         "openhub-system-{}",
         SystemTime::now()

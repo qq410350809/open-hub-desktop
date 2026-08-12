@@ -21,17 +21,27 @@ pub async fn detect_site_system_types(
         let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
         let mut statement = connection
             .prepare(
-                "SELECT id, api_base_url FROM directory_sites
-                 WHERE TRIM(api_base_url) <> '' AND TRIM(system_type) = ''",
+                "SELECT id, api_base_url, system_type FROM directory_sites
+                 WHERE TRIM(api_base_url) <> ''",
             )
             .map_err(|error| error.to_string())?;
         let targets = statement
             .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
             })
             .map_err(|error| error.to_string())?
             .filter_map(|row| row.ok())
-            .filter(|(site_id, _)| site_ids.contains(site_id))
+            .filter(|(site_id, api_base_url, stored_type)| {
+                site_ids.contains(site_id)
+                    && (stored_type.trim().is_empty()
+                        || system_type_hint_from_url(api_base_url)
+                            .is_some_and(|hint| !stored_type.eq_ignore_ascii_case(hint)))
+            })
+            .map(|(site_id, api_base_url, _)| (site_id, api_base_url))
             .collect::<Vec<_>>();
         targets
     };

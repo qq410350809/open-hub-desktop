@@ -3,7 +3,7 @@ import type {
   RawLogReport,
   RequestHealthReport,
   TokenStatsReport,
-  TokenTrackerSyncReport,
+  TokenCollectorSyncReport,
   TokenUsageReport,
 } from "../types";
 import { runCommand } from "./useLibrary";
@@ -29,11 +29,14 @@ const requestHealth = ref<RequestHealthReport | null>(null);
 const requestHealthLoading = ref(false);
 const requestHealthError = ref("");
 
-// Tokentracker 本地增量同步状态。同步只更新本地 cursor，不参与云端上传。
-const tokenTrackerSyncing = ref(false);
-const tokenTrackerSyncError = ref("");
-const tokenTrackerSyncReport = ref<TokenTrackerSyncReport | null>(null);
-let tokenTrackerSyncPromise: Promise<TokenTrackerSyncReport> | null = null;
+// OpenHub 自有 Token 采集状态；只读取本机日志并维护本地缓存。
+const tokenCollectorSyncing = ref(false);
+const tokenCollectorSyncError = ref("");
+const tokenCollectorSyncReport = ref<TokenCollectorSyncReport | null>(null);
+let tokenCollectorSyncPromise: Promise<TokenCollectorSyncReport> | null = null;
+let tokenDatabaseRefreshTimer: number | null = null;
+let tokenDatabaseRefreshRunning = false;
+const TOKEN_DATABASE_REFRESH_MS = 5_000;
 
 function toLocalDate(value: Date): string {
   const year = value.getFullYear();
@@ -183,29 +186,29 @@ function onRangeChange() {
 }
 
 function refreshTokenStats() {
-  void loadTokenStats(tokenStatsFrom.value, tokenStatsTo.value, true);
+  void loadTokenStats(tokenStatsFrom.value, tokenStatsTo.value);
 }
 
-async function syncTokenTracker(force = false): Promise<TokenTrackerSyncReport> {
-  if (tokenTrackerSyncPromise) {
-    return tokenTrackerSyncPromise;
+async function syncTokenCollector(force = false): Promise<TokenCollectorSyncReport> {
+  if (tokenCollectorSyncPromise) {
+    return tokenCollectorSyncPromise;
   }
-  tokenTrackerSyncing.value = true;
-  tokenTrackerSyncError.value = "";
-  const promise = runCommand<TokenTrackerSyncReport>("sync_token_tracker", { force })
+  tokenCollectorSyncing.value = true;
+  tokenCollectorSyncError.value = "";
+  const promise = runCommand<TokenCollectorSyncReport>("sync_token_data", { force })
     .then((report) => {
-      tokenTrackerSyncReport.value = report;
+      tokenCollectorSyncReport.value = report;
       return report;
     })
     .catch((error) => {
-      tokenTrackerSyncError.value = String(error);
+      tokenCollectorSyncError.value = String(error);
       throw error;
     })
     .finally(() => {
-      tokenTrackerSyncing.value = false;
-      tokenTrackerSyncPromise = null;
+      tokenCollectorSyncing.value = false;
+      tokenCollectorSyncPromise = null;
     });
-  tokenTrackerSyncPromise = promise;
+  tokenCollectorSyncPromise = promise;
   return promise;
 }
 
@@ -256,6 +259,47 @@ async function loadRequestHealth(refresh = false) {
   }
 }
 
+async function refreshTokenDatabaseView(showLoading = false) {
+  if (tokenDatabaseRefreshRunning) return;
+  tokenDatabaseRefreshRunning = true;
+  try {
+    if (showLoading) {
+      await Promise.all([loadTokenUsage(), loadTokenStats(), loadRequestHealth(false)]);
+      return;
+    }
+    // 周期查询只访问 SQLite；已有数据时不展示 loading，避免界面闪烁。
+    await Promise.all([
+      runCommand<TokenUsageReport>("get_token_usage").then((value) => { tokenUsage.value = value; }),
+      runCommand<TokenStatsReport>("get_token_stats", {
+        from: tokenStatsFrom.value || null,
+        to: tokenStatsTo.value || null,
+        refresh: false,
+      }).then((value) => { tokenStats.value = value; }),
+      runCommand<RequestHealthReport>("get_token_request_health", { refresh: false })
+        .then((value) => { requestHealth.value = value; }),
+    ]);
+  } catch (error) {
+    tokenUsageError.value = String(error);
+  } finally {
+    tokenDatabaseRefreshRunning = false;
+  }
+}
+
+function startTokenDatabaseRefresh() {
+  if (tokenDatabaseRefreshTimer != null) return;
+  void refreshTokenDatabaseView(true);
+  tokenDatabaseRefreshTimer = window.setInterval(() => {
+    void refreshTokenDatabaseView(false);
+  }, TOKEN_DATABASE_REFRESH_MS);
+}
+
+function stopTokenDatabaseRefresh() {
+  if (tokenDatabaseRefreshTimer != null) {
+    window.clearInterval(tokenDatabaseRefreshTimer);
+    tokenDatabaseRefreshTimer = null;
+  }
+}
+
 export function useTokenStats() {
   return {
     tokenStats,
@@ -272,10 +316,10 @@ export function useTokenStats() {
     requestHealth,
     requestHealthLoading,
     requestHealthError,
-    tokenTrackerSyncing,
-    tokenTrackerSyncError,
-    tokenTrackerSyncReport,
-    syncTokenTracker,
+    tokenCollectorSyncing,
+    tokenCollectorSyncError,
+    tokenCollectorSyncReport,
+    syncTokenCollector,
     quickRanges,
     isCurrentRange,
     applyQuickRange,
@@ -285,6 +329,9 @@ export function useTokenStats() {
     loadTokenUsage,
     loadTokenRawLogs,
     loadRequestHealth,
+    refreshTokenDatabaseView,
+    startTokenDatabaseRefresh,
+    stopTokenDatabaseRefresh,
     setQuickRange,
   };
 }

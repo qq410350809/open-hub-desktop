@@ -5,6 +5,7 @@ import { formatDate, formatRateLimit, logoText } from "../utils";
 import { useStore } from "../composables/useStore";
 import TagList from "./TagList.vue";
 import type { ChromeSessionInfo, SiteRecord } from "../types";
+import { normalizeSystemType } from "../types";
 
 const props = defineProps<{
   site: SiteRecord;
@@ -15,11 +16,14 @@ const store = useStore();
 const rateLimit = computed(() => formatRateLimit(props.site.rateLimit));
 const logo = computed(() => logoText(props.site.apiBaseUrl, props.site.name));
 const personalMode = computed(() => store.usageFilter.value === "personal");
+const pendingMode = computed(() => store.usageFilter.value === "pending");
+// “在用”保留原有账号卡片；“待定”只单向复用它的布局与操作区。
+const usageCardMode = computed(() => personalMode.value || pendingMode.value);
 const accountSessions = computed(() =>
   (store.chromeUsageAccounts.value[props.site.id] ?? []).filter((session) => session.isValid),
 );
 const displayedUpdatedAt = computed(() => {
-  if (!personalMode.value) return props.site.updatedAt;
+  if (!usageCardMode.value) return props.site.updatedAt;
   return accountSessions.value.reduce((latest, session) => {
     if (!session.accountUpdatedAt) return latest;
     if (!latest) return session.accountUpdatedAt;
@@ -84,7 +88,7 @@ function accountQuota(session: ChromeSessionInfo): string {
       'is-runaway': site.isRunaway,
       'is-personal': site.isPersonal,
       'is-pending': site.isPending,
-      'is-usage-mode': personalMode,
+      'is-usage-mode': usageCardMode,
     }"
     :data-id="site.id"
   >
@@ -114,7 +118,7 @@ function accountQuota(session: ChromeSessionInfo): string {
               v-html="icons.info"
             />
             <button
-              v-if="!personalMode"
+              v-if="!usageCardMode"
               type="button"
               :data-edit="site.id"
               title="编辑"
@@ -132,7 +136,7 @@ function accountQuota(session: ChromeSessionInfo): string {
               v-html="site.isPending ? icons.clock : icons.bookmark"
             />
             <button
-              v-if="personalMode"
+              v-if="usageCardMode"
               class="sync-session-toggle"
               type="button"
               :data-sync-session="site.id"
@@ -152,7 +156,7 @@ function accountQuota(session: ChromeSessionInfo): string {
               v-html="site.isRunaway ? icons.heartPulse : icons.flag"
             />
             <button
-              v-if="!personalMode"
+              v-if="!usageCardMode"
               class="delete-toggle"
               type="button"
               :data-delete="site.id"
@@ -165,7 +169,7 @@ function accountQuota(session: ChromeSessionInfo): string {
         <time class="site-updated-at" :datetime="displayedUpdatedAt">
           更新时间 {{ formatDate(displayedUpdatedAt) }}
         </time>
-        <div v-if="!personalMode" class="meta-chips">
+        <div v-if="!usageCardMode" class="meta-chips">
           <span class="level-chip">LV{{ site.registrationLimit }}</span>
           <span v-if="site.requiresInviteCode" class="invite-chip">邀请码</span>
           <span v-if="rateLimit" class="rate-chip" :title="`速率限制：${rateLimit}`">{{ rateLimit }}</span>
@@ -173,7 +177,7 @@ function accountQuota(session: ChromeSessionInfo): string {
       </div>
     </div>
 
-    <template v-if="!personalMode">
+    <template v-if="!usageCardMode">
       <TagList :tags="site.tags" :is-personal="site.isPersonal" :is-pending="site.isPending" />
 
       <p class="description" :class="{ muted: !site.description }">
@@ -195,7 +199,7 @@ function accountQuota(session: ChromeSessionInfo): string {
           </strong>
           <small>
             <span
-              v-if="site.systemType.toLowerCase() === 'newapi'"
+              v-if="normalizeSystemType(site.systemType) === 'newapi'"
               class="usage-account-token"
               :class="{ 'has-token': session.hasAccessToken }"
               :title="session.hasAccessToken ? '此账号已缓存 NewAPI 访问令牌' : '此账号尚未取得 NewAPI 访问令牌'"
@@ -232,7 +236,7 @@ function accountQuota(session: ChromeSessionInfo): string {
       </div>
       <div v-if="accountSessions.length === 0" class="usage-account-empty">
         <span v-html="icons.user" />
-        <p>此站点为手动在用标记，未检测到 Chrome 账户会话</p>
+        <p>{{ pendingMode ? "未检测到可展示的 Chrome 账户会话，请重新提取会话" : "此站点为手动在用标记，未检测到 Chrome 账户会话" }}</p>
       </div>
     </div>
 

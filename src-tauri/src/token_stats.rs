@@ -1,8 +1,10 @@
+use crate::db;
 use crate::models::{
-    RawConversation, RawLogReport, RawRequest, RawSession, RequestHealthBucket,
-    RequestHealthReport, RequestHealthSourceSummary, TokenStatsReport, TokenTrackerSyncReport,
+    Database, RawConversation, RawLogReport, RawRequest, RawSession, RequestHealthBucket,
+    RequestHealthReport, RequestHealthSourceSummary, TokenCollectorSyncReport, TokenStatsReport,
     TokenUsageBucket, TokenUsageReport,
 };
+use crate::token_collector;
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -10,440 +12,433 @@ use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, UNIX_EPOCH};
+use tauri::{AppHandle, Manager, State};
 
-/// 探测 tokentracker CLI 可执行文件，顺序：
-/// 1) OPENHUB_TOKENTRACKER_PATH 环境变量显式指定
-/// 2) 常见安装路径
-/// 3) PATH 中的 tokentracker
-fn find_tokentracker_binary() -> Option<PathBuf> {
-    if let Ok(value) = std::env::var("OPENHUB_TOKENTRACKER_PATH") {
+/// Token 查询接口只读取 OpenHub SQLite 快照，不触发日志扫描。
+#[tauri::command]
+pub async fn get_token_stats(
+    database: State<'_, Database>,
+    from: Option<String>,
+    to: Option<String>,
+    refresh: Option<bool>,
+) -> Result<TokenStatsReport, String> {
+    let _ = refresh;
+    query_token_stats(&database, from, to)
+}
+
+/// 手动触发一次本地日志采集并写入 SQLite；查询仍由独立接口完成。
+#[tauri::command]
+pub async fn sync_token_data(
+    app: AppHandle,
+    force: Option<bool>,
+) -> Result<TokenCollectorSyncReport, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let database = app.state::<Database>();
+        collect_token_data(&database, force.unwrap_or(false))
+    })
+    .await
+    .map_err(|error| format!("OpenHub Token 采集任务失败：{error}"))?
+}
+
+/// CatPawAI 仍由 OpenHub 直接读取本地 SQLite，并合并进统一小时桶。
+const CATPAWAI_SOURCE: &str = "catpawai";
+const CATPAWAI_UNKNOWN_MODEL: &str = "catpawai-unknown-model";
+
+/// CatPawAI 的会话与逐请求 Token 数据保存在本地 SQLite。
+/// 环境变量便于测试或适配自定义数据目录，默认覆盖当前 macOS/通用 HOME 布局。
+fn catpawai_db_path() -> Option<PathBuf> {
+    if let Ok(value) = std::env::var("OPENHUB_CATPAWAI_DB_PATH") {
         let path = PathBuf::from(value);
         if path.is_file() {
             return Some(path);
         }
     }
-    for path in [
-        "/usr/local/bin/tokentracker",
-        "/opt/homebrew/bin/tokentracker",
-        "/usr/bin/tokentracker",
-    ] {
-        let path = PathBuf::from(path);
-        if path.is_file() {
-            return Some(path);
-        }
-    }
-    std::env::var_os("PATH").and_then(|paths| {
-        std::env::split_paths(&paths)
-            .map(|path| path.join("tokentracker"))
-            .find(|path| path.is_file())
-    })
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    [
+        home.join(".sankuai")
+            .join("CatPawAI")
+            .join("sqliteDB")
+            .join("globalCache.sqlite"),
+        home.join("Library")
+            .join("Application Support")
+            .join("CatPawAI")
+            .join("sqliteDB")
+            .join("globalCache.sqlite"),
+    ]
+    .into_iter()
+    .find(|path| path.is_file())
 }
 
-fn run_tokentracker_sessions(
-    from: Option<String>,
-    to: Option<String>,
-    refresh: bool,
-) -> Result<TokenStatsReport, String> {
-    let binary = find_tokentracker_binary().ok_or_else(|| {
-        "未找到 tokentracker CLI。请先安装：npm i -g tokentracker-cli（或设置 OPENHUB_TOKENTRACKER_PATH 指向可执行文件）"
-            .to_string()
-    })?;
-
-    let mut command = Command::new(binary);
-    command
-        .arg("sessions")
-        .arg("--format")
-        .arg("json")
-        // 跳过 git 结果分析，只读取本地会话日志，速度更快。
-        .arg("--no-git");
-    if let Some(from) = from.filter(|value| !value.trim().is_empty()) {
-        command.arg("--from").arg(from.trim());
-    }
-    if let Some(to) = to.filter(|value| !value.trim().is_empty()) {
-        command.arg("--to").arg(to.trim());
-    }
-    if refresh {
-        command.arg("--refresh");
-    }
-
-    let output = command
-        .output()
-        .map_err(|error| format!("执行 tokentracker 失败：{error}"))?;
-    if !output.status.success() {
-        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(if detail.is_empty() {
-            format!("tokentracker sessions 执行失败：{}", output.status)
-        } else {
-            format!("tokentracker sessions 执行失败：{detail}")
-        });
-    }
-
-    let stdout = String::from_utf8(output.stdout)
-        .map_err(|error| format!("tokentracker 输出编码异常：{error}"))?;
-    serde_json::from_str(&stdout).map_err(|error| format!("tokentracker 输出解析失败：{error}"))
+fn sqlite_table_exists(conn: &Connection, table: &str) -> bool {
+    conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        [table],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|count| count > 0)
+    .unwrap_or(false)
 }
 
-/// 读取 tokentracker CLI 的 token 统计报告。
-/// - from / to：YYYY-MM-DD 日期范围（可空，空则统计全部）
-/// - refresh：为 true 时强制重读本地会话日志（否则用 tokentracker 缓存，速度更快）
-#[tauri::command]
-pub async fn get_token_stats(
-    from: Option<String>,
-    to: Option<String>,
-    refresh: Option<bool>,
-) -> Result<TokenStatsReport, String> {
-    // CLI 解析本地日志在 spawn_blocking 中执行，避免阻塞 UI 线程。
-    tauri::async_runtime::spawn_blocking(move || {
-        run_tokentracker_sessions(from, to, refresh.unwrap_or(false))
-    })
-    .await
-    .map_err(|error| format!("Token 统计任务执行失败：{error}"))?
+fn catpawai_nonempty_string(value: &JsonValue, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(JsonValue::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
-/// Tokentracker 本地增量同步的进程内协调器。
-/// OpenHub 只触发本地解析，不调用上传/发布流程；同步锁仍由 tokentracker 自己负责。
-struct TokenTrackerSyncCache {
-    report: TokenTrackerSyncReport,
-    finished_at: Instant,
-}
-
-fn tokentracker_sync_cache() -> &'static Mutex<Option<TokenTrackerSyncCache>> {
-    static CACHE: OnceLock<Mutex<Option<TokenTrackerSyncCache>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(None))
-}
-
-fn tokentracker_sync_lock() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-}
-
-const TOKENTRACKER_SYNC_TTL: Duration = Duration::from_secs(8);
-
-fn cursors_file_state() -> (bool, u64, u64, String) {
-    let Some(path) = cursors_json_path() else {
-        return (false, 0, 0, String::new());
-    };
-    let Ok(metadata) = fs::metadata(&path) else {
-        return (false, 0, 0, String::new());
-    };
-    let size = metadata.len();
-    let modified_ms = metadata
-        .modified()
-        .ok()
-        .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|value| value.as_millis() as u64)
-        .unwrap_or(0);
-    let updated_at = fs::read_to_string(&path)
-        .ok()
-        .and_then(|text| serde_json::from_str::<JsonValue>(&text).ok())
-        .and_then(|value| {
+fn catpawai_selected_model(value: &JsonValue) -> Option<String> {
+    catpawai_nonempty_string(value, "selectedModelName")
+        .or_else(|| {
             value
-                .get("updatedAt")
-                .and_then(JsonValue::as_str)
-                .map(str::to_owned)
+                .get("submitEditorState")
+                .and_then(|state| catpawai_nonempty_string(state, "selectedModelName"))
         })
-        .unwrap_or_default();
-    (true, size, modified_ms, updated_at)
+        .or_else(|| {
+            value
+                .get("submitEditorState")
+                .and_then(|state| state.get("selectedModelInfo"))
+                .and_then(|info| catpawai_nonempty_string(info, "modelTypeName"))
+        })
 }
 
-fn run_tokentracker_local_sync() -> Result<TokenTrackerSyncReport, String> {
-    let binary = find_tokentracker_binary().ok_or_else(|| {
-        "未找到 tokentracker CLI，无法执行本地增量同步。请先安装 tokentracker-cli，或设置 OPENHUB_TOKENTRACKER_PATH".to_string()
-    })?;
-    let before = cursors_file_state();
-    let started = Instant::now();
-
-    // 当前 tokentracker 版本中，--auto --background 会跳过云端上传；
-    // --all-local-sources 让已安装的本地工具都参与增量检查。
-    let output = Command::new(&binary)
-        .arg("sync")
-        .arg("--auto")
-        .arg("--background")
-        .arg("--all-local-sources")
-        .env("CI", "1")
-        .output()
-        .map_err(|error| format!("启动 tokentracker 本地同步失败：{error}"))?;
-
-    if !output.status.success() {
-        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(if detail.is_empty() {
-            format!("tokentracker 本地同步失败：{}", output.status)
-        } else {
-            format!("tokentracker 本地同步失败：{detail}")
-        });
-    }
-
-    let after = cursors_file_state();
-    let changed = before != after;
-    let updated_at = if !after.3.is_empty() {
-        after.3.clone()
-    } else {
-        chrono_like_now_iso()
-    };
-    Ok(TokenTrackerSyncReport {
-        available: true,
-        changed,
-        skipped: !changed,
-        elapsed_ms: started.elapsed().as_millis() as i64,
-        updated_at,
-        message: if changed {
-            "Tokentracker 已完成本地增量同步".to_string()
-        } else {
-            "本地数据没有变化，已复用 Tokentracker 增量游标".to_string()
-        },
+fn catpawai_actual_model(value: &JsonValue) -> Option<String> {
+    catpawai_nonempty_string(value, "actualUseModelName").or_else(|| {
+        value
+            .get("blockData")
+            .and_then(|block| catpawai_nonempty_string(block, "actualUseModelName"))
     })
 }
 
-fn chrono_like_now_iso() -> String {
-    // 不新增 chrono 依赖；这里仅作为无 cursors.updatedAt 时的状态时间。
-    String::new()
+/// CatPawAI 某些版本把 actualUseModelName 写成内部数字 ID。
+/// 这类值无法用于展示或定价，需回退到同一会话最近一次 selectedModelName。
+fn catpawai_model_is_resolved(model: &str) -> bool {
+    let value = model.trim();
+    !value.is_empty()
+        && !value.eq_ignore_ascii_case("unknown")
+        && !value.chars().all(|ch| ch.is_ascii_digit())
 }
 
-/// 触发 tokentracker 本地增量同步。
-#[tauri::command]
-pub async fn sync_token_tracker(force: Option<bool>) -> Result<TokenTrackerSyncReport, String> {
-    let force = force.unwrap_or(false);
-    tauri::async_runtime::spawn_blocking(move || {
-        if !force {
-            if let Ok(guard) = tokentracker_sync_cache().lock() {
-                if let Some(cache) = guard.as_ref() {
-                    if cache.finished_at.elapsed() < TOKENTRACKER_SYNC_TTL {
-                        return Ok(TokenTrackerSyncReport {
-                            ..cache.report.clone()
-                        });
-                    }
+fn catpawai_usage(value: &JsonValue) -> Option<&JsonValue> {
+    value
+        .get("tokenUsage")
+        .filter(|usage| usage.is_object())
+        .or_else(|| {
+            value
+                .get("blockData")
+                .and_then(|block| block.get("usage"))
+                .filter(|usage| usage.is_object())
+        })
+}
+
+fn catpawai_number(value: &JsonValue, keys: &[&str]) -> i64 {
+    keys.iter()
+        .find_map(|key| {
+            value.get(*key).and_then(|number| {
+                number
+                    .as_i64()
+                    .or_else(|| number.as_u64().and_then(|n| i64::try_from(n).ok()))
+                    .or_else(|| number.as_f64().map(|n| n as i64))
+                    .or_else(|| number.as_str().and_then(|n| n.parse::<i64>().ok()))
+            })
+        })
+        .unwrap_or(0)
+        .max(0)
+}
+
+fn load_catpawai_projects(conn: &Connection) -> BTreeMap<String, String> {
+    let mut projects = BTreeMap::new();
+    if sqlite_table_exists(conn, "t_conversations") {
+        if let Ok(mut stmt) =
+            conn.prepare("SELECT conversation_id, workspace_id, title FROM t_conversations")
+        {
+            if let Ok(rows) = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            }) {
+                for row in rows.flatten() {
+                    let (conversation_id, workspace_id, title) = row;
+                    let project = workspace_id
+                        .filter(|value| !value.trim().is_empty())
+                        .or_else(|| title.filter(|value| !value.trim().is_empty()))
+                        .unwrap_or_else(|| "CatPawAI".to_string());
+                    projects.insert(conversation_id, project);
                 }
             }
         }
-
-        let _guard = tokentracker_sync_lock()
-            .lock()
-            .map_err(|_| "Tokentracker 同步锁异常".to_string())?;
-        let report = run_tokentracker_local_sync()?;
-        if let Ok(mut cache) = tokentracker_sync_cache().lock() {
-            *cache = Some(TokenTrackerSyncCache {
-                report: report.clone(),
-                finished_at: Instant::now(),
-            });
-        }
-        Ok(report)
-    })
-    .await
-    .map_err(|error| format!("Tokentracker 同步任务执行失败：{error}"))?
-}
-
-/// Tokentracker 本地读模型：queue.jsonl。
-/// Tokentracker 自己的界面读取 queue.jsonl，并按 source/model/hour_start 保留最新累计行；
-/// OpenHub 必须复用同一口径，不能只读 hourly.buckets，否则会漏掉历史修正后的 Codex 数据。
-fn queue_json_path() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from).map(|home| {
-        home.join(".tokentracker")
-            .join("tracker")
-            .join("queue.jsonl")
-    })
-}
-
-/// tokentracker 的用量原始存储：~/.tokentracker/tracker/cursors.json
-/// 作为 queue.jsonl 不可用时的兼容 fallback。
-fn cursors_json_path() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from).map(|home| {
-        home.join(".tokentracker")
-            .join("tracker")
-            .join("cursors.json")
-    })
-}
-
-fn queue_number(value: &JsonValue, key: &str) -> i64 {
-    value
-        .get(key)
-        .and_then(|value| value.as_f64().or_else(|| value.as_i64().map(|n| n as f64)))
-        .map(|value| value as i64)
-        .unwrap_or(0)
-}
-
-/// 与 tokentracker local-api.normalizeQueueRow 对齐的历史兼容修正：
-/// 旧版 Codex queue 行把 cached input 包含在 input_tokens 中，
-/// 需要减掉 cached_input_tokens 才能得到纯输入 Token。
-fn normalize_queue_row(mut row: JsonValue) -> JsonValue {
-    let source = row
-        .get("source")
-        .and_then(JsonValue::as_str)
-        .unwrap_or("")
-        .to_string();
-    let input = queue_number(&row, "input_tokens");
-    let cached = queue_number(&row, "cached_input_tokens");
-    let output = queue_number(&row, "output_tokens");
-    let total = queue_number(&row, "total_tokens");
-    let is_legacy_codex = source.eq_ignore_ascii_case("codex")
-        && cached > 0
-        && input >= cached
-        && total == input + output;
-    if is_legacy_codex {
-        if let Some(object) = row.as_object_mut() {
-            object.insert("input_tokens".to_string(), JsonValue::from(input - cached));
+    }
+    // 兼容旧版 CatPawAI 表结构；新表优先，旧表仅补缺失会话。
+    if sqlite_table_exists(conn, "t_conversation") {
+        if let Ok(mut stmt) =
+            conn.prepare("SELECT conversation_id, project_path, history_title FROM t_conversation")
+        {
+            if let Ok(rows) = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            }) {
+                for row in rows.flatten() {
+                    let (conversation_id, project_path, title) = row;
+                    projects.entry(conversation_id).or_insert_with(|| {
+                        project_path
+                            .filter(|value| !value.trim().is_empty())
+                            .or_else(|| title.filter(|value| !value.trim().is_empty()))
+                            .unwrap_or_else(|| "CatPawAI".to_string())
+                    });
+                }
+            }
         }
     }
-    // queue rows use billable_total_tokens for the dashboard headline. Cursor
-    // sources from older versions may have written zero even though total_tokens
-    // is present; normalize them exactly as tokentracker does.
-    let total_for_billing = queue_number(&row, "total_tokens");
-    if source.eq_ignore_ascii_case("cursor")
-        && queue_number(&row, "billable_total_tokens") < total_for_billing
-    {
-        if let Some(object) = row.as_object_mut() {
-            object.insert(
-                "billable_total_tokens".to_string(),
-                JsonValue::from(total_for_billing),
-            );
-        }
-    }
-    row
+    projects
 }
 
-/// 读取 Tokentracker queue.jsonl 的最新累计行。
-/// queue 是 append-only，每次同步会重新写入被触碰的累计桶，不能直接相加。
-fn read_queue_buckets() -> Result<Vec<TokenUsageBucket>, String> {
-    let path = queue_json_path().ok_or("无法定位用户目录")?;
-    let text = fs::read_to_string(&path)
-        .map_err(|error| format!("无法读取 tokentracker 队列（{}）：{error}", path.display()))?;
-    let mut latest = BTreeMap::<String, JsonValue>::new();
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let Ok(row) = serde_json::from_str::<JsonValue>(line) else {
-            // 与 Tokentracker dashboard 一致：单条损坏/半写入行不影响其他数据。
-            continue;
-        };
-        let source = row.get("source").and_then(JsonValue::as_str).unwrap_or("");
-        let model = row.get("model").and_then(JsonValue::as_str).unwrap_or("");
-        let hour = row
-            .get("hour_start")
-            .and_then(JsonValue::as_str)
-            .unwrap_or("");
-        if source.is_empty() || model.is_empty() || hour.is_empty() {
-            continue;
-        }
-        let key = format!("{source}|{model}|{hour}");
-        latest.insert(key, normalize_queue_row(row));
-    }
-
-    let buckets = latest
-        .into_values()
-        .map(|row| TokenUsageBucket {
-            source: row
-                .get("source")
-                .and_then(JsonValue::as_str)
-                .unwrap_or("")
-                .to_string(),
-            model: row
-                .get("model")
-                .and_then(JsonValue::as_str)
-                .unwrap_or("")
-                .to_string(),
-            timestamp: row
-                .get("hour_start")
-                .and_then(JsonValue::as_str)
-                .unwrap_or("")
-                .to_string(),
-            total_tokens: queue_number(&row, "total_tokens"),
-            billable_total_tokens: queue_number(&row, "billable_total_tokens"),
-            input_tokens: queue_number(&row, "input_tokens"),
-            cached_input_tokens: queue_number(&row, "cached_input_tokens"),
-            cache_creation_input_tokens: queue_number(&row, "cache_creation_input_tokens"),
-            output_tokens: queue_number(&row, "output_tokens"),
-            reasoning_output_tokens: queue_number(&row, "reasoning_output_tokens"),
-            conversation_count: queue_number(&row, "conversation_count"),
-        })
-        .collect::<Vec<_>>();
-    Ok(buckets)
+fn catpawai_bucket_mut<'a>(
+    buckets: &'a mut BTreeMap<(String, String, String), TokenUsageBucket>,
+    model: String,
+    project_key: String,
+    timestamp: String,
+) -> &'a mut TokenUsageBucket {
+    let key = (model.clone(), project_key.clone(), timestamp.clone());
+    buckets.entry(key).or_insert_with(|| TokenUsageBucket {
+        source: CATPAWAI_SOURCE.to_string(),
+        model,
+        project_key,
+        timestamp,
+        total_tokens: 0,
+        billable_total_tokens: 0,
+        input_tokens: 0,
+        cached_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+        output_tokens: 0,
+        reasoning_output_tokens: 0,
+        conversation_count: 0,
+        cost_usd: 0.0,
+        pricing_available: false,
+        estimated_tokens: 0,
+    })
 }
 
-fn read_cursors_buckets() -> Result<Vec<TokenUsageBucket>, String> {
-    let path = cursors_json_path().ok_or("无法定位用户目录")?;
-    let text = fs::read_to_string(&path).map_err(|error| {
-        format!(
-            "无法读取 tokentracker 用量数据（{}）：{error}",
-            path.display()
+/// 直读 CatPawAI 的逐请求 tokenUsage，聚合为 OpenHub 使用的小时桶。
+/// prompt_tokens 包含 cachedTokens/cacheWriteTokens，必须拆出后再计 fresh input，
+/// 否则成本计算与缓存命中率都会重复计算缓存 Token。
+fn read_catpawai_buckets_from_path(path: &Path) -> Result<Vec<TokenUsageBucket>, String> {
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| format!("无法读取 CatPawAI 数据库（{}）：{error}", path.display()))?;
+    if !sqlite_table_exists(&conn, "t_ui_messages") {
+        return Err("CatPawAI 数据库缺少 t_ui_messages 表".to_string());
+    }
+    let projects = load_catpawai_projects(&conn);
+    let mut stmt = conn
+        .prepare(
+            "SELECT conversation_id, message_type, create_time, content \
+             FROM t_ui_messages ORDER BY conversation_id ASC, create_time ASC, id ASC",
         )
-    })?;
-    let value: JsonValue = serde_json::from_str(&text)
-        .map_err(|error| format!("tokentracker 用量数据解析失败：{error}"))?;
-    let buckets = value
-        .get("hourly")
-        .and_then(|hourly| hourly.get("buckets"))
-        .and_then(JsonValue::as_object)
-        .ok_or("tokentracker 用量数据结构异常（缺少 hourly.buckets）")?;
+        .map_err(|error| format!("CatPawAI 消息查询准备失败：{error}"))?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .map_err(|error| format!("CatPawAI 消息查询失败：{error}"))?;
 
-    let number = |field: &JsonValue, key: &str| -> i64 {
-        field
-            .get(key)
-            .and_then(JsonValue::as_f64)
-            .map(|value| value as i64)
-            .unwrap_or(0)
-    };
-    let mut out = Vec::with_capacity(buckets.len());
-    for (key, value) in buckets {
-        // key 形如 "source|model|ISO时间戳"
-        let parts = key.split('|').collect::<Vec<_>>();
-        if parts.len() < 3 {
+    let mut current_models = BTreeMap::<String, String>::new();
+    let mut buckets = BTreeMap::<(String, String, String), TokenUsageBucket>::new();
+    for row in rows.flatten() {
+        let (conversation_id, message_type, create_time, content) = row;
+        let Ok(value) = serde_json::from_str::<JsonValue>(&content) else {
+            continue;
+        };
+        if let Some(selected) = catpawai_selected_model(&value) {
+            if catpawai_model_is_resolved(&selected) {
+                current_models.insert(conversation_id.clone(), selected);
+            }
+        }
+        let actual_model = catpawai_actual_model(&value);
+        let model = actual_model
+            .as_deref()
+            .filter(|model| catpawai_model_is_resolved(model))
+            .map(str::to_string)
+            .or_else(|| current_models.get(&conversation_id).cloned())
+            .unwrap_or_else(|| CATPAWAI_UNKNOWN_MODEL.to_string());
+        let normalized_ms = if create_time > 0 && create_time < 100_000_000_000 {
+            create_time.saturating_mul(1000)
+        } else {
+            create_time
+        };
+        let Some(timestamp) = hour_key_from_millis(normalized_ms) else {
+            continue;
+        };
+        let project_key = projects
+            .get(&conversation_id)
+            .cloned()
+            .unwrap_or_else(|| "CatPawAI".to_string());
+
+        if message_type == "user_prompt" {
+            catpawai_bucket_mut(
+                &mut buckets,
+                model.clone(),
+                project_key.clone(),
+                timestamp.clone(),
+            )
+            .conversation_count += 1;
+        }
+
+        let Some(usage) = catpawai_usage(&value) else {
+            continue;
+        };
+        let prompt = catpawai_number(
+            usage,
+            &[
+                "prompt_tokens",
+                "promptTokens",
+                "input_tokens",
+                "inputTokens",
+            ],
+        );
+        let completion = catpawai_number(
+            usage,
+            &[
+                "completion_tokens",
+                "completionTokens",
+                "output_tokens",
+                "outputTokens",
+            ],
+        );
+        let cached_from_details = usage
+            .get("promptTokensDetails")
+            .or_else(|| usage.get("prompt_tokens_details"))
+            .map(|details| catpawai_number(details, &["cachedTokens", "cached_tokens"]))
+            .unwrap_or(0);
+        let cache_read = catpawai_number(
+            usage,
+            &[
+                "cacheReadTokens",
+                "cache_read_tokens",
+                "cached_input_tokens",
+                "cachedInputTokens",
+            ],
+        )
+        .max(cached_from_details);
+        let cache_write = catpawai_number(
+            usage,
+            &[
+                "cacheWriteTokens",
+                "cache_write_tokens",
+                "cache_creation_input_tokens",
+                "cacheCreationInputTokens",
+            ],
+        );
+        let reasoning = usage
+            .get("completionTokensDetails")
+            .or_else(|| usage.get("completion_tokens_details"))
+            .map(|details| catpawai_number(details, &["reasoningTokens", "reasoning_tokens"]))
+            .unwrap_or_else(|| {
+                catpawai_number(usage, &["reasoning_output_tokens", "reasoningOutputTokens"])
+            });
+        let total = catpawai_number(usage, &["total_tokens", "totalTokens"])
+            .max(prompt.saturating_add(completion));
+        if total <= 0 {
             continue;
         }
-        let totals = value.get("totals").cloned().unwrap_or(JsonValue::Null);
-        out.push(TokenUsageBucket {
-            source: parts[0].to_string(),
-            model: parts[1].to_string(),
-            timestamp: parts[2].to_string(),
-            total_tokens: number(&totals, "total_tokens"),
-            billable_total_tokens: number(&totals, "billable_total_tokens"),
-            input_tokens: number(&totals, "input_tokens"),
-            cached_input_tokens: number(&totals, "cached_input_tokens"),
-            cache_creation_input_tokens: number(&totals, "cache_creation_input_tokens"),
-            output_tokens: number(&totals, "output_tokens"),
-            reasoning_output_tokens: number(&totals, "reasoning_output_tokens"),
-            conversation_count: number(&totals, "conversation_count"),
-        });
+        let fresh_input = prompt.saturating_sub(cache_read.saturating_add(cache_write));
+        let bucket = catpawai_bucket_mut(&mut buckets, model, project_key, timestamp);
+        bucket.total_tokens += total;
+        bucket.billable_total_tokens += total;
+        bucket.input_tokens += fresh_input;
+        bucket.cached_input_tokens += cache_read;
+        bucket.cache_creation_input_tokens += cache_write;
+        bucket.output_tokens += completion;
+        bucket.reasoning_output_tokens += reasoning.min(completion);
     }
-    Ok(out)
+    Ok(buckets.into_values().collect())
 }
 
-/// 读取 tokentracker 全部工具的用量桶。
-/// 主路径复用 queue.jsonl（与 Tokentracker 自己的界面一致），
-/// cursors.json 仅作为兼容 fallback。
-#[tauri::command]
-pub async fn get_token_usage() -> Result<TokenUsageReport, String> {
-    tauri::async_runtime::spawn_blocking(|| {
-        let buckets = match read_queue_buckets() {
-            Ok(buckets) if !buckets.is_empty() => buckets,
-            _ => read_cursors_buckets()?,
-        };
-        let mut start_date = String::new();
-        let mut end_date = String::new();
-        for bucket in &buckets {
-            let day = bucket.timestamp.get(..10).unwrap_or("");
-            if day.is_empty() {
-                continue;
-            }
-            if start_date.is_empty() || day < start_date.as_str() {
-                start_date = day.to_string();
-            }
-            if end_date.is_empty() || day > end_date.as_str() {
-                end_date = day.to_string();
-            }
+fn read_catpawai_buckets() -> Result<Vec<TokenUsageBucket>, String> {
+    let Some(path) = catpawai_db_path() else {
+        return Ok(Vec::new());
+    };
+    read_catpawai_buckets_from_path(&path)
+}
+
+fn is_catpawai_source(source: &str) -> bool {
+    let normalized = source
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    normalized == "catpawai" || normalized == "catpaw"
+}
+
+fn merge_catpawai_usage(mut report: TokenUsageReport) -> Result<TokenUsageReport, String> {
+    let catpawai_buckets = read_catpawai_buckets()?;
+    if !report
+        .buckets
+        .iter()
+        .any(|bucket| is_catpawai_source(&bucket.source))
+    {
+        report.buckets.extend(catpawai_buckets);
+    }
+    report.buckets.sort_by(|left, right| {
+        left.timestamp
+            .cmp(&right.timestamp)
+            .then_with(|| left.source.cmp(&right.source))
+            .then_with(|| left.model.cmp(&right.model))
+            .then_with(|| left.project_key.cmp(&right.project_key))
+    });
+    report.start_date.clear();
+    report.end_date.clear();
+    for bucket in &report.buckets {
+        let day = bucket.timestamp.get(..10).unwrap_or("");
+        if day.is_empty() {
+            continue;
         }
-        Ok(TokenUsageReport {
-            available: !buckets.is_empty(),
-            buckets,
-            start_date,
-            end_date,
-        })
-    })
-    .await
-    .map_err(|error| format!("Token 用量读取失败：{error}"))?
+        if report.start_date.is_empty() || day < report.start_date.as_str() {
+            report.start_date = day.to_string();
+        }
+        if report.end_date.is_empty() || day > report.end_date.as_str() {
+            report.end_date = day.to_string();
+        }
+    }
+    report.available = !report.buckets.is_empty();
+    Ok(report)
+}
+
+pub(crate) fn query_token_usage(database: &Database) -> Result<TokenUsageReport, String> {
+    Ok(db::read_token_usage_snapshot(database)?.unwrap_or_default())
+}
+
+pub(crate) fn query_token_stats(
+    database: &Database,
+    from: Option<String>,
+    to: Option<String>,
+) -> Result<TokenStatsReport, String> {
+    let sessions = db::read_token_sessions_snapshot(database)?.unwrap_or_default();
+    Ok(token_collector::build_token_stats(sessions, from, to))
+}
+
+pub(crate) fn query_token_health(database: &Database) -> Result<RequestHealthReport, String> {
+    Ok(db::read_token_health_snapshot(database)?.unwrap_or_default())
+}
+
+/// 只查询 SQLite 中的 Token 用量快照。
+#[tauri::command]
+pub async fn get_token_usage(database: State<'_, Database>) -> Result<TokenUsageReport, String> {
+    query_token_usage(&database)
 }
 
 /// 解析一个 Claude 会话 jsonl 文件为 会话 + 对话 + 请求。
@@ -744,6 +739,161 @@ mod tests {
     use super::*;
 
     #[test]
+    fn token_queries_read_only_database_snapshots() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE token_cache_snapshots (
+                    kind TEXT PRIMARY KEY,
+                    payload_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );",
+            )
+            .unwrap();
+        let database = Database(std::sync::Mutex::new(connection));
+        let usage = TokenUsageReport {
+            available: true,
+            buckets: vec![TokenUsageBucket {
+                source: "antigravity".to_string(),
+                model: "gemini-pro-default".to_string(),
+                timestamp: "2026-08-12T01:00:00.000Z".to_string(),
+                total_tokens: 321,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let sessions = vec![crate::models::TokenSession {
+            version: 1,
+            session_hash: "openhub:antigravity:db-test".to_string(),
+            source: "antigravity".to_string(),
+            model: "gemini-pro-default".to_string(),
+            started_at: "2026-08-12T01:00:00.000Z".to_string(),
+            ended_at: "2026-08-12T01:01:00.000Z".to_string(),
+            turns: 1,
+            total_tokens: 321,
+            ..Default::default()
+        }];
+        let health = RequestHealthReport {
+            available: true,
+            buckets: vec![RequestHealthBucket {
+                hour: "2026-08-12T01:00:00.000Z".to_string(),
+                dialogues: 1,
+                requests: 2,
+                success: 2,
+                failed: 0,
+            }],
+            ..Default::default()
+        };
+        db::write_token_snapshots(&database, &usage, &sessions, &health).unwrap();
+
+        assert_eq!(
+            query_token_usage(&database).unwrap().buckets[0].total_tokens,
+            321
+        );
+        assert_eq!(
+            query_token_stats(
+                &database,
+                Some("2026-08-12".to_string()),
+                Some("2026-08-12".to_string()),
+            )
+            .unwrap()
+            .summary
+            .total_tokens,
+            321
+        );
+        assert_eq!(
+            query_token_health(&database).unwrap().buckets[0].requests,
+            2
+        );
+    }
+
+    #[test]
+    fn reads_catpawai_usage_and_resolves_numeric_model_ids() {
+        let path = std::env::temp_dir().join(format!(
+            "openhub-catpawai-usage-{}.sqlite",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&path);
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE t_conversations (
+                conversation_id TEXT PRIMARY KEY,
+                workspace_id TEXT,
+                title TEXT
+            );
+            CREATE TABLE t_ui_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                conversation_id TEXT NOT NULL,
+                message_type TEXT NOT NULL,
+                create_time INTEGER NOT NULL,
+                content TEXT NOT NULL
+            );
+            "#,
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO t_conversations (conversation_id, workspace_id, title) VALUES (?1, ?2, ?3)",
+            rusqlite::params!["conversation-1", "/Applications/custom/OpenHub", "OpenHub"],
+        )
+        .unwrap();
+        let insert = |message_type: &str, create_time: i64, content: &str| {
+            conn.execute(
+                "INSERT INTO t_ui_messages (conversation_id, message_type, create_time, content) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params!["conversation-1", message_type, create_time, content],
+            )
+            .unwrap();
+        };
+        insert(
+            "user_prompt",
+            1_786_413_900_000,
+            r#"{"selectedModelName":"glm-5.2","submitEditorState":{"selectedModelName":"glm-5.2"}}"#,
+        );
+        insert(
+            "tool",
+            1_786_413_960_000,
+            r#"{"actualUseModelName":"100000000037","tokenUsage":{"prompt_tokens":100,"completion_tokens":20,"promptTokensDetails":{"cachedTokens":60},"cacheWriteTokens":10,"completionTokensDetails":{"reasoningTokens":5},"total_tokens":120}}"#,
+        );
+        // 兼容 tokenUsage 只保存在 blockData.usage 的历史版本。
+        insert(
+            "text",
+            1_786_414_020_000,
+            r#"{"blockData":{"actualUseModelName":"100000000037","usage":{"prompt_tokens":50,"completion_tokens":10,"promptTokensDetails":{"cachedTokens":20},"total_tokens":60}}}"#,
+        );
+        drop(conn);
+
+        let buckets = read_catpawai_buckets_from_path(&path).unwrap();
+        let _ = fs::remove_file(&path);
+        assert_eq!(buckets.len(), 1);
+        let bucket = &buckets[0];
+        assert_eq!(bucket.source, CATPAWAI_SOURCE);
+        assert_eq!(bucket.model, "glm-5.2");
+        assert_eq!(bucket.project_key, "/Applications/custom/OpenHub");
+        assert_eq!(bucket.timestamp, "2026-08-11T02:00:00.000Z");
+        assert_eq!(bucket.total_tokens, 180);
+        assert_eq!(bucket.billable_total_tokens, 180);
+        assert_eq!(bucket.input_tokens, 60); // (100-60-10) + (50-20)
+        assert_eq!(bucket.cached_input_tokens, 80);
+        assert_eq!(bucket.cache_creation_input_tokens, 10);
+        assert_eq!(bucket.output_tokens, 30);
+        assert_eq!(bucket.reasoning_output_tokens, 5);
+        assert_eq!(bucket.conversation_count, 1);
+        let serialized = serde_json::to_value(bucket).unwrap();
+        assert_eq!(
+            serialized.get("projectKey").and_then(JsonValue::as_str),
+            Some("/Applications/custom/OpenHub")
+        );
+    }
+
+    #[test]
+    fn recognizes_catpawai_source_aliases_for_deduplication() {
+        assert!(is_catpawai_source("catpawai"));
+        assert!(is_catpawai_source("CatPaw-AI"));
+        assert!(is_catpawai_source("catpaw"));
+        assert!(!is_catpawai_source("claude"));
+    }
+
+    #[test]
     fn parses_claude_session_into_conversations_and_requests() {
         let dir = std::env::temp_dir().join("openhub-tt-test-claude");
         let _ = fs::remove_dir_all(&dir);
@@ -841,6 +991,7 @@ mod tests {
             parsed.push(TokenUsageBucket {
                 source: parts[0].to_string(),
                 model: parts[1].to_string(),
+                project_key: String::new(),
                 timestamp: parts[2].to_string(),
                 total_tokens: totals
                     .get("total_tokens")
@@ -874,6 +1025,9 @@ mod tests {
                     .get("conversation_count")
                     .and_then(JsonValue::as_f64)
                     .unwrap() as i64,
+                cost_usd: 0.0,
+                pricing_available: false,
+                estimated_tokens: 0,
             });
         }
         assert_eq!(parsed.len(), 2);
@@ -887,10 +1041,12 @@ mod tests {
         let serialized = serde_json::to_value(codex).unwrap();
         assert!(serialized.get("totalTokens").is_some());
         assert!(serialized.get("conversationCount").is_some());
+        assert!(serialized.get("costUsd").is_some());
+        assert!(serialized.get("pricingAvailable").is_some());
     }
 
     #[test]
-    fn parses_a_real_tokentracker_sessions_payload() {
+    fn parses_a_legacy_snake_case_sessions_payload() {
         let payload = r#"{
             "available": true,
             "session_count": 1,
@@ -1295,6 +1451,44 @@ fn claude_on_line(
     }
 }
 
+fn command_code_on_line(
+    value: &JsonValue,
+    map: &mut BTreeMap<String, HealthAgg>,
+    sources: &mut BTreeMap<String, HealthAgg>,
+) {
+    let entry_type = value.get("type").and_then(JsonValue::as_str).unwrap_or("");
+    let message = if entry_type == "message" {
+        value.get("message").unwrap_or(&JsonValue::Null)
+    } else {
+        value
+    };
+    let role = message
+        .get("role")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("");
+    if role != "user" && role != "assistant" {
+        return;
+    }
+    let timestamp = value
+        .get("timestamp")
+        .or_else(|| value.get("metadata").and_then(|meta| meta.get("timestamp")))
+        .and_then(JsonValue::as_str)
+        .unwrap_or("");
+    let Some(hour) = hour_key_from_ts(timestamp) else {
+        return;
+    };
+    if role == "user" {
+        let content = message.get("content").unwrap_or(&JsonValue::Null);
+        if claude_user_is_human(content) {
+            record(map, sources, "command-code", hour, 1, 0, 0, 0);
+        }
+    } else {
+        // V2/V3 的每个 assistant 条目都对应一次已返回的模型调用。
+        // V2 没有 Token usage，但请求活跃度仍可从本地会话精确恢复。
+        record(map, sources, "command-code", hour, 0, 1, 1, 0);
+    }
+}
+
 fn antigravity_on_line(
     value: &JsonValue,
     map: &mut BTreeMap<String, HealthAgg>,
@@ -1498,6 +1692,32 @@ fn collect_claude_activity_incremental(
     );
 }
 
+fn is_command_code_activity_file(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| {
+            name.ends_with(".jsonl")
+                && name != "history.jsonl"
+                && !name.ends_with(".checkpoints.jsonl")
+                && !name.ends_with(".prompts.jsonl")
+        })
+        .unwrap_or(false)
+}
+
+fn collect_command_code_activity_incremental(
+    root: &Path,
+    map: &mut BTreeMap<String, HealthAgg>,
+    sources: &mut BTreeMap<String, HealthAgg>,
+    cursors: &mut FileCursorMap,
+) {
+    collect_jsonl_incremental(
+        root,
+        &is_command_code_activity_file,
+        cursors,
+        &mut |value| command_code_on_line(value, map, sources),
+    );
+}
+
 fn collect_antigravity_activity_incremental(
     root: &Path,
     map: &mut BTreeMap<String, HealthAgg>,
@@ -1671,7 +1891,9 @@ fn collect_sqlite_message_activity_incremental(
 // 活动结果持久化（增量游标 + 累计报告）
 // ---------------------------------------------------------------------------
 
-/// 请求活动结果缓存 v2：自维护 per-source 增量游标。
+const ACTIVITY_CACHE_VERSION: u32 = 4;
+
+/// 请求活动结果缓存 v4：自维护 per-source 增量游标，并覆盖 Codex 归档与 Command Code。
 /// OpenHub 只缓存解析结果与游标，不复制原始日志。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -1695,11 +1917,35 @@ fn activity_cache() -> &'static Mutex<Option<ActivityCache>> {
 const ACTIVITY_CACHE_TTL: Duration = Duration::from_secs(15);
 
 fn activity_cache_path() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from).map(|home| {
-        home.join(".tokentracker")
-            .join("tracker")
-            .join("openhub-activity-cache.json")
-    })
+    if let Some(path) = std::env::var_os("OPENHUB_ACTIVITY_CACHE_PATH") {
+        return Some(PathBuf::from(path));
+    }
+    let home = PathBuf::from(std::env::var_os("HOME")?);
+    #[cfg(target_os = "macos")]
+    {
+        return Some(
+            home.join("Library")
+                .join("Application Support")
+                .join("com.dfeer.openhub.desktop")
+                .join("token-activity-cache.json"),
+        );
+    }
+    #[cfg(target_os = "windows")]
+    {
+        return std::env::var_os("APPDATA").map(PathBuf::from).map(|path| {
+            path.join("com.dfeer.openhub.desktop")
+                .join("token-activity-cache.json")
+        });
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        Some(
+            home.join(".local")
+                .join("share")
+                .join("com.dfeer.openhub.desktop")
+                .join("token-activity-cache.json"),
+        )
+    }
 }
 
 fn read_persisted_activity_cache() -> ActivityCacheEnvelope {
@@ -1712,7 +1958,7 @@ fn read_persisted_activity_cache() -> ActivityCacheEnvelope {
     let Ok(envelope) = serde_json::from_str::<ActivityCacheEnvelope>(&text) else {
         return ActivityCacheEnvelope::default();
     };
-    if envelope.version != 2 {
+    if envelope.version != ACTIVITY_CACHE_VERSION {
         return ActivityCacheEnvelope::default();
     }
     envelope
@@ -1790,136 +2036,222 @@ fn maps_to_report(
     }
 }
 
-/// 读取多工具对话/请求健康数据。
-/// - refresh=false：自维护增量游标，只扫描新增行/新消息（快）
-/// - refresh=true：清空游标全量重建（慢但兜底修复）
-#[tauri::command]
-pub async fn get_token_request_health(
-    refresh: Option<bool>,
-) -> Result<RequestHealthReport, String> {
-    let force = refresh.unwrap_or(false);
-    tauri::async_runtime::spawn_blocking(move || {
-        if !force {
-            if let Ok(guard) = activity_cache().lock() {
-                if let Some(cache) = guard.as_ref() {
-                    if cache.fetched_at.elapsed() < ACTIVITY_CACHE_TTL {
-                        return Ok(cache.report.clone());
-                    }
+/// 增量扫描请求活动并生成待写入数据库的健康快照。
+pub(crate) fn collect_request_health_snapshot(force: bool) -> Result<RequestHealthReport, String> {
+    if !force {
+        if let Ok(guard) = activity_cache().lock() {
+            if let Some(cache) = guard.as_ref() {
+                if cache.fetched_at.elapsed() < ACTIVITY_CACHE_TTL {
+                    return Ok(cache.report.clone());
                 }
             }
         }
+    }
 
-        let home = std::env::var_os("HOME").ok_or("无法定位用户目录")?;
-        let home = PathBuf::from(home);
+    let home = std::env::var_os("HOME").ok_or("无法定位用户目录")?;
+    let home = PathBuf::from(home);
 
-        let mut envelope = read_persisted_activity_cache();
-        if force {
-            // 全量重建：清空报告与游标，由增量路径从头扫描并重填游标
-            envelope.report = RequestHealthReport::default();
-            envelope.file_cursors.clear();
-            envelope.sqlite_cursors.clear();
-        }
-        let (mut map, mut sources) = report_to_maps(&envelope.report);
+    let mut envelope = read_persisted_activity_cache();
+    envelope.version = ACTIVITY_CACHE_VERSION;
+    if force {
+        envelope.report = RequestHealthReport::default();
+        envelope.file_cursors.clear();
+        envelope.sqlite_cursors.clear();
+    }
+    let (mut map, mut sources) = report_to_maps(&envelope.report);
 
-        let codex_root = home.join(".codex").join("sessions");
+    let codex_home = home.join(".codex");
+    for (cursor_key, codex_root) in [
+        ("codex", codex_home.join("sessions")),
+        ("codex-archived", codex_home.join("archived_sessions")),
+    ] {
         if codex_root.is_dir() {
             let cursors = envelope
                 .file_cursors
-                .entry("codex".to_string())
+                .entry(cursor_key.to_string())
                 .or_default();
             collect_codex_activity_incremental(&codex_root, &mut map, &mut sources, cursors);
         }
-        let claude_root = home.join(".claude").join("projects");
-        if claude_root.is_dir() {
-            let cursors = envelope
-                .file_cursors
-                .entry("claude".to_string())
-                .or_default();
-            collect_claude_activity_incremental(&claude_root, &mut map, &mut sources, cursors);
-        }
+    }
+    let claude_root = home.join(".claude").join("projects");
+    if claude_root.is_dir() {
+        let cursors = envelope
+            .file_cursors
+            .entry("claude".to_string())
+            .or_default();
+        collect_claude_activity_incremental(&claude_root, &mut map, &mut sources, cursors);
+    }
 
-        let opencode_db = home
-            .join(".local")
-            .join("share")
-            .join("opencode")
-            .join("opencode.db");
-        if opencode_db.is_file() {
-            let cursor = envelope
-                .sqlite_cursors
-                .entry("opencode".to_string())
-                .or_default();
-            collect_sqlite_message_activity_incremental(
-                &opencode_db,
-                "opencode",
-                &mut map,
-                &mut sources,
-                None,
-                cursor,
-            );
-        }
+    let command_code_root = home.join(".commandcode").join("projects");
+    if command_code_root.is_dir() {
+        let cursors = envelope
+            .file_cursors
+            .entry("command-code".to_string())
+            .or_default();
+        collect_command_code_activity_incremental(
+            &command_code_root,
+            &mut map,
+            &mut sources,
+            cursors,
+        );
+    }
 
-        let mimo_db = home
-            .join(".local")
-            .join("share")
-            .join("mimocode")
-            .join("mimocode.db");
-        if mimo_db.is_file() {
-            let allow = HashSet::from(["mimo", "xiaomi"]);
-            let cursor = envelope
-                .sqlite_cursors
-                .entry("mimo".to_string())
-                .or_default();
-            collect_sqlite_message_activity_incremental(
-                &mimo_db,
-                "mimo",
-                &mut map,
-                &mut sources,
-                Some(&allow),
-                cursor,
-            );
-        }
+    let opencode_db = home
+        .join(".local")
+        .join("share")
+        .join("opencode")
+        .join("opencode.db");
+    if opencode_db.is_file() {
+        let cursor = envelope
+            .sqlite_cursors
+            .entry("opencode".to_string())
+            .or_default();
+        collect_sqlite_message_activity_incremental(
+            &opencode_db,
+            "opencode",
+            &mut map,
+            &mut sources,
+            None,
+            cursor,
+        );
+    }
 
-        let zcode_db = home.join(".zcode").join("cli").join("db").join("db.sqlite");
-        if zcode_db.is_file() {
-            let cursor = envelope
-                .sqlite_cursors
-                .entry("zcode".to_string())
-                .or_default();
-            collect_sqlite_message_activity_incremental(
-                &zcode_db,
-                "zcode",
-                &mut map,
-                &mut sources,
-                None,
-                cursor,
-            );
-        }
+    let mimo_db = home
+        .join(".local")
+        .join("share")
+        .join("mimocode")
+        .join("mimocode.db");
+    if mimo_db.is_file() {
+        let allow = HashSet::from(["mimo", "xiaomi"]);
+        let cursor = envelope
+            .sqlite_cursors
+            .entry("mimo".to_string())
+            .or_default();
+        collect_sqlite_message_activity_incremental(
+            &mimo_db,
+            "mimo",
+            &mut map,
+            &mut sources,
+            Some(&allow),
+            cursor,
+        );
+    }
 
-        let gemini_root = home.join(".gemini");
-        if gemini_root.is_dir() {
-            let cursors = envelope
-                .file_cursors
-                .entry("antigravity".to_string())
-                .or_default();
-            collect_antigravity_activity_incremental(&gemini_root, &mut map, &mut sources, cursors);
-        }
+    let zcode_db = home.join(".zcode").join("cli").join("db").join("db.sqlite");
+    if zcode_db.is_file() {
+        let cursor = envelope
+            .sqlite_cursors
+            .entry("zcode".to_string())
+            .or_default();
+        collect_sqlite_message_activity_incremental(
+            &zcode_db,
+            "zcode",
+            &mut map,
+            &mut sources,
+            None,
+            cursor,
+        );
+    }
 
-        // 注意：kilo/goose/craft/workbuddy/copilot 暂不进活动时间线（无可靠事件时间）
+    let gemini_root = home.join(".gemini");
+    if gemini_root.is_dir() {
+        let cursors = envelope
+            .file_cursors
+            .entry("antigravity".to_string())
+            .or_default();
+        collect_antigravity_activity_incremental(&gemini_root, &mut map, &mut sources, cursors);
+    }
 
-        let report = maps_to_report(map, sources);
-        envelope.report = report.clone();
-        write_persisted_activity_cache(&envelope);
-        if let Ok(mut guard) = activity_cache().lock() {
-            *guard = Some(ActivityCache {
-                report: report.clone(),
-                fetched_at: Instant::now(),
-            });
-        }
-        Ok(report)
-    })
-    .await
-    .map_err(|error| format!("请求健康读取失败：{error}"))?
+    let report = maps_to_report(map, sources);
+    envelope.report = report.clone();
+    write_persisted_activity_cache(&envelope);
+    if let Ok(mut guard) = activity_cache().lock() {
+        *guard = Some(ActivityCache {
+            report: report.clone(),
+            fetched_at: Instant::now(),
+        });
+    }
+    Ok(report)
 }
+
+fn token_collection_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+pub(crate) fn collect_token_data(
+    database: &Database,
+    force: bool,
+) -> Result<TokenCollectorSyncReport, String> {
+    let _guard = token_collection_lock()
+        .lock()
+        .map_err(|_| "Token 数据采集锁异常".to_string())?;
+    let started = Instant::now();
+    let snapshot = token_collector::collect_snapshot(force)?;
+    // 即使主采集器文件指纹未变化，也要合并 CatPawAI 与请求健康的独立增量源。
+    // 写入的是三份聚合快照而非 20MB 文件游标缓存，事务替换成本可控。
+    let usage = merge_catpawai_usage(snapshot.usage.clone())?;
+    let health = collect_request_health_snapshot(force)?;
+    db::write_token_snapshots(database, &usage, &snapshot.sessions, &health)?;
+    Ok(token_collector::sync_report(
+        &snapshot,
+        started.elapsed().as_millis() as i64,
+    ))
+}
+
+/// 启动时优先把旧文件缓存迁移进 SQLite，避免界面等待首次扫描。
+pub(crate) fn seed_token_database_from_caches(database: &Database) -> Result<bool, String> {
+    if db::has_token_snapshots(database)? {
+        return Ok(false);
+    }
+    let Some(snapshot) = token_collector::load_cached_snapshot() else {
+        return Ok(false);
+    };
+    let usage = merge_catpawai_usage(snapshot.usage)?;
+    let health = read_persisted_activity_cache().report;
+    db::write_token_snapshots(database, &usage, &snapshot.sessions, &health)?;
+    Ok(true)
+}
+
+/// 查询请求健康时只读取 SQLite；refresh 参数保留用于前端兼容。
+#[tauri::command]
+pub async fn get_token_request_health(
+    database: State<'_, Database>,
+    refresh: Option<bool>,
+) -> Result<RequestHealthReport, String> {
+    let _ = refresh;
+    query_token_health(&database)
+}
+
+const TOKEN_COLLECT_INTERVAL: Duration = Duration::from_secs(20);
+
+/// 后台采集任务：只负责增量扫描并原子写入 SQLite，不直接驱动页面状态。
+pub(crate) fn start_token_collector(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let mut interval = tokio::time::interval(TOKEN_COLLECT_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            // tokio interval 第一次 tick 立即执行，应用启动后会立刻补一次增量采集。
+            interval.tick().await;
+            let handle = app.clone();
+            let result = tauri::async_runtime::spawn_blocking(move || {
+                let database = handle.state::<Database>();
+                collect_token_data(&database, false)
+            })
+            .await;
+            match result {
+                Ok(Ok(report)) => {
+                    if report.changed {
+                        eprintln!("[OpenHub] Token 后台采集完成：{}", report.message);
+                    }
+                }
+                Ok(Err(error)) => eprintln!("[OpenHub] Token 后台采集失败：{error}"),
+                Err(error) => eprintln!("[OpenHub] Token 后台任务异常：{error}"),
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 mod activity_tests {
     use super::*;
@@ -1962,6 +2294,41 @@ mod activity_tests {
     }
 
     #[test]
+    #[ignore = "reads the current user home for a manual smoke test"]
+    fn smoke_collects_active_and_archived_codex_activity() {
+        let home = PathBuf::from(std::env::var_os("HOME").expect("HOME"));
+        let mut map = BTreeMap::<String, HealthAgg>::new();
+        let mut sources = BTreeMap::<String, HealthAgg>::new();
+        let mut active = FileCursorMap::new();
+        let mut archived = FileCursorMap::new();
+        collect_codex_activity_incremental(
+            &home.join(".codex").join("sessions"),
+            &mut map,
+            &mut sources,
+            &mut active,
+        );
+        let active_requests = map.values().map(|value| value.requests).sum::<i64>();
+        collect_codex_activity_incremental(
+            &home.join(".codex").join("archived_sessions"),
+            &mut map,
+            &mut sources,
+            &mut archived,
+        );
+        let total_requests = map.values().map(|value| value.requests).sum::<i64>();
+        let active_days = map
+            .iter()
+            .filter(|(_, value)| value.dialogues > 0 || value.requests > 0)
+            .map(|(hour, _)| hour.get(..10).unwrap_or("").to_string())
+            .collect::<HashSet<_>>();
+        eprintln!(
+            "codex activity: active_requests={} total_with_archived={} active_days={:?}",
+            active_requests, total_requests, active_days
+        );
+        assert!(total_requests >= active_requests);
+        assert!(!active_days.is_empty());
+    }
+
+    #[test]
     fn jsonl_incremental_only_reads_new_bytes() {
         use std::io::Write;
         let dir = std::env::temp_dir().join(format!("openhub-tt-jsonl-{}", std::process::id()));
@@ -1987,6 +2354,65 @@ mod activity_tests {
         assert_eq!(map.values().map(|a| a.dialogues).sum::<i64>(), 1);
         assert_eq!(map.values().map(|a| a.requests).sum::<i64>(), 1);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn command_code_activity_counts_v2_and_v3_messages() {
+        let mut map = BTreeMap::new();
+        let mut sources = BTreeMap::new();
+        command_code_on_line(
+            &json!({
+                "id": "u1",
+                "timestamp": "2026-07-14T03:00:00.000Z",
+                "role": "user",
+                "content": [{"type": "text", "text": "hello"}],
+                "metadata": {"version": 2}
+            }),
+            &mut map,
+            &mut sources,
+        );
+        command_code_on_line(
+            &json!({
+                "id": "a1",
+                "timestamp": "2026-07-14T03:01:00.000Z",
+                "role": "assistant",
+                "content": [{"type": "text", "text": "hi"}],
+                "metadata": {"version": 2}
+            }),
+            &mut map,
+            &mut sources,
+        );
+        command_code_on_line(
+            &json!({
+                "type": "message",
+                "id": "a2",
+                "timestamp": "2026-08-12T04:01:00.000Z",
+                "message": {"role": "assistant", "content": []},
+                "usage": {"inputTokens": 10, "outputTokens": 2}
+            }),
+            &mut map,
+            &mut sources,
+        );
+
+        assert_eq!(map.values().map(|value| value.dialogues).sum::<i64>(), 1);
+        assert_eq!(map.values().map(|value| value.requests).sum::<i64>(), 2);
+        assert_eq!(map.values().map(|value| value.success).sum::<i64>(), 2);
+        let source = sources.get("command-code").unwrap();
+        assert_eq!(source.dialogues, 1);
+        assert_eq!(source.requests, 2);
+        assert_eq!(source.success, 2);
+    }
+
+    #[test]
+    fn command_code_activity_filter_excludes_checkpoint_files() {
+        assert!(is_command_code_activity_file(Path::new("session.jsonl")));
+        assert!(!is_command_code_activity_file(Path::new(
+            "session.checkpoints.jsonl"
+        )));
+        assert!(!is_command_code_activity_file(Path::new(
+            "session.prompts.jsonl"
+        )));
+        assert!(!is_command_code_activity_file(Path::new("history.jsonl")));
     }
 
     #[test]

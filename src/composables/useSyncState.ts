@@ -32,7 +32,8 @@ const remoteUser = ref<RemoteUserInfo | null>(null);
 const remoteUserLoading = ref(false);
 const remoteUserError = ref("");
 const syncDialogRunaway = ref(false);
-const syncDialogMode = ref<"remote" | "sessions">("remote");
+const syncDialogMode = ref<"remote" | "quota">("remote");
+const syncDialogUsage = ref<"personal" | "pending">("personal");
 const syncDialogSiteIds = ref<string[]>([]);
 
 let syncRunId = 0;
@@ -148,15 +149,11 @@ function openSyncDialog() {
   syncRunId += 1;
   resetSyncLog();
   syncDialogRunaway.value = runawayFilter.value === "runaway";
-  // 在用/待定走 Chrome 会话同步；待定需要全库比对，不能只扫当前筛选结果。
-  syncDialogMode.value =
-    usageFilter.value === "personal" || usageFilter.value === "pending"
-      ? "sessions"
-      : "remote";
-  syncDialogSiteIds.value =
-    usageFilter.value === "personal" || usageFilter.value === "pending"
-      ? sites.value.map((site) => site.id)
-      : filteredSites.value.map((site) => site.id);
+  const quotaMode = usageFilter.value === "personal" || usageFilter.value === "pending";
+  syncDialogMode.value = quotaMode ? "quota" : "remote";
+  syncDialogUsage.value = usageFilter.value === "pending" ? "pending" : "personal";
+  // 额度同步只锁定当前主视图及其余筛选条件中的站点，不扩展到全库。
+  syncDialogSiteIds.value = filteredSites.value.map((site) => site.id);
   syncDialogOpen.value = true;
   if (syncDialogMode.value === "remote") void refreshRemoteUser();
 }
@@ -361,30 +358,38 @@ async function syncSites() {
   remoteUserError.value = "";
   syncingSites.value = true;
   try {
-    if (mode === "sessions") {
+    if (mode === "quota") {
+      const usageLabel = syncDialogUsage.value === "pending" ? "待定" : "在用";
+      const siteIds = [...syncDialogSiteIds.value];
       appendSyncLog({
         stage: "scope",
         status: "info",
-        message: "只提取浏览器会话数据：有 Cookie/本地数据即比对本地站点；不做站点类型检测",
+        message: `额度同步范围：当前 ${siteIds.length} 个${usageLabel}站点；保持全部/在用/待定归类不变`,
       });
-      // 不传 siteIds：扫描全部本地站点。待定=有浏览器会话数据且未在用。
-      const accountResult = await analyzeChromeUsage(false, undefined, runId, undefined, true);
-      if (!accountResult) throw new Error("Chrome 会话提取失败");
+      if (siteIds.length === 0) {
+        appendSyncLog({ stage: "quota-empty", status: "info", message: `当前没有可同步额度的${usageLabel}站点` });
+        syncRunState.value = "complete";
+        stopSyncTimer();
+        showToast(`当前没有可同步额度的${usageLabel}站点`, true);
+        return;
+      }
+      const accountResult = await analyzeChromeUsage(
+        false,
+        undefined,
+        runId,
+        siteIds,
+        false,
+        syncDialogUsage.value === "pending",
+      );
+      if (!accountResult) throw new Error("额度同步失败");
       appendSyncLog({
-        stage: "pending-mark",
-        status: accountResult.newlyMarked > 0 ? "success" : "info",
-        message:
-          accountResult.newlyMarked > 0
-            ? `提取完成：浏览器有会话 ${accountResult.detected} 个站点，新标注待定 ${accountResult.newlyMarked} 个`
-            : `提取完成：浏览器有会话 ${accountResult.detected} 个站点，无新增待定`,
+        stage: "quota-complete",
+        status: accountResult.warnings > 0 ? "error" : "success",
+        message: `额度同步完成：${accountResult.accounts} 个合法账号${accountResult.warnings ? `，${accountResult.warnings} 个警告` : ""}`,
       });
       syncRunState.value = "complete";
       stopSyncTimer();
-      showToast(
-        accountResult.newlyMarked > 0
-          ? `会话提取完成：新待定 ${accountResult.newlyMarked} 个（有会话 ${accountResult.detected}）`
-          : `会话提取完成：有会话 ${accountResult.detected} 个站点，无新增待定`,
-      );
+      showToast(`已同步 ${usageLabel}站点额度：${accountResult.accounts} 个账号${accountResult.warnings ? `，${accountResult.warnings} 个警告` : ""}`);
       return;
     }
     const result = await runCommand<SyncSitesResult>("sync_remote_sites", { runaway, runId });
@@ -420,6 +425,7 @@ export function useSyncState() {
     remoteUserError,
     syncDialogRunaway,
     syncDialogMode,
+    syncDialogUsage,
     syncDialogSiteIds,
     refreshRemoteUser,
     openSyncDialog,

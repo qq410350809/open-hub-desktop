@@ -13,13 +13,16 @@ let unlistenProgress: (() => void) | undefined;
 let unlistenChromeProgress: (() => void) | undefined;
 
 const scopeLabel = computed(() => {
-  if (store.syncDialogMode.value === "sessions") {
-    return "全部本地站点（只提取浏览器会话数据）";
+  if (store.syncDialogMode.value === "quota") {
+    const usageLabel = store.syncDialogUsage.value === "pending" ? "待定" : "在用";
+    return `当前筛选中的 ${store.syncDialogSiteIds.value.length} 个${usageLabel}站点`;
   }
   return store.syncDialogRunaway.value ? "跑路站点" : "存活站点";
 });
 
-const dialogTitle = "同步站点";
+const dialogTitle = computed(() =>
+  store.syncDialogMode.value === "quota" ? "额度同步" : "同步站点",
+);
 
 const runStateLabel = computed(() => {
   switch (store.syncRunState.value) {
@@ -113,7 +116,7 @@ function onBackdropClick(event: MouseEvent) {
           <div>
             <h2 id="sync-sites-title">{{ dialogTitle }}</h2>
             <p v-if="store.syncDialogMode.value === 'remote'">验证 Chrome 登录状态后同步{{ scopeLabel }}</p>
-            <p v-else-if="store.syncDialogMode.value === 'sessions'">只提取浏览器会话数据；有数据即标注待定，不做站点类型检测</p>
+            <p v-else-if="store.syncDialogMode.value === 'quota'">刷新当前分类内的账号额度，不改变全部 / 在用 / 待定归类</p>
           </div>
           <button
             ref="closeBtnRef"
@@ -183,12 +186,12 @@ function onBackdropClick(event: MouseEvent) {
               <div>
                 <strong>本次同步范围</strong>
                 <p v-if="store.syncDialogMode.value === 'remote'">{{ scopeLabel }} · 同名远端记录会更新，本地在用状态会保留</p>
-                <p v-else-if="store.syncDialogMode.value === 'sessions'">{{ scopeLabel }} · 待定仍按上方存活/跑路筛选查看</p>
+                <p v-else-if="store.syncDialogMode.value === 'quota'">{{ scopeLabel }} · 仅刷新额度与账号缓存，站点归类保持不变</p>
               </div>
             </div>
 
             <div
-              v-if="store.syncDialogMode.value === 'sessions' && store.syncingModelKeys.value"
+              v-if="store.syncDialogMode.value === 'quota' && store.syncingModelKeys.value"
               class="model-sync-loading"
               role="status"
               aria-live="polite"
@@ -196,14 +199,14 @@ function onBackdropClick(event: MouseEvent) {
               <span class="model-sync-loading-icon" v-html="icons.restore" />
               <div class="model-sync-loading-content">
                 <header>
-                  <strong>正在同步 Key 与模型</strong>
+                  <strong>正在同步账号额度</strong>
                   <span>
                     {{ store.modelKeySyncCompleted.value }}/{{ store.modelKeySyncTotal.value }} 个账号
                   </span>
                 </header>
-                <p>正在读取账号 Key，并验证在线模型列表，请稍候。</p>
+                <p>正在读取账号信息与剩余额度，请稍候。</p>
                 <progress
-                  aria-label="Key 与模型同步进度"
+                  aria-label="账号额度同步进度"
                   :max="store.modelKeySyncTotal.value || 1"
                   :value="store.modelKeySyncCompleted.value"
                 />
@@ -256,7 +259,7 @@ function onBackdropClick(event: MouseEvent) {
             </button>
             <button class="primary-button" type="button" @click="store.syncSites()">
               <span v-html="icons.restore" />
-              <span>{{ store.syncDialogMode.value === 'sessions' ? '开始提取会话' : `同步${scopeLabel}` }}</span>
+              <span>{{ store.syncDialogMode.value === 'quota' ? '开始额度同步' : `同步${scopeLabel}` }}</span>
             </button>
           </template>
           <template v-else>

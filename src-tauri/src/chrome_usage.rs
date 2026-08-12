@@ -3,6 +3,7 @@ use crate::chrome_local_storage;
 use crate::chrome_session;
 use crate::db::*;
 use crate::models::*;
+use crate::platform_detect::{is_newapi, is_sub2api, is_zero_v_zero};
 use crate::site_ops::*;
 use rusqlite::{params, OptionalExtension};
 use serde_json;
@@ -19,9 +20,12 @@ pub async fn mark_sites_with_chrome_sessions(
     site_ids: Option<Vec<String>>,
     run_id: Option<u64>,
     extract_only: Option<bool>,
+    refresh_pending: Option<bool>,
 ) -> Result<ChromeUsageScanResult, String> {
     // extract_only=true：只提取浏览器是否有会话数据并标注待定，不探测站点类型、不刷新账号接口。
     let extract_only = extract_only.unwrap_or(false);
+    // refresh_pending=true：额度同步时允许刷新待定站点，但不改变其使用状态。
+    let refresh_pending = refresh_pending.unwrap_or(false);
     let site_id_was_supplied = site_id.is_some();
     let requested_site_id = site_id
         .map(|value| value.trim().to_string())
@@ -59,13 +63,15 @@ pub async fn mark_sites_with_chrome_sessions(
                 let api_base_url = account_base_url(&name, &api_base_url, &system_type);
                 let mut urls = Vec::with_capacity(4);
                 if !api_base_url.trim().is_empty() {
-                    let account_paths: &[&str] =
-                        match system_type.trim().to_ascii_lowercase().as_str() {
-                            "newapi" => &["/api/user/auth/refresh", "/api/user/self"],
-                            "sub2api" => &["/api/v1/auth/me"],
-                            "0v0" => &["/api/user/self", "/api/user/stats"],
-                            _ => &[],
-                        };
+                    let account_paths: &[&str] = if is_newapi(&system_type) {
+                        &["/api/user/auth/refresh", "/api/user/self"]
+                    } else if is_sub2api(&system_type) {
+                        &["/api/v1/auth/me"]
+                    } else if is_zero_v_zero(&system_type) {
+                        &["/api/user/self", "/api/user/stats"]
+                    } else {
+                        &[]
+                    };
                     for account_url in account_paths
                         .iter()
                         .filter_map(|path| Url::parse(&api_base_url).ok()?.join(path).ok())
@@ -103,10 +109,15 @@ pub async fn mark_sites_with_chrome_sessions(
             })
             .collect::<Vec<_>>()
     };
-    let personal_site_ids = {
+    let account_refresh_site_ids = {
         let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+        let condition = if refresh_pending {
+            "is_pending = 1"
+        } else {
+            "is_personal = 1"
+        };
         let mut statement = connection
-            .prepare("SELECT id FROM directory_sites WHERE is_personal = 1")
+            .prepare(&format!("SELECT id FROM directory_sites WHERE {condition}"))
             .map_err(|error| error.to_string())?;
         let ids = statement
             .query_map([], |row| row.get::<_, String>(0))
@@ -133,11 +144,14 @@ pub async fn mark_sites_with_chrome_sessions(
     // 提取会话只比对浏览器数据，不做 /api/status 站点类型检测。
     // 已有 system_type 仅用于在用账号刷新路径，不影响待定标注。
     for (_, _, urls, api_base_url, system_type) in &mut targets {
-        let account_paths: &[&str] = match system_type.trim().to_ascii_lowercase().as_str() {
-            "newapi" => &["/api/user/self", "/api/user/auth/refresh"],
-            "sub2api" => &["/api/v1/auth/me"],
-            "0v0" => &["/api/user/self", "/api/user/stats"],
-            _ => &[],
+        let account_paths: &[&str] = if is_newapi(system_type) {
+            &["/api/user/self", "/api/user/auth/refresh"]
+        } else if is_sub2api(system_type) {
+            &["/api/v1/auth/me"]
+        } else if is_zero_v_zero(system_type) {
+            &["/api/user/self", "/api/user/stats"]
+        } else {
+            &[]
         };
         for account_url in account_paths
             .iter()
@@ -156,7 +170,7 @@ pub async fn mark_sites_with_chrome_sessions(
         "running",
         format!("开始提取 {} 个本地站点的 Chrome 会话数据", targets.len()),
     );
-    let (current_month, previous_checkins) = {
+    let (current_month, previous_checkins, cached_accounts) = {
         let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
         let current_month: String = connection
             .query_row("SELECT strftime('%Y-%m', 'now', 'localtime')", [], |row| {
@@ -185,7 +199,15 @@ pub async fn mark_sites_with_chrome_sessions(
             .map_err(|error| error.to_string())?
             .collect::<Result<HashMap<_, _>, _>>()
             .map_err(|error| error.to_string())?;
-        (current_month, previous_checkins)
+        let cached_accounts = read_cached_usage_sites(&connection)?
+            .into_iter()
+            .flat_map(|site| {
+                site.sessions.into_iter().map(move |session| {
+                    ((site.site_id.clone(), session.profile_id.clone()), session)
+                })
+            })
+            .collect::<HashMap<_, _>>();
+        (current_month, previous_checkins, cached_accounts)
     };
     let scanned = targets.len();
     let scan_targets = targets
@@ -273,25 +295,38 @@ pub async fn mark_sites_with_chrome_sessions(
         .collect::<HashMap<_, _>>();
 
     let mut locally_inferred_types = HashMap::new();
-    for (site_id, _, _, _, system_type) in &mut targets {
-        if system_type.eq_ignore_ascii_case("0v0") {
+    for (site_id, _, _, api_base_url, system_type) in &mut targets {
+        if is_zero_v_zero(system_type) {
             locally_inferred_types.insert(site_id.clone(), "0v0".into());
             continue;
         }
-        if matches!(
-            system_type.trim().to_ascii_lowercase().as_str(),
-            "newapi" | "sub2api"
-        ) {
-            continue;
-        }
-        let inferred = infer_system_type_from_local_accounts(local_storage.iter().filter_map(
-            |((local_site_id, _), (values, error))| {
-                (local_site_id == site_id && error.is_empty()).then_some(values)
-            },
-        ));
-        if !inferred.is_empty() {
+        // 优先相信浏览器真实账号结构：该域 Local Storage 本身是 NewAPI 或 Sub2API。
+        // 即使库里已经有旧类型，也允许纠正，避免错误类型被永久保留。
+        let inferred_from_accounts =
+            infer_system_type_from_local_accounts(local_storage.iter().filter_map(
+                |((local_site_id, _), (values, error))| {
+                    (local_site_id == site_id && error.is_empty()).then_some(values)
+                },
+            ));
+        // Local Storage 无结论时，退而使用 API 地址中的高置信产品名提示。
+        let inferred = if inferred_from_accounts.is_empty() {
+            system_type_hint_from_url(api_base_url.as_str()).unwrap_or("")
+        } else {
+            inferred_from_accounts
+        };
+        if !inferred.is_empty() && !inferred.eq_ignore_ascii_case(system_type) {
+            let previous = system_type.clone();
             *system_type = inferred.into();
             locally_inferred_types.insert(site_id.clone(), inferred.into());
+            if !previous.is_empty() {
+                emit_optional_sync_progress(
+                    &app,
+                    run_id,
+                    "site-type-correct",
+                    "info",
+                    format!("站点类型纠正：{site_id} 由 {previous} 调整为 {inferred}"),
+                );
+            }
         }
     }
     if !extract_only {
@@ -405,6 +440,57 @@ pub async fn mark_sites_with_chrome_sessions(
             });
     }
 
+    // 账号缓存在重启/重新扫描前是被下面“全删后重插”覆盖的，这里先把缓存里的
+    // 签到/余额/令牌并回扫描结果，避免上一轮的账号业务数据被无会话结果冲掉。
+    for site in &mut matched_sites {
+        for session in &mut site.sessions {
+            let Some(cached) =
+                cached_accounts.get(&(site.site_id.clone(), session.profile_id.clone()))
+            else {
+                continue;
+            };
+            session.remaining = session.remaining.or(cached.remaining);
+            session.used = session.used.or(cached.used);
+            session.total = session.total.or(cached.total);
+            session.unit = if session.unit.is_empty() && !cached.unit.is_empty() {
+                cached.unit.clone()
+            } else {
+                session.unit.clone()
+            };
+            session.username = if session.username.is_empty() && !cached.username.is_empty() {
+                cached.username.clone()
+            } else {
+                session.username.clone()
+            };
+            session.is_valid = session.is_valid || cached.is_valid;
+            session.sync_error = if session.sync_error.is_empty() {
+                cached.sync_error.clone()
+            } else {
+                session.sync_error.clone()
+            };
+            // 签到状态：缓存在读取时已按当天折算（昨天的签到会被归零），
+            // 因此扫描结果缺失时可直接沿用缓存，避免重启后签到记录丢失。
+            session.checked_in_today = session.checked_in_today || cached.checked_in_today;
+            session.checkin_error = if session.checkin_error.is_empty() {
+                cached.checkin_error.clone()
+            } else {
+                session.checkin_error.clone()
+            };
+            session.account_updated_at = if session.account_updated_at.is_empty() {
+                cached.account_updated_at.clone()
+            } else {
+                session.account_updated_at.clone()
+            };
+            if session.newapi_token.is_empty() && !cached.newapi_token.is_empty() {
+                session.newapi_token = cached.newapi_token.clone();
+                session.has_access_token = true;
+            }
+            if session.newapi_user_id.is_empty() {
+                session.newapi_user_id = cached.newapi_user_id.clone();
+            }
+        }
+    }
+
     // Local Storage 里能解析出账号的，也视为浏览器有会话（即使 Cookie 查询因 path/分区漏掉）。
     for ((site_id, _), (values, error)) in &local_storage {
         if error.is_empty() && has_local_account_session("", values) {
@@ -452,7 +538,7 @@ pub async fn mark_sites_with_chrome_sessions(
         }
         for (site_index, site) in matched_sites.iter().enumerate() {
             // 额度/签到接口只刷新“在用”站点，避免全库会话比对时打爆外部接口。
-            if !personal_site_ids.contains(&site.site_id) {
+            if !account_refresh_site_ids.contains(&site.site_id) {
                 continue;
             }
             let Some((base_url, system_type, site_name)) = account_targets.get(&site.site_id)
@@ -475,7 +561,7 @@ pub async fn mark_sites_with_chrome_sessions(
                 };
                 let has_refresh_cookie =
                     has_newapi_refresh_cookie_name(session.cookie_names.iter().map(String::as_str));
-                let auth_label = if system_type.eq_ignore_ascii_case("NewAPI") {
+                let auth_label = if is_newapi(&system_type) {
                     if has_refresh_cookie {
                         "刷新令牌认证"
                     } else {
@@ -531,7 +617,7 @@ pub async fn mark_sites_with_chrome_sessions(
                     Some(session.newapi_user_id.clone())
                 };
                 let job = tauri::async_runtime::spawn(async move {
-                    let needs_cookie = system_type.eq_ignore_ascii_case("NewAPI")
+                    let needs_cookie = is_newapi(&system_type)
                         || (system_type.trim().is_empty()
                             && (parse_newapi_local_account(&local_values).is_ok()
                                 || has_refresh_cookie));
@@ -638,7 +724,7 @@ pub async fn mark_sites_with_chrome_sessions(
     let detected = browser_session_site_ids.len();
     let accounts = matched_sites
         .iter()
-        .filter(|site| personal_site_ids.contains(&site.site_id))
+        .filter(|site| account_refresh_site_ids.contains(&site.site_id))
         .flat_map(|site| &site.sessions)
         .filter(|session| session.is_valid)
         .count();
@@ -704,7 +790,7 @@ pub async fn mark_sites_with_chrome_sessions(
                 .map_err(|error| error.to_string())?;
         }
         for site in &matched_sites {
-            if !personal_site_ids.contains(&site.site_id) {
+            if !account_refresh_site_ids.contains(&site.site_id) {
                 continue;
             }
             for session in &site.sessions {
@@ -756,96 +842,98 @@ pub async fn mark_sites_with_chrome_sessions(
     // 不要用后面被账号候选规则滤掉的 matched_sites。
     let session_site_ids = browser_session_site_ids;
 
-    let scope_site_ids: Option<HashSet<String>> = if let Some(site_id) = &requested_site_id {
-        Some(HashSet::from([site_id.clone()]))
-    } else if has_site_scope {
-        Some(requested_site_ids.clone())
-    } else {
-        None
-    };
+    if extract_only {
+        let scope_site_ids: Option<HashSet<String>> = if let Some(site_id) = &requested_site_id {
+            Some(HashSet::from([site_id.clone()]))
+        } else if has_site_scope {
+            Some(requested_site_ids.clone())
+        } else {
+            None
+        };
 
-    if let Some(scope) = &scope_site_ids {
-        for site_id in scope {
-            let is_personal: i64 = transaction
-                .query_row(
-                    "SELECT is_personal FROM directory_sites WHERE id = ?1",
-                    [site_id],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(|error| error.to_string())?
-                .unwrap_or(0);
-            if is_personal != 0 {
-                transaction
-                    .execute(
-                        "UPDATE directory_sites SET is_pending = 0 WHERE id = ?1 AND is_pending <> 0",
+        if let Some(scope) = &scope_site_ids {
+            for site_id in scope {
+                let is_personal: i64 = transaction
+                    .query_row(
+                        "SELECT is_personal FROM directory_sites WHERE id = ?1",
                         [site_id],
+                        |row| row.get(0),
                     )
-                    .map_err(|error| error.to_string())?;
-                continue;
+                    .optional()
+                    .map_err(|error| error.to_string())?
+                    .unwrap_or(0);
+                if is_personal != 0 {
+                    transaction
+                            .execute(
+                                "UPDATE directory_sites SET is_pending = 0 WHERE id = ?1 AND is_pending <> 0",
+                                [site_id],
+                            )
+                            .map_err(|error| error.to_string())?;
+                    continue;
+                }
+                if session_site_ids.contains(site_id) {
+                    let changed = transaction
+                        .execute(
+                            "UPDATE directory_sites
+                                 SET is_pending = 1, favorite = 0, updated_at = CURRENT_TIMESTAMP
+                                 WHERE id = ?1 AND is_personal = 0 AND is_pending = 0",
+                            [site_id],
+                        )
+                        .map_err(|error| error.to_string())?;
+                    newly_marked += changed as usize;
+                } else {
+                    // 作用域内已无浏览器会话：清掉旧待定
+                    transaction
+                            .execute(
+                                "UPDATE directory_sites SET is_pending = 0 WHERE id = ?1 AND is_pending <> 0",
+                                [site_id],
+                            )
+                            .map_err(|error| error.to_string())?;
+                }
             }
-            if session_site_ids.contains(site_id) {
+        } else {
+            for site_id in &session_site_ids {
                 let changed = transaction
                     .execute(
                         "UPDATE directory_sites
-                         SET is_pending = 1, favorite = 0, updated_at = CURRENT_TIMESTAMP
-                         WHERE id = ?1 AND is_personal = 0 AND is_pending = 0",
+                             SET is_pending = 1, favorite = 0, updated_at = CURRENT_TIMESTAMP
+                             WHERE id = ?1 AND is_personal = 0 AND is_pending = 0",
                         [site_id],
                     )
                     .map_err(|error| error.to_string())?;
                 newly_marked += changed as usize;
-            } else {
-                // 作用域内已无浏览器会话：清掉旧待定
-                transaction
+            }
+            // 全库：在用清待定；不在会话集合里的旧待定也清掉，避免脏数据。
+            transaction
                     .execute(
-                        "UPDATE directory_sites SET is_pending = 0 WHERE id = ?1 AND is_pending <> 0",
-                        [site_id],
+                        "UPDATE directory_sites SET is_pending = 0 WHERE is_personal = 1 AND is_pending <> 0",
+                        [],
                     )
                     .map_err(|error| error.to_string())?;
-            }
-        }
-    } else {
-        for site_id in &session_site_ids {
-            let changed = transaction
-                .execute(
+            if !session_site_ids.is_empty() {
+                let placeholders = session_site_ids
+                    .iter()
+                    .enumerate()
+                    .map(|(index, _)| format!("?{}", index + 1))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let sql = format!(
                     "UPDATE directory_sites
-                     SET is_pending = 1, favorite = 0, updated_at = CURRENT_TIMESTAMP
-                     WHERE id = ?1 AND is_personal = 0 AND is_pending = 0",
-                    [site_id],
-                )
-                .map_err(|error| error.to_string())?;
-            newly_marked += changed as usize;
-        }
-        // 全库：在用清待定；不在会话集合里的旧待定也清掉，避免脏数据。
-        transaction
-            .execute(
-                "UPDATE directory_sites SET is_pending = 0 WHERE is_personal = 1 AND is_pending <> 0",
-                [],
-            )
-            .map_err(|error| error.to_string())?;
-        if !session_site_ids.is_empty() {
-            let placeholders = session_site_ids
-                .iter()
-                .enumerate()
-                .map(|(index, _)| format!("?{}", index + 1))
-                .collect::<Vec<_>>()
-                .join(", ");
-            let sql = format!(
-                "UPDATE directory_sites
-                 SET is_pending = 0
-                 WHERE is_pending <> 0
-                   AND is_personal = 0
-                   AND id NOT IN ({placeholders})"
-            );
-            let params = session_site_ids
-                .iter()
-                .map(|id| id.as_str())
-                .collect::<Vec<_>>();
-            transaction
-                .execute(&sql, rusqlite::params_from_iter(params))
-                .map_err(|error| error.to_string())?;
-        } else {
-            // 一个会话都没扫到时，不批量清待定，避免误伤（例如 Chrome 暂时不可读）。
+                         SET is_pending = 0
+                         WHERE is_pending <> 0
+                           AND is_personal = 0
+                           AND id NOT IN ({placeholders})"
+                );
+                let params = session_site_ids
+                    .iter()
+                    .map(|id| id.as_str())
+                    .collect::<Vec<_>>();
+                transaction
+                    .execute(&sql, rusqlite::params_from_iter(params))
+                    .map_err(|error| error.to_string())?;
+            } else {
+                // 一个会话都没扫到时，不批量清待定，避免误伤（例如 Chrome 暂时不可读）。
+            }
         }
     }
 
@@ -857,10 +945,10 @@ pub async fn mark_sites_with_chrome_sessions(
         "success",
         if extract_only {
             format!("浏览器会话提取完成：有会话 {detected} 个站点，新待定 {newly_marked} 个")
+        } else if refresh_pending {
+            format!("待定站点额度缓存已写入 SQLite：{accounts} 个账号，{warnings} 个警告")
         } else {
-            format!(
-                "Chrome 账号缓存已写入 SQLite：{accounts} 个账号，{warnings} 个警告；新待定 {newly_marked} 个"
-            )
+            format!("在用站点额度缓存已写入 SQLite：{accounts} 个账号，{warnings} 个警告")
         },
     );
 

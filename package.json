@@ -10,7 +10,10 @@
     "preview": "vite preview",
     "desktop": "tauri dev",
     "desktop:build": "tauri build",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "clean:target": "bash scripts/clean-target.sh",
+    "clean:deep": "bash scripts/clean-target.sh --deep",
+    "postdesktop": "bash scripts/clean-target.sh"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.11.4",
@@ -21,6 +24,7 @@
     "vue-tsc": "^2.2.0"
   },
   "dependencies": {
+    "@tanstack/vue-table": "^9.1.2",
     "@tauri-apps/api": "^2.8.0",
     "@tauri-apps/plugin-opener": "^2.5.0",
     "echarts": "^6.1.0",

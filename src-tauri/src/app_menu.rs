@@ -3,7 +3,7 @@
 //! 2) 编辑菜单中文项供系统快捷键/部分文本菜单复用；
 //! 3) 页面内右键由前端中文菜单接管（WKWebView 默认英文菜单不可完全本地化）。
 
-use tauri::menu::{AboutMetadata, IsMenuItem, Menu, PredefinedMenuItem, Submenu};
+use tauri::menu::{AboutMetadata, IsMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::Manager;
 
 type DynItem<'a, R> = &'a dyn IsMenuItem<R>;
@@ -36,10 +36,17 @@ pub fn install_chinese_menu<R: tauri::Runtime>(app: &tauri::App<R>) -> tauri::Re
     let app_menu = Submenu::with_items(app, "OpenHub", true, &app_items)?;
 
     let close_window = PredefinedMenuItem::close_window(app, Some("关闭窗口")).ok();
-    let file_items: Vec<DynItem<'_, R>> = vec![close_window.as_ref().map(|i| i as DynItem<'_, R>)]
-        .into_iter()
-        .flatten()
-        .collect();
+    let refresh_item = MenuItem::with_id(app, "file-refresh", "刷新", true, Some("CmdOrCtrl+R"))
+        .expect("创建文件菜单刷新项失败");
+    let sep_file = PredefinedMenuItem::separator(app).ok();
+    let file_items: Vec<DynItem<'_, R>> = vec![
+        close_window.as_ref().map(|i| i as DynItem<'_, R>),
+        sep_file.as_ref().map(|i| i as DynItem<'_, R>),
+        Some(&refresh_item as DynItem<'_, R>),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
     let file_menu = Submenu::with_items(app, "文件", true, &file_items)?;
 
     // 编辑菜单是文本输入区域系统菜单/快捷键的数据来源之一。

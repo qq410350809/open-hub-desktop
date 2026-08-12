@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, ref, watch, nextTick } from "vue";
-import { invoke } from "@tauri-apps/api/core";
+import { runCommand } from "../composables/useLibrary";
 import { icons } from "../icons";
 import { useStore } from "../composables/useStore";
 import { logoText } from "../utils";
@@ -59,7 +59,7 @@ interface LocalSiteModelCache {
 async function readCachedModels(siteId: string): Promise<boolean> {
   if (!isTauri) return false;
   try {
-    const data = await invoke<LocalSiteModelCache>("get_site_model_cache", { siteId });
+    const data = await runCommand<LocalSiteModelCache>("get_site_model_cache", { siteId });
     if (!data || !Array.isArray(data.models)) return false;
     liveModels.value = (data.models as LiveModelItem[]).map((model: LiveModelItem) => ({
       ...model,

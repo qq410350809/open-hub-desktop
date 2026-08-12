@@ -57,8 +57,9 @@
       "minimumSystemVersion": "10.13",
       "signingIdentity": "-"
     },
-    "resources": [
-      "resources/zh-Hans.lproj"
-    ]
+    "resources": {
+      "resources/zh-Hans.lproj": "resources/zh-Hans.lproj",
+      "../dist": "dist"
+    }
   }
 }

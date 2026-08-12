@@ -32,3 +32,19 @@ maxminddb = "0.30"
 futures-util = "0.3"
 tokio-util = "0.7"
 tokio = { version = "1", features = ["time", "rt", "rt-multi-thread", "macros", "sync"] }
+
+# 开发编译体积优化：减少 debug 信息层级，避免 deps 目录无限膨胀。
+[profile.dev]
+debug = "line-tables-only"
+# strip 不影响 dev（链接器仅对 release 生效），但减少 .a/二进制体积
+strip = "none"
+
+[profile.dev.package."*"]
+debug = false
+opt-level = 0
+
+# release 更激进瘦身
+[profile.release]
+strip = "symbols"
+lto = "thin"
+codegen-units = 1

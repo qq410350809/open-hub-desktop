@@ -5,14 +5,22 @@ mod chrome_local_storage;
 mod chrome_session;
 mod chrome_usage;
 mod db;
+mod detect_all;
 mod models;
+pub use detect_all::run_library_detect;
+mod model_catalog;
+pub use model_catalog::sync_model_catalog_once;
 mod models_fetch;
+mod platform_detect;
 mod proxy_pool;
 mod remote_sync;
+mod single_instance;
 mod site_crud;
 mod site_ops;
 mod system_detect;
+mod token_collector;
 mod token_stats;
+mod web_server;
 
 use models::*;
 
@@ -428,7 +436,7 @@ mod tests {
         )]);
         assert_eq!(
             infer_system_type_from_local_accounts([&any_router]),
-            "NewAPI"
+            "new-api"
         );
     }
 
@@ -674,6 +682,10 @@ mod tests {
         assert!(script.contains("readJson(\"/v1/models\""));
         assert!(script.contains("readJson(\"/api/user/auth/refresh\""));
         assert!(script.contains("keyResponse.status === 401"));
+        assert!(script.contains(
+            "if (systemType === \"sub2api\" && dashboardAccessToken) keys.push(dashboardAccessToken)"
+        ));
+        assert!(!script.contains("if (dashboardAccessToken) keys.push(dashboardAccessToken)"));
         assert!(!script.contains("!keyResponse.ok || extractKeys(keyResponse.data).length === 0"));
         assert!(script.contains("return \"__OPENHUB_PROFILE_MISMATCH__\""));
         assert!(!script.contains("http://"));
@@ -716,7 +728,7 @@ mod tests {
         let explicit = serde_json::json!({ "siteType": "sub2api" });
         assert_eq!(
             infer_remote_system_type(explicit.as_object().unwrap()),
-            "Sub2API"
+            "sub2api"
         );
 
         let inferred = serde_json::json!({
@@ -724,11 +736,28 @@ mod tests {
         });
         assert_eq!(
             infer_remote_system_type(inferred.as_object().unwrap()),
-            "NewAPI"
+            "new-api"
         );
 
         let unknown = serde_json::json!({ "apiBaseUrl": "https://example.com/" });
         assert!(infer_remote_system_type(unknown.as_object().unwrap()).is_empty());
+    }
+
+    #[test]
+    fn recognizes_high_confidence_system_type_url_hints() {
+        assert_eq!(
+            system_type_hint_from_url("https://sub2api.example.com/"),
+            Some("sub2api")
+        );
+        assert_eq!(
+            system_type_hint_from_url("https://newapi.example.com/"),
+            Some("new-api")
+        );
+        assert_eq!(
+            system_type_hint_from_url("https://new-api.example.com/"),
+            Some("new-api")
+        );
+        assert_eq!(system_type_hint_from_url("https://api.example.com/"), None);
     }
 
     #[test]
@@ -742,21 +771,21 @@ mod tests {
         };
         assert_eq!(
             system_type_from_probes(probe(reqwest::StatusCode::OK, true), None),
-            Some("NewAPI")
+            Some("new-api")
         );
         assert_eq!(
             system_type_from_probes(
                 probe(reqwest::StatusCode::UNAUTHORIZED, false),
                 probe(reqwest::StatusCode::OK, true),
             ),
-            Some("NewAPI")
+            Some("new-api")
         );
         assert_eq!(
             system_type_from_probes(
                 probe(reqwest::StatusCode::NOT_FOUND, true),
                 probe(reqwest::StatusCode::OK, true),
             ),
-            Some("Sub2API")
+            Some("sub2api")
         );
         assert_eq!(
             system_type_from_probes(
@@ -840,8 +869,15 @@ mod tests {
         assert!(script.contains("const allowChallengeNavigation = true"));
         assert!(script.contains("return \"__OPENHUB_PROFILE_MISMATCH__\""));
         assert!(
+            script.find("fetch(\"/api/user/token\"").unwrap()
+                < script.find("const checkinResponse").unwrap()
+        );
+        assert!(
             script.find("const checkinResponse").unwrap()
                 < script.find("fetch(\"/api/user/self\"").unwrap()
+        );
+        assert!(
+            script.contains("method: \"GET\", credentials: \"omit\", cache: \"no-store\", headers")
         );
         assert!(script.contains("const requestTimeout = 30000"));
         assert_eq!(
@@ -920,22 +956,72 @@ pub fn run() {
                     .status();
             }
             app_menu::install_chinese_menu(app)?;
+
+            // 菜单刷新：文件 → 刷新 → 后端直接全量刷新 + 通知前端刷新 UI。
+            app.on_menu_event(move |app_handle, event| {
+                if event.id() == "file-refresh" {
+                    eprintln!("[OpenHub] 菜单 file-refresh 触发");
+                    let handle = app_handle.clone();
+                    tauri::async_runtime::spawn(async move {
+                        let database = handle.state::<crate::models::Database>();
+                        let monitor =
+                            handle.state::<crate::charity_monitor::CharityMonitorRuntime>();
+                        match crate::charity_monitor::refresh_all_charity_feeds(database, monitor)
+                            .await
+                        {
+                            Ok(_) => {
+                                eprintln!("[OpenHub] 全量刷新已提交");
+                            }
+                            Err(err) => {
+                                eprintln!("[OpenHub] 全量刷新失败：{err}");
+                            }
+                        }
+                        let _ = tauri::Emitter::emit(&handle, "menu-refresh-requested", ());
+                    });
+                }
+            });
+
             let app_data_dir = app
                 .path()
                 .app_data_dir()
                 .map_err(|error| error.to_string())?;
             fs::create_dir_all(&app_data_dir)?;
+            // 先关掉旧实例，再开数据库/绑端口，避免端口顺延导致浏览器指向旧实例。
+            single_instance::claim(&app_data_dir);
             let database = Database::open(&app_data_dir.join("sites.sqlite3"))
                 .map_err(std::io::Error::other)?;
+            // 升级阶段先把现有采集缓存迁入 SQLite，页面首次查询即可得到完整快照。
+            if let Err(error) = token_stats::seed_token_database_from_caches(&database) {
+                eprintln!("[OpenHub] Token 缓存迁移到数据库失败：{error}");
+            }
             let proxy_runtime = proxy_pool::ProxyRuntime::new(app_data_dir.join("proxy-runtime"));
             let charity_runtime = charity_monitor::CharityMonitorRuntime::new();
+            let model_catalog_runtime = model_catalog::ModelCatalogRuntime::new();
             app.manage(database);
             app.manage(proxy_runtime);
             app.manage(charity_runtime);
+            app.manage(model_catalog_runtime);
+            // Token 采集与页面查询完全解耦：后台每 20 秒增量入库。
+            token_stats::start_token_collector(app.handle().clone());
+
+            // 轻量模式：常驻本地 HTTP 服务（浏览器访问内核）。
+            let web_server = match web_server::start(app.handle().clone()) {
+                Ok(handle) => handle,
+                Err(error) => {
+                    eprintln!("OpenHub 轻量模式服务启动失败：{error}");
+                    web_server::WebServerHandle::disabled()
+                }
+            };
+            app.manage(web_server);
+            web_server::apply_startup_lightweight_mode(app.handle());
 
             // 启动阶段禁止阻塞 UI 线程：
             // 1) 恢复代理在后台
-            // 2) 公益监听延后启动
+            // 2) 检查模型参数当天是否已同步
+            // 3) 公益监听延后启动
+            // 前端启动后调用 sync_model_catalog(false)：后端以本地日期判断当天是否已同步；
+            // 页面保持打开跨过午夜时，前端计时器会再次调用同一命令。
+
             let restore_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -993,9 +1079,13 @@ pub fn run() {
             models_fetch::get_site_model_cache,
             models_fetch::clear_site_model_cache_for_site,
             models_fetch::save_site_model_cache_for_account,
+            model_catalog::get_model_catalog,
+            model_catalog::get_model_catalog_detail,
+            model_catalog::sync_model_catalog,
             chrome_session::list_chrome_sessions,
             chrome_session::read_chrome_session,
             chrome_session::open_url_in_chrome_profile,
+            chrome_session::close_chrome_sync_tabs,
             charity_monitor::get_charity_feed,
             charity_monitor::fetch_charity_feed,
             charity_monitor::mark_charity_feed_read,
@@ -1006,13 +1096,27 @@ pub fn run() {
             charity_monitor::clear_charity_sync_logs,
             charity_monitor::set_charity_monitor_visible,
             charity_monitor::request_charity_round,
+            charity_monitor::list_charity_sources,
+            charity_monitor::add_charity_source,
+            charity_monitor::update_charity_source,
+            charity_monitor::remove_charity_source,
             charity_monitor::refresh_all_charity_feeds,
             token_stats::get_token_stats,
-            token_stats::sync_token_tracker,
+            token_stats::sync_token_data,
             token_stats::get_token_usage,
             token_stats::get_token_raw_logs,
-            token_stats::get_token_request_health
+            token_stats::get_token_request_health,
+            web_server::get_lightweight_mode_state,
+            web_server::enter_lightweight_mode,
+            web_server::show_main_window
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building Tauri application")
+        .run(|app_handle, event| {
+            // macOS：点击 Dock 图标时重新显示轻量模式下隐藏的窗口。
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Reopen { .. } = event {
+                let _ = web_server::show_main_window(app_handle.clone());
+            }
+        });
 }

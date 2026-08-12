@@ -452,180 +452,233 @@ pub(crate) struct ProxyIpAnalysis {
     pub(crate) groups: Vec<ProxyIpGroup>,
 }
 
-// —— Token 统计（数据来源：tokentracker CLI，见 token_stats.rs）——
-// CLI `sessions` 输出键为 snake_case，而 app 前端约定 camelCase，
-// 因此这里序列化走 camelCase、反序列化走 snake_case 双向映射。
+// —— Token 统计（OpenHub 直接读取各工具本地日志）——
+// 后端缓存与前端均使用 camelCase，避免自有缓存序列化/反序列化口径分裂。
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(
-    default,
-    rename_all(serialize = "camelCase", deserialize = "snake_case")
-)]
+#[serde(default, rename_all = "camelCase")]
 pub(crate) struct TokenStatsReport {
     pub(crate) available: bool,
     pub(crate) sessions: Vec<TokenSession>,
+    #[serde(alias = "session_count")]
     pub(crate) session_count: i64,
     pub(crate) summary: TokenSummary,
+    #[serde(alias = "by_model")]
     pub(crate) by_model: Vec<TokenModelStat>,
     pub(crate) subagents: Vec<TokenSubagentStat>,
     pub(crate) provenance: JsonValue,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(
-    default,
-    rename_all(serialize = "camelCase", deserialize = "snake_case")
-)]
+#[serde(default, rename_all = "camelCase")]
 pub(crate) struct TokenSessionTokens {
+    #[serde(alias = "input_tokens")]
     pub(crate) input_tokens: i64,
+    #[serde(alias = "cached_input_tokens")]
     pub(crate) cached_input_tokens: i64,
+    #[serde(alias = "cache_creation_input_tokens")]
     pub(crate) cache_creation_input_tokens: i64,
+    #[serde(alias = "output_tokens")]
     pub(crate) output_tokens: i64,
+    #[serde(alias = "reasoning_output_tokens")]
     pub(crate) reasoning_output_tokens: i64,
+    #[serde(alias = "total_tokens")]
     pub(crate) total_tokens: i64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(
-    default,
-    rename_all(serialize = "camelCase", deserialize = "snake_case")
-)]
+#[serde(default, rename_all = "camelCase")]
 pub(crate) struct TokenSession {
     pub(crate) version: i64,
+    #[serde(alias = "session_hash")]
     pub(crate) session_hash: String,
     pub(crate) source: String,
+    #[serde(alias = "project_key")]
     pub(crate) project_key: String,
     pub(crate) model: String,
+    #[serde(alias = "started_at")]
     pub(crate) started_at: String,
+    #[serde(alias = "ended_at")]
     pub(crate) ended_at: String,
+    #[serde(alias = "active_ms")]
     pub(crate) active_ms: i64,
     pub(crate) turns: i64,
+    #[serde(alias = "edit_turns")]
     pub(crate) edit_turns: i64,
+    #[serde(alias = "retry_turns")]
     pub(crate) retry_turns: i64,
+    #[serde(alias = "subagent_calls")]
     pub(crate) subagent_calls: i64,
+    #[serde(alias = "subagent_types")]
     pub(crate) subagent_types: JsonValue,
     pub(crate) tokens: TokenSessionTokens,
     pub(crate) provenance: JsonValue,
+    #[serde(alias = "duration_ms")]
     pub(crate) duration_ms: i64,
+    #[serde(alias = "total_tokens")]
     pub(crate) total_tokens: i64,
+    #[serde(alias = "cost_usd")]
     pub(crate) cost_usd: f64,
     pub(crate) productive: bool,
+    #[serde(alias = "first_pass")]
     pub(crate) first_pass: bool,
+    #[serde(alias = "one_shot")]
     pub(crate) one_shot: bool,
+    #[serde(alias = "tokens_per_edit")]
     pub(crate) tokens_per_edit: Option<f64>,
+    #[serde(alias = "cost_per_edit")]
     pub(crate) cost_per_edit: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(
-    default,
-    rename_all(serialize = "camelCase", deserialize = "snake_case")
-)]
+#[serde(default, rename_all = "camelCase")]
 pub(crate) struct TokenSummary {
     pub(crate) sessions: i64,
+    #[serde(alias = "productive_sessions")]
     pub(crate) productive_sessions: i64,
+    #[serde(alias = "one_shot_sessions")]
     pub(crate) one_shot_sessions: i64,
+    #[serde(alias = "edit_turns")]
     pub(crate) edit_turns: i64,
     pub(crate) retries: i64,
+    #[serde(alias = "total_tokens")]
     pub(crate) total_tokens: i64,
+    #[serde(alias = "cost_usd")]
     pub(crate) cost_usd: f64,
+    #[serde(alias = "edit_tokens")]
     pub(crate) edit_tokens: i64,
+    #[serde(alias = "edit_cost_usd")]
     pub(crate) edit_cost_usd: f64,
+    #[serde(alias = "productive_rate")]
     pub(crate) productive_rate: f64,
+    #[serde(alias = "one_shot_rate")]
     pub(crate) one_shot_rate: Option<f64>,
+    #[serde(alias = "edit_sessions")]
     pub(crate) edit_sessions: i64,
+    #[serde(alias = "first_pass_sessions")]
     pub(crate) first_pass_sessions: i64,
+    #[serde(alias = "edit_session_rate")]
     pub(crate) edit_session_rate: f64,
+    #[serde(alias = "first_pass_rate")]
     pub(crate) first_pass_rate: Option<f64>,
+    #[serde(alias = "tokens_per_edit")]
     pub(crate) tokens_per_edit: Option<f64>,
+    #[serde(alias = "cost_per_edit")]
     pub(crate) cost_per_edit: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(
-    default,
-    rename_all(serialize = "camelCase", deserialize = "snake_case")
-)]
+#[serde(default, rename_all = "camelCase")]
 pub(crate) struct TokenModelStat {
     pub(crate) model: String,
     pub(crate) sessions: i64,
+    #[serde(alias = "productive_sessions")]
     pub(crate) productive_sessions: i64,
+    #[serde(alias = "one_shot_sessions")]
     pub(crate) one_shot_sessions: i64,
+    #[serde(alias = "edit_turns")]
     pub(crate) edit_turns: i64,
     pub(crate) retries: i64,
+    #[serde(alias = "total_tokens")]
     pub(crate) total_tokens: i64,
+    #[serde(alias = "cost_usd")]
     pub(crate) cost_usd: f64,
+    #[serde(alias = "edit_tokens")]
     pub(crate) edit_tokens: i64,
+    #[serde(alias = "edit_cost_usd")]
     pub(crate) edit_cost_usd: f64,
+    #[serde(alias = "productive_rate")]
     pub(crate) productive_rate: f64,
+    #[serde(alias = "one_shot_rate")]
     pub(crate) one_shot_rate: Option<f64>,
+    #[serde(alias = "edit_sessions")]
     pub(crate) edit_sessions: i64,
+    #[serde(alias = "first_pass_sessions")]
     pub(crate) first_pass_sessions: i64,
+    #[serde(alias = "edit_session_rate")]
     pub(crate) edit_session_rate: f64,
+    #[serde(alias = "first_pass_rate")]
     pub(crate) first_pass_rate: Option<f64>,
+    #[serde(alias = "tokens_per_edit")]
     pub(crate) tokens_per_edit: Option<f64>,
+    #[serde(alias = "cost_per_edit")]
     pub(crate) cost_per_edit: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(
-    default,
-    rename_all(serialize = "camelCase", deserialize = "snake_case")
-)]
+#[serde(default, rename_all = "camelCase")]
 pub(crate) struct TokenSubagentStat {
     pub(crate) name: String,
     pub(crate) calls: i64,
     pub(crate) sessions: i64,
+    #[serde(alias = "total_tokens")]
     pub(crate) total_tokens: f64,
+    #[serde(alias = "cost_usd")]
     pub(crate) cost_usd: f64,
 }
 
-// —— Token 用量小时桶（数据来源：~/.tokentracker/tracker/cursors.json 的 hourly.buckets）——
-// tokentracker 仪表盘的汇总数据来自这里（覆盖所有工具的每小时用量），
-// 而 `sessions` 子命令只聚合 Claude/Codex 会话日志。
+// —— Token 用量小时桶（OpenHub 自有采集器按来源/模型/项目/半小时聚合）——
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(
-    default,
-    rename_all(serialize = "camelCase", deserialize = "snake_case")
-)]
+#[serde(default, rename_all = "camelCase")]
 pub(crate) struct TokenUsageBucket {
     pub(crate) source: String,
     pub(crate) model: String,
+    /// 可选项目维度；支持该维度的数据源会由 OpenHub 直接填充。
+    #[serde(alias = "project_key")]
+    pub(crate) project_key: String,
     pub(crate) timestamp: String,
+    #[serde(alias = "total_tokens")]
     pub(crate) total_tokens: i64,
+    #[serde(alias = "billable_total_tokens")]
     pub(crate) billable_total_tokens: i64,
+    #[serde(alias = "input_tokens")]
     pub(crate) input_tokens: i64,
+    #[serde(alias = "cached_input_tokens")]
     pub(crate) cached_input_tokens: i64,
+    #[serde(alias = "cache_creation_input_tokens")]
     pub(crate) cache_creation_input_tokens: i64,
+    #[serde(alias = "output_tokens")]
     pub(crate) output_tokens: i64,
+    #[serde(alias = "reasoning_output_tokens")]
     pub(crate) reasoning_output_tokens: i64,
+    #[serde(alias = "conversation_count")]
     pub(crate) conversation_count: i64,
+    /// 数据源明确上报的成本；未上报时为 0。
+    #[serde(alias = "cost_usd")]
+    pub(crate) cost_usd: f64,
+    /// 当前桶是否包含可信的来源上报成本。
+    #[serde(alias = "pricing_available")]
+    pub(crate) pricing_available: bool,
+    /// 其中有多少 Token 是根据本地可见会话上下文估算，而非来源直接上报。
+    #[serde(alias = "estimated_tokens")]
+    pub(crate) estimated_tokens: i64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(
-    default,
-    rename_all(serialize = "camelCase", deserialize = "snake_case")
-)]
+#[serde(default, rename_all = "camelCase")]
 pub(crate) struct TokenUsageReport {
     pub(crate) available: bool,
     pub(crate) buckets: Vec<TokenUsageBucket>,
+    #[serde(alias = "start_date")]
     pub(crate) start_date: String,
+    #[serde(alias = "end_date")]
     pub(crate) end_date: String,
+    /// 成本数据来源（当前为来源上报，未上报则不估算）。
+    #[serde(alias = "pricing_source")]
+    pub(crate) pricing_source: String,
 }
 
-// —— Tokentracker 本地同步状态 ——
+// —— OpenHub 本地 Token 采集状态 ——
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(
-    default,
-    rename_all(serialize = "camelCase", deserialize = "snake_case")
-)]
-pub(crate) struct TokenTrackerSyncReport {
+#[serde(default, rename_all = "camelCase")]
+pub(crate) struct TokenCollectorSyncReport {
     pub(crate) available: bool,
     pub(crate) changed: bool,
     pub(crate) skipped: bool,
+    #[serde(alias = "elapsed_ms")]
     pub(crate) elapsed_ms: i64,
+    #[serde(alias = "updated_at")]
     pub(crate) updated_at: String,
     pub(crate) message: String,
 }

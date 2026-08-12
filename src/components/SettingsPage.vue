@@ -4,7 +4,8 @@ import { icons } from "../icons";
 import { useStore } from "../composables/useStore";
 import { usePreferences } from "../composables/usePreferences";
 import { useTheme } from "../composables/useTheme";
-import type { ThemePreference, ProxyNodeViewModePreference } from "../types";
+import { runCommand } from "../composables/useLibrary";
+import type { LightweightState, ThemePreference, ProxyNodeViewModePreference } from "../types";
 
 const store = useStore();
 const { preferences, updatePreferences } = usePreferences();
@@ -17,6 +18,7 @@ watch(
   (page) => {
     if (page === "settings") {
       nextTick(() => closeBtnRef.value?.focus());
+      void loadLightweightState();
     }
   },
 );
@@ -31,6 +33,30 @@ function onBackdropClick(event: MouseEvent) {
 
 function setProxyNodeViewMode(mode: ProxyNodeViewModePreference) {
   updatePreferences({ proxyNodeViewMode: mode });
+}
+
+const lightweight = ref<LightweightState | null>(null);
+const lightweightLoading = ref(false);
+
+async function loadLightweightState() {
+  lightweightLoading.value = true;
+  try {
+    lightweight.value = await runCommand<LightweightState>("get_lightweight_mode_state");
+  } catch {
+    lightweight.value = null;
+  } finally {
+    lightweightLoading.value = false;
+  }
+}
+
+async function enterLightweightMode() {
+  if (!lightweight.value?.running) return;
+  try {
+    const state = await runCommand<LightweightState>("enter_lightweight_mode");
+    lightweight.value = { ...state, enabled: true };
+  } catch (error) {
+    store.showToast(String(error), true);
+  }
 }
 </script>
 
@@ -169,6 +195,38 @@ function setProxyNodeViewMode(mode: ProxyNodeViewModePreference) {
                       <span v-html="icons.sessionImport" /><span>待定</span>
                     </button>
                   </div>
+                </div>
+              </div>
+            </section>
+
+            <!-- 轻量模式 -->
+            <section class="settings-section">
+              <div class="settings-section-title">
+                <span v-html="icons.globe" />
+                <div>
+                  <h2>轻量模式</h2>
+                  <p>关闭 GUI 窗口，只保留内核在后台运行，通过浏览器访问</p>
+                </div>
+              </div>
+              <div class="settings-rows">
+                <div class="settings-row">
+                  <div>
+                    <strong>一键轻量模式</strong>
+                    <small v-if="lightweightLoading">正在读取服务状态…</small>
+                    <small v-else-if="lightweight?.running">
+                      访问地址：<code class="lightweight-address">{{ lightweight.url }}</code>
+                    </small>
+                    <small v-else>轻量模式服务未运行，请重启应用后重试</small>
+                    <small v-if="lightweight?.enabled">已开启：下次启动将自动进入轻量模式，点 Dock 图标可唤出窗口</small>
+                  </div>
+                  <button
+                    type="button"
+                    class="secondary-button lightweight-enter-button"
+                    :disabled="!lightweight?.running || lightweightLoading"
+                    @click="enterLightweightMode"
+                  >
+                    <span v-html="icons.globe" /><span>启用并进入轻量模式</span>
+                  </button>
                 </div>
               </div>
             </section>

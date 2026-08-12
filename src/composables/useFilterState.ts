@@ -1,7 +1,7 @@
 import { computed, ref, type ComputedRef } from "vue";
 import { useLibrary } from "./useLibrary";
 import { usePreferences } from "./usePreferences";
-import type { SiteRecord } from "../types";
+import { KNOWN_SYSTEM_TYPES, normalizeSystemType, type SiteRecord } from "../types";
 
 // ============================================================
 //  过滤状态 —— 模块级单例，所有组件共享
@@ -33,14 +33,11 @@ const filteredSites: ComputedRef<SiteRecord[]> = computed(() => {
       if (tag.value !== "all" && !site.tags.includes(tag.value)) return false;
       if (level.value !== "all" && site.registrationLimit !== Number(level.value)) return false;
       if (!matchesFeature(site, feature.value)) return false;
-      const siteSystemType = site.systemType.trim().toLocaleLowerCase();
-      if (
-        systemTypeFilter.value === "unknown" &&
-        ["newapi", "sub2api"].includes(siteSystemType)
-      ) return false;
+      const siteSystemType = normalizeSystemType(site.systemType);
+      if (systemTypeFilter.value === "unknown" && KNOWN_SYSTEM_TYPES.has(siteSystemType)) return false;
       if (
         !["all", "unknown"].includes(systemTypeFilter.value) &&
-        siteSystemType !== systemTypeFilter.value
+        siteSystemType !== normalizeSystemType(systemTypeFilter.value)
       ) return false;
       const content = [
         site.name,

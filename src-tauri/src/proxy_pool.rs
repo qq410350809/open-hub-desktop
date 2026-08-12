@@ -2617,6 +2617,46 @@ pub(crate) fn list_fast_proxy_nodes(
 
 /// 供公益监听整轮同步使用：一次性把全部待轮询快节点装入全局内核，
 /// 后续每个节点只需 API 切换出口，不再反复重启 Mihomo。
+/// 供公益监听使用：优先选择「有订阅来源」的节点（如 igi 专线，信誉好、IP 干净），
+/// 再补充剩余 success 节点。免费公共节点（无订阅关联）常被 Cloudflare 风控，
+/// 若排在最前会导致大量 403；这里把订阅节点提到队首，降低坏节点命中率。
+pub(crate) fn list_prioritized_fast_proxy_nodes(
+    database: &Database,
+    max_latency_ms: i64,
+) -> Result<Vec<(String, String, i64)>, String> {
+    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    let mut statement = connection
+        .prepare(
+            // igi/香港等高质量专线节点绝对优先，其次有订阅来源的节点，
+            // 最后是无来源的免费公共节点（常被 Cloudflare 风控，导致 403）。
+            "SELECT n.id, n.name, n.latency_ms
+             FROM proxy_pool_nodes n
+             WHERE n.test_status = 'success'
+               AND n.latency_ms IS NOT NULL
+               AND n.latency_ms > 0
+               AND n.latency_ms <= ?1
+             ORDER BY
+               (CASE WHEN n.name LIKE 'iGG%' OR n.name LIKE 'igi%' THEN 0
+                     WHEN (SELECT COUNT(*) FROM proxy_subscription_nodes sn WHERE sn.node_id = n.id) > 0 THEN 1
+                     ELSE 2 END) ASC,
+               n.latency_ms ASC,
+               n.name COLLATE NOCASE",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([max_latency_ms], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    Ok(rows)
+}
+
 pub(crate) async fn prepare_proxy_nodes_transient(
     database: &Database,
     runtime: &ProxyRuntime,

@@ -18,6 +18,18 @@ const navItems = computed(() => [
     onClick: () => store.openLibrary(),
   },
   {
+    id: "modelparams",
+    label: "模型参数",
+    icon: icons.cpu,
+    active: store.page.value === "modelparams",
+    badge: store.modelCatalog.value.total
+      ? store.modelCatalog.value.total >= 1_000
+        ? `${(store.modelCatalog.value.total / 1_000).toFixed(1)}K`
+        : String(store.modelCatalog.value.total)
+      : "",
+    onClick: () => store.openModelParams(),
+  },
+  {
     id: "charity",
     label: "公益监听",
     icon: icons.heartPulse,

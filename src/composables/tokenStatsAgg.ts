@@ -1,5 +1,5 @@
 // Token 统计页的纯聚合/绘图几何逻辑（无 Vue 依赖，可独立测试）。
-// 数据来自 tokentracker CLI 的 sessions 数组。
+// 数据来自 OpenHub 自有本地采集器的 sessions 数组。
 
 export interface TokenTokensLike {
   inputTokens?: number;
@@ -567,7 +567,7 @@ export function healthLevelOf(
 
 /**
  * 估算 API 请求次数。
- * tokentracker hourly.buckets 只有 conversation_count，没有 request_count；
+ * Token 小时桶只有 conversation_count，没有 request_count；
  * 用 output/reasoning 规模把“对话轮”放大成更接近真实请求量的估计值。
  */
 export function estimateRequestCount(input: {
@@ -602,7 +602,7 @@ export interface HealthUsageInput {
 /**
  * 按趋势粒度生成与左侧图表一一对应的完整节点。
  * - 请求量优先取后端多工具提取（Codex/Claude/OpenCode/Mimo/Zcode/Antigravity）
- * - 仅当完全没有提取数据时，才用 token usage 估算兜底
+ * - 每个时间节点独立判断：该节点没有提取请求时，用 token usage 估算兜底
  * - 对话数取后端 dialogues（用户发起 turns）
  * - 成功率=(请求−已知失败)/请求；有失败必降色，不允许被大量成功完全稀释成全绿
  */
@@ -693,14 +693,15 @@ export function buildHealthTimeline(
     const rawFailed = health?.failed ?? 0;
     const extractedRequests = health?.requests ?? 0;
     const usageRequests = usageMap.get(key) || 0;
-    // 展示请求量优先级：
-    // 1) 后端多工具提取的真实 API 请求数
-    // 2) 仅当完全没有提取数据时，才用 usage 估算兜底
-    // 3) 成功失败样本合计
+    // 展示请求量按节点独立兜底：
+    // 1) 当前节点有后端提取请求 → 使用真实请求数
+    // 2) 当前节点无提取请求但有 Token 活动 → 用 usage 估算
+    // 3) 否则使用成功/失败样本合计
+    // 不能因为其他日期有提取数据，就把本日期的 Token 活动误画成“无数据”。
     const sampleRequests = rawSuccess + rawFailed;
     const requests = extractedRequests > 0
       ? extractedRequests
-      : (!hasExtracted && usageRequests > 0 ? usageRequests : sampleRequests);
+      : (usageRequests > 0 ? usageRequests : sampleRequests);
 
     // 成功率口径：以请求为底，已知失败扣减。
     // 避免 Codex token_count 与 task_complete 样本混用导致 成功+失败 ≠ 请求、成功率被严重压低。
@@ -770,7 +771,7 @@ export function isKnownSource(source?: string) {
   return value !== "" && value !== "unknown";
 }
 
-// —— 小时用量桶聚合（tokentracker cursors.json）——
+// —— OpenHub 本地用量桶聚合 ——
 export interface UsageBucketLike {
   source: string;
   model: string;
@@ -783,6 +784,8 @@ export interface UsageBucketLike {
   outputTokens?: number;
   reasoningOutputTokens?: number;
   conversationCount?: number;
+  costUsd?: number;
+  estimatedTokens?: number;
 }
 
 export function buildDailyMapFromBuckets(buckets: UsageBucketLike[]): Map<string, DailyStat> {
@@ -821,12 +824,50 @@ export function bucketTotals(buckets: UsageBucketLike[]) {
   return result;
 }
 
-export function bucketSourceTotals(buckets: UsageBucketLike[]) {
-  const groups = new Map<string, { source: string; totalTokens: number; conversations: number }>();
+export interface BucketBreakdownTotal {
+  totalTokens: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheTokens: number;
+  reasoningTokens: number;
+  conversations: number;
+  costUsd: number;
+  estimatedTokens: number;
+}
+
+function emptyBucketBreakdown(): BucketBreakdownTotal {
+  return {
+    totalTokens: 0,
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheTokens: 0,
+    reasoningTokens: 0,
+    conversations: 0,
+    costUsd: 0,
+    estimatedTokens: 0,
+  };
+}
+
+function addBucketBreakdown(target: BucketBreakdownTotal, bucket: UsageBucketLike) {
+  target.totalTokens += bucket.totalTokens || 0;
+  target.inputTokens += bucket.inputTokens || 0;
+  target.outputTokens += bucket.outputTokens || 0;
+  target.cacheTokens += (bucket.cachedInputTokens || 0) + (bucket.cacheCreationInputTokens || 0);
+  target.reasoningTokens += bucket.reasoningOutputTokens || 0;
+  target.conversations += bucket.conversationCount || 0;
+  target.costUsd += bucket.costUsd || 0;
+  target.estimatedTokens += bucket.estimatedTokens || 0;
+}
+
+export interface SourceTotal extends BucketBreakdownTotal {
+  source: string;
+}
+
+export function bucketSourceTotals(buckets: UsageBucketLike[]): SourceTotal[] {
+  const groups = new Map<string, SourceTotal>();
   for (const bucket of buckets) {
-    const current = groups.get(bucket.source) || { source: bucket.source, totalTokens: 0, conversations: 0 };
-    current.totalTokens += bucket.totalTokens || 0;
-    current.conversations += bucket.conversationCount || 0;
+    const current = groups.get(bucket.source) || { source: bucket.source, ...emptyBucketBreakdown() };
+    addBucketBreakdown(current, bucket);
     groups.set(bucket.source, current);
   }
   return [...groups.values()].sort((a, b) => b.totalTokens - a.totalTokens);
@@ -841,10 +882,8 @@ export function normalizeModelName(name: string): string {
   return trimmed;
 }
 
-export interface ModelTotal {
+export interface ModelTotal extends BucketBreakdownTotal {
   model: string;
-  totalTokens: number;
-  conversations: number;
 }
 
 // 剥离 "-small" / "-code" 等后缀：返回 [基础名, 是否命中]。
@@ -887,9 +926,15 @@ export function mergeModelTotals(items: ModelTotal[]): ModelTotal[] {
   const byName = new Map<string, ModelTotal>();
   for (const item of items) {
     const name = normalizeModelName(item.model) || item.model;
-    const current = byName.get(name) || { model: name, totalTokens: 0, conversations: 0 };
+    const current = byName.get(name) || { model: name, ...emptyBucketBreakdown() };
     current.totalTokens += item.totalTokens;
+    current.inputTokens += item.inputTokens;
+    current.outputTokens += item.outputTokens;
+    current.cacheTokens += item.cacheTokens;
+    current.reasoningTokens += item.reasoningTokens;
     current.conversations += item.conversations;
+    current.costUsd += item.costUsd;
+    current.estimatedTokens += item.estimatedTokens;
     byName.set(name, current);
   }
 
@@ -900,21 +945,26 @@ export function mergeModelTotals(items: ModelTotal[]): ModelTotal[] {
   for (const item of list) {
     const { base, changed } = stripSuffix(item.model);
     const targetName = changed ? base : item.model;
-    const target = result.get(targetName) || { model: targetName, totalTokens: 0, conversations: 0 };
+    const target = result.get(targetName) || { model: targetName, ...emptyBucketBreakdown() };
     target.totalTokens += item.totalTokens;
+    target.inputTokens += item.inputTokens;
+    target.outputTokens += item.outputTokens;
+    target.cacheTokens += item.cacheTokens;
+    target.reasoningTokens += item.reasoningTokens;
     target.conversations += item.conversations;
+    target.costUsd += item.costUsd;
+    target.estimatedTokens += item.estimatedTokens;
     result.set(targetName, target);
   }
 
   return [...result.values()].sort((a, b) => b.totalTokens - a.totalTokens);
 }
 
-export function bucketModelTotals(buckets: UsageBucketLike[]) {
-  const groups = new Map<string, { model: string; totalTokens: number; conversations: number }>();
+export function bucketModelTotals(buckets: UsageBucketLike[]): ModelTotal[] {
+  const groups = new Map<string, ModelTotal>();
   for (const bucket of buckets) {
-    const current = groups.get(bucket.model) || { model: bucket.model, totalTokens: 0, conversations: 0 };
-    current.totalTokens += bucket.totalTokens || 0;
-    current.conversations += bucket.conversationCount || 0;
+    const current = groups.get(bucket.model) || { model: bucket.model, ...emptyBucketBreakdown() };
+    addBucketBreakdown(current, bucket);
     groups.set(bucket.model, current);
   }
   return [...groups.values()].sort((a, b) => b.totalTokens - a.totalTokens);

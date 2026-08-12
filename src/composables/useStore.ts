@@ -9,6 +9,7 @@ import { useSiteActions } from "./useSiteActions";
 import { useCharityMonitor } from "./useCharityMonitor";
 import { useProxyPool } from "./useProxyPool";
 import { useTokenStats } from "./useTokenStats";
+import { useModelCatalog } from "./useModelCatalog";
 
 export function useStore() {
   const { sites, suggestedTags, loading, loadLibrary, startDailyRefresh, stopDailyRefresh } = useLibrary();
@@ -23,6 +24,7 @@ export function useStore() {
   const charity = useCharityMonitor();
   const proxy = useProxyPool();
   const tokenStats = useTokenStats();
+  const modelCatalog = useModelCatalog();
 
   return {
     // 数据
@@ -46,6 +48,8 @@ export function useStore() {
     ...proxy,
     // Token 统计
     ...tokenStats,
+    // 模型参数
+    ...modelCatalog,
     // 通用
     loadLibrary,
     startDailyRefresh,

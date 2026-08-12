@@ -17,53 +17,93 @@ use crate::proxy_pool::{self, ProxyRuntime};
 
 pub(crate) const DEFAULT_CHARITY_FEED_ID: &str = "1515";
 
-#[derive(Debug, Clone, Copy)]
-struct CharityFeedSource {
-    id: &'static str,
-    name: &'static str,
-    json_url: &'static str,
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CharityFeedSource {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) json_url: String,
+    #[serde(default)]
+    pub(crate) enabled: bool,
+    #[serde(default)]
+    pub(crate) sort_order: i64,
 }
 
-const CHARITY_FEEDS: &[CharityFeedSource] = &[
-    CharityFeedSource {
-        id: "1515",
-        name: "公益推广",
-        json_url: "https://linux.do/tag/1515-tag/1515.json?order=created&ascending=false",
-    },
-    CharityFeedSource {
-        id: "1980",
-        name: "公益站",
-        json_url: "https://linux.do/tag/1980-tag/1980.json?order=created&ascending=false",
-    },
-    CharityFeedSource {
-        id: "2233",
-        name: "中转站",
-        json_url: "https://linux.do/tag/2233-tag/2233.json?order=created&ascending=false",
-    },
-    CharityFeedSource {
-        id: "2234",
-        name: "开源推广",
-        json_url: "https://linux.do/tag/2234-tag/2234.json?order=created&ascending=false",
-    },
-    CharityFeedSource {
-        id: "1514",
-        name: "高级推广",
-        json_url: "https://linux.do/tag/1514-tag/1514.json?order=created&ascending=false",
-    },
-    CharityFeedSource {
-        id: "193",
-        name: "订阅节点",
-        json_url: "https://linux.do/tag/193-tag/193.json?order=created&ascending=false",
-    },
-];
+/// 从数据库读取所有已启用的公益标签源（按 sort_order 排序）。
+fn load_charity_sources(database: &Database) -> Result<Vec<CharityFeedSource>, String> {
+    let connection = database
+        .0
+        .lock()
+        .map_err(|_| "本地数据库锁定失败".to_string())?;
+    let mut statement = connection
+        .prepare(
+            "SELECT id, name, json_url, enabled, sort_order FROM charity_feed_sources
+             WHERE enabled = 1 ORDER BY sort_order, id",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(CharityFeedSource {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                json_url: row.get(2)?,
+                enabled: row.get::<_, i64>(3).unwrap_or(1) != 0,
+                sort_order: row.get(4).unwrap_or(0),
+            })
+        })
+        .map_err(|error| error.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())
+}
 
-fn charity_feed_source(feed_id: &str) -> Result<CharityFeedSource, String> {
+/// 从数据库读取所有公益标签源（含已禁用的，管理界面用）。
+fn load_all_charity_sources(database: &Database) -> Result<Vec<CharityFeedSource>, String> {
+    let connection = database
+        .0
+        .lock()
+        .map_err(|_| "本地数据库锁定失败".to_string())?;
+    let mut statement = connection
+        .prepare(
+            "SELECT id, name, json_url, enabled, sort_order FROM charity_feed_sources
+             ORDER BY sort_order, id",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(CharityFeedSource {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                json_url: row.get(2)?,
+                enabled: row.get::<_, i64>(3).unwrap_or(1) != 0,
+                sort_order: row.get(4).unwrap_or(0),
+            })
+        })
+        .map_err(|error| error.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())
+}
+
+fn charity_feed_source(database: &Database, feed_id: &str) -> Result<CharityFeedSource, String> {
     let feed_id = feed_id.trim();
-    CHARITY_FEEDS
-        .iter()
-        .copied()
-        .find(|source| source.id == feed_id)
-        .ok_or_else(|| format!("不支持的 Linux.do 标签：{feed_id}"))
+    let connection = database
+        .0
+        .lock()
+        .map_err(|_| "本地数据库锁定失败".to_string())?;
+    connection
+        .query_row(
+            "SELECT id, name, json_url, enabled, sort_order FROM charity_feed_sources WHERE id = ?1",
+            params![feed_id],
+            |row| {
+                Ok(CharityFeedSource {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    json_url: row.get(2)?,
+                    enabled: row.get::<_, i64>(3).unwrap_or(1) != 0,
+                    sort_order: row.get(4).unwrap_or(0),
+                })
+            },
+        )
+        .map_err(|_| format!("不支持的 Linux.do 标签：{feed_id}"))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -569,12 +609,12 @@ fn items_from_topic_list(value: &str) -> Result<Vec<CharityFeedItem>, String> {
 
 async fn request_topic_list(
     client: &reqwest::Client,
-    source: CharityFeedSource,
+    source: &CharityFeedSource,
     cookie_header: Option<&str>,
 ) -> Result<(String, String), String> {
     // 追加当前时间戳 t，穿透 CDN / 服务端缓存，避免拿到旧数据。
     let request_url = {
-        let mut url = url::Url::parse(source.json_url)
+        let mut url = url::Url::parse(&source.json_url)
             .map_err(|error| format!("标签地址解析失败：{error}"))?;
         url.query_pairs_mut().append_pair(
             "t",
@@ -632,7 +672,7 @@ async fn request_topic_list(
 async fn fetch_topic_body(
     app: &tauri::AppHandle,
     client: reqwest::Client,
-    source: CharityFeedSource,
+    source: &CharityFeedSource,
 ) -> Result<(String, String, String, String), String> {
     // 静默方案：纯 HTTP 请求（走代理出口），不打开/控制浏览器。
     // 403 通常是节点出口 IP 被 Cloudflare 临时风控，换节点即可解决；
@@ -660,19 +700,21 @@ async fn fetch_topic_body(
         .map(|profile| {
             let client = client.clone();
             let home_dir = home_dir.clone();
+            let source_clone = source.clone();
             tauri::async_runtime::spawn(async move {
                 let profile_id = profile.id.clone();
+                let json_url_for_cookie = source_clone.json_url.clone();
                 let cookie_header = tauri::async_runtime::spawn_blocking(move || {
                     chrome_session::read_chrome_cookie_header_from_home(
                         &home_dir,
-                        source.json_url,
+                        &json_url_for_cookie,
                         &profile_id,
                     )
                 })
                 .await
                 .map_err(|error| format!("读取 Chrome Cookie 任务失败：{error}"))??;
                 let (body, protocol) =
-                    request_topic_list(&client, source, Some(&cookie_header)).await?;
+                    request_topic_list(&client, &source_clone, Some(&cookie_header)).await?;
                 Ok::<_, String>((body, profile.name, profile.account_name, protocol))
             })
         })
@@ -693,12 +735,12 @@ async fn fetch_topic_body(
 
 fn persist_feed(
     database: &Database,
-    source: CharityFeedSource,
+    source: &CharityFeedSource,
     mut items: Vec<CharityFeedItem>,
     source_profile_name: String,
     source_account_name: String,
 ) -> Result<CharityFeedResult, String> {
-    let keys = feed_meta_keys(source.id);
+    let keys = feed_meta_keys(&source.id);
     let initialized_key = keys.initialized.clone();
     let source_key = keys.source_url.clone();
     let fetched_key = keys.fetched_at.clone();
@@ -720,7 +762,7 @@ fn persist_feed(
             )
             .map_err(|error| error.to_string())?;
         let rows = statement
-            .query_map([source.id], |row| {
+            .query_map([source.id.as_str()], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     (
@@ -814,7 +856,7 @@ fn persist_feed(
                WHERE feed_id = ?1
                ORDER BY last_seen_at DESC, rowid DESC LIMIT 120
              )",
-            [source.id],
+            [source.id.as_str()],
         )
         .map_err(|error| error.to_string())?;
     transaction.commit().map_err(|error| error.to_string())?;
@@ -844,7 +886,7 @@ fn persist_feed(
                 .query_row(
                     "SELECT COUNT(*) FROM charity_feed_items
                      WHERE feed_id = ?1 AND first_seen_at > ?2",
-                    params![source.id, read_at],
+                    params![source.id.as_str(), read_at],
                     |row| row.get::<_, i64>(0),
                 )
                 .map_err(|error| error.to_string())?
@@ -852,8 +894,8 @@ fn persist_feed(
         }
     };
     Ok(CharityFeedResult {
-        feed_id: source.id.into(),
-        feed_name: source.name.into(),
+        feed_id: source.id.clone(),
+        feed_name: source.name.clone(),
         items,
         fetched_at,
         changed: new_count > 0 || updated_count > 0,
@@ -953,7 +995,7 @@ fn touch_running_charity_sync_log(
 
 fn emit_running_progress(
     app: &AppHandle,
-    source: CharityFeedSource,
+    source: &CharityFeedSource,
     stage: &str,
     message: &str,
     node_name: &str,
@@ -961,8 +1003,8 @@ fn emit_running_progress(
     emit_charity_progress(
         app,
         CharitySyncProgress {
-            feed_id: source.id.into(),
-            feed_name: source.name.into(),
+            feed_id: source.id.clone(),
+            feed_name: source.name.clone(),
             stage: stage.into(),
             status: "running".into(),
             message: message.into(),
@@ -983,7 +1025,7 @@ fn finish_charity_sync_log(
     app: &AppHandle,
     database: &Database,
     log_id: Option<i64>,
-    source: CharityFeedSource,
+    source: &CharityFeedSource,
     stage: &str,
     status: &str,
     message: &str,
@@ -999,8 +1041,8 @@ fn finish_charity_sync_log(
     emit_charity_progress(
         app,
         CharitySyncProgress {
-            feed_id: source.id.into(),
-            feed_name: source.name.into(),
+            feed_id: source.id.clone(),
+            feed_name: source.name.clone(),
             stage: stage.into(),
             status: status.into(),
             message: message.into(),
@@ -1144,11 +1186,18 @@ fn load_all_feed_items_from_db(
         feed_id,
     ) in all
     {
-        let feed_name = CHARITY_FEEDS
-            .iter()
-            .find(|f| f.id == feed_id)
-            .map(|f| f.name.to_string())
-            .unwrap_or_default();
+        let feed_name = {
+            let conn = database
+                .0
+                .lock()
+                .map_err(|_| "本地数据库锁定失败".to_string())?;
+            conn.query_row(
+                "SELECT name FROM charity_feed_sources WHERE id = ?1",
+                params![&feed_id],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap_or_default()
+        };
         if let Some(item) = merged.iter_mut().find(|existing| existing.id == guid) {
             if !item.feed_ids.iter().any(|id| id == &feed_id) {
                 item.feed_ids.push(feed_id);
@@ -1345,13 +1394,13 @@ fn unread_count_for_feed(database: &Database, feed_id: &str) -> Result<usize, St
 
 fn load_feed_items_from_db(
     database: &Database,
-    source: CharityFeedSource,
+    source: &CharityFeedSource,
     offset: usize,
     limit: usize,
     keyword: &str,
 ) -> Result<CharityFeedResult, String> {
     let limit = limit.clamp(1, CHARITY_PAGE_LIMIT_MAX);
-    let keys = feed_meta_keys(source.id);
+    let keys = feed_meta_keys(&source.id);
     // 单次加锁完成 meta + count + page，避免切标签时多次抢锁卡死。
     let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
     let read_meta = |key: &str| -> Result<String, String> {
@@ -1377,7 +1426,7 @@ fn load_feed_items_from_db(
             .query_row(
                 "SELECT COUNT(*) FROM charity_feed_items
                  WHERE feed_id = ?1 AND (title LIKE ?2 OR author LIKE ?2 OR categories LIKE ?2)",
-                params![source.id, key_pat],
+                params![source.id.as_str(), key_pat],
                 |row| row.get::<_, i64>(0),
             )
             .map_err(|error| error.to_string())?
@@ -1386,7 +1435,7 @@ fn load_feed_items_from_db(
         connection
             .query_row(
                 "SELECT COUNT(*) FROM charity_feed_items WHERE feed_id = ?1",
-                [source.id],
+                [source.id.as_str()],
                 |row| row.get::<_, i64>(0),
             )
             .map_err(|error| error.to_string())?
@@ -1399,7 +1448,7 @@ fn load_feed_items_from_db(
             .query_row(
                 "SELECT COUNT(*) FROM charity_feed_items
                  WHERE feed_id = ?1 AND first_seen_at > ?2",
-                params![source.id, read_at],
+                params![source.id.as_str(), read_at],
                 |row| row.get::<_, i64>(0),
             )
             .map_err(|error| error.to_string())?
@@ -1417,7 +1466,7 @@ fn load_feed_items_from_db(
         .map_err(|error| error.to_string())?;
     let items = statement
         .query_map(
-            params![source.id, limit as i64, offset as i64, key_pat],
+            params![source.id.as_str(), limit as i64, offset as i64, key_pat],
             |row| {
                 let categories: String = row.get(6)?;
                 let first_seen_at: String = row.get(7)?;
@@ -1466,8 +1515,8 @@ fn load_feed_items_from_db(
     };
     let skipped = status == "skipped";
     Ok(CharityFeedResult {
-        feed_id: source.id.into(),
-        feed_name: source.name.into(),
+        feed_id: source.id.clone(),
+        feed_name: source.name.clone(),
         items,
         fetched_at,
         changed: false,
@@ -1532,12 +1581,12 @@ fn finish_cancelled_feed_sync(
     app: &AppHandle,
     database: &Database,
     log_id: Option<i64>,
-    source: CharityFeedSource,
+    source: &CharityFeedSource,
     stage: &str,
     duration_ms: i64,
 ) -> String {
     let message = format!("{CHARITY_SYNC_CANCELLED_PREFIX}：{}", source.name);
-    let unread_count = unread_count_for_feed(database, source.id).unwrap_or(0);
+    let unread_count = unread_count_for_feed(database, &source.id).unwrap_or(0);
     finish_charity_sync_log(
         app,
         database,
@@ -1647,7 +1696,7 @@ async fn sync_feed_with_fast_nodes(
     app: &AppHandle,
     database: &Database,
     runtime: &ProxyRuntime,
-    source: CharityFeedSource,
+    source: &CharityFeedSource,
     stage: &str,
     cancellation: &CancellationToken,
     shared_queue: Option<Arc<Mutex<CharityNodeQueue>>>,
@@ -1681,8 +1730,8 @@ async fn sync_feed_with_fast_nodes(
             // 无可用客户端：记一条失败任务
             let log_id = append_charity_sync_log(
                 database,
-                source.id,
-                source.name,
+                &source.id,
+                &source.name,
                 stage,
                 "running",
                 &format!("{stage_label}失败：无法初始化代理客户端"),
@@ -1716,8 +1765,8 @@ async fn sync_feed_with_fast_nodes(
             Err(error) => {
                 let log_id = append_charity_sync_log(
                     database,
-                    source.id,
-                    source.name,
+                    &source.id,
+                    &source.name,
                     stage,
                     "running",
                     &format!("{stage_label}失败：读取候选节点"),
@@ -1745,8 +1794,8 @@ async fn sync_feed_with_fast_nodes(
                 format!("无 ≤{CHARITY_FAST_NODE_MAX_LATENCY_MS}ms 可用公益候选节点，本轮跳过");
             let log_id = append_charity_sync_log(
                 database,
-                source.id,
-                source.name,
+                &source.id,
+                &source.name,
                 stage,
                 "running",
                 &format!("{stage_label}跳过：{}", source.name),
@@ -1755,7 +1804,7 @@ async fn sync_feed_with_fast_nodes(
             let local = tokio::task::block_in_place(|| {
                 load_feed_items_from_db(database, source, 0, CHARITY_PAGE_SIZE, "")
             })?;
-            let _ = write_feed_sync_meta(database, source.id, "skipped", &message, "", 0);
+            let _ = write_feed_sync_meta(database, &source.id, "skipped", &message, "", 0);
             finish_charity_sync_log(
                 app,
                 database,
@@ -1784,8 +1833,8 @@ async fn sync_feed_with_fast_nodes(
                 let message = format!("装载快节点失败：{error}");
                 let log_id = append_charity_sync_log(
                     database,
-                    source.id,
-                    source.name,
+                    &source.id,
+                    &source.name,
                     stage,
                     "running",
                     &format!("{stage_label}失败：装载节点"),
@@ -1859,8 +1908,8 @@ async fn sync_feed_with_fast_nodes(
         );
         let log_id = append_charity_sync_log(
             database,
-            source.id,
-            source.name,
+            &source.id,
+            &source.name,
             stage,
             "running",
             &running_msg,
@@ -1979,7 +2028,7 @@ async fn sync_feed_with_fast_nodes(
                                 );
                                 let _ = write_feed_sync_meta(
                                     database,
-                                    source.id,
+                                    &source.id,
                                     "success",
                                     &result.message,
                                     &node.name,
@@ -2099,8 +2148,8 @@ async fn sync_feed_with_fast_nodes(
         load_feed_items_from_db(database, source, 0, CHARITY_PAGE_SIZE, "")
     })
     .unwrap_or(CharityFeedResult {
-        feed_id: source.id.into(),
-        feed_name: source.name.into(),
+        feed_id: source.id.clone(),
+        feed_name: source.name.clone(),
         items: Vec::new(),
         fetched_at: String::new(),
         changed: false,
@@ -2132,7 +2181,7 @@ async fn sync_feed_with_fast_nodes(
             last_error, CHARITY_MAX_NODE_ATTEMPTS
         )
     };
-    let _ = write_feed_sync_meta(database, source.id, "error", &local.message, "", 0);
+    let _ = write_feed_sync_meta(database, &source.id, "error", &local.message, "", 0);
     // 各节点失败已分别记日志；这里不再追加空节点总失败行，避免“节点—”污染。
     Err(local.message.clone())
 }
@@ -2155,13 +2204,13 @@ pub async fn get_charity_feed(
             load_all_feed_items_from_db(&database, offset, limit, &keyword)
         });
     }
-    let source = charity_feed_source(requested)?;
+    let source = charity_feed_source(&database, requested)?;
     // 读库离开 async worker，避免同步命令/锁拖住运行时。
     let mut result = tokio::task::block_in_place(|| {
-        load_feed_items_from_db(&database, source, offset, limit, &keyword)
+        load_feed_items_from_db(&database, &source, offset, limit, &keyword)
     })?;
     if let Ok(errors) = runtime.last_errors.lock() {
-        if let Some(message) = errors.get(source.id) {
+        if let Some(message) = errors.get(&source.id) {
             if result.message.is_empty() {
                 result.message = message.clone();
                 if result.status == "local" {
@@ -2194,15 +2243,16 @@ pub async fn mark_charity_feed_read(
         if requested == "all" {
             // 全部视图：一次性把 6 个标签的已读水位都推进
             let mut total = 0usize;
-            for source in CHARITY_FEEDS {
-                write_app_meta(&database, &feed_meta_keys(source.id).read_at, &now)?;
-                total += unread_count_for_feed(&database, source.id)?;
+            let sources = load_charity_sources(&database)?;
+            for source in &sources {
+                write_app_meta(&database, &feed_meta_keys(&source.id).read_at, &now)?;
+                total += unread_count_for_feed(&database, &source.id)?;
             }
             return Ok(total);
         }
-        let source = charity_feed_source(requested)?;
-        write_app_meta(&database, &feed_meta_keys(source.id).read_at, &now)?;
-        unread_count_for_feed(&database, source.id)
+        let source = charity_feed_source(&database, requested)?;
+        write_app_meta(&database, &feed_meta_keys(&source.id).read_at, &now)?;
+        unread_count_for_feed(&database, &source.id)
     })
 }
 
@@ -2266,8 +2316,9 @@ fn local_utc_offset_secs() -> i64 {
 pub async fn get_charity_unread_total(database: State<'_, Database>) -> Result<usize, String> {
     tokio::task::block_in_place(|| {
         let mut total = 0usize;
-        for source in CHARITY_FEEDS {
-            total += unread_count_for_feed(&database, source.id)?;
+        let sources = load_charity_sources(&database)?;
+        for source in &sources {
+            total += unread_count_for_feed(&database, &source.id)?;
         }
         Ok(total)
     })
@@ -2281,11 +2332,14 @@ pub async fn fetch_charity_feed(
     monitor: State<'_, CharityMonitorRuntime>,
     feed_id: Option<String>,
 ) -> Result<CharityFeedResult, String> {
-    let source = charity_feed_source(feed_id.as_deref().unwrap_or(DEFAULT_CHARITY_FEED_ID))?;
+    let source = charity_feed_source(
+        &database,
+        feed_id.as_deref().unwrap_or(DEFAULT_CHARITY_FEED_ID),
+    )?;
     // 手动刷新与后台轮询互斥，避免打开页面时和定时任务抢锁卡死。
     let Some(cancellation) = monitor.try_begin_sync() else {
         let mut local = tokio::task::block_in_place(|| {
-            load_feed_items_from_db(&database, source, 0, CHARITY_PAGE_SIZE, "")
+            load_feed_items_from_db(&database, &source, 0, CHARITY_PAGE_SIZE, "")
         })?;
         local.message = "后台同步进行中，已返回本地数据".into();
         local.status = if local.status.is_empty() {
@@ -2296,8 +2350,8 @@ pub async fn fetch_charity_feed(
         emit_charity_progress(
             &app,
             CharitySyncProgress {
-                feed_id: source.id.into(),
-                feed_name: source.name.into(),
+                feed_id: source.id.clone(),
+                feed_name: source.name.clone(),
                 stage: "manual".into(),
                 status: "skipped".into(),
                 message: local.message.clone(),
@@ -2315,7 +2369,7 @@ pub async fn fetch_charity_feed(
         &app,
         &database,
         &runtime,
-        source,
+        &source,
         "manual",
         &cancellation,
         None,
@@ -2326,7 +2380,7 @@ pub async fn fetch_charity_feed(
     match &sync_result {
         Ok(_) => {
             if let Ok(mut errors) = monitor.last_errors.lock() {
-                errors.remove(source.id);
+                errors.remove(&source.id);
             }
         }
         Err(error) => {
@@ -2339,7 +2393,7 @@ pub async fn fetch_charity_feed(
     }
     // 无论成功失败，UI 应以本地库为准；同步错误通过 status/message 元数据体现。
     let mut local = tokio::task::block_in_place(|| {
-        load_feed_items_from_db(&database, source, 0, CHARITY_PAGE_SIZE, "")
+        load_feed_items_from_db(&database, &source, 0, CHARITY_PAGE_SIZE, "")
     })?;
     if let Err(error) = sync_result {
         if local.message.is_empty() {
@@ -2481,7 +2535,9 @@ pub async fn refresh_all_charity_feeds(
     Ok(CharityRefreshAllResult {
         cancelled_active_round,
         cancelled_log_count,
-        feed_count: CHARITY_FEEDS.len(),
+        feed_count: load_charity_sources(&database)
+            .map(|v| v.len())
+            .unwrap_or(0),
     })
 }
 
@@ -2625,13 +2681,14 @@ pub(crate) fn start_charity_monitor(app: AppHandle) {
                     .unwrap_or_default();
 
             if round_nodes.is_empty() {
-                for source in CHARITY_FEEDS {
+                let sources_for_skip = load_charity_sources(&database).unwrap_or_default();
+                for source in &sources_for_skip {
                     let message = format!(
                         "无 ≤{CHARITY_FAST_NODE_MAX_LATENCY_MS}ms 可用公益候选节点，本轮跳过"
                     );
-                    let _ = write_feed_sync_meta(&database, source.id, "skipped", &message, "", 0);
+                    let _ = write_feed_sync_meta(&database, &source.id, "skipped", &message, "", 0);
                     if let Ok(mut errors) = monitor.last_errors.lock() {
-                        errors.insert(source.id.to_string(), message);
+                        errors.insert(source.id.clone(), message);
                     }
                 }
                 monitor.end_sync();
@@ -2646,21 +2703,22 @@ pub(crate) fn start_charity_monitor(app: AppHandle) {
                 proxy_pool::prepare_proxy_nodes_transient(&database, &runtime, &prepare_ids).await
             {
                 let message = format!("装载公益候选节点失败：{error}");
-                for source in CHARITY_FEEDS {
-                    let _ = write_feed_sync_meta(&database, source.id, "error", &message, "", 0);
+                let sources_for_err = load_charity_sources(&database).unwrap_or_default();
+                for source in &sources_for_err {
+                    let _ = write_feed_sync_meta(&database, &source.id, "error", &message, "", 0);
                     if let Ok(mut errors) = monitor.last_errors.lock() {
-                        errors.insert(source.id.to_string(), message.clone());
+                        errors.insert(source.id.clone(), message.clone());
                     }
                 }
                 monitor.end_sync();
                 continue;
             }
 
-            let mut handles = Vec::with_capacity(CHARITY_FEEDS.len());
+            let sources_for_round = load_charity_sources(&database).unwrap_or_default();
+            let mut handles = Vec::with_capacity(sources_for_round.len());
             let shared_queue = Arc::new(Mutex::new(CharityNodeQueue::from_nodes(round_nodes)));
-            for source in CHARITY_FEEDS {
+            for source in sources_for_round {
                 let app = app.clone();
-                let source = *source;
                 let cancellation = cancellation.clone();
                 let shared_queue = shared_queue.clone();
                 handles.push(tauri::async_runtime::spawn(async move {
@@ -2670,7 +2728,7 @@ pub(crate) fn start_charity_monitor(app: AppHandle) {
                         &app,
                         &database,
                         &runtime,
-                        source,
+                        &source,
                         stage,
                         &cancellation,
                         Some(shared_queue),
@@ -2711,6 +2769,7 @@ pub(crate) fn start_charity_monitor(app: AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::Connection;
 
     #[test]
     fn active_charity_round_can_be_cancelled_and_released() {
@@ -2829,14 +2888,40 @@ mod tests {
     }
 
     #[test]
-    fn recognizes_configured_linux_do_tags() {
-        assert_eq!(charity_feed_source("1515").unwrap().name, "公益推广");
-        assert_eq!(charity_feed_source("1980").unwrap().name, "公益站");
-        assert_eq!(charity_feed_source("2233").unwrap().name, "中转站");
-        assert_eq!(charity_feed_source("2234").unwrap().name, "开源推广");
-        assert_eq!(charity_feed_source("1514").unwrap().name, "高级推广");
-        assert_eq!(charity_feed_source("193").unwrap().name, "订阅节点");
-        assert!(charity_feed_source("unknown").is_err());
+    fn charity_feed_source_url_pattern() {
+        // 标签 URL 模式：linux.do/tag/{id}-tag/{id}.json
+        let id = "1515";
+        let url = format!("https://linux.do/tag/{id}-tag/{id}.json?order=created&ascending=false");
+        assert!(url.contains(id));
+        assert_eq!(charity_tag_json_url("1980"), url.replace("1515", "1980"));
+    }
+
+    #[test]
+    fn seeds_charity_feed_sources_table_once() {
+        let connection = Connection::open_in_memory().unwrap();
+        crate::db::ensure_charity_feed_sources_table(&connection).unwrap();
+        let count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM charity_feed_sources", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 6);
+        let first: String = connection
+            .query_row(
+                "SELECT id FROM charity_feed_sources ORDER BY sort_order LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(first, "1515");
+        // 重复调用不重复播种
+        crate::db::ensure_charity_feed_sources_table(&connection).unwrap();
+        let again: i64 = connection
+            .query_row("SELECT COUNT(*) FROM charity_feed_sources", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(again, 6);
     }
 
     #[test]
@@ -2863,4 +2948,130 @@ mod tests {
             "https://linux.do/user_avatar/linux.do/user7/48/1_2.png"
         );
     }
+}
+
+// ── 公益标签源管理命令 ──────────────────────────────────────────────────
+
+/// 自动根据标签 id 生成 linux.do 标签 JSON URL。
+fn charity_tag_json_url(tag_id: &str) -> String {
+    format!("https://linux.do/tag/{tag_id}-tag/{tag_id}.json?order=created&ascending=false")
+}
+
+#[tauri::command]
+pub async fn list_charity_sources(
+    database: State<'_, Database>,
+) -> Result<Vec<CharityFeedSource>, String> {
+    tokio::task::block_in_place(|| load_all_charity_sources(&database))
+}
+
+#[tauri::command]
+pub async fn add_charity_source(
+    database: State<'_, Database>,
+    id: String,
+    name: String,
+    json_url: Option<String>,
+) -> Result<CharityFeedSource, String> {
+    let id = id.trim().to_string();
+    let name = name.trim().to_string();
+    if id.is_empty() || name.is_empty() {
+        return Err("标签 ID 和名称不能为空".into());
+    }
+    let json_url = json_url
+        .filter(|u| !u.trim().is_empty())
+        .unwrap_or_else(|| charity_tag_json_url(&id));
+    tokio::task::block_in_place(|| {
+        let connection = database
+            .0
+            .lock()
+            .map_err(|_| "本地数据库锁定失败".to_string())?;
+        // 取当前最大 sort_order
+        let max_sort: i64 = connection
+            .query_row(
+                "SELECT COALESCE(MAX(sort_order), 0) FROM charity_feed_sources",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        connection
+            .execute(
+                "INSERT INTO charity_feed_sources (id, name, json_url, enabled, sort_order)
+                 VALUES (?1, ?2, ?3, 1, ?4)",
+                params![id, name, json_url, max_sort + 1],
+            )
+            .map_err(|error| format!("添加标签源失败：{error}"))?;
+        Ok(CharityFeedSource {
+            id,
+            name,
+            json_url,
+            enabled: true,
+            sort_order: max_sort + 1,
+        })
+    })
+}
+
+#[tauri::command]
+pub async fn update_charity_source(
+    database: State<'_, Database>,
+    id: String,
+    name: Option<String>,
+    json_url: Option<String>,
+    enabled: Option<bool>,
+) -> Result<(), String> {
+    tokio::task::block_in_place(|| {
+        let connection = database
+            .0
+            .lock()
+            .map_err(|_| "本地数据库锁定失败".to_string())?;
+        if let Some(name) = name {
+            let name = name.trim().to_string();
+            if !name.is_empty() {
+                connection
+                    .execute(
+                        "UPDATE charity_feed_sources SET name = ?2 WHERE id = ?1",
+                        params![id, name],
+                    )
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+        if let Some(json_url) = json_url {
+            let json_url = json_url.trim().to_string();
+            if !json_url.is_empty() {
+                connection
+                    .execute(
+                        "UPDATE charity_feed_sources SET json_url = ?2 WHERE id = ?1",
+                        params![id, json_url],
+                    )
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+        if let Some(enabled) = enabled {
+            connection
+                .execute(
+                    "UPDATE charity_feed_sources SET enabled = ?2 WHERE id = ?1",
+                    params![id, enabled as i64],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    })
+}
+
+#[tauri::command]
+pub async fn remove_charity_source(
+    database: State<'_, Database>,
+    id: String,
+) -> Result<(), String> {
+    tokio::task::block_in_place(|| {
+        let connection = database
+            .0
+            .lock()
+            .map_err(|_| "本地数据库锁定失败".to_string())?;
+        connection
+            .execute(
+                "DELETE FROM charity_feed_sources WHERE id = ?1",
+                params![id],
+            )
+            .map_err(|error| format!("删除标签源失败：{error}"))?;
+        Ok(())
+    })
 }

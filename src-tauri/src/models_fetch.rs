@@ -3,6 +3,7 @@ use crate::chrome_local_storage;
 use crate::chrome_session;
 use crate::db::*;
 use crate::models::*;
+use crate::platform_detect::{is_newapi, is_sub2api};
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use serde_json;
@@ -448,7 +449,8 @@ pub(crate) fn chrome_models_bridge_script(
       }
     }
     visibleKeys = [...new Set(keys)];
-    if (dashboardAccessToken) keys.push(dashboardAccessToken);
+    // Sub2API auth_token 可直接用于模型接口；NewAPI 访问令牌只能管理 Key，不能冒充模型 Key。
+    if (systemType === "sub2api" && dashboardAccessToken) keys.push(dashboardAccessToken);
     if (!keys.length) throw new Error(`${keyPath} 没有返回可用 Key（HTTP ${keyResponse.status}）`);
     let lastStatus = 0;
     let lastError = "";
@@ -688,28 +690,49 @@ pub async fn fetch_site_models_json(
     }
     let base_url = Url::parse(&base).map_err(|_| "站点 API 地址无效".to_string())?;
     let user_agent = chrome_session::chrome_user_agent();
-    let (system_type, mut profile_ids) = if let Some(site_id) = site_id.as_deref() {
-        let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
-        let system_type = connection
-            .query_row(
-                "SELECT system_type FROM directory_sites WHERE id = ?1",
-                [site_id],
-                |row| row.get::<_, String>(0),
-            )
-            .unwrap_or_default();
-        let mut statement = connection
-            .prepare("SELECT profile_id FROM site_accounts WHERE site_id = ?1 AND is_valid = 1 GROUP BY profile_id ORDER BY max(updated_at) DESC")
-            .map_err(|error| error.to_string())?;
-        let profile_ids = statement
-            .query_map([site_id], |row| row.get::<_, String>(0))
-            .map_err(|error| error.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| error.to_string())?;
-        (system_type, profile_ids)
-    } else {
-        (String::new(), Vec::new())
-    };
     let requested_profile_id = profile_id.clone();
+    let (system_type, mut profile_ids, cached_model_keys) =
+        if let Some(site_id) = site_id.as_deref() {
+            let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+            let system_type = connection
+                .query_row(
+                    "SELECT system_type FROM directory_sites WHERE id = ?1",
+                    [site_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap_or_default();
+            // 请求指定账号时，即使账号额度状态暂时无效，也要允许使用已有缓存 Key 直连模型。
+            let requested_profile = requested_profile_id.as_deref().unwrap_or_default();
+            let mut statement = connection
+                .prepare(
+                    "SELECT profile_id FROM site_accounts
+                     WHERE site_id = ?1 AND (is_valid = 1 OR profile_id = ?2)
+                     GROUP BY profile_id ORDER BY max(updated_at) DESC",
+                )
+                .map_err(|error| error.to_string())?;
+            let profile_ids = statement
+                .query_map(params![site_id, requested_profile], |row| {
+                    row.get::<_, String>(0)
+                })
+                .map_err(|error| error.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())?;
+            let mut key_statement = connection
+                .prepare("SELECT profile_id, keys_json FROM site_model_cache WHERE site_id = ?1")
+                .map_err(|error| error.to_string())?;
+            let cached_model_keys = key_statement
+                .query_map([site_id], |row| {
+                    let keys_json: String = row.get(1)?;
+                    let keys = serde_json::from_str::<Vec<String>>(&keys_json).unwrap_or_default();
+                    Ok((row.get::<_, String>(0)?, keys))
+                })
+                .map_err(|error| error.to_string())?
+                .collect::<Result<HashMap<_, _>, _>>()
+                .map_err(|error| error.to_string())?;
+            (system_type, profile_ids, cached_model_keys)
+        } else {
+            (String::new(), Vec::new(), HashMap::new())
+        };
     if let Some(requested_profile_id) = requested_profile_id.as_deref() {
         profile_ids.retain(|candidate| candidate == requested_profile_id);
     }
@@ -753,16 +776,16 @@ pub async fn fetch_site_models_json(
         let values = local_values.get(profile_id).cloned().unwrap_or_default();
         let inferred_type = if system_type.trim().is_empty() {
             if parse_newapi_local_account(&values).is_ok() {
-                "NewAPI"
+                "new-api"
             } else if parse_sub2api_local_account(&values).is_ok() {
-                "Sub2API"
+                "sub2api"
             } else {
                 ""
             }
         } else {
             system_type.as_str()
         };
-        if inferred_type.eq_ignore_ascii_case("NewAPI") {
+        if is_newapi(inferred_type) {
             let token_url = base_url
                 .join("/api/token/?p=1&size=20")
                 .map_err(|_| "无法生成 /api/token 地址")?;
@@ -779,6 +802,36 @@ pub async fn fetch_site_models_json(
             } else {
                 (String::new(), String::new())
             };
+
+            // 已同步过的 NewAPI 访问秘钥优先直连 /v1/models，避免因为额度/签到状态异常再次弹出浏览器。
+            if let Some(cached_keys) = cached_model_keys
+                .get(profile_id)
+                .filter(|keys| !keys.is_empty())
+            {
+                match fetch_models_with_keys(
+                    &client,
+                    &base_url,
+                    cached_keys.clone(),
+                    cached_keys.clone(),
+                    &user_agent,
+                    "newapi-key",
+                    (!cached_uid.is_empty()).then_some(cached_uid.as_str()),
+                )
+                .await
+                {
+                    Ok(result) => {
+                        return cache_profile_api_counts(
+                            &database,
+                            site_id.as_deref(),
+                            requested_profile_id.as_deref(),
+                            result,
+                        );
+                    }
+                    Err(error) => errors.push(format!(
+                        "{profile_id}：已有访问秘钥无法获取模型，继续检查其他认证方式：{error}"
+                    )),
+                }
+            }
 
             let mut used_cached_token = false;
             let mut auth = if !cached_token.is_empty() {
@@ -867,58 +920,8 @@ pub async fn fetch_site_models_json(
 
             let mut auth = auth.unwrap();
 
-            // 有访问令牌（access token）直接使用：先直接同步模型列表，
-            // 不再先经过 /api/token 获取 Key。只有直接同步失败才回落到 Key 接口。
-            if let NewApiAuth::Token {
-                access_token,
-                user_id,
-            } = &auth
-            {
-                if !access_token.is_empty() {
-                    let direct_models_url = base_url
-                        .join("/v1/models")
-                        .map_err(|_| "无法生成 /v1/models 地址".to_string())?;
-                    let mut direct_errors = Vec::new();
-                    for candidate in [access_token.clone(), format!("sk-{access_token}")] {
-                        let mut request = chrome_request_headers(
-                            client.get(direct_models_url.clone()),
-                            base_url.as_str(),
-                            &user_agent,
-                        )
-                        .bearer_auth(&candidate);
-                        if !user_id.is_empty() {
-                            request = request.header("new-api-user", user_id);
-                        }
-                        match request_json(request, "NewAPI 模型接口").await {
-                            Ok(value) => {
-                                let models = parse_site_models(&value);
-                                if !models.is_empty() {
-                                    merge_api_keys(&mut discovered_keys, [access_token.clone()]);
-                                    return cache_profile_api_counts(
-                                        &database,
-                                        site_id.as_deref(),
-                                        requested_profile_id.as_deref(),
-                                        SiteModelsResult {
-                                            models,
-                                            source: "newapi-key".into(),
-                                            keys: vec![access_token.clone()],
-                                        },
-                                    );
-                                }
-                                direct_errors.push("访问令牌获取的模型列表为空".to_string());
-                            }
-                            Err(error) => direct_errors.push(error),
-                        }
-                    }
-                    if !direct_errors.is_empty() {
-                        errors.push(format!(
-                            "{profile_id}：直接使用访问令牌同步失败（{}），回落到 Key 接口",
-                            direct_errors.last().cloned().unwrap_or_default()
-                        ));
-                    }
-                }
-            }
-
+            // 访问令牌只用于 NewAPI 账号与 Key 管理接口；模型接口必须使用 NewAPI Key。
+            // 已有缓存 Key 已在前面优先验证；没有可用 Key 时，才用访问令牌读取 Key 列表与明文 Key。
             let mut request = apply_newapi_auth(
                 chrome_request_headers(
                     client.get(token_url.clone()),
@@ -1032,7 +1035,7 @@ pub async fn fetch_site_models_json(
                 }
                 Err(error) => errors.push(format!("{profile_id}：{error}")),
             }
-        } else if inferred_type.eq_ignore_ascii_case("Sub2API") {
+        } else if is_sub2api(inferred_type) {
             let auth_token = values
                 .get("auth_token")
                 .map(|value| local_scalar(value))
@@ -1128,9 +1131,9 @@ pub async fn fetch_site_models_json(
         let values = local_values.get(profile_id).cloned().unwrap_or_default();
         let inferred_type = if system_type.trim().is_empty() {
             if parse_sub2api_local_account(&values).is_ok() {
-                "Sub2API"
+                "sub2api"
             } else {
-                "NewAPI"
+                "new-api"
             }
         } else {
             system_type.as_str()
@@ -1348,7 +1351,7 @@ pub async fn fetch_site_models_json(
         Err(error) => errors.push(error),
     }
     if !discovered_keys.is_empty() {
-        let source = if system_type.eq_ignore_ascii_case("Sub2API") {
+        let source = if is_sub2api(&system_type) {
             "sub2api-key"
         } else {
             "newapi-key"

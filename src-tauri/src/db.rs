@@ -1,6 +1,7 @@
 use crate::chrome_session;
 use crate::models::*;
 use rusqlite::{params, Connection, OptionalExtension};
+use serde::{de::DeserializeOwned, Serialize};
 use std::{collections::HashMap, path::Path, time::Duration};
 
 impl Database {
@@ -127,6 +128,73 @@ impl Database {
                     value TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS token_cache_snapshots (
+                    kind TEXT PRIMARY KEY,
+                    payload_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE TABLE IF NOT EXISTS model_catalog_sources (
+                    source TEXT PRIMARY KEY,
+                    url TEXT NOT NULL,
+                    fetched_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    record_count INTEGER NOT NULL DEFAULT 0,
+                    raw_json TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS model_catalog_models (
+                    canonical_key TEXT PRIMARY KEY,
+                    display_name TEXT NOT NULL DEFAULT '',
+                    provider TEXT NOT NULL DEFAULT '',
+                    mode TEXT NOT NULL DEFAULT '',
+                    context_length INTEGER NOT NULL DEFAULT 0,
+                    max_input_tokens INTEGER NOT NULL DEFAULT 0,
+                    max_output_tokens INTEGER NOT NULL DEFAULT 0,
+                    input_cost_per_token REAL NOT NULL DEFAULT 0,
+                    output_cost_per_token REAL NOT NULL DEFAULT 0,
+                    cache_read_cost_per_token REAL NOT NULL DEFAULT 0,
+                    cache_write_cost_per_token REAL NOT NULL DEFAULT 0,
+                    image_cost REAL NOT NULL DEFAULT 0,
+                    audio_input_cost_per_token REAL NOT NULL DEFAULT 0,
+                    audio_output_cost_per_token REAL NOT NULL DEFAULT 0,
+                    request_cost REAL NOT NULL DEFAULT 0,
+                    source_count INTEGER NOT NULL DEFAULT 0,
+                    variant_count INTEGER NOT NULL DEFAULT 0,
+                    capabilities_json TEXT NOT NULL DEFAULT '[]',
+                    source_ids_json TEXT NOT NULL DEFAULT '[]',
+                    pricing_json TEXT NOT NULL DEFAULT '{}',
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE TABLE IF NOT EXISTS model_catalog_entries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source TEXT NOT NULL,
+                    source_model_id TEXT NOT NULL,
+                    canonical_key TEXT NOT NULL,
+                    provider TEXT NOT NULL DEFAULT '',
+                    mode TEXT NOT NULL DEFAULT '',
+                    display_name TEXT NOT NULL DEFAULT '',
+                    context_length INTEGER NOT NULL DEFAULT 0,
+                    max_input_tokens INTEGER NOT NULL DEFAULT 0,
+                    max_output_tokens INTEGER NOT NULL DEFAULT 0,
+                    input_cost_per_token REAL NOT NULL DEFAULT 0,
+                    output_cost_per_token REAL NOT NULL DEFAULT 0,
+                    cache_read_cost_per_token REAL NOT NULL DEFAULT 0,
+                    cache_write_cost_per_token REAL NOT NULL DEFAULT 0,
+                    image_cost REAL NOT NULL DEFAULT 0,
+                    audio_input_cost_per_token REAL NOT NULL DEFAULT 0,
+                    audio_output_cost_per_token REAL NOT NULL DEFAULT 0,
+                    request_cost REAL NOT NULL DEFAULT 0,
+                    capabilities_json TEXT NOT NULL DEFAULT '[]',
+                    raw_json TEXT NOT NULL,
+                    FOREIGN KEY(canonical_key) REFERENCES model_catalog_models(canonical_key) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_model_catalog_models_provider ON model_catalog_models(provider);
+                CREATE INDEX IF NOT EXISTS idx_model_catalog_models_mode ON model_catalog_models(mode);
+                CREATE INDEX IF NOT EXISTS idx_model_catalog_entries_model ON model_catalog_entries(canonical_key);
+                CREATE INDEX IF NOT EXISTS idx_model_catalog_entries_source ON model_catalog_entries(source, source_model_id);
+
                 CREATE TABLE IF NOT EXISTS charity_feed_items (
                     feed_id TEXT NOT NULL,
                     guid TEXT NOT NULL,
@@ -231,6 +299,7 @@ impl Database {
         ensure_site_account_columns(&connection)?;
         ensure_charity_feed_schema(&connection)?;
         ensure_charity_sync_log_columns(&connection)?;
+        ensure_charity_feed_sources_table(&connection)?;
         ensure_proxy_pool_node_columns(&connection)?;
         reset_expired_checkin_states(&connection)?;
 
@@ -288,17 +357,139 @@ impl Database {
             .execute(
                 "UPDATE directory_sites
                  SET system_type = CASE
-                    WHEN LOWER(checkin_url) LIKE '%/console/%' THEN 'NewAPI'
+                    WHEN LOWER(checkin_url) LIKE '%/console/%' THEN 'new-api'
                     WHEN LOWER(checkin_url) LIKE '%/profile%'
-                      OR LOWER(checkin_url) LIKE '%/dashboard%' THEN 'Sub2API'
+                      OR LOWER(checkin_url) LIKE '%/dashboard%' THEN 'sub2api'
                     ELSE system_type
                  END
                  WHERE TRIM(system_type) = ''",
                 [],
             )
             .map_err(|error| error.to_string())?;
+        // 平台类型归一化（校验键大小写无关，幂等）：迁移 metapi 的规范类型名。
+        // 旧值 NewAPI/Sub2API 等统一写成 new-api/sub2api，前端按规范名展示与过滤。
+        connection
+            .execute_batch(
+                "UPDATE directory_sites SET system_type = 'new-api'
+                   WHERE LOWER(TRIM(system_type)) IN ('newapi', 'new api', 'new_api', 'new-api',
+                                                      'vo-api', 'voapi', 'super-api', 'superapi',
+                                                      'rix-api', 'rixapi', 'neo-api', 'neoapi',
+                                                      'wonggongyi');
+                 UPDATE directory_sites SET system_type = 'one-api'
+                   WHERE LOWER(TRIM(system_type)) IN ('oneapi', 'one api', 'one_api', 'one-api');
+                 UPDATE directory_sites SET system_type = 'one-hub'
+                   WHERE LOWER(TRIM(system_type)) IN ('onehub', 'one hub', 'one-hub');
+                 UPDATE directory_sites SET system_type = 'done-hub'
+                   WHERE LOWER(TRIM(system_type)) IN ('donehub', 'done hub', 'done-hub');
+                 UPDATE directory_sites SET system_type = 'sub2api'
+                   WHERE LOWER(TRIM(system_type)) IN ('sub 2api', 'sub2 api', 'sub2api');
+                 UPDATE directory_sites SET system_type = 'claude'
+                   WHERE LOWER(TRIM(system_type)) = 'anthropic';
+                 UPDATE directory_sites SET system_type = 'cliproxyapi'
+                   WHERE LOWER(TRIM(system_type)) IN ('cpa', 'cli-proxy-api', 'cliproxapi');
+                 UPDATE directory_sites SET system_type = 'antigravity'
+                   WHERE LOWER(TRIM(system_type)) = 'anti-gravity';
+                 UPDATE directory_sites SET system_type = 'codex'
+                   WHERE LOWER(TRIM(system_type)) IN ('chatgpt-codex', 'chatgpt codex');
+                 UPDATE directory_sites SET system_type = 'gemini'
+                   WHERE LOWER(TRIM(system_type)) = 'google';
+                 UPDATE directory_sites SET system_type = '0v0'
+                   WHERE LOWER(TRIM(system_type)) = 'zerovzero';",
+            )
+            .map_err(|error| error.to_string())?;
         Ok(Self(std::sync::Mutex::new(connection)))
     }
+}
+
+const TOKEN_USAGE_SNAPSHOT: &str = "usage";
+const TOKEN_SESSIONS_SNAPSHOT: &str = "sessions";
+const TOKEN_HEALTH_SNAPSHOT: &str = "health";
+
+fn serialize_snapshot<T: Serialize>(value: &T) -> Result<String, String> {
+    serde_json::to_string(value).map_err(|error| format!("Token 数据序列化失败：{error}"))
+}
+
+fn read_snapshot<T: DeserializeOwned>(
+    database: &Database,
+    kind: &str,
+) -> Result<Option<T>, String> {
+    let payload = {
+        let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+        connection
+            .query_row(
+                "SELECT payload_json FROM token_cache_snapshots WHERE kind = ?1",
+                [kind],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+    };
+    payload
+        .map(|payload| {
+            serde_json::from_str(&payload)
+                .map_err(|error| format!("Token 数据库快照解析失败（{kind}）：{error}"))
+        })
+        .transpose()
+}
+
+pub(crate) fn has_token_snapshots(database: &Database) -> Result<bool, String> {
+    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM token_cache_snapshots WHERE kind = ?1)",
+            [TOKEN_USAGE_SNAPSHOT],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|value| value != 0)
+        .map_err(|error| error.to_string())
+}
+
+pub(crate) fn write_token_snapshots(
+    database: &Database,
+    usage: &TokenUsageReport,
+    sessions: &[TokenSession],
+    health: &RequestHealthReport,
+) -> Result<(), String> {
+    let payloads = [
+        (TOKEN_USAGE_SNAPSHOT, serialize_snapshot(usage)?),
+        (TOKEN_SESSIONS_SNAPSHOT, serialize_snapshot(&sessions)?),
+        (TOKEN_HEALTH_SNAPSHOT, serialize_snapshot(health)?),
+    ];
+    let mut connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
+    for (kind, payload) in payloads {
+        transaction
+            .execute(
+                "INSERT INTO token_cache_snapshots (kind, payload_json, updated_at)
+                 VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+                 ON CONFLICT(kind) DO UPDATE SET
+                    payload_json = excluded.payload_json,
+                    updated_at = excluded.updated_at",
+                params![kind, payload],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    transaction.commit().map_err(|error| error.to_string())
+}
+
+pub(crate) fn read_token_usage_snapshot(
+    database: &Database,
+) -> Result<Option<TokenUsageReport>, String> {
+    read_snapshot(database, TOKEN_USAGE_SNAPSHOT)
+}
+
+pub(crate) fn read_token_sessions_snapshot(
+    database: &Database,
+) -> Result<Option<Vec<TokenSession>>, String> {
+    read_snapshot(database, TOKEN_SESSIONS_SNAPSHOT)
+}
+
+pub(crate) fn read_token_health_snapshot(
+    database: &Database,
+) -> Result<Option<RequestHealthReport>, String> {
+    read_snapshot(database, TOKEN_HEALTH_SNAPSHOT)
 }
 
 /// 将跨天的签到缓存归零。签到状态只对 `checkin_date` 当天有效，
@@ -780,4 +971,142 @@ pub(crate) fn ensure_proxy_pool_node_columns(connection: &Connection) -> Result<
         )
         .map_err(|error| error.to_string())?;
     Ok(())
+}
+
+pub(crate) fn ensure_charity_feed_sources_table(connection: &Connection) -> Result<(), String> {
+    connection
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS charity_feed_sources (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                json_url TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+            );",
+        )
+        .map_err(|error| error.to_string())?;
+    // 仅在表为空时插入默认标签
+    let count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM charity_feed_sources", [], |row| {
+            row.get(0)
+        })
+        .map_err(|error| error.to_string())?;
+    if count == 0 {
+        connection
+            .execute_batch(
+                "INSERT INTO charity_feed_sources (id, name, json_url, sort_order) VALUES
+                    ('1515', '公益推广', 'https://linux.do/tag/1515-tag/1515.json?order=created&ascending=false', 1),
+                    ('1980', '公益站',   'https://linux.do/tag/1980-tag/1980.json?order=created&ascending=false', 2),
+                    ('2233', '中转站',   'https://linux.do/tag/2233-tag/2233.json?order=created&ascending=false', 3),
+                    ('2234', '开源推广', 'https://linux.do/tag/2234-tag/2234.json?order=created&ascending=false', 4),
+                    ('1514', '高级推广', 'https://linux.do/tag/1514-tag/1514.json?order=created&ascending=false', 5),
+                    ('193',  '订阅节点', 'https://linux.do/tag/193-tag/193.json?order=created&ascending=false', 6)
+                ;",
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod token_snapshot_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn test_database() -> Database {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE token_cache_snapshots (
+                    kind TEXT PRIMARY KEY,
+                    payload_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );",
+            )
+            .unwrap();
+        Database(std::sync::Mutex::new(connection))
+    }
+
+    #[test]
+    fn token_snapshots_round_trip_atomically() {
+        let database = test_database();
+        let usage = TokenUsageReport {
+            available: true,
+            buckets: vec![TokenUsageBucket {
+                source: "antigravity".to_string(),
+                model: "gemini-pro-default".to_string(),
+                project_key: "OpenHub".to_string(),
+                timestamp: "2026-08-12T01:00:00.000Z".to_string(),
+                total_tokens: 123,
+                estimated_tokens: 123,
+                ..Default::default()
+            }],
+            start_date: "2026-08-12".to_string(),
+            end_date: "2026-08-12".to_string(),
+            pricing_source: "openhub-local-no-pricing".to_string(),
+        };
+        let sessions = vec![TokenSession {
+            version: 1,
+            session_hash: "openhub:antigravity:test".to_string(),
+            source: "antigravity".to_string(),
+            project_key: "OpenHub".to_string(),
+            model: "gemini-pro-default".to_string(),
+            started_at: "2026-08-12T01:00:00.000Z".to_string(),
+            ended_at: "2026-08-12T01:01:00.000Z".to_string(),
+            turns: 1,
+            total_tokens: 123,
+            provenance: json!({"tokenUsage":"estimated-antigravity-local-context"}),
+            ..Default::default()
+        }];
+        let health = RequestHealthReport {
+            available: true,
+            buckets: vec![RequestHealthBucket {
+                hour: "2026-08-12T01:00:00.000Z".to_string(),
+                dialogues: 1,
+                requests: 2,
+                success: 2,
+                failed: 0,
+            }],
+            by_source: vec![RequestHealthSourceSummary {
+                source: "antigravity".to_string(),
+                dialogues: 1,
+                requests: 2,
+                success: 2,
+                failed: 0,
+            }],
+        };
+
+        write_token_snapshots(&database, &usage, &sessions, &health).unwrap();
+        assert!(has_token_snapshots(&database).unwrap());
+        assert_eq!(
+            read_token_usage_snapshot(&database)
+                .unwrap()
+                .unwrap()
+                .buckets[0]
+                .total_tokens,
+            123
+        );
+        assert_eq!(
+            read_token_sessions_snapshot(&database).unwrap().unwrap()[0].source,
+            "antigravity"
+        );
+        assert_eq!(
+            read_token_health_snapshot(&database)
+                .unwrap()
+                .unwrap()
+                .buckets[0]
+                .requests,
+            2
+        );
+    }
+
+    #[test]
+    fn empty_token_database_returns_none_without_scanning() {
+        let database = test_database();
+        assert!(!has_token_snapshots(&database).unwrap());
+        assert!(read_token_usage_snapshot(&database).unwrap().is_none());
+        assert!(read_token_sessions_snapshot(&database).unwrap().is_none());
+        assert!(read_token_health_snapshot(&database).unwrap().is_none());
+    }
 }

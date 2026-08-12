@@ -1,5 +1,6 @@
 use crate::db::*;
 use crate::models::*;
+use crate::platform_detect::{detect_platform, is_newapi, is_sub2api};
 use crate::site_ops::*;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::time::Duration;
@@ -245,6 +246,7 @@ pub fn create_site(
 pub async fn import_site(
     database: State<'_, Database>,
     site_url: String,
+    usage_state: Option<String>,
 ) -> Result<SiteRecord, String> {
     let base_url = normalize_import_base_url(&site_url)?;
     let canonical_url = base_url.to_string();
@@ -278,12 +280,17 @@ pub async fn import_site(
         "application/json",
     ));
     let sub2api_job = tauri::async_runtime::spawn(fetch_discovery_resource(
-        client,
+        client.clone(),
         base_url
             .join("/setup/status")
             .map_err(|error| error.to_string())?,
         "application/json",
     ));
+    let detect_job = tauri::async_runtime::spawn({
+        let client = client.clone();
+        let canonical_url = canonical_url.clone();
+        async move { detect_platform(&client, &canonical_url).await }
+    });
     let root_response = root_job.await.ok().flatten();
     let newapi_response = newapi_job.await.ok().flatten();
     let sub2api_response = sub2api_job.await.ok().flatten();
@@ -291,21 +298,19 @@ pub async fn import_site(
         return Err("无法连接该站点，请检查 URL 或网络代理后重试".into());
     }
 
-    let newapi_probe = newapi_response
-        .as_ref()
-        .map(DiscoveryResponse::endpoint_probe);
-    let sub2api_probe = sub2api_response
-        .as_ref()
-        .map(DiscoveryResponse::endpoint_probe);
-    let system_type = system_type_from_probes(newapi_probe, sub2api_probe)
-        .unwrap_or_default()
-        .to_string();
+    // 平台类型：移植自 metapi 的 detectPlatform 流水线。
+    let detected = detect_job.await.ok();
+    let system_type = detected
+        .and_then(|detection| detection.platform)
+        .unwrap_or_default();
     let newapi_json = newapi_response.as_ref().and_then(DiscoveryResponse::json);
     let sub2api_json = sub2api_response.as_ref().and_then(DiscoveryResponse::json);
-    let status_sources = match system_type.as_str() {
-        "NewAPI" => newapi_json.iter().collect::<Vec<_>>(),
-        "Sub2API" => sub2api_json.iter().collect::<Vec<_>>(),
-        _ => Vec::new(),
+    let status_sources = if is_newapi(&system_type) {
+        newapi_json.iter().collect::<Vec<_>>()
+    } else if is_sub2api(&system_type) {
+        sub2api_json.iter().collect::<Vec<_>>()
+    } else {
+        Vec::new()
     };
     let first_status_string = |keys: &[&str]| {
         status_sources
@@ -377,12 +382,12 @@ pub async fn import_site(
             ],
         )
     });
-    let checkin_url = if supports_checkin && system_type == "NewAPI" {
+    let checkin_url = if supports_checkin && is_newapi(&system_type) {
         base_url
             .join("/console/personal")
             .map(|url| url.to_string())
             .unwrap_or_default()
-    } else if supports_checkin && system_type == "Sub2API" {
+    } else if supports_checkin && is_sub2api(&system_type) {
         base_url
             .join("/dashboard")
             .map(|url| url.to_string())
@@ -391,6 +396,13 @@ pub async fn import_site(
         String::new()
     };
 
+    let usage_state = usage_state.unwrap_or_else(|| "all".into());
+    let (is_personal, is_pending) = match usage_state.as_str() {
+        "personal" => (true, false),
+        "pending" => (false, true),
+        "all" | "" => (false, false),
+        _ => return Err("无效的站点归类，只支持全部、在用或待定".into()),
+    };
     let mut site = SiteRecord {
         id: generated_id(),
         name: name.chars().take(100).collect(),
@@ -401,6 +413,8 @@ pub async fn import_site(
         supports_checkin,
         checkin_url,
         use_system_proxy: false,
+        is_personal,
+        is_pending,
         ..SiteRecord::default()
     };
     site = normalize_site(site)?;
@@ -455,14 +469,14 @@ pub fn update_site(
             checkin_url=?10, checkin_note=?11, benefit_url=?12, rate_limit=?13, status_url=?14,
             is_only_maintainer_visible=?15, requires_invite_code=?16, is_runaway=?17, is_fake_charity=?18,
             has_pending_report=?19, is_personal=?20, is_pending=?21, use_system_proxy=?22,
-            updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
-         WHERE id=?23",
+            system_type=?23, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE id=?24",
         params![
             input.name, input.description, input.registration_limit, input.icon, input.api_base_url,
             input.supports_immersive_translation, input.supports_ldc, input.supports_checkin, input.supports_nsfw,
             input.checkin_url, input.checkin_note, input.benefit_url, input.rate_limit, input.status_url,
             input.is_only_maintainer_visible, input.requires_invite_code, input.is_runaway, input.is_fake_charity,
-            input.has_pending_report, input.is_personal, input.is_pending, input.use_system_proxy, id
+            input.has_pending_report, input.is_personal, input.is_pending, input.use_system_proxy, input.system_type, id
         ],
     ).map_err(|e| e.to_string())?;
 
