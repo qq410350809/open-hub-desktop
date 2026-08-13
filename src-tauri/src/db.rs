@@ -116,6 +116,7 @@ impl Database {
                     username TEXT NOT NULL DEFAULT '',
                     api_source TEXT NOT NULL DEFAULT '',
                     keys_json TEXT NOT NULL DEFAULT '[]',
+                    groups_json TEXT NOT NULL DEFAULT '{}',
                     models_json TEXT NOT NULL DEFAULT '[]',
                     error TEXT NOT NULL DEFAULT '',
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -297,6 +298,7 @@ impl Database {
             .map_err(|error| error.to_string())?;
 
         ensure_site_account_columns(&connection)?;
+        ensure_site_model_cache_columns(&connection)?;
         ensure_charity_feed_schema(&connection)?;
         ensure_charity_sync_log_columns(&connection)?;
         ensure_charity_feed_sources_table(&connection)?;
@@ -550,6 +552,26 @@ pub(crate) fn ensure_site_account_columns(connection: &Connection) -> Result<(),
                 )
                 .map_err(|error| error.to_string())?;
         }
+    }
+    Ok(())
+}
+
+pub(crate) fn ensure_site_model_cache_columns(connection: &Connection) -> Result<(), String> {
+    let exists = connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('site_model_cache') WHERE name = 'groups_json'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| error.to_string())?
+        > 0;
+    if !exists {
+        connection
+            .execute(
+                "ALTER TABLE site_model_cache ADD COLUMN groups_json TEXT NOT NULL DEFAULT '{}'",
+                [],
+            )
+            .map_err(|error| error.to_string())?;
     }
     Ok(())
 }

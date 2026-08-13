@@ -11,6 +11,7 @@ import {
   bucketSourceTotals,
   bucketTotals,
   buildDailyMapFromBuckets,
+  cacheHitRateOf,
   bucketKeyFor,
   buildHealthTimeline,
   buildPrecedingKeys,
@@ -83,6 +84,7 @@ const dailyColumns: AppTableColumn[] = [
   { key: "input", title: "输入", width: "90px", align: "right", sortable: true },
   { key: "output", title: "输出", width: "90px", align: "right", sortable: true },
   { key: "cache", title: "缓存", width: "90px", align: "right", sortable: true },
+  { key: "cacheHitRate", title: "缓存命中率", width: "110px", align: "right", sortable: true },
   { key: "reasoning", title: "推理", width: "90px", align: "right", sortable: true },
   { key: "sessions", title: "对话", width: "90px", align: "right", sortable: true },
 ];
@@ -93,6 +95,7 @@ const projectColumns: AppTableColumn[] = [
   { key: "input", title: "输入", width: "90px", align: "right", sortable: true },
   { key: "output", title: "输出", width: "90px", align: "right", sortable: true },
   { key: "cache", title: "缓存", width: "90px", align: "right", sortable: true },
+  { key: "cacheHitRate", title: "缓存命中率", width: "110px", align: "right", sortable: true },
   { key: "reasoning", title: "推理", width: "90px", align: "right", sortable: true },
   { key: "sessions", title: "对话", width: "90px", align: "right", sortable: true },
   { key: "costUsd", title: "成本", width: "100px", align: "right", sortable: true },
@@ -104,6 +107,7 @@ const sourceColumns: AppTableColumn[] = [
   { key: "inputTokens", title: "输入", width: "90px", align: "right", sortable: true },
   { key: "outputTokens", title: "输出", width: "90px", align: "right", sortable: true },
   { key: "cacheTokens", title: "缓存", width: "90px", align: "right", sortable: true },
+  { key: "cacheHitRate", title: "缓存命中率", width: "110px", align: "right", sortable: true },
   { key: "reasoningTokens", title: "推理", width: "90px", align: "right", sortable: true },
   { key: "conversations", title: "对话", width: "90px", align: "right", sortable: true },
   { key: "costUsd", title: "成本", width: "100px", align: "right", sortable: true },
@@ -274,6 +278,9 @@ type ProjectUsageItem = {
   input: number;
   output: number;
   cache: number;
+  cacheRead: number;
+  cacheWrite: number;
+  cacheHitRate: number | null;
   reasoning: number;
   costUsd: number;
   estimatedTokens: number;
@@ -281,7 +288,7 @@ type ProjectUsageItem = {
 const projectUsage = computed<ProjectUsageItem[]>(() => {
   const groups = new Map<
     string,
-    { project: string; sessions: number; totalTokens: number; input: number; output: number; cache: number; reasoning: number; costUsd: number; estimatedTokens: number }
+    { project: string; sessions: number; totalTokens: number; input: number; output: number; cache: number; cacheRead: number; cacheWrite: number; cacheHitRate: number | null; reasoning: number; costUsd: number; estimatedTokens: number }
   >();
   const normalizeProject = (rawKey?: string) => {
     const value = rawKey?.trim() || "未知项目";
@@ -294,7 +301,8 @@ const projectUsage = computed<ProjectUsageItem[]>(() => {
     const key = normalizeProject(rawKey);
     const current = groups.get(key) || {
       project: key, sessions: 0, totalTokens: 0,
-      input: 0, output: 0, cache: 0, reasoning: 0, costUsd: 0, estimatedTokens: 0,
+      input: 0, output: 0, cache: 0, cacheRead: 0, cacheWrite: 0, cacheHitRate: null,
+      reasoning: 0, costUsd: 0, estimatedTokens: 0,
     };
     groups.set(key, current);
     return current;
@@ -312,6 +320,8 @@ const projectUsage = computed<ProjectUsageItem[]>(() => {
     current.input += bucket.inputTokens || 0;
     current.output += bucket.outputTokens || 0;
     current.cache += (bucket.cachedInputTokens || 0) + (bucket.cacheCreationInputTokens || 0);
+    current.cacheRead += bucket.cachedInputTokens || 0;
+    current.cacheWrite += bucket.cacheCreationInputTokens || 0;
     current.reasoning += bucket.reasoningOutputTokens || 0;
     current.costUsd += bucket.costUsd || 0;
     current.estimatedTokens += bucket.estimatedTokens || 0;
@@ -326,12 +336,17 @@ const projectUsage = computed<ProjectUsageItem[]>(() => {
     current.input += session.tokens?.inputTokens || 0;
     current.output += session.tokens?.outputTokens || 0;
     current.cache += (session.tokens?.cachedInputTokens || 0) + (session.tokens?.cacheCreationInputTokens || 0);
+    current.cacheRead += session.tokens?.cachedInputTokens || 0;
+    current.cacheWrite += session.tokens?.cacheCreationInputTokens || 0;
     current.reasoning += session.tokens?.reasoningOutputTokens || 0;
     current.costUsd += session.costUsd || 0;
     const usageKind = String(session.provenance?.tokenUsage || "");
     if (usageKind.includes("estimated")) current.estimatedTokens += session.totalTokens || 0;
   }
-  return [...groups.values()].sort((a, b) => b.totalTokens - a.totalTokens).slice(0, 20);
+  return [...groups.values()]
+    .map((item) => ({ ...item, cacheHitRate: cacheHitRateOf(item.cacheRead, item.cacheWrite, item.input) }))
+    .sort((a, b) => b.totalTokens - a.totalTokens)
+    .slice(0, 20);
 });
 
 const trendSeries = computed(() =>
@@ -933,6 +948,7 @@ onBeforeUnmount(() => {
                   <template #cell-input="{ row }">{{ formatCompact(row.input) }}</template>
                   <template #cell-output="{ row }">{{ formatCompact(row.output) }}</template>
                   <template #cell-cache="{ row }">{{ formatCompact(row.cache) }}</template>
+                  <template #cell-cacheHitRate="{ row }">{{ formatRate(row.cacheHitRate) }}</template>
                   <template #cell-reasoning="{ row }">{{ formatCompact(row.reasoning) }}</template>
                   <template #cell-sessions="{ row }">{{ formatTokens(row.sessions) }}</template>
                 </AppTable>
@@ -953,6 +969,7 @@ onBeforeUnmount(() => {
                   <template #cell-input="{ row }">{{ formatCompact(row.input) }}</template>
                   <template #cell-output="{ row }">{{ formatCompact(row.output) }}</template>
                   <template #cell-cache="{ row }">{{ formatCompact(row.cache) }}</template>
+                  <template #cell-cacheHitRate="{ row }">{{ formatRate(row.cacheHitRate) }}</template>
                   <template #cell-reasoning="{ row }">{{ formatCompact(row.reasoning) }}</template>
                   <template #cell-sessions="{ row }">{{ formatTokens(row.sessions) }}</template>
                   <template #cell-costUsd="{ row }">{{ formatCost(row.costUsd) }}</template>
@@ -982,6 +999,7 @@ onBeforeUnmount(() => {
                 <template #cell-inputTokens="{ row }">{{ formatCompact(row.inputTokens) }}</template>
                 <template #cell-outputTokens="{ row }">{{ formatCompact(row.outputTokens) }}</template>
                 <template #cell-cacheTokens="{ row }">{{ formatCompact(row.cacheTokens) }}</template>
+                <template #cell-cacheHitRate="{ row }">{{ formatRate(row.cacheHitRate) }}</template>
                 <template #cell-reasoningTokens="{ row }">{{ formatCompact(row.reasoningTokens) }}</template>
                 <template #cell-conversations="{ row }">{{ formatTokens(row.conversations) }}</template>
                 <template #cell-costUsd="{ row }">{{ row.costUsd > 0 ? formatCost(row.costUsd) : "—" }}</template>
@@ -1011,6 +1029,7 @@ onBeforeUnmount(() => {
                 <template #cell-inputTokens="{ row }">{{ formatCompact(row.inputTokens) }}</template>
                 <template #cell-outputTokens="{ row }">{{ formatCompact(row.outputTokens) }}</template>
                 <template #cell-cacheTokens="{ row }">{{ formatCompact(row.cacheTokens) }}</template>
+                <template #cell-cacheHitRate="{ row }">{{ formatRate(row.cacheHitRate) }}</template>
                 <template #cell-reasoningTokens="{ row }">{{ formatCompact(row.reasoningTokens) }}</template>
                 <template #cell-conversations="{ row }">{{ formatTokens(row.conversations) }}</template>
                 <template #cell-costUsd="{ row }">{{ row.costUsd > 0 ? formatCost(row.costUsd) : "—" }}</template>

@@ -2,7 +2,7 @@ use crate::chrome_session;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use tauri::Emitter;
 
 pub(crate) const SEED_JSON: &str = include_str!("../resources/sites.json");
@@ -234,6 +234,8 @@ pub(crate) struct SiteModelCacheAccount {
     pub(crate) account_name: String,
     pub(crate) username: String,
     pub(crate) keys: Vec<String>,
+    #[serde(default)]
+    pub(crate) key_groups: HashMap<String, String>,
     pub(crate) error: String,
 }
 

@@ -5,7 +5,7 @@ import {
   coreFeatures,
   rowPaginationFeature,
   rowSortingFeature,
-  createCoreRowModel,
+  tableFeatures,
   createSortedRowModel,
   createPaginatedRowModel,
   type SortingState,
@@ -80,6 +80,14 @@ const pageSizeRef = ref(props.pageSize);
 watch(() => props.page, (value) => { pageIndex.value = Math.max(0, value - 1); });
 watch(() => props.pageSize, (value) => { pageSizeRef.value = value; });
 
+// 每页条数：以内部状态为唯一事实源，保证选择器始终可用；
+// 同时把当前值兜底并入可选项，避免父组件传入固定值（如 12/20）时下拉为空。
+const pageSizeOptionsList = computed(() => {
+  const set = new Set<number>(props.pageSizeOptions);
+  set.add(pageSizeRef.value);
+  return [...set].sort((a, b) => a - b);
+});
+
 // v9 的类型系统把 table 泛型收紧到 RowData，与组件泛型 T 不兼容。
 // 组件内部按 any 使用 table 实例，对外暴露的 props/slots 仍保持 T 的强类型。
 const columnDefs = computed(() =>
@@ -92,7 +100,13 @@ const columnDefs = computed(() =>
 );
 
 // v9 的 features 必须是对象（会被 spread 进 options），数组会导致 table 崩溃。
-const features = { ...coreFeatures, rowPaginationFeature, rowSortingFeature };
+const features = tableFeatures({
+  ...coreFeatures,
+  rowPaginationFeature,
+  rowSortingFeature,
+  sortedRowModel: createSortedRowModel(),
+  paginatedRowModel: createPaginatedRowModel(),
+});
 
 // state 必须传纯值对象；嵌套 ref 不会被自动解包，用 computed 保证每次读取都是值。
 const tableState = computed(() => ({
@@ -121,9 +135,6 @@ const table = useTable({
       emit("update:page", next.pageIndex + 1);
     }
   }) as any,
-  coreRowModel: createCoreRowModel() as any,
-  sortedRowModel: createSortedRowModel() as any,
-  paginatedRowModel: props.manualPagination ? undefined : (createPaginatedRowModel() as any),
   manualPagination: props.manualPagination,
   pageCount: props.manualPagination ? Math.max(1, Math.ceil(props.total / props.pageSize)) : undefined,
   rowCount: props.manualPagination ? props.total : undefined,
@@ -141,8 +152,14 @@ const headerGroups = computed(() => (table as any).getHeaderGroups() as Array<{
 }>);
 
 const totalCount = computed(() => (props.manualPagination ? props.total : props.rows.length));
-const totalPages = computed(() => Math.max(1, Math.ceil(totalCount.value / props.pageSize)));
+const totalPages = computed(() => Math.max(1, Math.ceil(totalCount.value / pageSizeRef.value)));
 const currentPage = computed(() => Math.min(Math.max(1, props.page), totalPages.value));
+const rangeStart = computed(() => totalCount.value === 0 ? 0 : (currentPage.value - 1) * pageSizeRef.value + 1);
+const rangeEnd = computed(() => Math.min(currentPage.value * pageSizeRef.value, totalCount.value));
+
+watch(totalPages, (pages) => {
+  if (props.page > pages) emit("update:page", pages);
+});
 
 const pageNumbers = computed<Array<number | "ellipsis">>(() => {
   const total = totalPages.value;
@@ -154,7 +171,16 @@ const pageNumbers = computed<Array<number | "ellipsis">>(() => {
 });
 
 function gotoPage(page: number) {
-  emit("update:page", Math.max(1, Math.min(totalPages.value, page)));
+  const nextPage = Math.max(1, Math.min(totalPages.value, page));
+  pageIndex.value = nextPage - 1;
+  emit("update:page", nextPage);
+}
+function changePageSize(value: number) {
+  if (!Number.isFinite(value) || value <= 0) return;
+  pageSizeRef.value = value;
+  pageIndex.value = 0;
+  emit("update:pageSize", value);
+  emit("update:page", 1);
 }
 interface HeaderItem {
   id: string;
@@ -179,7 +205,7 @@ void icons;
   <div class="app-table-wrap">
     <div class="app-table-scroll">
       <table class="app-table" role="table">
-        <thead v-if="props.stickyHeader">
+        <thead :class="{ 'is-sticky': props.stickyHeader }">
           <tr v-for="hg in headerGroups" :key="hg.id" role="row">
             <th
               v-for="header in hg.headers"
@@ -232,8 +258,8 @@ void icons;
 
     <footer v-if="props.showPagination && totalCount > 0" class="app-table-pagination">
       <label>每页
-        <select :value="props.pageSize" @change="emit('update:pageSize', Number(($event.target as HTMLSelectElement).value))">
-          <option v-for="opt in props.pageSizeOptions" :key="opt" :value="opt">{{ opt }}</option>
+        <select :value="pageSizeRef" @change="changePageSize(Number(($event.target as HTMLSelectElement).value))">
+          <option v-for="opt in pageSizeOptionsList" :key="opt" :value="opt">{{ opt }}</option>
         </select>
         条
       </label>
@@ -251,7 +277,7 @@ void icons;
         <button type="button" :disabled="currentPage >= totalPages" @click="gotoPage(currentPage + 1)">下一页</button>
         <button type="button" :disabled="currentPage >= totalPages" @click="gotoPage(totalPages)">末页</button>
       </div>
-      <span class="app-table-page-total">{{ currentPage.toLocaleString() }}–{{ Math.min(currentPage * props.pageSize, totalCount).toLocaleString() }} / {{ totalCount.toLocaleString() }}</span>
+      <span class="app-table-page-total">{{ rangeStart.toLocaleString() }}–{{ rangeEnd.toLocaleString() }} / {{ totalCount.toLocaleString() }}</span>
     </footer>
   </div>
 </template>

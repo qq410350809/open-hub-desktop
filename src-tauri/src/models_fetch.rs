@@ -32,6 +32,8 @@ pub(crate) struct SiteModelsResult {
     pub(crate) models: Vec<SiteModelItem>,
     pub(crate) source: String,
     pub(crate) keys: Vec<String>,
+    #[serde(default)]
+    pub(crate) key_groups: HashMap<String, String>,
 }
 
 pub(crate) fn json_array_at<'a>(
@@ -132,7 +134,7 @@ pub(crate) fn normalize_api_key_value(value: &str) -> Option<String> {
     .then_some(value)
 }
 
-pub(crate) fn parse_api_keys(value: &serde_json::Value) -> Vec<String> {
+pub(crate) fn parse_api_key_entries(value: &serde_json::Value) -> Vec<(String, String)> {
     let Some(items) = json_array_at(
         value,
         &[
@@ -148,10 +150,12 @@ pub(crate) fn parse_api_keys(value: &serde_json::Value) -> Vec<String> {
     ) else {
         return Vec::new();
     };
-    let mut keys = Vec::new();
+    let mut entries = HashMap::<String, String>::new();
     for item in items.iter().filter(|item| api_key_is_enabled(item)) {
-        let (value, prefix) = match item {
-            serde_json::Value::String(value) => (value.trim().to_string(), String::new()),
+        let (value, prefix, group) = match item {
+            serde_json::Value::String(value) => {
+                (value.trim().to_string(), String::new(), String::new())
+            }
             serde_json::Value::Object(_) => (
                 json_string(
                     item,
@@ -169,20 +173,64 @@ pub(crate) fn parse_api_keys(value: &serde_json::Value) -> Vec<String> {
                     ],
                 ),
                 json_string(item, &["/key_prefix", "/keyPrefix", "/prefix"]),
+                json_string(
+                    item,
+                    &[
+                        "/group",
+                        "/group_name",
+                        "/groupName",
+                        "/token_group",
+                        "/tokenGroup",
+                    ],
+                ),
             ),
             _ => continue,
         };
         let Some(value) = normalize_api_key_value(&value) else {
             continue;
         };
-        keys.push(value.clone());
+        let insert = |entries: &mut HashMap<String, String>, key: String, group: &str| {
+            let current = entries.entry(key).or_default();
+            if current.is_empty() && !group.is_empty() {
+                *current = group.to_string();
+            }
+        };
+        insert(&mut entries, value.clone(), &group);
         if !prefix.is_empty() && !value.starts_with(&prefix) {
-            keys.push(format!("{prefix}{value}"));
+            insert(&mut entries, format!("{prefix}{value}"), &group);
         }
     }
-    keys.sort();
-    keys.dedup();
-    keys
+    let mut entries = entries.into_iter().collect::<Vec<_>>();
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    entries
+}
+
+pub(crate) fn parse_api_keys(value: &serde_json::Value) -> Vec<String> {
+    parse_api_key_entries(value)
+        .into_iter()
+        .map(|(key, _)| key)
+        .collect()
+}
+
+pub(crate) fn parse_api_key_groups(value: &serde_json::Value) -> HashMap<String, String> {
+    let mut groups = parse_api_key_entries(value)
+        .into_iter()
+        .filter(|(_, group)| !group.is_empty())
+        .collect::<HashMap<_, _>>();
+    for pointer in ["/keyGroups", "/key_groups", "/data/keyGroups", "/data/key_groups"] {
+        let Some(object) = value.pointer(pointer).and_then(serde_json::Value::as_object) else {
+            continue;
+        };
+        merge_api_key_groups(
+            &mut groups,
+            object.iter().filter_map(|(key, group)| {
+                let group = group.as_str()?.trim();
+                (!key.trim().is_empty() && !group.is_empty())
+                    .then_some((key.trim().to_string(), group.to_string()))
+            }),
+        );
+    }
+    groups
 }
 
 pub(crate) fn parse_newapi_token_ids(value: &serde_json::Value) -> Vec<String> {
@@ -208,6 +256,31 @@ pub(crate) fn parse_newapi_token_ids(value: &serde_json::Value) -> Vec<String> {
     ids.sort();
     ids.dedup();
     ids
+}
+
+pub(crate) fn parse_newapi_token_groups(value: &serde_json::Value) -> HashMap<String, String> {
+    let Some(items) = json_array_at(value, &["", "/data", "/data/items", "/items", "/result/items"])
+    else {
+        return HashMap::new();
+    };
+    items
+        .iter()
+        .filter(|item| api_key_is_enabled(item))
+        .filter_map(|item| {
+            let id = json_string(item, &["/id", "/token_id", "/tokenId"]);
+            let group = json_string(
+                item,
+                &[
+                    "/group",
+                    "/group_name",
+                    "/groupName",
+                    "/token_group",
+                    "/tokenGroup",
+                ],
+            );
+            (!id.is_empty() && !group.is_empty()).then_some((id, group))
+        })
+        .collect()
 }
 
 pub(crate) fn parse_revealed_api_key(value: &serde_json::Value) -> Option<String> {
@@ -236,12 +309,14 @@ pub(crate) async fn reveal_newapi_keys(
     auth: &NewApiAuth,
     user_agent: &str,
     token_list: &serde_json::Value,
-) -> Result<Vec<String>, String> {
+) -> Result<(Vec<String>, HashMap<String, String>), String> {
     let mut keys = parse_api_keys(token_list);
+    let mut key_groups = parse_api_key_groups(token_list);
     if !keys.is_empty() {
-        return Ok(keys);
+        return Ok((keys, key_groups));
     }
     let token_ids = parse_newapi_token_ids(token_list);
+    let token_groups = parse_newapi_token_groups(token_list);
     if token_ids.is_empty() {
         return Err("/api/token 没有返回可用令牌 ID".into());
     }
@@ -257,6 +332,9 @@ pub(crate) async fn reveal_newapi_keys(
         match request_json(request, "NewAPI 完整 Key 接口").await {
             Ok(value) => {
                 if let Some(key) = parse_revealed_api_key(&value) {
+                    if let Some(group) = token_groups.get(&token_id).filter(|group| !group.is_empty()) {
+                        key_groups.insert(key.clone(), group.clone());
+                    }
                     keys.push(key);
                 } else {
                     errors.push(format!("令牌 {token_id} 没有返回完整 Key"));
@@ -273,7 +351,7 @@ pub(crate) async fn reveal_newapi_keys(
             .cloned()
             .unwrap_or_else(|| "没有取得可用的完整 Key".into()))
     } else {
-        Ok(keys)
+        Ok((keys, key_groups))
     }
 }
 
@@ -282,6 +360,7 @@ pub(crate) async fn fetch_models_with_keys(
     base_url: &Url,
     keys: Vec<String>,
     visible_keys: Vec<String>,
+    visible_key_groups: HashMap<String, String>,
     user_agent: &str,
     source: &str,
     newapi_user_id: Option<&str>,
@@ -316,6 +395,7 @@ pub(crate) async fn fetch_models_with_keys(
                             models,
                             source: source.into(),
                             keys: visible_keys,
+                            key_groups: visible_key_groups,
                         });
                     }
                     errors.push("模型接口返回空列表".to_string());
@@ -388,17 +468,24 @@ pub(crate) fn chrome_models_bridge_script(
   };
   const activeKeyItems = (value) => arrays(value, [[], ["data"], ["data","items"], ["data","keys"], ["keys"], ["items"], ["result","items"], ["result","keys"]])
     .filter((item) => item && item.enabled !== false && item.is_active !== false && ![0, "0", "disabled", "inactive", "expired", "revoked"].includes(item.status));
-  const extractKeys = (value) => activeKeyItems(value)
+  const keyGroup = (item) => typeof item === "object" && item ? String(item.group || item.group_name || item.groupName || item.token_group || item.tokenGroup || "").trim() : "";
+  const extractKeyEntries = (value) => activeKeyItems(value)
     .flatMap((item) => {
       const key = String(typeof item === "string" ? item : item.key || item.api_key || item.apiKey || item.plain_key || item.plainKey || item.secret_key || item.secretKey || item.token || item.secret || item.value || "").replace(/^Bearer\s+/i, "").trim();
       const prefix = typeof item === "object" && item ? String(item.key_prefix || item.keyPrefix || item.prefix || "") : "";
-      return prefix && !key.startsWith(prefix) ? [key, `${prefix}${key}`] : [key];
+      const group = keyGroup(item);
+      return (prefix && !key.startsWith(prefix) ? [key, `${prefix}${key}`] : [key]).map((value) => ({ key: value, group }));
     })
-    .filter((key) => key.length >= 8 && !/\s|\*|…|\.\.\./.test(key));
+    .filter((item) => item.key.length >= 8 && !/\s|\*|…|\.\.\./.test(item.key));
+  const extractKeys = (value) => extractKeyEntries(value).map((item) => item.key);
+  const extractKeyGroups = (value) => Object.fromEntries(extractKeyEntries(value).filter((item) => item.group).map((item) => [item.key, item.group]));
   const extractTokenIds = (value) => activeKeyItems(value)
     .map((item) => typeof item === "object" && item ? item.id ?? item.token_id ?? item.tokenId ?? "" : "")
     .map((id) => String(id))
     .filter((id) => id.length > 0 && id.length <= 64 && /^[A-Za-z0-9_-]+$/.test(id));
+  const extractTokenGroups = (value) => Object.fromEntries(activeKeyItems(value)
+    .map((item) => [String(item && (item.id ?? item.token_id ?? item.tokenId) || ""), keyGroup(item)])
+    .filter(([id, group]) => id && group));
   const extractRevealedKey = (value) => {
     const key = String(value?.data?.key || value?.data?.api_key || value?.data?.apiKey || value?.data?.secret_key || value?.data?.secretKey ||
       (typeof value?.data === "string" ? value.data : "") || value?.key || value?.api_key || value?.apiKey || value?.secret_key || value?.secretKey || "")
@@ -412,6 +499,7 @@ pub(crate) fn chrome_models_bridge_script(
     })
     .filter((item) => item.id);
   let visibleKeys = [];
+  let visibleKeyGroups = {};
   (async () => {
     const headers = { Accept: "application/json, text/plain, */*" };
     let keyPath = "/api/token/?p=1&size=20";
@@ -441,11 +529,16 @@ pub(crate) fn chrome_models_bridge_script(
       }
     }
     const keys = extractKeys(keyResponse.data);
+    visibleKeyGroups = extractKeyGroups(keyResponse.data);
     if (systemType !== "sub2api" && !keys.length) {
+      const tokenGroups = extractTokenGroups(keyResponse.data);
       for (const tokenId of extractTokenIds(keyResponse.data)) {
         const revealResponse = await readJson(`/api/token/${encodeURIComponent(tokenId)}/key`, { method: "POST", headers });
         const revealedKey = extractRevealedKey(revealResponse.data);
-        if (revealResponse.ok && revealedKey) keys.push(revealedKey);
+        if (revealResponse.ok && revealedKey) {
+          keys.push(revealedKey);
+          if (tokenGroups[tokenId]) visibleKeyGroups[revealedKey] = tokenGroups[tokenId];
+        }
       }
     }
     visibleKeys = [...new Set(keys)];
@@ -464,14 +557,14 @@ pub(crate) fn chrome_models_bridge_script(
         lastError = response.data?.error?.message || response.data?.message || response.data?.msg || response.data?.detail || "";
         const models = extractModels(response.data);
         if (response.ok && models.length) {
-          bridge.result = { ok: true, models, source, keys: visibleKeys };
+          bridge.result = { ok: true, models, source, keys: visibleKeys, keyGroups: visibleKeyGroups };
           return;
         }
       }
     }
     throw new Error(`/v1/models 未返回模型（HTTP ${lastStatus}${lastError ? `：${lastError}` : ""}）`);
   })().catch((error) => {
-    bridge.result = { ok: false, error: error && error.message || String(error), keys: visibleKeys };
+    bridge.result = { ok: false, error: error && error.message || String(error), keys: visibleKeys, keyGroups: visibleKeyGroups };
   });
   return pending;
 })()"#
@@ -494,6 +587,7 @@ pub(crate) fn parse_chrome_models_result(value: &str) -> Result<SiteModelsResult
         models,
         source: json_string(&value, &["/source"]),
         keys: parse_api_keys(&value),
+        key_groups: parse_api_key_groups(&value),
     })
 }
 
@@ -507,6 +601,21 @@ pub(crate) fn merge_api_keys(target: &mut Vec<String>, keys: impl IntoIterator<I
     target.extend(keys);
     target.sort();
     target.dedup();
+}
+
+pub(crate) fn merge_api_key_groups(
+    target: &mut HashMap<String, String>,
+    groups: impl IntoIterator<Item = (String, String)>,
+) {
+    for (key, group) in groups {
+        if group.is_empty() {
+            continue;
+        }
+        let current = target.entry(key).or_default();
+        if current.is_empty() {
+            *current = group;
+        }
+    }
 }
 
 pub(crate) fn cache_profile_api_counts(
@@ -566,18 +675,23 @@ pub(crate) fn save_site_model_cache(
     let keys = result
         .map(|item| item.keys.clone())
         .unwrap_or_else(|| account.keys.clone());
+    let key_groups = result
+        .map(|item| item.key_groups.clone())
+        .filter(|groups| !groups.is_empty())
+        .unwrap_or_else(|| account.key_groups.clone());
     let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
     connection
         .execute(
             "INSERT INTO site_model_cache
-             (site_id, profile_id, profile_name, account_name, username, api_source, keys_json, models_json, error, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, CURRENT_TIMESTAMP)
+             (site_id, profile_id, profile_name, account_name, username, api_source, keys_json, groups_json, models_json, error, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, CURRENT_TIMESTAMP)
              ON CONFLICT(site_id, profile_id) DO UPDATE SET
                profile_name = excluded.profile_name,
                account_name = excluded.account_name,
                username = excluded.username,
                api_source = excluded.api_source,
                keys_json = excluded.keys_json,
+               groups_json = excluded.groups_json,
                models_json = excluded.models_json,
                error = excluded.error,
                updated_at = CURRENT_TIMESTAMP",
@@ -589,6 +703,7 @@ pub(crate) fn save_site_model_cache(
                 account.username,
                 api_source,
                 serde_json::to_string(&keys).map_err(|error| error.to_string())?,
+                serde_json::to_string(&key_groups).map_err(|error| error.to_string())?,
                 serde_json::to_string(&models).map_err(|error| error.to_string())?,
                 account.error,
             ],
@@ -623,7 +738,7 @@ pub fn get_site_model_cache(
     let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
     let mut statement = connection
         .prepare(
-            "SELECT profile_id, profile_name, account_name, username, api_source, keys_json, models_json, error
+            "SELECT profile_id, profile_name, account_name, username, api_source, keys_json, groups_json, models_json, error
              FROM site_model_cache WHERE site_id = ?1 ORDER BY profile_name, account_name, profile_id",
         )
         .map_err(|error| error.to_string())?;
@@ -632,10 +747,13 @@ pub fn get_site_model_cache(
     let accounts = statement
         .query_map([site_id.as_str()], |row| {
             let keys_json: String = row.get(5)?;
-            let models_json: String = row.get(6)?;
+            let groups_json: String = row.get(6)?;
+            let models_json: String = row.get(7)?;
             let account_models: Vec<SiteModelItem> =
                 serde_json::from_str(&models_json).unwrap_or_default();
             let keys: Vec<String> = serde_json::from_str(&keys_json).unwrap_or_default();
+            let key_groups: HashMap<String, String> =
+                serde_json::from_str(&groups_json).unwrap_or_default();
             let source: String = row.get(4)?;
             if api_source.is_empty() && !source.is_empty() {
                 api_source = source;
@@ -647,7 +765,8 @@ pub fn get_site_model_cache(
                 account_name: row.get(2)?,
                 username: row.get(3)?,
                 keys,
-                error: row.get(7)?,
+                key_groups,
+                error: row.get(8)?,
             })
         })
         .map_err(|error| error.to_string())?
@@ -718,13 +837,17 @@ pub async fn fetch_site_models_json(
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|error| error.to_string())?;
             let mut key_statement = connection
-                .prepare("SELECT profile_id, keys_json FROM site_model_cache WHERE site_id = ?1")
+                .prepare("SELECT profile_id, keys_json, groups_json FROM site_model_cache WHERE site_id = ?1")
                 .map_err(|error| error.to_string())?;
             let cached_model_keys = key_statement
                 .query_map([site_id], |row| {
                     let keys_json: String = row.get(1)?;
+                    let groups_json: String = row.get(2)?;
                     let keys = serde_json::from_str::<Vec<String>>(&keys_json).unwrap_or_default();
-                    Ok((row.get::<_, String>(0)?, keys))
+                    let key_groups =
+                        serde_json::from_str::<HashMap<String, String>>(&groups_json)
+                            .unwrap_or_default();
+                    Ok((row.get::<_, String>(0)?, (keys, key_groups)))
                 })
                 .map_err(|error| error.to_string())?
                 .collect::<Result<HashMap<_, _>, _>>()
@@ -770,6 +893,7 @@ pub async fn fetch_site_models_json(
         .collect::<HashMap<_, _>>();
     let mut errors = Vec::new();
     let mut discovered_keys = Vec::new();
+    let mut discovered_key_groups = HashMap::new();
     let mut no_browser_fallback_profiles = HashSet::new();
 
     for profile_id in &profile_ids {
@@ -804,15 +928,16 @@ pub async fn fetch_site_models_json(
             };
 
             // 已同步过的 NewAPI 访问秘钥优先直连 /v1/models，避免因为额度/签到状态异常再次弹出浏览器。
-            if let Some(cached_keys) = cached_model_keys
+            if let Some((cached_keys, cached_key_groups)) = cached_model_keys
                 .get(profile_id)
-                .filter(|keys| !keys.is_empty())
+                .filter(|(keys, _)| !keys.is_empty())
             {
                 match fetch_models_with_keys(
                     &client,
                     &base_url,
                     cached_keys.clone(),
                     cached_keys.clone(),
+                    cached_key_groups.clone(),
                     &user_agent,
                     "newapi-key",
                     (!cached_uid.is_empty()).then_some(cached_uid.as_str()),
@@ -996,13 +1121,18 @@ pub async fn fetch_site_models_json(
             match remote_result {
                 Ok(value) => {
                     match reveal_newapi_keys(&client, &base_url, &auth, &user_agent, &value).await {
-                        Ok(keys) => {
+                        Ok((keys, key_groups)) => {
                             merge_api_keys(&mut discovered_keys, keys.iter().cloned());
+                            merge_api_key_groups(
+                                &mut discovered_key_groups,
+                                key_groups.clone(),
+                            );
                             match fetch_models_with_keys(
                                 &client,
                                 &base_url,
                                 keys.clone(),
                                 keys,
+                                key_groups,
                                 &user_agent,
                                 "newapi-key",
                                 (!model_user_id.is_empty()).then_some(model_user_id.as_str()),
@@ -1070,6 +1200,7 @@ pub async fn fetch_site_models_json(
                                     models,
                                     source: "sub2api-key".into(),
                                     keys: vec![auth_token.clone()],
+                                    key_groups: HashMap::new(),
                                 },
                             );
                         }
@@ -1094,7 +1225,12 @@ pub async fn fetch_site_models_json(
             match request_json(request, "Sub2API Key 接口").await {
                 Ok(value) => {
                     let visible_keys = parse_api_keys(&value);
+                    let visible_key_groups = parse_api_key_groups(&value);
                     merge_api_keys(&mut discovered_keys, visible_keys.iter().cloned());
+                    merge_api_key_groups(
+                        &mut discovered_key_groups,
+                        visible_key_groups.clone(),
+                    );
                     let mut keys = visible_keys.clone();
                     keys.push(dashboard_token);
                     match fetch_models_with_keys(
@@ -1102,6 +1238,7 @@ pub async fn fetch_site_models_json(
                         &base_url,
                         keys,
                         visible_keys,
+                        visible_key_groups,
                         &user_agent,
                         "sub2api-key",
                         None,
@@ -1315,6 +1452,7 @@ pub async fn fetch_site_models_json(
                         models,
                         source: "pricing".into(),
                         keys: discovered_keys.clone(),
+                        key_groups: discovered_key_groups.clone(),
                     },
                 );
             }
@@ -1343,6 +1481,7 @@ pub async fn fetch_site_models_json(
                         models,
                         source: "models".into(),
                         keys: discovered_keys,
+                        key_groups: discovered_key_groups,
                     },
                 );
             }
@@ -1364,6 +1503,7 @@ pub async fn fetch_site_models_json(
                 models: Vec::new(),
                 source: source.into(),
                 keys: discovered_keys,
+                key_groups: discovered_key_groups,
             },
         );
     }

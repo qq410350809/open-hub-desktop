@@ -206,6 +206,7 @@ interface SyncedSiteModelsResult {
   models: Array<{ id: string; owned_by?: string; ownedBy?: string }>;
   source: string;
   keys: string[];
+  keyGroups?: Record<string, string>;
 }
 
 interface SyncedModelCacheAccount {
@@ -214,6 +215,7 @@ interface SyncedModelCacheAccount {
   accountName: string;
   username: string;
   keys: string[];
+  keyGroups: Record<string, string>;
   error: string;
 }
 
@@ -296,6 +298,7 @@ async function syncAllModelKeys(
               accountName: session.accountName,
               username: session.username,
               keys: result.keys ?? [],
+              keyGroups: result.keyGroups ?? {},
               error: "",
             } satisfies SyncedModelCacheAccount,
             result,
@@ -314,6 +317,7 @@ async function syncAllModelKeys(
               accountName: session.accountName,
               username: session.username,
               keys: [],
+              keyGroups: {},
               error: String(error),
             } satisfies SyncedModelCacheAccount,
             result: null,

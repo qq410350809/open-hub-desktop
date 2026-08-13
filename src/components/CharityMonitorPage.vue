@@ -291,7 +291,7 @@ onUnmounted(() => {
       </div>
     </header>
 
-    <div class="charity-monitor-scroll">
+    <div class="charity-monitor-topbar">
       <div v-if="store.charityFeedSyncing.value" class="charity-monitor-status">
         <span class="is-spinning" v-html="icons.restore" />
         <span>正在后台同步 {{ store.charityTags.value.filter(t => t.id !== "all" && t.enabled !== false).length }} 个标签，完成后自动刷新列表…</span>
@@ -363,7 +363,9 @@ onUnmounted(() => {
           <p>{{ store.charityFeedError.value }}</p>
         </div>
       </div>
+    </div>
 
+    <div class="charity-monitor-body">
       <div
         v-if="store.charityFeedLoading.value && store.charityFeedItems.value.length === 0"
         class="charity-monitor-empty"
@@ -394,12 +396,13 @@ onUnmounted(() => {
           empty-text="本地暂无公益帖子"
           :page="store.charityFeedCurrentPage.value"
           :page-size="20"
-          :total="store.charityFeedTotalPages.value * 20"
+          :page-size-options="[20]"
+          :total="store.charityFeedTotalCount.value"
           manual-pagination
-          :show-pagination="false"
           :row-class="topicRowClass"
           clickable
           @row-click="(item: any) => store.openExternal(item.link)"
+          @update:page="(page: number) => store.goCharityPage(page)"
         >
           <template #cell-title="{ row }">
             <div class="charity-topic-cell">
@@ -439,29 +442,7 @@ onUnmounted(() => {
       </section>
 
       <div
-        v-if="store.charityFeedItems.value.length"
-        class="charity-pager"
-      >
-        <button
-          type="button"
-          :disabled="store.charityFeedCurrentPage.value <= 1 || store.charityFeedLoading.value"
-          @click="store.goCharityPage(store.charityFeedCurrentPage.value - 1)"
-        >‹ 上一页</button>
-        <span>
-          第 {{ store.charityFeedCurrentPage.value }} / {{ store.charityFeedTotalPages.value }} 页
-        </span>
-        <button
-          type="button"
-          :disabled="
-            store.charityFeedCurrentPage.value >= store.charityFeedTotalPages.value ||
-            store.charityFeedLoading.value
-          "
-          @click="store.goCharityPage(store.charityFeedCurrentPage.value + 1)"
-        >下一页 ›</button>
-      </div>
-
-      <div
-        v-else-if="!store.charityFeedLoading.value && !store.charityFeedItems.value.length"
+        v-else
         class="charity-monitor-empty"
       >
         <span v-html="icons.heartPulse" />

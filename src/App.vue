@@ -194,13 +194,38 @@ onUnmounted(() => {
           class="library-page"
           aria-labelledby="library-nav"
         >
-          <header class="app-header library-header">
-            <div class="header-inner">
-              <div class="library-primary-nav">
-                <div class="library-heading">
-                  <strong>站点库</strong>
-                  <span>{{ store.filteredSites.value.length }} / {{ store.sites.value.length }}</span>
-                </div>
+          <header class="library-header">
+            <div class="library-header-bar">
+              <div class="library-heading">
+                <span class="library-eyebrow">OpenHub · 站点资料库</span>
+                <h1>站点库</h1>
+                <p>已筛选 {{ store.filteredSites.value.length }} / 共 {{ store.sites.value.length }} 个站点</p>
+              </div>
+              <div class="library-header-actions">
+                <button
+                  class="secondary-button sync-button"
+                  :disabled="store.syncingSites.value || store.syncingModelKeys.value"
+                  :data-tooltip="store.usageFilter.value === 'all'
+                    ? '根据当前存活/跑路状态，从 ldoh 同步站点'
+                    : `同步当前${store.usageFilter.value === 'pending' ? '待定' : '在用'}站点的账号额度`"
+                  @click="store.openSyncDialog()"
+                >
+                  <span v-html="store.usageFilter.value === 'all' ? icons.restore : icons.activity" />
+                  <span>{{ store.usageFilter.value === 'all' ? '同步站点' : '额度同步' }}</span>
+                </button>
+                <button
+                  v-if="store.runawayFilter.value === 'active'"
+                  class="primary-button"
+                  id="add-site"
+                  @click="store.openModal()"
+                >
+                  <span v-html="icons.plus" /><span>添加站点</span>
+                </button>
+              </div>
+            </div>
+
+            <div class="library-toolbar" aria-label="站点筛选">
+              <div class="library-toolbar-main">
                 <div class="filter-segment surface library-usage-switch" role="group" aria-label="站点库视图">
                   <button
                     id="all-usage-filter"
@@ -224,42 +249,43 @@ onUnmounted(() => {
                     @click="store.setUsageFilter('pending')"
                   >待定</button>
                 </div>
+                <label class="search-box library-search">
+                  <span v-html="icons.search" />
+                  <input
+                    id="search-input"
+                    v-model="store.query.value"
+                    type="search"
+                    placeholder="搜索站点、API 地址或标签…"
+                    autocomplete="off"
+                  />
+                  <kbd>⌘ K</kbd>
+                </label>
+                <div class="library-filter-segments">
+                  <div class="filter-segment surface is-runaway" role="group" aria-label="站点状态">
+                    <button
+                      id="active-filter"
+                      type="button"
+                      :class="{ active: store.runawayFilter.value === 'active' }"
+                      :aria-pressed="store.runawayFilter.value === 'active'"
+                      @click="store.setRunawayFilter('active')"
+                    >存活</button>
+                    <button
+                      id="runaway-filter"
+                      type="button"
+                      :class="{ active: store.runawayFilter.value === 'runaway' }"
+                      :aria-pressed="store.runawayFilter.value === 'runaway'"
+                      @click="store.setRunawayFilter('runaway')"
+                    >跑路</button>
+                  </div>
+                  <button
+                    v-if="store.hasFilters.value"
+                    class="text-button library-clear-filters"
+                    id="clear-filter-header"
+                    type="button"
+                    @click="store.clearFilters()"
+                  >清除筛选</button>
+                </div>
               </div>
-              <label class="search-box">
-                <span v-html="icons.search" />
-                <input
-                  id="search-input"
-                  v-model="store.query.value"
-                  type="search"
-                  placeholder="搜索站点、API 地址或标签…"
-                  autocomplete="off"
-                />
-                <kbd>⌘ K</kbd>
-              </label>
-              <div class="header-actions">
-                <button
-                  class="secondary-button sync-button"
-                  :disabled="store.syncingSites.value || store.syncingModelKeys.value"
-                  :data-tooltip="store.usageFilter.value === 'all'
-                    ? '根据当前存活/跑路状态，从 ldoh 同步站点'
-                    : `同步当前${store.usageFilter.value === 'pending' ? '待定' : '在用'}站点的账号额度`"
-                  @click="store.openSyncDialog()"
-                >
-                  <span v-html="store.usageFilter.value === 'all' ? icons.restore : icons.activity" />
-                  <span>{{ store.usageFilter.value === 'all' ? '同步站点' : '额度同步' }}</span>
-                </button>
-                <button
-                  v-if="store.runawayFilter.value === 'active'"
-                  class="primary-button"
-                  id="add-site"
-                  @click="store.openModal()"
-                >
-                  <span v-html="icons.plus" /><span>添加站点</span>
-                </button>
-              </div>
-            </div>
-
-            <div class="library-filters" aria-label="站点筛选">
               <div class="library-filter-selects">
                 <CustomSelect
                   class="library-select"
@@ -289,31 +315,6 @@ onUnmounted(() => {
                   @update:model-value="store.systemTypeFilter.value = $event"
                   aria-label="系统类型筛选"
                 />
-              </div>
-              <div class="library-filter-segments">
-                <div class="filter-segment surface is-runaway" role="group" aria-label="站点状态">
-                  <button
-                    id="active-filter"
-                    type="button"
-                    :class="{ active: store.runawayFilter.value === 'active' }"
-                    :aria-pressed="store.runawayFilter.value === 'active'"
-                    @click="store.setRunawayFilter('active')"
-                  >存活</button>
-                  <button
-                    id="runaway-filter"
-                    type="button"
-                    :class="{ active: store.runawayFilter.value === 'runaway' }"
-                    :aria-pressed="store.runawayFilter.value === 'runaway'"
-                    @click="store.setRunawayFilter('runaway')"
-                  >跑路</button>
-                </div>
-                <button
-                  v-if="store.hasFilters.value"
-                  class="text-button library-clear-filters"
-                  id="clear-filter-header"
-                  type="button"
-                  @click="store.clearFilters()"
-                >清除筛选</button>
               </div>
             </div>
           </header>

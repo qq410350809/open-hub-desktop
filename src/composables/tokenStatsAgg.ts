@@ -276,6 +276,9 @@ export interface TrendDetailItem {
   input: number;
   output: number;
   cache: number;
+  cacheRead: number;
+  cacheWrite: number;
+  cacheHitRate: number | null;
   reasoning: number;
   sessions: number;
 }
@@ -293,11 +296,14 @@ export function buildTrendDetailFromBuckets(
     if (!key) continue;
     const current = map.get(key) || {
       label,
-      total: 0, input: 0, output: 0, cache: 0, reasoning: 0, sessions: 0,
+      total: 0, input: 0, output: 0, cache: 0, cacheRead: 0, cacheWrite: 0, cacheHitRate: null,
+      reasoning: 0, sessions: 0,
     };
     current.total += bucket.totalTokens || 0;
     current.input += bucket.inputTokens || 0;
     current.output += bucket.outputTokens || 0;
+    current.cacheRead += bucket.cachedInputTokens || 0;
+    current.cacheWrite += bucket.cacheCreationInputTokens || 0;
     current.cache += (bucket.cachedInputTokens || 0) + (bucket.cacheCreationInputTokens || 0);
     current.reasoning += bucket.reasoningOutputTokens || 0;
     current.sessions += bucket.conversationCount || 0;
@@ -307,10 +313,13 @@ export function buildTrendDetailFromBuckets(
   if (!span) return [];
   return buildRangeKeys(span.from, span.to, granularity).map(({ key, label }) => {
     const current = map.get(key);
-    return current || {
+    const item = current || {
       label,
-      total: 0, input: 0, output: 0, cache: 0, reasoning: 0, sessions: 0,
+      total: 0, input: 0, output: 0, cache: 0, cacheRead: 0, cacheWrite: 0, cacheHitRate: null,
+      reasoning: 0, sessions: 0,
     };
+    item.cacheHitRate = cacheHitRateOf(item.cacheRead, item.cacheWrite, item.input);
+    return item;
   });
 }
 
@@ -829,6 +838,9 @@ export interface BucketBreakdownTotal {
   inputTokens: number;
   outputTokens: number;
   cacheTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  cacheHitRate: number | null;
   reasoningTokens: number;
   conversations: number;
   costUsd: number;
@@ -841,6 +853,9 @@ function emptyBucketBreakdown(): BucketBreakdownTotal {
     inputTokens: 0,
     outputTokens: 0,
     cacheTokens: 0,
+    cacheReadTokens: 0,
+    cacheWriteTokens: 0,
+    cacheHitRate: null,
     reasoningTokens: 0,
     conversations: 0,
     costUsd: 0,
@@ -853,6 +868,8 @@ function addBucketBreakdown(target: BucketBreakdownTotal, bucket: UsageBucketLik
   target.inputTokens += bucket.inputTokens || 0;
   target.outputTokens += bucket.outputTokens || 0;
   target.cacheTokens += (bucket.cachedInputTokens || 0) + (bucket.cacheCreationInputTokens || 0);
+  target.cacheReadTokens += bucket.cachedInputTokens || 0;
+  target.cacheWriteTokens += bucket.cacheCreationInputTokens || 0;
   target.reasoningTokens += bucket.reasoningOutputTokens || 0;
   target.conversations += bucket.conversationCount || 0;
   target.costUsd += bucket.costUsd || 0;
@@ -870,7 +887,9 @@ export function bucketSourceTotals(buckets: UsageBucketLike[]): SourceTotal[] {
     addBucketBreakdown(current, bucket);
     groups.set(bucket.source, current);
   }
-  return [...groups.values()].sort((a, b) => b.totalTokens - a.totalTokens);
+  return [...groups.values()]
+    .map((item) => ({ ...item, cacheHitRate: cacheHitRateOf(item.cacheReadTokens, item.cacheWriteTokens, item.inputTokens) }))
+    .sort((a, b) => b.totalTokens - a.totalTokens);
 }
 
 // 归一化模型名：去掉斜杠前的厂家前缀（如 "anthropic/claude-sonnet-4" → "claude-sonnet-4"），保留完整模型名
@@ -931,6 +950,8 @@ export function mergeModelTotals(items: ModelTotal[]): ModelTotal[] {
     current.inputTokens += item.inputTokens;
     current.outputTokens += item.outputTokens;
     current.cacheTokens += item.cacheTokens;
+    current.cacheReadTokens += item.cacheReadTokens;
+    current.cacheWriteTokens += item.cacheWriteTokens;
     current.reasoningTokens += item.reasoningTokens;
     current.conversations += item.conversations;
     current.costUsd += item.costUsd;
@@ -950,6 +971,8 @@ export function mergeModelTotals(items: ModelTotal[]): ModelTotal[] {
     target.inputTokens += item.inputTokens;
     target.outputTokens += item.outputTokens;
     target.cacheTokens += item.cacheTokens;
+    target.cacheReadTokens += item.cacheReadTokens;
+    target.cacheWriteTokens += item.cacheWriteTokens;
     target.reasoningTokens += item.reasoningTokens;
     target.conversations += item.conversations;
     target.costUsd += item.costUsd;
@@ -957,7 +980,9 @@ export function mergeModelTotals(items: ModelTotal[]): ModelTotal[] {
     result.set(targetName, target);
   }
 
-  return [...result.values()].sort((a, b) => b.totalTokens - a.totalTokens);
+  return [...result.values()]
+    .map((item) => ({ ...item, cacheHitRate: cacheHitRateOf(item.cacheReadTokens, item.cacheWriteTokens, item.inputTokens) }))
+    .sort((a, b) => b.totalTokens - a.totalTokens);
 }
 
 export function bucketModelTotals(buckets: UsageBucketLike[]): ModelTotal[] {
@@ -967,7 +992,9 @@ export function bucketModelTotals(buckets: UsageBucketLike[]): ModelTotal[] {
     addBucketBreakdown(current, bucket);
     groups.set(bucket.model, current);
   }
-  return [...groups.values()].sort((a, b) => b.totalTokens - a.totalTokens);
+  return [...groups.values()]
+    .map((item) => ({ ...item, cacheHitRate: cacheHitRateOf(item.cacheReadTokens, item.cacheWriteTokens, item.inputTokens) }))
+    .sort((a, b) => b.totalTokens - a.totalTokens);
 }
 
 // —— 数字格式化 ——
@@ -999,4 +1026,10 @@ export function formatCost(value?: number | null) {
 export function formatRate(value?: number | null) {
   if (value == null) return "—";
   return `${Math.round(Number(value) * 100)}%`;
+}
+
+// 缓存命中率：缓存读取 token 占（缓存读取 + 缓存写入 + 全新输入）的比例；无输入返回 null。
+export function cacheHitRateOf(cacheRead: number, cacheWrite: number, freshInput: number): number | null {
+  const total = cacheRead + cacheWrite + freshInput;
+  return total > 0 ? cacheRead / total : null;
 }

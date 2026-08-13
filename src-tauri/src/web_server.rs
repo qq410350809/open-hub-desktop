@@ -144,16 +144,29 @@ fn generate_token() -> String {
 }
 
 fn serve_loop(listener: TcpListener, app: AppHandle, handle: Arc<WebServerHandle>) {
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
+    // 非阻塞 accept + 轮询 running：stop() 后能及时退出循环并释放端口。
+    let _ = listener.set_nonblocking(true);
+    while handle.running.load(Ordering::Relaxed) {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                let _ = stream.set_nonblocking(false);
                 let app = app.clone();
                 let handle = handle.clone();
                 std::thread::spawn(move || handle_connection(&app, &handle, stream));
             }
-            Err(_) => continue,
+            Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(_) => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
         }
     }
+    handle.running.store(false, Ordering::Relaxed);
+}
+
+/// 停止轻量模式 HTTP 服务：置 running=false，后台 accept 循环在下一轮退出并释放端口。
+pub fn stop(handle: &Arc<WebServerHandle>) {
     handle.running.store(false, Ordering::Relaxed);
 }
 

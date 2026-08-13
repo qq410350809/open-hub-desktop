@@ -19,6 +19,7 @@ interface LiveAccountKeys {
   accountName: string;
   username: string;
   keys: string[];
+  keyGroups?: Record<string, string>;
   error: string;
 }
 
@@ -133,6 +134,22 @@ async function copyModelId(modelId: string) {
 async function copyApiKey(key: string, index: number, accountName: string) {
   await store.copyAddress(key, `${accountName} API Key ${index + 1}`);
 }
+
+function maskApiKey(key: string): string {
+  const value = key.trim();
+  if (!value) return "—";
+  if (value.length <= 6) return `${"•".repeat(6)}`;
+  const prefixLength = value.startsWith("sk-") ? 7 : 4;
+  const suffixLength = Math.min(4, Math.max(2, Math.floor(value.length / 8)));
+  if (value.length <= prefixLength + suffixLength) {
+    return `${value.slice(0, 4)}${"•".repeat(6)}`;
+  }
+  return `${value.slice(0, prefixLength)}${"•".repeat(8)}${value.slice(-suffixLength)}`;
+}
+
+function keyGroup(account: LiveAccountKeys, key: string): string {
+  return account.keyGroups?.[key]?.trim() || "默认分组";
+}
 </script>
 
 <template>
@@ -217,7 +234,10 @@ async function copyApiKey(key: string, index: number, accountName: string) {
                   <small>{{ account.keys.length }} 个</small>
                 </div>
                 <div v-for="(key, index) in account.keys" :key="key" class="site-api-key-row">
-                  <code :title="key">{{ key }}</code>
+                  <div class="site-api-key-value">
+                    <code :title="`已脱敏 · ${keyGroup(account, key)}`">{{ maskApiKey(key) }}</code>
+                    <small class="site-api-key-group" :title="`Key 分组：${keyGroup(account, key)}`">{{ keyGroup(account, key) }}</small>
+                  </div>
                   <button
                     type="button"
                     class="copy-icon-btn"

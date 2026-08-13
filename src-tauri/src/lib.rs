@@ -347,6 +347,7 @@ mod tests {
             }],
             source: "newapi-key".into(),
             keys: vec!["sk-one".into(), "sk-two".into()],
+            key_groups: HashMap::new(),
         };
         cache_profile_api_counts(&database, Some("site-a"), Some("Default"), result).unwrap();
         let connection = database.0.lock().unwrap();
@@ -585,20 +586,24 @@ mod tests {
             "success": true,
             "data": {
                 "items": [
-                    { "key": "sk-newapi-enabled", "status": 1 },
+                    { "key": "sk-newapi-enabled", "status": 1, "group": "vip" },
                     { "key": "sk-newapi-disabled", "status": 0 },
                     { "key": "sk-newapi-expired", "status": 1, "expired_time": 1 }
                 ]
             }
         });
         assert_eq!(parse_api_keys(&newapi), ["sk-newapi-enabled"]);
+        assert_eq!(
+            parse_api_key_groups(&newapi).get("sk-newapi-enabled"),
+            Some(&"vip".to_string())
+        );
 
         let sub2api = serde_json::json!({
             "data": {
                 "keys": [
                     { "api_key": "sk-sub2api-enabled", "is_active": true },
                     { "apiKey": "sk-sub2api-disabled", "is_active": false },
-                    { "secret_key": "raw-key-value", "key_prefix": "sub2-" },
+                    { "secret_key": "raw-key-value", "key_prefix": "sub2-", "group_name": "pro" },
                     { "key": "sk-****masked" }
                 ]
             }
@@ -607,6 +612,9 @@ mod tests {
             parse_api_keys(&sub2api),
             ["raw-key-value", "sk-sub2api-enabled", "sub2-raw-key-value"]
         );
+        let sub2api_groups = parse_api_key_groups(&sub2api);
+        assert_eq!(sub2api_groups.get("raw-key-value"), Some(&"pro".to_string()));
+        assert_eq!(sub2api_groups.get("sub2-raw-key-value"), Some(&"pro".to_string()));
 
         let masked_newapi = serde_json::json!({
             "data": {
@@ -1045,6 +1053,15 @@ pub fn run() {
 
             Ok(())
         })
+        .on_window_event(|window, event| {
+            // 关闭主窗口视为退出整个应用：macOS 默认关窗不退出，
+            // 若进程常驻，轻量模式服务会一直占用端口。
+            if window.label() == "main" {
+                if let tauri::WindowEvent::CloseRequested { .. } = event {
+                    window.app_handle().exit(0);
+                }
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             site_crud::list_library,
             site_crud::create_site,
@@ -1113,6 +1130,11 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building Tauri application")
         .run(|app_handle, event| {
+            // 退出应用时同步停止轻量模式服务，避免端口被常驻进程占用。
+            if let tauri::RunEvent::ExitRequested { .. } = event {
+                let server = app_handle.state::<std::sync::Arc<web_server::WebServerHandle>>();
+                web_server::stop(&server);
+            }
             // macOS：点击 Dock 图标时重新显示轻量模式下隐藏的窗口。
             #[cfg(target_os = "macos")]
             if let tauri::RunEvent::Reopen { .. } = event {

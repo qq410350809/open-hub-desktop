@@ -47,6 +47,7 @@ export const icons = {
   chart: icon('<path d="M4 19h16M8 19V10M13 19V5M18 19v-7"></path>'),
   flame: icon('<path d="M12 2c1 4 4 6 4 10a4 4 0 0 1-8 0c0-2 1-3 1-4-3 1-5 3-5 7a7 7 0 0 0 14 0c0-5-4-8-6-13Z"></path>'),
   activity: icon('<path d="M22 12h-4l-3 8-6-16-3 8H2"></path>'),
+  chat: icon('<path d="M21 12a8 8 0 0 1-8 8H4l2-3.2A8 8 0 1 1 21 12Z"></path><path d="M8.5 11h.01M12 11h.01M15.5 11h.01"></path>'),
 } as const;
 
 export type IconKey = keyof typeof icons;
