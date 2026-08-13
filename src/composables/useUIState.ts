@@ -5,7 +5,7 @@ import type { SiteRecord, SiteLinkKind } from "../types";
 const { sites } = useLibrary();
 
 // 页面状态
-const page = ref<"library" | "modelparams" | "charity" | "proxy" | "tokenstats" | "settings">("library");
+const page = ref<"library" | "modelparams" | "charity" | "proxy" | "tokenstats" | "settings">("tokenstats");
 const editingId = ref<string | null>(null);
 const activeTab = ref<"basic" | "features" | "maintenance">("basic");
 
@@ -34,7 +34,7 @@ const editingSite: ComputedRef<SiteRecord | null> = computed(() =>
 );
 
 function openSettings() { page.value = "settings"; }
-function closeSettings() { page.value = "library"; }
+function closeSettings() { page.value = "tokenstats"; }
 function openModelParams() { page.value = "modelparams"; }
 function openLibrary() { page.value = "library"; }
 function openCharityMonitor() { page.value = "charity"; }

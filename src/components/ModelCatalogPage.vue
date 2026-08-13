@@ -31,18 +31,6 @@ const typeTabs = [
   { key: "other", label: "其他", icon: "more" },
 ] as const;
 
-const typeOrder: Record<string, number> = {
-  chat: 0,
-  completion: 1,
-  embedding: 2,
-  image_generation: 3,
-  audio_speech: 4,
-  audio_transcription: 5,
-  rerank: 6,
-  moderation: 7,
-  search: 8,
-};
-
 const typeCounts = computed(() => {
   const counts: Record<string, number> = {};
   for (const model of store.modelCatalog.value.models) {
@@ -85,12 +73,6 @@ const filteredModels = computed(() => {
         model.mode,
         ...model.capabilities,
       ].join(" ").toLocaleLowerCase("zh-CN").includes(term);
-    })
-    .sort((a, b) => {
-      const ma = typeOrder[a.mode] ?? 99;
-      const mb = typeOrder[b.mode] ?? 99;
-      if (ma !== mb) return ma - mb;
-      return a.displayName.localeCompare(b.displayName, "zh-CN");
     });
 });
 

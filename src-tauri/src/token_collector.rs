@@ -11,13 +11,14 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
-const CACHE_VERSION: i64 = 5;
+const CACHE_VERSION: i64 = 6;
 const CACHE_TTL: Duration = Duration::from_secs(5);
 const UNKNOWN_CODEX_MODEL: &str = "codex-unknown-model";
 const UNKNOWN_CLAUDE_MODEL: &str = "claude-unknown-model";
 const UNKNOWN_OPENCODE_MODEL: &str = "opencode-unknown-model";
 const UNKNOWN_COMMAND_CODE_MODEL: &str = "command-code-unknown-model";
 const UNKNOWN_ANTIGRAVITY_MODEL: &str = "antigravity-unknown-model";
+const UNKNOWN_KIRO_MODEL: &str = "kiro-auto-model";
 const LOCAL_ESTIMATED_CONTEXT_LIMIT: i64 = 64_000;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -295,10 +296,26 @@ fn antigravity_fingerprint(path: &Path) -> FileFingerprint {
     }
 }
 
+fn kiro_session_metadata_path(path: &Path) -> PathBuf {
+    path.parent()
+        .map(|parent| parent.join("session.json"))
+        .unwrap_or_else(|| path.with_file_name("session.json"))
+}
+
+fn kiro_fingerprint(path: &Path) -> FileFingerprint {
+    let transcript = fingerprint(path);
+    let metadata = fingerprint(&kiro_session_metadata_path(path));
+    FileFingerprint {
+        size: transcript.size.saturating_add(metadata.size),
+        modified_ms: transcript.modified_ms.max(metadata.modified_ms),
+    }
+}
+
 fn source_file_fingerprint(source: &str, path: &Path) -> FileFingerprint {
     match source {
         "command-code" => command_code_fingerprint(path),
         "antigravity" => antigravity_fingerprint(path),
+        "kiro" => kiro_fingerprint(path),
         _ => fingerprint(path),
     }
 }
@@ -1100,6 +1117,179 @@ fn antigravity_fallback_project(path: &Path) -> String {
         })
         .unwrap_or("Antigravity")
         .to_string()
+}
+
+fn kiro_session_id(path: &Path, metadata: &JsonValue) -> String {
+    metadata
+        .get("id")
+        .and_then(JsonValue::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            path.parent()
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str())
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_string)
+        })
+        .or_else(|| {
+            path.file_stem()
+                .and_then(|name| name.to_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "kiro-session".to_string())
+}
+
+fn kiro_project_from_metadata(metadata: &JsonValue) -> String {
+    metadata
+        .get("workspacePaths")
+        .and_then(JsonValue::as_array)
+        .and_then(|paths| paths.iter().find_map(JsonValue::as_str))
+        .map(|path| basename_or_fallback(path, "Kiro"))
+        .unwrap_or_else(|| "Kiro".to_string())
+}
+
+fn kiro_model_from_metadata(metadata: &JsonValue) -> String {
+    metadata
+        .get("modelId")
+        .and_then(JsonValue::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| UNKNOWN_KIRO_MODEL.to_string())
+}
+
+fn parse_kiro_file(path: &Path) -> CachedFile {
+    let file_fingerprint = kiro_fingerprint(path);
+    let metadata = fs::read_to_string(kiro_session_metadata_path(path))
+        .ok()
+        .and_then(|text| serde_json::from_str::<JsonValue>(&text).ok())
+        .unwrap_or(JsonValue::Null);
+    let session_id = kiro_session_id(path, &metadata);
+    let project_key = kiro_project_from_metadata(&metadata);
+    let model = kiro_model_from_metadata(&metadata);
+    let mut first_ts = String::new();
+    let mut last_ts = String::new();
+    let mut visible_context_tokens = 0i64;
+    let mut turns = 0i64;
+    let mut assistant_responses = 0i64;
+    let mut events = Vec::<UsageEvent>::new();
+
+    let Ok(text) = fs::read_to_string(path) else {
+        return CachedFile {
+            fingerprint: file_fingerprint,
+            ..Default::default()
+        };
+    };
+    for (index, line) in text.lines().enumerate() {
+        let Ok(value) = serde_json::from_str::<JsonValue>(line) else {
+            continue;
+        };
+        let timestamp = value
+            .get("timestamp")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("")
+            .to_string();
+        update_bounds(&mut first_ts, &mut last_ts, &timestamp);
+        let payload = value.get("payload").unwrap_or(&JsonValue::Null);
+        let payload_type = payload
+            .get("type")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("");
+        let event_id = value
+            .get("id")
+            .and_then(JsonValue::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{session_id}:{payload_type}:{index}"));
+
+        match payload_type {
+            "user" => {
+                let content = payload.get("content").unwrap_or(&JsonValue::Null);
+                let content_tokens = estimate_local_content_tokens(content);
+                if !claude_user_is_human(content) {
+                    continue;
+                }
+                turns += 1;
+                events.push(UsageEvent {
+                    id: format!("u:{event_id}"),
+                    source: "kiro".to_string(),
+                    model: model.clone(),
+                    project_key: project_key.clone(),
+                    timestamp,
+                    conversation_count: 1,
+                    ..Default::default()
+                });
+                visible_context_tokens = visible_context_tokens.saturating_add(content_tokens);
+            }
+            "assistant" => {
+                assistant_responses += 1;
+                let content = payload.get("content").unwrap_or(&JsonValue::Null);
+                let output_tokens = estimate_local_content_tokens(content);
+                let input_tokens = visible_context_tokens
+                    .saturating_add(32)
+                    .min(LOCAL_ESTIMATED_CONTEXT_LIMIT);
+                let total_tokens = input_tokens.saturating_add(output_tokens);
+                events.push(UsageEvent {
+                    id: event_id,
+                    source: "kiro".to_string(),
+                    model: model.clone(),
+                    project_key: project_key.clone(),
+                    timestamp,
+                    input_tokens,
+                    output_tokens,
+                    total_tokens,
+                    estimated_tokens: total_tokens,
+                    ..Default::default()
+                });
+                visible_context_tokens = visible_context_tokens.saturating_add(output_tokens);
+            }
+            "tool_call" | "tool_result" => {
+                visible_context_tokens =
+                    visible_context_tokens.saturating_add(estimate_local_content_tokens(payload));
+            }
+            _ => {}
+        }
+    }
+
+    let tokens = events
+        .iter()
+        .fold(TokenSessionTokens::default(), |mut total, event| {
+            total.input_tokens += event.input_tokens;
+            total.cached_input_tokens += event.cached_input_tokens;
+            total.cache_creation_input_tokens += event.cache_creation_input_tokens;
+            total.output_tokens += event.output_tokens;
+            total.reasoning_output_tokens += event.reasoning_output_tokens;
+            total.total_tokens += event.total_tokens;
+            total
+        });
+    let mut session = token_session(
+        session_id,
+        "kiro",
+        project_key,
+        model,
+        first_ts,
+        last_ts,
+        turns,
+        tokens,
+        0.0,
+    );
+    session.productive = turns > 0 && assistant_responses > 0;
+    session.provenance = json!({
+        "source": "openhub-local-collector",
+        "confidence": "estimated",
+        "privacy": "metadata-only",
+        "tokenUsage": "estimated-kiro-local-context",
+        "assistantResponses": assistant_responses,
+        "estimationMethod": "visible-context-chars-v1",
+        "estimatedContextLimit": LOCAL_ESTIMATED_CONTEXT_LIMIT,
+        "modelId": metadata.get("modelId").cloned().unwrap_or(JsonValue::Null)
+    });
+    CachedFile {
+        fingerprint: file_fingerprint,
+        events,
+        sessions: vec![session],
+    }
 }
 
 fn parse_antigravity_file(path: &Path) -> CachedFile {
@@ -2034,6 +2224,18 @@ fn collect_uncached(force: bool) -> Result<CollectedData, String> {
             .into_iter()
             .map(|path| ("antigravity".to_string(), path)),
     );
+    let kiro_root = home.join(".kiro").join("sessions");
+    let mut kiro_files = Vec::new();
+    collect_jsonl_files(
+        &kiro_root,
+        &|path| path.file_name().and_then(|name| name.to_str()) == Some("messages.jsonl"),
+        &mut kiro_files,
+    );
+    files.extend(
+        kiro_files
+            .into_iter()
+            .map(|path| ("kiro".to_string(), path)),
+    );
     files.sort_by(|left, right| left.1.cmp(&right.1));
 
     let live_paths = files
@@ -2066,6 +2268,7 @@ fn collect_uncached(force: bool) -> Result<CollectedData, String> {
             "codex" => parse_codex_file(&path),
             "command-code" => parse_command_code_file(&path),
             "antigravity" => parse_antigravity_file(&path),
+            "kiro" => parse_kiro_file(&path),
             _ => parse_claude_file(&path),
         };
         envelope.files.insert(key, parsed);
@@ -2286,7 +2489,7 @@ pub(crate) fn build_token_stats(
             "source": "openhub-token-database",
             "privacy": "metadata-only",
             "independent": true,
-            "sources": ["codex", "claude", "command-code", "antigravity", "opencode", "mimo", "zcode", "catpawai"]
+            "sources": ["codex", "claude", "command-code", "antigravity", "kiro", "opencode", "mimo", "zcode", "catpawai"]
         }),
     }
 }
@@ -2473,6 +2676,50 @@ mod tests {
         assert!(!is_command_code_transcript_path(Path::new(
             "session.meta.json"
         )));
+    }
+
+    #[test]
+    fn kiro_messages_estimate_visible_context_and_ignore_credit_summary() {
+        let dir = temp_command_code_dir("kiro");
+        let session_dir = dir.join("session-kiro");
+        fs::create_dir_all(&session_dir).unwrap();
+        fs::write(
+            session_dir.join("session.json"),
+            r#"{"id":"sess-kiro","workspacePaths":["/tmp/OpenHub"],"modelId":"auto"}"#,
+        )
+        .unwrap();
+        let path = session_dir.join("messages.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"id":"u1","timestamp":"2026-08-13T05:00:00.000Z","payload":{"type":"user","content":"hello"}}"#,
+                "\n",
+                r#"{"id":"t1","timestamp":"2026-08-13T05:00:01.000Z","payload":{"type":"tool_result","content":"local result"}}"#,
+                "\n",
+                r#"{"id":"a1","timestamp":"2026-08-13T05:00:02.000Z","payload":{"type":"assistant","content":"done"}}"#,
+                "\n",
+                r#"{"id":"s1","timestamp":"2026-08-13T05:00:03.000Z","payload":{"type":"usage_summary","status":"success","requestIds":["req-1"],"promptTurnSummaries":[{"unit":"credit","usage":1.2}]}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+
+        let parsed = parse_kiro_file(&path);
+        assert_eq!(parsed.sessions.len(), 1);
+        let session = &parsed.sessions[0];
+        assert_eq!(session.source, "kiro");
+        assert_eq!(session.project_key, "OpenHub");
+        assert_eq!(session.model, "auto");
+        assert_eq!(session.turns, 1);
+        assert_eq!(parsed.events.len(), 2);
+        let assistant = parsed.events.iter().find(|event| event.id == "a1").unwrap();
+        assert!(assistant.estimated_tokens > 0);
+        assert_eq!(assistant.total_tokens, assistant.estimated_tokens);
+        assert_eq!(
+            session.provenance.get("tokenUsage"),
+            Some(&json!("estimated-kiro-local-context"))
+        );
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

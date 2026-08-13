@@ -234,10 +234,8 @@ pub(crate) fn parse_api_key_groups(value: &serde_json::Value) -> HashMap<String,
 }
 
 pub(crate) fn parse_newapi_token_ids(value: &serde_json::Value) -> Vec<String> {
-    let Some(items) = json_array_at(
-        value,
-        &["", "/data", "/data/items", "/items", "/result/items"],
-    ) else {
+    let Some(items) = json_array_at(value, &["", "/data", "/data/items", "/items", "/result/items"])
+    else {
         return Vec::new();
     };
     let mut ids = items
@@ -259,8 +257,10 @@ pub(crate) fn parse_newapi_token_ids(value: &serde_json::Value) -> Vec<String> {
 }
 
 pub(crate) fn parse_newapi_token_groups(value: &serde_json::Value) -> HashMap<String, String> {
-    let Some(items) = json_array_at(value, &["", "/data", "/data/items", "/items", "/result/items"])
-    else {
+    let Some(items) = json_array_at(
+        value,
+        &["", "/data", "/data/items", "/items", "/result/items"],
+    ) else {
         return HashMap::new();
     };
     items

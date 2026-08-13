@@ -50,13 +50,7 @@ const filteredSites: ComputedRef<SiteRecord[]> = computed(() => {
         .join(" ")
         .toLocaleLowerCase("zh-CN");
       return !q || content.includes(q);
-    })
-    .sort(
-      (a, b) =>
-        Number(b.isPersonal) - Number(a.isPersonal) ||
-        Number(b.isPending) - Number(a.isPending) ||
-        new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime(),
-    );
+    });
 });
 
 const activeCount: ComputedRef<number> = computed(() => sites.value.filter((site) => !site.isRunaway).length);

@@ -104,7 +104,7 @@ function onKeydown(event: KeyboardEvent) {
     else if (store.linkDialogOpen.value) store.closeLinkDialog();
     else if (store.modalOpen.value) store.closeModal();
     else if (store.page.value === "settings") store.closeSettings();
-    else if (["modelparams", "charity", "proxy", "tokenstats"].includes(store.page.value)) store.openLibrary();
+    else if (["library", "modelparams", "charity", "proxy", "tokenstats"].includes(store.page.value)) store.openTokenStats();
   }
 }
 

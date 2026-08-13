@@ -157,12 +157,12 @@ function formatRelativeActivity(value?: string, fallback?: string) {
 }
 
 const topicColumns: AppTableColumn[] = [
-  { key: "title", title: "话题", width: "minmax(220px,1fr)" },
-  { key: "author", title: "作者", width: "120px" },
-  { key: "publishedAt", title: "创建时间", width: "120px" },
-  { key: "replyCount", title: "回复", width: "70px", align: "right", sortable: true },
-  { key: "views", title: "浏览量", width: "80px", align: "right", sortable: true },
-  { key: "lastActivityAt", title: "活动", width: "110px" },
+  { key: "title", title: "话题", width: "minmax(220px,1fr)", sortable: false },
+  { key: "author", title: "作者", width: "120px", sortable: false },
+  { key: "publishedAt", title: "创建时间", width: "120px", sortable: false },
+  { key: "replyCount", title: "回复", width: "70px", align: "right", sortable: false },
+  { key: "views", title: "浏览量", width: "80px", align: "right", sortable: false },
+  { key: "lastActivityAt", title: "活动", width: "110px", sortable: false },
 ];
 
 function topicRowClass(row: { isNew?: boolean; pinned?: boolean }) {

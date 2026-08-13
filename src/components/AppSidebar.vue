@@ -10,6 +10,14 @@ const { preferences, updatePreferences } = usePreferences();
 
 const navItems = computed(() => [
   {
+    id: "tokenstats",
+    label: "Token 统计",
+    icon: icons.chart,
+    active: store.page.value === "tokenstats",
+    badge: todayTokenBadge.value,
+    onClick: () => store.openTokenStats(),
+  },
+  {
     id: "library",
     label: "站点库",
     icon: icons.database,
@@ -49,14 +57,6 @@ const navItems = computed(() => [
       ? String(store.proxyPool.value.nodeCount)
       : "",
     onClick: () => store.openProxyPool(),
-  },
-  {
-    id: "tokenstats",
-    label: "Token 统计",
-    icon: icons.chart,
-    active: store.page.value === "tokenstats",
-    badge: todayTokenBadge.value,
-    onClick: () => store.openTokenStats(),
   },
 ]);
 

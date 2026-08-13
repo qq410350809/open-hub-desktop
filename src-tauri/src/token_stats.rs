@@ -1521,6 +1521,72 @@ fn antigravity_on_line(
     }
 }
 
+fn kiro_on_line(
+    value: &JsonValue,
+    map: &mut BTreeMap<String, HealthAgg>,
+    sources: &mut BTreeMap<String, HealthAgg>,
+) {
+    let payload = value.get("payload").unwrap_or(&JsonValue::Null);
+    let type_name = payload
+        .get("type")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("");
+    let ts = value
+        .get("timestamp")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("");
+    let Some(hour) = hour_key_from_ts(ts) else {
+        return;
+    };
+    match type_name {
+        "user" => {
+            let content = payload.get("content").unwrap_or(&JsonValue::Null);
+            if claude_user_is_human(content) {
+                record(map, sources, "kiro", hour, 1, 0, 0, 0);
+            }
+        }
+        "usage_summary" => {
+            let request_count = payload
+                .get("requestIds")
+                .and_then(JsonValue::as_array)
+                .map(|ids| ids.len() as i64)
+                .unwrap_or(0);
+            if request_count <= 0 {
+                return;
+            }
+            let status = payload
+                .get("status")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if status == "failed" || status == "error" {
+                record(
+                    map,
+                    sources,
+                    "kiro",
+                    hour,
+                    0,
+                    request_count,
+                    0,
+                    request_count,
+                );
+            } else {
+                record(
+                    map,
+                    sources,
+                    "kiro",
+                    hour,
+                    0,
+                    request_count,
+                    request_count,
+                    0,
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
 fn assistant_tokens_positive(data: &JsonValue) -> bool {
     let Some(tokens) = data.get("tokens") else {
         return false;
@@ -1734,6 +1800,20 @@ fn collect_antigravity_activity_incremental(
         },
         cursors,
         &mut |value| antigravity_on_line(value, map, sources),
+    );
+}
+
+fn collect_kiro_activity_incremental(
+    root: &Path,
+    map: &mut BTreeMap<String, HealthAgg>,
+    sources: &mut BTreeMap<String, HealthAgg>,
+    cursors: &mut FileCursorMap,
+) {
+    collect_jsonl_incremental(
+        root,
+        &|path| path.file_name().and_then(|name| name.to_str()) == Some("messages.jsonl"),
+        cursors,
+        &mut |value| kiro_on_line(value, map, sources),
     );
 }
 
@@ -2162,6 +2242,12 @@ pub(crate) fn collect_request_health_snapshot(force: bool) -> Result<RequestHeal
         collect_antigravity_activity_incremental(&gemini_root, &mut map, &mut sources, cursors);
     }
 
+    let kiro_root = home.join(".kiro").join("sessions");
+    if kiro_root.is_dir() {
+        let cursors = envelope.file_cursors.entry("kiro".to_string()).or_default();
+        collect_kiro_activity_incremental(&kiro_root, &mut map, &mut sources, cursors);
+    }
+
     let report = maps_to_report(map, sources);
     envelope.report = report.clone();
     write_persisted_activity_cache(&envelope);
@@ -2401,6 +2487,38 @@ mod activity_tests {
         assert_eq!(source.dialogues, 1);
         assert_eq!(source.requests, 2);
         assert_eq!(source.success, 2);
+    }
+
+    #[test]
+    fn kiro_activity_uses_request_ids_and_ignores_credit_amount() {
+        let mut map = BTreeMap::new();
+        let mut sources = BTreeMap::new();
+        kiro_on_line(
+            &json!({
+                "timestamp": "2026-08-13T05:00:00.000Z",
+                "payload": {"type": "user", "content": "hello"}
+            }),
+            &mut map,
+            &mut sources,
+        );
+        kiro_on_line(
+            &json!({
+                "timestamp": "2026-08-13T05:00:02.000Z",
+                "payload": {
+                    "type": "usage_summary",
+                    "status": "success",
+                    "requestIds": ["a", "b"],
+                    "promptTurnSummaries": [{"unit": "credit", "usage": 99.0}]
+                }
+            }),
+            &mut map,
+            &mut sources,
+        );
+        let source = sources.get("kiro").unwrap();
+        assert_eq!(source.dialogues, 1);
+        assert_eq!(source.requests, 2);
+        assert_eq!(source.success, 2);
+        assert_eq!(source.failed, 0);
     }
 
     #[test]
