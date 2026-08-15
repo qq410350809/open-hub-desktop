@@ -6,9 +6,10 @@ import { runCommand } from "./useLibrary";
 const isTauri = "__TAURI_INTERNALS__" in window;
 
 const emptyState = (): ProxyPoolState => ({
-  subscriptions: [], nodes: [], activeNodeId: "", activeNode: null,
+  subscriptions: [], nodes: [], channels: [], defaultChannelId: "default",
+  activeNodeId: "", activeNode: null,
   enabled: false, ignoreAddresses: "localhost,127.0.0.1,::1,.local,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16",
-  speedTestUrl: "https://cp.cloudflare.com/generate_204", runtimeAvailable: false,
+  speedTestUrl: "http://www.gstatic.com/generate_204", runtimeAvailable: false,
   runtimePath: "", runtimeError: "", nodeCount: 0, subscriptionCount: 0,
   invalidNodeCount: 0,
 });
@@ -17,6 +18,7 @@ const proxyPool = ref<ProxyPoolState>(emptyState());
 const proxyPoolLoading = ref(false);
 const proxyPoolError = ref("");
 const proxyPoolBusyId = ref("");
+const channelTestBusyId = ref("");
 // 节点切换是独立状态，不再占用全局 busy，避免整片节点卡片变灰。
 const proxyPoolSwitchingNodeId = ref("");
 let desiredProxyNodeId = "";
@@ -216,10 +218,10 @@ async function refreshAllProxySubscriptions() {
   return { succeeded: ids.length - failed, failed, discarded };
 }
 
-async function saveProxyPoolSettings(ignoreAddresses: string, speedTestUrl: string) {
+async function saveProxyPoolSettings(ignoreAddresses: string) {
   proxyPoolError.value = "";
   try {
-    proxyPool.value = await runCommand<ProxyPoolState>("set_proxy_pool_settings", { ignoreAddresses, speedTestUrl });
+    proxyPool.value = await runCommand<ProxyPoolState>("set_proxy_pool_settings", { ignoreAddresses });
     bumpProxyNodesRevision();
   } catch (error) {
     proxyPoolError.value = String(error);
@@ -442,6 +444,107 @@ async function testProxyNodes(nodeIds: string[], busyId = "test-selection") {
   return runProxyNodeBatch(nodeIds, busyId);
 }
 
+async function saveProxyChannel(name: string, id?: string) {
+  proxyPoolBusyId.value = "channel-save";
+  proxyPoolError.value = "";
+  try {
+    proxyPool.value = await runCommand<ProxyPoolState>("save_proxy_channel", {
+      id: id || null,
+      name,
+    });
+    bumpProxyNodesRevision();
+    return proxyPool.value;
+  } catch (error) {
+    proxyPoolError.value = String(error);
+    throw error;
+  } finally {
+    if (proxyPoolBusyId.value === "channel-save") proxyPoolBusyId.value = "";
+  }
+}
+
+async function deleteProxyChannel(id: string) {
+  proxyPoolBusyId.value = "channel-delete";
+  proxyPoolError.value = "";
+  try {
+    proxyPool.value = await runCommand<ProxyPoolState>("delete_proxy_channel", { id });
+    bumpProxyNodesRevision();
+    return proxyPool.value;
+  } catch (error) {
+    proxyPoolError.value = String(error);
+    throw error;
+  } finally {
+    if (proxyPoolBusyId.value === "channel-delete") proxyPoolBusyId.value = "";
+  }
+}
+
+async function setProxyChannelNode(channelId: string, nodeId: string) {
+  proxyPoolBusyId.value = "channel-node";
+  proxyPoolError.value = "";
+  try {
+    proxyPool.value = await runCommand<ProxyPoolState>("set_proxy_channel_node", { channelId, nodeId });
+    bumpProxyNodesRevision();
+    return proxyPool.value;
+  } catch (error) {
+    proxyPoolError.value = String(error);
+    throw error;
+  } finally {
+    if (proxyPoolBusyId.value === "channel-node") proxyPoolBusyId.value = "";
+  }
+}
+
+async function assignAccountProxyChannel(profileId: string, channelId: string) {
+  proxyPoolBusyId.value = "channel-assign";
+  proxyPoolError.value = "";
+  try {
+    proxyPool.value = await runCommand<ProxyPoolState>("assign_account_proxy_channel", {
+      profileId,
+      channelId,
+    });
+    bumpProxyNodesRevision();
+    return proxyPool.value;
+  } catch (error) {
+    proxyPoolError.value = String(error);
+    throw error;
+  } finally {
+    if (proxyPoolBusyId.value === "channel-assign") proxyPoolBusyId.value = "";
+  }
+}
+
+async function unassignAccountProxyChannel(profileId: string) {
+  proxyPoolBusyId.value = "channel-assign";
+  proxyPoolError.value = "";
+  try {
+    proxyPool.value = await runCommand<ProxyPoolState>("unassign_account_proxy_channel", {
+      profileId,
+    });
+    bumpProxyNodesRevision();
+    return proxyPool.value;
+  } catch (error) {
+    proxyPoolError.value = String(error);
+    throw error;
+  } finally {
+    if (proxyPoolBusyId.value === "channel-assign") proxyPoolBusyId.value = "";
+  }
+}
+
+async function testProxyChannelNodes(channelId: string) {
+  const busyId = `test-channel-${channelId}`;
+  channelTestBusyId.value = busyId;
+  proxyPoolError.value = "";
+  try {
+    proxyPool.value = await runCommand<ProxyPoolState>("test_proxy_channel_nodes", {
+      channelId,
+    });
+    bumpProxyNodesRevision();
+    return proxyPool.value;
+  } catch (error) {
+    proxyPoolError.value = String(error);
+    throw error;
+  } finally {
+    if (channelTestBusyId.value === busyId) channelTestBusyId.value = "";
+  }
+}
+
 async function cancelProxyNodeTests() {
   // 取消必须瞬时响应：只发信号，不阻塞在测速主命令上。
   proxyTestCancelRequested.value = true;
@@ -483,11 +586,13 @@ async function deleteInvalidProxyNodes() {
 
 export function useProxyPool() {
   return {
-    proxyPool, proxyPoolLoading, proxyPoolError, proxyPoolBusyId, proxyPoolSwitchingNodeId, testingNodeIds, proxyTestProgress, proxyTestCancelling, proxyNodesRevision, proxySourceProgress, proxyPoolActive,
+    proxyPool, proxyPoolLoading, proxyPoolError, proxyPoolBusyId, channelTestBusyId, proxyPoolSwitchingNodeId, testingNodeIds, proxyTestProgress, proxyTestCancelling, proxyNodesRevision, proxySourceProgress, proxyPoolActive,
     loadProxyPool, saveProxySubscription, deleteProxySubscription, refreshProxySubscription,
     refreshAllProxySubscriptions, saveProxyPoolSettings, activateProxyNode, clearActiveProxyNode,
     analyzeProxyNodes,
     deleteInvalidProxyNodes,
     testProxyNode, testProxyNodes, testAllProxyNodes, cancelProxyNodeTests,
+    saveProxyChannel, deleteProxyChannel, setProxyChannelNode,
+    assignAccountProxyChannel, unassignAccountProxyChannel, testProxyChannelNodes,
   };
 }

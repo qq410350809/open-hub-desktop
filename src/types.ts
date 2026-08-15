@@ -45,6 +45,7 @@ export interface SiteRecord {
   hasPendingReport: boolean;
   isPersonal: boolean;
   isPending: boolean;
+  useProxyPool: boolean;
   favorite: boolean;
   hidden: boolean;
   updatedAt: string;
@@ -251,7 +252,8 @@ export const SYSTEM_TYPES: { value: string; text: string }[] = [
   { value: "done-hub", text: "Done Hub" },
   { value: "one-hub", text: "One Hub" },
   { value: "veloera", text: "Veloera" },
-  { value: "new-api", text: "NewAPI" },
+  { value: "new-api", text: "NewAPI · Cookie" },
+  { value: "newapi2", text: "NewAPI · 刷新令牌" },
   { value: "sub2api", text: "Sub2API" },
   { value: "one-api", text: "One API" },
   { value: "0v0", text: "0v0" },
@@ -260,6 +262,15 @@ export const SYSTEM_TYPES: { value: string; text: string }[] = [
 /** 去除空白/中划线/下划线并转小写，用于跨新旧命名比较。 */
 export function normalizeSystemType(raw: string): string {
   return raw.trim().toLocaleLowerCase().replace(/[\s_\-]/g, "");
+}
+
+/** 系统类型的友好展示名（如 newapi2 → NewAPI · 刷新令牌）；未知类型回退为原始值。 */
+export function systemTypeLabel(raw: string): string {
+  const normalized = normalizeSystemType(raw);
+  const match = SYSTEM_TYPES.find(
+    (item) => normalizeSystemType(item.value) === normalized,
+  );
+  return match?.text ?? raw;
 }
 
 /** 已知系统类型的规范化值集合（用于"未知类型"过滤）。 */
@@ -294,6 +305,7 @@ export const emptySite = (): SiteRecord => ({
   hasPendingReport: false,
   isPersonal: false,
   isPending: false,
+  useProxyPool: false,
   favorite: false,
   hidden: false,
   updatedAt: "",
@@ -321,6 +333,8 @@ export interface ProxyNode {
   latencyMs: number | null;
   testStatus: string;
   testedAt: string;
+  channelLatencyMs: number | null;
+  channelTestStatus: string;
   countryCode: string;
   countryName: string;
   classification: string;
@@ -328,9 +342,27 @@ export interface ProxyNode {
   updatedAt: string;
 }
 
+export interface ProxyChannelAccount {
+  profileId: string;
+}
+
+export interface ProxyChannel {
+  id: string;
+  name: string;
+  nodeId: string;
+  node: ProxyNode | null;
+  testUrl: string;
+  accountCount: number;
+  accounts: ProxyChannelAccount[];
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface ProxyPoolState {
   subscriptions: ProxySubscription[];
   nodes: ProxyNode[];
+  channels: ProxyChannel[];
+  defaultChannelId: string;
   activeNodeId: string;
   activeNode: ProxyNode | null;
   enabled: boolean;

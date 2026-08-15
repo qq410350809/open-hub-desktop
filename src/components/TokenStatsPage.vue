@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { EChartsOption } from "../echarts";
 import EChart from "./EChart.vue";
 import QuickRangeDropdown from "./QuickRangeDropdown.vue";
@@ -61,6 +62,118 @@ function openModal(kind: ModalKind) {
 function closeModal() {
   modalOpen.value = false;
   modal.value = null;
+}
+
+// —— 统计重建弹窗：确认后执行，并展示后端阶段日志 ——
+type RefreshPhase = "confirm" | "running" | "success" | "error";
+type RefreshLogStatus = "running" | "success" | "error";
+type TokenCollectorProgress = {
+  stage: string;
+  status: RefreshLogStatus;
+  message: string;
+};
+type RefreshLogEntry = TokenCollectorProgress & {
+  id: number;
+  time: string;
+};
+
+const isTauri = "__TAURI_INTERNALS__" in window;
+const refreshDialogOpen = ref(false);
+const refreshPhase = ref<RefreshPhase>("confirm");
+const refreshLogs = ref<RefreshLogEntry[]>([]);
+const refreshLogListRef = ref<HTMLOListElement>();
+let refreshLogId = 0;
+let unlistenTokenCollectorProgress: UnlistenFn | undefined;
+let tokenStatsPageMounted = true;
+
+const refreshStageLabels: Record<string, string> = {
+  prepare: "准备",
+  cache: "缓存",
+  scan: "扫描",
+  aggregate: "汇总",
+  database: "数据库",
+  view: "页面",
+  complete: "完成",
+  error: "错误",
+};
+
+const refreshStatusTitle = computed(() => {
+  if (refreshPhase.value === "running") return "正在重建 Token 统计";
+  if (refreshPhase.value === "success") return "统计重建完成";
+  if (refreshPhase.value === "error") return "统计重建失败";
+  return "重建 Token 统计";
+});
+
+const refreshStatusDescription = computed(() => {
+  if (refreshPhase.value === "running") return "正在重新读取日志并重建本地数据库，请稍候。";
+  if (refreshPhase.value === "success") return "本地数据库与当前页面数据均已更新。";
+  if (refreshPhase.value === "error") return "任务未能完成，请根据下方日志检查后重试。";
+  return "执行前请确认本次统计重建的影响范围。";
+});
+
+function appendRefreshLog(progress: TokenCollectorProgress) {
+  const last = refreshLogs.value[refreshLogs.value.length - 1];
+  if (last?.stage === progress.stage && last.status === progress.status && last.message === progress.message) {
+    return;
+  }
+  refreshLogs.value.push({
+    ...progress,
+    id: ++refreshLogId,
+    time: new Date().toLocaleTimeString("zh-CN", {
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: false,
+    }),
+  });
+}
+
+function openRefreshDialog() {
+  refreshDialogOpen.value = true;
+  if (store.tokenCollectorSyncing.value) {
+    refreshPhase.value = "running";
+    return;
+  }
+  refreshPhase.value = "confirm";
+  refreshLogs.value = [];
+}
+
+function closeRefreshDialog() {
+  refreshDialogOpen.value = false;
+}
+
+async function startRefresh() {
+  if (store.tokenCollectorSyncing.value) return;
+  refreshPhase.value = "running";
+  refreshLogs.value = [];
+  appendRefreshLog({ stage: "prepare", status: "running", message: "统计重建请求已提交" });
+
+  try {
+    await store.syncTokenCollector(true);
+  } catch (error) {
+    appendRefreshLog({
+      stage: "error",
+      status: "error",
+      message: String(error),
+    });
+    refreshPhase.value = "error";
+    return;
+  }
+
+  appendRefreshLog({ stage: "view", status: "running", message: "正在重新读取数据库快照并更新页面" });
+  try {
+    await store.refreshTokenDatabaseView(true);
+    appendRefreshLog({ stage: "view", status: "success", message: "页面数据已更新" });
+    appendRefreshLog({ stage: "complete", status: "success", message: "统计重建全部完成" });
+    refreshPhase.value = "success";
+  } catch (error) {
+    appendRefreshLog({
+      stage: "view",
+      status: "error",
+      message: `页面更新失败：${String(error)}`,
+    });
+    refreshPhase.value = "error";
+  }
 }
 
 // —— 明细弹窗：标签页 + 分页 ——
@@ -134,6 +247,7 @@ const PROVIDER_COLORS: Record<string, string> = {
   cursor: "#8b5cf6",
   catpawai: "#ec4899",
   "command-code": "#10b981",
+  dsh: "#1e88e5",
 };
 function providerColor(source: string, index: number) {
   return PROVIDER_COLORS[source.toLowerCase()] || `hsl(${150 + index * 40}, 60%, 45%)`;
@@ -153,6 +267,7 @@ const sourceNameMap: Record<string, string> = {
   antigravity: "Antigravity",
   zed: "Zed",
   "command-code": "Command Code",
+  dsh: "DSH",
 };
 function sourceLabel(source: string) {
   return sourceNameMap[source.toLowerCase()] || source || "未知来源";
@@ -265,8 +380,12 @@ const costCaption = computed(() => {
 });
 
 const totalTokensAll = computed(() => bucketTotal.value.total);
-const bySource = computed(() => bucketSourceTotals(filteredBuckets.value));
-const byModel = computed(() => mergeModelTotals(bucketModelTotals(filteredBuckets.value)));
+const bySource = computed(() =>
+  bucketSourceTotals(filteredBuckets.value).filter((item) => item.totalTokens > 0),
+);
+const byModel = computed(() =>
+  mergeModelTotals(bucketModelTotals(filteredBuckets.value)).filter((item) => item.totalTokens > 0),
+);
 const topSources = computed(() => bySource.value.slice(0, 5));
 const topModels = computed(() => byModel.value.slice(0, 5));
 
@@ -331,7 +450,7 @@ const projectUsage = computed<ProjectUsageItem[]>(() => {
   for (const session of sessions.value) {
     if (projectBucketSources.has((session.source || "").toLowerCase())) continue;
     const current = ensureGroup(session.projectKey);
-    current.sessions += 1;
+    current.sessions += Math.max(1, session.turns || 0);
     current.totalTokens += session.totalTokens || 0;
     current.input += session.tokens?.inputTokens || 0;
     current.output += session.tokens?.outputTokens || 0;
@@ -436,6 +555,19 @@ const healthTimeline = computed(() =>
     })),
   ),
 );
+
+// 总步数 = 总请求数 = 用户请求(对话轮) + 工具请求(API 调用)
+const totalSteps = computed(
+  () => healthTimeline.value.totalDialogues + healthTimeline.value.totalRequests,
+);
+
+// 平均每轮步数 = 总步数 ÷ 对话数（对话 = 轮；步 = 请求，用户请求与工具请求都算一步）
+const stepsPerTurnLabel = computed(() => {
+  const dialogues = healthTimeline.value.totalDialogues;
+  if (!dialogues) return "—";
+  const avg = totalSteps.value / dialogues;
+  return avg >= 10 ? String(Math.round(avg)) : avg.toFixed(1);
+});
 
 // 网格：上→下、左→右（列优先），排满容器；所选区间落在末尾
 const HEALTH_ROWS = 8;
@@ -631,22 +763,31 @@ const trendChartOption = computed<EChartsOption>(() => {
 
 const modalTitle = computed(() => "用量明细");
 
-async function refreshAll() {
-  try {
-    await store.syncTokenCollector(true);
-  } catch {
-    // 保留现有缓存数据，错误由同步状态区域展示。
-  }
-  await store.refreshTokenDatabaseView(true);
-}
-
-
 watch(
   () => [healthTimeline.value.nodeCount, store.tokenStatsFrom.value, store.tokenStatsTo.value, trendGranularity.value],
   () => nextTick(() => measureHealthGrid()),
 );
 
+watch(
+  () => refreshLogs.value.length,
+  () => nextTick(() => {
+    if (refreshLogListRef.value) {
+      refreshLogListRef.value.scrollTop = refreshLogListRef.value.scrollHeight;
+    }
+  }),
+);
+
 onMounted(() => {
+  tokenStatsPageMounted = true;
+  if (isTauri) {
+    listen<TokenCollectorProgress>("token-collector-progress", ({ payload }) => {
+      appendRefreshLog(payload);
+    }).then((unlisten) => {
+      if (!tokenStatsPageMounted) unlisten();
+      else unlistenTokenCollectorProgress = unlisten;
+    });
+  }
+
   // 全局查询定时器已维护数据库快照；页面挂载只负责图表布局。
   nextTick(() => {
     measureHealthGrid();
@@ -659,6 +800,9 @@ onMounted(() => {
 });
 
 onBeforeUnmount(() => {
+  tokenStatsPageMounted = false;
+  unlistenTokenCollectorProgress?.();
+  unlistenTokenCollectorProgress = undefined;
   healthRo?.disconnect();
   healthRo = null;
   window.removeEventListener("resize", measureHealthGrid);
@@ -678,24 +822,19 @@ onBeforeUnmount(() => {
         <button
           class="tt-btn"
           type="button"
-          :disabled="store.tokenStatsLoading.value || store.tokenUsageLoading.value || store.tokenCollectorSyncing.value"
-          title="立即采集本地 Token 日志并刷新数据库"
-          @click="refreshAll"
+          :disabled="!store.tokenCollectorSyncing.value && (store.tokenStatsLoading.value || store.tokenUsageLoading.value)"
+          :title="store.tokenCollectorSyncing.value ? '打开统计重建日志' : '确认后清除 OpenHub 本地 Token 缓存，重新扫描日志并重建统计'"
+          @click="openRefreshDialog"
         >
           <span :class="{ 'is-spinning': store.tokenStatsLoading.value || store.tokenCollectorSyncing.value }">↻</span>
-          <span>{{ store.tokenCollectorSyncing.value ? "同步中…" : (store.tokenStatsLoading.value ? "读取中…" : "刷新") }}</span>
+          <span>{{ store.tokenCollectorSyncing.value ? "查看日志" : (store.tokenStatsLoading.value ? "读取中…" : "重建统计") }}</span>
         </button>
       </div>
       <span
-        v-if="store.tokenCollectorSyncing.value"
-        class="tt-sync-status"
-        role="status"
-      >正在采集本地日志并写入数据库…</span>
-      <span
-        v-else-if="store.tokenCollectorSyncError.value"
+        v-if="!store.tokenCollectorSyncing.value && store.tokenCollectorSyncError.value"
         class="tt-sync-status is-error"
         :title="store.tokenCollectorSyncError.value"
-      >同步失败，显示本地缓存</span>
+      >上次统计重建失败</span>
     </header>
 
     <div class="token-stats-scroll">
@@ -703,6 +842,7 @@ onBeforeUnmount(() => {
         <strong>无法读取 Token 统计</strong>
         <p>{{ store.tokenUsageError.value }}</p>
         <p>OpenHub 会直接读取 Codex、Claude、Command Code、Antigravity、OpenCode、MiMo、ZCode 与 CatPawAI 的本地日志；请确认相关工具已产生可读取记录。</p>
+        <p>已支持读取 DSH (DeepSeek AI CLI) 的压缩会话日志。</p>
       </div>
 
       <template v-if="store.tokenUsageLoading.value && !store.tokenUsage.value">
@@ -760,13 +900,7 @@ onBeforeUnmount(() => {
                 正在扫描多工具日志…
               </template>
               <template v-else>
-                请求 {{ formatTokens(healthTimeline.totalRequests) }}
-                <template v-if="healthTimeline.totalSuccess + healthTimeline.totalFailed > 0">
-                  · 失败 {{ formatTokens(healthTimeline.totalFailed) }}
-                </template>
-                <template v-else>
-                  · 用户发起
-                </template>
+                平均每轮 {{ stepsPerTurnLabel }} 步 · 请求 {{ formatTokens(totalSteps) }}
               </template>
             </span>
           </div>
@@ -906,6 +1040,87 @@ onBeforeUnmount(() => {
     </div>
 
     <!-- 详情弹窗 -->
+    <Transition name="tt-modal-fade">
+      <div v-if="refreshDialogOpen" class="tt-modal-backdrop" @click.self="closeRefreshDialog">
+        <section
+          class="tt-modal tt-refresh-modal"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="tt-refresh-title"
+        >
+          <header class="tt-modal-head">
+            <div>
+              <h2 id="tt-refresh-title">{{ refreshStatusTitle }}</h2>
+              <p>{{ refreshStatusDescription }}</p>
+            </div>
+            <button type="button" class="tt-modal-close" aria-label="关闭统计重建窗口" @click="closeRefreshDialog">×</button>
+          </header>
+
+          <div class="tt-modal-body tt-refresh-body">
+            <template v-if="refreshPhase === 'confirm'">
+              <div class="tt-refresh-intro">
+                <span class="tt-refresh-intro-icon" v-html="icons.restore"></span>
+                <div>
+                  <strong>执行一次完整数据重建</strong>
+                  <p>适合在统计缺失、日志来源变化或需要重新校准数据时使用。</p>
+                </div>
+              </div>
+              <div class="tt-refresh-steps" aria-label="统计重建步骤">
+                <div><i>1</i><span><strong>清除本地缓存</strong><small>删除 OpenHub 维护的解析缓存与旧数据库快照</small></span></div>
+                <div><i>2</i><span><strong>重新扫描日志</strong><small>读取 Codex、Claude、Command Code 等工具的本地记录</small></span></div>
+                <div><i>3</i><span><strong>重建统计数据</strong><small>重新汇总 Token、会话与请求健康数据并更新页面</small></span></div>
+              </div>
+              <div class="tt-refresh-notice">
+                <span v-html="icons.info"></span>
+                <p><strong>不会删除来源工具的原始日志。</strong>重建期间当前统计可能短暂不可用，耗时取决于本地日志数量。</p>
+              </div>
+            </template>
+
+            <template v-else>
+              <div class="tt-refresh-run-status" :class="`is-${refreshPhase}`" role="status" aria-live="polite">
+                <span class="tt-refresh-state-icon" :class="{ 'is-spinning': refreshPhase === 'running' }">
+                  {{ refreshPhase === "running" ? "↻" : (refreshPhase === "success" ? "✓" : "!") }}
+                </span>
+                <div>
+                  <strong>{{ refreshStatusTitle }}</strong>
+                  <p>{{ refreshStatusDescription }}</p>
+                </div>
+              </div>
+              <div class="tt-refresh-log-head">
+                <strong>执行日志</strong>
+                <span>{{ refreshLogs.length }} 条</span>
+              </div>
+              <ol ref="refreshLogListRef" class="tt-refresh-log" aria-live="polite">
+                <li v-for="entry in refreshLogs" :key="entry.id" :class="`is-${entry.status}`">
+                  <time>{{ entry.time }}</time>
+                  <span class="tt-refresh-log-stage">{{ refreshStageLabels[entry.stage] || entry.stage }}</span>
+                  <p>{{ entry.message }}</p>
+                  <i aria-hidden="true">{{ entry.status === "running" ? "…" : (entry.status === "success" ? "✓" : "!") }}</i>
+                </li>
+              </ol>
+            </template>
+          </div>
+
+          <footer class="tt-refresh-footer">
+            <template v-if="refreshPhase === 'confirm'">
+              <button type="button" class="tt-refresh-secondary" @click="closeRefreshDialog">取消</button>
+              <button type="button" class="tt-refresh-primary" @click="startRefresh">
+                <span>↻</span>开始重建
+              </button>
+            </template>
+            <template v-else>
+              <span v-if="refreshPhase === 'running'">关闭窗口不会中断重建，可通过“查看日志”重新打开。</span>
+              <span v-else-if="refreshPhase === 'success'">统计重建结果已写入本地数据库。</span>
+              <span v-else>可关闭窗口检查环境后再次重建。</span>
+              <button type="button" class="tt-refresh-secondary" @click="closeRefreshDialog">
+                {{ refreshPhase === "running" ? "后台运行" : "关闭" }}
+              </button>
+            </template>
+          </footer>
+        </section>
+      </div>
+    </Transition>
+
     <Transition name="tt-modal-fade">
       <div v-if="modalOpen" class="tt-modal-backdrop" @click.self="closeModal">
         <div

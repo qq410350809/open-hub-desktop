@@ -1,11 +1,11 @@
 <script setup lang="ts">
-import { computed } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, ref } from "vue";
 import { icons } from "../icons";
 import { formatDate, formatRateLimit, logoText } from "../utils";
 import { useStore } from "../composables/useStore";
 import TagList from "./TagList.vue";
 import type { ChromeSessionInfo, SiteRecord } from "../types";
-import { normalizeSystemType } from "../types";
+import { normalizeSystemType, systemTypeLabel } from "../types";
 
 const props = defineProps<{
   site: SiteRecord;
@@ -79,6 +79,178 @@ function accountQuota(session: ChromeSessionInfo): string {
   }).format(session.remaining);
   return session.unit ? `${amount} ${session.unit}` : amount;
 }
+
+// —— ⋯ 更多操作菜单 ——
+const menuOpen = ref(false);
+const menuRoot = ref<HTMLElement | null>(null);
+const menuTrigger = ref<HTMLButtonElement | null>(null);
+const menuPopup = ref<HTMLElement | null>(null);
+
+interface CardMenuEntry {
+  key: string;
+  label: string;
+  icon: string;
+  danger?: boolean;
+  success?: boolean;
+  active?: boolean;
+  separatorBefore?: boolean;
+}
+
+const cardMenuId = computed(() => `card-menu-${props.site.id}`);
+
+const menuEntries = computed<CardMenuEntry[]>(() => {
+  const isUsage = usageCardMode.value;
+  const entries: CardMenuEntry[] = [
+    { key: "models", label: "查看模型", icon: icons.cpu },
+    { key: "preview", label: "查看详情", icon: icons.info },
+    { key: "edit", label: "编辑", icon: icons.edit },
+    ...(isUsage
+      ? [{ key: "sync-session", label: "同步会话", icon: icons.sessionImport }]
+      : []),
+    {
+      key: "usage",
+      label: props.site.isPersonal
+        ? "切换为待定"
+        : props.site.isPending
+          ? "切换为未在用"
+          : "切换为在用",
+      icon: props.site.isPending ? icons.clock : icons.bookmark,
+      active: props.site.isPersonal || props.site.isPending,
+    },
+    {
+      key: "runaway",
+      label: props.site.isRunaway ? "恢复存活" : "标记为跑路",
+      icon: props.site.isRunaway ? icons.heartPulse : icons.flag,
+      danger: !props.site.isRunaway,
+      success: props.site.isRunaway,
+    },
+    ...(isUsage
+      ? []
+      : [
+          {
+            key: "delete",
+            label: "删除",
+            icon: icons.trash,
+            danger: true,
+            separatorBefore: true,
+          } satisfies CardMenuEntry,
+        ]),
+  ];
+  return entries;
+});
+
+function visibleMenuItems(): HTMLButtonElement[] {
+  if (!menuPopup.value) return [];
+  return Array.from(
+    menuPopup.value.querySelectorAll<HTMLButtonElement>(".card-menu-item"),
+  );
+}
+
+function openMenu() {
+  menuOpen.value = true;
+  nextTick(() => {
+    (visibleMenuItems()[0] ?? menuPopup.value)?.focus({ preventScroll: true });
+  });
+}
+
+function closeMenu(restoreFocus = false) {
+  if (!menuOpen.value) return;
+  menuOpen.value = false;
+  if (restoreFocus) menuTrigger.value?.focus({ preventScroll: true });
+}
+
+function toggleMenu() {
+  if (menuOpen.value) closeMenu(true);
+  else openMenu();
+}
+
+function onMenuKeydown(event: KeyboardEvent) {
+  const items = visibleMenuItems();
+  if (items.length === 0) return;
+  const current = items.indexOf(document.activeElement as HTMLButtonElement);
+  switch (event.key) {
+    case "ArrowDown": {
+      event.preventDefault();
+      items[(current + 1) % items.length].focus();
+      break;
+    }
+    case "ArrowUp": {
+      event.preventDefault();
+      items[(current - 1 + items.length) % items.length].focus();
+      break;
+    }
+    case "Home": {
+      event.preventDefault();
+      items[0]?.focus();
+      break;
+    }
+    case "End": {
+      event.preventDefault();
+      items[items.length - 1]?.focus();
+      break;
+    }
+    case "Escape": {
+      event.preventDefault();
+      closeMenu(true);
+      break;
+    }
+  }
+}
+
+function runMenuAction(key: string, event: Event) {
+  const trigger = event.currentTarget as HTMLElement;
+  switch (key) {
+    case "models":
+      store.openSiteModelsDialog(props.site);
+      break;
+    case "preview":
+      store.openPreview(props.site, trigger);
+      break;
+    case "edit":
+      store.openModal(props.site);
+      break;
+    case "usage":
+      void store.cycleUsageState(props.site);
+      break;
+    case "sync-session":
+      store.syncChromeSession(props.site, trigger);
+      break;
+    case "runaway":
+      void store.toggleRunaway(props.site);
+      break;
+    case "delete":
+      void store.deleteSite(props.site);
+      break;
+    default:
+      break;
+  }
+  menuOpen.value = false;
+}
+
+function onDocumentPointerDown(event: PointerEvent) {
+  if (!menuOpen.value) return;
+  const target = event.target;
+  if (target instanceof Node && menuRoot.value?.contains(target)) return;
+  closeMenu();
+}
+
+function onDocumentKeydown(event: KeyboardEvent) {
+  if (!menuOpen.value) return;
+  if (event.key === "Escape") {
+    event.preventDefault();
+    closeMenu(true);
+  }
+}
+
+onMounted(() => {
+  document.addEventListener("pointerdown", onDocumentPointerDown, true);
+  document.addEventListener("keydown", onDocumentKeydown, true);
+});
+
+onUnmounted(() => {
+  document.removeEventListener("pointerdown", onDocumentPointerDown, true);
+  document.removeEventListener("keydown", onDocumentKeydown, true);
+});
 </script>
 
 <template>
@@ -96,74 +268,53 @@ function accountQuota(session: ChromeSessionInfo): string {
       <div class="site-avatar">{{ logo }}</div>
       <div class="site-main">
         <div class="title-row">
-          <h2 :title="site.systemType ? `${site.name}（${site.systemType}）` : site.name">
-            {{ site.name }}<span v-if="site.systemType" class="site-system-type">（{{ site.systemType }}）</span>
+          <h2 :title="site.systemType ? `${site.name}（${systemTypeLabel(site.systemType)}）` : site.name">
+            {{ site.name }}<span v-if="site.systemType" class="site-system-type">（{{ systemTypeLabel(site.systemType) }}）</span>
           </h2>
           <div class="card-actions">
-            <button
-              type="button"
-              class="site-models-toggle"
-              :data-models="site.id"
-              title="查看支持的模型"
-              aria-label="查看此站点的支持模型"
-              @click="store.openSiteModelsDialog(site)"
-              v-html="icons.cpu"
-            />
-            <button
-              type="button"
-              :data-preview="site.id"
-              title="查看详情"
-              aria-label="查看站点详情"
-              @click="store.openPreview(site, $event.currentTarget as HTMLElement)"
-              v-html="icons.info"
-            />
-            <button
-              v-if="!usageCardMode"
-              type="button"
-              :data-edit="site.id"
-              title="编辑"
-              @click="store.openModal(site)"
-              v-html="icons.edit"
-            />
-            <button
-              class="usage-state-toggle"
-              :class="{ 'is-personal': site.isPersonal, 'is-pending': site.isPending }"
-              type="button"
-              :data-usage-state="site.id"
-              :title="site.isPersonal ? '当前：在用，点击切换为待定' : site.isPending ? '当前：待定，点击切换为未在用' : '当前：未在用，点击切换为在用'"
-              :aria-label="site.isPersonal ? '当前：在用，点击切换为待定' : site.isPending ? '当前：待定，点击切换为未在用' : '当前：未在用，点击切换为在用'"
-              @click="store.cycleUsageState(site)"
-              v-html="site.isPending ? icons.clock : icons.bookmark"
-            />
-            <button
-              v-if="usageCardMode"
-              class="sync-session-toggle"
-              type="button"
-              :data-sync-session="site.id"
-              title="同步会话"
-              aria-label="同步会话"
-              @click="store.syncChromeSession(site, $event.currentTarget as HTMLElement)"
-              v-html="icons.sessionImport"
-            />
-            <button
-              class="runaway-toggle"
-              :class="{ 'is-runaway': site.isRunaway }"
-              type="button"
-              :data-runaway="site.id"
-              :title="site.isRunaway ? '恢复存活' : '标记为跑路'"
-              :aria-label="site.isRunaway ? '恢复存活' : '标记为跑路'"
-              @click="store.toggleRunaway(site)"
-              v-html="site.isRunaway ? icons.heartPulse : icons.flag"
-            />
-            <button
-              v-if="!usageCardMode"
-              class="delete-toggle"
-              type="button"
-              :data-delete="site.id"
-              title="删除"
-              @click="store.deleteSite(site)"
-              v-html="icons.trash"
-            />
+            <div ref="menuRoot" class="card-menu">
+              <button
+                ref="menuTrigger"
+                type="button"
+                class="card-menu-trigger"
+                :class="{ 'is-open': menuOpen }"
+                title="更多操作"
+                aria-label="更多操作"
+                aria-haspopup="menu"
+                :aria-expanded="menuOpen"
+                :aria-controls="cardMenuId"
+                @click.stop="toggleMenu"
+                v-html="icons.more"
+              />
+              <div
+                v-if="menuOpen"
+                :id="cardMenuId"
+                ref="menuPopup"
+                class="card-menu-popup"
+                role="menu"
+                :aria-label="`${site.name} 的操作`"
+                tabindex="-1"
+                @keydown="onMenuKeydown"
+              >
+                <template v-for="entry in menuEntries" :key="entry.key">
+                  <div v-if="entry.separatorBefore" class="card-menu-sep" role="separator" />
+                  <button
+                    type="button"
+                    role="menuitem"
+                    class="card-menu-item"
+                    :class="{
+                      'is-danger': entry.danger,
+                      'is-success': entry.success,
+                      'is-active': entry.active,
+                    }"
+                    @click="runMenuAction(entry.key, $event)"
+                  >
+                    <span class="card-menu-item-icon" v-html="entry.icon" />
+                    <span class="card-menu-item-label">{{ entry.label }}</span>
+                  </button>
+                </template>
+              </div>
+            </div>
           </div>
         </div>
         <time class="site-updated-at" :datetime="displayedUpdatedAt">
@@ -199,7 +350,7 @@ function accountQuota(session: ChromeSessionInfo): string {
           </strong>
           <small>
             <span
-              v-if="normalizeSystemType(site.systemType) === 'newapi'"
+              v-if="normalizeSystemType(site.systemType) === 'newapi' || normalizeSystemType(site.systemType) === 'newapi2'"
               class="usage-account-token"
               :class="{ 'has-token': session.hasAccessToken }"
               :title="session.hasAccessToken ? '此账号已缓存 NewAPI 访问令牌' : '此账号尚未取得 NewAPI 访问令牌'"

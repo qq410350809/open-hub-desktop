@@ -1,6 +1,7 @@
 use crate::chrome_session;
 use crate::db::*;
 use crate::models::*;
+use crate::platform_detect;
 use crate::site_ops::*;
 use rusqlite::OptionalExtension;
 use std::{collections::HashSet, time::Duration};
@@ -292,7 +293,7 @@ pub async fn sync_remote_sites(
 
         let existing = transaction
             .query_row(
-                "SELECT favorite, hidden, is_personal, is_pending, use_system_proxy, system_type FROM directory_sites WHERE id = ?1",
+                "SELECT favorite, hidden, is_personal, is_pending, use_system_proxy, use_proxy_pool, system_type FROM directory_sites WHERE id = ?1",
                 [&site.id],
                 |row| {
                     Ok((
@@ -301,21 +302,35 @@ pub async fn sync_remote_sites(
                         row.get::<_, i64>(2)? != 0,
                         row.get::<_, i64>(3)? != 0,
                         row.get::<_, i64>(4)? != 0,
-                        row.get::<_, String>(5)?,
+                        row.get::<_, i64>(5)? != 0,
+                        row.get::<_, String>(6)?,
                     ))
                 },
             )
             .optional()
             .map_err(|error| error.to_string())?;
-        if let Some((favorite, hidden, is_personal, is_pending, use_system_proxy, system_type)) =
-            existing
+        if let Some((
+            favorite,
+            hidden,
+            is_personal,
+            is_pending,
+            use_system_proxy,
+            use_proxy_pool,
+            system_type,
+        )) = existing
         {
             site.favorite = favorite;
             site.hidden = hidden;
             site.is_personal = is_personal;
             site.is_pending = is_pending && !is_personal;
             site.use_system_proxy = use_system_proxy;
-            if site.system_type.trim().is_empty() {
+            site.use_proxy_pool = use_proxy_pool;
+            // 浏览器证据得出的刷新令牌细分（newapi2）优先于远端通用判定（new-api）：
+            // 远端同步只应补充/纠正基础类型，不应把更细的认证形态打回 Cookie 模式。
+            let remote_type = site.system_type.trim().to_string();
+            if remote_type.is_empty() {
+                site.system_type = system_type;
+            } else if system_type == "newapi2" && platform_detect::is_newapi(&remote_type) {
                 site.system_type = system_type;
             }
             updated += 1;
@@ -324,6 +339,7 @@ pub async fn sync_remote_sites(
             site.hidden = false;
             site.is_pending = false;
             site.use_system_proxy = false;
+            site.use_proxy_pool = false;
             added += 1;
         }
         site.is_runaway = runaway;

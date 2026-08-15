@@ -653,13 +653,70 @@ fn dispatch(app: &AppHandle, command: &str, args: &Value) -> Result<Value, Strin
         }
         "set_proxy_pool_settings" => {
             let ignore_addresses = take_string(args, &["ignoreAddresses", "ignore_addresses"])?;
-            let speed_test_url = take_string(args, &["speedTestUrl", "speed_test_url"])?;
             Ok(json!(proxy_pool::set_proxy_pool_settings(
                 app.state::<Database>(),
                 app.state::<ProxyRuntime>(),
                 ignore_addresses,
-                speed_test_url,
             )))
+        }
+        "save_proxy_channel" => {
+            let id: Option<String> = take_opt(args, &["id"])?;
+            let name = take_string(args, &["name"])?;
+            Ok(json!(proxy_pool::save_proxy_channel(
+                app.state::<Database>(),
+                app.state::<ProxyRuntime>(),
+                id,
+                name,
+            )))
+        }
+        "delete_proxy_channel" => {
+            let id = take_string(args, &["id"])?;
+            Ok(json!(proxy_pool::delete_proxy_channel(
+                app.state::<Database>(),
+                app.state::<ProxyRuntime>(),
+                id,
+            )))
+        }
+        "set_proxy_channel_node" => {
+            let channel_id = take_string(args, &["channelId", "channel_id"])?;
+            let node_id = take_string(args, &["nodeId", "node_id"])?;
+            Ok(json!(proxy_pool::set_proxy_channel_node(
+                app.state::<Database>(),
+                app.state::<ProxyRuntime>(),
+                channel_id,
+                node_id,
+            )))
+        }
+        "assign_account_proxy_channel" => {
+            let profile_id = take_string(args, &["profileId", "profile_id"])?;
+            let channel_id = take_string(args, &["channelId", "channel_id"])?;
+            Ok(json!(proxy_pool::assign_account_proxy_channel(
+                app.state::<Database>(),
+                app.state::<ProxyRuntime>(),
+                profile_id,
+                channel_id,
+            )))
+        }
+        "unassign_account_proxy_channel" => {
+            let profile_id = take_string(args, &["profileId", "profile_id"])?;
+            Ok(json!(proxy_pool::unassign_account_proxy_channel(
+                app.state::<Database>(),
+                app.state::<ProxyRuntime>(),
+                profile_id,
+            )))
+        }
+        "test_proxy_channel_nodes" => {
+            let channel_id = take_string(args, &["channelId", "channel_id"])?;
+            let app = app.clone();
+            Ok(json!(tauri::async_runtime::block_on(async move {
+                proxy_pool::test_proxy_channel_nodes(
+                    app.clone(),
+                    app.state::<Database>(),
+                    app.state::<ProxyRuntime>(),
+                    channel_id,
+                )
+                .await
+            })))
         }
         "set_active_proxy_node" => {
             let node_id = take_string(args, &["nodeId", "node_id"])?;

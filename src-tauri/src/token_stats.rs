@@ -14,7 +14,7 @@ use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, UNIX_EPOCH};
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 /// Token 查询接口只读取 OpenHub SQLite 快照，不触发日志扫描。
 #[tauri::command]
@@ -28,18 +28,67 @@ pub async fn get_token_stats(
     query_token_stats(&database, from, to)
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TokenCollectorProgress {
+    stage: String,
+    status: String,
+    message: String,
+}
+
+fn emit_token_collector_progress(
+    app: Option<&AppHandle>,
+    stage: &str,
+    status: &str,
+    message: impl Into<String>,
+) {
+    let Some(app) = app else { return };
+    let _ = app.emit(
+        "token-collector-progress",
+        TokenCollectorProgress {
+            stage: stage.into(),
+            status: status.into(),
+            message: message.into(),
+        },
+    );
+}
+
 /// 手动触发一次本地日志采集并写入 SQLite；查询仍由独立接口完成。
 #[tauri::command]
 pub async fn sync_token_data(
     app: AppHandle,
     force: Option<bool>,
 ) -> Result<TokenCollectorSyncReport, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let database = app.state::<Database>();
-        collect_token_data(&database, force.unwrap_or(false))
+    let force = force.unwrap_or(false);
+    let worker_app = app.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        emit_token_collector_progress(
+            Some(&worker_app),
+            "prepare",
+            "running",
+            if force {
+                "已创建完整刷新任务"
+            } else {
+                "已创建增量采集任务"
+            },
+        );
+        let database = worker_app.state::<Database>();
+        let result = collect_token_data(&database, force, Some(&worker_app));
+        if let Err(error) = &result {
+            emit_token_collector_progress(Some(&worker_app), "error", "error", error.clone());
+        }
+        result
     })
-    .await
-    .map_err(|error| format!("OpenHub Token 采集任务失败：{error}"))?
+    .await;
+
+    match result {
+        Ok(result) => result,
+        Err(error) => {
+            let message = format!("OpenHub Token 采集任务失败：{error}");
+            emit_token_collector_progress(Some(&app), "error", "error", message.clone());
+            Err(message)
+        }
+    }
 }
 
 /// CatPawAI 仍由 OpenHub 直接读取本地 SQLite，并合并进统一小时桶。
@@ -1348,10 +1397,34 @@ fn open_readonly_sqlite(path: &Path) -> Option<Connection> {
 
 fn codex_on_line(
     value: &JsonValue,
+    use_response_item_users: bool,
     map: &mut BTreeMap<String, HealthAgg>,
     sources: &mut BTreeMap<String, HealthAgg>,
 ) {
-    if value.get("type").and_then(JsonValue::as_str) != Some("event_msg") {
+    let kind = value.get("type").and_then(JsonValue::as_str).unwrap_or("");
+    let ts = value
+        .get("timestamp")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("");
+    let Some(hour) = hour_key_from_ts(ts) else {
+        return;
+    };
+
+    // 新版 Codex 把用户消息放在 response_item(message, role=user)，不再发 event_msg(user_message)。
+    if kind == "response_item" {
+        if use_response_item_users {
+            let payload = value.get("payload").unwrap_or(&JsonValue::Null);
+            if payload.get("type").and_then(JsonValue::as_str) == Some("message")
+                && payload.get("role").and_then(JsonValue::as_str) == Some("user")
+                && token_collector::codex_user_message_is_human(payload)
+            {
+                record(map, sources, "codex", hour, 1, 0, 0, 0);
+            }
+        }
+        return;
+    }
+
+    if kind != "event_msg" {
         return;
     }
     // 兼容 payload / msg 两种结构
@@ -1361,13 +1434,6 @@ fn codex_on_line(
         .cloned()
         .unwrap_or(JsonValue::Null);
     let Some(p_type) = payload.get("type").and_then(JsonValue::as_str) else {
-        return;
-    };
-    let ts = value
-        .get("timestamp")
-        .and_then(JsonValue::as_str)
-        .unwrap_or("");
-    let Some(hour) = hour_key_from_ts(ts) else {
         return;
     };
     match p_type {
@@ -1587,6 +1653,36 @@ fn kiro_on_line(
     }
 }
 
+/// DSH (DeepSeek AI CLI) 会话事件 → 请求健康。
+/// user/message = 用户请求（1 对话）；assistant/message 带 data.usage = 一次真实 API 请求。
+fn dsh_on_line(
+    value: &JsonValue,
+    map: &mut BTreeMap<String, HealthAgg>,
+    sources: &mut BTreeMap<String, HealthAgg>,
+) {
+    let kind = value.get("type").and_then(JsonValue::as_str).unwrap_or("");
+    let time_ms = value.get("time").and_then(JsonValue::as_i64).unwrap_or(0);
+    let Some(hour) = hour_key_from_millis(time_ms) else {
+        return;
+    };
+    match kind {
+        "user/message" => {
+            record(map, sources, "dsh", hour, 1, 0, 0, 0);
+        }
+        "assistant/message" => {
+            let has_usage = value
+                .get("data")
+                .and_then(|data| data.get("usage"))
+                .map(|usage| usage.is_object())
+                .unwrap_or(false);
+            if has_usage {
+                record(map, sources, "dsh", hour, 0, 1, 1, 0);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn assistant_tokens_positive(data: &JsonValue) -> bool {
     let Some(tokens) = data.get("tokens") else {
         return false;
@@ -1720,23 +1816,101 @@ fn collect_jsonl_incremental(
     }
 }
 
+/// Codex rollout 文件需要按文件判断版本（旧版 event_msg(user_message)，新版 response_item）。
+fn scan_codex_file_incremental(
+    path: &Path,
+    cursors: &mut FileCursorMap,
+    map: &mut BTreeMap<String, HealthAgg>,
+    sources: &mut BTreeMap<String, HealthAgg>,
+) {
+    let key = path.to_string_lossy().to_string();
+    let Ok(meta) = fs::metadata(path) else {
+        return;
+    };
+    let inode = metadata_ino(&meta);
+    let size = meta.len();
+    let mtime_ms = meta
+        .modified()
+        .ok()
+        .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+        .map(|value| value.as_millis() as u64)
+        .unwrap_or(0);
+    let start = match cursors.get(&key) {
+        Some(prev) if prev.inode == inode && size >= prev.offset => prev.offset,
+        _ => 0,
+    };
+
+    let Ok(bytes) = fs::read(path) else {
+        return;
+    };
+    let Ok(text) = String::from_utf8(bytes.clone()) else {
+        return;
+    };
+
+    let has_user_message_events = text.lines().any(|line| {
+        serde_json::from_str::<JsonValue>(line)
+            .map(|v| {
+                v.get("type").and_then(JsonValue::as_str) == Some("event_msg")
+                    && v.get("payload")
+                        .and_then(|p| p.get("type"))
+                        .and_then(JsonValue::as_str)
+                        == Some("user_message")
+            })
+            .unwrap_or(false)
+    });
+    let use_response_item_users = !has_user_message_events;
+
+    let new_bytes: &[u8] = if start == 0 {
+        bytes.as_slice()
+    } else {
+        &bytes[start as usize..]
+    };
+    let new_text = String::from_utf8_lossy(new_bytes);
+    for line in new_text.lines() {
+        if let Ok(value) = serde_json::from_str::<JsonValue>(line) {
+            codex_on_line(&value, use_response_item_users, map, sources);
+        }
+    }
+
+    cursors.insert(
+        key,
+        FileCursor {
+            inode,
+            size,
+            mtime_ms,
+            offset: size,
+        },
+    );
+}
+
 fn collect_codex_activity_incremental(
     dir: &Path,
     map: &mut BTreeMap<String, HealthAgg>,
     sources: &mut BTreeMap<String, HealthAgg>,
     cursors: &mut FileCursorMap,
 ) {
-    collect_jsonl_incremental(
-        dir,
-        &|path| {
-            path.file_name()
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&current) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let is_codex = path
+                .file_name()
                 .and_then(|name| name.to_str())
                 .map(|name| name.starts_with("rollout-") && name.ends_with(".jsonl"))
-                .unwrap_or(false)
-        },
-        cursors,
-        &mut |value| codex_on_line(value, map, sources),
-    );
+                .unwrap_or(false);
+            if !is_codex {
+                continue;
+            }
+            scan_codex_file_incremental(&path, cursors, map, sources);
+        }
+    }
 }
 
 fn collect_claude_activity_incremental(
@@ -1815,6 +1989,106 @@ fn collect_kiro_activity_incremental(
         cursors,
         &mut |value| kiro_on_line(value, map, sources),
     );
+}
+
+/// DSH 会话是 zstd 压缩的 JSONL（只会追加）。解压后按「已处理行数」做增量，
+/// 末尾若为未写完的半行则留到下次扫描，避免漏行。
+fn scan_zstd_jsonl_incremental(
+    path: &Path,
+    cursors: &mut FileCursorMap,
+    on_line: &mut dyn FnMut(&JsonValue),
+) {
+    let key = path.to_string_lossy().to_string();
+    let Ok(meta) = fs::metadata(path) else {
+        return;
+    };
+    let inode = metadata_ino(&meta);
+    let size = meta.len();
+    let mtime_ms = meta
+        .modified()
+        .ok()
+        .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+        .map(|value| value.as_millis() as u64)
+        .unwrap_or(0);
+
+    // 文件重写/截断（inode 变化或体积缩小）时从头读。
+    let start_lines = match cursors.get(&key) {
+        Some(prev) if prev.inode == inode && size >= prev.size => prev.offset,
+        _ => 0,
+    };
+
+    let Ok(raw) = fs::read(path) else {
+        return;
+    };
+    let Ok(bytes) = zstd::decode_all(raw.as_slice()) else {
+        return;
+    };
+    let Ok(text) = String::from_utf8(bytes) else {
+        return;
+    };
+
+    let lines: Vec<&str> = text.lines().collect();
+    let total = lines.len() as u64;
+    // 末尾半行（解析失败）留到下次；其余按游标增量处理。
+    let mut end = total;
+    if total > 0 && serde_json::from_str::<JsonValue>(lines.last().unwrap()).is_err() {
+        end = total - 1;
+    }
+    let end = end.max(start_lines).min(total);
+    for (index, line) in lines.iter().enumerate() {
+        let index = index as u64;
+        if index >= end {
+            break;
+        }
+        if index < start_lines {
+            continue;
+        }
+        if let Ok(value) = serde_json::from_str::<JsonValue>(line) {
+            on_line(&value);
+        }
+    }
+
+    cursors.insert(
+        key,
+        FileCursor {
+            inode,
+            size,
+            mtime_ms,
+            offset: end,
+        },
+    );
+}
+
+fn collect_dsh_activity_incremental(
+    root: &Path,
+    map: &mut BTreeMap<String, HealthAgg>,
+    sources: &mut BTreeMap<String, HealthAgg>,
+    cursors: &mut FileCursorMap,
+) {
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&current) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let is_dsh = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.ends_with(".jsonl.zstd"))
+                .unwrap_or(false);
+            if !is_dsh {
+                continue;
+            }
+            scan_zstd_jsonl_incremental(&path, cursors, &mut |value| {
+                dsh_on_line(value, map, sources);
+            });
+        }
+    }
 }
 
 fn collect_sqlite_message_activity_incremental(
@@ -1971,9 +2245,9 @@ fn collect_sqlite_message_activity_incremental(
 // 活动结果持久化（增量游标 + 累计报告）
 // ---------------------------------------------------------------------------
 
-const ACTIVITY_CACHE_VERSION: u32 = 4;
+const ACTIVITY_CACHE_VERSION: u32 = 6;
 
-/// 请求活动结果缓存 v4：自维护 per-source 增量游标，并覆盖 Codex 归档与 Command Code。
+/// 请求活动结果缓存 v5：自维护 per-source 增量游标，并覆盖 Codex 归档与 Command Code。
 /// OpenHub 只缓存解析结果与游标，不复制原始日志。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -2061,6 +2335,36 @@ fn write_persisted_activity_cache(envelope: &ActivityCacheEnvelope) {
     if fs::write(&tmp, json).is_ok() {
         let _ = fs::rename(tmp, path);
     }
+}
+
+fn clear_request_health_cache() -> Result<(), String> {
+    if let Ok(mut cache) = activity_cache().lock() {
+        *cache = None;
+    }
+    if let Some(path) = activity_cache_path() {
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "清除 Token 请求健康缓存失败（{}）：{error}",
+                    path.display()
+                ));
+            }
+        }
+        let tmp = path.with_extension("json.tmp");
+        match fs::remove_file(&tmp) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "清除 Token 请求健康临时缓存失败（{}）：{error}",
+                    tmp.display()
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn report_to_maps(
@@ -2242,10 +2546,21 @@ pub(crate) fn collect_request_health_snapshot(force: bool) -> Result<RequestHeal
         collect_antigravity_activity_incremental(&gemini_root, &mut map, &mut sources, cursors);
     }
 
-    let kiro_root = home.join(".kiro").join("sessions");
+    let kiro_root = token_collector::kiro_v2_session_root(&home);
     if kiro_root.is_dir() {
         let cursors = envelope.file_cursors.entry("kiro".to_string()).or_default();
         collect_kiro_activity_incremental(&kiro_root, &mut map, &mut sources, cursors);
+    }
+    // Kiro 0.x 的 v1 JSON 会话没有独立请求 ID；Token 采集器仍会估算其
+    // 用量与对话数，请求健康只读取新版 JSONL，避免把旧会话猜成成功请求。
+
+    let dsh_root = home.join(".dsh").join("sessions");
+    if dsh_root.is_dir() {
+        let cursors = envelope
+            .file_cursors
+            .entry("dsh".to_string())
+            .or_default();
+        collect_dsh_activity_incremental(&dsh_root, &mut map, &mut sources, cursors);
     }
 
     let report = maps_to_report(map, sources);
@@ -2268,21 +2583,81 @@ fn token_collection_lock() -> &'static Mutex<()> {
 pub(crate) fn collect_token_data(
     database: &Database,
     force: bool,
+    progress_app: Option<&AppHandle>,
 ) -> Result<TokenCollectorSyncReport, String> {
     let _guard = token_collection_lock()
         .lock()
         .map_err(|_| "Token 数据采集锁异常".to_string())?;
     let started = Instant::now();
+    if force {
+        // “刷新”执行完整重建：删除 OpenHub 自己的文件/内存/SQLite 快照缓存，
+        // 再从来源工具的原始本地日志重新拉取并计算；原始日志不会被删除。
+        emit_token_collector_progress(
+            progress_app,
+            "cache",
+            "running",
+            "正在清除 OpenHub 本地 Token 缓存与数据库快照",
+        );
+        token_collector::clear_local_cache()?;
+        clear_request_health_cache()?;
+        db::clear_token_snapshots(database)?;
+        emit_token_collector_progress(
+            progress_app,
+            "cache",
+            "success",
+            "本地缓存已清除，来源工具的原始日志保持不变",
+        );
+    }
+    emit_token_collector_progress(
+        progress_app,
+        "scan",
+        "running",
+        "正在扫描 Codex、Claude 等工具的本地日志",
+    );
     let snapshot = token_collector::collect_snapshot(force)?;
+    emit_token_collector_progress(
+        progress_app,
+        "scan",
+        "success",
+        format!(
+            "日志扫描完成：重扫 {} 个文件，复用 {} 个文件",
+            snapshot.scanned_files, snapshot.reused_files
+        ),
+    );
     // 即使主采集器文件指纹未变化，也要合并 CatPawAI 与请求健康的独立增量源。
     // 写入的是三份聚合快照而非 20MB 文件游标缓存，事务替换成本可控。
+    emit_token_collector_progress(
+        progress_app,
+        "aggregate",
+        "running",
+        "正在合并 Token 用量、会话与请求健康数据",
+    );
     let usage = merge_catpawai_usage(snapshot.usage.clone())?;
     let health = collect_request_health_snapshot(force)?;
+    emit_token_collector_progress(
+        progress_app,
+        "aggregate",
+        "success",
+        format!("数据汇总完成：{} 个会话", snapshot.sessions.len()),
+    );
+    emit_token_collector_progress(
+        progress_app,
+        "database",
+        "running",
+        "正在写入 OpenHub 本地数据库",
+    );
     db::write_token_snapshots(database, &usage, &snapshot.sessions, &health)?;
-    Ok(token_collector::sync_report(
-        &snapshot,
-        started.elapsed().as_millis() as i64,
-    ))
+    emit_token_collector_progress(progress_app, "database", "success", "数据库快照写入完成");
+    let mut report = token_collector::sync_report(&snapshot, started.elapsed().as_millis() as i64);
+    if force {
+        report.changed = true;
+        report.skipped = false;
+        report.message = format!(
+            "已清除本地 Token 缓存并重新拉取计算：重扫 {} 个文件",
+            snapshot.scanned_files
+        );
+    }
+    Ok(report)
 }
 
 /// 启动时优先把旧文件缓存迁移进 SQLite，避免界面等待首次扫描。
@@ -2322,7 +2697,7 @@ pub(crate) fn start_token_collector(app: AppHandle) {
             let handle = app.clone();
             let result = tauri::async_runtime::spawn_blocking(move || {
                 let database = handle.state::<Database>();
-                collect_token_data(&database, false)
+                collect_token_data(&database, false, None)
             })
             .await;
             match result {
@@ -2377,6 +2752,48 @@ mod activity_tests {
         assert!(assistant_tokens_positive(&value));
         let empty = json!({"tokens": {"input": 0, "output": 0}});
         assert!(!assistant_tokens_positive(&empty));
+    }
+
+    #[test]
+    fn dsh_activity_counts_user_and_assistant_messages() {
+        let mut map = BTreeMap::new();
+        let mut sources = BTreeMap::new();
+
+        // 用户消息 = 1 对话
+        dsh_on_line(
+            &json!({"type": "user/message", "time": 1786687444127u64}),
+            &mut map,
+            &mut sources,
+        );
+        // 带 usage 的 assistant = 1 请求 + 1 成功
+        dsh_on_line(
+            &json!({
+                "type": "assistant/message",
+                "time": 1786687449831u64,
+                "data": {"usage": {"inputTokens": 8740, "outputTokens": 228}}
+            }),
+            &mut map,
+            &mut sources,
+        );
+        // 无 usage 的 assistant 不计请求
+        dsh_on_line(
+            &json!({"type": "assistant/message", "time": 1786687449831u64, "data": {}}),
+            &mut map,
+            &mut sources,
+        );
+        // 无关事件忽略
+        dsh_on_line(
+            &json!({"type": "tool/call", "time": 1786687449831u64}),
+            &mut map,
+            &mut sources,
+        );
+
+        assert_eq!(map.values().map(|a| a.dialogues).sum::<i64>(), 1);
+        assert_eq!(map.values().map(|a| a.requests).sum::<i64>(), 1);
+        assert_eq!(map.values().map(|a| a.success).sum::<i64>(), 1);
+        let dsh = sources.get("dsh").expect("dsh source should exist");
+        assert_eq!(dsh.dialogues, 1);
+        assert_eq!(dsh.requests, 1);
     }
 
     #[test]

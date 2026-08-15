@@ -41,6 +41,7 @@ interface SyncedSiteModelsResult {
   models: Array<{ id: string; owned_by?: string; ownedBy?: string }>;
   source: string;
   keys: string[];
+  keyGroups?: Record<string, string>;
 }
 
 interface SyncedModelCacheAccount {
@@ -49,6 +50,7 @@ interface SyncedModelCacheAccount {
   accountName: string;
   username: string;
   keys: string[];
+  keyGroups?: Record<string, string>;
   error: string;
 }
 
@@ -74,7 +76,8 @@ function needsChromeAccountFallback(session: ChromeSessionInfo): boolean {
 }
 
 function canSyncAccountViaChrome(session: ChromeSessionInfo): boolean {
-  return normalizeSystemType(chromeSessionSite.value?.systemType ?? "") === "newapi"
+  const normalized = normalizeSystemType(chromeSessionSite.value?.systemType ?? "");
+  return (normalized === "newapi" || normalized === "newapi2")
     && needsChromeAccountFallback(session);
 }
 
@@ -238,6 +241,7 @@ async function syncChromeModelsForSessions(
             accountName: session.accountName,
             username: session.username,
             keys: result.keys ?? [],
+            keyGroups: result.keyGroups ?? {},
             error: "",
           } satisfies SyncedModelCacheAccount,
           result,
@@ -263,6 +267,7 @@ async function syncChromeModelsForSessions(
             accountName: session.accountName,
             username: session.username,
             keys: [],
+            keyGroups: {},
             error: message,
           } satisfies SyncedModelCacheAccount,
           result: null,

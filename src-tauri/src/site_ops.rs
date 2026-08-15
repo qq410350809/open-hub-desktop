@@ -158,7 +158,11 @@ pub(crate) fn infer_remote_system_type(
             }
         }
     }
+    // 刷新令牌形态（newapi2）优先于 Cookie 形态（new-api）：
+    // 站点同时下发两个标记时，以更具体的认证形态为准。
     for (key, system_type) in [
+        ("isNewApi2", "newapi2"),
+        ("is_newapi2", "newapi2"),
         ("isSub2Api", "Sub2API"),
         ("is_sub2api", "Sub2API"),
         ("isNewApi", "NewAPI"),

@@ -13,7 +13,7 @@ pub(crate) fn read_site(connection: &Connection, id: &str) -> Result<Option<Site
                 supports_immersive_translation, supports_ldc, supports_checkin, supports_nsfw,
                 checkin_url, checkin_note, benefit_url, rate_limit, status_url,
                 is_only_maintainer_visible, requires_invite_code, is_runaway, is_fake_charity,
-                has_pending_report, is_personal, is_pending, use_system_proxy, favorite, hidden, updated_at
+                has_pending_report, is_personal, is_pending, use_system_proxy, use_proxy_pool, favorite, hidden, updated_at
          FROM directory_sites WHERE id = ?1",
         )
         .map_err(|e| e.to_string())?;
@@ -45,9 +45,10 @@ pub(crate) fn read_site(connection: &Connection, id: &str) -> Result<Option<Site
                 is_personal: row.get::<_, i64>(21)? != 0,
                 is_pending: row.get::<_, i64>(22)? != 0,
                 use_system_proxy: row.get::<_, i64>(23)? != 0,
-                favorite: row.get::<_, i64>(24)? != 0,
-                hidden: row.get::<_, i64>(25)? != 0,
-                updated_at: row.get(26)?,
+                use_proxy_pool: row.get::<_, i64>(24)? != 0,
+                favorite: row.get::<_, i64>(25)? != 0,
+                hidden: row.get::<_, i64>(26)? != 0,
+                updated_at: row.get(27)?,
                 tags: vec![],
                 maintainers: vec![],
                 extension_links: vec![],
@@ -109,7 +110,7 @@ pub fn list_library(database: State<'_, Database>) -> Result<LibraryData, String
                 supports_immersive_translation, supports_ldc, supports_checkin, supports_nsfw,
                 checkin_url, checkin_note, benefit_url, rate_limit, status_url,
                 is_only_maintainer_visible, requires_invite_code, is_runaway, is_fake_charity,
-                has_pending_report, is_personal, is_pending, use_system_proxy, favorite, hidden, updated_at
+                has_pending_report, is_personal, is_pending, use_system_proxy, use_proxy_pool, favorite, hidden, updated_at
          FROM directory_sites
          ORDER BY is_personal DESC, is_pending DESC, datetime(updated_at) DESC, rowid DESC",
         )
@@ -142,9 +143,10 @@ pub fn list_library(database: State<'_, Database>) -> Result<LibraryData, String
                 is_personal: row.get::<_, i64>(21)? != 0,
                 is_pending: row.get::<_, i64>(22)? != 0,
                 use_system_proxy: row.get::<_, i64>(23)? != 0,
-                favorite: row.get::<_, i64>(24)? != 0,
-                hidden: row.get::<_, i64>(25)? != 0,
-                updated_at: row.get(26)?,
+                use_proxy_pool: row.get::<_, i64>(24)? != 0,
+                favorite: row.get::<_, i64>(25)? != 0,
+                hidden: row.get::<_, i64>(26)? != 0,
+                updated_at: row.get(27)?,
                 tags: vec![],
                 maintainers: vec![],
                 extension_links: vec![],
@@ -469,14 +471,14 @@ pub fn update_site(
             checkin_url=?10, checkin_note=?11, benefit_url=?12, rate_limit=?13, status_url=?14,
             is_only_maintainer_visible=?15, requires_invite_code=?16, is_runaway=?17, is_fake_charity=?18,
             has_pending_report=?19, is_personal=?20, is_pending=?21, use_system_proxy=?22,
-            system_type=?23, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
-         WHERE id=?24",
+            use_proxy_pool=?23, system_type=?24, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE id=?25",
         params![
             input.name, input.description, input.registration_limit, input.icon, input.api_base_url,
             input.supports_immersive_translation, input.supports_ldc, input.supports_checkin, input.supports_nsfw,
             input.checkin_url, input.checkin_note, input.benefit_url, input.rate_limit, input.status_url,
             input.is_only_maintainer_visible, input.requires_invite_code, input.is_runaway, input.is_fake_charity,
-            input.has_pending_report, input.is_personal, input.is_pending, input.use_system_proxy, input.system_type, id
+            input.has_pending_report, input.is_personal, input.is_pending, input.use_system_proxy, input.use_proxy_pool, input.system_type, id
         ],
     ).map_err(|e| e.to_string())?;
 

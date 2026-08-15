@@ -3,6 +3,7 @@ import { runCommand, useLibrary } from "./useLibrary";
 import { useToast } from "./useToast";
 import { useUIState } from "./useUIState";
 import type { AddressItem, SiteRecord, SiteLinkKind, SiteUsageState } from "../types";
+import { systemTypeLabel } from "../types";
 
 const isTauri = "__TAURI_INTERNALS__" in window;
 const { loadLibrary } = useLibrary();
@@ -32,7 +33,7 @@ async function importSite(siteUrl: string, usageState: SiteUsageState = "all"): 
     closeModal();
     await loadLibrary();
     const usageLabel = usageState === "personal" ? "在用" : usageState === "pending" ? "待定" : "全部";
-    showToast(`已导入「${site.name}」${site.systemType ? `（${site.systemType}）` : ""} · ${usageLabel}`);
+    showToast(`已导入「${site.name}」${site.systemType ? `（${systemTypeLabel(site.systemType)}）` : ""} · ${usageLabel}`);
     return site;
   } catch (error) {
     showToast(`导入失败：${String(error)}`, true);

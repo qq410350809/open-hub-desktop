@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
-const CACHE_VERSION: i64 = 6;
+const CACHE_VERSION: i64 = 9;
 const CACHE_TTL: Duration = Duration::from_secs(5);
 const UNKNOWN_CODEX_MODEL: &str = "codex-unknown-model";
 const UNKNOWN_CLAUDE_MODEL: &str = "claude-unknown-model";
@@ -19,6 +19,7 @@ const UNKNOWN_OPENCODE_MODEL: &str = "opencode-unknown-model";
 const UNKNOWN_COMMAND_CODE_MODEL: &str = "command-code-unknown-model";
 const UNKNOWN_ANTIGRAVITY_MODEL: &str = "antigravity-unknown-model";
 const UNKNOWN_KIRO_MODEL: &str = "kiro-auto-model";
+const UNKNOWN_DSH_MODEL: &str = "dsh-unknown-model";
 const LOCAL_ESTIMATED_CONTEXT_LIMIT: i64 = 64_000;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -311,6 +312,139 @@ fn kiro_fingerprint(path: &Path) -> FileFingerprint {
     }
 }
 
+pub(crate) fn kiro_v2_session_root(home: &Path) -> PathBuf {
+    home.join(".kiro").join("sessions")
+}
+
+/// Kiro 0.x 把会话保存在 VS Code globalStorage 中。新版 Kiro 会把这些
+/// v1 JSON 会话迁移到 `~/.kiro/sessions/**/messages.jsonl`，但 Intel Mac 上
+/// 经常仍停留在旧版目录，因此两种扩展标识都兼容。
+pub(crate) fn kiro_legacy_session_roots(home: &Path) -> Vec<PathBuf> {
+    let mut storage_roots = Vec::new();
+    #[cfg(target_os = "macos")]
+    {
+        let global_storage = home
+            .join("Library")
+            .join("Application Support")
+            .join("Kiro")
+            .join("User")
+            .join("globalStorage");
+        storage_roots.push(global_storage.join("kiro.kiroagent"));
+        storage_roots.push(global_storage.join("kiro.kiro-agent"));
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(app_data) = std::env::var_os("APPDATA") {
+            let global_storage = PathBuf::from(app_data)
+                .join("Kiro")
+                .join("User")
+                .join("globalStorage");
+            storage_roots.push(global_storage.join("kiro.kiroagent"));
+            storage_roots.push(global_storage.join("kiro.kiro-agent"));
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let global_storage = home
+            .join(".config")
+            .join("Kiro")
+            .join("User")
+            .join("globalStorage");
+        storage_roots.push(global_storage.join("kiro.kiroagent"));
+        storage_roots.push(global_storage.join("kiro.kiro-agent"));
+    }
+
+    storage_roots
+        .into_iter()
+        .flat_map(|root| [root.join("workspace-sessions"), root.join("sessions")])
+        .collect()
+}
+
+fn kiro_v2_session_id(path: &Path) -> Option<String> {
+    fs::read_to_string(kiro_session_metadata_path(path))
+        .ok()
+        .and_then(|text| serde_json::from_str::<JsonValue>(&text).ok())
+        .and_then(|metadata| {
+            metadata
+                .get("id")
+                .and_then(JsonValue::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
+        .or_else(|| {
+            path.parent()
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
+}
+
+fn kiro_legacy_session_id(path: &Path) -> Option<String> {
+    path.file_stem()
+        .and_then(|name| name.to_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn normalized_kiro_session_id(value: &str) -> &str {
+    let value = value.trim();
+    value
+        .strip_prefix("sess_")
+        .or_else(|| value.strip_prefix("sess-"))
+        .unwrap_or(value)
+}
+
+fn is_kiro_legacy_session_file(path: &Path) -> bool {
+    path.extension().and_then(|value| value.to_str()) == Some("json")
+        && path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .map(|name| {
+                name != "sessions.json"
+                    && !name.starts_with("._migration-")
+                    && !name.starts_with(".migrated-")
+            })
+            .unwrap_or(false)
+}
+
+fn collect_kiro_source_files(home: &Path) -> Vec<(String, PathBuf)> {
+    let mut v2_files = Vec::new();
+    collect_jsonl_files(
+        &kiro_v2_session_root(home),
+        &|path| path.file_name().and_then(|name| name.to_str()) == Some("messages.jsonl"),
+        &mut v2_files,
+    );
+    let migrated_ids = v2_files
+        .iter()
+        .filter_map(|path| kiro_v2_session_id(path))
+        .map(|id| normalized_kiro_session_id(&id).to_string())
+        .collect::<HashSet<_>>();
+
+    let mut legacy_files = Vec::new();
+    for root in kiro_legacy_session_roots(home) {
+        collect_jsonl_files(&root, &is_kiro_legacy_session_file, &mut legacy_files);
+    }
+    legacy_files.retain(|path| {
+        kiro_legacy_session_id(path)
+            .map(|id| !migrated_ids.contains(normalized_kiro_session_id(&id)))
+            .unwrap_or(false)
+    });
+
+    v2_files
+        .into_iter()
+        .map(|path| ("kiro".to_string(), path))
+        .chain(
+            legacy_files
+                .into_iter()
+                .map(|path| ("kiro-legacy".to_string(), path)),
+        )
+        .collect()
+}
+
 fn source_file_fingerprint(source: &str, path: &Path) -> FileFingerprint {
     match source {
         "command-code" => command_code_fingerprint(path),
@@ -361,6 +495,40 @@ fn write_envelope(envelope: &CollectorEnvelope) {
     if fs::write(&tmp, bytes).is_ok() {
         let _ = fs::rename(tmp, path);
     }
+}
+
+/// 清除 OpenHub 自己维护的 Token 解析缓存，不删除任何来源工具的原始日志。
+pub(crate) fn clear_local_cache() -> Result<(), String> {
+    let _guard = collector_lock()
+        .lock()
+        .map_err(|_| "OpenHub Token 采集锁异常".to_string())?;
+    if let Ok(mut cache) = memory_cache().lock() {
+        *cache = None;
+    }
+    if let Some(path) = collector_cache_path() {
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "清除 Token 采集缓存失败（{}）：{error}",
+                    path.display()
+                ));
+            }
+        }
+        let tmp = path.with_extension("json.tmp");
+        match fs::remove_file(&tmp) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "清除 Token 临时缓存失败（{}）：{error}",
+                    tmp.display()
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn collect_jsonl_files(root: &Path, accept: &dyn Fn(&Path) -> bool, out: &mut Vec<PathBuf>) {
@@ -589,6 +757,28 @@ fn claude_user_is_human(content: &JsonValue) -> bool {
         }),
         _ => false,
     }
+}
+
+/// Codex 新版把用户消息放在 response_item(message, role=user)，
+/// 其中 <environment_context>/<codex_internal_context>/<turn_aborted> 是系统注入，不算用户提问。
+pub(crate) fn codex_user_message_is_human(payload: &JsonValue) -> bool {
+    for item in payload
+        .get("content")
+        .and_then(JsonValue::as_array)
+        .map(|items| items.as_slice())
+        .unwrap_or(&[])
+    {
+        if let Some(text) = item.get("text").and_then(JsonValue::as_str) {
+            let trimmed = text.trim_start();
+            if trimmed.is_empty() {
+                continue;
+            }
+            return !(trimmed.starts_with("<environment_context")
+                || trimmed.starts_with("<codex_internal_context")
+                || trimmed.starts_with("<turn_aborted"));
+        }
+    }
+    false
 }
 
 fn parse_claude_file(path: &Path) -> CachedFile {
@@ -1292,6 +1482,192 @@ fn parse_kiro_file(path: &Path) -> CachedFile {
     }
 }
 
+fn json_timestamp(value: &JsonValue) -> String {
+    for key in ["timestamp", "createdAt", "created_at", "time", "date"] {
+        let Some(raw) = value.get(key) else {
+            continue;
+        };
+        if let Some(timestamp) = raw
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return timestamp.to_string();
+        }
+        let millis = raw
+            .as_i64()
+            .or_else(|| raw.as_u64().map(|value| value.min(i64::MAX as u64) as i64));
+        if let Some(value) = millis {
+            let millis = if value > 0 && value < 10_000_000_000 {
+                value.saturating_mul(1_000)
+            } else {
+                value
+            };
+            return iso_from_millis(millis);
+        }
+    }
+    String::new()
+}
+
+fn parse_kiro_legacy_file(path: &Path) -> CachedFile {
+    let file_fingerprint = fingerprint(path);
+    let Ok(text) = fs::read_to_string(path) else {
+        return CachedFile {
+            fingerprint: file_fingerprint,
+            ..Default::default()
+        };
+    };
+    let Ok(root) = serde_json::from_str::<JsonValue>(&text) else {
+        return CachedFile {
+            fingerprint: file_fingerprint,
+            ..Default::default()
+        };
+    };
+    let session_id = root
+        .get("sessionId")
+        .and_then(JsonValue::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| kiro_legacy_session_id(path))
+        .unwrap_or_else(|| "kiro-v1-session".to_string());
+    let project_key = ["workspaceDirectory", "workspacePath", "cwd"]
+        .into_iter()
+        .find_map(|key| root.get(key).and_then(JsonValue::as_str))
+        .map(|path| basename_or_fallback(path, "Kiro"))
+        .unwrap_or_else(|| "Kiro".to_string());
+    let model = ["modelId", "selectedModel"]
+        .into_iter()
+        .find_map(|key| root.get(key).and_then(JsonValue::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| UNKNOWN_KIRO_MODEL.to_string());
+    let fallback_timestamp = {
+        let timestamp = json_timestamp(&root);
+        if timestamp.is_empty() {
+            iso_from_millis(file_fingerprint.modified_ms.min(i64::MAX as u64) as i64)
+        } else {
+            timestamp
+        }
+    };
+    let mut first_ts = String::new();
+    let mut last_ts = String::new();
+    let mut visible_context_tokens = 0i64;
+    let mut turns = 0i64;
+    let mut assistant_responses = 0i64;
+    let mut events = Vec::<UsageEvent>::new();
+
+    for (index, item) in root
+        .get("history")
+        .and_then(JsonValue::as_array)
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        let message = item.get("message").unwrap_or(item);
+        let role = message
+            .get("role")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("");
+        let content = message.get("content").unwrap_or(&JsonValue::Null);
+        let timestamp = {
+            let item_timestamp = json_timestamp(item);
+            if item_timestamp.is_empty() {
+                let message_timestamp = json_timestamp(message);
+                if message_timestamp.is_empty() {
+                    fallback_timestamp.clone()
+                } else {
+                    message_timestamp
+                }
+            } else {
+                item_timestamp
+            }
+        };
+        update_bounds(&mut first_ts, &mut last_ts, &timestamp);
+        let event_id = format!("{session_id}:v1:{index}:{role}");
+        match role {
+            "user" => {
+                if !claude_user_is_human(content) {
+                    continue;
+                }
+                turns += 1;
+                events.push(UsageEvent {
+                    id: format!("u:{event_id}"),
+                    source: "kiro".to_string(),
+                    model: model.clone(),
+                    project_key: project_key.clone(),
+                    timestamp,
+                    conversation_count: 1,
+                    ..Default::default()
+                });
+                visible_context_tokens =
+                    visible_context_tokens.saturating_add(estimate_local_content_tokens(content));
+            }
+            "assistant" => {
+                assistant_responses += 1;
+                let output_tokens = estimate_local_content_tokens(content);
+                let input_tokens = visible_context_tokens
+                    .saturating_add(32)
+                    .min(LOCAL_ESTIMATED_CONTEXT_LIMIT);
+                let total_tokens = input_tokens.saturating_add(output_tokens);
+                events.push(UsageEvent {
+                    id: event_id,
+                    source: "kiro".to_string(),
+                    model: model.clone(),
+                    project_key: project_key.clone(),
+                    timestamp,
+                    input_tokens,
+                    output_tokens,
+                    total_tokens,
+                    estimated_tokens: total_tokens,
+                    ..Default::default()
+                });
+                visible_context_tokens = visible_context_tokens.saturating_add(output_tokens);
+            }
+            "system" => {
+                visible_context_tokens =
+                    visible_context_tokens.saturating_add(estimate_local_content_tokens(content));
+            }
+            _ => {}
+        }
+    }
+
+    let tokens = events
+        .iter()
+        .fold(TokenSessionTokens::default(), |mut total, event| {
+            total.input_tokens += event.input_tokens;
+            total.output_tokens += event.output_tokens;
+            total.total_tokens += event.total_tokens;
+            total
+        });
+    let mut session = token_session(
+        session_id,
+        "kiro",
+        project_key,
+        model,
+        first_ts,
+        last_ts,
+        turns,
+        tokens,
+        0.0,
+    );
+    session.productive = turns > 0 && assistant_responses > 0;
+    session.provenance = json!({
+        "source": "openhub-local-collector",
+        "confidence": "estimated",
+        "privacy": "metadata-only",
+        "tokenUsage": "estimated-kiro-v1-local-context",
+        "storageFormat": "kiro-global-storage-v1",
+        "assistantResponses": assistant_responses
+    });
+    CachedFile {
+        fingerprint: file_fingerprint,
+        events,
+        sessions: vec![session],
+    }
+}
+
 fn parse_antigravity_file(path: &Path) -> CachedFile {
     let file_fingerprint = antigravity_fingerprint(path);
     let Ok(text) = fs::read_to_string(path) else {
@@ -1578,6 +1954,178 @@ impl CodexUsageState {
     }
 }
 
+/// DSH (DeepSeek AI CLI) 会话日志解析。
+/// 日志路径: ~/.dsh/sessions/<cwd-hash>/session-<uuid>/session.jsonl.zstd
+/// 格式: zstd 压缩的 JSONL，每行一个事件对象。
+/// usage 来源:
+///   - assistant/message 事件: data.usage (最终汇总)
+///   - assistant/chunk 事件: data.chunk.usage (增量，作为 fallback)
+/// 模型名: data.message.source.model
+/// 时间戳: 毫秒级 epoch，需转 ISO
+fn parse_dsh_file(path: &Path) -> CachedFile {
+    let fp = fingerprint(path);
+    let Ok(raw) = fs::read(path) else {
+        return CachedFile { fingerprint: fp, ..Default::default() };
+    };
+    let text = match zstd::decode_all(raw.as_slice()) {
+        Ok(bytes) => match String::from_utf8(bytes) {
+            Ok(s) => s,
+            Err(_) => return CachedFile { fingerprint: fp, ..Default::default() },
+        },
+        Err(_) => return CachedFile { fingerprint: fp, ..Default::default() },
+    };
+
+    let mut session_id = String::new();
+    let mut project_key = String::new();
+    let mut model = String::new();
+    let mut first_ts = String::new();
+    let mut last_ts = String::new();
+    let mut user_events: BTreeMap<String, String> = BTreeMap::new();
+    let mut usage_events: BTreeMap<String, UsageEvent> = BTreeMap::new();
+
+    for (index, line) in text.lines().enumerate() {
+        let Ok(value) = serde_json::from_str::<JsonValue>(line) else { continue };
+        let kind = value.get("type").and_then(JsonValue::as_str).unwrap_or("");
+        let time_ms = value.get("time").and_then(JsonValue::as_i64).unwrap_or(0);
+        let timestamp = iso_from_millis(time_ms);
+
+        if kind == "session" {
+            if let Some(id) = value.get("id").and_then(JsonValue::as_str).filter(|v| !v.is_empty()) {
+                session_id = id.to_string();
+            }
+            if let Some(cwd) = value.get("cwd").and_then(JsonValue::as_str).filter(|v| !v.is_empty()) {
+                project_key = basename_or_fallback(cwd, &project_key);
+            }
+            if !timestamp.is_empty() {
+                update_bounds(&mut first_ts, &mut last_ts, &timestamp);
+            }
+            continue;
+        }
+
+        if kind == "user/message" {
+            if !timestamp.is_empty() {
+                update_bounds(&mut first_ts, &mut last_ts, &timestamp);
+                let id = format!("dsh:user:{index}");
+                user_events.entry(id).or_insert(timestamp);
+            }
+            continue;
+        }
+
+        if kind == "assistant/message" {
+            let data = value.get("data").unwrap_or(&JsonValue::Null);
+            if !timestamp.is_empty() {
+                update_bounds(&mut first_ts, &mut last_ts, &timestamp);
+            }
+            let msg = data.get("message").unwrap_or(&JsonValue::Null);
+            if let Some(m) = msg.get("source").and_then(|s| s.get("model")).and_then(JsonValue::as_str).filter(|v| !v.is_empty()) {
+                model = m.to_string();
+            }
+            // 优先从 data.usage 取（最终汇总）
+            if let Some(usage) = data.get("usage").filter(|u| u.is_object()) {
+                let event = dsh_usage_event(usage, &session_id, &project_key, &model, &timestamp, index);
+                if let Some(ev) = event {
+                    let msg_id = ev.id.clone();
+                    let total = ev.total_tokens;
+                    let should_replace = usage_events.get(&msg_id).map(|ex| total > ex.total_tokens).unwrap_or(true);
+                    if should_replace { usage_events.insert(msg_id, ev); }
+                }
+            }
+            continue;
+        }
+
+        if kind == "assistant/chunk" {
+            let data = value.get("data").unwrap_or(&JsonValue::Null);
+            if !timestamp.is_empty() {
+                update_bounds(&mut first_ts, &mut last_ts, &timestamp);
+            }
+            // 从 chunk.usage 取增量 usage 作为 fallback（仅当没有 assistant/message 的汇总时）
+            if let Some(usage) = data.get("chunk").and_then(|c| c.get("usage")).filter(|u| u.is_object()) {
+                let turn = data.get("turn").and_then(JsonValue::as_i64).unwrap_or(0);
+                let step = data.get("step").and_then(JsonValue::as_i64).unwrap_or(0);
+                let event = dsh_usage_event(usage, &session_id, &project_key, &model, &timestamp, index);
+                if let Some(ev) = event {
+                    let chunk_id = format!("{}:chunk:{}:{}", ev.id, turn, step);
+                    let should_replace = usage_events.get(&chunk_id).map(|ex| ev.total_tokens > ex.total_tokens).unwrap_or(true);
+                    if should_replace {
+                        usage_events.insert(chunk_id.clone(), UsageEvent { id: chunk_id, ..ev });
+                    }
+                }
+            }
+            continue;
+        }
+    }
+
+    if session_id.is_empty() {
+        session_id = path.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()).unwrap_or("dsh-session").to_string();
+    }
+    if project_key.is_empty() {
+        project_key = "DSH".to_string();
+    }
+    if model.is_empty() {
+        model = UNKNOWN_DSH_MODEL.to_string();
+    }
+
+    // DSH 的 assistant/message 有 data.usage 汇总时优先用它；
+    // 如果只有 chunk usage（没有 message usage），则 chunk 级事件保留。
+    // 如果两者都有，message 级的 id 会覆盖同 id 的 chunk 级（因为 id 相同）。
+    let has_message_usage = usage_events.keys().any(|k| !k.contains(":chunk:"));
+    if has_message_usage {
+        usage_events.retain(|k, _| !k.contains(":chunk:"));
+    }
+
+    let mut events = usage_events.into_values().collect::<Vec<_>>();
+    events.extend(user_events.into_iter().map(|(id, timestamp)| UsageEvent {
+        id,
+        source: "dsh".to_string(),
+        model: model.clone(),
+        project_key: project_key.clone(),
+        timestamp,
+        conversation_count: 1,
+        ..Default::default()
+    }));
+
+    let tokens = events.iter().fold(TokenSessionTokens::default(), |mut total, event| {
+        total.input_tokens += event.input_tokens;
+        total.cached_input_tokens += event.cached_input_tokens;
+        total.cache_creation_input_tokens += event.cache_creation_input_tokens;
+        total.output_tokens += event.output_tokens;
+        total.reasoning_output_tokens += event.reasoning_output_tokens;
+        total.total_tokens += event.total_tokens;
+        total
+    });
+    let turns = events.iter().map(|e| e.conversation_count).sum();
+    let session = token_session(session_id, "dsh", project_key, model, first_ts, last_ts, turns, tokens, 0.0);
+    CachedFile { fingerprint: fp, events, sessions: vec![session] }
+}
+
+fn dsh_usage_event(usage: &JsonValue, session_id: &str, project_key: &str, model: &str, timestamp: &str, index: usize) -> Option<UsageEvent> {
+    let input = number(usage, &["inputTokens", "input_tokens"]);
+    let cached = number(usage, &["cacheReadTokens", "cache_read_input_tokens"]);
+    let output = number(usage, &["outputTokens", "output_tokens"]);
+    let total = input.saturating_add(cached).saturating_add(output);
+    if total <= 0 || timestamp.is_empty() {
+        return None;
+    }
+    let id = format!("{session_id}:dsh:{index}");
+    Some(UsageEvent {
+        id,
+        source: "dsh".to_string(),
+        model: if model.is_empty() { UNKNOWN_DSH_MODEL.to_string() } else { model.to_string() },
+        project_key: project_key.to_string(),
+        timestamp: timestamp.to_string(),
+        input_tokens: input,
+        cached_input_tokens: cached,
+        cache_creation_input_tokens: 0,
+        output_tokens: output,
+        reasoning_output_tokens: 0,
+        total_tokens: total,
+        conversation_count: 0,
+        cost_usd: 0.0,
+        pricing_available: false,
+        estimated_tokens: 0,
+    })
+}
+
 fn parse_codex_file(path: &Path) -> CachedFile {
     let Ok(text) = fs::read_to_string(path) else {
         return CachedFile {
@@ -1585,6 +2133,18 @@ fn parse_codex_file(path: &Path) -> CachedFile {
             ..Default::default()
         };
     };
+    // 判断 Codex 版本：旧版用 event_msg(user_message) 记用户轮；新版只用 response_item(message, role=user)。
+    let has_user_message_events = text.lines().any(|line| {
+        serde_json::from_str::<JsonValue>(line)
+            .map(|v| {
+                v.get("type").and_then(JsonValue::as_str) == Some("event_msg")
+                    && v.get("payload")
+                        .and_then(|p| p.get("type"))
+                        .and_then(JsonValue::as_str)
+                        == Some("user_message")
+            })
+            .unwrap_or(false)
+    });
     let fallback_id = path
         .file_stem()
         .and_then(|name| name.to_str())
@@ -1646,6 +2206,34 @@ fn parse_codex_file(path: &Path) -> CachedFile {
             {
                 current_model = model.to_string();
                 session_model = model.to_string();
+            }
+            continue;
+        }
+        if kind == "response_item" {
+            if !has_user_message_events
+                && payload.get("type").and_then(JsonValue::as_str) == Some("message")
+                && payload.get("role").and_then(JsonValue::as_str) == Some("user")
+                && codex_user_message_is_human(payload)
+            {
+                let id = payload
+                    .get("id")
+                    .and_then(JsonValue::as_str)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("{session_id}:user:{index}"));
+                events.push(UsageEvent {
+                    id: format!("u:{id}"),
+                    source: "codex".to_string(),
+                    model: if current_model.is_empty() {
+                        UNKNOWN_CODEX_MODEL.to_string()
+                    } else {
+                        current_model.clone()
+                    },
+                    project_key: project_key.clone(),
+                    timestamp,
+                    conversation_count: 1,
+                    ..Default::default()
+                });
             }
             continue;
         }
@@ -2224,18 +2812,20 @@ fn collect_uncached(force: bool) -> Result<CollectedData, String> {
             .into_iter()
             .map(|path| ("antigravity".to_string(), path)),
     );
-    let kiro_root = home.join(".kiro").join("sessions");
-    let mut kiro_files = Vec::new();
+    files.extend(collect_kiro_source_files(&home));
+    let dsh_root = home.join(".dsh").join("sessions");
+    let mut dsh_files = Vec::new();
     collect_jsonl_files(
-        &kiro_root,
-        &|path| path.file_name().and_then(|name| name.to_str()) == Some("messages.jsonl"),
-        &mut kiro_files,
+        &dsh_root,
+        &|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.ends_with(".jsonl.zstd"))
+                .unwrap_or(false)
+        },
+        &mut dsh_files,
     );
-    files.extend(
-        kiro_files
-            .into_iter()
-            .map(|path| ("kiro".to_string(), path)),
-    );
+    files.extend(dsh_files.into_iter().map(|path| ("dsh".to_string(), path)));
     files.sort_by(|left, right| left.1.cmp(&right.1));
 
     let live_paths = files
@@ -2266,9 +2856,11 @@ fn collect_uncached(force: bool) -> Result<CollectedData, String> {
         }
         let parsed = match source.as_str() {
             "codex" => parse_codex_file(&path),
+            "dsh" => parse_dsh_file(&path),
             "command-code" => parse_command_code_file(&path),
             "antigravity" => parse_antigravity_file(&path),
             "kiro" => parse_kiro_file(&path),
+            "kiro-legacy" => parse_kiro_legacy_file(&path),
             _ => parse_claude_file(&path),
         };
         envelope.files.insert(key, parsed);
@@ -2535,6 +3127,25 @@ mod tests {
     }
 
     #[test]
+    fn codex_user_message_is_human_filters_system_context() {
+        let env = json!({"content": [{"type": "input_text", "text": "<environment_context>  <cwd>/app</cwd>"}]});
+        assert!(!codex_user_message_is_human(&env));
+
+        let goal = json!({"content": [{"type": "input_text", "text": "<codex_internal_context source=\"goal\"> keep going"}]});
+        assert!(!codex_user_message_is_human(&goal));
+
+        let aborted = json!({"content": [{"type": "input_text", "text": "<turn_aborted> interrupted"}]});
+        assert!(!codex_user_message_is_human(&aborted));
+
+        let real = json!({"content": [{"type": "input_text", "text": "帮我修复这个 bug"}]});
+        assert!(codex_user_message_is_human(&real));
+
+        // 用户粘贴的 SVG 以 < 开头，但不是系统注入，应计为用户消息
+        let svg = json!({"content": [{"type": "input_text", "text": "<svg width=\"24\">...</svg>"}]});
+        assert!(codex_user_message_is_human(&svg));
+    }
+
+    #[test]
     fn cache_round_trip_preserves_sessions() {
         let session = token_session(
             "session-1".to_string(),
@@ -2720,6 +3331,84 @@ mod tests {
             Some(&json!("estimated-kiro-local-context"))
         );
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn kiro_v1_global_storage_session_is_parsed_on_legacy_macs() {
+        let dir = temp_command_code_dir("kiro-v1");
+        let path = dir.join("sess-intel.json");
+        fs::write(
+            &path,
+            r#"{
+                "title":"Intel Mac session",
+                "sessionId":"sess-intel",
+                "workspaceDirectory":"/Users/test/Projects/OpenHub",
+                "selectedModel":"claude-sonnet",
+                "createdAt":"2026-08-01T01:00:00.000Z",
+                "history":[
+                    {"timestamp":"2026-08-01T01:00:01.000Z","message":{"role":"user","content":"hello from Intel"}},
+                    {"timestamp":"2026-08-01T01:00:02.000Z","message":{"role":"assistant","content":[{"type":"text","text":"done"}]}},
+                    {"timestamp":"2026-08-01T01:00:03.000Z","message":{"role":"system","content":"system context"}}
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let parsed = parse_kiro_legacy_file(&path);
+        assert_eq!(parsed.sessions.len(), 1);
+        let session = &parsed.sessions[0];
+        assert_eq!(session.session_hash, "openhub:kiro:sess-intel");
+        assert_eq!(session.project_key, "OpenHub");
+        assert_eq!(session.model, "claude-sonnet");
+        assert_eq!(session.turns, 1);
+        assert!(session.total_tokens > 0);
+        assert_eq!(parsed.events.len(), 2);
+        assert_eq!(
+            session.provenance.get("storageFormat"),
+            Some(&json!("kiro-global-storage-v1"))
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn kiro_v2_session_suppresses_same_id_legacy_copy() {
+        let home = temp_command_code_dir("kiro-dedup");
+        let v2_dir = home
+            .join(".kiro")
+            .join("sessions")
+            .join("workspace")
+            .join("sess-shared");
+        fs::create_dir_all(&v2_dir).unwrap();
+        fs::write(v2_dir.join("messages.jsonl"), "{}\n").unwrap();
+        fs::write(v2_dir.join("session.json"), r#"{"id":"sess-shared"}"#).unwrap();
+
+        let legacy_root = kiro_legacy_session_roots(&home).into_iter().next().unwrap();
+        fs::create_dir_all(&legacy_root).unwrap();
+        fs::write(
+            legacy_root.join("shared.json"),
+            r#"{"title":"old","history":[]}"#,
+        )
+        .unwrap();
+        fs::write(
+            legacy_root.join("sess-legacy-only.json"),
+            r#"{"title":"old only","history":[]}"#,
+        )
+        .unwrap();
+
+        let files = collect_kiro_source_files(&home);
+        assert!(files.iter().any(|(source, path)| {
+            source == "kiro"
+                && path.file_name().and_then(|name| name.to_str()) == Some("messages.jsonl")
+        }));
+        assert!(!files.iter().any(|(source, path)| {
+            source == "kiro-legacy"
+                && path.file_name().and_then(|name| name.to_str()) == Some("shared.json")
+        }));
+        assert!(files.iter().any(|(source, path)| {
+            source == "kiro-legacy"
+                && path.file_name().and_then(|name| name.to_str()) == Some("sess-legacy-only.json")
+        }));
+        let _ = fs::remove_dir_all(home);
     }
 
     #[test]

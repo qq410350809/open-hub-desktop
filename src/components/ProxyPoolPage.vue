@@ -3,17 +3,11 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, watch 
 import { icons } from "../icons";
 import { useStore } from "../composables/useStore";
 import { usePreferences } from "../composables/usePreferences";
-import type { ProxyNode, ProxySubscription } from "../types";
+import type { ProxyChannel, ProxyNode, ProxySubscription } from "../types";
+import CustomSelect from "./CustomSelect.vue";
 
 const store = useStore();
 const { preferences, updatePreferences } = usePreferences();
-const speedTestPresets = [
-  { label: "Google · generate_204", value: "http://www.gstatic.com/generate_204" },
-  { label: "Google · HTTPS 204", value: "https://www.gstatic.com/generate_204" },
-  { label: "Apple · Captive Portal", value: "http://captive.apple.com/hotspot-detect.html" },
-  { label: "Microsoft · HTTP", value: "http://www.msftconnecttest.com/connecttest.txt" },
-  { label: "Cloudflare · 204", value: "https://cp.cloudflare.com/generate_204" },
-];
 const sourceName = ref("");
 const sourceLinks = ref("");
 const editingId = ref("");
@@ -27,13 +21,24 @@ const latencyFilterOptions = [
   { value: "error", label: "失败/超时" },
   { value: "all", label: "全部(限流显示)" },
 ] as const;
+const latencySelectOptions = latencyFilterOptions.map((opt) => ({ value: opt.value, text: opt.label }));
+const sourceSelectOptions = computed(() => [
+  { value: "all", text: "全部来源" },
+  ...store.proxyPool.value.subscriptions.map((sub) => ({ value: sub.id, text: sub.name })),
+]);
+const channels = computed(() => store.proxyPool.value.channels);
 const settingsOpen = ref(false);
 const ignoreAddresses = ref("");
-const speedTestUrl = ref("");
-const speedTestPreset = ref("http://www.gstatic.com/generate_204");
 const message = ref("");
 const importDialogOpen = ref(false);
 const deleteConfirmId = ref("");
+const channelDialogOpen = ref(false);
+const channelEditingId = ref("");
+const channelName = ref("");
+const channelSelectedNodeId = ref("");
+const channelNodeQuery = ref("");
+const channelAssignedProfileIds = ref<Set<string>>(new Set());
+const deleteChannelConfirmId = ref("");
 const nodeViewMode = ref<"list" | "ip">(preferences.proxyNodeViewMode === "country" ? "ip" : "list");
 const collapsedGroups = ref<Set<string>>(new Set());
 const cancelConfirmOpen = ref(false);
@@ -49,38 +54,12 @@ let liveRebuildTimer = 0;
 const rawNodeCount = computed(() => store.proxyPool.value.subscriptions
   .reduce((sum, item) => sum + item.nodeCount, 0));
 const duplicateCount = computed(() => Math.max(0, rawNodeCount.value - store.proxyPool.value.nodeCount));
-const switchingNode = computed(() => store.proxyPool.value.nodes.find(
-  (node) => node.id === store.proxyPoolSwitchingNodeId.value,
-) || null);
-// 状态栏/概览显示“代理模式 / 直连”模式标签，切换时给出明确的过渡状态。
-const runtimeStatusText = computed(() => {
-  if (store.proxyPoolSwitchingNodeId.value) return "正在切换代理…";
-  const node = store.proxyPool.value.activeNode;
-  if (node?.name) return `代理模式 · ${node.name}`;
-  return store.proxyPool.value.runtimeAvailable ? "直连" : "代理核心不可用";
-});
-const runtimeStatusTitle = computed(() => {
-  if (store.proxyPoolSwitchingNodeId.value) {
-    const node = switchingNode.value;
-    return node ? `正在切换到「${node.name}」…` : "正在切换代理节点…";
-  }
-  const node = store.proxyPool.value.activeNode;
-  if (node?.name) return `${node.name} · ${endpoint(node)}`;
-  return store.proxyPool.value.runtimeError || "当前未启用代理，外部接口直接连接";
-});
-const summaryModeLabel = computed(() => {
-  if (store.proxyPoolSwitchingNodeId.value) return "正在切换…";
-  return store.proxyPool.value.activeNode ? "代理模式" : "直连";
-});
-const summaryEndpointText = computed(() => {
-  if (store.proxyPoolSwitchingNodeId.value) {
-    const node = switchingNode.value;
-    return node ? `正在切换到「${node.name}」…` : "正在切换代理节点…";
-  }
-  const node = store.proxyPool.value.activeNode;
-  if (node?.name) return `${node.name} · ${endpoint(node)}`;
-  return "当前外部请求不使用代理节点";
-});
+const assignedAccountCount = computed(() => channels.value.reduce(
+  (sum, channel) => sum + channel.accountCount, 0,
+));
+const defaultChannel = computed(() => channels.value.find(
+  (channel) => channel.id === store.proxyPool.value.defaultChannelId,
+) ?? channels.value[0] ?? null);
 
 function nodeSortRank(node: ProxyNode) {
   if (node.testStatus === "error" || node.testStatus === "invalid") return 2;
@@ -256,17 +235,6 @@ function scheduleInitialChunks() {
 
 function syncSettings() {
   ignoreAddresses.value = store.proxyPool.value.ignoreAddresses;
-  speedTestUrl.value = store.proxyPool.value.speedTestUrl;
-  speedTestPreset.value = speedTestPresets.some((item) => item.value === speedTestUrl.value)
-    ? speedTestUrl.value
-    : "custom";
-}
-function onSpeedTestPresetChange() {
-  if (speedTestPreset.value === "custom") {
-    if (speedTestPresets.some((item) => item.value === speedTestUrl.value)) speedTestUrl.value = "";
-    return;
-  }
-  speedTestUrl.value = speedTestPreset.value;
 }
 function openImportDialog() {
   resetSource();
@@ -333,25 +301,176 @@ async function refreshAll() {
       : "全部来源刷新完成";
   }
 }
-async function saveSettings() {
+function isDefaultChannel(channel: ProxyChannel) {
+  return channel.id === store.proxyPool.value.defaultChannelId;
+}
+function channelBusyId(channel: ProxyChannel) {
+  return `test-channel-${channel.id}`;
+}
+function isChannelTesting(channel: ProxyChannel) {
+  return store.channelTestBusyId.value === channelBusyId(channel);
+}
+function channelNodeLabel(channel: ProxyChannel) {
+  if (!channel.node) return "未固定节点";
+  return `${channel.node.name} · ${downloadRateText(channel.node.channelLatencyMs ?? channel.node.latencyMs)}`;
+}
+function downloadRateText(latencyMs: number | null | undefined) {
+  if (latencyMs == null) return "待测速";
+  const seconds = Math.max(latencyMs, 1) / 1000;
+  const mbps = 500_000 / 1_000_000 / seconds;
+  if (mbps >= 100) return `${Math.round(mbps)}MB/s`;
+  if (mbps >= 1) return `${mbps.toFixed(1)}MB/s`;
+  return `${Math.round(mbps * 1000)}KB/s`;
+}
+type ProxyPoolAccountOption = {
+  profileId: string;
+  profileName: string;
+  accountName: string;
+  sites: { siteId: string; siteName: string; apiBaseUrl: string }[];
+};
+const proxyPoolAccounts = computed<ProxyPoolAccountOption[]>(() => {
+  const byProfile = new Map<string, ProxyPoolAccountOption>();
+  for (const site of store.sites.value) {
+    if (!site.useProxyPool) continue;
+    const sessions = store.chromeUsageAccounts.value[site.id] ?? [];
+    for (const session of sessions) {
+      let entry = byProfile.get(session.profileId);
+      if (!entry) {
+        entry = {
+          profileId: session.profileId,
+          profileName: session.profileName,
+          accountName: session.accountName,
+          sites: [],
+        };
+        byProfile.set(session.profileId, entry);
+      }
+      if (!entry.sites.some((item) => item.siteId === site.id)) {
+        entry.sites.push({ siteId: site.id, siteName: site.name, apiBaseUrl: site.apiBaseUrl });
+      }
+    }
+  }
+  return [...byProfile.values()].sort((left, right) =>
+    (left.accountName || left.profileName).localeCompare(right.accountName || right.profileName, "zh-CN"),
+  );
+});
+const accountChannelLabels = computed(() => {
+  const map = new Map<string, string>();
+  for (const channel of channels.value) {
+    for (const account of channel.accounts) {
+      if (!map.has(account.profileId)) map.set(account.profileId, channel.name);
+    }
+  }
+  return map;
+});
+const channelCandidateNodes = computed(() => {
+  const query = channelNodeQuery.value.trim().toLowerCase();
+  return store.proxyPool.value.nodes
+    .filter((node) => node.channelTestStatus === "success" && node.channelLatencyMs != null && node.channelLatencyMs <= 500)
+    .filter((node) => {
+      if (!query) return true;
+      return [
+        node.name,
+        node.countryName,
+        node.countryCode,
+        node.server,
+      ].some((value) => value.toLowerCase().includes(query));
+    })
+    .sort((left, right) => (left.channelLatencyMs ?? Number.POSITIVE_INFINITY) - (right.channelLatencyMs ?? Number.POSITIVE_INFINITY));
+});
+function openChannelDialog(channel?: ProxyChannel) {
+  channelEditingId.value = channel?.id ?? "";
+  channelName.value = channel?.name ?? "";
+  channelSelectedNodeId.value = channel?.nodeId ?? "";
+  channelNodeQuery.value = "";
+  channelAssignedProfileIds.value = new Set((channel?.accounts ?? []).map((account) => account.profileId));
+  channelDialogOpen.value = true;
+}
+function closeChannelDialog() {
+  channelDialogOpen.value = false;
+  channelEditingId.value = "";
+  channelName.value = "";
+  channelSelectedNodeId.value = "";
+  channelNodeQuery.value = "";
+  channelAssignedProfileIds.value = new Set();
+}
+function addChannel() {
+  openChannelDialog();
+}
+function toggleChannelAccount(profileId: string) {
+  const next = new Set(channelAssignedProfileIds.value);
+  if (next.has(profileId)) next.delete(profileId);
+  else next.add(profileId);
+  channelAssignedProfileIds.value = next;
+}
+function isChannelAccountLocked(profileId: string) {
+  return !channelAssignedProfileIds.value.has(profileId) && accountChannelLabels.value.has(profileId);
+}
+function selectChannelNode(nodeId: string) {
+  channelSelectedNodeId.value = nodeId;
+}
+async function testChannelNodes() {
+  message.value = "";
   try {
-    await store.saveProxyPoolSettings(ignoreAddresses.value, speedTestUrl.value);
-    syncSettings(); message.value = "代理规则已保存，本地与局域网地址始终直连";
+    await store.testProxyChannelNodes(channelEditingId.value || "");
+    message.value = "测速完成，请选择节点后保存";
   } catch { /* store error */ }
 }
-async function activate(node: ProxyNode) {
-  try { await store.activateProxyNode(node.id); message.value = `应用已开始通过"${node.name}"访问外部接口`; } catch { /* store error */ }
+async function saveChannel() {
+  message.value = "";
+  if (!channelName.value.trim()) {
+    message.value = "请输入通道名称";
+    return;
+  }
+  try {
+    const state = await store.saveProxyChannel(channelName.value, channelEditingId.value || undefined);
+    const channelId = state.channels.find((item) => item.id === channelEditingId.value)?.id
+      ?? state.channels.find((item) => item.name === channelName.value)?.id
+      ?? state.defaultChannelId;
+    if (channelId && channelSelectedNodeId.value) {
+      await store.setProxyChannelNode(channelId, channelSelectedNodeId.value);
+    }
+    if (channelId) {
+      const previous = new Set(
+        (state.channels.find((item) => item.id === channelId)?.accounts ?? [])
+          .map((account) => account.profileId),
+      );
+      for (const account of proxyPoolAccounts.value) {
+        if (channelAssignedProfileIds.value.has(account.profileId) && !previous.has(account.profileId)) {
+          await store.assignAccountProxyChannel(account.profileId, channelId);
+        } else if (!channelAssignedProfileIds.value.has(account.profileId) && previous.has(account.profileId)) {
+          await store.unassignAccountProxyChannel(account.profileId);
+        }
+      }
+    }
+    closeChannelDialog();
+    message.value = `通道「${channelName.value}」已保存`;
+  } catch { /* store error */ }
 }
-function selectNode(node: ProxyNode) {
-  if (
-    node.id === store.proxyPool.value.activeNodeId ||
-    !store.proxyPool.value.runtimeAvailable ||
-    Boolean(store.proxyPoolBusyId.value)
-  ) return;
-  void activate(node);
+async function removeChannel(channel: ProxyChannel) {
+  if (isDefaultChannel(channel)) {
+    message.value = "默认通道不能删除";
+    return;
+  }
+  if (channels.value.length <= 1) {
+    message.value = "至少保留一个代理通道";
+    return;
+  }
+  if (deleteChannelConfirmId.value !== channel.id) {
+    deleteChannelConfirmId.value = channel.id;
+    return;
+  }
+  message.value = "";
+  try {
+    await store.deleteProxyChannel(channel.id);
+    deleteChannelConfirmId.value = "";
+    message.value = `通道「${channel.name}」已删除`;
+  } catch { /* store error */ }
 }
-async function direct() {
-  try { await store.clearActiveProxyNode(); message.value = "代理已关闭，应用外部接口恢复直连"; } catch { /* store error */ }
+async function saveSettings() {
+  try {
+    await store.saveProxyPoolSettings(ignoreAddresses.value);
+    syncSettings(); message.value = "代理规则已保存，本地与局域网地址始终直连";
+  } catch { /* store error */ }
 }
 async function testNode(node: ProxyNode) {
   try { await store.testProxyNode(node.id); } catch { /* failed state is saved */ }
@@ -387,7 +506,7 @@ function nodesForSelectedSource() {
   return store.proxyPool.value.nodes.filter((node) => node.subscriptionNames.includes(sourceName));
 }
 function testableNodesForSelectedSource() {
-  // 测速按“选中渠道的全部节点”执行，不限制当前延迟显示阈值。
+  // 测速按“选中来源的全部节点”执行，不限制当前延迟显示阈值。
   return nodesForSelectedSource();
 }
 function requestCancelTest() {
@@ -479,10 +598,16 @@ function groupIpCount(nodes: ProxyNode[]) {
   return ips.size;
 }
 function latencyClass(node: ProxyNode) {
-  if (node.testStatus === "error" || node.testStatus === "invalid") return "bad";
-  if (node.latencyMs == null) return "untested";
-  if (node.latencyMs < 250) return "fast";
-  if (node.latencyMs < 400) return "medium";
+  return latencyClassForMs(node.latencyMs, node.testStatus);
+}
+function channelLatencyClass(node: ProxyNode) {
+  return latencyClassForMs(node.channelLatencyMs, node.channelTestStatus);
+}
+function latencyClassForMs(latencyMs: number | null | undefined, testStatus: string) {
+  if (testStatus === "error" || testStatus === "invalid") return "bad";
+  if (latencyMs == null) return "untested";
+  if (latencyMs < 250) return "fast";
+  if (latencyMs < 400) return "medium";
   return "slow";
 }
 function latencyText(node: ProxyNode) {
@@ -526,7 +651,6 @@ function nodeDetailTitle(node: ProxyNode) {
     nodeCountryLabel(node) ? `地区：${nodeCountryLabel(node)}${node.countryCode && node.countryCode !== "ZZ" ? ` (${node.countryCode})` : ""}` : "",
     `来源：${node.subscriptionNames.join(" / ") || "未分来源"}`,
     node.latencyMs != null ? `延迟：${node.latencyMs}ms` : "延迟：未测速",
-    node.id === store.proxyPool.value.activeNodeId ? "状态：使用中" : "",
   ].filter(Boolean);
   return lines.join("\n");
 }
@@ -593,27 +717,17 @@ watch(
       <div>
         <span class="proxy-pool-eyebrow">NETWORK ROUTING</span>
         <h1>代理池</h1>
-        <p>选择代理节点后，应用的外部接口请求将统一通过该节点。</p>
+        <p>代理池轮询使用节点，通道为 Chrome 账号固定出口，账号下的站点共享固定节点。</p>
       </div>
       <div class="proxy-header-actions">
         <div
           class="proxy-runtime-status"
-          :class="{ active: store.proxyPool.value.enabled, switching: Boolean(store.proxyPoolSwitchingNodeId.value) }"
-          :title="runtimeStatusTitle"
+          :class="{ active: Boolean(defaultChannel?.node) }"
+          :title="defaultChannel ? channelNodeLabel(defaultChannel) : '暂无通道'"
         >
           <i />
-          <span>{{ runtimeStatusText }}</span>
+          <span>{{ defaultChannel ? `默认通道 · ${channelNodeLabel(defaultChannel)}` : "未配置通道" }}</span>
         </div>
-        <button
-          v-if="store.proxyPool.value.activeNodeId"
-          class="secondary-button proxy-direct-button"
-          type="button"
-          :disabled="store.proxyPoolBusyId.value === 'clear' || Boolean(store.proxyPoolSwitchingNodeId.value)"
-          @click="direct"
-        >
-          <span v-html="icons.wifiOff" />
-          <span>关闭代理</span>
-        </button>
         <button class="secondary-button proxy-settings-button" type="button" :aria-expanded="settingsOpen" @click="settingsOpen = !settingsOpen">
           <span v-html="icons.settings" />
           <span>代理规则</span>
@@ -623,28 +737,74 @@ watch(
 
     <div class="proxy-pool-scroll">
       <section class="proxy-summary-grid" aria-label="代理池概览">
-        <div><strong>{{ store.proxyPool.value.subscriptionCount }}</strong><span>导入来源</span></div>
+        <div><strong>{{ channels.length }}</strong><span>代理通道</span></div>
         <div><strong>{{ store.proxyPool.value.nodeCount }}</strong><span>去重节点</span></div>
         <div><strong>{{ duplicateCount }}</strong><span>已合并重复</span></div>
         <div class="proxy-summary-endpoint">
-          <strong>{{ summaryModeLabel }}</strong>
-          <span>{{ summaryEndpointText }}</span>
+          <strong>{{ assignedAccountCount }}</strong>
+          <span>已固定通道的账号</span>
+        </div>
+      </section>
+
+      <section class="proxy-channels-panel" aria-label="代理通道">
+        <div class="proxy-channels-heading">
+          <div>
+            <strong>代理通道</strong>
+            <span>每个 Chrome 账号只归属一个通道，账号下的所有站点共享该通道固定出口。</span>
+          </div>
+          <button class="secondary-button" type="button" @click="addChannel">
+            <span v-html="icons.plus" />
+            <span>添加通道</span>
+          </button>
+        </div>
+        <div class="proxy-channel-grid">
+          <article
+            v-for="channel in channels"
+            :key="channel.id"
+            class="proxy-channel-card"
+            :class="{ default: isDefaultChannel(channel), testing: isChannelTesting(channel) }"
+            @click="openChannelDialog(channel)"
+          >
+            <header>
+              <div class="proxy-channel-title">
+                <strong>{{ channel.name }}</strong>
+                <span v-if="isDefaultChannel(channel)">默认通道</span>
+                <span>{{ channel.accountCount }} 个账号使用</span>
+              </div>
+              <i :class="{ muted: !channel.node }" />
+            </header>
+            <p class="proxy-channel-url">Cloudflare 500KB 下载测速</p>
+            <div class="proxy-channel-meta">
+              <span v-if="channel.node" class="proxy-channel-fastest">
+                <span v-html="icons.activity" />
+                {{ channelNodeLabel(channel) }}
+              </span>
+              <span v-else-if="isChannelTesting(channel)" class="proxy-channel-testing">正在测速…</span>
+              <span v-else>未固定节点</span>
+            </div>
+            <footer>
+              <button class="text-button" type="button" @click.stop="openChannelDialog(channel)">
+                配置
+              </button>
+              <button
+                v-if="!isDefaultChannel(channel)"
+                class="text-button danger"
+                type="button"
+                :disabled="channels.length <= 1 || Boolean(store.proxyPoolBusyId.value)"
+                @click.stop="removeChannel(channel)"
+              >
+                {{ deleteChannelConfirmId === channel.id ? "确认删除" : "删除" }}
+              </button>
+            </footer>
+          </article>
         </div>
       </section>
 
       <section v-if="settingsOpen" class="proxy-settings-panel">
         <div class="proxy-section-title">
-          <div><strong>请求规则</strong><span>配置代理测速地址与必须保持直连的目标。</span></div>
+          <div><strong>请求规则</strong><span>测速固定使用 Cloudflare 500KB 下载地址，这里只配置必须保持直连的目标。</span></div>
         </div>
         <div class="proxy-connection-grid">
-          <label class="proxy-speed-field">
-            <span>测速地址</span>
-            <select class="proxy-speed-select" v-model="speedTestPreset" @change="onSpeedTestPresetChange">
-              <option v-for="preset in speedTestPresets" :key="preset.value" :value="preset.value">{{ preset.label }}</option>
-              <option value="custom">自定义地址</option>
-            </select>
-            <input v-if="speedTestPreset === 'custom'" v-model="speedTestUrl" placeholder="输入 http(s) 测速地址" />
-          </label>
           <label class="proxy-ignore-field">
             <span>忽略地址</span>
             <textarea v-model="ignoreAddresses" rows="4" placeholder="127.0.0.1&#10;192.168.0.0/16&#10;localhost" />
@@ -673,14 +833,21 @@ watch(
               · 共 {{ store.proxyPool.value.nodeCount }}
             </span>
           </div>
-          <div class="proxy-node-filters">
-            <select class="proxy-source-select" v-model="selectedSource" aria-label="筛选导入来源">
-              <option value="all">全部来源</option>
-              <option v-for="sub in store.proxyPool.value.subscriptions" :key="sub.id" :value="sub.id">{{ sub.name }}</option>
-            </select>
-            <select class="proxy-latency-select" v-model="latencyFilter" aria-label="按延迟显示节点">
-              <option v-for="option in latencyFilterOptions" :key="option.value" :value="option.value">{{ option.label }}</option>
-            </select>
+         <div class="proxy-node-filters">
+            <CustomSelect
+              class="proxy-source-select"
+              :options="sourceSelectOptions"
+              :model-value="selectedSource"
+              aria-label="筛选导入来源"
+              @update:model-value="selectedSource = String($event)"
+            />
+            <CustomSelect
+              class="proxy-latency-select"
+              :options="latencySelectOptions"
+              :model-value="latencyFilter"
+              aria-label="按延迟显示节点"
+              @update:model-value="latencyFilter = String($event) as typeof latencyFilter"
+            />
           </div>
           <div class="proxy-node-actions">
             <button class="secondary-button proxy-import-button" type="button" @click="openImportDialog">
@@ -719,17 +886,8 @@ watch(
             v-for="node in renderedNodes"
             :key="node.id"
             class="proxy-node-tile"
-            :class="{
-              active: node.id === store.proxyPool.value.activeNodeId,
-              switching: node.id === store.proxyPoolSwitchingNodeId.value,
-              disabled: !store.proxyPool.value.runtimeAvailable || Boolean(store.proxyPoolBusyId.value),
-            }"
-            role="button"
-            :tabindex="store.proxyPool.value.runtimeAvailable ? 0 : -1"
+            :class="{ disabled: Boolean(store.proxyPoolBusyId.value) }"
             :title="nodeDetailTitle(node)"
-            @click="selectNode(node)"
-            @keydown.enter.prevent="selectNode(node)"
-            @keydown.space.prevent="selectNode(node)"
           >
             <div class="proxy-node-tile-head">
               <div class="proxy-node-tile-title">
@@ -757,8 +915,8 @@ watch(
               <span>{{ protocolLabel(node.proxyType) }}</span>
               <span v-if="node.udp">UDP</span>
               <span v-if="node.cipher">{{ node.cipher }}</span>
-              <i v-if="node.id === store.proxyPoolSwitchingNodeId.value" class="switching">切换中…</i>
-              <i v-else-if="node.id === store.proxyPool.value.activeNodeId">使用中</i>
+              <i v-if="!node.latencyMs && node.testStatus !== 'success'">未测速</i>
+              <i v-else-if="node.testStatus === 'error'">失败</i>
             </div>
           </article>
         </div>
@@ -804,17 +962,8 @@ watch(
                 v-for="node in groupRenderedNodes(group)"
                 :key="`${group.key}-${node.id}`"
                 class="proxy-node-tile"
-                :class="{
-                  active: node.id === store.proxyPool.value.activeNodeId,
-                  switching: node.id === store.proxyPoolSwitchingNodeId.value,
-                  disabled: !store.proxyPool.value.runtimeAvailable || Boolean(store.proxyPoolBusyId.value),
-                }"
-                role="button"
-                :tabindex="store.proxyPool.value.runtimeAvailable ? 0 : -1"
+                :class="{ disabled: Boolean(store.proxyPoolBusyId.value) }"
                 :title="nodeDetailTitle(node)"
-                @click="selectNode(node)"
-                @keydown.enter.prevent="selectNode(node)"
-                @keydown.space.prevent="selectNode(node)"
               >
                 <div class="proxy-node-tile-head">
                   <div class="proxy-node-tile-title">
@@ -836,8 +985,8 @@ watch(
                   <span>{{ protocolLabel(node.proxyType) }}</span>
                   <span v-if="node.udp">UDP</span>
                   <span v-if="node.cipher">{{ node.cipher }}</span>
-                  <i v-if="node.id === store.proxyPoolSwitchingNodeId.value" class="switching">切换中…</i>
-                  <i v-else-if="node.id === store.proxyPool.value.activeNodeId">使用中</i>
+                  <i v-if="!node.latencyMs && node.testStatus !== 'success'">未测速</i>
+                  <i v-else-if="node.testStatus === 'error'">失败</i>
                 </div>
               </article>
             </div>
@@ -951,7 +1100,12 @@ watch(
                 <button class="text-button" type="button" :disabled="store.proxyPoolBusyId.value === source.id || store.proxyPoolBusyId.value === 'all'" @click.stop="refreshSource(source)">
                   {{ isSourceParsing(source.id) ? "解析中" : "刷新" }}
                 </button>
-                <button class="text-button danger" type="button" @click.stop="removeSource(source)">删除</button>
+                <button
+                  class="text-button danger"
+                  type="button"
+                  :disabled="store.proxyPoolBusyId.value === source.id || store.proxyPoolBusyId.value === 'all'"
+                  @click.stop="removeSource(source)"
+                >删除</button>
               </footer>
               <footer v-else class="proxy-delete-confirm">
                 <span>确定删除？</span>
@@ -961,6 +1115,122 @@ watch(
             </article>
             <div v-if="!store.proxyPool.value.subscriptions.length" class="proxy-side-empty">粘贴订阅地址或节点链接开始导入</div>
           </div>
+        </div>
+      </section>
+    </div>
+  </Teleport>
+
+  <!-- 代理通道配置弹窗 -->
+  <Teleport to="body">
+    <div v-if="channelDialogOpen" class="proxy-import-backdrop" @click.self="closeChannelDialog">
+      <section class="proxy-channel-dialog" role="dialog" aria-modal="true">
+        <header class="proxy-import-dialog-header">
+          <div>
+            <strong>{{ channelEditingId ? "配置通道" : "添加通道" }}</strong>
+            <span>测速不会固定节点，选中节点保存后才固定；一个账号只能归属一个通道。</span>
+          </div>
+          <button class="icon-button proxy-import-close" type="button" title="关闭" @click="closeChannelDialog" v-html="icons.close" />
+        </header>
+        <div class="proxy-channel-dialog-body">
+          <form class="proxy-channel-form" @submit.prevent="saveChannel()">
+            <label>
+              <span>通道名称</span>
+              <input v-model="channelName" required placeholder="例如：香港固定出口" />
+            </label>
+            <div class="proxy-channel-node-field">
+              <span>固定节点</span>
+              <div class="proxy-channel-node-panel">
+                <div class="proxy-channel-node-toolbar">
+                  <label class="proxy-channel-node-search">
+                    <span v-html="icons.search" />
+                    <input v-model="channelNodeQuery" placeholder="搜索节点 / 地区" />
+                  </label>
+                  <span class="proxy-channel-node-count">{{ channelCandidateNodes.length }} 个候选</span>
+                </div>
+                <div class="proxy-channel-node-list">
+                  <label
+                    v-for="node in channelCandidateNodes"
+                    :key="node.id"
+                    class="proxy-channel-node-card"
+                    :class="{ selected: channelSelectedNodeId === node.id }"
+                  >
+                    <input
+                      type="radio"
+                      name="channel-node"
+                      :value="node.id"
+                      :checked="channelSelectedNodeId === node.id"
+                      @change="selectChannelNode(node.id)"
+                    />
+                    <span v-if="channelSelectedNodeId === node.id" class="proxy-channel-node-card-check" v-html="icons.check" />
+                    <span class="proxy-channel-node-card-flag">{{ countryFlag(node.countryCode) }}</span>
+                    <span class="proxy-channel-node-card-body">
+                      <strong>{{ node.name }}</strong>
+                      <small>{{ [nodeCountryLabel(node), endpoint(node)].filter(Boolean).join(" · ") }}</small>
+                    </span>
+                    <span class="proxy-channel-node-card-latency" :class="channelLatencyClass(node)">
+                      <template v-if="node.channelLatencyMs != null">{{ downloadRateText(node.channelLatencyMs) }}</template>
+                      <template v-else>待测速</template>
+                    </span>
+                  </label>
+                  <div v-if="!channelCandidateNodes.length" class="proxy-channel-node-empty">
+                    <span v-html="icons.globe" />
+                    <strong>{{ channelNodeQuery ? "没有匹配的候选节点" : "没有 ≤500ms 的候选节点" }}</strong>
+                    <small>先在节点列表完成测速，再回来选择</small>
+                  </div>
+                </div>
+                <div class="proxy-channel-node-footer">
+                  <span v-html="icons.activity" />
+                  <span>测速只刷新下载速率，保存通道后才固定节点</span>
+                </div>
+              </div>
+            </div>
+            <div class="proxy-channel-form-actions">
+              <button class="secondary-button" type="button" @click="closeChannelDialog">取消</button>
+              <button
+                class="secondary-button"
+                type="button"
+                :disabled="Boolean(store.proxyPoolBusyId.value) || Boolean(store.channelTestBusyId.value)"
+                @click="testChannelNodes"
+              >{{ store.channelTestBusyId.value ? "测速中…" : "测速" }}</button>
+              <button class="primary-button" type="submit" :disabled="Boolean(store.proxyPoolBusyId.value)">保存通道</button>
+            </div>
+          </form>
+          <section v-if="proxyPoolAccounts.length" class="proxy-channel-sites">
+            <div>
+              <strong>分配给该通道的账号</strong>
+              <span>按 Chrome 账号选择，账号级固定出口；每个账号只能归属一个通道，已归属其他通道的账号不可重复选择。</span>
+            </div>
+            <div
+              v-for="account in proxyPoolAccounts"
+              :key="account.profileId"
+              class="proxy-channel-account"
+              :class="{ locked: isChannelAccountLocked(account.profileId) }"
+            >
+              <label class="proxy-channel-site-row">
+                <input
+                  type="checkbox"
+                  :checked="channelAssignedProfileIds.has(account.profileId)"
+                  :disabled="isChannelAccountLocked(account.profileId)"
+                  @change="toggleChannelAccount(account.profileId)"
+                />
+                <span>
+                  <strong>{{ account.accountName || account.profileName }}</strong>
+                  <small>
+                    {{ account.profileId }}
+                    <template v-if="isChannelAccountLocked(account.profileId)">
+                      · 已归属其他通道：{{ accountChannelLabels.get(account.profileId) }}
+                    </template>
+                  </small>
+                </span>
+              </label>
+              <ul class="proxy-channel-account-sites">
+                <li v-for="site in account.sites" :key="site.siteId">
+                  <span>{{ site.siteName }}</span>
+                  <small>{{ site.apiBaseUrl }}</small>
+                </li>
+              </ul>
+            </div>
+          </section>
         </div>
       </section>
     </div>

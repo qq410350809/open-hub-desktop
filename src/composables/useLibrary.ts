@@ -92,14 +92,14 @@ const previewModelSnapshot: ModelCatalogSnapshot = {
   syncedToday: true,
   sources: [
     { source: "openrouter", url: "https://openrouter.ai/api/v1/models?output_modalities=all", fetchedAt: new Date().toISOString(), recordCount: 532 },
-    { source: "litellm", url: "https://cdn.jsdelivr.net/gh/BerriAI/litellm@main/model_prices_and_context_window.json", fetchedAt: new Date().toISOString(), recordCount: 2987 },
   ],
 };
 
 let browserProxyPool: ProxyPoolState = {
-  subscriptions: [], nodes: [], activeNodeId: "", activeNode: null, enabled: false,
+  subscriptions: [], nodes: [], channels: [], defaultChannelId: "default",
+  activeNodeId: "", activeNode: null, enabled: false,
   ignoreAddresses: "localhost,127.0.0.1,::1,.local,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16",
-  speedTestUrl: "https://cp.cloudflare.com/generate_204", runtimeAvailable: true,
+  speedTestUrl: "http://www.gstatic.com/generate_204", runtimeAvailable: true,
   runtimePath: "/Applications/Clash Verge.app/Contents/MacOS/verge-mihomo",
   runtimeError: "", nodeCount: 0, subscriptionCount: 0,
   invalidNodeCount: 0,
@@ -192,7 +192,17 @@ async function browserFallback<T>(
   }
 
   if (command === "list_library") return browserData as T;
-  if (command === "get_proxy_pool_state") return structuredClone(browserProxyPool) as T;
+  if (command === "get_proxy_pool_state") {
+    if (!browserProxyPool.channels.length) {
+      const now = new Date().toISOString();
+      browserProxyPool.channels = [{
+        id: "default", name: "默认通道", nodeId: "", node: null, testUrl: "",
+        accountCount: 0, accounts: [], createdAt: now, updatedAt: now,
+      }];
+      browserProxyPool.defaultChannelId = "default";
+    }
+    return structuredClone(browserProxyPool) as T;
+  }
   if (command === "analyze_proxy_nodes") {
     const countryFromName = (name: string) => {
       const value = name.toUpperCase();
@@ -288,6 +298,7 @@ async function browserFallback<T>(
         return {
           id, subscriptionNames: [source.name], name, proxyType, server, port: 443,
           cipher: "", udp, latencyMs, testStatus: "success", testedAt: new Date().toISOString(),
+          channelLatencyMs: null, channelTestStatus: "",
           countryCode, countryName, classification: "public", primaryIp: "",
           updatedAt: new Date().toISOString(),
         };
@@ -299,8 +310,78 @@ async function browserFallback<T>(
   }
   if (command === "set_proxy_pool_settings") {
     browserProxyPool.ignoreAddresses = String(args.ignoreAddresses || "");
-    browserProxyPool.speedTestUrl = String(args.speedTestUrl || "");
+    browserProxyPool.speedTestUrl = "http://www.gstatic.com/generate_204";
     return browserProxyPool as T;
+  }
+  if (command === "save_proxy_channel") {
+    const id = String(args.id || `browser-channel-${Date.now()}`);
+    const current = browserProxyPool.channels.find((item) => item.id === id);
+    const now = new Date().toISOString();
+    const channel = {
+      id,
+      name: String(args.name || "通道"),
+      nodeId: current?.nodeId ?? "",
+      node: current?.node ?? null,
+      testUrl: String(args.testUrl || ""),
+      accountCount: current?.accountCount ?? 0,
+      accounts: current?.accounts ?? [],
+      createdAt: current?.createdAt ?? now,
+      updatedAt: now,
+    };
+    browserProxyPool.channels = [channel, ...browserProxyPool.channels.filter((item) => item.id !== id)];
+    return structuredClone(browserProxyPool) as T;
+  }
+  if (command === "delete_proxy_channel") {
+    const id = String(args.id);
+    browserProxyPool.channels = browserProxyPool.channels.filter((item) => item.id !== id);
+    if (!browserProxyPool.channels.length) {
+      const now = new Date().toISOString();
+      browserProxyPool.channels = [{
+        id: "default", name: "默认通道", nodeId: "", node: null, testUrl: "",
+        accountCount: 0, accounts: [], createdAt: now, updatedAt: now,
+      }];
+    }
+    return structuredClone(browserProxyPool) as T;
+  }
+  if (command === "set_proxy_channel_node") {
+    const channelId = String(args.channelId);
+    const nodeId = String(args.nodeId);
+    const channel = browserProxyPool.channels.find((item) => item.id === channelId);
+    if (channel) {
+      channel.nodeId = nodeId;
+      channel.node = browserProxyPool.nodes.find((item) => item.id === nodeId) ?? null;
+      channel.updatedAt = new Date().toISOString();
+    }
+    return structuredClone(browserProxyPool) as T;
+  }
+  if (command === "assign_account_proxy_channel" || command === "unassign_account_proxy_channel") {
+    const profileId = String(args.profileId || "");
+    if (command === "assign_account_proxy_channel") {
+      const channelId = String(args.channelId || "");
+      const existing = browserProxyPool.channels.find(
+        (channel) => channel.id !== channelId && channel.accounts.some((account) => account.profileId === profileId),
+      );
+      if (existing) throw new Error(`该账号已归属通道「${existing.name}」`);
+      const target = browserProxyPool.channels.find((channel) => channel.id === channelId);
+      if (target && !target.accounts.some((account) => account.profileId === profileId)) {
+        target.accounts.push({ profileId });
+        target.accountCount = target.accounts.length;
+      }
+    } else {
+      for (const channel of browserProxyPool.channels) {
+        channel.accounts = channel.accounts.filter((account) => account.profileId !== profileId);
+        channel.accountCount = channel.accounts.length;
+      }
+    }
+    return structuredClone(browserProxyPool) as T;
+  }
+  if (command === "test_proxy_channel_nodes") {
+    browserProxyPool.nodes.forEach((node) => {
+      if (node.latencyMs == null || node.latencyMs > 500) return;
+      node.channelLatencyMs = 96 + Math.floor(Math.random() * 260);
+      node.channelTestStatus = "success";
+    });
+    return structuredClone(browserProxyPool) as T;
   }
   if (command === "set_active_proxy_node") {
     browserProxyPool.activeNodeId = String(args.nodeId);
@@ -490,25 +571,6 @@ async function browserFallback<T>(
           audioOutputCostPerToken: model.audioOutputCostPerToken,
           requestCost: model.requestCost,
           raw: { id: model.canonicalKey, preview: true },
-        },
-        {
-          source: "litellm",
-          sourceModelId: model.canonicalKey.split("/").at(-1) ?? model.canonicalKey,
-          channel: model.manufacturer,
-          mode: model.mode,
-          displayName: model.displayName,
-          contextLength: model.contextLength,
-          maxInputTokens: model.maxInputTokens,
-          maxOutputTokens: model.maxOutputTokens,
-          inputCostPerToken: model.inputCostPerToken * 1.2,
-          outputCostPerToken: model.outputCostPerToken * 1.2,
-          cacheReadCostPerToken: model.cacheReadCostPerToken,
-          cacheWriteCostPerToken: model.cacheWriteCostPerToken,
-          imageCost: model.imageCost,
-          audioInputCostPerToken: model.audioInputCostPerToken,
-          audioOutputCostPerToken: model.audioOutputCostPerToken,
-          requestCost: model.requestCost,
-          raw: { model: model.canonicalKey, preview: true, supplement: true },
         },
       ],
     };

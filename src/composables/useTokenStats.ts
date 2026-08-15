@@ -35,7 +35,7 @@ const tokenCollectorSyncError = ref("");
 const tokenCollectorSyncReport = ref<TokenCollectorSyncReport | null>(null);
 let tokenCollectorSyncPromise: Promise<TokenCollectorSyncReport> | null = null;
 let tokenDatabaseRefreshTimer: number | null = null;
-let tokenDatabaseRefreshRunning = false;
+let tokenDatabaseRefreshPromise: Promise<void> | null = null;
 const TOKEN_DATABASE_REFRESH_MS = 5_000;
 
 function toLocalDate(value: Date): string {
@@ -260,13 +260,28 @@ async function loadRequestHealth(refresh = false) {
 }
 
 async function refreshTokenDatabaseView(showLoading = false) {
-  if (tokenDatabaseRefreshRunning) return;
-  tokenDatabaseRefreshRunning = true;
-  try {
+  // 强制重建完成后的前台刷新必须等待正在进行的轮询，然后再读一次新快照；
+  // 普通轮询则直接复用当前任务，避免每 5 秒堆积并发查询。
+  if (tokenDatabaseRefreshPromise) {
+    try {
+      await tokenDatabaseRefreshPromise;
+    } catch {
+      // 前台刷新会在下方重试；普通轮询的错误已由原任务记录。
+    }
+    if (!showLoading) return;
+  }
+
+  const refreshPromise = (async () => {
     if (showLoading) {
       await Promise.all([loadTokenUsage(), loadTokenStats(), loadRequestHealth(false)]);
+      const errors = [tokenUsageError.value, tokenStatsError.value, requestHealthError.value]
+        .filter((message) => message.trim());
+      if (errors.length) {
+        throw new Error(errors.join("；"));
+      }
       return;
     }
+
     // 周期查询只访问 SQLite；已有数据时不展示 loading，避免界面闪烁。
     await Promise.all([
       runCommand<TokenUsageReport>("get_token_usage").then((value) => { tokenUsage.value = value; }),
@@ -278,18 +293,26 @@ async function refreshTokenDatabaseView(showLoading = false) {
       runCommand<RequestHealthReport>("get_token_request_health", { refresh: false })
         .then((value) => { requestHealth.value = value; }),
     ]);
+  })();
+  tokenDatabaseRefreshPromise = refreshPromise;
+
+  try {
+    await refreshPromise;
   } catch (error) {
     tokenUsageError.value = String(error);
+    throw error;
   } finally {
-    tokenDatabaseRefreshRunning = false;
+    if (tokenDatabaseRefreshPromise === refreshPromise) {
+      tokenDatabaseRefreshPromise = null;
+    }
   }
 }
 
 function startTokenDatabaseRefresh() {
   if (tokenDatabaseRefreshTimer != null) return;
-  void refreshTokenDatabaseView(true);
+  void refreshTokenDatabaseView(true).catch(() => {});
   tokenDatabaseRefreshTimer = window.setInterval(() => {
-    void refreshTokenDatabaseView(false);
+    void refreshTokenDatabaseView(false).catch(() => {});
   }, TOKEN_DATABASE_REFRESH_MS);
 }
 

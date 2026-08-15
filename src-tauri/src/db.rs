@@ -52,6 +52,7 @@ impl Database {
                     is_personal INTEGER NOT NULL,
                     is_pending INTEGER NOT NULL DEFAULT 0,
                     use_system_proxy INTEGER NOT NULL DEFAULT 0,
+                    use_proxy_pool INTEGER NOT NULL DEFAULT 0,
                     favorite INTEGER NOT NULL DEFAULT 0,
                     hidden INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -220,6 +221,13 @@ impl Database {
                 CREATE INDEX IF NOT EXISTS idx_directory_sites_hidden ON directory_sites(hidden);
                 CREATE INDEX IF NOT EXISTS idx_directory_sites_updated ON directory_sites(updated_at);
                 CREATE INDEX IF NOT EXISTS idx_site_accounts_site ON site_accounts(site_id);
+                -- 同一站点同一 Chrome Profile 只允许一条账号缓存，杜绝重复/串行账号行。
+                DELETE FROM site_accounts
+                WHERE rowid NOT IN (
+                    SELECT MIN(rowid) FROM site_accounts GROUP BY site_id, profile_id
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_site_accounts_site_profile
+                    ON site_accounts(site_id, profile_id);
                 CREATE INDEX IF NOT EXISTS idx_site_model_cache_site ON site_model_cache(site_id);
                                 CREATE INDEX IF NOT EXISTS idx_charity_feed_seen ON charity_feed_items(feed_id, last_seen_at);
                 CREATE INDEX IF NOT EXISTS idx_charity_feed_published ON charity_feed_items(feed_id, published_at DESC);
@@ -293,10 +301,35 @@ impl Database {
 
                 CREATE INDEX IF NOT EXISTS idx_proxy_subscription_nodes_node ON proxy_subscription_nodes(node_id);
 
+                CREATE TABLE IF NOT EXISTS proxy_channels (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    node_id TEXT NOT NULL DEFAULT '',
+                    test_url TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_proxy_channels_node ON proxy_channels(node_id);
+
+                CREATE TABLE IF NOT EXISTS account_proxy_channels (
+                    profile_id TEXT PRIMARY KEY,
+                    channel_id TEXT NOT NULL,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(channel_id) REFERENCES proxy_channels(id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_account_proxy_channels_channel ON account_proxy_channels(channel_id);
+
+                -- 旧的“每个账号独立固定节点”实现会造成站点内不同账号 IP 抖动，已废弃。
+                DROP TABLE IF EXISTS account_proxy_nodes;
+                DROP TABLE IF EXISTS site_proxy_channels;
+
                 ",
             )
             .map_err(|error| error.to_string())?;
 
+        migrate_account_proxy_channels_to_profile(&connection)?;
         ensure_site_account_columns(&connection)?;
         ensure_site_model_cache_columns(&connection)?;
         ensure_charity_feed_schema(&connection)?;
@@ -332,6 +365,22 @@ impl Database {
             connection
                 .execute(
                     "ALTER TABLE directory_sites ADD COLUMN use_system_proxy INTEGER NOT NULL DEFAULT 0",
+                    [],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+
+        let has_use_proxy_pool: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('directory_sites') WHERE name='use_proxy_pool'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if has_use_proxy_pool == 0 {
+            connection
+                .execute(
+                    "ALTER TABLE directory_sites ADD COLUMN use_proxy_pool INTEGER NOT NULL DEFAULT 0",
                     [],
                 )
                 .map_err(|error| error.to_string())?;
@@ -446,6 +495,13 @@ pub(crate) fn has_token_snapshots(database: &Database) -> Result<bool, String> {
         .map_err(|error| error.to_string())
 }
 
+pub(crate) fn clear_token_snapshots(database: &Database) -> Result<usize, String> {
+    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    connection
+        .execute("DELETE FROM token_cache_snapshots", [])
+        .map_err(|error| error.to_string())
+}
+
 pub(crate) fn write_token_snapshots(
     database: &Database,
     usage: &TokenUsageReport,
@@ -518,6 +574,46 @@ pub(crate) fn migrate_legacy_favorites_to_personal(connection: &Connection) -> R
         .map_err(|error| error.to_string())
 }
 
+/// 通道账号从“站点 + 账号”级升级为账号级：一个 Chrome 账号只能归属一个通道。
+/// 旧表按 (site_id, profile_id) 去重时保留每个账号最近一次分配的通道。
+pub(crate) fn migrate_account_proxy_channels_to_profile(
+    connection: &Connection,
+) -> Result<(), String> {
+    let has_site_id: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('account_proxy_channels') WHERE name = 'site_id'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if has_site_id == 0 {
+        return Ok(());
+    }
+    connection
+        .execute_batch(
+            "DROP INDEX IF EXISTS idx_account_proxy_channels_channel;
+             ALTER TABLE account_proxy_channels RENAME TO account_proxy_channels_legacy;
+             CREATE TABLE account_proxy_channels (
+                 profile_id TEXT PRIMARY KEY,
+                 channel_id TEXT NOT NULL,
+                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                 FOREIGN KEY(channel_id) REFERENCES proxy_channels(id) ON DELETE CASCADE
+             );
+             INSERT OR IGNORE INTO account_proxy_channels (profile_id, channel_id, updated_at)
+                 SELECT legacy.profile_id, legacy.channel_id, legacy.updated_at
+                 FROM account_proxy_channels_legacy AS legacy
+                 WHERE legacy.updated_at = (
+                     SELECT MAX(inner_row.updated_at)
+                     FROM account_proxy_channels_legacy AS inner_row
+                     WHERE inner_row.profile_id = legacy.profile_id
+                 );
+             DROP TABLE account_proxy_channels_legacy;
+             CREATE INDEX IF NOT EXISTS idx_account_proxy_channels_channel
+                 ON account_proxy_channels(channel_id);",
+        )
+        .map_err(|error| error.to_string())
+}
+
 pub(crate) fn ensure_site_account_columns(connection: &Connection) -> Result<(), String> {
     for (name, definition) in [
         ("username", "TEXT NOT NULL DEFAULT ''"),
@@ -569,6 +665,22 @@ pub(crate) fn ensure_site_model_cache_columns(connection: &Connection) -> Result
         connection
             .execute(
                 "ALTER TABLE site_model_cache ADD COLUMN groups_json TEXT NOT NULL DEFAULT '{}'",
+                [],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    let has_key_models = connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('site_model_cache') WHERE name = 'key_models_json'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| error.to_string())?
+        > 0;
+    if !has_key_models {
+        connection
+            .execute(
+                "ALTER TABLE site_model_cache ADD COLUMN key_models_json TEXT NOT NULL DEFAULT '{}'",
                 [],
             )
             .map_err(|error| error.to_string())?;
@@ -858,21 +970,21 @@ pub(crate) fn insert_site_transaction(
             supports_immersive_translation, supports_ldc, supports_checkin, supports_nsfw,
             checkin_url, checkin_note, benefit_url, rate_limit, status_url,
             is_only_maintainer_visible, requires_invite_code, is_runaway, is_fake_charity,
-            has_pending_report, is_personal, is_pending, use_system_proxy, favorite, hidden, created_at, updated_at
+            has_pending_report, is_personal, is_pending, use_system_proxy, use_proxy_pool, favorite, hidden, created_at, updated_at
         ) VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7,
             ?8, ?9, ?10, ?11,
             ?12, ?13, ?14, ?15, ?16,
             ?17, ?18, ?19, ?20,
-            ?21, ?22, ?23, ?24, ?25, ?26,
-            COALESCE(NULLIF(?27, ''), CURRENT_TIMESTAMP), COALESCE(NULLIF(?27, ''), CURRENT_TIMESTAMP)
+            ?21, ?22, ?23, ?24, ?25, ?26, ?27,
+            COALESCE(NULLIF(?28, ''), CURRENT_TIMESTAMP), COALESCE(NULLIF(?28, ''), CURRENT_TIMESTAMP)
         )",
         params![
             site.id, site.name, site.description, site.registration_limit, site.icon, site.api_base_url, site.system_type,
             site.supports_immersive_translation, site.supports_ldc, site.supports_checkin, site.supports_nsfw,
             site.checkin_url, site.checkin_note, site.benefit_url, site.rate_limit, site.status_url,
             site.is_only_maintainer_visible, site.requires_invite_code, site.is_runaway, site.is_fake_charity,
-            site.has_pending_report, site.is_personal, site.is_pending, site.use_system_proxy, site.favorite, site.hidden, site.updated_at
+            site.has_pending_report, site.is_personal, site.is_pending, site.use_system_proxy, site.use_proxy_pool, site.favorite, site.hidden, site.updated_at
         ],
     ).map_err(|error| error.to_string())?;
 
@@ -963,6 +1075,9 @@ pub(crate) fn ensure_proxy_pool_node_columns(connection: &Connection) -> Result<
         ("country_name", "TEXT NOT NULL DEFAULT ''"),
         ("classification", "TEXT NOT NULL DEFAULT ''"),
         ("primary_ip", "TEXT NOT NULL DEFAULT ''"),
+        ("channel_latency_ms", "INTEGER"),
+        ("channel_test_status", "TEXT NOT NULL DEFAULT ''"),
+        ("channel_tested_at", "TEXT NOT NULL DEFAULT ''"),
     ] {
         let exists = connection
             .query_row(
@@ -1124,11 +1239,109 @@ mod token_snapshot_tests {
     }
 
     #[test]
+    fn clear_token_snapshots_removes_all_cached_reports() {
+        let database = test_database();
+        write_token_snapshots(
+            &database,
+            &TokenUsageReport::default(),
+            &[],
+            &RequestHealthReport::default(),
+        )
+        .unwrap();
+
+        assert_eq!(clear_token_snapshots(&database).unwrap(), 3);
+        assert!(!has_token_snapshots(&database).unwrap());
+        assert!(read_token_usage_snapshot(&database).unwrap().is_none());
+        assert!(read_token_sessions_snapshot(&database).unwrap().is_none());
+        assert!(read_token_health_snapshot(&database).unwrap().is_none());
+    }
+
+    #[test]
     fn empty_token_database_returns_none_without_scanning() {
         let database = test_database();
         assert!(!has_token_snapshots(&database).unwrap());
         assert!(read_token_usage_snapshot(&database).unwrap().is_none());
         assert!(read_token_sessions_snapshot(&database).unwrap().is_none());
         assert!(read_token_health_snapshot(&database).unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
+mod account_proxy_channel_tests {
+    use super::*;
+
+    fn legacy_database() -> Database {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE proxy_channels (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    node_id TEXT NOT NULL DEFAULT '',
+                    test_url TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                 CREATE TABLE account_proxy_channels (
+                    site_id TEXT NOT NULL,
+                    profile_id TEXT NOT NULL,
+                    channel_id TEXT NOT NULL,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (site_id, profile_id),
+                    FOREIGN KEY(channel_id) REFERENCES proxy_channels(id) ON DELETE CASCADE
+                );
+                 INSERT INTO proxy_channels (id, name) VALUES ('default', '默认通道'), ('hk', '香港');
+                 INSERT INTO account_proxy_channels (site_id, profile_id, channel_id, updated_at)
+                 VALUES
+                    ('site-a', 'profile-1', 'hk', '2026-08-15T10:00:00Z'),
+                    ('site-b', 'profile-1', 'default', '2026-08-15T11:00:00Z'),
+                    ('site-a', 'profile-2', 'hk', '2026-08-15T10:00:00Z');",
+            )
+            .unwrap();
+        Database(std::sync::Mutex::new(connection))
+    }
+
+    #[test]
+    fn legacy_account_rows_collapse_to_one_channel_per_profile() {
+        let database = legacy_database();
+        migrate_account_proxy_channels_to_profile(&database.0.lock().unwrap()).unwrap();
+
+        let connection = database.0.lock().unwrap();
+        let has_site_id: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('account_proxy_channels') WHERE name = 'site_id'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_site_id, 0);
+        let mut statement = connection
+            .prepare("SELECT profile_id, channel_id FROM account_proxy_channels ORDER BY profile_id")
+            .unwrap();
+        let rows = statement
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("profile-1".to_string(), "default".to_string()),
+                ("profile-2".to_string(), "hk".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn migration_is_idempotent_on_new_schema() {
+        let database = legacy_database();
+        migrate_account_proxy_channels_to_profile(&database.0.lock().unwrap()).unwrap();
+        migrate_account_proxy_channels_to_profile(&database.0.lock().unwrap()).unwrap();
+
+        let connection = database.0.lock().unwrap();
+        let count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM account_proxy_channels", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
     }
 }

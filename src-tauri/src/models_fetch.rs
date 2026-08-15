@@ -3,7 +3,8 @@ use crate::chrome_local_storage;
 use crate::chrome_session;
 use crate::db::*;
 use crate::models::*;
-use crate::platform_detect::{is_newapi, is_sub2api};
+use crate::platform_detect::{is_newapi, is_sub2api, is_zero_v_zero};
+use crate::proxy_pool;
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use serde_json;
@@ -34,6 +35,10 @@ pub(crate) struct SiteModelsResult {
     pub(crate) keys: Vec<String>,
     #[serde(default)]
     pub(crate) key_groups: HashMap<String, String>,
+    /// 每个 Key 对应的模型列表（逐 Key 查询 /v1/models 的结果）。
+    /// Key 为去前缀的原始值，与 `keys` 字段一致。
+    #[serde(default)]
+    pub(crate) key_models: HashMap<String, Vec<SiteModelItem>>,
 }
 
 pub(crate) fn json_array_at<'a>(
@@ -181,6 +186,9 @@ pub(crate) fn parse_api_key_entries(value: &serde_json::Value) -> Vec<(String, S
                         "/groupName",
                         "/token_group",
                         "/tokenGroup",
+                        "/name",
+                        "/token_name",
+                        "/tokenName",
                     ],
                 ),
             ),
@@ -276,6 +284,9 @@ pub(crate) fn parse_newapi_token_groups(value: &serde_json::Value) -> HashMap<St
                     "/groupName",
                     "/token_group",
                     "/tokenGroup",
+                    "/name",
+                    "/token_name",
+                    "/tokenName",
                 ],
             );
             (!id.is_empty() && !group.is_empty()).then_some((id, group))
@@ -372,7 +383,8 @@ pub(crate) async fn fetch_models_with_keys(
         .join("/v1/models")
         .map_err(|_| "无法生成 /v1/models 地址".to_string())?;
     let mut errors = Vec::new();
-    for key in keys {
+    let mut key_models: HashMap<String, Vec<SiteModelItem>> = HashMap::new();
+    for key in &keys {
         let mut candidates = vec![key.clone()];
         if !key.starts_with("sk-") {
             candidates.push(format!("sk-{key}"));
@@ -391,12 +403,8 @@ pub(crate) async fn fetch_models_with_keys(
                 Ok(value) => {
                     let models = parse_site_models(&value);
                     if !models.is_empty() {
-                        return Ok(SiteModelsResult {
-                            models,
-                            source: source.into(),
-                            keys: visible_keys,
-                            key_groups: visible_key_groups,
-                        });
+                        key_models.insert(key.clone(), models);
+                        break;
                     }
                     errors.push("模型接口返回空列表".to_string());
                 }
@@ -404,10 +412,29 @@ pub(crate) async fn fetch_models_with_keys(
             }
         }
     }
-    Err(errors
-        .last()
-        .cloned()
-        .unwrap_or_else(|| "现有 Key 均无法获取模型".into()))
+    if key_models.is_empty() {
+        return Err(errors
+            .last()
+            .cloned()
+            .unwrap_or_else(|| "现有 Key 均无法获取模型".into()));
+    }
+    // 合并所有 Key 的模型作为整站模型列表（去重），保持向后兼容。
+    let mut all_models: Vec<SiteModelItem> = Vec::new();
+    for models in key_models.values() {
+        for model in models {
+            if !all_models.iter().any(|item| item.id == model.id) {
+                all_models.push(model.clone());
+            }
+        }
+    }
+    all_models.sort_by(|left, right| left.id.cmp(&right.id));
+    Ok(SiteModelsResult {
+        models: all_models,
+        source: source.into(),
+        keys: visible_keys,
+        key_groups: visible_key_groups,
+        key_models,
+    })
 }
 
 pub(crate) fn chrome_models_bridge_script(
@@ -468,7 +495,7 @@ pub(crate) fn chrome_models_bridge_script(
   };
   const activeKeyItems = (value) => arrays(value, [[], ["data"], ["data","items"], ["data","keys"], ["keys"], ["items"], ["result","items"], ["result","keys"]])
     .filter((item) => item && item.enabled !== false && item.is_active !== false && ![0, "0", "disabled", "inactive", "expired", "revoked"].includes(item.status));
-  const keyGroup = (item) => typeof item === "object" && item ? String(item.group || item.group_name || item.groupName || item.token_group || item.tokenGroup || "").trim() : "";
+  const keyGroup = (item) => typeof item === "object" && item ? String(item.group || item.group_name || item.groupName || item.token_group || item.tokenGroup || item.name || item.token_name || item.tokenName || "").trim() : "";
   const extractKeyEntries = (value) => activeKeyItems(value)
     .flatMap((item) => {
       const key = String(typeof item === "string" ? item : item.key || item.api_key || item.apiKey || item.plain_key || item.plainKey || item.secret_key || item.secretKey || item.token || item.secret || item.value || "").replace(/^Bearer\s+/i, "").trim();
@@ -588,6 +615,7 @@ pub(crate) fn parse_chrome_models_result(value: &str) -> Result<SiteModelsResult
         source: json_string(&value, &["/source"]),
         keys: parse_api_keys(&value),
         key_groups: parse_api_key_groups(&value),
+        key_models: HashMap::new(),
     })
 }
 
@@ -679,12 +707,16 @@ pub(crate) fn save_site_model_cache(
         .map(|item| item.key_groups.clone())
         .filter(|groups| !groups.is_empty())
         .unwrap_or_else(|| account.key_groups.clone());
+    let key_models = result
+        .map(|item| item.key_models.clone())
+        .filter(|map| !map.is_empty())
+        .unwrap_or_default();
     let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
     connection
         .execute(
             "INSERT INTO site_model_cache
-             (site_id, profile_id, profile_name, account_name, username, api_source, keys_json, groups_json, models_json, error, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, CURRENT_TIMESTAMP)
+             (site_id, profile_id, profile_name, account_name, username, api_source, keys_json, groups_json, models_json, key_models_json, error, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, CURRENT_TIMESTAMP)
              ON CONFLICT(site_id, profile_id) DO UPDATE SET
                profile_name = excluded.profile_name,
                account_name = excluded.account_name,
@@ -693,6 +725,7 @@ pub(crate) fn save_site_model_cache(
                keys_json = excluded.keys_json,
                groups_json = excluded.groups_json,
                models_json = excluded.models_json,
+               key_models_json = excluded.key_models_json,
                error = excluded.error,
                updated_at = CURRENT_TIMESTAMP",
             params![
@@ -705,6 +738,7 @@ pub(crate) fn save_site_model_cache(
                 serde_json::to_string(&keys).map_err(|error| error.to_string())?,
                 serde_json::to_string(&key_groups).map_err(|error| error.to_string())?,
                 serde_json::to_string(&models).map_err(|error| error.to_string())?,
+                serde_json::to_string(&key_models).map_err(|error| error.to_string())?,
                 account.error,
             ],
         )
@@ -738,7 +772,7 @@ pub fn get_site_model_cache(
     let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
     let mut statement = connection
         .prepare(
-            "SELECT profile_id, profile_name, account_name, username, api_source, keys_json, groups_json, models_json, error
+            "SELECT profile_id, profile_name, account_name, username, api_source, keys_json, groups_json, models_json, key_models_json, error
              FROM site_model_cache WHERE site_id = ?1 ORDER BY profile_name, account_name, profile_id",
         )
         .map_err(|error| error.to_string())?;
@@ -749,11 +783,14 @@ pub fn get_site_model_cache(
             let keys_json: String = row.get(5)?;
             let groups_json: String = row.get(6)?;
             let models_json: String = row.get(7)?;
+            let key_models_json: String = row.get(8)?;
             let account_models: Vec<SiteModelItem> =
                 serde_json::from_str(&models_json).unwrap_or_default();
             let keys: Vec<String> = serde_json::from_str(&keys_json).unwrap_or_default();
             let key_groups: HashMap<String, String> =
                 serde_json::from_str(&groups_json).unwrap_or_default();
+            let key_models: HashMap<String, Vec<SiteModelItem>> =
+                serde_json::from_str(&key_models_json).unwrap_or_default();
             let source: String = row.get(4)?;
             if api_source.is_empty() && !source.is_empty() {
                 api_source = source;
@@ -766,7 +803,8 @@ pub fn get_site_model_cache(
                 username: row.get(3)?,
                 keys,
                 key_groups,
-                error: row.get(8)?,
+                key_models,
+                error: row.get(9)?,
             })
         })
         .map_err(|error| error.to_string())?
@@ -789,17 +827,51 @@ pub async fn fetch_site_models_json(
     site_id: Option<String>,
     profile_id: Option<String>,
 ) -> Result<SiteModelsResult, String> {
-    let client = if let Some(site_id) = site_id.as_deref() {
-        build_http_client_for_site(
-            &database,
-            site_id,
-            Duration::from_secs(6),
-            3,
-            "站点模型请求",
-        )?
-    } else {
-        build_http_client(&database, Duration::from_secs(6), 3, "站点模型请求")?
+    let Some(site_id) = site_id.clone() else {
+        let client = build_http_client(&database, Duration::from_secs(6), 3, "站点模型请求")?;
+        return fetch_site_models_json_inner(&app, &*database, url, None, profile_id, client).await;
     };
+    let profile_key = profile_id.clone().unwrap_or_default();
+    let app_ref = &app;
+    let database_ref = &*database;
+    let site_id_for_closure = site_id.clone();
+    proxy_pool::with_account_proxy(
+        app_ref,
+        &site_id,
+        &profile_key,
+        Duration::from_secs(6),
+        3,
+        "站点模型请求",
+        move |client| {
+            let url = url.clone();
+            let site_id = site_id_for_closure.clone();
+            let profile_id = profile_id.clone();
+            let app_ref = app_ref;
+            let database_ref = database_ref;
+            async move {
+                fetch_site_models_json_inner(
+                    app_ref,
+                    database_ref,
+                    url,
+                    Some(site_id),
+                    profile_id,
+                    client,
+                )
+                .await
+            }
+        },
+    )
+    .await
+}
+
+async fn fetch_site_models_json_inner(
+    app: &tauri::AppHandle,
+    database: &Database,
+    url: String,
+    site_id: Option<String>,
+    profile_id: Option<String>,
+    client: reqwest::Client,
+) -> Result<SiteModelsResult, String> {
     let mut base = url.trim().to_string();
     if !base.starts_with("http://") && !base.starts_with("https://") {
         base = format!("https://{base}");
@@ -895,6 +967,9 @@ pub async fn fetch_site_models_json(
     let mut discovered_keys = Vec::new();
     let mut discovered_key_groups = HashMap::new();
     let mut no_browser_fallback_profiles = HashSet::new();
+    // 认证被明确拒绝（登录令牌失效）后，匿名 /v1/models 必然同样 401，
+    // 用它决定是否跳过无意义的匿名兜底请求。
+    let mut auth_rejected = false;
 
     for profile_id in &profile_ids {
         let values = local_values.get(profile_id).cloned().unwrap_or_default();
@@ -946,7 +1021,7 @@ pub async fn fetch_site_models_json(
                 {
                     Ok(result) => {
                         return cache_profile_api_counts(
-                            &database,
+                            database,
                             site_id.as_deref(),
                             requested_profile_id.as_deref(),
                             result,
@@ -998,44 +1073,34 @@ pub async fn fetch_site_models_json(
                         }
                     };
 
-                    if cookie_header_has_name(&cookie_header_str, "new_api_refresh") {
-                        errors.push(format!(
-                            "{profile_id}：refresh cookie 必须通过 Chrome 同源请求刷新，以便写回浏览器"
-                        ));
+                    // 带 new_api_refresh 的站点（newapi2）也先尝试本地旧版会话：
+                    // /api/user/token 不触发 refresh 轮换，不会写坏浏览器里的
+                    // HttpOnly 刷新令牌。若旧会话失效，再由 acquire_newapi_token_with_refresh
+                    // 走本地 refresh 换取访问令牌；只有本地 refresh 也失败时才交 Chrome。
+                    let has_refresh_cookie =
+                        cookie_header_has_name(&cookie_header_str, "new_api_refresh");
+                    let user_id = newapi_user_id(&values).unwrap_or_default();
+                    // refresh 流程用 Bearer 令牌标识用户，不依赖 user_id；
+                    // 只有旧版会话（无 refresh cookie）才必须有 user_id 才能继续。
+                    if user_id.is_empty() && !has_refresh_cookie {
+                        errors.push(format!("{profile_id}：旧版 NewAPI 本地 user 缺少用户 ID"));
                         continue;
-                    } else {
-                        let user_id = match newapi_user_id(&values) {
-                            Some(u) => u,
-                            None => {
-                                errors.push(format!("{profile_id}：旧版 NewAPI 本地 user 缺少用户 ID"));
-                                continue;
-                            }
-                        };
-                        model_user_id = user_id.clone();
-                        NewApiAuth::Legacy {
-                            cookie_header: cookie_header_str,
-                            user_id: user_id.clone(),
-                        }
+                    }
+                    model_user_id = user_id.clone();
+                    NewApiAuth::Legacy {
+                        cookie_header: cookie_header_str,
+                        user_id: user_id.clone(),
                     }
                 }};
             }
 
             if auth.is_none() {
                 let legacy_auth = require_legacy_auth!();
-                match try_acquire_newapi_token(&client, &base_url, &legacy_auth, &user_agent).await
+                match acquire_newapi_token_with_refresh(&client, &base_url, &legacy_auth, &user_agent)
+                    .await
                 {
-                    Ok(Some(token)) => {
-                        auth = Some(NewApiAuth::Token {
-                            access_token: token,
-                            user_id: match &legacy_auth {
-                                NewApiAuth::Legacy { user_id, .. }
-                                | NewApiAuth::Token { user_id, .. } => user_id.clone(),
-                            },
-                        });
-                    }
-                    Ok(None) => {
-                        auth = Some(legacy_auth);
-                    }
+                    Ok(Some(auth_value)) => auth = Some(auth_value),
+                    Ok(None) => auth = Some(legacy_auth),
                     Err(e) => {
                         errors.push(format!("{profile_id}：{e}"));
                         continue;
@@ -1060,9 +1125,20 @@ pub async fn fetch_site_models_json(
 
             if let Err(error) = &remote_result {
                 if used_cached_token && !access_token_was_rejected(error) {
-                    no_browser_fallback_profiles.insert(profile_id.clone());
+                    // 遇盾（Cloudflare/HTML/网络拦截）不是令牌失效：直接请求被挡，
+                    // Chrome 同源兜底是唯一可行路径，不能排除在 Chrome 兜底之外；
+                    // 只有确证令牌类问题才跳过 Chrome。
+                    let is_shield = is_cloudflare_shield_error(error);
+                    if !is_shield {
+                        no_browser_fallback_profiles.insert(profile_id.clone());
+                    }
                     errors.push(format!(
-                        "{profile_id}：缓存访问令牌请求失败，不执行 refresh token：{error}"
+                        "{profile_id}：缓存访问令牌请求失败，{}：{error}",
+                        if is_shield {
+                            "将转 Chrome 同源兜底获取模型"
+                        } else {
+                            "不执行 refresh token"
+                        }
                     ));
                     continue;
                 }
@@ -1070,20 +1146,11 @@ pub async fn fetch_site_models_json(
 
             if remote_result.is_err() && used_cached_token {
                 let legacy_auth = require_legacy_auth!();
-                match try_acquire_newapi_token(&client, &base_url, &legacy_auth, &user_agent).await
+                match acquire_newapi_token_with_refresh(&client, &base_url, &legacy_auth, &user_agent)
+                    .await
                 {
-                    Ok(Some(token)) => {
-                        auth = NewApiAuth::Token {
-                            access_token: token,
-                            user_id: match &legacy_auth {
-                                NewApiAuth::Legacy { user_id, .. }
-                                | NewApiAuth::Token { user_id, .. } => user_id.clone(),
-                            },
-                        };
-                    }
-                    Ok(None) => {
-                        auth = legacy_auth;
-                    }
+                    Ok(Some(auth_value)) => auth = auth_value,
+                    Ok(None) => auth = legacy_auth,
                     Err(e) => {
                         errors.push(format!("{profile_id}：{e}"));
                         continue;
@@ -1141,14 +1208,14 @@ pub async fn fetch_site_models_json(
                             {
                                 Ok(result) => {
                                     return cache_profile_api_counts(
-                                        &database,
+                                        database,
                                         site_id.as_deref(),
                                         requested_profile_id.as_deref(),
                                         result,
                                     )
                                 }
                                 Err(error) => {
-                                    if used_cached_token {
+                                    if used_cached_token && !is_cloudflare_shield_error(&error) {
                                         no_browser_fallback_profiles.insert(profile_id.clone());
                                     }
                                     errors.push(format!("{profile_id}：{error}"));
@@ -1156,7 +1223,7 @@ pub async fn fetch_site_models_json(
                             }
                         }
                         Err(error) => {
-                            if used_cached_token {
+                            if used_cached_token && !is_cloudflare_shield_error(&error) {
                                 no_browser_fallback_profiles.insert(profile_id.clone());
                             }
                             errors.push(format!("{profile_id}：{error}"));
@@ -1174,7 +1241,7 @@ pub async fn fetch_site_models_json(
                 errors.push(format!("{profile_id}：Sub2API 本地数据中没有 auth_token"));
                 continue;
             };
-            // 已有访问秘钥（auth_token）优先直接使用：用它同步模型列表，
+            // 已有登录令牌（auth_token）优先直接使用：用它同步模型列表，
             // 不再通过 /api/v1/keys 获取 Key。只有直接同步失败才回落到 Key 接口。
             let direct_models_url = base_url
                 .join("/v1/models")
@@ -1187,13 +1254,19 @@ pub async fn fetch_site_models_json(
                     &user_agent,
                 )
                 .bearer_auth(&candidate);
-                match request_json(request, "Sub2API 模型接口").await {
+                match request_json_with_hint(
+                    request,
+                    "Sub2API 模型接口",
+                    SUB2API_AUTH_FAILURE_HINT,
+                )
+                .await
+                {
                     Ok(value) => {
                         let models = parse_site_models(&value);
                         if !models.is_empty() {
                             merge_api_keys(&mut discovered_keys, [auth_token.clone()]);
                             return cache_profile_api_counts(
-                                &database,
+                                database,
                                 site_id.as_deref(),
                                 requested_profile_id.as_deref(),
                                 SiteModelsResult {
@@ -1201,6 +1274,7 @@ pub async fn fetch_site_models_json(
                                     source: "sub2api-key".into(),
                                     keys: vec![auth_token.clone()],
                                     key_groups: HashMap::new(),
+                                    key_models: HashMap::new(),
                                 },
                             );
                         }
@@ -1209,9 +1283,10 @@ pub async fn fetch_site_models_json(
                     Err(error) => direct_errors.push(error),
                 }
             }
+            let mut sub2api_errors = Vec::new();
             if !direct_errors.is_empty() {
-                errors.push(format!(
-                    "{profile_id}：直接使用访问秘钥同步失败（{}），回落到 Key 接口",
+                sub2api_errors.push(format!(
+                    "直接使用访问秘钥同步失败（{}），回落到 Key 接口",
                     direct_errors.last().cloned().unwrap_or_default()
                 ));
             }
@@ -1222,7 +1297,13 @@ pub async fn fetch_site_models_json(
             let request =
                 chrome_request_headers(client.get(keys_url), base_url.as_str(), &user_agent)
                     .bearer_auth(&auth_token);
-            match request_json(request, "Sub2API Key 接口").await {
+            match request_json_with_hint(
+                request,
+                "Sub2API Key 接口",
+                SUB2API_AUTH_FAILURE_HINT,
+            )
+            .await
+            {
                 Ok(value) => {
                     let visible_keys = parse_api_keys(&value);
                     let visible_key_groups = parse_api_key_groups(&value);
@@ -1247,16 +1328,36 @@ pub async fn fetch_site_models_json(
                     {
                         Ok(result) => {
                             return cache_profile_api_counts(
-                                &database,
+                                database,
                                 site_id.as_deref(),
                                 requested_profile_id.as_deref(),
                                 result,
                             )
                         }
-                        Err(error) => errors.push(format!("{profile_id}：{error}")),
+                        Err(error) => sub2api_errors.push(error),
                     }
                 }
-                Err(error) => errors.push(format!("{profile_id}：{error}")),
+                Err(error) => sub2api_errors.push(error),
+            }
+            if !sub2api_errors.is_empty() {
+                if sub2api_errors
+                    .iter()
+                    .all(|error| access_token_was_rejected(error))
+                {
+                    // 模型与 Key 接口都被认证拒绝：登录令牌（auth_token）已失效。
+                    // Chrome 兜底同样依赖 auth_token，重试无意义，只保留一条精简提示。
+                    auth_rejected = true;
+                    no_browser_fallback_profiles.insert(profile_id.clone());
+                    errors.push(format!(
+                        "{profile_id}：Sub2API 登录令牌（auth_token）已失效或过期，请重新登录后同步账号"
+                    ));
+                } else {
+                    errors.extend(
+                        sub2api_errors
+                            .into_iter()
+                            .map(|error| format!("{profile_id}：{error}")),
+                    );
+                }
             }
         }
     }
@@ -1314,7 +1415,7 @@ pub async fn fetch_site_models_json(
                     match parse_chrome_models_result(&value) {
                         Ok(result) => {
                             return cache_profile_api_counts(
-                                &database,
+                                database,
                                 site_id.as_deref(),
                                 requested_profile_id.as_deref(),
                                 result,
@@ -1367,7 +1468,7 @@ pub async fn fetch_site_models_json(
                 match parse_chrome_models_result(&value) {
                     Ok(result) => {
                         return cache_profile_api_counts(
-                            &database,
+                            database,
                             site_id.as_deref(),
                             requested_profile_id.as_deref(),
                             result,
@@ -1414,7 +1515,7 @@ pub async fn fetch_site_models_json(
                 match parse_chrome_models_result(&value) {
                     Ok(result) => {
                         return cache_profile_api_counts(
-                            &database,
+                            database,
                             site_id.as_deref(),
                             requested_profile_id.as_deref(),
                             result,
@@ -1432,62 +1533,76 @@ pub async fn fetch_site_models_json(
         }
     }
 
-    let pricing_url = base_url
-        .join("/api/pricing")
-        .map_err(|_| "无法生成 /api/pricing 地址")?;
-    match request_json(
-        chrome_request_headers(client.get(pricing_url), base_url.as_str(), &user_agent),
-        "公开模型接口",
-    )
-    .await
-    {
-        Ok(value) => {
-            let models = parse_site_models(&value);
-            if !models.is_empty() {
-                return cache_profile_api_counts(
-                    &database,
-                    site_id.as_deref(),
-                    requested_profile_id.as_deref(),
-                    SiteModelsResult {
-                        models,
-                        source: "pricing".into(),
-                        keys: discovered_keys.clone(),
-                        key_groups: discovered_key_groups.clone(),
-                    },
-                );
+    // /api/pricing 是 NewAPI 系列站点的公开端点；Sub2API / 0v0 没有该端点，
+    // 直接请求只会得到非 JSON 响应，产生误导性的解析失败提示。
+    if !is_sub2api(&system_type) && !is_zero_v_zero(&system_type) {
+        let pricing_url = base_url
+            .join("/api/pricing")
+            .map_err(|_| "无法生成 /api/pricing 地址")?;
+        match request_json(
+            chrome_request_headers(client.get(pricing_url), base_url.as_str(), &user_agent),
+            "公开模型接口",
+        )
+        .await
+        {
+            Ok(value) => {
+                let models = parse_site_models(&value);
+                if !models.is_empty() {
+                    return cache_profile_api_counts(
+                        database,
+                        site_id.as_deref(),
+                        requested_profile_id.as_deref(),
+                        SiteModelsResult {
+                            models,
+                            source: "pricing".into(),
+                            keys: discovered_keys.clone(),
+                            key_groups: discovered_key_groups.clone(),
+                            key_models: HashMap::new(),
+                        },
+                    );
+                }
+                errors.push("/api/pricing 返回空模型列表".into());
             }
-            errors.push("/api/pricing 返回空模型列表".into());
+            Err(error) => errors.push(error),
         }
-        Err(error) => errors.push(error),
     }
 
-    let models_url = base_url
-        .join("/v1/models")
-        .map_err(|_| "无法生成 /v1/models 地址")?;
-    match request_json(
-        chrome_request_headers(client.get(models_url), base_url.as_str(), &user_agent),
-        "无鉴权模型接口",
-    )
-    .await
-    {
-        Ok(value) => {
-            let models = parse_site_models(&value);
-            if !models.is_empty() {
-                return cache_profile_api_counts(
-                    &database,
-                    site_id.as_deref(),
-                    requested_profile_id.as_deref(),
-                    SiteModelsResult {
-                        models,
-                        source: "models".into(),
-                        keys: discovered_keys,
-                        key_groups: discovered_key_groups,
-                    },
-                );
+    // 认证已被明确拒绝（登录令牌失效）时，匿名 /v1/models 必然同样 401，
+    // 跳过无意义的兜底请求，避免错误信息堆叠。
+    let auth_conclusively_rejected = auth_rejected
+        || (!errors.is_empty()
+            && errors.iter().all(|error| access_token_was_rejected(error)));
+    if !auth_conclusively_rejected {
+        let models_url = base_url
+            .join("/v1/models")
+            .map_err(|_| "无法生成 /v1/models 地址")?;
+        match request_json_with_hint(
+            chrome_request_headers(client.get(models_url), base_url.as_str(), &user_agent),
+            "无鉴权模型接口",
+            "（模型接口需要 API Key 或登录态）",
+        )
+        .await
+        {
+            Ok(value) => {
+                let models = parse_site_models(&value);
+                if !models.is_empty() {
+                    return cache_profile_api_counts(
+                        database,
+                        site_id.as_deref(),
+                        requested_profile_id.as_deref(),
+                        SiteModelsResult {
+                            models,
+                            source: "models".into(),
+                            keys: discovered_keys,
+                            key_groups: discovered_key_groups,
+                            key_models: HashMap::new(),
+                        },
+                    );
+                }
+                errors.push("/v1/models 返回空模型列表".into());
             }
-            errors.push("/v1/models 返回空模型列表".into());
+            Err(error) => errors.push(error),
         }
-        Err(error) => errors.push(error),
     }
     if !discovered_keys.is_empty() {
         let source = if is_sub2api(&system_type) {
@@ -1496,7 +1611,7 @@ pub async fn fetch_site_models_json(
             "newapi-key"
         };
         return cache_profile_api_counts(
-            &database,
+            database,
             site_id.as_deref(),
             requested_profile_id.as_deref(),
             SiteModelsResult {
@@ -1504,6 +1619,7 @@ pub async fn fetch_site_models_json(
                 source: source.into(),
                 keys: discovered_keys,
                 key_groups: discovered_key_groups,
+                key_models: HashMap::new(),
             },
         );
     }

@@ -78,6 +78,7 @@ pub(crate) struct SiteRecord {
     pub(crate) is_pending: bool,
     #[serde(skip)]
     pub(crate) use_system_proxy: bool,
+    pub(crate) use_proxy_pool: bool,
 
     pub(crate) favorite: bool,
     pub(crate) hidden: bool,
@@ -114,6 +115,7 @@ impl Default for SiteRecord {
             is_personal: false,
             is_pending: false,
             use_system_proxy: false,
+            use_proxy_pool: false,
             favorite: false,
             hidden: false,
             updated_at: String::new(),
@@ -236,6 +238,9 @@ pub(crate) struct SiteModelCacheAccount {
     pub(crate) keys: Vec<String>,
     #[serde(default)]
     pub(crate) key_groups: HashMap<String, String>,
+    /// 每个 Key 对应的模型列表（逐 Key 查询 /v1/models 的结果）。
+    #[serde(default)]
+    pub(crate) key_models: HashMap<String, Vec<SiteModelItem>>,
     pub(crate) error: String,
 }
 
@@ -255,7 +260,7 @@ pub(crate) struct SiteModelItem {
     pub(crate) owned_by: Option<String>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct SiteAccountSnapshot {
     pub(crate) username: String,
     pub(crate) remaining: Option<f64>,
@@ -356,6 +361,8 @@ pub(crate) struct ProxyNode {
     pub(crate) latency_ms: Option<i64>,
     pub(crate) test_status: String,
     pub(crate) tested_at: String,
+    pub(crate) channel_latency_ms: Option<i64>,
+    pub(crate) channel_test_status: String,
     pub(crate) country_code: String,
     pub(crate) country_name: String,
     pub(crate) classification: String,
@@ -365,9 +372,31 @@ pub(crate) struct ProxyNode {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
+pub(crate) struct ProxyChannelAccount {
+    pub(crate) profile_id: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub(crate) struct ProxyChannel {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) node_id: String,
+    pub(crate) node: Option<ProxyNode>,
+    pub(crate) test_url: String,
+    pub(crate) account_count: i64,
+    pub(crate) accounts: Vec<ProxyChannelAccount>,
+    pub(crate) created_at: String,
+    pub(crate) updated_at: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 pub(crate) struct ProxyPoolState {
     pub(crate) subscriptions: Vec<ProxySubscription>,
     pub(crate) nodes: Vec<ProxyNode>,
+    pub(crate) channels: Vec<ProxyChannel>,
+    pub(crate) default_channel_id: String,
     pub(crate) active_node_id: String,
     pub(crate) active_node: Option<ProxyNode>,
     pub(crate) enabled: bool,

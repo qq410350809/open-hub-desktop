@@ -11,6 +11,7 @@ import {
   type SortingState,
 } from "@tanstack/table-core";
 import { icons } from "../icons";
+import CustomSelect from "./CustomSelect.vue";
 
 export interface AppTableColumn {
   key: string;
@@ -182,6 +183,9 @@ function changePageSize(value: number) {
   emit("update:pageSize", value);
   emit("update:page", 1);
 }
+const pageSizeSelectOptions = computed(() =>
+  pageSizeOptionsList.value.map((opt) => ({ value: opt, text: String(opt) })),
+);
 interface HeaderItem {
   id: string;
   index: number;
@@ -257,11 +261,16 @@ void icons;
     </div>
 
     <footer v-if="props.showPagination && totalCount > 0" class="app-table-pagination">
-      <label>每页
-        <select :value="pageSizeRef" @change="changePageSize(Number(($event.target as HTMLSelectElement).value))">
-          <option v-for="opt in pageSizeOptionsList" :key="opt" :value="opt">{{ opt }}</option>
-        </select>
-        条
+      <label>
+        <span>每页</span>
+        <CustomSelect
+          class="app-table-page-size"
+          :options="pageSizeSelectOptions"
+          :model-value="pageSizeRef"
+          aria-label="每页条数"
+          @update:model-value="changePageSize(Number($event))"
+        />
+        <span>条</span>
       </label>
       <div class="app-table-page-buttons">
         <button type="button" :disabled="currentPage <= 1" @click="gotoPage(1)">首页</button>

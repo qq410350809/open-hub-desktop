@@ -4,6 +4,7 @@ import { icons } from "../icons";
 import { useStore } from "../composables/useStore";
 import type { ModelCatalogDetail, ModelCatalogItem } from "../types";
 import AppTable, { type AppTableColumn } from "./AppTable.vue";
+import CustomSelect from "./CustomSelect.vue";
 
 const store = useStore();
 const query = ref("");
@@ -55,6 +56,16 @@ const manufacturers = computed(() => [
   "all",
   ...new Set(store.modelCatalog.value.models.map((model) => model.manufacturer).filter(Boolean)),
 ].sort((a, b) => a === "all" ? -1 : b === "all" ? 1 : a.localeCompare(b)));
+
+const manufacturerOptions = computed(() => [
+  { value: "all", text: "全部厂商" },
+  ...manufacturers.value.filter((item) => item !== "all").map((item) => ({ value: item, text: manufacturerLabel(item) })),
+]);
+const pricingOptions = [
+  { value: "all", text: "全部价格" },
+  { value: "paid", text: "有价格" },
+  { value: "free", text: "无价格" },
+];
 
 const filteredModels = computed(() => {
   const term = query.value.trim().toLocaleLowerCase("zh-CN");
@@ -169,7 +180,7 @@ const detailPriceNote = computed(() => {
   if (mode === "image_generation") return "按生成图片数量计价；未标价字段默认缺失。";
   if (mode === "audio_speech" || mode === "audio_transcription") return "音频模型按音频 Token 计价，单位 /1M tokens。";
   if (mode === "embedding" || mode === "rerank") return "此类模型通常只有输入（或写入）计费，无输出计费。";
-  return "优先采用主目录价格；缺失字段由补偿数据填充，单位 /1M tokens。";
+  return "价格与能力参数均来自 OpenRouter；未标价字段显示为缺失，单位 /1M tokens。";
 });
 
 const modeLabels: Record<string, string> = {
@@ -334,8 +345,20 @@ onMounted(() => {
       </div>
       <div class="model-catalog-filters">
         <label class="search-box model-catalog-search"><span v-html="icons.search" /><input v-model="query" type="search" placeholder="搜索模型名称或 ID…" /></label>
-        <select v-model="manufacturer" aria-label="模型厂商筛选"><option value="all">全部厂商</option><option v-for="item in manufacturers.filter(item => item !== 'all')" :key="item" :value="item">{{ manufacturerLabel(item) }}</option></select>
-        <select v-model="pricing" aria-label="价格筛选"><option value="all">全部价格</option><option value="paid">有价格</option><option value="free">无价格</option></select>
+        <CustomSelect
+          class="model-catalog-filter-select"
+          :options="manufacturerOptions"
+          :model-value="manufacturer"
+          aria-label="模型厂商筛选"
+          @update:model-value="manufacturer = String($event)"
+        />
+        <CustomSelect
+          class="model-catalog-filter-select"
+          :options="pricingOptions"
+          :model-value="pricing"
+          aria-label="价格筛选"
+          @update:model-value="pricing = String($event)"
+        />
         <div class="model-catalog-toolbar-stats">
           <b>{{ filteredModels.length.toLocaleString() }}</b><span>个模型</span>
           <i></i>
@@ -459,11 +482,11 @@ onMounted(() => {
                   <div v-if="showRaw" class="model-catalog-raw-body">
                     <div class="model-catalog-source-tabs" role="tablist">
                       <button type="button" :class="{ active: sourceTab === 'merged' }" @click="sourceTab = 'merged'">最终参数</button>
-                      <button v-for="entry in detail.entries" :key="`${entry.source}:${entry.sourceModelId}`" type="button" :class="{ active: sourceTab === `${entry.source}:${entry.sourceModelId}` }" @click="sourceTab = `${entry.source}:${entry.sourceModelId}`">{{ entry.source === "openrouter" ? "主数据" : "补偿数据" }} · {{ entry.sourceModelId }}</button>
+                      <button v-for="entry in detail.entries" :key="`${entry.source}:${entry.sourceModelId}`" type="button" :class="{ active: sourceTab === `${entry.source}:${entry.sourceModelId}` }" @click="sourceTab = `${entry.source}:${entry.sourceModelId}`">OpenRouter · {{ entry.sourceModelId }}</button>
                     </div>
                     <div v-if="sourceTab === 'merged'" class="model-catalog-raw-summary"><pre>{{ JSON.stringify({ model: detail.model, pricing: detail.pricing }, null, 2) }}</pre></div>
                     <div v-else-if="selectedEntry" class="model-catalog-raw-summary">
-                      <div class="model-catalog-entry-facts"><span><b>用途</b>{{ selectedEntry.source === "openrouter" ? "主数据" : "缺失补偿" }}</span><span><b>模型 ID</b>{{ selectedEntry.sourceModelId }}</span><span><b>类型</b>{{ modeLabel(selectedEntry.mode) }}</span></div>
+                      <div class="model-catalog-entry-facts"><span><b>用途</b>OpenRouter 主数据</span><span><b>模型 ID</b>{{ selectedEntry.sourceModelId }}</span><span><b>类型</b>{{ modeLabel(selectedEntry.mode) }}</span></div>
                       <pre>{{ JSON.stringify(selectedEntry.raw, null, 2) }}</pre>
                     </div>
                   </div>

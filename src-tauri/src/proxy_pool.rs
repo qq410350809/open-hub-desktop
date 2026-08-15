@@ -16,7 +16,7 @@ use std::sync::{
     Mutex,
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
@@ -32,6 +32,16 @@ const BATCH_PROXY_TEST_TIMEOUT_MS: &str = "10000";
 const BATCH_PROXY_TEST_CONCURRENCY: usize = 10;
 // 选中来源通常远小于此值；全量测速时按块装载，避免一次灌入 6000+
 const BATCH_PROXY_TEST_NODE_CHUNK: usize = 120;
+// 站点级账号代理：同一账号固定一个 ≤500ms 节点并持久化；失败换节点最多重试一次。
+const ACCOUNT_PROXY_MAX_LATENCY_MS: i64 = 500;
+const ACCOUNT_PROXY_MAX_ATTEMPTS: usize = 2;
+const ACCOUNT_PROXY_BAN_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const ACCOUNT_PROXY_BAN_FORBIDDEN: Duration = Duration::from_secs(2 * 60 * 60);
+const ACCOUNT_PROXY_BAN_UNREACHABLE: Duration = Duration::from_secs(2 * 60 * 60);
+const ACCOUNT_PROXY_BAN_DEFAULT: Duration = Duration::from_secs(15 * 60);
+const DEFAULT_PROXY_CHANNEL_ID: &str = "default";
+const DEFAULT_PROXY_CHANNEL_NAME: &str = "默认通道";
+const CHANNEL_SPEED_TEST_URL: &str = "https://speed.cloudflare.com/__down?bytes=500000";
 
 #[derive(Debug, Clone)]
 struct ParsedNode {
@@ -73,6 +83,10 @@ pub(crate) struct ProxyRuntime {
     // 全局代理内核“重启/选节点”的串行锁：用户切换与公益监听等后台任务
     // 互斥操作同一 Mihomo，避免互相杀进程/覆盖选择导致切换卡死。
     runtime_op_lock: tokio::sync::Mutex<()>,
+    // 站点级账号代理：串行化“选节点 + 请求 + 失败重试”原子区间。
+    account_proxy_lock: tokio::sync::Mutex<()>,
+    // 账号代理节点黑名单（内存 TTL）：node_id -> 解禁时间。
+    account_ban_until: Mutex<HashMap<String, Instant>>,
 }
 
 struct ProxyTestLease<'a> {
@@ -108,6 +122,8 @@ impl ProxyRuntime {
             active_test: Mutex::new(None),
             next_test_id: AtomicU64::new(1),
             runtime_op_lock: tokio::sync::Mutex::new(()),
+            account_proxy_lock: tokio::sync::Mutex::new(()),
+            account_ban_until: Mutex::new(HashMap::new()),
         }
     }
 
@@ -143,6 +159,42 @@ impl ProxyRuntime {
         // 批量测速使用独立 Mihomo 运行时；这里只发取消信号，绝不停止用户全局代理。
         test.cancellation.cancel();
         Ok(true)
+    }
+
+    fn purge_account_bans(&self) {
+        let Ok(mut bans) = self.account_ban_until.lock() else {
+            return;
+        };
+        let now = Instant::now();
+        bans.retain(|_, until| *until > now);
+    }
+
+    fn account_node_is_banned(&self, node_id: &str) -> bool {
+        if node_id.trim().is_empty() {
+            return false;
+        }
+        let Ok(mut bans) = self.account_ban_until.lock() else {
+            return false;
+        };
+        let now = Instant::now();
+        match bans.get(node_id) {
+            Some(until) if *until > now => true,
+            Some(_) => {
+                bans.remove(node_id);
+                false
+            }
+            None => false,
+        }
+    }
+
+    fn account_ban_node(&self, node_id: &str, ttl: Duration) {
+        if node_id.trim().is_empty() {
+            return;
+        }
+        if let Ok(mut bans) = self.account_ban_until.lock() {
+            let until = Instant::now() + ttl;
+            bans.insert(node_id.to_string(), until);
+        }
     }
 }
 
@@ -233,6 +285,84 @@ fn runtime_info(runtime: &ProxyRuntime) -> (bool, String, String) {
     (!path.is_empty(), path, error)
 }
 
+fn ensure_default_proxy_channel(connection: &rusqlite::Connection) -> Result<(), String> {
+    connection
+        .execute(
+            "INSERT OR IGNORE INTO proxy_channels (id, name) VALUES (?1, ?2)",
+            params![DEFAULT_PROXY_CHANNEL_ID, DEFAULT_PROXY_CHANNEL_NAME],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn load_channels(
+    connection: &rusqlite::Connection,
+    nodes: &[ProxyNode],
+) -> Result<(Vec<ProxyChannel>, String), String> {
+    ensure_default_proxy_channel(connection)?;
+    let mut statement = connection
+        .prepare(
+            "SELECT id, name, node_id, test_url, created_at, updated_at
+             FROM proxy_channels
+             ORDER BY CASE WHEN id = ?1 THEN 0 ELSE 1 END, updated_at DESC, name COLLATE NOCASE",
+        )
+        .map_err(|error| error.to_string())?;
+    let mut channels = statement
+        .query_map([DEFAULT_PROXY_CHANNEL_ID], |row| {
+            let node_id: String = row.get(2)?;
+            Ok(ProxyChannel {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                node: nodes.iter().find(|node| node.id == node_id).cloned(),
+                node_id,
+                test_url: row.get(3)?,
+                created_at: row.get(4)?,
+                updated_at: row.get(5)?,
+                account_count: 0,
+                accounts: Vec::new(),
+            })
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    let mut account_statement = connection
+        .prepare(
+            "SELECT channel_id, profile_id
+             FROM account_proxy_channels
+             ORDER BY profile_id",
+        )
+        .map_err(|error| error.to_string())?;
+    let mut accounts_by_channel = HashMap::<String, Vec<ProxyChannelAccount>>::new();
+    let account_rows = account_statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+            ))
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    for (channel_id, profile_id) in account_rows {
+        accounts_by_channel
+            .entry(channel_id)
+            .or_default()
+            .push(ProxyChannelAccount { profile_id });
+    }
+    for channel in &mut channels {
+        if let Some(accounts) = accounts_by_channel.remove(&channel.id) {
+            channel.account_count = accounts.len() as i64;
+            channel.accounts = accounts;
+        }
+    }
+    let default_id = channels
+        .iter()
+        .find(|channel| channel.id == DEFAULT_PROXY_CHANNEL_ID)
+        .map(|channel| channel.id.clone())
+        .unwrap_or_else(|| DEFAULT_PROXY_CHANNEL_ID.to_string());
+    Ok((channels, default_id))
+}
+
 fn load_state(database: &Database, runtime: &ProxyRuntime) -> Result<ProxyPoolState, String> {
     let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
     let subscriptions = connection
@@ -252,7 +382,9 @@ fn load_state(database: &Database, runtime: &ProxyRuntime) -> Result<ProxyPoolSt
                     n.latency_ms, n.test_status, n.tested_at, n.updated_at,
                     COALESCE(n.country_code, ''), COALESCE(n.country_name, ''),
                     COALESCE(n.classification, ''), COALESCE(n.primary_ip, ''),
-                    COALESCE(GROUP_CONCAT(DISTINCT s.name), '')
+                    COALESCE(GROUP_CONCAT(DISTINCT s.name), ''),
+                    n.channel_latency_ms,
+                    COALESCE(n.channel_test_status, '')
              FROM proxy_pool_nodes n
              LEFT JOIN proxy_subscription_nodes sn ON sn.node_id = n.id
              LEFT JOIN proxy_subscriptions s ON s.id = sn.subscription_id
@@ -278,6 +410,8 @@ fn load_state(database: &Database, runtime: &ProxyRuntime) -> Result<ProxyPoolSt
                 country_name: row.get(12)?,
                 classification: row.get(13)?,
                 primary_ip: row.get(14)?,
+                channel_latency_ms: row.get(16)?,
+                channel_test_status: row.get(17)?,
                 subscription_names: names
                     .split(',')
                     .filter(|item| !item.is_empty())
@@ -324,6 +458,7 @@ fn load_state(database: &Database, runtime: &ProxyRuntime) -> Result<ProxyPoolSt
         dirty = true;
     }
     let _ = dirty;
+    let (channels, default_channel_id) = load_channels(&connection, &rows)?;
 
     let meta = |key: &str| -> Result<String, String> {
         connection
@@ -365,6 +500,8 @@ fn load_state(database: &Database, runtime: &ProxyRuntime) -> Result<ProxyPoolSt
         invalid_node_count: rows.iter().filter(|n| n.test_status == "invalid").count() as i64,
         subscriptions,
         nodes: rows,
+        channels,
+        default_channel_id,
         enabled: !active_node_id.is_empty() && network_proxy == active_runtime_url,
         active_node_id,
         active_node,
@@ -803,9 +940,124 @@ fn canonical_json(value: &JsonValue, remove_name: bool) -> JsonValue {
     }
 }
 
+fn speed_value_end(lower: &str, from: usize) -> Option<usize> {
+    let bytes = lower.as_bytes();
+    let mut index = from;
+    while index < bytes.len() && bytes[index].is_ascii_digit() {
+        index += 1;
+    }
+    if index == from {
+        return None;
+    }
+    if index < bytes.len() && bytes[index] == b'.' {
+        index += 1;
+        while index < bytes.len() && bytes[index].is_ascii_digit() {
+            index += 1;
+        }
+    }
+    let rest = &lower[index..];
+    let after_space = rest.trim_start_matches(' ');
+    let space_len = rest.len() - after_space.len();
+    let units = [
+        "mb/s", "kb/s", "gb/s", "tb/s",
+        "mbps", "kbps", "gbps", "tbps",
+        "mbs", "kbs", "gbs", "tbs",
+        "mbit/s", "kbit/s", "gbit/s", "tbit/s",
+        "mbits/s", "kbits/s", "gbits/s", "tbits/s",
+        "mb/秒", "kb/秒", "gb/秒", "tb/秒",
+        "m/s", "k/s", "g/s", "t/s",
+        "m/秒", "k/秒", "g/秒", "t/秒",
+    ];
+    units
+        .iter()
+        .find(|unit| after_space.starts_with(**unit))
+        .map(|unit| index + space_len + unit.len())
+}
+
+fn speed_result_start(lower: &str, original: &str) -> Option<usize> {
+    let bytes = lower.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if !bytes[index].is_ascii_digit() {
+            index += 1;
+            continue;
+        }
+        let separated = index == 0
+            || original[..index]
+                .chars()
+                .next_back()
+                .is_some_and(|character| {
+                    matches!(
+                        character,
+                        '|' | '｜' | '·' | '•' | '-' | '—' | ':' | '：' | '/' | '(' | '（' | '[' | '【' | ' ' | '\t'
+                    )
+                });
+        if separated && speed_value_end(lower, index).is_some() {
+            return Some(index);
+        }
+        while index < bytes.len() && bytes[index].is_ascii_digit() {
+            index += 1;
+        }
+        if index < bytes.len() && bytes[index] == b'.' {
+            index += 1;
+            while index < bytes.len() && bytes[index].is_ascii_digit() {
+                index += 1;
+            }
+        }
+    }
+    None
+}
+
+/// 去掉订阅里常见的测速结果后缀（如「| 延迟 123ms」「测速：88ms」「| 52MB/s」），
+/// 只保留真实节点名。仅当标识词/数值前有分隔符时裁剪，避免误伤「低延迟专线」这类合法名称。
+fn clean_node_name(name: &str) -> String {
+    let lower = name.to_lowercase();
+    let markers = [
+        "测速结果", "测速", "速度测试", "延迟测试", "时延", "延迟", "速度",
+        "speedtest", "speed test", "latency", "rtt", "ping",
+    ];
+    let mut cut = name.len();
+    for marker in markers {
+        let mut offset = 0;
+        while let Some(found) = lower[offset..].find(marker) {
+            let index = offset + found;
+            let separated = name[..index]
+                .chars()
+                .next_back()
+                .map(|character| {
+                    matches!(
+                        character,
+                        '|' | '｜' | '·' | '•' | '-' | '—' | ':' | '：' | '/' | '(' | '（' | '[' | '【' | ' ' | '\t'
+                    )
+                })
+                .unwrap_or(true);
+            if separated {
+                cut = cut.min(index);
+                break;
+            }
+            offset = index + marker.len();
+        }
+    }
+    if let Some(speed_cut) = speed_result_start(&lower, name) {
+        cut = cut.min(speed_cut);
+    }
+    let cleaned = name[..cut].trim_end_matches(|character: char| {
+        matches!(
+            character,
+            '|' | '｜' | '·' | '•' | '-' | '—' | ':' | '：' | '/' | '(' | '（' | '[' | '【' | ' ' | '\t'
+        )
+    });
+    let cleaned = cleaned.trim();
+    if cleaned.is_empty() {
+        name.trim().to_string()
+    } else {
+        cleaned.to_string()
+    }
+}
+
 fn node_from_json(mut value: JsonValue) -> Option<ParsedNode> {
     let object = value.as_object_mut()?;
-    let name = object.get("name")?.as_str()?.trim().to_string();
+    let name = clean_node_name(object.get("name")?.as_str()?.trim());
     let proxy_type = object.get("type")?.as_str()?.trim().to_ascii_lowercase();
     if name.is_empty() || proxy_type.is_empty() {
         return None;
@@ -839,6 +1091,57 @@ fn node_from_json(mut value: JsonValue) -> Option<ParsedNode> {
         udp,
         raw_json: value,
     })
+}
+
+/// 启动时修复历史节点名：去掉订阅里遗留的测速结果后缀，清洗后重名自动加序号。
+pub(crate) fn repair_stored_node_names(database: &Database) -> Result<usize, String> {
+    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    let rows = connection
+        .prepare("SELECT id, name, raw_json FROM proxy_pool_nodes ORDER BY name COLLATE NOCASE")
+        .map_err(|error| error.to_string())?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let mut used_names = rows
+        .iter()
+        .map(|(_, name, _)| name.clone())
+        .collect::<HashSet<_>>();
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|error| error.to_string())?;
+    let mut repaired = 0usize;
+    for (id, name, raw_json) in rows {
+        let cleaned = clean_node_name(&name);
+        if cleaned == name {
+            continue;
+        }
+        let final_name = unique_name(&cleaned, &mut used_names);
+        let mut config: JsonValue = serde_json::from_str(&raw_json).unwrap_or(JsonValue::Null);
+        if let Some(object) = config.as_object_mut() {
+            object.insert("name".into(), JsonValue::String(final_name.clone()));
+        }
+        transaction
+            .execute(
+                "UPDATE proxy_pool_nodes SET name = ?2, raw_json = ?3 WHERE id = ?1",
+                params![id, final_name, config.to_string()],
+            )
+            .map_err(|error| error.to_string())?;
+        repaired += 1;
+    }
+    transaction
+        .commit()
+        .map_err(|error| error.to_string())?;
+    Ok(repaired)
 }
 
 fn parse_clash_document(body: &str) -> Option<Vec<ParsedNode>> {
@@ -2388,7 +2691,9 @@ pub async fn refresh_proxy_subscription(
             .optional()
             .map_err(|error| error.to_string())?;
         let is_new = existing_name.is_none();
-        node.name = existing_name.unwrap_or_else(|| unique_name(&node.name, &mut used_names));
+        node.name = existing_name
+            .map(|name| clean_node_name(&name))
+            .unwrap_or_else(|| unique_name(&node.name, &mut used_names));
         if let Some(object) = node.raw_json.as_object_mut() {
             object.insert("name".into(), json!(node.name));
         }
@@ -2585,36 +2890,6 @@ fn normalize_ignore_addresses(value: &str) -> String {
     items.join(",")
 }
 
-pub(crate) fn list_fast_proxy_nodes(
-    database: &Database,
-    max_latency_ms: i64,
-) -> Result<Vec<(String, String, i64)>, String> {
-    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
-    let mut statement = connection
-        .prepare(
-            "SELECT id, name, latency_ms
-             FROM proxy_pool_nodes
-             WHERE test_status = 'success'
-               AND latency_ms IS NOT NULL
-               AND latency_ms > 0
-               AND latency_ms <= ?1
-             ORDER BY latency_ms ASC, name COLLATE NOCASE",
-        )
-        .map_err(|error| error.to_string())?;
-    let rows = statement
-        .query_map([max_latency_ms], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
-            ))
-        })
-        .map_err(|error| error.to_string())?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| error.to_string())?;
-    Ok(rows)
-}
-
 /// 供公益监听整轮同步使用：一次性把全部待轮询快节点装入全局内核，
 /// 后续每个节点只需 API 切换出口，不再反复重启 Mihomo。
 /// 供公益监听使用：优先选择「有订阅来源」的节点（如 igi 专线，信誉好、IP 干净），
@@ -2641,6 +2916,38 @@ pub(crate) fn list_prioritized_fast_proxy_nodes(
                      ELSE 2 END) ASC,
                n.latency_ms ASC,
                n.name COLLATE NOCASE",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([max_latency_ms], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    Ok(rows)
+}
+
+/// 通道专属测速结果：只认 `channel_test_status`/`channel_latency_ms`，
+/// 与代理池外面列表的普通延迟测速互不覆盖。
+fn list_channel_candidate_nodes(
+    database: &Database,
+    max_latency_ms: i64,
+) -> Result<Vec<(String, String, i64)>, String> {
+    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    let mut statement = connection
+        .prepare(
+            "SELECT id, name, channel_latency_ms
+             FROM proxy_pool_nodes
+             WHERE channel_test_status = 'success'
+               AND channel_latency_ms IS NOT NULL
+               AND channel_latency_ms > 0
+               AND channel_latency_ms <= ?1
+             ORDER BY channel_latency_ms ASC, name COLLATE NOCASE",
         )
         .map_err(|error| error.to_string())?;
     let rows = statement
@@ -2722,23 +3029,463 @@ pub(crate) fn runtime_proxy_url_pub(runtime: &ProxyRuntime) -> String {
     runtime_proxy_url(runtime)
 }
 
+pub(crate) fn is_http_forbidden_error(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("http 403")
+        || lower.contains("status: 403")
+        || lower.contains("status 403")
+        || lower.contains("(403)")
+        || lower.contains(" 403 ")
+        || lower.contains("403 forbidden")
+        || lower.ends_with("403")
+        || lower.contains("error code: 403")
+}
+
+pub(crate) fn is_transport_error(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("error sending request")
+        || lower.contains("i/o timeout")
+        || lower.contains("timeout")
+        || lower.contains("timed out")
+        || lower.contains("deadline")
+        || lower.contains("connection")
+        || lower.contains("connection reset")
+        || lower.contains("connect error")
+        || lower.contains("连接失败")
+        || lower.contains("无法建立连接")
+        || lower.contains("连接被重置")
+}
+
+fn account_proxy_failure_ttl(error: &str) -> Duration {
+    let lower = error.to_ascii_lowercase();
+    if is_http_forbidden_error(error) {
+        ACCOUNT_PROXY_BAN_FORBIDDEN
+    } else if is_transport_error(error) {
+        ACCOUNT_PROXY_BAN_UNREACHABLE
+    } else if lower.contains("超时") {
+        ACCOUNT_PROXY_BAN_TIMEOUT
+    } else {
+        ACCOUNT_PROXY_BAN_DEFAULT
+    }
+}
+
+pub(crate) fn read_site_uses_proxy_pool(
+    database: &Database,
+    site_id: &str,
+) -> Result<bool, String> {
+    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    connection
+        .query_row(
+            "SELECT use_proxy_pool FROM directory_sites WHERE id = ?1",
+            [site_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map(|value| value.unwrap_or(0) != 0)
+        .map_err(|error| error.to_string())
+}
+
+fn read_account_proxy_channel_id(
+    database: &Database,
+    profile_id: &str,
+) -> Result<Option<String>, String> {
+    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    connection
+        .query_row(
+            "SELECT channel_id FROM account_proxy_channels WHERE profile_id = ?1",
+            [profile_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())
+}
+
+fn read_channel_node_id(database: &Database, channel_id: &str) -> Result<String, String> {
+    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    connection
+        .query_row(
+            "SELECT node_id FROM proxy_channels WHERE id = ?1",
+            [channel_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map(|value| value.unwrap_or_default())
+        .map_err(|error| error.to_string())
+}
+
+fn write_channel_node(
+    database: &Database,
+    channel_id: &str,
+    node_id: &str,
+) -> Result<(), String> {
+    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    ensure_default_proxy_channel(&connection)?;
+    connection
+        .execute(
+            "UPDATE proxy_channels
+             SET node_id = ?2, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+             WHERE id = ?1",
+            params![channel_id, node_id],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn node_is_channel_available(database: &Database, node_id: &str) -> bool {
+    let Ok(connection) = database.0.lock() else {
+        return false;
+    };
+    connection
+        .query_row(
+            "SELECT 1 FROM proxy_pool_nodes
+             WHERE id = ?1 AND test_status = 'success'
+               AND latency_ms IS NOT NULL AND latency_ms > 0 AND latency_ms <= ?2",
+            params![node_id, ACCOUNT_PROXY_MAX_LATENCY_MS],
+            |_| Ok(()),
+        )
+        .optional()
+        .map(|value| value.is_some())
+        .unwrap_or(false)
+}
+
+fn channel_candidate_nodes(
+    database: &Database,
+    runtime: &ProxyRuntime,
+    exclude_node_id: &str,
+) -> Result<Vec<(String, String, i64)>, String> {
+    runtime.purge_account_bans();
+    let raw = list_prioritized_fast_proxy_nodes(database, ACCOUNT_PROXY_MAX_LATENCY_MS)?;
+    Ok(raw
+        .into_iter()
+        .filter(|(id, _, _)| id != exclude_node_id && !runtime.account_node_is_banned(id))
+        .collect())
+}
+
+fn channel_id_for_account(
+    database: &Database,
+    profile_id: &str,
+) -> Result<String, String> {
+    if let Some(channel_id) = read_account_proxy_channel_id(database, profile_id)? {
+        if !channel_id.trim().is_empty() {
+            return Ok(channel_id);
+        }
+    }
+    Ok(DEFAULT_PROXY_CHANNEL_ID.to_string())
+}
+
+pub(crate) async fn select_channel_proxy_node(
+    database: &Database,
+    runtime: &ProxyRuntime,
+    channel_id: &str,
+) -> Result<String, String> {
+    let existing = read_channel_node_id(database, channel_id)?;
+    if !existing.is_empty() {
+        if node_is_channel_available(database, &existing) && !runtime.account_node_is_banned(&existing)
+        {
+            select_proxy_node_transient(database, runtime, &existing).await?;
+            return Ok(existing);
+        }
+    }
+    let node_id = channel_candidate_nodes(database, runtime, "")?
+        .first()
+        .map(|(id, _, _)| id.clone())
+        .ok_or_else(|| format!("代理池中没有 ≤{ACCOUNT_PROXY_MAX_LATENCY_MS}ms 的可用节点"))?;
+    select_proxy_node_transient(database, runtime, &node_id).await?;
+    write_channel_node(database, channel_id, &node_id)?;
+    Ok(node_id)
+}
+
+pub(crate) async fn rotate_channel_proxy_node(
+    database: &Database,
+    runtime: &ProxyRuntime,
+    channel_id: &str,
+    failed_node_id: &str,
+    error: &str,
+) -> Result<String, String> {
+    runtime.account_ban_node(failed_node_id, account_proxy_failure_ttl(error));
+    let node_id = channel_candidate_nodes(database, runtime, failed_node_id)?
+        .first()
+        .map(|(id, _, _)| id.clone())
+        .ok_or_else(|| format!("代理池中没有其他 ≤{ACCOUNT_PROXY_MAX_LATENCY_MS}ms 的可用节点"))?;
+    select_proxy_node_transient(database, runtime, &node_id).await?;
+    write_channel_node(database, channel_id, &node_id)?;
+    Ok(node_id)
+}
+
+fn build_channel_proxy_client(
+    database: &Database,
+    runtime: &ProxyRuntime,
+    timeout: Duration,
+    redirects: usize,
+    purpose: &str,
+) -> Result<reqwest::Client, String> {
+    let proxy_url = runtime_proxy_url_pub(runtime);
+    let ignore = crate::db::read_proxy_ignore_addresses(database)?;
+    let proxy = reqwest::Proxy::all(&proxy_url)
+        .map_err(|_| "代理池当前出口地址无效")?
+        .no_proxy(reqwest::NoProxy::from_string(&ignore));
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::limited(redirects))
+        .proxy(proxy)
+        .build()
+        .map_err(|error| format!("无法初始化{purpose}：{error}"))
+}
+
+pub(crate) async fn with_account_proxy<T, F, Fut>(
+    app: &tauri::AppHandle,
+    site_id: &str,
+    profile_id: &str,
+    timeout: Duration,
+    redirects: usize,
+    purpose: &str,
+    mut request: F,
+) -> Result<T, String>
+where
+    F: FnMut(reqwest::Client) -> Fut,
+    Fut: std::future::Future<Output = Result<T, String>>,
+{
+    let database = app.state::<Database>();
+    let runtime = app.state::<ProxyRuntime>();
+    if !read_site_uses_proxy_pool(&database, site_id)? {
+        let client =
+            crate::db::build_http_client_for_site(&database, site_id, timeout, redirects, purpose)?;
+        return request(client).await;
+    }
+
+    let _guard = runtime.account_proxy_lock.lock().await;
+    let result = async {
+        let mut last_error = String::new();
+        let mut selected_node_id: Option<String> = None;
+        let channel_id = channel_id_for_account(&database, profile_id)?;
+        for attempt in 0..ACCOUNT_PROXY_MAX_ATTEMPTS {
+            let node_id = if attempt == 0 {
+                select_channel_proxy_node(&database, &runtime, &channel_id).await?
+            } else {
+                rotate_channel_proxy_node(
+                    &database,
+                    &runtime,
+                    &channel_id,
+                    selected_node_id.as_deref().unwrap_or_default(),
+                    &last_error,
+                )
+                .await?
+            };
+            selected_node_id = Some(node_id);
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            let client =
+                build_channel_proxy_client(&database, &runtime, timeout, redirects, purpose)?;
+            match request(client).await {
+                Ok(value) => return Ok(value),
+                Err(error) => {
+                    last_error = error;
+                    if attempt + 1 < ACCOUNT_PROXY_MAX_ATTEMPTS
+                        && (is_transport_error(&last_error)
+                            || is_http_forbidden_error(&last_error))
+                    {
+                        continue;
+                    }
+                    return Err(last_error);
+                }
+            }
+        }
+        Err(last_error)
+    }
+    .await;
+    result
+}
+
 #[tauri::command]
 pub fn set_proxy_pool_settings(
     database: State<'_, Database>,
     runtime: State<'_, ProxyRuntime>,
     ignore_addresses: String,
-    speed_test_url: String,
 ) -> Result<ProxyPoolState, String> {
-    let speed_test_url = speed_test_url.trim();
-    let parsed = Url::parse(speed_test_url).map_err(|_| "测速地址格式无效".to_string())?;
-    if !matches!(parsed.scheme(), "http" | "https") {
-        return Err("测速地址必须是 HTTP(S) 地址".into());
-    }
     let ignore = normalize_ignore_addresses(&ignore_addresses);
     let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
     write_meta(&connection, PROXY_IGNORE_KEY, &ignore)?;
-    write_meta(&connection, PROXY_SPEED_TEST_URL_KEY, speed_test_url)?;
     drop(connection);
+    load_state(&database, &runtime)
+}
+
+#[tauri::command]
+pub fn save_proxy_channel(
+    database: State<'_, Database>,
+    runtime: State<'_, ProxyRuntime>,
+    id: Option<String>,
+    name: String,
+) -> Result<ProxyPoolState, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("请输入通道名称".into());
+    }
+    let channel_id = id
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| stable_id(&["proxy-channel", name]));
+    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    ensure_default_proxy_channel(&connection)?;
+    connection
+        .execute(
+            "INSERT INTO proxy_channels (id, name, created_at, updated_at)
+             VALUES (?1, ?2, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+             ON CONFLICT(id) DO UPDATE SET
+               name = excluded.name,
+               updated_at = CURRENT_TIMESTAMP",
+            params![channel_id, name],
+        )
+        .map_err(|error| error.to_string())?;
+    drop(connection);
+    load_state(&database, &runtime)
+}
+
+#[tauri::command]
+pub fn delete_proxy_channel(
+    database: State<'_, Database>,
+    runtime: State<'_, ProxyRuntime>,
+    id: String,
+) -> Result<ProxyPoolState, String> {
+    let id = id.trim();
+    if id == DEFAULT_PROXY_CHANNEL_ID {
+        return Err("默认通道不能删除".into());
+    }
+    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    ensure_default_proxy_channel(&connection)?;
+    let count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM proxy_channels", [], |row| row.get(0))
+        .map_err(|error| error.to_string())?;
+    if count <= 1 {
+        return Err("至少保留一个通道".into());
+    }
+    connection
+        .execute(
+            "UPDATE account_proxy_channels SET channel_id = ?2 WHERE channel_id = ?1",
+            params![id, DEFAULT_PROXY_CHANNEL_ID],
+        )
+        .map_err(|error| error.to_string())?;
+    connection
+        .execute("DELETE FROM proxy_channels WHERE id = ?1", [id])
+        .map_err(|error| error.to_string())?;
+    drop(connection);
+    load_state(&database, &runtime)
+}
+
+#[tauri::command]
+pub fn set_proxy_channel_node(
+    database: State<'_, Database>,
+    runtime: State<'_, ProxyRuntime>,
+    channel_id: String,
+    node_id: String,
+) -> Result<ProxyPoolState, String> {
+    let channel_id = channel_id.trim();
+    let node_id = node_id.trim();
+    if channel_id.is_empty() || node_id.is_empty() {
+        return Err("通道或节点标识为空".into());
+    }
+    write_channel_node(&database, channel_id, node_id)?;
+    load_state(&database, &runtime)
+}
+
+#[tauri::command]
+pub fn assign_account_proxy_channel(
+    database: State<'_, Database>,
+    runtime: State<'_, ProxyRuntime>,
+    profile_id: String,
+    channel_id: String,
+) -> Result<ProxyPoolState, String> {
+    let profile_id = profile_id.trim();
+    let channel_id = channel_id.trim();
+    if profile_id.is_empty() || channel_id.is_empty() {
+        return Err("账号或通道标识为空".into());
+    }
+    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    ensure_default_proxy_channel(&connection)?;
+    let current_channel: Option<String> = connection
+        .query_row(
+            "SELECT channel_id FROM account_proxy_channels WHERE profile_id = ?1",
+            [profile_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    if let Some(existing) = current_channel {
+        if existing != channel_id {
+            return Err("该账号已归属其他通道，请先取消原通道分配".into());
+        }
+        drop(connection);
+        return load_state(&database, &runtime);
+    }
+    connection
+        .execute(
+            "INSERT INTO account_proxy_channels (profile_id, channel_id, updated_at)
+             VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+             ON CONFLICT(profile_id) DO UPDATE SET
+               channel_id = excluded.channel_id,
+               updated_at = excluded.updated_at",
+            params![profile_id, channel_id],
+        )
+        .map_err(|error| error.to_string())?;
+    drop(connection);
+    load_state(&database, &runtime)
+}
+
+#[tauri::command]
+pub fn unassign_account_proxy_channel(
+    database: State<'_, Database>,
+    runtime: State<'_, ProxyRuntime>,
+    profile_id: String,
+) -> Result<ProxyPoolState, String> {
+    let profile_id = profile_id.trim();
+    if profile_id.is_empty() {
+        return Err("账号标识为空".into());
+    }
+    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    connection
+        .execute(
+            "DELETE FROM account_proxy_channels WHERE profile_id = ?1",
+            [profile_id],
+        )
+        .map_err(|error| error.to_string())?;
+    drop(connection);
+    load_state(&database, &runtime)
+}
+
+#[tauri::command]
+pub async fn test_proxy_channel_nodes(
+    app: AppHandle,
+    database: State<'_, Database>,
+    runtime: State<'_, ProxyRuntime>,
+    channel_id: String,
+) -> Result<ProxyPoolState, String> {
+    let channel_id = channel_id.trim();
+    // channel_id 仅保留在命令签名中以兼容旧调用；测速本身与通道无关。
+    let _ = channel_id;
+    let candidates = list_channel_candidate_nodes(&database, ACCOUNT_PROXY_MAX_LATENCY_MS)?;
+    // 首次还没有通道专属结果时，用当前 ≤500ms 节点作为初始候选集。
+    let candidates = if candidates.is_empty() {
+        list_prioritized_fast_proxy_nodes(&database, ACCOUNT_PROXY_MAX_LATENCY_MS)?
+    } else {
+        candidates
+    };
+    if candidates.is_empty() {
+        return Err(format!(
+            "没有 ≤{ACCOUNT_PROXY_MAX_LATENCY_MS}ms 的候选节点，请先在节点列表完成测速"
+        ));
+    }
+    let requested = candidates
+        .into_iter()
+        .map(|(id, _, _)| id)
+        .collect::<HashSet<_>>();
+    // 只测 ≤500ms 候选；固定地址下载 500KB，测出的耗时即“下载成功时长”。
+    // 测速只刷新候选列表，不写入通道固定节点，保存时才固定。
+    run_proxy_node_pool(
+        &app,
+        &database,
+        &runtime,
+        Some(requested),
+        Some(CHANNEL_SPEED_TEST_URL.to_string()),
+        true,
+    )
+    .await?;
     load_state(&database, &runtime)
 }
 
@@ -2898,6 +3645,8 @@ async fn run_proxy_node_pool(
     database: &Database,
     runtime: &ProxyRuntime,
     requested_node_ids: Option<HashSet<String>>,
+    speed_test_url_override: Option<String>,
+    channel_test: bool,
 ) -> Result<ProxyPoolState, String> {
     // 测速策略（对齐 Clash Verge Rev DelayManager.checkListDelay）：
     // 1) 只测请求集合（选中来源/指定节点/全部）
@@ -2905,7 +3654,13 @@ async fn run_proxy_node_pool(
     // 3) 并发上限 10（与 Verge 前端 actualConcurrency 一致）
     // 4) 固定测速 URL；每条代理独立拨号计时
     // 5) 测速使用独立 Mihomo 运行时，不覆盖或重启用户的全局代理出口
-    let configured = {
+    let configured = if let Some(override_url) = speed_test_url_override {
+        let parsed = Url::parse(&override_url).map_err(|_| "测速地址格式无效".to_string())?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            return Err("测速地址必须是 HTTP(S) 地址".into());
+        }
+        override_url
+    } else {
         let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
         connection
             .query_row(
@@ -2948,6 +3703,11 @@ async fn run_proxy_node_pool(
     }
 
     let targets = speed_test_candidates(&configured);
+    let progress_event = if channel_test {
+        "proxy-channel-test-progress"
+    } else {
+        "proxy-node-test-progress"
+    };
     let client = controller_client()?;
     let test_lease = runtime.start_proxy_test()?;
     let cancellation = test_lease.cancellation.clone();
@@ -2968,6 +3728,16 @@ async fn run_proxy_node_pool(
     let mut cancelled = false;
     let mut pending_writes: Vec<(String, Option<i64>)> = Vec::with_capacity(64);
     let mut last_flush = Instant::now();
+    let success_sql = if channel_test {
+        "UPDATE proxy_pool_nodes SET channel_latency_ms=?2, channel_test_status='success', channel_tested_at=CURRENT_TIMESTAMP WHERE id=?1"
+    } else {
+        "UPDATE proxy_pool_nodes SET latency_ms=?2, test_status='success', tested_at=CURRENT_TIMESTAMP WHERE id=?1"
+    };
+    let error_sql = if channel_test {
+        "UPDATE proxy_pool_nodes SET channel_latency_ms=NULL, channel_test_status='error', channel_tested_at=CURRENT_TIMESTAMP WHERE id=?1"
+    } else {
+        "UPDATE proxy_pool_nodes SET latency_ms=NULL, test_status='error', tested_at=CURRENT_TIMESTAMP WHERE id=?1"
+    };
     let flush_writes = |pending: &mut Vec<(String, Option<i64>)>| -> Result<(), String> {
         if pending.is_empty() {
             return Ok(());
@@ -2979,13 +3749,13 @@ async fn run_proxy_node_pool(
         for (id, delay) in pending.drain(..) {
             if let Some(delay) = delay {
                 tx.execute(
-                    "UPDATE proxy_pool_nodes SET latency_ms=?2, test_status='success', tested_at=CURRENT_TIMESTAMP WHERE id=?1",
+                    success_sql,
                     params![id, delay],
                 )
                 .map_err(|error| error.to_string())?;
             } else {
                 tx.execute(
-                    "UPDATE proxy_pool_nodes SET latency_ms=NULL, test_status='error', tested_at=CURRENT_TIMESTAMP WHERE id=?1",
+                    error_sql,
                     [&id],
                 )
                 .map_err(|error| error.to_string())?;
@@ -3023,7 +3793,7 @@ async fn run_proxy_node_pool(
                 completed += 1;
                 pending_writes.push((id.clone(), None));
                 let _ = app.emit(
-                    "proxy-node-test-progress",
+                    progress_event,
                     ProxyNodeTestProgress {
                         node_id: id.clone(),
                         phase: "completed".to_string(),
@@ -3048,7 +3818,7 @@ async fn run_proxy_node_pool(
                     completed += 1;
                     pending_writes.push((id.clone(), None));
                     let _ = app.emit(
-                        "proxy-node-test-progress",
+                        progress_event,
                         ProxyNodeTestProgress {
                             node_id: id.clone(),
                             phase: "completed".to_string(),
@@ -3075,7 +3845,7 @@ async fn run_proxy_node_pool(
                 completed += 1;
                 pending_writes.push((id.clone(), None));
                 let _ = app.emit(
-                    "proxy-node-test-progress",
+                    progress_event,
                     ProxyNodeTestProgress {
                         node_id: id.clone(),
                         phase: "completed".to_string(),
@@ -3101,7 +3871,7 @@ async fn run_proxy_node_pool(
                         return (id, None, true);
                     }
                     let _ = app.emit(
-                        "proxy-node-test-progress",
+                        progress_event,
                         ProxyNodeTestProgress {
                             node_id: id.clone(),
                             phase: "started".to_string(),
@@ -3136,7 +3906,7 @@ async fn run_proxy_node_pool(
             if node_cancelled || cancellation.is_cancelled() {
                 cancelled = true;
                 let _ = app.emit(
-                    "proxy-node-test-progress",
+                    progress_event,
                     ProxyNodeTestProgress {
                         node_id: id,
                         phase: "completed".to_string(),
@@ -3161,7 +3931,7 @@ async fn run_proxy_node_pool(
                 last_flush = Instant::now();
             }
             let _ = app.emit(
-                "proxy-node-test-progress",
+                progress_event,
                 ProxyNodeTestProgress {
                     node_id: id,
                     phase: "completed".to_string(),
@@ -3208,7 +3978,7 @@ pub async fn test_all_proxy_nodes(
     database: State<'_, Database>,
     runtime: State<'_, ProxyRuntime>,
 ) -> Result<ProxyPoolState, String> {
-    run_proxy_node_pool(&app, &database, &runtime, None).await
+    run_proxy_node_pool(&app, &database, &runtime, None, None, false).await
 }
 
 #[tauri::command]
@@ -3225,7 +3995,7 @@ pub async fn test_proxy_nodes(
     if requested.is_empty() {
         return Err("请选择需要测速的节点".into());
     }
-    run_proxy_node_pool(&app, &database, &runtime, Some(requested)).await
+    run_proxy_node_pool(&app, &database, &runtime, Some(requested), None, false).await
 }
 
 #[cfg(test)]
@@ -3342,6 +4112,92 @@ mod tests {
     }
 
     #[test]
+    fn node_names_strip_speed_test_suffixes() {
+        assert_eq!(clean_node_name("香港 01 | 延迟 123ms"), "香港 01");
+        assert_eq!(clean_node_name("日本 02 测速：88ms"), "日本 02");
+        assert_eq!(clean_node_name("新加坡 [速度测试 10Mbps]"), "新加坡");
+        assert_eq!(clean_node_name("US 01 - latency 50ms"), "US 01");
+        assert_eq!(clean_node_name("德国 03｜测速结果：45ms"), "德国 03");
+        assert_eq!(clean_node_name("香港 01 | 52MB/s"), "香港 01");
+        assert_eq!(clean_node_name("日本 02 45.5Mbps"), "日本 02");
+        assert_eq!(clean_node_name("香港 02 | 0.19MBs"), "香港 02");
+        assert_eq!(clean_node_name("新加坡 [12 MB/s] 01"), "新加坡");
+        assert_eq!(clean_node_name("英国 04｜测速 88MB/s 延迟 30ms"), "英国 04");
+        assert_eq!(clean_node_name("低延迟专线 01"), "低延迟专线 01");
+        assert_eq!(clean_node_name("测试节点"), "测试节点");
+        assert_eq!(clean_node_name("5G 专线 02"), "5G 专线 02");
+        assert_eq!(clean_node_name("节点 | 剩余流量 90GB"), "节点 | 剩余流量 90GB");
+    }
+
+    #[test]
+    fn repair_stored_node_names_cleans_and_deduplicates() {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE proxy_pool_nodes (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    raw_json TEXT NOT NULL DEFAULT '{}'
+                );
+                 INSERT INTO proxy_pool_nodes (id, name, raw_json) VALUES
+                    ('a', '香港 01 | 52MB/s', '{\"name\":\"香港 01 | 52MB/s\"}'),
+                    ('b', '香港 01 | 延迟 30ms', '{\"name\":\"香港 01 | 延迟 30ms\"}'),
+                    ('c', '低延迟专线 01', '{\"name\":\"低延迟专线 01\"}');",
+            )
+            .unwrap();
+        let database = Database(std::sync::Mutex::new(connection));
+        assert_eq!(repair_stored_node_names(&database).unwrap(), 2);
+
+        let connection = database.0.lock().unwrap();
+        let mut statement = connection
+            .prepare("SELECT id, name FROM proxy_pool_nodes ORDER BY id")
+            .unwrap();
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("a".to_string(), "香港 01".to_string()),
+                ("b".to_string(), "香港 01 [2]".to_string()),
+                ("c".to_string(), "低延迟专线 01".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn channel_candidates_use_only_channel_test_fields() {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE proxy_pool_nodes (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    latency_ms INTEGER,
+                    test_status TEXT NOT NULL DEFAULT '',
+                    channel_latency_ms INTEGER,
+                    channel_test_status TEXT NOT NULL DEFAULT '',
+                    channel_tested_at TEXT NOT NULL DEFAULT ''
+                );
+                 INSERT INTO proxy_pool_nodes (id, name, latency_ms, test_status, channel_latency_ms, channel_test_status) VALUES
+                    ('a', '全局快未测通道', 100, 'success', NULL, ''),
+                    ('b', '通道超时', 100, 'success', 600, 'success'),
+                    ('c', '全局失败但通道快', 900, 'error', 200, 'success');",
+            )
+            .unwrap();
+        let database = Database(std::sync::Mutex::new(connection));
+        let rows = list_channel_candidate_nodes(&database, 500).unwrap();
+        assert_eq!(
+            rows,
+            vec![("c".to_string(), "全局失败但通道快".to_string(), 200)]
+        );
+    }
+
+    #[test]
     fn controller_paths_do_not_contain_double_slashes() {
         let mut endpoint = Url::parse(&controller_url(19090, "/proxies/")).unwrap();
         append_controller_path(&mut endpoint, &["NodeA", "delay"]).unwrap();
@@ -3365,5 +4221,47 @@ mod tests {
         let reader = Reader::open_readfile(path).unwrap();
         let country = geoip_country(&reader, "89.160.20.128".parse().unwrap()).unwrap();
         assert_eq!(country.0, "SE");
+    }
+
+    #[test]
+    fn classifies_proxy_failure_errors() {
+        assert!(is_transport_error("error sending request for url"));
+        assert!(is_transport_error("connect error: Connection refused"));
+        assert!(is_transport_error("请求失败：连接失败"));
+        assert!(!is_transport_error("HTTP 401 未授权"));
+
+        assert!(is_http_forbidden_error("HTTP 403 Forbidden"));
+        assert!(is_http_forbidden_error("请求失败：HTTP 403"));
+        assert!(!is_http_forbidden_error("HTTP 404 Not Found"));
+    }
+
+    #[test]
+    fn assigns_ttl_for_proxy_failures() {
+        assert_eq!(
+            account_proxy_failure_ttl("HTTP 403 Forbidden"),
+            ACCOUNT_PROXY_BAN_FORBIDDEN
+        );
+        assert_eq!(
+            account_proxy_failure_ttl("error sending request for url"),
+            ACCOUNT_PROXY_BAN_UNREACHABLE
+        );
+        assert_eq!(
+            account_proxy_failure_ttl("请求超时"),
+            ACCOUNT_PROXY_BAN_TIMEOUT
+        );
+        assert_eq!(
+            account_proxy_failure_ttl("未知错误"),
+            ACCOUNT_PROXY_BAN_DEFAULT
+        );
+    }
+
+    #[test]
+    fn account_node_bans_expire() {
+        let runtime = ProxyRuntime::new(std::env::temp_dir().join("openhub-account-ban-test"));
+        assert!(!runtime.account_node_is_banned("node-a"));
+        runtime.account_ban_node("node-a", Duration::from_millis(1));
+        assert!(runtime.account_node_is_banned("node-a"));
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(!runtime.account_node_is_banned("node-a"));
     }
 }

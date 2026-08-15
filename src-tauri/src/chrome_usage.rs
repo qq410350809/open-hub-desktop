@@ -4,6 +4,7 @@ use crate::chrome_session;
 use crate::db::*;
 use crate::models::*;
 use crate::platform_detect::{is_newapi, is_sub2api, is_zero_v_zero};
+use crate::proxy_pool;
 use crate::site_ops::*;
 use rusqlite::{params, OptionalExtension};
 use serde_json;
@@ -81,7 +82,23 @@ pub async fn mark_sites_with_chrome_sessions(
                     urls.push(api_base_url.clone());
                 }
                 if !checkin_url.trim().is_empty() && !urls.iter().any(|url| url == &checkin_url) {
-                    urls.push(checkin_url);
+                    // 签到地址只在“与 API 地址同主机”时才参与账号会话匹配。
+                    // 跨主机的签到地址（常见为共享签到门户或第三方兑换站）只证明
+                    // 访问过该地址，不能证明该 Chrome Profile 在本站有登录账号；
+                    // 否则会把其他站点（甚至共享主机上的新 API 站点）的登录会话
+                    // 串到本站名下，造成多出/重复/串站账号。
+                    let host_of = |value: &str| {
+                        Url::parse(value)
+                            .ok()
+                            .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+                    };
+                    let same_host = api_base_url.trim().is_empty()
+                        || host_of(&api_base_url).is_some_and(|host| {
+                            host_of(&checkin_url).is_some_and(|other| other == host)
+                        });
+                    if same_host {
+                        urls.push(checkin_url);
+                    }
                 }
                 Ok((id, name, urls, api_base_url, system_type))
             })
@@ -170,7 +187,7 @@ pub async fn mark_sites_with_chrome_sessions(
         "running",
         format!("开始提取 {} 个本地站点的 Chrome 会话数据", targets.len()),
     );
-    let (current_month, previous_checkins, cached_accounts) = {
+    let (current_month, previous_checkins, cached_accounts, cached_model_keys) = {
         let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
         let current_month: String = connection
             .query_row("SELECT strftime('%Y-%m', 'now', 'localtime')", [], |row| {
@@ -207,7 +224,22 @@ pub async fn mark_sites_with_chrome_sessions(
                 })
             })
             .collect::<HashMap<_, _>>();
-        (current_month, previous_checkins, cached_accounts)
+        let mut key_statement = connection
+            .prepare("SELECT site_id, profile_id, keys_json FROM site_model_cache")
+            .map_err(|error| error.to_string())?;
+        let cached_model_keys = key_statement
+            .query_map([], |row| {
+                let keys_json: String = row.get(2)?;
+                let keys = serde_json::from_str::<Vec<String>>(&keys_json).unwrap_or_default();
+                Ok((
+                    (row.get::<_, String>(0)?, row.get::<_, String>(1)?),
+                    keys,
+                ))
+            })
+            .map_err(|error| error.to_string())?
+            .collect::<Result<HashMap<_, _>, _>>()
+            .map_err(|error| error.to_string())?;
+        (current_month, previous_checkins, cached_accounts, cached_model_keys)
     };
     let scanned = targets.len();
     let scan_targets = targets
@@ -295,6 +327,17 @@ pub async fn mark_sites_with_chrome_sessions(
         .collect::<HashMap<_, _>>();
 
     let mut locally_inferred_types = HashMap::new();
+    // newapi2（刷新令牌模式）的依据是浏览器里存在 new_api_refresh cookie；
+    // 同域 Chrome 会话若带该 cookie，说明站点用 refresh token 认证而非纯 Cookie。
+    let refresh_cookie_site_ids = matched_sites
+        .iter()
+        .filter(|site| {
+            site.sessions.iter().any(|session| {
+                has_newapi_refresh_cookie_name(session.cookie_names.iter().map(String::as_str))
+            })
+        })
+        .map(|site| site.site_id.clone())
+        .collect::<HashSet<_>>();
     for (site_id, _, _, api_base_url, system_type) in &mut targets {
         if is_zero_v_zero(system_type) {
             locally_inferred_types.insert(site_id.clone(), "0v0".into());
@@ -309,11 +352,16 @@ pub async fn mark_sites_with_chrome_sessions(
                 },
             ));
         // Local Storage 无结论时，退而使用 API 地址中的高置信产品名提示。
-        let inferred = if inferred_from_accounts.is_empty() {
+        let mut inferred = if inferred_from_accounts.is_empty() {
             system_type_hint_from_url(api_base_url.as_str()).unwrap_or("")
         } else {
             inferred_from_accounts
         };
+        // NewAPI 进一步细分：带 new_api_refresh cookie 的账号走刷新令牌认证（newapi2），
+        // 否则保持 Cookie 模式（new-api）。检测顺序上 cookie 证据优先于类型名。
+        if is_newapi(inferred) && refresh_cookie_site_ids.contains(site_id) {
+            inferred = "newapi2";
+        }
         if !inferred.is_empty() && !inferred.eq_ignore_ascii_case(system_type) {
             let previous = system_type.clone();
             *system_type = inferred.into();
@@ -522,20 +570,6 @@ pub async fn mark_sites_with_chrome_sessions(
     if !extract_only && !matched_sites.is_empty() {
         let chrome_user_agent = chrome_session::chrome_user_agent();
         let mut jobs = Vec::new();
-        // All requests use the global proxy-pool mode; site-specific proxy settings were removed
-        let mut site_clients: HashMap<String, reqwest::Client> = HashMap::new();
-        for site in &matched_sites {
-            if !site_clients.contains_key(&site.site_id) {
-                let client = build_http_client_for_site(
-                    &database,
-                    &site.site_id,
-                    Duration::from_secs(12),
-                    3,
-                    "账号同步请求",
-                )?;
-                site_clients.insert(site.site_id.clone(), client);
-            }
-        }
         for (site_index, site) in matched_sites.iter().enumerate() {
             // 额度/签到接口只刷新“在用”站点，避免全库会话比对时打爆外部接口。
             if !account_refresh_site_ids.contains(&site.site_id) {
@@ -545,11 +579,7 @@ pub async fn mark_sites_with_chrome_sessions(
             else {
                 continue;
             };
-            let Some(client) = site_clients.get(&site.site_id).cloned() else {
-                continue;
-            };
             for (session_index, session) in site.sessions.iter().enumerate() {
-                let client = client.clone();
                 let base_url = base_url.clone();
                 let system_type = system_type.clone();
                 let user_agent = chrome_user_agent.clone();
@@ -583,7 +613,7 @@ pub async fn mark_sites_with_chrome_sessions(
                 let should_checkin = checkin_site_ids.contains(&site.site_id);
                 let current_month = current_month.clone();
                 let previous_checkin = previous_checkins
-                    .get(&(site_id, profile_id.clone()))
+                    .get(&(site_id.clone(), profile_id.clone()))
                     .cloned()
                     .unwrap_or_default();
                 let cookie_home_dir = home_dir.clone();
@@ -616,17 +646,23 @@ pub async fn mark_sites_with_chrome_sessions(
                 } else {
                     Some(session.newapi_user_id.clone())
                 };
+                let cached_sub2api_keys = cached_model_keys
+                    .get(&(site_id.clone(), profile_id.clone()))
+                    .cloned()
+                    .unwrap_or_default();
+                let app = app.clone();
                 let job = tauri::async_runtime::spawn(async move {
                     let needs_cookie = is_newapi(&system_type)
                         || (system_type.trim().is_empty()
                             && (parse_newapi_local_account(&local_values).is_ok()
                                 || has_refresh_cookie));
                     let cookie_header = if needs_cookie {
+                        let profile_id_for_cookie = profile_id.clone();
                         tauri::async_runtime::spawn_blocking(move || {
                             chrome_session::read_chrome_cookie_header_from_home(
                                 &cookie_home_dir,
                                 &cookie_base_url,
-                                &profile_id,
+                                &profile_id_for_cookie,
                             )
                         })
                         .await
@@ -634,19 +670,44 @@ pub async fn mark_sites_with_chrome_sessions(
                     } else {
                         Ok(String::new())
                     };
-                    fetch_site_account(
-                        &client,
-                        &base_url,
-                        &system_type,
-                        &local_values,
-                        &local_error,
-                        cookie_header,
-                        &user_agent,
-                        &current_month,
-                        should_checkin,
-                        previous_checkin,
-                        cached_token,
-                        cached_uid,
+                    proxy_pool::with_account_proxy(
+                        &app,
+                        &site_id,
+                        &profile_id,
+                        Duration::from_secs(12),
+                        3,
+                        "账号同步请求",
+                        move |client| {
+                            let base_url = base_url.clone();
+                            let system_type = system_type.clone();
+                            let local_values = local_values.clone();
+                            let local_error = local_error.clone();
+                            let cookie_header = cookie_header.clone();
+                            let user_agent = user_agent.clone();
+                            let current_month = current_month.clone();
+                            let cached_token = cached_token.clone();
+                            let cached_uid = cached_uid.clone();
+                            let cached_sub2api_keys = cached_sub2api_keys.clone();
+                            let previous_checkin = previous_checkin.clone();
+                            async move {
+                                fetch_site_account(
+                                    &client,
+                                    &base_url,
+                                    &system_type,
+                                    &local_values,
+                                    &local_error,
+                                    cookie_header,
+                                    &user_agent,
+                                    &current_month,
+                                    should_checkin,
+                                    previous_checkin,
+                                    cached_token,
+                                    cached_uid,
+                                    &cached_sub2api_keys,
+                                )
+                                .await
+                            }
+                        },
                     )
                     .await
                 });
@@ -701,13 +762,19 @@ pub async fn mark_sites_with_chrome_sessions(
                     "今日未签到".into()
                 });
             }
-            if !session.sync_error.is_empty() {
+            // 刷新令牌移交（本地会话失效 → 交 Chrome 同源刷新）不是失败，
+            // 按信息展示，避免每次扫描都误报“额度刷新失败”。
+            let is_refresh_handoff = session.sync_error == NEWAPI_REFRESH_HANDOFF_MESSAGE;
+            if is_refresh_handoff {
+                details.push(format!("额度刷新转 Chrome 处理：{}", session.sync_error));
+            } else if !session.sync_error.is_empty() {
                 details.push(format!("额度刷新失败：{}", session.sync_error));
             }
             if !session.checkin_error.is_empty() {
                 details.push(format!("签到失败：{}", session.checkin_error));
             }
-            let has_warning = !session.sync_error.is_empty() || !session.checkin_error.is_empty();
+            let has_warning = (!session.sync_error.is_empty() && !is_refresh_handoff)
+                || !session.checkin_error.is_empty();
             emit_optional_sync_progress(
                 &app,
                 run_id,
@@ -732,7 +799,11 @@ pub async fn mark_sites_with_chrome_sessions(
     let warnings = matched_sites
         .iter()
         .flat_map(|site| &site.sessions)
-        .filter(|session| !session.sync_error.is_empty() || !session.checkin_error.is_empty())
+        .filter(|session| {
+            (session.sync_error != NEWAPI_REFRESH_HANDOFF_MESSAGE
+                && !session.sync_error.is_empty())
+                || !session.checkin_error.is_empty()
+        })
         .count();
 
     let mut connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
@@ -798,7 +869,7 @@ pub async fn mark_sites_with_chrome_sessions(
                     .map_err(|error| error.to_string())?;
                 transaction
                     .execute(
-                        "INSERT INTO site_accounts (
+                        "INSERT OR REPLACE INTO site_accounts (
                             site_id, profile_id, domain, cookie_count, cookie_names,
                             profile_name, account_name, username, api_key_count, api_model_count,
                             remaining, used, total, unit, is_valid, sync_error,

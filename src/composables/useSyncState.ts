@@ -215,7 +215,7 @@ interface SyncedModelCacheAccount {
   accountName: string;
   username: string;
   keys: string[];
-  keyGroups: Record<string, string>;
+  keyGroups?: Record<string, string>;
   error: string;
 }
 

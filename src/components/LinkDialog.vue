@@ -4,6 +4,8 @@ import { icons } from "../icons";
 import { useStore } from "../composables/useStore";
 import type { AddressItem, SiteLinkKind } from "../types";
 
+import CustomSelect from "./CustomSelect.vue";
+
 const store = useStore();
 
 const closeBtnRef = ref<HTMLButtonElement>();
@@ -78,6 +80,13 @@ function profileLabel(session: (typeof profileSessions.value)[number]) {
   return account ? `${account}（${session.profileName}）` : session.profileName;
 }
 
+const profileOptions = computed(() =>
+  profileSessions.value.map((session) => ({
+    value: session.profileId,
+    text: profileLabel(session),
+  })),
+);
+
 async function copyAddress(item: AddressItem) {
   await store.copyAddress(item.url, item.label);
 }
@@ -121,14 +130,12 @@ async function copyAddress(item: AddressItem) {
             <small>使用所选 Chrome Profile 打开地址</small>
           </label>
           <div class="link-account-select">
-            <select id="link-browser-account" v-model="selectedProfileId">
-              <option
-                v-for="session in profileSessions"
-                :key="session.profileId"
-                :value="session.profileId"
-              >{{ profileLabel(session) }}</option>
-            </select>
-            <span v-html="icons.chevron" />
+            <CustomSelect
+              :options="profileOptions"
+              :model-value="selectedProfileId"
+              aria-label="浏览器账户"
+              @update:model-value="selectedProfileId = String($event)"
+            />
           </div>
         </div>
         <div class="address-list">

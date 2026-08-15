@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::chrome_session;
 use crate::models::*;
-use crate::proxy_pool::{self, ProxyRuntime};
+use crate::proxy_pool::{self, is_http_forbidden_error, is_transport_error, ProxyRuntime};
 
 pub(crate) const DEFAULT_CHARITY_FEED_ID: &str = "1515";
 
@@ -1602,33 +1602,6 @@ fn finish_cancelled_feed_sync(
         unread_count,
     );
     message
-}
-
-fn is_http_forbidden_error(error: &str) -> bool {
-    let lower = error.to_ascii_lowercase();
-    lower.contains("http 403")
-        || lower.contains("status: 403")
-        || lower.contains("status 403")
-        || lower.contains("(403)")
-        || lower.contains(" 403 ")
-        || lower.contains("403 forbidden")
-        || lower.ends_with("403")
-        || lower.contains("error code: 403")
-}
-
-fn is_transport_error(error: &str) -> bool {
-    let lower = error.to_ascii_lowercase();
-    lower.contains("error sending request")
-        || lower.contains("i/o timeout")
-        || lower.contains("timeout")
-        || lower.contains("timed out")
-        || lower.contains("deadline")
-        || lower.contains("connection")
-        || lower.contains("connection reset")
-        || lower.contains("connect error")
-        || lower.contains("连接失败")
-        || lower.contains("无法建立连接")
-        || lower.contains("连接被重置")
 }
 
 fn ban_ttl_for_error(error: &str) -> Duration {

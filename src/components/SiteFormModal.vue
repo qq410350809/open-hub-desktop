@@ -48,6 +48,7 @@ interface FormState {
   isPersonal: boolean;
   isPending: boolean;
   isRunaway: boolean;
+  useProxyPool: boolean;
   checkinUrl: string;
   benefitUrl: string;
   checkinNote: string;
@@ -72,6 +73,7 @@ const form = reactive<FormState>({
   isPersonal: false,
   isPending: false,
   isRunaway: false,
+  useProxyPool: false,
   checkinUrl: "",
   benefitUrl: "",
   checkinNote: "",
@@ -97,6 +99,7 @@ function resetForm(site?: SiteRecord) {
   form.isPersonal = value.isPersonal;
   form.isPending = value.isPending;
   form.isRunaway = value.isRunaway;
+  form.useProxyPool = value.useProxyPool;
   form.checkinUrl = value.checkinUrl;
   form.benefitUrl = value.benefitUrl;
   form.checkinNote = value.checkinNote;
@@ -226,6 +229,7 @@ async function handleSubmit() {
     isPersonal: form.isPersonal,
     isPending: form.isPending && !form.isPersonal,
     isRunaway: form.isRunaway,
+    useProxyPool: form.useProxyPool,
     checkinUrl: form.checkinUrl.trim(),
     benefitUrl: form.benefitUrl.trim(),
     checkinNote: form.checkinNote.trim(),
@@ -450,6 +454,11 @@ function onBackdropClick(event: MouseEvent) {
                   <input v-model="form.supportsNsfw" name="supportsNsfw" type="checkbox" />
                   <i></i>
                   <span><strong>支持 NSFW</strong><small>是否支持 NSFW</small></span>
+                </label>
+                <label class="check-card">
+                  <input v-model="form.useProxyPool" name="useProxyPool" type="checkbox" />
+                  <i></i>
+                  <span><strong>使用代理池</strong><small>账号请求按账号固定一个 ≤500ms 节点，失败自动切换</small></span>
                 </label>
               </div>
               <h3 class="section-title section-spaced">

@@ -26,6 +26,7 @@ pub(crate) fn canonical_platform(raw: &str) -> String {
         "wonggongyi" => "new-api".into(),
         "voapi" | "superapi" | "rixapi" | "neoapi" => "new-api".into(),
         "newapi" => "new-api".into(),
+        "newapi2" | "newapi-refresh" | "newapirefresh" => "newapi2".into(),
         "oneapi" => "one-api".into(),
         "onehub" => "one-hub".into(),
         "donehub" => "done-hub".into(),
@@ -48,7 +49,10 @@ pub(crate) fn is_platform(system_type: &str, kind: &str) -> bool {
 }
 
 pub(crate) fn is_newapi(system_type: &str) -> bool {
-    is_platform(system_type, "new-api")
+    // new-api 与 newapi2 是同一套 NewAPI 后端的两种认证形态：
+    // new-api 走 Cookie（session/new-api-user），newapi2 走刷新令牌。
+    // 后端账号/Key/模型同步逻辑对两者完全一致，因此统一命中。
+    is_platform(system_type, "new-api") || is_platform(system_type, "newapi2")
 }
 
 pub(crate) fn is_sub2api(system_type: &str) -> bool {

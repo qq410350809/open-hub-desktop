@@ -36,10 +36,14 @@ pub async fn detect_site_system_types(
             .map_err(|error| error.to_string())?
             .filter_map(|row| row.ok())
             .filter(|(site_id, api_base_url, stored_type)| {
-                site_ids.contains(site_id)
+                let needs_detect = site_ids.contains(site_id)
                     && (stored_type.trim().is_empty()
                         || system_type_hint_from_url(api_base_url)
-                            .is_some_and(|hint| !stored_type.eq_ignore_ascii_case(hint)))
+                            .is_some_and(|hint| !stored_type.eq_ignore_ascii_case(hint)));
+                // 浏览器证据得出的刷新令牌细分（newapi2）不参与通用探测：探测流水线
+                // 只能给出 new-api，重新探测只会把细分类型打回 Cookie 模式；
+                // 只有新的浏览器证据（new_api_refresh cookie）才能纠正它。
+                needs_detect && !crate::platform_detect::is_platform(stored_type, "newapi2")
             })
             .map(|(site_id, api_base_url, _)| (site_id, api_base_url))
             .collect::<Vec<_>>();

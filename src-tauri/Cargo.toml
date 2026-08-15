@@ -32,6 +32,7 @@ maxminddb = "0.30"
 futures-util = "0.3"
 tokio-util = "0.7"
 tokio = { version = "1", features = ["time", "rt", "rt-multi-thread", "macros", "sync"] }
+zstd = "0.13"
 
 # 开发编译体积优化：减少 debug 信息层级，避免 deps 目录无限膨胀。
 [profile.dev]

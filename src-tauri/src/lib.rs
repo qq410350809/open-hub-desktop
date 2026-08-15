@@ -348,6 +348,7 @@ mod tests {
             source: "newapi-key".into(),
             keys: vec!["sk-one".into(), "sk-two".into()],
             key_groups: HashMap::new(),
+            key_models: HashMap::new(),
         };
         cache_profile_api_counts(&database, Some("site-a"), Some("Default"), result).unwrap();
         let connection = database.0.lock().unwrap();
@@ -427,6 +428,64 @@ mod tests {
         ));
         assert!(!access_token_was_rejected("账号接口请求失败：连接超时"));
         assert!(!access_token_was_rejected("账号接口返回的 JSON 无法解析"));
+    }
+
+    #[test]
+    fn recognizes_cloudflare_shield_errors() {
+        let shield = "NewAPI Key 接口 HTTP 403 返回 HTML：Cloudflare 安全验证拦截了直接请求，请先用对应 Chrome 账号打开站点并通过验证";
+        assert!(is_cloudflare_shield_error(shield));
+        assert!(is_cloudflare_shield_error("接口返回 HTML：Cloudflare 拦截"));
+        assert!(is_cloudflare_shield_error("NewAPI Key 接口 HTTP 403 返回 HTML：站点返回了网页而不是 API 数据"));
+        assert!(is_cloudflare_shield_error("Cloudflare 验证仍需要浏览器交互"));
+        // 令牌类 403 / 401 不算安全盾，应走 refresh 或错误收敛。
+        assert!(!is_cloudflare_shield_error("账号接口 HTTP 403：无效的令牌"));
+        assert!(!is_cloudflare_shield_error("账号接口 HTTP 401：访问令牌无效"));
+        assert!(!is_cloudflare_shield_error("账号接口请求失败：连接超时"));
+        // 能区分：盾错误不是令牌拒绝，反之亦然。
+        assert!(!access_token_was_rejected(shield));
+        assert!(!access_token_was_rejected(
+            "NewAPI Key 接口 HTTP 403 返回 HTML：站点返回了网页而不是 API 数据"
+        ));
+    }
+
+    #[test]
+    fn sub2api_consolidated_errors_are_recognized_as_auth_rejection() {
+        // sub2api 分支合并判定：模型与 Key 接口都返回 401 时，两条错误
+        // 都必须被 access_token_was_rejected 命中，才能收敛为一条精简提示。
+        let direct = format!(
+            "直接使用访问秘钥同步失败（Sub2API 模型接口 HTTP 401：Invalid API key{SUB2API_AUTH_FAILURE_HINT}），回落到 Key 接口"
+        );
+        let keys = format!("Sub2API Key 接口 HTTP 401：Token has expired{SUB2API_AUTH_FAILURE_HINT}");
+        assert!(access_token_was_rejected(&direct));
+        assert!(access_token_was_rejected(&keys));
+        // 非认证失败（如模型列表为空）不触发收敛。
+        assert!(!access_token_was_rejected("访问秘钥获取的模型列表为空"));
+        // 提示文案明确是 Sub2API 登录令牌，而不是 NewAPI 的账号/访问令牌。
+        assert!(SUB2API_AUTH_FAILURE_HINT.contains("auth_token"));
+        assert!(!SUB2API_AUTH_FAILURE_HINT.contains("访问令牌"));
+    }
+
+    #[test]
+    fn translates_json_parse_errors_to_friendly_hints() {
+        let err = serde_json::from_slice::<serde_json::Value>(b"true;").unwrap_err();
+        let message = friendly_json_parse_error(&err, b"true;");
+        assert!(message.contains("多余内容"), "{message}");
+        assert!(message.contains("原文：true;"), "{message}");
+
+        let err = serde_json::from_slice::<serde_json::Value>(b"hello").unwrap_err();
+        let message = friendly_json_parse_error(&err, b"hello");
+        assert!(message.contains("没有返回 JSON"), "{message}");
+        assert!(message.contains("原文：hello"), "{message}");
+
+        let err = serde_json::from_slice::<serde_json::Value>(b"{\"a\":").unwrap_err();
+        let message = friendly_json_parse_error(&err, b"{\"a\":");
+        assert!(message.contains("不完整"), "{message}");
+
+        // 原文过长时只预览开头，避免日志被大段内容刷屏。
+        let long = format!("{{\"a\":{}}}", "x".repeat(200));
+        let err = serde_json::from_slice::<serde_json::Value>(long.as_bytes()).unwrap_err();
+        let message = friendly_json_parse_error(&err, long.as_bytes());
+        assert!(message.contains("原文：{"), "{message}");
     }
 
     #[test]
@@ -747,6 +806,30 @@ mod tests {
             "new-api"
         );
 
+        // 刷新令牌形态：isNewApi2 / is_newapi2 布尔标记应识别为 newapi2。
+        let refresh_explicit = serde_json::json!({ "isNewApi2": true });
+        assert_eq!(
+            infer_remote_system_type(refresh_explicit.as_object().unwrap()),
+            "newapi2"
+        );
+        let refresh_snake = serde_json::json!({ "is_newapi2": true });
+        assert_eq!(
+            infer_remote_system_type(refresh_snake.as_object().unwrap()),
+            "newapi2"
+        );
+        // 刷新令牌优先于 Cookie 形态。
+        let both = serde_json::json!({ "isNewApi": true, "is_newapi2": true });
+        assert_eq!(
+            infer_remote_system_type(both.as_object().unwrap()),
+            "newapi2"
+        );
+        // 字符串值同样归一为 newapi2。
+        let refresh_value = serde_json::json!({ "systemType": "newapi-refresh" });
+        assert_eq!(
+            infer_remote_system_type(refresh_value.as_object().unwrap()),
+            "newapi2"
+        );
+
         let unknown = serde_json::json!({ "apiBaseUrl": "https://example.com/" });
         assert!(infer_remote_system_type(unknown.as_object().unwrap()).is_empty());
     }
@@ -1009,6 +1092,12 @@ pub fn run() {
             app.manage(proxy_runtime);
             app.manage(charity_runtime);
             app.manage(model_catalog_runtime);
+            // 启动时清理历史订阅里遗留的测速结果后缀，避免旧库节点名继续显示脏数据。
+            if let Err(error) =
+                proxy_pool::repair_stored_node_names(&app.state::<crate::models::Database>())
+            {
+                eprintln!("[OpenHub] 修复代理节点名称失败：{error}");
+            }
             // Token 采集与页面查询完全解耦：后台每 20 秒增量入库。
             token_stats::start_token_collector(app.handle().clone());
 
@@ -1079,6 +1168,12 @@ pub fn run() {
             proxy_pool::delete_proxy_subscription,
             proxy_pool::refresh_proxy_subscription,
             proxy_pool::set_proxy_pool_settings,
+            proxy_pool::save_proxy_channel,
+            proxy_pool::delete_proxy_channel,
+            proxy_pool::set_proxy_channel_node,
+            proxy_pool::assign_account_proxy_channel,
+            proxy_pool::unassign_account_proxy_channel,
+            proxy_pool::test_proxy_channel_nodes,
             proxy_pool::set_active_proxy_node,
             proxy_pool::clear_active_proxy_node,
             proxy_pool::delete_invalid_proxy_nodes,

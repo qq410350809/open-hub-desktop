@@ -1,14 +1,23 @@
 <script setup lang="ts">
 import { computed, ref, watch, nextTick } from "vue";
-import { runCommand } from "../composables/useLibrary";
+import { runCommand, useLibrary } from "../composables/useLibrary";
 import { icons } from "../icons";
 import { useStore } from "../composables/useStore";
 import { logoText } from "../utils";
+import { systemTypeLabel } from "../types";
 
 interface LiveModelItem {
   id: string;
   owned_by?: string;
   ownedBy?: string;
+}
+
+interface FetchSiteModelsResult {
+  models: LiveModelItem[];
+  source: string;
+  keys: string[];
+  keyGroups?: Record<string, string>;
+  keyModels?: Record<string, LiveModelItem[]>;
 }
 
 type ModelApiSource = "newapi-key" | "sub2api-key" | "pricing" | "models" | "none";
@@ -20,11 +29,14 @@ interface LiveAccountKeys {
   username: string;
   keys: string[];
   keyGroups?: Record<string, string>;
+  /** 每个 Key 对应的模型列表（逐 Key 查询 /v1/models 的结果）。 */
+  keyModels?: Record<string, LiveModelItem[]>;
   error: string;
 }
 
 const isTauri = "__TAURI_INTERNALS__" in window;
 const store = useStore();
+const { usageSites } = useLibrary();
 const closeBtnRef = ref<HTMLButtonElement>();
 const searchQuery = ref("");
 const liveFetching = ref(false);
@@ -32,6 +44,10 @@ const liveError = ref("");
 const liveModels = ref<LiveModelItem[]>([]);
 const liveAccountKeys = ref<LiveAccountKeys[]>([]);
 const apiSource = ref<ModelApiSource>("none");
+/** 已折叠的账号 key（profileId 或 accountName）；默认全部展开。 */
+const collapsedAccounts = ref<Set<string>>(new Set());
+/** 当前选中的 API Key；选中后右侧只显示该 Key 对应的模型。 */
+const selectedKeyId = ref<string | null>(null);
 let liveFetchRequestId = 0;
 
 const site = computed(() => store.siteModelsSite.value);
@@ -43,12 +59,46 @@ const logo = computed(() =>
   site.value ? logoText(site.value.apiBaseUrl, site.value.name) : "",
 );
 
+const apiSourceLabel = computed(() => {
+  switch (apiSource.value) {
+    case "newapi-key":
+      return "通过 NewAPI Key 获取";
+    case "sub2api-key":
+      return "通过 Sub2API Key 获取";
+    case "pricing":
+      return "同步自站点定价数据";
+    case "models":
+      return "同步自站点模型数据";
+    default:
+      return "本地模型数据";
+  }
+});
+
+/** 选中 Key 时，该 Key 对应的模型列表；未选中时为 null 表示显示全站模型。 */
+const selectedKeyModels = computed<LiveModelItem[] | null>(() => {
+  const keyId = selectedKeyId.value;
+  if (!keyId) return null;
+  for (const account of liveAccountKeys.value) {
+    const models = account.keyModels?.[keyId];
+    if (models) return models;
+  }
+  return null;
+});
+
 const filteredLiveModels = computed(() => {
+  const source = selectedKeyModels.value ?? liveModels.value;
   const q = searchQuery.value.trim().toLowerCase();
-  if (!q) return liveModels.value;
-  return liveModels.value.filter(
+  if (!q) return source;
+  return source.filter(
     (m) => m.id.toLowerCase().includes(q) || (m.owned_by && m.owned_by.toLowerCase().includes(q)),
   );
+});
+
+const modelCountLabel = computed(() => {
+  const source = selectedKeyModels.value ?? liveModels.value;
+  const total = source.length;
+  const q = searchQuery.value.trim();
+  return q ? `${filteredLiveModels.value.length} / ${total}` : String(total);
 });
 
 interface LocalSiteModelCache {
@@ -86,6 +136,8 @@ watch(
       liveError.value = "";
       searchQuery.value = "";
       apiSource.value = "none";
+      collapsedAccounts.value = new Set();
+      selectedKeyId.value = null;
       void refreshModels();
     } else {
       liveFetchRequestId += 1;
@@ -103,7 +155,7 @@ function onBackdropClick(event: MouseEvent) {
   if (event.target === event.currentTarget) close();
 }
 
-async function refreshModels() {
+async function refreshModels(mode: "cache" | "keys" | "models" = "cache") {
   const requestedSite = site.value;
   if (!requestedSite) return;
   const requestId = ++liveFetchRequestId;
@@ -112,7 +164,83 @@ async function refreshModels() {
   liveModels.value = [];
   liveAccountKeys.value = [];
   apiSource.value = "none";
+  selectedKeyId.value = null;
   try {
+    if (mode !== "cache") {
+      // "keys"：只同步 Key 列表（不保存 keyModels 映射）
+      // "models"：用已有缓存 Key 逐个拉取 /v1/models 并保存 keyModels
+      // 两者都调 fetch_site_models_json，区别在于保存时是否包含 keyModels
+      const saveKeyModels = mode === "models";
+      const siteUsage = usageSites.value.find((item) => item.siteId === requestedSite.id);
+      const sessions = siteUsage?.sessions?.filter((s) => s.isValid) ?? [];
+      let baseUrl = requestedSite.apiBaseUrl.trim();
+      if (!baseUrl.endsWith("/")) baseUrl += "/";
+      if (sessions.length === 0) {
+        // 没有有效账号，尝试不带 profileId 请求。
+        try {
+          const result = await runCommand<FetchSiteModelsResult>("fetch_site_models_json", {
+            url: baseUrl,
+            siteId: requestedSite.id,
+          });
+          await runCommand("save_site_model_cache_for_account", {
+            siteId: requestedSite.id,
+            account: {
+              profileId: "",
+              profileName: "",
+              accountName: "",
+              username: "",
+              keys: result.keys ?? [],
+              keyGroups: result.keyGroups ?? {},
+              keyModels: saveKeyModels ? result.keyModels ?? {} : {},
+              error: "",
+            },
+            result: saveKeyModels ? result : null,
+          });
+        } catch {
+          /* 忽略，继续读缓存 */
+        }
+      } else {
+        for (const session of sessions) {
+          if (requestId !== liveFetchRequestId) return;
+          try {
+            const result = await runCommand<FetchSiteModelsResult>("fetch_site_models_json", {
+              url: baseUrl,
+              siteId: requestedSite.id,
+              profileId: session.profileId,
+            });
+            await runCommand("save_site_model_cache_for_account", {
+              siteId: requestedSite.id,
+              account: {
+                profileId: session.profileId,
+                profileName: session.profileName,
+                accountName: session.accountName,
+                username: session.username,
+                keys: result.keys ?? [],
+                keyGroups: result.keyGroups ?? {},
+                keyModels: saveKeyModels ? result.keyModels ?? {} : {},
+                error: "",
+              },
+              result: saveKeyModels ? result : null,
+            });
+          } catch (error) {
+            await runCommand("save_site_model_cache_for_account", {
+              siteId: requestedSite.id,
+              account: {
+                profileId: session.profileId,
+                profileName: session.profileName,
+                accountName: session.accountName,
+                username: session.username,
+                keys: [],
+                keyGroups: {},
+                keyModels: {},
+                error: String(error),
+              },
+              result: null,
+            });
+          }
+        }
+      }
+    }
     const cached = await readCachedModels(requestedSite.id);
     if (requestId !== liveFetchRequestId) return;
     if (!cached) {
@@ -135,6 +263,20 @@ async function copyApiKey(key: string, index: number, accountName: string) {
   await store.copyAddress(key, `${accountName} API Key ${index + 1}`);
 }
 
+function accountLabel(account: LiveAccountKeys): string {
+  return account.username || account.accountName || account.profileName || "未命名账号";
+}
+
+function accountDetail(account: LiveAccountKeys): string {
+  // 用户名优先作为主标签；副标签再展示 Chrome 账号与配置名，便于区分同配置下的多账号。
+  if (account.username) {
+    return [account.accountName, account.profileName]
+      .filter((value) => value && value !== account.username)
+      .join(" · ");
+  }
+  return account.profileName || "";
+}
+
 function maskApiKey(key: string): string {
   const value = key.trim();
   if (!value) return "—";
@@ -149,6 +291,27 @@ function maskApiKey(key: string): string {
 
 function keyGroup(account: LiveAccountKeys, key: string): string {
   return account.keyGroups?.[key]?.trim() || "默认分组";
+}
+
+function toggleAccount(id: string) {
+  const next = new Set(collapsedAccounts.value);
+  if (next.has(id)) next.delete(id);
+  else next.add(id);
+  collapsedAccounts.value = next;
+}
+
+/** 点击 Key 行时切换选中态，右侧模型列表随之联动。 */
+function selectKey(key: string) {
+  selectedKeyId.value = selectedKeyId.value === key ? null : key;
+}
+
+/** 某个 Key 对应的模型数量；没有映射数据时返回 null。 */
+function keyModelCount(key: string): number | null {
+  for (const account of liveAccountKeys.value) {
+    const models = account.keyModels?.[key];
+    if (models) return models.length;
+  }
+  return null;
 }
 </script>
 
@@ -166,138 +329,209 @@ function keyGroup(account: LiveAccountKeys, key: string): string {
         aria-modal="true"
         aria-labelledby="site-models-title"
       >
-        <header class="dialog-header">
-          <div class="header-left">
-            <div class="site-avatar">{{ logo }}</div>
-            <div>
-              <h2 id="site-models-title">
-                {{ site?.name || "站点" }}
-                <span v-if="site?.systemType" class="system-badge">{{ site.systemType }}</span>
+        <header class="site-models-header">
+          <div class="site-models-site">
+            <div class="site-models-avatar" aria-hidden="true">{{ logo }}</div>
+            <div class="site-models-site-meta">
+              <h2 id="site-models-title" class="site-models-title">
+                <span class="site-models-name">{{ site?.name || "站点" }}</span>
+                <span v-if="site?.systemType" class="site-models-badge">{{ systemTypeLabel(site.systemType) }}</span>
               </h2>
-              <p class="site-url">{{ site?.apiBaseUrl }}</p>
+              <p class="site-models-url" :title="site?.apiBaseUrl">{{ site?.apiBaseUrl }}</p>
             </div>
           </div>
 
-          <button
-            ref="closeBtnRef"
-            class="close-button"
-            type="button"
-            aria-label="关闭模型窗口"
-            @click="close"
-            v-html="icons.close"
-          />
+          <div class="site-models-actions">
+            <button
+              type="button"
+              class="site-models-icon-btn"
+              :disabled="liveFetching"
+              :aria-label="liveFetching ? '正在同步 Key' : '同步 Key：拉取站点 API Key 列表'"
+              title="同步 Key：拉取站点 API Key 列表"
+              @click="refreshModels('keys')"
+            >
+              <span v-html="icons.key" :class="{ 'site-models-spin': liveFetching }" />
+            </button>
+            <button
+              type="button"
+              class="site-models-icon-btn"
+              :disabled="liveFetching"
+              :aria-label="liveFetching ? '正在同步模型' : '同步模型：按 Key 逐个拉取 /v1/models 并保存'"
+              title="同步模型：按 Key 逐个拉取 /v1/models 并保存"
+              @click="refreshModels('models')"
+            >
+              <span v-html="icons.restore" :class="{ 'site-models-spin': liveFetching }" />
+            </button>
+            <button
+              ref="closeBtnRef"
+              type="button"
+              class="site-models-icon-btn site-models-close"
+              aria-label="关闭模型窗口"
+              title="关闭"
+              @click="close"
+              v-html="icons.close"
+            />
+          </div>
         </header>
 
-        <div class="dialog-toolbar">
-          <label class="models-search-input">
-            <span v-html="icons.search" />
-            <input
-              v-model="searchQuery"
-              type="text"
-              placeholder="搜索模型标识或厂商…"
-            />
-          </label>
-
-          <button
-            type="button"
-            class="fetch-live-btn"
-            :disabled="liveFetching"
-            @click="refreshModels"
-          >
-            <span v-html="icons.restore" />
-            <span>{{ liveFetching ? '读取中…' : '重新读取本地数据' }}</span>
-          </button>
-        </div>
-
-        <div class="dialog-body">
-          <section
-            v-if="liveAccountKeys.length > 0 || liveModels.length > 0"
-            class="site-api-keys"
-            aria-label="可用 API Key"
-          >
-            <header>
+        <div class="site-models-main">
+          <aside class="site-models-side" aria-label="账号与 API Key">
+            <div class="site-models-side-head">
               <span v-html="icons.key" />
-              <strong>可用 Key</strong>
-              <small>{{ liveKeyCount }} 个</small>
-            </header>
-            <div class="site-api-key-list">
-              <div
-                v-for="account in liveAccountKeys"
-                :key="account.profileId || account.accountName"
-                class="site-api-key-account"
-              >
-                <div class="site-api-key-account-header">
-                  <span v-html="icons.user" />
-                  <strong :title="account.accountName || account.profileName">
-                    {{ account.accountName || account.profileName }}<span v-if="account.username">（{{ account.username }}）</span>
-                  </strong>
-                  <small>{{ account.keys.length }} 个</small>
+              <strong>账号与 Key</strong>
+              <small>{{ liveKeyCount }}</small>
+            </div>
+
+            <div class="site-models-side-body">
+              <div class="site-models-side-section">
+                <div class="site-models-side-label">
+                  <span>账号与 Key</span>
+                  <small>{{ liveAccountKeys.length }} / {{ liveKeyCount }}</small>
                 </div>
-                <div v-for="(key, index) in account.keys" :key="key" class="site-api-key-row">
-                  <div class="site-api-key-value">
-                    <code :title="`已脱敏 · ${keyGroup(account, key)}`">{{ maskApiKey(key) }}</code>
-                    <small class="site-api-key-group" :title="`Key 分组：${keyGroup(account, key)}`">{{ keyGroup(account, key) }}</small>
-                  </div>
-                  <button
-                    type="button"
-                    class="copy-icon-btn"
-                    :aria-label="`复制 ${account.accountName || account.profileName} 的 API Key ${index + 1}`"
-                    title="复制 Key"
-                    @click="copyApiKey(key, index, account.accountName || account.profileName)"
-                  >
-                    <span v-html="icons.copy" />
-                  </button>
+                <div class="site-models-side-scroll">
+                  <template v-if="liveAccountKeys.length > 0">
+                    <div
+                      v-for="account in liveAccountKeys"
+                      :key="account.profileId || account.accountName"
+                      class="site-models-tree-node"
+                    >
+                      <button
+                        type="button"
+                        class="site-models-tree-parent"
+                        :class="{ 'is-open': !collapsedAccounts.has(account.profileId || account.accountName) }"
+                        :title="[accountLabel(account), accountDetail(account)].filter(Boolean).join(' · ') || '未命名账号'"
+                        @click="toggleAccount(account.profileId || account.accountName)"
+                      >
+                        <span class="site-models-tree-chevron" v-html="icons.chevron" />
+                        <span v-html="icons.user" />
+                        <strong>
+                          {{ accountLabel(account) }}<span
+                            v-if="accountDetail(account)"
+                            class="site-models-account-user"
+                            >（{{ accountDetail(account) }}）</span
+                          >
+                        </strong>
+                        <small>{{ account.keys.length }}</small>
+                      </button>
+                      <div
+                        v-if="!collapsedAccounts.has(account.profileId || account.accountName)"
+                        class="site-models-tree-children"
+                      >
+                        <template v-if="account.keys.length > 0">
+                          <div
+                            v-for="(key, keyIndex) in account.keys"
+                            :key="`${account.profileId || account.accountName}-${key}-${keyIndex}`"
+                            class="site-models-key-row"
+                            :class="{ 'is-selected': selectedKeyId === key }"
+                            :title="keyGroup(account, key)"
+                            @click="selectKey(key)"
+                          >
+                            <div class="site-models-key-meta">
+                              <span class="site-models-key-line">
+                                <code>{{ maskApiKey(key) }}</code>
+                                <small class="site-models-key-group">{{
+                                  keyGroup(account, key)
+                                }}</small>
+                              </span>
+                              <small
+                                v-if="keyModelCount(key) !== null"
+                                class="site-models-key-model-count"
+                              >{{ keyModelCount(key) }} 个模型</small>
+                            </div>
+                            <button
+                              type="button"
+                              class="site-models-copy"
+                              :aria-label="`复制 ${accountLabel(account)} 的 API Key ${keyIndex + 1}`"
+                              title="复制 Key"
+                              @click.stop="copyApiKey(key, keyIndex, accountLabel(account))"
+                            >
+                              <span v-html="icons.copy" />
+                            </button>
+                          </div>
+                        </template>
+                        <p v-else class="site-models-side-empty">暂无 Key</p>
+                      </div>
+                    </div>
+                  </template>
+                  <p v-else class="site-models-side-empty">暂无账号</p>
                 </div>
-                <p v-if="account.keys.length === 0" class="site-api-key-empty" :title="account.error">
-                  {{ account.error ? "Key 同步失败" : "此账号没有可用 Key" }}
-                </p>
               </div>
-              <p v-if="liveAccountKeys.length === 0" class="site-api-key-empty">未读取到可用 Key</p>
             </div>
-          </section>
+          </aside>
 
-          <div v-if="liveModels.length > 0" class="models-section">
-            <div class="section-title">
-              <span class="local-dot" />
-              <span>
-                本地模型列表
-                <small v-if="apiSource === 'newapi-key'">（通过 NewAPI Key 获取，共 {{ filteredLiveModels.length }} 个）</small>
-                <small v-else-if="apiSource === 'sub2api-key'">（通过 Sub2API Key 获取，共 {{ filteredLiveModels.length }} 个）</small>
-                <small v-else-if="apiSource === 'pricing'">（同步自站点定价数据，共 {{ filteredLiveModels.length }} 个）</small>
-                <small v-else-if="apiSource === 'models'">（同步自站点模型数据，共 {{ filteredLiveModels.length }} 个）</small>
-              </span>
+          <div class="site-models-panel">
+            <div class="site-models-panel-head">
+              <div class="site-models-panel-title">
+                <strong>{{ selectedKeyId ? "选中 Key 的模型" : "支持的模型" }}</strong>
+                <small class="site-models-source">{{
+                  selectedKeyId ? maskApiKey(selectedKeyId) : apiSourceLabel
+                }}</small>
+                <span class="site-models-count">{{ modelCountLabel }}</span>
+              </div>
+
+              <label class="site-models-search">
+                <span v-html="icons.search" />
+                <input
+                  v-model="searchQuery"
+                  type="text"
+                  placeholder="搜索模型标识或厂商…"
+                />
+                <button
+                  v-if="searchQuery"
+                  type="button"
+                  class="site-models-search-clear"
+                  aria-label="清除搜索"
+                  @click="searchQuery = ''"
+                  v-html="icons.close"
+                />
+              </label>
             </div>
 
-            <div class="models-chips-grid">
-              <div
-                v-for="model in filteredLiveModels"
-                :key="model.id"
-                class="model-item-chip"
-                @click="copyModelId(model.id)"
-              >
-                <div class="model-item-info">
-                  <strong>{{ model.id }}</strong>
-                  <div v-if="model.owned_by" class="model-sub-meta">
-                    <small>by {{ model.owned_by }}</small>
-                  </div>
-                </div>
-                <button type="button" class="copy-icon-btn" title="复制模型标识">
-                  <span v-html="icons.copy" />
+            <div class="site-models-scroll">
+              <div v-if="liveFetching" class="site-models-state">
+                <span class="site-models-state-icon site-models-spin" v-html="icons.restore" />
+                <strong>正在读取本地数据</strong>
+                <p>读取 {{ site?.name }} 的 Key 与模型信息…</p>
+              </div>
+
+              <div v-else-if="liveError" class="site-models-state site-models-state-error">
+                <span class="site-models-state-icon" v-html="icons.info" />
+                <strong>读取失败</strong>
+                <p>{{ liveError }}</p>
+              </div>
+
+              <div v-else-if="(selectedKeyModels ?? liveModels).length === 0" class="site-models-state">
+                <span class="site-models-state-icon" v-html="icons.database" />
+                <strong>暂无模型数据</strong>
+                <p>{{ selectedKeyId ? "该 Key 没有可用的模型数据，请重新同步会话。" : "本地同步数据中没有可用模型。" }}</p>
+              </div>
+
+              <div v-else-if="filteredLiveModels.length === 0" class="site-models-state">
+                <span class="site-models-state-icon" v-html="icons.search" />
+                <strong>未找到匹配模型</strong>
+                <p>试试其他关键词。</p>
+              </div>
+
+              <div v-else class="site-models-grid">
+                <button
+                  v-for="model in filteredLiveModels"
+                  :key="model.id"
+                  type="button"
+                  class="site-models-item"
+                  :title="`复制模型 ID：${model.id}`"
+                  @click="copyModelId(model.id)"
+                >
+                  <span class="site-models-item-info">
+                    <strong :title="model.id">{{ model.id }}</strong>
+                    <small v-if="model.owned_by" class="site-models-item-vendor"
+                      >by {{ model.owned_by }}</small
+                    >
+                  </span>
+                  <span class="site-models-item-copy" v-html="icons.copy" aria-hidden="true" />
                 </button>
               </div>
             </div>
           </div>
-
-          <div v-else-if="liveFetching" class="loading-models-banner">
-            <span v-html="icons.restore" class="spin-icon" />
-            <span>正在读取 {{ site?.name }} 的本地 Key 与模型数据…</span>
-          </div>
-
-          <div v-if="liveError" class="live-error-banner">
-            <span v-html="icons.info" />
-            <span>{{ liveError }}</span>
-          </div>
-
         </div>
       </section>
     </div>
