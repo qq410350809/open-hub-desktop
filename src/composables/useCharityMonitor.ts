@@ -10,7 +10,7 @@ import type {
 } from "../types";
 
 const isTauri = "__TAURI_INTERNALS__" in window;
-const PAGE_SIZE = 20;
+const DEFAULT_PAGE_SIZE = 20;
 const MAX_SYNC_LOG = 120;
 
 const charityTags = ref<CharityFeedTag[]>([
@@ -77,9 +77,7 @@ const loadingMore = ref(false);
 const error = ref("");
 const statusMessage = ref("");
 const lastFetchedAt = ref("");
-const unreadCount = ref(0);
-const totalUnreadCount = ref(0);
-/** 今天发布的帖子数（非未读，用于侧边栏菜单徽标）。 */
+/** 今天发布的帖子数（用于侧边栏菜单徽标）。 */
 const todayCount = ref(0);
 const updatedCount = ref(0);
 const usedNodeName = ref("");
@@ -89,7 +87,9 @@ const hasMore = ref(false);
 const nextOffset = ref(0);
 /** 当前页码（后端分页，UI 与 Token 明细列表一致）。 */
 const currentPage = ref(1);
-const totalPages = computed(() => Math.max(1, Math.ceil(totalCount.value / PAGE_SIZE)));
+/** 每页条数（后端分页，UI 与模型参数列表可选一致）。 */
+const pageSize = ref(DEFAULT_PAGE_SIZE);
+const totalPages = computed(() => Math.max(1, Math.ceil(totalCount.value / pageSize.value)));
 const syncLog = shallowRef<CharitySyncLogEntry[]>([]);
 const syncLogOpen = ref(false);
 const refreshAllBusy = ref(false);
@@ -144,7 +144,6 @@ function applyLocalPage(result: CharityFeedResult, mode: "replace" | "append") {
   hasMore.value = Boolean(
     result.hasMore ?? (totalCount.value > 0 && nextOffset.value < totalCount.value),
   );
-  if (typeof result.unreadCount === "number") unreadCount.value = result.unreadCount;
 
   if (result.status === "error" || result.skipped || result.status === "skipped") {
     error.value = result.message || "";
@@ -154,12 +153,7 @@ function applyLocalPage(result: CharityFeedResult, mode: "replace" | "append") {
   statusMessage.value = "";
 }
 
-async function refreshUnreadTotal() {
-  try {
-    totalUnreadCount.value = await runCommand<number>("get_charity_unread_total");
-  } catch {
-    /* ignore */
-  }
+async function refreshSidebarCounts() {
   try {
     todayCount.value = await runCommand<number>("get_charity_today_count");
   } catch {
@@ -219,18 +213,18 @@ async function queryLocalFeed(feedId = selectedTagId.value, page = currentPage.v
   const seq = ++loadSeq;
   loading.value = true;
   try {
-    const offset = Math.max(0, (page - 1) * PAGE_SIZE);
+    const offset = Math.max(0, (page - 1) * pageSize.value);
     const result = await runCommand<CharityFeedResult>("get_charity_feed", {
       feedId,
       offset,
-      limit: PAGE_SIZE,
+      limit: pageSize.value,
       keyword: searchKeyword.value.trim() || undefined,
     });
     if (seq !== loadSeq || feedId !== selectedTagId.value) return result;
     applyLocalPage(result, "replace");
-    const pageCount = Math.max(1, Math.ceil(totalCount.value / PAGE_SIZE));
+    const pageCount = Math.max(1, Math.ceil(totalCount.value / pageSize.value));
     currentPage.value = Math.min(page, pageCount);
-    void refreshUnreadTotal();
+    void refreshSidebarCounts();
     return result;
   } catch (cause) {
     if (seq === loadSeq && feedId === selectedTagId.value) error.value = String(cause);
@@ -249,7 +243,7 @@ function goCharityPage(page: number) {
 
 function scheduleLocalReload(feedId = selectedTagId.value) {
   if (feedId !== selectedTagId.value) {
-    void refreshUnreadTotal();
+    void refreshSidebarCounts();
     return;
   }
   if (reloadTimer != null) window.clearTimeout(reloadTimer);
@@ -318,28 +312,12 @@ async function selectTag(tagId: string) {
   hasMore.value = false;
   nextOffset.value = 0;
   currentPage.value = 1;
-  unreadCount.value = 0;
   updatedCount.value = 0;
   statusMessage.value = "";
   error.value = "";
   usedNodeName.value = "";
   loadingMore.value = false;
   await queryLocalFeed(tagId, 1);
-  void markCharityFeedRead();
-}
-
-async function markCharityFeedRead() {
-  try {
-    unreadCount.value = await runCommand<number>("mark_charity_feed_read", {
-      feedId: selectedTagId.value,
-    });
-    void refreshUnreadTotal();
-    if (items.value.some((item) => item.isNew)) {
-      items.value = items.value.map((item) => (item.isNew ? { ...item, isNew: false } : item));
-    }
-  } catch {
-    unreadCount.value = 0;
-  }
 }
 
 async function ensureEventBridge() {
@@ -381,7 +359,7 @@ async function ensureEventBridge() {
       }
       if (payload.status !== "running") {
         scheduleLocalReload(payload.feedId);
-        void refreshUnreadTotal();
+        void refreshSidebarCounts();
       }
     });
   } catch {
@@ -400,7 +378,7 @@ function onVisibilityChange() {
   if (visible) {
     // 回前台只刷新本地展示，不触发同步；定时由后端每 5 分钟对齐点负责。
     scheduleLocalReload(selectedTagId.value);
-    void refreshUnreadTotal();
+    void refreshSidebarCounts();
     if (syncLogOpen.value) void loadCharitySyncLogs();
   }
 }
@@ -414,7 +392,7 @@ async function startCharityMonitor() {
   const visible = document.visibilityState === "visible";
   void runCommand("set_charity_monitor_visible", { visible }).catch(() => undefined);
   void queryLocalFeed(selectedTagId.value, 1);
-  void refreshUnreadTotal();
+  void refreshSidebarCounts();
   // 不在启动时 request_charity_round：定时 = 每 5 分钟整点秒；临时 = 按钮。
 }
 
@@ -467,8 +445,15 @@ function closeCharitySyncLog() {
   void toggleCharitySyncLog(false);
 }
 
-const sidebarUnread = computed(() => totalUnreadCount.value || unreadCount.value);
 const displayedCount = computed(() => items.value.length);
+
+/** 切换每页条数：重置到第 1 页并重新拉库。 */
+function setCharityPageSize(size: number) {
+  if (!Number.isFinite(size) || size <= 0 || size === pageSize.value) return;
+  pageSize.value = size;
+  currentPage.value = 1;
+  void queryLocalFeed(selectedTagId.value, 1);
+}
 
 export function useCharityMonitor() {
   return {
@@ -485,11 +470,9 @@ export function useCharityMonitor() {
     charityFeedError: error,
     charityFeedStatusMessage: statusMessage,
     charityFeedLastFetchedAt: lastFetchedAt,
-    charityFeedUnreadCount: sidebarUnread,
     charityFeedTodayCount: todayCount,
     refreshTodayCount,
     charityProxyPoolSummary: proxyPoolSummary,
-    charityFeedSelectedUnreadCount: unreadCount,
     charityFeedUpdatedCount: updatedCount,
     charityFeedSourceProfileName: ref(""),
     charityFeedSourceAccountName: ref(""),
@@ -499,18 +482,19 @@ export function useCharityMonitor() {
     charityFeedDisplayedCount: displayedCount,
     charityFeedHasMore: hasMore,
     charityFeedCurrentPage: currentPage,
+    charityFeedPageSize: pageSize,
     charityFeedTotalPages: totalPages,
     charitySyncLog: syncLog,
     charitySyncLogOpen: syncLogOpen,
     charitySyncLogLoading: syncLogLoading,
     goCharityPage,
+    setCharityPageSize,
     loadCharityFeedLocal: queryLocalFeed,
     refreshCharityFeed,
     selectTag,
     setSearchKeyword,
     startCharityMonitor,
     stopCharityMonitor,
-    markCharityFeedRead,
     loadCharitySyncLogs,
     clearCharitySyncLog,
     toggleCharitySyncLog,

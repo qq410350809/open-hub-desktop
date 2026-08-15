@@ -3,8 +3,37 @@ import { computed, onMounted, onUnmounted, ref } from "vue";
 import { icons } from "../icons";
 import { useStore } from "../composables/useStore";
 import AppTable, { type AppTableColumn } from "./AppTable.vue";
+import type { CharityFeedItem } from "../types";
+import type { SortingState } from "@tanstack/table-core";
 
 const store = useStore();
+import CustomSelect from "./CustomSelect.vue";
+
+/** 帖子详情弹窗 */
+const selectedPost = ref<CharityFeedItem | null>(null);
+
+function openPostDetail(item: CharityFeedItem) {
+  selectedPost.value = item;
+  document.body.classList.add("modal-open");
+}
+
+function closePostDetail() {
+  selectedPost.value = null;
+  document.body.classList.remove("modal-open");
+}
+
+/** 点击标题：在系统浏览器中打开对应帖子链接。 */
+function openPostInBrowser(item: CharityFeedItem) {
+  void store.openExternal(item.link);
+}
+
+function onPostDetailBackdropClick(event: MouseEvent) {
+  if (event.target === event.currentTarget) closePostDetail();
+}
+void onPostDetailBackdropClick;
+
+/** 列表排序状态（客户端对当前页排序，与模型参数列表一致）。 */
+const topicSorting = ref<SortingState>([]);
 
 /** 标签管理弹窗状态 */
 const tagManagerOpen = ref(false);
@@ -110,6 +139,13 @@ const selectedLabel = computed(
   () => store.currentFeedName.value || store.selectedTagId.value || "公益监听",
 );
 
+const tagSelectOptions = computed(() =>
+  store.charityTags.value.map((tag) => ({
+    value: tag.id,
+    text: `${tag.name}${tag.enabled === false ? " (已禁用)" : ""}`,
+  })),
+);
+
 const pageLabel = computed(() => {
   const shown = store.charityFeedDisplayedCount.value;
   const total = store.charityFeedTotalCount.value || shown;
@@ -157,16 +193,18 @@ function formatRelativeActivity(value?: string, fallback?: string) {
 }
 
 const topicColumns: AppTableColumn[] = [
-  { key: "title", title: "话题", width: "minmax(220px,1fr)", sortable: false },
-  { key: "author", title: "作者", width: "120px", sortable: false },
-  { key: "publishedAt", title: "创建时间", width: "120px", sortable: false },
-  { key: "replyCount", title: "回复", width: "70px", align: "right", sortable: false },
-  { key: "views", title: "浏览量", width: "80px", align: "right", sortable: false },
-  { key: "lastActivityAt", title: "活动", width: "110px", sortable: false },
+  // fixed table-layout：话题是唯一自适应列（不设宽度，吃满剩余空间）；
+  // 作者 / 创建时间 / 回复 / 浏览量 / 活动 全部固定宽度，紧靠右侧排列。
+  { key: "title", title: "话题", sortable: false },
+  { key: "author", title: "作者", width: "110px", class: "charity-author-cell", sortable: true },
+  { key: "publishedAt", title: "创建时间", width: "110px", sortable: true },
+  { key: "replyCount", title: "回复", width: "70px", align: "right", sortable: true },
+  { key: "views", title: "浏览量", width: "80px", align: "right", sortable: true },
+  { key: "lastActivityAt", title: "活动", width: "100px", sortable: true },
 ];
 
-function topicRowClass(row: { isNew?: boolean; pinned?: boolean }) {
-  return [row.isNew && "is-new", row.pinned && "is-pinned"].filter(Boolean).join(" ");
+function topicRowClass(row: { pinned?: boolean }) {
+  return [row.pinned && "is-pinned"].filter(Boolean).join(" ");
 }
 
 
@@ -238,10 +276,6 @@ function onLogBackdropClick(event: MouseEvent) {
 onMounted(() => {
   // 进入页面只查本地库；同步完全后台，不在这里触发
   void store.loadCharityFeedLocal();
-  // 已读标记延后，避免和首屏读库抢同一把锁
-  window.setTimeout(() => {
-    void store.markCharityFeedRead();
-  }, 400);
   // 日志弹窗打开时保持 tick，让 running 耗时跳动
   tickTimer = window.setInterval(() => {
     nowTick.value = Date.now();
@@ -278,39 +312,37 @@ onUnmounted(() => {
         <button
           class="secondary-button charity-refresh-button"
           type="button"
-          :disabled="store.charityFeedRefreshAllBusy.value"
-          title="临时触发：取消未完成任务并立即同步全部标签（定时仍为每 5 分钟对齐点）"
+          :disabled="store.charityFeedRefreshAllBusy.value || store.charityFeedSyncing.value"
+          :title="store.charityFeedSyncing.value ? '后台同步进行中，完成后自动刷新列表' : '临时触发：取消未完成任务并立即同步全部标签（定时仍为每 5 分钟对齐点）'"
           @click="store.refreshCharityFeed()"
         >
           <span
-            :class="{ 'is-spinning': store.charityFeedRefreshAllBusy.value }"
+            :class="{ 'is-spinning': store.charityFeedRefreshAllBusy.value || store.charityFeedSyncing.value }"
             v-html="icons.restore"
           />
-          <span>{{ store.charityFeedRefreshAllBusy.value ? "正在提交…" : "立即刷新全部" }}</span>
+          <span>{{
+            store.charityFeedRefreshAllBusy.value
+              ? "正在提交…"
+              : store.charityFeedSyncing.value
+                ? "同步中…"
+                : "立即刷新全部"
+          }}</span>
         </button>
       </div>
     </header>
 
     <div class="charity-monitor-topbar">
-      <div v-if="store.charityFeedSyncing.value" class="charity-monitor-status">
-        <span class="is-spinning" v-html="icons.restore" />
-        <span>正在后台同步 {{ store.charityTags.value.filter(t => t.id !== "all" && t.enabled !== false).length }} 个标签，完成后自动刷新列表…</span>
-      </div>
-
       <!-- 筛选 + 统计整合为一块工具条 -->
       <section class="charity-toolbar" aria-label="筛选与统计">
-        <div class="charity-toolbar-filter">
-          <label class="charity-tag-label" for="charity-tag-select">标签</label>
-          <select
-            id="charity-tag-select"
+       <div class="charity-toolbar-filter">
+         <label class="charity-tag-label" for="charity-tag-select">标签</label>
+          <CustomSelect
             class="charity-tag-select"
-            :value="store.selectedTagId.value"
-            @change="store.selectTag(($event.target as HTMLSelectElement).value)"
-          >
-            <option v-for="tag in store.charityTags.value" :key="tag.id" :value="tag.id">
-              {{ tag.name }}{{ tag.enabled === false ? ' (已禁用)' : '' }}
-            </option>
-          </select>
+            :options="tagSelectOptions"
+            :model-value="store.selectedTagId.value"
+            aria-label="标签筛选"
+            @update:model-value="store.selectTag(String($event))"
+          />
           <button
             class="charity-tag-manage-button"
             type="button"
@@ -347,10 +379,6 @@ onUnmounted(() => {
             <strong>{{ store.charityFeedTotalCount.value }}</strong>
             <span>共 {{ pageLabel.split(" / ")[0] }} 条</span>
           </div>
-          <div class="charity-summary-stat" title="未读新帖">
-            <strong>{{ store.charityFeedSelectedUnreadCount.value }}</strong>
-            <span>未读</span>
-          </div>
         </div>
       </section>
 
@@ -376,18 +404,9 @@ onUnmounted(() => {
 
       <section
         v-else-if="store.charityFeedItems.value.length"
-        class="charity-topic-list"
+        class="charity-topic-list charity-topic-table"
         aria-label="最近公益帖子"
       >
-        <button
-          v-if="store.charityFeedSelectedUnreadCount.value > 0"
-          class="charity-new-topics-banner"
-          type="button"
-          @click="store.markCharityFeedRead()"
-        >
-          查看 {{ store.charityFeedSelectedUnreadCount.value }} 个新的或更新的话题
-        </button>
-
         <AppTable
           :rows="store.charityFeedItems.value"
           :columns="topicColumns"
@@ -395,14 +414,18 @@ onUnmounted(() => {
           :loading="store.charityFeedLoading.value"
           empty-text="本地暂无公益帖子"
           :page="store.charityFeedCurrentPage.value"
-          :page-size="20"
-          :page-size-options="[20]"
+          :page-size="store.charityFeedPageSize.value"
+          :page-size-options="[20, 50, 100]"
           :total="store.charityFeedTotalCount.value"
+          :sorting="topicSorting"
           manual-pagination
           :row-class="topicRowClass"
+          :selected-key="selectedPost?.id ?? null"
           clickable
-          @row-click="(item: any) => store.openExternal(item.link)"
+          @select="(item: any) => openPostDetail(item)"
           @update:page="(page: number) => store.goCharityPage(page)"
+          @update:page-size="(size: number) => store.setCharityPageSize(size)"
+          @update:sorting="(s: any) => topicSorting = s"
         >
           <template #cell-title="{ row }">
             <div class="charity-topic-cell">
@@ -414,8 +437,15 @@ onUnmounted(() => {
                   aria-hidden="true"
                   v-html="icons.pin"
                 ></span>
-                <h2 :title="row.title">{{ row.title }}</h2>
-                <span v-if="row.isNew" class="charity-new-badge">NEW</span>
+                <h2
+                  class="charity-topic-title-link"
+                  :title="`在浏览器中打开：${row.title}`"
+                  role="link"
+                  tabindex="0"
+                  @click.stop="openPostInBrowser(row)"
+                  @keydown.enter.stop.prevent="openPostInBrowser(row)"
+                  @keydown.space.stop.prevent="openPostInBrowser(row)"
+                >{{ row.title }}</h2>
                 <span
                   v-if="store.selectedTagId.value === 'all' && row.feedNames?.length"
                   class="charity-topic-feed-tags"
