@@ -844,20 +844,52 @@ pub async fn mark_sites_with_chrome_sessions(
         }
     }
     let mut newly_marked = 0_usize;
+    let mut preserved_accounts = 0_usize;
     if !extract_only {
-        if let Some(site_id) = &requested_site_id {
+        // 只重建「本次扫到会话」的站点：未扫到会话的站点保留缓存行。
+        // Chrome 会把新登录的 Cookie 攒在内存里延迟刷盘，Cookie 库也可能被
+        // 短暂锁定，这些瞬时情况下直接清空会把整站账号（余额/令牌）抹掉。
+        // 下次扫到会话时仍按 DELETE+INSERT 全量重建，登录态收敛不受影响。
+        let rebuilt_site_ids: HashSet<String> = matched_sites
+            .iter()
+            .filter(|site| account_refresh_site_ids.contains(&site.site_id))
+            .map(|site| site.site_id.clone())
+            .collect();
+        for site_id in &rebuilt_site_ids {
             transaction
                 .execute("DELETE FROM site_accounts WHERE site_id = ?1", [site_id])
                 .map_err(|error| error.to_string())?;
+        }
+        // 作用域内未扫到会话、但本地仍有账号缓存的站点：保留数据并标注原因，
+        // 让卡片以“账号信息同步失败”提示而非整站消失。
+        let stale_scope_site_ids: Vec<String> = if let Some(site_id) = &requested_site_id {
+            vec![site_id.clone()]
         } else if has_site_scope {
-            for site_id in &requested_site_ids {
-                transaction
-                    .execute("DELETE FROM site_accounts WHERE site_id = ?1", [site_id])
-                    .map_err(|error| error.to_string())?;
-            }
+            requested_site_ids.iter().cloned().collect()
         } else {
             transaction
-                .execute("DELETE FROM site_accounts", [])
+                .prepare("SELECT DISTINCT site_id FROM site_accounts")
+                .map_err(|error| error.to_string())?
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(|error| error.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())?
+        };
+        for site_id in &stale_scope_site_ids {
+            if rebuilt_site_ids.contains(site_id) {
+                continue;
+            }
+            preserved_accounts += transaction
+                .execute(
+                    "UPDATE site_accounts
+                         SET sync_error = ?1
+                         WHERE site_id = ?2
+                           AND sync_error <> ?1",
+                    params![
+                        "本次未在 Chrome 扫到该站点的登录会话，已保留上次缓存（刚在浏览器登录的话，请稍等 Cookie 写入后重试；已退出登录可忽略）",
+                        site_id
+                    ],
+                )
                 .map_err(|error| error.to_string())?;
         }
         for site in &matched_sites {
@@ -1016,10 +1048,17 @@ pub async fn mark_sites_with_chrome_sessions(
         "success",
         if extract_only {
             format!("浏览器会话提取完成：有会话 {detected} 个站点，新待定 {newly_marked} 个")
-        } else if refresh_pending {
-            format!("待定站点额度缓存已写入 SQLite：{accounts} 个账号，{warnings} 个警告")
         } else {
-            format!("在用站点额度缓存已写入 SQLite：{accounts} 个账号，{warnings} 个警告")
+            let preserved_note = if preserved_accounts > 0 {
+                format!("；未扫到会话，已保留 {preserved_accounts} 个缓存账号")
+            } else {
+                String::new()
+            };
+            if refresh_pending {
+                format!("待定站点额度缓存已写入 SQLite：{accounts} 个账号，{warnings} 个警告{preserved_note}")
+            } else {
+                format!("在用站点额度缓存已写入 SQLite：{accounts} 个账号，{warnings} 个警告{preserved_note}")
+            }
         },
     );
 

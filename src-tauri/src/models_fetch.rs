@@ -697,21 +697,79 @@ pub(crate) fn save_site_model_cache(
     site_id: &str,
     account: &SiteModelCacheAccount,
     result: Option<&SiteModelsResult>,
+    preserve_keys: bool,
 ) -> Result<(), String> {
-    let models = result.map(|item| &item.models).cloned().unwrap_or_default();
-    let api_source = result.map(|item| item.source.as_str()).unwrap_or("");
-    let keys = result
-        .map(|item| item.keys.clone())
-        .unwrap_or_else(|| account.keys.clone());
-    let key_groups = result
-        .map(|item| item.key_groups.clone())
-        .filter(|groups| !groups.is_empty())
-        .unwrap_or_else(|| account.key_groups.clone());
+    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    // 同步模型（preserve_keys）时：保留库中已有 Key/分组；拉取失败时模型数据也一并保留，
+    // 只更新错误信息，避免把左侧 Key 树或右侧模型列表清空。
+    let existing = if preserve_keys {
+        connection
+            .query_row(
+                "SELECT keys_json, groups_json, models_json, key_models_json, api_source
+                 FROM site_model_cache WHERE site_id = ?1 AND profile_id = ?2",
+                params![site_id, account.profile_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .ok()
+    } else {
+        None
+    };
+    let keys = if preserve_keys {
+        existing
+            .as_ref()
+            .and_then(|(keys_json, ..)| serde_json::from_str(keys_json).ok())
+            .unwrap_or_else(|| account.keys.clone())
+    } else {
+        result
+            .map(|item| item.keys.clone())
+            .unwrap_or_else(|| account.keys.clone())
+    };
+    let key_groups = if preserve_keys {
+        existing
+            .as_ref()
+            .and_then(|(_, groups_json, ..)| serde_json::from_str(groups_json).ok())
+            .unwrap_or_else(|| account.key_groups.clone())
+    } else {
+        result
+            .map(|item| item.key_groups.clone())
+            .filter(|groups| !groups.is_empty())
+            .unwrap_or_else(|| account.key_groups.clone())
+    };
+    let models = result
+        .map(|item| item.models.clone())
+        .or_else(|| {
+            existing
+                .as_ref()
+                .and_then(|(_, _, models_json, ..)| serde_json::from_str(models_json).ok())
+        })
+        .unwrap_or_default();
     let key_models = result
         .map(|item| item.key_models.clone())
         .filter(|map| !map.is_empty())
+        .or_else(|| {
+            existing
+                .as_ref()
+                .and_then(|(_, _, _, key_models_json, _)| {
+                    serde_json::from_str(key_models_json).ok()
+                })
+        })
         .unwrap_or_default();
-    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    let api_source = result
+        .map(|item| item.source.clone())
+        .or_else(|| {
+            existing
+                .as_ref()
+                .and_then(|(_, _, _, _, source)| (!source.is_empty()).then(|| source.clone()))
+        })
+        .unwrap_or_default();
     connection
         .execute(
             "INSERT INTO site_model_cache
@@ -760,8 +818,15 @@ pub fn save_site_model_cache_for_account(
     site_id: String,
     account: SiteModelCacheAccount,
     result: Option<SiteModelsResult>,
+    preserve_keys: Option<bool>,
 ) -> Result<(), String> {
-    save_site_model_cache(&database, &site_id, &account, result.as_ref())
+    save_site_model_cache(
+        &database,
+        &site_id,
+        &account,
+        result.as_ref(),
+        preserve_keys.unwrap_or(false),
+    )
 }
 
 #[tauri::command]

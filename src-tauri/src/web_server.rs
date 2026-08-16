@@ -830,11 +830,13 @@ fn dispatch(app: &AppHandle, command: &str, args: &Value) -> Result<Value, Strin
             let site_id = take_string(args, &["siteId", "site_id"])?;
             let account: SiteModelCacheAccount = take(args, &["account"])?;
             let result: Option<SiteModelsResult> = take_opt(args, &["result"])?;
+            let preserve_keys: Option<bool> = take_opt(args, &["preserveKeys", "preserve_keys"])?;
             Ok(json!(models_fetch::save_site_model_cache_for_account(
                 app.state::<Database>(),
                 site_id,
                 account,
                 result,
+                preserve_keys,
             )))
         }
         "get_model_catalog" => Ok(json!(model_catalog::get_model_catalog_inner(
