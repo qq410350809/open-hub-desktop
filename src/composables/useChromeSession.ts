@@ -24,6 +24,10 @@ const chromeSessionsError = ref("");
 const chromeSessionCopyingProfileId = ref("");
 const chromeBrowserSyncingProfileId = ref("");
 const chromeModelsSyncing = ref(false);
+// 覆盖整轮同步（扫描 → 逐账号资料/Key/模型 → 清理标签页）的总开关。
+// 账号之间的衔接间隙（如等待关闭临时 Chrome 标签页）没有其他在跑标志，
+// 没有它的话状态标签会短暂误显示“已完成”。
+const chromeSessionSyncActive = ref(false);
 const chromeBrowserSyncError = ref("");
 const chromeBrowserSyncLogs = ref<SyncLogEntry[]>([]);
 const chromeBrowserSyncElapsedMs = ref(0);
@@ -351,6 +355,7 @@ async function closeChromeSyncTabs(accountLabel = "当前账号", profileId = "c
 async function syncAccountViaChrome(session: ChromeSessionInfo) {
   if (chromeBrowserSyncingProfileId.value) return;
   startChromeBrowserSyncLog();
+  chromeSessionSyncActive.value = true;
   const accountLabel = session.username || session.accountName || session.profileName;
   const stage = `manual-sync-${session.profileId}`;
   appendChromeBrowserSyncLog({
@@ -377,6 +382,7 @@ async function syncAccountViaChrome(session: ChromeSessionInfo) {
     }
   } finally {
     await closeChromeSyncTabs(accountLabel, session.profileId);
+    chromeSessionSyncActive.value = false;
     stopChromeBrowserSyncTimer();
     chromeBrowserSyncingProfileId.value = "";
   }
@@ -513,6 +519,7 @@ async function analyzeChromeUsage(
 
 async function syncChromeSession(site: any, trigger: HTMLElement) {
   const requestId = ++chromeSessionRequestId;
+  chromeSessionSyncActive.value = true;
   chromeSessionSite.value = site;
   chromeSessionTrigger.value = trigger;
   chromeSessions.value = [];
@@ -656,6 +663,7 @@ async function syncChromeSession(site: any, trigger: HTMLElement) {
     });
   } finally {
     if (requestId === chromeSessionRequestId) {
+      chromeSessionSyncActive.value = false;
       stopChromeBrowserSyncTimer();
     }
   }
@@ -671,6 +679,7 @@ export function useChromeSession() {
     chromeSessionCopyingProfileId,
     chromeBrowserSyncingProfileId,
     chromeModelsSyncing,
+    chromeSessionSyncActive,
     chromeBrowserSyncError,
     chromeBrowserSyncLogs,
     chromeBrowserSyncElapsedMs,

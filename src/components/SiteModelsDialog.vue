@@ -40,12 +40,12 @@ const { usageSites } = useLibrary();
 const closeBtnRef = ref<HTMLButtonElement>();
 const searchQuery = ref("");
 const liveFetching = ref(false);
+/** 当前正在执行的同步类型；用于区分 Key/模型按钮各自的转圈状态。 */
+const liveFetchingKind = ref<"keys" | "models" | null>(null);
 const liveError = ref("");
 const liveModels = ref<LiveModelItem[]>([]);
 const liveAccountKeys = ref<LiveAccountKeys[]>([]);
 const apiSource = ref<ModelApiSource>("none");
-/** 已折叠的账号 key（profileId 或 accountName）；默认全部展开。 */
-const collapsedAccounts = ref<Set<string>>(new Set());
 /** 当前选中的 API Key；选中后右侧只显示该 Key 对应的模型。 */
 const selectedKeyId = ref<string | null>(null);
 let liveFetchRequestId = 0;
@@ -136,12 +136,12 @@ watch(
       liveError.value = "";
       searchQuery.value = "";
       apiSource.value = "none";
-      collapsedAccounts.value = new Set();
       selectedKeyId.value = null;
       void refreshModels();
     } else {
       liveFetchRequestId += 1;
       liveFetching.value = false;
+      liveFetchingKind.value = null;
       document.body.classList.remove("modal-open");
     }
   },
@@ -160,16 +160,20 @@ async function refreshModels(mode: "cache" | "keys" | "models" = "cache") {
   if (!requestedSite) return;
   const requestId = ++liveFetchRequestId;
   liveFetching.value = true;
+  liveFetchingKind.value = mode === "keys" ? "keys" : mode === "models" ? "models" : null;
   liveError.value = "";
   liveModels.value = [];
-  liveAccountKeys.value = [];
-  apiSource.value = "none";
-  selectedKeyId.value = null;
+  // 同步模型只刷新右侧模型列表：保留左侧 Key 树、来源标签与选中 Key，不重置它们。
+  if (mode !== "models") {
+    liveAccountKeys.value = [];
+    apiSource.value = "none";
+    selectedKeyId.value = null;
+  }
   try {
     if (mode !== "cache") {
       // "keys"：只同步 Key 列表（不保存 keyModels 映射）
-      // "models"：用已有缓存 Key 逐个拉取 /v1/models 并保存 keyModels
-      // 两者都调 fetch_site_models_json，区别在于保存时是否包含 keyModels
+      // "models"：用已有缓存 Key 逐个拉取 /v1/models 并保存 keyModels（不动已有 Key）
+      // 两者都调 fetch_site_models_json，区别在于保存时是否包含 keyModels / 是否覆盖 Key
       const saveKeyModels = mode === "models";
       const siteUsage = usageSites.value.find((item) => item.siteId === requestedSite.id);
       const sessions = siteUsage?.sessions?.filter((s) => s.isValid) ?? [];
@@ -195,6 +199,7 @@ async function refreshModels(mode: "cache" | "keys" | "models" = "cache") {
               error: "",
             },
             result: saveKeyModels ? result : null,
+            preserveKeys: saveKeyModels,
           });
         } catch {
           /* 忽略，继续读缓存 */
@@ -221,6 +226,7 @@ async function refreshModels(mode: "cache" | "keys" | "models" = "cache") {
                 error: "",
               },
               result: saveKeyModels ? result : null,
+              preserveKeys: saveKeyModels,
             });
           } catch (error) {
             await runCommand("save_site_model_cache_for_account", {
@@ -236,6 +242,7 @@ async function refreshModels(mode: "cache" | "keys" | "models" = "cache") {
                 error: String(error),
               },
               result: null,
+              preserveKeys: saveKeyModels,
             });
           }
         }
@@ -251,7 +258,10 @@ async function refreshModels(mode: "cache" | "keys" | "models" = "cache") {
   } catch (error) {
     if (requestId === liveFetchRequestId) liveError.value = String(error);
   } finally {
-    if (requestId === liveFetchRequestId) liveFetching.value = false;
+    if (requestId === liveFetchRequestId) {
+      liveFetching.value = false;
+      liveFetchingKind.value = null;
+    }
   }
 }
 
@@ -291,13 +301,6 @@ function maskApiKey(key: string): string {
 
 function keyGroup(account: LiveAccountKeys, key: string): string {
   return account.keyGroups?.[key]?.trim() || "默认分组";
-}
-
-function toggleAccount(id: string) {
-  const next = new Set(collapsedAccounts.value);
-  if (next.has(id)) next.delete(id);
-  else next.add(id);
-  collapsedAccounts.value = next;
 }
 
 /** 点击 Key 行时切换选中态，右侧模型列表随之联动。 */
@@ -346,21 +349,21 @@ function keyModelCount(key: string): number | null {
               type="button"
               class="site-models-icon-btn"
               :disabled="liveFetching"
-              :aria-label="liveFetching ? '正在同步 Key' : '同步 Key：拉取站点 API Key 列表'"
+              :aria-label="liveFetchingKind === 'keys' ? '正在同步 Key' : '同步 Key：拉取站点 API Key 列表'"
               title="同步 Key：拉取站点 API Key 列表"
               @click="refreshModels('keys')"
             >
-              <span v-html="icons.key" :class="{ 'site-models-spin': liveFetching }" />
+              <span v-html="icons.key" :class="{ 'site-models-spin': liveFetchingKind === 'keys' }" />
             </button>
             <button
               type="button"
               class="site-models-icon-btn"
               :disabled="liveFetching"
-              :aria-label="liveFetching ? '正在同步模型' : '同步模型：按 Key 逐个拉取 /v1/models 并保存'"
+              :aria-label="liveFetchingKind === 'models' ? '正在同步模型' : '同步模型：按 Key 逐个拉取 /v1/models 并保存'"
               title="同步模型：按 Key 逐个拉取 /v1/models 并保存"
               @click="refreshModels('models')"
             >
-              <span v-html="icons.restore" :class="{ 'site-models-spin': liveFetching }" />
+              <span v-html="icons.restore" :class="{ 'site-models-spin': liveFetchingKind === 'models' }" />
             </button>
             <button
               ref="closeBtnRef"
@@ -395,14 +398,10 @@ function keyModelCount(key: string): number | null {
                       :key="account.profileId || account.accountName"
                       class="site-models-tree-node"
                     >
-                      <button
-                        type="button"
+                      <div
                         class="site-models-tree-parent"
-                        :class="{ 'is-open': !collapsedAccounts.has(account.profileId || account.accountName) }"
                         :title="[accountLabel(account), accountDetail(account)].filter(Boolean).join(' · ') || '未命名账号'"
-                        @click="toggleAccount(account.profileId || account.accountName)"
                       >
-                        <span class="site-models-tree-chevron" v-html="icons.chevron" />
                         <span v-html="icons.user" />
                         <strong>
                           {{ accountLabel(account) }}<span
@@ -412,11 +411,8 @@ function keyModelCount(key: string): number | null {
                           >
                         </strong>
                         <small>{{ account.keys.length }}</small>
-                      </button>
-                      <div
-                        v-if="!collapsedAccounts.has(account.profileId || account.accountName)"
-                        class="site-models-tree-children"
-                      >
+                      </div>
+                      <div class="site-models-tree-children">
                         <template v-if="account.keys.length > 0">
                           <div
                             v-for="(key, keyIndex) in account.keys"

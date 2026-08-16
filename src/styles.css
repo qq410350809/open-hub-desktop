@@ -675,7 +675,9 @@ kbd { padding: 3px 7px; border: 1px solid var(--line); border-radius: var(--r-xs
 @keyframes sync-sites-spin { to { transform: rotate(360deg); } }
 
 /* —— Tooltip —— */
-.ui-tooltip { --tooltip-arrow-left: 50%; position: fixed; z-index: 230; width: max-content; max-width: min(420px,calc(100vw - 20px)); padding: 9px 12px; border: 1px solid rgba(255,255,255,.08); border-radius: var(--r-sm); background: #1c1e24; box-shadow: 0 10px 32px rgba(0,0,0,.32); color: #f4f5f6; white-space: pre-line; overflow-wrap: anywhere; text-align: left; font-size: 11px; font-weight: 500; line-height: 1.55; pointer-events: none; animation: tooltip-in .12s var(--ease-out); }
+/* z-index 必须高于所有弹层背景（site-models/mc-detail 均为 1000，toast 为 2000），
+   否则在“模型”等弹窗内悬停顶部按钮时气泡会渲染在遮罩之下，显示变暗模糊。 */
+.ui-tooltip { --tooltip-arrow-left: 50%; position: fixed; z-index: 3000; width: max-content; max-width: min(420px,calc(100vw - 20px)); padding: 9px 12px; border: 1px solid rgba(255,255,255,.08); border-radius: var(--r-sm); background: #1c1e24; box-shadow: 0 10px 32px rgba(0,0,0,.32); color: #f4f5f6; white-space: pre-line; overflow-wrap: anywhere; text-align: left; font-size: 11px; font-weight: 500; line-height: 1.55; pointer-events: none; animation: tooltip-in .12s var(--ease-out); }
 .ui-tooltip::after { position: absolute; left: var(--tooltip-arrow-left); top: 100%; width: 8px; height: 8px; border-right: 1px solid rgba(255,255,255,.08); border-bottom: 1px solid rgba(255,255,255,.08); background: #1c1e24; content: ""; transform: translate(-50%,-4px) rotate(45deg); }
 .ui-tooltip.is-below::after { top: 0; border: 0; border-top: 1px solid rgba(255,255,255,.08); border-left: 1px solid rgba(255,255,255,.08); transform: translate(-50%,-4px) rotate(45deg); }
 @keyframes tooltip-in { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
@@ -1123,13 +1125,9 @@ kbd { padding: 3px 7px; border: 1px solid var(--line); border-radius: var(--r-xs
 
 .site-models-tree-node { border-bottom: 1px solid var(--line-soft); }
 .site-models-tree-node:last-child { border-bottom: 0; }
-.site-models-tree-parent { width: 100%; min-height: 34px; padding: 0 14px 0 8px; display: grid; grid-template-columns: 16px 16px minmax(0, 1fr) auto; align-items: center; gap: 6px; border: 0; background: transparent; color: var(--muted); cursor: pointer; transition: background 0.15s var(--ease); }
-.site-models-tree-parent:hover { background: var(--surface-hover); }
-.site-models-tree-chevron { width: 16px; height: 16px; display: grid; place-items: center; color: var(--faint); transition: transform 0.15s var(--ease); }
-.site-models-tree-chevron svg { width: 14px; height: 14px; }
-.site-models-tree-parent.is-open .site-models-tree-chevron { transform: rotate(90deg); }
-.site-models-tree-parent > span:not(.site-models-tree-chevron) { min-width: 0; width: 16px; height: 16px; display: grid; place-items: center; overflow: hidden; }
-.site-models-tree-parent > span:not(.site-models-tree-chevron) svg { width: 14px; height: 14px; }
+.site-models-tree-parent { width: 100%; min-height: 34px; padding: 0 14px 0 8px; display: grid; grid-template-columns: 16px minmax(0, 1fr) auto; align-items: center; gap: 6px; border: 0; background: transparent; color: var(--muted); }
+.site-models-tree-parent > span { min-width: 0; width: 16px; height: 16px; display: grid; place-items: center; overflow: hidden; }
+.site-models-tree-parent > span svg { width: 14px; height: 14px; }
 .site-models-tree-parent strong { min-width: 0; overflow: hidden; color: var(--text); white-space: nowrap; text-overflow: ellipsis; font-size: 11.5px; font-weight: 600; }
 .site-models-account-user { color: var(--faint); font-weight: 500; }
 .site-models-tree-parent small { color: var(--faint); font-size: 10px; font-variant-numeric: tabular-nums; }

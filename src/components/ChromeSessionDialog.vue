@@ -14,6 +14,9 @@ const browserSyncStateLabel = computed(() => {
   if (store.chromeSessionsLoading.value || store.chromeUsageScanning.value) return "正在扫描";
   if (store.chromeBrowserSyncingProfileId.value) return "正在同步";
   if (store.chromeModelsSyncing.value) return "同步 Key 与模型";
+  // 整轮同步的衔接间隙（切换账号、清理临时标签页）仍属于同步中，
+  // 不能因为单个账号阶段结束就显示“已完成”。
+  if (store.chromeSessionSyncActive.value) return "正在同步";
   if (store.chromeBrowserSyncError.value) return "同步失败";
   return "已完成";
 });
@@ -116,7 +119,7 @@ async function syncViaChrome(session: ChromeSessionInfo) {
             class="close-button"
             type="button"
             aria-label="关闭 Chrome 账号会话"
-            :disabled="Boolean(store.chromeBrowserSyncingProfileId.value) || store.chromeModelsSyncing.value"
+            :disabled="store.chromeSessionSyncActive.value || store.chromeModelsSyncing.value"
             @click="close"
             v-html="icons.close"
           />
@@ -134,14 +137,14 @@ async function syncViaChrome(session: ChromeSessionInfo) {
                 <strong>执行日志</strong>
                 <span
                   :class="{
-                    'is-error': Boolean(store.chromeBrowserSyncError.value),
+                    'is-error': Boolean(store.chromeBrowserSyncError.value) && !store.chromeSessionSyncActive.value,
                     'is-running': store.chromeSessionsLoading.value
                       || store.chromeUsageScanning.value
-                      || Boolean(store.chromeBrowserSyncingProfileId.value)
+                      || store.chromeSessionSyncActive.value
                       || store.chromeModelsSyncing.value,
                     'is-complete': !store.chromeSessionsLoading.value
                       && !store.chromeUsageScanning.value
-                      && !store.chromeBrowserSyncingProfileId.value
+                      && !store.chromeSessionSyncActive.value
                       && !store.chromeModelsSyncing.value
                       && !store.chromeBrowserSyncError.value,
                   }"
@@ -203,7 +206,7 @@ async function syncViaChrome(session: ChromeSessionInfo) {
                 type="button"
                 :aria-label="`使用 Chrome 同步 ${session.profileName}`"
                 title="使用 Chrome 同步"
-                :disabled="Boolean(store.chromeBrowserSyncingProfileId.value) || store.chromeModelsSyncing.value"
+                :disabled="store.chromeSessionSyncActive.value"
                 @click="syncViaChrome(session)"
                 v-html="icons.globe"
               />
@@ -212,7 +215,7 @@ async function syncViaChrome(session: ChromeSessionInfo) {
                 type="button"
                 :aria-label="`复制 ${session.profileName} 的会话`"
                 title="复制会话"
-                :disabled="store.chromeSessionCopyingProfileId.value === session.profileId || Boolean(store.chromeBrowserSyncingProfileId.value) || store.chromeModelsSyncing.value"
+                :disabled="store.chromeSessionCopyingProfileId.value === session.profileId || store.chromeSessionSyncActive.value"
                 @click="copySession(session)"
                 v-html="icons.copy"
               />
