@@ -10,10 +10,12 @@ import type {
 
 const emptySnapshot = (): ModelCatalogSnapshot => ({
   models: [],
+  providers: [],
   total: 0,
   lastSyncedAt: "",
   syncedToday: false,
   sources: [],
+  meta: {},
 });
 
 const modelCatalog = ref<ModelCatalogSnapshot>(emptySnapshot());
@@ -55,8 +57,8 @@ async function syncModelCatalog(force = true) {
   }
 }
 
-async function getModelCatalogDetail(canonicalKey: string) {
-  return runCommand<ModelCatalogDetail>("get_model_catalog_detail", { canonicalKey });
+async function getModelCatalogDetail(id: string) {
+  return runCommand<ModelCatalogDetail>("get_model_catalog_detail", { id, canonicalKey: id });
 }
 
 function scheduleDailyModelCatalogSync() {

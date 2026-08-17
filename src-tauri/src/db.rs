@@ -20,6 +20,18 @@ impl Database {
             connection.execute_batch("DROP TABLE directory_sites; DROP TABLE IF EXISTS site_tags; DROP TABLE IF EXISTS site_maintainers; DROP TABLE IF EXISTS site_extensions; DROP TABLE IF EXISTS app_meta;").ok();
         }
 
+        let has_legacy_catalog: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('model_catalog_models') WHERE name='canonical_key'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+
+        if has_legacy_catalog > 0 {
+            connection.execute_batch("DROP TABLE IF EXISTS model_catalog_entries; DROP TABLE IF EXISTS model_catalog_models; DROP TABLE IF EXISTS model_catalog_sources; DROP TABLE IF EXISTS model_catalog_providers;").ok();
+        }
+
         connection
             .execute_batch(
                 "
@@ -146,58 +158,75 @@ impl Database {
                     raw_json TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS model_catalog_providers (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL DEFAULT '',
+                    npm TEXT,
+                    api TEXT,
+                    doc TEXT,
+                    tier TEXT,
+                    subscription INTEGER NOT NULL DEFAULT 0,
+                    model_count INTEGER NOT NULL DEFAULT 0,
+                    date_modified TEXT,
+                    raw_json TEXT NOT NULL DEFAULT '{}'
+                );
+
                 CREATE TABLE IF NOT EXISTS model_catalog_models (
-                    canonical_key TEXT PRIMARY KEY,
-                    display_name TEXT NOT NULL DEFAULT '',
-                    provider TEXT NOT NULL DEFAULT '',
-                    mode TEXT NOT NULL DEFAULT '',
+                    id TEXT PRIMARY KEY,
+                    slug TEXT NOT NULL DEFAULT '',
+                    name TEXT NOT NULL DEFAULT '',
+                    lab TEXT NOT NULL DEFAULT '',
+                    kind TEXT NOT NULL DEFAULT '',
+                    family TEXT,
+                    knowledge TEXT,
+                    status TEXT NOT NULL DEFAULT 'ga',
+                    open_weights INTEGER NOT NULL DEFAULT 0,
+                    reasoning INTEGER NOT NULL DEFAULT 0,
+                    tool_call INTEGER NOT NULL DEFAULT 0,
+                    attachment INTEGER NOT NULL DEFAULT 0,
+                    structured INTEGER NOT NULL DEFAULT 0,
+                    temperature INTEGER NOT NULL DEFAULT 0,
+                    input_modalities_json TEXT NOT NULL DEFAULT '[]',
                     context_length INTEGER NOT NULL DEFAULT 0,
-                    max_input_tokens INTEGER NOT NULL DEFAULT 0,
+                    context_min INTEGER NOT NULL DEFAULT 0,
+                    context_max INTEGER NOT NULL DEFAULT 0,
                     max_output_tokens INTEGER NOT NULL DEFAULT 0,
-                    input_cost_per_token REAL NOT NULL DEFAULT 0,
-                    output_cost_per_token REAL NOT NULL DEFAULT 0,
-                    cache_read_cost_per_token REAL NOT NULL DEFAULT 0,
-                    cache_write_cost_per_token REAL NOT NULL DEFAULT 0,
-                    image_cost REAL NOT NULL DEFAULT 0,
-                    audio_input_cost_per_token REAL NOT NULL DEFAULT 0,
-                    audio_output_cost_per_token REAL NOT NULL DEFAULT 0,
-                    request_cost REAL NOT NULL DEFAULT 0,
-                    source_count INTEGER NOT NULL DEFAULT 0,
-                    variant_count INTEGER NOT NULL DEFAULT 0,
-                    capabilities_json TEXT NOT NULL DEFAULT '[]',
-                    source_ids_json TEXT NOT NULL DEFAULT '[]',
-                    pricing_json TEXT NOT NULL DEFAULT '{}',
+                    ref_provider TEXT,
+                    ref_official INTEGER NOT NULL DEFAULT 0,
+                    ref_input_cost REAL NOT NULL DEFAULT 0,
+                    ref_output_cost REAL NOT NULL DEFAULT 0,
+                    ref_cache_read_cost REAL NOT NULL DEFAULT 0,
+                    min_provider TEXT,
+                    min_input_cost REAL NOT NULL DEFAULT 0,
+                    min_output_cost REAL NOT NULL DEFAULT 0,
+                    min_cache_read_cost REAL NOT NULL DEFAULT 0,
+                    price_spread REAL NOT NULL DEFAULT 0,
+                    blended_min REAL,
+                    blended_trusted REAL,
+                    blended_ref REAL,
+                    host_count INTEGER NOT NULL DEFAULT 0,
+                    priced_host_count INTEGER NOT NULL DEFAULT 0,
+                    free_host_count INTEGER NOT NULL DEFAULT 0,
+                    sub_host_count INTEGER NOT NULL DEFAULT 0,
+                    host_providers_json TEXT NOT NULL DEFAULT '[]',
+                    aa_idx REAL,
+                    aa_coding REAL,
+                    aa_agentic REAL,
+                    aa_speed REAL,
+                    aa_ttft REAL,
+                    aa_task_cost REAL,
+                    aa_json TEXT,
+                    benchmark_count INTEGER NOT NULL DEFAULT 0,
+                    release_date TEXT,
+                    last_updated TEXT,
+                    raw_json TEXT NOT NULL DEFAULT '{}',
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
 
-                CREATE TABLE IF NOT EXISTS model_catalog_entries (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    source TEXT NOT NULL,
-                    source_model_id TEXT NOT NULL,
-                    canonical_key TEXT NOT NULL,
-                    provider TEXT NOT NULL DEFAULT '',
-                    mode TEXT NOT NULL DEFAULT '',
-                    display_name TEXT NOT NULL DEFAULT '',
-                    context_length INTEGER NOT NULL DEFAULT 0,
-                    max_input_tokens INTEGER NOT NULL DEFAULT 0,
-                    max_output_tokens INTEGER NOT NULL DEFAULT 0,
-                    input_cost_per_token REAL NOT NULL DEFAULT 0,
-                    output_cost_per_token REAL NOT NULL DEFAULT 0,
-                    cache_read_cost_per_token REAL NOT NULL DEFAULT 0,
-                    cache_write_cost_per_token REAL NOT NULL DEFAULT 0,
-                    image_cost REAL NOT NULL DEFAULT 0,
-                    audio_input_cost_per_token REAL NOT NULL DEFAULT 0,
-                    audio_output_cost_per_token REAL NOT NULL DEFAULT 0,
-                    request_cost REAL NOT NULL DEFAULT 0,
-                    capabilities_json TEXT NOT NULL DEFAULT '[]',
-                    raw_json TEXT NOT NULL,
-                    FOREIGN KEY(canonical_key) REFERENCES model_catalog_models(canonical_key) ON DELETE CASCADE
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_model_catalog_models_provider ON model_catalog_models(provider);
-                CREATE INDEX IF NOT EXISTS idx_model_catalog_models_mode ON model_catalog_models(mode);
-                CREATE INDEX IF NOT EXISTS idx_model_catalog_entries_model ON model_catalog_entries(canonical_key);
-                CREATE INDEX IF NOT EXISTS idx_model_catalog_entries_source ON model_catalog_entries(source, source_model_id);
+                CREATE INDEX IF NOT EXISTS idx_model_catalog_models_lab ON model_catalog_models(lab);
+                CREATE INDEX IF NOT EXISTS idx_model_catalog_models_kind ON model_catalog_models(kind);
+                CREATE INDEX IF NOT EXISTS idx_model_catalog_models_status ON model_catalog_models(status);
+                CREATE INDEX IF NOT EXISTS idx_model_catalog_providers_name ON model_catalog_providers(name);
 
                 CREATE TABLE IF NOT EXISTS charity_feed_items (
                     feed_id TEXT NOT NULL,

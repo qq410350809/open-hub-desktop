@@ -232,18 +232,18 @@ interface CatalogMatcher {
   substring: ModelCatalogItem[];
 }
 
-/** 模型库（模型参数页）索引：canonicalKey 去厂商前缀后参与匹配。 */
+/** 模型库（模型参数页）索引：id 去厂商前缀后参与匹配。 */
 const catalogMatcher = computed<CatalogMatcher>(() => {
   const exact = new Map<string, ModelCatalogItem>();
   const items: ModelCatalogItem[] = [];
   for (const item of modelCatalog.value.models ?? []) {
-    const norm = normalizeModelId(item.canonicalKey);
+    const norm = normalizeModelId(item.id);
     if (!norm) continue;
     if (!exact.has(norm)) exact.set(norm, item);
     items.push(item);
   }
   items.sort((left, right) =>
-    normalizeModelId(right.canonicalKey).length - normalizeModelId(left.canonicalKey).length,
+    normalizeModelId(right.id).length - normalizeModelId(left.id).length,
   );
   return { exact, substring: items };
 });
@@ -262,13 +262,13 @@ function resolveCatalogModel(rawId: string): ModelCatalogItem | null {
   const exact = matcher.exact.get(base);
   if (exact) return exact;
   for (const item of matcher.substring) {
-    if (base.includes(normalizeModelId(item.canonicalKey))) return item;
+    if (base.includes(normalizeModelId(item.id))) return item;
   }
   return null;
 }
 
 function catalogVendor(item: ModelCatalogItem): string {
-  const vendor = item.manufacturer?.trim();
+  const vendor = item.lab?.trim();
   return vendor && vendor !== "unknown" ? vendor : DEFAULT_VENDOR;
 }
 
@@ -285,14 +285,14 @@ const modelAggTree = computed<ModelAggTreeVendor[]>(() => {
         models = new Map();
         vendors.set(vendor, models);
       }
-      const key = `catalog:${catalog.canonicalKey}`;
+      const key = `catalog:${catalog.id}`;
       const existing = models.get(key);
       if (existing) {
         existing.rawIds.push(rawId);
         existing.providerCount += countNewProviders(existing, rawId, providers);
       } else {
-        const displayName = catalog.displayName?.trim() || base || rawId;
-        const catalogBase = stripVendorPrefix(catalog.canonicalKey);
+        const displayName = catalog.name?.trim() || base || rawId;
+        const catalogBase = stripVendorPrefix(catalog.id);
         // 名称后括号显示模型 id；仅当名称与 id 完全同字符时才省略，避免重复。
         const label =
           displayName === catalogBase ? displayName : `${displayName} (${catalogBase})`;
@@ -302,7 +302,7 @@ const modelAggTree = computed<ModelAggTreeVendor[]>(() => {
           rawIds: [rawId],
           providerCount: providers.size,
           matched: true,
-          canonicalKey: catalog.canonicalKey,
+          canonicalKey: catalog.id,
         });
       }
     } else {

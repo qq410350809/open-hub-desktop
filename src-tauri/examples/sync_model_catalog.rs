@@ -1,4 +1,4 @@
-//! 一次性工具：对本地数据库强制重跑模型参数同步，验证 catalog 收录逻辑。
+//! 一次性工具：对本地数据库强制重跑模型参数同步，验证 LLMPricing 数据收录逻辑。
 //!
 //! 用法（在 src-tauri 目录下）：
 //!   cargo run --example sync_model_catalog -- [db_path]
@@ -16,8 +16,8 @@ fn main() {
     match sync_model_catalog_once(&db_path) {
         Ok(report) => {
             println!(
-                "同步完成：OpenRouter {} 条数据，生成 {} 个规范模型",
-                report.openrouter_count, report.model_count
+                "同步完成：LLMPricing 收录 {} 个供应商，{} 个模型（共 {} 个分片）",
+                report.provider_count, report.model_count, report.shard_count
             );
         }
         Err(error) => {

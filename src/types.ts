@@ -795,6 +795,18 @@ export interface LightweightState {
   url: string;
 }
 
+export interface ModelCatalogProvider {
+  id: string;
+  name: string;
+  npm?: string | null;
+  api?: string | null;
+  doc?: string | null;
+  tier?: string | null;
+  subscription: boolean;
+  count: number;
+  dateModified?: string | null;
+}
+
 export interface ModelCatalogSourceStatus {
   source: string;
   url: string;
@@ -803,56 +815,68 @@ export interface ModelCatalogSourceStatus {
 }
 
 export interface ModelCatalogItem {
-  canonicalKey: string;
-  displayName: string;
-  manufacturer: string;
-  mode: string;
+  id: string;
+  slug: string;
+  name: string;
+  lab: string;
+  kind: string;
+  family?: string | null;
+  knowledge?: string | null;
+  status: string;
+  openWeights: boolean;
+  reasoning: boolean;
+  toolCall: boolean;
+  attachment: boolean;
+  structured: boolean;
+  temperature: boolean;
+  inputModalities: string[];
   contextLength: number;
-  maxInputTokens: number;
+  contextMin: number;
+  contextMax: number;
   maxOutputTokens: number;
-  inputCostPerToken: number;
-  outputCostPerToken: number;
-  cacheReadCostPerToken: number;
-  cacheWriteCostPerToken: number;
-  imageCost: number;
-  audioInputCostPerToken: number;
-  audioOutputCostPerToken: number;
-  requestCost: number;
-  capabilities: string[];
+  refProvider?: string | null;
+  refOfficial: boolean;
+  refInputCost: number;
+  refOutputCost: number;
+  refCacheReadCost: number;
+  minProvider?: string | null;
+  minInputCost: number;
+  minOutputCost: number;
+  minCacheReadCost: number;
+  priceSpread: number;
+  blendedMin?: number | null;
+  blendedTrusted?: number | null;
+  blendedRef?: number | null;
+  hostCount: number;
+  pricedHostCount: number;
+  freeHostCount: number;
+  subHostCount: number;
+  hostProviders: string[];
+  aaIdx?: number | null;
+  aaCoding?: number | null;
+  aaAgentic?: number | null;
+  aaSpeed?: number | null;
+  aaTtft?: number | null;
+  aaTaskCost?: number | null;
+  benchmarkCount: number;
+  releaseDate?: string | null;
+  lastUpdated?: string | null;
 }
 
 export interface ModelCatalogSnapshot {
   models: ModelCatalogItem[];
+  providers: ModelCatalogProvider[];
   total: number;
   lastSyncedAt: string;
   syncedToday: boolean;
   sources: ModelCatalogSourceStatus[];
-}
-
-export interface ModelCatalogEntryDetail {
-  source: string;
-  sourceModelId: string;
-  channel: string;
-  mode: string;
-  displayName: string;
-  contextLength: number;
-  maxInputTokens: number;
-  maxOutputTokens: number;
-  inputCostPerToken: number;
-  outputCostPerToken: number;
-  cacheReadCostPerToken: number;
-  cacheWriteCostPerToken: number;
-  imageCost: number;
-  audioInputCostPerToken: number;
-  audioOutputCostPerToken: number;
-  requestCost: number;
-  raw: unknown;
+  meta: Record<string, any>;
 }
 
 export interface ModelCatalogDetail {
   model: ModelCatalogItem;
-  pricing: Record<string, number>;
-  entries: ModelCatalogEntryDetail[];
+  providers: ModelCatalogProvider[];
+  raw: any;
 }
 
 export interface ModelCatalogSyncResult {

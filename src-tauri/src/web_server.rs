@@ -847,10 +847,10 @@ fn dispatch(app: &AppHandle, command: &str, args: &Value) -> Result<Value, Strin
             &*app.state::<Database>()
         ))),
         "get_model_catalog_detail" => {
-            let canonical_key = take_string(args, &["canonicalKey", "canonical_key"])?;
-            Ok(json!(model_catalog::get_model_catalog_detail(
-                app.state::<Database>(),
-                canonical_key,
+            let key = take_string(args, &["id", "canonicalKey", "canonical_key"])?;
+            Ok(json!(model_catalog::get_model_catalog_detail_inner(
+                &*app.state::<Database>(),
+                &key,
             )))
         }
         "sync_model_catalog" => {
