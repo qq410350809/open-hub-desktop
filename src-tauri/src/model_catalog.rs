@@ -10,7 +10,7 @@ use tauri::{AppHandle, Emitter, State};
 
 pub const LLMPRICING_MANIFEST_URL: &str = "https://llmpricing.dev/rows/manifest.json";
 pub const LLMPRICING_BASE_URL: &str = "https://llmpricing.dev/rows";
-const CATALOG_SCHEMA_VERSION: &str = "8";
+const CATALOG_SCHEMA_VERSION: &str = "9";
 const CATALOG_SCHEMA_META_KEY: &str = "model_catalog_schema_version";
 
 pub(crate) struct ModelCatalogRuntime {
@@ -37,6 +37,28 @@ pub(crate) struct ModelCatalogProvider {
     pub subscription: bool,
     pub count: usize,
     pub date_modified: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ModelCatalogHostItem {
+    pub provider: String,
+    pub name: String,
+    pub model_id: Option<String>,
+    pub tier: Option<String>,
+    pub subscription: bool,
+    pub input: Option<f64>,
+    pub output: Option<f64>,
+    pub cache_read: Option<f64>,
+    pub cache_write: Option<f64>,
+    pub context: Option<i64>,
+    pub output_limit: Option<i64>,
+    pub status: Option<String>,
+    pub official: bool,
+    pub doc: Option<String>,
+    pub is_free: bool,
+    pub is_min: bool,
+    pub is_ref: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -116,6 +138,7 @@ pub(crate) struct ModelCatalogSnapshot {
 pub(crate) struct ModelCatalogDetail {
     pub model: ModelCatalogItem,
     pub providers: Vec<ModelCatalogProvider>,
+    pub hosts: Vec<ModelCatalogHostItem>,
     pub raw: Value,
 }
 
@@ -320,6 +343,7 @@ fn ensure_catalog_schema(connection: &mut rusqlite::Connection) -> Result<(), St
                 benchmark_count INTEGER NOT NULL DEFAULT 0,
                 release_date TEXT,
                 last_updated TEXT,
+                hosts_json TEXT,
                 raw_json TEXT NOT NULL DEFAULT '{}',
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
@@ -909,108 +933,311 @@ pub(crate) fn get_model_catalog_inner(database: &Database) -> Result<ModelCatalo
     })
 }
 
+fn extract_hosts_from_html(html: &str) -> Vec<Value> {
+    for key in ["\"hosts\":[", "\\\"hosts\\\":["] {
+        if let Some(idx) = html.find(key) {
+            let start = idx + key.len() - 1;
+            if let Some(slice_str) = html.get(start..) {
+                let mut count = 0;
+                let mut end = 0;
+                for (i, c) in slice_str.char_indices() {
+                    if c == '[' {
+                        count += 1;
+                    } else if c == ']' {
+                        count -= 1;
+                        if count == 0 {
+                            end = i + 1;
+                            break;
+                        }
+                    }
+                }
+                if end > 0 {
+                    let mut raw_chunk = slice_str[..end].to_string();
+                    if key.starts_with('\\') {
+                        raw_chunk = raw_chunk.replace("\\\"", "\"").replace("\\\\", "\\");
+                    }
+                    if let Ok(val) = serde_json::from_str::<Vec<Value>>(&raw_chunk) {
+                        if !val.is_empty() {
+                            return val;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Vec::new()
+}
+
+async fn fetch_hosts_for_model(client: &reqwest::Client, model_id: &str) -> Vec<Value> {
+    let url = format!("https://llmpricing.dev/m/{model_id}/");
+    let resp = client
+        .get(&url)
+        .timeout(Duration::from_secs(6))
+        .header(
+            reqwest::header::USER_AGENT,
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        )
+        .header(
+            reqwest::header::ACCEPT,
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        )
+        .send()
+        .await;
+
+    if let Ok(r) = resp {
+        if r.status().is_success() {
+            if let Ok(text) = r.text().await {
+                return extract_hosts_from_html(&text);
+            }
+        }
+    }
+    Vec::new()
+}
+
 #[tauri::command]
-pub fn get_model_catalog_detail(
+pub async fn get_model_catalog_detail(
     database: State<'_, Database>,
     canonical_key: Option<String>,
     id: Option<String>,
 ) -> Result<ModelCatalogDetail, String> {
     let key = id.or(canonical_key).unwrap_or_default();
-    get_model_catalog_detail_inner(&database, &key)
+    get_model_catalog_detail_inner(&database, &key).await
 }
 
-pub(crate) fn get_model_catalog_detail_inner(
+pub(crate) async fn get_model_catalog_detail_inner(
     database: &Database,
     key: &str,
 ) -> Result<ModelCatalogDetail, String> {
-    let mut connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
-    clear_legacy_catalog_if_needed(&mut connection)?;
+    let (model, raw, cached_hosts_json, all_providers_map) = {
+        let mut connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+        clear_legacy_catalog_if_needed(&mut connection)?;
 
-    let model_res = connection.query_row(
-        "SELECT id, slug, name, lab, kind, family, knowledge, status,
-                open_weights, reasoning, tool_call, attachment, structured, temperature,
-                input_modalities_json, context_length, context_min, context_max, max_output_tokens,
-                ref_provider, ref_official, ref_input_cost, ref_output_cost, ref_cache_read_cost,
-                min_provider, min_input_cost, min_output_cost, min_cache_read_cost, price_spread,
-                blended_min, blended_trusted, blended_ref,
-                host_count, host_providers_json, priced_host_count, free_host_count, sub_host_count,
-                aa_idx, aa_coding, aa_agentic, aa_speed, aa_ttft, aa_task_cost, benchmark_count,
-                release_date, last_updated
-         FROM model_catalog_models
-         WHERE id = ?1 OR slug = ?1",
-        [key],
-        read_model_row,
-    );
-
-    let model = match model_res {
-        Ok(m) => m,
-        Err(_) => {
-            // Try prefix/case-insensitive match
-            let found = connection.query_row(
-                "SELECT id, slug, name, lab, kind, family, knowledge, status,
-                        open_weights, reasoning, tool_call, attachment, structured, temperature,
-                        input_modalities_json, context_length, context_min, context_max, max_output_tokens,
-                        ref_provider, ref_official, ref_input_cost, ref_output_cost, ref_cache_read_cost,
-                        min_provider, min_input_cost, min_output_cost, min_cache_read_cost, price_spread,
-                        blended_min, blended_trusted, blended_ref,
-                        host_count, host_providers_json, priced_host_count, free_host_count, sub_host_count,
-                        aa_idx, aa_coding, aa_agentic, aa_speed, aa_ttft, aa_task_cost, benchmark_count,
-                        release_date, last_updated
-                 FROM model_catalog_models
-                 WHERE id LIKE ?1 COLLATE NOCASE OR slug LIKE ?1 COLLATE NOCASE
-                 LIMIT 1",
-                [format!("%{key}%")],
-                read_model_row,
-            ).optional().map_err(|e| e.to_string())?;
-
-            found.ok_or_else(|| format!("未找到模型：{key}"))?
-        }
-    };
-
-    let raw_text: String = connection
-        .query_row(
-            "SELECT raw_json FROM model_catalog_models WHERE id = ?1",
-            [&model.id],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|error| error.to_string())?
-        .unwrap_or_else(|| "{}".into());
-
-    let raw: Value = serde_json::from_str(&raw_text).unwrap_or(Value::Null);
-
-    // Query matched providers for host_providers
-    let mut matched_providers = Vec::new();
-    if !model.host_providers.is_empty() {
-        let mut placeholders = Vec::new();
-        let mut params_vec = Vec::new();
-        for p in &model.host_providers {
-            placeholders.push("?");
-            params_vec.push(p.as_str());
-        }
-        let sql = format!(
-            "SELECT id, name, npm, api, doc, tier, subscription, model_count, date_modified
-             FROM model_catalog_providers
-             WHERE id IN ({})
-             ORDER BY tier, name COLLATE NOCASE",
-            placeholders.join(",")
+        let model_res = connection.query_row(
+            "SELECT id, slug, name, lab, kind, family, knowledge, status,
+                    open_weights, reasoning, tool_call, attachment, structured, temperature,
+                    input_modalities_json, context_length, context_min, context_max, max_output_tokens,
+                    ref_provider, ref_official, ref_input_cost, ref_output_cost, ref_cache_read_cost,
+                    min_provider, min_input_cost, min_output_cost, min_cache_read_cost, price_spread,
+                    blended_min, blended_trusted, blended_ref,
+                    host_count, host_providers_json, priced_host_count, free_host_count, sub_host_count,
+                    aa_idx, aa_coding, aa_agentic, aa_speed, aa_ttft, aa_task_cost, benchmark_count,
+                    release_date, last_updated
+             FROM model_catalog_models
+             WHERE id = ?1 OR slug = ?1",
+            [key],
+            read_model_row,
         );
 
-        let mut p_stmt = connection.prepare(&sql).map_err(|e| e.to_string())?;
-        let rows = p_stmt
-            .query_map(rusqlite::params_from_iter(params_vec), read_provider_row)
-            .map_err(|e| e.to_string())?;
+        let model = match model_res {
+            Ok(m) => m,
+            Err(_) => {
+                // Try prefix/case-insensitive match
+                let found = connection.query_row(
+                    "SELECT id, slug, name, lab, kind, family, knowledge, status,
+                            open_weights, reasoning, tool_call, attachment, structured, temperature,
+                            input_modalities_json, context_length, context_min, context_max, max_output_tokens,
+                            ref_provider, ref_official, ref_input_cost, ref_output_cost, ref_cache_read_cost,
+                            min_provider, min_input_cost, min_output_cost, min_cache_read_cost, price_spread,
+                            blended_min, blended_trusted, blended_ref,
+                            host_count, host_providers_json, priced_host_count, free_host_count, sub_host_count,
+                            aa_idx, aa_coding, aa_agentic, aa_speed, aa_ttft, aa_task_cost, benchmark_count,
+                            release_date, last_updated
+                     FROM model_catalog_models
+                     WHERE id LIKE ?1 COLLATE NOCASE OR slug LIKE ?1 COLLATE NOCASE
+                     LIMIT 1",
+                    [format!("%{key}%")],
+                    read_model_row,
+                ).optional().map_err(|e| e.to_string())?;
 
-        for r in rows {
-            if let Ok(p) = r {
-                matched_providers.push(p);
+                found.ok_or_else(|| format!("未找到模型：{key}"))?
             }
+        };
+
+        let raw_text: String = connection
+            .query_row(
+                "SELECT raw_json FROM model_catalog_models WHERE id = ?1",
+                [&model.id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .unwrap_or_else(|| "{}".into());
+
+        let cached_hosts: Option<String> = connection
+            .query_row(
+                "SELECT hosts_json FROM model_catalog_models WHERE id = ?1",
+                [&model.id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .flatten();
+
+        let raw: Value = serde_json::from_str(&raw_text).unwrap_or(Value::Null);
+
+        // Load all providers into map
+        let mut p_stmt = connection
+            .prepare("SELECT id, name, npm, api, doc, tier, subscription, model_count, date_modified FROM model_catalog_providers")
+            .map_err(|e| e.to_string())?;
+        let p_rows = p_stmt
+            .query_map([], read_provider_row)
+            .map_err(|e| e.to_string())?;
+        let mut prov_map = BTreeMap::new();
+        for r in p_rows {
+            if let Ok(p) = r {
+                prov_map.insert(p.id.clone(), p);
+            }
+        }
+
+        (model, raw, cached_hosts, prov_map)
+    };
+
+    // Determine hosts data
+    let mut raw_hosts = Vec::new();
+    if let Some(cached) = &cached_hosts_json {
+        if let Ok(parsed) = serde_json::from_str::<Vec<Value>>(cached) {
+            if !parsed.is_empty() {
+                raw_hosts = parsed;
+            }
+        }
+    }
+
+    if raw_hosts.is_empty() {
+        if let Ok(client) = build_http_client(database, Duration::from_secs(8), 5, "获取模型渠道明细") {
+            let fetched = fetch_hosts_for_model(&client, &model.id).await;
+            if !fetched.is_empty() {
+                if let Ok(hosts_str) = serde_json::to_string(&fetched) {
+                    if let Ok(conn) = database.0.lock() {
+                        let _ = conn.execute(
+                            "UPDATE model_catalog_models SET hosts_json = ?1 WHERE id = ?2",
+                            params![hosts_str, model.id],
+                        );
+                    }
+                }
+                raw_hosts = fetched;
+            }
+        }
+    }
+
+    let mut hosts_list = Vec::new();
+    let mut matched_providers = Vec::new();
+
+    if !raw_hosts.is_empty() {
+        for h in &raw_hosts {
+            let p_id = text(h.get("provider"));
+            if p_id.is_empty() {
+                continue;
+            }
+            let p_meta = all_providers_map.get(&p_id);
+            let name = p_meta.map(|p| p.name.clone()).unwrap_or_else(|| p_id.clone());
+            let tier = p_meta.and_then(|p| p.tier.clone()).or_else(|| opt_text(h.get("tier")));
+            let subscription = p_meta.map(|p| p.subscription).unwrap_or(false) || boolean(h.get("subscription"));
+            let doc = p_meta.and_then(|p| p.doc.clone());
+            let model_id = opt_text(h.get("modelId"));
+            let input = opt_numeric(h.get("input"));
+            let output = opt_numeric(h.get("output"));
+            let cache_read = opt_numeric(h.get("cacheRead"));
+            let cache_write = opt_numeric(h.get("cacheWrite"));
+            let context = opt_numeric(h.get("context")).map(|c| c as i64).or(Some(model.context_length));
+            let output_limit = opt_numeric(h.get("outputLimit")).map(|c| c as i64).or(Some(model.max_output_tokens));
+            let status = opt_text(h.get("status"));
+            let official = boolean(h.get("official")) || (Some(&p_id) == model.ref_provider.as_ref() && model.ref_official);
+            let is_free = (input == Some(0.0) && output == Some(0.0)) && !subscription;
+            let is_min = (Some(&p_id) == model.min_provider.as_ref() && !is_free)
+                || (input == Some(model.min_input_cost) && model.min_input_cost > 0.0);
+            let is_ref = Some(&p_id) == model.ref_provider.as_ref() || official;
+
+            if let Some(meta) = p_meta {
+                if !matched_providers.iter().any(|p: &ModelCatalogProvider| p.id == meta.id) {
+                    matched_providers.push(meta.clone());
+                }
+            }
+
+            hosts_list.push(ModelCatalogHostItem {
+                provider: p_id,
+                name,
+                model_id,
+                tier,
+                subscription,
+                input,
+                output,
+                cache_read,
+                cache_write,
+                context,
+                output_limit,
+                status,
+                official,
+                doc,
+                is_free,
+                is_min,
+                is_ref,
+            });
+        }
+    } else {
+        // Fallback using model.host_providers
+        for p_id in &model.host_providers {
+            let p_meta = all_providers_map.get(p_id);
+            let name = p_meta.map(|p| p.name.clone()).unwrap_or_else(|| p_id.clone());
+            let tier = p_meta.and_then(|p| p.tier.clone());
+            let subscription = p_meta.map(|p| p.subscription).unwrap_or(false);
+            let doc = p_meta.and_then(|p| p.doc.clone());
+            let is_ref = Some(p_id) == model.ref_provider.as_ref();
+            let is_min = Some(p_id) == model.min_provider.as_ref();
+            let input = if is_min && model.min_input_cost > 0.0 {
+                Some(model.min_input_cost)
+            } else if is_ref && model.ref_input_cost > 0.0 {
+                Some(model.ref_input_cost)
+            } else {
+                None
+            };
+            let output = if is_min && model.min_output_cost > 0.0 {
+                Some(model.min_output_cost)
+            } else if is_ref && model.ref_output_cost > 0.0 {
+                Some(model.ref_output_cost)
+            } else {
+                None
+            };
+            let cache_read = if is_min && model.min_cache_read_cost > 0.0 {
+                Some(model.min_cache_read_cost)
+            } else if is_ref && model.ref_cache_read_cost > 0.0 {
+                Some(model.ref_cache_read_cost)
+            } else {
+                None
+            };
+            let is_free = (input == Some(0.0) && output == Some(0.0)) && !subscription;
+
+            if let Some(meta) = p_meta {
+                if !matched_providers.iter().any(|p: &ModelCatalogProvider| p.id == meta.id) {
+                    matched_providers.push(meta.clone());
+                }
+            }
+
+            hosts_list.push(ModelCatalogHostItem {
+                provider: p_id.clone(),
+                name,
+                model_id: None,
+                tier,
+                subscription,
+                input,
+                output,
+                cache_read,
+                cache_write: None,
+                context: Some(model.context_length),
+                output_limit: Some(model.max_output_tokens),
+                status: None,
+                official: is_ref && model.ref_official,
+                doc,
+                is_free,
+                is_min,
+                is_ref,
+            });
         }
     }
 
     Ok(ModelCatalogDetail {
         model,
         providers: matched_providers,
+        hosts: hosts_list,
         raw,
     })
 }

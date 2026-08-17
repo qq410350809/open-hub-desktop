@@ -915,6 +915,25 @@ async function browserFallback<T>(
     const detail: ModelCatalogDetail = {
       model,
       providers: matchedProviders,
+      hosts: matchedProviders.map((p) => ({
+        provider: p.id,
+        name: p.name,
+        modelId: null,
+        tier: p.tier,
+        subscription: p.subscription,
+        input: p.id === model.minProvider ? model.minInputCost : p.id === model.refProvider ? model.refInputCost : null,
+        output: p.id === model.minProvider ? model.minOutputCost : p.id === model.refProvider ? model.refOutputCost : null,
+        cacheRead: p.id === model.minProvider ? model.minCacheReadCost : p.id === model.refProvider ? model.refCacheReadCost : null,
+        cacheWrite: null,
+        context: model.contextLength,
+        outputLimit: model.maxOutputTokens,
+        status: null,
+        official: p.id === model.refProvider && model.refOfficial,
+        doc: p.doc,
+        isFree: false,
+        isMin: p.id === model.minProvider,
+        isRef: p.id === model.refProvider,
+      })),
       raw: { id: model.id, name: model.name, preview: true },
     };
     return structuredClone(detail) as T;

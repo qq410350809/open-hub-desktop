@@ -848,10 +848,10 @@ fn dispatch(app: &AppHandle, command: &str, args: &Value) -> Result<Value, Strin
         ))),
         "get_model_catalog_detail" => {
             let key = take_string(args, &["id", "canonicalKey", "canonical_key"])?;
-            Ok(json!(model_catalog::get_model_catalog_detail_inner(
-                &*app.state::<Database>(),
-                &key,
-            )))
+            let db = app.state::<Database>();
+            Ok(json!(tauri::async_runtime::block_on(async move {
+                model_catalog::get_model_catalog_detail_inner(&*db, &key).await
+            })?))
         }
         "sync_model_catalog" => {
             let force: Option<bool> = take_opt(args, &["force"])?;

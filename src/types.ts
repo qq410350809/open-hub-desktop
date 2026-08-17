@@ -873,9 +873,30 @@ export interface ModelCatalogSnapshot {
   meta: Record<string, any>;
 }
 
+export interface ModelCatalogHostItem {
+  provider: string;
+  name: string;
+  modelId?: string | null;
+  tier?: string | null;
+  subscription: boolean;
+  input?: number | null;
+  output?: number | null;
+  cacheRead?: number | null;
+  cacheWrite?: number | null;
+  context?: number | null;
+  outputLimit?: number | null;
+  status?: string | null;
+  official: boolean;
+  doc?: string | null;
+  isFree: boolean;
+  isMin: boolean;
+  isRef: boolean;
+}
+
 export interface ModelCatalogDetail {
   model: ModelCatalogItem;
   providers: ModelCatalogProvider[];
+  hosts: ModelCatalogHostItem[];
   raw: any;
 }
 

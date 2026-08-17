@@ -9,7 +9,7 @@ import CustomSelect from "./CustomSelect.vue";
 const store = useStore();
 
 // —— 视图模式 ——
-type ViewMode = "cards" | "table" | "providers" | "arena";
+type ViewMode = "cards" | "table" | "providers";
 const currentView = ref<ViewMode>("cards");
 
 // —— 搜索与过滤 ——
@@ -47,16 +47,14 @@ const selectedId = ref("");
 const detail = ref<ModelCatalogDetail | null>(null);
 const detailLoading = ref(false);
 const detailError = ref("");
-const activeDetailTab = ref<"specs" | "pricing" | "aa" | "providers" | "code" | "raw">("specs");
-const rawCopied = ref(false);
-const codeCopied = ref(false);
-const codeLanguage = ref<"python" | "node" | "curl">("python");
-const codeSelectedProvider = ref("");
+const activeDetailTab = ref<"overview" | "providers" | "pricing">("overview");
+const idCopied = ref(false);
+const providerTablePricedOnly = ref(false);
 
 // —— 交互式成本计算器状态 ——
 const calcMonthlyInputTokens = ref(10); // 百万 Tokens (M)
 const calcMonthlyOutputTokens = ref(2); // 百万 Tokens (M)
-const calcCurrency = ref<"USD" | "CNY">("USD");
+const calcCurrency = ref<"USD" | "CNY">("CNY");
 const exchangeRate = 7.25;
 
 // —— 多模型对战对比 Arena ——
@@ -88,10 +86,10 @@ const comparedModels = computed(() => {
 // —— 类型标签 ——
 const typeTabs = [
   { key: "all", label: "全部", icon: "layers" },
-  { key: "text", label: "对话/文本", icon: "chat" },
+  { key: "text", label: "对话 / 文本", icon: "chat" },
   { key: "image", label: "图像生成", icon: "eye" },
   { key: "video", label: "视频生成", icon: "video" },
-  { key: "audio", label: "语音/音频", icon: "activity" },
+  { key: "audio", label: "语音 / 音频", icon: "activity" },
   { key: "embedding", label: "向量嵌入", icon: "database" },
   { key: "classify", label: "分类审核", icon: "eyeOff" },
   { key: "rerank", label: "重排检索", icon: "pulse" },
@@ -103,13 +101,13 @@ const popularLabs = [
   { id: "anthropic", name: "Anthropic", logo: "anthropic", tone: "brand" },
   { id: "google", name: "Google", logo: "google", tone: "info" },
   { id: "deepseek", name: "DeepSeek", logo: "deepseek", tone: "violet" },
-  { id: "alibaba", name: "Qwen", logo: "alibaba", tone: "warning" },
+  { id: "alibaba", name: "阿里通义", logo: "alibaba", tone: "warning" },
   { id: "zhipuai", name: "智谱 GLM", logo: "zhipuai", tone: "violet" },
-  { id: "meta", name: "Llama", logo: "meta", tone: "info" },
+  { id: "meta", name: "Meta Llama", logo: "meta", tone: "info" },
   { id: "mistral", name: "Mistral", logo: "mistral", tone: "brand" },
-  { id: "moonshotai", name: "Kimi", logo: "moonshotai", tone: "success" },
-  { id: "minimax", name: "MiniMax", logo: "minimax", tone: "brand" },
-  { id: "xai", name: "Grok", logo: "xai", tone: "neutral" },
+  { id: "moonshotai", name: "月之暗面 Kimi", logo: "moonshotai", tone: "success" },
+  { id: "minimax", name: "MiniMax 海螺", logo: "minimax", tone: "brand" },
+  { id: "xai", name: "xAI Grok", logo: "xai", tone: "neutral" },
 ];
 
 const kindCounts = computed(() => {
@@ -171,30 +169,30 @@ const labOptions = computed(() => [
 ]);
 
 const pricingOptions = [
-  { value: "all", text: "全部价格" },
-  { value: "freeHost", text: "免费可用 (Free Host)" },
-  { value: "paid", text: "有标价 ($)" },
-  { value: "refOfficial", text: "官方直销 (Official)" },
-  { value: "spread", text: "显著价差 (>1.5x)" },
+  { value: "all", text: "全部价格类型" },
+  { value: "freeHost", text: "有免费渠道可用" },
+  { value: "paid", text: "有公开标价 ($)" },
+  { value: "refOfficial", text: "原厂官方直销" },
+  { value: "spread", text: "显著价差 (>1.5倍)" },
   { value: "budget", text: "极低单价 (<$0.5/1M)" },
 ];
 
 const statusOptions = [
   { value: "all", text: "全部状态" },
   { value: "ga", text: "正式版 (GA)" },
-  { value: "beta", text: "测试/预览 (Beta)" },
-  { value: "deprecated", text: "已废弃 (Deprecated)" },
+  { value: "beta", text: "测试/预览版 (Beta)" },
+  { value: "deprecated", text: "已废弃/旧版" },
 ];
 
 const sortOptions = [
-  { value: "default", text: "综合排序" },
-  { value: "aa_idx_desc", text: "AA 质量评分最高" },
-  { value: "aa_speed_desc", text: "生成速率最快" },
+  { value: "default", text: "综合推荐排序" },
+  { value: "aa_idx_desc", text: "AA 质量评分 (从高到低)" },
+  { value: "aa_speed_desc", text: "生成吞吐速率 (从快到慢)" },
   { value: "min_price_asc", text: "最低市场价 (从低到高)" },
-  { value: "ref_price_asc", text: "官方价格 (从低到高)" },
-  { value: "context_desc", text: "上下文长度 (从大到小)" },
-  { value: "host_count_desc", text: "支持渠道最多" },
-  { value: "spread_desc", text: "价差倍数最高" },
+  { value: "ref_price_asc", text: "官方参考价 (从低到高)" },
+  { value: "context_desc", text: "上下文容量 (从大到小)" },
+  { value: "host_count_desc", text: "支持渠道数 (从多到少)" },
+  { value: "spread_desc", text: "渠道价差倍数 (从高到低)" },
 ];
 
 // —— 过滤与排序后的模型列表 ——
@@ -300,13 +298,13 @@ const providersList = computed(() => {
 
 // —— 大表视图列配置 ——
 const tableColumns = computed<AppTableColumn[]>(() => [
-  { key: "name", title: "模型名称 / ID", width: "minmax(240px, 1.4fr)", sortable: true },
-  { key: "lab", title: "厂商", width: "110px", sortable: true },
-  { key: "contextLength", title: "上下文", width: "95px", align: "right" as const, sortable: true },
+  { key: "name", title: "模型名称 / 标识", width: "minmax(240px, 1.4fr)", sortable: true },
+  { key: "lab", title: "所属厂商", width: "110px", sortable: true },
+  { key: "contextLength", title: "上下文容量", width: "95px", align: "right" as const, sortable: true },
   { key: "maxOutputTokens", title: "最大输出", width: "90px", align: "right" as const, sortable: true },
   { key: "refPrice", title: "参考价格 (入/出/1M)", width: "160px", align: "right" as const, sortable: true },
   { key: "minPrice", title: "全网最低价 (1M)", width: "160px", align: "right" as const, sortable: true },
-  { key: "hostCount", title: "渠道数", width: "85px", align: "right" as const, sortable: true },
+  { key: "hostCount", title: "支持渠道", width: "85px", align: "right" as const, sortable: true },
   { key: "aaScores", title: "AA 质量/速度", width: "130px", align: "right" as const, sortable: true },
 ]);
 
@@ -320,7 +318,7 @@ const labLabels: Record<string, string> = {
   anthropic: "Anthropic",
   google: "Google",
   deepseek: "DeepSeek",
-  alibaba: "阿里巴巴 (Qwen)",
+  alibaba: "阿里巴巴 (通义)",
   zhipuai: "智谱 AI (GLM)",
   mistral: "Mistral AI",
   meta: "Meta (Llama)",
@@ -336,7 +334,7 @@ const labLabels: Record<string, string> = {
   stepfun: "阶跃星辰",
   baai: "智源研究院",
   stability: "Stability AI",
-  microsoft: "Microsoft",
+  microsoft: "微软 (Microsoft)",
   misc: "开源社区",
 };
 
@@ -373,12 +371,12 @@ function labInitials(lab: string): string {
 }
 
 const kindLabels: Record<string, string> = {
-  text: "文本/对话",
+  text: "对话 / 文本",
   image: "图像生成",
   video: "视频生成",
-  audio: "语音/音频",
+  audio: "语音 / 音频",
   embedding: "向量嵌入",
-  classify: "分类/审核",
+  classify: "分类 / 审核",
   rerank: "重排检索",
 };
 
@@ -412,11 +410,46 @@ function kindIcon(kind: string): keyof typeof icons {
   return map[kind] ?? "cpu";
 }
 
+const tierLabels: Record<string, string> = {
+  lab: "原厂直销",
+  gateway: "聚合网关",
+  cloud: "算力云",
+};
+
+function tierLabel(tier?: string | null) {
+  return tierLabels[tier || "gateway"] || (tier || "网关").toUpperCase();
+}
+
+const modalityLabels: Record<string, string> = {
+  text: "文本 (Text)",
+  image: "图像 (Image)",
+  audio: "音频 (Audio)",
+  video: "视频 (Video)",
+  pdf: "PDF 文档",
+};
+
+function modalityLabel(mod: string) {
+  return modalityLabels[mod.toLowerCase()] || mod.toUpperCase();
+}
+
 function formatTokens(value: number): string {
   if (!value) return "—";
   if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(value % 1_000_000 ? 1 : 0)}M`;
   if (value >= 1_000) return `${(value / 1_000).toFixed(value % 1_000 ? 1 : 0)}K`;
   return String(value);
+}
+
+function formatTokensFull(value: number): string {
+  if (!value) return "—";
+  return value.toLocaleString("zh-CN");
+}
+
+function formatHugeTokens(value: number): string {
+  if (!value) return "—";
+  if (value >= 1_000_000_000_000) return `${(value / 1_000_000_000_000).toFixed(2)} 万亿 Tokens`;
+  if (value >= 100_000_000) return `${(value / 100_000_000).toFixed(2)} 亿 Tokens`;
+  if (value >= 10_000) return `${(value / 10_000).toFixed(1)} 万 Tokens`;
+  return `${value.toLocaleString()} Tokens`;
 }
 
 function formatPrice(cost: number | undefined | null): string {
@@ -438,8 +471,8 @@ async function openModelDetail(model: ModelCatalogItem) {
   detail.value = null;
   detailError.value = "";
   detailLoading.value = true;
-  activeDetailTab.value = "specs";
-  codeSelectedProvider.value = model.hostProviders[0] || model.refProvider || "openrouter";
+  activeDetailTab.value = "overview";
+  providerTablePricedOnly.value = false;
   try {
     detail.value = await store.getModelCatalogDetail(model.id);
   } catch (error) {
@@ -473,6 +506,12 @@ function selectLabQuick(labId: string) {
   currentPage.value = 1;
 }
 
+async function copyModelId(id: string) {
+  await navigator.clipboard.writeText(id);
+  idCopied.value = true;
+  setTimeout(() => (idCopied.value = false), 2000);
+}
+
 // —— 成本计算器计算 ——
 const calculatedCosts = computed(() => {
   if (!selectedModel.value) return null;
@@ -501,79 +540,15 @@ const calculatedCosts = computed(() => {
   };
 });
 
-// —— 生成调用代码 ——
-const generatedSnippet = computed(() => {
-  if (!selectedModel.value) return "";
-  const modelId = selectedModel.value.id;
-  const matchedProv = detail.value?.providers.find((p) => p.id === codeSelectedProvider.value);
-  const baseUrl = matchedProv?.api || "https://api.openai.com/v1";
-
-  if (codeLanguage.value === "python") {
-    return `from openai import OpenAI
-
-client = OpenAI(
-    base_url="${baseUrl}",
-    api_key="YOUR_API_KEY",
-)
-
-response = client.chat.completions.create(
-    model="${modelId}",
-    messages=[
-        {"role": "system", "content": "You are a helpful AI assistant."},
-        {"role": "user", "content": "Hello! Introduce yourself."},
-    ],
-    temperature=0.7,
-)
-
-print(response.choices[0].message.content)`;
+// —— 渠道列表（带过滤与排序） ——
+const drawerHosts = computed(() => {
+  if (!detail.value) return [];
+  let list = detail.value.hosts || [];
+  if (providerTablePricedOnly.value) {
+    list = list.filter((h) => !h.subscription && !h.isFree && (h.input !== null || h.output !== null));
   }
-
-  if (codeLanguage.value === "node") {
-    return `import OpenAI from "openai";
-
-const client = new OpenAI({
-  baseURL: "${baseUrl}",
-  apiKey: process.env.API_KEY || "YOUR_API_KEY",
+  return list;
 });
-
-async function main() {
-  const completion = await client.chat.completions.create({
-    model: "${modelId}",
-    messages: [
-      { role: "system", content: "You are a helpful AI assistant." },
-      { role: "user", content: "Hello! Introduce yourself." },
-    ],
-  });
-
-  console.log(completion.choices[0].message.content);
-}
-
-main();`;
-  }
-
-  return `curl "${baseUrl}/chat/completions" \\
-  -H "Content-Type: application/json" \\
-  -H "Authorization: Bearer YOUR_API_KEY" \\
-  -d '{
-    "model": "${modelId}",
-    "messages": [
-      {"role": "user", "content": "Hello!"}
-    ]
-  }'`;
-});
-
-async function copyCode() {
-  await navigator.clipboard.writeText(generatedSnippet.value);
-  codeCopied.value = true;
-  setTimeout(() => (codeCopied.value = false), 2000);
-}
-
-async function copyRawJson() {
-  if (!detail.value) return;
-  await navigator.clipboard.writeText(JSON.stringify(detail.value.raw || detail.value.model, null, 2));
-  rawCopied.value = true;
-  setTimeout(() => (rawCopied.value = false), 2000);
-}
 
 async function manualSync() {
   const result = await store.syncModelCatalog(true);
@@ -634,7 +609,7 @@ onMounted(() => {
         <div class="mc-metric-card">
           <div class="mc-metric-icon mc-tone-brand" v-html="icons.database" />
           <div class="mc-metric-info">
-            <span class="mc-metric-label">收录大模型总数</span>
+            <span class="mc-metric-label">全网收录大模型</span>
             <div class="mc-metric-val">
               <strong>{{ metrics.totalModels.toLocaleString() }}</strong>
               <small>含 {{ metrics.openWeightsCount }} 款开源权重</small>
@@ -648,7 +623,7 @@ onMounted(() => {
             <span class="mc-metric-label">接入供应商渠道</span>
             <div class="mc-metric-val">
               <strong>{{ metrics.totalProviders }}</strong>
-              <small>覆盖官方直销与聚合网关</small>
+              <small>覆盖原厂直销与聚合网关</small>
             </div>
           </div>
         </div>
@@ -658,7 +633,7 @@ onMounted(() => {
           <div class="mc-metric-info">
             <span class="mc-metric-label">全网渠道最高价差</span>
             <div class="mc-metric-val">
-              <strong class="text-success">{{ metrics.maxSpread.toFixed(1) }}x</strong>
+              <strong class="text-success">{{ metrics.maxSpread.toFixed(1) }} 倍</strong>
               <small>多渠道比价最高节省 80%+</small>
             </div>
           </div>
@@ -667,7 +642,7 @@ onMounted(() => {
         <div class="mc-metric-card">
           <div class="mc-metric-icon mc-tone-violet" v-html="icons.flame" />
           <div class="mc-metric-info">
-            <span class="mc-metric-label">AA 质量最高模型</span>
+            <span class="mc-metric-label">AA 综合质量最高模型</span>
             <div class="mc-metric-val">
               <strong>{{ metrics.topQualityModel?.name || "Claude 3.7" }}</strong>
               <small class="text-violet">{{ metrics.topQualityModel?.aaIdx?.toFixed(1) }} 评测分</small>
@@ -733,7 +708,7 @@ onMounted(() => {
             @click="currentView = 'cards'"
           >
             <span v-html="icons.grid" />
-            <span>卡片</span>
+            <span>画廊卡片</span>
           </button>
           <button
             type="button"
@@ -742,7 +717,7 @@ onMounted(() => {
             @click="currentView = 'table'"
           >
             <span v-html="icons.rows" />
-            <span>数据表</span>
+            <span>全景数据表</span>
           </button>
           <button
             type="button"
@@ -751,7 +726,7 @@ onMounted(() => {
             @click="currentView = 'providers'"
           >
             <span v-html="icons.globe" />
-            <span>供应商</span>
+            <span>供应商渠道</span>
           </button>
         </div>
       </div>
@@ -764,7 +739,7 @@ onMounted(() => {
           <input
             v-model="query"
             type="search"
-            placeholder="搜索模型名称、ID、厂商、家族、支持渠道…"
+            placeholder="搜索模型名称、标识、厂商、家族、支持渠道…"
           />
           <button v-if="query" type="button" class="mc-clear-search" @click="query = ''">
             <span v-html="icons.close" />
@@ -811,7 +786,7 @@ onMounted(() => {
       <!-- 特性开关芯片栏 -->
       <div class="mc-feature-bar">
         <div class="mc-feature-chips">
-          <span class="mc-chips-title">特性与基准：</span>
+          <span class="mc-chips-title">特性与能力：</span>
           <button
             type="button"
             class="mc-chip"
@@ -826,7 +801,7 @@ onMounted(() => {
             :class="{ active: featureFilters.toolCall }"
             @click="toggleFeature('toolCall')"
           >
-            🛠️ 工具调用 (FC)
+            🛠️ 工具与函数调用
           </button>
           <button
             type="button"
@@ -834,7 +809,7 @@ onMounted(() => {
             :class="{ active: featureFilters.attachment }"
             @click="toggleFeature('attachment')"
           >
-            📄 附件直传
+            📄 多模态文件附件
           </button>
           <button
             type="button"
@@ -842,7 +817,7 @@ onMounted(() => {
             :class="{ active: featureFilters.structured }"
             @click="toggleFeature('structured')"
           >
-            🧩 结构化 JSON
+            🧩 结构化输出
           </button>
           <button
             type="button"
@@ -858,7 +833,7 @@ onMounted(() => {
             :class="{ active: featureFilters.topQuality }"
             @click="toggleFeature('topQuality')"
           >
-            🏆 AA 质量 > 80分
+            🏆 AA 质量评分 > 80
           </button>
           <button
             type="button"
@@ -866,18 +841,18 @@ onMounted(() => {
             :class="{ active: featureFilters.highSpeed }"
             @click="toggleFeature('highSpeed')"
           >
-            ⚡ 高速 > 100 t/s
+            ⚡ 高吞吐速率 > 100 tok/s
           </button>
         </div>
 
         <!-- 当前过滤结果总数 -->
         <div class="mc-results-meta">
           <span v-if="selectedProviderFilter" class="mc-active-provider-filter">
-            供应商：<b>{{ selectedProviderFilter }}</b>
+            筛选供应商：<b>{{ selectedProviderFilter }}</b>
             <button type="button" @click="clearProviderFilter"><span v-html="icons.close" /></button>
           </span>
           <span class="mc-filter-count">
-            找到 <b>{{ filteredModels.length.toLocaleString() }}</b> 个匹配模型
+            匹配到 <b>{{ filteredModels.length.toLocaleString() }}</b> 款模型
           </span>
         </div>
       </div>
@@ -927,7 +902,7 @@ onMounted(() => {
                 type="button"
                 class="mc-card-compare-btn"
                 :class="{ active: comparedModelIds.includes(model.id) }"
-                title="加入对战对比"
+                title="加入多模型横向对比"
                 @click.stop="toggleCompareModel(model.id)"
               >
                 <span v-html="comparedModelIds.includes(model.id) ? icons.check : icons.plus" />
@@ -955,7 +930,7 @@ onMounted(() => {
                 <strong class="mc-spec-v">{{ formatTokens(model.contextLength) }}</strong>
               </div>
               <div class="mc-spec-item">
-                <span class="mc-spec-k">最大单次输出</span>
+                <span class="mc-spec-k">单次最大输出</span>
                 <strong class="mc-spec-v">{{ formatTokens(model.maxOutputTokens) }}</strong>
               </div>
               <div class="mc-spec-item">
@@ -1122,7 +1097,7 @@ onMounted(() => {
           <template #cell-aaScores="{ row }">
             <div v-if="row.aaIdx || row.aaSpeed" class="mc-table-aa-cell">
               <span v-if="row.aaIdx" class="text-violet font-semibold">{{ row.aaIdx.toFixed(1) }} 分</span>
-              <small v-if="row.aaSpeed">{{ Math.round(row.aaSpeed) }} t/s</small>
+              <small v-if="row.aaSpeed">{{ Math.round(row.aaSpeed) }} tok/s</small>
             </div>
             <span v-else class="muted">—</span>
           </template>
@@ -1133,8 +1108,8 @@ onMounted(() => {
       <section v-else-if="currentView === 'providers'" class="mc-providers-matrix-view">
         <div class="mc-matrix-header">
           <div>
-            <h2>全网接入供应商拓扑（共 {{ providersList.length }} 家）</h2>
-            <p>点击任意供应商卡片，可一键筛选并查看其支持的全部模型与 API 调用入口</p>
+            <h2>全网接入供应商拓扑渠道（共 {{ providersList.length }} 家）</h2>
+            <p>点击任意供应商卡片，可一键筛选并查看其支持的全部模型与 API 接入信息</p>
           </div>
         </div>
 
@@ -1153,7 +1128,7 @@ onMounted(() => {
                   <strong>{{ prov.name }}</strong>
                   <div class="mc-pm-tags">
                     <span class="mc-tier-pill" :class="`mc-tier-${prov.tier || 'gateway'}`">
-                      {{ (prov.tier || 'gateway').toUpperCase() }}
+                      {{ tierLabel(prov.tier) }}
                     </span>
                     <span v-if="prov.subscription" class="mc-sub-pill">订阅制</span>
                   </div>
@@ -1179,7 +1154,7 @@ onMounted(() => {
 
             <div class="mc-pm-footer">
               <span class="mc-pm-count">托管 <b>{{ prov.count }}</b> 款模型</span>
-              <span class="mc-pm-action">查看模型 &rarr;</span>
+              <span class="mc-pm-action">查看全部模型 &rarr;</span>
             </div>
           </article>
         </div>
@@ -1191,7 +1166,7 @@ onMounted(() => {
       <div class="mc-arena-dock-content">
         <div class="mc-arena-dock-title">
           <span v-html="icons.flame" />
-          <strong>模型对战对比 ({{ comparedModels.length }} / 4)</strong>
+          <strong>模型横向对战 ({{ comparedModels.length }} / 4)</strong>
         </div>
 
         <div class="mc-arena-chips">
@@ -1241,18 +1216,28 @@ onMounted(() => {
                 </span>
                 <div class="mc-drawer-title-box">
                   <div class="mc-drawer-tags">
-                    <span class="mc-card-tag" :class="`mc-tone-${labTone(selectedModel.lab)}`">
-                      {{ labLabel(selectedModel.lab) }}
-                    </span>
+                    <span class="mc-meta-lab">{{ labLabel(selectedModel.lab) }}</span>
+                    <span class="mc-meta-sep">·</span>
+                    <span class="mc-meta-id font-mono">{{ selectedModel.id }}</span>
+                    <span class="mc-meta-sep">·</span>
+                    <span class="mc-meta-status">{{ selectedModel.status.toUpperCase() }}</span>
+                    <span class="mc-meta-sep">·</span>
+                    <span v-if="selectedModel.openWeights" class="mc-meta-open-weights">开源权重</span>
+                    <span v-else class="mc-meta-closed">闭源商用</span>
+                    <template v-if="selectedModel.family">
+                      <span class="mc-meta-sep">·</span>
+                      <span class="mc-meta-family">{{ selectedModel.family }} 系列</span>
+                    </template>
+                    <span class="mc-meta-sep">·</span>
                     <span class="mc-card-tag" :class="`mc-tone-${kindTone(selectedModel.kind)}`">
                       {{ kindLabel(selectedModel.kind) }}
                     </span>
-                    <span v-if="selectedModel.openWeights" class="mc-pill mc-pill-open">开源权重</span>
-                    <span v-if="selectedModel.status !== 'ga'" class="mc-pill mc-pill-beta">{{ selectedModel.status.toUpperCase() }}</span>
                   </div>
-                  <h2>{{ selectedModel.name || selectedModel.id }}</h2>
-                  <p class="mc-drawer-id">
-                    <code>{{ selectedModel.id }}</code>
+
+                  <h2 class="mc-drawer-title">{{ selectedModel.name || selectedModel.id }}</h2>
+
+                  <p v-if="detail?.raw?.description" class="mc-drawer-desc">
+                    {{ detail.raw.description }}
                   </p>
                 </div>
               </div>
@@ -1260,12 +1245,20 @@ onMounted(() => {
               <div class="mc-drawer-head-actions">
                 <button
                   type="button"
+                  class="mc-btn-copy-id"
+                  @click="copyModelId(selectedModel.id)"
+                >
+                  <span v-html="idCopied ? icons.check : icons.copy" />
+                  <span>{{ idCopied ? "已复制" : "复制模型 ID" }}</span>
+                </button>
+                <button
+                  type="button"
                   class="mc-compare-toggle-btn"
                   :class="{ active: comparedModelIds.includes(selectedModel.id) }"
                   @click="toggleCompareModel(selectedModel.id)"
                 >
                   <span v-html="comparedModelIds.includes(selectedModel.id) ? icons.check : icons.plus" />
-                  <span>{{ comparedModelIds.includes(selectedModel.id) ? "已加入对战" : "加入对战" }}</span>
+                  <span>{{ comparedModelIds.includes(selectedModel.id) ? "已在对比池" : "+ 加入横向对比" }}</span>
                 </button>
                 <button type="button" class="mc-drawer-close-btn" aria-label="关闭抽屉" @click="closeDetail">
                   <span v-html="icons.close" />
@@ -1273,32 +1266,15 @@ onMounted(() => {
               </div>
             </header>
 
-            <!-- 抽屉 Tab 导航 -->
+            <!-- 抽屉 Tab 导航 (精简为 3 个聚焦视图) -->
             <nav class="mc-drawer-tabs">
               <button
                 type="button"
-                :class="{ active: activeDetailTab === 'specs' }"
-                @click="activeDetailTab = 'specs'"
+                :class="{ active: activeDetailTab === 'overview' }"
+                @click="activeDetailTab = 'overview'"
               >
-                <span v-html="icons.settings" />
-                <span>特性矩阵</span>
-              </button>
-              <button
-                type="button"
-                :class="{ active: activeDetailTab === 'pricing' }"
-                @click="activeDetailTab = 'pricing'"
-              >
-                <span v-html="icons.card" />
-                <span>定价与算费器</span>
-              </button>
-              <button
-                v-if="selectedModel.aaIdx || selectedModel.aaSpeed"
-                type="button"
-                :class="{ active: activeDetailTab === 'aa' }"
-                @click="activeDetailTab = 'aa'"
-              >
-                <span v-html="icons.flame" />
-                <span>AA 权威评测</span>
+                <span v-html="icons.layers" />
+                <span>全景属性总览</span>
               </button>
               <button
                 type="button"
@@ -1306,23 +1282,15 @@ onMounted(() => {
                 @click="activeDetailTab = 'providers'"
               >
                 <span v-html="icons.globe" />
-                <span>接入渠道 ({{ detail?.providers.length || selectedModel.hostProviders.length }})</span>
+                <span>全网渠道明细 (共 {{ detail?.providers.length || selectedModel.hostProviders.length }} 家)</span>
               </button>
               <button
                 type="button"
-                :class="{ active: activeDetailTab === 'code' }"
-                @click="activeDetailTab = 'code'"
+                :class="{ active: activeDetailTab === 'pricing' }"
+                @click="activeDetailTab = 'pricing'"
               >
-                <span v-html="icons.edit" />
-                <span>调用代码</span>
-              </button>
-              <button
-                type="button"
-                :class="{ active: activeDetailTab === 'raw' }"
-                @click="activeDetailTab = 'raw'"
-              >
-                <span v-html="icons.database" />
-                <span>原始 JSON</span>
+                <span v-html="icons.card" />
+                <span>月度用量算费器</span>
               </button>
             </nav>
 
@@ -1336,124 +1304,458 @@ onMounted(() => {
               <p v-else-if="detailError" class="mc-detail-error">{{ detailError }}</p>
 
               <template v-else-if="detail">
-                <!-- TAB 1: 核心参数与能力矩阵 -->
-                <div v-if="activeDetailTab === 'specs'" class="mc-tab-panel">
-                  <div class="mc-specs-grid-6">
-                    <div class="mc-spec-box">
-                      <span>最大上下文容量</span>
-                      <strong>{{ formatTokens(selectedModel.contextLength) }} Tokens</strong>
-                    </div>
-                    <div class="mc-spec-box">
-                      <span>上下文支持区间</span>
-                      <strong>{{ formatTokens(selectedModel.contextMin) }} ~ {{ formatTokens(selectedModel.contextMax) }}</strong>
-                    </div>
-                    <div class="mc-spec-box">
-                      <span>最大单次输出</span>
-                      <strong>{{ selectedModel.maxOutputTokens ? `${formatTokens(selectedModel.maxOutputTokens)} Tokens` : "—" }}</strong>
-                    </div>
-                    <div class="mc-spec-box">
-                      <span>知识库截止日期</span>
-                      <strong>{{ selectedModel.knowledge || "未指定" }}</strong>
-                    </div>
-                    <div class="mc-spec-box">
-                      <span>官方发布时间</span>
-                      <strong>{{ selectedModel.releaseDate || "—" }}</strong>
-                    </div>
-                    <div class="mc-spec-box">
-                      <span>权重开放协议</span>
-                      <strong>{{ selectedModel.openWeights ? "开源 (Open Weights)" : "闭源商用" }}</strong>
-                    </div>
-                  </div>
-
-                  <!-- 能力清单 -->
-                  <h4 class="mc-subheading">能力矩阵清单</h4>
-                  <div class="mc-capability-matrix">
-                    <div class="mc-cap-card" :class="{ enabled: selectedModel.reasoning }">
-                      <span class="mc-cap-emoji">🧠</span>
-                      <div>
-                        <strong>深度思考推理 (Reasoning)</strong>
-                        <p>{{ selectedModel.reasoning ? "具备原生深度思考链 (CoT) 与推理模式" : "标准非推理模型" }}</p>
+                <!-- TAB 1: 全景属性总览 (丰富呈现列表无法展现的深层信息) -->
+                <div v-if="activeDetailTab === 'overview'" class="mc-tab-panel">
+                  <!-- 1. 全网用量热度与市场地位 (Usage & Market Share) -->
+                  <div v-if="detail.raw?.usage || selectedModel.benchmarkCount" class="mc-usage-cockpit-card">
+                    <div class="mc-usage-header">
+                      <div class="mc-usage-title">
+                        <span v-html="icons.pulse" />
+                        <strong>全网用量与市场热度统计</strong>
                       </div>
-                    </div>
-                    <div class="mc-cap-card" :class="{ enabled: selectedModel.toolCall }">
-                      <span class="mc-cap-emoji">🛠️</span>
-                      <div>
-                        <strong>函数与工具调用 (Tool Call)</strong>
-                        <p>{{ selectedModel.toolCall ? "原生支持 Function Calling 与外部工具交互" : "暂不支持结构化工具调用" }}</p>
-                      </div>
-                    </div>
-                    <div class="mc-cap-card" :class="{ enabled: selectedModel.structured }">
-                      <span class="mc-cap-emoji">🧩</span>
-                      <div>
-                        <strong>结构化输出 (Structured JSON)</strong>
-                        <p>{{ selectedModel.structured ? "严格遵循 JSON Schema 格式化输出" : "自由文本输出" }}</p>
-                      </div>
-                    </div>
-                    <div class="mc-cap-card" :class="{ enabled: selectedModel.attachment }">
-                      <span class="mc-cap-emoji">📄</span>
-                      <div>
-                        <strong>多模态文件附件 (Attachments)</strong>
-                        <p>{{ selectedModel.attachment ? "支持文档、图片等附件直接输入" : "仅限纯文本输入" }}</p>
-                      </div>
-                    </div>
-                  </div>
-
-                  <!-- 输入模态 -->
-                  <div v-if="selectedModel.inputModalities.length" class="mc-modalities-box">
-                    <span class="mc-modalities-title">支持输入模态：</span>
-                    <div class="mc-mod-tags">
-                      <span v-for="mod in selectedModel.inputModalities" :key="mod" class="mc-mod-badge">
-                        {{ mod.toUpperCase() }}
+                      <span v-if="selectedModel.benchmarkCount" class="mc-benchmarks-count-badge">
+                        收录 {{ selectedModel.benchmarkCount }} 项权威基准评测
                       </span>
+                    </div>
+
+                    <div class="mc-usage-grid">
+                      <div v-if="detail.raw?.usage?.tokens" class="mc-usage-box">
+                        <span class="mc-usage-k">全网消耗 Token 总量</span>
+                        <strong class="mc-usage-v text-brand">{{ formatHugeTokens(detail.raw.usage.tokens) }}</strong>
+                      </div>
+                      <div v-if="detail.raw?.usage?.rank" class="mc-usage-box">
+                        <span class="mc-usage-k">全球热度排名</span>
+                        <strong class="mc-usage-v text-violet">Top #{{ detail.raw.usage.rank }}</strong>
+                      </div>
+                      <div v-if="detail.raw?.usage?.share" class="mc-usage-box">
+                        <span class="mc-usage-k">全网市场份额</span>
+                        <strong class="mc-usage-v text-success">{{ (detail.raw.usage.share * 100).toFixed(2) }}%</strong>
+                      </div>
+                      <div class="mc-usage-box">
+                        <span class="mc-usage-k">支持托管渠道</span>
+                        <strong class="mc-usage-v">{{ selectedModel.hostCount }} 家服务商</strong>
+                      </div>
+                    </div>
+                  </div>
+
+                  <!-- 2. 加权成本指数与价差阶梯 (Blended Cost & Price Indices) -->
+                  <div class="mc-blended-indices-card">
+                    <div class="mc-indices-header">
+                      <span>综合计价与成本指数 (Blended Index)</span>
+                      <small>公式：输入单价 × 75% + 输出单价 × 25%</small>
+                    </div>
+                    <div class="mc-indices-grid">
+                      <div class="mc-index-col">
+                        <span class="mc-index-k">官方参考指数</span>
+                        <strong class="mc-index-v">{{ formatPrice(selectedModel.blendedRef) }}</strong>
+                        <small>官方渠道标准加权成本</small>
+                      </div>
+                      <div class="mc-index-col">
+                        <span class="mc-index-k">可信渠道指数</span>
+                        <strong class="mc-index-v text-brand">{{ formatPrice(selectedModel.blendedTrusted) }}</strong>
+                        <small>主流一线算力云加权成本</small>
+                      </div>
+                      <div class="mc-index-col">
+                        <span class="mc-index-k">全网最低指数</span>
+                        <strong class="mc-index-v text-emerald">{{ formatPrice(selectedModel.blendedMin) }}</strong>
+                        <small>最激进网关加权成本</small>
+                      </div>
+                      <div class="mc-index-col mc-index-col-spread">
+                        <span class="mc-index-k">最大价差倍数</span>
+                        <strong class="mc-index-v text-success">{{ selectedModel.priceSpread.toFixed(1) }} 倍</strong>
+                        <small v-if="selectedModel.priceSpread > 1.2">多渠道选择最高可省 {{ Math.round((1 - 1 / selectedModel.priceSpread) * 100) }}%</small>
+                      </div>
+                    </div>
+                  </div>
+
+                  <!-- 3. 核心属性总览网格 (At a glance) -->
+                  <div class="mc-at-a-glance-card">
+                    <div class="mc-glance-header">
+                      <span>核心规格与参数矩阵</span>
+                    </div>
+                    <div class="mc-glance-grid">
+                      <!-- Reference price -->
+                      <div class="mc-glance-item">
+                        <span class="mc-glance-label">参考/官方定价</span>
+                        <div class="mc-glance-val">
+                          <span class="mc-glance-main-price">
+                            {{ formatPrice(selectedModel.refInputCost) }} / {{ formatPrice(selectedModel.refOutputCost) }}
+                          </span>
+                          <span class="mc-glance-unit">/ 100万 Tokens</span>
+                          <div class="mc-glance-subline">
+                            <span v-if="selectedModel.refCacheReadCost">缓存读取 {{ formatPrice(selectedModel.refCacheReadCost) }} · </span>
+                            <span>{{ selectedModel.refProvider ? labLabel(selectedModel.refProvider) : "官方标准" }}{{ selectedModel.refOfficial ? " (原厂直销)" : "" }}</span>
+                          </div>
+                        </div>
+                      </div>
+
+                      <!-- Lowest paid -->
+                      <div class="mc-glance-item">
+                        <span class="mc-glance-label">全网最低渠道价</span>
+                        <div class="mc-glance-val">
+                          <span class="mc-glance-main-price text-emerald">
+                            {{ formatPrice(selectedModel.minInputCost) }} / {{ formatPrice(selectedModel.minOutputCost) }}
+                          </span>
+                          <div class="mc-glance-subline flex items-center gap-1.5">
+                            <span>{{ selectedModel.minProvider || "多网关聚合" }}</span>
+                            <span class="mc-tier-pill mc-tier-gateway">聚合网关</span>
+                            <span v-if="selectedModel.priceSpread > 1.2" class="mc-savings-badge">
+                              省 {{ Math.round((1 - 1 / selectedModel.priceSpread) * 100) }}%
+                            </span>
+                          </div>
+                        </div>
+                      </div>
+
+                      <!-- Context -->
+                      <div class="mc-glance-item">
+                        <span class="mc-glance-label">上下文窗口</span>
+                        <div class="mc-glance-val">
+                          <span class="mc-glance-main-num font-mono">
+                            {{ formatTokensFull(selectedModel.contextLength) }} Tokens
+                          </span>
+                          <div v-if="selectedModel.contextMin && selectedModel.contextMin !== selectedModel.contextMax" class="mc-glance-subline">
+                            支持区间: {{ formatTokensFull(selectedModel.contextMin) }} ~ {{ formatTokensFull(selectedModel.contextMax) }}
+                          </div>
+                        </div>
+                      </div>
+
+                      <!-- Output limit -->
+                      <div class="mc-glance-item">
+                        <span class="mc-glance-label">单次最大输出</span>
+                        <div class="mc-glance-val">
+                          <span class="mc-glance-main-num font-mono">
+                            {{ formatTokensFull(selectedModel.maxOutputTokens) }} Tokens
+                          </span>
+                        </div>
+                      </div>
+
+                      <!-- Capabilities -->
+                      <div class="mc-glance-item">
+                        <span class="mc-glance-label">核心能力矩阵</span>
+                        <div class="mc-glance-val">
+                          <div class="mc-capabilities-chips-wrap">
+                            <span
+                              class="mc-cap-pill"
+                              :class="{ 'is-disabled': !selectedModel.reasoning }"
+                            >
+                              深度思考推理
+                            </span>
+                            <span
+                              class="mc-cap-pill"
+                              :class="{ 'is-disabled': !selectedModel.toolCall }"
+                            >
+                              工具与函数调用
+                            </span>
+                            <span
+                              class="mc-cap-pill"
+                              :class="{ 'is-disabled': !selectedModel.structured }"
+                            >
+                              结构化输出
+                            </span>
+                            <span
+                              class="mc-cap-pill"
+                              :class="{ 'is-disabled': !selectedModel.temperature }"
+                            >
+                              温度调节
+                            </span>
+                            <span
+                              class="mc-cap-pill"
+                              :class="{ 'is-disabled': !selectedModel.attachment }"
+                            >
+                              多模态文件附件
+                            </span>
+                          </div>
+                        </div>
+                      </div>
+
+                      <!-- Modalities -->
+                      <div class="mc-glance-item">
+                        <span class="mc-glance-label">支持输入模态</span>
+                        <div class="mc-glance-val">
+                          <div class="mc-modalities-chips-wrap">
+                            <span
+                              v-for="mod in selectedModel.inputModalities"
+                              :key="mod"
+                              class="mc-modality-pill"
+                            >
+                              {{ modalityLabel(mod) }}
+                            </span>
+                          </div>
+                        </div>
+                      </div>
+
+                      <!-- Knowledge cutoff -->
+                      <div class="mc-glance-item">
+                        <span class="mc-glance-label">知识库截止</span>
+                        <div class="mc-glance-val">
+                          <span class="mc-glance-main-text">{{ selectedModel.knowledge || "—" }}</span>
+                        </div>
+                      </div>
+
+                      <!-- Released / updated -->
+                      <div class="mc-glance-item">
+                        <span class="mc-glance-label">发布 / 更新时间</span>
+                        <div class="mc-glance-val">
+                          <span class="mc-glance-main-text">
+                            {{ selectedModel.releaseDate || "—" }} / {{ selectedModel.lastUpdated || "—" }}
+                          </span>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  <!-- 4. 完整 Artificial Analysis 权威性能与评测仪表盘 -->
+                  <div class="mc-section-block">
+                    <div class="mc-section-head-row">
+                      <h3 class="mc-section-title">
+                        <span v-html="icons.flame" />
+                        <span>Artificial Analysis 权威性能与基准评测</span>
+                      </h3>
+                      <span v-if="detail?.raw?.aa?.variant" class="mc-aa-variant-tag">
+                        变体：{{ detail.raw.aa.variant }}
+                      </span>
+                    </div>
+
+                    <div v-if="selectedModel.aaIdx || selectedModel.aaSpeed" class="mc-aa-gauges-grid">
+                      <div v-if="selectedModel.aaIdx" class="mc-gauge-card">
+                        <div class="mc-gauge-head">
+                          <span class="mc-gauge-k">综合质量指数 (Quality Index)</span>
+                          <strong class="mc-gauge-v text-violet">{{ selectedModel.aaIdx.toFixed(1) }} <small>/ 100</small></strong>
+                        </div>
+                        <div class="mc-gauge-bar-wrap">
+                          <div class="mc-gauge-bar mc-bar-violet" :style="{ width: `${Math.min(100, selectedModel.aaIdx)}%` }" />
+                        </div>
+                      </div>
+
+                      <div v-if="selectedModel.aaCoding" class="mc-gauge-card">
+                        <div class="mc-gauge-head">
+                          <span class="mc-gauge-k">代码编程能力 (Coding Score)</span>
+                          <strong class="mc-gauge-v text-brand">{{ selectedModel.aaCoding.toFixed(1) }} <small>/ 100</small></strong>
+                        </div>
+                        <div class="mc-gauge-bar-wrap">
+                          <div class="mc-gauge-bar mc-bar-brand" :style="{ width: `${Math.min(100, selectedModel.aaCoding)}%` }" />
+                        </div>
+                      </div>
+
+                      <div v-if="selectedModel.aaAgentic" class="mc-gauge-card">
+                        <div class="mc-gauge-head">
+                          <span class="mc-gauge-k">智能体复杂任务 (Agentic Score)</span>
+                          <strong class="mc-gauge-v text-success">{{ selectedModel.aaAgentic.toFixed(1) }} <small>/ 100</small></strong>
+                        </div>
+                        <div class="mc-gauge-bar-wrap">
+                          <div class="mc-gauge-bar" :style="{ width: `${Math.min(100, selectedModel.aaAgentic)}%` }" />
+                        </div>
+                      </div>
+
+                      <div v-if="selectedModel.aaSpeed" class="mc-gauge-card">
+                        <div class="mc-gauge-head">
+                          <span class="mc-gauge-k">生成吞吐速率 (Output Speed)</span>
+                          <strong class="mc-gauge-v text-emerald">{{ Math.round(selectedModel.aaSpeed) }} <small>tok/s</small></strong>
+                        </div>
+                        <div class="mc-gauge-bar-wrap">
+                          <div class="mc-gauge-bar" :style="{ width: `${Math.min(100, (selectedModel.aaSpeed / 300) * 100)}%` }" />
+                        </div>
+                      </div>
+
+                      <div v-if="selectedModel.aaTtft" class="mc-gauge-card">
+                        <div class="mc-gauge-head">
+                          <span class="mc-gauge-k">首字响应延迟 (TTFT Latency)</span>
+                          <strong class="mc-gauge-v">{{ selectedModel.aaTtft.toFixed(2) }} <small>秒</small></strong>
+                        </div>
+                      </div>
+
+                      <div v-if="selectedModel.aaTaskCost" class="mc-gauge-card">
+                        <div class="mc-gauge-head">
+                          <span class="mc-gauge-k">标准基准单任务费用</span>
+                          <strong class="mc-gauge-v">${{ selectedModel.aaTaskCost.toFixed(4) }}</strong>
+                        </div>
+                      </div>
+                    </div>
+                    <p v-else class="mc-aa-uncovered-note">
+                      Artificial Analysis 尚未收录此模型评测数据（全网约 267 / 2059 款模型覆盖详细评测）。质量数据源自独立第三方主流模型评测基准。
+                    </p>
+                  </div>
+
+                  <!-- 5. 渠道分布与快捷直达 -->
+                  <div class="mc-section-block">
+                    <div class="mc-section-head-row">
+                      <h3 class="mc-section-title">
+                        <span v-html="icons.globe" />
+                        <span>渠道生态分布（共 {{ selectedModel.hostCount }} 家供应商）</span>
+                      </h3>
+                      <button type="button" class="mc-link-action-btn" @click="activeDetailTab = 'providers'">
+                        <span>查看全部渠道明细表 &rarr;</span>
+                      </button>
+                    </div>
+
+                    <div class="mc-channel-dist-grid">
+                      <div class="mc-channel-stat-box">
+                        <span class="mc-cs-num">{{ selectedModel.hostCount }}</span>
+                        <span class="mc-cs-lbl">接入总渠道数</span>
+                      </div>
+                      <div class="mc-channel-stat-box">
+                        <span class="mc-cs-num text-brand">{{ selectedModel.pricedHostCount }}</span>
+                        <span class="mc-cs-lbl">公开标价服务商</span>
+                      </div>
+                      <div class="mc-channel-stat-box">
+                        <span class="mc-cs-num text-emerald">{{ selectedModel.freeHostCount }}</span>
+                        <span class="mc-cs-lbl">提供免费调用</span>
+                      </div>
+                      <div class="mc-channel-stat-box">
+                        <span class="mc-cs-num text-warning">{{ selectedModel.subHostCount }}</span>
+                        <span class="mc-cs-lbl">套餐 / 订阅制渠道</span>
+                      </div>
                     </div>
                   </div>
                 </div>
 
-                <!-- TAB 2: 定价与交互式算费器 -->
-                <div v-else-if="activeDetailTab === 'pricing'" class="mc-tab-panel">
-                  <div class="mc-pricing-cards-3">
-                    <div class="mc-pricing-card">
-                      <div class="mc-pcard-header">
-                        <span class="mc-pcard-tag mc-tone-brand">官方 / 参考定价</span>
-                        <small>{{ selectedModel.refProvider ? labLabel(selectedModel.refProvider) : "官方标准" }}</small>
-                      </div>
-                      <div class="mc-pcard-rows">
-                        <div><span>输入 (Input / 1M)</span><strong>{{ formatPrice(selectedModel.refInputCost) }}</strong></div>
-                        <div><span>输出 (Output / 1M)</span><strong>{{ formatPrice(selectedModel.refOutputCost) }}</strong></div>
-                        <div><span>缓存读取 (Cache)</span><strong>{{ formatPrice(selectedModel.refCacheReadCost) }}</strong></div>
-                      </div>
+                <!-- TAB 2: 全网渠道明细大表 (Available at X providers) -->
+                <div v-else-if="activeDetailTab === 'providers'" class="mc-tab-panel">
+                  <div class="mc-providers-table-header">
+                    <div class="mc-providers-table-title-box">
+                      <h3 class="mc-section-title">
+                        {{ detail.hosts?.length || detail.providers?.length }} 家服务商提供
+                      </h3>
+                      <span class="mc-sub-counts-line">
+                        {{ detail.hosts?.filter(h => !h.subscription && !h.isFree && (h.input !== null || h.output !== null)).length || selectedModel.pricedHostCount }} 家公开价格 ·
+                        {{ detail.hosts?.filter(h => h.isFree || (h.input === 0 && h.output === 0)).length || selectedModel.freeHostCount }} 家免费 ·
+                        {{ detail.hosts?.filter(h => h.subscription).length || selectedModel.subHostCount }} 家订阅覆盖
+                      </span>
                     </div>
-
-                    <div class="mc-pricing-card mc-pcard-lowest">
-                      <div class="mc-pcard-header">
-                        <span class="mc-pcard-tag mc-tone-success">全网最低渠道价</span>
-                        <small>{{ selectedModel.minProvider || "最低" }}</small>
-                      </div>
-                      <div class="mc-pcard-rows">
-                        <div><span>最低输入</span><strong class="text-success">{{ formatPrice(selectedModel.minInputCost) }}</strong></div>
-                        <div><span>最低输出</span><strong class="text-success">{{ formatPrice(selectedModel.minOutputCost) }}</strong></div>
-                        <div><span>最低缓存读取</span><strong class="text-success">{{ formatPrice(selectedModel.minCacheReadCost) }}</strong></div>
-                      </div>
-                    </div>
-
-                    <div class="mc-pricing-card mc-pcard-spread">
-                      <div class="mc-pcard-header">
-                        <span class="mc-pcard-tag mc-tone-violet">价差与渠道潜力</span>
-                      </div>
-                      <div class="mc-pcard-rows">
-                        <div><span>最高/最低价差</span><strong>{{ selectedModel.priceSpread.toFixed(1) }}x</strong></div>
-                        <div><span>Blended 指数</span><strong>{{ formatPrice(selectedModel.blendedMin) }}</strong></div>
-                        <div><span>支持供应商</span><strong>{{ selectedModel.hostCount }} 家</strong></div>
-                      </div>
-                    </div>
+                    <label class="mc-priced-only-toggle">
+                      <input v-model="providerTablePricedOnly" type="checkbox" />
+                      <span>仅显示有公开标价渠道</span>
+                    </label>
                   </div>
 
-                  <!-- 交互式实时成本计算器 -->
+                  <div class="mc-providers-full-table-wrap">
+                    <table class="mc-providers-full-table">
+                      <thead>
+                        <tr>
+                          <th>服务商</th>
+                          <th>分层</th>
+                          <th class="text-right">输入</th>
+                          <th class="text-right">输出</th>
+                          <th class="text-right">缓存读取</th>
+                          <th class="text-right">缓存写入</th>
+                          <th class="text-right">上下文</th>
+                          <th class="text-right">最大输出</th>
+                          <th>状态</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        <tr
+                          v-for="h in drawerHosts"
+                          :key="h.provider + (h.modelId || '')"
+                          :class="{
+                            'is-ref-row': h.isRef,
+                            'is-min-row': h.isMin,
+                            'is-free-row': h.isFree,
+                            'is-sub-row': h.subscription
+                          }"
+                        >
+                          <!-- 服务商 -->
+                          <td>
+                            <div class="mc-pt-name-cell">
+                              <div class="mc-pt-title-wrap">
+                                <div class="mc-pt-name-row">
+                                  <strong>{{ h.name }}</strong>
+                                  <a v-if="h.doc" :href="h.doc" target="_blank" rel="noreferrer" class="mc-pt-doc-link" title="查看官方文档">
+                                    <span v-html="icons.external" />
+                                  </a>
+                                  <span v-if="h.official" class="mc-official-pill">原厂</span>
+                                </div>
+                                <small v-if="h.modelId" class="mc-pt-model-slug font-mono" :title="h.modelId">{{ h.modelId }}</small>
+                              </div>
+                            </div>
+                          </td>
+
+                          <!-- 分层 -->
+                          <td>
+                            <span class="mc-tier-pill" :class="`mc-tier-${h.tier || 'gateway'}`">
+                              {{ tierLabel(h.tier) }}
+                            </span>
+                          </td>
+
+                          <!-- 输入 -->
+                          <td class="text-right tabular-nums">
+                            <span v-if="h.subscription" class="mc-sub-text">订阅覆盖</span>
+                            <span v-else-if="h.isFree || (h.input === 0 && h.output === 0)" class="mc-free-text font-bold">免费</span>
+                            <span
+                              v-else-if="h.input !== null && h.input !== undefined"
+                              :class="{ 'text-emerald font-bold': h.isMin, 'font-mono': true }"
+                            >
+                              {{ formatPrice(h.input) }}
+                            </span>
+                            <span v-else class="muted">—</span>
+                          </td>
+
+                          <!-- 输出 -->
+                          <td class="text-right tabular-nums">
+                            <span v-if="h.subscription || h.isFree || (h.input === 0 && h.output === 0)"></span>
+                            <span
+                              v-else-if="h.output !== null && h.output !== undefined"
+                              :class="{ 'text-emerald font-bold': h.isMin, 'font-mono': true }"
+                            >
+                              {{ formatPrice(h.output) }}
+                            </span>
+                            <span v-else class="muted">—</span>
+                          </td>
+
+                          <!-- 缓存读取 -->
+                          <td class="text-right font-mono tabular-nums">
+                            <span v-if="h.cacheRead !== null && h.cacheRead !== undefined">{{ formatPrice(h.cacheRead) }}</span>
+                            <span v-else class="muted">—</span>
+                          </td>
+
+                          <!-- 缓存写入 -->
+                          <td class="text-right font-mono tabular-nums">
+                            <span v-if="h.cacheWrite !== null && h.cacheWrite !== undefined">{{ formatPrice(h.cacheWrite) }}</span>
+                            <span v-else class="muted">—</span>
+                          </td>
+
+                          <!-- 上下文 -->
+                          <td
+                            class="text-right font-mono tabular-nums"
+                            :class="{ 'text-warning font-semibold': h.context && h.context !== selectedModel.contextLength }"
+                          >
+                            {{ h.context ? formatTokensFull(h.context) : formatTokensFull(selectedModel.contextLength) }}
+                            <span
+                              v-if="h.context && h.context !== selectedModel.contextLength"
+                              title="该服务商提供的上下文容量与原厂标准不一致"
+                              class="mc-warn-icon"
+                            >⚠️</span>
+                          </td>
+
+                          <!-- 最大输出 -->
+                          <td class="text-right font-mono tabular-nums">
+                            {{ h.outputLimit ? formatTokensFull(h.outputLimit) : formatTokensFull(selectedModel.maxOutputTokens) }}
+                          </td>
+
+                          <!-- 状态 -->
+                          <td>
+                            <span v-if="h.official" class="mc-status-tag-official">官方</span>
+                            <span v-else-if="h.isMin" class="mc-status-tag-min">最低价</span>
+                            <span v-else-if="h.status" class="mc-status-tag">{{ h.status.toUpperCase() }}</span>
+                            <span v-else class="mc-status-tag-active">可用</span>
+                          </td>
+                        </tr>
+                      </tbody>
+                    </table>
+                  </div>
+                  <p class="mc-providers-table-footnote">
+                    按综合加权单价 (输入×0.75 + 输出×0.25) 从低到高排序。官方原厂直销渠道与最低单价渠道高亮显示。
+                  </p>
+                </div>
+
+                <!-- TAB 3: 月度用量算费器 (Your usage cost) -->
+                <div v-else-if="activeDetailTab === 'pricing'" class="mc-tab-panel">
+                  <h3 class="mc-section-title">月度用量与成本估算 (Cost Calculator)</h3>
                   <div class="mc-cost-calculator">
                     <div class="mc-calc-head">
                       <div>
-                        <h4><span class="mc-calc-icon" v-html="icons.card" />交互式 Token 月度费用计算器</h4>
-                        <p>拖动滑块自定义每月 Token 用量，实时对比官方直销与最低渠道费用</p>
+                        <h4>交互式 Token 月度用量与费用对比</h4>
+                        <p>设定每月预期 Token 输入与输出用量，实时评估官方直销与最低渠道费用及差价</p>
                       </div>
                       <div class="mc-currency-toggle">
                         <button
@@ -1461,14 +1763,14 @@ onMounted(() => {
                           :class="{ active: calcCurrency === 'USD' }"
                           @click="calcCurrency = 'USD'"
                         >
-                          USD ($)
+                          美元 ($)
                         </button>
                         <button
                           type="button"
                           :class="{ active: calcCurrency === 'CNY' }"
                           @click="calcCurrency = 'CNY'"
                         >
-                          CNY (¥)
+                          人民币 (¥)
                         </button>
                       </div>
                     </div>
@@ -1476,8 +1778,8 @@ onMounted(() => {
                     <div class="mc-calc-sliders">
                       <div class="mc-slider-group">
                         <div class="mc-slider-label">
-                          <span>每月输入 Tokens</span>
-                          <b>{{ calcMonthlyInputTokens }}M Tokens</b>
+                          <span>每月预估输入 Tokens (Input)</span>
+                          <b>{{ calcMonthlyInputTokens }}M Tokens ({{ calcMonthlyInputTokens }}00万)</b>
                         </div>
                         <input
                           v-model.number="calcMonthlyInputTokens"
@@ -1490,8 +1792,8 @@ onMounted(() => {
 
                       <div class="mc-slider-group">
                         <div class="mc-slider-label">
-                          <span>每月输出 Tokens</span>
-                          <b>{{ calcMonthlyOutputTokens }}M Tokens</b>
+                          <span>每月预估输出 Tokens (Output)</span>
+                          <b>{{ calcMonthlyOutputTokens }}M Tokens ({{ calcMonthlyOutputTokens }}00万)</b>
                         </div>
                         <input
                           v-model.number="calcMonthlyOutputTokens"
@@ -1505,159 +1807,18 @@ onMounted(() => {
 
                     <div v-if="calculatedCosts" class="mc-calc-results-bar">
                       <div class="mc-calc-res-item">
-                        <span>官方预估月费</span>
+                        <span>官方参考预估月费</span>
                         <strong>{{ calculatedCosts.symbol }}{{ calculatedCosts.refTotal }}</strong>
                       </div>
                       <div class="mc-calc-res-item">
-                        <span>最低渠道月费</span>
-                        <strong class="text-success">{{ calculatedCosts.symbol }}{{ calculatedCosts.minTotal }}</strong>
+                        <span>最低渠道预估月费</span>
+                        <strong class="text-emerald">{{ calculatedCosts.symbol }}{{ calculatedCosts.minTotal }}</strong>
                       </div>
                       <div class="mc-calc-res-item mc-calc-res-saved">
-                        <span>预计每月节省</span>
+                        <span>预计每月节省金额</span>
                         <strong>{{ calculatedCosts.symbol }}{{ calculatedCosts.savedTotal }} <small>({{ calculatedCosts.savedPercent }}%)</small></strong>
                       </div>
                     </div>
-                  </div>
-                </div>
-
-                <!-- TAB 3: Artificial Analysis 权威评测 -->
-                <div v-else-if="activeDetailTab === 'aa'" class="mc-tab-panel">
-                  <div class="mc-aa-hero-card">
-                    <div class="mc-aa-hero-title">
-                      <span v-html="icons.sparkles" />
-                      <div>
-                        <h4>Artificial Analysis 全球大模型权威基准评测</h4>
-                        <p>基于标准化测试集评估模型综合质量、代码能力、Agentic 表现与吞吐速率</p>
-                      </div>
-                    </div>
-
-                    <div class="mc-aa-gauges-grid">
-                      <div v-if="selectedModel.aaIdx" class="mc-gauge-card">
-                        <span class="mc-gauge-k">综合质量指数 (Quality Index)</span>
-                        <div class="mc-gauge-bar-wrap">
-                          <div class="mc-gauge-bar" :style="{ width: `${Math.min(100, selectedModel.aaIdx)}%` }" />
-                        </div>
-                        <strong class="mc-gauge-v">{{ selectedModel.aaIdx.toFixed(1) }} <small>/ 100</small></strong>
-                      </div>
-
-                      <div v-if="selectedModel.aaCoding" class="mc-gauge-card">
-                        <span class="mc-gauge-k">代码编程能力 (Coding Score)</span>
-                        <div class="mc-gauge-bar-wrap">
-                          <div class="mc-gauge-bar mc-bar-brand" :style="{ width: `${Math.min(100, selectedModel.aaCoding)}%` }" />
-                        </div>
-                        <strong class="mc-gauge-v">{{ selectedModel.aaCoding.toFixed(1) }} <small>/ 100</small></strong>
-                      </div>
-
-                      <div v-if="selectedModel.aaAgentic" class="mc-gauge-card">
-                        <span class="mc-gauge-k">智能体评分 (Agentic Score)</span>
-                        <div class="mc-gauge-bar-wrap">
-                          <div class="mc-gauge-bar mc-bar-violet" :style="{ width: `${Math.min(100, selectedModel.aaAgentic)}%` }" />
-                        </div>
-                        <strong class="mc-gauge-v">{{ selectedModel.aaAgentic.toFixed(1) }} <small>/ 100</small></strong>
-                      </div>
-
-                      <div v-if="selectedModel.aaSpeed" class="mc-gauge-card">
-                        <span class="mc-gauge-k">输出生成速率 (Speed)</span>
-                        <strong class="mc-gauge-v text-success">{{ Math.round(selectedModel.aaSpeed) }} <small>tok/s</small></strong>
-                      </div>
-
-                      <div v-if="selectedModel.aaTtft" class="mc-gauge-card">
-                        <span class="mc-gauge-k">首字延迟 (TTFT Latency)</span>
-                        <strong class="mc-gauge-v">{{ selectedModel.aaTtft.toFixed(2) }} <small>秒</small></strong>
-                      </div>
-
-                      <div v-if="selectedModel.aaTaskCost" class="mc-gauge-card">
-                        <span class="mc-gauge-k">基准任务单次平均费用</span>
-                        <strong class="mc-gauge-v">${{ selectedModel.aaTaskCost.toFixed(4) }}</strong>
-                      </div>
-                    </div>
-                  </div>
-                </div>
-
-                <!-- TAB 4: 接入渠道与供应商拓扑 -->
-                <div v-else-if="activeDetailTab === 'providers'" class="mc-tab-panel">
-                  <div class="mc-providers-panel-grid">
-                    <div
-                      v-for="prov in detail.providers"
-                      :key="prov.id"
-                      class="mc-prov-card"
-                    >
-                      <div class="mc-prov-card-top">
-                        <div class="mc-prov-info">
-                          <strong>{{ prov.name }}</strong>
-                          <span class="mc-tier-pill" :class="`mc-tier-${prov.tier || 'gateway'}`">
-                            {{ (prov.tier || 'gateway').toUpperCase() }}
-                          </span>
-                          <span v-if="prov.subscription" class="mc-sub-pill">订阅制</span>
-                        </div>
-                        <a
-                          v-if="prov.doc"
-                          :href="prov.doc"
-                          target="_blank"
-                          rel="noreferrer"
-                          class="mc-doc-link-btn"
-                          title="查看官方文档"
-                        >
-                          <span v-html="icons.external" />
-                        </a>
-                      </div>
-
-                      <div v-if="prov.api" class="mc-prov-api-row">
-                        <code>{{ prov.api }}</code>
-                      </div>
-                    </div>
-                  </div>
-                </div>
-
-                <!-- TAB 5: 快捷调用代码生成 -->
-                <div v-else-if="activeDetailTab === 'code'" class="mc-tab-panel">
-                  <div class="mc-code-snippet-box">
-                    <div class="mc-snippet-toolbar">
-                      <div class="mc-code-lang-selector">
-                        <button
-                          type="button"
-                          :class="{ active: codeLanguage === 'python' }"
-                          @click="codeLanguage = 'python'"
-                        >
-                          Python (OpenAI SDK)
-                        </button>
-                        <button
-                          type="button"
-                          :class="{ active: codeLanguage === 'node' }"
-                          @click="codeLanguage = 'node'"
-                        >
-                          Node.js (TypeScript)
-                        </button>
-                        <button
-                          type="button"
-                          :class="{ active: codeLanguage === 'curl' }"
-                          @click="codeLanguage = 'curl'"
-                        >
-                          cURL
-                        </button>
-                      </div>
-
-                      <button type="button" class="mc-copy-btn" @click="copyCode">
-                        <span v-html="codeCopied ? icons.check : icons.copy" />
-                        <span>{{ codeCopied ? "已复制" : "复制代码" }}</span>
-                      </button>
-                    </div>
-
-                    <pre class="mc-code-block"><code>{{ generatedSnippet }}</code></pre>
-                  </div>
-                </div>
-
-                <!-- TAB 6: 原始数据检查器 -->
-                <div v-else-if="activeDetailTab === 'raw'" class="mc-tab-panel">
-                  <div class="mc-raw-box">
-                    <div class="mc-raw-top">
-                      <span>完整 JSON 元数据</span>
-                      <button type="button" class="mc-copy-btn" @click="copyRawJson">
-                        <span v-html="rawCopied ? icons.check : icons.copy" />
-                        <span>{{ rawCopied ? "已复制" : "复制 JSON" }}</span>
-                      </button>
-                    </div>
-                    <pre class="mc-code-block"><code>{{ JSON.stringify(detail.raw || detail.model, null, 2) }}</code></pre>
                   </div>
                 </div>
               </template>
@@ -1679,7 +1840,7 @@ onMounted(() => {
             <div class="mc-arena-modal-title">
               <span class="mc-arena-flame" v-html="icons.flame" />
               <div>
-                <h2>多模型全方位横向对战 (Arena Comparison)</h2>
+                <h2>多模型全方位横向对战对比 (Arena Comparison)</h2>
                 <p>对比 {{ comparedModels.length }} 款模型的参数规格、定价阶梯、能力支持与 AA 评测指标</p>
               </div>
             </div>
@@ -1716,7 +1877,7 @@ onMounted(() => {
                 <tr>
                   <td class="mc-arena-feature-col">开源权重</td>
                   <td v-for="m in comparedModels" :key="m.id">
-                    <span :class="m.openWeights ? 'text-success font-semibold' : 'muted'">
+                    <span :class="m.openWeights ? 'text-emerald font-semibold' : 'muted'">
                       {{ m.openWeights ? "✓ 开源" : "闭源商用" }}
                     </span>
                   </td>
@@ -1754,13 +1915,13 @@ onMounted(() => {
                 <tr>
                   <td class="mc-arena-feature-col">全网最低渠道价 (/1M)</td>
                   <td v-for="m in comparedModels" :key="m.id">
-                    <strong class="text-success">{{ formatPrice(m.minInputCost) }} / {{ formatPrice(m.minOutputCost) }}</strong>
+                    <strong class="text-emerald">{{ formatPrice(m.minInputCost) }} / {{ formatPrice(m.minOutputCost) }}</strong>
                   </td>
                 </tr>
                 <tr>
                   <td class="mc-arena-feature-col">渠道价差倍数</td>
                   <td v-for="m in comparedModels" :key="m.id">
-                    <span class="mc-savings-badge">{{ m.priceSpread.toFixed(1) }}x</span>
+                    <span class="mc-savings-badge">{{ m.priceSpread.toFixed(1) }} 倍</span>
                   </td>
                 </tr>
                 <tr>
@@ -2914,19 +3075,19 @@ onMounted(() => {
 }
 .mc-arena-launch-btn :deep(svg) { width: 12px; height: 12px; }
 
-/* —— 5. 全景模型详情深度抽屉 —— */
+/* —— 5. 全景模型详情深度抽屉 (Slide-over Drawer) —— */
 .mc-drawer-backdrop {
   position: fixed;
   inset: 0;
-  background: rgba(0, 0, 0, 0.45);
-  backdrop-filter: blur(4px);
+  background: rgba(0, 0, 0, 0.5);
+  backdrop-filter: blur(5px);
   z-index: 1000;
   display: flex;
   justify-content: flex-end;
 }
 
 .mc-drawer-panel {
-  width: min(720px, 90vw);
+  width: min(860px, 95vw);
   height: 100%;
   background: var(--surface);
   border-left: 1px solid var(--line);
@@ -2941,7 +3102,7 @@ onMounted(() => {
 }
 
 .mc-drawer-header {
-  padding: 20px 24px;
+  padding: 22px 24px 18px;
   border-bottom: 1px solid var(--line);
   display: flex;
   justify-content: space-between;
@@ -2951,18 +3112,18 @@ onMounted(() => {
 
 .mc-drawer-head-identity {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 14px;
   min-width: 0;
 }
 .mc-drawer-avatar {
-  width: 48px;
-  height: 48px;
+  width: 46px;
+  height: 46px;
   border-radius: var(--r-xl);
   display: flex;
   align-items: center;
   justify-content: center;
-  font-size: 18px;
+  font-size: 16px;
   font-weight: 700;
   flex-shrink: 0;
 }
@@ -2975,38 +3136,79 @@ onMounted(() => {
   display: flex;
   align-items: center;
   gap: 6px;
+  flex-wrap: wrap;
+  font-size: 12.5px;
+  color: var(--muted);
   margin-bottom: 4px;
 }
-.mc-drawer-title-box h2 {
-  margin: 0;
-  font-size: 18px;
+.mc-meta-lab { font-weight: 600; color: var(--text); }
+.mc-meta-sep { color: var(--faint); }
+.mc-meta-id { font-size: 11.5px; color: var(--muted); }
+.mc-meta-status { font-weight: 600; font-size: 11px; }
+.mc-meta-open-weights {
+  font-size: 10.5px;
   font-weight: 700;
-  letter-spacing: -0.02em;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--success-soft);
+  color: var(--success);
 }
-.mc-drawer-id {
-  margin: 2px 0 0;
-  font-size: 11.5px;
+.mc-meta-closed {
+  font-size: 10.5px;
   color: var(--muted);
-  font-family: ui-monospace, monospace;
+}
+.mc-meta-family { font-size: 11.5px; color: var(--muted); }
+
+.mc-drawer-title {
+  margin: 2px 0 0;
+  font-size: 22px;
+  font-weight: 700;
+  letter-spacing: -0.025em;
+  color: var(--text);
+}
+.mc-drawer-desc {
+  margin: 6px 0 0;
+  font-size: 13.5px;
+  color: var(--muted);
+  line-height: 1.45;
 }
 
 .mc-drawer-head-actions {
   display: flex;
   align-items: center;
   gap: 8px;
+  flex-shrink: 0;
 }
+.mc-btn-copy-id {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 12px;
+  border-radius: var(--r-md);
+  font-size: 12px;
+  font-weight: 500;
+  border: 1px solid var(--line);
+  background: var(--surface-soft);
+  color: var(--text);
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+.mc-btn-copy-id:hover { background: var(--surface-hover); }
+.mc-btn-copy-id :deep(svg) { width: 12px; height: 12px; }
+
 .mc-compare-toggle-btn {
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  padding: 6px 10px;
+  padding: 6px 12px;
   border-radius: var(--r-md);
-  font-size: 11.5px;
+  font-size: 12px;
   font-weight: 600;
   border: 1px solid var(--line);
   background: var(--surface-soft);
   color: var(--text);
   cursor: pointer;
+  transition: all 0.15s ease;
 }
 .mc-compare-toggle-btn.active {
   background: var(--brand-soft);
@@ -3035,7 +3237,7 @@ onMounted(() => {
   padding: 0 24px;
   border-bottom: 1px solid var(--line);
   display: flex;
-  gap: 16px;
+  gap: 20px;
   overflow-x: auto;
   background: var(--surface-soft);
 }
@@ -3047,7 +3249,7 @@ onMounted(() => {
   border: none;
   background: transparent;
   color: var(--muted);
-  font-size: 12.5px;
+  font-size: 13px;
   font-weight: 500;
   cursor: pointer;
   border-bottom: 2px solid transparent;
@@ -3060,7 +3262,7 @@ onMounted(() => {
   font-weight: 600;
   border-bottom-color: var(--brand);
 }
-.mc-drawer-tabs button :deep(svg) { width: 14px; height: 14px; }
+.mc-drawer-tabs button :deep(svg) { width: 15px; height: 15px; }
 
 .mc-drawer-body {
   flex: 1;
@@ -3071,145 +3273,340 @@ onMounted(() => {
 .mc-tab-panel {
   display: flex;
   flex-direction: column;
-  gap: 20px;
+  gap: 24px;
 }
 
-/* Specs 6-Grid */
-.mc-specs-grid-6 {
-  display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: 10px;
-}
-.mc-spec-box {
-  padding: 12px;
-  border-radius: var(--r-lg);
-  background: var(--surface-soft);
-  border: 1px solid var(--line-soft);
+/* 1. 全网用量与热度 Cockpit */
+.mc-usage-cockpit-card {
+  padding: 16px;
+  border-radius: var(--r-xl);
+  background: linear-gradient(135deg, rgba(99, 102, 241, 0.05), rgba(168, 85, 247, 0.05));
+  border: 1px solid rgba(99, 102, 241, 0.2);
   display: flex;
   flex-direction: column;
-}
-.mc-spec-box span { font-size: 11px; color: var(--muted); }
-.mc-spec-box strong { font-size: 13px; font-weight: 600; color: var(--text); margin-top: 4px; }
-
-.mc-subheading {
-  margin: 0;
-  font-size: 13px;
-  font-weight: 700;
-  color: var(--text);
-}
-
-.mc-capability-matrix {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 10px;
-}
-.mc-cap-card {
-  padding: 12px;
-  border-radius: var(--r-lg);
-  background: var(--surface-soft);
-  border: 1px solid var(--line-soft);
-  display: flex;
-  gap: 10px;
-  opacity: 0.55;
-}
-.mc-cap-card.enabled {
-  opacity: 1;
-  border-color: var(--line);
-  background: var(--surface);
-  box-shadow: var(--shadow-xs);
-}
-.mc-cap-emoji { font-size: 18px; line-height: 1; }
-.mc-cap-card strong { font-size: 12.5px; color: var(--text); }
-.mc-cap-card p { margin: 2px 0 0; font-size: 11px; color: var(--muted); }
-
-.mc-modalities-box {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-.mc-modalities-title { font-size: 12px; color: var(--muted); }
-.mc-mod-tags { display: flex; gap: 6px; }
-.mc-mod-badge {
-  font-size: 11px;
-  font-weight: 700;
-  padding: 2px 8px;
-  border-radius: var(--r-sm);
-  background: var(--brand-soft);
-  color: var(--brand-deep);
-}
-
-/* 3-Cards Pricing */
-.mc-pricing-cards-3 {
-  display: grid;
-  grid-template-columns: repeat(3, 1fr);
   gap: 12px;
 }
-.mc-pricing-card {
-  padding: 14px;
-  border-radius: var(--r-xl);
-  background: var(--surface-soft);
-  border: 1px solid var(--line-soft);
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
-.mc-pcard-lowest {
-  border-color: var(--success);
-  background: var(--success-soft);
-}
-.mc-pcard-spread {
-  border-color: var(--violet);
-  background: var(--violet-soft);
-}
-.mc-pcard-header {
+.mc-usage-header {
   display: flex;
   justify-content: space-between;
   align-items: center;
 }
-.mc-pcard-tag {
-  font-size: 11px;
-  font-weight: 700;
-  padding: 2px 6px;
-  border-radius: var(--r-sm);
+.mc-usage-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--text);
 }
-.mc-pcard-rows {
+.mc-usage-title :deep(svg) { width: 16px; height: 16px; color: var(--brand); }
+.mc-benchmarks-count-badge {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: var(--r-full);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  color: var(--muted);
+}
+.mc-usage-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 10px;
+}
+.mc-usage-box {
+  padding: 10px 12px;
+  border-radius: var(--r-lg);
+  background: var(--surface);
+  border: 1px solid var(--line-soft);
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 2px;
 }
-.mc-pcard-rows > div {
-  display: flex;
-  justify-content: space-between;
-  font-size: 11.5px;
-}
-.mc-pcard-rows span { color: var(--muted); }
-.mc-pcard-rows strong { font-family: ui-monospace, monospace; }
+.mc-usage-k { font-size: 11px; color: var(--muted); }
+.mc-usage-v { font-size: 16px; font-weight: 700; }
 
-/* 算费器 */
-.mc-cost-calculator {
+/* 2. 综合加权成本指数卡片 */
+.mc-blended-indices-card {
   padding: 16px;
   border-radius: var(--r-xl);
   background: var(--surface-soft);
   border: 1px solid var(--line);
   display: flex;
   flex-direction: column;
-  gap: 14px;
+  gap: 12px;
+}
+.mc-indices-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+}
+.mc-indices-header span {
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.mc-indices-header small {
+  font-size: 10.5px;
+  color: var(--muted);
+}
+.mc-indices-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 10px;
+}
+.mc-index-col {
+  padding: 10px 12px;
+  border-radius: var(--r-lg);
+  background: var(--surface);
+  border: 1px solid var(--line-soft);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.mc-index-k { font-size: 11px; color: var(--muted); }
+.mc-index-v { font-size: 16px; font-weight: 700; font-family: ui-monospace, monospace; }
+.mc-index-col small { font-size: 10px; color: var(--faint); margin-top: 2px; }
+
+/* 3. At a glance 8-box Grid */
+.mc-at-a-glance-card {
+  border-radius: var(--r-xl);
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  overflow: hidden;
+}
+.mc-glance-header {
+  padding: 10px 16px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--line);
+  font-size: 11.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+}
+.mc-glance-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+}
+.mc-glance-item {
+  display: flex;
+  gap: 12px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--line-soft);
+  font-size: 13px;
+}
+.mc-glance-item:nth-child(odd) {
+  border-right: 1px solid var(--line-soft);
+}
+.mc-glance-item:nth-last-child(-n+2) {
+  border-bottom: none;
+}
+.mc-glance-label {
+  width: 95px;
+  flex-shrink: 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+.mc-glance-val {
+  flex: 1;
+  min-width: 0;
+}
+.mc-glance-main-price {
+  font-size: 15px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+.mc-glance-main-num {
+  font-size: 15px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+.mc-glance-main-text {
+  font-size: 13px;
+  color: var(--text);
+}
+.mc-glance-unit {
+  font-size: 12px;
+  color: var(--muted);
+  margin-left: 4px;
+}
+.mc-glance-subline {
+  font-size: 12px;
+  color: var(--muted);
+  margin-top: 2px;
+}
+
+/* Capabilities Chips */
+.mc-capabilities-chips-wrap {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.mc-cap-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: var(--r-full);
+  font-size: 11.5px;
+  font-weight: 500;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  color: var(--text);
+}
+.mc-cap-pill.is-disabled {
+  text-decoration: line-through;
+  opacity: 0.45;
+  color: var(--faint);
+}
+
+/* Modalities Chips */
+.mc-modalities-chips-wrap {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.mc-modality-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 9px;
+  border-radius: var(--r-full);
+  font-size: 11.5px;
+  font-weight: 600;
+  background: var(--info-soft);
+  color: var(--info);
+  border: 1px solid rgba(59, 130, 196, 0.2);
+}
+
+/* Section Blocks */
+.mc-section-block {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.mc-section-head-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.mc-section-title {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--text);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.mc-section-title :deep(svg) {
+  width: 16px;
+  height: 16px;
+  color: var(--brand);
+}
+
+.mc-aa-variant-tag {
+  font-size: 11px;
+  font-family: ui-monospace, monospace;
+  padding: 2px 8px;
+  border-radius: var(--r-sm);
+  background: var(--surface-soft);
+  color: var(--muted);
+  border: 1px solid var(--line-soft);
+}
+
+/* AA Gauges Grid */
+.mc-aa-gauges-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 12px;
+}
+.mc-gauge-card {
+  padding: 12px 14px;
+  border-radius: var(--r-xl);
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.mc-gauge-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+}
+.mc-gauge-k { font-size: 11.5px; color: var(--muted); }
+.mc-gauge-v { font-size: 16px; font-weight: 700; }
+.mc-gauge-v small { font-size: 11px; font-weight: normal; color: var(--muted); }
+.mc-gauge-bar-wrap {
+  height: 6px;
+  border-radius: 999px;
+  background: var(--line);
+  overflow: hidden;
+}
+.mc-gauge-bar {
+  height: 100%;
+  border-radius: 999px;
+  background: var(--success);
+}
+.mc-bar-brand { background: var(--brand); }
+.mc-bar-violet { background: var(--violet); }
+
+.mc-aa-uncovered-note {
+  margin: 0;
+  font-size: 12.5px;
+  color: var(--muted);
+  line-height: 1.5;
+}
+
+/* 渠道分布统计 */
+.mc-channel-dist-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 10px;
+}
+.mc-channel-stat-box {
+  padding: 12px 14px;
+  border-radius: var(--r-xl);
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: 2px;
+}
+.mc-cs-num { font-size: 20px; font-weight: 800; color: var(--text); }
+.mc-cs-lbl { font-size: 11px; color: var(--muted); }
+
+.mc-link-action-btn {
+  border: none;
+  background: transparent;
+  color: var(--brand);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.mc-link-action-btn:hover { text-decoration: underline; }
+
+/* 算费器 */
+.mc-cost-calculator {
+  padding: 18px;
+  border-radius: var(--r-xl);
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
 }
 .mc-calc-head {
   display: flex;
   justify-content: space-between;
   align-items: flex-start;
 }
-.mc-calc-head h4 {
-  margin: 0;
-  font-size: 13.5px;
-  font-weight: 700;
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-.mc-calc-head p { margin: 3px 0 0; font-size: 11px; color: var(--muted); }
-.mc-calc-icon :deep(svg) { width: 14px; height: 14px; color: var(--brand); }
+.mc-calc-head h4 { margin: 0; font-size: 14px; font-weight: 700; }
+.mc-calc-head p { margin: 3px 0 0; font-size: 11.5px; color: var(--muted); }
 
 .mc-currency-toggle {
   display: inline-flex;
@@ -3258,7 +3655,7 @@ onMounted(() => {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
   gap: 10px;
-  padding: 12px;
+  padding: 14px;
   border-radius: var(--r-lg);
   background: var(--surface);
   border: 1px solid var(--line-soft);
@@ -3267,158 +3664,171 @@ onMounted(() => {
   display: flex;
   flex-direction: column;
 }
-.mc-calc-res-item span { font-size: 10.5px; color: var(--muted); }
-.mc-calc-res-item strong { font-size: 16px; font-weight: 700; color: var(--text); margin-top: 2px; }
+.mc-calc-res-item span { font-size: 11px; color: var(--muted); }
+.mc-calc-res-item strong { font-size: 17px; font-weight: 700; color: var(--text); margin-top: 2px; }
 .mc-calc-res-saved strong { color: var(--success); }
 
-/* AA Hero */
-.mc-aa-hero-card {
-  padding: 18px;
-  border-radius: var(--r-xl);
-  background: var(--surface-soft);
-  border: 1px solid var(--line);
+/* 渠道全景表格 */
+.mc-providers-table-header {
   display: flex;
-  flex-direction: column;
+  justify-content: space-between;
+  align-items: center;
   gap: 16px;
+  flex-wrap: wrap;
 }
-.mc-aa-hero-title {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
-.mc-aa-hero-title :deep(svg) {
-  width: 22px;
-  height: 22px;
-  color: var(--violet);
-}
-.mc-aa-hero-title h4 { margin: 0; font-size: 14px; font-weight: 700; }
-.mc-aa-hero-title p { margin: 2px 0 0; font-size: 11.5px; color: var(--muted); }
-
-.mc-aa-gauges-grid {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 12px;
-}
-.mc-gauge-card {
-  padding: 12px;
-  border-radius: var(--r-lg);
-  background: var(--surface);
-  border: 1px solid var(--line-soft);
+.mc-providers-table-title-box {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 2px;
 }
-.mc-gauge-k { font-size: 11px; color: var(--muted); }
-.mc-gauge-bar-wrap {
-  height: 6px;
-  border-radius: 999px;
-  background: var(--line-soft);
-  overflow: hidden;
-}
-.mc-gauge-bar {
-  height: 100%;
-  border-radius: 999px;
-  background: var(--success);
-}
-.mc-bar-brand { background: var(--brand); }
-.mc-bar-violet { background: var(--violet); }
-.mc-gauge-v { font-size: 16px; font-weight: 700; color: var(--text); }
-.mc-gauge-v small { font-size: 11px; font-weight: normal; color: var(--muted); }
-
-/* Providers Tab in Drawer */
-.mc-providers-panel-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
-  gap: 12px;
-}
-.mc-prov-card {
-  padding: 12px;
-  border-radius: var(--r-lg);
-  background: var(--surface-soft);
-  border: 1px solid var(--line-soft);
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-.mc-prov-card-top {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-}
-.mc-prov-info {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-.mc-prov-info strong { font-size: 13px; }
-.mc-prov-api-row code {
-  font-size: 10.5px;
-  font-family: ui-monospace, monospace;
-  color: var(--muted);
-  background: var(--surface);
-  padding: 2px 6px;
-  border-radius: var(--r-xs);
-  word-break: break-all;
-}
-
-/* Code Snippet & Raw */
-.mc-code-snippet-box, .mc-raw-box {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
-.mc-snippet-toolbar, .mc-raw-top {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-}
-.mc-code-lang-selector {
-  display: flex;
-  gap: 4px;
-}
-.mc-code-lang-selector button {
-  padding: 5px 10px;
-  border-radius: var(--r-md);
+.mc-sub-counts-line {
   font-size: 11.5px;
-  font-weight: 600;
-  border: 1px solid var(--line);
-  background: var(--surface-soft);
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.mc-priced-only-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
   color: var(--muted);
   cursor: pointer;
 }
-.mc-code-lang-selector button.active {
+.mc-priced-only-toggle input {
+  accent-color: var(--brand);
+}
+
+.mc-providers-full-table-wrap {
+  border-radius: var(--r-xl);
+  border: 1px solid var(--line);
+  overflow-x: auto;
+  background: var(--surface);
+}
+.mc-providers-full-table {
+  width: 100%;
+  border-collapse: collapse;
+  text-align: left;
+  font-size: 12px;
+}
+.mc-providers-full-table th {
+  padding: 10px 12px;
+  background: var(--surface-soft);
+  border-bottom: 1px solid var(--line);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--muted);
+  white-space: nowrap;
+}
+.mc-providers-full-table td {
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--line-soft);
+  vertical-align: middle;
+}
+.mc-providers-full-table tr:last-child td {
+  border-bottom: none;
+}
+.mc-providers-full-table tr:hover {
+  background: var(--surface-hover);
+}
+.mc-providers-full-table tr.is-min-row {
+  background: rgba(18, 166, 101, 0.04);
+}
+.mc-providers-full-table tr.is-ref-row {
+  background: rgba(99, 102, 241, 0.03);
+}
+
+.mc-pt-name-cell {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.mc-pt-title-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.mc-pt-name-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.mc-pt-name-row strong {
+  font-size: 12.5px;
+  color: var(--text);
+}
+.mc-pt-doc-link {
+  color: var(--muted);
+  display: flex;
+}
+.mc-pt-doc-link:hover { color: var(--brand); }
+.mc-pt-doc-link :deep(svg) { width: 12px; height: 12px; }
+
+.mc-official-pill {
+  font-size: 9px;
+  font-weight: 700;
+  padding: 1px 5px;
+  border-radius: 3px;
   background: var(--brand-soft);
-  border-color: var(--brand);
   color: var(--brand-deep);
 }
 
-.mc-copy-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  padding: 5px 10px;
-  border-radius: var(--r-md);
-  font-size: 11.5px;
-  font-weight: 600;
-  border: 1px solid var(--line);
-  background: var(--surface-soft);
-  color: var(--text);
-  cursor: pointer;
+.mc-pt-model-slug {
+  font-size: 10px;
+  color: var(--muted);
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
-.mc-copy-btn:hover { background: var(--surface-hover); }
-.mc-copy-btn :deep(svg) { width: 12px; height: 12px; }
 
-.mc-code-block {
+.mc-sub-text {
+  font-size: 11px;
+  color: var(--muted);
+}
+.mc-free-text {
+  color: #059669;
+  font-size: 11.5px;
+}
+.mc-warn-icon {
+  margin-left: 2px;
+  font-size: 10px;
+  color: #d97706;
+}
+
+.mc-status-tag-official {
+  font-size: 9.5px;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 3px;
+  background: var(--brand-soft);
+  color: var(--brand-deep);
+}
+.mc-status-tag-min {
+  font-size: 9.5px;
+  font-weight: 700;
+  padding: 1px 6px;
+  border-radius: 3px;
+  background: var(--success-soft);
+  color: var(--success);
+}
+.mc-status-tag {
+  font-size: 9.5px;
+  font-weight: 500;
+  padding: 1px 5px;
+  border-radius: 3px;
+  background: var(--surface-soft);
+  color: var(--muted);
+}
+.mc-status-tag-active {
+  font-size: 9.5px;
+  color: var(--muted);
+}
+
+.mc-providers-table-footnote {
   margin: 0;
-  padding: 16px;
-  border-radius: var(--r-xl);
-  background: #0f1117;
-  color: #e2e8f0;
-  font-family: ui-monospace, "SF Mono", Menlo, monospace;
-  font-size: 12px;
-  line-height: 1.5;
-  overflow-x: auto;
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  font-size: 11px;
+  color: var(--muted);
+  line-height: 1.4;
 }
 
 /* —— 6. Arena 对战全屏弹窗 —— */
@@ -3525,9 +3935,17 @@ onMounted(() => {
 }
 
 /* 常用文本色彩辅助类 */
+.text-brand { color: var(--brand) !important; }
 .text-success { color: var(--success) !important; }
+.text-emerald { color: #059669 !important; }
 .text-violet { color: var(--violet) !important; }
+.text-warning { color: var(--warning) !important; }
 .font-semibold { font-weight: 600; }
 .font-bold { font-weight: 700; }
+.font-mono { font-family: ui-monospace, "SF Mono", Menlo, monospace; }
 .muted { color: var(--muted); }
+.text-right { text-align: right; }
+.flex { display: flex; }
+.items-center { align-items: center; }
+.gap-1\.5 { gap: 6px; }
 </style>
