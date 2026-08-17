@@ -1,6 +1,7 @@
 use crate::db;
 use crate::models::{
-    Database, RawConversation, RawLogReport, RawRequest, RawSession, RequestHealthBucket,
+    Database, LocalAgentEnvOverride, LocalAgentPathEntry, LocalAgentPaths, LocalAgentPathsReport,
+    RawConversation, RawLogReport, RawRequest, RawSession, RequestHealthBucket,
     RequestHealthReport, RequestHealthSourceSummary, TokenCollectorSyncReport, TokenStatsReport,
     TokenUsageBucket, TokenUsageReport,
 };
@@ -269,9 +270,11 @@ fn catpawai_bucket_mut<'a>(
         output_tokens: 0,
         reasoning_output_tokens: 0,
         conversation_count: 0,
+        request_count: 0,
         cost_usd: 0.0,
         pricing_available: false,
         estimated_tokens: 0,
+        estimated_input_tokens: 0,
     })
 }
 
@@ -406,6 +409,8 @@ fn read_catpawai_buckets_from_path(path: &Path) -> Result<Vec<TokenUsageBucket>,
         }
         let fresh_input = prompt.saturating_sub(cache_read.saturating_add(cache_write));
         let bucket = catpawai_bucket_mut(&mut buckets, model, project_key, timestamp);
+        // 每条带 usage 的消息就是一次真实 API 请求。
+        bucket.request_count += 1;
         bucket.total_tokens += total;
         bucket.billable_total_tokens += total;
         bucket.input_tokens += fresh_input;
@@ -491,8 +496,9 @@ pub async fn get_token_usage(database: State<'_, Database>) -> Result<TokenUsage
 }
 
 /// 解析一个 Claude 会话 jsonl 文件为 会话 + 对话 + 请求。
-/// 对话 = 每次 user 消息开新轮；请求 = 每条带 usage 的 assistant 消息（真实 API 请求，含 token 数）；
-/// 跳过子代理线程。
+/// 对话 = 每次真人 user 消息开新轮（子代理任务 prompt 不开新轮）；
+/// 请求 = 每条带 usage 的 assistant 消息（真实 API 请求，含 token 数，含子代理请求），
+/// 同一 message.id 按内容块拆多行只计一次。
 fn parse_claude_file(
     path: &Path,
     project: &str,
@@ -521,18 +527,17 @@ fn parse_claude_file(
     let mut conv_index = 0i64;
     let mut session_tokens = 0i64;
     let mut current: Option<(RawConversation, String)> = None;
+    // 已计入请求的 message.id（同一请求按内容块拆多行，usage 相同）
+    let mut counted_message_ids: HashSet<String> = HashSet::new();
 
     for line in text.lines() {
         let Ok(value) = serde_json::from_str::<JsonValue>(line) else {
             continue;
         };
-        if value
+        let is_sidechain = value
             .get("isSidechain")
             .and_then(JsonValue::as_bool)
-            .unwrap_or(false)
-        {
-            continue;
-        }
+            .unwrap_or(false);
         let kind = value.get("type").and_then(JsonValue::as_str).unwrap_or("");
         if kind != "user" && kind != "assistant" {
             continue;
@@ -563,6 +568,18 @@ fn parse_claude_file(
         message_count += 1;
 
         if kind == "user" {
+            // 子代理任务 prompt 不开新对话轮
+            if is_sidechain {
+                continue;
+            }
+            let content = value
+                .get("message")
+                .and_then(|message| message.get("content"))
+                .cloned()
+                .unwrap_or(JsonValue::Null);
+            if !token_collector::claude_user_line_is_human(&value, &content) {
+                continue;
+            }
             if let Some((conv, _)) = current.take() {
                 conversations.push(conv);
             }
@@ -582,7 +599,13 @@ fn parse_claude_file(
             continue;
         }
 
-        // assistant：提取真实 API 请求的 token 用量
+        // assistant：提取真实 API 请求的 token 用量（含子代理请求；message.id 去重）
+        let message_id = value
+            .get("message")
+            .and_then(|message| message.get("id"))
+            .and_then(JsonValue::as_str)
+            .unwrap_or("")
+            .to_string();
         let usage = value
             .get("message")
             .and_then(|message| message.get("usage"));
@@ -597,6 +620,9 @@ fn parse_claude_file(
         if total <= 0 {
             continue;
         }
+        if !message_id.is_empty() && !counted_message_ids.insert(message_id.clone()) {
+            continue;
+        }
         session_tokens += total;
         if let Some((conv, conv_last)) = current.as_mut() {
             conv.request_count += 1;
@@ -608,10 +634,16 @@ fn parse_claude_file(
             }
             conv.total_tokens += total;
             requests.push(RawRequest {
-                id: if uuid.is_empty() {
-                    format!("{session_id}#{message_count}")
+                // message.id 是一次 API 请求的标识（按内容块拆多行时相同）；
+                // 旧日志缺失时回退行级 uuid。
+                id: if message_id.is_empty() {
+                    if uuid.is_empty() {
+                        format!("{session_id}#{message_count}")
+                    } else {
+                        uuid
+                    }
                 } else {
-                    uuid
+                    message_id
                 },
                 session_id: session_id.clone(),
                 conversation_id: conv.id.clone(),
@@ -733,7 +765,7 @@ pub async fn get_token_raw_logs() -> Result<RawLogReport, String> {
         let mut conversations: Vec<RawConversation> = Vec::new();
         let mut requests: Vec<RawRequest> = Vec::new();
 
-        let claude_root = home.join(".claude").join("projects");
+        let claude_root = crate::token_collector::claude_config_dir(&home).join("projects");
         if let Ok(projects) = fs::read_dir(&claude_root) {
             for project_entry in projects.flatten() {
                 let project_dir = project_entry.path();
@@ -769,8 +801,11 @@ pub async fn get_token_raw_logs() -> Result<RawLogReport, String> {
             }
         }
 
-        let codex_root = home.join(".codex").join("sessions");
-        collect_codex_files(&codex_root, &mut sessions);
+        let codex_base = crate::token_collector::codex_home(&home);
+        // Codex 会把归档任务移入 archived_sessions/；原始日志视图两处都要扫，
+        // 否则会话归档后在“原始日志”里消失（usage 采集器早已是双目录扫描）。
+        collect_codex_files(&codex_base.join("sessions"), &mut sessions);
+        collect_codex_files(&codex_base.join("archived_sessions"), &mut sessions);
 
         Ok(RawLogReport {
             available: !sessions.is_empty(),
@@ -781,6 +816,423 @@ pub async fn get_token_raw_logs() -> Result<RawLogReport, String> {
     })
     .await
     .map_err(|error| format!("原始日志解析失败：{error}"))?
+}
+
+// ---------------------------------------------------------------------------
+// 本地 AI Agent 路径诊断
+// ---------------------------------------------------------------------------
+
+fn path_display(path: &Path) -> String {
+    path.to_string_lossy().to_string()
+}
+
+fn size_human(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    let mut value = bytes as f64;
+    let mut unit = 0usize;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+/// 路径附加信息：文件显示大小，目录显示直属条目数；不存在时为空。
+fn path_detail(path: &Path) -> String {
+    if path.is_file() {
+        return fs::metadata(path)
+            .map(|meta| size_human(meta.len()))
+            .unwrap_or_default();
+    }
+    if path.is_dir() {
+        let count = fs::read_dir(path)
+            .map(|entries| entries.take(1001).count())
+            .unwrap_or(0);
+        return if count == 0 {
+            String::new()
+        } else if count > 1000 {
+            "1000+ 项".to_string()
+        } else {
+            format!("{count} 项")
+        };
+    }
+    String::new()
+}
+
+/// 追加一条路径条目；path 为 None 表示该平台不适用（不展示）。
+fn push_agent_path(
+    entries: &mut Vec<LocalAgentPathEntry>,
+    kind: &str,
+    label: &str,
+    path: Option<&Path>,
+) {
+    let Some(path) = path else {
+        return;
+    };
+    entries.push(LocalAgentPathEntry {
+        kind: kind.to_string(),
+        label: label.to_string(),
+        exists: path.exists(),
+        detail: path_detail(path),
+        path: path_display(path),
+    });
+}
+
+fn finish_agent(
+    source: &str,
+    name: &str,
+    root: Option<&Path>,
+    mut entries: Vec<LocalAgentPathEntry>,
+) -> LocalAgentPaths {
+    // 根目录未设置时，退而使用第一条路径所在目录作为展示根。
+    let root_path = match root {
+        Some(path) => path_display(path),
+        None => entries
+            .first()
+            .map(|entry| {
+                Path::new(&entry.path)
+                    .parent()
+                    .map(path_display)
+                    .unwrap_or_else(|| entry.path.clone())
+            })
+            .unwrap_or_default(),
+    };
+    entries.sort_by(|left, right| {
+        left.kind
+            .cmp(&right.kind)
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    let detected = entries.iter().any(|entry| entry.exists);
+    LocalAgentPaths {
+        source: source.to_string(),
+        name: name.to_string(),
+        root: root_path,
+        detected,
+        paths: entries,
+        collected_sessions: 0,
+        collected_events: 0,
+    }
+}
+
+fn kiro_legacy_storage_roots(home: &Path) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    #[cfg(target_os = "macos")]
+    {
+        let global_storage = home
+            .join("Library")
+            .join("Application Support")
+            .join("Kiro")
+            .join("User")
+            .join("globalStorage");
+        roots.push(global_storage.join("kiro.kiroagent"));
+        roots.push(global_storage.join("kiro.kiro-agent"));
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(app_data) = std::env::var_os("APPDATA") {
+            let global_storage = PathBuf::from(app_data)
+                .join("Kiro")
+                .join("User")
+                .join("globalStorage");
+            roots.push(global_storage.join("kiro.kiroagent"));
+            roots.push(global_storage.join("kiro.kiro-agent"));
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let global_storage = home
+            .join(".config")
+            .join("Kiro")
+            .join("User")
+            .join("globalStorage");
+        roots.push(global_storage.join("kiro.kiroagent"));
+        roots.push(global_storage.join("kiro.kiro-agent"));
+    }
+    roots
+}
+
+fn catpawai_data_roots(home: &Path) -> Vec<PathBuf> {
+    let mut roots = vec![home.join(".sankuai").join("CatPawAI").join("sqliteDB")];
+    #[cfg(target_os = "macos")]
+    {
+        roots.push(
+            home.join("Library")
+                .join("Application Support")
+                .join("CatPawAI")
+                .join("sqliteDB"),
+        );
+    }
+    roots
+}
+
+/// 枚举 OpenHub 会读取的本地 AI Agent 及其配置 / 数据 / 数据库根目录。
+/// 只读文件系统存在性，不读取任何内容，供「本地 Agent 路径诊断」弹窗展示。
+fn collect_local_agent_paths(home: &Path) -> LocalAgentPathsReport {
+    let mut agents = Vec::<LocalAgentPaths>::new();
+
+    // Codex
+    {
+        let root = crate::token_collector::codex_home(home);
+        let mut entries = Vec::new();
+        push_agent_path(
+            &mut entries,
+            "config",
+            "配置 config.toml",
+            Some(&root.join("config.toml")),
+        );
+        push_agent_path(
+            &mut entries,
+            "config",
+            "认证 auth.json",
+            Some(&root.join("auth.json")),
+        );
+        push_agent_path(
+            &mut entries,
+            "data",
+            "会话 sessions",
+            Some(&root.join("sessions")),
+        );
+        push_agent_path(
+            &mut entries,
+            "data",
+            "归档会话 archived_sessions",
+            Some(&root.join("archived_sessions")),
+        );
+        agents.push(finish_agent("codex", "Codex", Some(&root), entries));
+    }
+
+    // Claude Code
+    {
+        let root = crate::token_collector::claude_config_dir(home);
+        let mut entries = Vec::new();
+        push_agent_path(
+            &mut entries,
+            "config",
+            "项目设置 settings.json",
+            Some(&root.join("settings.json")),
+        );
+        push_agent_path(
+            &mut entries,
+            "config",
+            "全局配置 ~/.claude.json",
+            Some(&home.join(".claude.json")),
+        );
+        push_agent_path(
+            &mut entries,
+            "data",
+            "会话项目 projects",
+            Some(&root.join("projects")),
+        );
+        agents.push(finish_agent("claude", "Claude Code", Some(&root), entries));
+    }
+
+    // Command Code
+    {
+        let root = home.join(".commandcode");
+        let mut entries = Vec::new();
+        push_agent_path(
+            &mut entries,
+            "data",
+            "会话项目 projects",
+            Some(&root.join("projects")),
+        );
+        agents.push(finish_agent(
+            "command-code",
+            "Command Code",
+            Some(&root),
+            entries,
+        ));
+    }
+
+    // Antigravity (Gemini 客户端)
+    {
+        let root = home.join(".gemini");
+        let mut entries = Vec::new();
+        push_agent_path(
+            &mut entries,
+            "data",
+            "转录 antigravity-cli",
+            Some(&root.join("antigravity-cli")),
+        );
+        push_agent_path(
+            &mut entries,
+            "data",
+            "转录 antigravity-ide",
+            Some(&root.join("antigravity-ide")),
+        );
+        agents.push(finish_agent(
+            "antigravity",
+            "Antigravity (Gemini)",
+            Some(&root),
+            entries,
+        ));
+    }
+
+    // Kiro
+    {
+        let root = home.join(".kiro");
+        let mut entries = Vec::new();
+        push_agent_path(
+            &mut entries,
+            "data",
+            "会话 sessions (v2)",
+            Some(&root.join("sessions")),
+        );
+        for (index, legacy) in kiro_legacy_storage_roots(home).iter().enumerate() {
+            let label = if index == 0 {
+                "旧版全局存储 (globalStorage)"
+            } else {
+                "旧版全局存储 (备用)"
+            };
+            push_agent_path(&mut entries, "data", label, Some(legacy));
+        }
+        agents.push(finish_agent("kiro", "Kiro", Some(&root), entries));
+    }
+
+    // DSH (DeepSeek)
+    {
+        let root = home.join(".dsh");
+        let mut entries = Vec::new();
+        push_agent_path(
+            &mut entries,
+            "data",
+            "会话 sessions (.jsonl.zstd)",
+            Some(&root.join("sessions")),
+        );
+        agents.push(finish_agent("dsh", "DSH (DeepSeek)", Some(&root), entries));
+    }
+
+    // OpenCode
+    {
+        let data_root = crate::token_collector::xdg_data_home(home).join("opencode");
+        let mut entries = Vec::new();
+        push_agent_path(
+            &mut entries,
+            "config",
+            "配置目录",
+            Some(&home.join(".config").join("opencode")),
+        );
+        push_agent_path(
+            &mut entries,
+            "database",
+            "数据库 opencode.db",
+            Some(&data_root.join("opencode.db")),
+        );
+        agents.push(finish_agent(
+            "opencode",
+            "OpenCode",
+            Some(&data_root),
+            entries,
+        ));
+    }
+
+    // MiMo Code
+    {
+        let root = crate::token_collector::xdg_data_home(home).join("mimocode");
+        let mut entries = Vec::new();
+        push_agent_path(
+            &mut entries,
+            "database",
+            "数据库 mimocode.db",
+            Some(&root.join("mimocode.db")),
+        );
+        agents.push(finish_agent("mimo", "MiMo Code", Some(&root), entries));
+    }
+
+    // ZCode
+    {
+        let root = home.join(".zcode");
+        let mut entries = Vec::new();
+        push_agent_path(
+            &mut entries,
+            "database",
+            "数据库 db.sqlite",
+            Some(&crate::token_collector::zcode_db_path(home)),
+        );
+        agents.push(finish_agent("zcode", "ZCode", Some(&root), entries));
+    }
+
+    // CatPawAI
+    {
+        let roots = catpawai_data_roots(home);
+        let primary = roots.first().cloned();
+        let mut entries = Vec::new();
+        for (index, data_root) in roots.iter().enumerate() {
+            let label = if index == 0 {
+                "数据库 globalCache.sqlite"
+            } else {
+                "数据库 globalCache.sqlite (备用)"
+            };
+            push_agent_path(
+                &mut entries,
+                "database",
+                label,
+                Some(&data_root.join("globalCache.sqlite")),
+            );
+        }
+        agents.push(finish_agent(
+            "catpawai",
+            "CatPawAI",
+            primary.as_deref(),
+            entries,
+        ));
+    }
+
+    // 路径存在 ≠ 采到了数据：附上最近一次采集的会话/事件量与缓存时间。
+    let collected = crate::token_collector::collected_stats_by_source();
+    let collected_at = collected
+        .values()
+        .next()
+        .map(|stats| stats.updated_at.clone())
+        .unwrap_or_default();
+    for agent in &mut agents {
+        if let Some(stats) = collected.get(&agent.source) {
+            agent.collected_sessions = stats.sessions;
+            agent.collected_events = stats.events;
+        }
+    }
+
+    LocalAgentPathsReport {
+        available: true,
+        home: path_display(home),
+        agents,
+        env_overrides: collected_env_overrides(),
+        collected_at: collected_at,
+    }
+}
+
+/// 当前生效的路径重定向环境变量；未设置为空列表。
+fn collected_env_overrides() -> Vec<LocalAgentEnvOverride> {
+    [
+        "CLAUDE_CONFIG_DIR",
+        "CODEX_HOME",
+        "XDG_DATA_HOME",
+        "OPENHUB_CATPAWAI_DB_PATH",
+    ]
+    .iter()
+    .filter_map(|key| {
+        let value = std::env::var_os(key)?;
+        (!value.is_empty()).then(|| LocalAgentEnvOverride {
+            key: (*key).to_string(),
+            value: path_display(&PathBuf::from(value)),
+        })
+    })
+    .collect()
+}
+
+/// 只读扫描本地 AI Agent 的配置 / 数据路径（不读取日志内容）。
+#[tauri::command]
+pub async fn get_local_agent_paths() -> Result<LocalAgentPathsReport, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let home = std::env::var_os("HOME").ok_or("无法定位用户目录")?;
+        Ok(collect_local_agent_paths(&PathBuf::from(home)))
+    })
+    .await
+    .map_err(|error| format!("本地 Agent 路径扫描失败：{error}"))?
 }
 
 #[cfg(test)]
@@ -951,11 +1403,13 @@ mod tests {
         fs::write(
             &path,
             r#"{"type":"queue-operation","timestamp":"2026-08-01T00:00:00.000Z"}
-{"type":"user","uuid":"u1","isSidechain":false,"timestamp":"2026-08-01T00:00:01.000Z","message":{"role":"user","model":"deepseek-v4-flash"}}
-{"type":"assistant","uuid":"a1","isSidechain":false,"timestamp":"2026-08-01T00:00:02.000Z","message":{"role":"assistant","model":"deepseek-v4-flash","usage":{"input_tokens":100,"cache_read_input_tokens":50,"cache_creation_input_tokens":10,"output_tokens":40}}}
-{"type":"user","uuid":"u2","isSidechain":false,"timestamp":"2026-08-01T00:00:03.000Z","message":{"role":"user"}}
-{"type":"assistant","uuid":"a2","isSidechain":false,"timestamp":"2026-08-01T00:00:04.000Z","message":{"role":"assistant","model":"deepseek-v4-flash","usage":{"input_tokens":200,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":60}}}
+{"type":"user","uuid":"u1","isSidechain":false,"timestamp":"2026-08-01T00:00:01.000Z","message":{"role":"user","model":"deepseek-v4-flash","content":"first question"}}
+{"type":"assistant","uuid":"a1","isSidechain":false,"timestamp":"2026-08-01T00:00:02.000Z","message":{"id":"msg-a1","role":"assistant","model":"deepseek-v4-flash","usage":{"input_tokens":100,"cache_read_input_tokens":50,"cache_creation_input_tokens":10,"output_tokens":40}}}
+{"type":"user","uuid":"u2","isSidechain":false,"timestamp":"2026-08-01T00:00:03.000Z","message":{"role":"user","content":"second question"}}
+{"type":"assistant","uuid":"a2","isSidechain":false,"timestamp":"2026-08-01T00:00:04.000Z","message":{"id":"msg-a2","role":"assistant","model":"deepseek-v4-flash","usage":{"input_tokens":200,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":60}}}
 {"type":"user","uuid":"s1","isSidechain":true,"timestamp":"2026-08-01T00:00:05.000Z","message":{"role":"user"}}
+{"type":"assistant","uuid":"sa1","isSidechain":true,"timestamp":"2026-08-01T00:00:06.000Z","message":{"id":"msg-sa1","role":"assistant","model":"deepseek-v4-pro","usage":{"input_tokens":30,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":10}}}
+{"type":"assistant","uuid":"sa1","isSidechain":true,"timestamp":"2026-08-01T00:00:06.100Z","message":{"id":"msg-sa1","role":"assistant","model":"deepseek-v4-pro","usage":{"input_tokens":30,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":10}}}
 "#,
         )
         .unwrap();
@@ -972,22 +1426,25 @@ mod tests {
 
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, "session-abc");
-        assert_eq!(sessions[0].message_count, 4);
+        assert_eq!(sessions[0].message_count, 7);
+        // 子代理任务 prompt（s1）不开新对话轮
         assert_eq!(sessions[0].conversation_count, 2);
         assert_eq!(sessions[0].model, "deepseek-v4-flash");
-        assert_eq!(sessions[0].total_tokens, 460); // 200+50+10+40 + 200+0+0+60
+        // 200+50+10+40 + 200+0+0+60 + 30+0+0+10（子代理请求计入，重复行只计一次）
+        assert_eq!(sessions[0].total_tokens, 500);
         assert_eq!(conversations.len(), 2);
         assert_eq!(conversations[0].request_count, 1);
         assert_eq!(conversations[0].total_tokens, 200);
-        assert_eq!(conversations[1].request_count, 1);
-        assert_eq!(conversations[1].total_tokens, 260);
-        assert_eq!(requests.len(), 2);
+        // 子代理请求归属最近一次真人对话（第二轮）
+        assert_eq!(conversations[1].request_count, 2);
+        assert_eq!(conversations[1].total_tokens, 300);
+        assert_eq!(requests.len(), 3);
         assert!(requests.iter().all(|r| r.role == "assistant"));
         assert_eq!(requests[0].input_tokens, 100);
         assert_eq!(requests[0].cache_read_tokens, 50);
         assert_eq!(requests[0].total_tokens, 200);
-        // 子代理消息被跳过
-        assert!(requests.iter().all(|r| r.id != "s1"));
+        // 同一 message.id 的重复内容块行只计一次
+        assert_eq!(requests.iter().filter(|r| r.id == "msg-sa1").count(), 1);
         // camelCase 序列化
         let serialized = serde_json::to_value(&sessions[0]).unwrap();
         assert!(serialized.get("messageCount").is_some());
@@ -1074,9 +1531,11 @@ mod tests {
                     .get("conversation_count")
                     .and_then(JsonValue::as_f64)
                     .unwrap() as i64,
+                request_count: 0,
                 cost_usd: 0.0,
                 pricing_available: false,
                 estimated_tokens: 0,
+                estimated_input_tokens: 0,
             });
         }
         assert_eq!(parsed.len(), 2);
@@ -1255,12 +1714,12 @@ fn hour_key_from_ts(ts: &str) -> Option<String> {
     // 接受:
     // - 2026-08-06T04:59:44.123Z
     // - 2026-08-06T04:59:44Z
-    // - 2026-08-06T04:59:44+08:00
+    // - 2026-08-06T04:59:44+08:00 / +0800 / +08
+    // 带时区偏移的时间戳先归一到 UTC 再取小时，避免本地时间被当成 UTC 错位归桶。
     let cleaned = ts.trim();
     if cleaned.len() < 13 {
         return None;
     }
-    // 取到小时：YYYY-MM-DDTHH
     let prefix = &cleaned[..13];
     if !(prefix.as_bytes().get(4) == Some(&b'-')
         && prefix.as_bytes().get(7) == Some(&b'-')
@@ -1268,7 +1727,22 @@ fn hour_key_from_ts(ts: &str) -> Option<String> {
     {
         return None;
     }
-    Some(format!("{prefix}:00:00.000Z"))
+    let offset_secs = token_collector::tz_offset_secs(cleaned);
+    if offset_secs == 0 {
+        return Some(format!("{prefix}:00:00.000Z"));
+    }
+    let year: i64 = cleaned.get(0..4)?.parse().ok()?;
+    let month: i64 = cleaned.get(5..7)?.parse().ok()?;
+    let day: i64 = cleaned.get(8..10)?.parse().ok()?;
+    let hour: i64 = cleaned.get(11..13)?.parse().ok()?;
+    let days = token_collector::days_from_civil(year, month, day);
+    let utc_secs = days * 86_400 + hour * 3_600 - offset_secs;
+    let tod = utc_secs.rem_euclid(86_400);
+    let (y, m, d) = civil_from_days(utc_secs.div_euclid(86_400));
+    Some(format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:00:00.000Z",
+        tod / 3_600
+    ))
 }
 
 fn hour_key_from_millis(ms: i64) -> Option<String> {
@@ -1452,24 +1926,20 @@ fn codex_on_line(
     }
 }
 
-fn claude_user_is_human(content: &JsonValue) -> bool {
-    match content {
-        JsonValue::String(text) => !text.trim().is_empty(),
-        JsonValue::Array(items) => items.iter().any(|item| {
-            matches!(
-                item.get("type").and_then(JsonValue::as_str),
-                Some("text") | Some("image")
-            ) || item.get("text").and_then(JsonValue::as_str).is_some()
-        }),
-        _ => false,
-    }
-}
-
 fn claude_on_line(
     value: &JsonValue,
     map: &mut BTreeMap<String, HealthAgg>,
     sources: &mut BTreeMap<String, HealthAgg>,
+    last_user_hour: &mut Option<String>,
+    counted_message_ids: &mut HashSet<String>,
 ) {
+    // 子代理（Task）会话与主会话共用日志文件（或位于 subagents/ 目录）。
+    // 子代理里的 user 输入是任务 prompt，不是真人对话轮；但其 assistant 响应
+    // 仍是真实 API 请求，请求数应包含（对话数不包含）。
+    let is_sidechain = value
+        .get("isSidechain")
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(false);
     let Some(type_name) = value.get("type").and_then(JsonValue::as_str) else {
         return;
     };
@@ -1482,18 +1952,33 @@ fn claude_on_line(
     };
 
     if type_name == "user" {
+        if is_sidechain {
+            return;
+        }
         let content = value
             .get("message")
             .and_then(|m| m.get("content"))
             .cloned()
             .unwrap_or(JsonValue::Null);
-        if claude_user_is_human(&content) {
+        if token_collector::claude_user_line_is_human(value, &content) {
+            *last_user_hour = Some(hour.clone());
             record(map, sources, "claude", hour, 1, 0, 0, 0);
         }
         return;
     }
 
     if type_name != "assistant" {
+        return;
+    }
+    // 同一请求（message.id）会按内容块拆成多行，usage 相同；按 id 去重防止请求重复计数。
+    let message_id = value
+        .get("message")
+        .and_then(|m| m.get("id"))
+        .and_then(JsonValue::as_str)
+        .unwrap_or("")
+        .to_string();
+    let already_counted = !message_id.is_empty() && counted_message_ids.contains(&message_id);
+    if already_counted {
         return;
     }
     let is_api_error = value
@@ -1510,10 +1995,18 @@ fn claude_on_line(
                 + json_i64(u, "cache_creation_input_tokens")
         })
         .unwrap_or(0);
+    // 请求的时间锚定到本轮 user 请求，与 Token 采集器同口径。
+    let req_hour = last_user_hour.clone().unwrap_or_else(|| hour.clone());
     if is_api_error {
-        record(map, sources, "claude", hour, 0, 1, 0, 1);
+        if !message_id.is_empty() {
+            counted_message_ids.insert(message_id);
+        }
+        record(map, sources, "claude", req_hour, 0, 1, 0, 1);
     } else if usage_tokens > 0 {
-        record(map, sources, "claude", hour, 0, 1, 1, 0);
+        if !message_id.is_empty() {
+            counted_message_ids.insert(message_id);
+        }
+        record(map, sources, "claude", req_hour, 0, 1, 1, 0);
     }
 }
 
@@ -1545,7 +2038,7 @@ fn command_code_on_line(
     };
     if role == "user" {
         let content = message.get("content").unwrap_or(&JsonValue::Null);
-        if claude_user_is_human(content) {
+        if token_collector::claude_user_is_human(content) {
             record(map, sources, "command-code", hour, 1, 0, 0, 0);
         }
     } else {
@@ -1607,7 +2100,7 @@ fn kiro_on_line(
     match type_name {
         "user" => {
             let content = payload.get("content").unwrap_or(&JsonValue::Null);
-            if claude_user_is_human(content) {
+            if token_collector::claude_user_is_human(content) {
                 record(map, sources, "kiro", hour, 1, 0, 0, 0);
             }
         }
@@ -1659,6 +2152,7 @@ fn dsh_on_line(
     value: &JsonValue,
     map: &mut BTreeMap<String, HealthAgg>,
     sources: &mut BTreeMap<String, HealthAgg>,
+    last_user_hour: &mut Option<String>,
 ) {
     let kind = value.get("type").and_then(JsonValue::as_str).unwrap_or("");
     let time_ms = value.get("time").and_then(JsonValue::as_i64).unwrap_or(0);
@@ -1667,7 +2161,11 @@ fn dsh_on_line(
     };
     match kind {
         "user/message" => {
-            record(map, sources, "dsh", hour, 1, 0, 0, 0);
+            // 只算真实用户输入；runtime context / skill 目录等注入不算。
+            if token_collector::dsh_user_is_human(value) {
+                *last_user_hour = Some(hour.clone());
+                record(map, sources, "dsh", hour, 1, 0, 0, 0);
+            }
         }
         "assistant/message" => {
             let has_usage = value
@@ -1676,7 +2174,9 @@ fn dsh_on_line(
                 .map(|usage| usage.is_object())
                 .unwrap_or(false);
             if has_usage {
-                record(map, sources, "dsh", hour, 0, 1, 1, 0);
+                // 请求的时间锚定到本轮 user 请求，与 Token 采集器同口径。
+                let req_hour = last_user_hour.clone().unwrap_or_else(|| hour.clone());
+                record(map, sources, "dsh", req_hour, 0, 1, 1, 0);
             }
         }
         _ => {}
@@ -1919,17 +2419,40 @@ fn collect_claude_activity_incremental(
     sources: &mut BTreeMap<String, HealthAgg>,
     cursors: &mut FileCursorMap,
 ) {
-    collect_jsonl_incremental(
-        dir,
-        &|path| {
-            path.extension()
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&current) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let is_jsonl = path
+                .extension()
                 .and_then(|ext| ext.to_str())
                 .map(|ext| ext.eq_ignore_ascii_case("jsonl"))
-                .unwrap_or(false)
-        },
-        cursors,
-        &mut |value| claude_on_line(value, map, sources),
-    );
+                .unwrap_or(false);
+            if !is_jsonl {
+                continue;
+            }
+            // 每个文件独立追踪最近一次用户输入的小时（供 assistant 请求锚定）
+            // 与已计数的 message.id（同一请求按内容块拆多行，防重复计数）。
+            let mut last_user_hour: Option<String> = None;
+            let mut counted_message_ids: HashSet<String> = HashSet::new();
+            scan_jsonl_file_incremental(&path, cursors, &mut |value| {
+                claude_on_line(
+                    value,
+                    map,
+                    sources,
+                    &mut last_user_hour,
+                    &mut counted_message_ids,
+                );
+            });
+        }
+    }
 }
 
 fn is_command_code_activity_file(path: &Path) -> bool {
@@ -2084,8 +2607,10 @@ fn collect_dsh_activity_incremental(
             if !is_dsh {
                 continue;
             }
+            // 每个文件独立追踪最近一次用户输入的小时，供 assistant 请求锚定。
+            let mut last_user_hour: Option<String> = None;
             scan_zstd_jsonl_incremental(&path, cursors, &mut |value| {
-                dsh_on_line(value, map, sources);
+                dsh_on_line(value, map, sources, &mut last_user_hour);
             });
         }
     }
@@ -2245,9 +2770,12 @@ fn collect_sqlite_message_activity_incremental(
 // 活动结果持久化（增量游标 + 累计报告）
 // ---------------------------------------------------------------------------
 
-const ACTIVITY_CACHE_VERSION: u32 = 6;
+// v7：Claude 请求按 message.id 去重（同一请求多内容块行只计一次）、子代理请求
+// 开始计入、对话轮改用 origin.kind 判定、新增 CatPawAI 来源、时区偏移归一 UTC。
+// 计数口径变更需要全量重扫历史文件，因此提升缓存版本使旧游标失效。
+const ACTIVITY_CACHE_VERSION: u32 = 7;
 
-/// 请求活动结果缓存 v5：自维护 per-source 增量游标，并覆盖 Codex 归档与 Command Code。
+/// 请求活动结果缓存：自维护 per-source 增量游标，并覆盖 Codex 归档与 Command Code。
 /// OpenHub 只缓存解析结果与游标，不复制原始日志。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -2367,6 +2895,90 @@ fn clear_request_health_cache() -> Result<(), String> {
     Ok(())
 }
 
+/// CatPawAI 请求健康增量扫描：user_prompt → 对话；带 usage 的消息 → 请求。
+/// 与 read_catpawai_buckets_from_path 同口径，保证 KPI 对话数覆盖 CatPawAI。
+fn collect_catpawai_activity_incremental(
+    map: &mut BTreeMap<String, HealthAgg>,
+    sources_map: &mut BTreeMap<String, HealthAgg>,
+    cursor: &mut SqliteCursor,
+) {
+    let Some(path) = catpawai_db_path() else {
+        return;
+    };
+    let Some(conn) = open_readonly_sqlite(&path) else {
+        return;
+    };
+    if !sqlite_table_exists(&conn, "t_ui_messages") {
+        return;
+    }
+    let since = cursor.max_time_created;
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT message_type, create_time, content FROM t_ui_messages \
+         WHERE create_time > ?1 ORDER BY create_time ASC, id ASC",
+    ) else {
+        return;
+    };
+    let rows = stmt.query_map([since], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    });
+    let Ok(rows) = rows else {
+        return;
+    };
+    let mut max_time = since;
+    for row in rows.flatten() {
+        let (message_type, create_time, content) = row;
+        if create_time > max_time {
+            max_time = create_time;
+        }
+        let normalized_ms = if create_time > 0 && create_time < 100_000_000_000 {
+            create_time.saturating_mul(1000)
+        } else {
+            create_time
+        };
+        let Some(hour) = hour_key_from_millis(normalized_ms) else {
+            continue;
+        };
+        if message_type == "user_prompt" {
+            record(map, sources_map, CATPAWAI_SOURCE, hour, 1, 0, 0, 0);
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<JsonValue>(&content) else {
+            continue;
+        };
+        let Some(usage) = catpawai_usage(&value) else {
+            continue;
+        };
+        let prompt = catpawai_number(
+            usage,
+            &[
+                "prompt_tokens",
+                "promptTokens",
+                "input_tokens",
+                "inputTokens",
+            ],
+        );
+        let completion = catpawai_number(
+            usage,
+            &[
+                "completion_tokens",
+                "completionTokens",
+                "output_tokens",
+                "outputTokens",
+            ],
+        );
+        let total = catpawai_number(usage, &["total_tokens", "totalTokens"])
+            .max(prompt.saturating_add(completion));
+        if total > 0 {
+            record(map, sources_map, CATPAWAI_SOURCE, hour, 0, 1, 1, 0);
+        }
+    }
+    cursor.max_time_created = max_time;
+}
+
 fn report_to_maps(
     report: &RequestHealthReport,
 ) -> (BTreeMap<String, HealthAgg>, BTreeMap<String, HealthAgg>) {
@@ -2444,10 +3056,10 @@ pub(crate) fn collect_request_health_snapshot(force: bool) -> Result<RequestHeal
     }
     let (mut map, mut sources) = report_to_maps(&envelope.report);
 
-    let codex_home = home.join(".codex");
+    let codex_base = crate::token_collector::codex_home(&home);
     for (cursor_key, codex_root) in [
-        ("codex", codex_home.join("sessions")),
-        ("codex-archived", codex_home.join("archived_sessions")),
+        ("codex", codex_base.join("sessions")),
+        ("codex-archived", codex_base.join("archived_sessions")),
     ] {
         if codex_root.is_dir() {
             let cursors = envelope
@@ -2457,7 +3069,7 @@ pub(crate) fn collect_request_health_snapshot(force: bool) -> Result<RequestHeal
             collect_codex_activity_incremental(&codex_root, &mut map, &mut sources, cursors);
         }
     }
-    let claude_root = home.join(".claude").join("projects");
+    let claude_root = crate::token_collector::claude_config_dir(&home).join("projects");
     if claude_root.is_dir() {
         let cursors = envelope
             .file_cursors
@@ -2480,11 +3092,7 @@ pub(crate) fn collect_request_health_snapshot(force: bool) -> Result<RequestHeal
         );
     }
 
-    let opencode_db = home
-        .join(".local")
-        .join("share")
-        .join("opencode")
-        .join("opencode.db");
+    let opencode_db = crate::token_collector::opencode_db_path(&home);
     if opencode_db.is_file() {
         let cursor = envelope
             .sqlite_cursors
@@ -2500,11 +3108,7 @@ pub(crate) fn collect_request_health_snapshot(force: bool) -> Result<RequestHeal
         );
     }
 
-    let mimo_db = home
-        .join(".local")
-        .join("share")
-        .join("mimocode")
-        .join("mimocode.db");
+    let mimo_db = crate::token_collector::mimo_db_path(&home);
     if mimo_db.is_file() {
         let allow = HashSet::from(["mimo", "xiaomi"]);
         let cursor = envelope
@@ -2521,7 +3125,7 @@ pub(crate) fn collect_request_health_snapshot(force: bool) -> Result<RequestHeal
         );
     }
 
-    let zcode_db = home.join(".zcode").join("cli").join("db").join("db.sqlite");
+    let zcode_db = crate::token_collector::zcode_db_path(&home);
     if zcode_db.is_file() {
         let cursor = envelope
             .sqlite_cursors
@@ -2556,11 +3160,18 @@ pub(crate) fn collect_request_health_snapshot(force: bool) -> Result<RequestHeal
 
     let dsh_root = home.join(".dsh").join("sessions");
     if dsh_root.is_dir() {
-        let cursors = envelope
-            .file_cursors
-            .entry("dsh".to_string())
-            .or_default();
+        let cursors = envelope.file_cursors.entry("dsh".to_string()).or_default();
         collect_dsh_activity_incremental(&dsh_root, &mut map, &mut sources, cursors);
+    }
+
+    // CatPawAI：与 Token 用量桶同口径（user_prompt=对话，带 usage=请求），
+    // 使 KPI「对话数」的 health 口径覆盖该来源，与工具表对齐。
+    {
+        let cursor = envelope
+            .sqlite_cursors
+            .entry("catpawai".to_string())
+            .or_default();
+        collect_catpawai_activity_incremental(&mut map, &mut sources, cursor);
     }
 
     let report = maps_to_report(map, sources);
@@ -2686,6 +3297,35 @@ pub async fn get_token_request_health(
 
 const TOKEN_COLLECT_INTERVAL: Duration = Duration::from_secs(20);
 
+/// 读取本地完整时间戳（macOS/Linux 用 /bin/date；失败时退回 UTC 近似，保证日志不中断）。
+fn local_timestamp() -> String {
+    if let Ok(output) = std::process::Command::new("/bin/date")
+        .arg("+%Y-%m-%d %H:%M:%S")
+        .output()
+    {
+        if output.status.success() {
+            let text = String::from_utf8_lossy(&output.stdout);
+            let value = text.trim();
+            if !value.is_empty() {
+                return value.to_string();
+            }
+        }
+    }
+    // fallback: UTC
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    let days = secs / 86_400;
+    let tod = secs % 86_400;
+    format!(
+        "1970-01-01 {:02}:{:02}:{:02} UTC+{days}d",
+        tod / 3600,
+        (tod % 3600) / 60,
+        tod % 60
+    )
+}
+
 /// 后台采集任务：只负责增量扫描并原子写入 SQLite，不直接驱动页面状态。
 pub(crate) fn start_token_collector(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
@@ -2703,11 +3343,21 @@ pub(crate) fn start_token_collector(app: AppHandle) {
             match result {
                 Ok(Ok(report)) => {
                     if report.changed {
-                        eprintln!("[OpenHub] Token 后台采集完成：{}", report.message);
+                        eprintln!(
+                            "[OpenHub] {} Token 后台采集完成：{}",
+                            local_timestamp(),
+                            report.message
+                        );
                     }
                 }
-                Ok(Err(error)) => eprintln!("[OpenHub] Token 后台采集失败：{error}"),
-                Err(error) => eprintln!("[OpenHub] Token 后台任务异常：{error}"),
+                Ok(Err(error)) => eprintln!(
+                    "[OpenHub] {} Token 后台采集失败：{error}",
+                    local_timestamp()
+                ),
+                Err(error) => eprintln!(
+                    "[OpenHub] {} Token 后台任务异常：{error}",
+                    local_timestamp()
+                ),
             }
         }
     });
@@ -2728,22 +3378,43 @@ mod activity_tests {
             hour_key_from_ts("2026-08-06T04:59:44Z").as_deref(),
             Some("2026-08-06T04:00:00.000Z")
         );
+        // +08:00 的本地时间 04:59 实际是 UTC 前一天 20:59
         assert_eq!(
             hour_key_from_ts("2026-08-06T04:59:44+08:00").as_deref(),
-            Some("2026-08-06T04:00:00.000Z")
+            Some("2026-08-05T20:00:00.000Z")
+        );
+        assert_eq!(
+            hour_key_from_ts("2026-08-06T04:59:44+0800").as_deref(),
+            Some("2026-08-05T20:00:00.000Z")
+        );
+        assert_eq!(
+            hour_key_from_ts("2026-08-06T23:59:44-05:00").as_deref(),
+            Some("2026-08-07T04:00:00.000Z")
         );
     }
 
     #[test]
-    fn claude_user_is_human_filters_tool_result() {
+    fn claude_user_is_human_filters_non_user_input() {
         let tool_only = json!([{"type": "tool_result", "content": "ok"}]);
-        assert!(!claude_user_is_human(&tool_only));
+        assert!(!token_collector::claude_user_is_human(&tool_only));
 
         let text = json!([{"type": "text", "text": "hello"}]);
-        assert!(claude_user_is_human(&text));
+        assert!(token_collector::claude_user_is_human(&text));
 
         let plain = json!("hello");
-        assert!(claude_user_is_human(&plain));
+        assert!(token_collector::claude_user_is_human(&plain));
+
+        // Esc 中断不算对话轮
+        let interrupted =
+            json!([{"type": "text", "text": "[Request interrupted by user for tool use]"}]);
+        assert!(!token_collector::claude_user_is_human(&interrupted));
+
+        // 斜杠命令输出回显不算；命令本身算
+        let stdout =
+            json!([{"type": "text", "text": "<local-command-stdout>ok</local-command-stdout>"}]);
+        assert!(!token_collector::claude_user_is_human(&stdout));
+        let cmd = json!("<command-name>/compact</command-name>");
+        assert!(token_collector::claude_user_is_human(&cmd));
     }
 
     #[test]
@@ -2755,15 +3426,214 @@ mod activity_tests {
     }
 
     #[test]
+    fn claude_on_line_skips_sidechain_transcripts() {
+        let mut map = BTreeMap::new();
+        let mut sources = BTreeMap::new();
+        let mut last_user_hour = None;
+        let mut counted = HashSet::new();
+        // 子代理消息标记 isSidechain，不应计为主对话
+        claude_on_line(
+            &json!({
+                "type": "user",
+                "timestamp": "2026-08-06T04:00:00.000Z",
+                "isSidechain": true,
+                "message": {"role": "user", "content": "subagent prompt"}
+            }),
+            &mut map,
+            &mut sources,
+            &mut last_user_hour,
+            &mut counted,
+        );
+        assert_eq!(map.values().map(|a| a.dialogues).sum::<i64>(), 0);
+        // 正常用户输入仍计 1 轮
+        claude_on_line(
+            &json!({
+                "type": "user",
+                "timestamp": "2026-08-06T04:00:00.000Z",
+                "message": {"role": "user", "content": "hello"}
+            }),
+            &mut map,
+            &mut sources,
+            &mut last_user_hour,
+            &mut counted,
+        );
+        assert_eq!(map.values().map(|a| a.dialogues).sum::<i64>(), 1);
+    }
+
+    #[test]
+    fn claude_sidechain_requests_counted_but_not_dialogues() {
+        let mut map = BTreeMap::new();
+        let mut sources = BTreeMap::new();
+        let mut last_user_hour = None;
+        let mut counted = HashSet::new();
+        // 真人输入开 1 轮
+        claude_on_line(
+            &json!({
+                "type": "user",
+                "timestamp": "2026-08-06T04:00:00.000Z",
+                "message": {"role": "user", "content": "hello"}
+            }),
+            &mut map,
+            &mut sources,
+            &mut last_user_hour,
+            &mut counted,
+        );
+        // 子代理的 assistant 响应 = 真实 API 请求，计入请求数
+        claude_on_line(
+            &json!({
+                "type": "assistant",
+                "timestamp": "2026-08-06T04:05:00.000Z",
+                "isSidechain": true,
+                "message": {"id": "chatcmpl-side-1", "usage": {"input_tokens": 100, "output_tokens": 50}}
+            }),
+            &mut map,
+            &mut sources,
+            &mut last_user_hour,
+            &mut counted,
+        );
+        let hour = map.get("2026-08-06T04:00:00.000Z").expect("bucket exists");
+        assert_eq!(hour.dialogues, 1);
+        assert_eq!(hour.requests, 1);
+    }
+
+    #[test]
+    fn claude_dedupes_same_message_id_lines() {
+        let mut map = BTreeMap::new();
+        let mut sources = BTreeMap::new();
+        let mut last_user_hour = None;
+        let mut counted = HashSet::new();
+        let line = json!({
+            "type": "assistant",
+            "timestamp": "2026-08-06T04:00:00.000Z",
+            "message": {"id": "chatcmpl-dup", "usage": {"input_tokens": 100, "output_tokens": 50}}
+        });
+        claude_on_line(
+            &line,
+            &mut map,
+            &mut sources,
+            &mut last_user_hour,
+            &mut counted,
+        );
+        // 同一 message.id 的第二个内容块行（usage 相同）不应重复计数
+        claude_on_line(
+            &line,
+            &mut map,
+            &mut sources,
+            &mut last_user_hour,
+            &mut counted,
+        );
+        let hour = map.get("2026-08-06T04:00:00.000Z").expect("bucket exists");
+        assert_eq!(hour.requests, 1);
+    }
+
+    #[test]
+    fn claude_origin_kind_filters_non_human() {
+        let mut map = BTreeMap::new();
+        let mut sources = BTreeMap::new();
+        let mut last_user_hour = None;
+        let mut counted = HashSet::new();
+        // origin.kind = task-notification 的 user 行不算对话轮
+        claude_on_line(
+            &json!({
+                "type": "user",
+                "timestamp": "2026-08-06T04:00:00.000Z",
+                "origin": {"kind": "task-notification"},
+                "message": {"role": "user", "content": "background task done"}
+            }),
+            &mut map,
+            &mut sources,
+            &mut last_user_hour,
+            &mut counted,
+        );
+        assert_eq!(map.values().map(|a| a.dialogues).sum::<i64>(), 0);
+        // origin.kind = human 计 1 轮
+        claude_on_line(
+            &json!({
+                "type": "user",
+                "timestamp": "2026-08-06T04:00:00.000Z",
+                "origin": {"kind": "human"},
+                "message": {"role": "user", "content": "hello"}
+            }),
+            &mut map,
+            &mut sources,
+            &mut last_user_hour,
+            &mut counted,
+        );
+        assert_eq!(map.values().map(|a| a.dialogues).sum::<i64>(), 1);
+    }
+
+    #[test]
+    fn claude_request_anchors_to_last_user_hour() {
+        let mut map = BTreeMap::new();
+        let mut sources = BTreeMap::new();
+        let mut last_user_hour = None;
+        let mut counted = HashSet::new();
+        // 用户在 04:xx 输入，assistant 在 05:xx 才返回 → 请求应记到 04:00
+        claude_on_line(
+            &json!({
+                "type": "user",
+                "timestamp": "2026-08-06T04:10:00.000Z",
+                "message": {"role": "user", "content": "hello"}
+            }),
+            &mut map,
+            &mut sources,
+            &mut last_user_hour,
+            &mut counted,
+        );
+        claude_on_line(
+            &json!({
+                "type": "assistant",
+                "timestamp": "2026-08-06T05:20:00.000Z",
+                "message": {"usage": {"input_tokens": 10, "output_tokens": 20}}
+            }),
+            &mut map,
+            &mut sources,
+            &mut last_user_hour,
+            &mut counted,
+        );
+        let hour04 = map
+            .get("2026-08-06T04:00:00.000Z")
+            .expect("request anchored to 04:00");
+        assert_eq!(hour04.dialogues, 1);
+        assert_eq!(hour04.requests, 1);
+        assert!(!map.contains_key("2026-08-06T05:00:00.000Z"));
+    }
+
+    #[test]
     fn dsh_activity_counts_user_and_assistant_messages() {
         let mut map = BTreeMap::new();
         let mut sources = BTreeMap::new();
+        let mut last_user_hour = None;
 
         // 用户消息 = 1 对话
         dsh_on_line(
             &json!({"type": "user/message", "time": 1786687444127u64}),
             &mut map,
             &mut sources,
+            &mut last_user_hour,
+        );
+        // 带 source.kind 的真实用户输入 = 1 对话
+        dsh_on_line(
+            &json!({"type": "user/message", "time": 1786687445000u64,
+                    "data": {"source": {"kind": "user"}}}),
+            &mut map,
+            &mut sources,
+            &mut last_user_hour,
+        );
+        // 注入消息（runtime context / skill 目录 / 插件通知）不算对话
+        dsh_on_line(
+            &json!({"type": "user/message", "time": 1786687446000u64,
+                    "data": {"source": {"kind": "plugin"}, "content": [{"type": "text", "text": "background job bash-1 finished"}]}}),
+            &mut map,
+            &mut sources,
+            &mut last_user_hour,
+        );
+        dsh_on_line(
+            &json!({"type": "user/message", "time": 1786687447000u64,
+                    "data": {"content": [{"type": "text", "text": "<system-reminder>…"}]}}),
+            &mut map,
+            &mut sources,
+            &mut last_user_hour,
         );
         // 带 usage 的 assistant = 1 请求 + 1 成功
         dsh_on_line(
@@ -2774,25 +3644,28 @@ mod activity_tests {
             }),
             &mut map,
             &mut sources,
+            &mut last_user_hour,
         );
         // 无 usage 的 assistant 不计请求
         dsh_on_line(
             &json!({"type": "assistant/message", "time": 1786687449831u64, "data": {}}),
             &mut map,
             &mut sources,
+            &mut last_user_hour,
         );
         // 无关事件忽略
         dsh_on_line(
             &json!({"type": "tool/call", "time": 1786687449831u64}),
             &mut map,
             &mut sources,
+            &mut last_user_hour,
         );
 
-        assert_eq!(map.values().map(|a| a.dialogues).sum::<i64>(), 1);
+        assert_eq!(map.values().map(|a| a.dialogues).sum::<i64>(), 2);
         assert_eq!(map.values().map(|a| a.requests).sum::<i64>(), 1);
         assert_eq!(map.values().map(|a| a.success).sum::<i64>(), 1);
         let dsh = sources.get("dsh").expect("dsh source should exist");
-        assert_eq!(dsh.dialogues, 1);
+        assert_eq!(dsh.dialogues, 2);
         assert_eq!(dsh.requests, 1);
     }
 

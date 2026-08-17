@@ -616,6 +616,35 @@ pub fn toggle_pending(database: State<'_, Database>, id: String) -> Result<SiteR
 }
 
 #[tauri::command]
+pub fn set_usage_state(
+    database: State<'_, Database>,
+    id: String,
+    state: String,
+) -> Result<SiteRecord, String> {
+    let (is_personal, is_pending) = match state.as_str() {
+        "personal" => (true, false),
+        "pending" => (false, true),
+        "unused" => (false, false),
+        _ => return Err("未知的使用状态".into()),
+    };
+    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    let changed = connection
+        .execute(
+            &format!(
+                "UPDATE directory_sites
+                 SET is_personal = ?1, is_pending = ?2, favorite = 0, updated_at = {NOW_SQL}
+                 WHERE id = ?3"
+            ),
+            params![is_personal, is_pending, id],
+        )
+        .map_err(|error| error.to_string())?;
+    if changed == 0 {
+        return Err("找不到该站点".into());
+    }
+    read_site(&connection, &id)?.ok_or_else(|| "读取站点失败".into())
+}
+
+#[tauri::command]
 pub fn toggle_hidden(database: State<'_, Database>, id: String) -> Result<SiteRecord, String> {
     let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
     let changed = connection

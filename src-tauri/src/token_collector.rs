@@ -11,7 +11,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
-const CACHE_VERSION: i64 = 9;
+// v11：Claude 子代理（sidechain/subagents 目录）请求与 Token 开始计入；
+// 对话轮改用 origin.kind 判定真人输入；usage 桶新增 request_count。
+const CACHE_VERSION: i64 = 11;
 const CACHE_TTL: Duration = Duration::from_secs(5);
 const UNKNOWN_CODEX_MODEL: &str = "codex-unknown-model";
 const UNKNOWN_CLAUDE_MODEL: &str = "claude-unknown-model";
@@ -591,8 +593,17 @@ fn basename_or_fallback(path: &str, fallback: &str) -> String {
 }
 
 fn claude_project_from_path(path: &Path) -> String {
-    let raw = path
-        .parent()
+    // 子代理文件位于 <项目>/<会话>/subagents/ 下，项目目录要再往上一层。
+    let mut parent = path.parent();
+    while parent
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .map(|name| name == "subagents")
+        .unwrap_or(false)
+    {
+        parent = parent.and_then(Path::parent);
+    }
+    let raw = parent
         .and_then(Path::file_name)
         .and_then(|name| name.to_str())
         .unwrap_or("")
@@ -658,10 +669,79 @@ fn half_hour_key(timestamp: &str) -> Option<String> {
         return None;
     }
     let minute = value.get(14..16)?.parse::<u32>().ok()?;
+    let offset_secs = tz_offset_secs(value);
+    if offset_secs == 0 {
+        return Some(format!(
+            "{prefix}:{:02}:00.000Z",
+            if minute < 30 { 0 } else { 30 }
+        ));
+    }
+    // 带时区偏移的时间戳（如 +08:00）：先归一到 UTC 再取半小时桶，
+    // 否则本地时间会被当成 UTC，桶位错开数小时。
+    let year: i64 = value.get(0..4)?.parse().ok()?;
+    let month: i64 = value.get(5..7)?.parse().ok()?;
+    let day: i64 = value.get(8..10)?.parse().ok()?;
+    let hour: i64 = value.get(11..13)?.parse().ok()?;
+    let days = days_from_civil(year, month, day);
+    let utc_secs = days * 86_400 + hour * 3_600 + i64::from(minute) * 60 - offset_secs;
+    let tod = utc_secs.rem_euclid(86_400);
+    let (y, m, d) = civil_from_days(utc_secs.div_euclid(86_400));
     Some(format!(
-        "{prefix}:{:02}:00.000Z",
-        if minute < 30 { 0 } else { 30 }
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:00.000Z",
+        tod / 3_600,
+        if (tod % 3_600) / 60 < 30 { 0 } else { 30 }
     ))
+}
+
+/// 解析 ISO 时间戳的时区偏移（秒）：
+/// `Z` → 0；`+08:00` / `+0800` / `+08` → 28800；`-05:00` → -18000；
+/// 没有时区标记时按 0（UTC）处理，与旧口径保持一致。
+pub(crate) fn tz_offset_secs(ts: &str) -> i64 {
+    let Some(t_index) = ts.find('T') else {
+        return 0;
+    };
+    let Some(zone_start) = ts[t_index..]
+        .find(['Z', 'z', '+', '-'])
+        .map(|i| t_index + i)
+    else {
+        return 0;
+    };
+    match ts.as_bytes()[zone_start] {
+        b'Z' | b'z' => 0,
+        sign => {
+            let positive = sign != b'-';
+            let digits: String = ts[zone_start + 1..]
+                .chars()
+                .filter(|ch| ch.is_ascii_digit())
+                .collect();
+            let (hours, minutes) = match digits.len() {
+                4 => (
+                    digits[0..2].parse::<i64>().unwrap_or(0),
+                    digits[2..4].parse::<i64>().unwrap_or(0),
+                ),
+                2 => (digits[0..2].parse::<i64>().unwrap_or(0), 0),
+                1 => (digits[0..1].parse::<i64>().unwrap_or(0), 0),
+                _ => (0, 0),
+            };
+            let magnitude = hours * 3_600 + minutes * 60;
+            if positive {
+                magnitude
+            } else {
+                -magnitude
+            }
+        }
+    }
+}
+
+/// Howard Hinnant days_from_civil（civil_from_days 的逆函数）：年月日 → UTC 天数。
+pub(crate) fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let yoe = year - era * 400;
+    let month_shifted = if month > 2 { month - 3 } else { month + 9 };
+    let doy = (153 * month_shifted + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
 }
 
 fn civil_from_days(days: i64) -> (i32, u32, u32) {
@@ -746,16 +826,53 @@ fn token_session(
     }
 }
 
-fn claude_user_is_human(content: &JsonValue) -> bool {
+/// Claude Code 的 user 消息里混着非用户输入：tool_result（工具结果）、
+/// <local-command-stdout>（斜杠命令输出回显）、[Request interrupted by user...]（Esc 中断）。
+/// 这些算成对话轮会让对话数虚高；<command-name> 斜杠命令本身是用户操作，保留。
+pub(crate) fn claude_user_is_human(content: &JsonValue) -> bool {
+    fn human_text(text: &str) -> bool {
+        let trimmed = text.trim();
+        !trimmed.is_empty()
+            && !trimmed.starts_with("[Request interrupted")
+            && !trimmed.starts_with("<local-command-stdout>")
+            && !trimmed.starts_with("<command-stdout>")
+    }
     match content {
-        JsonValue::String(text) => !text.trim().is_empty(),
-        JsonValue::Array(items) => items.iter().any(|item| {
-            matches!(
-                item.get("type").and_then(JsonValue::as_str),
-                Some("text") | Some("image")
-            ) || item.get("text").and_then(JsonValue::as_str).is_some()
-        }),
+        JsonValue::String(text) => human_text(text),
+        JsonValue::Array(items) => {
+            // tool_result 与文本混在同一条消息（个别版本在结果后注入 reminder），
+            // 不是新一轮用户输入，整体不算。
+            if items
+                .iter()
+                .any(|item| item.get("type").and_then(JsonValue::as_str) == Some("tool_result"))
+            {
+                return false;
+            }
+            items.iter().any(|item| {
+                if let Some(text) = item.get("text").and_then(JsonValue::as_str) {
+                    return human_text(text);
+                }
+                matches!(item.get("type").and_then(JsonValue::as_str), Some("image"))
+            })
+        }
         _ => false,
+    }
+}
+
+/// 判定一行 Claude user 消息是否真人输入（开启新对话轮）。
+/// 新版日志带 origin.kind（实测取值 human / task-notification 等），
+/// 有该字段时以其为准；旧版本缺失时回退到内容启发式 claude_user_is_human。
+pub(crate) fn claude_user_line_is_human(value: &JsonValue, content: &JsonValue) -> bool {
+    if !claude_user_is_human(content) {
+        return false;
+    }
+    match value
+        .get("origin")
+        .and_then(|origin| origin.get("kind"))
+        .and_then(JsonValue::as_str)
+    {
+        Some(kind) => kind == "human",
+        None => true,
     }
 }
 
@@ -781,6 +898,44 @@ pub(crate) fn codex_user_message_is_human(payload: &JsonValue) -> bool {
     false
 }
 
+/// DSH 的 user/message 里混着大量非用户输入：runtime context 快照、skill 目录、
+/// 插件后台任务通知等（source.kind 为 plugin / skill-catalog 等）。
+/// 只有 source.kind == "user" 才是真实用户输入；旧版本没有 source.kind 时按注入文本前缀兜底。
+pub(crate) fn dsh_user_is_human(payload: &JsonValue) -> bool {
+    let data = payload.get("data").unwrap_or(&JsonValue::Null);
+    let kind = data
+        .get("source")
+        .or_else(|| payload.get("source"))
+        .and_then(|source| source.get("kind"))
+        .and_then(JsonValue::as_str)
+        .unwrap_or("");
+    if !kind.is_empty() {
+        return kind == "user";
+    }
+    let content = data
+        .get("content")
+        .or_else(|| payload.get("content"))
+        .unwrap_or(&JsonValue::Null);
+    let text = dsh_content_text(content);
+    let trimmed = text.trim_start();
+    !(trimmed.starts_with("<system-reminder>")
+        || trimmed.starts_with("Current runtime context")
+        || trimmed.starts_with("[Request")
+        || trimmed.starts_with("<environment"))
+}
+
+fn dsh_content_text(content: &JsonValue) -> String {
+    match content {
+        JsonValue::String(text) => text.clone(),
+        JsonValue::Array(items) => items
+            .iter()
+            .filter_map(|item| item.get("text").and_then(JsonValue::as_str))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
 fn parse_claude_file(path: &Path) -> CachedFile {
     let Ok(text) = fs::read_to_string(path) else {
         return CachedFile {
@@ -795,30 +950,41 @@ fn parse_claude_file(path: &Path) -> CachedFile {
         .to_string();
     let mut session_id = fallback_id.clone();
     let mut project_key = claude_project_from_path(path);
+    // 新版 Claude 把子代理会话放在 <会话>/subagents/*.jsonl，文件里的 sessionId 是
+    // 父会话 id，直接沿用会与主会话撞 id，因此子代理文件的会话 id 单独合成。
+    let is_subagent_file = path
+        .components()
+        .any(|component| component.as_os_str() == "subagents");
     let mut model = String::new();
     let mut first_ts = String::new();
     let mut last_ts = String::new();
     let mut user_events: BTreeMap<String, String> = BTreeMap::new();
     let mut usage_events: BTreeMap<String, UsageEvent> = BTreeMap::new();
+    // 请求的时间锚定到「本轮 user 请求」：assistant 的用量事件挂在最近一次用户输入上，
+    // 让对话轮数与请求/token 落到同一个时间桶（避免长回合跨小时时出现“有 token 无轮数”）。
+    let mut last_user_ts = String::new();
+    // 对话轮要归属到「本轮实际响应的模型」，而不是会话最终模型——会话中途切换模型时，
+    // 否则轮数会被统一挂到最后一个模型上，导致按模型看“有 token 的模型对话数=0”。
+    let mut user_models: BTreeMap<String, String> = BTreeMap::new();
+    let mut pending_user_ids: Vec<String> = Vec::new();
 
     for (index, line) in text.lines().enumerate() {
         let Ok(value) = serde_json::from_str::<JsonValue>(line) else {
             continue;
         };
-        if value
+        let is_sidechain = value
             .get("isSidechain")
             .and_then(JsonValue::as_bool)
-            .unwrap_or(false)
-        {
-            continue;
-        }
-        if let Some(value) = value
-            .get("sessionId")
-            .or_else(|| value.get("session_id"))
-            .and_then(JsonValue::as_str)
-            .filter(|value| !value.trim().is_empty())
-        {
-            session_id = value.to_string();
+            .unwrap_or(false);
+        if !is_sidechain {
+            if let Some(value) = value
+                .get("sessionId")
+                .or_else(|| value.get("session_id"))
+                .and_then(JsonValue::as_str)
+                .filter(|value| !value.trim().is_empty())
+            {
+                session_id = value.to_string();
+            }
         }
         if let Some(cwd) = value
             .get("cwd")
@@ -839,20 +1005,27 @@ fn parse_claude_file(path: &Path) -> CachedFile {
         update_bounds(&mut first_ts, &mut last_ts, &timestamp);
 
         if kind == "user" {
+            // 子代理的任务 prompt（sidechain user）不是真人对话轮，跳过；
+            // 它触发的请求由下方 assistant 分支正常计入，归属当前对话。
+            if is_sidechain {
+                continue;
+            }
             let content = value
                 .get("message")
                 .and_then(|message| message.get("content"))
                 .unwrap_or(&JsonValue::Null);
-            if !claude_user_is_human(content) {
+            if !claude_user_line_is_human(&value, content) {
                 continue;
             }
+            last_user_ts = timestamp.clone();
             let id = value
                 .get("uuid")
                 .and_then(JsonValue::as_str)
                 .filter(|value| !value.is_empty())
                 .map(str::to_string)
                 .unwrap_or_else(|| format!("{session_id}:user:{index}"));
-            user_events.entry(id).or_insert(timestamp);
+            user_events.entry(id.clone()).or_insert(timestamp);
+            pending_user_ids.push(id);
             continue;
         }
 
@@ -889,6 +1062,15 @@ fn parse_claude_file(path: &Path) -> CachedFile {
         if total <= 0 || timestamp.is_empty() {
             continue;
         }
+        // 本轮第一个带用量的 assistant 请求决定这一轮 user 事件归属的模型。
+        let turn_model = if message_model.is_empty() {
+            UNKNOWN_CLAUDE_MODEL.to_string()
+        } else {
+            message_model.to_string()
+        };
+        for pending_id in pending_user_ids.drain(..) {
+            user_models.entry(pending_id).or_insert(turn_model.clone());
+        }
         let message_id = message
             .get("id")
             .and_then(JsonValue::as_str)
@@ -915,7 +1097,11 @@ fn parse_claude_file(path: &Path) -> CachedFile {
                 message_model.to_string()
             },
             project_key: project_key.clone(),
-            timestamp,
+            timestamp: if last_user_ts.is_empty() {
+                timestamp
+            } else {
+                last_user_ts.clone()
+            },
             input_tokens: input,
             cached_input_tokens: cached,
             cache_creation_input_tokens: cache_creation,
@@ -940,14 +1126,19 @@ fn parse_claude_file(path: &Path) -> CachedFile {
         model = UNKNOWN_CLAUDE_MODEL.to_string();
     }
     let mut events = usage_events.into_values().collect::<Vec<_>>();
-    events.extend(user_events.into_iter().map(|(id, timestamp)| UsageEvent {
-        id: format!("u:{id}"),
-        source: "claude".to_string(),
-        model: model.clone(),
-        project_key: project_key.clone(),
-        timestamp,
-        conversation_count: 1,
-        ..Default::default()
+    events.extend(user_events.into_iter().map(|(id, timestamp)| {
+        UsageEvent {
+            id: format!("u:{id}"),
+            source: "claude".to_string(),
+            model: user_models
+                .get(&id)
+                .cloned()
+                .unwrap_or_else(|| model.clone()),
+            project_key: project_key.clone(),
+            timestamp,
+            conversation_count: 1,
+            ..Default::default()
+        }
     }));
     let tokens = events
         .iter()
@@ -962,7 +1153,11 @@ fn parse_claude_file(path: &Path) -> CachedFile {
         });
     let turns = events.iter().map(|event| event.conversation_count).sum();
     let session = token_session(
-        session_id,
+        if is_subagent_file {
+            format!("{session_id}:agent:{fallback_id}")
+        } else {
+            session_id
+        },
         "claude",
         project_key,
         model,
@@ -1965,14 +2160,27 @@ impl CodexUsageState {
 fn parse_dsh_file(path: &Path) -> CachedFile {
     let fp = fingerprint(path);
     let Ok(raw) = fs::read(path) else {
-        return CachedFile { fingerprint: fp, ..Default::default() };
+        return CachedFile {
+            fingerprint: fp,
+            ..Default::default()
+        };
     };
     let text = match zstd::decode_all(raw.as_slice()) {
         Ok(bytes) => match String::from_utf8(bytes) {
             Ok(s) => s,
-            Err(_) => return CachedFile { fingerprint: fp, ..Default::default() },
+            Err(_) => {
+                return CachedFile {
+                    fingerprint: fp,
+                    ..Default::default()
+                }
+            }
         },
-        Err(_) => return CachedFile { fingerprint: fp, ..Default::default() },
+        Err(_) => {
+            return CachedFile {
+                fingerprint: fp,
+                ..Default::default()
+            }
+        }
     };
 
     let mut session_id = String::new();
@@ -1982,18 +2190,33 @@ fn parse_dsh_file(path: &Path) -> CachedFile {
     let mut last_ts = String::new();
     let mut user_events: BTreeMap<String, String> = BTreeMap::new();
     let mut usage_events: BTreeMap<String, UsageEvent> = BTreeMap::new();
+    // 请求的时间锚定到「本轮 user 请求」，与 Claude 解析器同口径。
+    let mut last_user_ts = String::new();
+    // 对话轮归属到本轮实际响应的模型，而非会话最终模型（与 Claude 解析器同口径）。
+    let mut user_models: BTreeMap<String, String> = BTreeMap::new();
+    let mut pending_user_ids: Vec<String> = Vec::new();
 
     for (index, line) in text.lines().enumerate() {
-        let Ok(value) = serde_json::from_str::<JsonValue>(line) else { continue };
+        let Ok(value) = serde_json::from_str::<JsonValue>(line) else {
+            continue;
+        };
         let kind = value.get("type").and_then(JsonValue::as_str).unwrap_or("");
         let time_ms = value.get("time").and_then(JsonValue::as_i64).unwrap_or(0);
         let timestamp = iso_from_millis(time_ms);
 
         if kind == "session" {
-            if let Some(id) = value.get("id").and_then(JsonValue::as_str).filter(|v| !v.is_empty()) {
+            if let Some(id) = value
+                .get("id")
+                .and_then(JsonValue::as_str)
+                .filter(|v| !v.is_empty())
+            {
                 session_id = id.to_string();
             }
-            if let Some(cwd) = value.get("cwd").and_then(JsonValue::as_str).filter(|v| !v.is_empty()) {
+            if let Some(cwd) = value
+                .get("cwd")
+                .and_then(JsonValue::as_str)
+                .filter(|v| !v.is_empty())
+            {
                 project_key = basename_or_fallback(cwd, &project_key);
             }
             if !timestamp.is_empty() {
@@ -2005,8 +2228,13 @@ fn parse_dsh_file(path: &Path) -> CachedFile {
         if kind == "user/message" {
             if !timestamp.is_empty() {
                 update_bounds(&mut first_ts, &mut last_ts, &timestamp);
+            }
+            // 只有真实用户输入算对话轮；runtime context / skill 目录等注入不算。
+            if dsh_user_is_human(&value) {
+                last_user_ts = timestamp.clone();
                 let id = format!("dsh:user:{index}");
-                user_events.entry(id).or_insert(timestamp);
+                user_events.entry(id.clone()).or_insert(timestamp);
+                pending_user_ids.push(id);
             }
             continue;
         }
@@ -2017,17 +2245,39 @@ fn parse_dsh_file(path: &Path) -> CachedFile {
                 update_bounds(&mut first_ts, &mut last_ts, &timestamp);
             }
             let msg = data.get("message").unwrap_or(&JsonValue::Null);
-            if let Some(m) = msg.get("source").and_then(|s| s.get("model")).and_then(JsonValue::as_str).filter(|v| !v.is_empty()) {
+            if let Some(m) = msg
+                .get("source")
+                .and_then(|s| s.get("model"))
+                .and_then(JsonValue::as_str)
+                .filter(|v| !v.is_empty())
+            {
                 model = m.to_string();
             }
             // 优先从 data.usage 取（最终汇总）
             if let Some(usage) = data.get("usage").filter(|u| u.is_object()) {
-                let event = dsh_usage_event(usage, &session_id, &project_key, &model, &timestamp, index);
+                // 本轮第一个带用量的 assistant 请求决定这一轮 user 事件归属的模型。
+                for pending_id in pending_user_ids.drain(..) {
+                    user_models
+                        .entry(pending_id)
+                        .or_insert_with(|| model.clone());
+                }
+                let anchor_ts = if last_user_ts.is_empty() {
+                    timestamp.clone()
+                } else {
+                    last_user_ts.clone()
+                };
+                let event =
+                    dsh_usage_event(usage, &session_id, &project_key, &model, &anchor_ts, index);
                 if let Some(ev) = event {
                     let msg_id = ev.id.clone();
                     let total = ev.total_tokens;
-                    let should_replace = usage_events.get(&msg_id).map(|ex| total > ex.total_tokens).unwrap_or(true);
-                    if should_replace { usage_events.insert(msg_id, ev); }
+                    let should_replace = usage_events
+                        .get(&msg_id)
+                        .map(|ex| total > ex.total_tokens)
+                        .unwrap_or(true);
+                    if should_replace {
+                        usage_events.insert(msg_id, ev);
+                    }
                 }
             }
             continue;
@@ -2039,13 +2289,26 @@ fn parse_dsh_file(path: &Path) -> CachedFile {
                 update_bounds(&mut first_ts, &mut last_ts, &timestamp);
             }
             // 从 chunk.usage 取增量 usage 作为 fallback（仅当没有 assistant/message 的汇总时）
-            if let Some(usage) = data.get("chunk").and_then(|c| c.get("usage")).filter(|u| u.is_object()) {
+            if let Some(usage) = data
+                .get("chunk")
+                .and_then(|c| c.get("usage"))
+                .filter(|u| u.is_object())
+            {
                 let turn = data.get("turn").and_then(JsonValue::as_i64).unwrap_or(0);
                 let step = data.get("step").and_then(JsonValue::as_i64).unwrap_or(0);
-                let event = dsh_usage_event(usage, &session_id, &project_key, &model, &timestamp, index);
+                let anchor_ts = if last_user_ts.is_empty() {
+                    timestamp.clone()
+                } else {
+                    last_user_ts.clone()
+                };
+                let event =
+                    dsh_usage_event(usage, &session_id, &project_key, &model, &anchor_ts, index);
                 if let Some(ev) = event {
                     let chunk_id = format!("{}:chunk:{}:{}", ev.id, turn, step);
-                    let should_replace = usage_events.get(&chunk_id).map(|ex| ev.total_tokens > ex.total_tokens).unwrap_or(true);
+                    let should_replace = usage_events
+                        .get(&chunk_id)
+                        .map(|ex| ev.total_tokens > ex.total_tokens)
+                        .unwrap_or(true);
                     if should_replace {
                         usage_events.insert(chunk_id.clone(), UsageEvent { id: chunk_id, ..ev });
                     }
@@ -2056,7 +2319,12 @@ fn parse_dsh_file(path: &Path) -> CachedFile {
     }
 
     if session_id.is_empty() {
-        session_id = path.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()).unwrap_or("dsh-session").to_string();
+        session_id = path
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .unwrap_or("dsh-session")
+            .to_string();
     }
     if project_key.is_empty() {
         project_key = "DSH".to_string();
@@ -2074,31 +2342,59 @@ fn parse_dsh_file(path: &Path) -> CachedFile {
     }
 
     let mut events = usage_events.into_values().collect::<Vec<_>>();
-    events.extend(user_events.into_iter().map(|(id, timestamp)| UsageEvent {
-        id,
-        source: "dsh".to_string(),
-        model: model.clone(),
-        project_key: project_key.clone(),
-        timestamp,
-        conversation_count: 1,
-        ..Default::default()
+    events.extend(user_events.into_iter().map(|(id, timestamp)| {
+        UsageEvent {
+            id: id.clone(),
+            source: "dsh".to_string(),
+            model: user_models
+                .get(&id)
+                .cloned()
+                .unwrap_or_else(|| model.clone()),
+            project_key: project_key.clone(),
+            timestamp,
+            conversation_count: 1,
+            ..Default::default()
+        }
     }));
 
-    let tokens = events.iter().fold(TokenSessionTokens::default(), |mut total, event| {
-        total.input_tokens += event.input_tokens;
-        total.cached_input_tokens += event.cached_input_tokens;
-        total.cache_creation_input_tokens += event.cache_creation_input_tokens;
-        total.output_tokens += event.output_tokens;
-        total.reasoning_output_tokens += event.reasoning_output_tokens;
-        total.total_tokens += event.total_tokens;
-        total
-    });
+    let tokens = events
+        .iter()
+        .fold(TokenSessionTokens::default(), |mut total, event| {
+            total.input_tokens += event.input_tokens;
+            total.cached_input_tokens += event.cached_input_tokens;
+            total.cache_creation_input_tokens += event.cache_creation_input_tokens;
+            total.output_tokens += event.output_tokens;
+            total.reasoning_output_tokens += event.reasoning_output_tokens;
+            total.total_tokens += event.total_tokens;
+            total
+        });
     let turns = events.iter().map(|e| e.conversation_count).sum();
-    let session = token_session(session_id, "dsh", project_key, model, first_ts, last_ts, turns, tokens, 0.0);
-    CachedFile { fingerprint: fp, events, sessions: vec![session] }
+    let session = token_session(
+        session_id,
+        "dsh",
+        project_key,
+        model,
+        first_ts,
+        last_ts,
+        turns,
+        tokens,
+        0.0,
+    );
+    CachedFile {
+        fingerprint: fp,
+        events,
+        sessions: vec![session],
+    }
 }
 
-fn dsh_usage_event(usage: &JsonValue, session_id: &str, project_key: &str, model: &str, timestamp: &str, index: usize) -> Option<UsageEvent> {
+fn dsh_usage_event(
+    usage: &JsonValue,
+    session_id: &str,
+    project_key: &str,
+    model: &str,
+    timestamp: &str,
+    index: usize,
+) -> Option<UsageEvent> {
     let input = number(usage, &["inputTokens", "input_tokens"]);
     let cached = number(usage, &["cacheReadTokens", "cache_read_input_tokens"]);
     let output = number(usage, &["outputTokens", "output_tokens"]);
@@ -2110,7 +2406,11 @@ fn dsh_usage_event(usage: &JsonValue, session_id: &str, project_key: &str, model
     Some(UsageEvent {
         id,
         source: "dsh".to_string(),
-        model: if model.is_empty() { UNKNOWN_DSH_MODEL.to_string() } else { model.to_string() },
+        model: if model.is_empty() {
+            UNKNOWN_DSH_MODEL.to_string()
+        } else {
+            model.to_string()
+        },
         project_key: project_key.to_string(),
         timestamp: timestamp.to_string(),
         input_tokens: input,
@@ -2386,18 +2686,22 @@ fn database_provider(value: &JsonValue) -> String {
         .to_ascii_lowercase()
 }
 
+/// ZCode 的内置/自定义 provider 都属于自身数据；仅排除会被其他采集器读取的
+/// 子代理 provider（anthropic/openai/google）。按 ':' '/' 分段精确匹配，
+/// 避免误伤名字里恰好含这些单词的自定义中转（如 "my-openai-relay"）。
+fn zcode_provider_allowed(provider: &str) -> bool {
+    !provider.is_empty()
+        && !provider
+            .split([':', '/'])
+            .any(|segment| matches!(segment, "anthropic" | "openai" | "google"))
+}
+
 fn database_message_allowed(source: &str, value: &JsonValue) -> bool {
     let provider = database_provider(value);
     match source {
         // MiMo 数据库会镜像 Claude 会话；只保留 MiMo 自己的 provider。
         "mimo" => provider == "mimo" || provider == "xiaomi",
-        // ZCode 的内置/自定义 provider 都属于自身数据；仅排除会被其他采集器读取的子代理。
-        "zcode" => {
-            !provider.is_empty()
-                && !provider.contains("anthropic")
-                && !provider.contains("openai")
-                && !provider.contains("google")
-        }
+        "zcode" => zcode_provider_allowed(&provider),
         _ => true,
     }
 }
@@ -2409,6 +2713,28 @@ fn unknown_database_model(source: &str) -> String {
         _ => UNKNOWN_OPENCODE_MODEL,
     }
     .to_string()
+}
+
+/// OpenCode 系 DB 的 token 分项口径拆分，返回 (全新输入, 缓存读取, 缓存写入, 输出, 思考)。
+/// ZCode 的 tokens.input 是完整 prompt，cache.read/write 是其中的子集（同 OpenAI 的
+/// prompt_tokens ⊇ cached_tokens 口径），必须扣除后才是全新输入；OpenCode/MiCo 的
+/// input 本身不含缓存。混用会把缓存命中率拉低近一半，total 也会重复累计缓存 Token。
+fn database_token_parts(source: &str, tokens: &JsonValue) -> (i64, i64, i64, i64, i64) {
+    let cache = tokens.get("cache").unwrap_or(&JsonValue::Null);
+    let cached = number(cache, &["read"]);
+    let cache_creation = number(cache, &["write"]);
+    let input_total = number(tokens, &["input"]);
+    let input = if source == "zcode" {
+        input_total
+            .saturating_sub(cached)
+            .saturating_sub(cache_creation)
+            .max(0)
+    } else {
+        input_total
+    };
+    let output = number(tokens, &["output"]);
+    let reasoning = number(tokens, &["reasoning"]);
+    (input, cached, cache_creation, output, reasoning)
 }
 
 fn parse_local_database(path: &Path, source: &str) -> CachedDatabase {
@@ -2516,13 +2842,8 @@ fn parse_local_database(path: &Path, source: &str) -> CachedDatabase {
                     continue;
                 }
 
-                let tokens = value.get("tokens").unwrap_or(&JsonValue::Null);
-                let cache = tokens.get("cache").unwrap_or(&JsonValue::Null);
-                let input = number(tokens, &["input"]);
-                let cached = number(cache, &["read"]);
-                let cache_creation = number(cache, &["write"]);
-                let output = number(tokens, &["output"]);
-                let reasoning = number(tokens, &["reasoning"]);
+                let (input, cached, cache_creation, output, reasoning) =
+                    database_token_parts(source, value.get("tokens").unwrap_or(&JsonValue::Null));
                 // OpenCode 系工具的 tokens.total 在部分版本为空或口径不一致；
                 // 统一按五个明确分项求和，避免缓存 Token 被漏算或重复算。
                 let total = input
@@ -2633,9 +2954,17 @@ fn aggregate_events(events: Vec<UsageEvent>) -> TokenUsageReport {
         bucket.total_tokens += event.total_tokens;
         bucket.billable_total_tokens += event.total_tokens;
         bucket.conversation_count += event.conversation_count;
+        // 一条用量事件（conversation_count == 0 且有 token）就是一次真实 API 请求；
+        // 估算事件（estimated_tokens > 0，来源未上报 usage）同样代表一次模型调用。
+        if event.conversation_count == 0 && (event.total_tokens > 0 || event.estimated_tokens > 0) {
+            bucket.request_count += 1;
+        }
         bucket.cost_usd += event.cost_usd;
         bucket.pricing_available |= event.pricing_available;
         bucket.estimated_tokens += event.estimated_tokens;
+        if event.estimated_tokens > 0 {
+            bucket.estimated_input_tokens += event.input_tokens;
+        }
     }
     let mut buckets = buckets.into_values().collect::<Vec<_>>();
     buckets.sort_by(|left, right| {
@@ -2726,6 +3055,88 @@ pub(crate) fn load_cached_snapshot() -> Option<CollectedData> {
     ))
 }
 
+fn env_path_override(key: &str) -> Option<PathBuf> {
+    let value = std::env::var_os(key)?;
+    let path = PathBuf::from(value);
+    (!path.as_os_str().is_empty()).then_some(path)
+}
+
+// —— 各工具数据目录解析：优先遵循工具自身的重定向环境变量 ——
+// Claude Code 支持 CLAUDE_CONFIG_DIR、Codex 支持 CODEX_HOME、OpenCode/MiCo 遵循
+// XDG_DATA_HOME；不读这些变量的话，用户一旦重定向，采集会静默归零。
+// 注意：GUI 从 Finder 启动时继承不到 shell 配置的变量，dev（npm run desktop）
+// 或 launchctl setenv 设置后才可见；未设置时行为与原来完全一致。
+
+pub(crate) fn claude_config_dir(home: &Path) -> PathBuf {
+    env_path_override("CLAUDE_CONFIG_DIR").unwrap_or_else(|| home.join(".claude"))
+}
+
+pub(crate) fn codex_home(home: &Path) -> PathBuf {
+    env_path_override("CODEX_HOME").unwrap_or_else(|| home.join(".codex"))
+}
+
+pub(crate) fn xdg_data_home(home: &Path) -> PathBuf {
+    env_path_override("XDG_DATA_HOME").unwrap_or_else(|| home.join(".local").join("share"))
+}
+
+pub(crate) fn opencode_db_path(home: &Path) -> PathBuf {
+    xdg_data_home(home).join("opencode").join("opencode.db")
+}
+
+pub(crate) fn mimo_db_path(home: &Path) -> PathBuf {
+    xdg_data_home(home).join("mimocode").join("mimocode.db")
+}
+
+pub(crate) fn zcode_db_path(home: &Path) -> PathBuf {
+    home.join(".zcode").join("cli").join("db").join("db.sqlite")
+}
+
+#[derive(Default)]
+pub(crate) struct SourceCollectStats {
+    pub(crate) sessions: usize,
+    pub(crate) events: usize,
+    /// 采集缓存的最近更新时间（ISO）。
+    pub(crate) updated_at: String,
+}
+
+/// 汇总采集缓存里每个来源的会话 / 用量事件量。
+/// 「本地 Agent 路径」弹窗用它区分「路径存在」和「实际采到了数据」。
+pub(crate) fn collected_stats_by_source() -> BTreeMap<String, SourceCollectStats> {
+    let envelope = read_envelope();
+    let mut map = BTreeMap::<String, SourceCollectStats>::new();
+    fn bump(
+        map: &mut BTreeMap<String, SourceCollectStats>,
+        source: &str,
+        sessions: usize,
+        events: usize,
+    ) {
+        let entry = map.entry(source.to_string()).or_default();
+        entry.sessions += sessions;
+        entry.events += events;
+    }
+    for cached in envelope.files.values() {
+        for session in &cached.sessions {
+            bump(&mut map, &session.source, 1, 0);
+        }
+        for event in &cached.events {
+            bump(&mut map, &event.source, 0, 1);
+        }
+    }
+    for cached in envelope.databases.values() {
+        for session in &cached.sessions {
+            bump(&mut map, &session.source, 1, 0);
+        }
+        for event in &cached.events {
+            bump(&mut map, &event.source, 0, 1);
+        }
+    }
+    let updated_at = envelope.updated_at.clone();
+    for stats in map.values_mut() {
+        stats.updated_at = updated_at.clone();
+    }
+    map
+}
+
 fn collect_uncached(force: bool) -> Result<CollectedData, String> {
     let home = PathBuf::from(std::env::var_os("HOME").ok_or("无法定位用户目录")?);
     let mut envelope = if force {
@@ -2736,13 +3147,13 @@ fn collect_uncached(force: bool) -> Result<CollectedData, String> {
     envelope.version = CACHE_VERSION;
 
     let mut files = Vec::<(String, PathBuf)>::new();
-    let codex_home = home.join(".codex");
+    let codex_base = codex_home(&home);
     // Codex 会把归档任务从 sessions/ 移到 archived_sessions/；两处都要扫描。
     // 后续按 session id + usage 事件签名全局去重，因此文件移动不会重复计数。
     let mut codex_files = Vec::new();
     for codex_root in [
-        codex_home.join("sessions"),
-        codex_home.join("archived_sessions"),
+        codex_base.join("sessions"),
+        codex_base.join("archived_sessions"),
     ] {
         collect_jsonl_files(
             &codex_root,
@@ -2761,16 +3172,13 @@ fn collect_uncached(force: bool) -> Result<CollectedData, String> {
             .map(|path| ("codex".to_string(), path)),
     );
 
-    let claude_root = home.join(".claude").join("projects");
+    let claude_root = claude_config_dir(&home).join("projects");
     let mut claude_files = Vec::new();
+    // subagents/ 目录（新版 Claude 的子代理会话）也纳入：其中的 API 请求同样消耗
+    // token，属于当前对话的请求；解析时通过 isSidechain 标记区分子代理 user 输入。
     collect_jsonl_files(
         &claude_root,
-        &|path| {
-            path.extension().and_then(|value| value.to_str()) == Some("jsonl")
-                && !path
-                    .components()
-                    .any(|component| component.as_os_str() == "subagents")
-        },
+        &|path| path.extension().and_then(|value| value.to_str()) == Some("jsonl"),
         &mut claude_files,
     );
     files.extend(
@@ -2869,24 +3277,9 @@ fn collect_uncached(force: bool) -> Result<CollectedData, String> {
     }
 
     let database_sources = [
-        (
-            "opencode",
-            home.join(".local")
-                .join("share")
-                .join("opencode")
-                .join("opencode.db"),
-        ),
-        (
-            "mimo",
-            home.join(".local")
-                .join("share")
-                .join("mimocode")
-                .join("mimocode.db"),
-        ),
-        (
-            "zcode",
-            home.join(".zcode").join("cli").join("db").join("db.sqlite"),
-        ),
+        ("opencode", opencode_db_path(&home)),
+        ("mimo", mimo_db_path(&home)),
+        ("zcode", zcode_db_path(&home)),
     ];
     let live_databases = database_sources
         .iter()
@@ -3112,6 +3505,55 @@ mod tests {
     use super::*;
 
     #[test]
+    fn zcode_provider_filter_matches_vendor_segments_only() {
+        // 生产实测形态：内置 provider 与自定义 UUID provider 都要保留。
+        assert!(zcode_provider_allowed("builtin:zai-start-plan"));
+        assert!(zcode_provider_allowed(
+            "b87fa901-a05f-4afa-8c18-beccb90f9ef6"
+        ));
+        // 空值与其他采集器会重复计数的官方 provider 排除。
+        assert!(!zcode_provider_allowed(""));
+        assert!(!zcode_provider_allowed("anthropic"));
+        assert!(!zcode_provider_allowed("builtin:anthropic"));
+        assert!(!zcode_provider_allowed("openai/gpt-5"));
+        // 名字里恰好含厂商单词的自定义中转不能被误伤（旧 contains 逻辑会误杀）。
+        assert!(zcode_provider_allowed("my-openai-relay"));
+        assert!(zcode_provider_allowed("anthropic-proxy-123"));
+    }
+
+    #[test]
+    fn zcode_database_input_includes_cache_read_subset() {
+        // 生产实测（GLM-5.3 高命中请求）：input=253_602、cache.read=252_608，
+        // input 是完整 prompt，命中部分必须扣除才是全新输入。
+        let tokens =
+            json!({"input": 253_602, "output": 500, "cache": {"read": 252_608, "write": 0}});
+        let (input, cached, cache_creation, output, reasoning) =
+            database_token_parts("zcode", &tokens);
+        assert_eq!(
+            (input, cached, cache_creation, output, reasoning),
+            (994, 252_608, 0, 500, 0)
+        );
+    }
+
+    #[test]
+    fn opencode_database_input_stays_fresh_only() {
+        // OpenCode/MiMo 的 input 不含缓存分项，保持原样累加。
+        let tokens = json!({"input": 1_000, "output": 100, "cache": {"read": 9_000, "write": 500}});
+        let (input, cached, cache_creation, output, _) = database_token_parts("opencode", &tokens);
+        assert_eq!(
+            (input, cached, cache_creation, output),
+            (1_000, 9_000, 500, 100)
+        );
+    }
+
+    #[test]
+    fn zcode_database_input_clamps_at_zero_when_cache_exceeds() {
+        let tokens = json!({"input": 100, "cache": {"read": 150, "write": 10}});
+        let (input, _, _, _, _) = database_token_parts("zcode", &tokens);
+        assert_eq!(input, 0);
+    }
+
+    #[test]
     fn codex_usage_normalization_separates_cached_input() {
         let usage = CodexUsage {
             input_tokens: 100,
@@ -3134,14 +3576,16 @@ mod tests {
         let goal = json!({"content": [{"type": "input_text", "text": "<codex_internal_context source=\"goal\"> keep going"}]});
         assert!(!codex_user_message_is_human(&goal));
 
-        let aborted = json!({"content": [{"type": "input_text", "text": "<turn_aborted> interrupted"}]});
+        let aborted =
+            json!({"content": [{"type": "input_text", "text": "<turn_aborted> interrupted"}]});
         assert!(!codex_user_message_is_human(&aborted));
 
         let real = json!({"content": [{"type": "input_text", "text": "帮我修复这个 bug"}]});
         assert!(codex_user_message_is_human(&real));
 
         // 用户粘贴的 SVG 以 < 开头，但不是系统注入，应计为用户消息
-        let svg = json!({"content": [{"type": "input_text", "text": "<svg width=\"24\">...</svg>"}]});
+        let svg =
+            json!({"content": [{"type": "input_text", "text": "<svg width=\"24\">...</svg>"}]});
         assert!(codex_user_message_is_human(&svg));
     }
 
@@ -3199,6 +3643,37 @@ mod tests {
         let report = aggregate_events(vec![event.clone(), event]);
         assert_eq!(report.buckets.len(), 1);
         assert_eq!(report.buckets[0].total_tokens, 12);
+        // 用量事件只计一次请求
+        assert_eq!(report.buckets[0].request_count, 1);
+    }
+
+    #[test]
+    fn aggregate_counts_requests_and_dialogues_separately() {
+        let request_event = UsageEvent {
+            id: "msg-1".to_string(),
+            source: "claude".to_string(),
+            model: "model-1".to_string(),
+            project_key: "OpenHub".to_string(),
+            timestamp: "2026-08-12T03:10:00.000Z".to_string(),
+            input_tokens: 10,
+            output_tokens: 2,
+            total_tokens: 12,
+            ..Default::default()
+        };
+        let user_event = UsageEvent {
+            id: "u:user-1".to_string(),
+            source: "claude".to_string(),
+            model: "model-1".to_string(),
+            project_key: "OpenHub".to_string(),
+            timestamp: "2026-08-12T03:09:00.000Z".to_string(),
+            conversation_count: 1,
+            ..Default::default()
+        };
+        let report = aggregate_events(vec![request_event, user_event]);
+        assert_eq!(report.buckets.len(), 1);
+        // 半小时桶内：1 次请求 + 1 轮对话
+        assert_eq!(report.buckets[0].request_count, 1);
+        assert_eq!(report.buckets[0].conversation_count, 1);
     }
 
     fn temp_command_code_dir(name: &str) -> PathBuf {
@@ -3575,5 +4050,143 @@ mod tests {
             half_hour_key("2026-08-12T03:30:01.000Z").as_deref(),
             Some("2026-08-12T03:30:00.000Z")
         );
+    }
+
+    #[test]
+    fn half_hour_bucket_normalizes_timezone_offset() {
+        // +08:00 本地 03:29 = UTC 前一天 19:29 → 19:00 桶
+        assert_eq!(
+            half_hour_key("2026-08-12T03:29:59.000+08:00").as_deref(),
+            Some("2026-08-11T19:00:00.000Z")
+        );
+        // -05:00 本地 23:45 = UTC 次日 04:45 → 04:30 桶
+        assert_eq!(
+            half_hour_key("2026-08-12T23:45:00.000-05:00").as_deref(),
+            Some("2026-08-13T04:30:00.000Z")
+        );
+        assert_eq!(tz_offset_secs("2026-08-12T03:29:59.000Z"), 0);
+        assert_eq!(tz_offset_secs("2026-08-12T03:29:59+08:00"), 28_800);
+        assert_eq!(tz_offset_secs("2026-08-12T03:29:59-0500"), -18_000);
+        assert_eq!(tz_offset_secs("2026-08-12T03:29:59.000"), 0);
+    }
+
+    #[test]
+    fn claude_user_line_origin_kind_refines_human_detection() {
+        let line = json!({
+            "origin": {"kind": "human"},
+            "message": {"role": "user", "content": "hello"}
+        });
+        assert!(claude_user_line_is_human(
+            &line,
+            &line["message"]["content"]
+        ));
+        let notification = json!({
+            "origin": {"kind": "task-notification"},
+            "message": {"role": "user", "content": "background task done"}
+        });
+        assert!(!claude_user_line_is_human(
+            &notification,
+            &notification["message"]["content"]
+        ));
+        // 旧版本无 origin 字段：回退内容启发式
+        let legacy = json!({"message": {"role": "user", "content": "hello"}});
+        assert!(claude_user_line_is_human(
+            &legacy,
+            &legacy["message"]["content"]
+        ));
+    }
+
+    #[test]
+    fn claude_user_is_human_excludes_injected_messages() {
+        // 真实输入
+        assert!(claude_user_is_human(
+            &json!([{"type": "text", "text": "hello"}])
+        ));
+        assert!(claude_user_is_human(&json!("hello")));
+        // 工具结果
+        assert!(!claude_user_is_human(
+            &json!([{"type": "tool_result", "content": "ok"}])
+        ));
+        // 斜杠命令本身算用户操作，输出回显不算
+        assert!(claude_user_is_human(&json!(
+            "<command-name>/compact</command-name>"
+        )));
+        assert!(!claude_user_is_human(&json!(
+            [{"type": "text", "text": "<local-command-stdout>done</local-command-stdout>"}]
+        )));
+        assert!(!claude_user_is_human(&json!(
+            [{"type": "text", "text": "<command-stdout>done</command-stdout>"}]
+        )));
+        // Esc 中断不算
+        assert!(!claude_user_is_human(&json!(
+            [{"type": "text", "text": "[Request interrupted by user for tool use]"}]
+        )));
+        // tool_result 与文本混在同一条消息（个别版本注入 reminder）不算
+        assert!(!claude_user_is_human(&json!([
+            {"type": "tool_result", "content": "ok"},
+            {"type": "text", "text": "<system-reminder>…</system-reminder>"}
+        ])));
+    }
+
+    #[test]
+    fn claude_turns_attach_to_their_own_assistant_model() {
+        let dir = std::env::temp_dir().join(format!("openhub-claude-model-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"type":"user","uuid":"u1","timestamp":"2026-08-13T05:00:00.000Z","message":{"role":"user","content":"hello"}}"#,
+                "\n",
+                r#"{"type":"assistant","timestamp":"2026-08-13T05:00:01.000Z","message":{"model":"model-a","usage":{"input_tokens":10,"output_tokens":20}}}"#,
+                "\n",
+                r#"{"type":"user","uuid":"u2","timestamp":"2026-08-13T05:01:00.000Z","message":{"role":"user","content":"second"}}"#,
+                "\n",
+                r#"{"type":"assistant","timestamp":"2026-08-13T05:01:01.000Z","message":{"model":"model-b","usage":{"input_tokens":5,"output_tokens":5}}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let parsed = parse_claude_file(&path);
+        // 每个 user 事件归属到本轮第一个 assistant 的模型，而不是会话最终模型。
+        let u1 = parsed
+            .events
+            .iter()
+            .find(|e| e.id == "u:u1")
+            .expect("u1 event");
+        let u2 = parsed
+            .events
+            .iter()
+            .find(|e| e.id == "u:u2")
+            .expect("u2 event");
+        assert_eq!(u1.model, "model-a");
+        assert_eq!(u2.model, "model-b");
+        assert_eq!(u1.conversation_count, 1);
+        assert_eq!(u2.conversation_count, 1);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dsh_user_is_human_only_counts_real_user_kind() {
+        // 真实用户输入（带/不带 source.kind）
+        assert!(dsh_user_is_human(&json!({
+            "data": {"source": {"kind": "user"}, "content": [{"type": "text", "text": "hi"}]}
+        })));
+        assert!(dsh_user_is_human(&json!({"data": {"content": "hi"}})));
+        // 注入消息
+        assert!(!dsh_user_is_human(&json!({
+            "data": {"source": {"kind": "plugin"}, "content": [{"type": "text", "text": "background job finished"}]}
+        })));
+        assert!(!dsh_user_is_human(&json!({
+            "data": {"source": {"kind": "skill-catalog"}, "content": [{"type": "text", "text": "<system-reminder>…</system-reminder>"}]}
+        })));
+        // 旧格式无 source.kind 时按注入文本前缀兜底
+        assert!(!dsh_user_is_human(&json!({
+            "data": {"content": [{"type": "text", "text": "<system-reminder>…</system-reminder>"}]}
+        })));
+        assert!(!dsh_user_is_human(&json!({
+            "data": {"content": [{"type": "text", "text": "Current runtime context. This snapshot supersedes…"}]}
+        })));
     }
 }

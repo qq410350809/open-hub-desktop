@@ -39,10 +39,19 @@ pub struct ChromeSessionInfo {
     pub(crate) checked_in_today: bool,
     pub(crate) checkin_error: String,
     pub(crate) account_updated_at: String,
+    /// 浏览器兜底剩余冷却毫秒数（由 failed_at + 连续失败次数算出，读取时计算）。
+    /// 前端据此决定自动重试是否跳过浏览器；手动按钮不受限制。
+    pub(crate) browser_fallback_cooldown_ms: i64,
     #[serde(skip)]
     pub(crate) newapi_token: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub(crate) newapi_user_id: String,
+    /// 浏览器兜底冷却的原始持久化值：扫描流程 DELETE+INSERT 重建 site_accounts
+    /// 时原样写回，避免一次扫描就把退避状态清零。
+    #[serde(skip)]
+    pub(crate) browser_fallback_failed_at: i64,
+    #[serde(skip)]
+    pub(crate) browser_fallback_fail_count: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -491,7 +500,9 @@ end run
         let result = String::from_utf8_lossy(&output.stdout).trim().to_string();
         if let Some(tab_id) = chrome_tab_id_from_pending(&result) {
             target_tab_id = tab_id.to_string();
-            thread::sleep(Duration::from_millis(500));
+            // 轮询间隔 200ms：osascript 本身有百毫秒级开销，过长间隔会让
+            // 已完成的桥接脚本多等一轮，直接拖慢账号同步。
+            thread::sleep(Duration::from_millis(200));
             continue;
         }
         if !matches!(
@@ -500,7 +511,7 @@ end run
         ) {
             return Ok(result);
         }
-        thread::sleep(Duration::from_millis(500));
+        thread::sleep(Duration::from_millis(200));
     }
     Err("等待 Chrome 返回账号数据超时；请完成页面验证后重试".into())
 }
@@ -774,8 +785,11 @@ fn list_chrome_sessions_from_home(
             checked_in_today: false,
             checkin_error: String::new(),
             account_updated_at: String::new(),
+            browser_fallback_cooldown_ms: 0,
             newapi_token: String::new(),
             newapi_user_id: String::new(),
+            browser_fallback_failed_at: 0,
+            browser_fallback_fail_count: 0,
         });
     }
 
@@ -984,8 +998,11 @@ pub(crate) fn site_sessions_from_home(
                                 checked_in_today: false,
                                 checkin_error: String::new(),
                                 account_updated_at: String::new(),
+                                browser_fallback_cooldown_ms: 0,
                                 newapi_token: String::new(),
                                 newapi_user_id: String::new(),
+                                browser_fallback_failed_at: 0,
+                                browser_fallback_fail_count: 0,
                             });
                             matched_profiles.insert(profile.id.clone());
                         }

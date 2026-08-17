@@ -281,6 +281,7 @@ export interface TrendDetailItem {
   cacheHitRate: number | null;
   reasoning: number;
   sessions: number;
+  estimatedInput: number;
 }
 
 // 按粒度聚合完整分项，用于明细列表（与图表 buildTrendFromBuckets 同粒度、同 key，保证一一对应）
@@ -297,7 +298,7 @@ export function buildTrendDetailFromBuckets(
     const current = map.get(key) || {
       label,
       total: 0, input: 0, output: 0, cache: 0, cacheRead: 0, cacheWrite: 0, cacheHitRate: null,
-      reasoning: 0, sessions: 0,
+      reasoning: 0, sessions: 0, estimatedInput: 0,
     };
     current.total += bucket.totalTokens || 0;
     current.input += bucket.inputTokens || 0;
@@ -307,6 +308,7 @@ export function buildTrendDetailFromBuckets(
     current.cache += (bucket.cachedInputTokens || 0) + (bucket.cacheCreationInputTokens || 0);
     current.reasoning += bucket.reasoningOutputTokens || 0;
     current.sessions += bucket.conversationCount || 0;
+    current.estimatedInput += bucket.estimatedInputTokens || 0;
     map.set(key, current);
   }
   const span = resolveTrendSpan(buckets, from, to);
@@ -316,9 +318,9 @@ export function buildTrendDetailFromBuckets(
     const item = current || {
       label,
       total: 0, input: 0, output: 0, cache: 0, cacheRead: 0, cacheWrite: 0, cacheHitRate: null,
-      reasoning: 0, sessions: 0,
+      reasoning: 0, sessions: 0, estimatedInput: 0,
     };
-    item.cacheHitRate = cacheHitRateOf(item.cacheRead, item.cacheWrite, item.input);
+    item.cacheHitRate = cacheHitRateOf(item.cacheRead, item.cacheWrite, item.input, item.estimatedInput);
     return item;
   });
 }
@@ -499,7 +501,8 @@ export interface HealthTimelineCell {
   success: number;
   failed: number;
   requests: number;          // 展示用请求量：优先后端提取，其次 usage 估算
-  usageRequests: number;     // token usage 侧估算请求量（仅兜底）
+  usageRequests: number;     // token usage 侧请求量（真实 requestCount 或估算兜底）
+  requestsEstimated: boolean; // 本节点请求量是否为估算值（展示 ≈ 标记）
   successRate: number | null; // 0~1，null=无健康样本
   level: number; // 0=无请求 1=很差 2=差 3=中 4=好 5=很好/默认健康
 }
@@ -638,15 +641,19 @@ export function buildHealthTimeline(
   }
   const hasExtracted = extractedTotal > 0;
 
-  // usage activity: estimated request count from token usage
-  const usageMap = new Map<string, number>();
+  // usage activity: 优先真实 requestCount；旧快照缺失时按输出规模估算
+  const usageMap = new Map<string, { count: number; estimated: boolean }>();
   for (const b of usageBuckets) {
     const { key } = bucketKeyFor(granularity, b.timestamp);
     if (!key) continue;
-    const req = b.requests != null
-      ? Number(b.requests || 0)
-      : estimateRequestCount(b);
-    usageMap.set(key, (usageMap.get(key) || 0) + req);
+    const current = usageMap.get(key) || { count: 0, estimated: false };
+    if (b.requests != null) {
+      current.count += Number(b.requests || 0);
+    } else {
+      current.count += estimateRequestCount(b);
+      current.estimated = true;
+    }
+    usageMap.set(key, current);
   }
 
   // 区间：优先顶部选择；否则取 usage/health 并集跨度
@@ -701,16 +708,24 @@ export function buildHealthTimeline(
     const rawSuccess = health?.success ?? 0;
     const rawFailed = health?.failed ?? 0;
     const extractedRequests = health?.requests ?? 0;
-    const usageRequests = usageMap.get(key) || 0;
     // 展示请求量按节点独立兜底：
     // 1) 当前节点有后端提取请求 → 使用真实请求数
-    // 2) 当前节点无提取请求但有 Token 活动 → 用 usage 估算
-    // 3) 否则使用成功/失败样本合计
+    // 2) 当前节点无提取请求但有 Token 活动 → 用 usage 桶请求量（真实，旧快照为估算）
+    // 3) 否则使用成功/失败样本合计（真实观测）
     // 不能因为其他日期有提取数据，就把本日期的 Token 活动误画成“无数据”。
     const sampleRequests = rawSuccess + rawFailed;
-    const requests = extractedRequests > 0
-      ? extractedRequests
-      : (usageRequests > 0 ? usageRequests : sampleRequests);
+    const usage = usageMap.get(key);
+    const usageRequests = usage?.count ?? 0;
+    let requests = extractedRequests;
+    let requestsEstimated = false;
+    if (requests <= 0) {
+      if (usageRequests > 0) {
+        requests = usageRequests;
+        requestsEstimated = usage?.estimated ?? false;
+      } else {
+        requests = sampleRequests;
+      }
+    }
 
     // 成功率口径：以请求为底，已知失败扣减。
     // 避免 Codex token_count 与 task_complete 样本混用导致 成功+失败 ≠ 请求、成功率被严重压低。
@@ -736,6 +751,7 @@ export function buildHealthTimeline(
       failed,
       requests,
       usageRequests,
+      requestsEstimated,
       successRate,
       level: healthLevelOf(successRate, requests > 0 || failed > 0, failed, requests),
     };
@@ -793,8 +809,11 @@ export interface UsageBucketLike {
   outputTokens?: number;
   reasoningOutputTokens?: number;
   conversationCount?: number;
+  /** 桶内真实 API 请求数；旧快照缺失时回退估算。 */
+  requestCount?: number;
   costUsd?: number;
   estimatedTokens?: number;
+  estimatedInputTokens?: number;
 }
 
 export function buildDailyMapFromBuckets(buckets: UsageBucketLike[]): Map<string, DailyStat> {
@@ -843,8 +862,13 @@ export interface BucketBreakdownTotal {
   cacheHitRate: number | null;
   reasoningTokens: number;
   conversations: number;
+  /** API 请求数：优先桶内真实 requestCount，旧快照缺失时按输出规模估算。 */
+  requests: number;
+  /** 是否有任一来源用了估算（展示 ≈ 标记）。 */
+  requestsEstimated: boolean;
   costUsd: number;
   estimatedTokens: number;
+  estimatedInputTokens: number;
 }
 
 function emptyBucketBreakdown(): BucketBreakdownTotal {
@@ -858,8 +882,11 @@ function emptyBucketBreakdown(): BucketBreakdownTotal {
     cacheHitRate: null,
     reasoningTokens: 0,
     conversations: 0,
+    requests: 0,
+    requestsEstimated: false,
     costUsd: 0,
     estimatedTokens: 0,
+    estimatedInputTokens: 0,
   };
 }
 
@@ -872,8 +899,20 @@ function addBucketBreakdown(target: BucketBreakdownTotal, bucket: UsageBucketLik
   target.cacheWriteTokens += bucket.cacheCreationInputTokens || 0;
   target.reasoningTokens += bucket.reasoningOutputTokens || 0;
   target.conversations += bucket.conversationCount || 0;
+  if (bucket.requestCount != null) {
+    target.requests += bucket.requestCount || 0;
+  } else {
+    target.requests += estimateRequestCount({
+      conversationCount: bucket.conversationCount,
+      outputTokens: bucket.outputTokens,
+      reasoningOutputTokens: bucket.reasoningOutputTokens,
+      totalTokens: bucket.totalTokens,
+    });
+    target.requestsEstimated = true;
+  }
   target.costUsd += bucket.costUsd || 0;
   target.estimatedTokens += bucket.estimatedTokens || 0;
+  target.estimatedInputTokens += bucket.estimatedInputTokens || 0;
 }
 
 export interface SourceTotal extends BucketBreakdownTotal {
@@ -888,7 +927,15 @@ export function bucketSourceTotals(buckets: UsageBucketLike[]): SourceTotal[] {
     groups.set(bucket.source, current);
   }
   return [...groups.values()]
-    .map((item) => ({ ...item, cacheHitRate: cacheHitRateOf(item.cacheReadTokens, item.cacheWriteTokens, item.inputTokens) }))
+    .map((item) => ({
+      ...item,
+      cacheHitRate: cacheHitRateOf(
+        item.cacheReadTokens,
+        item.cacheWriteTokens,
+        item.inputTokens,
+        item.estimatedInputTokens,
+      ),
+    }))
     .sort((a, b) => b.totalTokens - a.totalTokens);
 }
 
@@ -954,8 +1001,11 @@ export function mergeModelTotals(items: ModelTotal[]): ModelTotal[] {
     current.cacheWriteTokens += item.cacheWriteTokens;
     current.reasoningTokens += item.reasoningTokens;
     current.conversations += item.conversations;
+    current.requests += item.requests;
+    current.requestsEstimated = current.requestsEstimated || item.requestsEstimated;
     current.costUsd += item.costUsd;
     current.estimatedTokens += item.estimatedTokens;
+    current.estimatedInputTokens += item.estimatedInputTokens;
     byName.set(name, current);
   }
 
@@ -975,13 +1025,24 @@ export function mergeModelTotals(items: ModelTotal[]): ModelTotal[] {
     target.cacheWriteTokens += item.cacheWriteTokens;
     target.reasoningTokens += item.reasoningTokens;
     target.conversations += item.conversations;
+    target.requests += item.requests;
+    target.requestsEstimated = target.requestsEstimated || item.requestsEstimated;
     target.costUsd += item.costUsd;
     target.estimatedTokens += item.estimatedTokens;
+    target.estimatedInputTokens += item.estimatedInputTokens;
     result.set(targetName, target);
   }
 
   return [...result.values()]
-    .map((item) => ({ ...item, cacheHitRate: cacheHitRateOf(item.cacheReadTokens, item.cacheWriteTokens, item.inputTokens) }))
+    .map((item) => ({
+      ...item,
+      cacheHitRate: cacheHitRateOf(
+        item.cacheReadTokens,
+        item.cacheWriteTokens,
+        item.inputTokens,
+        item.estimatedInputTokens,
+      ),
+    }))
     .sort((a, b) => b.totalTokens - a.totalTokens);
 }
 
@@ -993,7 +1054,15 @@ export function bucketModelTotals(buckets: UsageBucketLike[]): ModelTotal[] {
     groups.set(bucket.model, current);
   }
   return [...groups.values()]
-    .map((item) => ({ ...item, cacheHitRate: cacheHitRateOf(item.cacheReadTokens, item.cacheWriteTokens, item.inputTokens) }))
+    .map((item) => ({
+      ...item,
+      cacheHitRate: cacheHitRateOf(
+        item.cacheReadTokens,
+        item.cacheWriteTokens,
+        item.inputTokens,
+        item.estimatedInputTokens,
+      ),
+    }))
     .sort((a, b) => b.totalTokens - a.totalTokens);
 }
 
@@ -1023,13 +1092,25 @@ export function formatCost(value?: number | null) {
   return `$${amount.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
 
+// 缓存命中率等比率显示：保留小数点后 2 位（如 45.67%、3.45%、0.46%、100.00%）。
 export function formatRate(value?: number | null) {
   if (value == null) return "—";
-  return `${Math.round(Number(value) * 100)}%`;
+  const pct = Number(value) * 100;
+  if (!Number.isFinite(pct)) return "—";
+  return `${pct.toFixed(2)}%`;
 }
 
-// 缓存命中率：缓存读取 token 占（缓存读取 + 缓存写入 + 全新输入）的比例；无输入返回 null。
-export function cacheHitRateOf(cacheRead: number, cacheWrite: number, freshInput: number): number | null {
+// 缓存命中率：缓存读取 token 占（缓存读取 + 缓存写入 + 全新输入）的比例。
+// 纯估算来源（kiro/antigravity 等）根本不上报缓存字段，读/写恒为 0 但输入 > 0——
+// 那不是真实 0% 命中而是"无缓存数据"，返回 null 显示为 "—"，避免拉低整体 KPI。
+export function cacheHitRateOf(
+  cacheRead: number,
+  cacheWrite: number,
+  freshInput: number,
+  estimatedInput = 0,
+): number | null {
   const total = cacheRead + cacheWrite + freshInput;
-  return total > 0 ? cacheRead / total : null;
+  if (total <= 0) return null;
+  if (cacheRead + cacheWrite === 0 && estimatedInput >= freshInput) return null;
+  return cacheRead / total;
 }

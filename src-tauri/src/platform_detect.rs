@@ -39,7 +39,6 @@ pub(crate) fn canonical_platform(raw: &str) -> String {
         "geminicli" => "gemini-cli".into(),
         "antigravity" => "antigravity".into(),
         "cliproxyapi" | "cpa" | "cliproxapi" => "cliproxyapi".into(),
-        "0v0" | "zerovzero" => "0v0".into(),
         _ => String::new(),
     }
 }
@@ -51,16 +50,23 @@ pub(crate) fn is_platform(system_type: &str, kind: &str) -> bool {
 pub(crate) fn is_newapi(system_type: &str) -> bool {
     // new-api 与 newapi2 是同一套 NewAPI 后端的两种认证形态：
     // new-api 走 Cookie（session/new-api-user），newapi2 走刷新令牌。
-    // 后端账号/Key/模型同步逻辑对两者完全一致，因此统一命中。
-    is_platform(system_type, "new-api") || is_platform(system_type, "newapi2")
+    // 同时 anyrouter、one-api、one-hub、done-hub、veloera 等同源/衍生架构
+    // 在账号（/api/user/self、/api/user/token、/api/user/checkin）、Key 与模型同步接口上完全兼容。
+    is_platform(system_type, "new-api")
+        || is_newapi_refresh(system_type)
+        || is_platform(system_type, "anyrouter")
+        || is_platform(system_type, "one-api")
+        || is_platform(system_type, "one-hub")
+        || is_platform(system_type, "done-hub")
+        || is_platform(system_type, "veloera")
+}
+
+pub(crate) fn is_newapi_refresh(system_type: &str) -> bool {
+    is_platform(system_type, "newapi2")
 }
 
 pub(crate) fn is_sub2api(system_type: &str) -> bool {
     is_platform(system_type, "sub2api")
-}
-
-pub(crate) fn is_zero_v_zero(system_type: &str) -> bool {
-    is_platform(system_type, "0v0")
 }
 
 // ---------------------------------------------------------------- URL 提示

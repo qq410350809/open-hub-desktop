@@ -27,7 +27,8 @@ use crate::models::{Database, SiteModelCacheAccount, SiteRecord};
 use crate::models_fetch::SiteModelsResult;
 use crate::proxy_pool::ProxyRuntime;
 use crate::{
-    charity_monitor, chrome_usage, model_catalog, models_fetch, proxy_pool, site_crud, token_stats,
+    auto_sync, charity_monitor, chrome_usage, model_catalog, models_fetch, proxy_pool, site_crud,
+    token_stats,
 };
 
 /// 首选端口；被占用时向后顺延。
@@ -569,6 +570,15 @@ fn dispatch(app: &AppHandle, command: &str, args: &Value) -> Result<Value, Strin
                 id
             )))
         }
+        "set_usage_state" => {
+            let id = take_string(args, &["id"])?;
+            let state = take_string(args, &["state"])?;
+            Ok(json!(site_crud::set_usage_state(
+                app.state::<Database>(),
+                id,
+                state
+            )))
+        }
         "toggle_hidden" => {
             let id = take_string(args, &["id"])?;
             Ok(json!(site_crud::toggle_hidden(app.state::<Database>(), id)))
@@ -809,6 +819,9 @@ fn dispatch(app: &AppHandle, command: &str, args: &Value) -> Result<Value, Strin
                 &*app.state::<Database>()
             )))
         }
+        "get_local_agent_paths" => Ok(json!(tauri::async_runtime::block_on(
+            token_stats::get_local_agent_paths()
+        ))),
 
         // —— 模型缓存 ——
         "get_system_fonts" => Ok(json!(models_fetch::get_system_fonts())),
@@ -819,6 +832,9 @@ fn dispatch(app: &AppHandle, command: &str, args: &Value) -> Result<Value, Strin
                 site_id,
             )))
         }
+        "get_all_site_model_caches" => Ok(json!(models_fetch::get_all_site_model_caches(
+            app.state::<Database>(),
+        ))),
         "clear_site_model_cache_for_site" => {
             let site_id = take_string(args, &["siteId", "site_id"])?;
             Ok(json!(models_fetch::clear_site_model_cache_for_site(
@@ -878,6 +894,27 @@ fn dispatch(app: &AppHandle, command: &str, args: &Value) -> Result<Value, Strin
                 .await
             })))
         }
+
+        // —— 自动会话同步 ——
+        "get_auto_sync_settings" => Ok(json!(auto_sync::get_auto_sync_settings(
+            app.state::<Database>(),
+        ))),
+        "get_auto_sync_status" => Ok(json!(auto_sync::get_auto_sync_status(
+            app.state::<Database>(),
+        ))),
+        "set_auto_sync_settings" => {
+            let enabled: Option<bool> = take_opt(args, &["enabled"])?;
+            let interval_minutes: Option<u64> =
+                take_opt(args, &["intervalMinutes", "interval_minutes"])?;
+            let app = app.clone();
+            Ok(json!(auto_sync::set_auto_sync_settings(
+                app.clone(),
+                app.state::<Database>(),
+                enabled,
+                interval_minutes,
+            )))
+        }
+        "request_auto_sync_round" => Ok(json!(auto_sync::request_auto_sync_round(app.clone(),))),
 
         // —— 公益监听 ——
         "get_charity_today_count" => Ok(json!(tauri::async_runtime::block_on(

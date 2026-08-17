@@ -1,5 +1,6 @@
 mod account_sync;
 pub mod app_menu;
+mod auto_sync;
 mod charity_monitor;
 mod chrome_local_storage;
 mod chrome_session;
@@ -30,6 +31,8 @@ use account_sync::*;
 use db::*;
 #[cfg(test)]
 use models_fetch::*;
+#[cfg(test)]
+use platform_detect::*;
 #[cfg(test)]
 use site_ops::*;
 
@@ -197,7 +200,9 @@ mod tests {
                     checkin_date TEXT NOT NULL DEFAULT '',
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     newapi_token TEXT NOT NULL DEFAULT '',
-                    newapi_user_id TEXT NOT NULL DEFAULT ''
+                    newapi_user_id TEXT NOT NULL DEFAULT '',
+                    browser_fallback_failed_at INTEGER NOT NULL DEFAULT 0,
+                    browser_fallback_fail_count INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE TABLE site_model_cache (
                     site_id TEXT NOT NULL,
@@ -394,21 +399,10 @@ mod tests {
 
     #[test]
     fn recognizes_newapi_refresh_cookie_without_local_user() {
-        let values = HashMap::new();
         let cookie_names = vec!["new_api_refresh".to_string()];
 
         assert!(has_newapi_refresh_cookie_name(
             cookie_names.iter().map(String::as_str)
-        ));
-        assert!(has_account_session_candidate(
-            "NewAPI",
-            &values,
-            &cookie_names
-        ));
-        assert!(!has_account_session_candidate(
-            "Sub2API",
-            &values,
-            &cookie_names
         ));
         assert!(cookie_header_has_name(
             "status=active; new_api_refresh=redacted",
@@ -418,6 +412,40 @@ mod tests {
             "new_api_refresh_backup=redacted",
             "new_api_refresh"
         ));
+    }
+
+    #[test]
+    fn separates_newapi_cookie_and_refresh_auth_modes() {
+        assert!(is_newapi("new-api"));
+        assert!(!is_newapi_refresh("new-api"));
+        assert!(is_newapi("newapi2"));
+        assert!(is_newapi_refresh("newapi2"));
+        assert!(is_newapi("anyrouter"));
+        assert!(!is_newapi_refresh("anyrouter"));
+        assert!(is_newapi("one-api"));
+        assert!(is_newapi("one-hub"));
+        assert!(is_newapi("done-hub"));
+        assert!(is_newapi("veloera"));
+    }
+
+    #[test]
+    fn browser_session_evidence_accepts_any_cookie_or_local_key() {
+        // 宽松判定：无 Cookie 且无 Local Storage 键才判“无会话”。
+        assert!(!has_browser_session_evidence("new-api", None, 0));
+        assert!(!has_browser_session_evidence(
+            "new-api",
+            Some(&HashMap::new()),
+            0
+        ));
+        // 任意 Cookie（站点自定义会话名也算）即视为有会话。
+        assert!(has_browser_session_evidence("new-api", None, 1));
+        assert!(has_browser_session_evidence("sub2api", None, 3));
+        // Local Storage 任意已知键（残缺账号数据，如仅 status）也算。
+        let partial = HashMap::from([("status".to_string(), r#"{"ok":true}"#.to_string())]);
+        assert!(has_browser_session_evidence("new-api", Some(&partial), 0));
+        // 结构化账号数据依旧是会话证据。
+        let valid = HashMap::from([("user".into(), r#"{"id":10288,"username":"wudixm"}"#.into())]);
+        assert!(has_browser_session_evidence("NewAPI", Some(&valid), 0));
     }
 
     #[test]
@@ -435,11 +463,17 @@ mod tests {
         let shield = "NewAPI Key 接口 HTTP 403 返回 HTML：Cloudflare 安全验证拦截了直接请求，请先用对应 Chrome 账号打开站点并通过验证";
         assert!(is_cloudflare_shield_error(shield));
         assert!(is_cloudflare_shield_error("接口返回 HTML：Cloudflare 拦截"));
-        assert!(is_cloudflare_shield_error("NewAPI Key 接口 HTTP 403 返回 HTML：站点返回了网页而不是 API 数据"));
-        assert!(is_cloudflare_shield_error("Cloudflare 验证仍需要浏览器交互"));
+        assert!(is_cloudflare_shield_error(
+            "NewAPI Key 接口 HTTP 403 返回 HTML：站点返回了网页而不是 API 数据"
+        ));
+        assert!(is_cloudflare_shield_error(
+            "Cloudflare 验证仍需要浏览器交互"
+        ));
         // 令牌类 403 / 401 不算安全盾，应走 refresh 或错误收敛。
         assert!(!is_cloudflare_shield_error("账号接口 HTTP 403：无效的令牌"));
-        assert!(!is_cloudflare_shield_error("账号接口 HTTP 401：访问令牌无效"));
+        assert!(!is_cloudflare_shield_error(
+            "账号接口 HTTP 401：访问令牌无效"
+        ));
         assert!(!is_cloudflare_shield_error("账号接口请求失败：连接超时"));
         // 能区分：盾错误不是令牌拒绝，反之亦然。
         assert!(!access_token_was_rejected(shield));
@@ -455,7 +489,8 @@ mod tests {
         let direct = format!(
             "直接使用访问秘钥同步失败（Sub2API 模型接口 HTTP 401：Invalid API key{SUB2API_AUTH_FAILURE_HINT}），回落到 Key 接口"
         );
-        let keys = format!("Sub2API Key 接口 HTTP 401：Token has expired{SUB2API_AUTH_FAILURE_HINT}");
+        let keys =
+            format!("Sub2API Key 接口 HTTP 401：Token has expired{SUB2API_AUTH_FAILURE_HINT}");
         assert!(access_token_was_rejected(&direct));
         assert!(access_token_was_rejected(&keys));
         // 非认证失败（如模型列表为空）不触发收敛。
@@ -486,18 +521,6 @@ mod tests {
         let err = serde_json::from_slice::<serde_json::Value>(long.as_bytes()).unwrap_err();
         let message = friendly_json_parse_error(&err, long.as_bytes());
         assert!(message.contains("原文：{"), "{message}");
-    }
-
-    #[test]
-    fn infers_newapi_from_valid_local_user_after_inconclusive_status_probe() {
-        let any_router = HashMap::from([(
-            "user".into(),
-            r#"{"id":162120,"username":"linuxdo_162120","quota":0}"#.into(),
-        )]);
-        assert_eq!(
-            infer_system_type_from_local_accounts([&any_router]),
-            "new-api"
-        );
     }
 
     #[test]
@@ -583,53 +606,6 @@ mod tests {
     }
 
     #[test]
-    fn extracts_zero_v_zero_account_and_stats_without_exposing_the_token() {
-        let values = HashMap::from([("0v0_token".into(), r#""secret-token""#.into())]);
-        assert_eq!(zero_v_zero_token(&values).as_deref(), Some("secret-token"));
-
-        let self_value = serde_json::json!({
-            "success": true,
-            "data": {
-                "id": 871,
-                "username": "zero-user",
-                "quota": 10_000_000,
-                "used_quota": 2_500_000
-            }
-        });
-        let mut account = parse_zero_v_zero_self(&self_value).unwrap();
-        assert_eq!(account.username, "zero-user");
-        assert_eq!(account.remaining, Some(20.0));
-        assert_eq!(account.used, Some(5.0));
-        assert_eq!(account.total, Some(25.0));
-
-        let stats = serde_json::json!({
-            "success": true,
-            "data": { "total_quota": 25_000_000, "used_quota": 1_000_000 }
-        });
-        apply_zero_v_zero_stats(&mut account, &stats).unwrap();
-        assert_eq!(account.remaining, Some(50.0));
-        assert_eq!(account.used, Some(2.0));
-        assert_eq!(account.total, Some(52.0));
-        assert_eq!(account.unit, "USD");
-    }
-
-    #[test]
-    fn maps_zero_v_zero_document_and_api_domains_to_the_console() {
-        assert_eq!(
-            account_base_url("0v0", "https://docs.0v0.club/", ""),
-            "https://0v0.club/"
-        );
-        assert_eq!(
-            account_base_url("Other", "https://api.0v0.club/v1", ""),
-            "https://0v0.club/"
-        );
-        assert_eq!(
-            account_base_url("Other", "https://example.com/", "NewAPI"),
-            "https://example.com/"
-        );
-    }
-
-    #[test]
     fn sub2api_local_account_requires_auth_user_and_defaults_missing_balance_to_zero() {
         let token_only = HashMap::from([("auth_token".into(), r#""secret""#.into())]);
         assert!(parse_sub2api_local_account(&token_only).is_err());
@@ -672,8 +648,14 @@ mod tests {
             ["raw-key-value", "sk-sub2api-enabled", "sub2-raw-key-value"]
         );
         let sub2api_groups = parse_api_key_groups(&sub2api);
-        assert_eq!(sub2api_groups.get("raw-key-value"), Some(&"pro".to_string()));
-        assert_eq!(sub2api_groups.get("sub2-raw-key-value"), Some(&"pro".to_string()));
+        assert_eq!(
+            sub2api_groups.get("raw-key-value"),
+            Some(&"pro".to_string())
+        );
+        assert_eq!(
+            sub2api_groups.get("sub2-raw-key-value"),
+            Some(&"pro".to_string())
+        );
 
         let masked_newapi = serde_json::json!({
             "data": {
@@ -747,8 +729,9 @@ mod tests {
             "`/api/token/${encodeURIComponent(tokenId)}/key`, { method: \"GET\", headers }"
         ));
         assert!(script.contains("readJson(\"/v1/models\""));
+        assert!(script.contains("const useRefreshAuth = false"));
         assert!(script.contains("readJson(\"/api/user/auth/refresh\""));
-        assert!(script.contains("keyResponse.status === 401"));
+        assert!(script.contains("if (useRefreshAuth && keyResponse.status === 401)"));
         assert!(script.contains(
             "if (systemType === \"sub2api\" && dashboardAccessToken) keys.push(dashboardAccessToken)"
         ));
@@ -757,6 +740,9 @@ mod tests {
         assert!(script.contains("return \"__OPENHUB_PROFILE_MISMATCH__\""));
         assert!(!script.contains("http://"));
         assert!(!script.contains("https://"));
+
+        let refresh_script = chrome_models_bridge_script("newapi2", None, "openhub-models-refresh");
+        assert!(refresh_script.contains("const useRefreshAuth = true"));
 
         let result = parse_chrome_models_result(
             r#"{"ok":true,"source":"newapi-key","keys":["sk-model-key"],"models":[{"id":"gpt-5","ownedBy":"openai"}]}"#,
@@ -949,6 +935,7 @@ mod tests {
         assert_eq!(script.matches("fetch(").count(), 5);
         assert!(!script.contains("http://"));
         assert!(!script.contains("https://"));
+        assert!(!script.contains("turnstile"));
         assert!(script.contains("window.location.protocol !== \"http:\""));
         assert!(script.contains("message.includes(\"Failed to parse URL\")"));
         assert!(script.contains("previous.state !== \"challenge\""));
@@ -967,9 +954,15 @@ mod tests {
             script.find("const checkinResponse").unwrap()
                 < script.find("fetch(\"/api/user/self\"").unwrap()
         );
+        assert!(script
+            .contains("method: \"GET\", credentials: \"include\", cache: \"no-store\", headers"));
+        // 访问令牌逻辑只允许在 useRefreshAuth 分支内执行。
         assert!(
-            script.contains("method: \"GET\", credentials: \"omit\", cache: \"no-store\", headers")
+            script.find("if (useRefreshAuth) {").unwrap()
+                < script.find("fetch(\"/api/user/token\"").unwrap()
         );
+        assert!(script.contains("const useSessionCookies = !apiToken"));
+        assert!(script.contains("if (useSessionCookies) {"));
         assert!(script.contains("const requestTimeout = 30000"));
         assert_eq!(
             script
@@ -993,12 +986,17 @@ mod tests {
         );
 
         assert!(script.contains("const useRefreshAuth = false"));
+        assert!(
+            script.find("if (useRefreshAuth) {").unwrap()
+                < script.find("fetch(\"/api/user/token\"").unwrap()
+        );
         assert!(!script.contains("isAnyRouter"));
         assert!(!script.contains("fetch(\"/api/user/sign_in\""));
         assert!(script.contains("`/api/user/checkin?month=${encodeURIComponent(\"2026-08\")}`"));
         assert!(script.contains("fetch(\"/api/user/checkin\""));
         assert!(script.contains("method: \"POST\""));
-        assert_eq!(script.matches("fetch(").count(), 5);
+        // 静态脚本包含 refresh 分支，但常量为 false，Cookie 模式运行时不会请求令牌端点。
+        assert!(script.contains("if (useRefreshAuth) {"));
     }
 
     #[test]
@@ -1087,10 +1085,12 @@ pub fn run() {
             }
             let proxy_runtime = proxy_pool::ProxyRuntime::new(app_data_dir.join("proxy-runtime"));
             let charity_runtime = charity_monitor::CharityMonitorRuntime::new();
+            let auto_sync_runtime = auto_sync::AutoSyncRuntime::default();
             let model_catalog_runtime = model_catalog::ModelCatalogRuntime::new();
             app.manage(database);
             app.manage(proxy_runtime);
             app.manage(charity_runtime);
+            app.manage(auto_sync_runtime);
             app.manage(model_catalog_runtime);
             // 启动时清理历史订阅里遗留的测速结果后缀，避免旧库节点名继续显示脏数据。
             if let Err(error) =
@@ -1137,7 +1137,10 @@ pub fn run() {
                 // 代理恢复后再启动公益监听，避免启动瞬间抢锁/抢内核。
                 // 前端 onMounted 会 request_charity_round，循环启动后立刻消费 force。
                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                charity_monitor::start_charity_monitor(restore_handle);
+                charity_monitor::start_charity_monitor(restore_handle.clone());
+                // 自动会话同步：账号保活 / 失效恢复 / 模型刷新全程后台化，
+                // 与公益监听错开启动（调度器内部还有首轮延迟）。
+                auto_sync::start_auto_sync(restore_handle);
             });
 
             Ok(())
@@ -1160,6 +1163,7 @@ pub fn run() {
             site_crud::toggle_personal,
             site_crud::toggle_pending,
             site_crud::cycle_usage_state,
+            site_crud::set_usage_state,
             site_crud::toggle_hidden,
             site_crud::toggle_runaway,
             proxy_pool::get_proxy_pool_state,
@@ -1184,11 +1188,16 @@ pub fn run() {
             remote_sync::get_remote_user,
             chrome_usage::mark_sites_with_chrome_sessions,
             account_sync::sync_site_account_via_chrome,
+            auto_sync::get_auto_sync_settings,
+            auto_sync::set_auto_sync_settings,
+            auto_sync::get_auto_sync_status,
+            auto_sync::request_auto_sync_round,
             remote_sync::sync_remote_sites,
             system_detect::detect_site_system_types,
             models_fetch::get_system_fonts,
             models_fetch::fetch_site_models_json,
             models_fetch::get_site_model_cache,
+            models_fetch::get_all_site_model_caches,
             models_fetch::clear_site_model_cache_for_site,
             models_fetch::save_site_model_cache_for_account,
             model_catalog::get_model_catalog,
@@ -1218,6 +1227,7 @@ pub fn run() {
             token_stats::get_token_usage,
             token_stats::get_token_raw_logs,
             token_stats::get_token_request_health,
+            token_stats::get_local_agent_paths,
             web_server::get_lightweight_mode_state,
             web_server::enter_lightweight_mode,
             web_server::show_main_window

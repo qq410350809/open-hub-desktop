@@ -92,11 +92,27 @@ interface CardMenuEntry {
   icon: string;
   danger?: boolean;
   success?: boolean;
-  active?: boolean;
   separatorBefore?: boolean;
 }
 
 const cardMenuId = computed(() => `card-menu-${props.site.id}`);
+
+// 使用状态三选一：只展示除当前状态外的两个可切换目标，不显示当前状态自身。
+const usageTargets = computed<CardMenuEntry[]>(() => {
+  const { isPersonal, isPending } = props.site;
+  return [
+    { key: "usage-personal", label: "转换为在用", icon: icons.bookmark, show: !isPersonal },
+    { key: "usage-pending", label: "转换为待定", icon: icons.clock, show: !isPending },
+    {
+      key: "usage-unused",
+      label: "转换为未在用",
+      icon: icons.eyeOff,
+      show: isPersonal || isPending,
+    },
+  ]
+    .filter((entry) => entry.show)
+    .map(({ show: _show, ...entry }) => entry);
+});
 
 const menuEntries = computed<CardMenuEntry[]>(() => {
   const isUsage = usageCardMode.value;
@@ -107,16 +123,7 @@ const menuEntries = computed<CardMenuEntry[]>(() => {
     ...(isUsage
       ? [{ key: "sync-session", label: "同步会话", icon: icons.sessionImport }]
       : []),
-    {
-      key: "usage",
-      label: props.site.isPersonal
-        ? "切换为待定"
-        : props.site.isPending
-          ? "切换为未在用"
-          : "切换为在用",
-      icon: props.site.isPending ? icons.clock : icons.bookmark,
-      active: props.site.isPersonal || props.site.isPending,
-    },
+    ...usageTargets.value,
     {
       key: "runaway",
       label: props.site.isRunaway ? "恢复存活" : "标记为跑路",
@@ -209,8 +216,14 @@ function runMenuAction(key: string, event: Event) {
     case "edit":
       store.openModal(props.site);
       break;
-    case "usage":
-      void store.cycleUsageState(props.site);
+    case "usage-personal":
+      void store.setUsageState(props.site, "personal");
+      break;
+    case "usage-pending":
+      void store.setUsageState(props.site, "pending");
+      break;
+    case "usage-unused":
+      void store.setUsageState(props.site, "unused");
       break;
     case "sync-session":
       store.syncChromeSession(props.site, trigger);
@@ -305,7 +318,6 @@ onUnmounted(() => {
                     :class="{
                       'is-danger': entry.danger,
                       'is-success': entry.success,
-                      'is-active': entry.active,
                     }"
                     @click="runMenuAction(entry.key, $event)"
                   >
@@ -350,7 +362,7 @@ onUnmounted(() => {
           </strong>
           <small>
             <span
-              v-if="normalizeSystemType(site.systemType) === 'newapi' || normalizeSystemType(site.systemType) === 'newapi2'"
+              v-if="normalizeSystemType(site.systemType) === 'newapi2'"
               class="usage-account-token"
               :class="{ 'has-token': session.hasAccessToken }"
               :title="session.hasAccessToken ? '此账号已缓存 NewAPI 访问令牌' : '此账号尚未取得 NewAPI 访问令牌'"

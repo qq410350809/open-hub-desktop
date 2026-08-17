@@ -176,6 +176,55 @@ async function startRefresh() {
   }
 }
 
+// —— 本地 AI Agent 路径诊断弹窗 ——
+const agentDialogOpen = ref(false);
+const agentKindLabels: Record<string, string> = {
+  config: "配置",
+  data: "数据",
+  database: "数据库",
+  logs: "日志",
+};
+const localAgents = computed(() => store.localAgentPaths.value?.agents ?? []);
+const localAgentsHome = computed(() => store.localAgentPaths.value?.home ?? "");
+const localAgentEnvOverrides = computed(() => store.localAgentPaths.value?.envOverrides ?? []);
+const localAgentsCollectedAt = computed(() => {
+  const raw = store.localAgentPaths.value?.collectedAt ?? "";
+  // ISO → 本地可读的 MM-dd HH:mm
+  return raw.length >= 16 ? raw.slice(5, 16).replace("T", " ") : "";
+});
+function formatAgentCount(value: number): string {
+  return value >= 10000 ? `${(value / 1000).toFixed(1)}k` : String(value);
+}
+// 展示时把主目录前缀折叠成 ~，路径更短、更容易一行放下；复制与悬浮仍用完整路径。
+function displayAgentPath(path: string): string {
+  const home = localAgentsHome.value;
+  if (home && path.startsWith(`${home}/`)) return `~${path.slice(home.length)}`;
+  return path;
+}
+// 按 / 切成整段渲染，换行只发生在路径分隔符处，避免 sqliteDB 被硬拆成 "sqliteD / B"。
+function agentPathSegments(path: string): string[] {
+  return displayAgentPath(path)
+    .split("/")
+    .filter(Boolean)
+    .map((part, index, parts) => (index < parts.length - 1 ? `${part}/` : part));
+}
+function openAgentDialog() {
+  agentDialogOpen.value = true;
+  void store.loadLocalAgentPaths();
+}
+function closeAgentDialog() {
+  agentDialogOpen.value = false;
+}
+async function copyAgentPath(path: string) {
+  if (!path) return;
+  try {
+    await navigator.clipboard.writeText(path);
+    store.showToast("已复制路径");
+  } catch {
+    store.showToast("复制失败", true);
+  }
+}
+
 // —— 明细弹窗：标签页 + 分页 ——
 const detailTab = ref<"daily" | "projects">("daily");
 const PAGE_SIZE = 12;
@@ -200,6 +249,7 @@ const dailyColumns: AppTableColumn[] = [
   { key: "cacheHitRate", title: "缓存命中率", width: "110px", align: "right", sortable: true },
   { key: "reasoning", title: "推理", width: "90px", align: "right", sortable: true },
   { key: "sessions", title: "对话", width: "90px", align: "right", sortable: true },
+  { key: "requests", title: "请求数", width: "90px", align: "right", sortable: true },
 ];
 
 const projectColumns: AppTableColumn[] = [
@@ -211,6 +261,7 @@ const projectColumns: AppTableColumn[] = [
   { key: "cacheHitRate", title: "缓存命中率", width: "110px", align: "right", sortable: true },
   { key: "reasoning", title: "推理", width: "90px", align: "right", sortable: true },
   { key: "sessions", title: "对话", width: "90px", align: "right", sortable: true },
+  { key: "requests", title: "请求数", width: "90px", align: "right", sortable: true },
   { key: "costUsd", title: "成本", width: "100px", align: "right", sortable: true },
 ];
 
@@ -223,6 +274,7 @@ const sourceColumns: AppTableColumn[] = [
   { key: "cacheHitRate", title: "缓存命中率", width: "110px", align: "right", sortable: true },
   { key: "reasoningTokens", title: "推理", width: "90px", align: "right", sortable: true },
   { key: "conversations", title: "对话", width: "90px", align: "right", sortable: true },
+  { key: "requests", title: "请求数", width: "90px", align: "right", sortable: true },
   { key: "costUsd", title: "成本", width: "100px", align: "right", sortable: true },
   { key: "share", title: "占比", width: "70px", align: "right" },
 ];
@@ -343,13 +395,14 @@ const cacheHitRate = computed(() => {
   let cacheRead = 0;
   let cacheWrite = 0;
   let fresh = 0;
+  let estimatedInput = 0;
   for (const bucket of filteredBuckets.value) {
     cacheRead += bucket.cachedInputTokens || 0;
     cacheWrite += bucket.cacheCreationInputTokens || 0;
     fresh += bucket.inputTokens || 0;
+    estimatedInput += bucket.estimatedInputTokens || 0;
   }
-  const total = cacheRead + cacheWrite + fresh;
-  return total > 0 ? cacheRead / total : null;
+  return cacheHitRateOf(cacheRead, cacheWrite, fresh, estimatedInput);
 });
 
 // 成本只汇总数据源明确上报的金额，不对缺少价格的数据进行猜测。
@@ -393,6 +446,8 @@ const topModels = computed(() => byModel.value.slice(0, 5));
 type ProjectUsageItem = {
   project: string;
   sessions: number;
+  requests: number;
+  requestsEstimated: boolean;
   totalTokens: number;
   input: number;
   output: number;
@@ -407,10 +462,12 @@ type ProjectUsageItem = {
 const projectUsage = computed<ProjectUsageItem[]>(() => {
   const groups = new Map<
     string,
-    { project: string; sessions: number; totalTokens: number; input: number; output: number; cache: number; cacheRead: number; cacheWrite: number; cacheHitRate: number | null; reasoning: number; costUsd: number; estimatedTokens: number }
+    { project: string; sessions: number; requests: number; requestsEstimated: boolean; totalTokens: number; input: number; output: number; cache: number; cacheRead: number; cacheWrite: number; cacheHitRate: number | null; reasoning: number; costUsd: number; estimatedTokens: number; estimatedInput: number }
   >();
   const normalizeProject = (rawKey?: string) => {
     const value = rawKey?.trim() || "未知项目";
+    // 路径中带 books 的项目统一汇总到 books。
+    if (value.toLowerCase().includes("books")) return "books";
     // UUID 形态的项目名无法识别（Claude Code 缺失 cwd 上下文时产生），归并为“其他”。
     return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value)
       ? "其他"
@@ -419,9 +476,9 @@ const projectUsage = computed<ProjectUsageItem[]>(() => {
   const ensureGroup = (rawKey?: string) => {
     const key = normalizeProject(rawKey);
     const current = groups.get(key) || {
-      project: key, sessions: 0, totalTokens: 0,
+      project: key, sessions: 0, requests: 0, requestsEstimated: false, totalTokens: 0,
       input: 0, output: 0, cache: 0, cacheRead: 0, cacheWrite: 0, cacheHitRate: null,
-      reasoning: 0, costUsd: 0, estimatedTokens: 0,
+      reasoning: 0, costUsd: 0, estimatedTokens: 0, estimatedInput: 0,
     };
     groups.set(key, current);
     return current;
@@ -435,6 +492,18 @@ const projectUsage = computed<ProjectUsageItem[]>(() => {
     projectBucketSources.add(bucket.source.toLowerCase());
     const current = ensureGroup(bucket.projectKey);
     current.sessions += bucket.conversationCount || 0;
+    // 优先桶内真实请求数；旧快照缺失时按输出规模估算并标记
+    if (bucket.requestCount != null) {
+      current.requests += bucket.requestCount || 0;
+    } else {
+      current.requests += estimateRequestCount({
+        conversationCount: bucket.conversationCount,
+        outputTokens: bucket.outputTokens,
+        reasoningOutputTokens: bucket.reasoningOutputTokens,
+        totalTokens: bucket.totalTokens,
+      });
+      current.requestsEstimated = true;
+    }
     current.totalTokens += bucket.totalTokens || 0;
     current.input += bucket.inputTokens || 0;
     current.output += bucket.outputTokens || 0;
@@ -444,13 +513,22 @@ const projectUsage = computed<ProjectUsageItem[]>(() => {
     current.reasoning += bucket.reasoningOutputTokens || 0;
     current.costUsd += bucket.costUsd || 0;
     current.estimatedTokens += bucket.estimatedTokens || 0;
+    current.estimatedInput += bucket.estimatedInputTokens || 0;
   }
 
   // 对没有项目桶的兼容来源，使用会话数据补充项目维度。
   for (const session of sessions.value) {
     if (projectBucketSources.has((session.source || "").toLowerCase())) continue;
     const current = ensureGroup(session.projectKey);
-    current.sessions += Math.max(1, session.turns || 0);
+    // 会话路径没有逐请求计数：对话数取会话 turns（零轮会话不虚计），请求数只能估算
+    const sessionTurns = session.turns || 0;
+    current.sessions += sessionTurns;
+    current.requests += estimateRequestCount({
+      conversationCount: sessionTurns,
+      outputTokens: session.tokens?.outputTokens,
+      reasoningOutputTokens: session.tokens?.reasoningOutputTokens,
+    });
+    current.requestsEstimated = true;
     current.totalTokens += session.totalTokens || 0;
     current.input += session.tokens?.inputTokens || 0;
     current.output += session.tokens?.outputTokens || 0;
@@ -460,10 +538,17 @@ const projectUsage = computed<ProjectUsageItem[]>(() => {
     current.reasoning += session.tokens?.reasoningOutputTokens || 0;
     current.costUsd += session.costUsd || 0;
     const usageKind = String(session.provenance?.tokenUsage || "");
-    if (usageKind.includes("estimated")) current.estimatedTokens += session.totalTokens || 0;
+    if (usageKind.includes("estimated")) {
+      current.estimatedTokens += session.totalTokens || 0;
+      current.estimatedInput += session.tokens?.inputTokens || 0;
+    }
   }
   return [...groups.values()]
-    .map((item) => ({ ...item, cacheHitRate: cacheHitRateOf(item.cacheRead, item.cacheWrite, item.input) }))
+    .map((item) => ({
+      ...item,
+      cacheHitRate: cacheHitRateOf(item.cacheRead, item.cacheWrite, item.input, item.estimatedInput),
+    }))
+    .filter((item) => item.totalTokens > 0)
     .sort((a, b) => b.totalTokens - a.totalTokens)
     .slice(0, 20);
 });
@@ -517,6 +602,7 @@ function healthCellTitle(cell: {
   label: string;
   dialogues?: number;
   requests: number;
+  requestsEstimated?: boolean;
   success: number;
   failed: number;
   successRate: number | null;
@@ -531,11 +617,12 @@ function healthCellTitle(cell: {
       ? `${cell.label}${dialoguePart} · 无请求`
       : `${cell.label} · 无请求`;
   }
+  const reqPart = cell.requestsEstimated ? `≈${formatTokens(cell.requests)}` : formatTokens(cell.requests);
   const rateTxt = cell.successRate == null ? "—" : `${(cell.successRate * 100).toFixed(1)}%`;
   const failPart = cell.failed > 0
     ? ` · ⚠ 失败 ${formatTokens(cell.failed)}`
     : ` · 失败 ${formatTokens(cell.failed)}`;
-  return `${cell.label}${dialoguePart} · 请求 ${formatTokens(cell.requests)} · 成功 ${formatTokens(cell.success)}${failPart} · 成功率 ${rateTxt}`;
+  return `${cell.label}${dialoguePart} · 请求 ${reqPart} · 成功 ${formatTokens(cell.success)}${failPart} · 成功率 ${rateTxt}`;
 }
 
 // —— 请求健康时间线：与左侧趋势同粒度完整节点 ——
@@ -545,29 +632,57 @@ const healthTimeline = computed(() =>
     trendGranularity.value,
     store.tokenStatsFrom.value || undefined,
     store.tokenStatsTo.value || undefined,
-    // 用全量 usage（含区间外）作为请求活跃度底图，避免大量误显示“无数据”
+    // 用全量 usage（含区间外）作为请求活跃度底图，避免大量误显示“无数据”；
+    // 请求量优先传桶内真实 requestCount，旧快照缺失时才走估算
     (store.tokenUsage.value?.buckets ?? []).map((b) => ({
       timestamp: b.timestamp,
       conversationCount: b.conversationCount || 0,
       outputTokens: b.outputTokens || 0,
       reasoningOutputTokens: b.reasoningOutputTokens || 0,
       totalTokens: b.totalTokens || 0,
+      requests: b.requestCount ?? undefined,
     })),
   ),
 );
 
-// 总步数 = 总请求数 = 用户请求(对话轮) + 工具请求(API 调用)
-const totalSteps = computed(
-  () => healthTimeline.value.totalDialogues + healthTimeline.value.totalRequests,
-);
+// —— KPI 口径 ——
+// 请求 = 一次真实 API 调用（模型响应，含子代理与工具循环触发）；对话 = 真人输入的一轮。
+// 「请求 N」只展示请求数本身；平均每轮请求数 = 总请求 ÷ 对话轮数。
 
-// 平均每轮步数 = 总步数 ÷ 对话数（对话 = 轮；步 = 请求，用户请求与工具请求都算一步）
-const stepsPerTurnLabel = computed(() => {
+// 平均每轮请求数 = 总请求数 ÷ 对话数
+const requestsPerTurnLabel = computed(() => {
   const dialogues = healthTimeline.value.totalDialogues;
   if (!dialogues) return "—";
-  const avg = totalSteps.value / dialogues;
+  const avg = healthTimeline.value.totalRequests / dialogues;
   return avg >= 10 ? String(Math.round(avg)) : avg.toFixed(1);
 });
+
+// —— 趋势明细列表增强 ——
+// 请求数：与趋势明细同粒度、同区间，按节点 label 对齐（沿用健康时间线的请求口径）。
+const requestsByLabel = computed(() => {
+  const map = new Map<string, { requests: number; requestsEstimated: boolean }>();
+  for (const cell of healthTimeline.value.cells) {
+    map.set(cell.label, {
+      requests: Math.max(0, cell.requests || 0),
+      requestsEstimated: cell.requestsEstimated || false,
+    });
+  }
+  return map;
+});
+// 明细列表过滤掉总计为 0 的空节点（图表仍保留完整节点，二者不再强行一一对应）。
+// 同时把请求数并入行数据，使“请求数”列可排序。
+const trendDetailList = computed(() =>
+  trendDetail.value
+    .filter((item) => item.total > 0)
+    .map((item) => {
+      const hit = requestsByLabel.value.get(item.label);
+      return {
+        ...item,
+        requests: hit?.requests ?? 0,
+        requestsEstimated: hit?.requestsEstimated ?? false,
+      };
+    }),
+);
 
 // 网格：上→下、左→右（列优先），排满容器；所选区间落在末尾
 const HEALTH_ROWS = 8;
@@ -593,6 +708,7 @@ type HealthDisplayCell = {
   success: number;
   failed: number;
   requests: number;
+  requestsEstimated?: boolean;
   successRate: number | null;
   level: number;
   pad?: boolean;
@@ -603,11 +719,11 @@ type HealthDisplayCell = {
 // 若节点过多则只保留末尾 capacity 个（仍保证选中区间的最后部分在网格末端）
 // 全量健康桶按当前粒度聚合（含所选区间之外），供前置补全取值
 const healthBucketMap = computed(() => {
-  const map = new Map<string, { dialogues: number; requests: number; success: number; failed: number; usage: number }>();
+  const map = new Map<string, { dialogues: number; requests: number; success: number; failed: number; usage: number; usageEstimated: boolean }>();
   for (const b of store.requestHealth.value?.buckets ?? []) {
     const { key } = bucketKeyFor(trendGranularity.value, b.hour);
     if (!key) continue;
-    const cur = map.get(key) || { dialogues: 0, requests: 0, success: 0, failed: 0, usage: 0 };
+    const cur = map.get(key) || { dialogues: 0, requests: 0, success: 0, failed: 0, usage: 0, usageEstimated: false };
     cur.dialogues += Number(b.dialogues || 0);
     cur.requests += b.requests || 0;
     cur.success += b.success || 0;
@@ -619,13 +735,18 @@ const healthBucketMap = computed(() => {
   for (const b of store.tokenUsage.value?.buckets ?? []) {
     const { key } = bucketKeyFor(trendGranularity.value, b.timestamp);
     if (!key) continue;
-    const cur = map.get(key) || { dialogues: 0, requests: 0, success: 0, failed: 0, usage: 0 };
-    cur.usage += estimateRequestCount({
-      conversationCount: b.conversationCount || 0,
-      outputTokens: b.outputTokens || 0,
-      reasoningOutputTokens: b.reasoningOutputTokens || 0,
-      totalTokens: b.totalTokens || 0,
-    });
+    const cur = map.get(key) || { dialogues: 0, requests: 0, success: 0, failed: 0, usage: 0, usageEstimated: false };
+    if (b.requestCount != null) {
+      cur.usage += b.requestCount || 0;
+    } else {
+      cur.usage += estimateRequestCount({
+        conversationCount: b.conversationCount || 0,
+        outputTokens: b.outputTokens || 0,
+        reasoningOutputTokens: b.reasoningOutputTokens || 0,
+        totalTokens: b.totalTokens || 0,
+      });
+      cur.usageEstimated = true;
+    }
     map.set(key, cur);
   }
   return map;
@@ -652,16 +773,18 @@ const healthDisplayCells = computed<HealthDisplayCell[]>(() => {
       const rawSuccess = hit?.success ?? 0;
       const rawFailed = hit?.failed ?? 0;
       const extractedRequests = hit?.requests ?? 0;
-      const sampleRequests = rawSuccess + rawFailed;
-      const usageRequests = hit?.usage ?? 0;
-      const requests = extractedRequests > 0 ? extractedRequests : (usageRequests > 0 ? usageRequests : sampleRequests);
-      const failed = Math.max(0, rawFailed);
-      const success = requests > 0
-        ? Math.max(0, requests - Math.min(failed, requests))
-        : rawSuccess;
-      const successRate = requests > 0
-        ? success / requests
-        : (failed > 0 ? 0 : (sampleRequests > 0 ? rawSuccess / sampleRequests : null));
+        const sampleRequests = rawSuccess + rawFailed;
+        const usageRequests = hit?.usage ?? 0;
+        const requests = extractedRequests > 0 ? extractedRequests : (usageRequests > 0 ? usageRequests : sampleRequests);
+        // 前置补全区间不在所选范围内，usage 侧缺真实请求数时只能估算
+        const requestsEstimated = extractedRequests <= 0 && usageRequests > 0 && (hit?.usageEstimated ?? false);
+        const failed = Math.max(0, rawFailed);
+        const success = requests > 0
+          ? Math.max(0, requests - Math.min(failed, requests))
+          : rawSuccess;
+        const successRate = requests > 0
+          ? success / requests
+          : (failed > 0 ? 0 : (sampleRequests > 0 ? rawSuccess / sampleRequests : null));
       return {
         key: `pre-${p.key}`,
         label: p.label,
@@ -669,6 +792,7 @@ const healthDisplayCells = computed<HealthDisplayCell[]>(() => {
         success,
         failed,
         requests,
+        requestsEstimated,
         successRate,
         level: healthLevelOf(successRate, requests > 0 || failed > 0, failed, requests),
         pad: false,
@@ -829,6 +953,15 @@ onBeforeUnmount(() => {
           <span :class="{ 'is-spinning': store.tokenStatsLoading.value || store.tokenCollectorSyncing.value }">↻</span>
           <span>{{ store.tokenCollectorSyncing.value ? "查看日志" : (store.tokenStatsLoading.value ? "读取中…" : "重建统计") }}</span>
         </button>
+        <button
+          class="tt-btn"
+          type="button"
+          :title="'只读扫描本机各 AI 工具的配置 / 数据 / 数据库根目录'"
+          @click="openAgentDialog"
+        >
+          <span v-html="icons.cpu"></span>
+          <span>本地 Agent</span>
+        </button>
       </div>
       <span
         v-if="!store.tokenCollectorSyncing.value && store.tokenCollectorSyncError.value"
@@ -867,7 +1000,6 @@ onBeforeUnmount(() => {
                 <span><i class="dot in"></i>输入 {{ formatCompact(rangeSplits.input) }}</span>
                 <span><i class="dot out"></i>输出 {{ formatCompact(rangeSplits.output) }}</span>
               </div>
-              <span class="tt-kpi-sub">本地日志统计</span>
             </div>
             <div class="tt-kpi-total-side">
               <div class="tt-kpi-top">
@@ -900,7 +1032,7 @@ onBeforeUnmount(() => {
                 正在扫描多工具日志…
               </template>
               <template v-else>
-                平均每轮 {{ stepsPerTurnLabel }} 步 · 请求 {{ formatTokens(totalSteps) }}
+                请求 {{ formatTokens(healthTimeline.totalRequests) }} · 平均每轮 {{ requestsPerTurnLabel }} 次
               </template>
             </span>
           </div>
@@ -1121,11 +1253,113 @@ onBeforeUnmount(() => {
       </div>
     </Transition>
 
+    <!-- 本地 AI Agent 路径诊断弹窗 -->
+    <Transition name="tt-modal-fade">
+      <div v-if="agentDialogOpen" class="tt-modal-backdrop" @click.self="closeAgentDialog">
+        <section
+          class="tt-modal tt-agent-modal"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="tt-agent-title"
+        >
+          <header class="tt-modal-head">
+            <div>
+              <h2 id="tt-agent-title">本地 AI Agent 路径</h2>
+              <p>只读扫描本机各 AI 工具的配置 / 数据 / 数据库根目录，不读取任何日志内容。</p>
+            </div>
+            <button type="button" class="tt-modal-close" aria-label="关闭" @click="closeAgentDialog">×</button>
+          </header>
+
+          <div class="tt-modal-body tt-agent-body">
+            <div v-if="store.localAgentPathsLoading.value && !store.localAgentPaths.value" class="tt-empty">
+              <span class="is-spinning">↻</span><strong>正在扫描本地 AI Agent 路径…</strong>
+            </div>
+            <div v-else-if="store.localAgentPathsError.value" class="tt-error" role="alert">
+              <strong>无法读取本地 Agent 路径</strong>
+              <p>{{ store.localAgentPathsError.value }}</p>
+            </div>
+            <template v-else-if="store.localAgentPaths.value">
+              <div class="tt-agent-meta">
+                <div class="tt-agent-meta-row">
+                  <span class="tt-agent-meta-label">主目录</span>
+                  <code>{{ localAgentsHome }}</code>
+                  <span class="tt-agent-meta-sep">·</span>
+                  <span>{{ localAgents.length }} 个 Agent</span>
+                  <span class="tt-agent-meta-sep">·</span>
+                  <span>{{ localAgents.filter((a) => a.detected).length }} 个已检测</span>
+                  <template v-if="localAgentsCollectedAt">
+                    <span class="tt-agent-meta-sep">·</span>
+                    <span>采集于 {{ localAgentsCollectedAt }}</span>
+                  </template>
+                </div>
+                <div v-if="localAgentEnvOverrides.length" class="tt-agent-env-row">
+                  <span
+                    v-for="override in localAgentEnvOverrides"
+                    :key="override.key"
+                    class="tt-agent-env-chip"
+                    :title="override.value"
+                  >{{ override.key }} → {{ override.value }}</span>
+                </div>
+              </div>
+              <div class="tt-agent-grid">
+                <div
+                  v-for="agent in localAgents"
+                  :key="agent.source"
+                  class="tt-agent-card"
+                  :class="{ 'is-detected': agent.detected }"
+                >
+                  <header class="tt-agent-head">
+                    <span class="tt-agent-dot" :class="{ on: agent.detected }"></span>
+                    <strong>{{ agent.name }}</strong>
+                    <span
+                      v-if="agent.collectedEvents > 0 || agent.collectedSessions > 0"
+                      class="tt-agent-count"
+                      :title="`最近一次采集：${agent.collectedSessions} 个会话，${agent.collectedEvents} 条用量记录`"
+                    >{{ formatAgentCount(agent.collectedSessions) }} 会话 · {{ formatAgentCount(agent.collectedEvents) }} 请求</span>
+                    <span class="tt-agent-status" :class="{ on: agent.detected }">
+                      {{ agent.detected ? "已检测" : "未检测" }}
+                    </span>
+                  </header>
+                  <code class="tt-agent-root" :title="agent.root">{{ displayAgentPath(agent.root) }}</code>
+                  <ul class="tt-agent-paths">
+                    <li
+                      v-for="(entry, index) in agent.paths"
+                      :key="index"
+                      :title="`点击复制：${entry.path}`"
+                      @click="copyAgentPath(entry.path)"
+                    >
+                      <span class="tt-agent-kind" :data-kind="entry.kind">{{ agentKindLabels[entry.kind] || entry.kind }}</span>
+                      <span class="tt-agent-entry-main">
+                        <span class="tt-agent-label">{{ entry.label }}</span>
+                        <code class="tt-agent-path" :class="{ missing: !entry.exists }"><span
+                          v-for="(segment, segmentIndex) in agentPathSegments(entry.path)"
+                          :key="segmentIndex"
+                          class="tt-path-seg"
+                        >{{ segment }}</span></code>
+                      </span>
+                      <span class="tt-agent-entry-side">
+                        <span v-if="entry.detail" class="tt-agent-detail">{{ entry.detail }}</span>
+                        <span class="tt-agent-exists" :class="{ off: !entry.exists }"></span>
+                      </span>
+                    </li>
+                  </ul>
+                </div>
+              </div>
+            </template>
+          </div>
+
+          <footer class="tt-refresh-footer">
+            <span>点击路径行复制到剪贴板 · 圆点表示存在，空心表示缺失 · “N 会话 · M 请求”为最近一次采集到的数据量</span>
+            <button type="button" class="tt-refresh-secondary" @click="closeAgentDialog">关闭</button>
+          </footer>
+        </section>
+      </div>
+    </Transition>
+
     <Transition name="tt-modal-fade">
       <div v-if="modalOpen" class="tt-modal-backdrop" @click.self="closeModal">
         <div
-          class="tt-modal"
-          :class="{ 'tt-modal-wide': modal === 'sources' || modal === 'models' }"
+          class="tt-modal tt-modal-wide"
           role="dialog"
           aria-modal="true"
           :aria-label="modalTitle"
@@ -1143,14 +1377,14 @@ onBeforeUnmount(() => {
             <!-- 明细：两个标签 + 分页 -->
             <div v-if="modal === 'daily' || modal === 'projects'">
               <div class="tt-modal-tabs">
-                <button type="button" :class="{ active: detailTab === 'daily' }" @click="switchDetailTab('daily')">趋势明细 · {{ trendDetail.length }}</button>
+                <button type="button" :class="{ active: detailTab === 'daily' }" @click="switchDetailTab('daily')">趋势明细 · {{ trendDetailList.length }}</button>
                 <button type="button" :class="{ active: detailTab === 'projects' }" @click="switchDetailTab('projects')">项目用量 · {{ projectUsage.length }}</button>
               </div>
 
               <div v-if="detailTab === 'daily'">
-                <div class="tt-list-meta">按当前趋势粒度 · {{ trendUnitLabel() }}</div>
+                <div class="tt-list-meta">按当前趋势粒度 · {{ trendUnitLabel() }} · 已过滤总计为 0 的空节点</div>
                 <AppTable
-                  :rows="trendDetail"
+                  :rows="trendDetailList"
                   :columns="dailyColumns"
                   :row-key="(item: any) => item.label"
                   :page="detailPage"
@@ -1166,6 +1400,7 @@ onBeforeUnmount(() => {
                   <template #cell-cacheHitRate="{ row }">{{ formatRate(row.cacheHitRate) }}</template>
                   <template #cell-reasoning="{ row }">{{ formatCompact(row.reasoning) }}</template>
                   <template #cell-sessions="{ row }">{{ formatTokens(row.sessions) }}</template>
+                  <template #cell-requests="{ row }">{{ row.requestsEstimated ? "≈" : "" }}{{ formatTokens(row.requests) }}</template>
                 </AppTable>
               </div>
 
@@ -1187,6 +1422,7 @@ onBeforeUnmount(() => {
                   <template #cell-cacheHitRate="{ row }">{{ formatRate(row.cacheHitRate) }}</template>
                   <template #cell-reasoning="{ row }">{{ formatCompact(row.reasoning) }}</template>
                   <template #cell-sessions="{ row }">{{ formatTokens(row.sessions) }}</template>
+                  <template #cell-requests="{ row }">{{ row.requestsEstimated ? "≈" : "" }}{{ formatTokens(row.requests) }}</template>
                   <template #cell-costUsd="{ row }">{{ formatCost(row.costUsd) }}</template>
                 </AppTable>
               </div>
@@ -1217,6 +1453,7 @@ onBeforeUnmount(() => {
                 <template #cell-cacheHitRate="{ row }">{{ formatRate(row.cacheHitRate) }}</template>
                 <template #cell-reasoningTokens="{ row }">{{ formatCompact(row.reasoningTokens) }}</template>
                 <template #cell-conversations="{ row }">{{ formatTokens(row.conversations) }}</template>
+                <template #cell-requests="{ row }">{{ row.requestsEstimated ? "≈" : "" }}{{ formatTokens(row.requests) }}</template>
                 <template #cell-costUsd="{ row }">{{ row.costUsd > 0 ? formatCost(row.costUsd) : "—" }}</template>
                 <template #cell-share="{ row }">{{ shareOf(row.totalTokens, totalTokensAll).toFixed(2) }}%</template>
               </AppTable>
@@ -1247,6 +1484,7 @@ onBeforeUnmount(() => {
                 <template #cell-cacheHitRate="{ row }">{{ formatRate(row.cacheHitRate) }}</template>
                 <template #cell-reasoningTokens="{ row }">{{ formatCompact(row.reasoningTokens) }}</template>
                 <template #cell-conversations="{ row }">{{ formatTokens(row.conversations) }}</template>
+                <template #cell-requests="{ row }">{{ row.requestsEstimated ? "≈" : "" }}{{ formatTokens(row.requests) }}</template>
                 <template #cell-costUsd="{ row }">{{ row.costUsd > 0 ? formatCost(row.costUsd) : "—" }}</template>
                 <template #cell-share="{ row }">{{ shareOf(row.totalTokens, totalTokensAll).toFixed(2) }}%</template>
               </AppTable>

@@ -9,7 +9,7 @@ import type {
   SyncLogEntry,
   SyncSitesProgress,
 } from "../types";
-import { normalizeSystemType } from "../types";
+import { isNewApiCompatible, normalizeSystemType } from "../types";
 
 const { sites, usageSites, loadLibrary } = useLibrary();
 const { showToast } = useToast();
@@ -39,6 +39,9 @@ let chromeBrowserSyncRunId = 0;
 let chromeBrowserSyncLogId = 0;
 let chromeBrowserSyncStartedAt = 0;
 let chromeBrowserSyncLastLogAt = 0;
+// 浏览器兜底冷却已改为后端持久化（site_accounts.browser_fallback_*，指数退避），
+// 前端从会话信息的 browserFallbackCooldownMs 读取：重启不丢失，自动调度与
+// 手动弹窗共用同一份状态；手动点击账号行的 Chrome 同步按钮不受冷却限制。
 let chromeBrowserSyncTimer: number | null = null;
 
 interface SyncedSiteModelsResult {
@@ -74,14 +77,12 @@ const chromeUsageAccounts: ComputedRef<Record<string, ChromeSessionInfo[]>> = co
 );
 
 function needsChromeAccountFallback(session: ChromeSessionInfo): boolean {
-  // 只有访问令牌缺失或被服务端拒绝时才进入 Cookie/refresh token/Chrome 回退。
-  // 普通网络错误、self 解析错误等保留日志，但不应额外弹出浏览器。
-  return !session.isValid;
+  // 账号数据无效或存在同步错误时，按站点配置进入 Cookie 或 refresh token 回退。
+  return !session.isValid || Boolean(session.syncError);
 }
 
 function canSyncAccountViaChrome(session: ChromeSessionInfo): boolean {
-  const normalized = normalizeSystemType(chromeSessionSite.value?.systemType ?? "");
-  return (normalized === "newapi" || normalized === "newapi2")
+  return isNewApiCompatible(chromeSessionSite.value?.systemType ?? "")
     && needsChromeAccountFallback(session);
 }
 
@@ -169,6 +170,8 @@ async function runChromeAccountSync(
     });
     const index = chromeSessions.value.findIndex((item) => item.profileId === session.profileId);
     if (index >= 0) chromeSessions.value[index] = refreshed;
+    // 失败冷却与失败原因由后端写入 site_accounts（sync_error / browser_fallback_*），
+    // 返回的 refreshed 会话已带最新的 browserFallbackCooldownMs。
     if (reloadLibrary) await loadLibrary();
     appendChromeBrowserSyncLog({
       stage,
@@ -598,11 +601,14 @@ async function syncChromeSession(site: any, trigger: HTMLElement) {
       });
       try {
         if (canSyncAccountViaChrome(session)) {
-          accountMode = "通过 Cookie/refresh token 取得访问令牌并刷新账号资料";
+          const useRefreshAuth = normalizeSystemType(chromeSessionSite.value?.systemType ?? "") === "newapi2";
+          accountMode = useRefreshAuth
+            ? "通过 refresh token 取得访问令牌并刷新账号资料"
+            : "通过 Cookie 刷新账号资料";
           appendChromeBrowserSyncLog({
             stage: `${stage}-strategy`,
             status: "info",
-            message: `账号资料｜${accountLabel}｜本地数据不可用，进入 Cookie/refresh token 回退流程`,
+            message: `账号资料｜${accountLabel}｜本地数据不可用或存在异常，进入${useRefreshAuth ? " refresh token" : " Cookie"}回退流程`,
           });
           accountReady = await runChromeAccountSync(session, { reloadLibrary: false });
           const refreshed = chromeSessions.value.find((item) => item.profileId === session.profileId);
@@ -617,11 +623,11 @@ async function syncChromeSession(site: any, trigger: HTMLElement) {
           });
         } else {
           accountReady = false;
-          accountMode = "账号访问令牌不可用";
+          accountMode = "账号认证不可用";
           appendChromeBrowserSyncLog({
             stage: `${stage}-strategy`,
             status: "error",
-            message: `账号资料｜${accountLabel}｜访问令牌不可用，且当前类型不支持认证回退`,
+            message: `账号资料｜${accountLabel}｜认证不可用，且当前类型不支持认证回退`,
           });
         }
 

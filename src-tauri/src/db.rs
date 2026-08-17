@@ -2,7 +2,7 @@ use crate::chrome_session;
 use crate::models::*;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{de::DeserializeOwned, Serialize};
-use std::{collections::HashMap, path::Path, time::Duration};
+use std::{path::Path, time::Duration};
 
 impl Database {
     pub(crate) fn open(path: &Path) -> Result<Self, String> {
@@ -105,6 +105,8 @@ impl Database {
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     newapi_token TEXT NOT NULL DEFAULT '',
                     newapi_user_id TEXT NOT NULL DEFAULT '',
+                    browser_fallback_failed_at INTEGER NOT NULL DEFAULT 0,
+                    browser_fallback_fail_count INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY (site_id, profile_id, domain),
                     FOREIGN KEY(site_id) REFERENCES directory_sites(id) ON DELETE CASCADE
                 );
@@ -443,9 +445,7 @@ impl Database {
                  UPDATE directory_sites SET system_type = 'codex'
                    WHERE LOWER(TRIM(system_type)) IN ('chatgpt-codex', 'chatgpt codex');
                  UPDATE directory_sites SET system_type = 'gemini'
-                   WHERE LOWER(TRIM(system_type)) = 'google';
-                 UPDATE directory_sites SET system_type = '0v0'
-                   WHERE LOWER(TRIM(system_type)) = 'zerovzero';",
+                   WHERE LOWER(TRIM(system_type)) = 'google';",
             )
             .map_err(|error| error.to_string())?;
         Ok(Self(std::sync::Mutex::new(connection)))
@@ -631,6 +631,10 @@ pub(crate) fn ensure_site_account_columns(connection: &Connection) -> Result<(),
         ("checkin_date", "TEXT NOT NULL DEFAULT ''"),
         ("newapi_token", "TEXT NOT NULL DEFAULT ''"),
         ("newapi_user_id", "TEXT NOT NULL DEFAULT ''"),
+        // 浏览器兜底失败的持久化冷却：failed_at 为 unix 毫秒，fail_count 支撑指数退避。
+        // 之前冷却只存在前端内存里，应用重启即丢失，自动同步会反复拉起后台标签页。
+        ("browser_fallback_failed_at", "INTEGER NOT NULL DEFAULT 0"),
+        ("browser_fallback_fail_count", "INTEGER NOT NULL DEFAULT 0"),
     ] {
         let exists = connection
             .query_row(
@@ -805,6 +809,7 @@ pub(crate) fn read_cached_usage_sites(
                     sa.checkin_enabled,
                     CASE WHEN sa.checkin_date = date('now', 'localtime') THEN sa.checked_in_today ELSE 0 END,
                     sa.checkin_error, sa.updated_at, sa.newapi_token, sa.newapi_user_id,
+                    sa.browser_fallback_failed_at, sa.browser_fallback_fail_count,
                     CASE WHEN smc.profile_id IS NULL THEN 0 ELSE 1 END,
                     COALESCE(smc.error, '')
              FROM site_accounts sa
@@ -817,6 +822,8 @@ pub(crate) fn read_cached_usage_sites(
         .query_map([], |row| {
             let cookie_names_json = row.get::<_, String>(4)?;
             let newapi_token = row.get::<_, String>(20)?;
+            let browser_fallback_failed_at = row.get::<_, i64>(22)?;
+            let browser_fallback_fail_count = row.get::<_, i64>(23)?;
             Ok((
                 row.get::<_, String>(0)?,
                 chrome_session::ChromeSessionInfo {
@@ -829,8 +836,8 @@ pub(crate) fn read_cached_usage_sites(
                     username: row.get(7)?,
                     api_key_count: row.get::<_, i64>(8)?.max(0) as usize,
                     api_model_count: row.get::<_, i64>(9)?.max(0) as usize,
-                    api_counts_synced: row.get::<_, i64>(22)? != 0,
-                    api_sync_error: row.get(23)?,
+                    api_counts_synced: row.get::<_, i64>(24)? != 0,
+                    api_sync_error: row.get(25)?,
                     has_access_token: !newapi_token.is_empty(),
                     remaining: row.get(10)?,
                     used: row.get(11)?,
@@ -842,7 +849,14 @@ pub(crate) fn read_cached_usage_sites(
                     checked_in_today: row.get::<_, i64>(17)? != 0,
                     checkin_error: row.get(18)?,
                     account_updated_at: row.get(19)?,
+                    browser_fallback_cooldown_ms:
+                        crate::account_sync::browser_fallback_cooldown_remaining_ms(
+                            browser_fallback_failed_at,
+                            browser_fallback_fail_count,
+                        ),
                     newapi_token,
+                    browser_fallback_failed_at,
+                    browser_fallback_fail_count,
                     newapi_user_id: row.get(21)?,
                 },
             ))
@@ -876,28 +890,6 @@ pub(crate) fn read_network_proxy(database: &Database) -> Result<String, String> 
         .optional()
         .map(|value| value.unwrap_or_default())
         .map_err(|error| error.to_string())
-}
-
-pub(crate) fn persist_site_system_types(
-    database: &Database,
-    system_types: &HashMap<String, String>,
-) -> Result<(), String> {
-    if system_types.is_empty() {
-        return Ok(());
-    }
-    let mut connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
-    let transaction = connection
-        .transaction()
-        .map_err(|error| error.to_string())?;
-    for (site_id, system_type) in system_types {
-        transaction
-            .execute(
-                "UPDATE directory_sites SET system_type = ?2 WHERE id = ?1",
-                params![site_id, system_type],
-            )
-            .map_err(|error| error.to_string())?;
-    }
-    transaction.commit().map_err(|error| error.to_string())
 }
 
 pub(crate) fn read_proxy_ignore_addresses(database: &Database) -> Result<String, String> {
@@ -1316,10 +1308,14 @@ mod account_proxy_channel_tests {
             .unwrap();
         assert_eq!(has_site_id, 0);
         let mut statement = connection
-            .prepare("SELECT profile_id, channel_id FROM account_proxy_channels ORDER BY profile_id")
+            .prepare(
+                "SELECT profile_id, channel_id FROM account_proxy_channels ORDER BY profile_id",
+            )
             .unwrap();
         let rows = statement
-            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
@@ -1340,7 +1336,9 @@ mod account_proxy_channel_tests {
 
         let connection = database.0.lock().unwrap();
         let count: i64 = connection
-            .query_row("SELECT COUNT(*) FROM account_proxy_channels", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM account_proxy_channels", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(count, 2);
     }

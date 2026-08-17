@@ -466,6 +466,24 @@ async function browserFallback<T>(
   if (command === "set_charity_monitor_visible") return undefined as T;
   if (command === "request_charity_round") return undefined as T;
 
+  // 浏览器降级模式下无桌面内核调度器，自动同步返回“已关闭”的空状态。
+  if (command === "get_auto_sync_settings") return { enabled: false, intervalMinutes: 30 } as T;
+  if (command === "set_auto_sync_settings") {
+    return {
+      enabled: Boolean(args.enabled),
+      intervalMinutes: Number(args.intervalMinutes || 30),
+    } as T;
+  }
+  if (command === "get_auto_sync_status") {
+    return {
+      enabled: false,
+      intervalMinutes: 30,
+      lastRoundAt: 0,
+      lastSummary: null,
+    } as T;
+  }
+  if (command === "request_auto_sync_round") return undefined as T;
+
   if (command === "get_token_stats") {
     return {
       available: true,
@@ -539,6 +557,64 @@ async function browserFallback<T>(
         { source: "mimo", dialogues: 90, requests: 900, success: 880, failed: 5 },
       ],
     } as T;
+  }
+  if (command === "get_local_agent_paths") {
+    const home = "~/";
+    const mk = (source: string, name: string, root: string, paths: { kind: string; label: string; path: string; exists: boolean }[]) =>
+      ({ source, name, root, detected: paths.some((p) => p.exists), paths });
+    return {
+      available: true,
+      home,
+      agents: [
+        mk("codex", "Codex", `${home}.codex`, [
+          { kind: "config", label: "配置 config.toml", path: `${home}.codex/config.toml`, exists: false },
+          { kind: "data", label: "会话 sessions", path: `${home}.codex/sessions`, exists: false },
+        ]),
+        mk("claude", "Claude Code", `${home}.claude`, [
+          { kind: "config", label: "项目设置 settings.json", path: `${home}.claude/settings.json`, exists: false },
+          { kind: "data", label: "会话项目 projects", path: `${home}.claude/projects`, exists: false },
+        ]),
+        mk("opencode", "OpenCode", `${home}.local/share/opencode`, [
+          { kind: "database", label: "数据库 opencode.db", path: `${home}.local/share/opencode/opencode.db`, exists: false },
+        ]),
+      ],
+    } as T;
+  }
+  if (command === "get_all_site_model_caches") {
+    // 与 previewModelSnapshot 配套：gpt-5.4 验证精确匹配 + 跨站合并，
+    // openai/gpt-5.4-preview 验证子串回退匹配，claude-sonnet-4 验证未匹配兜底。
+    return [
+      {
+        siteId: "preview-a",
+        cache: {
+          models: [
+            { id: "anthropic/claude-sonnet-4", ownedBy: "anthropic" },
+            { id: "gpt-5.4", ownedBy: "openai" },
+          ],
+          accounts: [{
+            profileId: "p1", profileName: "默认", accountName: "preview@a", username: "preview-a",
+            keys: ["sk-preview-aaaa1111", "sk-preview-bbbb2222"],
+            keyGroups: { "sk-preview-aaaa1111": "vip", "sk-preview-bbbb2222": "default" },
+            keyModels: {
+              "sk-preview-aaaa1111": [{ id: "anthropic/claude-sonnet-4", ownedBy: "anthropic" }],
+              "sk-preview-bbbb2222": [{ id: "gpt-5.4", ownedBy: "openai" }],
+            },
+          }],
+        },
+      },
+      {
+        siteId: "preview-b",
+        cache: {
+          models: [{ id: "openai/gpt-5.4-preview", ownedBy: "openai" }],
+          accounts: [{
+            profileId: "p1", profileName: "默认", accountName: "preview@b", username: "preview-b",
+            keys: ["sk-preview-cccc3333"],
+            keyGroups: { "sk-preview-cccc3333": "vip" },
+            keyModels: { "sk-preview-cccc3333": [{ id: "openai/gpt-5.4-preview", ownedBy: "openai" }] },
+          }],
+        },
+      },
+    ] as T;
   }
   if (command === "get_model_catalog") return structuredClone(previewModelSnapshot) as T;
   if (command === "get_model_catalog_detail") {
@@ -667,6 +743,14 @@ async function browserFallback<T>(
       site.isPersonal = true;
       site.isPending = false;
     }
+    site.updatedAt = new Date().toISOString();
+    return site as T;
+  }
+  if (command === "set_usage_state") {
+    const site = browserData!.sites.find((item) => item.id === args.id)!;
+    const state = String(args.state);
+    site.isPersonal = state === "personal";
+    site.isPending = state === "pending";
     site.updatedAt = new Date().toISOString();
     return site as T;
   }

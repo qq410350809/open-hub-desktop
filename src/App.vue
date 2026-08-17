@@ -19,10 +19,12 @@ import SettingsPage from "./components/SettingsPage.vue";
 import SyncSitesDialog from "./components/SyncSitesDialog.vue";
 import ChromeSessionDialog from "./components/ChromeSessionDialog.vue";
 import SiteModelsDialog from "./components/SiteModelsDialog.vue";
+import ConfirmDialog from "./components/ConfirmDialog.vue";
 import CharityMonitorPage from "./components/CharityMonitorPage.vue";
 import ProxyPoolPage from "./components/ProxyPoolPage.vue";
 import TokenStatsPage from "./components/TokenStatsPage.vue";
 import ModelCatalogPage from "./components/ModelCatalogPage.vue";
+import ModelAggregatePage from "./components/ModelAggregatePage.vue";
 
 const store = useStore();
 
@@ -104,7 +106,7 @@ function onKeydown(event: KeyboardEvent) {
     else if (store.linkDialogOpen.value) store.closeLinkDialog();
     else if (store.modalOpen.value) store.closeModal();
     else if (store.page.value === "settings") store.closeSettings();
-    else if (["library", "modelparams", "charity", "proxy", "tokenstats"].includes(store.page.value)) store.openTokenStats();
+    else if (["library", "modelparams", "modelagg", "charity", "proxy", "tokenstats"].includes(store.page.value)) store.openTokenStats();
   }
 }
 
@@ -118,6 +120,7 @@ function onMenuNavigate(event: Event) {
   const page = detail?.page;
   if (page === "library") store.openLibrary();
   else if (page === "modelparams") store.openModelParams();
+  else if (page === "modelagg") store.openModelAgg();
   else if (page === "charity") store.openCharityMonitor();
   else if (page === "proxy") store.openProxyPool();
   else if (page === "tokenstats") store.openTokenStats();
@@ -154,6 +157,8 @@ onMounted(async () => {
   ]);
   store.startDailyRefresh();
   store.startCharityMonitor();
+  // 自动会话同步：读取设置并订阅轮次事件（恢复成功/需人工过盾时 toast 提醒）。
+  store.initializeAutoSync();
 });
 
 onUnmounted(() => {
@@ -171,6 +176,7 @@ onUnmounted(() => {
   store.stopDailyRefresh();
   store.stopTokenDatabaseRefresh();
   store.stopModelCatalogEvents();
+  store.unbindAutoSyncListeners();
 });
 
 </script>
@@ -330,6 +336,14 @@ onUnmounted(() => {
           <ModelCatalogPage />
         </div>
         <div
+          v-else-if="store.page.value === 'modelagg'"
+          id="model-agg-panel"
+          class="modelagg-panel"
+          aria-labelledby="modelagg-nav"
+        >
+          <ModelAggregatePage />
+        </div>
+        <div
           v-else-if="store.page.value === 'charity'"
           id="charity-panel"
           class="charity-panel"
@@ -386,6 +400,7 @@ onUnmounted(() => {
   <SyncSitesDialog />
   <ChromeSessionDialog />
   <SiteModelsDialog />
+  <ConfirmDialog />
   <SettingsPage />
 
   <!-- 中文右键菜单：覆盖 WKWebView 默认英文菜单 -->

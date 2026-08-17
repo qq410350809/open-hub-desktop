@@ -202,6 +202,15 @@ function onRowClick(row: T) {
 function cellValue(row: T, key: string): unknown {
   return row[key];
 }
+// minmax(a, b) 是 grid 轨道专用值，直接用作 width 会被浏览器整条丢弃，
+// 导致该列宽度失控（auto 布局下吞掉全部剩余空间或塌缩）。
+// 转为 min-width 保留最小宽度，同时让该列在 auto 布局下自然吸收剩余空间。
+function columnStyle(col: AppTableColumn): Record<string, string> | undefined {
+  if (!col.width) return undefined;
+  const match = col.width.match(/^minmax\(\s*([^,\s)]+)\s*,\s*[^)]*\)$/);
+  if (match) return { minWidth: match[1].trim() };
+  return { width: col.width };
+}
 void icons;
 </script>
 
@@ -216,7 +225,7 @@ void icons;
               :key="header.id"
               role="columnheader"
               :class="['app-table-th', props.columns[header.index]?.align && `align-${props.columns[header.index].align}`]"
-              :style="props.columns[header.index]?.width ? { width: props.columns[header.index].width } : undefined"
+              :style="columnStyle(props.columns[header.index])"
               :aria-sort="header.column.getIsSorted() === 'asc' ? 'ascending' : header.column.getIsSorted() === 'desc' ? 'descending' : undefined"
             >
               <button
@@ -249,7 +258,7 @@ void icons;
               :key="col.key"
               role="cell"
               :class="['app-table-td', col.align && `align-${col.align}`, col.class]"
-              :style="col.width ? { width: col.width } : undefined"
+              :style="columnStyle(col)"
             >
               <slot :name="`cell-${col.key}`" :row="row.original" :value="cellValue(row.original, col.key)">{{ cellValue(row.original, col.key) ?? "—" }}</slot>
             </td>

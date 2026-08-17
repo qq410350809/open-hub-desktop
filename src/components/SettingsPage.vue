@@ -11,6 +11,24 @@ const store = useStore();
 const { preferences, updatePreferences } = usePreferences();
 const { setThemePreference } = useTheme();
 
+const AUTO_SYNC_INTERVAL_CHOICES = [15, 30, 60] as const;
+
+function setAutoSyncEnabled(enabled: boolean) {
+  void store.updateAutoSyncSettings({ enabled });
+}
+
+function setAutoSyncInterval(intervalMinutes: number) {
+  void store.updateAutoSyncSettings({ intervalMinutes });
+}
+
+function formatAutoSyncTime(at: number) {
+  if (!at) return "尚未运行";
+  const date = new Date(at * 1000);
+  const sameDay = new Date().toDateString() === date.toDateString();
+  const time = `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
+  return sameDay ? `今天 ${time}` : `${date.getMonth() + 1}/${date.getDate()} ${time}`;
+}
+
 const closeBtnRef = ref<HTMLButtonElement>();
 
 watch(
@@ -19,6 +37,7 @@ watch(
     if (page === "settings") {
       nextTick(() => closeBtnRef.value?.focus());
       void loadLightweightState();
+      void store.loadAutoSyncState();
     }
   },
 );
@@ -195,6 +214,82 @@ async function enterLightweightMode() {
                       <span v-html="icons.sessionImport" /><span>待定</span>
                     </button>
                   </div>
+                </div>
+              </div>
+            </section>
+
+            <!-- 自动会话同步 -->
+            <section class="settings-section">
+              <div class="settings-section-title">
+                <span v-html="icons.restore" />
+                <div>
+                  <h2>自动会话同步</h2>
+                  <p>后台定期刷新在用站点的账号额度与签到；刷新令牌模式会同步访问令牌，会话失效时自动通过 Chrome 恢复</p>
+                </div>
+              </div>
+              <div class="settings-rows">
+                <div class="settings-row">
+                  <div>
+                    <strong>自动同步</strong>
+                    <small>浏览器恢复只使用静默与后台标签，绝不弹出前台窗口；需要人工过盾时会提示</small>
+                  </div>
+                  <div class="preference-segment" id="auto-sync-enabled" role="group" aria-label="自动会话同步">
+                    <button
+                      type="button"
+                      :class="{ active: store.autoSyncSettings.value?.enabled }"
+                      data-auto-sync-choice="on"
+                      @click="setAutoSyncEnabled(true)"
+                    >
+                      <span v-html="icons.check" /><span>开启</span>
+                    </button>
+                    <button
+                      type="button"
+                      :class="{ active: store.autoSyncSettings.value && !store.autoSyncSettings.value.enabled }"
+                      data-auto-sync-choice="off"
+                      @click="setAutoSyncEnabled(false)"
+                    >
+                      <span v-html="icons.close" /><span>关闭</span>
+                    </button>
+                  </div>
+                </div>
+                <div class="settings-row">
+                  <div>
+                    <strong>同步间隔</strong>
+                    <small>每轮执行直连保活 → 失效账号恢复 → Key/模型刷新（过期缓存每天补刷一次）</small>
+                  </div>
+                  <div class="preference-segment" id="auto-sync-interval" role="group" aria-label="自动同步间隔">
+                    <button
+                      v-for="choice in AUTO_SYNC_INTERVAL_CHOICES"
+                      :key="choice"
+                      type="button"
+                      :class="{ active: (store.autoSyncSettings.value?.intervalMinutes ?? 30) === choice }"
+                      :data-auto-sync-interval="choice"
+                      @click="setAutoSyncInterval(choice)"
+                    >
+                      <span v-html="icons.clock" /><span>{{ choice }} 分钟</span>
+                    </button>
+                  </div>
+                </div>
+                <div class="settings-row">
+                  <div>
+                    <strong>最近一轮</strong>
+                    <small v-if="store.autoSyncStatus.value?.lastSummary">
+                      {{ formatAutoSyncTime(store.autoSyncStatus.value.lastRoundAt) }} ·
+                      保活 {{ store.autoSyncStatus.value.lastSummary.refreshedAccounts }} 个账号，
+                      恢复 {{ store.autoSyncStatus.value.lastSummary.recovered.length }} 个，
+                      待人工 {{ store.autoSyncStatus.value.lastSummary.pendingManual.length }} 个，
+                      Key/模型 {{ store.autoSyncStatus.value.lastSummary.modelsRefreshed }} 成功
+                    </small>
+                    <small v-else>{{ formatAutoSyncTime(store.autoSyncStatus.value?.lastRoundAt ?? 0) }}</small>
+                  </div>
+                  <button
+                    type="button"
+                    class="secondary-button"
+                    :disabled="store.autoSyncRoundRunning.value || !store.autoSyncSettings.value?.enabled"
+                    @click="store.requestAutoSyncRound()"
+                  >
+                    <span v-html="icons.restore" /><span>立即同步一轮</span>
+                  </button>
                 </div>
               </div>
             </section>

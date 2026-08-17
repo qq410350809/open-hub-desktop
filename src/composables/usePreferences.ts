@@ -1,5 +1,10 @@
 import { reactive, watch } from "vue";
-import type { Preferences, ThemePreference, ProxyNodeViewModePreference } from "../types";
+import type {
+  ModelAggGroupMode,
+  Preferences,
+  ThemePreference,
+  ProxyNodeViewModePreference,
+} from "../types";
 
 const PREFERENCES_KEY = "ldoh:preferences";
 
@@ -9,7 +14,27 @@ const defaultPreferences: Preferences = {
   defaultUsageFilter: "all",
   proxyNodeViewMode: "list",
   sidebarCollapsed: false,
+  modelAggSiteOrder: [],
+  modelAggGroupModes: {},
+  modelAggHiddenModels: [],
 };
+
+/** 过滤出非空字符串并保持顺序（用于站点顺序、隐藏模型键等列表型偏好）。 */
+function normalizeStringList(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.filter((item): item is string => typeof item === "string" && item.trim().length > 0);
+}
+
+function normalizeModelAggGroupModes(raw: unknown): Record<string, ModelAggGroupMode> {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  const modes: Record<string, ModelAggGroupMode> = {};
+  for (const [group, mode] of Object.entries(raw as Record<string, unknown>)) {
+    if (group.trim().length > 0 && (mode === "aggregate" || mode === "independent")) {
+      modes[group] = mode;
+    }
+  }
+  return modes;
+}
 
 function loadPreferences(): Preferences {
   try {
@@ -30,6 +55,9 @@ function loadPreferences(): Preferences {
       defaultUsageFilter: saved.defaultUsageFilter ?? "all",
       proxyNodeViewMode: proxyNodeViewMode as ProxyNodeViewModePreference,
       sidebarCollapsed: Boolean(saved.sidebarCollapsed),
+      modelAggSiteOrder: normalizeStringList(saved.modelAggSiteOrder),
+      modelAggGroupModes: normalizeModelAggGroupModes(saved.modelAggGroupModes),
+      modelAggHiddenModels: normalizeStringList(saved.modelAggHiddenModels),
     };
   } catch {
     return { ...defaultPreferences };

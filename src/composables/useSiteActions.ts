@@ -2,12 +2,14 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import { runCommand, useLibrary } from "./useLibrary";
 import { useToast } from "./useToast";
 import { useUIState } from "./useUIState";
+import { useConfirm } from "./useConfirm";
 import type { AddressItem, SiteRecord, SiteLinkKind, SiteUsageState } from "../types";
 import { systemTypeLabel } from "../types";
 
 const isTauri = "__TAURI_INTERNALS__" in window;
 const { loadLibrary } = useLibrary();
 const { showToast } = useToast();
+const { confirm } = useConfirm();
 const { editingId, closeModal } = useUIState();
 
 async function saveSite(input: SiteRecord): Promise<boolean> {
@@ -42,7 +44,13 @@ async function importSite(siteUrl: string, usageState: SiteUsageState = "all"): 
 }
 
 async function deleteSite(site: SiteRecord) {
-  if (!window.confirm(`确定删除"${site.name}"吗？此操作会永久移除本地记录。`)) return;
+  const accepted = await confirm({
+    title: "删除站点",
+    message: `确定删除「${site.name}」吗？此操作会永久移除本地记录。`,
+    confirmText: "删除",
+    danger: true,
+  });
+  if (!accepted) return;
   try {
     await runCommand<void>("delete_site", { id: site.id });
     await loadLibrary();
@@ -65,6 +73,15 @@ async function togglePending(site: SiteRecord) {
 async function cycleUsageState(site: SiteRecord) {
   try {
     await runCommand<SiteRecord>("cycle_usage_state", { id: site.id });
+    await loadLibrary();
+  } catch (error) {
+    showToast(`状态更新失败：${String(error)}`, true);
+  }
+}
+
+async function setUsageState(site: SiteRecord, state: "personal" | "pending" | "unused") {
+  try {
+    await runCommand<SiteRecord>("set_usage_state", { id: site.id, state });
     await loadLibrary();
   } catch (error) {
     showToast(`状态更新失败：${String(error)}`, true);
@@ -139,6 +156,7 @@ export function useSiteActions() {
     togglePersonal,
     togglePending,
     cycleUsageState,
+    setUsageState,
     toggleRunaway,
     openExternal,
     openExternalInChromeProfile,

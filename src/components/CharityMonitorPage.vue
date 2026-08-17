@@ -2,11 +2,13 @@
 import { computed, onMounted, onUnmounted, ref } from "vue";
 import { icons } from "../icons";
 import { useStore } from "../composables/useStore";
+import { useConfirm } from "../composables/useConfirm";
 import AppTable, { type AppTableColumn } from "./AppTable.vue";
 import type { CharityFeedItem } from "../types";
 import type { SortingState } from "@tanstack/table-core";
 
 const store = useStore();
+const { confirm } = useConfirm();
 import CustomSelect from "./CustomSelect.vue";
 
 /** 帖子详情弹窗 */
@@ -84,7 +86,13 @@ async function handleToggleTag(id: string, enabled: boolean) {
 }
 
 async function handleRemoveTag(id: string, name: string) {
-  if (!confirm(`确定删除标签「${name}」吗？已抓取的帖子不会被删除。`)) return;
+  const accepted = await confirm({
+    title: "删除标签",
+    message: `确定删除标签「${name}」吗？已抓取的帖子不会被删除。`,
+    confirmText: "删除",
+    danger: true,
+  });
+  if (!accepted) return;
   try {
     await store.removeCharitySource(id);
   } catch (cause) {

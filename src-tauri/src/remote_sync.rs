@@ -1,7 +1,6 @@
 use crate::chrome_session;
 use crate::db::*;
 use crate::models::*;
-use crate::platform_detect;
 use crate::site_ops::*;
 use rusqlite::OptionalExtension;
 use std::{collections::HashSet, time::Duration};
@@ -325,12 +324,10 @@ pub async fn sync_remote_sites(
             site.is_pending = is_pending && !is_personal;
             site.use_system_proxy = use_system_proxy;
             site.use_proxy_pool = use_proxy_pool;
-            // 浏览器证据得出的刷新令牌细分（newapi2）优先于远端通用判定（new-api）：
-            // 远端同步只应补充/纠正基础类型，不应把更细的认证形态打回 Cookie 模式。
-            let remote_type = site.system_type.trim().to_string();
-            if remote_type.is_empty() {
-                site.system_type = system_type;
-            } else if system_type == "newapi2" && platform_detect::is_newapi(&remote_type) {
+            // 已存在站点的类型一律冻结：本地类型可能来自用户手工调整或既有证据，
+            // 全量同步只允许为“新增站点”提供类型；本地非空时绝不改写，
+            // 本地为空（历史遗留缺类型）时才用远端值补齐——补缺不算修改。
+            if !system_type.trim().is_empty() {
                 site.system_type = system_type;
             }
             updated += 1;

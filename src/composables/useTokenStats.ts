@@ -5,6 +5,7 @@ import type {
   TokenStatsReport,
   TokenCollectorSyncReport,
   TokenUsageReport,
+  LocalAgentPathsReport,
 } from "../types";
 import { runCommand } from "./useLibrary";
 
@@ -13,6 +14,11 @@ const tokenStatsLoading = ref(false);
 const tokenStatsError = ref("");
 const tokenStatsFrom = ref("");
 const tokenStatsTo = ref("");
+
+// 本地 AI Agent 路径诊断（只读扫描配置 / 数据 / 数据库目录）
+const localAgentPaths = ref<LocalAgentPathsReport | null>(null);
+const localAgentPathsLoading = ref(false);
+const localAgentPathsError = ref("");
 
 // 小时用量桶（Token 统计页概览数据源，覆盖所有工具）
 const tokenUsage = ref<TokenUsageReport | null>(null);
@@ -259,6 +265,19 @@ async function loadRequestHealth(refresh = false) {
   }
 }
 
+async function loadLocalAgentPaths() {
+  localAgentPathsLoading.value = true;
+  localAgentPathsError.value = "";
+  try {
+    localAgentPaths.value = await runCommand<LocalAgentPathsReport>("get_local_agent_paths");
+  } catch (error) {
+    localAgentPathsError.value = String(error);
+    localAgentPaths.value = null;
+  } finally {
+    localAgentPathsLoading.value = false;
+  }
+}
+
 async function refreshTokenDatabaseView(showLoading = false) {
   // 强制重建完成后的前台刷新必须等待正在进行的轮询，然后再读一次新快照；
   // 普通轮询则直接复用当前任务，避免每 5 秒堆积并发查询。
@@ -342,6 +361,10 @@ export function useTokenStats() {
     tokenCollectorSyncing,
     tokenCollectorSyncError,
     tokenCollectorSyncReport,
+    localAgentPaths,
+    localAgentPathsLoading,
+    localAgentPathsError,
+    loadLocalAgentPaths,
     syncTokenCollector,
     quickRanges,
     isCurrentRange,

@@ -335,10 +335,7 @@ fn load_channels(
     let mut accounts_by_channel = HashMap::<String, Vec<ProxyChannelAccount>>::new();
     let account_rows = account_statement
         .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-            ))
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })
         .map_err(|error| error.to_string())?
         .collect::<Result<Vec<_>, _>>()
@@ -959,14 +956,10 @@ fn speed_value_end(lower: &str, from: usize) -> Option<usize> {
     let after_space = rest.trim_start_matches(' ');
     let space_len = rest.len() - after_space.len();
     let units = [
-        "mb/s", "kb/s", "gb/s", "tb/s",
-        "mbps", "kbps", "gbps", "tbps",
-        "mbs", "kbs", "gbs", "tbs",
-        "mbit/s", "kbit/s", "gbit/s", "tbit/s",
-        "mbits/s", "kbits/s", "gbits/s", "tbits/s",
-        "mb/秒", "kb/秒", "gb/秒", "tb/秒",
-        "m/s", "k/s", "g/s", "t/s",
-        "m/秒", "k/秒", "g/秒", "t/秒",
+        "mb/s", "kb/s", "gb/s", "tb/s", "mbps", "kbps", "gbps", "tbps", "mbs", "kbs", "gbs", "tbs",
+        "mbit/s", "kbit/s", "gbit/s", "tbit/s", "mbits/s", "kbits/s", "gbits/s", "tbits/s",
+        "mb/秒", "kb/秒", "gb/秒", "tb/秒", "m/s", "k/s", "g/s", "t/s", "m/秒", "k/秒", "g/秒",
+        "t/秒",
     ];
     units
         .iter()
@@ -989,7 +982,20 @@ fn speed_result_start(lower: &str, original: &str) -> Option<usize> {
                 .is_some_and(|character| {
                     matches!(
                         character,
-                        '|' | '｜' | '·' | '•' | '-' | '—' | ':' | '：' | '/' | '(' | '（' | '[' | '【' | ' ' | '\t'
+                        '|' | '｜'
+                            | '·'
+                            | '•'
+                            | '-'
+                            | '—'
+                            | ':'
+                            | '：'
+                            | '/'
+                            | '('
+                            | '（'
+                            | '['
+                            | '【'
+                            | ' '
+                            | '\t'
                     )
                 });
         if separated && speed_value_end(lower, index).is_some() {
@@ -1013,8 +1019,18 @@ fn speed_result_start(lower: &str, original: &str) -> Option<usize> {
 fn clean_node_name(name: &str) -> String {
     let lower = name.to_lowercase();
     let markers = [
-        "测速结果", "测速", "速度测试", "延迟测试", "时延", "延迟", "速度",
-        "speedtest", "speed test", "latency", "rtt", "ping",
+        "测速结果",
+        "测速",
+        "速度测试",
+        "延迟测试",
+        "时延",
+        "延迟",
+        "速度",
+        "speedtest",
+        "speed test",
+        "latency",
+        "rtt",
+        "ping",
     ];
     let mut cut = name.len();
     for marker in markers {
@@ -1027,7 +1043,20 @@ fn clean_node_name(name: &str) -> String {
                 .map(|character| {
                     matches!(
                         character,
-                        '|' | '｜' | '·' | '•' | '-' | '—' | ':' | '：' | '/' | '(' | '（' | '[' | '【' | ' ' | '\t'
+                        '|' | '｜'
+                            | '·'
+                            | '•'
+                            | '-'
+                            | '—'
+                            | ':'
+                            | '：'
+                            | '/'
+                            | '('
+                            | '（'
+                            | '['
+                            | '【'
+                            | ' '
+                            | '\t'
                     )
                 })
                 .unwrap_or(true);
@@ -1044,7 +1073,20 @@ fn clean_node_name(name: &str) -> String {
     let cleaned = name[..cut].trim_end_matches(|character: char| {
         matches!(
             character,
-            '|' | '｜' | '·' | '•' | '-' | '—' | ':' | '：' | '/' | '(' | '（' | '[' | '【' | ' ' | '\t'
+            '|' | '｜'
+                | '·'
+                | '•'
+                | '-'
+                | '—'
+                | ':'
+                | '：'
+                | '/'
+                | '('
+                | '（'
+                | '['
+                | '【'
+                | ' '
+                | '\t'
         )
     });
     let cleaned = cleaned.trim();
@@ -1138,9 +1180,7 @@ pub(crate) fn repair_stored_node_names(database: &Database) -> Result<usize, Str
             .map_err(|error| error.to_string())?;
         repaired += 1;
     }
-    transaction
-        .commit()
-        .map_err(|error| error.to_string())?;
+    transaction.commit().map_err(|error| error.to_string())?;
     Ok(repaired)
 }
 
@@ -3113,11 +3153,7 @@ fn read_channel_node_id(database: &Database, channel_id: &str) -> Result<String,
         .map_err(|error| error.to_string())
 }
 
-fn write_channel_node(
-    database: &Database,
-    channel_id: &str,
-    node_id: &str,
-) -> Result<(), String> {
+fn write_channel_node(database: &Database, channel_id: &str, node_id: &str) -> Result<(), String> {
     let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
     ensure_default_proxy_channel(&connection)?;
     connection
@@ -3161,10 +3197,7 @@ fn channel_candidate_nodes(
         .collect())
 }
 
-fn channel_id_for_account(
-    database: &Database,
-    profile_id: &str,
-) -> Result<String, String> {
+fn channel_id_for_account(database: &Database, profile_id: &str) -> Result<String, String> {
     if let Some(channel_id) = read_account_proxy_channel_id(database, profile_id)? {
         if !channel_id.trim().is_empty() {
             return Ok(channel_id);
@@ -3180,7 +3213,8 @@ pub(crate) async fn select_channel_proxy_node(
 ) -> Result<String, String> {
     let existing = read_channel_node_id(database, channel_id)?;
     if !existing.is_empty() {
-        if node_is_channel_available(database, &existing) && !runtime.account_node_is_banned(&existing)
+        if node_is_channel_available(database, &existing)
+            && !runtime.account_node_is_banned(&existing)
         {
             select_proxy_node_transient(database, runtime, &existing).await?;
             return Ok(existing);
@@ -3280,8 +3314,7 @@ where
                 Err(error) => {
                     last_error = error;
                     if attempt + 1 < ACCOUNT_PROXY_MAX_ATTEMPTS
-                        && (is_transport_error(&last_error)
-                            || is_http_forbidden_error(&last_error))
+                        && (is_transport_error(&last_error) || is_http_forbidden_error(&last_error))
                     {
                         continue;
                     }
@@ -3748,17 +3781,11 @@ async fn run_proxy_node_pool(
             .map_err(|error| error.to_string())?;
         for (id, delay) in pending.drain(..) {
             if let Some(delay) = delay {
-                tx.execute(
-                    success_sql,
-                    params![id, delay],
-                )
-                .map_err(|error| error.to_string())?;
+                tx.execute(success_sql, params![id, delay])
+                    .map_err(|error| error.to_string())?;
             } else {
-                tx.execute(
-                    error_sql,
-                    [&id],
-                )
-                .map_err(|error| error.to_string())?;
+                tx.execute(error_sql, [&id])
+                    .map_err(|error| error.to_string())?;
             }
         }
         tx.commit().map_err(|error| error.to_string())?;
@@ -4126,7 +4153,10 @@ mod tests {
         assert_eq!(clean_node_name("低延迟专线 01"), "低延迟专线 01");
         assert_eq!(clean_node_name("测试节点"), "测试节点");
         assert_eq!(clean_node_name("5G 专线 02"), "5G 专线 02");
-        assert_eq!(clean_node_name("节点 | 剩余流量 90GB"), "节点 | 剩余流量 90GB");
+        assert_eq!(
+            clean_node_name("节点 | 剩余流量 90GB"),
+            "节点 | 剩余流量 90GB"
+        );
     }
 
     #[test]

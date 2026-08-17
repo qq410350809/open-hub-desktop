@@ -83,6 +83,8 @@ export interface ChromeSessionInfo {
   checkinError: string;
   accountUpdatedAt: string;
   newapiUserId?: string;
+  /** 浏览器兜底剩余冷却毫秒（后端持久化指数退避），0 表示不在冷却。 */
+  browserFallbackCooldownMs?: number;
 }
 
 export interface ChromeSessionValue {
@@ -125,6 +127,44 @@ export interface SyncSitesProgress {
   stage: string;
   status: SyncProgressStatus;
   message: string;
+}
+
+export interface AutoSyncSettings {
+  enabled: boolean;
+  intervalMinutes: number;
+}
+
+export interface AutoSyncAccountChange {
+  siteId: string;
+  siteName: string;
+  profileId: string;
+  accountLabel: string;
+  error: string;
+}
+
+export interface AutoSyncRoundSummary {
+  startedAt: number;
+  finishedAt: number;
+  refreshedAccounts: number;
+  recovered: AutoSyncAccountChange[];
+  pendingManual: AutoSyncAccountChange[];
+  modelsRefreshed: number;
+  modelsFailed: number;
+  error: string;
+}
+
+export interface AutoSyncStatus {
+  enabled: boolean;
+  intervalMinutes: number;
+  lastRoundAt: number;
+  lastSummary: AutoSyncRoundSummary | null;
+}
+
+export interface AutoSyncProgress {
+  stage: string;
+  status: SyncProgressStatus;
+  message: string;
+  at: number;
 }
 
 export interface SyncLogEntry {
@@ -231,12 +271,50 @@ export interface ModelItem {
 export type ThemePreference = "system" | "light" | "dark";
 export type ProxyNodeViewModePreference = "list" | "country";
 
+/** 模型聚合页：同名分组的展示模式（聚合 = 跨站合并，独立 = 各站分开）。 */
+export type ModelAggGroupMode = "aggregate" | "independent";
+
 export interface Preferences {
   theme: ThemePreference;
   defaultRunawayFilter: string;
   defaultUsageFilter: string;
   proxyNodeViewMode: ProxyNodeViewModePreference;
   sidebarCollapsed: boolean;
+  /** 模型聚合页右侧条目顺序（独立站点 = site id，聚合块 = `group:<分组名>`）。 */
+  modelAggSiteOrder: string[];
+  /** 模型聚合页：分组名 → 聚合/独立模式。 */
+  modelAggGroupModes: Record<string, ModelAggGroupMode>;
+  /** 模型聚合页：手动取消勾选（隐藏）的树节点键；默认空 = 全部选中。 */
+  modelAggHiddenModels: string[];
+}
+
+// —— 站点模型缓存（与 Rust 侧 models.rs 的同名结构对齐，camelCase）——
+
+export interface SiteModelItem {
+  id: string;
+  ownedBy?: string;
+}
+
+export interface SiteModelCacheAccount {
+  profileId: string;
+  profileName: string;
+  accountName: string;
+  username: string;
+  keys: string[];
+  keyGroups?: Record<string, string>;
+  keyModels?: Record<string, SiteModelItem[]>;
+  error?: string;
+}
+
+export interface SiteModelCache {
+  models: SiteModelItem[];
+  apiSource?: string;
+  accounts: SiteModelCacheAccount[];
+}
+
+export interface SiteModelCacheEntry {
+  siteId: string;
+  cache: SiteModelCache;
 }
 
 // —— 系统类型（与 Rust 侧 platform_detect::canonical_platform 保持一致）——
@@ -256,7 +334,6 @@ export const SYSTEM_TYPES: { value: string; text: string }[] = [
   { value: "newapi2", text: "NewAPI · 刷新令牌" },
   { value: "sub2api", text: "Sub2API" },
   { value: "one-api", text: "One API" },
-  { value: "0v0", text: "0v0" },
 ];
 
 /** 去除空白/中划线/下划线并转小写，用于跨新旧命名比较。 */
@@ -277,6 +354,20 @@ export function systemTypeLabel(raw: string): string {
 export const KNOWN_SYSTEM_TYPES: ReadonlySet<string> = new Set(
   SYSTEM_TYPES.map((item) => normalizeSystemType(item.value)),
 );
+
+/** 判断系统类型是否属于/兼容 NewAPI 架构（NewAPI / AnyRouter / One API / One Hub / Done Hub / Veloera）。 */
+export function isNewApiCompatible(raw: string): boolean {
+  const normalized = normalizeSystemType(raw);
+  return [
+    "newapi",
+    "newapi2",
+    "anyrouter",
+    "oneapi",
+    "onehub",
+    "donehub",
+    "veloera",
+  ].includes(normalized);
+}
 
 export const emptySite = (): SiteRecord => ({
   id: "",
@@ -530,10 +621,14 @@ export interface TokenUsageBucket {
   outputTokens: number;
   reasoningOutputTokens: number;
   conversationCount: number;
+  /** 桶内真实 API 请求数（一次模型调用 = 一次请求，含子代理/工具循环触发）。旧快照可能缺失。 */
+  requestCount?: number;
   costUsd: number;
   pricingAvailable: boolean;
   /** 根据本地可见会话上下文估算、而非来源直接上报的 Token 数。 */
   estimatedTokens: number;
+  /** 输入 Token 中来自无缓存字段来源的估算部分；用于区分 0% 命中与无缓存数据。 */
+  estimatedInputTokens: number;
 }
 
 export interface TokenUsageReport {
@@ -619,6 +714,42 @@ export interface RawLogReport {
   sessions: RawSession[];
   conversations: RawConversation[];
   requests: RawRequest[];
+}
+
+// —— 本地 AI Agent 路径诊断 ——
+export interface LocalAgentPathEntry {
+  kind: string;   // config / data / database
+  label: string;
+  path: string;
+  exists: boolean;
+  /** 文件大小（如 38 MB）或目录直属条目数（如 12 项）。 */
+  detail: string;
+}
+
+export interface LocalAgentPaths {
+  source: string;
+  name: string;
+  root: string;
+  detected: boolean;
+  paths: LocalAgentPathEntry[];
+  /** 最近一次采集中该来源的会话数 / 用量事件数。 */
+  collectedSessions: number;
+  collectedEvents: number;
+}
+
+export interface LocalAgentEnvOverride {
+  key: string;
+  value: string;
+}
+
+export interface LocalAgentPathsReport {
+  available: boolean;
+  home: string;
+  agents: LocalAgentPaths[];
+  /** 当前生效的路径重定向环境变量。 */
+  envOverrides: LocalAgentEnvOverride[];
+  /** 采集缓存的最近更新时间（ISO），空表示尚无采集缓存。 */
+  collectedAt: string;
 }
 
 export interface LightweightState {

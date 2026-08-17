@@ -19,7 +19,6 @@ pub(crate) const PROXY_RUNTIME_URL: &str = "http://127.0.0.1:17890";
 pub(crate) const DEFAULT_PROXY_IGNORE: &str =
     "localhost,127.0.0.1,::1,.local,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16";
 pub(crate) const DEFAULT_PROXY_SPEED_TEST_URL: &str = "http://www.gstatic.com/generate_204";
-pub(crate) const ZERO_V_ZERO_CONSOLE_URL: &str = "https://0v0.club/";
 
 pub(crate) struct Database(pub(crate) std::sync::Mutex<Connection>);
 
@@ -250,6 +249,14 @@ pub(crate) struct SiteModelCache {
     pub(crate) models: Vec<SiteModelItem>,
     pub(crate) api_source: String,
     pub(crate) accounts: Vec<SiteModelCacheAccount>,
+}
+
+/// 跨站点聚合用：站点 ID + 该站点的模型缓存。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SiteModelCacheEntry {
+    pub(crate) site_id: String,
+    pub(crate) cache: SiteModelCache,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -675,6 +682,10 @@ pub(crate) struct TokenUsageBucket {
     pub(crate) reasoning_output_tokens: i64,
     #[serde(alias = "conversation_count")]
     pub(crate) conversation_count: i64,
+    /// 桶内真实 API 请求数（一次模型调用 = 一次请求，含子代理与工具循环触发）。
+    /// 由采集器的用量事件逐条计数；旧快照可能缺失，前端需按 0 兜底。
+    #[serde(alias = "request_count")]
+    pub(crate) request_count: i64,
     /// 数据源明确上报的成本；未上报时为 0。
     #[serde(alias = "cost_usd")]
     pub(crate) cost_usd: f64,
@@ -684,6 +695,9 @@ pub(crate) struct TokenUsageBucket {
     /// 其中有多少 Token 是根据本地可见会话上下文估算，而非来源直接上报。
     #[serde(alias = "estimated_tokens")]
     pub(crate) estimated_tokens: i64,
+    /// 输入 Token 中来自“无缓存字段来源”的估算部分；用于区分真实 0% 命中与无缓存数据。
+    #[serde(alias = "estimated_input_tokens")]
+    pub(crate) estimated_input_tokens: i64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -828,4 +842,53 @@ pub(crate) struct RawLogReport {
     pub(crate) sessions: Vec<RawSession>,
     pub(crate) conversations: Vec<RawConversation>,
     pub(crate) requests: Vec<RawRequest>,
+}
+
+// —— 本地 AI Agent 路径诊断：展示各工具配置 / 数据 / 数据库的根目录 ——
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub(crate) struct LocalAgentPathEntry {
+    /// 配置 / 数据 / 日志 / 数据库
+    pub(crate) kind: String,
+    /// 展示用简短说明（如「配置 config.toml」）
+    pub(crate) label: String,
+    pub(crate) path: String,
+    pub(crate) exists: bool,
+    /// 附加信息：文件大小（如 38 MB）或目录直属条目数（如 12 项）。
+    pub(crate) detail: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub(crate) struct LocalAgentPaths {
+    pub(crate) source: String,
+    pub(crate) name: String,
+    /// 该 Agent 的首选根目录
+    pub(crate) root: String,
+    /// 是否检测到至少一个路径（或根目录存在）
+    pub(crate) detected: bool,
+    pub(crate) paths: Vec<LocalAgentPathEntry>,
+    /// 最近一次采集中该来源的会话数 / 用量事件数；0 表示尚未采到数据。
+    pub(crate) collected_sessions: usize,
+    pub(crate) collected_events: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub(crate) struct LocalAgentEnvOverride {
+    /// 生效中的重定向环境变量名（如 CLAUDE_CONFIG_DIR）
+    pub(crate) key: String,
+    pub(crate) value: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub(crate) struct LocalAgentPathsReport {
+    pub(crate) available: bool,
+    pub(crate) home: String,
+    pub(crate) agents: Vec<LocalAgentPaths>,
+    /// 当前生效的路径重定向环境变量。
+    pub(crate) env_overrides: Vec<LocalAgentEnvOverride>,
+    /// 采集缓存的最近更新时间（ISO），空表示尚无采集缓存。
+    pub(crate) collected_at: String,
 }

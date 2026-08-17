@@ -3,9 +3,8 @@ use crate::chrome_local_storage;
 use crate::chrome_session;
 use crate::db::*;
 use crate::models::*;
-use crate::platform_detect::{is_newapi, is_sub2api, is_zero_v_zero};
+use crate::platform_detect::{is_newapi, is_newapi_refresh, is_sub2api};
 use crate::proxy_pool;
-use crate::site_ops::*;
 use rusqlite::{params, OptionalExtension};
 use serde_json;
 use std::collections::{HashMap, HashSet};
@@ -54,22 +53,13 @@ pub async fn mark_sites_with_chrome_sessions(
                 let name = row.get::<_, String>(1)?;
                 let checkin_url = row.get::<_, String>(2)?;
                 let api_base_url = row.get::<_, String>(3)?;
-                let stored_system_type = row.get::<_, String>(4)?;
-                let system_type = if is_zero_v_zero_site(&name, &api_base_url, &stored_system_type)
-                {
-                    "0v0".to_string()
-                } else {
-                    stored_system_type
-                };
-                let api_base_url = account_base_url(&name, &api_base_url, &system_type);
+                let system_type = row.get::<_, String>(4)?;
                 let mut urls = Vec::with_capacity(4);
                 if !api_base_url.trim().is_empty() {
                     let account_paths: &[&str] = if is_newapi(&system_type) {
                         &["/api/user/auth/refresh", "/api/user/self"]
                     } else if is_sub2api(&system_type) {
                         &["/api/v1/auth/me"]
-                    } else if is_zero_v_zero(&system_type) {
-                        &["/api/user/self", "/api/user/stats"]
                     } else {
                         &[]
                     };
@@ -136,11 +126,17 @@ pub async fn mark_sites_with_chrome_sessions(
         let mut statement = connection
             .prepare(&format!("SELECT id FROM directory_sites WHERE {condition}"))
             .map_err(|error| error.to_string())?;
-        let ids = statement
+        let mut ids = statement
             .query_map([], |row| row.get::<_, String>(0))
             .map_err(|error| error.to_string())?
             .collect::<Result<HashSet<_>, _>>()
             .map_err(|error| error.to_string())?;
+        if let Some(site_id) = &requested_site_id {
+            ids.insert(site_id.clone());
+        }
+        for site_id in &requested_site_ids {
+            ids.insert(site_id.clone());
+        }
         ids
     };
     let checkin_site_ids = {
@@ -165,8 +161,6 @@ pub async fn mark_sites_with_chrome_sessions(
             &["/api/user/self", "/api/user/auth/refresh"]
         } else if is_sub2api(system_type) {
             &["/api/v1/auth/me"]
-        } else if is_zero_v_zero(system_type) {
-            &["/api/user/self", "/api/user/stats"]
         } else {
             &[]
         };
@@ -231,15 +225,17 @@ pub async fn mark_sites_with_chrome_sessions(
             .query_map([], |row| {
                 let keys_json: String = row.get(2)?;
                 let keys = serde_json::from_str::<Vec<String>>(&keys_json).unwrap_or_default();
-                Ok((
-                    (row.get::<_, String>(0)?, row.get::<_, String>(1)?),
-                    keys,
-                ))
+                Ok(((row.get::<_, String>(0)?, row.get::<_, String>(1)?), keys))
             })
             .map_err(|error| error.to_string())?
             .collect::<Result<HashMap<_, _>, _>>()
             .map_err(|error| error.to_string())?;
-        (current_month, previous_checkins, cached_accounts, cached_model_keys)
+        (
+            current_month,
+            previous_checkins,
+            cached_accounts,
+            cached_model_keys,
+        )
     };
     let scanned = targets.len();
     let scan_targets = targets
@@ -326,72 +322,11 @@ pub async fn mark_sites_with_chrome_sessions(
         .map(|profile| (profile.id.clone(), profile))
         .collect::<HashMap<_, _>>();
 
-    let mut locally_inferred_types = HashMap::new();
-    // newapi2（刷新令牌模式）的依据是浏览器里存在 new_api_refresh cookie；
-    // 同域 Chrome 会话若带该 cookie，说明站点用 refresh token 认证而非纯 Cookie。
-    let refresh_cookie_site_ids = matched_sites
-        .iter()
-        .filter(|site| {
-            site.sessions.iter().any(|session| {
-                has_newapi_refresh_cookie_name(session.cookie_names.iter().map(String::as_str))
-            })
-        })
-        .map(|site| site.site_id.clone())
-        .collect::<HashSet<_>>();
-    for (site_id, _, _, api_base_url, system_type) in &mut targets {
-        if is_zero_v_zero(system_type) {
-            locally_inferred_types.insert(site_id.clone(), "0v0".into());
-            continue;
-        }
-        // 优先相信浏览器真实账号结构：该域 Local Storage 本身是 NewAPI 或 Sub2API。
-        // 即使库里已经有旧类型，也允许纠正，避免错误类型被永久保留。
-        let inferred_from_accounts =
-            infer_system_type_from_local_accounts(local_storage.iter().filter_map(
-                |((local_site_id, _), (values, error))| {
-                    (local_site_id == site_id && error.is_empty()).then_some(values)
-                },
-            ));
-        // Local Storage 无结论时，退而使用 API 地址中的高置信产品名提示。
-        let mut inferred = if inferred_from_accounts.is_empty() {
-            system_type_hint_from_url(api_base_url.as_str()).unwrap_or("")
-        } else {
-            inferred_from_accounts
-        };
-        // NewAPI 进一步细分：带 new_api_refresh cookie 的账号走刷新令牌认证（newapi2），
-        // 否则保持 Cookie 模式（new-api）。检测顺序上 cookie 证据优先于类型名。
-        if is_newapi(inferred) && refresh_cookie_site_ids.contains(site_id) {
-            inferred = "newapi2";
-        }
-        if !inferred.is_empty() && !inferred.eq_ignore_ascii_case(system_type) {
-            let previous = system_type.clone();
-            *system_type = inferred.into();
-            locally_inferred_types.insert(site_id.clone(), inferred.into());
-            if !previous.is_empty() {
-                emit_optional_sync_progress(
-                    &app,
-                    run_id,
-                    "site-type-correct",
-                    "info",
-                    format!("站点类型纠正：{site_id} 由 {previous} 调整为 {inferred}"),
-                );
-            }
-        }
-    }
-    if !extract_only {
-        persist_site_system_types(&database, &locally_inferred_types)?;
-        if !locally_inferred_types.is_empty() {
-            emit_optional_sync_progress(
-                &app,
-                run_id,
-                "site-type-local",
-                "success",
-                format!(
-                    "已通过 Chrome Local Storage 补充 {} 个站点类型",
-                    locally_inferred_types.len()
-                ),
-            );
-        }
-    }
+    // 站点类型冻结：已入库站点的 system_type 一律以库中存储值为准，
+    // 扫描（含自动调度）不再推断、不再纠正、不写库。类型只允许两个来源：
+    // 新增站点时的识别（远端同步/URL 导入）与用户在编辑表单里的手工修改。
+    // 会话行为全部按每个账号的实际证据判定（refresh cookie、Local Storage 键），
+    // 与库中存储的基础类型无关，因此冻结类型不影响同步语义。
 
     let account_targets = targets
         .iter()
@@ -411,27 +346,24 @@ pub async fn mark_sites_with_chrome_sessions(
             .map(|(_, system_type, _)| system_type.as_str())
             .unwrap_or_default();
         site.sessions.retain(|session| {
-            let local_session = local_storage
+            let local_values = local_storage
                 .get(&(site.site_id.clone(), session.profile_id.clone()))
                 .filter(|(_, error)| error.is_empty())
                 .map(|(values, _)| values);
-            let has_local =
-                local_session.is_some_and(|values| has_local_account_session(system_type, values));
-            has_local
-                || has_account_session_candidate(
-                    system_type,
-                    &HashMap::new(),
-                    &session.cookie_names,
-                )
+            // 宽松会话判定：任意 Cookie 或任意已知 Local Storage 键即保留，
+            // 不再要求结构化账号数据或特定 Cookie 名（详见函数注释）。
+            has_browser_session_evidence(system_type, local_values, session.cookie_count)
         });
         !site.sessions.is_empty()
     });
 
     for ((site_id, profile_id), (values, _)) in &local_storage {
-        let Some((base_url, system_type, _)) = account_targets.get(site_id) else {
+        let Some((base_url, _system_type, _)) = account_targets.get(site_id) else {
             continue;
         };
-        if !has_local_account_session(system_type, values) {
+        if values.is_empty() {
+            // Local Storage 一个已知键都没有才算真无痕迹；有任意键（含残缺数据）
+            // 就作为会话候选加入，交给账号接口验证。
             continue;
         }
         let Some(profile) = profile_map.get(profile_id) else {
@@ -483,14 +415,20 @@ pub async fn mark_sites_with_chrome_sessions(
                 checked_in_today: false,
                 checkin_error: String::new(),
                 account_updated_at: String::new(),
+                browser_fallback_cooldown_ms: 0,
                 newapi_token: String::new(),
                 newapi_user_id: String::new(),
+                browser_fallback_failed_at: 0,
+                browser_fallback_fail_count: 0,
             });
     }
 
     // 账号缓存在重启/重新扫描前是被下面“全删后重插”覆盖的，这里先把缓存里的
     // 签到/余额/令牌并回扫描结果，避免上一轮的账号业务数据被无会话结果冲掉。
     for site in &mut matched_sites {
+        let use_refresh_auth = account_targets
+            .get(&site.site_id)
+            .is_some_and(|(_, system_type, _)| is_newapi_refresh(system_type));
         for session in &mut site.sessions {
             let Some(cached) =
                 cached_accounts.get(&(site.site_id.clone(), session.profile_id.clone()))
@@ -529,7 +467,13 @@ pub async fn mark_sites_with_chrome_sessions(
             } else {
                 session.account_updated_at.clone()
             };
-            if session.newapi_token.is_empty() && !cached.newapi_token.is_empty() {
+            session.browser_fallback_cooldown_ms = cached.browser_fallback_cooldown_ms;
+            session.browser_fallback_failed_at = cached.browser_fallback_failed_at;
+            session.browser_fallback_fail_count = cached.browser_fallback_fail_count;
+            if use_refresh_auth
+                && session.newapi_token.is_empty()
+                && !cached.newapi_token.is_empty()
+            {
                 session.newapi_token = cached.newapi_token.clone();
                 session.has_access_token = true;
             }
@@ -541,7 +485,7 @@ pub async fn mark_sites_with_chrome_sessions(
 
     // Local Storage 里能解析出账号的，也视为浏览器有会话（即使 Cookie 查询因 path/分区漏掉）。
     for ((site_id, _), (values, error)) in &local_storage {
-        if error.is_empty() && has_local_account_session("", values) {
+        if error.is_empty() && !values.is_empty() {
             browser_session_site_ids.insert(site_id.clone());
         }
     }
@@ -591,8 +535,9 @@ pub async fn mark_sites_with_chrome_sessions(
                 };
                 let has_refresh_cookie =
                     has_newapi_refresh_cookie_name(session.cookie_names.iter().map(String::as_str));
+                let use_refresh_auth = is_newapi_refresh(&system_type);
                 let auth_label = if is_newapi(&system_type) {
-                    if has_refresh_cookie {
+                    if use_refresh_auth {
                         "刷新令牌认证"
                     } else {
                         "传统会话认证"
@@ -617,7 +562,7 @@ pub async fn mark_sites_with_chrome_sessions(
                     .cloned()
                     .unwrap_or_default();
                 let cookie_home_dir = home_dir.clone();
-                let cookie_endpoint = if has_refresh_cookie {
+                let cookie_endpoint = if use_refresh_auth {
                     "/api/user/auth/refresh"
                 } else {
                     "/api/user/self"
@@ -800,8 +745,7 @@ pub async fn mark_sites_with_chrome_sessions(
         .iter()
         .flat_map(|site| &site.sessions)
         .filter(|session| {
-            (session.sync_error != NEWAPI_REFRESH_HANDOFF_MESSAGE
-                && !session.sync_error.is_empty())
+            (session.sync_error != NEWAPI_REFRESH_HANDOFF_MESSAGE && !session.sync_error.is_empty())
                 || !session.checkin_error.is_empty()
         })
         .count();
@@ -906,11 +850,12 @@ pub async fn mark_sites_with_chrome_sessions(
                             profile_name, account_name, username, api_key_count, api_model_count,
                             remaining, used, total, unit, is_valid, sync_error,
                             checkin_enabled, checked_in_today, checkin_error,
-                            checkin_date, updated_at, newapi_token, newapi_user_id
+                            checkin_date, updated_at, newapi_token, newapi_user_id,
+                            browser_fallback_failed_at, browser_fallback_fail_count
                          ) VALUES (
                             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
                             ?13, ?14, ?15, ?16, ?17, ?18, ?19, date('now', 'localtime'), CURRENT_TIMESTAMP,
-                            ?20, ?21
+                            ?20, ?21, ?22, ?23
                          )",
                         params![
                             site.site_id,
@@ -934,6 +879,8 @@ pub async fn mark_sites_with_chrome_sessions(
                             session.checkin_error,
                             session.newapi_token.clone(),
                             session.newapi_user_id.clone(),
+                            session.browser_fallback_failed_at,
+                            session.browser_fallback_fail_count,
                         ],
                     )
                     .map_err(|error| error.to_string())?;

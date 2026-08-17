@@ -108,28 +108,6 @@ pub(crate) fn canonical_system_type(value: &str) -> String {
     platform_detect::canonical_platform(value)
 }
 
-pub(crate) fn is_zero_v_zero_site(name: &str, api_base_url: &str, system_type: &str) -> bool {
-    platform_detect::is_zero_v_zero(system_type)
-        || name.trim().eq_ignore_ascii_case("0v0")
-        || Url::parse(api_base_url)
-            .ok()
-            .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
-            .is_some_and(|host| {
-                matches!(
-                    host.as_str(),
-                    "0v0.club" | "docs.0v0.club" | "docs.0v0.xyz" | "api.0v0.club"
-                )
-            })
-}
-
-pub(crate) fn account_base_url(name: &str, api_base_url: &str, system_type: &str) -> String {
-    if is_zero_v_zero_site(name, api_base_url, system_type) {
-        ZERO_V_ZERO_CONSOLE_URL.into()
-    } else {
-        api_base_url.to_string()
-    }
-}
-
 /// 仅基于 URL 中明确出现的产品名提供高置信度提示。
 /// 不把通用的 `api`、`new-api` 等模糊命名当成类型依据，避免误判。
 pub(crate) fn system_type_hint_from_url(value: &str) -> Option<&'static str> {
