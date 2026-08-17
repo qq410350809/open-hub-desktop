@@ -751,7 +751,7 @@ pub(crate) fn save_site_model_cache(
             .map(|item| item.keys.clone())
             .unwrap_or_else(|| account.keys.clone())
     };
-    let key_groups = if preserve_keys {
+    let mut key_groups = if preserve_keys {
         existing
             .as_ref()
             .and_then(|(_, groups_json, ..)| serde_json::from_str(groups_json).ok())
@@ -770,7 +770,7 @@ pub(crate) fn save_site_model_cache(
                 .and_then(|(_, _, models_json, ..)| serde_json::from_str(models_json).ok())
         })
         .unwrap_or_default();
-    let key_models = result
+    let mut key_models = result
         .map(|item| item.key_models.clone())
         .filter(|map| !map.is_empty())
         .or_else(|| {
@@ -779,6 +779,12 @@ pub(crate) fn save_site_model_cache(
             })
         })
         .unwrap_or_default();
+
+    // 关键清理：移除已经不在 keys 中的旧 Key（保证删除的 Key 彻底从分组与模型映射中移除）
+    let key_set: HashSet<&str> = keys.iter().map(String::as_str).collect();
+    key_groups.retain(|k, _| key_set.contains(k.as_str()));
+    key_models.retain(|k, _| key_set.contains(k.as_str()));
+
     let api_source = result
         .map(|item| item.source.clone())
         .or_else(|| {
@@ -1203,43 +1209,12 @@ async fn fetch_site_models_json_inner(
                 (String::new(), String::new())
             };
 
-            // 已同步过的 NewAPI 访问秘钥优先直连 /v1/models，避免因为额度/签到状态异常再次弹出浏览器。
-            if let Some((cached_keys, cached_key_groups)) = cached_model_keys
-                .get(profile_id)
-                .filter(|(keys, _)| !keys.is_empty())
-            {
-                match fetch_models_with_keys(
-                    &client,
-                    &base_url,
-                    cached_keys.clone(),
-                    cached_keys.clone(),
-                    cached_key_groups.clone(),
-                    &user_agent,
-                    "newapi-key",
-                    (!cached_uid.is_empty()).then_some(cached_uid.as_str()),
-                )
-                .await
-                {
-                    Ok(result) => {
-                        return cache_profile_api_counts(
-                            database,
-                            site_id.as_deref(),
-                            requested_profile_id.as_deref(),
-                            result,
-                        );
-                    }
-                    Err(error) => errors.push(format!(
-                        "{profile_id}：已有访问秘钥无法获取模型，继续检查其他认证方式：{error}"
-                    )),
-                }
-            }
-
             let mut used_cached_token = false;
             let mut auth = if use_refresh_auth && !cached_token.is_empty() {
                 used_cached_token = true;
                 Some(NewApiAuth::Token {
                     access_token: cached_token,
-                    user_id: cached_uid,
+                    user_id: cached_uid.clone(),
                 })
             } else {
                 None
@@ -1432,6 +1407,30 @@ async fn fetch_site_models_json_inner(
                     }
                 }
                 Err(error) => errors.push(format!("{profile_id}：{error}")),
+            }
+            if let Some((cached_keys, cached_key_groups)) = cached_model_keys
+                .get(profile_id)
+                .filter(|(keys, _)| !keys.is_empty())
+            {
+                if let Ok(result) = fetch_models_with_keys(
+                    &client,
+                    &base_url,
+                    cached_keys.clone(),
+                    cached_keys.clone(),
+                    cached_key_groups.clone(),
+                    &user_agent,
+                    "newapi-key",
+                    (!cached_uid.is_empty()).then_some(cached_uid.as_str()),
+                )
+                .await
+                {
+                    return cache_profile_api_counts(
+                        database,
+                        site_id.as_deref(),
+                        requested_profile_id.as_deref(),
+                        result,
+                    );
+                }
             }
         } else if is_sub2api(inferred_type) {
             let auth_token = values

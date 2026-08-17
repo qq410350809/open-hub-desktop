@@ -20,7 +20,16 @@ const pendingMode = computed(() => store.usageFilter.value === "pending");
 // “在用”保留原有账号卡片；“待定”只单向复用它的布局与操作区。
 const usageCardMode = computed(() => personalMode.value || pendingMode.value);
 const accountSessions = computed(() =>
-  (store.chromeUsageAccounts.value[props.site.id] ?? []).filter((session) => session.isValid),
+  (store.chromeUsageAccounts.value[props.site.id] ?? [])
+    .filter((session) => session.isValid)
+    .slice()
+    .sort((a, b) =>
+      (a.username || a.accountName || a.profileName || "").localeCompare(
+        b.username || b.accountName || b.profileName || "",
+        undefined,
+        { numeric: true, sensitivity: "base" }
+      )
+    ),
 );
 const displayedUpdatedAt = computed(() => {
   if (!usageCardMode.value) return props.site.updatedAt;

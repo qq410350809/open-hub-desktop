@@ -920,13 +920,14 @@ pub(crate) async fn fetch_site_account(
         let base_url_parsed = Url::parse(base_url).map_err(|_| "站点 API 地址无效".to_string())?;
         let uses_refresh_auth = is_newapi_refresh(system_type);
 
-        // 优先使用已缓存的访问令牌（/api/user/token 产物或 Chrome 桥接产物）进行直连校验。
-        if let Some(cached_token) = &cached_newapi_token {
-            if !cached_token.is_empty() {
-                let cached_auth = NewApiAuth::Token {
-                    access_token: cached_token.clone(),
-                    user_id: cached_newapi_user_id.clone().unwrap_or_default(),
-                };
+        // 只有刷新令牌模式才读取访问令牌缓存；Cookie 模式没有该机制。
+        if uses_refresh_auth {
+            if let Some(cached_token) = &cached_newapi_token {
+                if !cached_token.is_empty() {
+                    let cached_auth = NewApiAuth::Token {
+                        access_token: cached_token.clone(),
+                        user_id: cached_newapi_user_id.clone().unwrap_or_default(),
+                    };
                     let checkin = if should_checkin {
                         refresh_newapi_checkin(
                             client,

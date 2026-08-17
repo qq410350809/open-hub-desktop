@@ -1,9 +1,11 @@
-import { computed, ref } from "vue";
+import { computed, ref, watch } from "vue";
 import { runCommand, useLibrary } from "./useLibrary";
 import { usePreferences } from "./usePreferences";
 import { useModelCatalog } from "./useModelCatalog";
 import { useTokenStats } from "./useTokenStats";
 import type {
+  GatewayApiKeyItem,
+  GatewayStatus,
   ModelAggGroupMode,
   ModelCatalogItem,
   SiteModelCacheEntry,
@@ -179,6 +181,13 @@ const allKeyInfos = computed<ModelAggKeyInfo[]>(() => {
       }
     }
   }
+  infos.sort(
+    (a, b) =>
+      (a.accountLabel || "").localeCompare(b.accountLabel || "", undefined, {
+        numeric: true,
+        sensitivity: "base",
+      }) || a.key.localeCompare(b.key),
+  );
   return infos;
 });
 
@@ -438,6 +447,7 @@ function saveModelSelection(selectedModelKeys: ReadonlySet<string>) {
   }
   hiddenModelIds.value = next;
   updatePreferences({ modelAggHiddenModels: [...next] });
+  void syncGatewayConfig();
 }
 
 /** 汇总统计（页头副标题与侧栏徽标用）；模型数为归属合并后的树节点数，站点只计在用。 */
@@ -484,9 +494,39 @@ function groupMode(group: string): ModelAggGroupMode {
   return draftGroupModes.value[group] ?? "independent";
 }
 
-/** 右侧条目：未选模型 = 全部站点概览；选中模型 = 仅提供方（Key 级过滤，按节点全部原始 ID）。 */
+/** 当前选中模型的有效调度通道总数：聚合分组计为 1 个通道，独立分组按其实际 Key 数量分别计入通道。 */
+const selectedModelChannelCount = computed<number>(() => {
+  let count = 0;
+  for (const entry of modelAggRightEntries.value) {
+    if (entry.kind === "group") {
+      const mode = groupMode(entry.group);
+      if (mode === "aggregate") {
+        count += 1;
+      } else {
+        for (const site of entry.sites) {
+          count += site.keys.length;
+        }
+      }
+    } else {
+      for (const section of entry.groups) {
+        const mode = groupMode(section.group);
+        if (mode === "aggregate") {
+          count += 1;
+        } else {
+          count += section.keys.length;
+        }
+      }
+    }
+  }
+  return count;
+});
+
+/** 右侧条目：必须选中模型（左侧必须选中某个模型，右侧才显示具体的 Key 通道）。 */
 const modelAggRightEntries = computed<ModelAggEntry[]>(() => {
   const selectedRaw = selectedRawIds.value;
+  if (selectedRaw.size === 0) {
+    return [];
+  }
   interface SiteBucket {
     siteId: string;
     siteName: string;
@@ -496,7 +536,7 @@ const modelAggRightEntries = computed<ModelAggEntry[]>(() => {
   const buckets: SiteBucket[] = [];
   const bucketBySite = new Map<string, SiteBucket>();
   for (const info of allKeyInfos.value) {
-    if (selectedRaw.size > 0 && !info.models.some((id) => selectedRaw.has(id))) continue;
+    if (!info.models.some((id) => selectedRaw.has(id))) continue;
     let bucket = bucketBySite.get(info.siteId);
     if (!bucket) {
       const site = siteById.value.get(info.siteId);
@@ -576,11 +616,14 @@ const modelAggRightEntries = computed<ModelAggEntry[]>(() => {
   });
 });
 
-/** 保存右侧条目顺序草稿：给定键按当前顺序，未可见的旧键追加在末尾。 */
+/** 保存右侧条目顺序并即时落盘与同步网关。 */
 function updateDraftEntryOrder(keys: string[]) {
   const visible = new Set(keys);
   const hidden = draftSiteOrder.value.filter((key) => !visible.has(key));
-  draftSiteOrder.value = [...keys, ...hidden];
+  const next = [...keys, ...hidden];
+  draftSiteOrder.value = next;
+  updatePreferences({ modelAggSiteOrder: next });
+  void syncGatewayConfig();
 }
 
 /** 把 fromKey 移动到 targetKey 的前/后；用于拖拽与上下移按钮。 */
@@ -605,43 +648,155 @@ function moveAggEntry(orderKey: string, direction: -1 | 1) {
   dropAggEntry(orderKey, entries[target].orderKey, direction < 0 ? "before" : "after");
 }
 
-/** 设置某分组名的展示模式（独立是默认值，从草稿删除以保持干净），点「保存」才落盘。 */
+/** 设置某分组名的展示模式并即时落盘与同步网关，保持当前视觉位置不跳动。 */
 function setGroupMode(group: string, mode: ModelAggGroupMode) {
-  const modes = { ...draftGroupModes.value };
+  const currentEntries = modelAggRightEntries.value;
+  const targetGroupKey = `group:${group}`;
+
+  let currentOrder = [...draftSiteOrder.value];
+  if (currentOrder.length === 0) {
+    currentOrder = currentEntries.map((e) => e.orderKey);
+  }
+
+  if (mode === "aggregate") {
+    // 寻找包含该分组的第一个站点在当前列表中的位置
+    const siteIdx = currentOrder.findIndex((key) => {
+      if (key.startsWith("group:")) return false;
+      return allKeyInfos.value.some((k) => k.siteId === key && k.group === group);
+    });
+
+    currentOrder = currentOrder.filter((k) => k !== targetGroupKey);
+    if (siteIdx >= 0) {
+      currentOrder.splice(siteIdx, 0, targetGroupKey);
+    } else {
+      currentOrder.push(targetGroupKey);
+    }
+  } else {
+    // 独立模式：找到原聚合块的位置并就地展开为对应站点
+    const groupIdx = currentOrder.indexOf(targetGroupKey);
+    if (groupIdx >= 0) {
+      currentOrder = currentOrder.filter((k) => k !== targetGroupKey);
+      const memberSiteIds = Array.from(
+        new Set(allKeyInfos.value.filter((k) => k.group === group).map((k) => k.siteId)),
+      );
+      let insertIdx = groupIdx;
+      for (const siteId of memberSiteIds) {
+        if (!currentOrder.includes(siteId)) {
+          currentOrder.splice(insertIdx, 0, siteId);
+          insertIdx += 1;
+        }
+      }
+    }
+  }
+
+  const modes = { ...preferences.modelAggGroupModes };
   if (mode === "independent") delete modes[group];
   else modes[group] = mode;
-  draftGroupModes.value = modes;
+
+  draftGroupModes.value = { ...modes };
+  draftSiteOrder.value = currentOrder;
+  updatePreferences({
+    modelAggGroupModes: modes,
+    modelAggSiteOrder: currentOrder,
+  });
+  void syncGatewayConfig();
 }
 
-/** 两组字符串是否逐项相等。 */
-function sameStringList(left: string[], right: string[]): boolean {
-  if (left.length !== right.length) return false;
-  for (let i = 0; i < left.length; i += 1) {
-    if (left[i] !== right[i]) return false;
+/** 排序或分组模式是否有未保存的变更（现已实时保存，始终为 false）。 */
+const modelAggDirty = computed(() => false);
+
+const gatewayStatus = ref<GatewayStatus | null>(null);
+const gatewayLoading = ref(false);
+
+async function loadGatewayStatus() {
+  try {
+    const status = await runCommand<GatewayStatus>("get_gateway_status");
+    gatewayStatus.value = status;
+  } catch (error) {
+    console.error("Failed to load gateway status:", error);
   }
-  return true;
 }
 
-/** 两个分组模式表是否相等。 */
-function sameGroupModes(
-  left: Record<string, ModelAggGroupMode>,
-  right: Record<string, ModelAggGroupMode>,
-): boolean {
-  const leftKeys = Object.keys(left);
-  const rightKeys = Object.keys(right);
-  if (leftKeys.length !== rightKeys.length) return false;
-  for (const key of leftKeys) {
-    if (left[key] !== right[key]) return false;
+async function syncGatewayConfig() {
+  try {
+    const status = await runCommand<GatewayStatus>("update_gateway_config", {
+      config: {
+        enabled: preferences.gatewayEnabled,
+        port: preferences.gatewayPort,
+        apiKey: preferences.gatewayApiKey,
+        apiKeys: preferences.gatewayApiKeys,
+        modelAggGroupModes: preferences.modelAggGroupModes,
+        modelAggHiddenNodes: preferences.modelAggHiddenModels,
+      },
+    });
+    gatewayStatus.value = status;
+  } catch (error) {
+    console.error("Failed to sync gateway config:", error);
   }
-  return true;
 }
 
-/** 排序或分组模式是否有未保存的变更。 */
-const modelAggDirty = computed(() => {
-  if (!sameStringList(draftSiteOrder.value, preferences.modelAggSiteOrder)) return true;
-  if (!sameGroupModes(draftGroupModes.value, preferences.modelAggGroupModes)) return true;
-  return false;
-});
+async function startGateway(port?: number) {
+  gatewayLoading.value = true;
+  try {
+    const targetPort = port ?? preferences.gatewayPort;
+    const status = await runCommand<GatewayStatus>("start_gateway", { port: targetPort });
+    gatewayStatus.value = status;
+    updatePreferences({ gatewayEnabled: true, gatewayPort: status.port });
+  } catch (error) {
+    throw error;
+  } finally {
+    gatewayLoading.value = false;
+  }
+}
+
+async function stopGateway() {
+  gatewayLoading.value = true;
+  try {
+    const status = await runCommand<GatewayStatus>("stop_gateway");
+    gatewayStatus.value = status;
+    updatePreferences({ gatewayEnabled: false });
+  } catch (error) {
+    throw error;
+  } finally {
+    gatewayLoading.value = false;
+  }
+}
+
+async function updateGatewaySettings(settings: {
+  port?: number;
+  apiKey?: string;
+  apiKeys?: GatewayApiKeyItem[];
+  enabled?: boolean;
+}) {
+  gatewayLoading.value = true;
+  try {
+    const enabled = settings.enabled !== undefined ? settings.enabled : preferences.gatewayEnabled;
+    const port = settings.port ?? preferences.gatewayPort;
+    const apiKey = settings.apiKey !== undefined ? settings.apiKey : preferences.gatewayApiKey;
+    const apiKeys = settings.apiKeys !== undefined ? settings.apiKeys : preferences.gatewayApiKeys;
+    updatePreferences({
+      gatewayEnabled: enabled,
+      gatewayPort: port,
+      gatewayApiKey: apiKey,
+      gatewayApiKeys: apiKeys,
+    });
+    const status = await runCommand<GatewayStatus>("update_gateway_config", {
+      config: {
+        enabled,
+        port,
+        apiKey,
+        apiKeys,
+        modelAggGroupModes: preferences.modelAggGroupModes,
+        modelAggHiddenNodes: preferences.modelAggHiddenModels,
+      },
+    });
+    gatewayStatus.value = status;
+  } catch (error) {
+    throw error;
+  } finally {
+    gatewayLoading.value = false;
+  }
+}
 
 /** 一次性把顺序和分组模式写入偏好。 */
 function saveModelAgg() {
@@ -649,6 +804,7 @@ function saveModelAgg() {
     modelAggSiteOrder: [...draftSiteOrder.value],
     modelAggGroupModes: { ...draftGroupModes.value },
   });
+  void syncGatewayConfig();
 }
 
 /** 放弃未保存的变更，回到上次保存的状态。 */
@@ -658,12 +814,22 @@ function discardModelAggChanges() {
 }
 
 function selectModel(nodeKey: string) {
-  selectedModelId.value = selectedModelId.value === nodeKey ? null : nodeKey;
+  selectedModelId.value = nodeKey;
 }
 
 function clearSelectedModel() {
   selectedModelId.value = null;
 }
+
+watch(
+  () => modelAggTree.value,
+  (tree) => {
+    if (!selectedModelId.value && tree.length > 0 && tree[0].models.length > 0) {
+      selectedModelId.value = tree[0].models[0].key;
+    }
+  },
+  { immediate: true }
+);
 
 function toggleVendor(vendor: string) {
   const next = new Set(expandedVendors.value);
@@ -690,6 +856,7 @@ async function loadModelAggregation(force = false) {
     const data = await runCommand<SiteModelCacheEntry[]>("get_all_site_model_caches");
     modelAggEntries.value = data ?? [];
     modelAggLoaded.value = true;
+    void loadGatewayStatus();
   } catch (error) {
     modelAggError.value = String(error);
   } finally {
@@ -719,6 +886,7 @@ export function useModelAggregate() {
     selectedTreeNode,
     selectedRawIds,
     selectedModelProviderCount,
+    selectedModelChannelCount,
     modelTreeSearch,
     expandedVendors,
     groupMode,
@@ -734,5 +902,12 @@ export function useModelAggregate() {
     modelAggDirty,
     saveModelAgg,
     discardModelAggChanges,
+    gatewayStatus,
+    gatewayLoading,
+    loadGatewayStatus,
+    startGateway,
+    stopGateway,
+    updateGatewaySettings,
+    syncGatewayConfig,
   };
 }

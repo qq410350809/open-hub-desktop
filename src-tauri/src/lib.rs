@@ -12,6 +12,7 @@ pub use detect_all::run_library_detect;
 mod model_catalog;
 pub use model_catalog::sync_model_catalog_once;
 mod models_fetch;
+mod gateway;
 mod platform_detect;
 mod proxy_pool;
 mod remote_sync;
@@ -1087,11 +1088,13 @@ pub fn run() {
             let charity_runtime = charity_monitor::CharityMonitorRuntime::new();
             let auto_sync_runtime = auto_sync::AutoSyncRuntime::default();
             let model_catalog_runtime = model_catalog::ModelCatalogRuntime::new();
+            let gateway_state = gateway::GatewayState::new();
             app.manage(database);
             app.manage(proxy_runtime);
             app.manage(charity_runtime);
             app.manage(auto_sync_runtime);
             app.manage(model_catalog_runtime);
+            app.manage(gateway_state);
             // 启动时清理历史订阅里遗留的测速结果后缀，避免旧库节点名继续显示脏数据。
             if let Err(error) =
                 proxy_pool::repair_stored_node_names(&app.state::<crate::models::Database>())
@@ -1140,7 +1143,14 @@ pub fn run() {
                 charity_monitor::start_charity_monitor(restore_handle.clone());
                 // 自动会话同步：账号保活 / 失效恢复 / 模型刷新全程后台化，
                 // 与公益监听错开启动（调度器内部还有首轮延迟）。
-                auto_sync::start_auto_sync(restore_handle);
+                auto_sync::start_auto_sync(restore_handle.clone());
+
+                // 启动本地 Key 聚合轮询代理网关
+                let database = restore_handle.state::<crate::models::Database>();
+                let gw_state = restore_handle.state::<crate::gateway::GatewayState>();
+                if let Err(e) = gateway::start_gateway(database, gw_state, None).await {
+                    eprintln!("[OpenHub] 本地聚合网关启动失败: {e}");
+                }
             });
 
             Ok(())
@@ -1230,7 +1240,12 @@ pub fn run() {
             token_stats::get_local_agent_paths,
             web_server::get_lightweight_mode_state,
             web_server::enter_lightweight_mode,
-            web_server::show_main_window
+            web_server::show_main_window,
+            gateway::get_gateway_status,
+            gateway::start_gateway,
+            gateway::stop_gateway,
+            gateway::update_gateway_config,
+            gateway::reload_gateway_candidates
         ])
         .build(tauri::generate_context!())
         .expect("error while building Tauri application")

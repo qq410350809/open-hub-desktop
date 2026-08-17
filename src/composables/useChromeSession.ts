@@ -72,7 +72,16 @@ interface ChromeModelsSyncSummary {
 
 const chromeUsageAccounts: ComputedRef<Record<string, ChromeSessionInfo[]>> = computed(() =>
   Object.fromEntries(
-    usageSites.value.map((site) => [site.siteId, site.sessions]),
+    usageSites.value.map((site) => [
+      site.siteId,
+      (site.sessions ?? []).slice().sort((a, b) =>
+        (a.username || a.accountName || a.profileName || "").localeCompare(
+          b.username || b.accountName || b.profileName || "",
+          undefined,
+          { numeric: true, sensitivity: "base" }
+        )
+      ),
+    ]),
   ),
 );
 

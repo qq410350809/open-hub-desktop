@@ -7173,7 +7173,30 @@ kbd { padding: 3px 7px; border: 1px solid var(--line); border-radius: var(--r-xs
 }
 .modelagg-search-clear svg { width: 12px; height: 12px; }
 .modelagg-search-clear:hover { background: var(--surface-hover); color: var(--text); }
-.modelagg-expand-toggle { justify-content: center; }
+.modelagg-tree-toolbar-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 4px;
+}
+.modelagg-tree-toolbar-actions .text-button {
+  height: 24px;
+  padding: 0 4px;
+  font-size: 11.5px;
+  color: var(--muted);
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.modelagg-tree-toolbar-actions .text-button:hover {
+  color: var(--text);
+}
+.modelagg-tree-toolbar-actions .text-button svg {
+  width: 12px;
+  height: 12px;
+}
+.modelagg-expand-toggle { justify-content: flex-start; }
+.modelagg-filter-toggle { justify-content: flex-end; }
 
 .modelagg-tree-scroll {
   min-height: 0;
@@ -7400,9 +7423,22 @@ kbd { padding: 3px 7px; border: 1px solid var(--line); border-radius: var(--r-xs
   transition: .15s var(--ease);
 }
 .modelagg-key-row:hover { background: var(--surface-hover); }
-.modelagg-key-code { min-width: 0; flex: 0 1 auto; overflow: hidden; color: var(--text); font-size: 11.5px; white-space: nowrap; text-overflow: ellipsis; }
+.modelagg-key-row-merged {
+  background: color-mix(in srgb, var(--brand-glow) 10%, var(--surface-soft));
+  border: 1px solid color-mix(in srgb, var(--brand-deep) 20%, var(--line-soft));
+}
+.modelagg-merged-key-info {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+}
+.modelagg-key-code { min-width: 0; flex: 1 1 auto; overflow: hidden; color: var(--text); font-size: 11.5px; white-space: nowrap; text-overflow: ellipsis; }
+.modelagg-key-account-paren { color: var(--muted); font-weight: normal; font-size: 11px; margin-left: 2px; }
 .modelagg-key-account { min-width: 0; flex: 1 1 auto; overflow: hidden; color: var(--muted); font-size: 11px; white-space: nowrap; text-overflow: ellipsis; }
-.modelagg-key-count { flex: 0 0 auto; color: var(--faint); font-size: 10.5px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.modelagg-key-count { margin-left: auto; flex: 0 0 auto; color: var(--faint); font-size: 10.5px; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .modelagg-key-copy {
   width: 24px; height: 24px; flex: 0 0 auto;
   display: grid; place-items: center;
@@ -7456,3 +7492,366 @@ kbd { padding: 3px 7px; border: 1px solid var(--line); border-radius: var(--r-xs
 .modelagg-picker input[type="checkbox"] { width: 14px; height: 14px; flex: 0 0 auto; accent-color: var(--brand); cursor: pointer; }
 .modelagg-picker-footer { min-height: 64px; padding: 11px 20px; }
 .modelagg-picker-footer .save-button:disabled { cursor: not-allowed; }
+
+/* —— 本地聚合轮询网关状态栏 —— */
+.modelagg-gateway-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 10px 32px;
+  background: color-mix(in srgb, var(--brand-glow) 15%, var(--page-header));
+  border-bottom: 1px solid var(--page-line);
+  box-sizing: border-box;
+}
+
+.modelagg-gw-info {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+
+.modelagg-gw-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--surface) 70%, transparent);
+  border: 1px solid var(--line);
+  font-size: 11.5px;
+  font-weight: 650;
+  color: var(--muted);
+}
+
+.modelagg-gw-badge.is-running {
+  background: color-mix(in srgb, var(--success) 12%, transparent);
+  border-color: color-mix(in srgb, var(--success) 40%, var(--line));
+  color: var(--success);
+}
+
+.modelagg-gw-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--muted);
+}
+
+.modelagg-gw-badge.is-running .modelagg-gw-dot {
+  background: var(--success);
+  box-shadow: 0 0 0 0 color-mix(in srgb, var(--success) 60%, transparent);
+  animation: modelagg-gw-pulse 1.8s infinite;
+}
+
+@keyframes modelagg-gw-pulse {
+  0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--success) 60%, transparent); }
+  70% { box-shadow: 0 0 0 6px color-mix(in srgb, var(--success) 0%, transparent); }
+  100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--success) 0%, transparent); }
+}
+
+.modelagg-gw-endpoint {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+}
+
+.modelagg-gw-label {
+  color: var(--muted);
+  font-weight: 500;
+}
+
+.modelagg-gw-url {
+  padding: 2px 8px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  color: var(--brand-deep);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.modelagg-gw-copy {
+  width: 26px;
+  height: 26px;
+  display: grid;
+  place-items: center;
+  border-radius: var(--r-xs);
+  color: var(--muted);
+}
+.modelagg-gw-copy:hover {
+  background: var(--surface-hover);
+  color: var(--brand-deep);
+}
+.modelagg-gw-copy svg {
+  width: 14px;
+  height: 14px;
+}
+
+.modelagg-gw-stats {
+  font-size: 11.5px;
+  color: var(--muted);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.modelagg-gw-stats strong {
+  color: var(--text);
+  font-weight: 650;
+}
+
+.modelagg-gw-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.modelagg-gw-btn {
+  height: 32px;
+  padding: 0 12px;
+  font-size: 12px;
+}
+
+.modelagg-gw-settings-btn {
+  width: 32px;
+  height: 32px;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--surface);
+  color: var(--muted);
+  transition: .15s var(--ease);
+}
+.modelagg-gw-settings-btn:hover {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+.modelagg-gw-settings-btn svg {
+  width: 16px;
+  height: 16px;
+}
+
+.modelagg-gw-toggle-btn {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+}
+.modelagg-gw-toggle-btn.is-active {
+  color: var(--danger);
+}
+.modelagg-gw-toggle-btn:hover {
+  opacity: .85;
+}
+
+.modelagg-group-hint-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.modelagg-group-hint-sub {
+  color: var(--faint);
+  font-size: 11px;
+}
+
+/* —— 密钥管理弹窗 —— */
+.modelagg-gw-modal {
+  width: min(640px, calc(100vw - 48px));
+  max-height: min(680px, calc(100vh - 48px));
+}
+
+.modelagg-gw-body {
+  padding: 16px 20px 20px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.modelagg-gw-endpoint-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 14px;
+  border-radius: var(--r-md);
+  background: var(--surface-sub);
+  border: 1px solid var(--line);
+}
+
+.modelagg-gw-endpoint-info {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.modelagg-gw-endpoint-info .modelagg-gw-label {
+  color: var(--muted);
+  font-size: 11.5px;
+  font-weight: 600;
+}
+
+.modelagg-gw-url-box {
+  color: var(--brand-deep);
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.modelagg-gw-keys-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 4px;
+}
+
+.modelagg-gw-keys-header strong {
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.modelagg-gw-keys-header small {
+  color: var(--muted);
+  font-size: 11.5px;
+}
+
+.modelagg-gw-add-key-btn {
+  height: 30px;
+  padding: 0 10px;
+  font-size: 12px;
+}
+
+.modelagg-gw-empty-keys {
+  padding: 28px 20px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  border: 1px dashed var(--line);
+  border-radius: var(--r-md);
+  color: var(--muted);
+  text-align: center;
+}
+.modelagg-gw-empty-keys svg {
+  width: 24px;
+  height: 24px;
+  opacity: .5;
+}
+.modelagg-gw-empty-keys p {
+  margin: 0;
+  font-size: 12px;
+}
+
+.modelagg-gw-keys-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-height: 360px;
+  overflow-y: auto;
+}
+
+.modelagg-gw-key-card {
+  padding: 12px;
+  border-radius: var(--r-md);
+  background: var(--surface-sub);
+  border: 1px solid var(--line);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  transition: .15s var(--ease);
+}
+.modelagg-gw-key-card:hover {
+  border-color: color-mix(in srgb, var(--brand-deep) 35%, var(--line));
+}
+
+.modelagg-gw-key-row-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.modelagg-gw-key-name-input {
+  flex: 1 1 auto;
+  height: 28px;
+  padding: 0 8px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--line-soft);
+  background: var(--surface);
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 600;
+}
+.modelagg-gw-key-name-input:focus {
+  border-color: var(--brand-deep);
+  outline: none;
+}
+
+.modelagg-gw-key-enable {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11.5px;
+  color: var(--muted);
+  cursor: pointer;
+  user-select: none;
+}
+.modelagg-gw-key-enable input[type="checkbox"] {
+  accent-color: var(--brand-deep);
+  cursor: pointer;
+}
+
+.modelagg-gw-key-row-bottom {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.modelagg-gw-key-input {
+  flex: 1 1 auto;
+  height: 32px;
+  padding: 0 10px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--line);
+  background: var(--surface);
+  color: var(--brand-deep);
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+.modelagg-gw-key-input:focus {
+  border-color: var(--brand-deep);
+  outline: none;
+}
+
+.modelagg-gw-key-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.modelagg-gw-key-actions .icon-button {
+  width: 28px;
+  height: 28px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: var(--surface);
+  color: var(--muted);
+}
+.modelagg-gw-key-actions .icon-button:hover {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+.modelagg-gw-key-actions .icon-button svg {
+  width: 14px;
+  height: 14px;
+}
+.modelagg-gw-del-btn:hover {
+  color: var(--danger) !important;
+  border-color: color-mix(in srgb, var(--danger) 40%, var(--line)) !important;
+}
+
+

@@ -1,10 +1,11 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { computed, onMounted, ref, watch } from "vue";
 import { icons } from "../icons";
 import { useStore } from "../composables/useStore";
 import { systemTypeLabel } from "../types";
 import type {
   ModelAggEntry,
+  ModelAggGroupEntry,
   ModelAggKeyInfo,
   ModelAggTreeModel,
   ModelAggTreeVendor,
@@ -17,6 +18,91 @@ const pickerOpen = ref(false);
 const pickerSearch = ref("");
 const pickerSelectedKeys = ref<Set<string>>(new Set());
 const pickerInitialSelectedKeys = ref<Set<string>>(new Set());
+
+import type { GatewayApiKeyItem } from "../types";
+
+// —— API 密钥与本地网关维护弹窗 ——
+const gatewayModalOpen = ref(false);
+const draftApiKeys = ref<GatewayApiKeyItem[]>([]);
+
+function createRandomKey(): string {
+  const chars = "abcdef0123456789";
+  let rand = "";
+  for (let i = 0; i < 24; i++) {
+    rand += chars[Math.floor(Math.random() * chars.length)];
+  }
+  return `sk-oh-${rand}`;
+}
+
+function openGatewayModal() {
+  draftApiKeys.value = store.preferences.gatewayApiKeys.map((item) => ({ ...item }));
+  if (draftApiKeys.value.length === 0 && store.preferences.gatewayApiKey.trim()) {
+    draftApiKeys.value.push({
+      id: "default",
+      name: "默认客户端",
+      key: store.preferences.gatewayApiKey.trim(),
+      enabled: true,
+      createdAt: Date.now(),
+    });
+  }
+  gatewayModalOpen.value = true;
+}
+
+function closeGatewayModal() {
+  gatewayModalOpen.value = false;
+}
+
+function addApiKey() {
+  draftApiKeys.value.push({
+    id: `key-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+    name: `密钥 ${draftApiKeys.value.length + 1}`,
+    key: createRandomKey(),
+    enabled: true,
+    createdAt: Date.now(),
+  });
+}
+
+function removeApiKey(index: number) {
+  draftApiKeys.value.splice(index, 1);
+}
+
+function regenerateApiKey(index: number) {
+  if (draftApiKeys.value[index]) {
+    draftApiKeys.value[index].key = createRandomKey();
+  }
+}
+
+function copySpecificKey(key: string, name: string) {
+  void store.copyAddress(key, `${name || "API Key"}`);
+}
+
+async function handleSaveGatewaySettings() {
+  try {
+    const port = store.preferences.gatewayPort || 17896;
+    const cleanKeys = draftApiKeys.value
+      .map((item) => ({
+        ...item,
+        name: item.name.trim(),
+        key: item.key.trim(),
+      }))
+      .filter((item) => item.key.length > 0);
+
+    await store.updateGatewaySettings({
+      port,
+      apiKeys: cleanKeys,
+      enabled: true,
+    });
+    gatewayModalOpen.value = false;
+    store.showToast("API 密钥配置已保存并实时生效");
+  } catch (err) {
+    store.showToast(String(err), true);
+  }
+}
+
+function copyGatewayUrl() {
+  const url = store.gatewayStatus.value?.url || `http://127.0.0.1:${store.preferences.gatewayPort || 17896}/v1`;
+  void store.copyAddress(url, "本地聚合网关 API 端点地址");
+}
 
 function selectedModelKeys(): Set<string> {
   const selected = new Set<string>();
@@ -129,7 +215,7 @@ function savePicker() {
   if (!pickerDirty.value) return;
   store.saveModelSelection(pickerSelectedKeys.value);
   pickerOpen.value = false;
-  store.showToast("模型筛选已保存");
+  store.showToast("模型筛选已保存并同步至本地网关");
 }
 
 const dragKey = ref("");
@@ -145,19 +231,7 @@ watch(searching, (value) => {
 
 onMounted(() => {
   if (!store.modelAggLoaded.value) void store.loadModelAggregation();
-});
-
-/** 一次性保存顺序和分组模式（模型筛选由弹窗单独保存）。 */
-function saveChanges() {
-  store.saveModelAgg();
-  store.showToast("模型聚合设置已保存");
-}
-
-// 离开页面时丢弃未保存的草稿（操作只改内存，点「保存」才写盘）。
-onBeforeUnmount(() => {
-  if (store.modelAggDirty.value) {
-    store.showToast("模型聚合有未保存的改动，已丢弃", true);
-  }
+  void store.loadGatewayStatus();
 });
 
 function toggleExpandAll() {
@@ -180,8 +254,68 @@ function maskApiKey(key: string): string {
   return `${value.slice(0, prefixLength)}${"•".repeat(8)}${value.slice(-suffixLength)}`;
 }
 
-function copyKey(info: ModelAggKeyInfo) {
-  void store.copyAddress(info.key, `${info.group} · ${info.accountLabel} 的 API Key`);
+function getSiteGroupAggregatedInfo(keys: ModelAggKeyInfo[]) {
+  const sortedKeys = [...keys].sort(
+    (a, b) =>
+      (a.accountLabel || "").localeCompare(b.accountLabel || "", undefined, {
+        numeric: true,
+        sensitivity: "base",
+      }) || a.key.localeCompare(b.key),
+  );
+  const modelSet = new Set<string>();
+  for (const k of sortedKeys) {
+    for (const m of k.models) {
+      modelSet.add(m);
+    }
+  }
+  const maskedKeyPreview = sortedKeys
+    .map((k) => {
+      const masked = maskApiKey(k.key);
+      return k.accountLabel ? `${masked} (${k.accountLabel})` : masked;
+    })
+    .join(" · ");
+
+  return {
+    keyCount: sortedKeys.length,
+    maskedKeyPreview,
+    modelCount: modelSet.size,
+  };
+}
+
+function getGroupAggregatedInfo(entry: ModelAggGroupEntry) {
+  const allKeys: ModelAggKeyInfo[] = [];
+  const modelSet = new Set<string>();
+
+  for (const site of entry.sites) {
+    for (const k of site.keys) {
+      allKeys.push(k);
+      for (const m of k.models) {
+        modelSet.add(m);
+      }
+    }
+  }
+
+  allKeys.sort(
+    (a, b) =>
+      (a.accountLabel || "").localeCompare(b.accountLabel || "", undefined, {
+        numeric: true,
+        sensitivity: "base",
+      }) || a.key.localeCompare(b.key),
+  );
+
+  const maskedKeyPreview = allKeys
+    .map((k) => {
+      const masked = maskApiKey(k.key);
+      return k.accountLabel ? `${masked} (${k.accountLabel})` : masked;
+    })
+    .join(" · ");
+
+  return {
+    keyCount: allKeys.length,
+    allKeys,
+    maskedKeyPreview,
+    modelCount: modelSet.size,
+  };
 }
 
 function modelTitle(model: ModelAggTreeModel): string {
@@ -242,58 +376,24 @@ function onDragEnd() {
   <main class="modelagg-page">
     <header class="modelagg-header">
       <div>
-        <span class="modelagg-eyebrow">OpenHub · 跨站模型总览</span>
+        <span class="modelagg-eyebrow">OpenHub · 模型与多 Key 轮询网关</span>
         <h1>模型聚合</h1>
         <p>
           聚合 {{ store.modelAggStats.value.siteCount }} 个站点 ·
           {{ store.modelAggStats.value.modelCount }} 个模型 ·
           {{ store.modelAggStats.value.groupCount }} 个分组 ·
           {{ store.modelAggStats.value.keyCount }} 个 Key
-          <span v-if="store.modelAggDirty.value" class="modelagg-dirty-hint">有未保存的改动</span>
         </p>
       </div>
       <div class="modelagg-header-actions">
         <button
           class="secondary-button"
           type="button"
-          :title="`勾选要在左侧树显示的模型（已选 ${store.modelSelectionStats.value.selected} / ${store.modelSelectionStats.value.total}）`"
-          @click="openPicker()"
+          title="维护与查看本地聚合网关 API 密钥与端点配置"
+          @click="openGatewayModal()"
         >
-          <span v-html="icons.grid" />
-          <span>模型筛选 {{ store.modelSelectionStats.value.selected }}/{{ store.modelSelectionStats.value.total }}</span>
-        </button>
-        <button
-          class="secondary-button"
-          type="button"
-          :disabled="store.modelAggLoading.value"
-          title="重新读取本地模型缓存（仅读库，不触发网络同步）"
-          @click="store.loadModelAggregation(true)"
-        >
-          <span
-            :class="{ 'is-spinning': store.modelAggLoading.value }"
-            v-html="icons.restore"
-          />
-          <span>{{ store.modelAggLoading.value ? "读取中…" : "刷新缓存" }}</span>
-        </button>
-        <button
-          v-if="store.modelAggDirty.value"
-          class="text-button modelagg-discard"
-          type="button"
-          title="放弃未保存的改动，回到上次保存的状态"
-          @click="store.discardModelAggChanges()"
-        >
-          撤销改动
-        </button>
-        <button
-          class="save-button"
-          type="button"
-          :class="{ 'is-dirty': store.modelAggDirty.value }"
-          :disabled="!store.modelAggDirty.value"
-          :title="store.modelAggDirty.value ? '保存条目顺序与分组模式' : '没有未保存的改动'"
-          @click="saveChanges()"
-        >
-          <span v-html="icons.check" />
-          <span>{{ store.modelAggDirty.value ? "保存改动" : "已保存" }}</span>
+          <span v-html="icons.key" />
+          <span>API 密钥</span>
         </button>
       </div>
     </header>
@@ -326,22 +426,23 @@ function onDragEnd() {
               v-html="icons.close"
             />
           </div>
-          <button class="text-button modelagg-expand-toggle" type="button" @click="toggleExpandAll">
-            {{ store.expandedVendors.value.size === 0 ? "展开全部" : "收起全部" }}
-          </button>
+          <div class="modelagg-tree-toolbar-actions">
+            <button class="text-button modelagg-expand-toggle" type="button" @click="toggleExpandAll">
+              {{ store.expandedVendors.value.size === 0 ? "展开全部" : "收起全部" }}
+            </button>
+            <button
+              class="text-button modelagg-filter-toggle"
+              type="button"
+              :title="`勾选要在左侧树显示的模型（已选 ${store.modelSelectionStats.value.selected} / ${store.modelSelectionStats.value.total}）`"
+              @click="openPicker()"
+            >
+              <span v-html="icons.grid" />
+              <span>模型筛选 ({{ store.modelSelectionStats.value.selected }}/{{ store.modelSelectionStats.value.total }})</span>
+            </button>
+          </div>
         </div>
 
         <div class="modelagg-tree-scroll">
-          <button
-            class="modelagg-tree-all"
-            :class="{ active: !store.selectedModelId.value }"
-            type="button"
-            @click="store.clearSelectedModel()"
-          >
-            <span>全部模型</span>
-            <small>{{ store.filteredModelCount.value }}</small>
-          </button>
-
           <div
             v-if="store.modelAggLoading.value && !store.modelAggLoaded.value"
             class="modelagg-tree-empty"
@@ -408,24 +509,17 @@ function onDragEnd() {
               :title="modelTitle(store.selectedTreeNode.value)"
             >{{ store.selectedTreeNode.value.label }}</code>
             <span class="modelagg-list-count">
-              {{ store.selectedModelProviderCount.value }} 站提供 · {{ entries.length }} 个条目
+              {{ store.selectedModelProviderCount.value }} 站提供 · {{ store.selectedModelChannelCount.value }} 个通道
             </span>
-            <button class="text-button" type="button" @click="store.clearSelectedModel()">
-              清除筛选
-            </button>
           </template>
           <template v-else>
-            <span class="modelagg-list-title">全部站点概览</span>
-            <span class="modelagg-list-count">{{ entries.length }} 个条目</span>
+            <span class="modelagg-list-title">请在左侧选择模型以查看通道</span>
           </template>
         </div>
 
         <div class="modelagg-list-scroll">
-          <div
-            v-if="store.modelAggLoading.value && entries.length === 0"
-            class="modelagg-empty"
-          >
-            <span class="is-spinning" v-html="icons.restore" />
+          <div v-if="store.modelAggLoading.value" class="modelagg-loading">
+            <span class="spinner" />
             <strong>正在读取本地模型缓存…</strong>
           </div>
 
@@ -435,22 +529,28 @@ function onDragEnd() {
           >
             <span v-html="icons.layers" />
             <strong>本地还没有站点的 Key 缓存</strong>
-            <p>先到站点库同步站点的 Key 与模型，再回到这里查看跨站聚合。</p>
+            <p>先到站点库同步站点的 Key 与模型，再回到这里查看聚合与调度池。</p>
             <button class="secondary-button" type="button" @click="store.openLibrary()">
               前往站点库
             </button>
           </div>
 
           <div
-            v-else-if="entries.length === 0 && store.selectedTreeNode.value"
+            v-else-if="!store.selectedTreeNode.value"
+            class="modelagg-empty"
+          >
+            <span v-html="icons.sparkles" />
+            <strong>请在左侧选择一个模型</strong>
+            <p>选择模型后，右侧将显示提供该模型的站点、分组与具体 Key 调度通道</p>
+          </div>
+
+          <div
+            v-else-if="entries.length === 0"
             class="modelagg-empty"
           >
             <span v-html="icons.search" />
-            <strong>没有 Key 提供该模型</strong>
-            <p>当前模型没有任何站点分组提供，试试清除筛选查看全部站点。</p>
-            <button class="secondary-button" type="button" @click="store.clearSelectedModel()">
-              清除筛选
-            </button>
+            <strong>暂无站点 / Key 提供该模型</strong>
+            <p>当前选中的模型在已配置的站点分组中暂无对应 Key</p>
           </div>
 
           <template v-else>
@@ -482,7 +582,6 @@ function onDragEnd() {
                   <strong class="modelagg-entry-title modelagg-entry-title-group">
                     {{ entry.group }}
                   </strong>
-                  <span class="modelagg-type-badge">{{ entry.sites.length }} 站合并</span>
                 </template>
                 <div class="modelagg-entry-actions">
                   <button
@@ -513,79 +612,84 @@ function onDragEnd() {
                     <div
                       class="preference-segment modelagg-mode-toggle"
                       role="group"
-                      :aria-label="`分组 ${section.group} 展示模式`"
+                      :aria-label="`分组 ${section.group} 模式`"
                     >
                       <button
                         type="button"
                         :class="{ active: store.groupMode(section.group) === 'aggregate' }"
-                        title="把各站点中同名分组的 Key 合并成块展示"
+                        title="聚合：该分组多个 Key 合并为一个通道内部轮询"
                         @click="store.setGroupMode(section.group, 'aggregate')"
                       >聚合</button>
                       <button
                         type="button"
                         :class="{ active: store.groupMode(section.group) === 'independent' }"
-                        title="该分组在各站点卡片内单独展示"
+                        title="独立：每个 Key 作为独立通道参与调度"
                         @click="store.setGroupMode(section.group, 'independent')"
                       >独立</button>
                     </div>
                   </div>
-                  <div v-for="info in section.keys" :key="`${info.accountLabel}:${info.key}`" class="modelagg-key-row">
-                    <code class="modelagg-key-code">{{ maskApiKey(info.key) }}</code>
-                    <small class="modelagg-key-account" :title="info.accountLabel">{{ info.accountLabel }}</small>
-                    <small class="modelagg-key-count">{{ info.models.length }} 个模型</small>
-                    <button
-                      class="modelagg-key-copy"
-                      type="button"
-                      aria-label="复制完整 API Key"
-                      title="复制完整 API Key"
-                      @click.stop="copyKey(info)"
-                      v-html="icons.copy"
-                    />
+                  <div
+                    class="modelagg-key-row"
+                    :class="{ 'modelagg-key-row-merged': store.groupMode(section.group) === 'aggregate' }"
+                  >
+                    <div class="modelagg-merged-key-info">
+                      <code class="modelagg-key-code" :title="getSiteGroupAggregatedInfo(section.keys).maskedKeyPreview">
+                        {{ getSiteGroupAggregatedInfo(section.keys).maskedKeyPreview }}
+                      </code>
+                    </div>
+                    <small class="modelagg-key-count">
+                      {{ store.groupMode(section.group) === 'aggregate'
+                          ? `${getSiteGroupAggregatedInfo(section.keys).keyCount} Key 聚合轮询 · ${getSiteGroupAggregatedInfo(section.keys).modelCount} 个模型`
+                          : (getSiteGroupAggregatedInfo(section.keys).keyCount > 1
+                              ? `${getSiteGroupAggregatedInfo(section.keys).keyCount} Key 独立通道 · ${getSiteGroupAggregatedInfo(section.keys).modelCount} 个模型`
+                              : `${getSiteGroupAggregatedInfo(section.keys).modelCount} 个模型`)
+                      }}
+                    </small>
                   </div>
                 </div>
               </div>
 
               <div v-else class="modelagg-groups modelagg-group-block">
                 <div class="modelagg-group-head modelagg-group-block-head">
-                  <span class="modelagg-group-hint">同名分组已跨站合并</span>
+                  <span class="modelagg-group-name" :title="entry.group">{{ entry.group }}</span>
                   <div
                     class="preference-segment modelagg-mode-toggle"
                     role="group"
-                    :aria-label="`分组 ${entry.group} 展示模式`"
+                    :aria-label="`分组 ${entry.group} 展示与路由模式`"
                   >
                     <button
                       type="button"
                       :class="{ active: store.groupMode(entry.group) === 'aggregate' }"
+                      title="聚合：该分组下的多个 Key 合并为一个通道并在内部轮询"
                       @click="store.setGroupMode(entry.group, 'aggregate')"
                     >聚合</button>
                     <button
                       type="button"
                       :class="{ active: store.groupMode(entry.group) === 'independent' }"
-                      title="该分组回到各站点卡片内单独展示"
+                      title="独立：每个 Key 作为独立通道参与调度"
                       @click="store.setGroupMode(entry.group, 'independent')"
                     >独立</button>
                   </div>
                 </div>
-                <div v-for="site in entry.sites" :key="site.siteId" class="modelagg-group-site">
-                  <div class="modelagg-group-site-head">
-                    <strong>{{ site.siteName }}</strong>
-                    <span v-if="site.systemType" class="modelagg-type-badge">
-                      {{ systemTypeLabel(site.systemType) }}
-                    </span>
+
+                <!-- 聚合与独立模式：两个 Key 均合并成一行展示，仅右侧说明不同 -->
+                <div
+                  class="modelagg-key-row"
+                  :class="{ 'modelagg-key-row-merged': store.groupMode(entry.group) === 'aggregate' }"
+                >
+                  <div class="modelagg-merged-key-info">
+                    <code class="modelagg-key-code" :title="getGroupAggregatedInfo(entry).maskedKeyPreview">
+                      {{ getGroupAggregatedInfo(entry).maskedKeyPreview }}
+                    </code>
                   </div>
-                  <div v-for="info in site.keys" :key="`${info.accountLabel}:${info.key}`" class="modelagg-key-row">
-                    <code class="modelagg-key-code">{{ maskApiKey(info.key) }}</code>
-                    <small class="modelagg-key-account" :title="info.accountLabel">{{ info.accountLabel }}</small>
-                    <small class="modelagg-key-count">{{ info.models.length }} 个模型</small>
-                    <button
-                      class="modelagg-key-copy"
-                      type="button"
-                      aria-label="复制完整 API Key"
-                      title="复制完整 API Key"
-                      @click.stop="copyKey(info)"
-                      v-html="icons.copy"
-                    />
-                  </div>
+                  <small class="modelagg-key-count">
+                    {{ store.groupMode(entry.group) === 'aggregate'
+                        ? `${getGroupAggregatedInfo(entry).keyCount} Key 聚合轮询 · ${getGroupAggregatedInfo(entry).modelCount} 个模型`
+                        : (getGroupAggregatedInfo(entry).keyCount > 1
+                            ? `${getGroupAggregatedInfo(entry).keyCount} Key 独立通道 · ${getGroupAggregatedInfo(entry).modelCount} 个模型`
+                            : `${getGroupAggregatedInfo(entry).modelCount} 个模型`)
+                    }}
+                  </small>
                 </div>
               </div>
             </article>
@@ -594,6 +698,141 @@ function onDragEnd() {
       </section>
     </div>
 
+    <!-- API 密钥与网关接入维护弹窗 -->
+    <Teleport to="body">
+      <div
+        v-if="gatewayModalOpen"
+        class="modelagg-picker-backdrop"
+        @click.self="closeGatewayModal()"
+      >
+        <section
+          class="modelagg-picker modelagg-gw-modal"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="modelagg-gw-modal-title"
+          @click.stop
+        >
+          <header class="modelagg-picker-head">
+            <div>
+              <h2 id="modelagg-gw-modal-title">API 密钥管理</h2>
+              <p>统一本地 OpenAI / Claude 兼容端点，支持为不同客户端或项目分配独立 API Key 轮询调用。</p>
+            </div>
+            <button
+              class="close-button"
+              type="button"
+              aria-label="关闭"
+              @click="closeGatewayModal()"
+              v-html="icons.close"
+            />
+          </header>
+
+          <div class="modelagg-gw-body">
+            <!-- 统一端点卡片 -->
+            <div class="modelagg-gw-endpoint-card">
+              <div class="modelagg-gw-endpoint-info">
+                <span class="modelagg-gw-label">API 基础地址 (Base URL)</span>
+                <code class="modelagg-gw-url-box">http://127.0.0.1:{{ store.preferences.gatewayPort || 17896 }}/v1</code>
+              </div>
+              <button class="secondary-button" type="button" @click="copyGatewayUrl()">
+                <span v-html="icons.copy" />
+                <span>复制地址</span>
+              </button>
+            </div>
+
+            <!-- 密钥列表头部 -->
+            <div class="modelagg-gw-keys-header">
+              <div>
+                <strong>API 密钥列表</strong>
+                <small>（已配置 {{ draftApiKeys.length }} 个密钥，列表为空时本地免认证）</small>
+              </div>
+              <button class="secondary-button modelagg-gw-add-key-btn" type="button" @click="addApiKey()">
+                <span v-html="icons.plus" />
+                <span>添加密钥</span>
+              </button>
+            </div>
+
+            <!-- 空状态 -->
+            <div v-if="draftApiKeys.length === 0" class="modelagg-gw-empty-keys">
+              <span v-html="icons.key" />
+              <p>当前未配置任何 API 密钥，客户端填任意字符串均可免认证调用本地网关。</p>
+              <button class="secondary-button" type="button" @click="addApiKey()">
+                <span v-html="icons.plus" />
+                <span>创建第一个密钥</span>
+              </button>
+            </div>
+
+            <!-- 密钥列表 -->
+            <div v-else class="modelagg-gw-keys-list">
+              <div
+                v-for="(item, index) in draftApiKeys"
+                :key="item.id"
+                class="modelagg-gw-key-card"
+              >
+                <div class="modelagg-gw-key-row-top">
+                  <input
+                    v-model="item.name"
+                    class="modelagg-gw-key-name-input"
+                    type="text"
+                    placeholder="名称 / 备注（如 Cursor、Claude Code、Chatbox 等）"
+                  />
+                  <label class="modelagg-gw-key-enable">
+                    <input v-model="item.enabled" type="checkbox" />
+                    <span>{{ item.enabled ? '已启用' : '已停用' }}</span>
+                  </label>
+                </div>
+                <div class="modelagg-gw-key-row-bottom">
+                  <input
+                    v-model="item.key"
+                    class="modelagg-gw-key-input"
+                    type="text"
+                    placeholder="sk-oh-..."
+                  />
+                  <div class="modelagg-gw-key-actions">
+                    <button
+                      class="icon-button"
+                      type="button"
+                      title="复制完整 API Key"
+                      @click="copySpecificKey(item.key, item.name)"
+                      v-html="icons.copy"
+                    />
+                    <button
+                      class="icon-button"
+                      type="button"
+                      title="重新随机生成密钥"
+                      @click="regenerateApiKey(index)"
+                      v-html="icons.restore"
+                    />
+                    <button
+                      class="icon-button modelagg-gw-del-btn"
+                      type="button"
+                      title="删除该密钥"
+                      @click="removeApiKey(index)"
+                      v-html="icons.trash"
+                    />
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <footer class="modal-footer modelagg-picker-footer">
+            <button class="secondary-button" type="button" @click="closeGatewayModal()">
+              取消
+            </button>
+            <button
+              class="save-button"
+              type="button"
+              @click="handleSaveGatewaySettings()"
+            >
+              <span v-html="icons.check" />
+              <span>保存配置</span>
+            </button>
+          </footer>
+        </section>
+      </div>
+    </Teleport>
+
+    <!-- 模型勾选弹窗 -->
     <Teleport to="body">
       <div
         v-if="pickerOpen"
@@ -612,7 +851,7 @@ function onDragEnd() {
               <h2 id="modelagg-picker-title">筛选模型</h2>
               <p>
                 已选 {{ pickerSelectionStats.selected }} /
-                {{ pickerSelectionStats.total }} 个模型，保存后未勾选的将从左侧树隐藏。
+                {{ pickerSelectionStats.total }} 个模型，保存后未勾选的将从左侧树及网关路由池隐藏。
               </p>
             </div>
             <button

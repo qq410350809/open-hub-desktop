@@ -11,9 +11,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
-// v11：Claude 子代理（sidechain/subagents 目录）请求与 Token 开始计入；
-// 对话轮改用 origin.kind 判定真人输入；usage 桶新增 request_count。
-const CACHE_VERSION: i64 = 11;
+// v13：修复 ZCode/OpenCode 用户消息嵌套 modelID 导致的对话轮次无法归属到具体模型（如 GLM-5.3）的问题；
+const CACHE_VERSION: i64 = 13;
 const CACHE_TTL: Duration = Duration::from_secs(5);
 const UNKNOWN_CODEX_MODEL: &str = "codex-unknown-model";
 const UNKNOWN_CLAUDE_MODEL: &str = "claude-unknown-model";
@@ -1413,10 +1412,107 @@ fn parse_command_code_file(path: &Path) -> CachedFile {
     }
 }
 
-fn find_ascii_model_token(bytes: &[u8]) -> String {
-    const PREFIXES: [&[u8]; 3] = [b"gemini-", b"claude-", b"gpt-"];
+fn is_model_noise(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower == "gemini-pro-agent"
+        || lower == "gemini-pro-default"
+        || lower == "claude-login"
+        || lower == "claude-code-gui"
+        || lower.starts_with("gpt-migration-")
+        || lower.starts_with("gpt-update-")
+        || lower.starts_with("claude-unknown-model")
+        || lower.starts_with("antigravity-unknown-model")
+}
+
+fn normalize_model_slug(raw: &str) -> String {
+    let mut s = raw.trim();
+    if let Some(pos) = s.rfind('(') {
+        if s.ends_with(')') {
+            s = s[..pos].trim();
+        }
+    }
+    let mut s = s.to_ascii_lowercase();
+    for suffix in [
+        "-high", "-medium", "-low", "-thinking", "_high", "_medium", "_low", "_thinking",
+    ] {
+        if s.ends_with(suffix) {
+            s.truncate(s.len() - suffix.len());
+            break;
+        }
+    }
+    let mut result = String::with_capacity(s.len());
+    let mut last_dash = false;
+    for c in s.chars() {
+        if c == ' ' || c == '_' || c == '-' {
+            if !last_dash && !result.is_empty() {
+                result.push('-');
+                last_dash = true;
+            }
+        } else if c.is_ascii_alphanumeric() || c == '.' {
+            result.push(c);
+            last_dash = false;
+        }
+    }
+    result.trim_end_matches('-').to_string()
+}
+
+fn find_display_model_name(bytes: &[u8]) -> Option<String> {
+    const DISPLAY_PREFIXES: [&[u8]; 5] = [b"Gemini ", b"Claude ", b"GPT-", b"DeepSeek-", b"Qwen"];
     for index in 0..bytes.len() {
-        let Some(prefix) = PREFIXES
+        let Some(prefix) = DISPLAY_PREFIXES
+            .iter()
+            .find(|prefix| bytes[index..].starts_with(prefix))
+        else {
+            continue;
+        };
+        let mut end = index + prefix.len();
+        let mut paren_depth = 0;
+        while end < bytes.len() {
+            let b = bytes[end];
+            if b == b'(' {
+                paren_depth += 1;
+                end += 1;
+            } else if b == b')' {
+                if paren_depth > 0 {
+                    paren_depth -= 1;
+                    end += 1;
+                    if paren_depth == 0 {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            } else if b.is_ascii_alphanumeric() || matches!(b, b' ' | b'.' | b'-' | b'_') {
+                end += 1;
+            } else {
+                break;
+            }
+        }
+        let candidate = String::from_utf8_lossy(&bytes[index..end]).trim().to_string();
+        if candidate.len() >= 4 && !candidate.starts_with("Gemini 0") && !is_model_noise(&candidate) {
+            let lower = candidate.to_ascii_lowercase();
+            if lower.contains("flash")
+                || lower.contains("pro")
+                || lower.contains("sonnet")
+                || lower.contains("opus")
+                || lower.contains("haiku")
+                || lower.contains("ultra")
+                || lower.contains("gpt-")
+                || lower.contains("deepseek-")
+                || lower.contains("qwen")
+                || lower.chars().any(|c| c.is_ascii_digit())
+            {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+fn find_slug_model_name(bytes: &[u8]) -> Option<String> {
+    const SLUG_PREFIXES: [&[u8]; 5] = [b"gemini-", b"claude-", b"gpt-", b"deepseek-", b"qwen-"];
+    for index in 0..bytes.len() {
+        let Some(prefix) = SLUG_PREFIXES
             .iter()
             .find(|prefix| bytes[index..].starts_with(prefix))
         else {
@@ -1428,10 +1524,41 @@ fn find_ascii_model_token(bytes: &[u8]) -> String {
         {
             end += 1;
         }
-        if end > index + prefix.len() {
-            return String::from_utf8_lossy(&bytes[index..end]).to_string();
+        let candidate = String::from_utf8_lossy(&bytes[index..end])
+            .trim_end_matches('.')
+            .to_string();
+        if candidate.len() > prefix.len() && !is_model_noise(&candidate) {
+            return Some(candidate);
         }
     }
+    None
+}
+
+fn find_ascii_model_token(bytes: &[u8]) -> String {
+    let chunks: &[&[u8]] = if bytes.len() > 8192 {
+        &[&bytes[bytes.len() - 8192..], bytes]
+    } else {
+        &[bytes]
+    };
+
+    for chunk in chunks {
+        if let Some(model) = find_slug_model_name(chunk) {
+            let normalized = normalize_model_slug(&model);
+            if !normalized.is_empty() {
+                return normalized;
+            }
+        }
+    }
+
+    for chunk in chunks {
+        if let Some(model) = find_display_model_name(chunk) {
+            let normalized = normalize_model_slug(&model);
+            if !normalized.is_empty() {
+                return normalized;
+            }
+        }
+    }
+
     String::new()
 }
 
@@ -1443,15 +1570,18 @@ fn antigravity_database_metadata(path: &Path) -> (String, String) {
         return (String::new(), String::new());
     };
 
-    let model = conn
-        .query_row(
-            "SELECT data FROM gen_metadata ORDER BY idx ASC LIMIT 1",
-            [],
-            |row| row.get::<_, Vec<u8>>(0),
-        )
-        .ok()
-        .map(|data| find_ascii_model_token(&data[..data.len().min(16_384)]))
-        .unwrap_or_default();
+    let mut model = String::new();
+    if let Ok(mut stmt) = conn.prepare("SELECT data FROM gen_metadata ORDER BY idx DESC LIMIT 10") {
+        if let Ok(rows) = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0)) {
+            for row in rows.flatten() {
+                let candidate = find_ascii_model_token(&row);
+                if !candidate.is_empty() {
+                    model = candidate;
+                    break;
+                }
+            }
+        }
+    }
 
     let project = conn
         .query_row(
@@ -1863,6 +1993,31 @@ fn parse_kiro_legacy_file(path: &Path) -> CachedFile {
     }
 }
 
+fn extract_model_from_transcript_content(content: &str) -> Option<String> {
+    if !content.contains("Model Selection") {
+        return None;
+    }
+    let marker = "Model Selection` from ";
+    let start = content.find(marker)?;
+    let sub = &content[start + marker.len()..];
+    let to_pos = sub.find(" to ")?;
+    let candidate_sub = &sub[to_pos + 4..];
+    let end_pos = candidate_sub
+        .find(".\n")
+        .or_else(|| candidate_sub.find(". "))
+        .or_else(|| candidate_sub.find(".\r"))
+        .or_else(|| candidate_sub.find("."))
+        .unwrap_or(candidate_sub.len());
+    let candidate = candidate_sub[..end_pos].trim();
+    if !candidate.is_empty() && candidate.len() < 60 && !candidate.eq_ignore_ascii_case("none") {
+        let normalized = normalize_model_slug(candidate);
+        if !normalized.is_empty() && !is_model_noise(&normalized) {
+            return Some(normalized);
+        }
+    }
+    None
+}
+
 fn parse_antigravity_file(path: &Path) -> CachedFile {
     let file_fingerprint = antigravity_fingerprint(path);
     let Ok(text) = fs::read_to_string(path) else {
@@ -1880,7 +2035,7 @@ fn parse_antigravity_file(path: &Path) -> CachedFile {
             .to_string();
     }
     let (database_model, database_project) = antigravity_database_metadata(path);
-    let model = if database_model.is_empty() {
+    let mut model = if database_model.is_empty() {
         UNKNOWN_ANTIGRAVITY_MODEL.to_string()
     } else {
         database_model
@@ -1901,6 +2056,13 @@ fn parse_antigravity_file(path: &Path) -> CachedFile {
         let Ok(value) = serde_json::from_str::<JsonValue>(line) else {
             continue;
         };
+        if model == UNKNOWN_ANTIGRAVITY_MODEL {
+            if let Some(content) = value.get("content").and_then(JsonValue::as_str) {
+                if let Some(candidate) = extract_model_from_transcript_content(content) {
+                    model = candidate;
+                }
+            }
+        }
         let timestamp = value
             .get("created_at")
             .or_else(|| value.get("timestamp"))
@@ -1971,6 +2133,14 @@ fn parse_antigravity_file(path: &Path) -> CachedFile {
             });
         }
         visible_context_tokens = visible_context_tokens.saturating_add(context_delta);
+    }
+
+    if model != UNKNOWN_ANTIGRAVITY_MODEL {
+        for event in &mut events {
+            if event.model == UNKNOWN_ANTIGRAVITY_MODEL {
+                event.model = model.clone();
+            }
+        }
     }
 
     let tokens = events
@@ -2715,6 +2885,23 @@ fn unknown_database_model(source: &str) -> String {
     .to_string()
 }
 
+fn database_model(value: &JsonValue, source: &str) -> String {
+    value
+        .get("modelID")
+        .or_else(|| value.get("modelId"))
+        .and_then(JsonValue::as_str)
+        .or_else(|| {
+            value
+                .get("model")
+                .and_then(|model| model.get("modelID").or_else(|| model.get("modelId")))
+                .and_then(JsonValue::as_str)
+        })
+        .or_else(|| value.get("model").and_then(JsonValue::as_str))
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| unknown_database_model(source))
+}
+
 /// OpenCode 系 DB 的 token 分项口径拆分，返回 (全新输入, 缓存读取, 缓存写入, 输出, 思考)。
 /// ZCode 的 tokens.input 是完整 prompt，cache.read/write 是其中的子集（同 OpenAI 的
 /// prompt_tokens ⊇ cached_tokens 口径），必须扣除后才是全新输入；OpenCode/MiCo 的
@@ -2818,15 +3005,17 @@ fn parse_local_database(path: &Path, source: &str) -> CachedDatabase {
                     .filter(|value| !value.is_empty())
                     .unwrap_or_else(|| iso_from_millis(time_created));
                 update_bounds(&mut session.started_at, &mut session.ended_at, &timestamp);
-                let model = value
-                    .get("modelID")
-                    .or_else(|| value.get("modelId"))
-                    .and_then(JsonValue::as_str)
-                    .filter(|value| !value.trim().is_empty())
-                    .map(str::to_string)
-                    .unwrap_or_else(|| unknown_database_model(source));
-                if session.model.is_empty() && !model.is_empty() {
+                let mut model = database_model(&value, source);
+                let unknown = unknown_database_model(source);
+                if model == unknown && !session.model.is_empty() {
+                    model = session.model.clone();
+                } else if session.model.is_empty() && model != unknown {
                     session.model = model.clone();
+                    for event in &mut events {
+                        if event.id.starts_with(&format!("u:{session_id}:")) && event.model == unknown {
+                            event.model = model.clone();
+                        }
+                    }
                 }
                 if role == "user" {
                     session.turns += 1;
@@ -3554,6 +3743,20 @@ mod tests {
     }
 
     #[test]
+    fn zcode_database_extracts_nested_model_on_user_turn() {
+        let user_msg = json!({
+            "role": "user",
+            "model": {
+                "providerID": "builtin:zai-start-plan",
+                "modelID": "GLM-5.3",
+                "variant": "max"
+            }
+        });
+        assert_eq!(database_model(&user_msg, "zcode"), "GLM-5.3");
+        assert_eq!(database_provider(&user_msg), "builtin:zai-start-plan");
+    }
+
+    #[test]
     fn codex_usage_normalization_separates_cached_input() {
         let usage = CodexUsage {
             input_tokens: 100,
@@ -3693,11 +3896,31 @@ mod tests {
     fn antigravity_model_token_parser_reads_supported_prefixes() {
         assert_eq!(
             find_ascii_model_token(b"\0\x01prefix claude-opus-4-6-thinking\0suffix"),
-            "claude-opus-4-6-thinking"
+            "claude-opus-4-6"
         );
         assert_eq!(
             find_ascii_model_token(b"prefix gemini-3.6-flash-high suffix"),
-            "gemini-3.6-flash-high"
+            "gemini-3.6-flash"
+        );
+        assert_eq!(
+            find_ascii_model_token(b"\xaa\x01\x17Gemini 3.7 Flash (High)\x00"),
+            "gemini-3.7-flash"
+        );
+        assert_eq!(
+            find_ascii_model_token(b"\xaa\x01\x14Gemini 3.1 Pro (Low)\x00"),
+            "gemini-3.1-pro"
+        );
+        assert_eq!(
+            find_ascii_model_token(b"\xaa\x01\x1cClaude Opus 4.6 (Thinking)\x00"),
+            "claude-opus-4.6"
+        );
+        assert_eq!(
+            find_ascii_model_token(b"\xaa\x01\x06GPT-4o\x00"),
+            "gpt-4o"
+        );
+        assert_eq!(
+            find_ascii_model_token(b"\xaa\x01\x0bDeepSeek-V3\x00"),
+            "deepseek-v3"
         );
         assert_eq!(find_ascii_model_token(b"no model here"), "");
     }

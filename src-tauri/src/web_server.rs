@@ -1,4 +1,7 @@
-//! 轻量模式：内嵌本地 HTTP 服务。
+//! 轻量模式：内嵌本地 HTTP 服务（现统一由 Gateway 在 17896 端口处理 API 路由）。
+#![allow(dead_code)]
+#![allow(unused_imports)]
+#![allow(unused_variables)]
 //!
 //! 目标：设置页一键关闭 GUI 窗口后，进程继续作为内核常驻，
 //! 用户通过浏览器访问同一个资料库。
@@ -66,24 +69,9 @@ impl WebServerHandle {
     }
 }
 
-/// 启动轻量模式 HTTP 服务（非阻塞，后台线程常驻）。
-pub fn start(app: AppHandle) -> Result<Arc<WebServerHandle>, String> {
-    let (listener, port) = bind_listener()?;
-    let dist_dir = resolve_dist_dir(&app);
-    let handle = Arc::new(WebServerHandle {
-        running: AtomicBool::new(true),
-        port: AtomicU16::new(port),
-        token: Mutex::new(generate_token()),
-        dist_dir: Mutex::new(dist_dir),
-    });
-    let thread_handle = handle.clone();
-    let thread_app = app.clone();
-    std::thread::Builder::new()
-        .name("openhub-web-server".to_string())
-        .spawn(move || serve_loop(listener, thread_app, thread_handle))
-        .map_err(|error| format!("启动轻量模式服务线程失败：{error}"))?;
-    eprintln!("OpenHub 轻量模式服务已启动：http://127.0.0.1:{port}/");
-    Ok(handle)
+/// 启动轻量模式 HTTP 服务（纯 API 模式下由网关处理）。
+pub fn start(_app: AppHandle) -> Result<Arc<WebServerHandle>, String> {
+    Ok(WebServerHandle::disabled())
 }
 
 fn bind_listener() -> Result<(TcpListener, u16), String> {

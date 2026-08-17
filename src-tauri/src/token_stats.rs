@@ -2662,17 +2662,28 @@ fn collect_sqlite_message_activity_incremental(
 
     if filter {
         // 1) 先扩充“正规 session”集合：本轮新增的正规 assistant 所在 session
+fn sqlite_message_provider(value: &JsonValue) -> String {
+    value
+        .get("providerID")
+        .or_else(|| value.get("providerId"))
+        .and_then(JsonValue::as_str)
+        .or_else(|| {
+            value
+                .get("model")
+                .and_then(|model| model.get("providerID").or_else(|| model.get("providerId")))
+                .and_then(JsonValue::as_str)
+        })
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase()
+}
+
         let mut newly_allowed: Vec<String> = Vec::new();
         for (sid, _, value) in &new_rows {
             if value.get("role").and_then(JsonValue::as_str) != Some("assistant") {
                 continue;
             }
-            let provider = value
-                .get("providerID")
-                .or_else(|| value.get("providerId"))
-                .and_then(JsonValue::as_str)
-                .unwrap_or("")
-                .to_ascii_lowercase();
+            let provider = sqlite_message_provider(value);
             let allowed_provider = provider_allow
                 .map(|allow| allow.contains(provider.as_str()))
                 .unwrap_or(false);
@@ -2710,12 +2721,7 @@ fn collect_sqlite_message_activity_incremental(
             if role != "assistant" {
                 continue;
             }
-            let provider = value
-                .get("providerID")
-                .or_else(|| value.get("providerId"))
-                .and_then(JsonValue::as_str)
-                .unwrap_or("")
-                .to_ascii_lowercase();
+            let provider = sqlite_message_provider(value);
             let allowed_provider = provider_allow
                 .map(|allow| allow.contains(provider.as_str()))
                 .unwrap_or(false);

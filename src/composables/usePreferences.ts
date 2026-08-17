@@ -17,12 +17,52 @@ const defaultPreferences: Preferences = {
   modelAggSiteOrder: [],
   modelAggGroupModes: {},
   modelAggHiddenModels: [],
+  gatewayEnabled: true,
+  gatewayPort: 17896,
+  gatewayApiKey: "",
+  gatewayApiKeys: [
+    {
+      id: "default",
+      name: "默认客户端",
+      key: "sk-oh-default",
+      enabled: true,
+      createdAt: Date.now(),
+    },
+  ],
 };
 
 /** 过滤出非空字符串并保持顺序（用于站点顺序、隐藏模型键等列表型偏好）。 */
 function normalizeStringList(raw: unknown): string[] {
   if (!Array.isArray(raw)) return [];
   return raw.filter((item): item is string => typeof item === "string" && item.trim().length > 0);
+}
+
+function normalizeGatewayApiKeys(raw: unknown, legacyKey?: string): Preferences["gatewayApiKeys"] {
+  if (Array.isArray(raw) && raw.length > 0) {
+    const list = raw
+      .filter((item): item is Record<string, unknown> => typeof item === "object" && item !== null)
+      .map((item, idx) => ({
+        id: typeof item.id === "string" && item.id.trim() ? item.id.trim() : `key-${idx + 1}`,
+        name: typeof item.name === "string" ? item.name.trim() : `Key ${idx + 1}`,
+        key: typeof item.key === "string" ? item.key.trim() : "",
+        enabled: item.enabled !== false,
+        createdAt: typeof item.createdAt === "number" ? item.createdAt : Date.now(),
+      }))
+      .filter((item) => item.key.length > 0);
+    if (list.length > 0) return list;
+  }
+  if (typeof legacyKey === "string" && legacyKey.trim()) {
+    return [
+      {
+        id: "default",
+        name: "默认客户端",
+        key: legacyKey.trim(),
+        enabled: true,
+        createdAt: Date.now(),
+      },
+    ];
+  }
+  return [...defaultPreferences.gatewayApiKeys];
 }
 
 function normalizeModelAggGroupModes(raw: unknown): Record<string, ModelAggGroupMode> {
@@ -43,6 +83,10 @@ function loadPreferences(): Preferences {
     ) as Partial<Preferences>;
     const legacyTheme = localStorage.getItem("ldoh:theme");
     const proxyNodeViewMode = saved.proxyNodeViewMode === "country" ? "country" : "list";
+    const gatewayPort = typeof saved.gatewayPort === "number" && saved.gatewayPort > 0 && saved.gatewayPort <= 65535
+      ? (saved.gatewayPort === 52020 ? 17896 : saved.gatewayPort)
+      : 17896;
+    const legacyApiKey = typeof saved.gatewayApiKey === "string" ? saved.gatewayApiKey.trim() : "";
     return {
       theme: ["system", "light", "dark"].includes(String(saved.theme))
         ? (saved.theme as ThemePreference)
@@ -58,6 +102,10 @@ function loadPreferences(): Preferences {
       modelAggSiteOrder: normalizeStringList(saved.modelAggSiteOrder),
       modelAggGroupModes: normalizeModelAggGroupModes(saved.modelAggGroupModes),
       modelAggHiddenModels: normalizeStringList(saved.modelAggHiddenModels),
+      gatewayEnabled: saved.gatewayEnabled !== undefined ? Boolean(saved.gatewayEnabled) : true,
+      gatewayPort,
+      gatewayApiKey: legacyApiKey,
+      gatewayApiKeys: normalizeGatewayApiKeys(saved.gatewayApiKeys, legacyApiKey),
     };
   } catch {
     return { ...defaultPreferences };

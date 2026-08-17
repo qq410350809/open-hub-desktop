@@ -74,19 +74,29 @@ const apiSourceLabel = computed(() => {
   }
 });
 
-/** 选中 Key 时，该 Key 对应的模型列表；未选中时为 null 表示显示全站模型。 */
+/** 选中 Key 时，该 Key 对应的模型列表；未选中时为 null 表示未选中特定 Key。 */
 const selectedKeyModels = computed<LiveModelItem[] | null>(() => {
   const keyId = selectedKeyId.value;
   if (!keyId) return null;
   for (const account of liveAccountKeys.value) {
-    const models = account.keyModels?.[keyId];
-    if (models) return models;
+    if (account.keys.includes(keyId)) {
+      const models = account.keyModels?.[keyId];
+      return Array.isArray(models) ? models : [];
+    }
   }
-  return null;
+  return [];
+});
+
+/** 当前生效的模型列表：如果选中了 Key，以该 Key 的模型为准（即使为 0 个）；未选中 Key 时展示站点全量模型。 */
+const currentActiveModels = computed<LiveModelItem[]>(() => {
+  if (selectedKeyId.value !== null) {
+    return selectedKeyModels.value ?? [];
+  }
+  return liveModels.value;
 });
 
 const filteredLiveModels = computed(() => {
-  const source = selectedKeyModels.value ?? liveModels.value;
+  const source = currentActiveModels.value;
   const q = searchQuery.value.trim().toLowerCase();
   if (!q) return source;
   return source.filter(
@@ -95,7 +105,7 @@ const filteredLiveModels = computed(() => {
 });
 
 const modelCountLabel = computed(() => {
-  const source = selectedKeyModels.value ?? liveModels.value;
+  const source = currentActiveModels.value;
   const total = source.length;
   const q = searchQuery.value.trim();
   return q ? `${filteredLiveModels.value.length} / ${total}` : String(total);
@@ -118,7 +128,15 @@ async function readCachedModels(siteId: string): Promise<boolean> {
     }));
     apiSource.value = data.apiSource || "none";
     const accounts = Array.isArray(data.accounts) ? data.accounts : [];
-    liveAccountKeys.value = accounts;
+    liveAccountKeys.value = accounts
+      .slice()
+      .sort((a, b) =>
+        (a.username || a.accountName || a.profileName || "").localeCompare(
+          b.username || b.accountName || b.profileName || "",
+          undefined,
+          { numeric: true, sensitivity: "base" }
+        )
+      );
     return accounts.length > 0 || liveModels.value.length > 0;
   } catch {
     return false;
@@ -198,8 +216,8 @@ async function refreshModels(mode: "cache" | "keys" | "models" = "cache") {
               keyModels: saveKeyModels ? result.keyModels ?? {} : {},
               error: "",
             },
-            result: saveKeyModels ? result : null,
-            preserveKeys: saveKeyModels,
+            result,
+            preserveKeys: false,
           });
         } catch {
           /* 忽略，继续读缓存 */
@@ -222,11 +240,11 @@ async function refreshModels(mode: "cache" | "keys" | "models" = "cache") {
                 username: session.username,
                 keys: result.keys ?? [],
                 keyGroups: result.keyGroups ?? {},
-                keyModels: saveKeyModels ? result.keyModels ?? {} : {},
+                keyModels: result.keyModels ?? {},
                 error: "",
               },
-              result: saveKeyModels ? result : null,
-              preserveKeys: saveKeyModels,
+              result,
+              preserveKeys: false,
             });
           } catch (error) {
             await runCommand("save_site_model_cache_for_account", {
@@ -496,10 +514,10 @@ function keyModelCount(key: string): number | null {
                 <p>{{ liveError }}</p>
               </div>
 
-              <div v-else-if="(selectedKeyModels ?? liveModels).length === 0" class="site-models-state">
+              <div v-else-if="currentActiveModels.length === 0" class="site-models-state">
                 <span class="site-models-state-icon" v-html="icons.database" />
-                <strong>暂无模型数据</strong>
-                <p>{{ selectedKeyId ? "该 Key 没有可用的模型数据，请重新同步会话。" : "本地同步数据中没有可用模型。" }}</p>
+                <strong>{{ selectedKeyId ? "该 Key 暂无可用模型" : "暂无模型数据" }}</strong>
+                <p>{{ selectedKeyId ? "该 Key 没有可用或同步到的模型数据。" : "本地同步数据中没有可用模型。" }}</p>
               </div>
 
               <div v-else-if="filteredLiveModels.length === 0" class="site-models-state">
