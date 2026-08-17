@@ -2,7 +2,7 @@
 import { computed, onMounted, ref, watch } from "vue";
 import { icons } from "../icons";
 import { useStore } from "../composables/useStore";
-import type { ModelCatalogDetail, ModelCatalogItem } from "../types";
+import type { ModelCatalogDetail, ModelCatalogItem, ModelCatalogProvider, ModelCatalogHostItem } from "../types";
 import AppTable, { type AppTableColumn } from "./AppTable.vue";
 import CustomSelect from "./CustomSelect.vue";
 
@@ -465,20 +465,65 @@ function dateText(value: string) {
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString("zh-CN", { hour12: false });
 }
 
+const hostsLoading = ref(false);
+
+function createInitialDetail(model: ModelCatalogItem): ModelCatalogDetail {
+  const provMap = new Map(store.modelCatalog.value.providers.map((p) => [p.id, p]));
+  const providers = (model.hostProviders || [])
+    .map((pId) => provMap.get(pId))
+    .filter((p): p is ModelCatalogProvider => Boolean(p));
+
+  const hosts: ModelCatalogHostItem[] = (model.hostProviders || []).map((pId) => {
+    const p = provMap.get(pId);
+    const isRef = pId === model.refProvider;
+    const isMin = pId === model.minProvider;
+    return {
+      provider: pId,
+      name: p?.name || pId,
+      modelId: null,
+      tier: p?.tier || "gateway",
+      subscription: p?.subscription || false,
+      input: isMin && model.minInputCost > 0 ? model.minInputCost : isRef && model.refInputCost > 0 ? model.refInputCost : null,
+      output: isMin && model.minOutputCost > 0 ? model.minOutputCost : isRef && model.refOutputCost > 0 ? model.refOutputCost : null,
+      cacheRead: isMin && model.minCacheReadCost > 0 ? model.minCacheReadCost : isRef && model.refCacheReadCost > 0 ? model.refCacheReadCost : null,
+      cacheWrite: null,
+      context: model.contextLength,
+      outputLimit: model.maxOutputTokens,
+      status: null,
+      official: isRef && model.refOfficial,
+      doc: p?.doc || null,
+      isFree: (isMin && model.minInputCost === 0 && model.minOutputCost === 0) || (p?.subscription || false),
+      isMin,
+      isRef,
+    };
+  });
+
+  return {
+    model,
+    providers,
+    hosts,
+    raw: { id: model.id, name: model.name },
+  };
+}
+
 // —— 交互逻辑 ——
 async function openModelDetail(model: ModelCatalogItem) {
   selectedId.value = model.id;
-  detail.value = null;
+  detail.value = createInitialDetail(model); // 0ms 即时响应渲染
   detailError.value = "";
-  detailLoading.value = true;
+  detailLoading.value = false;
+  hostsLoading.value = true;
   activeDetailTab.value = "overview";
   providerTablePricedOnly.value = false;
   try {
-    detail.value = await store.getModelCatalogDetail(model.id);
+    const fullDetail = await store.getModelCatalogDetail(model.id);
+    if (selectedId.value === model.id && fullDetail) {
+      detail.value = fullDetail;
+    }
   } catch (error) {
-    detailError.value = String(error);
+    console.warn("加载全网服务商报价详情失败:", error);
   } finally {
-    detailLoading.value = false;
+    hostsLoading.value = false;
   }
 }
 
@@ -1282,7 +1327,7 @@ onMounted(() => {
                 @click="activeDetailTab = 'providers'"
               >
                 <span v-html="icons.globe" />
-                <span>全网渠道明细 (共 {{ detail?.providers.length || selectedModel.hostProviders.length }} 家)</span>
+                <span>全网渠道明细 (共 {{ detail?.hosts?.length || detail?.providers.length || selectedModel.hostProviders.length }} 家)</span>
               </button>
               <button
                 type="button"
@@ -1622,10 +1667,16 @@ onMounted(() => {
                         {{ detail.hosts?.filter(h => h.subscription).length || selectedModel.subHostCount }} 家订阅覆盖
                       </span>
                     </div>
-                    <label class="mc-priced-only-toggle">
-                      <input v-model="providerTablePricedOnly" type="checkbox" />
-                      <span>仅显示有公开标价渠道</span>
-                    </label>
+                    <div class="flex items-center gap-3">
+                      <div v-if="hostsLoading" class="mc-hosts-syncing-banner">
+                        <span class="is-spinning" v-html="icons.restore" />
+                        <span>同步最新报价中…</span>
+                      </div>
+                      <label class="mc-priced-only-toggle">
+                        <input v-model="providerTablePricedOnly" type="checkbox" />
+                        <span>仅显示有公开标价渠道</span>
+                      </label>
+                    </div>
                   </div>
 
                   <div class="mc-providers-full-table-wrap">
@@ -3685,6 +3736,21 @@ onMounted(() => {
   font-size: 11.5px;
   color: var(--muted);
   font-variant-numeric: tabular-nums;
+}
+.mc-hosts-syncing-banner {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 8px;
+  border-radius: var(--r-full);
+  background: var(--brand-soft);
+  color: var(--brand-deep);
+  font-size: 11px;
+  font-weight: 600;
+}
+.mc-hosts-syncing-banner :deep(svg) {
+  width: 12px;
+  height: 12px;
 }
 .mc-priced-only-toggle {
   display: flex;

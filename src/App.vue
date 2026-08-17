@@ -3,15 +3,13 @@ import { onMounted, onUnmounted, computed } from "vue";
 import { icons } from "./icons";
 import { useStore } from "./composables/useStore";
 import { isTauri, runCommand } from "./composables/useLibrary";
-import { SYSTEM_TYPES } from "./types";
 import { usePreferences } from "./composables/usePreferences";
 import { useTheme } from "./composables/useTheme";
 import { useToast } from "./composables/useToast";
 import { useTooltip } from "./composables/useTooltip";
 import { useContextMenu } from "./composables/useContextMenu";
 import AppSidebar from "./components/AppSidebar.vue";
-import CustomSelect from "./components/CustomSelect.vue";
-import SiteGrid from "./components/SiteGrid.vue";
+import SiteLibraryPage from "./components/SiteLibraryPage.vue";
 import SiteFormModal from "./components/SiteFormModal.vue";
 import LinkDialog from "./components/LinkDialog.vue";
 import PreviewDialog from "./components/PreviewDialog.vue";
@@ -27,31 +25,6 @@ import ModelCatalogPage from "./components/ModelCatalogPage.vue";
 import ModelAggregatePage from "./components/ModelAggregatePage.vue";
 
 const store = useStore();
-
-const tagOptions = computed(() => [
-  { value: "all", text: "全部标签" },
-  ...store.allTags.value.map((tag) => ({ value: tag, text: tag })),
-]);
-const levelOptions = [
-  { value: "all", text: "全部等级" },
-  { value: "0", text: "LV0" },
-  { value: "1", text: "LV1" },
-  { value: "2", text: "LV2" },
-  { value: "3", text: "LV3" },
-];
-const featureOptions = [
-  { value: "all", text: "全部功能" },
-  { value: "checkin", text: "支持签到" },
-  { value: "translation", text: "沉浸式翻译" },
-  { value: "ldc", text: "支持 LDC" },
-  { value: "nsfw", text: "支持 NSFW" },
-  { value: "invite", text: "需要邀请码" },
-];
-const systemTypeOptions = [
-  { value: "all", text: "全部系统类型" },
-  ...SYSTEM_TYPES,
-  { value: "unknown", text: "未知类型" },
-];
 const { preferences } = usePreferences();
 const { applyTheme } = useTheme();
 const { message, isError, visible } = useToast();
@@ -194,139 +167,14 @@ onUnmounted(() => {
 
     <div class="app-workspace">
       <div class="workspace-view">
-        <section
+        <div
           v-if="store.page.value === 'library'"
           id="library-panel"
-          class="library-page"
+          class="library-panel"
           aria-labelledby="library-nav"
         >
-          <header class="library-header">
-            <div class="library-header-bar">
-              <div class="library-heading">
-                <span class="library-eyebrow">OpenHub · 站点资料库</span>
-                <h1>站点库</h1>
-                <p>已筛选 {{ store.filteredSites.value.length }} / 共 {{ store.sites.value.length }} 个站点</p>
-              </div>
-              <div class="library-header-actions">
-                <button
-                  class="secondary-button sync-button"
-                  :disabled="store.syncingSites.value || store.syncingModelKeys.value"
-                  :data-tooltip="store.usageFilter.value === 'all'
-                    ? '根据当前存活/跑路状态，从 ldoh 同步站点'
-                    : `同步当前${store.usageFilter.value === 'pending' ? '待定' : '在用'}站点的账号额度`"
-                  @click="store.openSyncDialog()"
-                >
-                  <span v-html="store.usageFilter.value === 'all' ? icons.restore : icons.activity" />
-                  <span>{{ store.usageFilter.value === 'all' ? '同步站点' : '额度同步' }}</span>
-                </button>
-                <button
-                  v-if="store.runawayFilter.value === 'active'"
-                  class="primary-button"
-                  id="add-site"
-                  @click="store.openModal()"
-                >
-                  <span v-html="icons.plus" /><span>添加站点</span>
-                </button>
-              </div>
-            </div>
-
-            <div class="library-toolbar" aria-label="站点筛选">
-              <div class="library-toolbar-main">
-                <div class="filter-segment surface library-usage-switch" role="group" aria-label="站点库视图">
-                  <button
-                    id="all-usage-filter"
-                    type="button"
-                    :class="{ active: store.usageFilter.value === 'all' }"
-                    :aria-pressed="store.usageFilter.value === 'all'"
-                    @click="store.setUsageFilter('all')"
-                  >全部</button>
-                  <button
-                    id="personal-filter"
-                    type="button"
-                    :class="{ active: store.usageFilter.value === 'personal' }"
-                    :aria-pressed="store.usageFilter.value === 'personal'"
-                    @click="store.setUsageFilter('personal')"
-                  >在用</button>
-                  <button
-                    id="pending-filter"
-                    type="button"
-                    :class="{ active: store.usageFilter.value === 'pending' }"
-                    :aria-pressed="store.usageFilter.value === 'pending'"
-                    @click="store.setUsageFilter('pending')"
-                  >待定</button>
-                </div>
-                <label class="search-box library-search">
-                  <span v-html="icons.search" />
-                  <input
-                    id="search-input"
-                    v-model="store.query.value"
-                    type="search"
-                    placeholder="搜索站点、API 地址或标签…"
-                    autocomplete="off"
-                  />
-                  <kbd>⌘ K</kbd>
-                </label>
-                <div class="library-filter-segments">
-                  <div class="filter-segment surface is-runaway" role="group" aria-label="站点状态">
-                    <button
-                      id="active-filter"
-                      type="button"
-                      :class="{ active: store.runawayFilter.value === 'active' }"
-                      :aria-pressed="store.runawayFilter.value === 'active'"
-                      @click="store.setRunawayFilter('active')"
-                    >存活</button>
-                    <button
-                      id="runaway-filter"
-                      type="button"
-                      :class="{ active: store.runawayFilter.value === 'runaway' }"
-                      :aria-pressed="store.runawayFilter.value === 'runaway'"
-                      @click="store.setRunawayFilter('runaway')"
-                    >跑路</button>
-                  </div>
-                  <button
-                    v-if="store.hasFilters.value"
-                    class="text-button library-clear-filters"
-                    id="clear-filter-header"
-                    type="button"
-                    @click="store.clearFilters()"
-                  >清除筛选</button>
-                </div>
-              </div>
-              <div class="library-filter-selects">
-                <CustomSelect
-                  class="library-select"
-                  :options="tagOptions"
-                  :model-value="store.tag.value"
-                  @update:model-value="store.tag.value = $event"
-                  aria-label="标签筛选"
-                />
-                <CustomSelect
-                  class="library-select"
-                  :options="levelOptions"
-                  :model-value="store.level.value"
-                  @update:model-value="store.level.value = $event"
-                  aria-label="等级筛选"
-                />
-                <CustomSelect
-                  class="library-select"
-                  :options="featureOptions"
-                  :model-value="store.feature.value"
-                  @update:model-value="store.feature.value = $event"
-                  aria-label="功能筛选"
-                />
-                <CustomSelect
-                  class="library-select"
-                  :options="systemTypeOptions"
-                  :model-value="store.systemTypeFilter.value"
-                  @update:model-value="store.systemTypeFilter.value = $event"
-                  aria-label="系统类型筛选"
-                />
-              </div>
-            </div>
-          </header>
-
-          <SiteGrid />
-        </section>
+          <SiteLibraryPage />
+        </div>
         <div
           v-else-if="store.page.value === 'modelparams'"
           id="model-params-panel"

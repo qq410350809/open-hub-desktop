@@ -7,6 +7,7 @@ import QuickRangeDropdown from "./QuickRangeDropdown.vue";
 import AppTable, { type AppTableColumn } from "./AppTable.vue";
 import { icons } from "../icons";
 import { useStore } from "../composables/useStore";
+import { usePreferences } from "../composables/usePreferences";
 import {
   bucketModelTotals,
   bucketSourceTotals,
@@ -34,9 +35,24 @@ import {
 import type { TrendGranularity } from "../composables/tokenStatsAgg";
 
 const store = useStore();
+const { preferences } = usePreferences();
 
-// —— 趋势维度：根据顶部所选时间区间自动决定 X 轴粒度 ——
-// < 7 天 → 逐小时；7 天 ~ 3 个月 → 逐日；≥ 3 个月 → 逐月
+// —— 4 大深度分析弹窗状态 ——
+const toolsModalOpen = ref(false);
+const modelsModalOpen = ref(false);
+const projectsModalOpen = ref(false);
+const auditModalOpen = ref(false);
+
+// —— 趋势图表显示维度 ——
+type TrendMetric = "total" | "breakdown" | "reasoning" | "requests";
+const trendMetric = ref<TrendMetric>("total");
+
+// —— 搜索与过滤 ——
+const modelSearch = ref("");
+const projectSearch = ref("");
+const sourceSearch = ref("");
+
+// —— 趋势粒度：根据顶部所选时间区间自动决定 X 轴粒度 ——
 const trendGranularity = computed<TrendGranularity>(() => {
   const from = store.tokenStatsFrom.value;
   const to = store.tokenStatsTo.value;
@@ -46,25 +62,19 @@ const trendGranularity = computed<TrendGranularity>(() => {
     if (days <= 92) return "day";
     return "month";
   }
-  // 未设置范围：依据数据跨度自适应
   return "day";
 });
 
-// —— 弹窗状态：详情列表统一切到弹窗展示 ——
-type ModalKind = "daily" | "projects" | "sources" | "models";
-const modal = ref<ModalKind | null>(null);
-const modalOpen = ref(false);
-function openModal(kind: ModalKind) {
-  modal.value = kind;
-  detailPage.value = 1;
-  modalOpen.value = true;
-}
-function closeModal() {
-  modalOpen.value = false;
-  modal.value = null;
+function trendUnitLabel(): string {
+  switch (trendGranularity.value) {
+    case "hour": return "逐小时";
+    case "day": return "逐日";
+    case "month": return "逐月";
+    default: return "逐日";
+  }
 }
 
-// —— 统计重建弹窗：确认后执行，并展示后端阶段日志 ——
+// —— 统计重建状态与阶段日志 ——
 type RefreshPhase = "confirm" | "running" | "success" | "error";
 type RefreshLogStatus = "running" | "success" | "error";
 type TokenCollectorProgress = {
@@ -105,10 +115,10 @@ const refreshStatusTitle = computed(() => {
 });
 
 const refreshStatusDescription = computed(() => {
-  if (refreshPhase.value === "running") return "正在重新读取日志并重建本地数据库，请稍候。";
-  if (refreshPhase.value === "success") return "本地数据库与当前页面数据均已更新。";
+  if (refreshPhase.value === "running") return "正在重新读取多端日志并重建本地数据库，请稍候。";
+  if (refreshPhase.value === "success") return "本地数据库与当前页面快照均已更新。";
   if (refreshPhase.value === "error") return "任务未能完成，请根据下方日志检查后重试。";
-  return "执行前请确认本次统计重建的影响范围。";
+  return "清除本地临时解析缓存，重新完整扫描各 AI 工具的本地日志并写入 SQLite。";
 });
 
 function appendRefreshLog(progress: TokenCollectorProgress) {
@@ -163,7 +173,7 @@ async function startRefresh() {
   appendRefreshLog({ stage: "view", status: "running", message: "正在重新读取数据库快照并更新页面" });
   try {
     await store.refreshTokenDatabaseView(true);
-    appendRefreshLog({ stage: "view", status: "success", message: "页面数据已更新" });
+    appendRefreshLog({ stage: "view", status: "success", message: "页面快照已更新" });
     appendRefreshLog({ stage: "complete", status: "success", message: "统计重建全部完成" });
     refreshPhase.value = "success";
   } catch (error) {
@@ -187,156 +197,223 @@ const agentKindLabels: Record<string, string> = {
 const localAgents = computed(() => store.localAgentPaths.value?.agents ?? []);
 const localAgentsHome = computed(() => store.localAgentPaths.value?.home ?? "");
 const localAgentEnvOverrides = computed(() => store.localAgentPaths.value?.envOverrides ?? []);
+const detectedAgentsCount = computed(() => localAgents.value.filter((a) => a.detected).length);
 const localAgentsCollectedAt = computed(() => {
   const raw = store.localAgentPaths.value?.collectedAt ?? "";
-  // ISO → 本地可读的 MM-dd HH:mm
   return raw.length >= 16 ? raw.slice(5, 16).replace("T", " ") : "";
 });
+
 function formatAgentCount(value: number): string {
   return value >= 10000 ? `${(value / 1000).toFixed(1)}k` : String(value);
 }
-// 展示时把主目录前缀折叠成 ~，路径更短、更容易一行放下；复制与悬浮仍用完整路径。
+
 function displayAgentPath(path: string): string {
   const home = localAgentsHome.value;
   if (home && path.startsWith(`${home}/`)) return `~${path.slice(home.length)}`;
   return path;
 }
-// 按 / 切成整段渲染，换行只发生在路径分隔符处，避免 sqliteDB 被硬拆成 "sqliteD / B"。
+
 function agentPathSegments(path: string): string[] {
   return displayAgentPath(path)
     .split("/")
     .filter(Boolean)
     .map((part, index, parts) => (index < parts.length - 1 ? `${part}/` : part));
 }
+
 function openAgentDialog() {
   agentDialogOpen.value = true;
   void store.loadLocalAgentPaths();
 }
+
 function closeAgentDialog() {
   agentDialogOpen.value = false;
 }
+
 async function copyAgentPath(path: string) {
   if (!path) return;
   try {
     await navigator.clipboard.writeText(path);
-    store.showToast("已复制路径");
+    store.showToast("已复制路径至剪贴板");
   } catch {
     store.showToast("复制失败", true);
   }
 }
 
-// —— 明细弹窗：标签页 + 分页 ——
-const detailTab = ref<"daily" | "projects">("daily");
-const PAGE_SIZE = 12;
-const detailPage = ref(1);
-function openDetail(tab: "daily" | "projects") {
-  detailTab.value = tab;
-  detailPage.value = 1;
-  modal.value = tab; // 复用 modal 弹窗（daily/projects）
-  modalOpen.value = true;
+// —— 数据导出弹窗 ——
+const exportDialogOpen = ref(false);
+function openExportDialog() {
+  exportDialogOpen.value = true;
 }
-function switchDetailTab(tab: "daily" | "projects") {
-  detailTab.value = tab;
-  detailPage.value = 1;
+function closeExportDialog() {
+  exportDialogOpen.value = false;
 }
 
+function exportDataAsJson() {
+  const payload = {
+    exportTime: new Date().toISOString(),
+    timeRange: {
+      from: store.tokenStatsFrom.value || null,
+      to: store.tokenStatsTo.value || null,
+      label: rangeLabel.value,
+    },
+    summary: {
+      totalTokens: bucketTotal.value.total,
+      inputTokens: rangeSplits.value.input,
+      outputTokens: rangeSplits.value.output,
+      cacheTokens: rangeSplits.value.cache,
+      cacheHitRate: cacheHitRate.value,
+      dailyAverage: dailyAverage.value,
+      activeDays: activeDays.value,
+      streakDays: streakDays.value,
+      dialogues: healthTimeline.value.totalDialogues,
+      requests: healthTimeline.value.totalRequests,
+      estimatedCostUsd: estimatedCost.value,
+    },
+    sources: bySource.value,
+    models: byModel.value,
+    projects: projectUsage.value,
+    trendDetails: trendDetailList.value,
+  };
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `openhub-token-stats-${toLocalDate(new Date())}.json`;
+  a.click();
+  URL.revokeObjectURL(url);
+  store.showToast("已导出 JSON 报表");
+  closeExportDialog();
+}
+
+function exportDataAsCsv() {
+  const rows: string[] = [];
+  rows.push("时间,总计Token,输入Token,输出Token,缓存Token,缓存命中率,推理Token,对话数,请求数");
+  for (const item of trendDetailList.value) {
+    const hitRate = item.cacheHitRate != null ? `${(item.cacheHitRate * 100).toFixed(2)}%` : "0%";
+    rows.push(`"${item.label}",${item.total},${item.input},${item.output},${item.cache},"${hitRate}",${item.reasoning},${item.sessions},${item.requests}`);
+  }
+  const blob = new Blob(["\uFEFF" + rows.join("\n")], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `openhub-token-trend-${toLocalDate(new Date())}.csv`;
+  a.click();
+  URL.revokeObjectURL(url);
+  store.showToast("已导出 CSV 报表");
+  closeExportDialog();
+}
+
+// —— 表格列配置 ——
 const dailyColumns: AppTableColumn[] = [
-  { key: "label", title: "时间", width: "minmax(120px,1fr)" },
-  { key: "total", title: "总计", width: "90px", align: "right", sortable: true },
-  { key: "input", title: "输入", width: "90px", align: "right", sortable: true },
-  { key: "output", title: "输出", width: "90px", align: "right", sortable: true },
-  { key: "cache", title: "缓存", width: "90px", align: "right", sortable: true },
-  { key: "cacheHitRate", title: "缓存命中率", width: "110px", align: "right", sortable: true },
-  { key: "reasoning", title: "推理", width: "90px", align: "right", sortable: true },
-  { key: "sessions", title: "对话", width: "90px", align: "right", sortable: true },
-  { key: "requests", title: "请求数", width: "90px", align: "right", sortable: true },
+  { key: "label", title: "时间节点", width: "minmax(130px, 1.2fr)", sortable: true },
+  { key: "total", title: "总量 Tokens", width: "110px", align: "right", sortable: true },
+  { key: "input", title: "输入", width: "95px", align: "right", sortable: true },
+  { key: "output", title: "输出", width: "95px", align: "right", sortable: true },
+  { key: "cache", title: "缓存 (读+写)", width: "105px", align: "right", sortable: true },
+  { key: "cacheHitRate", title: "缓存命中率", width: "105px", align: "right", sortable: true },
+  { key: "reasoning", title: "深度推理", width: "95px", align: "right", sortable: true },
+  { key: "sessions", title: "对话轮次", width: "90px", align: "right", sortable: true },
+  { key: "requests", title: "API 请求数", width: "95px", align: "right", sortable: true },
 ];
 
 const projectColumns: AppTableColumn[] = [
-  { key: "project", title: "项目", width: "minmax(120px,1fr)" },
-  { key: "totalTokens", title: "总计", width: "90px", align: "right", sortable: true },
+  { key: "project", title: "项目 / 工作区", width: "minmax(160px, 1.4fr)", sortable: true },
+  { key: "totalTokens", title: "消耗总计", width: "110px", align: "right", sortable: true },
+  { key: "share", title: "占比", width: "80px", align: "right", sortable: false },
   { key: "input", title: "输入", width: "90px", align: "right", sortable: true },
   { key: "output", title: "输出", width: "90px", align: "right", sortable: true },
   { key: "cache", title: "缓存", width: "90px", align: "right", sortable: true },
-  { key: "cacheHitRate", title: "缓存命中率", width: "110px", align: "right", sortable: true },
+  { key: "cacheHitRate", title: "缓存命中率", width: "105px", align: "right", sortable: true },
   { key: "reasoning", title: "推理", width: "90px", align: "right", sortable: true },
-  { key: "sessions", title: "对话", width: "90px", align: "right", sortable: true },
+  { key: "sessions", title: "对话轮次", width: "90px", align: "right", sortable: true },
   { key: "requests", title: "请求数", width: "90px", align: "right", sortable: true },
-  { key: "costUsd", title: "成本", width: "100px", align: "right", sortable: true },
+  { key: "costUsd", title: "估算成本", width: "100px", align: "right", sortable: true },
 ];
 
 const sourceColumns: AppTableColumn[] = [
-  { key: "source", title: "工具", width: "minmax(120px,1fr)" },
-  { key: "totalTokens", title: "总计", width: "90px", align: "right", sortable: true },
+  { key: "source", title: "工具 / 来源", width: "minmax(150px, 1.3fr)", sortable: true },
+  { key: "totalTokens", title: "总量 Tokens", width: "110px", align: "right", sortable: true },
+  { key: "share", title: "占比", width: "80px", align: "right", sortable: false },
   { key: "inputTokens", title: "输入", width: "90px", align: "right", sortable: true },
   { key: "outputTokens", title: "输出", width: "90px", align: "right", sortable: true },
   { key: "cacheTokens", title: "缓存", width: "90px", align: "right", sortable: true },
-  { key: "cacheHitRate", title: "缓存命中率", width: "110px", align: "right", sortable: true },
+  { key: "cacheHitRate", title: "缓存命中率", width: "105px", align: "right", sortable: true },
+  { key: "reasoningTokens", title: "推理", width: "90px", align: "right", sortable: true },
+  { key: "conversations", title: "对话数", width: "90px", align: "right", sortable: true },
+  { key: "requests", title: "请求数", width: "90px", align: "right", sortable: true },
+  { key: "costUsd", title: "成本 (USD)", width: "100px", align: "right", sortable: true },
+];
+
+const modelColumns: AppTableColumn[] = [
+  { key: "model", title: "模型名称 / 家族", width: "minmax(180px, 1.5fr)", sortable: true },
+  { key: "totalTokens", title: "总量 Tokens", width: "110px", align: "right", sortable: true },
+  { key: "share", title: "占比", width: "80px", align: "right", sortable: false },
+  { key: "inputTokens", title: "输入", width: "90px", align: "right", sortable: true },
+  { key: "outputTokens", title: "输出", width: "90px", align: "right", sortable: true },
+  { key: "cacheTokens", title: "缓存", width: "90px", align: "right", sortable: true },
+  { key: "cacheHitRate", title: "缓存命中率", width: "105px", align: "right", sortable: true },
   { key: "reasoningTokens", title: "推理", width: "90px", align: "right", sortable: true },
   { key: "conversations", title: "对话", width: "90px", align: "right", sortable: true },
   { key: "requests", title: "请求数", width: "90px", align: "right", sortable: true },
-  { key: "costUsd", title: "成本", width: "100px", align: "right", sortable: true },
-  { key: "share", title: "占比", width: "70px", align: "right" },
+  { key: "costUsd", title: "成本 (USD)", width: "100px", align: "right", sortable: true },
 ];
 
-const modelColumns: AppTableColumn[] = sourceColumns;
-
-// sessions 仅用于项目用量表；顶部成本改用覆盖全部工具的小时桶逐模型定价。
 const sessions = computed(() => store.tokenStats.value?.sessions ?? []);
 
-// —— 供应商品牌色 ——
+// —— 供应商品牌色与配置 ——
 const PROVIDER_COLORS: Record<string, string> = {
   claude: "#d97757",
   codex: "#3b82f6",
+  cursor: "#8b5cf6",
   opencode: "#f59e0b",
   gemini: "#2196f3",
+  antigravity: "#ff6900",
   kiro: "#a78bfa",
   copilot: "#6b7280",
   openclaw: "#facc15",
   goose: "#ef4444",
-  antigravity: "#ff6900",
   zed: "#14b8a6",
-  cursor: "#8b5cf6",
   catpawai: "#ec4899",
   "command-code": "#10b981",
   dsh: "#1e88e5",
 };
-function providerColor(source: string, index: number) {
+
+function providerColor(source: string, index = 0): string {
   return PROVIDER_COLORS[source.toLowerCase()] || `hsl(${150 + index * 40}, 60%, 45%)`;
 }
 
 const sourceNameMap: Record<string, string> = {
-  claude: "Claude",
-  codex: "Codex",
+  claude: "Claude Code",
+  codex: "Codex CLI",
   cursor: "Cursor",
   catpawai: "CatPawAI",
-  gemini: "Gemini",
+  gemini: "Gemini CLI",
   opencode: "OpenCode",
   kiro: "Kiro",
-  copilot: "Copilot",
+  copilot: "GitHub Copilot",
   openclaw: "OpenClaw",
-  goose: "Goose",
-  antigravity: "Antigravity",
-  zed: "Zed",
+  goose: "Goose AI",
+  antigravity: "Google Antigravity",
+  zed: "Zed Editor",
   "command-code": "Command Code",
-  dsh: "DSH",
+  dsh: "DeepSeek CLI (DSH)",
 };
-function sourceLabel(source: string) {
+
+function sourceLabel(source: string): string {
   return sourceNameMap[source.toLowerCase()] || source || "未知来源";
 }
 
-function shareOf(value: number, total: number) {
+function shareOf(value: number, total: number): number {
   return total > 0 ? Math.min(100, (value / total) * 100) : 0;
 }
 
-// —— 小时用量桶（OpenHub 自有采集 + CatPawAI 本地 SQLite）——
+// —— 小时用量桶过滤 ——
 const allBuckets = computed(() => store.tokenUsage.value?.buckets ?? []);
 const filteredBuckets = computed(() => {
   const buckets = allBuckets.value;
   const from = store.tokenStatsFrom.value;
   const to = store.tokenStatsTo.value;
   return buckets.filter((bucket) => {
-    // 去掉 unknown / 空 模型与来源
     if (!isKnownModel(bucket.model) || !isKnownSource(bucket.source)) return false;
     const day = localDateOf(bucket.timestamp);
     return (!from || day >= from) && (!to || day <= to);
@@ -346,7 +423,7 @@ const filteredBuckets = computed(() => {
 const dailyMap = computed(() => buildDailyMapFromBuckets(filteredBuckets.value));
 const bucketTotal = computed(() => bucketTotals(filteredBuckets.value));
 
-// —— KPI 计算 ——
+// —— KPI 指标计算 ——
 const activeDays = computed(() => dailyMap.value.size);
 const streakDays = computed(() => {
   const keys = [...dailyMap.value.keys()].sort();
@@ -359,36 +436,39 @@ const streakDays = computed(() => {
   }
   return streak;
 });
-// —— 所选日期区间统计 ——
+
 const rangeLabel = computed(() => {
   const from = store.tokenStatsFrom.value;
   const to = store.tokenStatsTo.value;
-  if (!from && !to) return "全部";
+  if (!from && !to) return "全部时间";
+  if (from === to) return from;
   return `${from || "…"} ~ ${to || "…"}`;
 });
+
 const rangeDays = computed(() => {
   const from = store.tokenStatsFrom.value;
   const to = store.tokenStatsTo.value;
-  if (!from || !to) return activeDays.value;
+  if (!from || !to) return activeDays.value || 1;
   return Math.max(1, Math.round((parseLocal(to).getTime() - parseLocal(from).getTime()) / 86_400_000) + 1);
 });
-// 日均 Tokens（区间总量 / 区间活跃天数）
+
 const dailyAverage = computed(() => {
   const days = Math.max(1, activeDays.value);
   return bucketTotal.value.total / days;
 });
 
-// 区间 Token 拆分（输入 / 输出 / 缓存）
 const rangeSplits = computed(() => {
   let input = 0;
   let output = 0;
   let cache = 0;
+  let reasoning = 0;
   for (const stat of dailyMap.value.values()) {
     input += stat.input;
     output += stat.output;
     cache += stat.cache;
+    reasoning += stat.reasoning;
   }
-  return { input, output, cache };
+  return { input, output, cache, reasoning };
 });
 
 const cacheHitRate = computed(() => {
@@ -405,7 +485,23 @@ const cacheHitRate = computed(() => {
   return cacheHitRateOf(cacheRead, cacheWrite, fresh, estimatedInput);
 });
 
-// 成本只汇总数据源明确上报的金额，不对缺少价格的数据进行猜测。
+// 缓存命中率评级
+const cacheHitRateRating = computed(() => {
+  const rate = cacheHitRate.value;
+  if (rate == null || rate <= 0) return { label: "暂无缓存", class: "is-none" };
+  if (rate >= 0.7) return { label: "极高效率 ⚡", class: "is-excellent" };
+  if (rate >= 0.4) return { label: "良好 ✦", class: "is-good" };
+  return { label: "偏低 · 可优化", class: "is-fair" };
+});
+
+// Prompt Caching 节约估算（Prompt 缓存平均每 100 万 Token 节约 ~$2.70）
+const estimatedCacheSavings = computed(() => {
+  const cachedTokens = rangeSplits.value.cache;
+  if (cachedTokens <= 0) return 0;
+  return (cachedTokens / 1_000_000) * 2.70;
+});
+
+// 成本汇总
 const costSummary = computed(() => {
   let costUsd = 0;
   let pricedTokens = 0;
@@ -423,26 +519,44 @@ const costSummary = computed(() => {
     coverage: totalTokens > 0 ? pricedTokens / totalTokens : null,
   };
 });
+
 const estimatedCost = computed(() => costSummary.value.costUsd);
 const costCaption = computed(() => {
   const { coverage, pricedTokens, totalTokens } = costSummary.value;
-  if (totalTokens <= 0) return "按模型分项估算";
-  if (pricedTokens <= 0 || coverage == null) return "暂无匹配定价";
-  if (coverage >= 0.9995) return "来源上报成本 · 全部覆盖";
-  return `来源上报成本 · 覆盖 ${(coverage * 100).toFixed(1)}%`;
+  if (totalTokens <= 0) return "按模型标准价估算";
+  if (pricedTokens <= 0 || coverage == null) return "暂无定价上报";
+  if (coverage >= 0.9995) return "多端日志实际账单 · 100% 覆盖";
+  return `来源上报覆盖率 ${(coverage * 100).toFixed(1)}%`;
 });
 
 const totalTokensAll = computed(() => bucketTotal.value.total);
+
+// 工具分布
 const bySource = computed(() =>
   bucketSourceTotals(filteredBuckets.value).filter((item) => item.totalTokens > 0),
 );
+const filteredSources = computed(() => {
+  const q = sourceSearch.value.trim().toLowerCase();
+  if (!q) return bySource.value;
+  return bySource.value.filter((s) =>
+    s.source.toLowerCase().includes(q) || sourceLabel(s.source).toLowerCase().includes(q),
+  );
+});
+
+// 模型分布
 const byModel = computed(() =>
   mergeModelTotals(bucketModelTotals(filteredBuckets.value)).filter((item) => item.totalTokens > 0),
 );
-const topSources = computed(() => bySource.value.slice(0, 5));
-const topModels = computed(() => byModel.value.slice(0, 5));
+const filteredModels = computed(() => {
+  const q = modelSearch.value.trim().toLowerCase();
+  if (!q) return byModel.value;
+  return byModel.value.filter((m) => m.model.toLowerCase().includes(q));
+});
 
-// 项目用量按项目聚合（含各分项；buckets 无项目维度故用会话日志）
+const topSources = computed(() => bySource.value.slice(0, 6));
+const topModels = computed(() => byModel.value.slice(0, 6));
+
+// 项目用量
 type ProjectUsageItem = {
   project: string;
   sessions: number;
@@ -459,40 +573,66 @@ type ProjectUsageItem = {
   costUsd: number;
   estimatedTokens: number;
 };
+
 const projectUsage = computed<ProjectUsageItem[]>(() => {
   const groups = new Map<
     string,
-    { project: string; sessions: number; requests: number; requestsEstimated: boolean; totalTokens: number; input: number; output: number; cache: number; cacheRead: number; cacheWrite: number; cacheHitRate: number | null; reasoning: number; costUsd: number; estimatedTokens: number; estimatedInput: number }
+    {
+      project: string;
+      sessions: number;
+      requests: number;
+      requestsEstimated: boolean;
+      totalTokens: number;
+      input: number;
+      output: number;
+      cache: number;
+      cacheRead: number;
+      cacheWrite: number;
+      cacheHitRate: number | null;
+      reasoning: number;
+      costUsd: number;
+      estimatedTokens: number;
+      estimatedInput: number;
+    }
   >();
+
   const normalizeProject = (rawKey?: string) => {
-    const value = rawKey?.trim() || "未知项目";
-    // 路径中带 books 的项目统一汇总到 books。
+    const value = rawKey?.trim() || "默认工作区";
     if (value.toLowerCase().includes("books")) return "books";
-    // UUID 形态的项目名无法识别（Claude Code 缺失 cwd 上下文时产生），归并为“其他”。
     return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value)
-      ? "其他"
+      ? "其他临时任务"
       : value;
   };
+
   const ensureGroup = (rawKey?: string) => {
     const key = normalizeProject(rawKey);
     const current = groups.get(key) || {
-      project: key, sessions: 0, requests: 0, requestsEstimated: false, totalTokens: 0,
-      input: 0, output: 0, cache: 0, cacheRead: 0, cacheWrite: 0, cacheHitRate: null,
-      reasoning: 0, costUsd: 0, estimatedTokens: 0, estimatedInput: 0,
+      project: key,
+      sessions: 0,
+      requests: 0,
+      requestsEstimated: false,
+      totalTokens: 0,
+      input: 0,
+      output: 0,
+      cache: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      cacheHitRate: null,
+      reasoning: 0,
+      costUsd: 0,
+      estimatedTokens: 0,
+      estimatedInput: 0,
     };
     groups.set(key, current);
     return current;
   };
 
-  // CatPawAI 桶自带 workspace 项目维度，直接按当前前端日期范围精确聚合。
-  // 记录这些来源后，跳过同来源 sessions，避免项目维度重复统计。
   const projectBucketSources = new Set<string>();
   for (const bucket of filteredBuckets.value) {
     if (!bucket.projectKey?.trim()) continue;
     projectBucketSources.add(bucket.source.toLowerCase());
     const current = ensureGroup(bucket.projectKey);
     current.sessions += bucket.conversationCount || 0;
-    // 优先桶内真实请求数；旧快照缺失时按输出规模估算并标记
     if (bucket.requestCount != null) {
       current.requests += bucket.requestCount || 0;
     } else {
@@ -516,11 +656,9 @@ const projectUsage = computed<ProjectUsageItem[]>(() => {
     current.estimatedInput += bucket.estimatedInputTokens || 0;
   }
 
-  // 对没有项目桶的兼容来源，使用会话数据补充项目维度。
   for (const session of sessions.value) {
     if (projectBucketSources.has((session.source || "").toLowerCase())) continue;
     const current = ensureGroup(session.projectKey);
-    // 会话路径没有逐请求计数：对话数取会话 turns（零轮会话不虚计），请求数只能估算
     const sessionTurns = session.turns || 0;
     current.sessions += sessionTurns;
     current.requests += estimateRequestCount({
@@ -543,16 +681,23 @@ const projectUsage = computed<ProjectUsageItem[]>(() => {
       current.estimatedInput += session.tokens?.inputTokens || 0;
     }
   }
+
   return [...groups.values()]
     .map((item) => ({
       ...item,
       cacheHitRate: cacheHitRateOf(item.cacheRead, item.cacheWrite, item.input, item.estimatedInput),
     }))
     .filter((item) => item.totalTokens > 0)
-    .sort((a, b) => b.totalTokens - a.totalTokens)
-    .slice(0, 20);
+    .sort((a, b) => b.totalTokens - a.totalTokens);
 });
 
+const filteredProjects = computed(() => {
+  const q = projectSearch.value.trim().toLowerCase();
+  if (!q) return projectUsage.value;
+  return projectUsage.value.filter((p) => p.project.toLowerCase().includes(q));
+});
+
+// —— 趋势与明细数据 ——
 const trendSeries = computed(() =>
   buildTrendFromBuckets(
     filteredBuckets.value,
@@ -561,7 +706,7 @@ const trendSeries = computed(() =>
     store.tokenStatsTo.value || undefined,
   ),
 );
-// 明细列表与图表同粒度、同 key，保证一一对应（含空节点）
+
 const trendDetail = computed(() =>
   buildTrendDetailFromBuckets(
     filteredBuckets.value,
@@ -570,25 +715,14 @@ const trendDetail = computed(() =>
     store.tokenStatsTo.value || undefined,
   ),
 );
-function trendUnitLabel() {
-  switch (trendGranularity.value) {
-    case "hour": return "逐小时";
-    case "day": return "逐日";
-    case "month": return "逐月";
-    default: return "逐日";
-  }
-}
 
-// 明细列表时间标签：逐小时/逐日去掉年份，逐月保留
 function formatDetailTime(label: string): string {
   switch (trendGranularity.value) {
     case "hour": {
-      // "2026-08-08 00:00" → "08-08 00:00"
       const m = label.match(/^(\d{4})-(\d{2}-\d{2}) (\d{2}:\d{2})$/);
       return m ? `${m[2]} ${m[3]}` : label;
     }
     case "day": {
-      // "2026-08-08" → "08-08"
       const m = label.match(/^\d{4}-(\d{2}-\d{2})$/);
       return m ? m[1] : label;
     }
@@ -597,43 +731,13 @@ function formatDetailTime(label: string): string {
   }
 }
 
-// 请求健康时间线 cell tooltip
-function healthCellTitle(cell: {
-  label: string;
-  dialogues?: number;
-  requests: number;
-  requestsEstimated?: boolean;
-  success: number;
-  failed: number;
-  successRate: number | null;
-  pad?: boolean;
-}): string {
-  if (!cell.label && cell.pad) return "空档";
-  if (!cell.label) return "—";
-  const dialogues = cell.dialogues || 0;
-  const dialoguePart = dialogues > 0 ? ` · 对话 ${formatTokens(dialogues)}` : "";
-  if (cell.requests <= 0 && cell.failed <= 0) {
-    return dialogues > 0
-      ? `${cell.label}${dialoguePart} · 无请求`
-      : `${cell.label} · 无请求`;
-  }
-  const reqPart = cell.requestsEstimated ? `≈${formatTokens(cell.requests)}` : formatTokens(cell.requests);
-  const rateTxt = cell.successRate == null ? "—" : `${(cell.successRate * 100).toFixed(1)}%`;
-  const failPart = cell.failed > 0
-    ? ` · ⚠ 失败 ${formatTokens(cell.failed)}`
-    : ` · 失败 ${formatTokens(cell.failed)}`;
-  return `${cell.label}${dialoguePart} · 请求 ${reqPart} · 成功 ${formatTokens(cell.success)}${failPart} · 成功率 ${rateTxt}`;
-}
-
-// —— 请求健康时间线：与左侧趋势同粒度完整节点 ——
+// —— 请求健康时间线 ——
 const healthTimeline = computed(() =>
   buildHealthTimeline(
     store.requestHealth.value?.buckets ?? [],
     trendGranularity.value,
     store.tokenStatsFrom.value || undefined,
     store.tokenStatsTo.value || undefined,
-    // 用全量 usage（含区间外）作为请求活跃度底图，避免大量误显示“无数据”；
-    // 请求量优先传桶内真实 requestCount，旧快照缺失时才走估算
     (store.tokenUsage.value?.buckets ?? []).map((b) => ({
       timestamp: b.timestamp,
       conversationCount: b.conversationCount || 0,
@@ -645,11 +749,6 @@ const healthTimeline = computed(() =>
   ),
 );
 
-// —— KPI 口径 ——
-// 请求 = 一次真实 API 调用（模型响应，含子代理与工具循环触发）；对话 = 真人输入的一轮。
-// 「请求 N」只展示请求数本身；平均每轮请求数 = 总请求 ÷ 对话轮数。
-
-// 平均每轮请求数 = 总请求数 ÷ 对话数
 const requestsPerTurnLabel = computed(() => {
   const dialogues = healthTimeline.value.totalDialogues;
   if (!dialogues) return "—";
@@ -657,8 +756,6 @@ const requestsPerTurnLabel = computed(() => {
   return avg >= 10 ? String(Math.round(avg)) : avg.toFixed(1);
 });
 
-// —— 趋势明细列表增强 ——
-// 请求数：与趋势明细同粒度、同区间，按节点 label 对齐（沿用健康时间线的请求口径）。
 const requestsByLabel = computed(() => {
   const map = new Map<string, { requests: number; requestsEstimated: boolean }>();
   for (const cell of healthTimeline.value.cells) {
@@ -669,8 +766,7 @@ const requestsByLabel = computed(() => {
   }
   return map;
 });
-// 明细列表过滤掉总计为 0 的空节点（图表仍保留完整节点，二者不再强行一一对应）。
-// 同时把请求数并入行数据，使“请求数”列可排序。
+
 const trendDetailList = computed(() =>
   trendDetail.value
     .filter((item) => item.total > 0)
@@ -684,10 +780,10 @@ const trendDetailList = computed(() =>
     }),
 );
 
-// 网格：上→下、左→右（列优先），排满容器；所选区间落在末尾
+// —— 健康时间线网格测量 ——
 const HEALTH_ROWS = 8;
-const HEALTH_CELL = 11; // px
-const HEALTH_GAP = 3;   // px
+const HEALTH_CELL = 11;
+const HEALTH_GAP = 3;
 const healthGridRef = ref<HTMLElement | null>(null);
 const healthCols = ref(24);
 let healthRo: ResizeObserver | null = null;
@@ -714,10 +810,6 @@ type HealthDisplayCell = {
   pad?: boolean;
 };
 
-// 列优先展示：先填满一列（上→下），再下一列（左→右）
-// capacity = rows * cols 排满；若节点不足则前置占位，保证所选区间在末尾
-// 若节点过多则只保留末尾 capacity 个（仍保证选中区间的最后部分在网格末端）
-// 全量健康桶按当前粒度聚合（含所选区间之外），供前置补全取值
 const healthBucketMap = computed(() => {
   const map = new Map<string, { dialogues: number; requests: number; success: number; failed: number; usage: number; usageEstimated: boolean }>();
   for (const b of store.requestHealth.value?.buckets ?? []) {
@@ -730,8 +822,6 @@ const healthBucketMap = computed(() => {
     cur.failed += b.failed || 0;
     map.set(key, cur);
   }
-  // usage 对每个时间节点独立兜底。即使其他日期已有真实请求数据，
-  // 当前日期只要存在 Token 活动，也不应该被显示成“无数据”。
   for (const b of store.tokenUsage.value?.buckets ?? []) {
     const { key } = bucketKeyFor(trendGranularity.value, b.timestamp);
     if (!key) continue;
@@ -760,9 +850,7 @@ const healthDisplayCells = computed<HealthDisplayCell[]>(() => {
     body = body.slice(body.length - capacity);
   }
 
-  // 前置自动补全：向前延伸真实时间节点，并填入对应时间点的真实成功/失败值
   const padCount = Math.max(0, capacity - body.length);
-  let pads: HealthDisplayCell[] = [];
   if (padCount > 0) {
     const anchor = body[0]?.key || body[0]?.label || healthTimeline.value.startLabel || "";
     const preceding = buildPrecedingKeys(anchor, padCount, trendGranularity.value);
@@ -773,18 +861,17 @@ const healthDisplayCells = computed<HealthDisplayCell[]>(() => {
       const rawSuccess = hit?.success ?? 0;
       const rawFailed = hit?.failed ?? 0;
       const extractedRequests = hit?.requests ?? 0;
-        const sampleRequests = rawSuccess + rawFailed;
-        const usageRequests = hit?.usage ?? 0;
-        const requests = extractedRequests > 0 ? extractedRequests : (usageRequests > 0 ? usageRequests : sampleRequests);
-        // 前置补全区间不在所选范围内，usage 侧缺真实请求数时只能估算
-        const requestsEstimated = extractedRequests <= 0 && usageRequests > 0 && (hit?.usageEstimated ?? false);
-        const failed = Math.max(0, rawFailed);
-        const success = requests > 0
-          ? Math.max(0, requests - Math.min(failed, requests))
-          : rawSuccess;
-        const successRate = requests > 0
-          ? success / requests
-          : (failed > 0 ? 0 : (sampleRequests > 0 ? rawSuccess / sampleRequests : null));
+      const sampleRequests = rawSuccess + rawFailed;
+      const usageRequests = hit?.usage ?? 0;
+      const requests = extractedRequests > 0 ? extractedRequests : (usageRequests > 0 ? usageRequests : sampleRequests);
+      const requestsEstimated = extractedRequests <= 0 && usageRequests > 0 && (hit?.usageEstimated ?? false);
+      const failed = Math.max(0, rawFailed);
+      const success = requests > 0
+        ? Math.max(0, requests - Math.min(failed, requests))
+        : rawSuccess;
+      const successRate = requests > 0
+        ? success / requests
+        : (failed > 0 ? 0 : (sampleRequests > 0 ? rawSuccess / sampleRequests : null));
       return {
         key: `pre-${p.key}`,
         label: p.label,
@@ -798,74 +885,181 @@ const healthDisplayCells = computed<HealthDisplayCell[]>(() => {
         pad: false,
       };
     });
-    const lack = padCount - mapped.length;
-    const extras = Array.from({ length: Math.max(0, lack) }, (_, i) => ({
-      key: `pad-${i}`,
-      label: "",
-      dialogues: 0,
-      success: 0,
-      failed: 0,
-      requests: 0,
-      successRate: null as number | null,
-      level: 0,
-      pad: true,
-    }));
-    pads = [...extras, ...mapped];
+    body = [...mapped, ...body];
   }
-  return [...pads, ...body];
+  return body;
 });
 
-// —— ECharts 折线图 option（使用趋势）——
-const trendChartOption = computed<EChartsOption>(() => {
-  const isHourly = trendGranularity.value === "hour";
-  const labels = trendSeries.value.map((item) => {
-    if (isHourly) {
-      // 逐小时：拆分日期和小时，仅取小时做标签，完整放 tooltip
-      const m = item.label.match(/^(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2})$/);
-      return m ? m[2] : item.label;
-    }
-    return item.label;
-  });
-  const values = trendSeries.value.map((item) => item.value);
-  const dark = document.documentElement.dataset.theme === "dark";
-  const textColor = dark ? "#d4d4d4" : "#737373";
-  const faintColor = dark ? "#737373" : "#a3a3a3";
-  const splitColor = dark ? "#262626" : "#e5e5e5";
-  const areaTop = dark ? "rgba(52,211,153,0.22)" : "rgba(16,185,129,0.18)";
+function healthCellTitle(cell: HealthDisplayCell): string {
+  if (!cell.label && cell.pad) return "空档";
+  if (!cell.label) return "—";
+  const dialogues = cell.dialogues || 0;
+  const dialoguePart = dialogues > 0 ? ` · 对话 ${formatTokens(dialogues)}` : "";
+  if (cell.requests <= 0 && cell.failed <= 0) {
+    return dialogues > 0
+      ? `${cell.label}${dialoguePart} · 无请求`
+      : `${cell.label} · 无请求`;
+  }
+  const reqPart = cell.requestsEstimated ? `≈${formatTokens(cell.requests)}` : formatTokens(cell.requests);
+  const rateTxt = cell.successRate == null ? "—" : `${(cell.successRate * 100).toFixed(1)}%`;
+  const failPart = cell.failed > 0
+    ? ` · ⚠ 失败 ${formatTokens(cell.failed)}`
+    : ` · 失败 0`;
+  return `${cell.label}${dialoguePart} · 请求 ${reqPart} · 成功 ${formatTokens(cell.success)}${failPart} · 成功率 ${rateTxt}`;
+}
 
+// —— ECharts 交互配置 ——
+const trendChartOption = computed<EChartsOption>(() => {
+  const isDark = preferences.theme === "dark" || (preferences.theme === "system" && window.matchMedia("(prefers-color-scheme: dark)").matches);
+  const textColor = isDark ? "#94a3b8" : "#64748b";
+  const gridLineColor = isDark ? "rgba(255, 255, 255, 0.06)" : "rgba(0, 0, 0, 0.06)";
+  const labels = trendDetail.value.map((item) => formatDetailTime(item.label));
+
+  if (trendMetric.value === "breakdown") {
+    return {
+      tooltip: {
+        trigger: "axis",
+        axisPointer: { type: "shadow" },
+        backgroundColor: isDark ? "rgba(15, 23, 42, 0.95)" : "rgba(255, 255, 255, 0.95)",
+        borderColor: isDark ? "rgba(255, 255, 255, 0.15)" : "rgba(0, 0, 0, 0.1)",
+        textStyle: { color: isDark ? "#f8fafc" : "#0f172a", fontSize: 12 },
+      },
+      legend: {
+        data: ["输入 Tokens", "输出 Tokens", "Prompt 缓存", "推理 Tokens"],
+        textStyle: { color: textColor, fontSize: 11 },
+        top: 0,
+        right: 10,
+      },
+      grid: { left: 45, right: 15, top: 35, bottom: 25 },
+      xAxis: {
+        type: "category",
+        data: labels,
+        axisLine: { lineStyle: { color: gridLineColor } },
+        axisLabel: { color: textColor, fontSize: 10 },
+      },
+      yAxis: {
+        type: "value",
+        axisLabel: { color: textColor, fontSize: 10, formatter: (v: number) => formatCompact(v) },
+        splitLine: { lineStyle: { color: gridLineColor, type: "dashed" } },
+      },
+      series: [
+        {
+          name: "输入 Tokens",
+          type: "bar",
+          stack: "total",
+          data: trendDetail.value.map((i) => i.input),
+          itemStyle: { color: "#3b82f6" },
+        },
+        {
+          name: "输出 Tokens",
+          type: "bar",
+          stack: "total",
+          data: trendDetail.value.map((i) => i.output),
+          itemStyle: { color: "#10b981" },
+        },
+        {
+          name: "Prompt 缓存",
+          type: "bar",
+          stack: "total",
+          data: trendDetail.value.map((i) => i.cache),
+          itemStyle: { color: "#8b5cf6" },
+        },
+        {
+          name: "推理 Tokens",
+          type: "bar",
+          stack: "total",
+          data: trendDetail.value.map((i) => i.reasoning),
+          itemStyle: { color: "#f59e0b" },
+        },
+      ],
+    };
+  }
+
+  if (trendMetric.value === "requests") {
+    const reqData = trendDetailList.value.map((i) => i.requests);
+    return {
+      tooltip: {
+        trigger: "axis",
+        backgroundColor: isDark ? "rgba(15, 23, 42, 0.95)" : "rgba(255, 255, 255, 0.95)",
+        borderColor: isDark ? "rgba(255, 255, 255, 0.15)" : "rgba(0, 0, 0, 0.1)",
+        textStyle: { color: isDark ? "#f8fafc" : "#0f172a", fontSize: 12 },
+      },
+      grid: { left: 45, right: 15, top: 20, bottom: 25 },
+      xAxis: {
+        type: "category",
+        data: trendDetailList.value.map((i) => formatDetailTime(i.label)),
+        axisLine: { lineStyle: { color: gridLineColor } },
+        axisLabel: { color: textColor, fontSize: 10 },
+      },
+      yAxis: {
+        type: "value",
+        axisLabel: { color: textColor, fontSize: 10, formatter: (v: number) => formatTokens(v) },
+        splitLine: { lineStyle: { color: gridLineColor, type: "dashed" } },
+      },
+      series: [
+        {
+          name: "API 请求数",
+          type: "line",
+          smooth: 0.3,
+          symbol: "circle",
+          symbolSize: 6,
+          data: reqData,
+          lineStyle: { width: 2.5, color: "#06b6d4" },
+          itemStyle: { color: "#06b6d4" },
+          areaStyle: {
+            color: {
+              type: "linear",
+              x: 0,
+              y: 0,
+              x2: 0,
+              y2: 1,
+              colorStops: [
+                { offset: 0, color: "rgba(6, 182, 212, 0.35)" },
+                { offset: 1, color: "rgba(6, 182, 212, 0.0)" },
+              ],
+            },
+          },
+        },
+      ],
+    };
+  }
+
+  // 默认总用量折线面积图
+  const values = trendSeries.value.map((i) => i.value);
   return {
-    grid: { left: 6, right: 10, top: 8, bottom: 2, containLabel: true },
     tooltip: {
       trigger: "axis",
-      backgroundColor: dark ? "#1f1f1f" : "#ffffff",
-      borderColor: dark ? "#333333" : "#e5e5e5",
-      textStyle: { color: textColor, fontSize: 12 },
-      formatter: (params: unknown) => {
-        const list = params as { axisValue: string; value: number; dataIndex: number }[];
-        const first = list[0];
-        const raw = trendSeries.value[first.dataIndex]?.label ?? "";
-        const date = isHourly ? raw : raw;
-        return `<div style="font-weight:600;margin-bottom:4px">${date}</div><div style="display:flex;align-items:center;gap:6px"><span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:#10b981"></span>Tokens <b>${formatTokens(first.value)}</b></div>`;
+      backgroundColor: isDark ? "rgba(15, 23, 42, 0.95)" : "rgba(255, 255, 255, 0.95)",
+      borderColor: isDark ? "rgba(255, 255, 255, 0.15)" : "rgba(0, 0, 0, 0.1)",
+      textStyle: { color: isDark ? "#f8fafc" : "#0f172a", fontSize: 12 },
+      formatter: (params: any) => {
+        const p = Array.isArray(params) ? params[0] : params;
+        const index = p.dataIndex;
+        const detail = trendDetail.value[index];
+        if (!detail) return `${p.name}: ${formatCompact(p.value)}`;
+        const hitRateStr = detail.cacheHitRate != null ? `${(detail.cacheHitRate * 100).toFixed(1)}%` : "—";
+        return `
+          <div style="font-weight: 600; margin-bottom: 4px;">${detail.label}</div>
+          <div>总计: <strong>${formatCompact(detail.total)}</strong> (${formatTokens(detail.total)})</div>
+          <div style="color: #3b82f6;">输入: ${formatCompact(detail.input)}</div>
+          <div style="color: #10b981;">输出: ${formatCompact(detail.output)}</div>
+          <div style="color: #8b5cf6;">缓存: ${formatCompact(detail.cache)} (命中率 ${hitRateStr})</div>
+          ${detail.reasoning > 0 ? `<div style="color: #f59e0b;">推理: ${formatCompact(detail.reasoning)}</div>` : ""}
+          <div style="color: #06b6d4;">对话: ${detail.sessions} 轮</div>
+        `;
       },
     },
+    grid: { left: 45, right: 15, top: 20, bottom: 25 },
     xAxis: {
       type: "category",
       data: labels,
-      boundaryGap: isHourly ? false : true,
-      axisLine: { lineStyle: { color: splitColor } },
-      axisTick: { show: false },
-      axisLabel: {
-        color: faintColor,
-        fontSize: 10,
-        interval: "auto",
-        hideOverlap: true,
-        formatter: (v: string) => v,
-      },
+      axisLine: { lineStyle: { color: gridLineColor } },
+      axisLabel: { color: textColor, fontSize: 10 },
     },
     yAxis: {
       type: "value",
-      axisLabel: { color: faintColor, fontSize: 10, formatter: (v: number) => formatCompact(v) },
-      splitLine: { lineStyle: { type: "dashed", color: splitColor } },
+      axisLabel: { color: textColor, fontSize: 10, formatter: (v: number) => formatCompact(v) },
+      splitLine: { lineStyle: { color: gridLineColor, type: "dashed" } },
     },
     series: [
       {
@@ -874,18 +1068,26 @@ const trendChartOption = computed<EChartsOption>(() => {
         data: values,
         smooth: 0.35,
         symbol: "circle",
-        symbolSize: isHourly ? 4 : 5,
-        showSymbol: values.length <= 40,
-        lineStyle: { width: 2.5, color: "#10b981" },
-        itemStyle: { color: "#10b981", borderColor: dark ? "#171717" : "#ffffff", borderWidth: 1.5 },
-        areaStyle: { color: { type: "linear", x: 0, y: 0, x2: 0, y2: 1, colorStops: [{ offset: 0, color: areaTop }, { offset: 1, color: "rgba(16,185,129,0)" }] } },
-        emphasis: { focus: "series" },
+        symbolSize: 6,
+        lineStyle: { width: 3, color: "#10b981" },
+        itemStyle: { color: "#10b981", borderColor: isDark ? "#0f172a" : "#ffffff", borderWidth: 2 },
+        areaStyle: {
+          color: {
+            type: "linear",
+            x: 0,
+            y: 0,
+            x2: 0,
+            y2: 1,
+            colorStops: [
+              { offset: 0, color: "rgba(16, 185, 129, 0.4)" },
+              { offset: 1, color: "rgba(16, 185, 129, 0.0)" },
+            ],
+          },
+        },
       },
     ],
   };
 });
-
-const modalTitle = computed(() => "用量明细");
 
 watch(
   () => [healthTimeline.value.nodeCount, store.tokenStatsFrom.value, store.tokenStatsTo.value, trendGranularity.value],
@@ -912,7 +1114,6 @@ onMounted(() => {
     });
   }
 
-  // 全局查询定时器已维护数据库快照；页面挂载只负责图表布局。
   nextTick(() => {
     measureHealthGrid();
     if (typeof ResizeObserver !== "undefined" && healthGridRef.value) {
@@ -934,155 +1135,302 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <main class="token-stats-page tt-dash">
-    <header class="token-stats-header">
-      <div>
-        <span class="token-stats-eyebrow">TOKEN TRACKER</span>
-        <h1>Token 统计</h1>
-        <p>后台增量采集本地日志写入数据库，页面只查询数据库快照。</p>
+  <main class="token-stats-page tt-dashboard">
+    <!-- 顶部宏观智控驾驶舱 (Macro Cockpit Bar) -->
+    <header class="tt-cockpit-bar">
+      <div class="tt-cockpit-left">
+        <div class="tt-brand-section">
+          <div class="tt-eyebrow-row">
+            <span class="tt-live-dot" />
+            <span class="tt-eyebrow-text">Token Analytics & Insights</span>
+          </div>
+          <div class="tt-title-row">
+            <h1>Token 统计中心</h1>
+          </div>
+          <p class="tt-cockpit-subtitle">
+            全端本地日志采集 · SQLite 快照 · 覆盖 <strong>{{ bySource.length }}</strong> 款 AI 工具与 <strong>{{ byModel.length }}</strong> 个模型
+          </p>
+        </div>
       </div>
-      <div class="token-stats-actions">
+
+      <div class="tt-cockpit-right">
+        <!-- 快捷时间选择器 -->
         <QuickRangeDropdown />
+
+        <!-- 4 大维度分析弹窗触发按钮 -->
+        <div class="tt-cockpit-pills-group">
+          <button
+            type="button"
+            class="tt-pill-btn"
+            title="查看全部 AI 工具与客户端消耗明细"
+            @click="toolsModalOpen = true"
+          >
+            <span v-html="icons.cpu" />
+            <span>工具 ({{ bySource.length }})</span>
+          </button>
+
+          <button
+            type="button"
+            class="tt-pill-btn"
+            title="查看全部大模型消耗排行榜"
+            @click="modelsModalOpen = true"
+          >
+            <span v-html="icons.database" />
+            <span>模型 ({{ byModel.length }})</span>
+          </button>
+
+          <button
+            type="button"
+            class="tt-pill-btn"
+            title="查看各项目与工作区用量透视"
+            @click="projectsModalOpen = true"
+          >
+            <span v-html="icons.folder" />
+            <span>项目 ({{ projectUsage.length }})</span>
+          </button>
+
+          <button
+            type="button"
+            class="tt-pill-btn"
+            title="查看逐日逐时时序总账"
+            @click="auditModalOpen = true"
+          >
+            <span v-html="icons.sliders" />
+            <span>明细总账</span>
+          </button>
+        </div>
+
+        <div class="tt-cockpit-divider" />
+
         <button
-          class="tt-btn"
           type="button"
+          class="tt-btn-rebuild"
           :disabled="!store.tokenCollectorSyncing.value && (store.tokenStatsLoading.value || store.tokenUsageLoading.value)"
-          :title="store.tokenCollectorSyncing.value ? '打开统计重建日志' : '确认后清除 OpenHub 本地 Token 缓存，重新扫描日志并重建统计'"
           @click="openRefreshDialog"
         >
-          <span :class="{ 'is-spinning': store.tokenStatsLoading.value || store.tokenCollectorSyncing.value }">↻</span>
-          <span>{{ store.tokenCollectorSyncing.value ? "查看日志" : (store.tokenStatsLoading.value ? "读取中…" : "重建统计") }}</span>
+          <span :class="{ 'is-spinning': store.tokenStatsLoading.value || store.tokenCollectorSyncing.value }" v-html="icons.restore" />
+          <span>{{ store.tokenCollectorSyncing.value ? "查看重建日志" : "重建统计" }}</span>
         </button>
+
         <button
-          class="tt-btn"
           type="button"
-          :title="'只读扫描本机各 AI 工具的配置 / 数据 / 数据库根目录'"
+          class="tt-btn-secondary"
           @click="openAgentDialog"
         >
-          <span v-html="icons.cpu"></span>
+          <span v-html="icons.cpu" />
           <span>本地 Agent</span>
+          <span v-if="detectedAgentsCount > 0" class="tt-agent-count-chip">{{ detectedAgentsCount }} 在线</span>
+        </button>
+
+        <button
+          type="button"
+          class="tt-btn-secondary"
+          @click="openExportDialog"
+        >
+          <span v-html="icons.download" />
+          <span>导出报表</span>
         </button>
       </div>
-      <span
-        v-if="!store.tokenCollectorSyncing.value && store.tokenCollectorSyncError.value"
-        class="tt-sync-status is-error"
-        :title="store.tokenCollectorSyncError.value"
-      >上次统计重建失败</span>
     </header>
 
-    <div class="token-stats-scroll">
-      <div v-if="store.tokenUsageError.value" class="tt-error" role="alert">
-        <strong>无法读取 Token 统计</strong>
-        <p>{{ store.tokenUsageError.value }}</p>
-        <p>OpenHub 会直接读取 Codex、Claude、Command Code、Antigravity、OpenCode、MiMo、ZCode 与 CatPawAI 的本地日志；请确认相关工具已产生可读取记录。</p>
-        <p>已支持读取 DSH (DeepSeek AI CLI) 的压缩会话日志。</p>
+    <!-- 首页零滚动条主视口 (No-Scroll Viewport Layout) -->
+    <div class="tt-dashboard-body">
+      <!-- 错误提示 -->
+      <div v-if="store.tokenUsageError.value" class="tt-error-banner" role="alert">
+        <span class="tt-error-icon" v-html="icons.alert" />
+        <div class="tt-error-content">
+          <strong>读取 Token 数据异常</strong>
+          <p>{{ store.tokenUsageError.value }}</p>
+          <small>OpenHub 会直接读取 Codex, Claude, Cursor, Antigravity, OpenCode, Kiro, Goose, Zed, Copilot 与 CatPawAI 的本地记录。</small>
+        </div>
       </div>
 
-      <template v-if="store.tokenUsageLoading.value && !store.tokenUsage.value">
-        <div class="tt-empty"><span class="is-spinning">↻</span><strong>正在读取本地用量数据…</strong></div>
-      </template>
+      <!-- 加载中 -->
+      <div v-if="store.tokenUsageLoading.value && !store.tokenUsage.value" class="tt-loading-card">
+        <div class="tt-loading-spinner" />
+        <p>正在读取本地 SQLite 数据库用量快照…</p>
+      </div>
 
       <template v-else-if="store.tokenUsage.value">
-        <!-- KPI 指标卡 -->
-        <div class="tt-kpi-head">
-          <span class="tt-kpi-range">统计区间</span>
-          <strong class="tt-kpi-range-val">{{ rangeLabel }}</strong>
-        </div>
-        <div class="tt-kpis">
-          <div class="tt-kpi tt-kpi-total">
-            <div class="tt-kpi-total-main">
-              <div class="tt-kpi-top">
-                <span class="tt-kpi-ic ic-indigo" v-html="icons.chart"></span>
-                <span class="tt-kpi-label">TOKEN 总数</span>
+        <!-- ROW 1: 4 大核心 KPI 指标卡 (Compact Bento Deck) -->
+        <section class="tt-kpi-deck" aria-label="核心指标大盘">
+          <!-- KPI 1: Token 消耗大盘 -->
+          <div class="tt-kpi-card tt-kpi-total">
+            <div class="tt-kpi-card-inner">
+              <div class="tt-kpi-header">
+                <span class="tt-kpi-tag is-emerald">
+                  <span v-html="icons.chart" />
+                  <span>TOTAL TOKENS</span>
+                </span>
+                <span class="tt-kpi-badge-hit" :class="cacheHitRateRating.class">
+                  ⚡ 缓存命中率 {{ formatRate(cacheHitRate) }}
+                </span>
               </div>
-              <strong class="tt-kpi-value tt-kpi-value-lg">{{ formatCompact(bucketTotal.total) }}</strong>
-              <div class="tt-kpi-splits">
-                <span><i class="dot in"></i>输入 {{ formatCompact(rangeSplits.input) }}</span>
-                <span><i class="dot out"></i>输出 {{ formatCompact(rangeSplits.output) }}</span>
+              <div class="tt-kpi-main-val">
+                <strong>{{ formatCompact(bucketTotal.total) }}</strong>
+                <span class="tt-kpi-unit">Tokens</span>
+              </div>
+              <div class="tt-kpi-progress-bar">
+                <div
+                  class="tt-prog-seg is-in"
+                  :style="{ width: `${shareOf(rangeSplits.input, bucketTotal.total)}%` }"
+                  :title="`输入: ${formatCompact(rangeSplits.input)} (${shareOf(rangeSplits.input, bucketTotal.total).toFixed(1)}%)`"
+                />
+                <div
+                  class="tt-prog-seg is-out"
+                  :style="{ width: `${shareOf(rangeSplits.output, bucketTotal.total)}%` }"
+                  :title="`输出: ${formatCompact(rangeSplits.output)} (${shareOf(rangeSplits.output, bucketTotal.total).toFixed(1)}%)`"
+                />
+                <div
+                  class="tt-prog-seg is-cache"
+                  :style="{ width: `${shareOf(rangeSplits.cache, bucketTotal.total)}%` }"
+                  :title="`缓存: ${formatCompact(rangeSplits.cache)} (${shareOf(rangeSplits.cache, bucketTotal.total).toFixed(1)}%)`"
+                />
+              </div>
+              <div class="tt-kpi-sub-pills">
+                <span class="tt-sub-pill in"><i></i>输入 {{ formatCompact(rangeSplits.input) }}</span>
+                <span class="tt-sub-pill out"><i></i>输出 {{ formatCompact(rangeSplits.output) }}</span>
+                <span class="tt-sub-pill cache"><i></i>缓存 {{ formatCompact(rangeSplits.cache) }}</span>
+                <span v-if="rangeSplits.reasoning > 0" class="tt-sub-pill reasoning"><i></i>推理 {{ formatCompact(rangeSplits.reasoning) }}</span>
               </div>
             </div>
-            <div class="tt-kpi-total-side">
-              <div class="tt-kpi-top">
-                <span class="tt-kpi-ic ic-teal" v-html="icons.database"></span>
-                <span class="tt-kpi-label">缓存命中率</span>
-              </div>
-              <strong class="tt-kpi-value tt-kpi-value-md">{{ formatRate(cacheHitRate) }}</strong>
-              <span class="tt-kpi-sub">缓存 {{ formatCompact(rangeSplits.cache) }}</span>
-            </div>
           </div>
-          <div class="tt-kpi">
-            <div class="tt-kpi-top">
-              <span class="tt-kpi-ic ic-orange" v-html="icons.flame"></span>
-              <span class="tt-kpi-label">日均 Tokens</span>
-            </div>
-            <strong class="tt-kpi-value">{{ formatCompact(dailyAverage) }}</strong>
-            <span class="tt-kpi-sub">跨度 {{ formatTokens(rangeDays) }} 天 · 连续 {{ formatTokens(streakDays) }} 天</span>
-          </div>
-          <div class="tt-kpi">
-            <div class="tt-kpi-top">
-              <span class="tt-kpi-ic ic-blue" v-html="icons.activity"></span>
-              <span class="tt-kpi-label">对话数</span>
-            </div>
-            <strong class="tt-kpi-value">
-              <template v-if="store.requestHealthLoading.value && !store.requestHealth.value">…</template>
-              <template v-else>{{ formatTokens(healthTimeline.totalDialogues) }}</template>
-            </strong>
-            <span class="tt-kpi-sub">
-              <template v-if="store.requestHealthLoading.value && !store.requestHealth.value">
-                正在扫描多工具日志…
-              </template>
-              <template v-else>
-                请求 {{ formatTokens(healthTimeline.totalRequests) }} · 平均每轮 {{ requestsPerTurnLabel }} 次
-              </template>
-            </span>
-          </div>
-          <div class="tt-kpi">
-            <div class="tt-kpi-top">
-              <span class="tt-kpi-ic ic-purple" v-html="icons.card"></span>
-              <span class="tt-kpi-label">估算成本</span>
-            </div>
-            <strong class="tt-kpi-value">{{ costSummary.pricedTokens > 0 ? formatCost(estimatedCost) : "—" }}</strong>
-            <span class="tt-kpi-sub">{{ costCaption }}</span>
-          </div>
-        </div>
 
-                        <!-- 图表区：趋势 + 热力图 -->
-        <div class="tt-charts">
-          <section class="tt-card tt-card-chart">
-            <header class="tt-card-head">
-              <div>
-                <h2>使用趋势</h2>
-                <p>TREND · 按{{ trendUnitLabel() }} · 区间完整节点 {{ trendSeries.length }} 个（无数据也保留）</p>
+          <!-- KPI 2: 日均与连击活跃 -->
+          <div class="tt-kpi-card">
+            <div class="tt-kpi-card-inner">
+              <div class="tt-kpi-header">
+                <span class="tt-kpi-tag is-orange">
+                  <span v-html="icons.flame" />
+                  <span>BURN RATE & STREAK</span>
+                </span>
+                <span v-if="streakDays > 1" class="tt-kpi-streak-pill">
+                  🔥 连续 {{ streakDays }} 天
+                </span>
               </div>
-              <div class="tt-head-actions">
-                <button type="button" class="tt-link-btn" @click="openDetail('daily')">明细 ▾</button>
+              <div class="tt-kpi-main-val">
+                <strong>{{ formatCompact(dailyAverage) }}</strong>
+                <span class="tt-kpi-unit">/ 活跃日均</span>
+              </div>
+              <div class="tt-kpi-meta-text">
+                <span>跨度 <strong>{{ rangeDays }}</strong> 天 · 活跃 <strong>{{ activeDays }}</strong> 天</span>
+                <span v-if="rangeDays > 0" class="tt-active-rate-badge">活跃率 {{ ((activeDays / rangeDays) * 100).toFixed(0) }}%</span>
+              </div>
+              <div class="tt-kpi-footer-note">
+                统计区间: <code>{{ rangeLabel }}</code>
+              </div>
+            </div>
+          </div>
+
+          <!-- KPI 3: 会话与并发 API 调用 -->
+          <div class="tt-kpi-card">
+            <div class="tt-kpi-card-inner">
+              <div class="tt-kpi-header">
+                <span class="tt-kpi-tag is-blue">
+                  <span v-html="icons.activity" />
+                  <span>DIALOGUES & REQUESTS</span>
+                </span>
+                <span class="tt-kpi-badge-rate">
+                  {{ healthTimeline.successRate != null ? (healthTimeline.successRate * 100).toFixed(1) + "% 成功率" : "—" }}
+                </span>
+              </div>
+              <div class="tt-kpi-main-val">
+                <strong>{{ formatTokens(healthTimeline.totalDialogues) }}</strong>
+                <span class="tt-kpi-unit">轮对话</span>
+              </div>
+              <div class="tt-kpi-meta-text">
+                <span>真实 API 调用 <strong>{{ formatTokens(healthTimeline.totalRequests) }}</strong> 次</span>
+              </div>
+              <div class="tt-kpi-multiplier-pill">
+                <span>平均每轮触发 <strong>{{ requestsPerTurnLabel }}</strong> 次模型调用</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- KPI 4: 成本估算与价值洞察 -->
+          <div class="tt-kpi-card">
+            <div class="tt-kpi-card-inner">
+              <div class="tt-kpi-header">
+                <span class="tt-kpi-tag is-purple">
+                  <span v-html="icons.card" />
+                  <span>ECONOMIC VALUE</span>
+                </span>
+                <span v-if="estimatedCacheSavings > 0" class="tt-kpi-savings-pill">
+                  ⚡ 缓存节约 ≈ ${{ estimatedCacheSavings.toFixed(2) }}
+                </span>
+              </div>
+              <div class="tt-kpi-main-val">
+                <template v-if="costSummary.pricedTokens > 0">
+                  <strong>{{ formatCost(estimatedCost) }}</strong>
+                  <span class="tt-kpi-unit">USD</span>
+                </template>
+                <template v-else>
+                  <strong class="tt-val-unpriced">未定价 / 来源未上报</strong>
+                </template>
+              </div>
+              <div class="tt-kpi-meta-text">
+                <span>{{ costCaption }}</span>
+              </div>
+              <div class="tt-kpi-footer-note">
+                <span v-if="bucketTotal.total > 0 && costSummary.costUsd > 0">
+                  均价 ≈ ${{ ((costSummary.costUsd / bucketTotal.total) * 1_000_000).toFixed(3) }} / 1M Tokens
+                </span>
+                <span v-else>多端日志自动提取实际账单金额</span>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- ROW 2: 双主图表全景 (Flex: 1, Min-Height: 0, 趋势 + 请求健康) -->
+        <section class="tt-dual-charts-grid">
+          <!-- 趋势图卡片 -->
+          <div class="tt-card tt-chart-card">
+            <header class="tt-card-header">
+              <div class="tt-card-title-wrap">
+                <h2>Token 消耗趋势</h2>
+                <p>按 {{ trendUnitLabel() }} 聚合 · 共 {{ trendSeries.length }} 个时序节点</p>
+              </div>
+              <div class="tt-metric-switches">
+                <button
+                  type="button"
+                  class="tt-metric-btn"
+                  :class="{ active: trendMetric === 'total' }"
+                  @click="trendMetric = 'total'"
+                >总用量</button>
+                <button
+                  type="button"
+                  class="tt-metric-btn"
+                  :class="{ active: trendMetric === 'breakdown' }"
+                  @click="trendMetric = 'breakdown'"
+                >分项堆叠</button>
+                <button
+                  type="button"
+                  class="tt-metric-btn"
+                  :class="{ active: trendMetric === 'requests' }"
+                  @click="trendMetric = 'requests'"
+                >API 请求数</button>
               </div>
             </header>
             <div class="tt-card-body tt-chart-body">
-              <EChart v-if="trendSeries.length" :option="trendChartOption" height="180px" />
-              <div v-else class="tt-table-empty">该范围内没有趋势数据</div>
+              <EChart v-if="trendSeries.length" :option="trendChartOption" height="100%" />
+              <div v-else class="tt-empty-state">当前时间区间内暂无时序记录</div>
             </div>
-          </section>
+          </div>
 
-          <section class="tt-card tt-card-heat">
-            <header class="tt-card-head tt-health-head">
-              <div>
-                <h2>请求健康时间线</h2>
-                <p>色阶按成功率：≥99% 绿 · 95–99% 浅绿 · 85–95% 黄 · 70–85% 橙 · &lt;70% 红（用户取消不计失败）。</p>
+          <!-- 请求健康热力时间线 -->
+          <div class="tt-card tt-health-card">
+            <header class="tt-card-header">
+              <div class="tt-card-title-wrap">
+                <h2>请求健康矩阵 (Health Radar)</h2>
+                <p>色阶按成功率：≥99% 绿 · 95–99% 浅绿 · 85–95% 黄 · 70–85% 橙 · &lt;70% 红</p>
               </div>
-              <div class="tt-health-summary">
-                <div class="tt-health-rate-label">成功率</div>
-                <div class="tt-health-rate-value">
-                  {{ healthTimeline.successRate != null ? (healthTimeline.successRate * 100).toFixed(1) + "%" : "—" }}
-                </div>
-                <div class="tt-health-counts">
-                  <span class="ok">● 成功 {{ formatTokens(healthTimeline.totalSuccess) }}</span>
-                  <span class="bad">● 失败 {{ formatTokens(healthTimeline.totalFailed) }}</span>
-                </div>
+              <div class="tt-health-summary-pill">
+                <span class="ok">● 成功 {{ formatTokens(healthTimeline.totalSuccess) }}</span>
+                <span class="bad">● 失败 {{ formatTokens(healthTimeline.totalFailed) }}</span>
               </div>
             </header>
             <div class="tt-card-body tt-health-body">
-              <div v-if="healthTimeline.cells.length" class="tt-health-timeline">
+              <div v-if="healthTimeline.cells.length" class="tt-health-wrapper">
                 <div
                   ref="healthGridRef"
                   class="tt-health-grid"
@@ -1092,125 +1440,391 @@ onBeforeUnmount(() => {
                     v-for="cell in healthDisplayCells"
                     :key="cell.key"
                     class="tt-health-cell"
-                    :class="[
-                      'lv' + cell.level,
-                      { 'is-pad': cell.pad },
-                    ]"
+                    :class="['lv' + cell.level, { 'is-pad': cell.pad }]"
                     :title="healthCellTitle(cell)"
-                  ></div>
+                  />
                 </div>
                 <div class="tt-health-legend">
-                  <span>差</span>
-                  <span class="tt-health-cell lv1" title="成功率 &lt; 70%"></span>
-                  <span class="tt-health-cell lv2" title="70% ~ 85%"></span>
-                  <span class="tt-health-cell lv3" title="85% ~ 95%"></span>
-                  <span class="tt-health-cell lv4" title="95% ~ 99%"></span>
-                  <span class="tt-health-cell lv5" title="≥ 99%"></span>
-                  <span>优</span>
-                  <span class="tt-health-cell lv0"></span>
-                  <span>无数据</span>
-                  <span class="tt-health-meta">
-                    · 区间节点 {{ healthTimeline.nodeCount }}
-                    · 网格 {{ HEALTH_ROWS }}×{{ healthCols }}
-                    · 有数据 {{ healthTimeline.activeCount }}
-                  </span>
+                  <span>故障频发</span>
+                  <span class="tt-health-cell lv1" title="成功率 < 70%" />
+                  <span class="tt-health-cell lv2" title="70% ~ 85%" />
+                  <span class="tt-health-cell lv3" title="85% ~ 95%" />
+                  <span class="tt-health-cell lv4" title="95% ~ 99%" />
+                  <span class="tt-health-cell lv5" title="≥ 99%" />
+                  <span>极度健康</span>
+                  <span class="tt-health-cell lv0" />
+                  <span class="muted">无请求</span>
+                  <span class="tt-legend-meta">· 共 {{ healthTimeline.nodeCount }} 节点 · 活跃 {{ healthTimeline.activeCount }}</span>
                 </div>
               </div>
-              <div v-else class="tt-table-empty">该范围内没有请求健康数据</div>
+              <div v-else class="tt-empty-state">当前时间区间内暂无请求健康记录</div>
             </div>
-          </section>
-        </div>
+          </div>
+        </section>
 
-        <!-- 分布区：工具 + 模型（紧凑展示，完整列表进弹窗） -->
-        <div class="tt-dist">
-          <section class="tt-card">
-            <header class="tt-card-head">
+        <!-- ROW 3: 底部快捷分布与深度透视发射台 (Compact Row) -->
+        <section class="tt-bottom-row">
+          <!-- 工具消耗分布 -->
+          <div class="tt-card tt-preview-card">
+            <header class="tt-card-header">
               <div>
-                <h2>按工具分布</h2>
-                <p>BY SOURCE</p>
+                <h3>主要工具消耗分布</h3>
+                <p>Top 4 客户端用量占比</p>
               </div>
-              <button type="button" class="tt-link-btn" @click="openModal('sources')">查看全部 · {{ bySource.length }}</button>
+              <button type="button" class="tt-text-btn" @click="toolsModalOpen = true">
+                查看全部 {{ bySource.length }} 款工具明细 ➔
+              </button>
             </header>
-            <div class="tt-card-body">
-              <div v-for="(item, index) in topSources" :key="item.source" class="tt-provider">
-                <span class="tt-provider-dot" :style="{ background: providerColor(item.source, index) }"></span>
-                <span class="tt-provider-name">{{ sourceLabel(item.source) }}</span>
-                <span class="tt-provider-bar">
-                  <i :style="{ width: `${shareOf(item.totalTokens, totalTokensAll)}%`, background: providerColor(item.source, index) }"></i>
-                </span>
-                <span class="tt-provider-pct">{{ shareOf(item.totalTokens, totalTokensAll).toFixed(2) }}%</span>
-                <span class="tt-provider-val">{{ formatCompact(item.totalTokens) }}</span>
+            <div class="tt-card-body tt-preview-body">
+              <div v-for="(item, idx) in topSources.slice(0, 4)" :key="item.source" class="tt-bar-row">
+                <span class="tt-bar-dot" :style="{ background: providerColor(item.source, idx) }" />
+                <span class="tt-bar-label">{{ sourceLabel(item.source) }}</span>
+                <div class="tt-bar-track">
+                  <div class="tt-bar-fill" :style="{ width: `${shareOf(item.totalTokens, totalTokensAll)}%`, background: providerColor(item.source, idx) }" />
+                </div>
+                <span class="tt-bar-pct">{{ shareOf(item.totalTokens, totalTokensAll).toFixed(1) }}%</span>
+                <strong class="tt-bar-val">{{ formatCompact(item.totalTokens) }}</strong>
               </div>
-              <div v-if="!bySource.length" class="tt-muted">该范围内没有数据</div>
             </div>
-          </section>
+          </div>
 
-          <section class="tt-card">
-            <header class="tt-card-head">
+          <!-- 模型消耗排行 -->
+          <div class="tt-card tt-preview-card">
+            <header class="tt-card-header">
               <div>
-                <h2>主要模型</h2>
-                <p>BY MODEL</p>
+                <h3>主要模型消耗排行</h3>
+                <p>Top 4 旗舰模型用量占比</p>
               </div>
-              <button type="button" class="tt-link-btn" @click="openModal('models')">查看全部 · {{ byModel.length }}</button>
+              <button type="button" class="tt-text-btn" @click="modelsModalOpen = true">
+                查看全部 {{ byModel.length }} 款模型排行榜 ➔
+              </button>
             </header>
-            <div class="tt-card-body">
-              <div v-for="(model, index) in topModels" :key="model.model" class="tt-provider">
-                <span class="tt-provider-dot" :style="{ background: providerColor(model.model, index) }"></span>
-                <span class="tt-provider-name" :title="model.model">{{ model.model || "未知模型" }}</span>
-                <span class="tt-provider-bar">
-                  <i :style="{ width: `${shareOf(model.totalTokens, totalTokensAll)}%`, background: providerColor(model.model, index) }"></i>
-                </span>
-                <span class="tt-provider-pct">{{ shareOf(model.totalTokens, totalTokensAll).toFixed(2) }}%</span>
-                <span class="tt-provider-val">{{ formatCompact(model.totalTokens) }}</span>
+            <div class="tt-card-body tt-preview-body">
+              <div v-for="(model, idx) in topModels.slice(0, 4)" :key="model.model" class="tt-bar-row">
+                <span class="tt-bar-dot" :style="{ background: providerColor(model.model, idx) }" />
+                <span class="tt-bar-label font-mono" :title="model.model">{{ model.model }}</span>
+                <div class="tt-bar-track">
+                  <div class="tt-bar-fill" :style="{ width: `${shareOf(model.totalTokens, totalTokensAll)}%`, background: providerColor(model.model, idx) }" />
+                </div>
+                <span class="tt-bar-pct">{{ shareOf(model.totalTokens, totalTokensAll).toFixed(1) }}%</span>
+                <strong class="tt-bar-val">{{ formatCompact(model.totalTokens) }}</strong>
               </div>
-              <div v-if="!byModel.length" class="tt-muted">暂无模型数据</div>
             </div>
-          </section>
-        </div>
-
+          </div>
+        </section>
       </template>
     </div>
 
-    <!-- 详情弹窗 -->
+    <!-- ============================================================
+         4 大深度分析弹窗 (Popups / Modal Drawers)
+         ============================================================ -->
+
+    <!-- 1. 工具与来源全景分析弹窗 (Tools Modal) -->
     <Transition name="tt-modal-fade">
-      <div v-if="refreshDialogOpen" class="tt-modal-backdrop" @click.self="closeRefreshDialog">
-        <section
-          class="tt-modal tt-refresh-modal"
-          role="dialog"
-          aria-modal="true"
-          aria-labelledby="tt-refresh-title"
-        >
-          <header class="tt-modal-head">
+      <div v-if="toolsModalOpen" class="tt-modal-backdrop" @click.self="toolsModalOpen = false">
+        <section class="tt-modal-card is-wide" role="dialog" aria-modal="true">
+          <header class="tt-modal-header">
             <div>
-              <h2 id="tt-refresh-title">{{ refreshStatusTitle }}</h2>
-              <p>{{ refreshStatusDescription }}</p>
+              <h2>工具与来源全景分析</h2>
+              <p>覆盖本机探测到的所有 AI 编程工具与编辑器客户端用量</p>
             </div>
-            <button type="button" class="tt-modal-close" aria-label="关闭统计重建窗口" @click="closeRefreshDialog">×</button>
+            <button type="button" class="tt-modal-close-btn" aria-label="关闭" @click="toolsModalOpen = false">×</button>
           </header>
 
-          <div class="tt-modal-body tt-refresh-body">
-            <template v-if="refreshPhase === 'confirm'">
-              <div class="tt-refresh-intro">
-                <span class="tt-refresh-intro-icon" v-html="icons.restore"></span>
-                <div>
-                  <strong>执行一次完整数据重建</strong>
-                  <p>适合在统计缺失、日志来源变化或需要重新校准数据时使用。</p>
+          <div class="tt-modal-body">
+            <div class="tt-filter-bar">
+              <label class="tt-search-input">
+                <span v-html="icons.search" />
+                <input v-model="sourceSearch" type="search" placeholder="搜索 AI 工具、CLI 或编辑器…" />
+              </label>
+              <span class="tt-filter-count">共 {{ filteredSources.length }} 款工具</span>
+            </div>
+
+            <!-- 工具卡片网格 -->
+            <div class="tt-sources-grid">
+              <div
+                v-for="(src, idx) in filteredSources"
+                :key="src.source"
+                class="tt-source-card"
+              >
+                <header class="tt-source-header">
+                  <div class="tt-source-title">
+                    <span class="tt-bar-dot" :style="{ background: providerColor(src.source, idx) }" />
+                    <strong>{{ sourceLabel(src.source) }}</strong>
+                    <code class="tt-muted-code">({{ src.source }})</code>
+                  </div>
+                  <span class="tt-source-share">
+                    {{ shareOf(src.totalTokens, totalTokensAll).toFixed(1) }}%
+                  </span>
+                </header>
+
+                <div class="tt-source-main">
+                  <strong>{{ formatCompact(src.totalTokens) }}</strong>
+                  <span class="tt-source-sub">Tokens</span>
+                </div>
+
+                <div class="tt-source-breakdown-grid">
+                  <div class="tt-sbg-item"><span>输入:</span> <strong>{{ formatCompact(src.inputTokens) }}</strong></div>
+                  <div class="tt-sbg-item"><span>输出:</span> <strong>{{ formatCompact(src.outputTokens) }}</strong></div>
+                  <div class="tt-sbg-item"><span>缓存:</span> <strong>{{ formatCompact(src.cacheTokens) }}</strong></div>
+                  <div class="tt-sbg-item"><span>命中率:</span> <strong>{{ formatRate(src.cacheHitRate) }}</strong></div>
+                  <div class="tt-sbg-item"><span>对话:</span> <strong>{{ formatTokens(src.conversations) }}</strong></div>
+                  <div class="tt-sbg-item"><span>请求数:</span> <strong>{{ formatTokens(src.requests) }}</strong></div>
+                </div>
+
+                <div v-if="src.costUsd > 0" class="tt-source-cost-badge">
+                  <span>估算花费:</span>
+                  <strong>{{ formatCost(src.costUsd) }}</strong>
                 </div>
               </div>
-              <div class="tt-refresh-steps" aria-label="统计重建步骤">
-                <div><i>1</i><span><strong>清除本地缓存</strong><small>删除 OpenHub 维护的解析缓存与旧数据库快照</small></span></div>
-                <div><i>2</i><span><strong>重新扫描日志</strong><small>读取 Codex、Claude、Command Code 等工具的本地记录</small></span></div>
-                <div><i>3</i><span><strong>重建统计数据</strong><small>重新汇总 Token、会话与请求健康数据并更新页面</small></span></div>
+            </div>
+
+            <!-- 完整工具数据表 -->
+            <div class="tt-table-wrap">
+              <AppTable
+                :rows="filteredSources"
+                :columns="sourceColumns"
+                :row-key="(item: any) => item.source"
+                :page-size="10"
+                empty-text="没有匹配的工具数据"
+              >
+                <template #cell-source="{ row }">
+                  <div class="tt-cell-with-dot">
+                    <span class="tt-bar-dot" :style="{ background: providerColor(row.source) }" />
+                    <strong>{{ sourceLabel(row.source) }}</strong>
+                    <code class="tt-muted-code">({{ row.source }})</code>
+                  </div>
+                </template>
+                <template #cell-totalTokens="{ row }"><strong>{{ formatCompact(row.totalTokens) }}</strong></template>
+                <template #cell-share="{ row }">{{ shareOf(row.totalTokens, totalTokensAll).toFixed(2) }}%</template>
+                <template #cell-inputTokens="{ row }">{{ formatCompact(row.inputTokens) }}</template>
+                <template #cell-outputTokens="{ row }">{{ formatCompact(row.outputTokens) }}</template>
+                <template #cell-cacheTokens="{ row }">{{ formatCompact(row.cacheTokens) }}</template>
+                <template #cell-cacheHitRate="{ row }">{{ formatRate(row.cacheHitRate) }}</template>
+                <template #cell-reasoningTokens="{ row }">{{ formatCompact(row.reasoningTokens) }}</template>
+                <template #cell-conversations="{ row }">{{ formatTokens(row.conversations) }}</template>
+                <template #cell-requests="{ row }">{{ formatTokens(row.requests) }}</template>
+                <template #cell-costUsd="{ row }">{{ row.costUsd > 0 ? formatCost(row.costUsd) : "—" }}</template>
+              </AppTable>
+            </div>
+          </div>
+
+          <footer class="tt-modal-footer">
+            <button type="button" class="tt-btn-cancel" @click="toolsModalOpen = false">关闭</button>
+          </footer>
+        </section>
+      </div>
+    </Transition>
+
+    <!-- 2. 模型排行榜与家族透视弹窗 (Models Modal) -->
+    <Transition name="tt-modal-fade">
+      <div v-if="modelsModalOpen" class="tt-modal-backdrop" @click.self="modelsModalOpen = false">
+        <section class="tt-modal-card is-wide" role="dialog" aria-modal="true">
+          <header class="tt-modal-header">
+            <div>
+              <h2>模型排行榜与家族透视</h2>
+              <p>按 Token 消耗总量倒序排列 · 同系列模型智能归并</p>
+            </div>
+            <button type="button" class="tt-modal-close-btn" aria-label="关闭" @click="modelsModalOpen = false">×</button>
+          </header>
+
+          <div class="tt-modal-body">
+            <div class="tt-filter-bar">
+              <label class="tt-search-input">
+                <span v-html="icons.search" />
+                <input v-model="modelSearch" type="search" placeholder="搜索模型名称（如 claude-3-7, gpt-4o, r1）…" />
+              </label>
+              <span class="tt-filter-count">共 {{ filteredModels.length }} 款模型</span>
+            </div>
+
+            <div class="tt-table-wrap">
+              <AppTable
+                :rows="filteredModels"
+                :columns="modelColumns"
+                :row-key="(item: any) => item.model"
+                :page-size="15"
+                empty-text="没有匹配的模型数据"
+              >
+                <template #cell-model="{ row }">
+                  <div class="tt-cell-with-dot">
+                    <span class="tt-bar-dot" :style="{ background: providerColor(row.model) }" />
+                    <strong class="font-mono">{{ row.model }}</strong>
+                  </div>
+                </template>
+                <template #cell-totalTokens="{ row }"><strong>{{ formatCompact(row.totalTokens) }}</strong></template>
+                <template #cell-share="{ row }">{{ shareOf(row.totalTokens, totalTokensAll).toFixed(2) }}%</template>
+                <template #cell-inputTokens="{ row }">{{ formatCompact(row.inputTokens) }}</template>
+                <template #cell-outputTokens="{ row }">{{ formatCompact(row.outputTokens) }}</template>
+                <template #cell-cacheTokens="{ row }">{{ formatCompact(row.cacheTokens) }}</template>
+                <template #cell-cacheHitRate="{ row }">{{ formatRate(row.cacheHitRate) }}</template>
+                <template #cell-reasoningTokens="{ row }">{{ formatCompact(row.reasoningTokens) }}</template>
+                <template #cell-conversations="{ row }">{{ formatTokens(row.conversations) }}</template>
+                <template #cell-requests="{ row }">{{ formatTokens(row.requests) }}</template>
+                <template #cell-costUsd="{ row }">{{ row.costUsd > 0 ? formatCost(row.costUsd) : "—" }}</template>
+              </AppTable>
+            </div>
+          </div>
+
+          <footer class="tt-modal-footer">
+            <button type="button" class="tt-btn-cancel" @click="modelsModalOpen = false">关闭</button>
+          </footer>
+        </section>
+      </div>
+    </Transition>
+
+    <!-- 3. 项目与工作区透视弹窗 (Projects Modal) -->
+    <Transition name="tt-modal-fade">
+      <div v-if="projectsModalOpen" class="tt-modal-backdrop" @click.self="projectsModalOpen = false">
+        <section class="tt-modal-card is-wide" role="dialog" aria-modal="true">
+          <header class="tt-modal-header">
+            <div>
+              <h2>项目与工作区透视</h2>
+              <p>从本地日志中自动提取的项目目录与工作区用量</p>
+            </div>
+            <button type="button" class="tt-modal-close-btn" aria-label="关闭" @click="projectsModalOpen = false">×</button>
+          </header>
+
+          <div class="tt-modal-body">
+            <div class="tt-filter-bar">
+              <label class="tt-search-input">
+                <span v-html="icons.search" />
+                <input v-model="projectSearch" type="search" placeholder="按项目名称或路径过滤…" />
+              </label>
+              <span class="tt-filter-count">共 {{ filteredProjects.length }} 个工作区</span>
+            </div>
+
+            <div class="tt-table-wrap">
+              <AppTable
+                :rows="filteredProjects"
+                :columns="projectColumns"
+                :row-key="(item: any) => item.project"
+                :page-size="15"
+                empty-text="没有匹配的项目记录"
+              >
+                <template #cell-project="{ row }">
+                  <div class="tt-project-cell" :title="row.project">
+                    <span v-html="icons.folder" />
+                    <strong>{{ row.project }}</strong>
+                  </div>
+                </template>
+                <template #cell-totalTokens="{ row }"><strong>{{ formatCompact(row.totalTokens) }}</strong></template>
+                <template #cell-share="{ row }">{{ shareOf(row.totalTokens, totalTokensAll).toFixed(2) }}%</template>
+                <template #cell-input="{ row }">{{ formatCompact(row.input) }}</template>
+                <template #cell-output="{ row }">{{ formatCompact(row.output) }}</template>
+                <template #cell-cache="{ row }">{{ formatCompact(row.cache) }}</template>
+                <template #cell-cacheHitRate="{ row }">{{ formatRate(row.cacheHitRate) }}</template>
+                <template #cell-reasoning="{ row }">{{ formatCompact(row.reasoning) }}</template>
+                <template #cell-sessions="{ row }">{{ formatTokens(row.sessions) }}</template>
+                <template #cell-requests="{ row }">{{ row.requestsEstimated ? "≈" : "" }}{{ formatTokens(row.requests) }}</template>
+                <template #cell-costUsd="{ row }">{{ row.costUsd > 0 ? formatCost(row.costUsd) : "—" }}</template>
+              </AppTable>
+            </div>
+          </div>
+
+          <footer class="tt-modal-footer">
+            <button type="button" class="tt-btn-cancel" @click="projectsModalOpen = false">关闭</button>
+          </footer>
+        </section>
+      </div>
+    </Transition>
+
+    <!-- 4. 逐日/逐时明细总账弹窗 (Audit Modal) -->
+    <Transition name="tt-modal-fade">
+      <div v-if="auditModalOpen" class="tt-modal-backdrop" @click.self="auditModalOpen = false">
+        <section class="tt-modal-card is-wide" role="dialog" aria-modal="true">
+          <header class="tt-modal-header">
+            <div>
+              <h2>时序明细总账 (Granular Audit Ledger)</h2>
+              <p>按当前所选时间跨度 · {{ trendUnitLabel() }} · 已过滤零用量空节点</p>
+            </div>
+            <button type="button" class="tt-modal-close-btn" aria-label="关闭" @click="auditModalOpen = false">×</button>
+          </header>
+
+          <div class="tt-modal-body">
+            <div class="flex justify-between items-center">
+              <span class="tt-filter-count">共 {{ trendDetailList.length }} 个时序节点</span>
+              <button type="button" class="tt-btn-secondary" @click="exportDataAsCsv">
+                <span v-html="icons.download" />
+                <span>导出 CSV 表格</span>
+              </button>
+            </div>
+
+            <div class="tt-table-wrap">
+              <AppTable
+                :rows="trendDetailList"
+                :columns="dailyColumns"
+                :row-key="(item: any) => item.label"
+                :page-size="15"
+                empty-text="该时间范围内没有时序记录"
+              >
+                <template #cell-label="{ row }">
+                  <code>{{ row.label }}</code>
+                </template>
+                <template #cell-total="{ row }"><strong>{{ formatCompact(row.total) }}</strong></template>
+                <template #cell-input="{ row }">{{ formatCompact(row.input) }}</template>
+                <template #cell-output="{ row }">{{ formatCompact(row.output) }}</template>
+                <template #cell-cache="{ row }">{{ formatCompact(row.cache) }}</template>
+                <template #cell-cacheHitRate="{ row }">{{ formatRate(row.cacheHitRate) }}</template>
+                <template #cell-reasoning="{ row }">{{ formatCompact(row.reasoning) }}</template>
+                <template #cell-sessions="{ row }">{{ formatTokens(row.sessions) }}</template>
+                <template #cell-requests="{ row }">{{ row.requestsEstimated ? "≈" : "" }}{{ formatTokens(row.requests) }}</template>
+              </AppTable>
+            </div>
+          </div>
+
+          <footer class="tt-modal-footer">
+            <button type="button" class="tt-btn-cancel" @click="auditModalOpen = false">关闭</button>
+          </footer>
+        </section>
+      </div>
+    </Transition>
+
+    <!-- 统计重建控制台弹窗 (Reconstruction Console Modal) -->
+    <Transition name="tt-modal-fade">
+      <div v-if="refreshDialogOpen" class="tt-modal-backdrop" @click.self="closeRefreshDialog">
+        <section class="tt-modal tt-refresh-modal" role="dialog" aria-modal="true">
+          <header class="tt-modal-head">
+            <div>
+              <h2>{{ refreshStatusTitle }}</h2>
+              <p>{{ refreshStatusDescription }}</p>
+            </div>
+            <button type="button" class="tt-modal-close" aria-label="关闭" @click="closeRefreshDialog">×</button>
+          </header>
+
+          <div class="tt-modal-body">
+            <template v-if="refreshPhase === 'confirm'">
+              <div class="tt-refresh-workflow">
+                <div class="tt-wf-step">
+                  <div class="tt-wf-num">1</div>
+                  <div class="tt-wf-info">
+                    <strong>清除本地快照与解析缓存</strong>
+                    <small>删除旧解析索引与临时计算缓存，确保数据纯净</small>
+                  </div>
+                </div>
+                <div class="tt-wf-step">
+                  <div class="tt-wf-num">2</div>
+                  <div class="tt-wf-info">
+                    <strong>多端 AI 工具日志重新扫描</strong>
+                    <small>完整读取 Codex, Claude, Cursor, Antigravity, OpenCode 等本地记录</small>
+                  </div>
+                </div>
+                <div class="tt-wf-step">
+                  <div class="tt-wf-num">3</div>
+                  <div class="tt-wf-info">
+                    <strong>重构 SQLite 数据库与前端快照</strong>
+                    <small>建立小时/日/月多维聚合表，毫秒级即时呈现大盘</small>
+                  </div>
+                </div>
               </div>
-              <div class="tt-refresh-notice">
-                <span v-html="icons.info"></span>
-                <p><strong>不会删除来源工具的原始日志。</strong>重建期间当前统计可能短暂不可用，耗时取决于本地日志数量。</p>
+              <div class="tt-refresh-tips">
+                <span v-html="icons.info" />
+                <p>重建过程仅读取本机日志，<strong>不会修改或删除任何外部 AI 工具的原始会话数据</strong>。</p>
               </div>
             </template>
 
             <template v-else>
-              <div class="tt-refresh-run-status" :class="`is-${refreshPhase}`" role="status" aria-live="polite">
-                <span class="tt-refresh-state-icon" :class="{ 'is-spinning': refreshPhase === 'running' }">
+              <div class="tt-refresh-running-bar" :class="`is-${refreshPhase}`">
+                <span class="tt-state-icon" :class="{ 'is-spinning': refreshPhase === 'running' }">
                   {{ refreshPhase === "running" ? "↻" : (refreshPhase === "success" ? "✓" : "!") }}
                 </span>
                 <div>
@@ -1218,34 +1832,37 @@ onBeforeUnmount(() => {
                   <p>{{ refreshStatusDescription }}</p>
                 </div>
               </div>
-              <div class="tt-refresh-log-head">
-                <strong>执行日志</strong>
-                <span>{{ refreshLogs.length }} 条</span>
+              <div class="tt-log-terminal">
+                <div class="tt-log-header">
+                  <span>实时执行日志</span>
+                  <span>{{ refreshLogs.length }} 条记录</span>
+                </div>
+                <ol ref="refreshLogListRef" class="tt-log-list">
+                  <li v-for="entry in refreshLogs" :key="entry.id" :class="`is-${entry.status}`">
+                    <time>{{ entry.time }}</time>
+                    <span class="tt-log-stage">{{ refreshStageLabels[entry.stage] || entry.stage }}</span>
+                    <p>{{ entry.message }}</p>
+                    <i>{{ entry.status === "running" ? "…" : (entry.status === "success" ? "✓" : "!") }}</i>
+                  </li>
+                </ol>
               </div>
-              <ol ref="refreshLogListRef" class="tt-refresh-log" aria-live="polite">
-                <li v-for="entry in refreshLogs" :key="entry.id" :class="`is-${entry.status}`">
-                  <time>{{ entry.time }}</time>
-                  <span class="tt-refresh-log-stage">{{ refreshStageLabels[entry.stage] || entry.stage }}</span>
-                  <p>{{ entry.message }}</p>
-                  <i aria-hidden="true">{{ entry.status === "running" ? "…" : (entry.status === "success" ? "✓" : "!") }}</i>
-                </li>
-              </ol>
             </template>
           </div>
 
-          <footer class="tt-refresh-footer">
+          <footer class="tt-modal-footer">
             <template v-if="refreshPhase === 'confirm'">
-              <button type="button" class="tt-refresh-secondary" @click="closeRefreshDialog">取消</button>
-              <button type="button" class="tt-refresh-primary" @click="startRefresh">
-                <span>↻</span>开始重建
+              <button type="button" class="tt-btn-cancel" @click="closeRefreshDialog">取消</button>
+              <button type="button" class="tt-btn-primary" @click="startRefresh">
+                <span v-html="icons.restore" />
+                <span>开始完整重建</span>
               </button>
             </template>
             <template v-else>
-              <span v-if="refreshPhase === 'running'">关闭窗口不会中断重建，可通过“查看日志”重新打开。</span>
-              <span v-else-if="refreshPhase === 'success'">统计重建结果已写入本地数据库。</span>
-              <span v-else>可关闭窗口检查环境后再次重建。</span>
-              <button type="button" class="tt-refresh-secondary" @click="closeRefreshDialog">
-                {{ refreshPhase === "running" ? "后台运行" : "关闭" }}
+              <span class="tt-footer-hint">
+                {{ refreshPhase === "running" ? "后台运行中，可随时关闭此窗口。" : "重建已写入 SQLite 数据库。" }}
+              </span>
+              <button type="button" class="tt-btn-cancel" @click="closeRefreshDialog">
+                {{ refreshPhase === "running" ? "后台运行" : "完成并关闭" }}
               </button>
             </template>
           </footer>
@@ -1253,94 +1870,83 @@ onBeforeUnmount(() => {
       </div>
     </Transition>
 
-    <!-- 本地 AI Agent 路径诊断弹窗 -->
+    <!-- 本地 AI Agent 路径诊断弹窗 (Local Agent Inspector Modal) -->
     <Transition name="tt-modal-fade">
       <div v-if="agentDialogOpen" class="tt-modal-backdrop" @click.self="closeAgentDialog">
-        <section
-          class="tt-modal tt-agent-modal"
-          role="dialog"
-          aria-modal="true"
-          aria-labelledby="tt-agent-title"
-        >
+        <section class="tt-modal tt-agent-modal" role="dialog" aria-modal="true">
           <header class="tt-modal-head">
             <div>
-              <h2 id="tt-agent-title">本地 AI Agent 路径</h2>
-              <p>只读扫描本机各 AI 工具的配置 / 数据 / 数据库根目录，不读取任何日志内容。</p>
+              <h2>本机 AI Agent 诊断终端</h2>
+              <p>只读探测当前 macOS 系统中各 AI 编程工具的配置、数据库与日志目录</p>
             </div>
             <button type="button" class="tt-modal-close" aria-label="关闭" @click="closeAgentDialog">×</button>
           </header>
 
-          <div class="tt-modal-body tt-agent-body">
-            <div v-if="store.localAgentPathsLoading.value && !store.localAgentPaths.value" class="tt-empty">
-              <span class="is-spinning">↻</span><strong>正在扫描本地 AI Agent 路径…</strong>
-            </div>
-            <div v-else-if="store.localAgentPathsError.value" class="tt-error" role="alert">
-              <strong>无法读取本地 Agent 路径</strong>
-              <p>{{ store.localAgentPathsError.value }}</p>
+          <div class="tt-modal-body">
+            <div v-if="store.localAgentPathsLoading.value && !store.localAgentPaths.value" class="tt-loading-card">
+              <div class="tt-loading-spinner" />
+              <p>正在扫描本机 AI Agent 路径…</p>
             </div>
             <template v-else-if="store.localAgentPaths.value">
-              <div class="tt-agent-meta">
-                <div class="tt-agent-meta-row">
-                  <span class="tt-agent-meta-label">主目录</span>
-                  <code>{{ localAgentsHome }}</code>
-                  <span class="tt-agent-meta-sep">·</span>
-                  <span>{{ localAgents.length }} 个 Agent</span>
-                  <span class="tt-agent-meta-sep">·</span>
-                  <span>{{ localAgents.filter((a) => a.detected).length }} 个已检测</span>
-                  <template v-if="localAgentsCollectedAt">
-                    <span class="tt-agent-meta-sep">·</span>
-                    <span>采集于 {{ localAgentsCollectedAt }}</span>
-                  </template>
-                </div>
-                <div v-if="localAgentEnvOverrides.length" class="tt-agent-env-row">
-                  <span
-                    v-for="override in localAgentEnvOverrides"
-                    :key="override.key"
-                    class="tt-agent-env-chip"
-                    :title="override.value"
-                  >{{ override.key }} → {{ override.value }}</span>
-                </div>
+              <div class="tt-agent-overview-bar">
+                <span class="tt-agent-meta-chip">系统根路径: <code>{{ localAgentsHome }}</code></span>
+                <span class="tt-agent-meta-chip">共 <strong>{{ localAgents.length }}</strong> 款 Agent</span>
+                <span class="tt-agent-meta-chip is-success">已检测 <strong>{{ detectedAgentsCount }}</strong> 款活跃</span>
+                <span v-if="localAgentsCollectedAt" class="tt-agent-meta-chip">采集时间: {{ localAgentsCollectedAt }}</span>
               </div>
-              <div class="tt-agent-grid">
+
+              <div v-if="localAgentEnvOverrides.length" class="tt-agent-env-row">
+                <span
+                  v-for="override in localAgentEnvOverrides"
+                  :key="override.key"
+                  class="tt-agent-env-chip"
+                  :title="override.value"
+                >{{ override.key }} → {{ override.value }}</span>
+              </div>
+
+              <div class="tt-agent-cards-grid">
                 <div
                   v-for="agent in localAgents"
                   :key="agent.source"
-                  class="tt-agent-card"
+                  class="tt-agent-diag-card"
                   :class="{ 'is-detected': agent.detected }"
                 >
-                  <header class="tt-agent-head">
-                    <span class="tt-agent-dot" :class="{ on: agent.detected }"></span>
+                  <header class="tt-agent-diag-header">
+                    <span class="tt-agent-dot" :class="{ on: agent.detected }" />
                     <strong>{{ agent.name }}</strong>
                     <span
                       v-if="agent.collectedEvents > 0 || agent.collectedSessions > 0"
-                      class="tt-agent-count"
-                      :title="`最近一次采集：${agent.collectedSessions} 个会话，${agent.collectedEvents} 条用量记录`"
-                    >{{ formatAgentCount(agent.collectedSessions) }} 会话 · {{ formatAgentCount(agent.collectedEvents) }} 请求</span>
-                    <span class="tt-agent-status" :class="{ on: agent.detected }">
-                      {{ agent.detected ? "已检测" : "未检测" }}
+                      class="tt-agent-stat-badge"
+                    >
+                      {{ formatAgentCount(agent.collectedSessions) }} 会话 · {{ formatAgentCount(agent.collectedEvents) }} 请求
+                    </span>
+                    <span class="tt-agent-status-tag" :class="{ on: agent.detected }">
+                      {{ agent.detected ? "已检测" : "未安装/未激活" }}
                     </span>
                   </header>
-                  <code class="tt-agent-root" :title="agent.root">{{ displayAgentPath(agent.root) }}</code>
-                  <ul class="tt-agent-paths">
+
+                  <div class="tt-agent-root-row">
+                    <span class="label">根目录:</span>
+                    <code :title="agent.root">{{ displayAgentPath(agent.root) }}</code>
+                  </div>
+
+                  <ul class="tt-agent-path-list">
                     <li
-                      v-for="(entry, index) in agent.paths"
-                      :key="index"
-                      :title="`点击复制：${entry.path}`"
+                      v-for="(entry, eIdx) in agent.paths"
+                      :key="eIdx"
+                      :title="`点击复制路径: ${entry.path}`"
                       @click="copyAgentPath(entry.path)"
                     >
-                      <span class="tt-agent-kind" :data-kind="entry.kind">{{ agentKindLabels[entry.kind] || entry.kind }}</span>
-                      <span class="tt-agent-entry-main">
-                        <span class="tt-agent-label">{{ entry.label }}</span>
-                        <code class="tt-agent-path" :class="{ missing: !entry.exists }"><span
+                      <span class="tt-path-kind-badge" :data-kind="entry.kind">{{ agentKindLabels[entry.kind] || entry.kind }}</span>
+                      <span class="tt-path-text">
+                        <span class="tt-path-label">{{ entry.label }}</span>
+                        <code :class="{ missing: !entry.exists }"><span
                           v-for="(segment, segmentIndex) in agentPathSegments(entry.path)"
                           :key="segmentIndex"
                           class="tt-path-seg"
                         >{{ segment }}</span></code>
                       </span>
-                      <span class="tt-agent-entry-side">
-                        <span v-if="entry.detail" class="tt-agent-detail">{{ entry.detail }}</span>
-                        <span class="tt-agent-exists" :class="{ off: !entry.exists }"></span>
-                      </span>
+                      <span class="tt-path-status-icon" :class="{ exists: entry.exists }" />
                     </li>
                   </ul>
                 </div>
@@ -1348,150 +1954,1421 @@ onBeforeUnmount(() => {
             </template>
           </div>
 
-          <footer class="tt-refresh-footer">
-            <span>点击路径行复制到剪贴板 · 圆点表示存在，空心表示缺失 · “N 会话 · M 请求”为最近一次采集到的数据量</span>
-            <button type="button" class="tt-refresh-secondary" @click="closeAgentDialog">关闭</button>
+          <footer class="tt-modal-footer">
+            <span class="tt-footer-hint">点击任意路径行可直接复制完整路径至系统剪贴板。</span>
+            <button type="button" class="tt-btn-cancel" @click="closeAgentDialog">关闭</button>
           </footer>
         </section>
       </div>
     </Transition>
 
+    <!-- 导出数据弹窗 (Export Modal) -->
     <Transition name="tt-modal-fade">
-      <div v-if="modalOpen" class="tt-modal-backdrop" @click.self="closeModal">
-        <div
-          class="tt-modal tt-modal-wide"
-          role="dialog"
-          aria-modal="true"
-          :aria-label="modalTitle"
-        >
+      <div v-if="exportDialogOpen" class="tt-modal-backdrop" @click.self="closeExportDialog">
+        <section class="tt-modal tt-export-modal" role="dialog" aria-modal="true">
           <header class="tt-modal-head">
             <div>
-              <h2>{{ modalTitle }}</h2>
-              <p v-if="modal === 'sources'">按工具汇总 · 共 {{ bySource.length }} 项</p>
-              <p v-else-if="modal === 'models'">按模型汇总 · 共 {{ byModel.length }} 项</p>
-              <p v-else>当前时间区间内的用量明细</p>
+              <h2>导出 Token 数据分析报表</h2>
+              <p>导出当前所选时间范围 ({{ rangeLabel }}) 内的多维分析指标</p>
             </div>
-            <button type="button" class="tt-modal-close" aria-label="关闭" @click="closeModal">×</button>
+            <button type="button" class="tt-modal-close" aria-label="关闭" @click="closeExportDialog">×</button>
           </header>
+
           <div class="tt-modal-body">
-            <!-- 明细：两个标签 + 分页 -->
-            <div v-if="modal === 'daily' || modal === 'projects'">
-              <div class="tt-modal-tabs">
-                <button type="button" :class="{ active: detailTab === 'daily' }" @click="switchDetailTab('daily')">趋势明细 · {{ trendDetailList.length }}</button>
-                <button type="button" :class="{ active: detailTab === 'projects' }" @click="switchDetailTab('projects')">项目用量 · {{ projectUsage.length }}</button>
+            <div class="tt-export-options-grid">
+              <div class="tt-export-option-card" @click="exportDataAsJson">
+                <span class="tt-export-icon" v-html="icons.database" />
+                <strong>导出完整 JSON 结构化报表</strong>
+                <p>包含大盘概览、工具分布、模型排行榜、项目用量与完整时序明细，适合二次分析与归档。</p>
+                <button type="button" class="tt-btn-primary">下载 JSON 文件</button>
               </div>
 
-              <div v-if="detailTab === 'daily'">
-                <div class="tt-list-meta">按当前趋势粒度 · {{ trendUnitLabel() }} · 已过滤总计为 0 的空节点</div>
-                <AppTable
-                  :rows="trendDetailList"
-                  :columns="dailyColumns"
-                  :row-key="(item: any) => item.label"
-                  :page="detailPage"
-                  :page-size="PAGE_SIZE"
-                  empty-text="该范围内没有明细数据"
-                  @update:page="detailPage = $event"
-                >
-                  <template #cell-label="{ row }">{{ formatDetailTime(row.label) }}</template>
-                  <template #cell-total="{ row }">{{ formatCompact(row.total) }}</template>
-                  <template #cell-input="{ row }">{{ formatCompact(row.input) }}</template>
-                  <template #cell-output="{ row }">{{ formatCompact(row.output) }}</template>
-                  <template #cell-cache="{ row }">{{ formatCompact(row.cache) }}</template>
-                  <template #cell-cacheHitRate="{ row }">{{ formatRate(row.cacheHitRate) }}</template>
-                  <template #cell-reasoning="{ row }">{{ formatCompact(row.reasoning) }}</template>
-                  <template #cell-sessions="{ row }">{{ formatTokens(row.sessions) }}</template>
-                  <template #cell-requests="{ row }">{{ row.requestsEstimated ? "≈" : "" }}{{ formatTokens(row.requests) }}</template>
-                </AppTable>
+              <div class="tt-export-option-card" @click="exportDataAsCsv">
+                <span class="tt-export-icon" v-html="icons.download" />
+                <strong>导出时序明细 CSV 表格</strong>
+                <p>导出逐日/逐小时 Token 消耗明细（含输入、输出、缓存、命中率与请求数），适合 Excel / Numbers 打开。</p>
+                <button type="button" class="tt-btn-primary">下载 CSV 表格</button>
               </div>
-
-              <div v-else>
-                <AppTable
-                  :rows="projectUsage"
-                  :columns="projectColumns"
-                  :row-key="(item: any) => item.project"
-                  :page="detailPage"
-                  :page-size="PAGE_SIZE"
-                  empty-text="该范围内没有项目数据"
-                  @update:page="detailPage = $event"
-                >
-                  <template #cell-project="{ row }" :title="row.project">{{ row.project }}</template>
-                  <template #cell-totalTokens="{ row }">{{ formatCompact(row.totalTokens) }}</template>
-                  <template #cell-input="{ row }">{{ formatCompact(row.input) }}</template>
-                  <template #cell-output="{ row }">{{ formatCompact(row.output) }}</template>
-                  <template #cell-cache="{ row }">{{ formatCompact(row.cache) }}</template>
-                  <template #cell-cacheHitRate="{ row }">{{ formatRate(row.cacheHitRate) }}</template>
-                  <template #cell-reasoning="{ row }">{{ formatCompact(row.reasoning) }}</template>
-                  <template #cell-sessions="{ row }">{{ formatTokens(row.sessions) }}</template>
-                  <template #cell-requests="{ row }">{{ row.requestsEstimated ? "≈" : "" }}{{ formatTokens(row.requests) }}</template>
-                  <template #cell-costUsd="{ row }">{{ formatCost(row.costUsd) }}</template>
-                </AppTable>
-              </div>
-            </div>
-
-            <!-- 工具明细：完整 Token 用量列表 -->
-            <div v-else-if="modal === 'sources'">
-              <div class="tt-list-meta">所选时间区间 · 点击列头排序</div>
-              <AppTable
-                :rows="bySource"
-                :columns="sourceColumns"
-                :row-key="(item: any) => item.source"
-                :page="detailPage"
-                :page-size="PAGE_SIZE"
-                empty-text="该范围内没有工具数据"
-                @update:page="detailPage = $event"
-              >
-                <template #cell-source="{ row }">
-                  <span class="tt-dimension-name" :title="sourceLabel(row.source)">
-                    <i class="tt-provider-dot" :style="{ background: providerColor(row.source, 0) }"></i>
-                    <b>{{ sourceLabel(row.source) }}</b>
-                  </span>
-                </template>
-                <template #cell-totalTokens="{ row }">{{ formatCompact(row.totalTokens) }}</template>
-                <template #cell-inputTokens="{ row }">{{ formatCompact(row.inputTokens) }}</template>
-                <template #cell-outputTokens="{ row }">{{ formatCompact(row.outputTokens) }}</template>
-                <template #cell-cacheTokens="{ row }">{{ formatCompact(row.cacheTokens) }}</template>
-                <template #cell-cacheHitRate="{ row }">{{ formatRate(row.cacheHitRate) }}</template>
-                <template #cell-reasoningTokens="{ row }">{{ formatCompact(row.reasoningTokens) }}</template>
-                <template #cell-conversations="{ row }">{{ formatTokens(row.conversations) }}</template>
-                <template #cell-requests="{ row }">{{ row.requestsEstimated ? "≈" : "" }}{{ formatTokens(row.requests) }}</template>
-                <template #cell-costUsd="{ row }">{{ row.costUsd > 0 ? formatCost(row.costUsd) : "—" }}</template>
-                <template #cell-share="{ row }">{{ shareOf(row.totalTokens, totalTokensAll).toFixed(2) }}%</template>
-              </AppTable>
-            </div>
-
-            <!-- 模型明细：完整 Token 用量列表 -->
-            <div v-else-if="modal === 'models'">
-              <div class="tt-list-meta">所选时间区间 · 同系列模型归并 · 点击列头排序</div>
-              <AppTable
-                :rows="byModel"
-                :columns="modelColumns"
-                :row-key="(item: any) => item.model"
-                :page="detailPage"
-                :page-size="PAGE_SIZE"
-                empty-text="该范围内没有模型数据"
-                @update:page="detailPage = $event"
-              >
-                <template #cell-source="{ row }">
-                  <span class="tt-dimension-name" :title="row.model || '未知模型'">
-                    <i class="tt-provider-dot" :style="{ background: providerColor(row.model, 0) }"></i>
-                    <b>{{ row.model || "未知模型" }}</b>
-                  </span>
-                </template>
-                <template #cell-totalTokens="{ row }">{{ formatCompact(row.totalTokens) }}</template>
-                <template #cell-inputTokens="{ row }">{{ formatCompact(row.inputTokens) }}</template>
-                <template #cell-outputTokens="{ row }">{{ formatCompact(row.outputTokens) }}</template>
-                <template #cell-cacheTokens="{ row }">{{ formatCompact(row.cacheTokens) }}</template>
-                <template #cell-cacheHitRate="{ row }">{{ formatRate(row.cacheHitRate) }}</template>
-                <template #cell-reasoningTokens="{ row }">{{ formatCompact(row.reasoningTokens) }}</template>
-                <template #cell-conversations="{ row }">{{ formatTokens(row.conversations) }}</template>
-                <template #cell-requests="{ row }">{{ row.requestsEstimated ? "≈" : "" }}{{ formatTokens(row.requests) }}</template>
-                <template #cell-costUsd="{ row }">{{ row.costUsd > 0 ? formatCost(row.costUsd) : "—" }}</template>
-                <template #cell-share="{ row }">{{ shareOf(row.totalTokens, totalTokensAll).toFixed(2) }}%</template>
-              </AppTable>
             </div>
           </div>
-        </div>
+
+          <footer class="tt-modal-footer">
+            <button type="button" class="tt-btn-cancel" @click="closeExportDialog">取消</button>
+          </footer>
+        </section>
       </div>
     </Transition>
   </main>
 </template>
+
+<style scoped>
+.tt-dashboard {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  background: var(--page-bg);
+  color: var(--text);
+  overflow: hidden;
+}
+
+/* ============================================================
+   1. 顶部宏观智控驾驶舱 (Macro Cockpit Bar)
+   ============================================================ */
+.tt-cockpit-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 20px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--line);
+  flex-shrink: 0;
+}
+
+.tt-cockpit-left {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.tt-brand-section {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.tt-eyebrow-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.tt-live-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #10b981;
+  box-shadow: 0 0 8px #10b981;
+  animation: ttPulse 2s infinite ease-in-out;
+}
+
+@keyframes ttPulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.4; transform: scale(1.25); }
+}
+
+.tt-eyebrow-text {
+  font-size: 10px;
+  font-weight: 750;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--brand);
+}
+
+.tt-title-row h1 {
+  font-size: 18px;
+  font-weight: 750;
+  color: var(--text);
+  margin: 0;
+  line-height: 1.2;
+}
+
+.tt-cockpit-subtitle {
+  font-size: 11px;
+  color: var(--muted);
+  margin: 0;
+}
+
+.tt-cockpit-subtitle strong {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.tt-cockpit-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* 顶部快速视角气泡群组 */
+.tt-cockpit-pills-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  background: var(--page-bg);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md, 8px);
+  padding: 2px;
+}
+
+.tt-pill-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 28px;
+  padding: 0 10px;
+  border-radius: 6px;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 550;
+  cursor: pointer;
+  transition: all 0.12s ease;
+  white-space: nowrap;
+}
+
+.tt-pill-btn:hover {
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+}
+
+.tt-pill-btn :deep(svg) {
+  width: 13px;
+  height: 13px;
+}
+
+.tt-cockpit-divider {
+  width: 1px;
+  height: 20px;
+  background: var(--line);
+  margin: 0 2px;
+}
+
+/* 按钮规范 */
+.tt-btn-rebuild {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 32px;
+  padding: 0 12px;
+  border-radius: var(--r-md, 8px);
+  border: 1px solid color-mix(in srgb, var(--brand, #388bfd) 35%, transparent);
+  background: color-mix(in srgb, var(--brand, #388bfd) 10%, var(--surface));
+  color: var(--brand-deep, var(--brand, #388bfd));
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.tt-btn-rebuild:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--brand, #388bfd) 18%, var(--surface));
+  border-color: var(--brand);
+  transform: translateY(-1px);
+}
+
+.tt-btn-rebuild:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.tt-btn-rebuild :deep(svg) {
+  width: 13px;
+  height: 13px;
+}
+
+.tt-btn-secondary {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 32px;
+  padding: 0 11px;
+  border-radius: var(--r-md, 8px);
+  border: 1px solid var(--line);
+  background: var(--surface);
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 550;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.tt-btn-secondary:hover {
+  background: var(--surface-hover);
+  border-color: var(--line-hover);
+  transform: translateY(-1px);
+}
+
+.tt-btn-secondary :deep(svg) {
+  width: 13px;
+  height: 13px;
+  color: var(--muted);
+}
+
+.tt-agent-count-chip {
+  padding: 1px 5px;
+  border-radius: var(--r-full);
+  background: rgba(16, 185, 129, 0.12);
+  color: #10b981;
+  font-size: 9.5px;
+  font-weight: 700;
+}
+
+.is-spinning {
+  animation: ttSpin 1s infinite linear;
+}
+
+@keyframes ttSpin {
+  100% { transform: rotate(360deg); }
+}
+
+/* ============================================================
+   2. 首页主视口 (No-Scroll Viewport Layout)
+   ============================================================ */
+.tt-dashboard-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  padding: 12px 18px;
+  gap: 10px;
+}
+
+/* ROW 1: 4 KPI Cards (Compact) */
+.tt-kpi-deck {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 10px;
+  flex-shrink: 0;
+}
+
+@media (max-width: 1200px) {
+  .tt-kpi-deck {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+
+.tt-kpi-card {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg, 10px);
+  padding: 10px 14px;
+  display: flex;
+  flex-direction: column;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.02);
+  transition: all 0.15s ease;
+}
+
+.tt-kpi-card:hover {
+  border-color: var(--line-hover);
+}
+
+.tt-kpi-card-inner {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.tt-kpi-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  margin-bottom: 4px;
+}
+
+.tt-kpi-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10px;
+  font-weight: 750;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.tt-kpi-tag :deep(svg) {
+  width: 12px;
+  height: 12px;
+}
+
+.tt-kpi-tag.is-emerald { color: #10b981; }
+.tt-kpi-tag.is-orange { color: #f97316; }
+.tt-kpi-tag.is-blue { color: #3b82f6; }
+.tt-kpi-tag.is-purple { color: #a855f7; }
+
+.tt-kpi-badge-hit {
+  padding: 1px 6px;
+  border-radius: var(--r-full);
+  font-size: 10px;
+  font-weight: 700;
+}
+.tt-kpi-badge-hit.is-excellent { background: rgba(16, 185, 129, 0.12); color: #10b981; }
+.tt-kpi-badge-hit.is-good { background: rgba(59, 130, 246, 0.12); color: #3b82f6; }
+.tt-kpi-badge-hit.is-fair { background: rgba(245, 158, 11, 0.12); color: #f59e0b; }
+.tt-kpi-badge-hit.is-none { background: rgba(148, 163, 184, 0.12); color: #94a3b8; }
+
+.tt-kpi-streak-pill,
+.tt-kpi-savings-pill {
+  padding: 1px 6px;
+  border-radius: var(--r-full);
+  font-size: 10px;
+  font-weight: 700;
+  background: rgba(249, 115, 22, 0.12);
+  color: #f97316;
+}
+
+.tt-kpi-savings-pill {
+  background: rgba(168, 85, 247, 0.12);
+  color: #a855f7;
+}
+
+.tt-kpi-badge-rate {
+  padding: 1px 6px;
+  border-radius: var(--r-full);
+  font-size: 10px;
+  font-weight: 700;
+  background: rgba(59, 130, 246, 0.12);
+  color: #3b82f6;
+}
+
+.tt-kpi-main-val {
+  display: flex;
+  align-items: baseline;
+  gap: 5px;
+  margin-bottom: 4px;
+}
+
+.tt-kpi-main-val strong {
+  font-size: 22px;
+  font-weight: 800;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.02em;
+}
+
+.tt-kpi-main-val strong.tt-val-unpriced {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.tt-kpi-unit {
+  font-size: 11px;
+  color: var(--muted);
+  font-weight: 600;
+}
+
+/* 进度条 */
+.tt-kpi-progress-bar {
+  display: flex;
+  height: 4px;
+  border-radius: var(--r-full);
+  background: var(--page-bg);
+  overflow: hidden;
+  margin-bottom: 6px;
+}
+
+.tt-prog-seg {
+  height: 100%;
+  transition: width 0.3s ease;
+}
+.tt-prog-seg.is-in { background: #3b82f6; }
+.tt-prog-seg.is-out { background: #10b981; }
+.tt-prog-seg.is-cache { background: #8b5cf6; }
+
+.tt-kpi-sub-pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  font-size: 10.5px;
+}
+
+.tt-sub-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.tt-sub-pill i {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+}
+.tt-sub-pill.in i { background: #3b82f6; }
+.tt-sub-pill.out i { background: #10b981; }
+.tt-sub-pill.cache i { background: #8b5cf6; }
+.tt-sub-pill.reasoning i { background: #f59e0b; }
+
+.tt-kpi-meta-text {
+  font-size: 11px;
+  color: var(--muted);
+  margin-bottom: 4px;
+}
+
+.tt-kpi-meta-text strong {
+  color: var(--text);
+}
+
+.tt-active-rate-badge {
+  display: inline-block;
+  margin-left: 4px;
+  padding: 1px 4px;
+  border-radius: 3px;
+  background: var(--surface-hover);
+  font-size: 9.5px;
+  font-weight: 600;
+}
+
+.tt-kpi-footer-note {
+  margin-top: auto;
+  font-size: 10.5px;
+  color: var(--muted);
+}
+
+.tt-kpi-multiplier-pill {
+  margin-top: auto;
+  padding: 2px 6px;
+  border-radius: var(--r-md, 4px);
+  background: var(--surface-hover);
+  font-size: 10.5px;
+  color: var(--muted);
+}
+
+.tt-kpi-multiplier-pill strong {
+  color: #3b82f6;
+  font-weight: 700;
+}
+
+/* ROW 2: 双主图表全景 (Flex: 1, Min-Height: 0) */
+.tt-dual-charts-grid {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: 1.15fr 0.85fr;
+  gap: 10px;
+  overflow: hidden;
+}
+
+@media (max-width: 1100px) {
+  .tt-dual-charts-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.tt-card {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg, 10px);
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.tt-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 8px;
+  flex-shrink: 0;
+}
+
+.tt-card-title-wrap h2,
+.tt-card-title-wrap h3 {
+  font-size: 13.5px;
+  font-weight: 700;
+  margin: 0;
+}
+
+.tt-card-title-wrap p {
+  font-size: 10.5px;
+  color: var(--muted);
+  margin: 1px 0 0;
+}
+
+.tt-metric-switches {
+  display: flex;
+  gap: 2px;
+  background: var(--page-bg);
+  padding: 2px;
+  border-radius: var(--r-md, 6px);
+  border: 1px solid var(--line);
+}
+
+.tt-metric-btn {
+  height: 22px;
+  padding: 0 8px;
+  border-radius: 4px;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  font-size: 10.5px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.12s ease;
+}
+
+.tt-metric-btn.active {
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);
+}
+
+.tt-chart-body,
+.tt-health-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.tt-health-summary-pill {
+  display: inline-flex;
+  gap: 8px;
+  font-size: 10.5px;
+  font-weight: 600;
+}
+.tt-health-summary-pill .ok { color: #10b981; }
+.tt-health-summary-pill .bad { color: #ef4444; }
+
+.tt-health-wrapper {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+}
+
+.tt-health-grid {
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: 11px;
+  gap: 3px;
+  flex: 1;
+  min-height: 0;
+  align-content: center;
+}
+
+.tt-health-cell {
+  width: 11px;
+  height: 11px;
+  border-radius: 2px;
+  transition: transform 0.1s ease;
+}
+.tt-health-cell:hover {
+  transform: scale(1.3);
+  z-index: 10;
+}
+
+.tt-health-cell.lv0 { background: rgba(148, 163, 184, 0.15); }
+.tt-health-cell.lv1 { background: #ef4444; }
+.tt-health-cell.lv2 { background: #f97316; }
+.tt-health-cell.lv3 { background: #eab308; }
+.tt-health-cell.lv4 { background: #84cc16; }
+.tt-health-cell.lv5 { background: #10b981; }
+
+.tt-health-legend {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 10px;
+  color: var(--muted);
+  flex-shrink: 0;
+  padding-top: 4px;
+}
+.tt-health-legend .tt-health-cell {
+  width: 8px;
+  height: 8px;
+}
+.tt-legend-meta {
+  margin-left: auto;
+}
+
+/* ROW 3: 底部快捷分布与深度透视发射台 (Compact Row) */
+.tt-bottom-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  flex-shrink: 0;
+}
+
+.tt-preview-card {
+  padding: 10px 14px;
+}
+
+.tt-preview-body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.tt-bar-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 0;
+}
+
+.tt-bar-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.tt-bar-label {
+  font-size: 11.5px;
+  font-weight: 600;
+  width: 130px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tt-bar-track {
+  flex: 1;
+  height: 5px;
+  background: var(--page-bg);
+  border-radius: var(--r-full);
+  overflow: hidden;
+}
+
+.tt-bar-fill {
+  height: 100%;
+  border-radius: var(--r-full);
+  transition: width 0.3s ease;
+}
+
+.tt-bar-pct {
+  font-size: 10.5px;
+  color: var(--muted);
+  width: 40px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.tt-bar-val {
+  font-size: 11.5px;
+  width: 60px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.tt-text-btn {
+  background: transparent;
+  border: none;
+  color: var(--brand);
+  font-size: 11.5px;
+  font-weight: 600;
+  cursor: pointer;
+  padding: 0;
+}
+.tt-text-btn:hover {
+  text-decoration: underline;
+}
+
+/* ============================================================
+   3. 弹窗对话框体系 (Modal Dialogs)
+   ============================================================ */
+.tt-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 2000;
+  background: rgba(0, 0, 0, 0.5);
+  backdrop-filter: blur(4px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+}
+
+.tt-modal-card {
+  width: 100%;
+  max-width: 640px;
+  max-height: 85vh;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--r-xl, 14px);
+  box-shadow: 0 20px 48px rgba(0, 0, 0, 0.25);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.tt-modal-card.is-wide {
+  max-width: 960px;
+}
+
+.tt-modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--line);
+  flex-shrink: 0;
+}
+
+.tt-modal-header h2 {
+  font-size: 15px;
+  font-weight: 750;
+  margin: 0;
+}
+
+.tt-modal-header p {
+  font-size: 11px;
+  color: var(--muted);
+  margin: 2px 0 0;
+}
+
+.tt-modal-close-btn {
+  width: 28px;
+  height: 28px;
+  border-radius: 6px;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  font-size: 16px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.tt-modal-close-btn:hover {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+.tt-modal-body {
+  padding: 16px 18px;
+  overflow-y: auto;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.tt-modal-footer {
+  padding: 10px 18px;
+  border-top: 1px solid var(--line);
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 8px;
+  background: var(--page-bg);
+  flex-shrink: 0;
+}
+
+.tt-table-wrap {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md, 8px);
+  overflow: hidden;
+}
+
+/* 过滤搜索栏 */
+.tt-filter-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-shrink: 0;
+}
+
+.tt-search-input {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  height: 34px;
+  padding: 0 12px;
+  border-radius: var(--r-md, 8px);
+  border: 1px solid var(--line);
+  background: var(--page-bg);
+  width: 320px;
+}
+
+.tt-search-input input {
+  border: none;
+  background: transparent;
+  color: var(--text);
+  font-size: 12.5px;
+  width: 100%;
+  outline: none;
+}
+
+.tt-filter-count {
+  font-size: 11.5px;
+  color: var(--muted);
+}
+
+/* 工具卡片网格 */
+.tt-sources-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 10px;
+  flex-shrink: 0;
+}
+
+.tt-source-card {
+  background: var(--page-bg);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md, 8px);
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  transition: all 0.15s ease;
+}
+
+.tt-source-card:hover {
+  border-color: var(--line-hover);
+}
+
+.tt-source-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.tt-source-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.tt-source-title strong {
+  font-size: 12.5px;
+}
+
+.tt-source-share {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--brand);
+}
+
+.tt-source-main {
+  display: flex;
+  align-items: baseline;
+  gap: 5px;
+}
+
+.tt-source-main strong {
+  font-size: 18px;
+  font-weight: 800;
+  line-height: 1;
+}
+
+.tt-source-sub {
+  font-size: 10.5px;
+  color: var(--muted);
+}
+
+.tt-source-breakdown-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px 8px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: var(--surface);
+}
+
+.tt-sbg-item {
+  display: flex;
+  justify-content: space-between;
+  font-size: 10.5px;
+}
+
+.tt-sbg-item span { color: var(--muted); }
+.tt-sbg-item strong { font-weight: 600; font-variant-numeric: tabular-nums; }
+
+.tt-source-cost-badge {
+  font-size: 10.5px;
+  color: var(--muted);
+  margin-top: auto;
+}
+
+.tt-cell-with-dot {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.tt-muted-code {
+  font-size: 10px;
+  color: var(--muted);
+}
+
+.tt-project-cell {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tt-project-cell :deep(svg) {
+  width: 14px;
+  height: 14px;
+  color: var(--muted);
+  flex-shrink: 0;
+}
+
+.tt-btn-cancel {
+  height: 30px;
+  padding: 0 14px;
+  border-radius: var(--r-md, 6px);
+  border: 1px solid var(--line);
+  background: var(--surface);
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.tt-btn-cancel:hover {
+  background: var(--surface-hover);
+}
+
+.tt-btn-primary {
+  height: 30px;
+  padding: 0 14px;
+  border-radius: var(--r-md, 6px);
+  border: none;
+  background: var(--brand);
+  color: #fff;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+/* 步骤指示器 */
+.tt-refresh-workflow {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.tt-wf-step {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  border-radius: var(--r-md, 8px);
+  background: var(--page-bg);
+  border: 1px solid var(--line);
+}
+
+.tt-wf-num {
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background: var(--brand);
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  font-weight: 700;
+  flex-shrink: 0;
+}
+
+.tt-wf-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.tt-wf-info strong {
+  font-size: 12.5px;
+}
+
+.tt-wf-info small {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.tt-refresh-tips {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--brand) 10%, transparent);
+  color: var(--text);
+  font-size: 11.5px;
+}
+
+.tt-refresh-tips :deep(svg) {
+  width: 14px;
+  height: 14px;
+  color: var(--brand);
+  flex-shrink: 0;
+}
+
+.tt-refresh-tips p {
+  margin: 0;
+}
+
+.tt-refresh-running-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px;
+  border-radius: var(--r-md, 8px);
+  background: var(--page-bg);
+  border: 1px solid var(--line);
+}
+
+.tt-state-icon {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background: var(--brand-soft);
+  color: var(--brand);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 800;
+  font-size: 13px;
+}
+
+.tt-log-terminal {
+  background: #090d16;
+  border-radius: var(--r-md, 8px);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  padding: 10px 12px;
+  color: #f8fafc;
+  font-family: monospace;
+}
+
+.tt-log-header {
+  display: flex;
+  justify-content: space-between;
+  font-size: 10.5px;
+  color: #64748b;
+  padding-bottom: 6px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  margin-bottom: 6px;
+}
+
+.tt-log-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  max-height: 160px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 10.5px;
+}
+
+.tt-log-list li {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.tt-log-list time { color: #64748b; }
+.tt-log-stage {
+  padding: 1px 4px;
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.1);
+  color: #38bdf8;
+}
+.tt-log-list p { margin: 0; flex: 1; }
+
+.tt-footer-hint {
+  font-size: 11px;
+  color: var(--muted);
+  margin-right: auto;
+}
+
+/* Agent 诊断弹窗 */
+.tt-agent-overview-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.tt-agent-meta-chip {
+  padding: 3px 8px;
+  border-radius: var(--r-md, 6px);
+  background: var(--page-bg);
+  border: 1px solid var(--line);
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.tt-agent-meta-chip.is-success {
+  background: rgba(16, 185, 129, 0.12);
+  color: #10b981;
+  border-color: rgba(16, 185, 129, 0.3);
+}
+
+.tt-agent-env-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.tt-agent-env-chip {
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: var(--surface-hover);
+  font-size: 10.5px;
+  font-family: monospace;
+}
+
+.tt-agent-cards-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
+  gap: 10px;
+}
+
+.tt-agent-diag-card {
+  background: var(--page-bg);
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.tt-agent-diag-card.is-detected {
+  border-color: rgba(16, 185, 129, 0.4);
+  background: var(--surface);
+}
+
+.tt-agent-diag-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.tt-agent-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #94a3b8;
+}
+.tt-agent-dot.on {
+  background: #10b981;
+  box-shadow: 0 0 6px #10b981;
+}
+
+.tt-agent-stat-badge {
+  padding: 1px 6px;
+  border-radius: var(--r-full);
+  background: var(--surface-hover);
+  font-size: 10px;
+  color: var(--muted);
+}
+
+.tt-agent-status-tag {
+  margin-left: auto;
+  font-size: 11px;
+  color: #94a3b8;
+}
+.tt-agent-status-tag.on {
+  color: #10b981;
+  font-weight: 700;
+}
+
+.tt-agent-root-row {
+  font-size: 11px;
+  color: var(--muted);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.tt-agent-path-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.tt-agent-path-list li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 8px;
+  border-radius: 4px;
+  background: var(--surface);
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+
+.tt-agent-path-list li:hover {
+  background: var(--surface-hover);
+}
+
+.tt-path-kind-badge {
+  padding: 1px 4px;
+  border-radius: 3px;
+  background: var(--brand-soft);
+  color: var(--brand-deep);
+  font-size: 9px;
+  font-weight: 700;
+}
+
+.tt-path-text {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.tt-path-label {
+  font-size: 10px;
+  color: var(--muted);
+}
+
+.tt-path-text code {
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tt-path-text code.missing {
+  color: var(--muted);
+  text-decoration: line-through;
+}
+
+.tt-path-status-icon {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #94a3b8;
+}
+.tt-path-status-icon.exists {
+  background: #10b981;
+}
+
+/* 导出选项 */
+.tt-export-options-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+}
+
+.tt-export-option-card {
+  background: var(--page-bg);
+  border: 1px solid var(--line);
+  border-radius: var(--r-xl);
+  padding: 20px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: 12px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.tt-export-option-card:hover {
+  border-color: var(--brand);
+  transform: translateY(-2px);
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.06);
+}
+
+.tt-export-icon {
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  background: var(--brand-soft);
+  color: var(--brand);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.tt-export-icon :deep(svg) {
+  width: 22px;
+  height: 22px;
+}
+
+.tt-export-option-card strong {
+  font-size: 14px;
+}
+
+.tt-export-option-card p {
+  font-size: 12px;
+  color: var(--muted);
+  margin: 0;
+  flex: 1;
+}
+
+/* 状态提示 */
+.tt-error-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 14px 18px;
+  border-radius: var(--r-xl);
+  background: rgba(239, 68, 68, 0.1);
+  border: 1px solid rgba(239, 68, 68, 0.3);
+  color: #ef4444;
+}
+
+.tt-error-icon :deep(svg) {
+  width: 20px;
+  height: 20px;
+}
+
+.tt-error-content strong {
+  display: block;
+  font-size: 14px;
+}
+
+.tt-error-content p {
+  margin: 4px 0 2px;
+  font-size: 12px;
+}
+
+.tt-error-content small {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.tt-loading-card,
+.tt-empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 40px;
+  color: var(--muted);
+  font-size: 13px;
+  gap: 12px;
+}
+
+.tt-loading-spinner {
+  width: 28px;
+  height: 28px;
+  border: 3px solid var(--line);
+  border-top-color: var(--brand);
+  border-radius: 50%;
+  animation: ttSpin 0.8s infinite linear;
+}
+
+.tt-modal-fade-enter-active,
+.tt-modal-fade-leave-active {
+  transition: opacity 0.2s ease;
+}
+
+.tt-modal-fade-enter-from,
+.tt-modal-fade-leave-to {
+  opacity: 0;
+}
+</style>

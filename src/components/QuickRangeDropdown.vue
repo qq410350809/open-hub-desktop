@@ -246,7 +246,9 @@ function applyCustomRange() {
       class="tt-range-arrow tt-range-arrow-prev"
       title="前一天"
       @click.stop.prevent="applyShift(-1)"
-    >‹</button>
+    >
+      <span v-html="icons.chevron" class="tt-arrow-icon is-prev" />
+    </button>
     <button type="button" class="tt-range-trigger" :class="{ active: customMode }" @click="toggle">
       <span class="tt-range-label">{{ activeLabel }}</span>
       <span v-if="activeRangeText" class="tt-range-sub">{{ activeRangeText }}</span>
@@ -258,7 +260,9 @@ function applyCustomRange() {
       class="tt-range-arrow tt-range-arrow-next"
       title="后一天"
       @click.stop.prevent="applyShift(1)"
-    >›</button>
+    >
+      <span v-html="icons.chevron" class="tt-arrow-icon is-next" />
+    </button>
 
     <div v-if="open" class="tt-range-pop" @click.stop>
       <template v-if="!customMode">
@@ -334,3 +338,302 @@ function applyCustomRange() {
     </div>
   </div>
 </template>
+
+<style scoped>
+.tt-range-dd {
+  position: relative;
+  display: inline-flex;
+  align-items: stretch;
+  gap: 4px;
+}
+
+.tt-range-arrow {
+  width: 28px;
+  height: 34px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md, 8px);
+  background: var(--surface);
+  color: var(--muted);
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.tt-range-arrow:hover {
+  background: var(--surface-hover);
+  color: var(--text);
+  border-color: var(--line-hover);
+}
+
+.tt-arrow-icon {
+  display: inline-flex;
+}
+.tt-arrow-icon :deep(svg) {
+  width: 13px;
+  height: 13px;
+}
+.tt-arrow-icon.is-prev :deep(svg) {
+  transform: rotate(90deg);
+}
+.tt-arrow-icon.is-next :deep(svg) {
+  transform: rotate(-90deg);
+}
+
+.tt-range-trigger {
+  height: 34px;
+  padding: 0 12px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md, 8px);
+  background: var(--surface);
+  color: var(--text);
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  white-space: nowrap;
+}
+
+.tt-range-trigger:hover {
+  background: var(--surface-hover);
+  border-color: var(--line-hover);
+}
+
+.tt-range-label {
+  color: var(--brand);
+  font-weight: 700;
+}
+
+.tt-range-sub {
+  color: var(--muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.tt-range-caret {
+  display: inline-flex;
+  color: var(--muted);
+  transition: transform 0.2s ease;
+}
+.tt-range-caret :deep(svg) {
+  width: 12px;
+  height: 12px;
+}
+.tt-range-dd.open .tt-range-caret {
+  transform: rotate(180deg);
+}
+
+/* 弹出层 */
+.tt-range-pop {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 1200;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--r-xl, 12px);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.15);
+  padding: 12px;
+  min-width: 240px;
+}
+
+.tt-rp-groups {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.tt-rp-group-title {
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--muted);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  margin-bottom: 4px;
+}
+
+.tt-rp-group-items {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px;
+}
+
+.tt-rp-item {
+  height: 28px;
+  padding: 0 8px;
+  border-radius: var(--r-md, 6px);
+  border: 1px solid transparent;
+  background: var(--page-bg);
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 550;
+  cursor: pointer;
+  transition: all 0.12s ease;
+  text-align: center;
+}
+
+.tt-rp-item:hover {
+  background: var(--surface-hover);
+  border-color: var(--line);
+}
+
+.tt-rp-item.active {
+  background: var(--brand-soft);
+  color: var(--brand-deep);
+  border-color: var(--brand-line);
+  font-weight: 700;
+}
+
+/* 自定义日历 */
+.tt-rp-custom-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 10px;
+  font-size: 12px;
+}
+
+.tt-rp-back,
+.tt-rp-clear {
+  border: none;
+  background: transparent;
+  color: var(--brand);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.tt-rp-custom-range {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+}
+
+.tt-rp-calendars {
+  display: flex;
+  gap: 12px;
+}
+
+.tt-rp-cal {
+  width: 190px;
+}
+
+.tt-rp-cal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 6px;
+}
+
+.tt-rp-cal-title {
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.tt-rp-nav {
+  border: none;
+  background: transparent;
+  color: var(--text);
+  font-size: 14px;
+  cursor: pointer;
+  padding: 0 4px;
+}
+
+.tt-rp-week {
+  display: grid;
+  grid-template-columns: repeat(7, 1fr);
+  text-align: center;
+  font-size: 10px;
+  color: var(--muted);
+  margin-bottom: 4px;
+}
+
+.tt-rp-cells {
+  display: grid;
+  grid-template-columns: repeat(7, 1fr);
+  gap: 2px;
+}
+
+.tt-rp-cell {
+  height: 22px;
+  border-radius: 4px;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  font-size: 11px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.tt-rp-cell:hover:not(:disabled) {
+  background: var(--surface-hover);
+}
+
+.tt-rp-cell.inrange {
+  background: var(--brand-soft);
+  color: var(--brand-deep);
+}
+
+.tt-rp-cell.start,
+.tt-rp-cell.end {
+  background: var(--brand);
+  color: #fff;
+  font-weight: 700;
+}
+
+.tt-rp-cell.today {
+  border: 1px solid var(--brand);
+}
+
+.tt-rp-custom-foot {
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.tt-rp-hint {
+  font-size: 10px;
+  color: var(--muted);
+}
+
+.tt-rp-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.tt-rp-apply {
+  height: 26px;
+  padding: 0 10px;
+  border-radius: var(--r-md, 6px);
+  border: none;
+  background: var(--brand);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.tt-rp-cancel {
+  height: 26px;
+  padding: 0 8px;
+  border-radius: var(--r-md, 6px);
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--muted);
+  font-size: 11px;
+  cursor: pointer;
+}
+</style>

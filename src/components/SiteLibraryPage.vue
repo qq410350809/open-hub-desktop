@@ -1,0 +1,3862 @@
+<script setup lang="ts">
+import { computed, onMounted, onUnmounted, ref, watch } from "vue";
+import { icons } from "../icons";
+import { formatDate, formatRateLimit, logoText } from "../utils";
+import { useStore } from "../composables/useStore";
+import { runCommand, isTauri } from "../composables/useLibrary";
+import AppTable, { type AppTableColumn } from "./AppTable.vue";
+import CustomSelect from "./CustomSelect.vue";
+import type {
+  ChromeSessionInfo,
+  SiteModelCache,
+  SiteModelItem,
+  SiteRecord,
+} from "../types";
+import {
+  SYSTEM_TYPES,
+  isNewApiCompatible,
+  normalizeSystemType,
+  systemTypeLabel,
+} from "../types";
+
+const store = useStore();
+
+// —— 视图模式 ——
+type ViewMode = "cards" | "table" | "topology";
+const currentView = ref<ViewMode>("cards");
+
+// —— 搜索与筛选 ——
+const query = ref("");
+const selectedUsageTab = ref<"all" | "personal" | "pending" | "active" | "runaway" | "favorite">("all");
+const selectedSystemType = ref("all");
+const selectedLevel = ref("all");
+const selectedTag = ref("all");
+const sortBy = ref("default");
+const popularChip = ref("all");
+
+// —— 特性能力快捷开关 ——
+const featureFilters = ref({
+  checkin: false,
+  translation: false,
+  ldc: false,
+  nsfw: false,
+  invite: false,
+  hasKeys: false,
+  checkedInToday: false,
+  syncError: false,
+  proxyPool: false,
+});
+
+function toggleFeature(key: keyof typeof featureFilters.value) {
+  featureFilters.value[key] = !featureFilters.value[key];
+  currentPage.value = 1;
+}
+
+// —— 分页与排序 ——
+const currentPage = ref(1);
+const pageSize = ref(36);
+const tableSorting = ref<Array<{ id: string; desc: boolean }>>([]);
+
+// —— 批量多选与对比池 ——
+const batchSelectedIds = ref<string[]>([]);
+
+function toggleSelectSite(id: string) {
+  const idx = batchSelectedIds.value.indexOf(id);
+  if (idx >= 0) {
+    batchSelectedIds.value.splice(idx, 1);
+  } else {
+    batchSelectedIds.value.push(id);
+  }
+}
+
+function clearBatchSelection() {
+  batchSelectedIds.value = [];
+}
+
+// —— 全景详情深度抽屉 (Slide-over Drawer) ——
+const selectedSiteId = ref("");
+const activeDetailTab = ref<"overview" | "accounts" | "models" | "raw">("overview");
+const drawerModelCache = ref<SiteModelCache | null>(null);
+const drawerModelsLoading = ref(false);
+const drawerModelsError = ref("");
+const drawerModelSearch = ref("");
+const drawerSelectedKey = ref<string | null>(null);
+const drawerLiveFetchingKind = ref<"keys" | "models" | null>(null);
+const idCopied = ref(false);
+
+const selectedSite = computed<SiteRecord | null>(() => {
+  if (!selectedSiteId.value) return null;
+  return store.sites.value.find((s) => s.id === selectedSiteId.value) ?? null;
+});
+
+// —— 快捷热门芯片列表 (主流系统与高频标签) ——
+const popularChipsList = computed(() => [
+  { id: "all", label: "全部", count: store.sites.value.length },
+  { id: "newapi", label: "NewAPI", count: countBySystem("newapi") + countBySystem("newapi2") },
+  { id: "sub2api", label: "Sub2API", count: countBySystem("sub2api") },
+  { id: "oneapi", label: "One API", count: countBySystem("one-api") },
+  { id: "tag_free", label: "公益 / 免费", count: countByTag("免费") + countByTag("公益") },
+  { id: "tag_official", label: "官转直连", count: countByTag("官转") },
+  { id: "feat_trans", label: "沉浸式翻译", count: store.sites.value.filter((s) => s.supportsImmersiveTranslation).length },
+  { id: "feat_ldc", label: "LDC", count: store.sites.value.filter((s) => s.supportsLdc).length },
+  { id: "feat_checkin", label: "每日签到", count: store.sites.value.filter((s) => s.supportsCheckin).length },
+  { id: "feat_nsfw", label: "18+ NSFW", count: store.sites.value.filter((s) => s.supportsNsfw).length },
+]);
+
+function countBySystem(sys: string): number {
+  const norm = normalizeSystemType(sys);
+  return store.sites.value.filter((s) => normalizeSystemType(s.systemType) === norm).length;
+}
+
+function countByTag(tagName: string): number {
+  return store.sites.value.filter((s) => s.tags.includes(tagName)).length;
+}
+
+function selectPopularChip(chipId: string) {
+  if (popularChip.value === chipId) {
+    popularChip.value = "all";
+  } else {
+    popularChip.value = chipId;
+  }
+  currentPage.value = 1;
+}
+
+// —— 宏观驾驶舱 4 大核心指标 ——
+const metrics = computed(() => {
+  const allSites = store.sites.value;
+  const totalSites = allSites.length;
+  const activeSites = allSites.filter((s) => !s.isRunaway).length;
+  const personalSites = allSites.filter((s) => s.isPersonal).length;
+  const pendingSites = allSites.filter((s) => s.isPending).length;
+  const runawaySites = allSites.filter((s) => s.isRunaway).length;
+
+  // 账号会话与令牌统计
+  let totalAccounts = 0;
+  let accountsWithTokens = 0;
+  let checkedInAccounts = 0;
+  let errorAccounts = 0;
+
+  const usageMap = store.chromeUsageAccounts.value;
+  for (const siteId of Object.keys(usageMap)) {
+    const sessions = usageMap[siteId] ?? [];
+    for (const session of sessions) {
+      if (session.isValid) {
+        totalAccounts += 1;
+        if (session.hasAccessToken) accountsWithTokens += 1;
+        if (session.checkedInToday) checkedInAccounts += 1;
+        if (session.syncError || session.checkinError) errorAccounts += 1;
+      }
+    }
+  }
+
+  // 架构分布
+  const newApiCount = allSites.filter((s) => isNewApiCompatible(s.systemType)).length;
+  const sub2ApiCount = allSites.filter((s) => normalizeSystemType(s.systemType) === "sub2api").length;
+
+  return {
+    totalSites,
+    activeSites,
+    personalSites,
+    pendingSites,
+    runawaySites,
+    totalAccounts,
+    accountsWithTokens,
+    checkedInAccounts,
+    errorAccounts,
+    newApiCount,
+    sub2ApiCount,
+  };
+});
+
+// —— 分类状态 Tab 计数 ——
+const tabCounts = computed(() => {
+  const allSites = store.sites.value;
+  return {
+    all: allSites.length,
+    personal: allSites.filter((s) => s.isPersonal).length,
+    pending: allSites.filter((s) => s.isPending).length,
+    active: allSites.filter((s) => !s.isRunaway).length,
+    runaway: allSites.filter((s) => s.isRunaway).length,
+    favorite: allSites.filter((s) => s.favorite).length,
+  };
+});
+
+// —— 下拉筛选选项 ——
+const systemTypeOptions = computed(() => [
+  { value: "all", text: "全部系统架构" },
+  ...SYSTEM_TYPES.map((st) => {
+    const count = countBySystem(st.value);
+    return { value: st.value, text: `${st.text} (${count})` };
+  }),
+  { value: "unknown", text: `其他 / 未知 (${store.sites.value.filter((s) => !s.systemType).length})` },
+]);
+
+const levelOptions = [
+  { value: "all", text: "全部注册门槛" },
+  { value: "0", text: "LV0 · 无限制开放" },
+  { value: "1", text: "LV1 · 需基础账号" },
+  { value: "2", text: "LV2 · 进阶门槛" },
+  { value: "3", text: "LV3+ · 高限制门槛" },
+];
+
+const tagOptions = computed(() => {
+  const allTagsSet = new Set<string>();
+  for (const s of store.sites.value) {
+    for (const t of s.tags) if (t.trim()) allTagsSet.add(t.trim());
+  }
+  return [
+    { value: "all", text: "全部标签分类" },
+    ...Array.from(allTagsSet).sort().map((tag) => {
+      const count = countByTag(tag);
+      return { value: tag, text: `${tag} (${count})` };
+    }),
+  ];
+});
+
+const sortOptions = [
+  { value: "default", text: "默认综合排序 (在用/活跃优先)" },
+  { value: "updated_desc", text: "最近更新时间 (从新到旧)" },
+  { value: "level_asc", text: "注册等级门槛 (从低到高)" },
+  { value: "level_desc", text: "注册等级门槛 (从高到低)" },
+  { value: "name_asc", text: "站点名称 (A → Z)" },
+];
+
+// —— 核心过滤与排序计算 ——
+const filteredSites = computed(() => {
+  const term = query.value.trim().toLocaleLowerCase("zh-CN");
+  let list = store.sites.value.filter((site) => {
+    // 1. 分类 Tab
+    if (selectedUsageTab.value === "personal" && !site.isPersonal) return false;
+    if (selectedUsageTab.value === "pending" && !site.isPending) return false;
+    if (selectedUsageTab.value === "active" && site.isRunaway) return false;
+    if (selectedUsageTab.value === "runaway" && !site.isRunaway) return false;
+    if (selectedUsageTab.value === "favorite" && !site.favorite) return false;
+
+    // 2. 热门芯片
+    if (popularChip.value === "newapi" && !isNewApiCompatible(site.systemType)) return false;
+    if (popularChip.value === "sub2api" && normalizeSystemType(site.systemType) !== "sub2api") return false;
+    if (popularChip.value === "oneapi" && normalizeSystemType(site.systemType) !== "oneapi") return false;
+    if (popularChip.value === "tag_free" && !site.tags.includes("免费") && !site.tags.includes("公益")) return false;
+    if (popularChip.value === "tag_official" && !site.tags.includes("官转")) return false;
+    if (popularChip.value === "feat_trans" && !site.supportsImmersiveTranslation) return false;
+    if (popularChip.value === "feat_ldc" && !site.supportsLdc) return false;
+    if (popularChip.value === "feat_checkin" && !site.supportsCheckin) return false;
+    if (popularChip.value === "feat_nsfw" && !site.supportsNsfw) return false;
+
+    // 3. 系统类型
+    if (selectedSystemType.value !== "all") {
+      const siteNorm = normalizeSystemType(site.systemType);
+      if (selectedSystemType.value === "unknown") {
+        if (site.systemType && siteNorm) return false;
+      } else {
+        if (siteNorm !== normalizeSystemType(selectedSystemType.value)) return false;
+      }
+    }
+
+    // 4. 等级门槛
+    if (selectedLevel.value !== "all") {
+      const lvl = Number(selectedLevel.value);
+      if (lvl >= 3) {
+        if (site.registrationLimit < 3) return false;
+      } else {
+        if (site.registrationLimit !== lvl) return false;
+      }
+    }
+
+    // 5. 标签
+    if (selectedTag.value !== "all" && !site.tags.includes(selectedTag.value)) return false;
+
+    // 6. 特性开关
+    if (featureFilters.value.checkin && !site.supportsCheckin) return false;
+    if (featureFilters.value.translation && !site.supportsImmersiveTranslation) return false;
+    if (featureFilters.value.ldc && !site.supportsLdc) return false;
+    if (featureFilters.value.nsfw && !site.supportsNsfw) return false;
+    if (featureFilters.value.invite && !site.requiresInviteCode) return false;
+    if (featureFilters.value.proxyPool && !site.useProxyPool) return false;
+
+    const sessions = store.chromeUsageAccounts.value[site.id] ?? [];
+    if (featureFilters.value.hasKeys) {
+      const hasKey = sessions.some((s) => s.apiKeyCount > 0);
+      if (!hasKey) return false;
+    }
+    if (featureFilters.value.checkedInToday) {
+      const checked = sessions.some((s) => s.checkedInToday);
+      if (!checked) return false;
+    }
+    if (featureFilters.value.syncError) {
+      const hasErr = sessions.some((s) => s.syncError || s.checkinError || s.apiSyncError);
+      if (!hasErr) return false;
+    }
+
+    // 7. 搜索关键词
+    if (!term) return true;
+    const haystack = [
+      site.name,
+      site.apiBaseUrl,
+      site.description,
+      site.rateLimit,
+      systemTypeLabel(site.systemType),
+      ...site.tags,
+      ...site.maintainers.map((m) => `${m.name} ${m.username || ""} ${m.id || ""}`),
+    ]
+      .join(" ")
+      .toLocaleLowerCase("zh-CN");
+
+    return haystack.includes(term);
+  });
+
+  // 8. 排序逻辑
+  if (sortBy.value === "updated_desc") {
+    list = [...list].sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime());
+  } else if (sortBy.value === "level_asc") {
+    list = [...list].sort((a, b) => a.registrationLimit - b.registrationLimit);
+  } else if (sortBy.value === "level_desc") {
+    list = [...list].sort((a, b) => b.registrationLimit - a.registrationLimit);
+  } else if (sortBy.value === "name_asc") {
+    list = [...list].sort((a, b) => a.name.localeCompare(b.name, "zh-CN"));
+  } else {
+    // 默认综合排序：在用 > 待定 > 存活，再按更新时间
+    list = [...list].sort((a, b) => {
+      const scoreA = (a.isPersonal ? 100 : a.isPending ? 50 : 0) - (a.isRunaway ? 200 : 0);
+      const scoreB = (b.isPersonal ? 100 : b.isPending ? 50 : 0) - (b.isRunaway ? 200 : 0);
+      if (scoreA !== scoreB) return scoreB - scoreA;
+      return new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime();
+    });
+  }
+
+  return list;
+});
+
+// —— 分页切片 ——
+const paginatedSites = computed(() => {
+  const start = (currentPage.value - 1) * pageSize.value;
+  return filteredSites.value.slice(start, start + pageSize.value);
+});
+
+const totalPages = computed(() => Math.max(1, Math.ceil(filteredSites.value.length / pageSize.value)));
+
+// —— 全景表格列配置 ——
+const tableColumns = computed<AppTableColumn[]>(() => [
+  { key: "siteInfo", title: "站点标识 / 架构", width: "minmax(220px, 1.4fr)", sortable: true },
+  { key: "systemType", title: "系统类型", width: "120px", sortable: true },
+  { key: "accounts", title: "账号与会话", width: "160px", sortable: false },
+  { key: "quota", title: "剩余额度", width: "120px", align: "right" as const, sortable: true },
+  { key: "regLevel", title: "注册门槛", width: "95px", align: "center" as const, sortable: true },
+  { key: "rateLimit", title: "速率限制", width: "110px", sortable: true },
+  { key: "capabilities", title: "特性能力", width: "130px", sortable: false },
+  { key: "updatedAt", title: "更新时间", width: "130px", align: "right" as const, sortable: true },
+  { key: "actions", title: "快捷操作", width: "140px", align: "right" as const, sortable: false },
+]);
+
+// —— 辅助格式化方法 ——
+function getSiteSessions(siteId: string): ChromeSessionInfo[] {
+  return (store.chromeUsageAccounts.value[siteId] ?? []).filter((s) => s.isValid);
+}
+
+function getSiteQuotaText(siteId: string): string {
+  const sessions = getSiteSessions(siteId);
+  if (!sessions.length) return "未关联";
+  const validWithQuota = sessions.filter((s) => s.remaining !== null && Number.isFinite(s.remaining));
+  if (!validWithQuota.length) return "未读取";
+  const total = validWithQuota.reduce((acc, cur) => acc + (cur.remaining ?? 0), 0);
+  const unit = validWithQuota[0]?.unit || "";
+  const num = new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 2 }).format(total);
+  return unit ? `${num} ${unit}` : num;
+}
+
+function systemTone(raw: string): string {
+  const norm = normalizeSystemType(raw);
+  if (norm.includes("newapi")) return "brand";
+  if (norm.includes("sub2api")) return "violet";
+  if (norm.includes("oneapi") || norm.includes("onehub")) return "info";
+  if (norm.includes("openai") || norm.includes("claude") || norm.includes("gemini")) return "success";
+  return "neutral";
+}
+
+function siteInitials(apiBaseUrl: string, name: string): string {
+  return logoText(apiBaseUrl, name).slice(0, 3).toUpperCase();
+}
+
+function hasActiveFilters(): boolean {
+  return (
+    Boolean(query.value) ||
+    selectedUsageTab.value !== "all" ||
+    popularChip.value !== "all" ||
+    selectedSystemType.value !== "all" ||
+    selectedLevel.value !== "all" ||
+    selectedTag.value !== "all" ||
+    sortBy.value !== "default" ||
+    Object.values(featureFilters.value).some(Boolean)
+  );
+}
+
+function resetAllFilters() {
+  query.value = "";
+  selectedUsageTab.value = "all";
+  popularChip.value = "all";
+  selectedSystemType.value = "all";
+  selectedLevel.value = "all";
+  selectedTag.value = "all";
+  sortBy.value = "default";
+  for (const k of Object.keys(featureFilters.value) as Array<keyof typeof featureFilters.value>) {
+    featureFilters.value[k] = false;
+  }
+  currentPage.value = 1;
+}
+
+// —— 抽屉交互逻辑 ——
+async function openModelDetail(site: SiteRecord) {
+  selectedSiteId.value = site.id;
+  activeDetailTab.value = "overview";
+  drawerModelSearch.value = "";
+  drawerSelectedKey.value = null;
+  drawerModelsError.value = "";
+  drawerModelCache.value = null;
+  await readDrawerModelCache(site.id);
+}
+
+function closeDetail() {
+  selectedSiteId.value = "";
+  drawerModelCache.value = null;
+}
+
+async function readDrawerModelCache(siteId: string) {
+  if (!isTauri) return;
+  drawerModelsLoading.value = true;
+  try {
+    const data = await runCommand<SiteModelCache>("get_site_model_cache", { siteId });
+    if (data) {
+      drawerModelCache.value = data;
+    }
+  } catch (err) {
+    drawerModelsError.value = String(err);
+  } finally {
+    drawerModelsLoading.value = false;
+  }
+}
+
+async function triggerDrawerSync(mode: "keys" | "models") {
+  if (!selectedSite.value) return;
+  const site = selectedSite.value;
+  drawerLiveFetchingKind.value = mode;
+  try {
+    const sessions = getSiteSessions(site.id);
+    let baseUrl = site.apiBaseUrl.trim();
+    if (!baseUrl.endsWith("/")) baseUrl += "/";
+
+    if (sessions.length === 0) {
+      const result = await runCommand<any>("fetch_site_models_json", {
+        url: baseUrl,
+        siteId: site.id,
+      });
+      await runCommand("save_site_model_cache_for_account", {
+        siteId: site.id,
+        account: {
+          profileId: "",
+          profileName: "",
+          accountName: "",
+          username: "",
+          keys: result.keys ?? [],
+          keyGroups: result.keyGroups ?? {},
+          keyModels: mode === "models" ? result.keyModels ?? {} : {},
+          error: "",
+        },
+        result,
+        preserveKeys: false,
+      });
+    } else {
+      for (const session of sessions) {
+        try {
+          const result = await runCommand<any>("fetch_site_models_json", {
+            url: baseUrl,
+            siteId: site.id,
+            profileId: session.profileId,
+          });
+          await runCommand("save_site_model_cache_for_account", {
+            siteId: site.id,
+            account: {
+              profileId: session.profileId,
+              profileName: session.profileName,
+              accountName: session.accountName,
+              username: session.username,
+              keys: result.keys ?? [],
+              keyGroups: result.keyGroups ?? {},
+              keyModels: result.keyModels ?? {},
+              error: "",
+            },
+            result,
+            preserveKeys: false,
+          });
+        } catch (err) {
+          console.warn("同步账号模型失败:", err);
+        }
+      }
+    }
+    await readDrawerModelCache(site.id);
+    store.showToast(mode === "keys" ? "Key 列表同步完成" : "模型列表同步完成");
+  } catch (err) {
+    store.showToast(`同步失败：${String(err)}`, true);
+  } finally {
+    drawerLiveFetchingKind.value = null;
+  }
+}
+
+async function copyText(text: string, label = "内容") {
+  await store.copyAddress(text, label);
+  idCopied.value = true;
+  setTimeout(() => (idCopied.value = false), 2000);
+}
+
+function maskApiKey(key: string): string {
+  const value = key.trim();
+  if (!value) return "—";
+  if (value.length <= 8) return "••••••••";
+  const prefix = value.startsWith("sk-") ? 7 : 4;
+  const suffix = Math.min(4, Math.max(2, Math.floor(value.length / 8)));
+  return `${value.slice(0, prefix)}••••••••${value.slice(-suffix)}`;
+}
+
+const drawerFilteredModels = computed<SiteModelItem[]>(() => {
+  if (!drawerModelCache.value) return [];
+  let list = drawerModelCache.value.models || [];
+  if (drawerSelectedKey.value) {
+    for (const acc of drawerModelCache.value.accounts || []) {
+      if (acc.keys.includes(drawerSelectedKey.value)) {
+        const km = acc.keyModels?.[drawerSelectedKey.value];
+        if (Array.isArray(km)) {
+          list = km;
+          break;
+        }
+      }
+    }
+  }
+  const q = drawerModelSearch.value.trim().toLowerCase();
+  if (!q) return list;
+  return list.filter((m) => m.id.toLowerCase().includes(q) || (m.ownedBy && m.ownedBy.toLowerCase().includes(q)));
+});
+
+// —— 批量操作 ——
+async function batchSetUsage(state: "personal" | "pending" | "unused") {
+  if (!batchSelectedIds.value.length) return;
+  for (const id of batchSelectedIds.value) {
+    const site = store.sites.value.find((s) => s.id === id);
+    if (site) await store.setUsageState(site, state);
+  }
+  store.showToast(`已批量更新 ${batchSelectedIds.value.length} 个站点状态`);
+  clearBatchSelection();
+}
+
+async function batchToggleRunaway() {
+  if (!batchSelectedIds.value.length) return;
+  for (const id of batchSelectedIds.value) {
+    const site = store.sites.value.find((s) => s.id === id);
+    if (site) await store.toggleRunaway(site);
+  }
+  store.showToast(`已批量更新 ${batchSelectedIds.value.length} 个站点存活状态`);
+  clearBatchSelection();
+}
+
+async function batchSyncSession() {
+  if (!batchSelectedIds.value.length) return;
+  store.openSyncDialog();
+}
+
+// —— 键盘快捷键 (⌘ K 聚焦搜索) ——
+function handleGlobalKeydown(e: KeyboardEvent) {
+  if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+    e.preventDefault();
+    const searchInput = document.getElementById("sl-search-input") as HTMLInputElement | null;
+    searchInput?.focus();
+    searchInput?.select();
+  }
+}
+
+watch([query, selectedUsageTab, selectedSystemType, selectedLevel, selectedTag, sortBy, popularChip], () => {
+  currentPage.value = 1;
+});
+
+onMounted(() => {
+  window.addEventListener("keydown", handleGlobalKeydown);
+  if (!store.sites.value.length && !store.loading.value) {
+    void store.loadLibrary();
+  }
+});
+
+onUnmounted(() => {
+  window.removeEventListener("keydown", handleGlobalKeydown);
+});
+</script>
+
+<template>
+  <div class="sl-explorer-root">
+    <!-- 1. 顶部宏观数据驾驶舱 -->
+    <header class="sl-cockpit-bar">
+      <div class="sl-cockpit-header">
+        <div class="sl-brand-title">
+          <div class="sl-brand-logo" v-html="icons.database" />
+          <div>
+            <div class="sl-eyebrow">
+              <span>OpenHub · 站点资料库全景控制台</span>
+              <span class="sl-live-dot" />
+            </div>
+            <h1>站点库控制台</h1>
+          </div>
+        </div>
+
+        <div class="sl-cockpit-actions">
+          <div class="sl-sync-status-card">
+            <span class="sl-status-indicator" :class="{ synced: !store.syncingSites.value && !store.syncingModelKeys.value }" />
+            <div class="sl-status-text">
+              <strong>{{ store.syncingSites.value || store.syncingModelKeys.value ? "正在同步中…" : "本地数据已就绪" }}</strong>
+              <small>已收录 {{ store.sites.value.length }} 个站点资料</small>
+            </div>
+          </div>
+
+          <button
+            type="button"
+            class="sl-btn-secondary"
+            :disabled="store.syncingSites.value || store.syncingModelKeys.value"
+            @click="store.openSyncDialog()"
+          >
+            <span :class="{ 'is-spinning': store.syncingSites.value || store.syncingModelKeys.value }" v-html="icons.restore" />
+            <span>{{ selectedUsageTab === 'all' ? '同步站点' : '额度与会话同步' }}</span>
+          </button>
+
+          <button
+            type="button"
+            class="sl-btn-primary"
+            @click="store.openModal()"
+          >
+            <span v-html="icons.plus" />
+            <span>添加站点</span>
+          </button>
+        </div>
+      </div>
+
+      <!-- 宏观 4 大指标卡片 -->
+      <div class="sl-metrics-grid">
+        <div class="sl-metric-card" @click="selectedUsageTab = 'all'">
+          <div class="sl-metric-icon sl-tone-brand" v-html="icons.layers" />
+          <div class="sl-metric-info">
+            <span class="sl-metric-label">收录站点总数</span>
+            <div class="sl-metric-val">
+              <strong>{{ metrics.totalSites }}</strong>
+              <small>存活 {{ metrics.activeSites }} · 跑路 {{ metrics.runawaySites }}</small>
+            </div>
+          </div>
+        </div>
+
+        <div class="sl-metric-card" @click="selectedUsageTab = 'personal'">
+          <div class="sl-metric-icon sl-tone-success" v-html="icons.bookmark" />
+          <div class="sl-metric-info">
+            <span class="sl-metric-label">在用与待定监控</span>
+            <div class="sl-metric-val">
+              <strong class="text-success">{{ metrics.personalSites }} 在用</strong>
+              <small>待定 {{ metrics.pendingSites }} 个站点</small>
+            </div>
+          </div>
+        </div>
+
+        <div class="sl-metric-card" @click="currentView = 'topology'">
+          <div class="sl-metric-icon sl-tone-info" v-html="icons.user" />
+          <div class="sl-metric-info">
+            <span class="sl-metric-label">已关联 Chrome 账号</span>
+            <div class="sl-metric-val">
+              <strong>{{ metrics.totalAccounts }} 个会话</strong>
+              <small>含 {{ metrics.accountsWithTokens }} 个 NewAPI 令牌</small>
+            </div>
+          </div>
+        </div>
+
+        <div class="sl-metric-card" @click="toggleFeature('checkedInToday')">
+          <div class="sl-metric-icon sl-tone-violet" v-html="icons.calendar" />
+          <div class="sl-metric-info">
+            <span class="sl-metric-label">今日签到与健康监控</span>
+            <div class="sl-metric-val">
+              <strong class="text-violet">{{ metrics.checkedInAccounts }} 已签到</strong>
+              <small :class="{ 'text-danger': metrics.errorAccounts > 0 }">
+                {{ metrics.errorAccounts > 0 ? `${metrics.errorAccounts} 个账号同步异常` : '全部账号状态正常' }}
+              </small>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 快捷热门分类一键直达滚动栏 -->
+      <div class="sl-popular-chips-bar">
+        <span class="sl-chips-label">快捷直达：</span>
+        <div class="sl-chips-scroll">
+          <button
+            v-for="chip in popularChipsList"
+            :key="chip.id"
+            type="button"
+            class="sl-chip-btn"
+            :class="{ active: popularChip === chip.id }"
+            @click="selectPopularChip(chip.id)"
+          >
+            <span>{{ chip.label }}</span>
+            <b class="sl-chip-num">{{ chip.count }}</b>
+          </button>
+        </div>
+      </div>
+    </header>
+
+    <!-- 2. 控制中心：分类 Tab + 视图切换 + 筛选工具箱 -->
+    <div class="sl-control-center">
+      <!-- 上半区：分类 Tab 与 视图切换 -->
+      <div class="sl-control-top-row">
+        <!-- 分类状态 Tabs -->
+        <nav class="sl-usage-tabs" role="tablist">
+          <button
+            type="button"
+            role="tab"
+            :class="{ active: selectedUsageTab === 'all' }"
+            @click="selectedUsageTab = 'all'"
+          >
+            <span v-html="icons.layers" />
+            <span>全部</span>
+            <b class="sl-tab-badge">{{ tabCounts.all }}</b>
+          </button>
+          <button
+            type="button"
+            role="tab"
+            :class="{ active: selectedUsageTab === 'personal' }"
+            @click="selectedUsageTab = 'personal'"
+          >
+            <span v-html="icons.bookmark" />
+            <span>在用</span>
+            <b class="sl-tab-badge">{{ tabCounts.personal }}</b>
+          </button>
+          <button
+            type="button"
+            role="tab"
+            :class="{ active: selectedUsageTab === 'pending' }"
+            @click="selectedUsageTab = 'pending'"
+          >
+            <span v-html="icons.clock" />
+            <span>待定</span>
+            <b class="sl-tab-badge">{{ tabCounts.pending }}</b>
+          </button>
+          <button
+            type="button"
+            role="tab"
+            :class="{ active: selectedUsageTab === 'active' }"
+            @click="selectedUsageTab = 'active'"
+          >
+            <span v-html="icons.heartPulse" />
+            <span>存活</span>
+            <b class="sl-tab-badge">{{ tabCounts.active }}</b>
+          </button>
+          <button
+            type="button"
+            role="tab"
+            :class="{ active: selectedUsageTab === 'runaway' }"
+            @click="selectedUsageTab = 'runaway'"
+          >
+            <span v-html="icons.flag" />
+            <span>跑路</span>
+            <b class="sl-tab-badge">{{ tabCounts.runaway }}</b>
+          </button>
+          <button
+            type="button"
+            role="tab"
+            :class="{ active: selectedUsageTab === 'favorite' }"
+            @click="selectedUsageTab = 'favorite'"
+          >
+            <span v-html="icons.star" />
+            <span>收藏</span>
+            <b class="sl-tab-badge">{{ tabCounts.favorite }}</b>
+          </button>
+        </nav>
+
+        <!-- 视图切换模式 -->
+        <div class="sl-view-switcher">
+          <button
+            type="button"
+            :class="{ active: currentView === 'cards' }"
+            title="画廊卡片视图"
+            @click="currentView = 'cards'"
+          >
+            <span v-html="icons.grid" />
+            <span>画廊卡片</span>
+          </button>
+          <button
+            type="button"
+            :class="{ active: currentView === 'table' }"
+            title="全景数据表视图"
+            @click="currentView = 'table'"
+          >
+            <span v-html="icons.rows" />
+            <span>全景数据表</span>
+          </button>
+          <button
+            type="button"
+            :class="{ active: currentView === 'topology' }"
+            title="账号会话拓扑视图"
+            @click="currentView = 'topology'"
+          >
+            <span v-html="icons.user" />
+            <span>账号拓扑矩阵</span>
+          </button>
+        </div>
+      </div>
+
+      <!-- 中间区：搜索与筛选下拉 -->
+      <div class="sl-filters-row">
+        <!-- 搜索框 -->
+        <div class="sl-search-box">
+          <span v-html="icons.search" />
+          <input
+            id="sl-search-input"
+            v-model="query"
+            type="search"
+            placeholder="搜索站点名称、API 地址、描述、标签、维护者…"
+            autocomplete="off"
+          />
+          <button v-if="query" type="button" class="sl-clear-search" @click="query = ''">
+            <span v-html="icons.close" />
+          </button>
+          <kbd>⌘ K</kbd>
+        </div>
+
+        <!-- 系统架构下拉 -->
+        <CustomSelect
+          class="sl-filter-dropdown"
+          :options="systemTypeOptions"
+          :model-value="selectedSystemType"
+          aria-label="系统架构选择"
+          @update:model-value="selectedSystemType = String($event)"
+        />
+
+        <!-- 注册门槛下拉 -->
+        <CustomSelect
+          class="sl-filter-dropdown"
+          :options="levelOptions"
+          :model-value="selectedLevel"
+          aria-label="注册等级门槛"
+          @update:model-value="selectedLevel = String($event)"
+        />
+
+        <!-- 标签下拉 -->
+        <CustomSelect
+          class="sl-filter-dropdown"
+          :options="tagOptions"
+          :model-value="selectedTag"
+          aria-label="标签筛选"
+          @update:model-value="selectedTag = String($event)"
+        />
+
+        <!-- 智能排序 -->
+        <CustomSelect
+          class="sl-filter-dropdown"
+          :options="sortOptions"
+          :model-value="sortBy"
+          aria-label="排序规则"
+          @update:model-value="sortBy = String($event)"
+        />
+      </div>
+
+      <!-- 下半区：特性能力快捷开关芯片栏 -->
+      <div class="sl-feature-bar">
+        <div class="sl-feature-chips">
+          <span class="sl-chips-title">特性与能力：</span>
+          <button
+            type="button"
+            class="sl-chip"
+            :class="{ active: featureFilters.checkin }"
+            @click="toggleFeature('checkin')"
+          >
+            📅 每日签到
+          </button>
+          <button
+            type="button"
+            class="sl-chip"
+            :class="{ active: featureFilters.translation }"
+            @click="toggleFeature('translation')"
+          >
+            🌐 沉浸式翻译
+          </button>
+          <button
+            type="button"
+            class="sl-chip"
+            :class="{ active: featureFilters.ldc }"
+            @click="toggleFeature('ldc')"
+          >
+            💳 LDC 支付
+          </button>
+          <button
+            type="button"
+            class="sl-chip"
+            :class="{ active: featureFilters.nsfw }"
+            @click="toggleFeature('nsfw')"
+          >
+            🔞 18+ NSFW
+          </button>
+          <button
+            type="button"
+            class="sl-chip"
+            :class="{ active: featureFilters.invite }"
+            @click="toggleFeature('invite')"
+          >
+            🎟️ 需邀请码
+          </button>
+          <button
+            type="button"
+            class="sl-chip"
+            :class="{ active: featureFilters.hasKeys }"
+            @click="toggleFeature('hasKeys')"
+          >
+            🔑 已同步 Key
+          </button>
+          <button
+            type="button"
+            class="sl-chip"
+            :class="{ active: featureFilters.checkedInToday }"
+            @click="toggleFeature('checkedInToday')"
+          >
+            ✅ 今日已签到
+          </button>
+          <button
+            type="button"
+            class="sl-chip"
+            :class="{ active: featureFilters.syncError }"
+            @click="toggleFeature('syncError')"
+          >
+            ⚠️ 同步存在异常
+          </button>
+          <button
+            type="button"
+            class="sl-chip"
+            :class="{ active: featureFilters.proxyPool }"
+            @click="toggleFeature('proxyPool')"
+          >
+            🛡️ 走代理池
+          </button>
+        </div>
+
+        <!-- 当前过滤结果总数与清空按钮 -->
+        <div class="sl-results-meta">
+          <button
+            v-if="hasActiveFilters()"
+            type="button"
+            class="sl-clear-filters-btn"
+            @click="resetAllFilters"
+          >
+            <span v-html="icons.close" />
+            <span>重置筛选</span>
+          </button>
+          <span class="sl-filter-count">
+            匹配到 <b>{{ filteredSites.length }}</b> / {{ store.sites.value.length }} 个站点
+          </span>
+        </div>
+      </div>
+    </div>
+
+    <!-- 3. 主视图区域 -->
+    <main class="sl-main-content">
+      <!-- 视图 A：智能画廊卡片流 -->
+      <section v-if="currentView === 'cards'" class="sl-cards-view">
+        <div v-if="store.loading.value" class="sl-loading-state">
+          <span class="is-spinning" v-html="icons.restore" />
+          <p>正在读取本地站点资料库…</p>
+        </div>
+
+        <div v-else-if="!filteredSites.length" class="sl-empty-state">
+          <span v-html="icons.search" />
+          <h3>未找到匹配的站点</h3>
+          <p>请尝试重置筛选条件或更改搜索关键字</p>
+          <button type="button" class="sl-btn-secondary" @click="resetAllFilters">
+            清除全部筛选
+          </button>
+        </div>
+
+        <div v-else class="sl-cards-grid">
+          <article
+            v-for="site in paginatedSites"
+            :key="site.id"
+            class="sl-card"
+            :class="{
+              'is-selected': selectedSiteId === site.id,
+              'is-runaway': site.isRunaway,
+              'is-personal': site.isPersonal,
+              'is-pending': site.isPending,
+            }"
+            @click="openModelDetail(site)"
+          >
+            <!-- 卡片顶部：Avatar + 标题 + 架构徽章 + 多选/更多菜单 -->
+            <div class="sl-card-head">
+              <div class="sl-card-identity">
+                <span class="sl-card-avatar" :class="`sl-tone-${systemTone(site.systemType)}`">
+                  {{ siteInitials(site.apiBaseUrl, site.name) }}
+                </span>
+                <div class="sl-card-title-box">
+                  <div class="sl-card-title-row">
+                    <h3 :title="site.name">{{ site.name }}</h3>
+                    <span v-if="site.systemType" class="sl-pill sl-pill-system" :class="`sl-pill-${systemTone(site.systemType)}`">
+                      {{ systemTypeLabel(site.systemType) }}
+                    </span>
+                    <span v-if="site.isRunaway" class="sl-pill sl-pill-runaway">已跑路</span>
+                    <span v-else-if="site.isPersonal" class="sl-pill sl-pill-personal">在用</span>
+                    <span v-else-if="site.isPending" class="sl-pill sl-pill-pending">待定</span>
+                    <span v-if="site.isFakeCharity" class="sl-pill sl-pill-fake">伪公益</span>
+                  </div>
+                  <small class="sl-card-url" :title="site.apiBaseUrl">{{ site.apiBaseUrl }}</small>
+                </div>
+              </div>
+
+              <!-- 右上角多选与操作 -->
+              <div class="sl-card-head-tools" @click.stop>
+                <button
+                  type="button"
+                  class="sl-card-select-btn"
+                  :class="{ active: batchSelectedIds.includes(site.id) }"
+                  title="选择此站点进行批量操作"
+                  @click="toggleSelectSite(site.id)"
+                >
+                  <span v-html="batchSelectedIds.includes(site.id) ? icons.check : icons.plus" />
+                </button>
+              </div>
+            </div>
+
+            <!-- 卡片特性与标签徽章栏 -->
+            <div class="sl-card-badges">
+              <span class="sl-card-tag sl-tone-neutral">LV{{ site.registrationLimit }}</span>
+              <span v-if="formatRateLimit(site.rateLimit)" class="sl-card-tag sl-tone-brand" :title="`速率限制：${formatRateLimit(site.rateLimit)}`">
+                {{ formatRateLimit(site.rateLimit) }}
+              </span>
+              <span v-if="site.supportsCheckin" class="sl-card-feat">📅 每日签到</span>
+              <span v-if="site.supportsImmersiveTranslation" class="sl-card-feat">🌐 沉浸式翻译</span>
+              <span v-if="site.supportsLdc" class="sl-card-feat">💳 LDC</span>
+              <span v-if="site.supportsNsfw" class="sl-card-feat sl-feat-nsfw">🔞 18+</span>
+              <span v-if="site.requiresInviteCode" class="sl-card-feat sl-feat-invite">🎟️ 邀请码</span>
+            </div>
+
+            <!-- 标签列表 -->
+            <div v-if="site.tags.length" class="sl-card-tags-row">
+              <span v-for="t in site.tags.slice(0, 4)" :key="t" class="sl-tag-chip">{{ t }}</span>
+              <span v-if="site.tags.length > 4" class="sl-tag-more">+{{ site.tags.length - 4 }}</span>
+            </div>
+
+            <!-- 账号额度或概览条目 -->
+            <div class="sl-card-specs">
+              <div class="sl-spec-item">
+                <span class="sl-spec-k">关联会话</span>
+                <strong class="sl-spec-v">{{ getSiteSessions(site.id).length }} 个账号</strong>
+              </div>
+              <div class="sl-spec-item">
+                <span class="sl-spec-k">剩余额度</span>
+                <strong class="sl-spec-v text-brand">{{ getSiteQuotaText(site.id) }}</strong>
+              </div>
+              <div class="sl-spec-item">
+                <span class="sl-spec-k">更新时间</span>
+                <strong class="sl-spec-v font-mono">{{ formatDate(site.updatedAt) }}</strong>
+              </div>
+            </div>
+
+            <!-- 描述文本 -->
+            <p class="sl-card-desc" :class="{ muted: !site.description }">
+              {{ site.description || "暂无描述说明。" }}
+            </p>
+
+            <!-- 卡片底栏：快捷链接与全景按钮 -->
+            <div class="sl-card-footer" @click.stop>
+              <div class="sl-card-links">
+                <button
+                  v-if="site.apiBaseUrl"
+                  type="button"
+                  class="sl-link-btn"
+                  title="API 地址"
+                  @click="store.openLinkDialog(site, 'api', $event.currentTarget as HTMLElement)"
+                >
+                  <span v-html="icons.link" />
+                </button>
+                <button
+                  v-if="site.checkinUrl"
+                  type="button"
+                  class="sl-link-btn active"
+                  title="签到地址"
+                  @click="store.openLinkDialog(site, 'checkin', $event.currentTarget as HTMLElement)"
+                >
+                  <span v-html="icons.calendar" />
+                </button>
+                <button
+                  v-if="site.benefitUrl"
+                  type="button"
+                  class="sl-link-btn"
+                  title="福利站地址"
+                  @click="store.openLinkDialog(site, 'benefit', $event.currentTarget as HTMLElement)"
+                >
+                  <span v-html="icons.gift" />
+                </button>
+                <button
+                  v-if="site.statusUrl"
+                  type="button"
+                  class="sl-link-btn"
+                  title="状态页地址"
+                  @click="store.openLinkDialog(site, 'status', $event.currentTarget as HTMLElement)"
+                >
+                  <span v-html="icons.pulse" />
+                </button>
+              </div>
+
+              <div class="sl-card-footer-actions">
+                <button
+                  type="button"
+                  class="sl-card-models-btn"
+                  title="查看支持模型与 Key"
+                  @click.stop="store.openSiteModelsDialog(site)"
+                >
+                  <span v-html="icons.cpu" />
+                  <span>模型与 Key</span>
+                </button>
+                <button
+                  type="button"
+                  class="sl-card-detail-btn"
+                  @click.stop="openModelDetail(site)"
+                >
+                  <span>全景参数</span>
+                  <span v-html="icons.chevron" />
+                </button>
+              </div>
+            </div>
+          </article>
+        </div>
+
+        <!-- 卡片视图分页 -->
+        <footer v-if="totalPages > 1" class="sl-pagination-bar">
+          <button
+            type="button"
+            class="sl-page-btn"
+            :disabled="currentPage <= 1"
+            @click="currentPage--"
+          >
+            上一页
+          </button>
+          <span class="sl-page-info">第 {{ currentPage }} / {{ totalPages }} 页</span>
+          <button
+            type="button"
+            class="sl-page-btn"
+            :disabled="currentPage >= totalPages"
+            @click="currentPage++"
+          >
+            下一页
+          </button>
+        </footer>
+      </section>
+
+      <!-- 视图 B：全景数据大表视图 -->
+      <section v-else-if="currentView === 'table'" class="sl-table-view">
+        <AppTable
+          :rows="filteredSites"
+          :columns="tableColumns"
+          :row-key="(site: SiteRecord) => site.id"
+          :loading="store.loading.value"
+          empty-text="没有匹配的站点"
+          :page="currentPage"
+          :page-size="pageSize"
+          :sorting="tableSorting"
+          :selected-key="selectedSiteId"
+          clickable
+          @update:page="currentPage = $event"
+          @update:page-size="pageSize = $event"
+          @update:sorting="tableSorting = $event"
+          @select="openModelDetail"
+        >
+          <!-- 站点信息列 -->
+          <template #cell-siteInfo="{ row }">
+            <div class="sl-table-site-cell">
+              <span class="sl-card-avatar sl-avatar-sm" :class="`sl-tone-${systemTone(row.systemType)}`">
+                {{ siteInitials(row.apiBaseUrl, row.name) }}
+              </span>
+              <div class="sl-table-site-info">
+                <div class="sl-table-site-title">
+                  <strong>{{ row.name }}</strong>
+                  <span v-if="row.isRunaway" class="sl-pill sl-pill-runaway">跑路</span>
+                  <span v-else-if="row.isPersonal" class="sl-pill sl-pill-personal">在用</span>
+                  <span v-else-if="row.isPending" class="sl-pill sl-pill-pending">待定</span>
+                </div>
+                <small class="sl-table-site-url">{{ row.apiBaseUrl }}</small>
+              </div>
+            </div>
+          </template>
+
+          <!-- 系统架构列 -->
+          <template #cell-systemType="{ row }">
+            <span class="sl-pill sl-pill-system" :class="`sl-pill-${systemTone(row.systemType)}`">
+              {{ systemTypeLabel(row.systemType) || "未知架构" }}
+            </span>
+          </template>
+
+          <!-- 账号与会话列 -->
+          <template #cell-accounts="{ row }">
+            <div class="sl-table-accounts-cell">
+              <span>{{ getSiteSessions(row.id).length }} 个账号</span>
+              <small v-if="getSiteSessions(row.id).some((s: ChromeSessionInfo) => s.hasAccessToken)" class="text-brand">含刷新令牌</small>
+            </div>
+          </template>
+
+          <!-- 剩余额度列 -->
+          <template #cell-quota="{ row }">
+            <span class="font-mono font-semibold text-brand">{{ getSiteQuotaText(row.id) }}</span>
+          </template>
+
+          <!-- 注册门槛列 -->
+          <template #cell-regLevel="{ row }">
+            <span class="sl-level-badge">LV{{ row.registrationLimit }}</span>
+          </template>
+
+          <!-- 速率限制列 -->
+          <template #cell-rateLimit="{ row }">
+            <span class="font-mono text-muted text-xs">{{ formatRateLimit(row.rateLimit) || "—" }}</span>
+          </template>
+
+          <!-- 特性能力列 -->
+          <template #cell-capabilities="{ row }">
+            <div class="sl-table-caps-cell">
+              <span v-if="row.supportsCheckin" title="支持每日签到">📅</span>
+              <span v-if="row.supportsImmersiveTranslation" title="支持沉浸式翻译">🌐</span>
+              <span v-if="row.supportsLdc" title="支持 LDC 支付">💳</span>
+              <span v-if="row.supportsNsfw" title="支持 18+ NSFW">🔞</span>
+              <span v-if="row.useProxyPool" title="开启代理池">🛡️</span>
+            </div>
+          </template>
+
+          <!-- 更新时间列 -->
+          <template #cell-updatedAt="{ row }">
+            <span class="font-mono text-xs text-faint">{{ formatDate(row.updatedAt) }}</span>
+          </template>
+
+          <!-- 快捷操作列 -->
+          <template #cell-actions="{ row }">
+            <div class="sl-table-actions-cell" @click.stop>
+              <button
+                type="button"
+                class="sl-action-icon-btn"
+                title="查看支持模型与 Key"
+                @click="store.openSiteModelsDialog(row)"
+              >
+                <span v-html="icons.cpu" />
+              </button>
+              <button
+                type="button"
+                class="sl-action-icon-btn"
+                title="全景详情"
+                @click="openModelDetail(row)"
+              >
+                <span v-html="icons.info" />
+              </button>
+              <button
+                type="button"
+                class="sl-action-icon-btn"
+                title="编辑站点"
+                @click="store.openModal(row)"
+              >
+                <span v-html="icons.edit" />
+              </button>
+            </div>
+          </template>
+        </AppTable>
+      </section>
+
+      <!-- 视图 C：账号会话拓扑矩阵视图 -->
+      <section v-else-if="currentView === 'topology'" class="sl-topology-view">
+        <div class="sl-topology-header">
+          <div>
+            <h2>全网站点与 Chrome 账号拓扑矩阵</h2>
+            <p>实时监控并管理各个站点的 Chrome 授权会话、Access Token、额度消耗与签到状态</p>
+          </div>
+          <button type="button" class="sl-btn-secondary" @click="store.openSyncDialog()">
+            <span v-html="icons.sessionImport" />
+            <span>提取并导入 Chrome 会话</span>
+          </button>
+        </div>
+
+        <div class="sl-topology-grid">
+          <article
+            v-for="site in filteredSites"
+            :key="site.id"
+            class="sl-topo-card"
+            :class="{ 'has-sessions': getSiteSessions(site.id).length > 0 }"
+          >
+            <div class="sl-topo-card-head">
+              <div class="sl-topo-site-id">
+                <span class="sl-card-avatar sl-avatar-sm" :class="`sl-tone-${systemTone(site.systemType)}`">
+                  {{ siteInitials(site.apiBaseUrl, site.name) }}
+                </span>
+                <div>
+                  <strong>{{ site.name }}</strong>
+                  <span class="sl-pill sl-pill-system" :class="`sl-pill-${systemTone(site.systemType)}`">
+                    {{ systemTypeLabel(site.systemType) || "未知架构" }}
+                  </span>
+                </div>
+              </div>
+
+              <div class="sl-topo-head-actions">
+                <button
+                  type="button"
+                  class="sl-btn-xs"
+                  @click="store.syncChromeSession(site, $event.currentTarget as HTMLElement)"
+                >
+                  <span v-html="icons.restore" />
+                  <span>同步会话</span>
+                </button>
+              </div>
+            </div>
+
+            <!-- 会话账号列表 -->
+            <div class="sl-topo-sessions-list">
+              <template v-if="getSiteSessions(site.id).length > 0">
+                <div
+                  v-for="session in getSiteSessions(site.id)"
+                  :key="session.profileId"
+                  class="sl-topo-session-row"
+                  :class="{ 'has-error': session.syncError || session.checkinError }"
+                >
+                  <div class="sl-topo-session-meta">
+                    <span v-html="icons.user" />
+                    <div>
+                      <div class="sl-topo-user-line">
+                        <strong>{{ session.username || session.accountName || session.profileName }}</strong>
+                        <span v-if="session.newapiUserId" class="sl-user-id-pill">ID: {{ session.newapiUserId }}</span>
+                        <span v-if="session.hasAccessToken" class="sl-token-pill active">已取令牌</span>
+                        <span v-else class="sl-token-pill">无令牌</span>
+                      </div>
+                      <small class="sl-topo-subline">
+                        <span>配置：{{ session.profileName || "默认配置" }}</span>
+                        <span v-if="session.checkedInToday" class="text-success">· 今日已签到</span>
+                        <span v-else-if="session.checkinEnabled" class="text-warning">· 今日未签到</span>
+                      </small>
+                    </div>
+                  </div>
+
+                  <div class="sl-topo-session-quota">
+                    <strong class="font-mono text-brand">{{ session.remaining !== null ? `${session.remaining} ${session.unit || ''}` : '未同步额度' }}</strong>
+                    <small v-if="session.apiKeyCount || session.apiModelCount">
+                      {{ session.apiKeyCount || 0 }} Key · {{ session.apiModelCount || 0 }} 模型
+                    </small>
+                  </div>
+                </div>
+              </template>
+              <div v-else class="sl-topo-empty-sessions">
+                <span v-html="icons.user" />
+                <p>暂无关联的 Chrome 账号会话</p>
+                <button
+                  type="button"
+                  class="sl-link-action"
+                  @click="store.syncChromeSession(site, $event.currentTarget as HTMLElement)"
+                >
+                  点击提取会话 &rarr;
+                </button>
+              </div>
+            </div>
+          </article>
+        </div>
+      </section>
+    </main>
+
+    <!-- 4. 多选批量操作浮动底栏 (Batch Operations Dock) -->
+    <aside v-if="batchSelectedIds.length" class="sl-batch-dock">
+      <div class="sl-batch-dock-content">
+        <div class="sl-batch-dock-title">
+          <span v-html="icons.check" />
+          <strong>已选择 {{ batchSelectedIds.length }} 个站点</strong>
+        </div>
+
+        <div class="sl-batch-actions">
+          <button type="button" class="sl-batch-btn" @click="batchSetUsage('personal')">
+            转换为在用
+          </button>
+          <button type="button" class="sl-batch-btn" @click="batchSetUsage('pending')">
+            转换为待定
+          </button>
+          <button type="button" class="sl-batch-btn" @click="batchSetUsage('unused')">
+            设为未在用
+          </button>
+          <button type="button" class="sl-batch-btn" @click="batchToggleRunaway">
+            切换跑路/存活
+          </button>
+          <button type="button" class="sl-batch-btn sl-btn-accent" @click="batchSyncSession">
+            批量会话同步
+          </button>
+        </div>
+
+        <div class="sl-batch-dock-right">
+          <button type="button" class="sl-batch-clear-btn" @click="clearBatchSelection">
+            取消选择
+          </button>
+        </div>
+      </div>
+    </aside>
+
+    <!-- 5. 全景站点详情深度抽屉 (Slide-over Detail Drawer) -->
+    <Teleport to="body">
+      <div
+        class="sl-drawer-backdrop"
+        :hidden="!selectedSite"
+        @click="closeDetail"
+      >
+        <aside
+          class="sl-drawer-panel"
+          role="dialog"
+          aria-modal="true"
+          :aria-label="selectedSite?.name || '站点详情'"
+          @click.stop
+        >
+          <template v-if="selectedSite">
+            <!-- 抽屉头部 -->
+            <header class="sl-drawer-header">
+              <div class="sl-drawer-head-identity">
+                <span class="sl-drawer-avatar" :class="`sl-tone-${systemTone(selectedSite.systemType)}`">
+                  {{ siteInitials(selectedSite.apiBaseUrl, selectedSite.name) }}
+                </span>
+                <div class="sl-drawer-title-box">
+                  <div class="sl-drawer-tags">
+                    <span class="sl-meta-system">{{ systemTypeLabel(selectedSite.systemType) || "通用架构" }}</span>
+                    <span class="sl-meta-sep">·</span>
+                    <span v-if="selectedSite.isRunaway" class="sl-pill sl-pill-runaway">已跑路</span>
+                    <span v-else-if="selectedSite.isPersonal" class="sl-pill sl-pill-personal">在用站点</span>
+                    <span v-else-if="selectedSite.isPending" class="sl-pill sl-pill-pending">待定站点</span>
+                    <span v-else class="sl-pill sl-pill-unused">未在用</span>
+                    <span class="sl-meta-sep">·</span>
+                    <span class="sl-level-badge">LV{{ selectedSite.registrationLimit }}</span>
+                  </div>
+
+                  <h2 class="sl-drawer-title">{{ selectedSite.name }}</h2>
+                  <p class="sl-drawer-url font-mono">{{ selectedSite.apiBaseUrl }}</p>
+                </div>
+              </div>
+
+              <div class="sl-drawer-head-actions">
+                <button
+                  type="button"
+                  class="sl-btn-copy"
+                  @click="copyText(selectedSite.apiBaseUrl, 'API 地址')"
+                >
+                  <span v-html="idCopied ? icons.check : icons.copy" />
+                  <span>{{ idCopied ? "已复制" : "复制 API" }}</span>
+                </button>
+                <button
+                  type="button"
+                  class="sl-btn-edit"
+                  @click="store.openModal(selectedSite)"
+                >
+                  <span v-html="icons.edit" />
+                  <span>编辑站点</span>
+                </button>
+                <button
+                  type="button"
+                  class="sl-drawer-close-btn"
+                  aria-label="关闭抽屉"
+                  @click="closeDetail"
+                >
+                  <span v-html="icons.close" />
+                </button>
+              </div>
+            </header>
+
+            <!-- 抽屉 Tab 导航 -->
+            <nav class="sl-drawer-tabs">
+              <button
+                type="button"
+                :class="{ active: activeDetailTab === 'overview' }"
+                @click="activeDetailTab = 'overview'"
+              >
+                <span v-html="icons.layers" />
+                <span>全景概览</span>
+              </button>
+              <button
+                type="button"
+                :class="{ active: activeDetailTab === 'accounts' }"
+                @click="activeDetailTab = 'accounts'"
+              >
+                <span v-html="icons.user" />
+                <span>账号与额度 ({{ getSiteSessions(selectedSite.id).length }})</span>
+              </button>
+              <button
+                type="button"
+                :class="{ active: activeDetailTab === 'models' }"
+                @click="activeDetailTab = 'models'"
+              >
+                <span v-html="icons.cpu" />
+                <span>关联 Key 与支持模型</span>
+              </button>
+              <button
+                type="button"
+                :class="{ active: activeDetailTab === 'raw' }"
+                @click="activeDetailTab = 'raw'"
+              >
+                <span v-html="icons.database" />
+                <span>原始数据检视</span>
+              </button>
+            </nav>
+
+            <!-- 抽屉主体内容 -->
+            <div class="sl-drawer-body">
+              <!-- TAB 1: 全景概览 -->
+              <div v-if="activeDetailTab === 'overview'" class="sl-tab-panel">
+                <!-- 站点概览描述 -->
+                <div class="sl-section-card">
+                  <div class="sl-section-head">
+                    <span v-html="icons.info" />
+                    <strong>站点说明与描述</strong>
+                  </div>
+                  <p class="sl-desc-text">{{ selectedSite.description || "暂无站点详细说明，可随时点击右上角进行编辑补充。" }}</p>
+                </div>
+
+                <!-- 核心参数矩阵网格 -->
+                <div class="sl-facts-grid">
+                  <div class="sl-fact-box">
+                    <span class="sl-fact-k">API 基础地址</span>
+                    <strong class="sl-fact-v font-mono text-brand">{{ selectedSite.apiBaseUrl || "未配置" }}</strong>
+                  </div>
+                  <div class="sl-fact-box">
+                    <span class="sl-fact-k">注册等级门槛</span>
+                    <strong class="sl-fact-v">LV{{ selectedSite.registrationLimit }}</strong>
+                  </div>
+                  <div class="sl-fact-box">
+                    <span class="sl-fact-k">速率限制</span>
+                    <strong class="sl-fact-v">{{ formatRateLimit(selectedSite.rateLimit) || "无限制 / 未填写" }}</strong>
+                  </div>
+                  <div class="sl-fact-box">
+                    <span class="sl-fact-k">系统架构类型</span>
+                    <strong class="sl-fact-v">{{ systemTypeLabel(selectedSite.systemType) || "通用系统" }}</strong>
+                  </div>
+                  <div class="sl-fact-box">
+                    <span class="sl-fact-k">代理池配置</span>
+                    <strong class="sl-fact-v">{{ selectedSite.useProxyPool ? "强制通过 Clash 代理池" : "直连访问" }}</strong>
+                  </div>
+                  <div class="sl-fact-box">
+                    <span class="sl-fact-k">最近更新时间</span>
+                    <strong class="sl-fact-v font-mono">{{ formatDate(selectedSite.updatedAt) }}</strong>
+                  </div>
+                </div>
+
+                <!-- 特性与能力标签矩阵 -->
+                <div class="sl-section-card">
+                  <div class="sl-section-head">
+                    <span v-html="icons.sparkles" />
+                    <strong>支持特性与业务能力</strong>
+                  </div>
+                  <div class="sl-chips-wrap">
+                    <span class="sl-cap-pill" :class="{ 'is-disabled': !selectedSite.supportsCheckin }">📅 每日签到</span>
+                    <span class="sl-cap-pill" :class="{ 'is-disabled': !selectedSite.supportsImmersiveTranslation }">🌐 沉浸式翻译</span>
+                    <span class="sl-cap-pill" :class="{ 'is-disabled': !selectedSite.supportsLdc }">💳 LDC 支付</span>
+                    <span class="sl-cap-pill" :class="{ 'is-disabled': !selectedSite.supportsNsfw }">🔞 18+ NSFW</span>
+                    <span class="sl-cap-pill" :class="{ 'is-disabled': !selectedSite.requiresInviteCode }">🎟️ 需邀请码</span>
+                    <span class="sl-cap-pill" :class="{ 'is-disabled': !selectedSite.useProxyPool }">🛡️ 代理池接入</span>
+                  </div>
+                </div>
+
+                <!-- 标签列表 -->
+                <div v-if="selectedSite.tags.length" class="sl-section-card">
+                  <div class="sl-section-head">
+                    <span v-html="icons.bookmark" />
+                    <strong>站点所属标签</strong>
+                  </div>
+                  <div class="sl-tags-cloud">
+                    <span v-for="t in selectedSite.tags" :key="t" class="sl-tag-badge">{{ t }}</span>
+                  </div>
+                </div>
+
+                <!-- 维护者信息 -->
+                <div class="sl-section-card">
+                  <div class="sl-section-head">
+                    <span v-html="icons.users" />
+                    <strong>维护者列表 ({{ selectedSite.maintainers.length }})</strong>
+                  </div>
+                  <div v-if="selectedSite.maintainers.length" class="sl-maintainers-grid">
+                    <div v-for="m in selectedSite.maintainers" :key="m.id || m.username" class="sl-maintainer-card">
+                      <span class="sl-maintainer-avatar">{{ m.name[0] || m.username?.[0] || 'U' }}</span>
+                      <div class="sl-maintainer-info">
+                        <strong>{{ m.name }}</strong>
+                        <small v-if="m.username">@{{ m.username }}</small>
+                        <small v-if="m.id" class="sl-faint">ID: {{ m.id }}</small>
+                      </div>
+                      <button
+                        v-if="m.profileUrl"
+                        type="button"
+                        class="sl-btn-icon-xs"
+                        title="打开维护者主页"
+                        @click="store.openExternal(m.profileUrl)"
+                      >
+                        <span v-html="icons.external" />
+                      </button>
+                    </div>
+                  </div>
+                  <p v-else class="sl-empty-hint">未配置维护者信息</p>
+                </div>
+
+                <!-- 相关链接清单 -->
+                <div class="sl-section-card">
+                  <div class="sl-section-head">
+                    <span v-html="icons.link" />
+                    <strong>相关直达链接</strong>
+                  </div>
+                  <div class="sl-links-list">
+                    <div v-if="selectedSite.apiBaseUrl" class="sl-link-item">
+                      <div>
+                        <strong>API 服务地址</strong>
+                        <small>{{ selectedSite.apiBaseUrl }}</small>
+                      </div>
+                      <div class="sl-link-item-actions">
+                        <button type="button" class="sl-btn-xs" @click="store.openExternal(selectedSite.apiBaseUrl)">打开</button>
+                        <button type="button" class="sl-btn-xs" @click="copyText(selectedSite.apiBaseUrl, 'API 地址')">复制</button>
+                      </div>
+                    </div>
+                    <div v-if="selectedSite.checkinUrl" class="sl-link-item">
+                      <div>
+                        <strong>签到地址 {{ selectedSite.checkinNote ? `(${selectedSite.checkinNote})` : '' }}</strong>
+                        <small>{{ selectedSite.checkinUrl }}</small>
+                      </div>
+                      <div class="sl-link-item-actions">
+                        <button type="button" class="sl-btn-xs" @click="store.openExternal(selectedSite.checkinUrl)">打开</button>
+                        <button type="button" class="sl-btn-xs" @click="copyText(selectedSite.checkinUrl, '签到地址')">复制</button>
+                      </div>
+                    </div>
+                    <div v-if="selectedSite.benefitUrl" class="sl-link-item">
+                      <div>
+                        <strong>福利站地址</strong>
+                        <small>{{ selectedSite.benefitUrl }}</small>
+                      </div>
+                      <div class="sl-link-item-actions">
+                        <button type="button" class="sl-btn-xs" @click="store.openExternal(selectedSite.benefitUrl)">打开</button>
+                        <button type="button" class="sl-btn-xs" @click="copyText(selectedSite.benefitUrl, '福利站地址')">复制</button>
+                      </div>
+                    </div>
+                    <div v-if="selectedSite.statusUrl" class="sl-link-item">
+                      <div>
+                        <strong>系统状态页</strong>
+                        <small>{{ selectedSite.statusUrl }}</small>
+                      </div>
+                      <div class="sl-link-item-actions">
+                        <button type="button" class="sl-btn-xs" @click="store.openExternal(selectedSite.statusUrl)">打开</button>
+                        <button type="button" class="sl-btn-xs" @click="copyText(selectedSite.statusUrl, '状态页地址')">复制</button>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <!-- TAB 2: 账号与额度 -->
+              <div v-else-if="activeDetailTab === 'accounts'" class="sl-tab-panel">
+                <div class="sl-tab-action-bar">
+                  <span class="sl-tab-section-title">已关联 Chrome 授权账号</span>
+                  <button
+                    type="button"
+                    class="sl-btn-secondary"
+                    @click="store.syncChromeSession(selectedSite, $event.currentTarget as HTMLElement)"
+                  >
+                    <span v-html="icons.restore" />
+                    <span>同步此站点全部账号</span>
+                  </button>
+                </div>
+
+                <div v-if="getSiteSessions(selectedSite.id).length" class="sl-drawer-accounts-grid">
+                  <div
+                    v-for="session in getSiteSessions(selectedSite.id)"
+                    :key="session.profileId"
+                    class="sl-drawer-acc-card"
+                  >
+                    <div class="sl-drawer-acc-head">
+                      <div class="sl-drawer-acc-user">
+                        <span class="sl-drawer-acc-avatar" v-html="icons.user" />
+                        <div>
+                          <strong>{{ session.username || session.accountName || session.profileName }}</strong>
+                          <div class="sl-acc-chips-row">
+                            <span v-if="session.newapiUserId" class="sl-user-id-pill">UID: {{ session.newapiUserId }}</span>
+                            <span v-if="session.hasAccessToken" class="sl-token-pill active">已缓存访问令牌</span>
+                            <span v-if="session.checkedInToday" class="sl-token-pill sl-token-checked">今日已签到</span>
+                          </div>
+                        </div>
+                      </div>
+
+                      <div class="sl-drawer-acc-quota">
+                        <span class="sl-acc-quota-k">可用额度</span>
+                        <strong class="sl-acc-quota-v text-brand">{{ session.remaining !== null ? `${session.remaining} ${session.unit || ''}` : '未读取' }}</strong>
+                      </div>
+                    </div>
+
+                    <div class="sl-drawer-acc-facts">
+                      <div class="sl-acc-fact">
+                        <span>Chrome 配置</span>
+                        <strong>{{ session.profileName || "默认" }}</strong>
+                      </div>
+                      <div class="sl-acc-fact">
+                        <span>已同步 Key</span>
+                        <strong>{{ session.apiKeyCount || 0 }} 个</strong>
+                      </div>
+                      <div class="sl-acc-fact">
+                        <span>已同步模型</span>
+                        <strong>{{ session.apiModelCount || 0 }} 款</strong>
+                      </div>
+                      <div class="sl-acc-fact">
+                        <span>最后同步时间</span>
+                        <strong class="font-mono text-xs">{{ formatDate(session.accountUpdatedAt) }}</strong>
+                      </div>
+                    </div>
+
+                    <div v-if="session.syncError || session.checkinError" class="sl-drawer-acc-error">
+                      <span v-html="icons.info" />
+                      <span>{{ session.syncError || session.checkinError }}</span>
+                    </div>
+                  </div>
+                </div>
+                <div v-else class="sl-empty-state-compact">
+                  <span v-html="icons.user" />
+                  <p>该站点尚未提取或关联 Chrome 授权账号会话</p>
+                  <button
+                    type="button"
+                    class="sl-btn-primary"
+                    @click="store.syncChromeSession(selectedSite, $event.currentTarget as HTMLElement)"
+                  >
+                    立即提取 Chrome 会话
+                  </button>
+                </div>
+              </div>
+
+              <!-- TAB 3: 关联 Key 与支持模型 -->
+              <div v-else-if="activeDetailTab === 'models'" class="sl-tab-panel">
+                <div class="sl-tab-action-bar">
+                  <div class="sl-models-search-box">
+                    <span v-html="icons.search" />
+                    <input
+                      v-model="drawerModelSearch"
+                      type="search"
+                      placeholder="搜索此站点的支持模型 ID 或厂商…"
+                    />
+                  </div>
+
+                  <div class="sl-models-sync-btns">
+                    <button
+                      type="button"
+                      class="sl-btn-xs"
+                      :disabled="drawerLiveFetchingKind !== null"
+                      @click="triggerDrawerSync('keys')"
+                    >
+                      <span v-html="icons.key" :class="{ 'is-spinning': drawerLiveFetchingKind === 'keys' }" />
+                      <span>同步 Key</span>
+                    </button>
+                    <button
+                      type="button"
+                      class="sl-btn-xs sl-btn-accent"
+                      :disabled="drawerLiveFetchingKind !== null"
+                      @click="triggerDrawerSync('models')"
+                    >
+                      <span v-html="icons.restore" :class="{ 'is-spinning': drawerLiveFetchingKind === 'models' }" />
+                      <span>同步模型</span>
+                    </button>
+                  </div>
+                </div>
+
+                <!-- 账号与 Key 筛选栏 -->
+                <div v-if="drawerModelCache?.accounts?.length" class="sl-keys-bar">
+                  <span class="sl-keys-label">关联 Key：</span>
+                  <div class="sl-keys-chips">
+                    <button
+                      type="button"
+                      class="sl-key-chip"
+                      :class="{ active: drawerSelectedKey === null }"
+                      @click="drawerSelectedKey = null"
+                    >
+                      全部模型 ({{ drawerModelCache.models?.length || 0 }})
+                    </button>
+                    <template v-for="acc in drawerModelCache.accounts" :key="acc.profileId">
+                      <button
+                        v-for="k in acc.keys"
+                        :key="k"
+                        type="button"
+                        class="sl-key-chip font-mono"
+                        :class="{ active: drawerSelectedKey === k }"
+                        @click="drawerSelectedKey = drawerSelectedKey === k ? null : k"
+                      >
+                        <span>{{ maskApiKey(k) }}</span>
+                        <small>({{ acc.keyModels?.[k]?.length ?? '—' }})</small>
+                      </button>
+                    </template>
+                  </div>
+                </div>
+
+                <div v-if="drawerModelsLoading" class="sl-loading-state">
+                  <span class="is-spinning" v-html="icons.restore" />
+                  <p>正在读取模型与 Key 列表…</p>
+                </div>
+
+                <div v-else-if="!drawerFilteredModels.length" class="sl-empty-state-compact">
+                  <span v-html="icons.cpu" />
+                  <p>{{ drawerModelSearch ? "没有匹配的模型" : "暂无已缓存的站点支持模型数据" }}</p>
+                  <button
+                    type="button"
+                    class="sl-btn-secondary"
+                    @click="triggerDrawerSync('models')"
+                  >
+                    立即拉取最新模型列表
+                  </button>
+                </div>
+
+                <div v-else class="sl-drawer-models-grid">
+                  <div
+                    v-for="m in drawerFilteredModels"
+                    :key="m.id"
+                    class="sl-drawer-model-item"
+                    @click="copyText(m.id, '模型 ID')"
+                  >
+                    <div class="sl-model-item-info">
+                      <strong class="font-mono">{{ m.id }}</strong>
+                      <small v-if="m.ownedBy" class="text-faint">厂商: {{ m.ownedBy }}</small>
+                    </div>
+                    <button type="button" class="sl-model-copy-btn" title="复制模型 ID">
+                      <span v-html="icons.copy" />
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              <!-- TAB 4: 原始数据检视 -->
+              <div v-else-if="activeDetailTab === 'raw'" class="sl-tab-panel">
+                <div class="sl-tab-action-bar">
+                  <span class="sl-tab-section-title">站点完整 JSON 记录</span>
+                  <button
+                    type="button"
+                    class="sl-btn-secondary"
+                    @click="copyText(JSON.stringify(selectedSite, null, 2), '站点 JSON')"
+                  >
+                    <span v-html="icons.copy" />
+                    <span>复制 JSON</span>
+                  </button>
+                </div>
+
+                <div class="sl-raw-json-box">
+                  <pre><code>{{ JSON.stringify(selectedSite, null, 2) }}</code></pre>
+                </div>
+              </div>
+            </div>
+          </template>
+        </aside>
+      </div>
+    </Teleport>
+  </div>
+</template>
+
+<style scoped>
+/* ============================================================
+   站点库全景控制台核心样式 (参照模型参数设计体系)
+   ============================================================ */
+.sl-explorer-root {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  background: var(--page-bg, #0d1117);
+  color: var(--text, #c9d1d9);
+  overflow: hidden;
+}
+
+/* 1. 顶部驾驶舱 */
+.sl-cockpit-bar {
+  padding: 16px 24px 12px;
+  background: var(--page-header, #161b22);
+  border-bottom: 1px solid var(--page-line, #30363d);
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.sl-cockpit-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+}
+
+.sl-brand-title {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.sl-brand-logo {
+  width: 40px;
+  height: 40px;
+  border-radius: var(--r-md, 8px);
+  background: color-mix(in srgb, var(--brand, #388bfd) 15%, transparent);
+  color: var(--brand, #58a6ff);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.sl-brand-logo svg {
+  width: 22px;
+  height: 22px;
+}
+
+.sl-eyebrow {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--brand, #58a6ff);
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.sl-live-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--success, #2ea043);
+  box-shadow: 0 0 8px var(--success, #2ea043);
+  animation: pulse-dot 2s infinite;
+}
+
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.5; transform: scale(1.2); }
+}
+
+.sl-brand-title h1 {
+  margin: 2px 0 0;
+  font-size: 20px;
+  font-weight: 750;
+  color: var(--text, #f0f6fc);
+}
+
+.sl-cockpit-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.sl-sync-status-card {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  background: var(--surface, #21262d);
+  border: 1px solid var(--line, #30363d);
+  border-radius: var(--r-md, 8px);
+}
+
+.sl-status-indicator {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--warning, #d29922);
+}
+
+.sl-status-indicator.synced {
+  background: var(--success, #3fb950);
+}
+
+.sl-status-text {
+  display: flex;
+  flex-direction: column;
+}
+
+.sl-status-text strong {
+  font-size: 11.5px;
+  color: var(--text, #f0f6fc);
+}
+
+.sl-status-text small {
+  font-size: 10px;
+  color: var(--muted, #8b949e);
+}
+
+/* 按钮规范 */
+.sl-btn-primary {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 36px;
+  padding: 0 14px;
+  border-radius: var(--r-md, 8px);
+  background: var(--brand, #1f6feb);
+  color: #fff;
+  font-size: 12.5px;
+  font-weight: 600;
+  border: none;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+
+.sl-btn-primary:hover {
+  background: color-mix(in srgb, var(--brand, #1f6feb) 85%, white);
+}
+
+.sl-btn-secondary {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 36px;
+  padding: 0 12px;
+  border-radius: var(--r-md, 8px);
+  background: var(--surface, #21262d);
+  color: var(--text, #c9d1d9);
+  font-size: 12.5px;
+  font-weight: 550;
+  border: 1px solid var(--line, #30363d);
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.sl-btn-secondary:hover:not(:disabled) {
+  background: var(--surface-hover, #30363d);
+  color: var(--text, #f0f6fc);
+}
+
+.sl-btn-secondary:disabled {
+  opacity: 0.5;
+  cursor: wait;
+}
+
+.sl-btn-xs {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 26px;
+  padding: 0 8px;
+  border-radius: var(--r-sm, 6px);
+  background: var(--surface, #21262d);
+  color: var(--text, #c9d1d9);
+  font-size: 11px;
+  border: 1px solid var(--line, #30363d);
+  cursor: pointer;
+}
+
+.sl-btn-xs:hover:not(:disabled) {
+  background: var(--surface-hover, #30363d);
+  color: var(--text, #f0f6fc);
+}
+
+.sl-btn-accent {
+  background: color-mix(in srgb, var(--brand, #1f6feb) 20%, var(--surface, #21262d)) !important;
+  color: var(--brand, #58a6ff) !important;
+  border-color: color-mix(in srgb, var(--brand, #1f6feb) 40%, transparent) !important;
+}
+
+/* 宏观 4 大指标 */
+.sl-metrics-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 12px;
+}
+
+.sl-metric-card {
+  padding: 10px 14px;
+  background: var(--surface, #21262d);
+  border: 1px solid var(--line, #30363d);
+  border-radius: var(--r-md, 8px);
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.sl-metric-card:hover {
+  background: var(--surface-hover, #282e36);
+  border-color: color-mix(in srgb, var(--brand, #58a6ff) 40%, var(--line, #30363d));
+  transform: translateY(-1px);
+}
+
+.sl-metric-icon {
+  width: 36px;
+  height: 36px;
+  border-radius: var(--r-md, 8px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.sl-metric-icon svg {
+  width: 18px;
+  height: 18px;
+}
+
+.sl-tone-brand { background: color-mix(in srgb, var(--brand, #1f6feb) 15%, transparent); color: var(--brand, #58a6ff); }
+.sl-tone-success { background: color-mix(in srgb, var(--success, #2ea043) 15%, transparent); color: var(--success, #3fb950); }
+.sl-tone-violet { background: color-mix(in srgb, #a371f7 15%, transparent); color: #bc8cff; }
+.sl-tone-info { background: color-mix(in srgb, #388bfd 15%, transparent); color: #79c0ff; }
+.sl-tone-neutral { background: var(--surface-soft, #161b22); color: var(--muted, #8b949e); }
+
+.sl-metric-info {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.sl-metric-label {
+  font-size: 11px;
+  color: var(--muted, #8b949e);
+}
+
+.sl-metric-val {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.sl-metric-val strong {
+  font-size: 16px;
+  color: var(--text, #f0f6fc);
+}
+
+.sl-metric-val small {
+  font-size: 10.5px;
+  color: var(--faint, #6e7681);
+}
+
+/* 热门分类一键直达滚动栏 */
+.sl-popular-chips-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  overflow: hidden;
+}
+
+.sl-chips-label {
+  font-size: 11.5px;
+  color: var(--muted, #8b949e);
+  flex-shrink: 0;
+}
+
+.sl-chips-scroll {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  overflow-x: auto;
+  scrollbar-width: thin;
+  padding-bottom: 2px;
+}
+
+.sl-chip-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 9px;
+  border-radius: 999px;
+  background: var(--surface, #21262d);
+  border: 1px solid var(--line, #30363d);
+  color: var(--muted, #8b949e);
+  font-size: 11px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: all 0.15s ease;
+}
+
+.sl-chip-btn:hover {
+  background: var(--surface-hover, #30363d);
+  color: var(--text, #f0f6fc);
+}
+
+.sl-chip-btn.active {
+  background: color-mix(in srgb, var(--brand, #1f6feb) 20%, var(--surface, #21262d));
+  color: var(--brand, #58a6ff);
+  border-color: color-mix(in srgb, var(--brand, #1f6feb) 50%, transparent);
+}
+
+.sl-chip-num {
+  font-size: 9.5px;
+  padding: 1px 5px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--text, #c9d1d9) 12%, transparent);
+}
+
+/* 2. 控制中心 */
+.sl-control-center {
+  padding: 12px 24px;
+  background: var(--page-bg, #0d1117);
+  border-bottom: 1px solid var(--line, #30363d);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  flex-shrink: 0;
+}
+
+.sl-control-top-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+}
+
+.sl-usage-tabs {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  background: var(--surface-soft, #161b22);
+  padding: 3px;
+  border-radius: var(--r-md, 8px);
+  border: 1px solid var(--line, #30363d);
+}
+
+.sl-usage-tabs button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border-radius: var(--r-sm, 6px);
+  background: transparent;
+  border: none;
+  color: var(--muted, #8b949e);
+  font-size: 12px;
+  font-weight: 550;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.sl-usage-tabs button svg {
+  width: 14px;
+  height: 14px;
+}
+
+.sl-usage-tabs button:hover {
+  color: var(--text, #f0f6fc);
+}
+
+.sl-usage-tabs button.active {
+  background: var(--surface, #21262d);
+  color: var(--brand, #58a6ff);
+  box-shadow: 0 1px 3px rgba(0,0,0,0.2);
+}
+
+.sl-tab-badge {
+  font-size: 10px;
+  padding: 1px 5px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--muted, #8b949e) 20%, transparent);
+}
+
+.sl-view-switcher {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  background: var(--surface-soft, #161b22);
+  padding: 3px;
+  border-radius: var(--r-md, 8px);
+  border: 1px solid var(--line, #30363d);
+}
+
+.sl-view-switcher button {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 6px 10px;
+  border-radius: var(--r-sm, 6px);
+  background: transparent;
+  border: none;
+  color: var(--muted, #8b949e);
+  font-size: 11.5px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.sl-view-switcher button svg {
+  width: 14px;
+  height: 14px;
+}
+
+.sl-view-switcher button:hover {
+  color: var(--text, #f0f6fc);
+}
+
+.sl-view-switcher button.active {
+  background: var(--surface, #21262d);
+  color: var(--brand, #58a6ff);
+}
+
+/* 筛选行 */
+.sl-filters-row {
+  display: grid;
+  grid-template-columns: minmax(220px, 1.5fr) repeat(4, minmax(130px, 1fr));
+  gap: 8px;
+}
+
+.sl-search-box {
+  position: relative;
+  display: flex;
+  align-items: center;
+  background: var(--surface, #21262d);
+  border: 1px solid var(--line, #30363d);
+  border-radius: var(--r-md, 8px);
+  padding: 0 10px;
+  height: 36px;
+}
+
+.sl-search-box svg {
+  width: 15px;
+  height: 15px;
+  color: var(--muted, #8b949e);
+  flex-shrink: 0;
+}
+
+.sl-search-box input {
+  width: 100%;
+  height: 100%;
+  border: none;
+  background: transparent;
+  color: var(--text, #f0f6fc);
+  font-size: 12px;
+  padding: 0 8px;
+  outline: none;
+}
+
+.sl-search-box kbd {
+  font-size: 9.5px;
+  color: var(--faint, #6e7681);
+  background: var(--surface-soft, #161b22);
+  border: 1px solid var(--line, #30363d);
+  border-radius: 4px;
+  padding: 1px 4px;
+  flex-shrink: 0;
+}
+
+.sl-clear-search {
+  background: none;
+  border: none;
+  color: var(--muted, #8b949e);
+  cursor: pointer;
+  padding: 2px;
+  display: flex;
+  align-items: center;
+}
+
+.sl-filter-dropdown {
+  height: 36px;
+}
+
+/* 特性开关芯片栏 */
+.sl-feature-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.sl-feature-chips {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.sl-chips-title {
+  font-size: 11px;
+  color: var(--muted, #8b949e);
+}
+
+.sl-chip {
+  padding: 3px 8px;
+  border-radius: 6px;
+  background: var(--surface-soft, #161b22);
+  border: 1px solid var(--line, #30363d);
+  color: var(--muted, #8b949e);
+  font-size: 11px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.sl-chip:hover {
+  background: var(--surface-hover, #282e36);
+  color: var(--text, #f0f6fc);
+}
+
+.sl-chip.active {
+  background: color-mix(in srgb, var(--brand, #1f6feb) 20%, var(--surface, #21262d));
+  color: var(--brand, #58a6ff);
+  border-color: color-mix(in srgb, var(--brand, #1f6feb) 40%, transparent);
+}
+
+.sl-results-meta {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-shrink: 0;
+}
+
+.sl-clear-filters-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: none;
+  border: none;
+  color: var(--danger, #f85149);
+  font-size: 11.5px;
+  cursor: pointer;
+}
+
+.sl-clear-filters-btn svg {
+  width: 12px;
+  height: 12px;
+}
+
+.sl-filter-count {
+  font-size: 11px;
+  color: var(--muted, #8b949e);
+}
+
+.sl-filter-count b {
+  color: var(--text, #f0f6fc);
+}
+
+/* 3. 主视图 */
+.sl-main-content {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 16px 24px 32px;
+}
+
+/* 视图 A：卡片网格 */
+.sl-cards-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  gap: 14px;
+}
+
+.sl-card {
+  background: var(--surface, #161b22);
+  border: 1px solid var(--line, #30363d);
+  border-radius: var(--r-lg, 10px);
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  cursor: pointer;
+  transition: all 0.18s cubic-bezier(0.16, 1, 0.3, 1);
+  position: relative;
+}
+
+.sl-card:hover {
+  border-color: color-mix(in srgb, var(--brand, #58a6ff) 45%, var(--line, #30363d));
+  box-shadow: 0 4px 16px rgba(0,0,0,0.25);
+  transform: translateY(-2px);
+}
+
+.sl-card.is-selected {
+  border-color: var(--brand, #58a6ff);
+  box-shadow: 0 0 0 1px var(--brand, #58a6ff);
+}
+
+.sl-card.is-runaway {
+  opacity: 0.75;
+  border-color: color-mix(in srgb, var(--danger, #f85149) 30%, var(--line, #30363d));
+}
+
+.sl-card-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 10px;
+}
+
+.sl-card-identity {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.sl-card-avatar {
+  width: 38px;
+  height: 38px;
+  border-radius: var(--r-md, 8px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 13px;
+  font-weight: 750;
+  flex-shrink: 0;
+}
+
+.sl-avatar-sm {
+  width: 28px;
+  height: 28px;
+  font-size: 11px;
+}
+
+.sl-card-title-box {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.sl-card-title-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.sl-card-title-row h3 {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--text, #f0f6fc);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.sl-card-url {
+  font-size: 10px;
+  color: var(--faint, #6e7681);
+  font-family: monospace;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  margin-top: 2px;
+}
+
+.sl-card-head-tools {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.sl-card-select-btn {
+  width: 24px;
+  height: 24px;
+  border-radius: 6px;
+  background: var(--surface-soft, #21262d);
+  border: 1px solid var(--line, #30363d);
+  color: var(--muted, #8b949e);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+
+.sl-card-select-btn svg {
+  width: 12px;
+  height: 12px;
+}
+
+.sl-card-select-btn:hover {
+  color: var(--text, #f0f6fc);
+}
+
+.sl-card-select-btn.active {
+  background: var(--brand, #1f6feb);
+  color: #fff;
+  border-color: var(--brand, #1f6feb);
+}
+
+/* 药丸与徽章 */
+.sl-pill {
+  font-size: 9.5px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-weight: 600;
+}
+
+.sl-pill-system {
+  background: var(--surface-soft, #21262d);
+  border: 1px solid var(--line, #30363d);
+  color: var(--muted, #8b949e);
+}
+
+.sl-pill-brand { color: var(--brand, #58a6ff); border-color: color-mix(in srgb, var(--brand, #58a6ff) 30%, transparent); }
+.sl-pill-violet { color: #bc8cff; border-color: color-mix(in srgb, #bc8cff) 30%, transparent); }
+.sl-pill-info { color: #79c0ff; border-color: color-mix(in srgb, #79c0ff 30%, transparent); }
+.sl-pill-success { color: #3fb950; border-color: color-mix(in srgb, #3fb950 30%, transparent); }
+
+.sl-pill-runaway { background: color-mix(in srgb, var(--danger, #f85149) 15%, transparent); color: var(--danger, #f85149); }
+.sl-pill-personal { background: color-mix(in srgb, var(--success, #2ea043) 15%, transparent); color: var(--success, #3fb950); }
+.sl-pill-pending { background: color-mix(in srgb, var(--warning, #d29922) 15%, transparent); color: var(--warning, #d29922); }
+.sl-pill-fake { background: color-mix(in srgb, #ff7b72 15%, transparent); color: #ff7b72; }
+
+.sl-card-badges {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.sl-card-tag {
+  font-size: 10px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: var(--surface-soft, #21262d);
+  border: 1px solid var(--line, #30363d);
+  color: var(--muted, #8b949e);
+}
+
+.sl-card-feat {
+  font-size: 9.5px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--brand, #1f6feb) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--brand, #1f6feb) 20%, transparent);
+  color: var(--text, #c9d1d9);
+}
+
+.sl-feat-nsfw { color: #f85149; border-color: color-mix(in srgb, #f85149 25%, transparent); }
+.sl-feat-invite { color: #d29922; border-color: color-mix(in srgb, #d29922 25%, transparent); }
+
+.sl-card-tags-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+.sl-tag-chip {
+  font-size: 9px;
+  padding: 1px 5px;
+  border-radius: 3px;
+  background: var(--surface-hover, #282e36);
+  color: var(--faint, #8b949e);
+}
+
+.sl-tag-more {
+  font-size: 8.5px;
+  color: var(--faint, #6e7681);
+}
+
+.sl-card-specs {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+  padding: 8px 10px;
+  background: var(--surface-soft, #0d1117);
+  border-radius: var(--r-md, 8px);
+}
+
+.sl-spec-item {
+  display: flex;
+  flex-direction: column;
+}
+
+.sl-spec-k {
+  font-size: 9.5px;
+  color: var(--muted, #8b949e);
+}
+
+.sl-spec-v {
+  font-size: 11.5px;
+  color: var(--text, #f0f6fc);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.sl-card-desc {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--muted, #8b949e);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  min-height: 30px;
+}
+
+.sl-card-desc.muted {
+  color: var(--faint, #6e7681);
+  font-style: italic;
+}
+
+.sl-card-footer {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  border-top: 1px solid var(--line-soft, #21262d);
+  padding-top: 8px;
+  margin-top: auto;
+}
+
+.sl-card-links {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.sl-link-btn {
+  width: 26px;
+  height: 26px;
+  border-radius: 6px;
+  background: var(--surface-soft, #21262d);
+  border: 1px solid var(--line, #30363d);
+  color: var(--muted, #8b949e);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.sl-link-btn svg {
+  width: 13px;
+  height: 13px;
+}
+
+.sl-link-btn:hover {
+  background: var(--surface-hover, #30363d);
+  color: var(--text, #f0f6fc);
+}
+
+.sl-link-btn.active {
+  color: var(--brand, #58a6ff);
+}
+
+.sl-card-footer-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.sl-card-models-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 26px;
+  padding: 0 8px;
+  border-radius: 6px;
+  background: var(--surface-soft, #21262d);
+  border: 1px solid var(--line, #30363d);
+  color: var(--text, #c9d1d9);
+  font-size: 10.5px;
+  cursor: pointer;
+}
+
+.sl-card-models-btn svg {
+  width: 12px;
+  height: 12px;
+}
+
+.sl-card-models-btn:hover {
+  background: var(--surface-hover, #30363d);
+  color: var(--text, #f0f6fc);
+}
+
+.sl-card-detail-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  height: 26px;
+  padding: 0 8px;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--brand, #1f6feb) 15%, transparent);
+  border: 1px solid color-mix(in srgb, var(--brand, #1f6feb) 30%, transparent);
+  color: var(--brand, #58a6ff);
+  font-size: 10.5px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.sl-card-detail-btn svg {
+  width: 12px;
+  height: 12px;
+}
+
+.sl-card-detail-btn:hover {
+  background: var(--brand, #1f6feb);
+  color: #fff;
+}
+
+/* 分页 */
+.sl-pagination-bar {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  margin-top: 20px;
+}
+
+.sl-page-btn {
+  padding: 6px 14px;
+  border-radius: 6px;
+  background: var(--surface, #21262d);
+  border: 1px solid var(--line, #30363d);
+  color: var(--text, #c9d1d9);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.sl-page-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.sl-page-info {
+  font-size: 12px;
+  color: var(--muted, #8b949e);
+}
+
+/* 视图 B：表格定制单元格 */
+.sl-table-view {
+  background: var(--surface, #161b22);
+  border: 1px solid var(--line, #30363d);
+  border-radius: var(--r-lg, 10px);
+  overflow: hidden;
+}
+
+.sl-table-site-cell {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.sl-table-site-info {
+  display: flex;
+  flex-direction: column;
+}
+
+.sl-table-site-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.sl-table-site-title strong {
+  font-size: 12.5px;
+  color: var(--text, #f0f6fc);
+}
+
+.sl-table-site-url {
+  font-size: 10px;
+  color: var(--faint, #6e7681);
+  font-family: monospace;
+}
+
+.sl-table-accounts-cell {
+  display: flex;
+  flex-direction: column;
+  font-size: 11.5px;
+}
+
+.sl-level-badge {
+  font-size: 10.5px;
+  font-weight: 700;
+  color: var(--brand, #58a6ff);
+}
+
+.sl-table-caps-cell {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 13px;
+}
+
+.sl-table-actions-cell {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 4px;
+}
+
+.sl-action-icon-btn {
+  width: 26px;
+  height: 26px;
+  border-radius: 6px;
+  background: var(--surface-soft, #21262d);
+  border: 1px solid var(--line, #30363d);
+  color: var(--muted, #8b949e);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+
+.sl-action-icon-btn svg {
+  width: 13px;
+  height: 13px;
+}
+
+.sl-action-icon-btn:hover {
+  background: var(--surface-hover, #30363d);
+  color: var(--text, #f0f6fc);
+}
+
+/* 视图 C：拓扑矩阵 */
+.sl-topology-view {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.sl-topology-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 12px 16px;
+  background: var(--surface, #161b22);
+  border: 1px solid var(--line, #30363d);
+  border-radius: var(--r-md, 8px);
+}
+
+.sl-topology-header h2 {
+  margin: 0;
+  font-size: 15px;
+  color: var(--text, #f0f6fc);
+}
+
+.sl-topology-header p {
+  margin: 2px 0 0;
+  font-size: 11.5px;
+  color: var(--muted, #8b949e);
+}
+
+.sl-topology-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
+  gap: 14px;
+}
+
+.sl-topo-card {
+  background: var(--surface, #161b22);
+  border: 1px solid var(--line, #30363d);
+  border-radius: var(--r-md, 8px);
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.sl-topo-card.has-sessions {
+  border-color: color-mix(in srgb, var(--brand, #58a6ff) 30%, var(--line, #30363d));
+}
+
+.sl-topo-card-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.sl-topo-site-id {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.sl-topo-sessions-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.sl-topo-session-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 10px;
+  background: var(--surface-soft, #0d1117);
+  border: 1px solid var(--line-soft, #21262d);
+  border-radius: var(--r-sm, 6px);
+}
+
+.sl-topo-session-row.has-error {
+  border-color: color-mix(in srgb, var(--danger, #f85149) 40%, transparent);
+}
+
+.sl-topo-session-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.sl-topo-session-meta svg {
+  width: 16px;
+  height: 16px;
+  color: var(--brand, #58a6ff);
+}
+
+.sl-topo-user-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.sl-topo-user-line strong {
+  font-size: 12px;
+  color: var(--text, #f0f6fc);
+}
+
+.sl-user-id-pill {
+  font-size: 9px;
+  padding: 1px 4px;
+  border-radius: 3px;
+  background: var(--surface, #21262d);
+  color: var(--faint, #8b949e);
+  font-family: monospace;
+}
+
+.sl-token-pill {
+  font-size: 9px;
+  padding: 1px 5px;
+  border-radius: 3px;
+  background: var(--surface, #21262d);
+  color: var(--muted, #8b949e);
+}
+
+.sl-token-pill.active {
+  background: color-mix(in srgb, var(--brand, #1f6feb) 20%, transparent);
+  color: var(--brand, #58a6ff);
+}
+
+.sl-token-pill.sl-token-checked {
+  background: color-mix(in srgb, var(--success, #2ea043) 20%, transparent);
+  color: var(--success, #3fb950);
+}
+
+.sl-topo-subline {
+  font-size: 10px;
+  color: var(--muted, #8b949e);
+}
+
+.sl-topo-session-quota {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+}
+
+.sl-topo-session-quota strong {
+  font-size: 12px;
+}
+
+.sl-topo-session-quota small {
+  font-size: 9.5px;
+  color: var(--muted, #8b949e);
+}
+
+.sl-topo-empty-sessions {
+  padding: 18px;
+  text-align: center;
+  background: var(--surface-soft, #0d1117);
+  border-radius: var(--r-sm, 6px);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+}
+
+.sl-topo-empty-sessions svg {
+  width: 20px;
+  height: 20px;
+  color: var(--faint, #6e7681);
+}
+
+.sl-topo-empty-sessions p {
+  margin: 0;
+  font-size: 11px;
+  color: var(--faint, #6e7681);
+}
+
+.sl-link-action {
+  background: none;
+  border: none;
+  color: var(--brand, #58a6ff);
+  font-size: 11px;
+  cursor: pointer;
+  margin-top: 4px;
+}
+
+/* 4. 批量操作浮动底栏 */
+.sl-batch-dock {
+  position: fixed;
+  bottom: 24px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 100;
+  background: var(--surface, #161b22);
+  border: 1px solid var(--line, #30363d);
+  border-radius: var(--r-lg, 10px);
+  box-shadow: 0 8px 32px rgba(0,0,0,0.45);
+  padding: 8px 16px;
+  animation: slide-up 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@keyframes slide-up {
+  from { transform: translate(-50%, 20px); opacity: 0; }
+  to { transform: translate(-50%, 0); opacity: 1; }
+}
+
+.sl-batch-dock-content {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+.sl-batch-dock-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12.5px;
+  color: var(--brand, #58a6ff);
+}
+
+.sl-batch-dock-title svg {
+  width: 14px;
+  height: 14px;
+}
+
+.sl-batch-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.sl-batch-btn {
+  padding: 5px 10px;
+  border-radius: 6px;
+  background: var(--surface-soft, #21262d);
+  border: 1px solid var(--line, #30363d);
+  color: var(--text, #c9d1d9);
+  font-size: 11.5px;
+  cursor: pointer;
+}
+
+.sl-batch-btn:hover {
+  background: var(--surface-hover, #30363d);
+  color: var(--text, #f0f6fc);
+}
+
+.sl-batch-clear-btn {
+  background: none;
+  border: none;
+  color: var(--muted, #8b949e);
+  font-size: 11.5px;
+  cursor: pointer;
+}
+
+.sl-batch-clear-btn:hover {
+  color: var(--danger, #f85149);
+}
+
+/* 5. 全景详情深度抽屉 */
+.sl-drawer-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  backdrop-filter: blur(4px);
+  z-index: 1000;
+  display: flex;
+  justify-content: flex-end;
+}
+
+.sl-drawer-panel {
+  width: min(720px, 92vw);
+  height: 100%;
+  background: var(--page-bg, #0d1117);
+  border-left: 1px solid var(--line, #30363d);
+  display: flex;
+  flex-direction: column;
+  box-shadow: -8px 0 32px rgba(0,0,0,0.5);
+  animation: drawer-in 0.22s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@keyframes drawer-in {
+  from { transform: translateX(100%); }
+  to { transform: translateX(0); }
+}
+
+.sl-drawer-header {
+  padding: 16px 20px;
+  background: var(--page-header, #161b22);
+  border-bottom: 1px solid var(--line, #30363d);
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 16px;
+}
+
+.sl-drawer-head-identity {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+.sl-drawer-avatar {
+  width: 44px;
+  height: 44px;
+  border-radius: var(--r-md, 8px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 15px;
+  font-weight: 750;
+  flex-shrink: 0;
+}
+
+.sl-drawer-title-box {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.sl-drawer-tags {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+}
+
+.sl-meta-system {
+  color: var(--brand, #58a6ff);
+  font-weight: 650;
+}
+
+.sl-meta-sep {
+  color: var(--faint, #6e7681);
+}
+
+.sl-drawer-title {
+  margin: 2px 0 0;
+  font-size: 18px;
+  font-weight: 750;
+  color: var(--text, #f0f6fc);
+}
+
+.sl-drawer-url {
+  font-size: 11px;
+  color: var(--muted, #8b949e);
+  margin: 2px 0 0;
+}
+
+.sl-drawer-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.sl-btn-copy, .sl-btn-edit {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 30px;
+  padding: 0 10px;
+  border-radius: 6px;
+  background: var(--surface, #21262d);
+  border: 1px solid var(--line, #30363d);
+  color: var(--text, #c9d1d9);
+  font-size: 11.5px;
+  cursor: pointer;
+}
+
+.sl-btn-copy svg, .sl-btn-edit svg {
+  width: 13px;
+  height: 13px;
+}
+
+.sl-btn-copy:hover, .sl-btn-edit:hover {
+  background: var(--surface-hover, #30363d);
+  color: var(--text, #f0f6fc);
+}
+
+.sl-drawer-close-btn {
+  width: 30px;
+  height: 30px;
+  border-radius: 6px;
+  background: var(--surface, #21262d);
+  border: 1px solid var(--line, #30363d);
+  color: var(--muted, #8b949e);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+
+.sl-drawer-close-btn svg {
+  width: 14px;
+  height: 14px;
+}
+
+.sl-drawer-close-btn:hover {
+  color: var(--text, #f0f6fc);
+}
+
+.sl-drawer-tabs {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 20px;
+  background: var(--page-header, #161b22);
+  border-bottom: 1px solid var(--line, #30363d);
+}
+
+.sl-drawer-tabs button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border-radius: 6px;
+  background: transparent;
+  border: none;
+  color: var(--muted, #8b949e);
+  font-size: 12px;
+  font-weight: 550;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.sl-drawer-tabs button svg {
+  width: 14px;
+  height: 14px;
+}
+
+.sl-drawer-tabs button:hover {
+  color: var(--text, #f0f6fc);
+}
+
+.sl-drawer-tabs button.active {
+  background: var(--surface, #21262d);
+  color: var(--brand, #58a6ff);
+}
+
+.sl-drawer-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 16px 20px 32px;
+}
+
+.sl-tab-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.sl-section-card {
+  padding: 14px;
+  background: var(--surface, #161b22);
+  border: 1px solid var(--line, #30363d);
+  border-radius: var(--r-md, 8px);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.sl-section-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12.5px;
+  color: var(--text, #f0f6fc);
+}
+
+.sl-section-head svg {
+  width: 15px;
+  height: 15px;
+  color: var(--brand, #58a6ff);
+}
+
+.sl-desc-text {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--muted, #8b949e);
+}
+
+.sl-facts-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 10px;
+}
+
+.sl-fact-box {
+  padding: 10px 12px;
+  background: var(--surface, #161b22);
+  border: 1px solid var(--line, #30363d);
+  border-radius: var(--r-md, 8px);
+  display: flex;
+  flex-direction: column;
+}
+
+.sl-fact-k {
+  font-size: 10.5px;
+  color: var(--muted, #8b949e);
+}
+
+.sl-fact-v {
+  font-size: 12.5px;
+  color: var(--text, #f0f6fc);
+  margin-top: 2px;
+}
+
+.sl-chips-wrap {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.sl-cap-pill {
+  font-size: 11px;
+  padding: 4px 8px;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--brand, #1f6feb) 15%, transparent);
+  border: 1px solid color-mix(in srgb, var(--brand, #1f6feb) 30%, transparent);
+  color: var(--text, #c9d1d9);
+}
+
+.sl-cap-pill.is-disabled {
+  background: var(--surface-soft, #0d1117);
+  border-color: var(--line, #30363d);
+  color: var(--faint, #6e7681);
+  text-decoration: line-through;
+  opacity: 0.6;
+}
+
+.sl-tags-cloud {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.sl-tag-badge {
+  font-size: 10.5px;
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: var(--surface-soft, #21262d);
+  border: 1px solid var(--line, #30363d);
+  color: var(--muted, #8b949e);
+}
+
+.sl-maintainers-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 8px;
+}
+
+.sl-maintainer-card {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  background: var(--surface-soft, #0d1117);
+  border-radius: var(--r-sm, 6px);
+  border: 1px solid var(--line-soft, #21262d);
+}
+
+.sl-maintainer-avatar {
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  background: var(--brand, #1f6feb);
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  font-weight: 700;
+  flex-shrink: 0;
+}
+
+.sl-maintainer-info {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.sl-maintainer-info strong {
+  font-size: 11.5px;
+  color: var(--text, #f0f6fc);
+}
+
+.sl-maintainer-info small {
+  font-size: 10px;
+  color: var(--muted, #8b949e);
+}
+
+.sl-faint {
+  color: var(--faint, #6e7681) !important;
+}
+
+.sl-btn-icon-xs {
+  margin-left: auto;
+  background: none;
+  border: none;
+  color: var(--muted, #8b949e);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+}
+
+.sl-btn-icon-xs svg {
+  width: 13px;
+  height: 13px;
+}
+
+.sl-links-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.sl-link-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 12px;
+  background: var(--surface-soft, #0d1117);
+  border: 1px solid var(--line-soft, #21262d);
+  border-radius: var(--r-sm, 6px);
+}
+
+.sl-link-item strong {
+  font-size: 12px;
+  color: var(--text, #f0f6fc);
+  display: block;
+}
+
+.sl-link-item small {
+  font-size: 10.5px;
+  color: var(--muted, #8b949e);
+  font-family: monospace;
+}
+
+.sl-link-item-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.sl-empty-hint {
+  font-size: 11.5px;
+  color: var(--faint, #6e7681);
+  margin: 0;
+}
+
+/* 抽屉 TAB 2/3 */
+.sl-tab-action-bar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+}
+
+.sl-tab-section-title {
+  font-size: 13px;
+  font-weight: 650;
+  color: var(--text, #f0f6fc);
+}
+
+.sl-drawer-accounts-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.sl-drawer-acc-card {
+  padding: 12px 14px;
+  background: var(--surface, #161b22);
+  border: 1px solid var(--line, #30363d);
+  border-radius: var(--r-md, 8px);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.sl-drawer-acc-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.sl-drawer-acc-user {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.sl-drawer-acc-avatar {
+  width: 32px;
+  height: 32px;
+  border-radius: var(--r-md, 8px);
+  background: var(--surface-soft, #21262d);
+  color: var(--brand, #58a6ff);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.sl-drawer-acc-avatar svg {
+  width: 16px;
+  height: 16px;
+}
+
+.sl-acc-chips-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 2px;
+}
+
+.sl-drawer-acc-quota {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+}
+
+.sl-acc-quota-k {
+  font-size: 9.5px;
+  color: var(--muted, #8b949e);
+}
+
+.sl-acc-quota-v {
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.sl-drawer-acc-facts {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 8px;
+  padding: 8px 10px;
+  background: var(--surface-soft, #0d1117);
+  border-radius: var(--r-sm, 6px);
+}
+
+.sl-acc-fact {
+  display: flex;
+  flex-direction: column;
+}
+
+.sl-acc-fact span {
+  font-size: 9.5px;
+  color: var(--muted, #8b949e);
+}
+
+.sl-acc-fact strong {
+  font-size: 11.5px;
+  color: var(--text, #f0f6fc);
+}
+
+.sl-drawer-acc-error {
+  padding: 6px 10px;
+  border-radius: var(--r-sm, 6px);
+  background: color-mix(in srgb, var(--danger, #f85149) 15%, transparent);
+  color: var(--danger, #f85149);
+  font-size: 11px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.sl-drawer-acc-error svg {
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+}
+
+.sl-empty-state-compact {
+  padding: 32px 20px;
+  text-align: center;
+  background: var(--surface, #161b22);
+  border: 1px dashed var(--line, #30363d);
+  border-radius: var(--r-md, 8px);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+}
+
+.sl-empty-state-compact svg {
+  width: 28px;
+  height: 28px;
+  color: var(--faint, #6e7681);
+}
+
+.sl-empty-state-compact p {
+  margin: 0;
+  font-size: 12px;
+  color: var(--muted, #8b949e);
+}
+
+/* 抽屉模型与 Key 选项卡 */
+.sl-models-search-box {
+  position: relative;
+  display: flex;
+  align-items: center;
+  background: var(--surface, #21262d);
+  border: 1px solid var(--line, #30363d);
+  border-radius: var(--r-md, 8px);
+  padding: 0 10px;
+  height: 32px;
+  flex: 1;
+}
+
+.sl-models-search-box svg {
+  width: 13px;
+  height: 13px;
+  color: var(--muted, #8b949e);
+}
+
+.sl-models-search-box input {
+  width: 100%;
+  border: none;
+  background: transparent;
+  color: var(--text, #f0f6fc);
+  font-size: 11.5px;
+  padding: 0 6px;
+  outline: none;
+}
+
+.sl-models-sync-btns {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.sl-keys-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  overflow: hidden;
+}
+
+.sl-keys-label {
+  font-size: 11px;
+  color: var(--muted, #8b949e);
+  flex-shrink: 0;
+}
+
+.sl-keys-chips {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  overflow-x: auto;
+}
+
+.sl-key-chip {
+  padding: 3px 8px;
+  border-radius: 6px;
+  background: var(--surface, #21262d);
+  border: 1px solid var(--line, #30363d);
+  color: var(--muted, #8b949e);
+  font-size: 10.5px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.sl-key-chip.active {
+  background: color-mix(in srgb, var(--brand, #1f6feb) 20%, var(--surface, #21262d));
+  color: var(--brand, #58a6ff);
+  border-color: color-mix(in srgb, var(--brand, #1f6feb) 50%, transparent);
+}
+
+.sl-drawer-models-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 8px;
+}
+
+.sl-drawer-model-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 10px;
+  background: var(--surface, #161b22);
+  border: 1px solid var(--line, #30363d);
+  border-radius: var(--r-sm, 6px);
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.sl-drawer-model-item:hover {
+  background: var(--surface-hover, #282e36);
+  border-color: color-mix(in srgb, var(--brand, #58a6ff) 35%, var(--line, #30363d));
+}
+
+.sl-model-item-info {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.sl-model-item-info strong {
+  font-size: 11px;
+  color: var(--text, #f0f6fc);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.sl-model-copy-btn {
+  background: none;
+  border: none;
+  color: var(--muted, #8b949e);
+  cursor: pointer;
+  padding: 2px;
+  display: flex;
+  align-items: center;
+}
+
+.sl-model-copy-btn svg {
+  width: 12px;
+  height: 12px;
+}
+
+.sl-raw-json-box {
+  background: #090d13;
+  border: 1px solid var(--line, #30363d);
+  border-radius: var(--r-md, 8px);
+  padding: 14px;
+  max-height: 520px;
+  overflow: auto;
+}
+
+.sl-raw-json-box pre {
+  margin: 0;
+  font-family: monospace;
+  font-size: 11px;
+  color: #79c0ff;
+  line-height: 1.5;
+}
+
+/* 空状态与加载中 */
+.sl-loading-state, .sl-empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 60px 20px;
+  text-align: center;
+  color: var(--muted, #8b949e);
+}
+
+.sl-loading-state svg, .sl-empty-state svg {
+  width: 36px;
+  height: 36px;
+  margin-bottom: 12px;
+  color: var(--faint, #6e7681);
+}
+
+.sl-empty-state h3 {
+  margin: 0 0 6px;
+  color: var(--text, #f0f6fc);
+  font-size: 16px;
+}
+
+.sl-empty-state p {
+  margin: 0 0 16px;
+  font-size: 12px;
+}
+
+.is-spinning {
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+@media (max-width: 1024px) {
+  .sl-metrics-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+  .sl-filters-row {
+    grid-template-columns: 1fr 1fr;
+  }
+}
+</style>
