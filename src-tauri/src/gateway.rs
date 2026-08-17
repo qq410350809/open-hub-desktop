@@ -164,39 +164,43 @@ impl GatewayState {
     }
 }
 
+fn normalize_model_id(id: &str) -> String {
+    let trimmed = id.trim();
+    let stripped = trimmed.split('/').last().unwrap_or(trimmed);
+    stripped.to_ascii_lowercase()
+}
+
 pub fn load_candidates_from_connection(
     conn: &Connection,
     config: &GatewayConfig,
 ) -> Vec<CandidateKey> {
-    let mut stmt = match conn.prepare(
+    let rows = conn.prepare(
         "SELECT s.id, s.name, s.api_base_url, s.system_type, c.keys_json, c.groups_json, c.key_models_json, c.models_json
          FROM directory_sites s
-         JOIN site_model_cache c ON s.id = c.site_id
-         WHERE s.hidden = 0",
-    ) {
-        Ok(stmt) => stmt,
-        Err(_) => return Vec::new(),
-    };
-
-    let rows = stmt.query_map([], |row| {
-        let site_id: String = row.get(0)?;
-        let site_name: String = row.get(1)?;
-        let api_base_url: String = row.get(2)?;
-        let system_type: String = row.get(3)?;
-        let keys_json: String = row.get(4)?;
-        let groups_json: String = row.get(5)?;
-        let key_models_json: String = row.get(6)?;
-        let models_json: String = row.get(7)?;
-        Ok((
-            site_id,
-            site_name,
-            api_base_url,
-            system_type,
-            keys_json,
-            groups_json,
-            key_models_json,
-            models_json,
-        ))
+         INNER JOIN site_model_cache c ON s.id = c.site_id
+         WHERE s.is_personal = 1",
+    ).and_then(|mut stmt| {
+        let rows = stmt.query_map([], |row| {
+            let site_id: String = row.get(0)?;
+            let site_name: String = row.get(1)?;
+            let api_base_url: String = row.get(2)?;
+            let system_type: String = row.get(3)?;
+            let keys_json: String = row.get(4)?;
+            let groups_json: String = row.get(5)?;
+            let key_models_json: String = row.get(6)?;
+            let models_json: String = row.get(7)?;
+            Ok((
+                site_id,
+                site_name,
+                api_base_url,
+                system_type,
+                keys_json,
+                groups_json,
+                key_models_json,
+                models_json,
+            ))
+        })?;
+        Ok(rows.collect::<Vec<_>>())
     });
 
     let Ok(rows) = rows else {
@@ -204,13 +208,13 @@ pub fn load_candidates_from_connection(
     };
 
     let mut candidates = Vec::new();
-    let hidden_set: HashSet<&str> = config
+    let hidden_set: HashSet<String> = config
         .model_agg_hidden_nodes
         .iter()
-        .map(String::as_str)
+        .map(|s| normalize_model_id(s))
         .collect();
 
-    for item in rows.flatten() {
+    for item in rows.into_iter().flatten() {
         let (site_id, site_name, api_base_url, system_type, k_json, g_json, km_json, m_json) = item;
         let keys: Vec<String> = serde_json::from_str(&k_json).unwrap_or_default();
         let groups: HashMap<String, String> = serde_json::from_str(&g_json).unwrap_or_default();
@@ -243,8 +247,8 @@ pub fn load_candidates_from_connection(
                 general_models.clone()
             };
 
-            // 过滤掉被隐藏的模型
-            assigned_models.retain(|m| !hidden_set.contains(m.as_str()));
+            // 过滤掉被隐藏的模型（统一进行规范化比较）
+            assigned_models.retain(|m| !hidden_set.contains(&normalize_model_id(m)));
 
             candidates.push(CandidateKey {
                 site_id: site_id.clone(),
@@ -355,6 +359,10 @@ async fn list_models_handler(
     for candidate in candidates.iter() {
         for model in &candidate.models {
             unique_models.insert(model.clone());
+            let norm = normalize_model_id(model);
+            if !norm.is_empty() {
+                unique_models.insert(norm);
+            }
         }
     }
 
