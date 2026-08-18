@@ -144,16 +144,33 @@ function receiveNestedChromeSyncProgress(progress: SyncSitesProgress) {
   });
 }
 
-function openSyncDialog() {
+function openSyncDialog(
+  explicitMode?: "remote" | "quota",
+  explicitUsage?: "personal" | "pending",
+  explicitSiteIds?: string[],
+) {
   if (syncDialogOpen.value) return;
   syncRunId += 1;
   resetSyncLog();
   syncDialogRunaway.value = runawayFilter.value === "runaway";
-  const quotaMode = usageFilter.value === "personal" || usageFilter.value === "pending";
-  syncDialogMode.value = quotaMode ? "quota" : "remote";
-  syncDialogUsage.value = usageFilter.value === "pending" ? "pending" : "personal";
-  // 额度同步只锁定当前主视图及其余筛选条件中的站点，不扩展到全库。
-  syncDialogSiteIds.value = filteredSites.value.map((site) => site.id);
+  const quotaMode = explicitMode
+    ? explicitMode === "quota"
+    : (usageFilter.value === "personal" || usageFilter.value === "pending");
+  syncDialogMode.value = explicitMode ?? (quotaMode ? "quota" : "remote");
+  syncDialogUsage.value = explicitUsage ?? (usageFilter.value === "pending" ? "pending" : "personal");
+  if (explicitSiteIds && explicitSiteIds.length > 0) {
+    syncDialogSiteIds.value = [...explicitSiteIds];
+  } else if (syncDialogMode.value === "quota") {
+    const targetUsage = syncDialogUsage.value;
+    const targetSites = sites.value.filter((site) =>
+      targetUsage === "pending" ? site.isPending : site.isPersonal,
+    );
+    syncDialogSiteIds.value = targetSites.length > 0
+      ? targetSites.map((s) => s.id)
+      : filteredSites.value.map((s) => s.id);
+  } else {
+    syncDialogSiteIds.value = filteredSites.value.map((site) => site.id);
+  }
   syncDialogOpen.value = true;
   if (syncDialogMode.value === "remote") void refreshRemoteUser();
 }

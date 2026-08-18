@@ -33,6 +33,7 @@ import {
   toLocalDate,
 } from "../composables/tokenStatsAgg";
 import type { TrendGranularity } from "../composables/tokenStatsAgg";
+import { isTauri, runCommand } from "../composables/useLibrary";
 
 const store = useStore();
 const { preferences } = usePreferences();
@@ -87,7 +88,6 @@ type RefreshLogEntry = TokenCollectorProgress & {
   time: string;
 };
 
-const isTauri = "__TAURI_INTERNALS__" in window;
 const refreshDialogOpen = ref(false);
 const refreshPhase = ref<RefreshPhase>("confirm");
 const refreshLogs = ref<RefreshLogEntry[]>([]);
@@ -248,7 +248,36 @@ function closeExportDialog() {
   exportDialogOpen.value = false;
 }
 
-function exportDataAsJson() {
+async function downloadFile(filename: string, content: string, mimeType: string) {
+  if (isTauri) {
+    try {
+      // Base64 编码以安全传输二进制内容（如 CSV 的 BOM）
+      const encoder = new TextEncoder();
+      const bytes = encoder.encode(content);
+      let binary = "";
+      for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+      const base64 = btoa(binary);
+      const result = await runCommand<{ path: string | null; cancelled: boolean }>("save_export_file", {
+        args: { filename, content: base64 },
+      });
+      if (result.cancelled) return;
+      store.showToast(`已导出到 ${result.path}`);
+    } catch (e) {
+      store.showToast(`导出失败: ${e}`);
+    }
+  } else {
+    const blob = new Blob([content], { type: mimeType });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(url);
+    store.showToast("已导出文件");
+  }
+}
+
+async function exportDataAsJson() {
   const payload = {
     exportTime: new Date().toISOString(),
     timeRange: {
@@ -274,32 +303,26 @@ function exportDataAsJson() {
     projects: projectUsage.value,
     trendDetails: trendDetailList.value,
   };
-  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = `openhub-token-stats-${toLocalDate(new Date())}.json`;
-  a.click();
-  URL.revokeObjectURL(url);
-  store.showToast("已导出 JSON 报表");
+  await downloadFile(
+    `openhub-token-stats-${toLocalDate(new Date())}.json`,
+    JSON.stringify(payload, null, 2),
+    "application/json",
+  );
   closeExportDialog();
 }
 
-function exportDataAsCsv() {
+async function exportDataAsCsv() {
   const rows: string[] = [];
   rows.push("时间,总计Token,输入Token,输出Token,缓存Token,缓存命中率,推理Token,对话数,请求数");
   for (const item of trendDetailList.value) {
     const hitRate = item.cacheHitRate != null ? `${(item.cacheHitRate * 100).toFixed(2)}%` : "0%";
     rows.push(`"${item.label}",${item.total},${item.input},${item.output},${item.cache},"${hitRate}",${item.reasoning},${item.sessions},${item.requests}`);
   }
-  const blob = new Blob(["\uFEFF" + rows.join("\n")], { type: "text/csv;charset=utf-8;" });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = `openhub-token-trend-${toLocalDate(new Date())}.csv`;
-  a.click();
-  URL.revokeObjectURL(url);
-  store.showToast("已导出 CSV 报表");
+  await downloadFile(
+    `openhub-token-trend-${toLocalDate(new Date())}.csv`,
+    "\uFEFF" + rows.join("\n"),
+    "text/csv;charset=utf-8;",
+  );
   closeExportDialog();
 }
 
@@ -553,8 +576,8 @@ const filteredModels = computed(() => {
   return byModel.value.filter((m) => m.model.toLowerCase().includes(q));
 });
 
-const topSources = computed(() => bySource.value.slice(0, 6));
-const topModels = computed(() => byModel.value.slice(0, 6));
+const topSources = computed(() => bySource.value.slice(0, 5));
+const topModels = computed(() => byModel.value.slice(0, 5));
 
 // 项目用量
 type ProjectUsageItem = {
@@ -782,18 +805,28 @@ const trendDetailList = computed(() =>
 
 // —— 健康时间线网格测量 ——
 const HEALTH_ROWS = 8;
-const HEALTH_CELL = 11;
+const HEALTH_CELL = 12;
 const HEALTH_GAP = 3;
 const healthGridRef = ref<HTMLElement | null>(null);
 const healthCols = ref(24);
 let healthRo: ResizeObserver | null = null;
+
+const healthStatusInfo = computed(() => {
+  const rate = healthTimeline.value.successRate;
+  if (rate == null) return { label: "状态正常", class: "is-excellent" };
+  if (rate >= 0.98) return { label: "极佳", class: "is-excellent" };
+  if (rate >= 0.90) return { label: "良好", class: "is-good" };
+  if (rate >= 0.80) return { label: "波动", class: "is-fair" };
+  return { label: "异常", class: "is-bad" };
+});
 
 function measureHealthGrid() {
   const el = healthGridRef.value;
   if (!el) return;
   const width = el.clientWidth || el.getBoundingClientRect().width;
   if (width <= 0) return;
-  const cols = Math.max(1, Math.floor((width + HEALTH_GAP) / (HEALTH_CELL + HEALTH_GAP)));
+  const targetColWidth = HEALTH_CELL + HEALTH_GAP;
+  const cols = Math.max(12, Math.round((width + HEALTH_GAP) / targetColWidth));
   if (cols !== healthCols.value) healthCols.value = cols;
 }
 
@@ -948,7 +981,7 @@ const trendChartOption = computed<EChartsOption>(() => {
           type: "bar",
           stack: "total",
           data: trendDetail.value.map((i) => i.input),
-          itemStyle: { color: "#3b82f6" },
+          itemStyle: { color: "#0284c7" },
         },
         {
           name: "输出 Tokens",
@@ -1041,7 +1074,7 @@ const trendChartOption = computed<EChartsOption>(() => {
         return `
           <div style="font-weight: 600; margin-bottom: 4px;">${detail.label}</div>
           <div>总计: <strong>${formatCompact(detail.total)}</strong> (${formatTokens(detail.total)})</div>
-          <div style="color: #3b82f6;">输入: ${formatCompact(detail.input)}</div>
+          <div style="color: #0284c7;">输入: ${formatCompact(detail.input)}</div>
           <div style="color: #10b981;">输出: ${formatCompact(detail.output)}</div>
           <div style="color: #8b5cf6;">缓存: ${formatCompact(detail.cache)} (命中率 ${hitRateStr})</div>
           ${detail.reasoning > 0 ? `<div style="color: #f59e0b;">推理: ${formatCompact(detail.reasoning)}</div>` : ""}
@@ -1142,7 +1175,7 @@ onBeforeUnmount(() => {
         <div class="tt-brand-section">
           <div class="tt-eyebrow-row">
             <span class="tt-live-dot" />
-            <span class="tt-eyebrow-text">Token Analytics & Insights</span>
+            <span class="tt-eyebrow-text">Token 用量分析中心</span>
           </div>
           <div class="tt-title-row">
             <h1>Token 统计中心</h1>
@@ -1154,54 +1187,6 @@ onBeforeUnmount(() => {
       </div>
 
       <div class="tt-cockpit-right">
-        <!-- 快捷时间选择器 -->
-        <QuickRangeDropdown />
-
-        <!-- 4 大维度分析弹窗触发按钮 -->
-        <div class="tt-cockpit-pills-group">
-          <button
-            type="button"
-            class="tt-pill-btn"
-            title="查看全部 AI 工具与客户端消耗明细"
-            @click="toolsModalOpen = true"
-          >
-            <span v-html="icons.cpu" />
-            <span>工具 ({{ bySource.length }})</span>
-          </button>
-
-          <button
-            type="button"
-            class="tt-pill-btn"
-            title="查看全部大模型消耗排行榜"
-            @click="modelsModalOpen = true"
-          >
-            <span v-html="icons.database" />
-            <span>模型 ({{ byModel.length }})</span>
-          </button>
-
-          <button
-            type="button"
-            class="tt-pill-btn"
-            title="查看各项目与工作区用量透视"
-            @click="projectsModalOpen = true"
-          >
-            <span v-html="icons.folder" />
-            <span>项目 ({{ projectUsage.length }})</span>
-          </button>
-
-          <button
-            type="button"
-            class="tt-pill-btn"
-            title="查看逐日逐时时序总账"
-            @click="auditModalOpen = true"
-          >
-            <span v-html="icons.sliders" />
-            <span>明细总账</span>
-          </button>
-        </div>
-
-        <div class="tt-cockpit-divider" />
-
         <button
           type="button"
           class="tt-btn-rebuild"
@@ -1233,6 +1218,53 @@ onBeforeUnmount(() => {
       </div>
     </header>
 
+    <!-- 标题下方的筛选工具条：日期选择 + 维度弹窗按钮 -->
+    <div class="tt-filter-toolbar">
+      <QuickRangeDropdown />
+
+      <div class="tt-cockpit-pills-group">
+        <button
+          type="button"
+          class="tt-pill-btn"
+          title="查看全部 AI 工具与客户端消耗明细"
+          @click="toolsModalOpen = true"
+        >
+          <span v-html="icons.cpu" />
+          <span>工具 ({{ bySource.length }})</span>
+        </button>
+
+        <button
+          type="button"
+          class="tt-pill-btn"
+          title="查看全部大模型消耗排行榜"
+          @click="modelsModalOpen = true"
+        >
+          <span v-html="icons.database" />
+          <span>模型 ({{ byModel.length }})</span>
+        </button>
+
+        <button
+          type="button"
+          class="tt-pill-btn"
+          title="查看各项目与工作区用量透视"
+          @click="projectsModalOpen = true"
+        >
+          <span v-html="icons.folder" />
+          <span>项目 ({{ projectUsage.length }})</span>
+        </button>
+
+        <button
+          type="button"
+          class="tt-pill-btn"
+          title="查看逐日逐时时序总账"
+          @click="auditModalOpen = true"
+        >
+          <span v-html="icons.sliders" />
+          <span>明细总账</span>
+        </button>
+      </div>
+    </div>
+
     <!-- 首页零滚动条主视口 (No-Scroll Viewport Layout) -->
     <div class="tt-dashboard-body">
       <!-- 错误提示 -->
@@ -1260,7 +1292,7 @@ onBeforeUnmount(() => {
               <div class="tt-kpi-header">
                 <span class="tt-kpi-tag is-emerald">
                   <span v-html="icons.chart" />
-                  <span>TOTAL TOKENS</span>
+                  <span>总用量</span>
                 </span>
                 <span class="tt-kpi-badge-hit" :class="cacheHitRateRating.class">
                   ⚡ 缓存命中率 {{ formatRate(cacheHitRate) }}
@@ -1302,7 +1334,7 @@ onBeforeUnmount(() => {
               <div class="tt-kpi-header">
                 <span class="tt-kpi-tag is-orange">
                   <span v-html="icons.flame" />
-                  <span>BURN RATE & STREAK</span>
+                  <span>消耗速率与连续</span>
                 </span>
                 <span v-if="streakDays > 1" class="tt-kpi-streak-pill">
                   🔥 连续 {{ streakDays }} 天
@@ -1328,7 +1360,7 @@ onBeforeUnmount(() => {
               <div class="tt-kpi-header">
                 <span class="tt-kpi-tag is-blue">
                   <span v-html="icons.activity" />
-                  <span>DIALOGUES & REQUESTS</span>
+                  <span>对话与请求</span>
                 </span>
                 <span class="tt-kpi-badge-rate">
                   {{ healthTimeline.successRate != null ? (healthTimeline.successRate * 100).toFixed(1) + "% 成功率" : "—" }}
@@ -1353,7 +1385,7 @@ onBeforeUnmount(() => {
               <div class="tt-kpi-header">
                 <span class="tt-kpi-tag is-purple">
                   <span v-html="icons.card" />
-                  <span>ECONOMIC VALUE</span>
+                  <span>经济价值</span>
                 </span>
                 <span v-if="estimatedCacheSavings > 0" class="tt-kpi-savings-pill">
                   ⚡ 缓存节约 ≈ ${{ estimatedCacheSavings.toFixed(2) }}
@@ -1381,9 +1413,9 @@ onBeforeUnmount(() => {
           </div>
         </section>
 
-        <!-- ROW 2: 双主图表全景 (Flex: 1, Min-Height: 0, 趋势 + 请求健康) -->
-        <section class="tt-dual-charts-grid">
-          <!-- 趋势图卡片 -->
+        <!-- 4 大核心全景图表与分布四等分大盘 (Equal 4-Quadrant Grid) -->
+        <section class="tt-quad-grid">
+          <!-- 1. 趋势图卡片 -->
           <div class="tt-card tt-chart-card">
             <header class="tt-card-header">
               <div class="tt-card-title-wrap">
@@ -1417,20 +1449,53 @@ onBeforeUnmount(() => {
             </div>
           </div>
 
-          <!-- 请求健康热力时间线 -->
+          <!-- 2. 请求健康热力时间线 -->
           <div class="tt-card tt-health-card">
             <header class="tt-card-header">
               <div class="tt-card-title-wrap">
                 <h2>请求健康矩阵 (Health Radar)</h2>
                 <p>色阶按成功率：≥99% 绿 · 95–99% 浅绿 · 85–95% 黄 · 70–85% 橙 · &lt;70% 红</p>
               </div>
-              <div class="tt-health-summary-pill">
-                <span class="ok">● 成功 {{ formatTokens(healthTimeline.totalSuccess) }}</span>
-                <span class="bad">● 失败 {{ formatTokens(healthTimeline.totalFailed) }}</span>
-              </div>
             </header>
             <div class="tt-card-body tt-health-body">
               <div v-if="healthTimeline.cells.length" class="tt-health-wrapper">
+                <!-- 顶部 4 大健康遥测微指标 -->
+                <div class="tt-health-kpi-bar">
+                  <div class="tt-hk-card">
+                    <span class="tt-hk-lbl">综合成功率</span>
+                    <div class="tt-hk-val-box">
+                      <strong class="tt-hk-num" :class="healthTimeline.successRate != null && healthTimeline.successRate < 0.95 ? 'text-warning' : 'text-success'">
+                        {{ healthTimeline.successRate != null ? (healthTimeline.successRate * 100).toFixed(1) + '%' : '100%' }}
+                      </strong>
+                      <span class="tt-hk-badge" :class="healthStatusInfo.class">{{ healthStatusInfo.label }}</span>
+                    </div>
+                  </div>
+                  <div class="tt-hk-card">
+                    <span class="tt-hk-lbl">请求吞吐量</span>
+                    <div class="tt-hk-val-box">
+                      <strong class="tt-hk-num">{{ formatTokens(healthTimeline.totalRequests) }}</strong>
+                      <small class="tt-hk-unit">次</small>
+                    </div>
+                  </div>
+                  <div class="tt-hk-card">
+                    <span class="tt-hk-lbl">异常/失败</span>
+                    <div class="tt-hk-val-box">
+                      <strong class="tt-hk-num" :class="{ 'text-danger': healthTimeline.totalFailed > 0 }">
+                        {{ formatTokens(healthTimeline.totalFailed) }}
+                      </strong>
+                      <small class="tt-hk-unit">次</small>
+                    </div>
+                  </div>
+                  <div class="tt-hk-card">
+                    <span class="tt-hk-lbl">活跃监测时段</span>
+                    <div class="tt-hk-val-box">
+                      <strong class="tt-hk-num">{{ healthTimeline.activeCount }}</strong>
+                      <small class="tt-hk-unit">/ {{ healthTimeline.nodeCount }}</small>
+                    </div>
+                  </div>
+                </div>
+
+                <!-- 热力矩阵主体 -->
                 <div
                   ref="healthGridRef"
                   class="tt-health-grid"
@@ -1444,6 +1509,8 @@ onBeforeUnmount(() => {
                     :title="healthCellTitle(cell)"
                   />
                 </div>
+
+                <!-- 底部图例 -->
                 <div class="tt-health-legend">
                   <span>故障频发</span>
                   <span class="tt-health-cell lv1" title="成功率 < 70%" />
@@ -1460,23 +1527,20 @@ onBeforeUnmount(() => {
               <div v-else class="tt-empty-state">当前时间区间内暂无请求健康记录</div>
             </div>
           </div>
-        </section>
 
-        <!-- ROW 3: 底部快捷分布与深度透视发射台 (Compact Row) -->
-        <section class="tt-bottom-row">
-          <!-- 工具消耗分布 -->
+          <!-- 3. 工具消耗分布 -->
           <div class="tt-card tt-preview-card">
             <header class="tt-card-header">
               <div>
                 <h3>主要工具消耗分布</h3>
-                <p>Top 4 客户端用量占比</p>
+                <p>Top 5 客户端用量占比</p>
               </div>
               <button type="button" class="tt-text-btn" @click="toolsModalOpen = true">
                 查看全部 {{ bySource.length }} 款工具明细 ➔
               </button>
             </header>
             <div class="tt-card-body tt-preview-body">
-              <div v-for="(item, idx) in topSources.slice(0, 4)" :key="item.source" class="tt-bar-row">
+              <div v-for="(item, idx) in topSources.slice(0, 5)" :key="item.source" class="tt-bar-row">
                 <span class="tt-bar-dot" :style="{ background: providerColor(item.source, idx) }" />
                 <span class="tt-bar-label">{{ sourceLabel(item.source) }}</span>
                 <div class="tt-bar-track">
@@ -1488,19 +1552,19 @@ onBeforeUnmount(() => {
             </div>
           </div>
 
-          <!-- 模型消耗排行 -->
+          <!-- 4. 模型消耗排行 -->
           <div class="tt-card tt-preview-card">
             <header class="tt-card-header">
               <div>
                 <h3>主要模型消耗排行</h3>
-                <p>Top 4 旗舰模型用量占比</p>
+                <p>Top 5 旗舰模型用量占比</p>
               </div>
               <button type="button" class="tt-text-btn" @click="modelsModalOpen = true">
                 查看全部 {{ byModel.length }} 款模型排行榜 ➔
               </button>
             </header>
             <div class="tt-card-body tt-preview-body">
-              <div v-for="(model, idx) in topModels.slice(0, 4)" :key="model.model" class="tt-bar-row">
+              <div v-for="(model, idx) in topModels.slice(0, 5)" :key="model.model" class="tt-bar-row">
                 <span class="tt-bar-dot" :style="{ background: providerColor(model.model, idx) }" />
                 <span class="tt-bar-label font-mono" :title="model.model">{{ model.model }}</span>
                 <div class="tt-bar-track">
@@ -1608,10 +1672,6 @@ onBeforeUnmount(() => {
               </AppTable>
             </div>
           </div>
-
-          <footer class="tt-modal-footer">
-            <button type="button" class="tt-btn-cancel" @click="toolsModalOpen = false">关闭</button>
-          </footer>
         </section>
       </div>
     </Transition>
@@ -1664,10 +1724,6 @@ onBeforeUnmount(() => {
               </AppTable>
             </div>
           </div>
-
-          <footer class="tt-modal-footer">
-            <button type="button" class="tt-btn-cancel" @click="modelsModalOpen = false">关闭</button>
-          </footer>
         </section>
       </div>
     </Transition>
@@ -1720,10 +1776,6 @@ onBeforeUnmount(() => {
               </AppTable>
             </div>
           </div>
-
-          <footer class="tt-modal-footer">
-            <button type="button" class="tt-btn-cancel" @click="projectsModalOpen = false">关闭</button>
-          </footer>
         </section>
       </div>
     </Transition>
@@ -1771,10 +1823,6 @@ onBeforeUnmount(() => {
               </AppTable>
             </div>
           </div>
-
-          <footer class="tt-modal-footer">
-            <button type="button" class="tt-btn-cancel" @click="auditModalOpen = false">关闭</button>
-          </footer>
         </section>
       </div>
     </Transition>
@@ -1782,13 +1830,13 @@ onBeforeUnmount(() => {
     <!-- 统计重建控制台弹窗 (Reconstruction Console Modal) -->
     <Transition name="tt-modal-fade">
       <div v-if="refreshDialogOpen" class="tt-modal-backdrop" @click.self="closeRefreshDialog">
-        <section class="tt-modal tt-refresh-modal" role="dialog" aria-modal="true">
-          <header class="tt-modal-head">
+        <section class="tt-modal-card" role="dialog" aria-modal="true">
+          <header class="tt-modal-header">
             <div>
               <h2>{{ refreshStatusTitle }}</h2>
               <p>{{ refreshStatusDescription }}</p>
             </div>
-            <button type="button" class="tt-modal-close" aria-label="关闭" @click="closeRefreshDialog">×</button>
+            <button type="button" class="tt-modal-close-btn" aria-label="关闭" @click="closeRefreshDialog">×</button>
           </header>
 
           <div class="tt-modal-body">
@@ -1873,13 +1921,13 @@ onBeforeUnmount(() => {
     <!-- 本地 AI Agent 路径诊断弹窗 (Local Agent Inspector Modal) -->
     <Transition name="tt-modal-fade">
       <div v-if="agentDialogOpen" class="tt-modal-backdrop" @click.self="closeAgentDialog">
-        <section class="tt-modal tt-agent-modal" role="dialog" aria-modal="true">
-          <header class="tt-modal-head">
+        <section class="tt-modal-card is-wide" role="dialog" aria-modal="true">
+          <header class="tt-modal-header">
             <div>
               <h2>本机 AI Agent 诊断终端</h2>
               <p>只读探测当前 macOS 系统中各 AI 编程工具的配置、数据库与日志目录</p>
             </div>
-            <button type="button" class="tt-modal-close" aria-label="关闭" @click="closeAgentDialog">×</button>
+            <button type="button" class="tt-modal-close-btn" aria-label="关闭" @click="closeAgentDialog">×</button>
           </header>
 
           <div class="tt-modal-body">
@@ -1952,12 +2000,9 @@ onBeforeUnmount(() => {
                 </div>
               </div>
             </template>
-          </div>
 
-          <footer class="tt-modal-footer">
             <span class="tt-footer-hint">点击任意路径行可直接复制完整路径至系统剪贴板。</span>
-            <button type="button" class="tt-btn-cancel" @click="closeAgentDialog">关闭</button>
-          </footer>
+          </div>
         </section>
       </div>
     </Transition>
@@ -1965,13 +2010,13 @@ onBeforeUnmount(() => {
     <!-- 导出数据弹窗 (Export Modal) -->
     <Transition name="tt-modal-fade">
       <div v-if="exportDialogOpen" class="tt-modal-backdrop" @click.self="closeExportDialog">
-        <section class="tt-modal tt-export-modal" role="dialog" aria-modal="true">
-          <header class="tt-modal-head">
+        <section class="tt-modal-card is-wide" role="dialog" aria-modal="true">
+          <header class="tt-modal-header">
             <div>
               <h2>导出 Token 数据分析报表</h2>
               <p>导出当前所选时间范围 ({{ rangeLabel }}) 内的多维分析指标</p>
             </div>
-            <button type="button" class="tt-modal-close" aria-label="关闭" @click="closeExportDialog">×</button>
+            <button type="button" class="tt-modal-close-btn" aria-label="关闭" @click="closeExportDialog">×</button>
           </header>
 
           <div class="tt-modal-body">
@@ -1991,10 +2036,6 @@ onBeforeUnmount(() => {
               </div>
             </div>
           </div>
-
-          <footer class="tt-modal-footer">
-            <button type="button" class="tt-btn-cancel" @click="closeExportDialog">取消</button>
-          </footer>
         </section>
       </div>
     </Transition>
@@ -2029,7 +2070,8 @@ onBeforeUnmount(() => {
 .tt-cockpit-left {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 16px;
+  flex-shrink: 0;
 }
 
 .tt-brand-section {
@@ -2091,6 +2133,22 @@ onBeforeUnmount(() => {
   gap: 8px;
 }
 
+/* 标题下方筛选工具条：日期选择 + 维度按钮 */
+.tt-filter-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 20px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--line);
+  flex-shrink: 0;
+}
+
+/* 让 QuickRangeDropdown 在工具条中不被压缩 */
+.tt-filter-toolbar :deep(.tt-range-dd) {
+  flex-shrink: 0;
+}
+
 /* 顶部快速视角气泡群组 */
 .tt-cockpit-pills-group {
   display: inline-flex;
@@ -2100,6 +2158,7 @@ onBeforeUnmount(() => {
   border: 1px solid var(--line);
   border-radius: var(--r-md, 8px);
   padding: 2px;
+  flex-shrink: 0;
 }
 
 .tt-pill-btn {
@@ -2117,6 +2176,7 @@ onBeforeUnmount(() => {
   cursor: pointer;
   transition: all 0.12s ease;
   white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .tt-pill-btn:hover {
@@ -2135,6 +2195,12 @@ onBeforeUnmount(() => {
   height: 20px;
   background: var(--line);
   margin: 0 2px;
+  flex-shrink: 0;
+}
+
+/* 让 QuickRangeDropdown 在 cockpit-right 中不被压缩 */
+.tt-cockpit-right :deep(.tt-range-dd) {
+  flex-shrink: 0;
 }
 
 /* 按钮规范 */
@@ -2152,6 +2218,8 @@ onBeforeUnmount(() => {
   font-weight: 600;
   cursor: pointer;
   transition: all 0.15s ease;
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .tt-btn-rebuild:hover:not(:disabled) {
@@ -2184,6 +2252,8 @@ onBeforeUnmount(() => {
   font-weight: 550;
   cursor: pointer;
   transition: all 0.15s ease;
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .tt-btn-secondary:hover {
@@ -2436,19 +2506,22 @@ onBeforeUnmount(() => {
   font-weight: 700;
 }
 
-/* ROW 2: 双主图表全景 (Flex: 1, Min-Height: 0) */
-.tt-dual-charts-grid {
+/* 4 大核心全景图表与分布四等分大盘 (Equal 4-Quadrant 2x2 Grid) */
+.tt-quad-grid {
   flex: 1;
   min-height: 0;
   display: grid;
-  grid-template-columns: 1.15fr 0.85fr;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-rows: repeat(2, minmax(0, 1fr));
   gap: 10px;
   overflow: hidden;
 }
 
 @media (max-width: 1100px) {
-  .tt-dual-charts-grid {
+  .tt-quad-grid {
     grid-template-columns: 1fr;
+    grid-template-rows: auto;
+    overflow-y: auto;
   }
 }
 
@@ -2521,14 +2594,61 @@ onBeforeUnmount(() => {
   overflow: hidden;
 }
 
-.tt-health-summary-pill {
-  display: inline-flex;
-  gap: 8px;
-  font-size: 10.5px;
-  font-weight: 600;
+.tt-health-kpi-bar {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 6px;
+  margin-bottom: 6px;
+  flex-shrink: 0;
 }
-.tt-health-summary-pill .ok { color: #10b981; }
-.tt-health-summary-pill .bad { color: #ef4444; }
+
+.tt-hk-card {
+  padding: 5px 8px;
+  border-radius: var(--r-sm, 6px);
+  background: var(--page-bg);
+  border: 1px solid var(--line-soft);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.tt-hk-lbl {
+  font-size: 10px;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tt-hk-val-box {
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
+}
+
+.tt-hk-num {
+  font-size: 13.5px;
+  font-weight: 750;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+}
+
+.tt-hk-unit {
+  font-size: 9.5px;
+  color: var(--muted);
+}
+
+.tt-hk-badge {
+  font-size: 9px;
+  font-weight: 700;
+  padding: 1px 4px;
+  border-radius: 3px;
+  line-height: 1;
+}
+.tt-hk-badge.is-excellent { background: rgba(16, 185, 129, 0.15); color: #10b981; }
+.tt-hk-badge.is-good { background: rgba(59, 130, 246, 0.15); color: #3b82f6; }
+.tt-hk-badge.is-fair { background: rgba(245, 158, 11, 0.15); color: #f59e0b; }
+.tt-hk-badge.is-bad { background: rgba(239, 68, 68, 0.15); color: #ef4444; }
 
 .tt-health-wrapper {
   flex: 1;
@@ -2536,27 +2656,30 @@ onBeforeUnmount(() => {
   display: flex;
   flex-direction: column;
   justify-content: space-between;
+  gap: 6px;
 }
 
 .tt-health-grid {
   display: grid;
   grid-auto-flow: column;
-  grid-auto-columns: 11px;
+  grid-auto-columns: minmax(0, 1fr);
   gap: 3px;
+  width: 100%;
   flex: 1;
   min-height: 0;
   align-content: center;
 }
 
 .tt-health-cell {
-  width: 11px;
-  height: 11px;
-  border-radius: 2px;
-  transition: transform 0.1s ease;
+  width: 100%;
+  height: 100%;
+  border-radius: 2.5px;
+  transition: transform 0.1s ease, box-shadow 0.1s ease;
 }
 .tt-health-cell:hover {
-  transform: scale(1.3);
+  transform: scale(1.35);
   z-index: 10;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.2);
 }
 
 .tt-health-cell.lv0 { background: rgba(148, 163, 184, 0.15); }
@@ -2583,22 +2706,17 @@ onBeforeUnmount(() => {
   margin-left: auto;
 }
 
-/* ROW 3: 底部快捷分布与深度透视发射台 (Compact Row) */
-.tt-bottom-row {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 10px;
-  flex-shrink: 0;
-}
-
 .tt-preview-card {
-  padding: 10px 14px;
+  padding: 12px 14px;
 }
 
 .tt-preview-body {
+  flex: 1;
+  min-height: 0;
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  justify-content: flex-start;
+  gap: 4px;
 }
 
 .tt-bar-row {
@@ -2916,7 +3034,7 @@ onBeforeUnmount(() => {
 }
 
 .tt-btn-cancel {
-  height: 30px;
+  height: 32px;
   padding: 0 14px;
   border-radius: var(--r-md, 6px);
   border: 1px solid var(--line);
@@ -2925,6 +3043,7 @@ onBeforeUnmount(() => {
   font-size: 12px;
   font-weight: 600;
   cursor: pointer;
+  transition: all 0.15s ease;
 }
 
 .tt-btn-cancel:hover {
@@ -2932,8 +3051,8 @@ onBeforeUnmount(() => {
 }
 
 .tt-btn-primary {
-  height: 30px;
-  padding: 0 14px;
+  height: 32px;
+  padding: 0 16px;
   border-radius: var(--r-md, 6px);
   border: none;
   background: var(--brand);
@@ -2941,6 +3060,20 @@ onBeforeUnmount(() => {
   font-size: 12px;
   font-weight: 600;
   cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  transition: all 0.15s ease;
+}
+
+.tt-btn-primary :deep(svg) {
+  width: 14px;
+  height: 14px;
+}
+
+.tt-btn-primary:hover {
+  background: var(--brand-deep);
+  transform: translateY(-1px);
 }
 
 /* 步骤指示器 */

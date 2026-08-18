@@ -27,7 +27,8 @@ const currentView = ref<ViewMode>("cards");
 
 // —— 搜索与筛选 ——
 const query = ref("");
-const selectedUsageTab = ref<"all" | "personal" | "pending" | "active" | "runaway" | "favorite">("all");
+const selectedUsageTab = ref<"all" | "personal" | "pending">("all");
+const selectedAliveTab = ref<"all" | "active" | "runaway">("all");
 const selectedSystemType = ref("all");
 const selectedLevel = ref("all");
 const selectedTag = ref("all");
@@ -89,19 +90,39 @@ const selectedSite = computed<SiteRecord | null>(() => {
   return store.sites.value.find((s) => s.id === selectedSiteId.value) ?? null;
 });
 
-// —— 快捷热门芯片列表 (主流系统与高频标签) ——
-const popularChipsList = computed(() => [
-  { id: "all", label: "全部", count: store.sites.value.length },
-  { id: "newapi", label: "NewAPI", count: countBySystem("newapi") + countBySystem("newapi2") },
-  { id: "sub2api", label: "Sub2API", count: countBySystem("sub2api") },
-  { id: "oneapi", label: "One API", count: countBySystem("one-api") },
-  { id: "tag_free", label: "公益 / 免费", count: countByTag("免费") + countByTag("公益") },
-  { id: "tag_official", label: "官转直连", count: countByTag("官转") },
-  { id: "feat_trans", label: "沉浸式翻译", count: store.sites.value.filter((s) => s.supportsImmersiveTranslation).length },
-  { id: "feat_ldc", label: "LDC", count: store.sites.value.filter((s) => s.supportsLdc).length },
-  { id: "feat_checkin", label: "每日签到", count: store.sites.value.filter((s) => s.supportsCheckin).length },
-  { id: "feat_nsfw", label: "18+ NSFW", count: store.sites.value.filter((s) => s.supportsNsfw).length },
-]);
+// —— 快捷热门芯片列表 (仅展示有数值 count > 0 的项，支持换行与展开/收起) ——
+const isChipsExpanded = ref(false);
+const CHIPS_COLLAPSED_LIMIT = 8;
+
+const popularChipsList = computed(() => {
+  const allChips = [
+    { id: "all", label: "全部", count: store.sites.value.length },
+    { id: "newapi", label: "NewAPI", count: countBySystem("newapi") + countBySystem("newapi2") },
+    { id: "sub2api", label: "Sub2API", count: countBySystem("sub2api") },
+    { id: "oneapi", label: "One API", count: countBySystem("one-api") },
+    { id: "sub2one", label: "Sub2One", count: countBySystem("sub2one") },
+    { id: "tag_free", label: "公益 / 免费", count: countByTag("免费") + countByTag("公益") },
+    { id: "tag_official", label: "官转直连", count: countByTag("官转") },
+    { id: "feat_trans", label: "沉浸式翻译", count: store.sites.value.filter((s) => s.supportsImmersiveTranslation).length },
+    { id: "feat_ldc", label: "LDC", count: store.sites.value.filter((s) => s.supportsLdc).length },
+    { id: "feat_checkin", label: "每日签到", count: store.sites.value.filter((s) => s.supportsCheckin).length },
+    { id: "feat_nsfw", label: "18+ NSFW", count: store.sites.value.filter((s) => s.supportsNsfw).length },
+    { id: "feat_invite", label: "需要邀请码", count: store.sites.value.filter((s) => s.requiresInviteCode).length },
+  ];
+  // 必须要有值 (count > 0)
+  return allChips.filter((chip) => chip.count > 0);
+});
+
+const visibleChips = computed(() => {
+  if (isChipsExpanded.value || popularChipsList.value.length <= CHIPS_COLLAPSED_LIMIT) {
+    return popularChipsList.value;
+  }
+  return popularChipsList.value.slice(0, CHIPS_COLLAPSED_LIMIT);
+});
+
+const hiddenChipsCount = computed(() =>
+  Math.max(0, popularChipsList.value.length - CHIPS_COLLAPSED_LIMIT)
+);
 
 function countBySystem(sys: string): number {
   const norm = normalizeSystemType(sys);
@@ -135,6 +156,8 @@ const metrics = computed(() => {
   let accountsWithTokens = 0;
   let checkedInAccounts = 0;
   let errorAccounts = 0;
+  let totalQuotaNumber = 0;
+  let accountsWithQuota = 0;
 
   const usageMap = store.chromeUsageAccounts.value;
   for (const siteId of Object.keys(usageMap)) {
@@ -145,9 +168,17 @@ const metrics = computed(() => {
         if (session.hasAccessToken) accountsWithTokens += 1;
         if (session.checkedInToday) checkedInAccounts += 1;
         if (session.syncError || session.checkinError) errorAccounts += 1;
+        if (session.remaining !== null && Number.isFinite(session.remaining)) {
+          totalQuotaNumber += session.remaining;
+          accountsWithQuota += 1;
+        }
       }
     }
   }
+
+  const totalQuotaText = accountsWithQuota > 0
+    ? `¥ ${new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 2 }).format(totalQuotaNumber)}`
+    : "未读取额度";
 
   // 架构分布
   const newApiCount = allSites.filter((s) => isNewApiCompatible(s.systemType)).length;
@@ -163,6 +194,9 @@ const metrics = computed(() => {
     accountsWithTokens,
     checkedInAccounts,
     errorAccounts,
+    totalQuotaNumber,
+    accountsWithQuota,
+    totalQuotaText,
     newApiCount,
     sub2ApiCount,
   };
@@ -177,7 +211,6 @@ const tabCounts = computed(() => {
     pending: allSites.filter((s) => s.isPending).length,
     active: allSites.filter((s) => !s.isRunaway).length,
     runaway: allSites.filter((s) => s.isRunaway).length,
-    favorite: allSites.filter((s) => s.favorite).length,
   };
 });
 
@@ -225,23 +258,26 @@ const sortOptions = [
 const filteredSites = computed(() => {
   const term = query.value.trim().toLocaleLowerCase("zh-CN");
   let list = store.sites.value.filter((site) => {
-    // 1. 分类 Tab
+    // 1. 使用状态维度 (Dimension 1: Usage state)
     if (selectedUsageTab.value === "personal" && !site.isPersonal) return false;
     if (selectedUsageTab.value === "pending" && !site.isPending) return false;
-    if (selectedUsageTab.value === "active" && site.isRunaway) return false;
-    if (selectedUsageTab.value === "runaway" && !site.isRunaway) return false;
-    if (selectedUsageTab.value === "favorite" && !site.favorite) return false;
+
+    // 2. 站点存活与健康维度 (Dimension 2: Alive / Operational state)
+    if (selectedAliveTab.value === "active" && site.isRunaway) return false;
+    if (selectedAliveTab.value === "runaway" && !site.isRunaway) return false;
 
     // 2. 热门芯片
     if (popularChip.value === "newapi" && !isNewApiCompatible(site.systemType)) return false;
     if (popularChip.value === "sub2api" && normalizeSystemType(site.systemType) !== "sub2api") return false;
     if (popularChip.value === "oneapi" && normalizeSystemType(site.systemType) !== "oneapi") return false;
+    if (popularChip.value === "sub2one" && normalizeSystemType(site.systemType) !== "sub2one") return false;
     if (popularChip.value === "tag_free" && !site.tags.includes("免费") && !site.tags.includes("公益")) return false;
     if (popularChip.value === "tag_official" && !site.tags.includes("官转")) return false;
     if (popularChip.value === "feat_trans" && !site.supportsImmersiveTranslation) return false;
     if (popularChip.value === "feat_ldc" && !site.supportsLdc) return false;
     if (popularChip.value === "feat_checkin" && !site.supportsCheckin) return false;
     if (popularChip.value === "feat_nsfw" && !site.supportsNsfw) return false;
+    if (popularChip.value === "feat_invite" && !site.requiresInviteCode) return false;
 
     // 3. 系统类型
     if (selectedSystemType.value !== "all") {
@@ -337,15 +373,15 @@ const totalPages = computed(() => Math.max(1, Math.ceil(filteredSites.value.leng
 
 // —— 全景表格列配置 ——
 const tableColumns = computed<AppTableColumn[]>(() => [
-  { key: "siteInfo", title: "站点标识 / 架构", width: "minmax(220px, 1.4fr)", sortable: true },
-  { key: "systemType", title: "系统类型", width: "120px", sortable: true },
-  { key: "accounts", title: "账号与会话", width: "160px", sortable: false },
+  { key: "siteInfo", title: "站点标识 / 架构", width: "auto", sortable: true },
+  { key: "systemType", title: "系统架构", width: "120px", align: "center" as const, sortable: true },
+  { key: "accounts", title: "账号与会话", width: "125px", align: "center" as const, sortable: false },
   { key: "quota", title: "剩余额度", width: "120px", align: "right" as const, sortable: true },
-  { key: "regLevel", title: "注册门槛", width: "95px", align: "center" as const, sortable: true },
-  { key: "rateLimit", title: "速率限制", width: "110px", sortable: true },
-  { key: "capabilities", title: "特性能力", width: "130px", sortable: false },
-  { key: "updatedAt", title: "更新时间", width: "130px", align: "right" as const, sortable: true },
-  { key: "actions", title: "快捷操作", width: "140px", align: "right" as const, sortable: false },
+  { key: "regLevel", title: "注册等级", width: "85px", align: "center" as const, sortable: true },
+  { key: "rateLimit", title: "速率限制", width: "105px", align: "center" as const, sortable: true },
+  { key: "capabilities", title: "特性能力", width: "120px", align: "center" as const, sortable: false },
+  { key: "updatedAt", title: "更新时间", width: "135px", align: "right" as const, sortable: true },
+  { key: "actions", title: "操作", width: "105px", align: "right" as const, sortable: false },
 ]);
 
 // —— 辅助格式化方法 ——
@@ -379,8 +415,9 @@ function siteInitials(apiBaseUrl: string, name: string): string {
 
 function hasActiveFilters(): boolean {
   return (
-    Boolean(query.value) ||
+    Boolean(query.value.trim()) ||
     selectedUsageTab.value !== "all" ||
+    selectedAliveTab.value !== "all" ||
     popularChip.value !== "all" ||
     selectedSystemType.value !== "all" ||
     selectedLevel.value !== "all" ||
@@ -393,6 +430,7 @@ function hasActiveFilters(): boolean {
 function resetAllFilters() {
   query.value = "";
   selectedUsageTab.value = "all";
+  selectedAliveTab.value = "all";
   popularChip.value = "all";
   selectedSystemType.value = "all";
   selectedLevel.value = "all";
@@ -558,7 +596,24 @@ async function batchToggleRunaway() {
 
 async function batchSyncSession() {
   if (!batchSelectedIds.value.length) return;
-  store.openSyncDialog();
+  const selectedSites = store.sites.value.filter((s) => batchSelectedIds.value.includes(s.id));
+  if (!selectedSites.length) return;
+
+  if (selectedSites.length === 1) {
+    store.syncChromeSession(selectedSites[0], document.body);
+  } else {
+    const hasPending = selectedSites.some((s) => s.isPending);
+    store.openSyncDialog("quota", hasPending ? "pending" : "personal", batchSelectedIds.value);
+  }
+  clearBatchSelection();
+}
+
+function openQuotaAndSessionSync() {
+  if (selectedUsageTab.value === "pending") {
+    store.openSyncDialog("quota", "pending");
+  } else {
+    store.openSyncDialog("quota", "personal");
+  }
 }
 
 // —— 键盘快捷键 (⌘ K 聚焦搜索) ——
@@ -571,9 +626,39 @@ function handleGlobalKeydown(e: KeyboardEvent) {
   }
 }
 
-watch([query, selectedUsageTab, selectedSystemType, selectedLevel, selectedTag, sortBy, popularChip], () => {
-  currentPage.value = 1;
+watch(selectedUsageTab, (tab) => {
+  if (tab === "personal" || tab === "pending") {
+    store.setUsageFilter(tab);
+  } else {
+    store.setUsageFilter("all");
+  }
 });
+
+watch(selectedAliveTab, (tab) => {
+  if (tab === "runaway") {
+    store.setRunawayFilter("runaway");
+  } else if (tab === "active") {
+    store.setRunawayFilter("active");
+  } else {
+    store.setRunawayFilter("all");
+  }
+});
+
+watch(currentView, (mode) => {
+  if (mode === "topology") {
+    if (selectedUsageTab.value === "all") {
+      selectedUsageTab.value = "personal";
+    }
+    selectedAliveTab.value = "active";
+  }
+});
+
+watch(
+  [query, selectedUsageTab, selectedAliveTab, selectedSystemType, selectedLevel, selectedTag, sortBy, popularChip],
+  () => {
+    currentPage.value = 1;
+  },
+);
 
 onMounted(() => {
   window.addEventListener("keydown", handleGlobalKeydown);
@@ -608,7 +693,7 @@ onUnmounted(() => {
             <span class="sl-status-indicator" :class="{ synced: !store.syncingSites.value && !store.syncingModelKeys.value }" />
             <div class="sl-status-text">
               <strong>{{ store.syncingSites.value || store.syncingModelKeys.value ? "正在同步中…" : "本地数据已就绪" }}</strong>
-              <small>已收录 {{ store.sites.value.length }} 个站点资料</small>
+              <small>已收录 {{ store.sites.value.length }} 个站点 · {{ metrics.totalAccounts }} 个会话</small>
             </div>
           </div>
 
@@ -616,10 +701,22 @@ onUnmounted(() => {
             type="button"
             class="sl-btn-secondary"
             :disabled="store.syncingSites.value || store.syncingModelKeys.value"
-            @click="store.openSyncDialog()"
+            title="一键同步已关联站点的 Chrome 账号额度与会话"
+            @click="openQuotaAndSessionSync"
           >
             <span :class="{ 'is-spinning': store.syncingSites.value || store.syncingModelKeys.value }" v-html="icons.restore" />
-            <span>{{ selectedUsageTab === 'all' ? '同步站点' : '额度与会话同步' }}</span>
+            <span>额度与会话同步</span>
+          </button>
+
+          <button
+            type="button"
+            class="sl-btn-secondary"
+            :disabled="store.syncingSites.value || store.syncingModelKeys.value"
+            title="从远程仓库同步最新公共站点资料库"
+            @click="store.openSyncDialog('remote')"
+          >
+            <span v-html="icons.globe" />
+            <span>同步公共库</span>
           </button>
 
           <button
@@ -633,9 +730,9 @@ onUnmounted(() => {
         </div>
       </div>
 
-      <!-- 宏观 4 大指标卡片 -->
+      <!-- 宏观 4 大指标卡片 (纯信息展示，无点击事件) -->
       <div class="sl-metrics-grid">
-        <div class="sl-metric-card" @click="selectedUsageTab = 'all'">
+        <div class="sl-metric-card">
           <div class="sl-metric-icon sl-tone-brand" v-html="icons.layers" />
           <div class="sl-metric-info">
             <span class="sl-metric-label">收录站点总数</span>
@@ -646,29 +743,29 @@ onUnmounted(() => {
           </div>
         </div>
 
-        <div class="sl-metric-card" @click="selectedUsageTab = 'personal'">
+        <div class="sl-metric-card">
           <div class="sl-metric-icon sl-tone-success" v-html="icons.bookmark" />
           <div class="sl-metric-info">
             <span class="sl-metric-label">在用与待定监控</span>
             <div class="sl-metric-val">
               <strong class="text-success">{{ metrics.personalSites }} 在用</strong>
-              <small>待定 {{ metrics.pendingSites }} 个站点</small>
+              <small>待定 {{ metrics.pendingSites }}</small>
             </div>
           </div>
         </div>
 
-        <div class="sl-metric-card" @click="currentView = 'topology'">
-          <div class="sl-metric-icon sl-tone-info" v-html="icons.user" />
+        <div class="sl-metric-card">
+          <div class="sl-metric-icon sl-tone-warning" v-html="icons.card" />
           <div class="sl-metric-info">
-            <span class="sl-metric-label">已关联 Chrome 账号</span>
+            <span class="sl-metric-label">账户总额度池</span>
             <div class="sl-metric-val">
-              <strong>{{ metrics.totalAccounts }} 个会话</strong>
-              <small>含 {{ metrics.accountsWithTokens }} 个 NewAPI 令牌</small>
+              <strong class="text-warning">{{ metrics.totalQuotaText }}</strong>
+              <small>已读取 {{ metrics.accountsWithQuota }} / {{ metrics.totalAccounts }} 账号额度</small>
             </div>
           </div>
         </div>
 
-        <div class="sl-metric-card" @click="toggleFeature('checkedInToday')">
+        <div class="sl-metric-card">
           <div class="sl-metric-icon sl-tone-violet" v-html="icons.calendar" />
           <div class="sl-metric-info">
             <span class="sl-metric-label">今日签到与健康监控</span>
@@ -682,12 +779,12 @@ onUnmounted(() => {
         </div>
       </div>
 
-      <!-- 快捷热门分类一键直达滚动栏 -->
+      <!-- 快捷热门分类一键直达栏 (支持换行与展开/收起) -->
       <div class="sl-popular-chips-bar">
         <span class="sl-chips-label">快捷直达：</span>
-        <div class="sl-chips-scroll">
+        <div class="sl-chips-wrap">
           <button
-            v-for="chip in popularChipsList"
+            v-for="chip in visibleChips"
             :key="chip.id"
             type="button"
             class="sl-chip-btn"
@@ -697,6 +794,19 @@ onUnmounted(() => {
             <span>{{ chip.label }}</span>
             <b class="sl-chip-num">{{ chip.count }}</b>
           </button>
+
+          <!-- 展开 / 收起 按钮 -->
+          <button
+            v-if="popularChipsList.length > CHIPS_COLLAPSED_LIMIT"
+            type="button"
+            class="sl-chips-toggle-btn"
+            :class="{ active: isChipsExpanded }"
+            :title="isChipsExpanded ? '收起快捷直达' : `展开更多 (${hiddenChipsCount})`"
+            @click="isChipsExpanded = !isChipsExpanded"
+          >
+            <span>{{ isChipsExpanded ? "收起" : `展开更多 (${hiddenChipsCount})` }}</span>
+            <span class="sl-toggle-arrow" :class="{ 'is-up': isChipsExpanded }" v-html="icons.chevron" />
+          </button>
         </div>
       </div>
     </header>
@@ -705,69 +815,82 @@ onUnmounted(() => {
     <div class="sl-control-center">
       <!-- 上半区：分类 Tab 与 视图切换 -->
       <div class="sl-control-top-row">
-        <!-- 分类状态 Tabs -->
-        <nav class="sl-usage-tabs" role="tablist">
-          <button
-            type="button"
-            role="tab"
-            :class="{ active: selectedUsageTab === 'all' }"
-            @click="selectedUsageTab = 'all'"
-          >
-            <span v-html="icons.layers" />
-            <span>全部</span>
-            <b class="sl-tab-badge">{{ tabCounts.all }}</b>
-          </button>
-          <button
-            type="button"
-            role="tab"
-            :class="{ active: selectedUsageTab === 'personal' }"
-            @click="selectedUsageTab = 'personal'"
-          >
-            <span v-html="icons.bookmark" />
-            <span>在用</span>
-            <b class="sl-tab-badge">{{ tabCounts.personal }}</b>
-          </button>
-          <button
-            type="button"
-            role="tab"
-            :class="{ active: selectedUsageTab === 'pending' }"
-            @click="selectedUsageTab = 'pending'"
-          >
-            <span v-html="icons.clock" />
-            <span>待定</span>
-            <b class="sl-tab-badge">{{ tabCounts.pending }}</b>
-          </button>
-          <button
-            type="button"
-            role="tab"
-            :class="{ active: selectedUsageTab === 'active' }"
-            @click="selectedUsageTab = 'active'"
-          >
-            <span v-html="icons.heartPulse" />
-            <span>存活</span>
-            <b class="sl-tab-badge">{{ tabCounts.active }}</b>
-          </button>
-          <button
-            type="button"
-            role="tab"
-            :class="{ active: selectedUsageTab === 'runaway' }"
-            @click="selectedUsageTab = 'runaway'"
-          >
-            <span v-html="icons.flag" />
-            <span>跑路</span>
-            <b class="sl-tab-badge">{{ tabCounts.runaway }}</b>
-          </button>
-          <button
-            type="button"
-            role="tab"
-            :class="{ active: selectedUsageTab === 'favorite' }"
-            @click="selectedUsageTab = 'favorite'"
-          >
-            <span v-html="icons.star" />
-            <span>收藏</span>
-            <b class="sl-tab-badge">{{ tabCounts.favorite }}</b>
-          </button>
-        </nav>
+        <!-- 左侧多维筛选组：使用状态维度 + 运营存活维度 -->
+        <div class="sl-control-tabs-group">
+          <!-- 维度 1：使用状态分类 Tab (拓扑模式下仅提供在用与待定) -->
+          <nav class="sl-usage-tabs" role="tablist" aria-label="使用状态筛选">
+            <button
+              v-if="currentView !== 'topology'"
+              type="button"
+              role="tab"
+              :class="{ active: selectedUsageTab === 'all' }"
+              @click="selectedUsageTab = 'all'"
+            >
+              <span v-html="icons.layers" />
+              <span>全部</span>
+              <b class="sl-tab-badge">{{ tabCounts.all }}</b>
+            </button>
+            <button
+              type="button"
+              role="tab"
+              :class="{ active: selectedUsageTab === 'personal' }"
+              @click="selectedUsageTab = 'personal'"
+            >
+              <span v-html="icons.bookmark" />
+              <span>在用</span>
+              <b class="sl-tab-badge">{{ tabCounts.personal }}</b>
+            </button>
+            <button
+              type="button"
+              role="tab"
+              :class="{ active: selectedUsageTab === 'pending' }"
+              @click="selectedUsageTab = 'pending'"
+            >
+              <span v-html="icons.clock" />
+              <span>待定</span>
+              <b class="sl-tab-badge">{{ tabCounts.pending }}</b>
+            </button>
+          </nav>
+
+          <span class="sl-tabs-divider" />
+
+          <!-- 维度 2：存活与健康状态分段开关 (拓扑模式下仅展示存活) -->
+          <div class="sl-alive-tabs" role="group" aria-label="站点存活状态筛选">
+            <button
+              v-if="currentView !== 'topology'"
+              type="button"
+              :class="{ active: selectedAliveTab === 'all' }"
+              title="全部站点状态"
+              @click="selectedAliveTab = 'all'"
+            >
+              <span>全部状态</span>
+              <b class="sl-tab-badge">{{ tabCounts.all }}</b>
+            </button>
+            <button
+              type="button"
+              class="sl-alive-btn is-active"
+              :class="{ active: selectedAliveTab === 'active' }"
+              title="筛选正常存活站点"
+              @click="selectedAliveTab = 'active'"
+            >
+              <span class="sl-alive-dot is-live" />
+              <span>存活</span>
+              <b class="sl-tab-badge">{{ tabCounts.active }}</b>
+            </button>
+            <button
+              v-if="currentView !== 'topology'"
+              type="button"
+              class="sl-alive-btn is-runaway"
+              :class="{ active: selectedAliveTab === 'runaway' }"
+              title="筛选已跑路或失效站点"
+              @click="selectedAliveTab = 'runaway'"
+            >
+              <span class="sl-alive-dot is-dead" />
+              <span>跑路</span>
+              <b class="sl-tab-badge">{{ tabCounts.runaway }}</b>
+            </button>
+          </div>
+        </div>
 
         <!-- 视图切换模式 -->
         <div class="sl-view-switcher">
@@ -953,7 +1076,7 @@ onUnmounted(() => {
     </div>
 
     <!-- 3. 主视图区域 -->
-    <main class="sl-main-content">
+    <main class="sl-main-content" :class="{ 'is-table-mode': currentView === 'table', 'is-topology-mode': currentView === 'topology' }">
       <!-- 视图 A：智能画廊卡片流 -->
       <section v-if="currentView === 'cards'" class="sl-cards-view">
         <div v-if="store.loading.value" class="sl-loading-state">
@@ -2052,14 +2175,8 @@ onUnmounted(() => {
   display: flex;
   align-items: center;
   gap: 12px;
-  cursor: pointer;
-  transition: all 0.15s ease;
-}
-
-.sl-metric-card:hover {
-  background: var(--surface-hover, #282e36);
-  border-color: color-mix(in srgb, var(--brand, #58a6ff) 40%, var(--line, #30363d));
-  transform: translateY(-1px);
+  cursor: default;
+  user-select: none;
 }
 
 .sl-metric-icon {
@@ -2087,83 +2204,159 @@ onUnmounted(() => {
   display: flex;
   flex-direction: column;
   min-width: 0;
+  flex: 1;
 }
 
 .sl-metric-label {
   font-size: 11px;
   color: var(--muted, #8b949e);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .sl-metric-val {
   display: flex;
-  align-items: baseline;
-  gap: 6px;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  margin-top: 3px;
+  min-width: 0;
 }
 
 .sl-metric-val strong {
-  font-size: 16px;
+  font-size: 16.5px;
+  font-weight: 700;
   color: var(--text, #f0f6fc);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  line-height: 1.25;
+  max-width: 100%;
 }
 
 .sl-metric-val small {
   font-size: 10.5px;
-  color: var(--faint, #6e7681);
+  color: var(--muted, #8b949e);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  line-height: 1.3;
+  max-width: 100%;
 }
 
-/* 热门分类一键直达滚动栏 */
+/* 热门分类一键直达区域 */
 .sl-popular-chips-bar {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 8px;
-  overflow: hidden;
+  position: relative;
+  transition: all 0.2s ease;
 }
 
 .sl-chips-label {
   font-size: 11.5px;
   color: var(--muted, #8b949e);
   flex-shrink: 0;
+  padding-top: 4px;
+  line-height: 1;
 }
 
-.sl-chips-scroll {
+.sl-chips-wrap {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 6px;
-  overflow-x: auto;
-  scrollbar-width: thin;
-  padding-bottom: 2px;
+  gap: 6px 8px;
+  flex: 1;
+  min-width: 0;
 }
 
 .sl-chip-btn {
   display: inline-flex;
   align-items: center;
   gap: 5px;
-  padding: 4px 9px;
-  border-radius: 999px;
-  background: var(--surface, #21262d);
-  border: 1px solid var(--line, #30363d);
-  color: var(--muted, #8b949e);
-  font-size: 11px;
+  padding: 3px 10px;
+  border-radius: var(--r-full);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  color: var(--text);
+  font-size: 11.5px;
+  font-weight: 500;
   cursor: pointer;
   white-space: nowrap;
   transition: all 0.15s ease;
 }
 
 .sl-chip-btn:hover {
-  background: var(--surface-hover, #30363d);
-  color: var(--text, #f0f6fc);
+  background: var(--surface-hover);
+  border-color: var(--line-strong);
 }
 
 .sl-chip-btn.active {
-  background: color-mix(in srgb, var(--brand, #1f6feb) 20%, var(--surface, #21262d));
-  color: var(--brand, #58a6ff);
-  border-color: color-mix(in srgb, var(--brand, #1f6feb) 50%, transparent);
+  background: var(--brand-soft);
+  border-color: var(--brand);
+  color: var(--brand-deep);
+  font-weight: 600;
 }
 
 .sl-chip-num {
   font-size: 9.5px;
   padding: 1px 5px;
-  border-radius: 999px;
-  background: color-mix(in srgb, var(--text, #c9d1d9) 12%, transparent);
+  border-radius: var(--r-full);
+  background: var(--surface-hover);
+  color: var(--muted);
+}
+
+.sl-chip-btn.active .sl-chip-num {
+  background: var(--brand);
+  color: #fff;
+}
+
+.sl-chips-toggle-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 10px;
+  border-radius: var(--r-full);
+  background: var(--surface-soft);
+  border: 1px solid var(--line-soft, var(--line));
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: all 0.15s ease;
+}
+
+.sl-chips-toggle-btn:hover {
+  color: var(--text);
+  background: var(--surface-hover);
+  border-color: var(--line-strong);
+}
+
+.sl-chips-toggle-btn.active {
+  color: var(--brand-deep);
+  border-color: var(--brand);
+  background: var(--brand-soft);
+}
+
+.sl-toggle-arrow {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 12px;
+  height: 12px;
+  transition: transform 0.2s ease;
+}
+
+.sl-toggle-arrow.is-up {
+  transform: rotate(180deg);
+}
+
+.sl-toggle-arrow svg {
+  width: 12px;
+  height: 12px;
 }
 
 /* 2. 控制中心 */
@@ -2184,89 +2377,197 @@ onUnmounted(() => {
   gap: 12px;
 }
 
+.sl-control-tabs-group {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.sl-control-tabs-group::-webkit-scrollbar {
+  display: none;
+}
+
+.sl-tabs-divider {
+  width: 1px;
+  height: 18px;
+  background: var(--line);
+  flex-shrink: 0;
+}
+
+.sl-alive-tabs {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 3px;
+  border-radius: var(--r-md);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  flex-shrink: 0;
+}
+
+.sl-alive-tabs button {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 10px;
+  border-radius: calc(var(--r-md) - 2px);
+  font-size: 11.5px;
+  font-weight: 500;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  transition: all 0.15s ease;
+  white-space: nowrap;
+}
+
+.sl-alive-tabs button:hover {
+  color: var(--text);
+  background: var(--surface-hover);
+}
+
+.sl-alive-tabs button.active {
+  background: var(--brand-soft);
+  border-color: var(--brand);
+  color: var(--brand-deep);
+  font-weight: 600;
+  box-shadow: var(--shadow-xs);
+}
+
+.sl-alive-tabs button.active .sl-tab-badge {
+  background: var(--brand);
+  color: #fff;
+}
+
+.sl-alive-tabs button.is-runaway.active {
+  background: color-mix(in srgb, var(--danger, #f85149) 12%, var(--surface));
+  border-color: var(--danger, #f85149);
+  color: var(--danger, #f85149);
+}
+
+.sl-alive-tabs button.is-runaway.active .sl-tab-badge {
+  background: var(--danger, #f85149);
+  color: #fff;
+}
+
+.sl-alive-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.sl-alive-dot.is-live {
+  background: #10b981;
+}
+.sl-alive-dot.is-dead {
+  background: #ef4444;
+}
+
 .sl-usage-tabs {
   display: flex;
   align-items: center;
   gap: 4px;
-  background: var(--surface-soft, #161b22);
-  padding: 3px;
-  border-radius: var(--r-md, 8px);
-  border: 1px solid var(--line, #30363d);
+  overflow-x: auto;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+.sl-usage-tabs::-webkit-scrollbar {
+  display: none;
+  width: 0;
+  height: 0;
 }
 
 .sl-usage-tabs button {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  padding: 6px 12px;
-  border-radius: var(--r-sm, 6px);
-  background: transparent;
-  border: none;
-  color: var(--muted, #8b949e);
+  padding: 5px 12px;
+  border-radius: var(--r-md);
   font-size: 12px;
-  font-weight: 550;
+  font-weight: 500;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--muted);
   cursor: pointer;
   transition: all 0.15s ease;
-}
-
-.sl-usage-tabs button svg {
-  width: 14px;
-  height: 14px;
+  white-space: nowrap;
 }
 
 .sl-usage-tabs button:hover {
-  color: var(--text, #f0f6fc);
+  background: var(--surface-hover);
+  color: var(--text);
 }
 
 .sl-usage-tabs button.active {
-  background: var(--surface, #21262d);
-  color: var(--brand, #58a6ff);
-  box-shadow: 0 1px 3px rgba(0,0,0,0.2);
+  background: var(--brand-soft);
+  border-color: var(--brand);
+  color: var(--brand-deep);
+  font-weight: 600;
+  box-shadow: var(--shadow-xs);
+}
+
+.sl-usage-tabs button :deep(svg),
+.sl-usage-tabs button svg {
+  width: 14px;
+  height: 14px;
+  color: currentColor;
 }
 
 .sl-tab-badge {
   font-size: 10px;
-  padding: 1px 5px;
-  border-radius: 999px;
-  background: color-mix(in srgb, var(--muted, #8b949e) 20%, transparent);
+  font-weight: 600;
+  padding: 1px 5.5px;
+  border-radius: var(--r-full);
+  background: var(--surface-hover);
+  color: var(--muted);
+  transition: all 0.15s ease;
+}
+
+.sl-usage-tabs button.active .sl-tab-badge {
+  background: var(--brand);
+  color: #fff;
 }
 
 .sl-view-switcher {
-  display: flex;
-  align-items: center;
-  gap: 2px;
-  background: var(--surface-soft, #161b22);
-  padding: 3px;
-  border-radius: var(--r-md, 8px);
-  border: 1px solid var(--line, #30363d);
+  display: inline-flex;
+  padding: 2px;
+  border-radius: var(--r-md);
+  background: var(--surface-soft);
+  border: 1px solid var(--line-soft, var(--line));
 }
 
 .sl-view-switcher button {
   display: inline-flex;
   align-items: center;
-  gap: 5px;
-  padding: 6px 10px;
-  border-radius: var(--r-sm, 6px);
-  background: transparent;
-  border: none;
-  color: var(--muted, #8b949e);
+  gap: 4px;
+  padding: 5px 10px;
+  border-radius: var(--r-sm);
   font-size: 11.5px;
+  font-weight: 500;
+  border: none;
+  background: transparent;
+  color: var(--muted);
   cursor: pointer;
   transition: all 0.15s ease;
 }
 
-.sl-view-switcher button svg {
-  width: 14px;
-  height: 14px;
-}
-
 .sl-view-switcher button:hover {
-  color: var(--text, #f0f6fc);
+  color: var(--text);
 }
 
 .sl-view-switcher button.active {
-  background: var(--surface, #21262d);
-  color: var(--brand, #58a6ff);
+  background: var(--surface);
+  color: var(--text);
+  font-weight: 600;
+  box-shadow: var(--shadow-xs);
+}
+
+.sl-view-switcher button :deep(svg),
+.sl-view-switcher button svg {
+  width: 13px;
+  height: 13px;
 }
 
 /* 筛选行 */
@@ -2350,25 +2651,30 @@ onUnmounted(() => {
 }
 
 .sl-chip {
-  padding: 3px 8px;
-  border-radius: 6px;
-  background: var(--surface-soft, #161b22);
-  border: 1px solid var(--line, #30363d);
-  color: var(--muted, #8b949e);
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 9px;
+  border-radius: var(--r-full);
   font-size: 11px;
+  font-weight: 500;
+  border: 1px solid var(--line);
+  background: var(--surface-soft);
+  color: var(--muted);
   cursor: pointer;
   transition: all 0.15s ease;
 }
 
 .sl-chip:hover {
-  background: var(--surface-hover, #282e36);
-  color: var(--text, #f0f6fc);
+  background: var(--surface-hover);
+  color: var(--text);
 }
 
 .sl-chip.active {
-  background: color-mix(in srgb, var(--brand, #1f6feb) 20%, var(--surface, #21262d));
-  color: var(--brand, #58a6ff);
-  border-color: color-mix(in srgb, var(--brand, #1f6feb) 40%, transparent);
+  background: var(--brand-soft);
+  border-color: var(--brand);
+  color: var(--brand-deep);
+  font-weight: 600;
 }
 
 .sl-results-meta {
@@ -2409,6 +2715,13 @@ onUnmounted(() => {
   min-height: 0;
   overflow-y: auto;
   padding: 16px 24px 32px;
+}
+
+.sl-main-content.is-table-mode {
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  padding: 16px 24px 20px;
 }
 
 /* 视图 A：卡片网格 */
@@ -2791,55 +3104,124 @@ onUnmounted(() => {
 
 /* 视图 B：表格定制单元格 */
 .sl-table-view {
-  background: var(--surface, #161b22);
-  border: 1px solid var(--line, #30363d);
+  background: var(--surface);
+  border: 1px solid var(--line);
   border-radius: var(--r-lg, 10px);
   overflow: hidden;
+  height: 100%;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  box-shadow: var(--shadow-sm);
+}
+
+.sl-table-view :deep(.app-table-wrap) {
+  height: 100%;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.sl-table-view :deep(.app-table-scroll) {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+
+.sl-table-view :deep(.app-table) {
+  width: 100%;
+  table-layout: fixed;
+  border-collapse: separate;
+  border-spacing: 0;
+}
+
+.sl-table-view :deep(.app-table-th),
+.sl-table-view :deep(.app-table-td) {
+  padding: 10px 12px;
+  vertical-align: middle;
+  border-bottom: 1px solid var(--line-soft, var(--line));
+}
+
+.sl-table-view :deep(.app-table-th) {
+  background: var(--surface-soft);
+  color: var(--muted);
+  font-size: 11.5px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.sl-table-view :deep(.app-table-tr.clickable:hover) {
+  background: var(--surface-hover);
+}
+
+.sl-table-view :deep(.app-table-tr.clickable.active) {
+  background: var(--brand-soft);
 }
 
 .sl-table-site-cell {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 10px;
+  min-width: 0;
+  max-width: 100%;
 }
 
 .sl-table-site-info {
   display: flex;
   flex-direction: column;
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
 }
 
 .sl-table-site-title {
   display: flex;
   align-items: center;
   gap: 6px;
+  min-width: 0;
 }
 
 .sl-table-site-title strong {
   font-size: 12.5px;
-  color: var(--text, #f0f6fc);
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
 }
 
 .sl-table-site-url {
-  font-size: 10px;
-  color: var(--faint, #6e7681);
+  font-size: 10.5px;
+  color: var(--muted);
   font-family: monospace;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
 }
 
 .sl-table-accounts-cell {
   display: flex;
   flex-direction: column;
+  align-items: center;
   font-size: 11.5px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .sl-level-badge {
   font-size: 10.5px;
   font-weight: 700;
-  color: var(--brand, #58a6ff);
+  color: var(--brand);
 }
 
 .sl-table-caps-cell {
   display: flex;
   align-items: center;
+  justify-content: center;
   gap: 4px;
   font-size: 13px;
 }

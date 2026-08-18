@@ -716,7 +716,6 @@ onMounted(() => {
             :class="{ active: selectedLab === lab.id, [`mc-lab-${lab.tone}`]: true }"
             @click="selectLabQuick(lab.id)"
           >
-            <span class="mc-lab-chip-avatar">{{ lab.name[0] }}</span>
             <span>{{ lab.name }}</span>
           </button>
         </div>
@@ -2011,18 +2010,19 @@ onMounted(() => {
   min-height: 0;
   background: var(--bg);
   color: var(--text);
-  overflow-y: auto;
+  overflow: hidden;
   position: relative;
 }
 
 /* —— 1. 顶部宏观驾驶舱 —— */
 .mc-cockpit-bar {
-  padding: 20px 24px 16px;
+  padding: 14px 20px 10px;
   background: var(--surface);
   border-bottom: 1px solid var(--line);
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: 10px;
+  flex-shrink: 0;
 }
 
 .mc-cockpit-header {
@@ -2043,7 +2043,7 @@ onMounted(() => {
   width: 42px;
   height: 42px;
   border-radius: var(--r-lg);
-  background: linear-gradient(135deg, var(--brand), #818cf8);
+  background: linear-gradient(135deg, var(--brand), #0284c7);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -2207,29 +2207,42 @@ onMounted(() => {
   display: flex;
   flex-direction: column;
   min-width: 0;
+  flex: 1;
 }
 .mc-metric-label {
   font-size: 11px;
   color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .mc-metric-val {
   display: flex;
-  align-items: baseline;
-  gap: 6px;
-  margin-top: 2px;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  margin-top: 3px;
+  min-width: 0;
 }
 .mc-metric-val strong {
   font-size: 17px;
   font-weight: 700;
   color: var(--text);
   font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  line-height: 1.25;
+  max-width: 100%;
 }
 .mc-metric-val small {
-  font-size: 10px;
+  font-size: 10.5px;
   color: var(--muted);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  line-height: 1.3;
+  max-width: 100%;
 }
 
 /* 热门厂商直达 */
@@ -2249,13 +2262,19 @@ onMounted(() => {
   align-items: center;
   gap: 6px;
   overflow-x: auto;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
   padding-bottom: 2px;
+}
+.mc-labs-scroll::-webkit-scrollbar {
+  display: none;
+  width: 0;
+  height: 0;
 }
 .mc-lab-chip {
   display: inline-flex;
   align-items: center;
-  gap: 5px;
-  padding: 3px 9px;
+  padding: 3px 10px;
   border-radius: var(--r-full);
   font-size: 11.5px;
   font-weight: 500;
@@ -2276,25 +2295,16 @@ onMounted(() => {
   color: var(--brand-deep);
   font-weight: 600;
 }
-.mc-lab-chip-avatar {
-  width: 14px;
-  height: 14px;
-  border-radius: 50%;
-  background: rgba(0, 0, 0, 0.08);
-  font-size: 9px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-}
 
 /* —— 2. 控制中心 —— */
 .mc-control-center {
-  padding: 14px 24px;
+  padding: 10px 20px;
   background: var(--surface);
   border-bottom: 1px solid var(--line);
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 8px;
+  flex-shrink: 0;
 }
 
 .mc-control-top-row {
@@ -2521,7 +2531,10 @@ onMounted(() => {
 /* —— 3. 主内容区域 —— */
 .mc-main-content {
   flex: 1;
-  padding: 20px 24px 80px;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 14px 20px 40px;
 }
 
 /* 卡片视图 */

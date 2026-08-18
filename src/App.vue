@@ -127,6 +127,7 @@ onMounted(async () => {
     store.loadLibrary(),
     store.loadProxyPool(),
     store.initializeModelCatalog(),
+    store.loadModelAggregation(),
   ]);
   store.startDailyRefresh();
   store.startCharityMonitor();

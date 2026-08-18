@@ -258,10 +258,6 @@ function setSearchKeyword(value: string) {
   if (searchDebounceTimer != null) window.clearTimeout(searchDebounceTimer);
   searchDebounceTimer = window.setTimeout(() => {
     searchDebounceTimer = null;
-    items.value = [];
-    totalCount.value = 0;
-    hasMore.value = false;
-    nextOffset.value = 0;
     currentPage.value = 1;
     void queryLocalFeed(selectedTagId.value, 1);
   }, 260);
@@ -307,16 +303,9 @@ async function selectTag(tagId: string) {
   }
   selectedTagId.value = tagId;
   currentFeedName.value = tagMeta(tagId).name;
-  items.value = [];
-  totalCount.value = 0;
-  hasMore.value = false;
-  nextOffset.value = 0;
   currentPage.value = 1;
-  updatedCount.value = 0;
   statusMessage.value = "";
   error.value = "";
-  usedNodeName.value = "";
-  loadingMore.value = false;
   await queryLocalFeed(tagId, 1);
 }
 

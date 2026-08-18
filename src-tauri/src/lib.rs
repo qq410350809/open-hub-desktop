@@ -7,6 +7,7 @@ mod chrome_session;
 mod chrome_usage;
 mod db;
 mod detect_all;
+mod file_export;
 mod models;
 pub use detect_all::run_library_detect;
 mod model_catalog;
@@ -1245,7 +1246,8 @@ pub fn run() {
             gateway::start_gateway,
             gateway::stop_gateway,
             gateway::update_gateway_config,
-            gateway::reload_gateway_candidates
+            gateway::reload_gateway_candidates,
+            file_export::save_export_file
         ])
         .build(tauri::generate_context!())
         .expect("error while building Tauri application")

@@ -396,6 +396,7 @@ function applyCustomRange() {
   cursor: pointer;
   transition: all 0.15s ease;
   white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .tt-range-trigger:hover {
