@@ -40,6 +40,7 @@ axum = "0.8"
 async-stream = "0.3"
 tower-http = { version = "0.6", features = ["cors"] }
 zstd = "0.13"
+genai = "0.1"
 
 # 开发编译体积优化：减少 debug 信息层级，避免 deps 目录无限膨胀。
 [profile.dev]
