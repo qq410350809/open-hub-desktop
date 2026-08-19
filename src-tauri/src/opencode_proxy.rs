@@ -61,6 +61,10 @@ pub struct OpencodeProxyConfig {
     pub timeout_seconds: u64,
     #[serde(default)]
     pub record_request_body: bool,
+    /// 每次请求失败后的重试次数（默认 0 = 报错直接返回）。
+    /// 使用代理池轮询的渠道：失败节点作废移至队尾，按节点队列顺序取下一个节点，最多不超过可用节点数。
+    #[serde(default)]
+    pub max_retries: u32,
 }
 
 fn default_timeout_seconds() -> u64 {
@@ -76,6 +80,7 @@ impl Default for OpencodeProxyConfig {
             channels: default_channels(),
             timeout_seconds: default_timeout_seconds(),
             record_request_body: false,
+            max_retries: 0,
         }
     }
 }
@@ -148,6 +153,7 @@ pub struct OpencodeProxyContext {
     pub cached_models_updated_at: Arc<RwLock<Option<Instant>>>,
     pub default_http_client: reqwest::Client,
     pub app_handle: Arc<RwLock<Option<tauri::AppHandle>>>,
+    /// 当前活跃出口节点下标（原子，跨请求粘性保持）；失败时自动移到下一节点
     pub active_egress_idx: Arc<AtomicUsize>,
 }
 
@@ -916,6 +922,7 @@ async fn get_sorted_egress_candidates(
     candidates
 }
 
+
 async fn build_client_for_candidate(
     ctx: &OpencodeProxyContext,
     candidate: &str,
@@ -1337,7 +1344,12 @@ async fn handle_chat_completions(
 
     let candidates = get_sorted_egress_candidates(&ctx, chan).await;
     let total_candidates = candidates.len().max(1);
-    let max_attempts = if chan.use_proxy_pool { total_candidates.min(3) } else { 1 };
+    let max_retries = ctx.config.read().await.max_retries as usize;
+    let max_attempts = if chan.use_proxy_pool {
+        (max_retries + 1).min(total_candidates)
+    } else {
+        max_retries + 1
+    };
 
     let base_idx = ctx.active_egress_idx.load(Ordering::Relaxed);
     let mut final_res = None;
@@ -1675,7 +1687,12 @@ async fn handle_responses(
 
     let candidates = get_sorted_egress_candidates(&ctx, chan).await;
     let total_candidates = candidates.len().max(1);
-    let max_attempts = if chan.use_proxy_pool { total_candidates.min(3) } else { 1 };
+    let max_retries = ctx.config.read().await.max_retries as usize;
+    let max_attempts = if chan.use_proxy_pool {
+        (max_retries + 1).min(total_candidates)
+    } else {
+        max_retries + 1
+    };
 
     let base_idx = ctx.active_egress_idx.load(Ordering::Relaxed);
     let mut final_res = None;
@@ -2065,7 +2082,12 @@ async fn handle_messages(
 
     let candidates = get_sorted_egress_candidates(&ctx, chan).await;
     let total_candidates = candidates.len().max(1);
-    let max_attempts = if chan.use_proxy_pool { total_candidates.min(3) } else { 1 };
+    let max_retries = ctx.config.read().await.max_retries as usize;
+    let max_attempts = if chan.use_proxy_pool {
+        (max_retries + 1).min(total_candidates)
+    } else {
+        max_retries + 1
+    };
 
     let base_idx = ctx.active_egress_idx.load(Ordering::Relaxed);
     let mut final_res = None;
@@ -2684,6 +2706,10 @@ pub struct ProxyLogPage {
     pub total: u64,
     pub success_total: u64,
     pub error_total: u64,
+    /// 全库计数（不受当前 filter/搜索影响），供前端标签固定显示
+    pub global_total: u64,
+    pub global_success_total: u64,
+    pub global_error_total: u64,
 }
 
 #[tauri::command]
@@ -2805,11 +2831,32 @@ pub async fn get_opencode_proxy_logs(
         }
     }
 
+    let global_total: i64 = conn
+        .query_row("SELECT COUNT(*) FROM opencode_proxy_logs", [], |r| r.get(0))
+        .unwrap_or(0);
+    let global_success_total: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM opencode_proxy_logs WHERE status_code >= 200 AND status_code < 300",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let global_error_total: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM opencode_proxy_logs WHERE status_code >= 400",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+
     Ok(ProxyLogPage {
         items: rows,
         total: total as u64,
         success_total: success_total as u64,
         error_total: error_total as u64,
+        global_total: global_total as u64,
+        global_success_total: global_success_total as u64,
+        global_error_total: global_error_total as u64,
     })
 }
 

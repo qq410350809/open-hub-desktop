@@ -20,6 +20,8 @@ export interface OpencodeProxyConfig {
   channels: ChannelConfig[];
   timeoutSeconds: number;
   recordRequestBody?: boolean;
+  /** 失败重试次数，默认 0 = 失败直接返回；代理池渠道同时受可用节点数限制 */
+  maxRetries?: number;
 }
 
 export interface OpencodeProxyStatus {
@@ -81,6 +83,7 @@ const proxyConfig = ref<OpencodeProxyConfig>({
     },
   ],
   timeoutSeconds: 300,
+  maxRetries: 0,
 });
 
 const proxyStatus = ref<OpencodeProxyStatus>({
@@ -118,6 +121,10 @@ const logPageSize = ref(50);
 const logTotal = ref(0);
 const logSuccessTotal = ref(0);
 const logErrorTotal = ref(0);
+/** 全库固定计数（不随 filter/搜索变化），用于标签页显示 */
+const logGlobalTotal = ref(0);
+const logGlobalSuccess = ref(0);
+const logGlobalError = ref(0);
 const logPageCount = computed(() => Math.max(1, Math.ceil(logTotal.value / logPageSize.value)));
 const logRangeStart = computed(() => (logTotal.value === 0 ? 0 : (logPage.value - 1) * logPageSize.value + 1));
 const logRangeEnd = computed(() => Math.min(logPage.value * logPageSize.value, logTotal.value));
@@ -245,7 +252,15 @@ export function useModelProxy() {
       const filter = options.filter ?? "";
       const q = (options.q ?? "").trim().toLowerCase();
       const data = await runCommand<
-        | { items: ProxyRequestLog[]; total: number; successTotal: number; errorTotal: number }
+        | {
+            items: ProxyRequestLog[];
+            total: number;
+            successTotal: number;
+            errorTotal: number;
+            globalTotal?: number;
+            globalSuccessTotal?: number;
+            globalErrorTotal?: number;
+          }
         | ProxyRequestLog[]
       >("get_opencode_proxy_logs", {
         page: logPage.value,
@@ -275,12 +290,18 @@ export function useModelProxy() {
         logTotal.value = list.length;
         logSuccessTotal.value = list.filter((l) => l.statusCode >= 200 && l.statusCode < 300).length;
         logErrorTotal.value = list.filter((l) => l.statusCode >= 400).length;
+        logGlobalTotal.value = data.length;
+        logGlobalSuccess.value = data.filter((l) => l.statusCode >= 200 && l.statusCode < 300).length;
+        logGlobalError.value = data.filter((l) => l.statusCode >= 400).length;
         proxyLogs.value = list.slice((logPage.value - 1) * logPageSize.value, logPage.value * logPageSize.value);
       } else if (data && Array.isArray(data.items)) {
         proxyLogs.value = data.items;
         logTotal.value = data.total ?? proxyLogs.value.length;
         logSuccessTotal.value = data.successTotal ?? 0;
         logErrorTotal.value = data.errorTotal ?? 0;
+        logGlobalTotal.value = data.globalTotal ?? logTotal.value;
+        logGlobalSuccess.value = data.globalSuccessTotal ?? logSuccessTotal.value;
+        logGlobalError.value = data.globalErrorTotal ?? logErrorTotal.value;
       }
     } catch (e) {
       console.warn("获取请求日志失败:", e);
@@ -371,6 +392,9 @@ export function useModelProxy() {
     logTotal,
     logSuccessTotal,
     logErrorTotal,
+    logGlobalTotal,
+    logGlobalSuccess,
+    logGlobalError,
     logPageCount,
     logRangeStart,
     logRangeEnd,

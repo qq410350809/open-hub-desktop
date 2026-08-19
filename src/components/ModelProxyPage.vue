@@ -33,6 +33,9 @@ const {
   logTotal,
   logSuccessTotal,
   logErrorTotal,
+  logGlobalTotal,
+  logGlobalSuccess,
+  logGlobalError,
   logPageCount,
   logRangeStart,
   logRangeEnd,
@@ -390,11 +393,11 @@ function sortLogsBy(by: "timestamp" | "status" | "tokens" | "duration") {
   toggleLogSort(by, { filter: logStatusFilter.value, q: logSearchQuery.value.trim() });
 }
 
-/** 全量计数：来自后端分页响应的总数统计，与当前页无关 */
+/** 全量计数：来自后端全库计数，不随 filter/搜索变化，供标签固定显示 */
 const logCounts = computed(() => ({
-  all: logTotal.value,
-  success: logSuccessTotal.value,
-  error: logErrorTotal.value,
+  all: logGlobalTotal.value,
+  success: logGlobalSuccess.value,
+  error: logGlobalError.value,
 }));
 
 /** 切换状态筛选：回到第一页并按新条件重新拉取 */
@@ -798,42 +801,6 @@ async function copyModel(modelId: string) {
 
     <!-- 选项卡 3: 请求调用日志全景 (In-page Full View) -->
     <div v-else-if="currentMainTab === 'logs'" class="mp-tab-pane mp-logs-page-view">
-      <!-- 顶部固化数据库状态指示与操作栏 -->
-      <div class="mp-logs-summary-bar">
-        <div class="mp-lsb-left">
-          <div class="mp-lsb-badge-group">
-            <span class="mp-lsb-pill" title="所有日志已实时持久化到本地 SQLite 数据库，软件重启不丢失">
-              <span class="mp-lsb-dot" />
-              <span>已固化存储至本地 SQLite 数据库</span>
-            </span>
-            <span class="mp-header-chip font-mono">共 {{ logTotal }} 条记录</span>
-            <span v-if="logCounts.error > 0" class="mp-header-chip is-danger font-mono">{{ logCounts.error }} 条异常</span>
-          </div>
-        </div>
-
-        <div class="mp-logs-actions">
-          <button
-            type="button"
-            class="mp-btn mp-btn-ghost mp-btn-sm"
-            :disabled="loadingLogs"
-            title="从本地数据库刷新最新日志"
-            @click="fetchLogs({ filter: logStatusFilter, q: logSearchQuery.trim() })"
-          >
-            <span :class="{ 'mp-spin': loadingLogs }" v-html="icons.restore" />
-            <span>{{ loadingLogs ? "刷新中…" : "刷新日志" }}</span>
-          </button>
-          <button
-            type="button"
-            class="mp-btn mp-btn-ghost mp-btn-sm text-danger"
-            :disabled="proxyLogs.length === 0"
-            title="清理本地 SQLite 数据库中的反代请求日志"
-            @click="clearLogsModalOpen = true"
-          >
-            <span v-html="icons.trash" />
-            <span>清空数据库日志</span>
-          </button>
-        </div>
-      </div>
 
       <!-- 请求日志主卡片 -->
       <div class="mp-card mp-logs-main-card">
@@ -884,10 +851,38 @@ async function copyModel(modelId: string) {
               <span v-html="icons.close" />
             </button>
           </div>
+
+          <div class="mp-logs-actions">
+            <button
+              type="button"
+              class="mp-btn mp-btn-ghost mp-btn-sm"
+              :disabled="loadingLogs"
+              title="从本地数据库刷新最新日志"
+              @click="fetchLogs({ filter: logStatusFilter, q: logSearchQuery.trim() })"
+            >
+              <span :class="{ 'mp-spin': loadingLogs }" v-html="icons.restore" />
+              <span>{{ loadingLogs ? "刷新中…" : "刷新日志" }}</span>
+            </button>
+            <button
+              type="button"
+              class="mp-btn mp-btn-ghost mp-btn-sm text-danger"
+              :disabled="proxyLogs.length === 0"
+              title="清理本地 SQLite 数据库中的反代请求日志"
+              @click="clearLogsModalOpen = true"
+            >
+              <span v-html="icons.trash" />
+              <span>清空数据库日志</span>
+            </button>
+          </div>
         </div>
 
         <!-- 请求日志表格 -->
-        <div class="mp-logs-table-wrap">
+        <div class="mp-logs-table-wrap" :class="{ 'is-loading': loadingLogs }">
+          <!-- loading 遮罩 -->
+          <div v-if="loadingLogs" class="mp-table-loading-overlay">
+            <span class="mp-spin" v-html="icons.restore" />
+            <span>加载中…</span>
+          </div>
           <table class="mp-logs-table">
             <thead>
               <tr>
@@ -1130,6 +1125,21 @@ async function copyModel(modelId: string) {
               </label>
             </div>
             <small>开启后在请求日志中保存客户端传入的完整 JSON 报文（默认关闭以节省内存）</small>
+          </div>
+
+          <!-- 失败重试次数 -->
+          <div class="mp-field">
+            <label for="mp-max-retries">失败重试次数</label>
+            <input
+              id="mp-max-retries"
+              v-model.number="proxyConfig.maxRetries"
+              type="number"
+              min="0"
+              max="10"
+              class="mp-input font-mono"
+              placeholder="0"
+            />
+            <small>请求失败后最多重试几次（默认 0 = 失败直接返回）；开启代理池的渠道同时受可用节点数限制，失败节点自动移至队尾</small>
           </div>
         </form>
 
@@ -3669,6 +3679,7 @@ async function copyModel(modelId: string) {
 
 .mp-health-table-wrap,
 .mp-logs-table-wrap {
+  position: relative;
   border: 1px solid var(--line);
   border-radius: var(--r-md);
   overflow: hidden;
@@ -3677,6 +3688,25 @@ async function copyModel(modelId: string) {
   overflow-x: auto;
   width: 100%;
   box-sizing: border-box;
+}
+
+.mp-logs-table-wrap.is-loading {
+  pointer-events: none;
+}
+
+.mp-table-loading-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  background: color-mix(in srgb, var(--surface) 80%, transparent);
+  backdrop-filter: blur(2px);
+  font-size: 13px;
+  color: var(--muted);
+  font-weight: 500;
 }
 
 .mp-health-table,
