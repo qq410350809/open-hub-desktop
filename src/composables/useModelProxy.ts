@@ -229,7 +229,7 @@ export function useModelProxy() {
   async function fetchLogs() {
     loadingLogs.value = true;
     try {
-      const list = await runCommand<ProxyRequestLog[]>("get_opencode_proxy_logs", { limit: 200 });
+      const list = await runCommand<ProxyRequestLog[]>("get_opencode_proxy_logs", { limit: 500 });
       if (Array.isArray(list)) {
         proxyLogs.value = list;
       }
@@ -240,11 +240,17 @@ export function useModelProxy() {
     }
   }
 
-  async function clearLogs() {
+  async function clearLogs(mode: "payload_only" | "all" = "all") {
     try {
-      await runCommand("clear_opencode_proxy_logs");
-      proxyLogs.value = [];
-      showToast("已清空请求日志");
+      await runCommand("clear_opencode_proxy_logs", { mode });
+      if (mode === "payload_only") {
+        await fetchLogs();
+        showToast("已清空所有日志的请求与响应报文详细内容");
+      } else {
+        proxyLogs.value = [];
+        await refreshStatus();
+        showToast("已清空所有历史日志与统计数据");
+      }
     } catch (e) {
       showToast(`清空日志失败: ${String(e)}`, true);
     }

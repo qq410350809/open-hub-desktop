@@ -37,11 +37,23 @@ const logStatusFilter = ref<"all" | "success" | "error">("all");
 const configModalOpen = ref(false);
 const healthModalOpen = ref(false);
 const gatewayModelsModalOpen = ref(false);
-const currentMainTab = ref<"console" | "logs">("console");
+const currentMainTab = ref<"console" | "channels" | "logs">("console");
 const channelModelsModalOpen = ref(false);
+const clearLogsModalOpen = ref(false);
+const clearingLogs = ref(false);
 const selectedLogForDetail = ref<ProxyRequestLog | null>(null);
 const selectedChannel = ref<ChannelConfig | null>(null);
 const copiedModelId = ref<string | null>(null);
+
+async function handleClearLogs(mode: "payload_only" | "all") {
+  clearingLogs.value = true;
+  try {
+    await clearLogs(mode);
+    clearLogsModalOpen.value = false;
+  } finally {
+    clearingLogs.value = false;
+  }
+}
 
 let uptimeTicker: number | null = null;
 let statusPollTimer: number | null = null;
@@ -192,6 +204,25 @@ function getErrorSuggestion(log: ProxyRequestLog): string {
     return "OpenCode Public 免费通道对单出口 IP 存在频次限制 (Rate limit exceeded)。解决方案：① 在对应渠道卡片开启「内部代理池轮询」，网关将自动通过系统代理池中 ≤1000ms 的多个健康节点轮询出口 IP，并在遭遇频次限制时自动秒级重试切换；② 切换其他免费模型（如 deepseek-v4-flash-free / nemotron-3-ultra-free / mimo-v2.5-free / laguna-s-2.1-free）；③ 稍候 30 秒后自动恢复。";
   }
   return "请根据下方原始错误响应体排查上游返回的具体原因。";
+}
+
+function formatCompactToken(val?: number | null): string {
+  const num = Number(val ?? 0);
+  if (!Number.isFinite(num) || num <= 0) return "0";
+  if (num < 1000) return String(Math.round(num));
+  if (num < 1_000_000) {
+    const k = (num / 1000).toFixed(num < 100_000 ? 1 : 0).replace(/\.0$/, "");
+    return `${k}k`;
+  }
+  const m = (num / 1_000_000).toFixed(num < 100_000_000 ? 1 : 0).replace(/\.0$/, "");
+  return `${m}m`;
+}
+
+function formatSec(ms?: number | null): string {
+  if (ms == null || !Number.isFinite(ms)) return "--";
+  const sec = ms / 1000;
+  if (sec < 0.01 && ms > 0) return "<0.01s";
+  return `${sec.toFixed(2)}s`;
 }
 
 interface HealthCheckItem {
@@ -419,6 +450,19 @@ async function copyModel(modelId: string) {
       <button
         type="button"
         class="mp-main-nav-btn"
+        :class="{ active: currentMainTab === 'channels' }"
+        @click="currentMainTab = 'channels'"
+      >
+        <span v-html="icons.shield" />
+        <span>反代渠道</span>
+        <span class="mp-tab-count-pill font-mono">
+          {{ proxyConfig.channels.length }}
+        </span>
+      </button>
+
+      <button
+        type="button"
+        class="mp-main-nav-btn"
         :class="{ active: currentMainTab === 'logs' }"
         @click="switchToLogsTab"
       >
@@ -433,7 +477,7 @@ async function copyModel(modelId: string) {
       </button>
     </div>
 
-    <!-- 选项卡 1: 反代控制台 (Console / Overview / Channels) -->
+    <!-- 选项卡 1: 反代控制台 (Console / Overview) -->
     <div v-if="currentMainTab === 'console'" class="mp-tab-pane">
       <!-- 运行概览与连接参数 -->
       <section class="mp-card mp-overview-card">
@@ -570,8 +614,10 @@ async function copyModel(modelId: string) {
           </div>
         </div>
       </section>
+    </div>
 
-      <!-- 反代渠道矩阵 (三列卡片 / 3-Column Card Grid) -->
+    <!-- 选项卡 2: 反代上游渠道 (Channels Matrix) -->
+    <div v-else-if="currentMainTab === 'channels'" class="mp-tab-pane">
       <div class="mp-section-head">
         <div class="mp-card-title-group">
           <span class="mp-card-icon" v-html="icons.shield" />
@@ -658,7 +704,7 @@ async function copyModel(modelId: string) {
       </div>
     </div>
 
-    <!-- 选项卡 2: 请求调用日志全景 (In-page Full View) -->
+    <!-- 选项卡 3: 请求调用日志全景 (In-page Full View) -->
     <div v-else-if="currentMainTab === 'logs'" class="mp-tab-pane mp-logs-page-view">
       <!-- 顶部固化数据库状态指示与操作栏 -->
       <div class="mp-logs-summary-bar">
@@ -688,8 +734,8 @@ async function copyModel(modelId: string) {
             type="button"
             class="mp-btn mp-btn-ghost mp-btn-sm text-danger"
             :disabled="proxyLogs.length === 0"
-            title="清空本地 SQLite 数据库中的所有反代请求日志"
-            @click="clearLogs"
+            title="清理本地 SQLite 数据库中的反代请求日志"
+            @click="clearLogsModalOpen = true"
           >
             <span v-html="icons.trash" />
             <span>清空数据库日志</span>
@@ -753,16 +799,15 @@ async function copyModel(modelId: string) {
           <table class="mp-logs-table">
             <thead>
               <tr>
-                <th style="width: 130px;">请求时间</th>
-                <th style="width: 125px;">方法与路径</th>
-                <th style="width: 145px;">渠道 / 模型</th>
-                <th style="width: 110px;">出网节点</th>
+                <th style="width: 105px;">请求时间</th>
+                <th style="width: 135px;">方法与路径</th>
+                <th style="width: 180px;">渠道 / 模型</th>
+                <th style="width: 125px;">出网节点</th>
                 <th style="width: 60px;">模式</th>
                 <th style="width: 70px;">状态</th>
-                <th style="width: 175px;">Token 统计 (入/命/出/思)</th>
-                <th>说明 / 错误原因</th>
-                <th style="width: 80px;">耗时</th>
-                <th style="width: 70px; text-align: center;">操作</th>
+                <th style="min-width: 175px;">Token 统计</th>
+                <th style="width: 90px;">耗时</th>
+                <th style="width: 65px; text-align: center;">操作</th>
               </tr>
             </thead>
             <tbody>
@@ -773,7 +818,12 @@ async function copyModel(modelId: string) {
                 :class="{ 'has-error': log.statusCode >= 400 }"
                 @click="openLogDetail(log)"
               >
-                <td class="font-mono text-muted text-xs">{{ log.timestamp }}</td>
+                <td>
+                  <div class="mp-log-time-col font-mono">
+                    <span class="mp-log-date">{{ log.timestamp ? log.timestamp.split(' ')[0] : '--' }}</span>
+                    <strong class="mp-log-time">{{ log.timestamp && log.timestamp.split(' ')[1] ? log.timestamp.split(' ')[1] : log.timestamp }}</strong>
+                  </div>
+                </td>
                 <td>
                   <div class="mp-log-method-path">
                     <span class="mp-method-tag" :class="`method-${log.method.toLowerCase()}`">{{ log.method }}</span>
@@ -781,9 +831,11 @@ async function copyModel(modelId: string) {
                   </div>
                 </td>
                 <td>
-                  <div class="mp-log-model-wrap">
-                    <span class="mp-proto-tag">{{ log.channelId.toUpperCase() }}</span>
-                    <strong class="font-mono text-text text-xs">{{ log.model }}</strong>
+                  <div class="mp-log-model-col">
+                    <div class="mp-log-chan-row">
+                      <span class="mp-proto-tag">{{ log.channelId.toUpperCase() }}</span>
+                    </div>
+                    <strong class="mp-log-model-name font-mono" :title="log.model">{{ log.model }}</strong>
                   </div>
                 </td>
                 <td>
@@ -813,34 +865,41 @@ async function copyModel(modelId: string) {
                   </span>
                 </td>
                 <td>
-                  <!-- Token 统计列：显示 输入 (缓存命中) 与 输出 (思考) -->
+                  <!-- Token 统计列：输入 / 缓存 / 输出 / 思考，两行两列等宽卡片 -->
                   <div v-if="log.promptTokens !== undefined || log.completionTokens !== undefined" class="mp-log-tokens-cell font-mono">
                     <div class="mp-token-pill-row">
-                      <span class="mp-token-tag is-in" title="输入 Tokens (Prompt Tokens)">入: {{ log.promptTokens ?? 0 }}</span>
-                      <span v-if="log.promptCacheHitTokens" class="mp-token-tag is-hit" title="缓存命中 Tokens (Prompt Cache Hit)">⚡{{ log.promptCacheHitTokens }}</span>
+                      <span class="mp-token-tag is-in" :title="`输入 Token: ${log.promptTokens ?? 0}`">
+                        <span>输入</span>
+                        <strong>{{ formatCompactToken(log.promptTokens) }}</strong>
+                      </span>
+                      <span v-if="log.promptCacheHitTokens" class="mp-token-tag is-hit" :title="`缓存命中: ${log.promptCacheHitTokens}`">
+                        <span>缓存</span>
+                        <strong>{{ formatCompactToken(log.promptCacheHitTokens) }}</strong>
+                      </span>
                     </div>
                     <div class="mp-token-pill-row">
-                      <span class="mp-token-tag is-out" title="输出 Tokens (Completion Tokens)">出: {{ log.completionTokens ?? 0 }}</span>
-                      <span v-if="log.reasoningTokens" class="mp-token-tag is-think" title="思考/推理 Tokens (Reasoning Tokens)">🧠{{ log.reasoningTokens }}</span>
+                      <span class="mp-token-tag is-out" :title="`输出 Token: ${log.completionTokens ?? 0}`">
+                        <span>输出</span>
+                        <strong>{{ formatCompactToken(log.completionTokens) }}</strong>
+                      </span>
+                      <span v-if="log.reasoningTokens" class="mp-token-tag is-think" :title="`思考推理: ${log.reasoningTokens}`">
+                        <span>思考</span>
+                        <strong>{{ formatCompactToken(log.reasoningTokens) }}</strong>
+                      </span>
                     </div>
                   </div>
                   <span v-else class="text-muted text-xs font-mono">--</span>
                 </td>
                 <td>
-                  <div v-if="log.errorMessage" class="mp-log-err-preview" :title="log.errorMessage">
-                    <span class="mp-err-dot" />
-                    <span class="truncate">{{ log.errorMessage }}</span>
-                  </div>
-                  <div v-else-if="log.statusCode >= 200 && log.statusCode < 300" class="text-success text-xs flex-center-start">
-                    <span>✓ 正常完成</span>
-                    <span v-if="log.promptCacheHitTokens" class="text-brand font-mono ml-1" title="已命中前缀缓存">⚡命中缓存</span>
-                  </div>
-                  <span v-else class="text-muted text-xs">--</span>
-                </td>
-                <td>
-                  <div class="mp-dur-wrap font-mono text-xs">
-                    <span :class="log.durationMs > 2000 ? 'text-warn' : 'text-text'">{{ log.durationMs }}ms</span>
-                    <span v-if="log.ttftMs" class="mp-ttft-tag" title="首字响应耗时 (Time To First Token)">首字 {{ log.ttftMs }}ms</span>
+                  <div class="mp-dur-col font-mono text-xs">
+                    <div class="mp-dur-row">
+                      <span class="mp-dur-label">首:</span>
+                      <span class="mp-dur-val text-brand">{{ log.ttftMs ? formatSec(log.ttftMs) : '--' }}</span>
+                    </div>
+                    <div class="mp-dur-row">
+                      <span class="mp-dur-label">总:</span>
+                      <span class="mp-dur-val" :class="log.durationMs > 2000 ? 'text-warn font-semibold' : 'text-text font-semibold'">{{ formatSec(log.durationMs) }}</span>
+                    </div>
                   </div>
                 </td>
                 <td style="text-align: center;">
@@ -974,7 +1033,7 @@ async function copyModel(modelId: string) {
       aria-labelledby="mp-log-detail-title"
       @click.self="closeLogDetail"
     >
-      <div class="mp-modal-box mp-modal-box-wide mp-log-detail-box">
+      <div class="mp-modal-box mp-modal-box-extra-wide mp-log-detail-box">
         <div class="mp-modal-header">
           <div class="mp-modal-title-group">
             <div class="mp-modal-badge-icon" :class="selectedLogForDetail.statusCode >= 400 ? 'is-error' : 'is-success'">
@@ -1811,25 +1870,128 @@ async function copyModel(modelId: string) {
         </div>
       </div>
     </div>
+
+    <!-- 数据库日志清理选项弹窗 (Clear Logs Options Modal) -->
+    <div
+      v-if="clearLogsModalOpen"
+      class="mp-modal-backdrop mp-sub-backdrop"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="mp-clear-modal-title"
+      @click.self="clearLogsModalOpen = false"
+    >
+      <div class="mp-modal-box mp-modal-box-sm mp-clear-logs-box">
+        <div class="mp-modal-header">
+          <div class="mp-card-title-group">
+            <span class="mp-modal-icon text-danger" v-html="icons.trash" />
+            <h3 id="mp-clear-modal-title">清理数据库日志</h3>
+          </div>
+          <button
+            type="button"
+            class="mp-modal-close"
+            title="关闭 (Esc)"
+            @click="clearLogsModalOpen = false"
+          >
+            <span v-html="icons.close" />
+          </button>
+        </div>
+
+        <div class="mp-modal-body">
+          <p class="mp-clear-modal-desc">
+            请选择要执行的本地 SQLite 数据库日志清理模式：
+          </p>
+
+          <div class="mp-clear-options-grid">
+            <!-- 选项 1: 仅清空请求/响应报文 -->
+            <div class="mp-clear-option-card">
+              <div class="mp-coc-head">
+                <div class="mp-coc-title-wrap">
+                  <span class="mp-coc-icon">📝</span>
+                  <div>
+                    <strong>清理请求与响应详细内容</strong>
+                    <span class="mp-coc-badge">推荐（大幅节省磁盘空间）</span>
+                  </div>
+                </div>
+              </div>
+              <p class="mp-coc-desc">
+                仅清空日志中保存的客户端请求全文与服务端响应内容（释放大体积存储），<strong>保留</strong>历史调用时间、状态码、模型、节点、耗时与 Token 统计等列表索引。
+              </p>
+              <div class="mp-coc-action">
+                <button
+                  type="button"
+                  class="mp-btn mp-btn-ghost mp-btn-sm"
+                  :disabled="clearingLogs"
+                  @click="handleClearLogs('payload_only')"
+                >
+                  <span>{{ clearingLogs ? "清理中…" : "仅清理报文全文" }}</span>
+                </button>
+              </div>
+            </div>
+
+            <!-- 选项 2: 完全清空所有记录 -->
+            <div class="mp-clear-option-card is-danger">
+              <div class="mp-coc-head">
+                <div class="mp-coc-title-wrap">
+                  <span class="mp-coc-icon text-danger">🗑️</span>
+                  <div>
+                    <strong class="text-danger">彻底清空全部记录与统计</strong>
+                    <span class="mp-coc-badge is-danger">全部删除</span>
+                  </div>
+                </div>
+              </div>
+              <p class="mp-coc-desc">
+                从本地 SQLite 数据库中永久删除所有反代调用日志记录，并将控制台运行时计数器与 Token 统计归零。
+              </p>
+              <div class="mp-coc-action">
+                <button
+                  type="button"
+                  class="mp-btn mp-btn-danger mp-btn-sm"
+                  :disabled="clearingLogs"
+                  @click="handleClearLogs('all')"
+                >
+                  <span>{{ clearingLogs ? "清空中…" : "彻底清空所有记录" }}</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="mp-modal-footer">
+          <button
+            type="button"
+            class="mp-btn mp-btn-ghost"
+            @click="clearLogsModalOpen = false"
+          >
+            取消
+          </button>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
 <style scoped>
 .mp-page {
-  padding: 24px 32px 48px;
-  max-width: 1440px;
+  padding: 20px 24px 40px;
+  width: 100%;
+  max-width: 100%;
+  box-sizing: border-box;
   margin: 0 auto;
   display: flex;
   flex-direction: column;
-  gap: 20px;
+  gap: 16px;
+  min-width: 0;
 }
 
 /* 顶栏 */
 .mp-header {
   display: flex;
   justify-content: space-between;
-  align-items: flex-start;
+  align-items: center;
   gap: 16px;
+  width: 100%;
+  box-sizing: border-box;
+  flex-wrap: wrap;
 }
 
 .mp-header-title-row {
@@ -2067,6 +2229,10 @@ async function copyModel(modelId: string) {
   display: flex;
   flex-direction: column;
   gap: 16px;
+  width: 100%;
+  max-width: 100%;
+  box-sizing: border-box;
+  min-width: 0;
   animation: fadeInTab 0.18s ease;
 }
 
@@ -2081,6 +2247,8 @@ async function copyModel(modelId: string) {
   justify-content: space-between;
   align-items: center;
   gap: 12px;
+  width: 100%;
+  box-sizing: border-box;
   flex-wrap: wrap;
 }
 
@@ -2088,6 +2256,7 @@ async function copyModel(modelId: string) {
   display: flex;
   align-items: center;
   gap: 10px;
+  flex-wrap: wrap;
 }
 
 .mp-lsb-badge-group {
@@ -2120,10 +2289,15 @@ async function copyModel(modelId: string) {
 .mp-logs-main-card {
   padding: 0;
   overflow: hidden;
+  width: 100%;
+  max-width: 100%;
+  box-sizing: border-box;
 }
 
 .mp-logs-main-card .mp-logs-toolbar {
   padding: 16px 18px 12px;
+  width: 100%;
+  box-sizing: border-box;
 }
 
 .mp-logs-main-card .mp-logs-table-wrap {
@@ -2131,6 +2305,10 @@ async function copyModel(modelId: string) {
   max-height: calc(100vh - 300px);
   min-height: 400px;
   overflow-y: auto;
+  overflow-x: auto;
+  width: 100%;
+  max-width: 100%;
+  box-sizing: border-box;
 }
 
 .mp-btn-text {
@@ -3286,6 +3464,9 @@ async function copyModel(modelId: string) {
   overflow: hidden;
   max-height: 480px;
   overflow-y: auto;
+  overflow-x: auto;
+  width: 100%;
+  box-sizing: border-box;
 }
 
 .mp-health-table,
@@ -3469,10 +3650,49 @@ async function copyModel(modelId: string) {
   color: var(--text);
 }
 
-.mp-log-model-wrap {
+.mp-log-time-col {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  line-height: 1.25;
+}
+
+.mp-log-time-col .mp-log-date {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.mp-log-time-col .mp-log-time {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.mp-log-model-col {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 3px;
+  min-width: 0;
+  line-height: 1.25;
+}
+
+.mp-log-chan-row {
   display: flex;
   align-items: center;
-  gap: 6px;
+}
+
+.mp-log-model-col .mp-proto-tag {
+  font-size: 9.5px;
+  padding: 1px 5px;
+  border-radius: 3px;
+}
+
+.mp-log-model-col .mp-log-model-name {
+  font-size: 12px;
+  font-weight: 650;
+  color: var(--text);
+  word-break: break-all;
 }
 
 .mp-log-node-wrap {
@@ -3574,7 +3794,29 @@ async function copyModel(modelId: string) {
 
 /* 请求详情弹窗专属样式 */
 .mp-log-detail-box {
-  max-width: 800px;
+  max-width: 1180px;
+  width: 94vw;
+}
+
+.mp-log-detail-box .mp-modal-header {
+  padding: 16px 20px;
+}
+
+.mp-log-detail-box .mp-modal-title-group {
+  flex: 1;
+  min-width: 0;
+}
+
+.mp-log-detail-box .mp-modal-title-wrap {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: nowrap;
+  white-space: nowrap;
+}
+
+.mp-log-detail-box .mp-modal-title-wrap > * {
+  flex-shrink: 0;
 }
 
 .mp-log-error-banner {
@@ -3712,19 +3954,28 @@ async function copyModel(modelId: string) {
   color: var(--text);
 }
 
-.mp-dur-wrap {
+.mp-dur-col {
   display: flex;
   flex-direction: column;
   gap: 2px;
+  line-height: 1.25;
 }
 
-.mp-ttft-tag {
-  font-size: 9.5px;
-  color: var(--brand-deep);
-  background: var(--brand-soft);
-  padding: 0 4px;
-  border-radius: 2px;
-  width: fit-content;
+.mp-dur-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.mp-dur-label {
+  font-size: 11px;
+  color: var(--muted);
+  width: 18px;
+  flex-shrink: 0;
+}
+
+.mp-dur-val {
+  font-size: 11.5px;
 }
 
 .mp-log-tokens-cell {
@@ -3734,10 +3985,9 @@ async function copyModel(modelId: string) {
 }
 
 .mp-token-pill-row {
-  display: flex;
-  align-items: center;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 4px;
-  flex-wrap: wrap;
 }
 
 .mp-token-tag {
@@ -3747,7 +3997,14 @@ async function copyModel(modelId: string) {
   border-radius: 3px;
   display: inline-flex;
   align-items: center;
-  gap: 2px;
+  justify-content: space-between;
+  gap: 6px;
+  min-width: 0;
+}
+
+.mp-token-tag > strong {
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
 }
 
 .mp-token-tag.is-in {
@@ -3976,5 +4233,93 @@ async function copyModel(modelId: string) {
   max-height: 360px;
   overflow-y: auto;
   line-height: 1.5;
+}
+
+/* 清理数据库日志弹窗样式 */
+.mp-clear-logs-box {
+  max-width: 540px;
+}
+
+.mp-clear-modal-desc {
+  margin: 0 0 14px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.mp-clear-options-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.mp-clear-option-card {
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  transition: all 0.18s ease;
+}
+
+.mp-clear-option-card:hover {
+  border-color: var(--line-strong);
+  background: var(--surface-hover);
+}
+
+.mp-clear-option-card.is-danger {
+  border-color: color-mix(in srgb, var(--danger) 25%, transparent);
+  background: color-mix(in srgb, var(--danger) 4%, var(--surface-soft));
+}
+
+.mp-clear-option-card.is-danger:hover {
+  border-color: color-mix(in srgb, var(--danger) 45%, transparent);
+  background: color-mix(in srgb, var(--danger) 8%, var(--surface-soft));
+}
+
+.mp-coc-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.mp-coc-title-wrap {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.mp-coc-icon {
+  font-size: 18px;
+  line-height: 1;
+}
+
+.mp-coc-badge {
+  font-size: 10px;
+  font-weight: 700;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--brand-soft);
+  color: var(--brand-deep);
+  margin-left: 6px;
+}
+
+.mp-coc-badge.is-danger {
+  background: color-mix(in srgb, var(--danger) 15%, transparent);
+  color: var(--danger);
+}
+
+.mp-coc-desc {
+  margin: 0;
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.5;
+}
+
+.mp-coc-action {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 4px;
 }
 </style>

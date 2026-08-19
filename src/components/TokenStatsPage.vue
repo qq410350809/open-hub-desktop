@@ -2926,6 +2926,10 @@ onBeforeUnmount(() => {
   border: 1px solid var(--line);
   border-radius: var(--r-md, 8px);
   overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
 }
 
 /* 过滤搜索栏 */

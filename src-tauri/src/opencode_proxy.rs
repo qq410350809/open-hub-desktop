@@ -10,7 +10,6 @@ use futures_util::StreamExt;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as JsonValue};
-use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -148,7 +147,17 @@ pub struct OpencodeProxyContext {
     pub default_http_client: reqwest::Client,
     pub app_handle: Arc<RwLock<Option<tauri::AppHandle>>>,
     pub active_egress_idx: Arc<AtomicUsize>,
-    pub logs: Arc<RwLock<VecDeque<ProxyRequestLog>>>,
+}
+
+static REQ_ID_SEQ: AtomicU64 = AtomicU64::new(1);
+
+fn generate_req_id() -> String {
+    let seq = REQ_ID_SEQ.fetch_add(1, Ordering::Relaxed);
+    let now_nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("req_{:x}_{:x}", now_nanos, seq)
 }
 
 impl OpencodeProxyContext {
@@ -214,19 +223,13 @@ impl OpencodeProxyContext {
                 )?;
                 conn.execute(
                     "DELETE FROM opencode_proxy_logs WHERE id NOT IN (
-                        SELECT id FROM opencode_proxy_logs ORDER BY created_at DESC LIMIT 1000
+                        SELECT id FROM opencode_proxy_logs ORDER BY created_at DESC, rowid DESC LIMIT 1000
                     )",
                     [],
                 )?;
                 Ok(())
             })();
         }
-
-        let mut logs = self.logs.write().await;
-        if logs.len() >= 300 {
-            logs.pop_back();
-        }
-        logs.push_front(log);
     }
 }
 
@@ -264,7 +267,6 @@ impl OpencodeProxyState {
             default_http_client,
             app_handle: Arc::new(RwLock::new(app_handle)),
             active_egress_idx: Arc::new(AtomicUsize::new(0)),
-            logs: Arc::new(RwLock::new(VecDeque::with_capacity(320))),
         };
 
         Self {
@@ -368,6 +370,10 @@ fn clean_sse_stream(
                                         }
                                         if let Some(hit) = u.get("prompt_cache_hit_tokens")
                                             .or_else(|| u.get("prompt_tokens_details").and_then(|d| d.get("cached_tokens")))
+                                            .or_else(|| u.get("prompt_tokens_details").and_then(|d| d.get("cache_read")))
+                                            .or_else(|| u.get("cache_read_input_tokens"))
+                                            .or_else(|| u.get("cached_tokens"))
+                                            .or_else(|| u.get("cache_hit_tokens"))
                                             .and_then(JsonValue::as_u64)
                                         {
                                             prompt_cache_hit = Some(hit);
@@ -577,6 +583,10 @@ fn openai_to_anthropic_sse_stream(
                                         }
                                         if let Some(hit) = u.get("prompt_cache_hit_tokens")
                                             .or_else(|| u.get("prompt_tokens_details").and_then(|d| d.get("cached_tokens")))
+                                            .or_else(|| u.get("prompt_tokens_details").and_then(|d| d.get("cache_read")))
+                                            .or_else(|| u.get("cache_read_input_tokens"))
+                                            .or_else(|| u.get("cached_tokens"))
+                                            .or_else(|| u.get("cache_hit_tokens"))
                                             .and_then(JsonValue::as_u64)
                                         {
                                             prompt_cache_hit = Some(hit);
@@ -751,6 +761,39 @@ fn openai_to_anthropic_sse_stream(
 fn normalize_chat_messages(body: &mut JsonValue) {
     if let Some(messages) = body.get_mut("messages").and_then(JsonValue::as_array_mut) {
         for msg in messages {
+            // 1. 规范化 content 字段：如果客户端传入的是数组（包含 text, image_url 等复合 block），提取拼接为纯文本字符串
+            // 避免 OpenCode 上游反序列化器报错 "unknown variant image_url, expected text"
+            if let Some(content_val) = msg.get_mut("content") {
+                if let Some(arr) = content_val.as_array() {
+                    let mut combined_text = String::new();
+                    for part in arr {
+                        if let Some(t) = part.get("text").and_then(JsonValue::as_str) {
+                            if !combined_text.is_empty() {
+                                combined_text.push('\n');
+                            }
+                            combined_text.push_str(t);
+                        } else if part.get("type").and_then(JsonValue::as_str) == Some("image_url")
+                            || part.get("image_url").is_some()
+                            || part.get("type").and_then(JsonValue::as_str) == Some("image")
+                        {
+                            if !combined_text.is_empty() {
+                                combined_text.push('\n');
+                            }
+                            combined_text.push_str("[图片输入]");
+                        } else if let Some(_audio) = part.get("input_audio") {
+                            if !combined_text.is_empty() {
+                                combined_text.push('\n');
+                            }
+                            combined_text.push_str("[语音输入]");
+                        }
+                    }
+                    *content_val = JsonValue::String(combined_text);
+                } else if content_val.is_null() {
+                    *content_val = JsonValue::String(String::new());
+                }
+            }
+
+            // 2. Assistant 深度思考思维链提取
             if msg.get("role").and_then(JsonValue::as_str) == Some("assistant") {
                 let needs_reasoning = msg.get("reasoning_content").map_or(true, |v| v.is_null());
                 if needs_reasoning {
@@ -1129,7 +1172,7 @@ async fn handle_chat_completions(
     Json(mut body): Json<JsonValue>,
 ) -> Response {
     let start_time = Instant::now();
-    let req_id = format!("req_{:x}", start_time.elapsed().as_nanos());
+    let req_id = generate_req_id();
     let config = ctx.config.read().await;
 
     let req_body_str = if config.record_request_body {
@@ -1249,23 +1292,31 @@ async fn handle_chat_completions(
         used_cand_id = cand_id.clone();
         let client = build_client_for_candidate(&ctx, cand_id).await;
 
-        let session_id = format!(
-            "sess_{:x}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        );
+        let session_id = headers
+            .get("x-opencode-session")
+            .or_else(|| headers.get("session-id"))
+            .or_else(|| headers.get("x-session-id"))
+            .or_else(|| headers.get("conversation-id"))
+            .or_else(|| headers.get("x-conversation-id"))
+            .and_then(|v| v.to_str().ok())
+            .map(String::from)
+            .unwrap_or_else(|| "openhub-session".to_string());
 
-        let req = client
+        let mut req = client
             .post(&target_url)
             .header("Authorization", &auth_val)
             .header("Content-Type", "application/json")
             .header("User-Agent", "opencode/1.0.0")
             .header("x-opencode-client", "cli")
             .header("x-opencode-session", session_id)
-            .header("Accept", if is_stream { "text/event-stream" } else { "application/json" })
-            .json(&body);
+            .header("Accept", if is_stream { "text/event-stream" } else { "application/json" });
+
+        // 透传来自客户端的 cache_control 标头（如果客户端已标记）
+        if let Some(cc) = headers.get("anthropic-beta") {
+            req = req.header("anthropic-beta", cc);
+        }
+
+        let req = req.json(&body);
 
         match req.send().await {
             Ok(r) => {
@@ -1407,6 +1458,10 @@ async fn handle_chat_completions(
                 let pt = json_val.pointer("/usage/prompt_tokens").and_then(JsonValue::as_u64);
                 let hit = json_val.pointer("/usage/prompt_cache_hit_tokens")
                     .or_else(|| json_val.pointer("/usage/prompt_tokens_details/cached_tokens"))
+                    .or_else(|| json_val.pointer("/usage/prompt_tokens_details/cache_read"))
+                    .or_else(|| json_val.pointer("/usage/cache_read_input_tokens"))
+                    .or_else(|| json_val.pointer("/usage/cached_tokens"))
+                    .or_else(|| json_val.pointer("/usage/cache_hit_tokens"))
                     .and_then(JsonValue::as_u64);
                 let miss = json_val.pointer("/usage/prompt_cache_miss_tokens").and_then(JsonValue::as_u64);
                 let ct = json_val.pointer("/usage/completion_tokens").and_then(JsonValue::as_u64);
@@ -1459,7 +1514,7 @@ async fn handle_responses(
     Json(mut body): Json<JsonValue>,
 ) -> Response {
     let start_time = Instant::now();
-    let req_id = format!("req_{:x}", start_time.elapsed().as_nanos());
+    let req_id = generate_req_id();
     let config = ctx.config.read().await;
 
     let req_body_str = if config.record_request_body {
@@ -1546,23 +1601,30 @@ async fn handle_responses(
         used_cand_id = cand_id.clone();
         let client = build_client_for_candidate(&ctx, cand_id).await;
 
-        let session_id = format!(
-            "sess_{:x}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        );
+        let session_id = headers
+            .get("x-opencode-session")
+            .or_else(|| headers.get("session-id"))
+            .or_else(|| headers.get("x-session-id"))
+            .or_else(|| headers.get("conversation-id"))
+            .or_else(|| headers.get("x-conversation-id"))
+            .and_then(|v| v.to_str().ok())
+            .map(String::from)
+            .unwrap_or_else(|| "openhub-session".to_string());
 
-        let req = client
+        let mut req = client
             .post(&target_url)
             .header("Authorization", &auth_val)
             .header("Content-Type", "application/json")
             .header("User-Agent", "opencode/1.0.0")
             .header("x-opencode-client", "cli")
             .header("x-opencode-session", session_id)
-            .header("Accept", "application/json")
-            .json(&body);
+            .header("Accept", "application/json");
+
+        if let Some(cc) = headers.get("anthropic-beta") {
+            req = req.header("anthropic-beta", cc);
+        }
+
+        let req = req.json(&body);
 
         match req.send().await {
             Ok(r) => {
@@ -1678,6 +1740,10 @@ async fn handle_responses(
             let pt = json_val.pointer("/usage/prompt_tokens").and_then(JsonValue::as_u64);
             let hit = json_val.pointer("/usage/prompt_cache_hit_tokens")
                 .or_else(|| json_val.pointer("/usage/prompt_tokens_details/cached_tokens"))
+                .or_else(|| json_val.pointer("/usage/prompt_tokens_details/cache_read"))
+                .or_else(|| json_val.pointer("/usage/cache_read_input_tokens"))
+                .or_else(|| json_val.pointer("/usage/cached_tokens"))
+                .or_else(|| json_val.pointer("/usage/cache_hit_tokens"))
                 .and_then(JsonValue::as_u64);
             let miss = json_val.pointer("/usage/prompt_cache_miss_tokens").and_then(JsonValue::as_u64);
             let ct = json_val.pointer("/usage/completion_tokens").and_then(JsonValue::as_u64);
@@ -1729,7 +1795,7 @@ async fn handle_messages(
     Json(body): Json<JsonValue>,
 ) -> Response {
     let start_time = Instant::now();
-    let req_id = format!("req_{:x}", start_time.elapsed().as_nanos());
+    let req_id = generate_req_id();
     let config = ctx.config.read().await;
 
     let req_body_str = if config.record_request_body {
@@ -1808,7 +1874,17 @@ async fn handle_messages(
                 let mut text = String::new();
                 for block in arr {
                     if let Some(t) = block.get("text").and_then(JsonValue::as_str) {
+                        if !text.is_empty() {
+                            text.push('\n');
+                        }
                         text.push_str(t);
+                    } else if block.get("type").and_then(JsonValue::as_str) == Some("image")
+                        || block.get("type").and_then(JsonValue::as_str) == Some("image_url")
+                    {
+                        if !text.is_empty() {
+                            text.push('\n');
+                        }
+                        text.push_str("[图片输入]");
                     }
                 }
                 text
@@ -1886,23 +1962,30 @@ async fn handle_messages(
         used_cand_id = cand_id.clone();
         let client = build_client_for_candidate(&ctx, cand_id).await;
 
-        let session_id = format!(
-            "sess_{:x}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        );
+        let session_id = headers
+            .get("x-opencode-session")
+            .or_else(|| headers.get("session-id"))
+            .or_else(|| headers.get("x-session-id"))
+            .or_else(|| headers.get("conversation-id"))
+            .or_else(|| headers.get("x-conversation-id"))
+            .and_then(|v| v.to_str().ok())
+            .map(String::from)
+            .unwrap_or_else(|| "openhub-session".to_string());
 
-        let req = client
+        let mut req = client
             .post(&target_url)
             .header("Authorization", &auth_val)
             .header("Content-Type", "application/json")
             .header("User-Agent", "opencode/1.0.0")
             .header("x-opencode-client", "cli")
             .header("x-opencode-session", session_id)
-            .header("Accept", if is_stream { "text/event-stream" } else { "application/json" })
-            .json(&openai_body);
+            .header("Accept", if is_stream { "text/event-stream" } else { "application/json" });
+
+        if let Some(cc) = headers.get("anthropic-beta") {
+            req = req.header("anthropic-beta", cc);
+        }
+
+        let req = req.json(&openai_body);
 
         match req.send().await {
             Ok(r) => {
@@ -2445,7 +2528,7 @@ pub async fn get_opencode_proxy_logs(
     _state: tauri::State<'_, OpencodeProxyState>,
     limit: Option<usize>,
 ) -> Result<Vec<ProxyRequestLog>, String> {
-    let max = limit.unwrap_or(300);
+    let max = limit.unwrap_or(500);
     let conn = database.0.lock().map_err(|e| e.to_string())?;
     let mut stmt = conn.prepare(
         "SELECT id, timestamp, method, path, channel_id, model, stream,
@@ -2453,7 +2536,7 @@ pub async fn get_opencode_proxy_logs(
                 prompt_cache_miss_tokens, completion_tokens, reasoning_tokens, total_tokens,
                 error_message, request_body, response_body, node_name
          FROM opencode_proxy_logs
-         ORDER BY created_at DESC LIMIT ?1"
+         ORDER BY created_at DESC, rowid DESC LIMIT ?1"
     ).map_err(|e| e.to_string())?;
 
     let rows = stmt.query_map([max as i64], |row| {
@@ -2495,21 +2578,30 @@ pub async fn get_opencode_proxy_logs(
 pub async fn clear_opencode_proxy_logs(
     database: tauri::State<'_, crate::models::Database>,
     state: tauri::State<'_, OpencodeProxyState>,
+    mode: Option<String>,
 ) -> Result<(), String> {
-    if let Ok(conn) = database.0.lock() {
-        let _ = conn.execute("DELETE FROM opencode_proxy_logs", []);
-    }
-    let mut logs = state.context.logs.write().await;
-    logs.clear();
+    let clear_mode = mode.as_deref().unwrap_or("all");
 
-    state.context.metrics.total_requests.store(0, Ordering::Relaxed);
-    state.context.metrics.successful_requests.store(0, Ordering::Relaxed);
-    state.context.metrics.failed_requests.store(0, Ordering::Relaxed);
-    state.context.metrics.total_prompt_tokens.store(0, Ordering::Relaxed);
-    state.context.metrics.total_completion_tokens.store(0, Ordering::Relaxed);
-    state.context.metrics.total_reasoning_tokens.store(0, Ordering::Relaxed);
-    state.context.metrics.total_cache_hit_tokens.store(0, Ordering::Relaxed);
-    state.context.metrics.total_tokens.store(0, Ordering::Relaxed);
+    if clear_mode == "payload_only" || clear_mode == "details_only" {
+        // 仅清空请求和响应的详细报文内容（释放大体积存储，保留请求元数据及 Token 统计）
+        if let Ok(conn) = database.0.lock() {
+            let _ = conn.execute("UPDATE opencode_proxy_logs SET request_body = NULL, response_body = NULL", []);
+        }
+    } else {
+        // 全量清空所有历史记录
+        if let Ok(conn) = database.0.lock() {
+            let _ = conn.execute("DELETE FROM opencode_proxy_logs", []);
+        }
+
+        state.context.metrics.total_requests.store(0, Ordering::Relaxed);
+        state.context.metrics.successful_requests.store(0, Ordering::Relaxed);
+        state.context.metrics.failed_requests.store(0, Ordering::Relaxed);
+        state.context.metrics.total_prompt_tokens.store(0, Ordering::Relaxed);
+        state.context.metrics.total_completion_tokens.store(0, Ordering::Relaxed);
+        state.context.metrics.total_reasoning_tokens.store(0, Ordering::Relaxed);
+        state.context.metrics.total_cache_hit_tokens.store(0, Ordering::Relaxed);
+        state.context.metrics.total_tokens.store(0, Ordering::Relaxed);
+    }
 
     Ok(())
 }
