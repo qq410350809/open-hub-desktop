@@ -1046,8 +1046,113 @@ async function browserFallback<T>(
     site.updatedAt = new Date().toISOString();
     return site as T;
   }
+  if (command === "get_opencode_proxy_logs") {
+    // dev mock：与 get_opencode_proxy_status 共用同一份日志，统计自洽
+    const mockLogs = makeMockProxyLogs();
+    // 模拟后端分页：按 filter / 关键词过滤、按 sortBy/sortOrder 排序后切片返回
+    const filter = String(args.filter ?? "");
+    const q = String(args.q ?? "").trim().toLowerCase();
+    let list = mockLogs;
+    if (filter === "success") list = list.filter((l) => l.statusCode >= 200 && l.statusCode < 300);
+    else if (filter === "error") list = list.filter((l) => l.statusCode >= 400);
+    if (q) {
+      list = list.filter((l) =>
+        l.model.toLowerCase().includes(q) ||
+        l.path.toLowerCase().includes(q) ||
+        String(l.statusCode).includes(q) ||
+        (l.errorMessage ?? "").toLowerCase().includes(q)
+      );
+    }
+    // 排序白名单与 Rust 后端一致：timestamp/status/tokens/duration
+    const fieldMap: Record<string, (l: (typeof mockLogs)[number]) => string | number> = {
+      status: (l) => l.statusCode,
+      tokens: (l) => l.totalTokens,
+      duration: (l) => l.durationMs,
+    };
+    const sortBy = String(args.sortBy ?? "timestamp");
+    const sortOrder = String(args.sortOrder ?? "desc") === "asc" ? 1 : -1;
+    list = [...list].sort((a, b) => {
+      const get = fieldMap[sortBy] ?? ((l: (typeof mockLogs)[number]) => l.timestamp);
+      const av = get(a);
+      const bv = get(b);
+      return av < bv ? -sortOrder : av > bv ? sortOrder : 0;
+    });
+    const page = Math.max(1, Number(args.page ?? 1));
+    const pageSize = Math.min(200, Math.max(1, Number(args.pageSize ?? 50)));
+    return {
+      items: list.slice((page - 1) * pageSize, page * pageSize),
+      total: list.length,
+      successTotal: list.filter((l) => l.statusCode >= 200 && l.statusCode < 300).length,
+      errorTotal: list.filter((l) => l.statusCode >= 400).length,
+    } as T;
+  }
+  if (command === "get_opencode_proxy_status") {
+    // dev mock：统计与 mock 日志完全一致，避免控制台显示 0 而日志列表却有数据
+    const mockLogs = makeMockProxyLogs();
+    const sum = (fn: (l: (typeof mockLogs)[number]) => number) => mockLogs.reduce((acc, l) => acc + fn(l), 0);
+    return {
+      running: true,
+      port: 8088,
+      url: "http://127.0.0.1:8088/v1",
+      totalRequests: mockLogs.length,
+      successfulRequests: mockLogs.filter((l) => l.statusCode >= 200 && l.statusCode < 300).length,
+      failedRequests: mockLogs.filter((l) => l.statusCode >= 400).length,
+      uptimeSeconds: 5 * 3600,
+      modelsCount: 4,
+      channelsCount: 1,
+      totalPromptTokens: sum((l) => l.promptTokens),
+      totalCompletionTokens: sum((l) => l.completionTokens),
+      totalReasoningTokens: sum((l) => l.reasoningTokens || 0),
+      totalReasoningRequests: mockLogs.filter((l) => (l.reasoningTokens || 0) > 0).length,
+      totalCacheHitTokens: sum((l) => l.promptCacheHitTokens || 0),
+      totalTokens: sum((l) => l.totalTokens),
+      todayTotalTokens: sum((l) => l.totalTokens),
+    } as T;
+  }
   throw new Error(`Unsupported command: ${command}`);
 
+}
+
+/** dev mock：生成近几日不同模式与状态的请求日志（分页与状态统计共用一份） */
+function makeMockProxyLogs() {
+  const mockLogs = [];
+  const now = Date.now();
+  const mk = (i: number, stream: boolean, status: number) => {
+    const dur = 1200 + ((i * 733) % 9000);
+    const reasoningTokens = i % 3 === 0 || i === 17 || i === 23 ? 120 + i * 8 : 0;
+    return {
+      id: `mock-${i}`,
+      timestamp: new Date(now - i * 3_600_000).toLocaleString("sv-SE").replace("T", " ").slice(0, 19),
+      method: "POST",
+      path: "/v1/chat/completions",
+      channelId: "opencode",
+      model: stream ? "claude-sonnet-4" : "gpt-4o",
+      stream,
+      statusCode: status,
+      durationMs: dur,
+      ttftMs: 320 + (i % 5) * 40,
+      promptTokens: 2400 + i * 100,
+      promptCacheHitTokens: i % 2 === 0 ? 900 + i * 10 : 0,
+      promptCacheMissTokens: 1500,
+      completionTokens: 320 + i * 40,
+      reasoningTokens,
+      totalTokens: (2400 + i * 100) + (320 + i * 40),
+      errorMessage: status >= 400 ? `上游返回异常 (HTTP ${status})` : undefined,
+      requestBody: `{\n  "model": "${stream ? "claude-sonnet-4" : "gpt-4o"}",\n  "stream": ${stream}\n}`,
+      responseBody: i === 17
+        ? `{\n  "id": "msg_mock17",\n  "type": "message",\n  "role": "assistant",\n  "content": [\n    {\n      "type": "thinking",\n      "thinking": "这是 Anthropic 格式的思考过程（第 17 条）：先拆解需求，再逐步推理。\\n第二步验证假设。\\n第三步给出结论。"\n    },\n    {\n      "type": "text",\n      "text": "这是 Anthropic 同步响应的正文内容（第 17 条）"\n    }\n  ],\n  "usage": { "input_tokens": 0, "output_tokens": 0 }\n}`
+        : i === 23
+          ? `{\n  "id": "resp_mock23",\n  "output": [\n    {\n      "type": "reasoning",\n      "summary": [\n        { "type": "summary_text", "text": "这是 Responses API 的推理摘要（第 23 条）：先分析上下文。\\n再推导候选方案。" }\n      ]\n    },\n    {\n      "type": "message",\n      "content": [\n        { "type": "output_text", "text": "这是 Responses API 的最终正文（第 23 条）" }\n      ]\n    }\n  ],\n  "usage": { "prompt_tokens": 0, "completion_tokens": 0 }\n}`
+          : stream
+            ? ` thinking\n让我分析这个问题，需要先拆解需求。\n response\n\n这是流式响应的最终正文内容（第 ${i} 条）。`
+            : `{\n  "choices": [\n    {\n      "message": {\n        "role": "assistant",\n        "content": "这是同步响应的正文内容（第 ${i} 条）"\n      }\n    }\n  ]\n}`,
+      nodeName: "HK-01 香港节点",
+    };
+  };
+  for (let i = 0; i < 32; i++) {
+    mockLogs.push(mk(i, i % 2 === 0, i % 5 === 0 ? 502 : 200));
+  }
+  return mockLogs;
 }
 // —— 全局单例状态 ——
 const sites = ref<SiteRecord[]>([]);

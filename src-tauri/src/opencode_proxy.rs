@@ -120,6 +120,7 @@ pub struct OpencodeProxyStatus {
     pub total_prompt_tokens: u64,
     pub total_completion_tokens: u64,
     pub total_reasoning_tokens: u64,
+    pub total_reasoning_requests: u64,
     pub total_cache_hit_tokens: u64,
     pub total_tokens: u64,
     pub today_total_tokens: u64,
@@ -133,6 +134,7 @@ pub struct OpencodeProxyMetrics {
     pub total_prompt_tokens: AtomicU64,
     pub total_completion_tokens: AtomicU64,
     pub total_reasoning_tokens: AtomicU64,
+    pub total_reasoning_requests: AtomicU64,
     pub total_cache_hit_tokens: AtomicU64,
     pub total_tokens: AtomicU64,
 }
@@ -170,6 +172,9 @@ impl OpencodeProxyContext {
         }
         if let Some(rt) = log.reasoning_tokens {
             self.metrics.total_reasoning_tokens.fetch_add(rt, Ordering::Relaxed);
+            if rt > 0 {
+                self.metrics.total_reasoning_requests.fetch_add(1, Ordering::Relaxed);
+            }
         }
         if let Some(hit) = log.prompt_cache_hit_tokens {
             self.metrics.total_cache_hit_tokens.fetch_add(hit, Ordering::Relaxed);
@@ -312,6 +317,45 @@ fn format_upstream_error_message(status: u16, error_body: &str) -> String {
     format!("HTTP {status}: {error_body}")
 }
 
+/// 记录节点自动切换事件：请求在某节点失败并重试下一节点时，写入一条独立的错误日志，
+/// 让用户能从日志列表中看到切换原因（该请求的最终结果仍由成功/失败日志另行记录）。
+async fn record_failover_event(
+    ctx: &OpencodeProxyContext,
+    req_id: &str,
+    path: &str,
+    model: &str,
+    is_stream: bool,
+    status_code: u16,
+    error_message: String,
+    duration_ms: u64,
+    req_body_str: Option<String>,
+    cand_id: &str,
+) {
+    ctx.record_log(ProxyRequestLog {
+        id: req_id.to_string(),
+        timestamp: current_timestamp(),
+        method: "POST".to_string(),
+        path: path.to_string(),
+        channel_id: "opencode".to_string(),
+        model: model.to_string(),
+        stream: is_stream,
+        status_code,
+        duration_ms,
+        ttft_ms: None,
+        prompt_tokens: None,
+        prompt_cache_hit_tokens: None,
+        prompt_cache_miss_tokens: None,
+        completion_tokens: None,
+        reasoning_tokens: None,
+        total_tokens: None,
+        error_message: Some(error_message),
+        request_body: req_body_str,
+        response_body: None,
+        node_name: Some(get_node_display_name(ctx, cand_id).await),
+    })
+    .await;
+}
+
 fn clean_sse_stream(
     ctx: OpencodeProxyContext,
     req_id: String,
@@ -440,6 +484,13 @@ fn clean_sse_stream(
                 }
                 Err(e) => {
                     let total_dur = start_time.elapsed().as_millis() as u64;
+                    let mut interrupted_preview = String::new();
+                    if !collected_reasoning.is_empty() {
+                        interrupted_preview.push_str(" thinking\n");
+                        interrupted_preview.push_str(&collected_reasoning);
+                        interrupted_preview.push_str("\n response\n\n");
+                    }
+                    interrupted_preview.push_str(&collected_content);
                     ctx.record_log(ProxyRequestLog {
                         id: req_id.clone(),
                         timestamp: current_timestamp(),
@@ -459,7 +510,7 @@ fn clean_sse_stream(
                         total_tokens,
                         error_message: Some(format!("流式响应传输异常中断: {e}")),
                         request_body: req_body_str.clone(),
-                        response_body: if collected_content.is_empty() { None } else { Some(collected_content.clone()) },
+                        response_body: if interrupted_preview.is_empty() { None } else { Some(interrupted_preview) },
                         node_name: node_name.clone(),
                     }).await;
 
@@ -671,6 +722,13 @@ fn openai_to_anthropic_sse_stream(
                 }
                 Err(e) => {
                     let total_dur = start_time.elapsed().as_millis() as u64;
+                    let mut interrupted_preview = String::new();
+                    if !collected_reasoning.is_empty() {
+                        interrupted_preview.push_str(" thinking\n");
+                        interrupted_preview.push_str(&collected_reasoning);
+                        interrupted_preview.push_str("\n response\n\n");
+                    }
+                    interrupted_preview.push_str(&collected_content);
                     ctx.record_log(ProxyRequestLog {
                         id: req_id.clone(),
                         timestamp: current_timestamp(),
@@ -690,7 +748,7 @@ fn openai_to_anthropic_sse_stream(
                         total_tokens,
                         error_message: Some(format!("Anthropic 流式转换传输中断: {e}")),
                         request_body: req_body_str.clone(),
-                        response_body: if collected_content.is_empty() { None } else { Some(collected_content.clone()) },
+                        response_body: if interrupted_preview.is_empty() { None } else { Some(interrupted_preview) },
                         node_name: node_name.clone(),
                     }).await;
 
@@ -1287,6 +1345,7 @@ async fn handle_chat_completions(
     let mut used_cand_id = candidates.get(base_idx % candidates.len()).cloned().unwrap_or_else(|| "__direct__".to_string());
 
     for attempt in 0..max_attempts {
+        let attempt_start = Instant::now();
         let cand_idx = (base_idx + attempt) % candidates.len();
         let cand_id = &candidates[cand_idx];
         used_cand_id = cand_id.clone();
@@ -1322,6 +1381,20 @@ async fn handle_chat_completions(
             Ok(r) => {
                 let status = r.status();
                 if !status.is_success() && attempt + 1 < max_attempts {
+                    let err_body = r.text().await.unwrap_or_default();
+                    record_failover_event(
+                        &ctx,
+                        &req_id,
+                        "/v1/chat/completions",
+                        &model_to_send,
+                        is_stream,
+                        status.as_u16(),
+                        format!("节点失败自动切换：{}", format_upstream_error_message(status.as_u16(), &err_body)),
+                        attempt_start.elapsed().as_millis() as u64,
+                        req_body_str.clone(),
+                        cand_id,
+                    )
+                    .await;
                     let next_idx = (cand_idx + 1) % candidates.len();
                     ctx.active_egress_idx.store(next_idx, Ordering::Relaxed);
                     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -1334,9 +1407,23 @@ async fn handle_chat_completions(
                 final_res = Some(r);
                 break;
             }
-            Err(err) => {
-                last_send_err = Some(err);
+            Err(e) => {
+                let e_str = e.to_string();
+                last_send_err = Some(e);
                 if attempt + 1 < max_attempts {
+                    record_failover_event(
+                        &ctx,
+                        &req_id,
+                        "/v1/chat/completions",
+                        &model_to_send,
+                        is_stream,
+                        502,
+                        format!("节点连接失败自动切换：{e_str}"),
+                        attempt_start.elapsed().as_millis() as u64,
+                        req_body_str.clone(),
+                        cand_id,
+                    )
+                    .await;
                     let next_idx = (cand_idx + 1) % candidates.len();
                     ctx.active_egress_idx.store(next_idx, Ordering::Relaxed);
                     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -1596,6 +1683,7 @@ async fn handle_responses(
     let mut used_cand_id = candidates.get(base_idx % candidates.len()).cloned().unwrap_or_else(|| "__direct__".to_string());
 
     for attempt in 0..max_attempts {
+        let attempt_start = Instant::now();
         let cand_idx = (base_idx + attempt) % candidates.len();
         let cand_id = &candidates[cand_idx];
         used_cand_id = cand_id.clone();
@@ -1630,6 +1718,20 @@ async fn handle_responses(
             Ok(r) => {
                 let status = r.status();
                 if !status.is_success() && attempt + 1 < max_attempts {
+                    let err_body = r.text().await.unwrap_or_default();
+                    record_failover_event(
+                        &ctx,
+                        &req_id,
+                        "/v1/responses",
+                        &model_to_send,
+                        false,
+                        status.as_u16(),
+                        format!("节点失败自动切换：{}", format_upstream_error_message(status.as_u16(), &err_body)),
+                        attempt_start.elapsed().as_millis() as u64,
+                        req_body_str.clone(),
+                        cand_id,
+                    )
+                    .await;
                     let next_idx = (cand_idx + 1) % candidates.len();
                     ctx.active_egress_idx.store(next_idx, Ordering::Relaxed);
                     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -1642,8 +1744,22 @@ async fn handle_responses(
                 break;
             }
             Err(e) => {
+                let e_str = e.to_string();
                 last_send_err = Some(e);
                 if attempt + 1 < max_attempts {
+                    record_failover_event(
+                        &ctx,
+                        &req_id,
+                        "/v1/responses",
+                        &model_to_send,
+                        false,
+                        502,
+                        format!("节点连接失败自动切换：{e_str}"),
+                        attempt_start.elapsed().as_millis() as u64,
+                        req_body_str.clone(),
+                        cand_id,
+                    )
+                    .await;
                     let next_idx = (cand_idx + 1) % candidates.len();
                     ctx.active_egress_idx.store(next_idx, Ordering::Relaxed);
                     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -1957,6 +2073,7 @@ async fn handle_messages(
     let mut used_cand_id = candidates.get(base_idx % candidates.len()).cloned().unwrap_or_else(|| "__direct__".to_string());
 
     for attempt in 0..max_attempts {
+        let attempt_start = Instant::now();
         let cand_idx = (base_idx + attempt) % candidates.len();
         let cand_id = &candidates[cand_idx];
         used_cand_id = cand_id.clone();
@@ -1991,6 +2108,20 @@ async fn handle_messages(
             Ok(r) => {
                 let status = r.status();
                 if !status.is_success() && attempt + 1 < max_attempts {
+                    let err_body = r.text().await.unwrap_or_default();
+                    record_failover_event(
+                        &ctx,
+                        &req_id,
+                        "/v1/messages",
+                        stripped_model,
+                        is_stream,
+                        status.as_u16(),
+                        format!("节点失败自动切换：{}", format_upstream_error_message(status.as_u16(), &err_body)),
+                        attempt_start.elapsed().as_millis() as u64,
+                        req_body_str.clone(),
+                        cand_id,
+                    )
+                    .await;
                     let next_idx = (cand_idx + 1) % candidates.len();
                     ctx.active_egress_idx.store(next_idx, Ordering::Relaxed);
                     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -2003,8 +2134,22 @@ async fn handle_messages(
                 break;
             }
             Err(e) => {
+                let e_str = e.to_string();
                 last_send_err = Some(e);
                 if attempt + 1 < max_attempts {
+                    record_failover_event(
+                        &ctx,
+                        &req_id,
+                        "/v1/messages",
+                        stripped_model,
+                        is_stream,
+                        502,
+                        format!("节点连接失败自动切换：{e_str}"),
+                        attempt_start.elapsed().as_millis() as u64,
+                        req_body_str.clone(),
+                        cand_id,
+                    )
+                    .await;
                     let next_idx = (cand_idx + 1) % candidates.len();
                     ctx.active_egress_idx.store(next_idx, Ordering::Relaxed);
                     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -2129,6 +2274,10 @@ async fn handle_messages(
                     .pointer("/choices/0/message/content")
                     .and_then(JsonValue::as_str)
                     .unwrap_or_default();
+                let reasoning = chat_val
+                    .pointer("/choices/0/message/reasoning_content")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or_default();
                 let prompt_tokens = chat_val.pointer("/usage/prompt_tokens").and_then(JsonValue::as_u64);
                 let hit = chat_val.pointer("/usage/prompt_cache_hit_tokens")
                     .or_else(|| chat_val.pointer("/usage/prompt_tokens_details/cached_tokens"))
@@ -2144,17 +2293,19 @@ async fn handle_messages(
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_nanos();
+                // 思考过程一并透传：Anthropic 原生 thinking 块（OpenCode 客户端可展示），
+                // 同时让本地日志的「思考过程」详情有内容可看。
+                let mut content_items = Vec::new();
+                if !reasoning.trim().is_empty() {
+                    content_items.push(json!({ "type": "thinking", "thinking": reasoning }));
+                }
+                content_items.push(json!({ "type": "text", "text": text }));
                 let anthropic_res = json!({
                     "id": format!("msg_{nanos:x}"),
                     "type": "message",
                     "role": "assistant",
                     "model": format!("opencode/{}", stripped_model),
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": text
-                        }
-                    ],
+                    "content": content_items,
                     "stop_reason": "end_turn",
                     "usage": {
                         "input_tokens": prompt_tokens.unwrap_or(0),
@@ -2336,13 +2487,13 @@ pub async fn get_opencode_proxy_status_summary(state: &OpencodeProxyState) -> Op
     let models_count = state.context.cached_models.read().await.len();
     let channels_count = state.context.config.read().await.channels.len();
 
-    let (db_tot_req, db_succ_req, db_fail_req, db_prompt, db_completion, db_reasoning, db_cache_hit, db_total) = {
+    let (db_tot_req, db_succ_req, db_fail_req, db_prompt, db_completion, db_reasoning, db_reasoning_req, db_cache_hit, db_total) = {
         let app_opt = state.context.app_handle.read().await.clone();
         if let Some(app) = app_opt {
             let database = app.state::<crate::models::Database>();
             let counts = match database.0.lock() {
                 Ok(conn) => {
-                    let res: Result<(i64, i64, i64, i64, i64, i64, i64, i64), _> = conn.query_row(
+                    let res: Result<(i64, i64, i64, i64, i64, i64, i64, i64, i64), _> = conn.query_row(
                         "SELECT 
                             COUNT(*),
                             COALESCE(SUM(CASE WHEN status_code >= 200 AND status_code < 300 THEN 1 ELSE 0 END), 0),
@@ -2350,23 +2501,24 @@ pub async fn get_opencode_proxy_status_summary(state: &OpencodeProxyState) -> Op
                             COALESCE(SUM(prompt_tokens), 0),
                             COALESCE(SUM(completion_tokens), 0),
                             COALESCE(SUM(reasoning_tokens), 0),
+                            COALESCE(SUM(CASE WHEN COALESCE(reasoning_tokens, 0) > 0 THEN 1 ELSE 0 END), 0),
                             COALESCE(SUM(prompt_cache_hit_tokens), 0),
                             COALESCE(SUM(COALESCE(total_tokens, COALESCE(prompt_tokens, 0) + COALESCE(completion_tokens, 0))), 0)
                          FROM opencode_proxy_logs",
                         [],
-                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?)),
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?)),
                     );
                     if let Ok(vals) = res {
-                        (vals.0 as u64, vals.1 as u64, vals.2 as u64, vals.3 as u64, vals.4 as u64, vals.5 as u64, vals.6 as u64, vals.7 as u64)
+                        (vals.0 as u64, vals.1 as u64, vals.2 as u64, vals.3 as u64, vals.4 as u64, vals.5 as u64, vals.6 as u64, vals.7 as u64, vals.8 as u64)
                     } else {
-                        (0, 0, 0, 0, 0, 0, 0, 0)
+                        (0, 0, 0, 0, 0, 0, 0, 0, 0)
                     }
                 }
-                Err(_) => (0, 0, 0, 0, 0, 0, 0, 0),
+                Err(_) => (0, 0, 0, 0, 0, 0, 0, 0, 0),
             };
             counts
         } else {
-            (0, 0, 0, 0, 0, 0, 0, 0)
+            (0, 0, 0, 0, 0, 0, 0, 0, 0)
         }
     };
 
@@ -2376,6 +2528,7 @@ pub async fn get_opencode_proxy_status_summary(state: &OpencodeProxyState) -> Op
     let total_prompt_tokens = metrics.total_prompt_tokens.load(Ordering::Relaxed).max(db_prompt);
     let total_completion_tokens = metrics.total_completion_tokens.load(Ordering::Relaxed).max(db_completion);
     let total_reasoning_tokens = metrics.total_reasoning_tokens.load(Ordering::Relaxed).max(db_reasoning);
+    let total_reasoning_requests = metrics.total_reasoning_requests.load(Ordering::Relaxed).max(db_reasoning_req);
     let total_cache_hit_tokens = metrics.total_cache_hit_tokens.load(Ordering::Relaxed).max(db_cache_hit);
     let total_tokens = metrics.total_tokens.load(Ordering::Relaxed).max(db_total);
 
@@ -2416,6 +2569,7 @@ pub async fn get_opencode_proxy_status_summary(state: &OpencodeProxyState) -> Op
         total_prompt_tokens,
         total_completion_tokens,
         total_reasoning_tokens,
+        total_reasoning_requests,
         total_cache_hit_tokens,
         total_tokens,
         today_total_tokens,
@@ -2522,56 +2676,141 @@ pub async fn test_opencode_proxy_health(
     Ok(val)
 }
 
+/// 分页 + 状态过滤 + 关键词搜索的日志查询结果。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyLogPage {
+    pub items: Vec<ProxyRequestLog>,
+    pub total: u64,
+    pub success_total: u64,
+    pub error_total: u64,
+}
+
 #[tauri::command]
 pub async fn get_opencode_proxy_logs(
     database: tauri::State<'_, crate::models::Database>,
     _state: tauri::State<'_, OpencodeProxyState>,
-    limit: Option<usize>,
-) -> Result<Vec<ProxyRequestLog>, String> {
-    let max = limit.unwrap_or(500);
+    page: Option<usize>,
+    page_size: Option<usize>,
+    filter: Option<String>,
+    q: Option<String>,
+    sort_by: Option<String>,
+    sort_order: Option<String>,
+) -> Result<ProxyLogPage, String> {
+    let page = page.unwrap_or(1).max(1);
+    let page_size = page_size.unwrap_or(50).clamp(1, 200);
+    let offset = (page - 1) * page_size;
+
+    let mut where_sql = String::from("WHERE 1=1");
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    match filter.as_deref() {
+        Some("success") => where_sql.push_str(" AND status_code >= 200 AND status_code < 300"),
+        Some("error") => where_sql.push_str(" AND status_code >= 400"),
+        _ => {}
+    }
+    if let Some(kw) = q.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        where_sql.push_str(
+            " AND (model LIKE ? OR path LIKE ? OR error_message LIKE ? OR CAST(status_code AS TEXT) LIKE ?)",
+        );
+        let pat = format!("%{kw}%");
+        params.push(Box::new(pat.clone()));
+        params.push(Box::new(pat.clone()));
+        params.push(Box::new(pat.clone()));
+        params.push(Box::new(pat));
+    }
+
     let conn = database.0.lock().map_err(|e| e.to_string())?;
+    let total: i64 = conn
+        .query_row(
+            &format!("SELECT COUNT(*) FROM opencode_proxy_logs {where_sql}"),
+            rusqlite::params_from_iter(params.iter().map(|p| p.as_ref())),
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    let success_total: i64 = conn
+        .query_row(
+            &format!("SELECT COUNT(*) FROM opencode_proxy_logs {where_sql} AND status_code >= 200 AND status_code < 300"),
+            rusqlite::params_from_iter(params.iter().map(|p| p.as_ref())),
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    let error_total: i64 = conn
+        .query_row(
+            &format!("SELECT COUNT(*) FROM opencode_proxy_logs {where_sql} AND status_code >= 400"),
+            rusqlite::params_from_iter(params.iter().map(|p| p.as_ref())),
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+
+    // 排序：白名单映射列名，杜绝注入；timestamp 用真实时间戳列排序
+    let order_expr = match sort_by.as_deref() {
+        Some("status") => "status_code",
+        Some("model") => "model COLLATE NOCASE",
+        Some("tokens") => "COALESCE(total_tokens, COALESCE(prompt_tokens, 0) + COALESCE(completion_tokens, 0))",
+        Some("duration") => "duration_ms",
+        _ => "created_at",
+    };
+    let order_dir = if sort_order.as_deref() == Some("asc") { "ASC" } else { "DESC" };
+
     let mut stmt = conn.prepare(
-        "SELECT id, timestamp, method, path, channel_id, model, stream,
-                status_code, duration_ms, ttft_ms, prompt_tokens, prompt_cache_hit_tokens,
-                prompt_cache_miss_tokens, completion_tokens, reasoning_tokens, total_tokens,
-                error_message, request_body, response_body, node_name
-         FROM opencode_proxy_logs
-         ORDER BY created_at DESC, rowid DESC LIMIT ?1"
-    ).map_err(|e| e.to_string())?;
+        &format!(
+            "SELECT id, timestamp, method, path, channel_id, model, stream,
+                    status_code, duration_ms, ttft_ms, prompt_tokens, prompt_cache_hit_tokens,
+                    prompt_cache_miss_tokens, completion_tokens, reasoning_tokens, total_tokens,
+                    error_message, request_body, response_body, node_name
+             FROM opencode_proxy_logs
+             {where_sql}
+             ORDER BY {order_expr} {order_dir}, rowid {order_dir} LIMIT ?1 OFFSET ?2"
+        )
+    )
+    .map_err(|e| e.to_string())?;
 
-    let rows = stmt.query_map([max as i64], |row| {
-        let stream_int: i64 = row.get(6)?;
-        Ok(ProxyRequestLog {
-            id: row.get(0)?,
-            timestamp: row.get(1)?,
-            method: row.get(2)?,
-            path: row.get(3)?,
-            channel_id: row.get(4)?,
-            model: row.get(5)?,
-            stream: stream_int != 0,
-            status_code: row.get::<_, i64>(7)? as u16,
-            duration_ms: row.get::<_, i64>(8)? as u64,
-            ttft_ms: row.get::<_, Option<i64>>(9)?.map(|v| v as u64),
-            prompt_tokens: row.get::<_, Option<i64>>(10)?.map(|v| v as u64),
-            prompt_cache_hit_tokens: row.get::<_, Option<i64>>(11)?.map(|v| v as u64),
-            prompt_cache_miss_tokens: row.get::<_, Option<i64>>(12)?.map(|v| v as u64),
-            completion_tokens: row.get::<_, Option<i64>>(13)?.map(|v| v as u64),
-            reasoning_tokens: row.get::<_, Option<i64>>(14)?.map(|v| v as u64),
-            total_tokens: row.get::<_, Option<i64>>(15)?.map(|v| v as u64),
-            error_message: row.get(16)?,
-            request_body: row.get(17)?,
-            response_body: row.get(18)?,
-            node_name: row.get(19)?,
-        })
-    }).map_err(|e| e.to_string())?;
-
-    let mut logs = Vec::new();
-    for r in rows {
-        if let Ok(l) = r {
-            logs.push(l);
+    let mut rows = Vec::new();
+    {
+        let mut query_params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        query_params.extend(params.drain(..));
+        query_params.push(Box::new(page_size as i64));
+        query_params.push(Box::new(offset as i64));
+        let mut iter = stmt
+            .query_map(rusqlite::params_from_iter(query_params.iter().map(|p| p.as_ref())), |row| {
+                let stream_int: i64 = row.get(6)?;
+                Ok(ProxyRequestLog {
+                    id: row.get(0)?,
+                    timestamp: row.get(1)?,
+                    method: row.get(2)?,
+                    path: row.get(3)?,
+                    channel_id: row.get(4)?,
+                    model: row.get(5)?,
+                    stream: stream_int != 0,
+                    status_code: row.get::<_, i64>(7)? as u16,
+                    duration_ms: row.get::<_, i64>(8)? as u64,
+                    ttft_ms: row.get::<_, Option<i64>>(9)?.map(|v| v as u64),
+                    prompt_tokens: row.get::<_, Option<i64>>(10)?.map(|v| v as u64),
+                    prompt_cache_hit_tokens: row.get::<_, Option<i64>>(11)?.map(|v| v as u64),
+                    prompt_cache_miss_tokens: row.get::<_, Option<i64>>(12)?.map(|v| v as u64),
+                    completion_tokens: row.get::<_, Option<i64>>(13)?.map(|v| v as u64),
+                    reasoning_tokens: row.get::<_, Option<i64>>(14)?.map(|v| v as u64),
+                    total_tokens: row.get::<_, Option<i64>>(15)?.map(|v| v as u64),
+                    error_message: row.get(16)?,
+                    request_body: row.get(17)?,
+                    response_body: row.get(18)?,
+                    node_name: row.get(19)?,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        while let Some(l) = iter.next() {
+            if let Ok(l) = l {
+                rows.push(l);
+            }
         }
     }
-    Ok(logs)
+
+    Ok(ProxyLogPage {
+        items: rows,
+        total: total as u64,
+        success_total: success_total as u64,
+        error_total: error_total as u64,
+    })
 }
 
 #[tauri::command]
@@ -2599,6 +2838,7 @@ pub async fn clear_opencode_proxy_logs(
         state.context.metrics.total_prompt_tokens.store(0, Ordering::Relaxed);
         state.context.metrics.total_completion_tokens.store(0, Ordering::Relaxed);
         state.context.metrics.total_reasoning_tokens.store(0, Ordering::Relaxed);
+        state.context.metrics.total_reasoning_requests.store(0, Ordering::Relaxed);
         state.context.metrics.total_cache_hit_tokens.store(0, Ordering::Relaxed);
         state.context.metrics.total_tokens.store(0, Ordering::Relaxed);
     }

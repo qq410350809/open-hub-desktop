@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted } from "vue";
+import { ref, computed, watch, onMounted, onUnmounted } from "vue";
 import { icons } from "../icons";
 import { useModelProxy, type ChannelConfig, type ProxyRequestLog } from "../composables/useModelProxy";
 import { useToast } from "../composables/useToast";
@@ -24,9 +24,21 @@ const {
   testHealth,
   refreshModels,
   fetchLogs,
+  goLogPage,
   clearLogs,
   copyProxyUrl,
   copyProxyKey,
+  logPage,
+  logPageSize,
+  logTotal,
+  logSuccessTotal,
+  logErrorTotal,
+  logPageCount,
+  logRangeStart,
+  logRangeEnd,
+  logSortBy,
+  logSortOrder,
+  toggleLogSort,
 } = useModelProxy();
 
 const showKey = ref(false);
@@ -61,7 +73,7 @@ let statusPollTimer: number | null = null;
 onMounted(async () => {
   await loadProxyData();
   await refreshModels();
-  await fetchLogs();
+  await fetchLogs({ filter: logStatusFilter.value, q: logSearchQuery.value.trim() });
 
   uptimeTicker = window.setInterval(() => {
     if (proxyStatus.value.running) {
@@ -72,9 +84,6 @@ onMounted(async () => {
   statusPollTimer = window.setInterval(async () => {
     if (proxyStatus.value.running) {
       await refreshStatus();
-      if (currentMainTab.value === "logs") {
-        await fetchLogs();
-      }
     }
   }, 3000);
 });
@@ -92,7 +101,7 @@ onUnmounted(() => {
 
 async function switchToLogsTab() {
   currentMainTab.value = "logs";
-  await fetchLogs();
+  await fetchLogs({ filter: logStatusFilter.value, q: logSearchQuery.value.trim() });
 }
 
 async function handleSave() {
@@ -141,7 +150,9 @@ function closeChannelModelsModal() {
   channelModelsModalOpen.value = false;
 }
 
-const detailActiveTab = ref<"tokens" | "request" | "response" | "meta" | "error">("tokens");
+const detailActiveTab = ref<"tokens" | "request" | "response" | "reasoning" | "meta" | "error">("tokens");
+
+const parsedResponseBody = computed(() => parseResponseBody(selectedLogForDetail.value?.responseBody));
 
 function openLogDetail(log: ProxyRequestLog) {
   selectedLogForDetail.value = log;
@@ -163,19 +174,84 @@ function getCacheHitRate(log: ProxyRequestLog): string {
   return ((hit / prompt) * 100).toFixed(1);
 }
 
-function getReasoningRate(log: ProxyRequestLog): string {
-  const completion = log.completionTokens || 0;
-  const reasoning = log.reasoningTokens || 0;
-  if (completion <= 0) return "0.0";
-  return ((reasoning / completion) * 100).toFixed(1);
+/** 新增输入 = 总输入 - 缓存命中（扣掉复用部分才是真实新开销） */
+function getNewInputTokens(log: ProxyRequestLog): number {
+  return Math.max(0, (log.promptTokens || 0) - (log.promptCacheHitTokens || 0));
+}
+
+/** 生成输出（纯文本）= 总输出 − 思考推理（上游 usage.completion_tokens 通常已含 reasoning） */
+function getOutputTextTokens(log: ProxyRequestLog): number {
+  return Math.max(0, (log.completionTokens || 0) - (log.reasoningTokens || 0));
 }
 
 function getEstimatedTps(log: ProxyRequestLog): string {
-  const tokens = log.completionTokens || 0;
+  const tokens = getOutputTextTokens(log);
   if (tokens <= 0) return "0.0";
   const genDur = log.ttftMs && log.durationMs > log.ttftMs ? log.durationMs - log.ttftMs : log.durationMs;
   if (genDur <= 0) return "0.0";
   return ((tokens / genDur) * 1000).toFixed(1);
+}
+
+/** 解析后端保存的响应正文，拆出思考过程与最终正文两部分。 */
+function parseResponseBody(body: string | undefined | null): { thinking: string; content: string } {
+  if (!body) return { thinking: "", content: "" };
+
+  // 流式（OpenAI/Anthropic 共用）：后端拼接格式 " thinking\n<思考>\n response\n\n<正文>"
+  const markMatch = body.match(/^\s*thinking\n([\s\S]*?)\n\s*response\s*\n\n([\s\S]*)$/);
+  if (markMatch) return { thinking: markMatch[1].trim(), content: markMatch[2].trim() };
+
+  // 同步：完整 JSON 响应，提取 message 中的 reasoning_content 与 content
+  try {
+    const parsed = JSON.parse(body);
+    const message = parsed?.choices?.[0]?.message;
+    if (message && typeof message === "object") {
+      const thinking = typeof message.reasoning_content === "string" ? message.reasoning_content : "";
+      let content = typeof message.content === "string" ? message.content : "";
+      if (!content && Array.isArray(message.content)) {
+        content = message.content
+          .map((part: any) => (typeof part === "string" ? part : part?.text ?? ""))
+          .join("");
+      }
+      return { thinking: thinking.trim(), content: content.trim() };
+    }
+    // Anthropic messages 同步格式：content 数组可能含 thinking/text 块，顶层 thinking 兜底
+    if (Array.isArray(parsed?.content)) {
+      const parts = parsed.content.map((part: any) => (typeof part === "string" ? { type: "text", text: part } : part));
+      const thinking = parts
+        .filter((p: any) => p?.type === "thinking" || p?.type === "redacted_thinking")
+        .map((p: any) => p?.thinking ?? "")
+        .join("\n");
+      const content = parts
+        .filter((p: any) => p?.type === "text")
+        .map((p: any) => p?.text ?? "")
+        .join("");
+      const topThinking = typeof parsed.thinking === "string" ? parsed.thinking : "";
+      return { thinking: (thinking || topThinking).trim(), content: content.trim() };
+    }
+    // Responses API 同步格式：output 数组中的 reasoning 项与 message 项
+    if (Array.isArray(parsed?.output)) {
+      const thinking = parsed.output
+        .filter((o: any) => o?.type === "reasoning")
+        .map((o: any) =>
+          Array.isArray(o?.summary)
+            ? o.summary.map((s: any) => s?.text ?? "").join("")
+            : typeof o?.summary === "string"
+              ? o.summary
+              : ""
+        )
+        .join("\n");
+      const content = parsed.output
+        .filter((o: any) => o?.type === "message")
+        .flatMap((o: any) => (Array.isArray(o?.content) ? o.content : []))
+        .map((p: any) => (typeof p === "string" ? p : p?.text ?? ""))
+        .join("");
+      if (content || thinking) return { thinking: thinking.trim(), content: content.trim() };
+    }
+  } catch {
+    // 非 JSON 文本，整体视为正文
+  }
+
+  return { thinking: "", content: body.trim() };
 }
 
 async function copyText(text: string, label = "内容") {
@@ -300,34 +376,50 @@ const filteredChannelModels = computed(() => {
   return list.filter((m) => m.toLowerCase().includes(q) || `opencode/${m}`.toLowerCase().includes(q));
 });
 
-const filteredLogs = computed<ProxyRequestLog[]>(() => {
-  let list = proxyLogs.value;
-  const filter = logStatusFilter.value;
-  if (filter === "success") {
-    list = list.filter((l) => l.statusCode >= 200 && l.statusCode < 300);
-  } else if (filter === "error") {
-    list = list.filter((l) => l.statusCode >= 400);
-  }
+/** 当前页数据：筛选/搜索/排序已由后端 SQL 处理，前端仅透传展示 */
+const filteredLogs = computed<ProxyRequestLog[]>(() => proxyLogs.value);
 
-  const q = logSearchQuery.value.trim().toLowerCase();
-  if (q) {
-    list = list.filter(
-      (l) =>
-        l.model.toLowerCase().includes(q) ||
-        l.path.toLowerCase().includes(q) ||
-        String(l.statusCode).includes(q) ||
-        l.channelId.toLowerCase().includes(q) ||
-        (l.errorMessage && l.errorMessage.toLowerCase().includes(q))
-    );
-  }
-  return list;
+/** 排序指示符：未排序 ↕ / 升序 ▲ / 降序 ▼ */
+function logSortIndicator(by: "timestamp" | "status" | "tokens" | "duration") {
+  if (logSortBy.value !== by) return "↕";
+  return logSortOrder.value === "asc" ? "▲" : "▼";
+}
+
+/** 点击列头排序：沿用当前筛选与关键词，回到第一页由后端重新查询 */
+function sortLogsBy(by: "timestamp" | "status" | "tokens" | "duration") {
+  toggleLogSort(by, { filter: logStatusFilter.value, q: logSearchQuery.value.trim() });
+}
+
+/** 全量计数：来自后端分页响应的总数统计，与当前页无关 */
+const logCounts = computed(() => ({
+  all: logTotal.value,
+  success: logSuccessTotal.value,
+  error: logErrorTotal.value,
+}));
+
+/** 切换状态筛选：回到第一页并按新条件重新拉取 */
+function switchLogFilter(filter: "all" | "success" | "error") {
+  logStatusFilter.value = filter;
+  goLogPage(1, { filter, q: logSearchQuery.value.trim() });
+}
+
+/** 搜索防抖：停笔 350ms 后回到第一页重查 */
+let searchTimer: number | undefined;
+watch(logSearchQuery, (val) => {
+  window.clearTimeout(searchTimer);
+  searchTimer = window.setTimeout(() => {
+    goLogPage(1, { filter: logStatusFilter.value, q: val.trim() });
+  }, 350);
 });
 
-const logCounts = computed(() => {
-  const all = proxyLogs.value.length;
-  const success = proxyLogs.value.filter((l) => l.statusCode >= 200 && l.statusCode < 300).length;
-  const error = proxyLogs.value.filter((l) => l.statusCode >= 400).length;
-  return { all, success, error };
+/** 分页按钮序列：总页数 ≤7 全显，否则首尾 + 当前附近 + 省略号 */
+const logPageNumbers = computed<Array<number | "…">>(() => {
+  const total = logPageCount.value;
+  const current = logPage.value;
+  if (total <= 7) return Array.from({ length: total }, (_, index) => index + 1);
+  if (current <= 4) return [1, 2, 3, 4, 5, "…", total];
+  if (current >= total - 3) return [1, "…", total - 4, total - 3, total - 2, total - 1, total];
+  return [1, "…", current - 1, current, current + 1, "…", total];
 });
 
 function formatNumber(num: number | undefined | null): string {
@@ -523,13 +615,13 @@ async function copyModel(modelId: string) {
           </div>
 
           <div class="mp-mtp-grid">
-            <div class="mp-mtp-card is-in" title="累计接收的 Prompt 输入 Token">
+            <div class="mp-mtp-card is-in" title="累计实际新增的输入 Token（总输入 − 缓存命中）">
               <div class="mp-mtp-card-head">
                 <span class="mp-mtp-dot is-in" />
                 <span class="mp-mtp-card-label">累计输入</span>
               </div>
-              <strong class="mp-mtp-card-val font-mono">{{ formatNumber(proxyStatus.totalPromptTokens || 0) }}</strong>
-              <small class="mp-mtp-card-sub text-muted">上下文与提示词输入</small>
+              <strong class="mp-mtp-card-val font-mono">{{ formatNumber(Math.max(0, (proxyStatus.totalPromptTokens || 0) - (proxyStatus.totalCacheHitTokens || 0))) }}</strong>
+              <small class="mp-mtp-card-sub text-muted">新增输入（已扣除缓存命中）</small>
             </div>
 
             <div class="mp-mtp-card is-hit" title="累计命中的前缀缓存 Token（极大节省延迟与算力）">
@@ -553,20 +645,20 @@ async function copyModel(modelId: string) {
               </div>
               <strong class="mp-mtp-card-val font-mono">{{ formatNumber(proxyStatus.totalReasoningTokens || 0) }}</strong>
               <small class="mp-mtp-card-sub text-muted">
-                <span v-if="(proxyStatus.totalCompletionTokens || 0) > 0" class="font-mono">
-                  思维链占比 {{ Math.round(((proxyStatus.totalReasoningTokens || 0) / (proxyStatus.totalCompletionTokens || 1)) * 100) }}%
+                <span v-if="proxyStatus.totalRequests > 0" class="font-mono">
+                  触发思维 {{ proxyStatus.totalReasoningRequests ?? 0 }} / {{ proxyStatus.totalRequests }} 次 · 占比 {{ Math.round(((proxyStatus.totalReasoningRequests || 0) / proxyStatus.totalRequests) * 100) }}%
                 </span>
                 <span v-else>深度思考推理消耗</span>
               </small>
             </div>
 
-            <div class="mp-mtp-card is-out" title="累计模型回复生成的 Completion 输出 Token">
+            <div class="mp-mtp-card is-out" title="累计纯文本输出 Token = 生成输出 − 思考推理（已剥离重复计数）">
               <div class="mp-mtp-card-head">
                 <span class="mp-mtp-dot is-out" />
                 <span class="mp-mtp-card-label">累计生成输出</span>
               </div>
-              <strong class="mp-mtp-card-val font-mono">{{ formatNumber(proxyStatus.totalCompletionTokens || 0) }}</strong>
-              <small class="mp-mtp-card-sub text-muted">服务端模型回复生成</small>
+              <strong class="mp-mtp-card-val font-mono">{{ formatNumber(Math.max(0, (proxyStatus.totalCompletionTokens || 0) - (proxyStatus.totalReasoningTokens || 0))) }}</strong>
+              <small class="mp-mtp-card-sub text-muted">纯文本输出（已剥离思考推理）</small>
             </div>
           </div>
         </div>
@@ -714,7 +806,7 @@ async function copyModel(modelId: string) {
               <span class="mp-lsb-dot" />
               <span>已固化存储至本地 SQLite 数据库</span>
             </span>
-            <span class="mp-header-chip font-mono">共 {{ proxyLogs.length }} 条记录</span>
+            <span class="mp-header-chip font-mono">共 {{ logTotal }} 条记录</span>
             <span v-if="logCounts.error > 0" class="mp-header-chip is-danger font-mono">{{ logCounts.error }} 条异常</span>
           </div>
         </div>
@@ -725,7 +817,7 @@ async function copyModel(modelId: string) {
             class="mp-btn mp-btn-ghost mp-btn-sm"
             :disabled="loadingLogs"
             title="从本地数据库刷新最新日志"
-            @click="fetchLogs"
+            @click="fetchLogs({ filter: logStatusFilter, q: logSearchQuery.trim() })"
           >
             <span :class="{ 'mp-spin': loadingLogs }" v-html="icons.restore" />
             <span>{{ loadingLogs ? "刷新中…" : "刷新日志" }}</span>
@@ -752,7 +844,7 @@ async function copyModel(modelId: string) {
               type="button"
               class="mp-log-tab-btn"
               :class="{ active: logStatusFilter === 'all' }"
-              @click="logStatusFilter = 'all'"
+              @click="switchLogFilter('all')"
             >
               全部 ({{ logCounts.all }})
             </button>
@@ -760,7 +852,7 @@ async function copyModel(modelId: string) {
               type="button"
               class="mp-log-tab-btn"
               :class="{ active: logStatusFilter === 'success' }"
-              @click="logStatusFilter = 'success'"
+              @click="switchLogFilter('success')"
             >
               成功 ({{ logCounts.success }})
             </button>
@@ -768,7 +860,7 @@ async function copyModel(modelId: string) {
               type="button"
               class="mp-log-tab-btn"
               :class="{ active: logStatusFilter === 'error' }"
-              @click="logStatusFilter = 'error'"
+              @click="switchLogFilter('error')"
             >
               异常/失败 ({{ logCounts.error }})
             </button>
@@ -799,14 +891,14 @@ async function copyModel(modelId: string) {
           <table class="mp-logs-table">
             <thead>
               <tr>
-                <th style="width: 105px;">请求时间</th>
+                <th style="width: 105px;" class="mp-th-sortable" title="点击切换：升序 / 降序 / 默认排序" :class="{ 'is-sorted': logSortBy === 'timestamp' }" @click="sortLogsBy('timestamp')">请求时间<span class="mp-sort-arrow">{{ logSortIndicator('timestamp') }}</span></th>
                 <th style="width: 135px;">方法与路径</th>
                 <th style="width: 180px;">渠道 / 模型</th>
                 <th style="width: 125px;">出网节点</th>
-                <th style="width: 60px;">模式</th>
-                <th style="width: 70px;">状态</th>
-                <th style="min-width: 175px;">Token 统计</th>
-                <th style="width: 90px;">耗时</th>
+                <th style="width: 82px;">模式 / 速率</th>
+                <th style="width: 70px;" class="mp-th-sortable" title="点击切换：升序 / 降序 / 默认排序" :class="{ 'is-sorted': logSortBy === 'status' }" @click="sortLogsBy('status')">状态<span class="mp-sort-arrow">{{ logSortIndicator('status') }}</span></th>
+                <th style="min-width: 175px;" class="mp-th-sortable" title="点击切换：升序 / 降序 / 默认排序" :class="{ 'is-sorted': logSortBy === 'tokens' }" @click="sortLogsBy('tokens')">Token 统计<span class="mp-sort-arrow">{{ logSortIndicator('tokens') }}</span></th>
+                <th style="width: 90px;" class="mp-th-sortable" title="点击切换：升序 / 降序 / 默认排序" :class="{ 'is-sorted': logSortBy === 'duration' }" @click="sortLogsBy('duration')">耗时<span class="mp-sort-arrow">{{ logSortIndicator('duration') }}</span></th>
                 <th style="width: 65px; text-align: center;">操作</th>
               </tr>
             </thead>
@@ -851,9 +943,14 @@ async function copyModel(modelId: string) {
                   </div>
                 </td>
                 <td>
-                  <span class="mp-stream-tag" :class="{ 'is-stream': log.stream }">
-                    {{ log.stream ? "SSE" : "JSON" }}
-                  </span>
+                  <div class="mp-mode-cell">
+                    <span class="mp-stream-tag" :class="{ 'is-stream': log.stream }">
+                      {{ log.stream ? "流式" : "非流式" }}
+                    </span>
+                    <span class="mp-mode-tps font-mono" :title="`生成速率（输出 Token / 生成耗时）`">
+                      {{ getEstimatedTps(log) }} tok/s
+                    </span>
+                  </div>
                 </td>
                 <td>
                   <span
@@ -868,9 +965,9 @@ async function copyModel(modelId: string) {
                   <!-- Token 统计列：输入 / 缓存 / 输出 / 思考，两行两列等宽卡片 -->
                   <div v-if="log.promptTokens !== undefined || log.completionTokens !== undefined" class="mp-log-tokens-cell font-mono">
                     <div class="mp-token-pill-row">
-                      <span class="mp-token-tag is-in" :title="`输入 Token: ${log.promptTokens ?? 0}`">
+                      <span class="mp-token-tag is-in" :title="`新增输入 Token: ${getNewInputTokens(log)}（总输入 ${log.promptTokens ?? 0} − 缓存命中 ${log.promptCacheHitTokens ?? 0}）`">
                         <span>输入</span>
-                        <strong>{{ formatCompactToken(log.promptTokens) }}</strong>
+                        <strong>{{ formatCompactToken(getNewInputTokens(log)) }}</strong>
                       </span>
                       <span v-if="log.promptCacheHitTokens" class="mp-token-tag is-hit" :title="`缓存命中: ${log.promptCacheHitTokens}`">
                         <span>缓存</span>
@@ -878,9 +975,9 @@ async function copyModel(modelId: string) {
                       </span>
                     </div>
                     <div class="mp-token-pill-row">
-                      <span class="mp-token-tag is-out" :title="`输出 Token: ${log.completionTokens ?? 0}`">
+                      <span class="mp-token-tag is-out" :title="`输出 Token（纯文本，已剥离思考）: ${getOutputTextTokens(log)}（总输出 ${log.completionTokens ?? 0} − 思考 ${log.reasoningTokens ?? 0}）`">
                         <span>输出</span>
-                        <strong>{{ formatCompactToken(log.completionTokens) }}</strong>
+                        <strong>{{ formatCompactToken(getOutputTextTokens(log)) }}</strong>
                       </span>
                       <span v-if="log.reasoningTokens" class="mp-token-tag is-think" :title="`思考推理: ${log.reasoningTokens}`">
                         <span>思考</span>
@@ -927,6 +1024,39 @@ async function copyModel(modelId: string) {
             </tbody>
           </table>
         </div>
+
+        <!-- 分页：仅当前页数据渲染，翻页时向后端分页查询 -->
+        <footer v-if="logTotal > 0" class="app-table-pagination">
+          <label>
+            <span>每页</span>
+            <select
+              class="app-table-page-size"
+              :value="logPageSize"
+              aria-label="每页条数"
+              @change="logPageSize = Number(($event.target as HTMLSelectElement).value); goLogPage(1, { filter: logStatusFilter, q: logSearchQuery.trim() })"
+            >
+              <option :value="25">25</option>
+              <option :value="50">50</option>
+              <option :value="100">100</option>
+            </select>
+            <span>条</span>
+          </label>
+          <div class="app-table-page-buttons">
+            <button type="button" :disabled="logPage <= 1" @click="goLogPage(1, { filter: logStatusFilter, q: logSearchQuery.trim() })">首页</button>
+            <button type="button" :disabled="logPage <= 1" @click="goLogPage(logPage - 1, { filter: logStatusFilter, q: logSearchQuery.trim() })">上一页</button>
+            <button
+              v-for="pageNumber in logPageNumbers"
+              :key="String(pageNumber)"
+              type="button"
+              :class="{ active: pageNumber === logPage }"
+              :disabled="pageNumber === '…'"
+              @click="typeof pageNumber === 'number' && goLogPage(pageNumber, { filter: logStatusFilter, q: logSearchQuery.trim() })"
+            >{{ pageNumber }}</button>
+            <button type="button" :disabled="logPage >= logPageCount" @click="goLogPage(logPage + 1, { filter: logStatusFilter, q: logSearchQuery.trim() })">下一页</button>
+            <button type="button" :disabled="logPage >= logPageCount" @click="goLogPage(logPageCount, { filter: logStatusFilter, q: logSearchQuery.trim() })">末页</button>
+          </div>
+          <span class="app-table-page-total">{{ logRangeStart.toLocaleString() }}–{{ logRangeEnd.toLocaleString() }} / {{ logTotal.toLocaleString() }}</span>
+        </footer>
       </div>
     </div>
 
@@ -1052,7 +1182,7 @@ async function copyModel(modelId: string) {
                 <span class="mp-header-chip font-mono">{{ selectedLogForDetail.durationMs }}ms</span>
                 <span v-if="selectedLogForDetail.ttftMs" class="mp-header-chip font-mono">首字 {{ selectedLogForDetail.ttftMs }}ms</span>
                 <span class="mp-header-chip font-mono" :class="selectedLogForDetail.nodeName && selectedLogForDetail.nodeName !== '直连通道' ? 'is-proxy-chip' : ''">🌐 {{ selectedLogForDetail.nodeName || '直连通道' }}</span>
-                <span v-if="selectedLogForDetail.stream" class="mp-stream-tag is-stream">SSE 实时流</span>
+                <span v-if="selectedLogForDetail.stream" class="mp-stream-tag is-stream">流式实时流</span>
               </div>
               <small class="text-muted">请求 ID: {{ selectedLogForDetail.id }} · 记录时间: {{ selectedLogForDetail.timestamp }}</small>
             </div>
@@ -1070,21 +1200,21 @@ async function copyModel(modelId: string) {
         <div class="mp-modal-body">
           <!-- 4 宫格 Token 消耗与缓存命中仪表盘 -->
           <div class="mp-token-dashboard-grid">
-            <!-- 卡片 1: 输入 Tokens -->
-            <div class="mp-token-card is-in">
+            <!-- 卡片 1: 输入 Tokens（新增 = 总输入 − 缓存命中） -->
+            <div class="mp-token-card is-in" title="新增输入 = 总输入 − 缓存命中">
               <div class="mp-tc-head">
-                <span class="mp-tc-label">📥 输入 Token</span>
+                <span class="mp-tc-label">📥 新增输入</span>
                 <span class="mp-tc-badge" :class="(selectedLogForDetail.promptCacheHitTokens || 0) > 0 ? 'badge-hit' : ''">
                   {{ (selectedLogForDetail.promptCacheHitTokens || 0) > 0 ? `⚡ 命中率 ${getCacheHitRate(selectedLogForDetail)}%` : '未命中前缀' }}
                 </span>
               </div>
               <div class="mp-tc-value font-mono">
-                {{ selectedLogForDetail.promptTokens ?? 0 }}
+                {{ getNewInputTokens(selectedLogForDetail) }}
               </div>
               <div class="mp-tc-foot font-mono">
                 <span>⚡ 命中: <strong>{{ selectedLogForDetail.promptCacheHitTokens ?? 0 }}</strong></span>
                 <span class="mp-tc-divider">·</span>
-                <span>新增: <strong>{{ selectedLogForDetail.promptCacheMissTokens ?? ((selectedLogForDetail.promptTokens ?? 0) - (selectedLogForDetail.promptCacheHitTokens ?? 0)) }}</strong></span>
+                <span>总输入: <strong>{{ selectedLogForDetail.promptTokens ?? 0 }}</strong></span>
               </div>
             </div>
 
@@ -1114,24 +1244,48 @@ async function copyModel(modelId: string) {
               <div class="mp-tc-value font-mono" style="color: #8b5cf6;">
                 {{ selectedLogForDetail.reasoningTokens ?? 0 }}
               </div>
-              <div class="mp-tc-foot font-mono">
-                <span>思维链占比: <strong>{{ getReasoningRate(selectedLogForDetail) }}%</strong></span>
+              <div class="mp-tc-foot">
+                <span v-if="(selectedLogForDetail.reasoningTokens || 0) > 0" class="text-success font-semibold">
+                  ✓ 已触发深度思考
+                </span>
+                <span v-else class="text-muted">本轮未触发思考</span>
               </div>
             </div>
 
-            <!-- 卡片 4: 输出 Tokens -->
-            <div class="mp-token-card is-out">
+            <!-- 卡片 4: 输出 Tokens（纯文本 = 总输出 − 思考推理） -->
+            <div class="mp-token-card is-out" title="生成输出（纯文本）= 总输出 − 思考推理，避免重复计数">
               <div class="mp-tc-head">
                 <span class="mp-tc-label">📤 生成输出</span>
-                <span class="mp-tc-badge">总计 {{ selectedLogForDetail.totalTokens ?? ((selectedLogForDetail.promptTokens || 0) + (selectedLogForDetail.completionTokens || 0)) }} Token</span>
+                <span class="mp-tc-badge" v-if="(selectedLogForDetail.reasoningTokens || 0) > 0">已剥离思考 {{ selectedLogForDetail.reasoningTokens }} Token</span>
+                <span class="mp-tc-badge" v-else>纯文本输出</span>
               </div>
               <div class="mp-tc-value font-mono" style="color: #10b981;">
-                {{ selectedLogForDetail.completionTokens ?? 0 }}
+                {{ getOutputTextTokens(selectedLogForDetail) }}
               </div>
               <div class="mp-tc-foot font-mono">
                 <span>生成速率: <strong>~{{ getEstimatedTps(selectedLogForDetail) }}</strong> Token/秒</span>
                 <span v-if="selectedLogForDetail.ttftMs" class="mp-tc-divider">·</span>
                 <span v-if="selectedLogForDetail.ttftMs">首字 <strong>{{ selectedLogForDetail.ttftMs }}ms</strong></span>
+              </div>
+            </div>
+
+            <!-- 卡片 5: 总 Token（全宽汇总） -->
+            <div class="mp-token-card is-total" title="本次请求全部 Token 消耗 = 新增输入 + 缓存命中 + 思考推理 + 生成输出（各分项去重后相加）">
+              <div class="mp-tc-head">
+                <span class="mp-tc-label">🧮 总 Token 消耗</span>
+                <span class="mp-tc-badge badge-total">全部用量汇总</span>
+              </div>
+              <div class="mp-tc-value font-mono text-brand">
+                {{ selectedLogForDetail.totalTokens ?? ((selectedLogForDetail.promptTokens || 0) + (selectedLogForDetail.completionTokens || 0)) }}
+              </div>
+              <div class="mp-tc-foot font-mono">
+                <span>= 新增输入 <strong>{{ getNewInputTokens(selectedLogForDetail) }}</strong></span>
+                <span class="mp-tc-divider">+</span>
+                <span>缓存命中 <strong>{{ selectedLogForDetail.promptCacheHitTokens ?? 0 }}</strong></span>
+                <span class="mp-tc-divider">+</span>
+                <span>思考推理 <strong>{{ selectedLogForDetail.reasoningTokens ?? 0 }}</strong></span>
+                <span class="mp-tc-divider">+</span>
+                <span>输出生成 <strong>{{ getOutputTextTokens(selectedLogForDetail) }}</strong></span>
               </div>
             </div>
           </div>
@@ -1167,7 +1321,6 @@ async function copyModel(modelId: string) {
             >
               <span v-html="icons.code" />
               <span>📝 客户端请求全文</span>
-              <span v-if="selectedLogForDetail.requestBody" class="mp-tab-badge font-mono">{{ selectedLogForDetail.requestBody.length }}B</span>
             </button>
 
             <button
@@ -1177,8 +1330,17 @@ async function copyModel(modelId: string) {
               @click="detailActiveTab = 'response'"
             >
               <span v-html="icons.message" />
-              <span>💬 响应全文 / 思考过程</span>
-              <span v-if="selectedLogForDetail.responseBody" class="mp-tab-badge font-mono">{{ selectedLogForDetail.responseBody.length }}B</span>
+              <span>💬 响应全文</span>
+            </button>
+
+            <button
+              type="button"
+              class="mp-detail-tab-btn"
+              :class="{ active: detailActiveTab === 'reasoning' }"
+              @click="detailActiveTab = 'reasoning'"
+            >
+              <span v-html="icons.message" />
+              <span>🧠 思考过程</span>
             </button>
 
             <button
@@ -1229,9 +1391,10 @@ async function copyModel(modelId: string) {
           <div v-if="detailActiveTab === 'tokens'" class="mp-detail-tab-content">
             <div class="mp-log-detail-grid">
               <div class="mp-ld-item">
-                <label>输入 Token</label>
+                <label>📥 新增输入 Token</label>
                 <div class="mp-ld-val font-mono">
-                  <span>{{ selectedLogForDetail.promptTokens ?? 0 }} Tokens</span>
+                  <span>{{ getNewInputTokens(selectedLogForDetail) }} Tokens</span>
+                  <small class="text-muted font-mono" style="display: block;">总输入 {{ selectedLogForDetail.promptTokens ?? 0 }} − 缓存命中 {{ selectedLogForDetail.promptCacheHitTokens ?? 0 }}</small>
                 </div>
               </div>
 
@@ -1245,14 +1408,15 @@ async function copyModel(modelId: string) {
               <div class="mp-ld-item">
                 <label>🧠 思考推理 Token</label>
                 <div class="mp-ld-val font-mono" style="color: #8b5cf6;">
-                  <span>{{ selectedLogForDetail.reasoningTokens ?? 0 }} Tokens ({{ getReasoningRate(selectedLogForDetail) }}%)</span>
+                  <span>{{ selectedLogForDetail.reasoningTokens ?? 0 }} Tokens{{ (selectedLogForDetail.reasoningTokens || 0) > 0 ? '（已触发深度思考）' : '（未触发）' }}</span>
                 </div>
               </div>
 
               <div class="mp-ld-item">
                 <label>📤 输出生成 Token</label>
                 <div class="mp-ld-val font-mono text-success">
-                  <span>{{ selectedLogForDetail.completionTokens ?? 0 }} Tokens</span>
+                  <span>{{ getOutputTextTokens(selectedLogForDetail) }} Tokens</span>
+                  <small class="text-muted font-mono" style="display: block;">总输出 {{ selectedLogForDetail.completionTokens ?? 0 }} − 思考推理 {{ selectedLogForDetail.reasoningTokens ?? 0 }}（纯文本，已剥离重复计数）</small>
                 </div>
               </div>
 
@@ -1311,27 +1475,47 @@ async function copyModel(modelId: string) {
             </div>
           </div>
 
-          <!-- 选项卡内容 4: 响应全文 / 思考链 -->
+          <!-- 选项卡内容 4: 响应全文 -->
           <div v-if="detailActiveTab === 'response'" class="mp-detail-tab-content">
             <div class="mp-log-raw-box">
               <div class="mp-lrb-header">
-                <label>服务端响应内容与思考过程</label>
+                <label>服务端最终响应正文</label>
                 <button
-                  v-if="selectedLogForDetail.responseBody"
+                  v-if="parsedResponseBody.content"
                   type="button"
                   class="mp-action-btn"
                   title="一键复制服务端响应全文"
-                  @click="copyText(selectedLogForDetail.responseBody, '响应全文')"
+                  @click="copyText(parsedResponseBody.content, '响应全文')"
                 >
                   <span v-html="icons.copy" />
                   <span>复制全文</span>
                 </button>
               </div>
-              <pre class="mp-lrb-pre font-mono">{{ selectedLogForDetail.responseBody || '未捕获或流式尚未产生内容' }}</pre>
+              <pre class="mp-lrb-pre font-mono">{{ parsedResponseBody.content || '未捕获或流式尚未产生正文内容' }}</pre>
             </div>
           </div>
 
-          <!-- 选项卡内容 5: 元数据与参数 -->
+          <!-- 选项卡内容 5: 思考过程 -->
+          <div v-if="detailActiveTab === 'reasoning'" class="mp-detail-tab-content">
+            <div class="mp-log-raw-box">
+              <div class="mp-lrb-header">
+                <label>模型思考推理过程（reasoning）</label>
+                <button
+                  v-if="parsedResponseBody.thinking"
+                  type="button"
+                  class="mp-action-btn"
+                  title="一键复制思考过程"
+                  @click="copyText(parsedResponseBody.thinking, '思考过程')"
+                >
+                  <span v-html="icons.copy" />
+                  <span>复制全文</span>
+                </button>
+              </div>
+              <pre class="mp-lrb-pre font-mono">{{ parsedResponseBody.thinking || '该请求未产生思考过程（非推理模型或无 reasoning 输出）' }}</pre>
+            </div>
+          </div>
+
+          <!-- 选项卡内容 6: 元数据与参数 -->
           <div v-if="detailActiveTab === 'meta'" class="mp-detail-tab-content">
             <div class="mp-log-detail-grid">
               <div class="mp-ld-item">
@@ -1373,7 +1557,7 @@ async function copyModel(modelId: string) {
               <div class="mp-ld-item">
                 <label>传输协议模式</label>
                 <div class="mp-ld-val">
-                  <span>{{ selectedLogForDetail.stream ? "SSE 实时流式传输" : "标准 JSON 同步响应" }}</span>
+                  <span>{{ selectedLogForDetail.stream ? "流式实时传输" : "同步响应" }}</span>
                 </div>
               </div>
 
@@ -1981,6 +2165,8 @@ async function copyModel(modelId: string) {
   flex-direction: column;
   gap: 16px;
   min-width: 0;
+  flex: 1 1 auto;
+  min-height: 0;
 }
 
 /* 顶栏 */
@@ -2241,6 +2427,23 @@ async function copyModel(modelId: string) {
   to { opacity: 1; transform: translateY(0); }
 }
 
+/* 日志页视图：在 header + 主 tab 条之下撑满剩余高度，表格区自适应、分页条固定在底部可见 */
+.mp-logs-page-view {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden;
+  /* 抵消 .mp-page 底部留白，让分页条真正贴到视口底边 */
+  margin-bottom: -40px;
+}
+
+.mp-logs-page-view .mp-logs-summary-bar {
+  flex-shrink: 0;
+}
+
+.mp-logs-main-card .app-table-pagination {
+  flex-shrink: 0;
+}
+
 /* 请求日志全屏视图样式 */
 .mp-logs-summary-bar {
   display: flex;
@@ -2286,24 +2489,31 @@ async function copyModel(modelId: string) {
   background: var(--brand);
 }
 
-.mp-logs-main-card {
+.mp-card.mp-logs-main-card {
   padding: 0;
+  gap: 0;
   overflow: hidden;
   width: 100%;
   max-width: 100%;
   box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
 }
 
 .mp-logs-main-card .mp-logs-toolbar {
   padding: 16px 18px 12px;
   width: 100%;
   box-sizing: border-box;
+  flex-shrink: 0;
 }
 
 .mp-logs-main-card .mp-logs-table-wrap {
   border-top: 1px solid var(--line);
-  max-height: calc(100vh - 300px);
-  min-height: 400px;
+  flex: 1 1 auto;
+  min-height: 0;
+  max-height: none;
   overflow-y: auto;
   overflow-x: auto;
   width: 100%;
@@ -3488,6 +3698,27 @@ async function copyModel(modelId: string) {
   position: sticky;
   top: 0;
   z-index: 1;
+  white-space: nowrap;
+}
+
+.mp-logs-table .mp-th-sortable {
+  cursor: pointer;
+  user-select: none;
+  transition: color 0.15s;
+}
+
+.mp-logs-table .mp-th-sortable:hover {
+  color: var(--brand);
+}
+
+.mp-logs-table .mp-th-sortable.is-sorted {
+  color: var(--brand);
+}
+
+.mp-logs-table .mp-sort-arrow {
+  margin-left: 4px;
+  font-size: 10px;
+  opacity: 0.75;
 }
 
 .mp-health-table td,
@@ -3758,6 +3989,19 @@ async function copyModel(modelId: string) {
   color: var(--brand-deep);
   background: var(--brand-soft);
   border-color: color-mix(in srgb, var(--brand) 25%, transparent);
+}
+
+.mp-mode-cell {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 3px;
+}
+
+.mp-mode-tps {
+  font-size: 10px;
+  color: var(--faint);
+  white-space: nowrap;
 }
 
 .mp-log-err-preview {
@@ -4105,6 +4349,19 @@ async function copyModel(modelId: string) {
   border-color: color-mix(in srgb, var(--brand) 30%, transparent);
 }
 
+/* 总 Token 汇总卡：全宽横贯，视觉重量突出 */
+.mp-token-card.is-total {
+  grid-column: 1 / -1;
+  border-left: 3px solid var(--brand);
+  background: color-mix(in srgb, var(--brand) 6%, var(--surface-soft));
+}
+
+.mp-tc-badge.badge-total {
+  background: var(--brand-soft);
+  color: var(--brand-deep);
+  border-color: color-mix(in srgb, var(--brand) 30%, transparent);
+}
+
 .mp-tc-value {
   font-size: 22px;
   font-weight: 800;
@@ -4174,15 +4431,6 @@ async function copyModel(modelId: string) {
 .mp-detail-tab-btn.is-error.active {
   background: color-mix(in srgb, var(--danger) 18%, transparent);
   border-color: color-mix(in srgb, var(--danger) 40%, transparent);
-}
-
-.mp-tab-badge {
-  font-size: 10px;
-  padding: 0 5px;
-  border-radius: 999px;
-  background: var(--surface);
-  border: 1px solid var(--line);
-  color: var(--muted);
 }
 
 .mp-detail-tab-content {
