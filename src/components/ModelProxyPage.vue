@@ -31,8 +31,6 @@ const {
   logPage,
   logPageSize,
   logTotal,
-  logSuccessTotal,
-  logErrorTotal,
   logGlobalTotal,
   logGlobalSuccess,
   logGlobalError,
@@ -195,45 +193,100 @@ function getEstimatedTps(log: ProxyRequestLog): string {
   return ((tokens / genDur) * 1000).toFixed(1);
 }
 
-/** 解析后端保存的响应正文，拆出思考过程与最终正文两部分。 */
+/** 从任意文本中提取 <think> / <thought> / <thinking> / 流式前缀标签，分离出思考过程与干净正文 */
+function extractThinkFromText(rawText: string): { thinking: string; content: string } {
+  if (!rawText) return { thinking: "", content: "" };
+
+  let text = rawText;
+  const thinkingParts: string[] = [];
+
+  // 1. 匹配后端流式旧标记：^\s*thinking\n([\s\S]*?)\n\s*response\s*\n\n([\s\S]*)$
+  const markMatch = text.match(/^\s*thinking\n([\s\S]*?)\n\s*response\s*\n\n([\s\S]*)$/);
+  if (markMatch) {
+    if (markMatch[1].trim()) thinkingParts.push(markMatch[1].trim());
+    text = markMatch[2].trim();
+  }
+
+  // 2. 匹配并提取所有 <think>...</think>, <thought>...</thought>, <thinking>...</thinking> 标签块（支持未闭合到结尾）
+  const thinkTagRegex = /<(?:think|thought|thinking)>([\s\S]*?)(?:<\/(?:think|thought|thinking)>|$)/gi;
+  let match: RegExpExecArray | null;
+  while ((match = thinkTagRegex.exec(text)) !== null) {
+    if (match[1] && match[1].trim()) {
+      thinkingParts.push(match[1].trim());
+    }
+  }
+
+  // 3. 移除文本中所有的思考标签及内容
+  const cleanContent = text
+    .replace(/<(?:think|thought|thinking)>[\s\S]*?(?:<\/(?:think|thought|thinking)>|$)/gi, "")
+    .trim();
+
+  return {
+    thinking: thinkingParts.join("\n\n").trim(),
+    content: cleanContent,
+  };
+}
+
+/** 解析后端保存的响应正文，彻底剥离思考过程（reasoning / <think>）与最终正文两部分 */
 function parseResponseBody(body: string | undefined | null): { thinking: string; content: string } {
   if (!body) return { thinking: "", content: "" };
 
-  // 流式（OpenAI/Anthropic 共用）：后端拼接格式 " thinking\n<思考>\n response\n\n<正文>"
-  const markMatch = body.match(/^\s*thinking\n([\s\S]*?)\n\s*response\s*\n\n([\s\S]*)$/);
-  if (markMatch) return { thinking: markMatch[1].trim(), content: markMatch[2].trim() };
-
-  // 同步：完整 JSON 响应，提取 message 中的 reasoning_content 与 content
+  // 先尝试 JSON 解析（针对非流式 JSON 响应）
   try {
     const parsed = JSON.parse(body);
+
+    // 1. OpenAI 格式 (choices[0].message)
     const message = parsed?.choices?.[0]?.message;
     if (message && typeof message === "object") {
-      const thinking = typeof message.reasoning_content === "string" ? message.reasoning_content : "";
-      let content = typeof message.content === "string" ? message.content : "";
-      if (!content && Array.isArray(message.content)) {
-        content = message.content
+      const thinking = typeof message.reasoning_content === "string"
+        ? message.reasoning_content
+        : typeof message.reasoning === "string"
+          ? message.reasoning
+          : "";
+      let rawContent = typeof message.content === "string" ? message.content : "";
+      if (!rawContent && Array.isArray(message.content)) {
+        rawContent = message.content
           .map((part: any) => (typeof part === "string" ? part : part?.text ?? ""))
           .join("");
       }
-      return { thinking: thinking.trim(), content: content.trim() };
+      const extracted = extractThinkFromText(rawContent);
+      const combinedThinking = [thinking.trim(), extracted.thinking.trim()]
+        .filter(Boolean)
+        .join("\n\n");
+      return {
+        thinking: combinedThinking,
+        content: extracted.content,
+      };
     }
-    // Anthropic messages 同步格式：content 数组可能含 thinking/text 块，顶层 thinking 兜底
+
+    // 2. Anthropic messages 格式 (content: [{type: "thinking", ...}, {type: "text", ...}])
     if (Array.isArray(parsed?.content)) {
-      const parts = parsed.content.map((part: any) => (typeof part === "string" ? { type: "text", text: part } : part));
-      const thinking = parts
+      const parts = parsed.content.map((part: any) =>
+        typeof part === "string" ? { type: "text", text: part } : part
+      );
+      const thinkingFromBlocks = parts
         .filter((p: any) => p?.type === "thinking" || p?.type === "redacted_thinking")
         .map((p: any) => p?.thinking ?? "")
-        .join("\n");
-      const content = parts
+        .join("\n\n");
+      const rawText = parts
         .filter((p: any) => p?.type === "text")
         .map((p: any) => p?.text ?? "")
         .join("");
       const topThinking = typeof parsed.thinking === "string" ? parsed.thinking : "";
-      return { thinking: (thinking || topThinking).trim(), content: content.trim() };
+
+      const extracted = extractThinkFromText(rawText);
+      const combinedThinking = [topThinking.trim(), thinkingFromBlocks.trim(), extracted.thinking.trim()]
+        .filter(Boolean)
+        .join("\n\n");
+      return {
+        thinking: combinedThinking,
+        content: extracted.content,
+      };
     }
-    // Responses API 同步格式：output 数组中的 reasoning 项与 message 项
+
+    // 3. Responses API 格式 (output: [{type: "reasoning", ...}, {type: "message", ...}])
     if (Array.isArray(parsed?.output)) {
-      const thinking = parsed.output
+      const thinkingFromOutput = parsed.output
         .filter((o: any) => o?.type === "reasoning")
         .map((o: any) =>
           Array.isArray(o?.summary)
@@ -242,19 +295,28 @@ function parseResponseBody(body: string | undefined | null): { thinking: string;
               ? o.summary
               : ""
         )
-        .join("\n");
-      const content = parsed.output
+        .join("\n\n");
+      const rawContent = parsed.output
         .filter((o: any) => o?.type === "message")
         .flatMap((o: any) => (Array.isArray(o?.content) ? o.content : []))
         .map((p: any) => (typeof p === "string" ? p : p?.text ?? ""))
         .join("");
-      if (content || thinking) return { thinking: thinking.trim(), content: content.trim() };
+
+      const extracted = extractThinkFromText(rawContent);
+      const combinedThinking = [thinkingFromOutput.trim(), extracted.thinking.trim()]
+        .filter(Boolean)
+        .join("\n\n");
+      return {
+        thinking: combinedThinking,
+        content: extracted.content,
+      };
     }
   } catch {
-    // 非 JSON 文本，整体视为正文
+    // 非 JSON 文本（例如流式拼接文本），进入通用文本提取
   }
 
-  return { thinking: "", content: body.trim() };
+  // 流式拼接文本或普通文本，统一运行提取函数剥离 <think> 等标签
+  return extractThinkFromText(body);
 }
 
 async function copyText(text: string, label = "内容") {
