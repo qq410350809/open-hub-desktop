@@ -2,6 +2,7 @@ import { ref, computed, type ComputedRef } from "vue";
 import { runCommand, useLibrary } from "./useLibrary";
 import { useToast } from "./useToast";
 import { useUIState } from "./useUIState";
+import { useConfirm } from "./useConfirm";
 import type {
   ChromeSessionInfo,
   ChromeSessionValue,
@@ -14,6 +15,7 @@ import { isNewApiCompatible, normalizeSystemType } from "../types";
 const { sites, usageSites, loadLibrary } = useLibrary();
 const { showToast } = useToast();
 const { chromeSessionDialogOpen } = useUIState();
+const { confirm } = useConfirm();
 
 // Chrome 会话弹窗数据
 const chromeSessionSite = ref<any>(null);
@@ -43,32 +45,6 @@ let chromeBrowserSyncLastLogAt = 0;
 // 前端从会话信息的 browserFallbackCooldownMs 读取：重启不丢失，自动调度与
 // 手动弹窗共用同一份状态；手动点击账号行的 Chrome 同步按钮不受冷却限制。
 let chromeBrowserSyncTimer: number | null = null;
-
-interface SyncedSiteModelsResult {
-  models: Array<{ id: string; owned_by?: string; ownedBy?: string }>;
-  source: string;
-  keys: string[];
-  keyGroups?: Record<string, string>;
-}
-
-interface SyncedModelCacheAccount {
-  profileId: string;
-  profileName: string;
-  accountName: string;
-  username: string;
-  keys: string[];
-  keyGroups?: Record<string, string>;
-  error: string;
-}
-
-interface ChromeModelsSyncSummary {
-  success: boolean;
-  succeeded: number;
-  failed: number;
-  keyCount: number;
-  modelCount: number;
-  error: string;
-}
 
 const chromeUsageAccounts: ComputedRef<Record<string, ChromeSessionInfo[]>> = computed(() =>
   Object.fromEntries(
@@ -206,146 +182,6 @@ async function runChromeAccountSync(
   }
 }
 
-async function syncChromeModelsForSessions(
-  site: any,
-  sessions: ChromeSessionInfo[],
-  options: { clearCache?: boolean; reloadLibrary?: boolean } = {},
-): Promise<ChromeModelsSyncSummary> {
-  // 保留已有 Key，先验证缓存 Key；成功后按账号覆盖缓存，失败才进入访问令牌回退。
-  const clearCache = options.clearCache ?? false;
-  const reloadLibrary = options.reloadLibrary ?? true;
-  const targets = sessions.filter((session) => session.isValid);
-  if (targets.length === 0) {
-    const error = "没有合法账号可同步 Key 与模型";
-    appendChromeBrowserSyncLog({
-      stage: `models-empty-${site.id}`,
-      status: "info",
-      message: `Key/模型｜${error}`,
-    });
-    return { success: false, succeeded: 0, failed: 0, keyCount: 0, modelCount: 0, error };
-  }
-  chromeModelsSyncing.value = true;
-  let succeeded = 0;
-  let keyCount = 0;
-  let modelCount = 0;
-  const errors: string[] = [];
-  try {
-    if (clearCache) {
-      await runCommand("clear_site_model_cache_for_site", { siteId: site.id });
-    }
-    for (const session of targets) {
-      const stage = `models-${site.id}-${session.profileId}`;
-      const accountLabel = session.username || session.accountName || session.profileName;
-      appendChromeBrowserSyncLog({
-        stage,
-        status: "running",
-        message: `Key/模型｜${accountLabel}｜正在读取 Key 并验证模型列表`,
-      });
-      try {
-        let baseUrl = site.apiBaseUrl.trim();
-        if (!baseUrl.endsWith("/")) baseUrl += "/";
-        const result = await runCommand<SyncedSiteModelsResult>("fetch_site_models_json", {
-          url: baseUrl,
-          siteId: site.id,
-          profileId: session.profileId,
-        });
-        await runCommand("save_site_model_cache_for_account", {
-          siteId: site.id,
-          account: {
-            profileId: session.profileId,
-            profileName: session.profileName,
-            accountName: session.accountName,
-            username: session.username,
-            keys: result.keys ?? [],
-            keyGroups: result.keyGroups ?? {},
-            error: "",
-          } satisfies SyncedModelCacheAccount,
-          result,
-        });
-        const accountKeyCount = result.keys?.length ?? 0;
-        const accountModelCount = result.models?.length ?? 0;
-        succeeded += 1;
-        keyCount += accountKeyCount;
-        modelCount += accountModelCount;
-        appendChromeBrowserSyncLog({
-          stage,
-          status: "success",
-          message: `Key/模型｜${accountLabel}｜完成：${accountKeyCount} 个 Key，${accountModelCount} 个模型`,
-        });
-      } catch (error) {
-        const message = String(error);
-        errors.push(`${accountLabel}：${message}`);
-        await runCommand("save_site_model_cache_for_account", {
-          siteId: site.id,
-          account: {
-            profileId: session.profileId,
-            profileName: session.profileName,
-            accountName: session.accountName,
-            username: session.username,
-            keys: [],
-            keyGroups: {},
-            error: message,
-          } satisfies SyncedModelCacheAccount,
-          result: null,
-        });
-        appendChromeBrowserSyncLog({
-          stage,
-          status: "error",
-          message: `Key/模型｜${accountLabel}｜失败：${message}`,
-        });
-      }
-    }
-    if (reloadLibrary) {
-      await loadLibrary();
-      chromeSessions.value = chromeUsageAccounts.value[site.id] ?? chromeSessions.value;
-    }
-    const failed = targets.length - succeeded;
-    if (targets.length > 1) {
-      appendChromeBrowserSyncLog({
-        stage: `models-complete-${site.id}`,
-        status: failed > 0 ? "error" : "success",
-        message: failed > 0
-          ? `Key/模型汇总｜${succeeded} 个成功，${failed} 个失败，共 ${keyCount} 个 Key、${modelCount} 个模型`
-          : `Key/模型汇总｜${succeeded} 个账号完成，共 ${keyCount} 个 Key、${modelCount} 个模型`,
-      });
-    }
-    const error = errors.join("\n");
-    if (error) {
-      chromeBrowserSyncError.value = chromeBrowserSyncError.value
-        ? `${chromeBrowserSyncError.value}\n${error}`
-        : error;
-    }
-    return {
-      success: failed === 0,
-      succeeded,
-      failed,
-      keyCount,
-      modelCount,
-      error,
-    };
-  } catch (error) {
-    const message = String(error);
-    chromeBrowserSyncError.value = chromeBrowserSyncError.value
-      ? `${chromeBrowserSyncError.value}\n${message}`
-      : message;
-    appendChromeBrowserSyncLog({
-      stage: `models-failed-${site.id}`,
-      status: "error",
-      message: `Key/模型｜流程中断：${message}`,
-    });
-    return {
-      success: false,
-      succeeded,
-      failed: Math.max(1, targets.length - succeeded),
-      keyCount,
-      modelCount,
-      error: message,
-    };
-  } finally {
-    chromeModelsSyncing.value = false;
-  }
-}
-
 async function closeChromeSyncTabs(accountLabel = "当前账号", profileId = "current") {
   const stage = `chrome-cleanup-${profileId}`;
   try {
@@ -373,45 +209,51 @@ async function syncAccountViaChrome(session: ChromeSessionInfo) {
   appendChromeBrowserSyncLog({
     stage,
     status: "running",
-    message: `单账户同步｜${accountLabel}｜开始处理账号资料、Key 和模型`,
+    message: `单账户同步｜${accountLabel}｜开始同步额度与会话资料`,
   });
   let accountSucceeded = false;
-  let modelsSummary: ChromeModelsSyncSummary = {
-    success: false,
-    succeeded: 0,
-    failed: 0,
-    keyCount: 0,
-    modelCount: 0,
-    error: "",
-  };
   try {
     accountSucceeded = await runChromeAccountSync(session);
-    if (accountSucceeded && chromeSessionSite.value) {
-      const refreshed = chromeSessions.value.find((item) => item.profileId === session.profileId);
-      if (refreshed) {
-        modelsSummary = await syncChromeModelsForSessions(chromeSessionSite.value, [refreshed]);
-      }
-    }
   } finally {
     await closeChromeSyncTabs(accountLabel, session.profileId);
     chromeSessionSyncActive.value = false;
     stopChromeBrowserSyncTimer();
     chromeBrowserSyncingProfileId.value = "";
   }
-  const succeeded = accountSucceeded && modelsSummary.success;
   appendChromeBrowserSyncLog({
     stage,
-    status: succeeded ? "success" : "error",
-    message: succeeded
-      ? `单账户同步｜${accountLabel}｜完成：${modelsSummary.keyCount} 个 Key，${modelsSummary.modelCount} 个模型`
+    status: accountSucceeded ? "success" : "error",
+    message: accountSucceeded
+      ? `单账户同步｜${accountLabel}｜额度与会话资料同步完成`
       : `单账户同步｜${accountLabel}｜未完成，请查看上方失败步骤`,
   });
-  if (succeeded) {
-    showToast(`已更新 ${accountLabel}：${modelsSummary.keyCount} 个 Key、${modelsSummary.modelCount} 个模型`);
-  } else if (accountSucceeded) {
-    showToast(`账号资料已更新，但 Key/模型同步失败：${chromeBrowserSyncError.value}`, true);
+  if (accountSucceeded) {
+    showToast(`已更新 ${accountLabel} 额度与账号资料`);
   } else {
     showToast(`Chrome 同步失败：${chromeBrowserSyncError.value}`, true);
+  }
+}
+
+/// 删除站点下指定 Chrome 配置账号的关联记录（额度、令牌与模型缓存一并移除）。
+/// 仅解除本机关联，不影响 Chrome 配置本身；重新同步会再次建立关联。
+async function deleteSiteAccount(site: any, session: ChromeSessionInfo) {
+  const accountLabel = session.username || session.accountName || session.profileName;
+  const accepted = await confirm({
+    title: "删除会话账号",
+    message: `确定删除「${site?.name ?? "该站点"}」下账号「${accountLabel}」（Chrome 配置：${session.profileName}）吗？将同时移除该账号的额度、令牌与模型缓存，且不会影响 Chrome 配置本身。`,
+    confirmText: "删除",
+    danger: true,
+  });
+  if (!accepted) return;
+  try {
+    await runCommand<void>("delete_site_account", {
+      siteId: site.id,
+      profileId: session.profileId,
+    });
+    await loadLibrary();
+    showToast(`已删除账号「${accountLabel}」`);
+  } catch (error) {
+    showToast(`删除账号失败：${String(error)}`, true);
   }
 }
 
@@ -580,12 +422,10 @@ async function syncChromeSession(site: any, trigger: HTMLElement) {
     let reusedAccounts = 0;
     let completedAccounts = 0;
     let failedAccounts = 0;
-    let totalKeyCount = 0;
-    let totalModelCount = 0;
     appendChromeBrowserSyncLog({
       stage: "account-bundles",
       status: "info",
-      message: `同步计划｜共 ${sessionsToProcess.length} 个账号，将按顺序完成账号资料、Key、模型和标签清理`,
+      message: `同步计划｜共 ${sessionsToProcess.length} 个账号，将按顺序同步额度与会话资料`,
     });
 
     for (const [index, initialSession] of sessionsToProcess.entries()) {
@@ -595,29 +435,21 @@ async function syncChromeSession(site: any, trigger: HTMLElement) {
       const stage = `account-bundle-${session.profileId}`;
       let accountReady = true;
       let accountMode = "复用已有账号资料";
-      let modelsSummary: ChromeModelsSyncSummary = {
-        success: false,
-        succeeded: 0,
-        failed: 0,
-        keyCount: 0,
-        modelCount: 0,
-        error: "",
-      };
       appendChromeBrowserSyncLog({
         stage,
         status: "running",
-        message: `${progressLabel}｜${accountLabel}｜开始`,
+        message: `${progressLabel}｜${accountLabel}｜开始同步额度`,
       });
       try {
         if (canSyncAccountViaChrome(session)) {
           const useRefreshAuth = normalizeSystemType(chromeSessionSite.value?.systemType ?? "") === "newapi2";
           accountMode = useRefreshAuth
-            ? "通过 refresh token 取得访问令牌并刷新账号资料"
-            : "通过 Cookie 刷新账号资料";
+            ? "通过 refresh token 取得访问令牌并刷新额度"
+            : "通过 Cookie 刷新额度";
           appendChromeBrowserSyncLog({
             stage: `${stage}-strategy`,
             status: "info",
-            message: `账号资料｜${accountLabel}｜本地数据不可用或存在异常，进入${useRefreshAuth ? " refresh token" : " Cookie"}回退流程`,
+            message: `账号额度｜${accountLabel}｜进入${useRefreshAuth ? " refresh token" : " Cookie"}同步流程`,
           });
           accountReady = await runChromeAccountSync(session, { reloadLibrary: false });
           const refreshed = chromeSessions.value.find((item) => item.profileId === session.profileId);
@@ -628,7 +460,7 @@ async function syncChromeSession(site: any, trigger: HTMLElement) {
           appendChromeBrowserSyncLog({
             stage: `${stage}-strategy`,
             status: "info",
-            message: `账号资料｜${accountLabel}｜本地数据有效，跳过浏览器刷新`,
+            message: `账号额度｜${accountLabel}｜本地数据有效，跳过浏览器刷新`,
           });
         } else {
           accountReady = false;
@@ -636,20 +468,11 @@ async function syncChromeSession(site: any, trigger: HTMLElement) {
           appendChromeBrowserSyncLog({
             stage: `${stage}-strategy`,
             status: "error",
-            message: `账号资料｜${accountLabel}｜认证不可用，且当前类型不支持认证回退`,
+            message: `账号额度｜${accountLabel}｜认证不可用，且当前类型不支持认证回退`,
           });
         }
 
-        if (accountReady && session.isValid) {
-          modelsSummary = await syncChromeModelsForSessions(chromeSessionSite.value, [session], {
-            clearCache: false,
-            reloadLibrary: false,
-          });
-          totalKeyCount += modelsSummary.keyCount;
-          totalModelCount += modelsSummary.modelCount;
-        }
-
-        const bundleSucceeded = accountReady && session.isValid && modelsSummary.success;
+        const bundleSucceeded = accountReady && session.isValid;
         if (bundleSucceeded) {
           completedAccounts += 1;
         } else {
@@ -659,8 +482,8 @@ async function syncChromeSession(site: any, trigger: HTMLElement) {
           stage,
           status: bundleSucceeded ? "success" : "error",
           message: bundleSucceeded
-            ? `${progressLabel}｜${accountLabel}｜完成：${accountMode}，${modelsSummary.keyCount} 个 Key，${modelsSummary.modelCount} 个模型`
-            : `${progressLabel}｜${accountLabel}｜未完成：${accountReady ? "Key/模型同步失败" : accountMode}`,
+            ? `${progressLabel}｜${accountLabel}｜完成：${accountMode}`
+            : `${progressLabel}｜${accountLabel}｜未完成：${accountMode}`,
         });
       } finally {
         await closeChromeSyncTabs(accountLabel, session.profileId);
@@ -673,8 +496,8 @@ async function syncChromeSession(site: any, trigger: HTMLElement) {
       stage: "scan-complete",
       status: failedAccounts > 0 ? "error" : "success",
       message: failedAccounts > 0
-        ? `同步汇总｜${completedAccounts}/${sessionsToProcess.length} 个账号完成，${failedAccounts} 个失败；共 ${totalKeyCount} 个 Key、${totalModelCount} 个模型`
-        : `同步汇总｜${completedAccounts}/${sessionsToProcess.length} 个账号全部完成；账号资料刷新 ${refreshedAccounts} 个，复用 ${reusedAccounts} 个；共 ${totalKeyCount} 个 Key、${totalModelCount} 个模型`,
+        ? `同步汇总｜${completedAccounts}/${sessionsToProcess.length} 个账号完成，${failedAccounts} 个失败`
+        : `同步汇总｜${completedAccounts}/${sessionsToProcess.length} 个账号全部完成；额度刷新 ${refreshedAccounts} 个，有效 ${reusedAccounts} 个`,
     });
   } finally {
     if (requestId === chromeSessionRequestId) {
@@ -711,6 +534,7 @@ export function useChromeSession() {
     runChromeAccountSync,
     syncAccountViaChrome,
     copyChromeSession,
+    deleteSiteAccount,
     closeChromeSessionDialog,
     analyzeChromeUsage,
     syncChromeSession,

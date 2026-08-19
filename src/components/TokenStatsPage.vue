@@ -43,6 +43,7 @@ const toolsModalOpen = ref(false);
 const modelsModalOpen = ref(false);
 const projectsModalOpen = ref(false);
 const auditModalOpen = ref(false);
+const healthModalOpen = ref(false);
 
 // —— 趋势图表显示维度 ——
 type TrendMetric = "total" | "breakdown" | "reasoning" | "requests";
@@ -367,6 +368,24 @@ const sourceColumns: AppTableColumn[] = [
   { key: "costUsd", title: "成本 (USD)", width: "100px", align: "right", sortable: true },
 ];
 
+const healthColumns: AppTableColumn[] = [
+  { key: "label", title: "时段", width: "minmax(140px, 1.2fr)", sortable: true },
+  { key: "dialogues", title: "对话数", width: "80px", align: "right", sortable: true },
+  { key: "requests", title: "请求数", width: "90px", align: "right", sortable: true },
+  { key: "success", title: "成功", width: "80px", align: "right", sortable: true },
+  { key: "failed", title: "失败", width: "80px", align: "right", sortable: true },
+  { key: "successRate", title: "成功率", width: "90px", align: "right", sortable: true },
+  { key: "level", title: "健康等级", width: "100px", align: "center", sortable: true },
+];
+
+const healthTableRows = computed(() =>
+  healthDisplayCells.value
+    .map((c) => ({
+      ...c,
+      successRate: c.successRate != null ? (c.successRate * 100).toFixed(1) + "%" : "—",
+    })),
+);
+
 const modelColumns: AppTableColumn[] = [
   { key: "model", title: "模型名称 / 家族", width: "minmax(180px, 1.5fr)", sortable: true },
   { key: "totalTokens", title: "总量 Tokens", width: "110px", align: "right", sortable: true },
@@ -403,6 +422,11 @@ const PROVIDER_COLORS: Record<string, string> = {
 
 function providerColor(source: string, index = 0): string {
   return PROVIDER_COLORS[source.toLowerCase()] || `hsl(${150 + index * 40}, 60%, 45%)`;
+}
+
+const HEALTH_LEVEL_COLORS = ["rgba(148,163,184,0.4)", "#ef4444", "#f97316", "#eab308", "#84cc16", "#10b981"];
+function healthLevelColor(level: number): string {
+  return HEALTH_LEVEL_COLORS[level] ?? HEALTH_LEVEL_COLORS[0];
 }
 
 const sourceNameMap: Record<string, string> = {
@@ -1453,9 +1477,12 @@ onBeforeUnmount(() => {
           <div class="tt-card tt-health-card">
             <header class="tt-card-header">
               <div class="tt-card-title-wrap">
-                <h2>请求健康矩阵 (Health Radar)</h2>
+                <h2>请求健康矩阵</h2>
                 <p>色阶按成功率：≥99% 绿 · 95–99% 浅绿 · 85–95% 黄 · 70–85% 橙 · &lt;70% 红</p>
               </div>
+              <button type="button" class="tt-text-btn" @click="healthModalOpen = true">
+                查看全部 {{ healthTimeline.cells.length }} 个时段明细 ➔
+              </button>
             </header>
             <div class="tt-card-body tt-health-body">
               <div v-if="healthTimeline.cells.length" class="tt-health-wrapper">
@@ -1499,7 +1526,7 @@ onBeforeUnmount(() => {
                 <div
                   ref="healthGridRef"
                   class="tt-health-grid"
-                  :style="{ gridTemplateRows: `repeat(${HEALTH_ROWS}, ${HEALTH_CELL}px)` }"
+                  :style="{ gridTemplateRows: `repeat(${HEALTH_ROWS}, 1fr)` }"
                 >
                   <div
                     v-for="cell in healthDisplayCells"
@@ -1602,45 +1629,6 @@ onBeforeUnmount(() => {
                 <input v-model="sourceSearch" type="search" placeholder="搜索 AI 工具、CLI 或编辑器…" />
               </label>
               <span class="tt-filter-count">共 {{ filteredSources.length }} 款工具</span>
-            </div>
-
-            <!-- 工具卡片网格 -->
-            <div class="tt-sources-grid">
-              <div
-                v-for="(src, idx) in filteredSources"
-                :key="src.source"
-                class="tt-source-card"
-              >
-                <header class="tt-source-header">
-                  <div class="tt-source-title">
-                    <span class="tt-bar-dot" :style="{ background: providerColor(src.source, idx) }" />
-                    <strong>{{ sourceLabel(src.source) }}</strong>
-                    <code class="tt-muted-code">({{ src.source }})</code>
-                  </div>
-                  <span class="tt-source-share">
-                    {{ shareOf(src.totalTokens, totalTokensAll).toFixed(1) }}%
-                  </span>
-                </header>
-
-                <div class="tt-source-main">
-                  <strong>{{ formatCompact(src.totalTokens) }}</strong>
-                  <span class="tt-source-sub">Tokens</span>
-                </div>
-
-                <div class="tt-source-breakdown-grid">
-                  <div class="tt-sbg-item"><span>输入:</span> <strong>{{ formatCompact(src.inputTokens) }}</strong></div>
-                  <div class="tt-sbg-item"><span>输出:</span> <strong>{{ formatCompact(src.outputTokens) }}</strong></div>
-                  <div class="tt-sbg-item"><span>缓存:</span> <strong>{{ formatCompact(src.cacheTokens) }}</strong></div>
-                  <div class="tt-sbg-item"><span>命中率:</span> <strong>{{ formatRate(src.cacheHitRate) }}</strong></div>
-                  <div class="tt-sbg-item"><span>对话:</span> <strong>{{ formatTokens(src.conversations) }}</strong></div>
-                  <div class="tt-sbg-item"><span>请求数:</span> <strong>{{ formatTokens(src.requests) }}</strong></div>
-                </div>
-
-                <div v-if="src.costUsd > 0" class="tt-source-cost-badge">
-                  <span>估算花费:</span>
-                  <strong>{{ formatCost(src.costUsd) }}</strong>
-                </div>
-              </div>
             </div>
 
             <!-- 完整工具数据表 -->
@@ -1820,6 +1808,57 @@ onBeforeUnmount(() => {
                 <template #cell-reasoning="{ row }">{{ formatCompact(row.reasoning) }}</template>
                 <template #cell-sessions="{ row }">{{ formatTokens(row.sessions) }}</template>
                 <template #cell-requests="{ row }">{{ row.requestsEstimated ? "≈" : "" }}{{ formatTokens(row.requests) }}</template>
+              </AppTable>
+            </div>
+          </div>
+        </section>
+      </div>
+    </Transition>
+
+    <!-- 5. 请求健康矩阵明细弹窗 (Health Modal) -->
+    <Transition name="tt-modal-fade">
+      <div v-if="healthModalOpen" class="tt-modal-backdrop" @click.self="healthModalOpen = false">
+        <section class="tt-modal-card is-wide" role="dialog" aria-modal="true">
+          <header class="tt-modal-header">
+            <div>
+              <h2>请求健康矩阵明细</h2>
+              <p>每个时段的成功率、对话数与请求健康状态</p>
+            </div>
+            <button type="button" class="tt-modal-close-btn" aria-label="关闭" @click="healthModalOpen = false">×</button>
+          </header>
+
+          <div class="tt-modal-body">
+            <span class="tt-filter-count">共 {{ healthTableRows.length }} 个时段</span>
+
+            <div class="tt-table-wrap">
+              <AppTable
+                :rows="healthTableRows"
+                :columns="healthColumns"
+                :row-key="(item: any) => item.key || item.label"
+                :page-size="15"
+                empty-text="当前时间区间内暂无请求健康记录"
+              >
+                <template #cell-label="{ row }">
+                  <div class="tt-cell-with-dot">
+                    <span class="tt-bar-dot" :style="{ background: healthLevelColor(row.level) }" />
+                    <code v-if="row.label">{{ row.label }}</code>
+                    <span v-else class="muted">空档</span>
+                  </div>
+                </template>
+                <template #cell-dialogues="{ row }">{{ formatTokens(row.dialogues) }}</template>
+                <template #cell-requests="{ row }">{{ row.requestsEstimated ? "≈" : "" }}{{ formatTokens(row.requests) }}</template>
+                <template #cell-success="{ row }">{{ formatTokens(row.success) }}</template>
+                <template #cell-failed="{ row }">
+                  <span :class="{ 'text-danger': row.failed > 0 }">{{ formatTokens(row.failed) }}</span>
+                </template>
+                <template #cell-successRate="{ row }">
+                  <span :class="{ 'text-success': row.successRate !== '—' && Number(row.successRate) >= 99, 'text-warning': row.successRate !== '—' && Number(row.successRate) < 95 && Number(row.successRate) >= 70, 'text-danger': row.successRate !== '—' && Number(row.successRate) < 70 }">
+                    {{ row.successRate }}
+                  </span>
+                </template>
+                <template #cell-level="{ row }">
+                  <span class="tt-health-cell" :class="'lv' + row.level" :title="'等级 ' + row.level" />
+                </template>
               </AppTable>
             </div>
           </div>
@@ -2535,6 +2574,10 @@ onBeforeUnmount(() => {
   overflow: hidden;
 }
 
+.tt-card.tt-health-card {
+  padding: 8px 6px;
+}
+
 .tt-card-header {
   display: flex;
   align-items: center;
@@ -2598,7 +2641,7 @@ onBeforeUnmount(() => {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 6px;
-  margin-bottom: 6px;
+  margin-bottom: 8px;
   flex-shrink: 0;
 }
 
@@ -2663,7 +2706,8 @@ onBeforeUnmount(() => {
   display: grid;
   grid-auto-flow: column;
   grid-auto-columns: minmax(0, 1fr);
-  gap: 3px;
+  column-gap: 3px;
+  row-gap: 4px;
   width: 100%;
   flex: 1;
   min-height: 0;
@@ -2917,92 +2961,6 @@ onBeforeUnmount(() => {
 .tt-filter-count {
   font-size: 11.5px;
   color: var(--muted);
-}
-
-/* 工具卡片网格 */
-.tt-sources-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
-  gap: 10px;
-  flex-shrink: 0;
-}
-
-.tt-source-card {
-  background: var(--page-bg);
-  border: 1px solid var(--line);
-  border-radius: var(--r-md, 8px);
-  padding: 12px;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  transition: all 0.15s ease;
-}
-
-.tt-source-card:hover {
-  border-color: var(--line-hover);
-}
-
-.tt-source-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-}
-
-.tt-source-title {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-
-.tt-source-title strong {
-  font-size: 12.5px;
-}
-
-.tt-source-share {
-  font-size: 11px;
-  font-weight: 700;
-  color: var(--brand);
-}
-
-.tt-source-main {
-  display: flex;
-  align-items: baseline;
-  gap: 5px;
-}
-
-.tt-source-main strong {
-  font-size: 18px;
-  font-weight: 800;
-  line-height: 1;
-}
-
-.tt-source-sub {
-  font-size: 10.5px;
-  color: var(--muted);
-}
-
-.tt-source-breakdown-grid {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 4px 8px;
-  padding: 6px 8px;
-  border-radius: 6px;
-  background: var(--surface);
-}
-
-.tt-sbg-item {
-  display: flex;
-  justify-content: space-between;
-  font-size: 10.5px;
-}
-
-.tt-sbg-item span { color: var(--muted); }
-.tt-sbg-item strong { font-weight: 600; font-variant-numeric: tabular-nums; }
-
-.tt-source-cost-badge {
-  font-size: 10.5px;
-  color: var(--muted);
-  margin-top: auto;
 }
 
 .tt-cell-with-dot {

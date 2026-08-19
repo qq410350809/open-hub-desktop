@@ -1382,10 +1382,10 @@ onMounted(() => {
                     </div>
                   </div>
 
-                  <!-- 2. 加权成本指数与价差阶梯 (Blended Cost & Price Indices) -->
+                  <!-- 2. 加权成本指数与价差阶梯 -->
                   <div class="mc-blended-indices-card">
                     <div class="mc-indices-header">
-                      <span>综合计价与成本指数 (Blended Index)</span>
+                      <span>综合计价与成本指数</span>
                       <small>公式：输入单价 × 75% + 输出单价 × 25%</small>
                     </div>
                     <div class="mc-indices-grid">
@@ -1563,7 +1563,7 @@ onMounted(() => {
                     <div v-if="selectedModel.aaIdx || selectedModel.aaSpeed" class="mc-aa-gauges-grid">
                       <div v-if="selectedModel.aaIdx" class="mc-gauge-card">
                         <div class="mc-gauge-head">
-                          <span class="mc-gauge-k">综合质量指数 (Quality Index)</span>
+                          <span class="mc-gauge-k">综合质量指数</span>
                           <strong class="mc-gauge-v text-violet">{{ selectedModel.aaIdx.toFixed(1) }} <small>/ 100</small></strong>
                         </div>
                         <div class="mc-gauge-bar-wrap">

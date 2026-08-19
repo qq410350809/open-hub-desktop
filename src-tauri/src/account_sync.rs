@@ -458,11 +458,29 @@ pub(crate) async fn acquire_newapi_session_token(
     }
 }
 
+/// 识别签到"未启用"类提示。部分站点签到功能关闭时状态接口直接返回
+/// success:false + 提示语（如"签到功能未启用"），这并非数据异常，应视为
+/// 未启用状态，由调用方查当天签到日志兜底确认实际签到情况。
+pub(crate) fn is_checkin_disabled_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("未启用")
+        || lower.contains("未开启")
+        || lower.contains("没有启用")
+        || lower.contains("not enabled")
+        || lower.contains("not_enabled")
+        || lower.contains("checkin disabled")
+        || lower.contains("checkin_disabled")
+}
+
 pub(crate) fn parse_newapi_checkin_status(
     value: &serde_json::Value,
 ) -> Result<(bool, bool), String> {
     if value.get("success").and_then(serde_json::Value::as_bool) != Some(true) {
-        return Err(api_error_message(value, "签到状态数据无效"));
+        let error = api_error_message(value, "签到状态数据无效");
+        if is_checkin_disabled_message(&error) {
+            return Ok((false, false));
+        }
+        return Err(error);
     }
     let enabled = value
         .pointer("/data/enabled")
@@ -473,6 +491,87 @@ pub(crate) fn parse_newapi_checkin_status(
         .and_then(serde_json::Value::as_bool)
         .ok_or_else(|| "签到状态缺少 checked_in_today 字段".to_string())?;
     Ok((enabled, checked_in_today))
+}
+
+/// 当前本地时区相对 UTC 的偏移秒数（如东八区为 28800）。取不到时退化为 0。
+pub(crate) fn local_utc_offset_secs() -> i64 {
+    unsafe {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|value| value.as_secs() as libc::time_t)
+            .unwrap_or(0);
+        let mut tm: libc::tm = std::mem::zeroed();
+        if libc::localtime_r(&now, &mut tm).is_null() {
+            return 0;
+        }
+        tm.tm_gmtoff
+    }
+}
+
+/// 当天（本地时区）的 Unix 秒范围：[00:00:00, 23:59:59]，用于查询签到日志。
+pub(crate) fn local_day_unix_range() -> (i64, i64) {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_secs() as i64)
+        .unwrap_or(0);
+    let offset = local_utc_offset_secs();
+    let local_now = now + offset;
+    let local_start_of_day = local_now - local_now.rem_euclid(86_400);
+    let start = local_start_of_day - offset;
+    (start, start + 86_399)
+}
+
+/// 解析 NewAPI /api/log/self 响应：当天存在签到记录（type=4 过滤后的 items 非空）
+/// 返回 Ok(true)，无记录返回 Ok(false)。响应异常视为无法确认。
+pub(crate) fn parse_newapi_checkin_logs(value: &serde_json::Value) -> Result<bool, String> {
+    if value.get("success").and_then(serde_json::Value::as_bool) != Some(true) {
+        return Err(api_error_message(value, "签到日志数据无效"));
+    }
+    let items = [
+        "/data/items",
+        "/data/list",
+        "/data/records",
+        "/data/data",
+        "/items",
+        "/data",
+    ]
+    .iter()
+    .find_map(|pointer| value.pointer(pointer).and_then(serde_json::Value::as_array))
+    .ok_or_else(|| "签到日志缺少记录列表".to_string())?;
+    Ok(!items.is_empty())
+}
+
+/// 签到状态接口报 enabled=false 时的日志兜底：查当天（本地时区）签到日志确认
+/// 实际签到情况。部分站点状态接口的 enabled 字段不可靠，用户当天可能已在网页
+/// 手动签到过；返回 Ok(true) 表示今日已签到，Ok(false) 表示今日无签到记录。
+pub(crate) async fn query_newapi_checkin_log(
+    client: &reqwest::Client,
+    base_url: &str,
+    auth: &NewApiAuth,
+    user_agent: &str,
+) -> Result<bool, String> {
+    let base_url = Url::parse(base_url).map_err(|_| "站点 API 地址无效".to_string())?;
+    let (start_timestamp, end_timestamp) = local_day_unix_range();
+    let endpoint = base_url
+        .join("/api/log/self")
+        .map_err(|_| "无法生成签到日志接口地址".to_string())?;
+    let mut query_url = endpoint.clone();
+    query_url
+        .query_pairs_mut()
+        .append_pair("p", "1")
+        .append_pair("page_size", "20")
+        .append_pair("type", "4")
+        .append_pair("start_timestamp", &start_timestamp.to_string())
+        .append_pair("end_timestamp", &end_timestamp.to_string());
+    let value = request_json(
+        apply_newapi_auth(
+            chrome_request_headers(client.get(query_url), base_url.as_str(), user_agent),
+            auth,
+        ),
+        "签到日志接口",
+    )
+    .await?;
+    parse_newapi_checkin_logs(&value)
 }
 
 pub(crate) fn json_boolish(value: &serde_json::Value) -> Option<bool> {
@@ -742,15 +841,40 @@ pub(crate) async fn refresh_newapi_checkin(
     let headers = |request: reqwest::RequestBuilder| {
         apply_newapi_auth(chrome_request_headers(request, base_url, user_agent), auth)
     };
-    let value = match request_json(headers(client.get(query_url)), "签到状态接口").await {
+    let value = match request_json(headers(client.get(query_url.clone())), "签到状态接口").await {
         Ok(value) => value,
-        Err(error) => return CheckinSnapshot { error, ..previous },
+        // 实测该站点域名存在间歇性连接超时（同一端点三次请求可能失败一次）。
+        // 瞬时网络抖动不应被当成签到失败写入缓存，先重试一次再判定。
+        Err(first_error) => {
+            match request_json(headers(client.get(query_url)), "签到状态接口").await {
+                Ok(value) => value,
+                Err(_) => return CheckinSnapshot { error: first_error, ..previous },
+            }
+        }
     };
     let (enabled, checked_in_today) = match parse_newapi_checkin_status(&value) {
         Ok(status) => status,
         Err(error) => return CheckinSnapshot { error, ..previous },
     };
-    if !enabled || checked_in_today {
+    if !enabled {
+        // 状态接口报"功能未启用"时不可直接判定未签到：部分站点该字段不可靠，
+        // 用户当天可能已在网页手动签到过。改查当天签到日志（type=4）确认：
+        // 有记录按已签到展示，无记录按未签到展示，均不触发自动代签；
+        // 日志接口失败时维持"未启用"不展示，与原先行为一致。
+        return match query_newapi_checkin_log(client, base_url, auth, user_agent).await {
+            Ok(logged) => CheckinSnapshot {
+                enabled: true,
+                checked_in_today: logged,
+                error: String::new(),
+            },
+            Err(_) => CheckinSnapshot {
+                enabled: false,
+                checked_in_today: false,
+                error: api_error_message(&value, "签到功能未启用"),
+            },
+        };
+    }
+    if checked_in_today {
         return CheckinSnapshot {
             enabled,
             checked_in_today,
@@ -1457,6 +1581,7 @@ pub(crate) fn chrome_account_bridge_script(
     let checkinEnabled = false;
     let checkedInToday = false;
     let checkinError = "";
+    let checkinResolvedViaLog = false;
     if (shouldCheckin) {
       try {
         const checkinUrl = `/api/user/checkin?month=${encodeURIComponent(__OPENHUB_MONTH__)}`;
@@ -1474,7 +1599,45 @@ pub(crate) fn chrome_account_bridge_script(
         } else if (checkinResponse.data && checkinResponse.data.success === true) {
           checkinEnabled = checkinResponse.data.data?.enabled === true;
           checkedInToday = checkinResponse.data.data?.stats?.checked_in_today === true;
-          if (checkinEnabled && !checkedInToday) {
+        } else {
+          // 部分站点签到未启用时状态接口直接返回 success:false + 提示语（如
+          // "签到功能未启用"），并非数据异常；识别后交给下方日志兜底确认。
+          const statusMessage = messageOf(checkinResponse.data, "");
+          if (!/未启用|未开启|没有启用|not enabled|not_enabled|disabled/i.test(statusMessage)) {
+            checkinError = messageOf(checkinResponse.data, "签到状态数据无效");
+          }
+        }
+        if (!checkinEnabled && !checkinError) {
+          // 状态接口报"功能未启用"或缺少启用状态：查当天签到日志（type=4）兜底，
+          // 确认用户是否已在网页手动签到过。有记录标已签到、无记录标未签到；
+          // 日志兜底结果绝不触发自动代签。
+          const dayStart = new Date();
+          dayStart.setHours(0, 0, 0, 0);
+          const dayEnd = new Date();
+          dayEnd.setHours(23, 59, 59, 999);
+          const logResponse = await readResponse(await fetch(
+            `/api/log/self?p=1&page_size=20&type=4&start_timestamp=${Math.floor(dayStart.getTime() / 1000)}&end_timestamp=${Math.floor(dayEnd.getTime() / 1000)}`,
+            { method: "GET", credentials: "include", cache: "no-store", headers,
+              signal: AbortSignal.timeout(requestTimeout) }
+          ));
+          if (!logResponse.challenge && !logResponse.error &&
+              logResponse.status >= 200 && logResponse.status < 300 &&
+              logResponse.data && logResponse.data.success === true) {
+            const items = logResponse.data.data?.items || logResponse.data.data?.list ||
+              logResponse.data.data?.data || logResponse.data.data?.records;
+            if (Array.isArray(items)) {
+              checkinResolvedViaLog = true;
+              checkinEnabled = true;
+              checkedInToday = items.length > 0;
+              checkinError = "";
+            }
+          } else {
+            // 日志兜底失败：保留"未启用"提示，便于用户了解站点当前状态。
+            checkinError = "签到功能未启用";
+          }
+        }
+        // 仅当状态接口确认 enabled=true 且未签到、且未经过日志兜底时自动代签。
+        if (checkinEnabled && !checkedInToday && !checkinResolvedViaLog) {
             const postResponse = await readResponse(await fetch("/api/user/checkin", {
               method: "POST", credentials: "include", cache: "no-store", headers,
               signal: AbortSignal.timeout(requestTimeout)
@@ -1805,6 +1968,79 @@ async fn sync_site_account_via_chrome_inner(
     if origin == "null" {
         return Err("站点 API 地址缺少有效来源".into());
     }
+
+    // 轻量级可达性检测：用短超时 HEAD 请求探测站点是否在线，
+    // 如果 DNS 解析失败、连接被拒绝或超时则直接失败，避免拉起 Chrome。
+    // 只拦截网络层彻底不可达的情况（connect error / timeout）；
+    // HTTP 4xx/5xx（含 Cloudflare 403）视为"站点在线但需要认证"，放行。
+    {
+        emit_chrome_account_progress(
+            &app,
+            run_id,
+            "reachability",
+            "running",
+            format!("正在检测 {account_label} 站点可达性"),
+        );
+        let probe_client = build_http_client(
+            database,
+            Duration::from_secs(6),
+            3,
+            "站点可达性探测",
+        )
+        .unwrap_or_else(|_| {
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(6))
+                .no_proxy()
+                .build()
+                .expect("fallback client")
+        });
+        let probe_url = base_url.to_string();
+        match probe_client.head(&probe_url).send().await {
+            Ok(_response) => {
+                // 任何 HTTP 响应（含 4xx/5xx）都说明站点网络可达，继续正常流程。
+                emit_chrome_account_progress(
+                    &app,
+                    run_id,
+                    "reachability",
+                    "success",
+                    format!("{account_label} 站点网络可达"),
+                );
+            }
+            Err(error) => {
+                // 仅当连接层彻底不可达时快速失败：DNS 失败、连接被拒、超时等。
+                // 判断方式：is_connect() / is_timeout() / is_dns()（reqwest 0.12+）。
+                let is_unreachable = error.is_connect()
+                    || error.is_timeout()
+                    || {
+                        let msg = format!("{error:#}");
+                        msg.contains("dns error")
+                            || msg.contains("Name or service not known")
+                            || msg.contains("No address associated")
+                            || msg.contains("resolve")
+                    };
+                if is_unreachable {
+                    let reason = format!("站点不可达：{error:#}");
+                    emit_chrome_account_progress(
+                        &app,
+                        run_id,
+                        "reachability",
+                        "error",
+                        format!("{account_label} {reason}"),
+                    );
+                    return Err(reason);
+                }
+                // 其他错误（如 TLS 握手中断等）不一定意味着彻底不可达，放行让后续流程处理。
+                emit_chrome_account_progress(
+                    &app,
+                    run_id,
+                    "reachability",
+                    "success",
+                    format!("{account_label} 可达性检测遇到非致命错误，继续：{error:#}"),
+                );
+            }
+        }
+    }
+
     let home_dir = app
         .path()
         .home_dir()
@@ -2459,6 +2695,26 @@ mod tests {
     }
 
     #[test]
+    fn checkin_disabled_messages_route_to_log_fallback() {
+        // 部分站点签到关闭时返回 success:false + "签到功能未启用"提示，
+        // 需识别为未启用状态（走日志兜底），而不是解析失败。
+        assert!(is_checkin_disabled_message("签到功能未启用"));
+        assert!(is_checkin_disabled_message("签到功能尚未开启"));
+        assert!(is_checkin_disabled_message("checkin not enabled"));
+        assert!(!is_checkin_disabled_message("签到状态接口 HTTP 500"));
+        assert!(!is_checkin_disabled_message("今日已签到"));
+        // parse 层面：success=false + 未启用提示 → Ok((false, false))。
+        let value = serde_json::json!({
+            "success": false,
+            "message": "签到功能未启用",
+        });
+        assert_eq!(parse_newapi_checkin_status(&value), Ok((false, false)));
+        // 其他失败仍按解析失败处理。
+        let failed = serde_json::json!({ "success": false, "message": "未登录" });
+        assert!(parse_newapi_checkin_status(&failed).is_err());
+    }
+
+    #[test]
     fn chrome_account_bridge_script_always_includes_credentials() {
         let script =
             chrome_account_bridge_script(Some("42"), "2026-08", "openhub-test", false, true, true);
@@ -2466,5 +2722,75 @@ mod tests {
         assert!(!script.contains("credentials: useSessionCookies"));
         assert!(script.contains("method: \"GET\", credentials: \"include\""));
         assert!(script.contains("method: \"POST\", credentials: \"include\""));
+    }
+
+    #[test]
+    fn parse_newapi_checkin_logs_accepts_today_records() {
+        // 当天有签到记录：items 非空。
+        let value = serde_json::json!({
+            "success": true,
+            "message": "",
+            "data": { "items": [{ "id": 1, "type": 4, "created_at": 1786982400 }] }
+        });
+        assert_eq!(parse_newapi_checkin_logs(&value), Ok(true));
+        // 当天无签到记录：items 为空数组。
+        let empty = serde_json::json!({
+            "success": true,
+            "data": { "items": [], "pagination": { "total": 0 } }
+        });
+        assert_eq!(parse_newapi_checkin_logs(&empty), Ok(false));
+    }
+
+    #[test]
+    fn parse_newapi_checkin_logs_accepts_loose_shapes() {
+        // 部分实现把记录直接放在 data.list / data.data / data 下。
+        for data in [
+            serde_json::json!([{ "id": 1 }]),
+            serde_json::json!({ "list": [{ "id": 1 }] }),
+            serde_json::json!({ "records": [{ "id": 1 }] }),
+        ] {
+            let value = serde_json::json!({ "success": true, "data": data });
+            assert_eq!(parse_newapi_checkin_logs(&value), Ok(true), "{data}");
+        }
+    }
+
+    #[test]
+    fn parse_newapi_checkin_logs_rejects_bad_responses() {
+        // success=false 或缺少记录列表都视为无法确认。
+        let failed = serde_json::json!({ "success": false, "message": "未登录" });
+        assert!(parse_newapi_checkin_logs(&failed).is_err());
+        let missing = serde_json::json!({ "success": true, "data": { "pagination": {} } });
+        assert!(parse_newapi_checkin_logs(&missing).is_err());
+    }
+
+    #[test]
+    fn local_day_unix_range_spans_exactly_one_day() {
+        let (start, end) = local_day_unix_range();
+        // 区间长度固定为 86400 秒（23:59:59 - 00:00:00）。
+        assert_eq!(end - start, 86_399);
+        // start 转回本地时区后应落在本地当天 00:00:00（秒偏移为 0）。
+        assert_eq!((start + local_utc_offset_secs()) % 86_400, 0);
+        // 区间覆盖当前时刻。
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|value| value.as_secs() as i64)
+            .unwrap_or(0);
+        assert!(start <= now && now <= end);
+    }
+
+    #[test]
+    fn chrome_account_bridge_script_includes_checkin_log_fallback() {
+        let script =
+            chrome_account_bridge_script(Some("42"), "2026-08", "openhub-test", false, true, true);
+        // 状态接口报"功能未启用"（含 success:false + 提示语）时应携带当天签到日志查询
+        // （type=4 过滤），兜底结果标记 checkinResolvedViaLog，绝不触发自动代签。
+        assert!(script.contains("/api/log/self"));
+        assert!(script.contains("type=4"));
+        assert!(script.contains("start_timestamp="));
+        assert!(script.contains("end_timestamp="));
+        assert!(script.contains("未启用|未开启|没有启用|not enabled|not_enabled|disabled"));
+        assert!(script.contains("checkinResolvedViaLog"));
+        assert!(script.contains("!checkinResolvedViaLog"));
+        assert!(script.contains("checkinEnabled && !checkedInToday"));
     }
 }

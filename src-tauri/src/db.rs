@@ -367,6 +367,7 @@ impl Database {
         ensure_charity_sync_log_columns(&connection)?;
         ensure_charity_feed_sources_table(&connection)?;
         ensure_proxy_pool_node_columns(&connection)?;
+        ensure_opencode_proxy_logs_table(&connection)?;
         reset_expired_checkin_states(&connection)?;
 
         let has_system_type: i64 = connection
@@ -682,6 +683,17 @@ pub(crate) fn ensure_site_account_columns(connection: &Connection) -> Result<(),
                 .map_err(|error| error.to_string())?;
         }
     }
+    // 自动修复历史残留的 Chrome 默认占位名（'您的 Chrome' / 'Default' / '个人资料 1'）
+    let _ = connection.execute(
+        "UPDATE site_accounts
+         SET profile_name = CASE
+             WHEN account_name != '' THEN account_name
+             WHEN username != '' THEN username
+             ELSE profile_name
+         END
+         WHERE profile_name IN ('您的 Chrome', 'Default', '个人资料 1', 'Person 1', 'Profile 1')",
+        [],
+    );
     Ok(())
 }
 
@@ -806,6 +818,50 @@ pub(crate) fn ensure_charity_feed_metric_columns(connection: &Connection) -> Res
     Ok(())
 }
 
+pub(crate) fn ensure_opencode_proxy_logs_table(connection: &Connection) -> Result<(), String> {
+    connection
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS opencode_proxy_logs (
+                id TEXT PRIMARY KEY,
+                timestamp TEXT NOT NULL,
+                method TEXT NOT NULL,
+                path TEXT NOT NULL,
+                channel_id TEXT NOT NULL,
+                model TEXT NOT NULL,
+                stream INTEGER NOT NULL,
+                status_code INTEGER NOT NULL,
+                duration_ms INTEGER NOT NULL,
+                ttft_ms INTEGER,
+                prompt_tokens INTEGER,
+                prompt_cache_hit_tokens INTEGER,
+                prompt_cache_miss_tokens INTEGER,
+                completion_tokens INTEGER,
+                reasoning_tokens INTEGER,
+                total_tokens INTEGER,
+                error_message TEXT,
+                request_body TEXT,
+                response_body TEXT,
+                node_name TEXT,
+                created_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_opencode_proxy_logs_created ON opencode_proxy_logs(created_at DESC);",
+        )
+        .map_err(|e| e.to_string())?;
+
+    let has_node_name: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('opencode_proxy_logs') WHERE name='node_name'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    if has_node_name == 0 {
+        let _ = connection.execute("ALTER TABLE opencode_proxy_logs ADD COLUMN node_name TEXT", []);
+    }
+
+    Ok(())
+}
+
 fn ensure_charity_sync_log_columns(connection: &Connection) -> Result<(), String> {
     let has_duration: i64 = connection
         .query_row(
@@ -860,7 +916,15 @@ pub(crate) fn read_cached_usage_sites(
                     domain: row.get(2)?,
                     cookie_count: row.get::<_, i64>(3)?.max(0) as usize,
                     cookie_names: serde_json::from_str(&cookie_names_json).unwrap_or_default(),
-                    profile_name: row.get(5)?,
+                    profile_name: {
+                        let raw: String = row.get(5)?;
+                        let account: String = row.get(6)?;
+                        if (raw == "您的 Chrome" || raw == "Default" || raw.starts_with("个人资料")) && !account.is_empty() {
+                            account
+                        } else {
+                            raw
+                        }
+                    },
                     account_name: row.get(6)?,
                     username: row.get(7)?,
                     api_key_count: row.get::<_, i64>(8)?.max(0) as usize,

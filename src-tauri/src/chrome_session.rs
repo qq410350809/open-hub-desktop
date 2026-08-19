@@ -1268,17 +1268,46 @@ fn chrome_profiles(local_state: &serde_json::Value) -> Vec<ChromeProfile> {
         .filter(|id| is_safe_profile_dir(id) && seen.insert(id.clone()))
         .filter_map(|id| {
             let info = info_cache.get(&id)?;
+            let raw_name = info
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(&id)
+                .trim();
+            let gaia_name = info
+                .get("gaia_name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .trim();
+            let user_name = info
+                .get("user_name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .trim();
+
+            let is_generic = raw_name.is_empty()
+                || raw_name == "您的 Chrome"
+                || raw_name == "Default"
+                || raw_name.starts_with("个人资料")
+                || raw_name.starts_with("Person ")
+                || raw_name.starts_with("Profile ");
+
+            let name = if is_generic && !gaia_name.is_empty() {
+                gaia_name.to_string()
+            } else if is_generic && !user_name.is_empty() {
+                user_name.to_string()
+            } else if !raw_name.is_empty() {
+                raw_name.to_string()
+            } else if !gaia_name.is_empty() {
+                gaia_name.to_string()
+            } else if !user_name.is_empty() {
+                user_name.to_string()
+            } else {
+                id.clone()
+            };
+
             Some(ChromeProfile {
-                name: info
-                    .get("name")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or(&id)
-                    .to_string(),
-                account_name: info
-                    .get("user_name")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
+                name,
+                account_name: user_name.to_string(),
                 id,
             })
         })

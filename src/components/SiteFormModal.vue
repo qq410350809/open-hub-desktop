@@ -356,7 +356,7 @@ function onBackdropClick(event: MouseEvent) {
                   <small>手动指定站点使用的系统类型</small>
                 </label>
                 <label class="field field-wide">
-                  <span>API BASE URL <b>*</b></span>
+                  <span>API 接口地址 <b>*</b></span>
                   <input
                     v-model="form.apiBaseUrl"
                     name="apiBaseUrl"
@@ -376,14 +376,14 @@ function onBackdropClick(event: MouseEvent) {
                   />
                 </label>
                 <label class="field">
-                  <span>等级限制（LV）</span>
+                  <span>等级限制</span>
                   <CustomSelect
                     :options="registrationLevelOptions"
                     :model-value="form.registrationLimit"
                     @update:model-value="val => form.registrationLimit = Number(val)"
                     aria-label="等级限制"
                   />
-                  <small>等级限制范围为 0–3</small>
+                  <small>等级限制范围为 0–3 级</small>
                 </label>
                 <label class="field">
                   <span>速率限制</span>
@@ -402,7 +402,7 @@ function onBackdropClick(event: MouseEvent) {
                   </span>
                 </label>
                 <label class="field field-wide">
-                  <span>TAGS（支持的模型/功能）</span>
+                  <span>标签（支持的模型与功能）</span>
                   <input
                     v-model="form.tags"
                     name="tags"

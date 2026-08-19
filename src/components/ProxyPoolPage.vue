@@ -997,11 +997,11 @@ watch(nodeViewMode, () => {
         </div>
       </section>
 
-      <!-- 代理通道出口管理阵列 (Fixed Egress Channels) -->
+      <!-- 代理通道出口管理阵列 -->
       <section class="pp-channels-section" aria-label="代理通道">
         <div class="pp-channels-header">
           <div class="pp-channels-title-group">
-            <h2>固定出口通道 (Proxy Channels)</h2>
+            <h2>固定出口通道</h2>
             <p>每个 Chrome 账号归属一个通道，账号下的所有站点共享该通道固定出口与实测节点</p>
           </div>
           <button type="button" class="pp-btn-secondary pp-btn-sm" @click="addChannel">
@@ -1385,7 +1385,7 @@ watch(nodeViewMode, () => {
           <section class="pp-modal-card is-import" role="dialog" aria-modal="true">
             <header class="pp-modal-header">
               <div class="pp-modal-title-group">
-                <div class="pp-modal-eyebrow">PROXY SUBSCRIPTION & NODES</div>
+                <div class="pp-modal-eyebrow">代理订阅与节点管理</div>
                 <h2>{{ editingId ? "编辑订阅来源" : "导入代理订阅与节点" }}</h2>
               </div>
               <button type="button" class="pp-modal-close-btn" aria-label="关闭" @click="closeImportDialog">×</button>
@@ -1551,7 +1551,7 @@ watch(nodeViewMode, () => {
           <section class="pp-modal-card is-channel-dialog" role="dialog" aria-modal="true">
             <header class="pp-modal-header">
               <div class="pp-modal-title-group">
-                <div class="pp-modal-eyebrow">EGRESS CHANNEL ROUTING</div>
+                <div class="pp-modal-eyebrow">出口通道路由</div>
                 <h2>{{ channelEditingId ? "配置代理通道" : "新建代理通道" }}</h2>
                 <p>一个 Chrome 账号只归属一个固定通道出口，账号下的所有站点共享固定节点</p>
               </div>
@@ -1704,7 +1704,7 @@ watch(nodeViewMode, () => {
 
             <div class="pp-modal-body">
               <div class="pp-settings-field-group">
-                <label class="pp-label">直连与忽略地址名单 (Bypass Direct Addresses)</label>
+                <label class="pp-label">直连与忽略地址名单</label>
                 <textarea
                   v-model="ignoreAddresses"
                   class="pp-textarea is-rules"

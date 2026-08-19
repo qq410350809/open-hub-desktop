@@ -13,6 +13,32 @@ use tauri::{Manager, State};
 use url::Url;
 
 #[tauri::command]
+pub fn delete_site_account(
+    database: State<'_, Database>,
+    site_id: String,
+    profile_id: String,
+) -> Result<(), String> {
+    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    let deleted = connection
+        .execute(
+            "DELETE FROM site_accounts WHERE site_id = ?1 AND profile_id = ?2",
+            params![site_id, profile_id],
+        )
+        .map_err(|error| error.to_string())?;
+    if deleted == 0 {
+        return Err("未找到该账号记录".to_string());
+    }
+    // 连带清理该账号的模型/Key 缓存，避免残留旧数据。
+    connection
+        .execute(
+            "DELETE FROM site_model_cache WHERE site_id = ?1 AND profile_id = ?2",
+            params![site_id, profile_id],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
 pub async fn mark_sites_with_chrome_sessions(
     app: tauri::AppHandle,
     database: State<'_, Database>,

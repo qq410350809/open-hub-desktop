@@ -14,6 +14,7 @@ mod model_catalog;
 pub use model_catalog::sync_model_catalog_once;
 mod models_fetch;
 mod gateway;
+mod opencode_proxy;
 mod platform_detect;
 mod proxy_pool;
 mod remote_sync;
@@ -934,7 +935,8 @@ mod tests {
         assert!(script.contains("fetch(\"/api/user/self\""));
         assert!(script.contains("`/api/user/checkin?month=${encodeURIComponent(\"2026-08\")}`"));
         assert!(script.contains("fetch(\"/api/user/checkin\""));
-        assert_eq!(script.matches("fetch(").count(), 5);
+        assert!(script.contains("`/api/log/self?p=1&page_size=20&type=4&start_timestamp="));
+        assert_eq!(script.matches("fetch(").count(), 6);
         assert!(!script.contains("http://"));
         assert!(!script.contains("https://"));
         assert!(!script.contains("turnstile"));
@@ -970,7 +972,7 @@ mod tests {
             script
                 .matches("AbortSignal.timeout(requestTimeout)")
                 .count(),
-            5
+            6
         );
         assert!(!script.contains("account: accessToken"));
         assert!(!script.contains("if (Date.now() - previous.started < 3000) return pending;"));
@@ -1090,12 +1092,15 @@ pub fn run() {
             let auto_sync_runtime = auto_sync::AutoSyncRuntime::default();
             let model_catalog_runtime = model_catalog::ModelCatalogRuntime::new();
             let gateway_state = gateway::GatewayState::new();
+            let opencode_proxy_state =
+                opencode_proxy::OpencodeProxyState::new_with_app(Some(app.handle().clone()));
             app.manage(database);
             app.manage(proxy_runtime);
             app.manage(charity_runtime);
             app.manage(auto_sync_runtime);
             app.manage(model_catalog_runtime);
             app.manage(gateway_state);
+            app.manage(opencode_proxy_state);
             // 启动时清理历史订阅里遗留的测速结果后缀，避免旧库节点名继续显示脏数据。
             if let Err(error) =
                 proxy_pool::repair_stored_node_names(&app.state::<crate::models::Database>())
@@ -1149,8 +1154,21 @@ pub fn run() {
                 // 启动本地 Key 聚合轮询代理网关
                 let database = restore_handle.state::<crate::models::Database>();
                 let gw_state = restore_handle.state::<crate::gateway::GatewayState>();
-                if let Err(e) = gateway::start_gateway(database, gw_state, None).await {
+                if let Err(e) = gateway::start_gateway(database.clone(), gw_state, None).await {
                     eprintln!("[OpenHub] 本地聚合网关启动失败: {e}");
+                }
+
+                // 启动 OpenCode 独立反代服务
+                let proxy_state = restore_handle.state::<crate::opencode_proxy::OpencodeProxyState>();
+                let proxy_cfg = {
+                    let conn = database.0.lock().ok();
+                    conn.map(|c| opencode_proxy::load_opencode_proxy_config(&c)).unwrap_or_default()
+                };
+                *proxy_state.context.config.write().await = proxy_cfg.clone();
+                if proxy_cfg.enabled {
+                    if let Err(e) = opencode_proxy::start_opencode_proxy_server(&proxy_state).await {
+                        eprintln!("[OpenHub] OpenCode 反代服务启动失败: {e}");
+                    }
                 }
             });
 
@@ -1198,6 +1216,7 @@ pub fn run() {
             proxy_pool::cancel_proxy_node_tests,
             remote_sync::get_remote_user,
             chrome_usage::mark_sites_with_chrome_sessions,
+            chrome_usage::delete_site_account,
             account_sync::sync_site_account_via_chrome,
             auto_sync::get_auto_sync_settings,
             auto_sync::set_auto_sync_settings,
@@ -1247,6 +1266,15 @@ pub fn run() {
             gateway::stop_gateway,
             gateway::update_gateway_config,
             gateway::reload_gateway_candidates,
+            opencode_proxy::get_opencode_proxy_config,
+            opencode_proxy::save_opencode_proxy_config_cmd,
+            opencode_proxy::get_opencode_proxy_status,
+            opencode_proxy::start_opencode_proxy,
+            opencode_proxy::stop_opencode_proxy,
+            opencode_proxy::fetch_opencode_models,
+            opencode_proxy::test_opencode_proxy_health,
+            opencode_proxy::get_opencode_proxy_logs,
+            opencode_proxy::clear_opencode_proxy_logs,
             file_export::save_export_file
         ])
         .build(tauri::generate_context!())

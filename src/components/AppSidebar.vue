@@ -1,12 +1,18 @@
 <script setup lang="ts">
-import { computed } from "vue";
+import { computed, onMounted } from "vue";
 import { icons } from "../icons";
 import { useStore } from "../composables/useStore";
 import { usePreferences } from "../composables/usePreferences";
+import { useModelProxy } from "../composables/useModelProxy";
 import { formatCompact, localDateOf, toLocalDate } from "../composables/tokenStatsAgg";
 
 const store = useStore();
 const { preferences, updatePreferences } = usePreferences();
+const { proxyStatus, refreshStatus: refreshProxyStatus } = useModelProxy();
+
+onMounted(() => {
+  refreshProxyStatus();
+});
 
 const navItems = computed(() => [
   {
@@ -50,6 +56,14 @@ const navItems = computed(() => [
     onClick: () => store.openModelAgg(),
   },
   {
+    id: "modelproxy",
+    label: "模型反代",
+    icon: icons.repeat,
+    active: store.page.value === "modelproxy",
+    badge: todayProxyTokenBadge.value,
+    onClick: () => store.openModelProxy(),
+  },
+  {
     id: "charity",
     label: "公益监听",
     icon: icons.heartPulse,
@@ -89,6 +103,14 @@ const todayTokenBadge = computed(() =>
   todayTokenTotal.value > 0 ? formatCompact(todayTokenTotal.value) : "",
 );
 
+// 模型反代今日消耗的 Token 统计（用于侧边栏模型反代徽标，0 不显示）
+const todayProxyTokenTotal = computed(() => {
+  return proxyStatus.value?.todayTotalTokens || 0;
+});
+const todayProxyTokenBadge = computed(() =>
+  todayProxyTokenTotal.value > 0 ? formatCompact(todayProxyTokenTotal.value) : "",
+);
+
 function toggleSidebar() {
   updatePreferences({ sidebarCollapsed: !preferences.sidebarCollapsed });
 }
@@ -126,15 +148,17 @@ function toggleSidebar() {
         class="icon-button sidebar-collapse"
         id="sidebar-collapse"
         type="button"
+        :title="preferences.sidebarCollapsed ? '展开侧栏' : '收起侧栏'"
         :aria-label="preferences.sidebarCollapsed ? '展开侧栏' : '收起侧栏'"
         @click="toggleSidebar"
         v-html="preferences.sidebarCollapsed ? icons.sidebarOpen : icons.sidebarClose"
       />
       <button
-        class="icon-button"
+        class="icon-button sidebar-settings"
         id="settings-toggle"
         type="button"
         :class="{ active: store.page.value === 'settings' }"
+        title="系统设置"
         aria-label="打开设置"
         @click="store.openSettings()"
         v-html="icons.settings"

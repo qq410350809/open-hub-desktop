@@ -93,6 +93,16 @@ async function copySession(session: ChromeSessionInfo) {
 async function syncViaChrome(session: ChromeSessionInfo) {
   await store.syncAccountViaChrome(session);
 }
+
+async function openSiteInBrowser(session: ChromeSessionInfo) {
+  const site = store.chromeSessionSite.value;
+  const targetUrl = site?.apiBaseUrl || (session.domain ? `https://${session.domain}` : "");
+  if (!targetUrl) {
+    store.showToast("未找到站点的有效网址", true);
+    return;
+  }
+  await store.openExternalInChromeProfile(targetUrl, session.profileId);
+}
 </script>
 
 <template>
@@ -201,6 +211,14 @@ async function syncViaChrome(session: ChromeSessionInfo) {
             <span class="chrome-cookie-count">{{ session.cookieCount }} 个</span>
             <div class="chrome-session-actions">
               <button
+                class="chrome-browser-open"
+                type="button"
+                :aria-label="`使用 ${session.profileName} 在浏览器中打开此站点`"
+                title="在浏览器中打开此站点"
+                @click="openSiteInBrowser(session)"
+                v-html="icons.external"
+              />
+              <button
                 v-if="store.canSyncAccountViaChrome(session)"
                 class="chrome-browser-sync"
                 type="button"
@@ -208,7 +226,7 @@ async function syncViaChrome(session: ChromeSessionInfo) {
                 title="使用 Chrome 同步"
                 :disabled="store.chromeSessionSyncActive.value"
                 @click="syncViaChrome(session)"
-                v-html="icons.globe"
+                v-html="icons.restore"
               />
               <button
                 class="copy-address"

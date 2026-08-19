@@ -717,7 +717,7 @@ onUnmounted(() => {
               <div class="cm-modal-title-group">
                 <div class="cm-modal-eyebrow">
                   <span v-if="selectedPost.pinned" class="cm-pin-badge" v-html="icons.pin" />
-                  <span>LINUX.DO TOPIC DETAIL</span>
+                  <span>公益帖子详情</span>
                 </div>
                 <h2>{{ selectedPost.title }}</h2>
               </div>

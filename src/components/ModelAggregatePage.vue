@@ -867,7 +867,7 @@ function onDragEnd() {
           >
             <header class="ma-modal-header">
               <div class="ma-modal-title-group">
-                <div class="ma-modal-eyebrow">OPENAI / CLAUDE COMPATIBLE GATEWAY</div>
+                <div class="ma-modal-eyebrow">OpenAI / Claude 兼容网关</div>
                 <h2 id="ma-gw-title">API 密钥与本地网关管理</h2>
                 <p>统一本地 OpenAI / Claude 兼容端点，支持为不同客户端（Cursor, Claude Code, Chatbox 等）分配独立 API Key。</p>
               </div>
@@ -878,7 +878,7 @@ function onDragEnd() {
               <!-- 统一端点卡片 -->
               <div class="ma-gw-endpoint-card">
                 <div class="ma-gw-endpoint-info">
-                  <span class="ma-gw-label">本地网关基础地址 (Base URL)</span>
+                  <span class="ma-gw-label">本地网关基础接口地址</span>
                   <code class="ma-gw-url-box">http://127.0.0.1:{{ store.preferences.gatewayPort || 17896 }}/v1</code>
                 </div>
                 <button type="button" class="ma-btn-secondary ma-btn-sm" @click="copyGatewayUrl()">

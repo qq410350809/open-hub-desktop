@@ -23,6 +23,7 @@ import ProxyPoolPage from "./components/ProxyPoolPage.vue";
 import TokenStatsPage from "./components/TokenStatsPage.vue";
 import ModelCatalogPage from "./components/ModelCatalogPage.vue";
 import ModelAggregatePage from "./components/ModelAggregatePage.vue";
+import ModelProxyPage from "./components/ModelProxyPage.vue";
 
 const store = useStore();
 const { preferences } = usePreferences();
@@ -94,6 +95,7 @@ function onMenuNavigate(event: Event) {
   if (page === "library") store.openLibrary();
   else if (page === "modelparams") store.openModelParams();
   else if (page === "modelagg") store.openModelAgg();
+  else if (page === "modelproxy") store.openModelProxy();
   else if (page === "charity") store.openCharityMonitor();
   else if (page === "proxy") store.openProxyPool();
   else if (page === "tokenstats") store.openTokenStats();
@@ -191,6 +193,14 @@ onUnmounted(() => {
           aria-labelledby="modelagg-nav"
         >
           <ModelAggregatePage />
+        </div>
+        <div
+          v-else-if="store.page.value === 'modelproxy'"
+          id="model-proxy-panel"
+          class="modelproxy-panel"
+          aria-labelledby="modelproxy-nav"
+        >
+          <ModelProxyPage />
         </div>
         <div
           v-else-if="store.page.value === 'charity'"

@@ -26,14 +26,18 @@ serde_yaml = "0.9"
 base64 = "0.22"
 sha2 = "0.10"
 hex = "0.4"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+bytes = "1"
 
 percent-encoding = "2"
+libc = "0.2"
 maxminddb = "0.30"
 rfd = "0.17"
 futures-util = "0.3"
 tokio-util = "0.7"
 tokio = { version = "1", features = ["time", "rt", "rt-multi-thread", "macros", "sync", "net", "io-util"] }
 axum = "0.8"
+async-stream = "0.3"
 tower-http = { version = "0.6", features = ["cors"] }
 zstd = "0.13"
 

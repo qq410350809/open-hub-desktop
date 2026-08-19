@@ -545,6 +545,28 @@ async function copyText(text: string, label = "内容") {
   setTimeout(() => (idCopied.value = false), 2000);
 }
 
+async function copySessionCookie(site: SiteRecord, session: ChromeSessionInfo) {
+  const url = site.checkinUrl?.trim() || site.apiBaseUrl?.trim() || "";
+  if (!url) {
+    store.showToast("该站点地址无效", true);
+    return;
+  }
+  try {
+    const value = await runCommand<{ cookie: string; cookieCount: number; profileName: string }>("read_chrome_session", {
+      url,
+      profileId: session.profileId,
+    });
+    if (value?.cookie) {
+      await navigator.clipboard.writeText(value.cookie);
+      store.showToast(`已复制「${value.profileName}」的 ${value.cookieCount} 个 Cookie 到剪贴板`);
+    } else {
+      store.showToast("未检测到有效 Cookie", true);
+    }
+  } catch (err) {
+    store.showToast(`读取 Cookie 失败: ${String(err)}`, true);
+  }
+}
+
 function maskApiKey(key: string): string {
   const value = key.trim();
   if (!value) return "—";
@@ -606,14 +628,6 @@ async function batchSyncSession() {
     store.openSyncDialog("quota", hasPending ? "pending" : "personal", batchSelectedIds.value);
   }
   clearBatchSelection();
-}
-
-function openQuotaAndSessionSync() {
-  if (selectedUsageTab.value === "pending") {
-    store.openSyncDialog("quota", "pending");
-  } else {
-    store.openSyncDialog("quota", "personal");
-  }
 }
 
 // —— 键盘快捷键 (⌘ K 聚焦搜索) ——
@@ -696,17 +710,6 @@ onUnmounted(() => {
               <small>已收录 {{ store.sites.value.length }} 个站点 · {{ metrics.totalAccounts }} 个会话</small>
             </div>
           </div>
-
-          <button
-            type="button"
-            class="sl-btn-secondary"
-            :disabled="store.syncingSites.value || store.syncingModelKeys.value"
-            title="一键同步已关联站点的 Chrome 账号额度与会话"
-            @click="openQuotaAndSessionSync"
-          >
-            <span :class="{ 'is-spinning': store.syncingSites.value || store.syncingModelKeys.value }" v-html="icons.restore" />
-            <span>额度与会话同步</span>
-          </button>
 
           <button
             type="button"
@@ -1394,69 +1397,154 @@ onUnmounted(() => {
           </button>
         </div>
 
-        <div class="sl-topology-grid">
+        <div v-if="!filteredSites.length" class="sl-empty-state">
+          <span v-html="icons.search" />
+          <h3>未找到匹配的站点</h3>
+          <p>请尝试重置筛选条件或更改搜索关键字</p>
+          <button type="button" class="sl-btn-secondary" @click="resetAllFilters">
+            清除全部筛选
+          </button>
+        </div>
+
+        <div v-else class="sl-topology-grid">
           <article
-            v-for="site in filteredSites"
+            v-for="site in paginatedSites"
             :key="site.id"
             class="sl-topo-card"
-            :class="{ 'has-sessions': getSiteSessions(site.id).length > 0 }"
+            :class="{
+              'has-sessions': getSiteSessions(site.id).length > 0,
+              'is-selected': selectedSiteId === site.id,
+              'is-runaway': site.isRunaway,
+              'is-personal': site.isPersonal,
+              'is-pending': site.isPending,
+            }"
+            @click="openModelDetail(site)"
           >
-            <div class="sl-topo-card-head">
-              <div class="sl-topo-site-id">
+            <!-- 拓扑卡片头部：标识 + 状态徽章 + 多选 + 快捷操作 -->
+            <div class="sl-topo-card-head" @click.stop>
+              <div class="sl-topo-site-id" @click="openModelDetail(site)">
                 <span class="sl-card-avatar sl-avatar-sm" :class="`sl-tone-${systemTone(site.systemType)}`">
                   {{ siteInitials(site.apiBaseUrl, site.name) }}
                 </span>
-                <div>
-                  <strong>{{ site.name }}</strong>
-                  <span class="sl-pill sl-pill-system" :class="`sl-pill-${systemTone(site.systemType)}`">
-                    {{ systemTypeLabel(site.systemType) || "未知架构" }}
-                  </span>
+                <div class="sl-topo-title-box">
+                  <div class="sl-topo-title-row">
+                    <strong :title="site.name">{{ site.name }}</strong>
+                    <span class="sl-pill sl-pill-system" :class="`sl-pill-${systemTone(site.systemType)}`">
+                      {{ systemTypeLabel(site.systemType) || "未知架构" }}
+                    </span>
+                    <span v-if="site.isRunaway" class="sl-pill sl-pill-runaway">已跑路</span>
+                    <span v-else-if="site.isPersonal" class="sl-pill sl-pill-personal">在用</span>
+                    <span v-else-if="site.isPending" class="sl-pill sl-pill-pending">待定</span>
+                    <span v-if="site.isFakeCharity" class="sl-pill sl-pill-fake">伪公益</span>
+                  </div>
+                  <small class="sl-card-url" :title="site.apiBaseUrl">{{ site.apiBaseUrl }}</small>
                 </div>
               </div>
 
               <div class="sl-topo-head-actions">
+                <!-- 批量选择按钮 -->
                 <button
                   type="button"
-                  class="sl-btn-xs"
-                  @click="store.syncChromeSession(site, $event.currentTarget as HTMLElement)"
+                  class="sl-topo-head-btn sl-topo-select-btn"
+                  :class="{ active: batchSelectedIds.includes(site.id) }"
+                  title="选择此站点进行批量操作"
+                  @click.stop="toggleSelectSite(site.id)"
+                >
+                  <span v-html="batchSelectedIds.includes(site.id) ? icons.check : icons.plus" />
+                </button>
+
+                <!-- 同步会话 -->
+                <button
+                  type="button"
+                  class="sl-topo-head-btn sl-topo-sync-btn"
+                  :class="{ 'is-syncing': store.chromeSessionSyncActive.value && store.chromeSessionSite.value?.id === site.id }"
+                  title="提取或同步此站点的 Chrome 会话与额度"
+                  @click.stop="store.syncChromeSession(site, $event.currentTarget as HTMLElement)"
                 >
                   <span v-html="icons.restore" />
-                  <span>同步会话</span>
+                </button>
+
+                <!-- 编辑站点 -->
+                <button
+                  type="button"
+                  class="sl-topo-head-btn sl-topo-edit-btn"
+                  title="编辑此站点信息"
+                  @click.stop="store.openModal(site)"
+                >
+                  <span v-html="icons.edit" />
                 </button>
               </div>
             </div>
 
+
             <!-- 会话账号列表 -->
-            <div class="sl-topo-sessions-list">
+            <div class="sl-topo-sessions-list" @click.stop>
               <template v-if="getSiteSessions(site.id).length > 0">
                 <div
                   v-for="session in getSiteSessions(site.id)"
                   :key="session.profileId"
                   class="sl-topo-session-row"
-                  :class="{ 'has-error': session.syncError || session.checkinError }"
+                  :class="{ 'has-error': session.syncError || session.checkinError || session.apiSyncError }"
                 >
                   <div class="sl-topo-session-meta">
-                    <span v-html="icons.user" />
-                    <div>
+                    <span class="sl-topo-user-icon" v-html="icons.user" />
+                    <div class="sl-topo-user-info">
                       <div class="sl-topo-user-line">
                         <strong>{{ session.username || session.accountName || session.profileName }}</strong>
                         <span v-if="session.newapiUserId" class="sl-user-id-pill">ID: {{ session.newapiUserId }}</span>
-                        <span v-if="session.hasAccessToken" class="sl-token-pill active">已取令牌</span>
-                        <span v-else class="sl-token-pill">无令牌</span>
+                        <span v-if="session.hasAccessToken" class="sl-token-pill active" title="已从 Chrome 会话中获取访问令牌">已取令牌</span>
+                        <span v-else class="sl-token-pill" title="未获取到访问令牌，需刷新">无令牌</span>
+                        <span v-if="session.checkedInToday" class="sl-token-pill sl-token-checked">今日已签到</span>
+                        <span v-else-if="session.checkinEnabled" class="sl-token-pill sl-token-uncheck">今日未签到</span>
                       </div>
                       <small class="sl-topo-subline">
                         <span>配置：{{ session.profileName || "默认配置" }}</span>
-                        <span v-if="session.checkedInToday" class="text-success">· 今日已签到</span>
-                        <span v-else-if="session.checkinEnabled" class="text-warning">· 今日未签到</span>
+                        <span v-if="session.accountUpdatedAt" class="sl-topo-subtime">· {{ formatDate(session.accountUpdatedAt) }}</span>
                       </small>
+                      <!-- 错误提示 -->
+                      <div v-if="session.syncError || session.checkinError" class="sl-topo-err-hint" :title="session.syncError || session.checkinError">
+                        <span v-html="icons.info" />
+                        <span>{{ session.syncError || session.checkinError }}</span>
+                      </div>
                     </div>
                   </div>
 
-                  <div class="sl-topo-session-quota">
-                    <strong class="font-mono text-brand">{{ session.remaining !== null ? `${session.remaining} ${session.unit || ''}` : '未同步额度' }}</strong>
-                    <small v-if="session.apiKeyCount || session.apiModelCount">
-                      {{ session.apiKeyCount || 0 }} Key · {{ session.apiModelCount || 0 }} 模型
-                    </small>
+                  <div class="sl-topo-session-right">
+                    <div class="sl-topo-session-quota">
+                      <strong class="font-mono text-brand">{{ session.remaining !== null ? `${session.remaining} ${session.unit || ''}` : '未同步额度' }}</strong>
+                      <small v-if="session.apiKeyCount || session.apiModelCount">
+                        {{ session.apiKeyCount || 0 }} Key · {{ session.apiModelCount || 0 }} 模型
+                      </small>
+                    </div>
+                    <div class="sl-topo-session-btns">
+                      <!-- 复制 Cookie 按钮 -->
+                      <button
+                        type="button"
+                        class="sl-action-icon-btn"
+                        :title="`复制「${session.profileName}」的 Chrome Cookie`"
+                        @click.stop="copySessionCookie(site, session)"
+                      >
+                        <span v-html="icons.copy" />
+                      </button>
+                      <!-- 在 Chrome 对应配置中打开站点 -->
+                      <button
+                        type="button"
+                        class="sl-action-icon-btn sl-topo-open-btn"
+                        :title="`使用 ${session.profileName} 在 Chrome 中快捷打开此站点`"
+                        @click.stop="store.openExternalInChromeProfile(site.apiBaseUrl, session.profileId)"
+                      >
+                        <span v-html="icons.external" />
+                      </button>
+                      <!-- 删除会话账号（解除关联） -->
+                      <button
+                        type="button"
+                        class="sl-action-icon-btn sl-topo-delete-btn"
+                        :title="`删除「${session.profileName}」会话账号，解除与本站点的关联`"
+                        @click.stop="store.deleteSiteAccount(site, session)"
+                      >
+                        <span v-html="icons.trash" />
+                      </button>
+                    </div>
                   </div>
                 </div>
               </template>
@@ -1472,8 +1560,94 @@ onUnmounted(() => {
                 </button>
               </div>
             </div>
+
+            <!-- 卡片底栏：快捷链接、模型详情入口与状态切换 -->
+            <div class="sl-topo-card-footer" @click.stop>
+              <div class="sl-card-links">
+                <button
+                  v-if="site.apiBaseUrl"
+                  type="button"
+                  class="sl-link-btn"
+                  title="API 接口地址"
+                  @click="store.openLinkDialog(site, 'api', $event.currentTarget as HTMLElement)"
+                >
+                  <span v-html="icons.link" />
+                </button>
+                <button
+                  v-if="site.checkinUrl"
+                  type="button"
+                  class="sl-link-btn active"
+                  title="签到页面地址"
+                  @click="store.openLinkDialog(site, 'checkin', $event.currentTarget as HTMLElement)"
+                >
+                  <span v-html="icons.calendar" />
+                </button>
+                <button
+                  v-if="site.benefitUrl"
+                  type="button"
+                  class="sl-link-btn"
+                  title="福利站地址"
+                  @click="store.openLinkDialog(site, 'benefit', $event.currentTarget as HTMLElement)"
+                >
+                  <span v-html="icons.gift" />
+                </button>
+                <button
+                  v-if="site.statusUrl"
+                  type="button"
+                  class="sl-link-btn"
+                  title="系统状态页地址"
+                  @click="store.openLinkDialog(site, 'status', $event.currentTarget as HTMLElement)"
+                >
+                  <span v-html="icons.pulse" />
+                </button>
+              </div>
+
+              <div class="sl-topo-footer-actions">
+                <!-- 快速切换在用/待定 -->
+                <button
+                  type="button"
+                  class="sl-btn-text-xs"
+                  :title="site.isPersonal ? '当前为在用状态，点击切换' : site.isPending ? '当前为待定状态，点击切换' : '设置为在用状态'"
+                  @click="store.cycleUsageState(site)"
+                >
+                  <span>{{ site.isPersonal ? "在用 ★" : site.isPending ? "待定 ⏱" : "+ 加入在用" }}</span>
+                </button>
+
+                <!-- 全景详情 / 查看模型 -->
+                <button
+                  type="button"
+                  class="sl-btn-xs sl-btn-detail"
+                  title="打开全景详情抽屉，查看 Key 与支持模型列表"
+                  @click="openModelDetail(site)"
+                >
+                  <span v-html="icons.cpu" />
+                  <span>模型详情</span>
+                </button>
+              </div>
+            </div>
           </article>
         </div>
+
+        <!-- 拓扑视图分页栏 -->
+        <footer v-if="totalPages > 1" class="sl-pagination-bar">
+          <button
+            type="button"
+            class="sl-page-btn"
+            :disabled="currentPage <= 1"
+            @click="currentPage--"
+          >
+            上一页
+          </button>
+          <span class="sl-page-info">第 {{ currentPage }} / {{ totalPages }} 页</span>
+          <button
+            type="button"
+            class="sl-page-btn"
+            :disabled="currentPage >= totalPages"
+            @click="currentPage++"
+          >
+            下一页
+          </button>
+        </footer>
       </section>
     </main>
 
@@ -1602,14 +1776,6 @@ onUnmounted(() => {
               >
                 <span v-html="icons.cpu" />
                 <span>关联 Key 与支持模型</span>
-              </button>
-              <button
-                type="button"
-                :class="{ active: activeDetailTab === 'raw' }"
-                @click="activeDetailTab = 'raw'"
-              >
-                <span v-html="icons.database" />
-                <span>原始数据检视</span>
               </button>
             </nav>
 
@@ -1793,9 +1959,31 @@ onUnmounted(() => {
                         </div>
                       </div>
 
-                      <div class="sl-drawer-acc-quota">
-                        <span class="sl-acc-quota-k">可用额度</span>
-                        <strong class="sl-acc-quota-v text-brand">{{ session.remaining !== null ? `${session.remaining} ${session.unit || ''}` : '未读取' }}</strong>
+                      <div class="sl-drawer-acc-quota-block">
+                        <div class="sl-drawer-acc-quota">
+                          <span class="sl-acc-quota-k">可用额度</span>
+                          <strong class="sl-acc-quota-v text-brand">{{ session.remaining !== null ? `${session.remaining} ${session.unit || ''}` : '未读取' }}</strong>
+                        </div>
+                        <div class="sl-drawer-acc-btn-group">
+                          <button
+                            type="button"
+                            class="sl-btn-xs"
+                            :title="`使用 ${session.profileName} 在 Chrome 中打开此站点`"
+                            @click="store.openExternalInChromeProfile(selectedSite.apiBaseUrl, session.profileId)"
+                          >
+                            <span v-html="icons.external" />
+                            <span>打开站点</span>
+                          </button>
+                          <button
+                            type="button"
+                            class="sl-btn-xs is-danger"
+                            :title="`删除「${session.profileName}」会话账号，解除与本站点的关联`"
+                            @click="store.deleteSiteAccount(selectedSite, session)"
+                          >
+                            <span v-html="icons.trash" />
+                            <span>删除账号</span>
+                          </button>
+                        </div>
                       </div>
                     </div>
 
@@ -1931,25 +2119,6 @@ onUnmounted(() => {
                       <span v-html="icons.copy" />
                     </button>
                   </div>
-                </div>
-              </div>
-
-              <!-- TAB 4: 原始数据检视 -->
-              <div v-else-if="activeDetailTab === 'raw'" class="sl-tab-panel">
-                <div class="sl-tab-action-bar">
-                  <span class="sl-tab-section-title">站点完整 JSON 记录</span>
-                  <button
-                    type="button"
-                    class="sl-btn-secondary"
-                    @click="copyText(JSON.stringify(selectedSite, null, 2), '站点 JSON')"
-                  >
-                    <span v-html="icons.copy" />
-                    <span>复制 JSON</span>
-                  </button>
-                </div>
-
-                <div class="sl-raw-json-box">
-                  <pre><code>{{ JSON.stringify(selectedSite, null, 2) }}</code></pre>
                 </div>
               </div>
             </div>
@@ -3236,24 +3405,56 @@ onUnmounted(() => {
 .sl-action-icon-btn {
   width: 26px;
   height: 26px;
+  padding: 0;
+  margin: 0;
   border-radius: 6px;
-  background: var(--surface-soft, #21262d);
-  border: 1px solid var(--line, #30363d);
-  color: var(--muted, #8b949e);
-  display: flex;
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  color: var(--muted);
+  display: inline-flex;
   align-items: center;
   justify-content: center;
+  line-height: 0;
+  vertical-align: middle;
   cursor: pointer;
+  box-sizing: border-box;
+}
+
+.sl-action-icon-btn span {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 13px;
+  height: 13px;
+  line-height: 0;
 }
 
 .sl-action-icon-btn svg {
+  display: block;
   width: 13px;
   height: 13px;
+  flex-shrink: 0;
 }
 
 .sl-action-icon-btn:hover {
-  background: var(--surface-hover, #30363d);
-  color: var(--text, #f0f6fc);
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+.sl-action-icon-btn.sl-topo-delete-btn:hover {
+  background: color-mix(in srgb, var(--danger, #f85149) 15%, var(--surface-hover, #30363d));
+  color: var(--danger, #f85149);
+  border-color: color-mix(in srgb, var(--danger, #f85149) 35%, transparent);
+}
+
+.sl-btn-xs.is-danger {
+  color: var(--danger, #f85149);
+  border-color: color-mix(in srgb, var(--danger, #f85149) 35%, transparent);
+}
+
+.sl-btn-xs.is-danger:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--danger, #f85149) 15%, var(--surface-hover, #30363d));
+  color: var(--danger, #f85149);
 }
 
 /* 视图 C：拓扑矩阵 */
@@ -3268,53 +3469,188 @@ onUnmounted(() => {
   justify-content: space-between;
   align-items: center;
   padding: 12px 16px;
-  background: var(--surface, #161b22);
-  border: 1px solid var(--line, #30363d);
-  border-radius: var(--r-md, 8px);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
 }
 
 .sl-topology-header h2 {
   margin: 0;
   font-size: 15px;
-  color: var(--text, #f0f6fc);
+  font-weight: 750;
+  color: var(--text);
 }
 
 .sl-topology-header p {
   margin: 2px 0 0;
   font-size: 11.5px;
-  color: var(--muted, #8b949e);
+  color: var(--muted);
 }
 
 .sl-topology-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(380px, 1fr));
   gap: 14px;
 }
 
 .sl-topo-card {
-  background: var(--surface, #161b22);
-  border: 1px solid var(--line, #30363d);
-  border-radius: var(--r-md, 8px);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg, 10px);
   padding: 14px;
   display: flex;
   flex-direction: column;
   gap: 10px;
+  cursor: pointer;
+  transition: border-color .2s var(--ease), box-shadow .2s var(--ease), transform .18s var(--ease);
+}
+
+.sl-topo-card:hover {
+  border-color: var(--line-strong);
+  box-shadow: var(--shadow-sm);
+}
+
+.sl-topo-card.is-selected {
+  border-color: var(--brand);
+  box-shadow: 0 0 0 2px var(--brand-glow);
+}
+
+.sl-topo-card.is-runaway {
+  opacity: 0.82;
+  border-color: color-mix(in srgb, var(--danger) 30%, var(--line));
 }
 
 .sl-topo-card.has-sessions {
-  border-color: color-mix(in srgb, var(--brand, #58a6ff) 30%, var(--line, #30363d));
+  border-color: color-mix(in srgb, var(--brand) 30%, var(--line));
 }
 
 .sl-topo-card-head {
   display: flex;
   justify-content: space-between;
-  align-items: center;
+  align-items: flex-start;
+  gap: 10px;
 }
 
 .sl-topo-site-id {
   display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  min-width: 0;
+  flex: 1;
+}
+
+.sl-topo-title-box {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  flex: 1;
+  gap: 2px;
+}
+
+.sl-topo-title-row {
+  display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.sl-topo-title-row strong {
+  font-size: 13.5px;
+  font-weight: 700;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.sl-topo-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex-shrink: 0;
+}
+
+.sl-topo-head-btn {
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  margin: 0;
+  border-radius: var(--r-xs, 6px);
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  color: var(--muted);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 0;
+  vertical-align: middle;
+  cursor: pointer;
+  box-shadow: 0 1px 2px rgba(16, 35, 25, 0.03);
+  transition: all .18s var(--ease);
+  box-sizing: border-box;
+}
+
+.sl-topo-head-btn span {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  line-height: 0;
+}
+
+.sl-topo-head-btn svg {
+  display: block;
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+  transition: transform .25s var(--ease), color .18s var(--ease);
+}
+
+.sl-topo-head-btn:hover {
+  background: var(--surface-hover);
+  border-color: var(--line-strong);
+  color: var(--text);
+  transform: translateY(-1px);
+  box-shadow: 0 2px 6px rgba(16, 35, 25, 0.06);
+}
+
+.sl-topo-head-btn:active {
+  transform: translateY(0) scale(0.95);
+}
+
+.sl-topo-sync-btn:hover {
+  background: var(--brand-soft);
+  border-color: color-mix(in srgb, var(--brand) 40%, transparent);
+  color: var(--brand-deep);
+}
+
+.sl-topo-sync-btn:hover svg {
+  transform: rotate(180deg);
+}
+
+.sl-topo-sync-btn.is-syncing svg {
+  animation: sl-spin 1s linear infinite;
+  color: var(--brand);
+}
+
+.sl-topo-select-btn.active {
+  background: var(--brand);
+  color: #fff;
+  border-color: var(--brand);
+  box-shadow: 0 1px 4px var(--brand-glow);
+}
+
+.sl-topo-edit-btn:hover svg {
+  transform: scale(1.12);
+}
+
+.sl-topo-badges {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex-wrap: wrap;
+  margin: -2px 0 2px;
 }
 
 .sl-topo-sessions-list {
@@ -3327,69 +3663,146 @@ onUnmounted(() => {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 8px 10px;
-  background: var(--surface-soft, #0d1117);
-  border: 1px solid var(--line-soft, #21262d);
+  padding: 8px 12px;
+  background: var(--surface-soft);
+  border: 1px solid var(--line-soft);
   border-radius: var(--r-sm, 6px);
+  gap: 10px;
+  transition: all .15s ease;
+}
+
+.sl-topo-session-row:hover {
+  background: var(--surface-hover);
+  border-color: var(--line-strong);
 }
 
 .sl-topo-session-row.has-error {
-  border-color: color-mix(in srgb, var(--danger, #f85149) 40%, transparent);
+  border-color: color-mix(in srgb, var(--danger) 40%, transparent);
+  background: color-mix(in srgb, var(--danger-soft) 45%, var(--surface-soft));
 }
 
 .sl-topo-session-meta {
   display: flex;
-  align-items: center;
-  gap: 8px;
+  align-items: flex-start;
+  gap: 10px;
+  min-width: 0;
+  flex: 1;
 }
 
-.sl-topo-session-meta svg {
-  width: 16px;
-  height: 16px;
-  color: var(--brand, #58a6ff);
+.sl-topo-user-icon {
+  width: 28px;
+  height: 28px;
+  border-radius: var(--r-xs);
+  background: var(--sidebar-soft);
+  color: var(--brand);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+
+.sl-topo-user-icon svg {
+  width: 15px;
+  height: 15px;
+}
+
+.sl-topo-user-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1;
 }
 
 .sl-topo-user-line {
   display: flex;
   align-items: center;
   gap: 6px;
+  flex-wrap: wrap;
 }
 
 .sl-topo-user-line strong {
-  font-size: 12px;
-  color: var(--text, #f0f6fc);
+  font-size: 12.5px;
+  color: var(--text);
 }
 
 .sl-user-id-pill {
-  font-size: 9px;
+  font-size: 9.5px;
   padding: 1px 4px;
   border-radius: 3px;
-  background: var(--surface, #21262d);
-  color: var(--faint, #8b949e);
+  background: var(--page-bg);
+  color: var(--faint);
   font-family: monospace;
+  border: 1px solid var(--line-soft);
 }
 
 .sl-token-pill {
-  font-size: 9px;
+  font-size: 9.5px;
   padding: 1px 5px;
   border-radius: 3px;
-  background: var(--surface, #21262d);
-  color: var(--muted, #8b949e);
+  background: var(--page-bg);
+  color: var(--muted);
+  border: 1px solid var(--line-soft);
 }
 
 .sl-token-pill.active {
-  background: color-mix(in srgb, var(--brand, #1f6feb) 20%, transparent);
-  color: var(--brand, #58a6ff);
+  background: var(--brand-soft);
+  color: var(--brand-deep);
+  border-color: color-mix(in srgb, var(--brand) 28%, transparent);
+  font-weight: 600;
 }
 
 .sl-token-pill.sl-token-checked {
-  background: color-mix(in srgb, var(--success, #2ea043) 20%, transparent);
-  color: var(--success, #3fb950);
+  background: var(--success-soft);
+  color: var(--success);
+  border-color: color-mix(in srgb, var(--success) 28%, transparent);
+  font-weight: 600;
+}
+
+.sl-token-pill.sl-token-uncheck {
+  background: var(--warning-soft);
+  color: var(--warning);
+  border-color: color-mix(in srgb, var(--warning) 28%, transparent);
 }
 
 .sl-topo-subline {
-  font-size: 10px;
-  color: var(--muted, #8b949e);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 10.5px;
+  color: var(--muted);
+}
+
+.sl-topo-err-hint {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10.5px;
+  color: var(--danger);
+  margin-top: 2px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.sl-topo-err-hint svg {
+  width: 12px;
+  height: 12px;
+  flex-shrink: 0;
+}
+
+.sl-topo-session-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.sl-topo-session-btns {
+  display: flex;
+  align-items: center;
+  gap: 4px;
 }
 
 .sl-topo-session-quota {
@@ -3399,18 +3812,69 @@ onUnmounted(() => {
 }
 
 .sl-topo-session-quota strong {
-  font-size: 12px;
+  font-size: 12.5px;
+  font-weight: 700;
 }
 
 .sl-topo-session-quota small {
   font-size: 9.5px;
-  color: var(--muted, #8b949e);
+  color: var(--muted);
+}
+
+.sl-topo-card-footer {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--line-soft);
+}
+
+.sl-topo-footer-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.sl-btn-text-xs {
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: var(--r-xs);
+  padding: 2px 8px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--muted);
+  cursor: pointer;
+  transition: all .15s ease;
+}
+
+.sl-btn-text-xs:hover {
+  border-color: var(--brand);
+  color: var(--brand-deep);
+  background: var(--brand-soft);
+}
+
+.sl-btn-sync {
+  font-weight: 600;
+}
+
+.sl-btn-detail {
+  background: var(--brand-soft);
+  border-color: color-mix(in srgb, var(--brand) 28%, transparent);
+  color: var(--brand-deep);
+  font-weight: 650;
+}
+
+.sl-btn-detail:hover {
+  background: var(--brand);
+  color: #fff;
+  border-color: var(--brand);
 }
 
 .sl-topo-empty-sessions {
   padding: 18px;
   text-align: center;
-  background: var(--surface-soft, #0d1117);
+  background: var(--surface-soft);
   border-radius: var(--r-sm, 6px);
   display: flex;
   flex-direction: column;
@@ -3421,13 +3885,13 @@ onUnmounted(() => {
 .sl-topo-empty-sessions svg {
   width: 20px;
   height: 20px;
-  color: var(--faint, #6e7681);
+  color: var(--faint);
 }
 
 .sl-topo-empty-sessions p {
   margin: 0;
   font-size: 11px;
-  color: var(--faint, #6e7681);
+  color: var(--faint);
 }
 
 .sl-link-action {
@@ -3973,6 +4437,18 @@ onUnmounted(() => {
   margin-top: 2px;
 }
 
+.sl-drawer-acc-quota-block {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.sl-drawer-acc-btn-group {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
 .sl-drawer-acc-quota {
   display: flex;
   flex-direction: column;
@@ -4176,23 +4652,6 @@ onUnmounted(() => {
 .sl-model-copy-btn svg {
   width: 12px;
   height: 12px;
-}
-
-.sl-raw-json-box {
-  background: #090d13;
-  border: 1px solid var(--line, #30363d);
-  border-radius: var(--r-md, 8px);
-  padding: 14px;
-  max-height: 520px;
-  overflow: auto;
-}
-
-.sl-raw-json-box pre {
-  margin: 0;
-  font-family: monospace;
-  font-size: 11px;
-  color: #79c0ff;
-  line-height: 1.5;
 }
 
 /* 空状态与加载中 */
