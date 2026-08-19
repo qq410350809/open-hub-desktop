@@ -1,5 +1,11 @@
+<script lang="ts">
+import { ref } from "vue";
+// 全局共享单例：保证整个应用同一时刻仅展开一个下拉框
+const globalActiveSelectId = ref<string | null>(null);
+</script>
+
 <script setup lang="ts">
-import { ref, computed, watch, onUnmounted } from "vue";
+import { computed, watch, onUnmounted } from "vue";
 import { icons } from "../icons";
 
 interface Option {
@@ -7,18 +13,22 @@ interface Option {
   text: string;
 }
 
-const props = defineProps<{
-  options: Option[];
-  modelValue: string | number;
-  ariaLabel?: string;
-}>();
+const props = withDefaults(
+  defineProps<{
+    options: Option[];
+    modelValue: string | number;
+    ariaLabel?: string;
+    placement?: "auto" | "top" | "bottom";
+  }>(),
+  {
+    ariaLabel: undefined,
+    placement: "auto",
+  }
+);
 
 const emit = defineEmits<{
   "update:modelValue": [value: any];
 }>();
-
-// Shared active select manager ref so only one dropdown is active at a time across the app
-const activeSelectId = ref<string | null>(null);
 
 const instanceId = `select-${Math.random().toString(36).substring(2, 9)}`;
 const rootRef = ref<HTMLElement>();
@@ -26,7 +36,53 @@ const triggerRef = ref<HTMLButtonElement>();
 const menuRef = ref<HTMLElement>();
 const selectedText = ref("");
 
-const isOpen = computed(() => activeSelectId.value === instanceId);
+const isOpen = computed(() => globalActiveSelectId.value === instanceId);
+const flipUp = ref(false);
+
+// 下拉菜单默认向下展开；当位于底部或明确配置 placement="top" 时向上展开，避免被遮挡
+function getScrollParent(el: HTMLElement): HTMLElement | null {
+  let node = el.parentElement;
+  while (node) {
+    const overflowY = getComputedStyle(node).overflowY;
+    if (overflowY === "auto" || overflowY === "scroll" || overflowY === "overlay") return node;
+    node = node.parentElement;
+  }
+  return null;
+}
+
+function measurePlacement() {
+  if (props.placement === "top") {
+    flipUp.value = true;
+    return;
+  }
+  if (props.placement === "bottom") {
+    flipUp.value = false;
+    return;
+  }
+
+  const trigger = triggerRef.value;
+  const root = rootRef.value;
+  if (!trigger || !root) return;
+
+  const menu = menuRef.value;
+  const menuHeight = menu && menu.offsetHeight > 0 ? menu.offsetHeight : Math.max(120, (props.options.length || 3) * 32 + 12);
+  const triggerRect = trigger.getBoundingClientRect();
+  const scrollParent = getScrollParent(root);
+  let spaceBelow: number;
+  let spaceAbove: number;
+
+  if (scrollParent) {
+    const parentRect = scrollParent.getBoundingClientRect();
+    spaceBelow = parentRect.bottom - triggerRect.bottom;
+    spaceAbove = triggerRect.top - parentRect.top;
+  } else {
+    spaceBelow = window.innerHeight - triggerRect.bottom;
+    spaceAbove = triggerRect.top;
+  }
+
+  // 当下方空间不足以容纳菜单且上方空间更多，或者下方空间小于 140px 时，自动翻转向上
+  flipUp.value = (spaceBelow < menuHeight && spaceAbove > spaceBelow) || spaceBelow < 120;
+}
 
 function syncDisplay() {
   const selected = props.options.find((opt) => String(opt.value) === String(props.modelValue));
@@ -45,12 +101,14 @@ function toggle(e?: Event) {
 }
 
 function open() {
-  activeSelectId.value = instanceId;
+  globalActiveSelectId.value = instanceId;
+  measurePlacement();
+  requestAnimationFrame(measurePlacement);
 }
 
 function close() {
-  if (activeSelectId.value === instanceId) {
-    activeSelectId.value = null;
+  if (globalActiveSelectId.value === instanceId) {
+    globalActiveSelectId.value = null;
   }
 }
 
@@ -110,8 +168,8 @@ watch(isOpen, (openState) => {
 onUnmounted(() => {
   window.removeEventListener("pointerdown", onDocumentClick, { capture: true });
   window.removeEventListener("click", onDocumentClick, { capture: true });
-  if (activeSelectId.value === instanceId) {
-    activeSelectId.value = null;
+  if (globalActiveSelectId.value === instanceId) {
+    globalActiveSelectId.value = null;
   }
 });
 </script>
@@ -120,7 +178,7 @@ onUnmounted(() => {
   <div
     ref="rootRef"
     class="select-box"
-    :class="{ open: isOpen }"
+    :class="{ open: isOpen, 'flip-up': flipUp }"
     data-custom-select
     @keydown="onKeydown"
   >

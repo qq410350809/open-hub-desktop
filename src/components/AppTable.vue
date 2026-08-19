@@ -154,12 +154,17 @@ const headerGroups = computed(() => (table as any).getHeaderGroups() as Array<{
 
 const totalCount = computed(() => (props.manualPagination ? props.total : props.rows.length));
 const totalPages = computed(() => Math.max(1, Math.ceil(totalCount.value / pageSizeRef.value)));
-const currentPage = computed(() => Math.min(Math.max(1, props.page), totalPages.value));
+// 展示态统一跟随内部 pageIndex（实际渲染页），不能依赖可能未受控的 props.page：
+// 未绑定 update:page 时父组件不回写，props.page 恒为初始值，表翻页但高亮/范围却不动。
+const currentPage = computed(() => Math.min(Math.max(1, pageIndex.value + 1), totalPages.value));
 const rangeStart = computed(() => totalCount.value === 0 ? 0 : (currentPage.value - 1) * pageSizeRef.value + 1);
 const rangeEnd = computed(() => Math.min(currentPage.value * pageSizeRef.value, totalCount.value));
 
 watch(totalPages, (pages) => {
-  if (props.page > pages) emit("update:page", pages);
+  if (pageIndex.value + 1 > pages) {
+    pageIndex.value = pages - 1;
+    emit("update:page", pages);
+  }
 });
 
 const pageNumbers = computed<Array<number | "ellipsis">>(() => {
@@ -274,6 +279,7 @@ void icons;
         <span>每页</span>
         <CustomSelect
           class="app-table-page-size"
+          placement="top"
           :options="pageSizeSelectOptions"
           :model-value="pageSizeRef"
           aria-label="每页条数"

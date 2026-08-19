@@ -1603,16 +1603,6 @@ onUnmounted(() => {
               </div>
 
               <div class="sl-topo-footer-actions">
-                <!-- 快速切换在用/待定 -->
-                <button
-                  type="button"
-                  class="sl-btn-text-xs"
-                  :title="site.isPersonal ? '当前为在用状态，点击切换' : site.isPending ? '当前为待定状态，点击切换' : '设置为在用状态'"
-                  @click="store.cycleUsageState(site)"
-                >
-                  <span>{{ site.isPersonal ? "在用 ★" : site.isPending ? "待定 ⏱" : "+ 加入在用" }}</span>
-                </button>
-
                 <!-- 全景详情 / 查看模型 -->
                 <button
                   type="button"

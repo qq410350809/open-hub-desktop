@@ -10,6 +10,7 @@ use futures_util::StreamExt;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as JsonValue};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -31,8 +32,115 @@ pub struct ChannelConfig {
     pub upstream_url: String,
     #[serde(default)]
     pub api_key: String,
+    /// 站点转换继承的多个原 Key（请求时自动轮换尝试）；为空时回退使用 api_key。
+    #[serde(default)]
+    pub api_keys: Vec<String>,
     #[serde(default)]
     pub use_proxy_pool: bool,
+    /// 英文别名：作为网关模型前缀（如 opencode/*、mysite/*）。
+    /// 全部渠道（含 opencode）别名必须唯一；为空时回退为渠道 id。
+    #[serde(default)]
+    pub alias: String,
+    /// 通过「站点转换」创建时关联的站点库站点 id
+    #[serde(default)]
+    pub site_id: Option<String>,
+    /// 代理池固定通道：开启后始终经代理池出口节点转发，不优先直连
+    #[serde(default)]
+    pub use_fixed_proxy: bool,
+    /// 该渠道对外暴露的模型白名单：
+    /// - `None`（默认，兼容旧配置）= 全部启用
+    /// - `Some(空列表)` = 不对外暴露任何模型
+    /// - `Some(非空列表)` = 仅列表中勾选的模型在可用模型中体现
+    #[serde(default)]
+    pub enabled_models: Option<Vec<String>>,
+}
+
+impl ChannelConfig {
+    /// 渠道的生效别名：显式配置的别名（小写化）为空时回退为渠道 id。
+    pub fn effective_alias(&self) -> String {
+        let a = self.alias.trim().to_lowercase();
+        if a.is_empty() {
+            self.id.trim().to_lowercase()
+        } else {
+            a
+        }
+    }
+
+    /// 渠道可用的 Authorization 值列表：优先多 Key（api_keys），其次单 Key（api_key），都没有则 Bearer public。
+    pub fn auth_values(&self) -> Vec<String> {
+        let keys: Vec<String> = if !self.api_keys.is_empty() {
+            self.api_keys
+                .iter()
+                .map(|k| k.trim().to_string())
+                .filter(|k| !k.is_empty())
+                .collect()
+        } else if !self.api_key.trim().is_empty() {
+            vec![self.api_key.trim().to_string()]
+        } else {
+            Vec::new()
+        };
+        if keys.is_empty() {
+            vec!["Bearer public".to_string()]
+        } else {
+            keys.into_iter().map(|k| format!("Bearer {k}")).collect()
+        }
+    }
+}
+
+/// 将空别名补全为渠道 id，并统一小写化；把单 Key 回填进多 Key 列表，保证配置语义一致。
+fn normalize_channel_config(config: &mut OpencodeProxyConfig) {
+    for ch in config.channels.iter_mut() {
+        if ch.alias.trim().is_empty() {
+            ch.alias = ch.id.trim().to_lowercase();
+        } else {
+            ch.alias = ch.alias.trim().to_lowercase();
+        }
+        if ch.api_keys.is_empty() {
+            let single = ch.api_key.trim().to_string();
+            if !single.is_empty() {
+                ch.api_keys = vec![single];
+            }
+        }
+        // 两种渠道能力区分：站点转换渠道仅支持「代理池固定通道」；官方通道仅支持「内部代理池轮询」
+        if ch.site_id.is_some() {
+            ch.use_proxy_pool = false;
+        } else {
+            ch.use_fixed_proxy = false;
+        }
+    }
+}
+
+/// 校验渠道配置合法性：id 唯一、别名唯一（含 opencode）、别名仅含英文与连字符。
+fn validate_channel_config(config: &OpencodeProxyConfig) -> Result<(), String> {
+    let mut ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut aliases: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for ch in &config.channels {
+        if ch.id.trim().is_empty() {
+            return Err("渠道 id 不能为空".to_string());
+        }
+        if !ids.insert(ch.id.clone()) {
+            return Err(format!("渠道 id「{}」重复，请修正后重试", ch.id));
+        }
+        let alias = ch.effective_alias();
+        if alias.is_empty() {
+            return Err(format!("渠道「{}」缺少英文别名", ch.name));
+        }
+        if !alias
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            return Err(format!(
+                "渠道「{}」的英文别名「{alias}」只能包含英文字母、数字、- 与 _",
+                ch.name
+            ));
+        }
+        if !aliases.insert(alias.clone()) {
+            return Err(format!(
+                "英文别名「{alias}」已存在，所有渠道（含 opencode）的别名不能重复"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn default_channels() -> Vec<ChannelConfig> {
@@ -44,7 +152,12 @@ fn default_channels() -> Vec<ChannelConfig> {
         protocol: "opencode".to_string(),
         upstream_url: "https://opencode.ai/zen/v1".to_string(),
         api_key: "public".to_string(),
+        api_keys: Vec::new(),
         use_proxy_pool: false,
+        alias: "opencode".to_string(),
+        site_id: None,
+        use_fixed_proxy: false,
+        enabled_models: None,
     }]
 }
 
@@ -142,6 +255,31 @@ pub struct OpencodeProxyMetrics {
     pub total_reasoning_requests: AtomicU64,
     pub total_cache_hit_tokens: AtomicU64,
     pub total_tokens: AtomicU64,
+    /// 按渠道拆分的累计计数（key = channel_id），随 record_log 逐条更新
+    pub channel: std::sync::Mutex<HashMap<String, ChannelMetrics>>,
+}
+
+/// 单个渠道的累计使用计数（内存态，随请求实时累加）。
+#[derive(Default)]
+pub struct ChannelMetrics {
+    pub total_requests: AtomicU64,
+    pub successful_requests: AtomicU64,
+    pub failed_requests: AtomicU64,
+    pub total_prompt_tokens: AtomicU64,
+    pub total_completion_tokens: AtomicU64,
+    pub total_reasoning_tokens: AtomicU64,
+    pub total_reasoning_requests: AtomicU64,
+    pub total_cache_hit_tokens: AtomicU64,
+    pub total_tokens: AtomicU64,
+}
+
+/// 单个渠道拉取到的模型列表（含渠道别名，用于网关聚合 /v1/models）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelModelList {
+    pub channel_id: String,
+    pub alias: String,
+    pub models: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -149,7 +287,8 @@ pub struct OpencodeProxyContext {
     pub config: Arc<RwLock<OpencodeProxyConfig>>,
     pub metrics: Arc<OpencodeProxyMetrics>,
     pub started_at: Arc<RwLock<Option<Instant>>>,
-    pub cached_models: Arc<RwLock<Vec<String>>>,
+    /// 按渠道缓存的模型列表（渠道 id + 别名 + 裸模型名）
+    pub cached_channel_models: Arc<RwLock<Vec<ChannelModelList>>>,
     pub cached_models_updated_at: Arc<RwLock<Option<Instant>>>,
     pub default_http_client: reqwest::Client,
     pub app_handle: Arc<RwLock<Option<tauri::AppHandle>>>,
@@ -190,6 +329,36 @@ impl OpencodeProxyContext {
         });
         if tot > 0 {
             self.metrics.total_tokens.fetch_add(tot, Ordering::Relaxed);
+        }
+
+        // 按渠道累加使用统计（供渠道卡片展示累计请求/成功率/Token）
+        {
+            let mut channels = self.metrics.channel.lock().unwrap();
+            let cm = channels.entry(log.channel_id.clone()).or_default();
+            cm.total_requests.fetch_add(1, Ordering::Relaxed);
+            if (200..300).contains(&log.status_code) {
+                cm.successful_requests.fetch_add(1, Ordering::Relaxed);
+            } else if log.status_code >= 400 {
+                cm.failed_requests.fetch_add(1, Ordering::Relaxed);
+            }
+            if let Some(pt) = log.prompt_tokens {
+                cm.total_prompt_tokens.fetch_add(pt, Ordering::Relaxed);
+            }
+            if let Some(ct) = log.completion_tokens {
+                cm.total_completion_tokens.fetch_add(ct, Ordering::Relaxed);
+            }
+            if let Some(rt) = log.reasoning_tokens {
+                cm.total_reasoning_tokens.fetch_add(rt, Ordering::Relaxed);
+                if rt > 0 {
+                    cm.total_reasoning_requests.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            if let Some(hit) = log.prompt_cache_hit_tokens {
+                cm.total_cache_hit_tokens.fetch_add(hit, Ordering::Relaxed);
+            }
+            if tot > 0 {
+                cm.total_tokens.fetch_add(tot, Ordering::Relaxed);
+            }
         }
 
         let app_opt = self.app_handle.read().await.clone();
@@ -273,7 +442,7 @@ impl OpencodeProxyState {
             config: Arc::new(RwLock::new(OpencodeProxyConfig::default())),
             metrics: Arc::new(OpencodeProxyMetrics::default()),
             started_at: Arc::new(RwLock::new(None)),
-            cached_models: Arc::new(RwLock::new(Vec::new())),
+            cached_channel_models: Arc::new(RwLock::new(Vec::new())),
             cached_models_updated_at: Arc::new(RwLock::new(None)),
             default_http_client,
             app_handle: Arc::new(RwLock::new(app_handle)),
@@ -1543,6 +1712,24 @@ impl OpenAiProtocolAdapter {
         // 3. 规范化 messages
         if let Some(messages) = body.get_mut("messages").and_then(JsonValue::as_array_mut) {
             for msg in messages {
+                // 规范化 role：解决上游报 unknown variant `developer` 错误（developer -> system, model -> assistant, function -> tool）
+                if let Some(role_val) = msg.get_mut("role") {
+                    if let Some(r_str) = role_val.as_str() {
+                        match r_str {
+                            "developer" => {
+                                *role_val = JsonValue::String("system".to_string());
+                            }
+                            "model" => {
+                                *role_val = JsonValue::String("assistant".to_string());
+                            }
+                            "function" => {
+                                *role_val = JsonValue::String("tool".to_string());
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+
                 // 规范化 content 复合数组 -> 纯文本
                 if let Some(content_val) = msg.get_mut("content") {
                     if let Some(arr) = content_val.as_array() {
@@ -1671,11 +1858,15 @@ async fn get_sorted_egress_candidates(
     ctx: &OpencodeProxyContext,
     channel: &ChannelConfig,
 ) -> Vec<String> {
-    if !channel.use_proxy_pool {
+    if !channel.use_proxy_pool && !channel.use_fixed_proxy {
         return vec!["__direct__".to_string()];
     }
 
-    let mut candidates = vec!["__direct__".to_string()];
+    // 代理池固定通道：只走代理池节点，不包含直连
+    let mut candidates = Vec::new();
+    if !channel.use_fixed_proxy {
+        candidates.push("__direct__".to_string());
+    }
 
     if let Some(app) = ctx.app_handle.read().await.as_ref() {
         let database = app.state::<crate::models::Database>();
@@ -1824,7 +2015,20 @@ async fn check_auth(headers: &HeaderMap, config: &OpencodeProxyConfig) -> Result
 /// GET /healthz
 async fn handle_healthz(State(ctx): State<OpencodeProxyContext>) -> Response {
     let config = ctx.config.read().await;
-    let models_count = ctx.cached_models.read().await.len();
+    let models_count = {
+        let models = ctx.cached_channel_models.read().await;
+        models
+            .iter()
+            .map(|entry| {
+                let channel = config.channels.iter().find(|c| c.id == entry.channel_id);
+                let allowed = channel.and_then(|c| c.enabled_models.as_ref());
+                match allowed {
+                    None => entry.models.len(),
+                    Some(allowed) => entry.models.iter().filter(|m| allowed.contains(m)).count(),
+                }
+            })
+            .sum::<usize>()
+    };
     let uptime = ctx
         .started_at
         .read()
@@ -1841,6 +2045,7 @@ async fn handle_healthz(State(ctx): State<OpencodeProxyContext>) -> Response {
     let opencode_chan = config.channels.iter().find(|c| c.id == "opencode");
     let proxy_pool_desc = match opencode_chan {
         Some(c) if c.use_proxy_pool => "直连优先 + 代理池按速排序故障转移",
+        Some(c) if c.use_fixed_proxy => "代理池固定通道（不直连）",
         _ => "直接连接 (直连)",
     };
 
@@ -1899,69 +2104,126 @@ async fn handle_healthz(State(ctx): State<OpencodeProxyContext>) -> Response {
     (StatusCode::OK, Json(checks)).into_response()
 }
 
-/// 从 OpenCode 上游抓取并刷新模型列表
-async fn fetch_upstream_models_inner(
+/// 用渠道的 Key 列表逐个请求上游 /models，合并所有 Key 返回的模型 id（不同 Key 权限不同，合并取并集）。
+async fn fetch_channel_models_raw(
     ctx: &OpencodeProxyContext,
-    config: &OpencodeProxyConfig,
+    chan: &ChannelConfig,
+    extra_headers: &[(&str, &str)],
 ) -> Result<Vec<String>, String> {
-    let chan = config
-        .channels
-        .iter()
-        .find(|c| c.id == "opencode" && c.enabled)
-        .ok_or_else(|| "OpenCode 渠道未启用或未配置".to_string())?;
-
     let candidates = get_sorted_egress_candidates(ctx, chan).await;
     let candidate = candidates.first().map(|s| s.as_str()).unwrap_or("__direct__");
     let client = build_client_for_candidate(ctx, candidate).await;
     let models_url = format!("{}/models", chan.upstream_url.trim_end_matches('/'));
+    let auth_vals = chan.auth_values();
 
-    let auth_val = if chan.api_key.trim().is_empty() {
-        "Bearer public".to_string()
-    } else {
-        format!("Bearer {}", chan.api_key.trim())
-    };
+    let mut merged: Vec<String> = Vec::new();
+    let mut last_err: Option<String> = None;
+    for auth_val in &auth_vals {
+        let mut req = client
+            .get(&models_url)
+            .header("Authorization", auth_val)
+            .header("Accept", "application/json")
+            .timeout(Duration::from_secs(10));
+        for (k, v) in extra_headers {
+            req = req.header(*k, *v);
+        }
 
-    let res = client
-        .get(&models_url)
-        .header("Authorization", auth_val)
-        .header("User-Agent", "opencode/1.0.0")
-        .header("x-opencode-client", "cli")
-        .header("Accept", "application/json")
-        .timeout(Duration::from_secs(10))
-        .send()
-        .await
-        .map_err(|e| format!("无法连接 OpenCode 上游模型接口: {e}"))?;
-
-    if !res.status().is_success() {
-        return Err(format!("OpenCode 上游模型接口返回 HTTP {}", res.status()));
-    }
-
-    let val = res
-        .json::<JsonValue>()
-        .await
-        .map_err(|e| format!("解析模型列表 JSON 失败: {e}"))?;
-
-    let mut model_ids = Vec::new();
-    if let Some(list) = val.get("data").and_then(JsonValue::as_array) {
-        for item in list {
-            if let Some(id) = item.get("id").and_then(JsonValue::as_str) {
-                if id.contains("free") || id == "big-pickle" {
-                    if !model_ids.contains(&id.to_string()) {
-                        model_ids.push(id.to_string());
+        match req.send().await {
+            Ok(r) if r.status().is_success() => {
+                let val = r
+                    .json::<JsonValue>()
+                    .await
+                    .map_err(|e| format!("解析渠道「{}」模型列表失败: {e}", chan.name))?;
+                if let Some(list) = val.get("data").and_then(JsonValue::as_array) {
+                    for item in list {
+                        if let Some(id) = item.get("id").and_then(JsonValue::as_str) {
+                            let id = id.to_string();
+                            if !merged.contains(&id) {
+                                merged.push(id);
+                            }
+                        }
                     }
                 }
+            }
+            Ok(r) if r.status() == StatusCode::UNAUTHORIZED || r.status() == StatusCode::FORBIDDEN => {
+                // Key 无效：记录后继续尝试下一个 Key
+                last_err = Some(format!("渠道「{}」模型接口返回 HTTP {}（Key 无效）", chan.name, r.status()));
+            }
+            Ok(r) => {
+                last_err = Some(format!("渠道「{}」模型接口返回 HTTP {}", chan.name, r.status()));
+            }
+            Err(e) => {
+                last_err = Some(format!("无法连接渠道「{}」模型接口: {e}", chan.name));
             }
         }
     }
 
+    if merged.is_empty() {
+        Err(last_err.unwrap_or_else(|| format!("渠道「{}」模型接口请求失败", chan.name)))
+    } else {
+        Ok(merged)
+    }
+}
+
+/// 从 OpenCode 上游抓取模型（Public 免费通道：仅保留 free / big-pickle）
+async fn fetch_opencode_channel_models(
+    ctx: &OpencodeProxyContext,
+    chan: &ChannelConfig,
+) -> Result<Vec<String>, String> {
+    let ids = fetch_channel_models_raw(
+        ctx,
+        chan,
+        &[("User-Agent", "opencode/1.0.0"), ("x-opencode-client", "cli")],
+    )
+    .await?;
+    let model_ids: Vec<String> = ids
+        .into_iter()
+        .filter(|id| id.contains("free") || id == "big-pickle")
+        .collect();
     if model_ids.is_empty() {
         return Err("OpenCode 上游未返回可用的免费模型".to_string());
     }
-
     Ok(model_ids)
 }
 
-/// GET /v1/models (ID 统一为 opencode/原id)
+/// 从站点转换渠道抓取模型（OpenAI 兼容 /v1/models，保留全部模型 id）
+async fn fetch_site_channel_models(
+    ctx: &OpencodeProxyContext,
+    chan: &ChannelConfig,
+) -> Result<Vec<String>, String> {
+    let ids = fetch_channel_models_raw(ctx, chan, &[]).await?;
+    if ids.is_empty() {
+        return Err(format!("渠道「{}」未返回模型列表", chan.name));
+    }
+    Ok(ids)
+}
+
+/// 拉取全部启用渠道的模型列表（单个渠道失败不影响其他渠道）
+async fn fetch_upstream_models_inner(
+    ctx: &OpencodeProxyContext,
+    config: &OpencodeProxyConfig,
+) -> Vec<ChannelModelList> {
+    let mut result = Vec::new();
+    for chan in config.channels.iter().filter(|c| c.enabled) {
+        let fetched = if chan.id == "opencode" {
+            fetch_opencode_channel_models(ctx, chan).await
+        } else {
+            fetch_site_channel_models(ctx, chan).await
+        };
+        if let Ok(models) = fetched {
+            if !models.is_empty() {
+                result.push(ChannelModelList {
+                    channel_id: chan.id.clone(),
+                    alias: chan.effective_alias(),
+                    models,
+                });
+            }
+        }
+    }
+    result
+}
+
+/// GET /v1/models (ID 统一为 {alias}/原id)
 async fn handle_models(headers: HeaderMap, State(ctx): State<OpencodeProxyContext>) -> Response {
     let config = ctx.config.read().await;
     if let Err(res) = check_auth(&headers, &config).await {
@@ -1974,31 +2236,40 @@ async fn handle_models(headers: HeaderMap, State(ctx): State<OpencodeProxyContex
     };
 
     if need_refresh {
-        if let Ok(models) = fetch_upstream_models_inner(&ctx, &config).await {
-            let mut cached = ctx.cached_models.write().await;
-            *cached = models;
-            let mut updated = ctx.cached_models_updated_at.write().await;
-            *updated = Some(Instant::now());
-        }
+        let models = fetch_upstream_models_inner(&ctx, &config).await;
+        let mut cached = ctx.cached_channel_models.write().await;
+        *cached = models;
+        let mut updated = ctx.cached_models_updated_at.write().await;
+        *updated = Some(Instant::now());
     }
 
-    let models = ctx.cached_models.read().await;
+    let models = ctx.cached_channel_models.read().await;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
 
+    // 逐渠道输出模型：ID 带别名前缀，并应用该渠道的 enabled_models 白名单
     let data: Vec<JsonValue> = models
         .iter()
-        .map(|raw_id| {
-            json!({
-                "id": format!("opencode/{raw_id}"),
-                "object": "model",
-                "created": now,
-                "owned_by": "opencode",
-                "permission": [],
-                "root": format!("opencode/{raw_id}"),
-                "parent": null
+        .flat_map(|entry| {
+            let channel = config.channels.iter().find(|c| c.id == entry.channel_id);
+            let allowed = channel.and_then(|c| c.enabled_models.as_ref());
+            entry.models.iter().filter_map(move |raw_id| {
+                if let Some(allowed) = allowed {
+                    if !allowed.iter().any(|m| m == raw_id) {
+                        return None;
+                    }
+                }
+                Some(json!({
+                    "id": format!("{}/{}", entry.alias, raw_id),
+                    "object": "model",
+                    "created": now,
+                    "owned_by": entry.alias.clone(),
+                    "permission": [],
+                    "root": format!("{}/{}", entry.alias, raw_id),
+                    "parent": null
+                }))
             })
         })
         .collect();
@@ -2013,6 +2284,28 @@ async fn handle_models(headers: HeaderMap, State(ctx): State<OpencodeProxyContex
 
 fn strip_opencode_prefix(model: &str) -> &str {
     model.strip_prefix("opencode/").unwrap_or(model)
+}
+
+/// 根据请求模型名解析目标渠道与发送给上游的裸模型名。
+/// 规则：`alias/裸模型` 按别名前缀匹配启用渠道；无前缀或前缀未匹配时回退 opencode 渠道。
+fn resolve_channel<'a>(
+    config: &'a OpencodeProxyConfig,
+    raw_model: &str,
+) -> Option<(&'a ChannelConfig, String)> {
+    if let Some((prefix, rest)) = raw_model.split_once('/') {
+        if let Some(ch) = config
+            .channels
+            .iter()
+            .find(|c| c.enabled && c.effective_alias() == prefix)
+        {
+            return Some((ch, rest.to_string()));
+        }
+    }
+    config
+        .channels
+        .iter()
+        .find(|c| c.id == "opencode" && c.enabled)
+        .map(|ch| (ch, strip_opencode_prefix(raw_model).to_string()))
 }
 
 /// POST /v1/chat/completions (直连优先 + 代理池按速排序粘性轮询故障转移，全流完结后记录完整日志)
@@ -2067,21 +2360,14 @@ async fn handle_chat_completions(
         .and_then(JsonValue::as_str)
         .unwrap_or("unknown")
         .to_string();
-    let model_to_send = strip_opencode_prefix(&raw_model).to_string();
-
-    if let Some(model_val) = body.get_mut("model") {
-        *model_val = JsonValue::String(model_to_send.clone());
-    }
-
-    normalize_chat_messages(&mut body);
 
     let is_stream = body
         .get("stream")
         .and_then(JsonValue::as_bool)
         .unwrap_or(false);
 
-    let chan = match config.channels.iter().find(|c| c.id == "opencode" && c.enabled) {
-        Some(c) => c,
+    let (chan, model_to_send) = match resolve_channel(&config, &raw_model) {
+        Some((c, m)) => (c, m),
         None => {
             ctx.metrics.failed_requests.fetch_add(1, Ordering::Relaxed);
             ctx.record_log(ProxyRequestLog {
@@ -2090,7 +2376,7 @@ async fn handle_chat_completions(
                 method: "POST".to_string(),
                 path: "/v1/chat/completions".to_string(),
                 channel_id: "opencode".to_string(),
-                model: model_to_send,
+                model: strip_opencode_prefix(&raw_model).to_string(),
                 stream: is_stream,
                 status_code: 503,
                 duration_ms: start_time.elapsed().as_millis() as u64,
@@ -2101,7 +2387,7 @@ async fn handle_chat_completions(
                 completion_tokens: None,
                 reasoning_tokens: None,
                 total_tokens: None,
-                error_message: Some("渠道不可用：OpenCode 上游渠道已被手动禁用".to_string()),
+                error_message: Some("渠道不可用：未找到匹配的启用渠道（含默认 OpenCode）".to_string()),
                 request_body: req_body_str,
                 response_body: None,
                 node_name: Some("直连通道".to_string()),
@@ -2111,7 +2397,7 @@ async fn handle_chat_completions(
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({
                     "error": {
-                        "message": "OpenCode 上游渠道当前已被禁用",
+                        "message": "未找到可用的上游渠道，请检查渠道是否启用",
                         "type": "channel_disabled"
                     }
                 })),
@@ -2120,20 +2406,22 @@ async fn handle_chat_completions(
         }
     };
 
+    if let Some(model_val) = body.get_mut("model") {
+        *model_val = JsonValue::String(model_to_send.clone());
+    }
+
+    normalize_chat_messages(&mut body);
+
     let target_url = format!("{}/chat/completions", chan.upstream_url.trim_end_matches('/'));
-    let auth_val = if chan.api_key.trim().is_empty() {
-        "Bearer public".to_string()
-    } else {
-        format!("Bearer {}", chan.api_key.trim())
-    };
+    let auth_vals = chan.auth_values();
 
     let candidates = get_sorted_egress_candidates(&ctx, chan).await;
     let total_candidates = candidates.len().max(1);
     let max_retries = ctx.config.read().await.max_retries as usize;
-    let max_attempts = if chan.use_proxy_pool {
-        (max_retries + 1).min(total_candidates)
+    let max_attempts = if chan.use_proxy_pool || chan.use_fixed_proxy {
+        (max_retries + 1).min(total_candidates * auth_vals.len()).max(auth_vals.len())
     } else {
-        max_retries + 1
+        (max_retries + 1).max(auth_vals.len())
     };
 
     let base_idx = ctx.active_egress_idx.load(Ordering::Relaxed);
@@ -2160,7 +2448,7 @@ async fn handle_chat_completions(
 
         let mut req = client
             .post(&target_url)
-            .header("Authorization", &auth_val)
+            .header("Authorization", auth_vals[attempt % auth_vals.len()].as_str())
             .header("Content-Type", "application/json")
             .header("User-Agent", "opencode/1.0.0")
             .header("x-opencode-client", "cli")
@@ -2186,7 +2474,15 @@ async fn handle_chat_completions(
                         &model_to_send,
                         is_stream,
                         status.as_u16(),
-                        format!("节点失败自动切换：{}", format_upstream_error_message(status.as_u16(), &err_body)),
+                        format!(
+                            "{}自动切换：{}",
+                            if status.as_u16() == 401 || status.as_u16() == 403 || status.as_u16() == 429 {
+                                "Key/限流"
+                            } else {
+                                "节点失败"
+                            },
+                            format_upstream_error_message(status.as_u16(), &err_body)
+                        ),
                         attempt_start.elapsed().as_millis() as u64,
                         req_body_str.clone(),
                         cand_id,
@@ -2443,7 +2739,6 @@ async fn handle_responses(
         .and_then(JsonValue::as_str)
         .unwrap_or("unknown")
         .to_string();
-    let model_to_send = strip_opencode_prefix(&raw_model).to_string();
 
     let is_stream = body
         .get("stream")
@@ -2453,39 +2748,35 @@ async fn handle_responses(
     // 智能适配：如果 body 包含 input/instructions（Responses 格式），将其转换为标准 messages
     ResponsesProtocolAdapter::convert_input_to_messages(&mut body);
 
+    let (chan, model_to_send) = match resolve_channel(&config, &raw_model) {
+        Some((c, m)) => (c, m),
+        None => {
+            ctx.metrics.failed_requests.fetch_add(1, Ordering::Relaxed);
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": { "message": "未找到可用的上游渠道，请检查渠道是否启用", "type": "channel_disabled" } })),
+            )
+                .into_response();
+        }
+    };
+
     if let Some(model_val) = body.get_mut("model") {
         *model_val = JsonValue::String(model_to_send.clone());
     }
 
     normalize_chat_messages(&mut body);
 
-    let chan = match config.channels.iter().find(|c| c.id == "opencode" && c.enabled) {
-        Some(c) => c,
-        None => {
-            ctx.metrics.failed_requests.fetch_add(1, Ordering::Relaxed);
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({ "error": { "message": "OpenCode 上游渠道已禁用", "type": "channel_disabled" } })),
-            )
-                .into_response();
-        }
-    };
-
     // 默认转发至上游标准的 /chat/completions 端点
     let target_url = format!("{}/chat/completions", chan.upstream_url.trim_end_matches('/'));
-    let auth_val = if chan.api_key.trim().is_empty() {
-        "Bearer public".to_string()
-    } else {
-        format!("Bearer {}", chan.api_key.trim())
-    };
+    let auth_vals = chan.auth_values();
 
     let candidates = get_sorted_egress_candidates(&ctx, chan).await;
     let total_candidates = candidates.len().max(1);
     let max_retries = ctx.config.read().await.max_retries as usize;
-    let max_attempts = if chan.use_proxy_pool {
-        (max_retries + 1).min(total_candidates)
+    let max_attempts = if chan.use_proxy_pool || chan.use_fixed_proxy {
+        (max_retries + 1).min(total_candidates * auth_vals.len()).max(auth_vals.len())
     } else {
-        max_retries + 1
+        (max_retries + 1).max(auth_vals.len())
     };
 
     let base_idx = ctx.active_egress_idx.load(Ordering::Relaxed);
@@ -2512,7 +2803,7 @@ async fn handle_responses(
 
         let mut req = client
             .post(&target_url)
-            .header("Authorization", &auth_val)
+            .header("Authorization", auth_vals[attempt % auth_vals.len()].as_str())
             .header("Content-Type", "application/json")
             .header("User-Agent", "opencode/1.0.0")
             .header("x-opencode-client", "cli")
@@ -2537,7 +2828,15 @@ async fn handle_responses(
                         &model_to_send,
                         is_stream,
                         status.as_u16(),
-                        format!("节点失败自动切换：{}", format_upstream_error_message(status.as_u16(), &err_body)),
+                        format!(
+                            "{}自动切换：{}",
+                            if status.as_u16() == 401 || status.as_u16() == 403 || status.as_u16() == 429 {
+                                "Key/限流"
+                            } else {
+                                "节点失败"
+                            },
+                            format_upstream_error_message(status.as_u16(), &err_body)
+                        ),
                         attempt_start.elapsed().as_millis() as u64,
                         req_body_str.clone(),
                         cand_id,
@@ -2865,7 +3164,19 @@ async fn handle_messages(
         .get("model")
         .and_then(JsonValue::as_str)
         .unwrap_or("deepseek-v4-flash-free");
-    let stripped_model = strip_opencode_prefix(raw_model);
+    let (chan, model_to_send) = match resolve_channel(&config, raw_model) {
+        Some((c, m)) => (c, m),
+        None => {
+            ctx.metrics.failed_requests.fetch_add(1, Ordering::Relaxed);
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": { "type": "api_error", "message": "未找到可用的上游渠道，请检查渠道是否启用" } })),
+            )
+                .into_response();
+        }
+    };
+    let stripped_model = model_to_send.clone();
+    let chan_alias = chan.effective_alias();
 
     let mut openai_tools = Vec::new();
     if let Some(tools_arr) = body.get("tools").and_then(JsonValue::as_array) {
@@ -3099,32 +3410,16 @@ async fn handle_messages(
 
     normalize_chat_messages(&mut openai_body);
 
-    let chan = match config.channels.iter().find(|c| c.id == "opencode" && c.enabled) {
-        Some(c) => c,
-        None => {
-            ctx.metrics.failed_requests.fetch_add(1, Ordering::Relaxed);
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({ "error": { "type": "api_error", "message": "OpenCode 上游渠道未启用" } })),
-            )
-                .into_response();
-        }
-    };
-
     let target_url = format!("{}/chat/completions", chan.upstream_url.trim_end_matches('/'));
-    let auth_val = if chan.api_key.trim().is_empty() {
-        "Bearer public".to_string()
-    } else {
-        format!("Bearer {}", chan.api_key.trim())
-    };
+    let auth_vals = chan.auth_values();
 
     let candidates = get_sorted_egress_candidates(&ctx, chan).await;
     let total_candidates = candidates.len().max(1);
     let max_retries = ctx.config.read().await.max_retries as usize;
-    let max_attempts = if chan.use_proxy_pool {
-        (max_retries + 1).min(total_candidates)
+    let max_attempts = if chan.use_proxy_pool || chan.use_fixed_proxy {
+        (max_retries + 1).min(total_candidates * auth_vals.len()).max(auth_vals.len())
     } else {
-        max_retries + 1
+        (max_retries + 1).max(auth_vals.len())
     };
 
     let base_idx = ctx.active_egress_idx.load(Ordering::Relaxed);
@@ -3151,7 +3446,7 @@ async fn handle_messages(
 
         let mut req = client
             .post(&target_url)
-            .header("Authorization", &auth_val)
+            .header("Authorization", auth_vals[attempt % auth_vals.len()].as_str())
             .header("Content-Type", "application/json")
             .header("User-Agent", "opencode/1.0.0")
             .header("x-opencode-client", "cli")
@@ -3173,10 +3468,18 @@ async fn handle_messages(
                         &ctx,
                         &req_id,
                         "/v1/messages",
-                        stripped_model,
+                        &stripped_model,
                         is_stream,
                         status.as_u16(),
-                        format!("节点失败自动切换：{}", format_upstream_error_message(status.as_u16(), &err_body)),
+                        format!(
+                            "{}自动切换：{}",
+                            if status.as_u16() == 401 || status.as_u16() == 403 || status.as_u16() == 429 {
+                                "Key/限流"
+                            } else {
+                                "节点失败"
+                            },
+                            format_upstream_error_message(status.as_u16(), &err_body)
+                        ),
                         attempt_start.elapsed().as_millis() as u64,
                         req_body_str.clone(),
                         cand_id,
@@ -3201,7 +3504,7 @@ async fn handle_messages(
                         &ctx,
                         &req_id,
                         "/v1/messages",
-                        stripped_model,
+                        &stripped_model,
                         is_stream,
                         502,
                         format!("节点连接失败自动切换：{e_str}"),
@@ -3390,7 +3693,7 @@ async fn handle_messages(
                     "id": format!("msg_{nanos:x}"),
                     "type": "message",
                     "role": "assistant",
-                    "model": format!("opencode/{}", stripped_model),
+                    "model": format!("{chan_alias}/{stripped_model}"),
                     "content": content_items,
                     "stop_reason": stop_reason,
                     "usage": {
@@ -3475,10 +3778,12 @@ pub fn load_opencode_proxy_config(conn: &Connection) -> OpencodeProxyConfig {
         [],
         |r| r.get::<_, String>(0),
     );
-    match row {
+    let mut config = match row {
         Ok(json_str) => serde_json::from_str(&json_str).unwrap_or_default(),
         Err(_) => OpencodeProxyConfig::default(),
-    }
+    };
+    normalize_channel_config(&mut config);
+    config
 }
 
 pub fn save_opencode_proxy_config(conn: &Connection, config: &OpencodeProxyConfig) -> Result<(), String> {
@@ -3519,12 +3824,11 @@ pub async fn start_opencode_proxy_server(state: &OpencodeProxyState) -> Result<(
     let ctx_clone = state.context.clone();
     tokio::spawn(async move {
         let cfg = ctx_clone.config.read().await.clone();
-        if let Ok(models) = fetch_upstream_models_inner(&ctx_clone, &cfg).await {
-            let mut cached = ctx_clone.cached_models.write().await;
-            *cached = models;
-            let mut updated = ctx_clone.cached_models_updated_at.write().await;
-            *updated = Some(Instant::now());
-        }
+        let models = fetch_upstream_models_inner(&ctx_clone, &cfg).await;
+        let mut cached = ctx_clone.cached_channel_models.write().await;
+        *cached = models;
+        let mut updated = ctx_clone.cached_models_updated_at.write().await;
+        *updated = Some(Instant::now());
     });
 
     tokio::spawn(async move {
@@ -3570,7 +3874,21 @@ pub async fn get_opencode_proxy_status_summary(state: &OpencodeProxyState) -> Op
     } else {
         0
     };
-    let models_count = state.context.cached_models.read().await.len();
+    let models_count = {
+        let models = state.context.cached_channel_models.read().await;
+        let config = state.context.config.read().await;
+        models
+            .iter()
+            .map(|entry| {
+                let channel = config.channels.iter().find(|c| c.id == entry.channel_id);
+                let allowed = channel.and_then(|c| c.enabled_models.as_ref());
+                match allowed {
+                    None => entry.models.len(),
+                    Some(allowed) => entry.models.iter().filter(|m| allowed.contains(m)).count(),
+                }
+            })
+            .sum::<usize>()
+    };
     let channels_count = state.context.config.read().await.channels.len();
 
     let (db_tot_req, db_succ_req, db_fail_req, db_prompt, db_completion, db_reasoning, db_reasoning_req, db_cache_hit, db_total) = {
@@ -3683,8 +4001,10 @@ pub async fn get_opencode_proxy_config(
 pub async fn save_opencode_proxy_config_cmd(
     database: tauri::State<'_, crate::models::Database>,
     state: tauri::State<'_, OpencodeProxyState>,
-    config: OpencodeProxyConfig,
+    mut config: OpencodeProxyConfig,
 ) -> Result<OpencodeProxyStatus, String> {
+    normalize_channel_config(&mut config);
+    validate_channel_config(&config)?;
     {
         let conn = database.0.lock().map_err(|e| e.to_string())?;
         save_opencode_proxy_config(&conn, &config)?;
@@ -3731,10 +4051,10 @@ pub async fn stop_opencode_proxy(
 #[tauri::command]
 pub async fn fetch_opencode_models(
     state: tauri::State<'_, OpencodeProxyState>,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<ChannelModelList>, String> {
     let cfg = state.context.config.read().await.clone();
-    let models = fetch_upstream_models_inner(&state.context, &cfg).await?;
-    let mut cached = state.context.cached_models.write().await;
+    let models = fetch_upstream_models_inner(&state.context, &cfg).await;
+    let mut cached = state.context.cached_channel_models.write().await;
     *cached = models.clone();
     let mut updated = state.context.cached_models_updated_at.write().await;
     *updated = Some(Instant::now());
@@ -3774,6 +4094,133 @@ pub struct ProxyLogPage {
     pub global_total: u64,
     pub global_success_total: u64,
     pub global_error_total: u64,
+}
+
+/// 单个渠道的累计使用统计（供渠道卡片底部展示）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelUsageStats {
+    pub channel_id: String,
+    pub total_requests: u64,
+    pub successful_requests: u64,
+    pub failed_requests: u64,
+    pub total_prompt_tokens: u64,
+    pub total_completion_tokens: u64,
+    pub total_reasoning_tokens: u64,
+    pub total_reasoning_requests: u64,
+    pub total_cache_hit_tokens: u64,
+    pub total_tokens: u64,
+    pub today_total_tokens: u64,
+}
+
+/// 按渠道聚合使用统计：内存实时计数（自启动以来）与日志库留存记录（最近 1000 条）取最大值，
+/// 语义与全局「累计」统计一致。
+#[tauri::command]
+pub async fn get_opencode_channel_stats(
+    _database: tauri::State<'_, crate::models::Database>,
+    state: tauri::State<'_, OpencodeProxyState>,
+) -> Result<Vec<ChannelUsageStats>, String> {
+    let mut map: HashMap<String, ChannelUsageStats> = HashMap::new();
+    {
+        let channels = state.context.metrics.channel.lock().map_err(|e| e.to_string())?;
+        for (id, cm) in channels.iter() {
+            map.insert(
+                id.clone(),
+                ChannelUsageStats {
+                    channel_id: id.clone(),
+                    total_requests: cm.total_requests.load(Ordering::Relaxed),
+                    successful_requests: cm.successful_requests.load(Ordering::Relaxed),
+                    failed_requests: cm.failed_requests.load(Ordering::Relaxed),
+                    total_prompt_tokens: cm.total_prompt_tokens.load(Ordering::Relaxed),
+                    total_completion_tokens: cm.total_completion_tokens.load(Ordering::Relaxed),
+                    total_reasoning_tokens: cm.total_reasoning_tokens.load(Ordering::Relaxed),
+                    total_reasoning_requests: cm.total_reasoning_requests.load(Ordering::Relaxed),
+                    total_cache_hit_tokens: cm.total_cache_hit_tokens.load(Ordering::Relaxed),
+                    total_tokens: cm.total_tokens.load(Ordering::Relaxed),
+                    today_total_tokens: 0,
+                },
+            );
+        }
+    }
+
+    let app_opt = state.context.app_handle.read().await.clone();
+    if let Some(app) = app_opt {
+        let database = app.state::<crate::models::Database>();
+        let db_rows = match database.0.lock() {
+            Ok(conn) => query_channel_stats_from_db(&conn),
+            Err(_) => Ok(Vec::new()),
+        };
+        if let Ok(db_rows) = db_rows {
+            for (channel_id, total, success, failed, prompt, completion, reasoning, reasoning_req, cache_hit, total_tokens, today_tokens) in db_rows
+            {
+                let entry = map
+                    .entry(channel_id.clone())
+                    .or_insert_with(|| ChannelUsageStats {
+                        channel_id: channel_id.clone(),
+                        ..Default::default()
+                    });
+                entry.total_requests = entry.total_requests.max(total);
+                entry.successful_requests = entry.successful_requests.max(success);
+                entry.failed_requests = entry.failed_requests.max(failed);
+                entry.total_prompt_tokens = entry.total_prompt_tokens.max(prompt);
+                entry.total_completion_tokens = entry.total_completion_tokens.max(completion);
+                entry.total_reasoning_tokens = entry.total_reasoning_tokens.max(reasoning);
+                entry.total_reasoning_requests = entry.total_reasoning_requests.max(reasoning_req);
+                entry.total_cache_hit_tokens = entry.total_cache_hit_tokens.max(cache_hit);
+                entry.total_tokens = entry.total_tokens.max(total_tokens);
+                entry.today_total_tokens = entry.today_total_tokens.max(today_tokens);
+            }
+        }
+    }
+
+    let mut stats: Vec<ChannelUsageStats> = map.into_values().collect();
+    stats.sort_by(|a, b| a.channel_id.cmp(&b.channel_id));
+    Ok(stats)
+}
+
+/// 从日志库聚合各渠道统计（留存记录范围内）。
+fn query_channel_stats_from_db(
+    conn: &Connection,
+) -> Result<Vec<(String, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)>, String> {
+    let today_prefix = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let mut stmt = conn
+        .prepare(
+            "SELECT channel_id,
+                COUNT(*),
+                COALESCE(SUM(CASE WHEN status_code >= 200 AND status_code < 300 THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(prompt_tokens), 0),
+                COALESCE(SUM(completion_tokens), 0),
+                COALESCE(SUM(reasoning_tokens), 0),
+                COALESCE(SUM(CASE WHEN COALESCE(reasoning_tokens, 0) > 0 THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(prompt_cache_hit_tokens), 0),
+                COALESCE(SUM(COALESCE(total_tokens, COALESCE(prompt_tokens, 0) + COALESCE(completion_tokens, 0))), 0),
+                COALESCE(SUM(CASE WHEN timestamp LIKE ?1 THEN COALESCE(total_tokens, COALESCE(prompt_tokens, 0) + COALESCE(completion_tokens, 0)) ELSE 0 END), 0)
+             FROM opencode_proxy_logs GROUP BY channel_id",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([format!("{today_prefix}%")], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)? as u64,
+                r.get::<_, i64>(2)? as u64,
+                r.get::<_, i64>(3)? as u64,
+                r.get::<_, i64>(4)? as u64,
+                r.get::<_, i64>(5)? as u64,
+                r.get::<_, i64>(6)? as u64,
+                r.get::<_, i64>(7)? as u64,
+                r.get::<_, i64>(8)? as u64,
+                r.get::<_, i64>(9)? as u64,
+                r.get::<_, i64>(10)? as u64,
+            ))
+        })
+        .map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|e| e.to_string())?);
+    }
+    Ok(out)
 }
 
 #[tauri::command]

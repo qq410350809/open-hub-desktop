@@ -327,55 +327,55 @@ async function exportDataAsCsv() {
   closeExportDialog();
 }
 
-// —— 表格列配置 ——
+// —— 表格列配置（宽度总和需控制在弹窗内容宽 ~920px 内，避免横向滚动条） ——
 const dailyColumns: AppTableColumn[] = [
-  { key: "label", title: "时间节点", width: "minmax(130px, 1.2fr)", sortable: true },
-  { key: "total", title: "总量 Tokens", width: "110px", align: "right", sortable: true },
-  { key: "input", title: "输入", width: "95px", align: "right", sortable: true },
-  { key: "output", title: "输出", width: "95px", align: "right", sortable: true },
-  { key: "cache", title: "缓存 (读+写)", width: "105px", align: "right", sortable: true },
-  { key: "cacheHitRate", title: "缓存命中率", width: "105px", align: "right", sortable: true },
-  { key: "reasoning", title: "深度推理", width: "95px", align: "right", sortable: true },
-  { key: "sessions", title: "对话轮次", width: "90px", align: "right", sortable: true },
-  { key: "requests", title: "API 请求数", width: "95px", align: "right", sortable: true },
+  { key: "label", title: "时间节点", width: "minmax(120px, 1.2fr)", sortable: true },
+  { key: "total", title: "总量 Tokens", width: "88px", align: "right", sortable: true },
+  { key: "input", title: "输入", width: "72px", align: "right", sortable: true },
+  { key: "output", title: "输出", width: "72px", align: "right", sortable: true },
+  { key: "cache", title: "缓存 (读+写)", width: "76px", align: "right", sortable: true },
+  { key: "cacheHitRate", title: "缓存命中率", width: "80px", align: "right", sortable: true },
+  { key: "reasoning", title: "深度推理", width: "72px", align: "right", sortable: true },
+  { key: "sessions", title: "对话轮次", width: "72px", align: "right", sortable: true },
+  { key: "requests", title: "API 请求数", width: "80px", align: "right", sortable: true },
 ];
 
 const projectColumns: AppTableColumn[] = [
-  { key: "project", title: "项目 / 工作区", width: "minmax(160px, 1.4fr)", sortable: true },
-  { key: "totalTokens", title: "消耗总计", width: "110px", align: "right", sortable: true },
-  { key: "share", title: "占比", width: "80px", align: "right", sortable: false },
-  { key: "input", title: "输入", width: "90px", align: "right", sortable: true },
-  { key: "output", title: "输出", width: "90px", align: "right", sortable: true },
-  { key: "cache", title: "缓存", width: "90px", align: "right", sortable: true },
-  { key: "cacheHitRate", title: "缓存命中率", width: "105px", align: "right", sortable: true },
-  { key: "reasoning", title: "推理", width: "90px", align: "right", sortable: true },
-  { key: "sessions", title: "对话轮次", width: "90px", align: "right", sortable: true },
-  { key: "requests", title: "请求数", width: "90px", align: "right", sortable: true },
-  { key: "costUsd", title: "估算成本", width: "100px", align: "right", sortable: true },
+  { key: "project", title: "项目 / 工作区", width: "minmax(120px, 1.4fr)", sortable: true },
+  { key: "totalTokens", title: "消耗总计", width: "88px", align: "right", sortable: true },
+  { key: "share", title: "占比", width: "78px", align: "right", sortable: false },
+  { key: "input", title: "输入", width: "72px", align: "right", sortable: true },
+  { key: "output", title: "输出", width: "72px", align: "right", sortable: true },
+  { key: "cache", title: "缓存", width: "72px", align: "right", sortable: true },
+  { key: "cacheHitRate", title: "缓存命中率", width: "80px", align: "right", sortable: true },
+  { key: "reasoning", title: "推理", width: "72px", align: "right", sortable: true },
+  { key: "sessions", title: "对话轮次", width: "72px", align: "right", sortable: true },
+  { key: "requests", title: "请求数", width: "72px", align: "right", sortable: true },
+  { key: "costUsd", title: "估算成本", width: "90px", align: "right", sortable: true },
 ];
 
 const sourceColumns: AppTableColumn[] = [
-  { key: "source", title: "工具 / 来源", width: "minmax(150px, 1.3fr)", sortable: true },
-  { key: "totalTokens", title: "总量 Tokens", width: "110px", align: "right", sortable: true },
-  { key: "share", title: "占比", width: "80px", align: "right", sortable: false },
-  { key: "inputTokens", title: "输入", width: "90px", align: "right", sortable: true },
-  { key: "outputTokens", title: "输出", width: "90px", align: "right", sortable: true },
-  { key: "cacheTokens", title: "缓存", width: "90px", align: "right", sortable: true },
-  { key: "cacheHitRate", title: "缓存命中率", width: "105px", align: "right", sortable: true },
-  { key: "reasoningTokens", title: "推理", width: "90px", align: "right", sortable: true },
-  { key: "conversations", title: "对话数", width: "90px", align: "right", sortable: true },
-  { key: "requests", title: "请求数", width: "90px", align: "right", sortable: true },
-  { key: "costUsd", title: "成本 (USD)", width: "100px", align: "right", sortable: true },
+  { key: "source", title: "工具 / 来源", width: "minmax(120px, 1.3fr)", sortable: true },
+  { key: "totalTokens", title: "总量 Tokens", width: "88px", align: "right", sortable: true },
+  { key: "share", title: "占比", width: "78px", align: "right", sortable: false },
+  { key: "inputTokens", title: "输入", width: "72px", align: "right", sortable: true },
+  { key: "outputTokens", title: "输出", width: "72px", align: "right", sortable: true },
+  { key: "cacheTokens", title: "缓存", width: "72px", align: "right", sortable: true },
+  { key: "cacheHitRate", title: "缓存命中率", width: "80px", align: "right", sortable: true },
+  { key: "reasoningTokens", title: "推理", width: "72px", align: "right", sortable: true },
+  { key: "conversations", title: "对话数", width: "72px", align: "right", sortable: true },
+  { key: "requests", title: "请求数", width: "72px", align: "right", sortable: true },
+  { key: "costUsd", title: "成本 (USD)", width: "90px", align: "right", sortable: true },
 ];
 
 const healthColumns: AppTableColumn[] = [
-  { key: "label", title: "时段", width: "minmax(140px, 1.2fr)", sortable: true },
+  { key: "label", title: "时段", width: "minmax(120px, 1.2fr)", sortable: true },
   { key: "dialogues", title: "对话数", width: "80px", align: "right", sortable: true },
-  { key: "requests", title: "请求数", width: "90px", align: "right", sortable: true },
-  { key: "success", title: "成功", width: "80px", align: "right", sortable: true },
-  { key: "failed", title: "失败", width: "80px", align: "right", sortable: true },
-  { key: "successRate", title: "成功率", width: "90px", align: "right", sortable: true },
-  { key: "level", title: "健康等级", width: "100px", align: "center", sortable: true },
+  { key: "requests", title: "请求数", width: "82px", align: "right", sortable: true },
+  { key: "success", title: "成功", width: "78px", align: "right", sortable: true },
+  { key: "failed", title: "失败", width: "78px", align: "right", sortable: true },
+  { key: "successRate", title: "成功率", width: "84px", align: "right", sortable: true },
+  { key: "level", title: "健康等级", width: "86px", align: "center", sortable: true },
 ];
 
 const healthTableRows = computed(() =>
@@ -387,17 +387,17 @@ const healthTableRows = computed(() =>
 );
 
 const modelColumns: AppTableColumn[] = [
-  { key: "model", title: "模型名称 / 家族", width: "minmax(180px, 1.5fr)", sortable: true },
-  { key: "totalTokens", title: "总量 Tokens", width: "110px", align: "right", sortable: true },
-  { key: "share", title: "占比", width: "80px", align: "right", sortable: false },
-  { key: "inputTokens", title: "输入", width: "90px", align: "right", sortable: true },
-  { key: "outputTokens", title: "输出", width: "90px", align: "right", sortable: true },
-  { key: "cacheTokens", title: "缓存", width: "90px", align: "right", sortable: true },
-  { key: "cacheHitRate", title: "缓存命中率", width: "105px", align: "right", sortable: true },
-  { key: "reasoningTokens", title: "推理", width: "90px", align: "right", sortable: true },
-  { key: "conversations", title: "对话", width: "90px", align: "right", sortable: true },
-  { key: "requests", title: "请求数", width: "90px", align: "right", sortable: true },
-  { key: "costUsd", title: "成本 (USD)", width: "100px", align: "right", sortable: true },
+  { key: "model", title: "模型名称 / 家族", width: "minmax(130px, 1.5fr)", sortable: true },
+  { key: "totalTokens", title: "总量 Tokens", width: "88px", align: "right", sortable: true },
+  { key: "share", title: "占比", width: "78px", align: "right", sortable: false },
+  { key: "inputTokens", title: "输入", width: "72px", align: "right", sortable: true },
+  { key: "outputTokens", title: "输出", width: "72px", align: "right", sortable: true },
+  { key: "cacheTokens", title: "缓存", width: "72px", align: "right", sortable: true },
+  { key: "cacheHitRate", title: "缓存命中率", width: "80px", align: "right", sortable: true },
+  { key: "reasoningTokens", title: "推理", width: "72px", align: "right", sortable: true },
+  { key: "conversations", title: "对话", width: "72px", align: "right", sortable: true },
+  { key: "requests", title: "请求数", width: "72px", align: "right", sortable: true },
+  { key: "costUsd", title: "成本 (USD)", width: "90px", align: "right", sortable: true },
 ];
 
 const sessions = computed(() => store.tokenStats.value?.sessions ?? []);
@@ -1250,7 +1250,7 @@ onBeforeUnmount(() => {
         <button
           type="button"
           class="tt-pill-btn"
-          title="查看全部 AI 工具与客户端消耗明细"
+          title="查看工具明细"
           @click="toolsModalOpen = true"
         >
           <span v-html="icons.cpu" />
@@ -1260,7 +1260,7 @@ onBeforeUnmount(() => {
         <button
           type="button"
           class="tt-pill-btn"
-          title="查看全部大模型消耗排行榜"
+          title="查看模型排行榜"
           @click="modelsModalOpen = true"
         >
           <span v-html="icons.database" />
@@ -1285,6 +1285,16 @@ onBeforeUnmount(() => {
         >
           <span v-html="icons.sliders" />
           <span>明细总账</span>
+        </button>
+
+        <button
+          type="button"
+          class="tt-pill-btn"
+          title="查看请求健康矩阵明细"
+          @click="healthModalOpen = true"
+        >
+          <span v-html="icons.activity" />
+          <span>健康矩阵</span>
         </button>
       </div>
     </div>
@@ -1481,7 +1491,7 @@ onBeforeUnmount(() => {
                 <p>色阶按成功率：≥99% 绿 · 95–99% 浅绿 · 85–95% 黄 · 70–85% 橙 · &lt;70% 红</p>
               </div>
               <button type="button" class="tt-text-btn" @click="healthModalOpen = true">
-                查看全部 {{ healthTimeline.cells.length }} 个时段明细 ➔
+                查看明细 ➔
               </button>
             </header>
             <div class="tt-card-body tt-health-body">
@@ -1563,7 +1573,7 @@ onBeforeUnmount(() => {
                 <p>Top 5 客户端用量占比</p>
               </div>
               <button type="button" class="tt-text-btn" @click="toolsModalOpen = true">
-                查看全部 {{ bySource.length }} 款工具明细 ➔
+                查看明细 ➔
               </button>
             </header>
             <div class="tt-card-body tt-preview-body">
@@ -1587,7 +1597,7 @@ onBeforeUnmount(() => {
                 <p>Top 5 旗舰模型用量占比</p>
               </div>
               <button type="button" class="tt-text-btn" @click="modelsModalOpen = true">
-                查看全部 {{ byModel.length }} 款模型排行榜 ➔
+                查看排行榜 ➔
               </button>
             </header>
             <div class="tt-card-body tt-preview-body">

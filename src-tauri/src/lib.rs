@@ -1274,6 +1274,7 @@ pub fn run() {
             opencode_proxy::fetch_opencode_models,
             opencode_proxy::test_opencode_proxy_health,
             opencode_proxy::get_opencode_proxy_logs,
+            opencode_proxy::get_opencode_channel_stats,
             opencode_proxy::clear_opencode_proxy_logs,
             file_export::save_export_file
         ])

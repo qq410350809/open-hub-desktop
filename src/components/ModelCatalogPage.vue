@@ -1198,7 +1198,7 @@ onMounted(() => {
 
             <div class="mc-pm-footer">
               <span class="mc-pm-count">托管 <b>{{ prov.count }}</b> 款模型</span>
-              <span class="mc-pm-action">查看全部模型 &rarr;</span>
+              <span class="mc-pm-action">查看模型 &rarr;</span>
             </div>
           </article>
         </div>
@@ -1628,7 +1628,7 @@ onMounted(() => {
                         <span>渠道生态分布（共 {{ selectedModel.hostCount }} 家供应商）</span>
                       </h3>
                       <button type="button" class="mc-link-action-btn" @click="activeDetailTab = 'providers'">
-                        <span>查看全部渠道明细表 &rarr;</span>
+                        <span>查看明细表 &rarr;</span>
                       </button>
                     </div>
 

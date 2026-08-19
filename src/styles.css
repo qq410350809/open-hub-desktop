@@ -236,16 +236,18 @@ svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width:
 .select-trigger svg { width: 14px; flex: 0 0 auto; color: var(--muted); transition: transform .15s var(--ease); }
 .select-box.open .select-trigger svg { transform: rotate(180deg); }
 .select-menu { position: absolute; top: calc(100% + 6px); left: -1px; z-index: 120; width: max(100%,190px); max-height: 286px; padding: 5px; overflow-y: auto; overscroll-behavior: contain; border: 1px solid var(--line-strong); border-radius: var(--r-md); background: var(--surface); box-shadow: var(--shadow-md); }
+.select-box.flip-up .select-menu { top: auto; bottom: calc(100% + 6px); }
 .select-option { width: 100%; min-height: 34px; padding: 7px 10px; display: block; border-radius: var(--r-xs); background: transparent; color: var(--muted); text-align: left; font-size: 12px; line-height: 1.4; transition: .1s var(--ease); }
 .select-option:hover, .select-option:focus-visible { outline: 0; background: var(--surface-hover); color: var(--text); }
 .select-option.selected { background: var(--brand-soft); color: var(--brand-deep); font-weight: 650; }
 
-/* 分页条数下拉更紧凑 */
+/* 分页条数下拉更紧凑且确保顶层可见 */
 .app-table-page-size.select-box { min-width: 64px; height: 30px; }
 .app-table-page-size .select-trigger { padding: 0 8px; font-size: 11px; }
 .app-table-page-size .select-trigger svg { width: 12px; }
-.app-table-page-size .select-menu { min-width: 64px; max-height: 200px; }
+.app-table-page-size .select-menu { min-width: 64px; max-height: 200px; z-index: 1050; box-shadow: 0 4px 16px rgba(0, 0, 0, 0.18); }
 .app-table-page-size .select-option { min-height: 28px; padding: 4px 8px; font-size: 11px; }
+.app-table-pagination { position: relative; z-index: 20; }
 /* 代理池下拉需要填满网格列 */
 .proxy-speed-select.select-box,
 .proxy-source-select.select-box,
@@ -6889,6 +6891,12 @@ kbd { padding: 3px 7px; border: 1px solid var(--line); border-radius: var(--r-xs
 }
 .app-table-td.align-right { text-align: right; }
 .app-table-td.align-center { text-align: center; }
+/* Token 统计中心弹窗表格：列宽总和已控制在弹窗内容宽内，
+   用固定布局严格按列宽渲染，杜绝横向滚动条，超长数值省略号兜底 */
+.tt-table-wrap .app-table { table-layout: fixed; }
+.tt-table-wrap .app-table-scroll { overflow-x: hidden; overflow-y: auto; }
+.tt-table-wrap .app-table th.app-table-th { padding: 0 10px; }
+.tt-table-wrap .app-table td.app-table-td { padding: 10px; }
 .app-table-empty {
   min-height: 180px; display: grid; place-items: center;
   color: var(--faint); font-size: 12px;

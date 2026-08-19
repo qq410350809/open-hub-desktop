@@ -521,7 +521,7 @@ pub(crate) fn local_day_unix_range() -> (i64, i64) {
     (start, start + 86_399)
 }
 
-/// 解析 NewAPI /api/log/self 响应：当天存在签到记录（type=4 过滤后的 items 非空）
+/// 解析 NewAPI /api/log/self 响应：当天存在签到记录（items 非空）
 /// 返回 Ok(true)，无记录返回 Ok(false)。响应异常视为无法确认。
 pub(crate) fn parse_newapi_checkin_logs(value: &serde_json::Value) -> Result<bool, String> {
     if value.get("success").and_then(serde_json::Value::as_bool) != Some(true) {
@@ -543,7 +543,8 @@ pub(crate) fn parse_newapi_checkin_logs(value: &serde_json::Value) -> Result<boo
 
 /// 签到状态接口报 enabled=false 时的日志兜底：查当天（本地时区）签到日志确认
 /// 实际签到情况。部分站点状态接口的 enabled 字段不可靠，用户当天可能已在网页
-/// 手动签到过；返回 Ok(true) 表示今日已签到，Ok(false) 表示今日无签到记录。
+/// 手动签到过。分别查询 type=4（签到日志）和 type=1（充值/系统日志），任一存在
+/// 记录即视为今日已签到；返回 Ok(true) 表示今日已签到，Ok(false) 表示无签到记录。
 pub(crate) async fn query_newapi_checkin_log(
     client: &reqwest::Client,
     base_url: &str,
@@ -555,23 +556,36 @@ pub(crate) async fn query_newapi_checkin_log(
     let endpoint = base_url
         .join("/api/log/self")
         .map_err(|_| "无法生成签到日志接口地址".to_string())?;
-    let mut query_url = endpoint.clone();
-    query_url
-        .query_pairs_mut()
-        .append_pair("p", "1")
-        .append_pair("page_size", "20")
-        .append_pair("type", "4")
-        .append_pair("start_timestamp", &start_timestamp.to_string())
-        .append_pair("end_timestamp", &end_timestamp.to_string());
-    let value = request_json(
-        apply_newapi_auth(
-            chrome_request_headers(client.get(query_url), base_url.as_str(), user_agent),
-            auth,
-        ),
-        "签到日志接口",
-    )
-    .await?;
-    parse_newapi_checkin_logs(&value)
+    let start_str = start_timestamp.to_string();
+    let end_str = end_timestamp.to_string();
+    // 依次查询 type=4（签到日志）和 type=1（充值/系统日志），任一有记录即视为已签到。
+    for log_type in ["4", "1"] {
+        let mut query_url = endpoint.clone();
+        query_url
+            .query_pairs_mut()
+            .append_pair("p", "1")
+            .append_pair("page_size", "20")
+            .append_pair("type", log_type)
+            .append_pair("start_timestamp", &start_str)
+            .append_pair("end_timestamp", &end_str);
+        match request_json(
+            apply_newapi_auth(
+                chrome_request_headers(client.get(query_url), base_url.as_str(), user_agent),
+                auth,
+            ),
+            "签到日志接口",
+        )
+        .await
+        {
+            Ok(value) => {
+                if parse_newapi_checkin_logs(&value).unwrap_or(false) {
+                    return Ok(true);
+                }
+            }
+            Err(_) => {}
+        }
+    }
+    Ok(false)
 }
 
 pub(crate) fn json_boolish(value: &serde_json::Value) -> Option<bool> {
@@ -858,8 +872,8 @@ pub(crate) async fn refresh_newapi_checkin(
     };
     if !enabled {
         // 状态接口报"功能未启用"时不可直接判定未签到：部分站点该字段不可靠，
-        // 用户当天可能已在网页手动签到过。改查当天签到日志（type=4）确认：
-        // 有记录按已签到展示，无记录按未签到展示，均不触发自动代签；
+        // 用户当天可能已在网页手动签到过。改查当天签到日志（type=4 和 type=1）
+        // 确认：有记录按已签到展示，无记录按未签到展示，均不触发自动代签；
         // 日志接口失败时维持"未启用"不展示，与原先行为一致。
         return match query_newapi_checkin_log(client, base_url, auth, user_agent).await {
             Ok(logged) => CheckinSnapshot {
@@ -1608,31 +1622,40 @@ pub(crate) fn chrome_account_bridge_script(
           }
         }
         if (!checkinEnabled && !checkinError) {
-          // 状态接口报"功能未启用"或缺少启用状态：查当天签到日志（type=4）兜底，
-          // 确认用户是否已在网页手动签到过。有记录标已签到、无记录标未签到；
+          // 状态接口报"功能未启用"或缺少启用状态：查当天签到日志兜底，
+          // 依次查 type=4（签到日志）和 type=1（充值/系统日志），任一有记录即已签到；
           // 日志兜底结果绝不触发自动代签。
           const dayStart = new Date();
           dayStart.setHours(0, 0, 0, 0);
           const dayEnd = new Date();
           dayEnd.setHours(23, 59, 59, 999);
-          const logResponse = await readResponse(await fetch(
-            `/api/log/self?p=1&page_size=20&type=4&start_timestamp=${Math.floor(dayStart.getTime() / 1000)}&end_timestamp=${Math.floor(dayEnd.getTime() / 1000)}`,
-            { method: "GET", credentials: "include", cache: "no-store", headers,
-              signal: AbortSignal.timeout(requestTimeout) }
-          ));
-          if (!logResponse.challenge && !logResponse.error &&
-              logResponse.status >= 200 && logResponse.status < 300 &&
-              logResponse.data && logResponse.data.success === true) {
-            const items = logResponse.data.data?.items || logResponse.data.data?.list ||
-              logResponse.data.data?.data || logResponse.data.data?.records;
-            if (Array.isArray(items)) {
-              checkinResolvedViaLog = true;
-              checkinEnabled = true;
-              checkedInToday = items.length > 0;
-              checkinError = "";
+          const startTs = Math.floor(dayStart.getTime() / 1000);
+          const endTs = Math.floor(dayEnd.getTime() / 1000);
+          let logResolved = false;
+          for (const logType of [4, 1]) {
+            const logResponse = await readResponse(await fetch(
+              `/api/log/self?p=1&page_size=20&type=${logType}&start_timestamp=${startTs}&end_timestamp=${endTs}`,
+              { method: "GET", credentials: "include", cache: "no-store", headers,
+                signal: AbortSignal.timeout(requestTimeout) }
+            ));
+            if (!logResponse.challenge && !logResponse.error &&
+                logResponse.status >= 200 && logResponse.status < 300 &&
+                logResponse.data && logResponse.data.success === true) {
+              const items = logResponse.data.data?.items || logResponse.data.data?.list ||
+                logResponse.data.data?.data || logResponse.data.data?.records;
+              if (Array.isArray(items) && items.length > 0) {
+                checkinResolvedViaLog = true;
+                checkinEnabled = true;
+                checkedInToday = true;
+                checkinError = "";
+                logResolved = true;
+                break;
+              }
             }
-          } else {
-            // 日志兜底失败：保留"未启用"提示，便于用户了解站点当前状态。
+          }
+          if (!logResolved && !checkinResolvedViaLog) {
+            // 两种日志类型均无记录或请求失败时：如果至少有一种日志接口
+            // 成功返回了空列表，仍标记为"功能已启用但未签到"。
             checkinError = "签到功能未启用";
           }
         }
@@ -1656,10 +1679,7 @@ pub(crate) fn chrome_account_bridge_script(
               checkedInToday = true;
             }
           }
-        } else {
-          checkinError = messageOf(checkinResponse.data, "签到状态数据无效");
-        }
-      } catch (error) {
+        } catch (error) {
         checkinError = String(error && error.message || error);
       }
     }
@@ -2783,9 +2803,9 @@ mod tests {
         let script =
             chrome_account_bridge_script(Some("42"), "2026-08", "openhub-test", false, true, true);
         // 状态接口报"功能未启用"（含 success:false + 提示语）时应携带当天签到日志查询
-        // （type=4 过滤），兜底结果标记 checkinResolvedViaLog，绝不触发自动代签。
+        // （type=4 和 type=1），兜底结果标记 checkinResolvedViaLog，绝不触发自动代签。
         assert!(script.contains("/api/log/self"));
-        assert!(script.contains("type=4"));
+        assert!(script.contains("[4, 1]"));
         assert!(script.contains("start_timestamp="));
         assert!(script.contains("end_timestamp="));
         assert!(script.contains("未启用|未开启|没有启用|not enabled|not_enabled|disabled"));

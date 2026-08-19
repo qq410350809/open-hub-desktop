@@ -1,8 +1,25 @@
 <script setup lang="ts">
 import { ref, computed, watch, onMounted, onUnmounted } from "vue";
 import { icons } from "../icons";
-import { useModelProxy, type ChannelConfig, type ProxyRequestLog } from "../composables/useModelProxy";
+import {
+  useModelProxy,
+  channelAlias,
+  isValidChannelAlias,
+  filterChannelModels,
+  type ChannelConfig,
+  type ChannelUsageStats,
+  type ProxyRequestLog,
+} from "../composables/useModelProxy";
+import { useLibrary, runCommand } from "../composables/useLibrary";
 import { useToast } from "../composables/useToast";
+import CustomSelect from "./CustomSelect.vue";
+import type { SiteRecord } from "../types";
+
+const logPageSizeOptions = [
+  { value: 25, text: "25" },
+  { value: 50, text: "50" },
+  { value: 100, text: "100" },
+];
 
 const { showToast } = useToast();
 const {
@@ -12,13 +29,16 @@ const {
   togglingServer,
   testingHealth,
   fetchingModels,
-  modelsList,
+  channelModels,
+  modelsForChannel,
+  channelStats,
   healthResult,
   healthResultTime,
   proxyLogs,
   loadingLogs,
   loadProxyData,
   refreshStatus,
+  refreshChannelStats,
   saveConfig,
   toggleServer,
   testHealth,
@@ -52,6 +72,7 @@ const healthModalOpen = ref(false);
 const gatewayModelsModalOpen = ref(false);
 const currentMainTab = ref<"console" | "channels" | "logs">("console");
 const channelModelsModalOpen = ref(false);
+const channelSettingsDialogOpen = ref(false);
 const clearLogsModalOpen = ref(false);
 const clearingLogs = ref(false);
 const selectedLogForDetail = ref<ProxyRequestLog | null>(null);
@@ -70,6 +91,14 @@ async function handleClearLogs(mode: "payload_only" | "all") {
 
 let uptimeTicker: number | null = null;
 let statusPollTimer: number | null = null;
+let channelStatsTimer: number | null = null;
+
+// 切换到「反代渠道」标签时刷新一次渠道使用统计
+watch(currentMainTab, (tab) => {
+  if (tab === "channels") {
+    void refreshChannelStats();
+  }
+});
 
 onMounted(async () => {
   await loadProxyData();
@@ -87,6 +116,13 @@ onMounted(async () => {
       await refreshStatus();
     }
   }, 3000);
+
+  // 反代渠道标签处于激活且服务运行时，每 5s 刷新一次渠道使用统计
+  channelStatsTimer = window.setInterval(async () => {
+    if (currentMainTab.value === "channels" && proxyStatus.value.running) {
+      await refreshChannelStats();
+    }
+  }, 5000);
 });
 
 onUnmounted(() => {
@@ -97,6 +133,10 @@ onUnmounted(() => {
   if (statusPollTimer !== null) {
     clearInterval(statusPollTimer);
     statusPollTimer = null;
+  }
+  if (channelStatsTimer !== null) {
+    clearInterval(channelStatsTimer);
+    channelStatsTimer = null;
   }
 });
 
@@ -130,7 +170,7 @@ function closeHealthModal() {
 
 function handleOpenGatewayModelsModal() {
   gatewayModelsModalOpen.value = true;
-  if (modelsList.value.length === 0) {
+  if (Object.keys(channelModels.value).length === 0) {
     refreshModels();
   }
 }
@@ -142,13 +182,326 @@ function closeGatewayModelsModal() {
 function handleOpenChannelModelsModal(channel: ChannelConfig) {
   selectedChannel.value = channel;
   channelModelsModalOpen.value = true;
-  if (modelsList.value.length === 0) {
+  // 初始化勾选状态：白名单为 null（全部启用）时默认全选；否则仅勾选白名单中的模型
+  const allow = channel.enabledModels;
+  if (allow == null) {
+    channelModelAllChecked.value = true;
+    channelModelSelection.value = {};
+  } else {
+    channelModelAllChecked.value = false;
+    const map: Record<string, boolean> = {};
+    for (const m of allow) map[m] = true;
+    channelModelSelection.value = map;
+  }
+  if (modelsForChannel(channel.id).length === 0) {
     refreshModels();
   }
 }
 
 function closeChannelModelsModal() {
   channelModelsModalOpen.value = false;
+}
+
+// —— 渠道「管理模型」弹窗：勾选启用白名单 ——
+const channelModelSelection = ref<Record<string, boolean>>({});
+/** true = 全选模式（等价未配置白名单，对外全部启用） */
+const channelModelAllChecked = ref(true);
+
+function isModelChecked(model: string): boolean {
+  if (channelModelAllChecked.value) return true;
+  return !!channelModelSelection.value[model];
+}
+
+/** 当前选中渠道的模型列表（弹窗数据源） */
+function selectedChannelModels(): string[] {
+  const channel = selectedChannel.value;
+  return channel ? modelsForChannel(channel.id) : [];
+}
+
+/** 当前勾选数量（按现有模型列表计算），用于头部计数与保存结果 */
+const channelCheckedCount = computed(
+  () => selectedChannelModels().filter((m) => isModelChecked(m)).length,
+);
+
+function toggleModel(model: string) {
+  const list = selectedChannelModels();
+  if (channelModelAllChecked.value) {
+    // 首次取消勾选：从全选模式切换为显式列表，仅取消当前这一个
+    const map: Record<string, boolean> = {};
+    for (const m of list) map[m] = true;
+    map[model] = false;
+    channelModelSelection.value = map;
+    channelModelAllChecked.value = false;
+    return;
+  }
+  const map = { ...channelModelSelection.value };
+  if (map[model]) delete map[model];
+  else map[model] = true;
+  channelModelSelection.value = map;
+}
+
+function selectAllChannelModels() {
+  channelModelAllChecked.value = true;
+  channelModelSelection.value = {};
+}
+
+function clearChannelModels() {
+  channelModelAllChecked.value = false;
+  channelModelSelection.value = {};
+}
+
+async function saveChannelModelSelection() {
+  const channel = selectedChannel.value;
+  if (!channel) return;
+  // 全选 = 不配置白名单（全部启用）；部分勾选 = 白名单；一个不勾 = 不暴露任何模型
+  if (channelModelAllChecked.value) {
+    channel.enabledModels = null;
+  } else {
+    channel.enabledModels = selectedChannelModels().filter((m) => isModelChecked(m));
+  }
+  const ok = await saveConfig(proxyConfig.value);
+  if (ok) {
+    showToast(`已更新「${channel.name}」渠道可用模型（${channelCheckedCount.value} 个已启用）`);
+    channelModelsModalOpen.value = false;
+  }
+}
+
+// —— 渠道「设置」弹窗：别名 / 内部代理池轮询 / 代理池固定通道 ——
+interface ChannelSettingsDraft {
+  alias: string;
+  useProxyPool: boolean;
+  useFixedProxy: boolean;
+}
+
+const channelSettingsTarget = ref<ChannelConfig | null>(null);
+const channelSettingsDraft = ref<ChannelSettingsDraft>({
+  alias: "",
+  useProxyPool: false,
+  useFixedProxy: false,
+});
+const channelSettingsError = ref("");
+
+function handleOpenChannelSettingsDialog(channel: ChannelConfig) {
+  channelSettingsTarget.value = channel;
+  channelSettingsDraft.value = {
+    alias: channelAlias(channel),
+    useProxyPool: channel.useProxyPool,
+    useFixedProxy: !!channel.useFixedProxy,
+  };
+  channelSettingsError.value = "";
+  channelSettingsDialogOpen.value = true;
+}
+
+function closeChannelSettingsDialog() {
+  channelSettingsDialogOpen.value = false;
+}
+
+/** 校验别名：合法字符 + 全渠道唯一（含 opencode）。返回错误信息，空串表示通过。 */
+function validateAlias(alias: string, excludeId?: string): string {
+  const a = alias.trim().toLowerCase();
+  if (!a) return "请填写英文别名";
+  if (!isValidChannelAlias(a)) return "英文别名只能包含英文字母、数字、- 与 _";
+  const conflict = proxyConfig.value.channels.find(
+    (c) => c.id !== excludeId && channelAlias(c) === a,
+  );
+  if (conflict) return `别名「${a}」已存在（${conflict.name}），所有渠道别名不能重复`;
+  return "";
+}
+
+async function saveChannelSettings() {
+  const channel = channelSettingsTarget.value;
+  if (!channel) return;
+  const err = validateAlias(channelSettingsDraft.value.alias, channel.id);
+  if (err) {
+    channelSettingsError.value = err;
+    return;
+  }
+  channel.alias = channelSettingsDraft.value.alias.trim().toLowerCase();
+  // 两种渠道的设置界面不同：站点转换渠道只有「代理池固定通道」，官方通道只有「内部代理池轮询」
+  if (channel.siteId) {
+    channel.useProxyPool = false;
+    channel.useFixedProxy = channelSettingsDraft.value.useFixedProxy;
+  } else {
+    channel.useProxyPool = channelSettingsDraft.value.useProxyPool;
+    channel.useFixedProxy = false;
+  }
+  const ok = await saveConfig(proxyConfig.value);
+  if (ok) {
+    showToast(
+      `已更新「${channel.name}」渠道设置（别名 ${channel.alias}${channel.useFixedProxy ? " · 代理池固定通道" : channel.useProxyPool ? " · 代理池轮询" : ""}）`,
+    );
+    channelSettingsDialogOpen.value = false;
+  }
+}
+
+// —— 站点转换：从站点库「在用且存活」的站点创建反代渠道 ——
+const { sites: librarySites, loadLibrary } = useLibrary();
+const siteConvertDialogOpen = ref(false);
+const convertSelectedSite = ref<SiteRecord | null>(null);
+const convertAlias = ref("");
+const convertApiBaseUrl = ref("");
+const convertAliasError = ref("");
+const convertKeyLoading = ref(false);
+/** 站点同步数据中读取到的原 Key 列表（与站点纪录关联，全部继承） */
+const convertSiteKeys = ref<{ account: string; key: string }[]>([]);
+/** 未读取到站点 Key 时的手动兜底输入 */
+const convertManualKey = ref("");
+
+/** 在用且存活（未标记跑路）的站点；已转换为渠道的排除在外 */
+const convertibleSites = computed(() => {
+  const convertedIds = new Set(
+    proxyConfig.value.channels.map((c) => c.siteId).filter((v): v is string => !!v),
+  );
+  return librarySites.value
+    .filter((s) => s.isPersonal && !s.isRunaway)
+    .filter((s) => !convertedIds.has(s.id))
+    .slice()
+    .sort((a, b) => a.name.localeCompare(b.name, "zh-CN"));
+});
+
+/** 从站点名生成英文别名（中文名回退为 site），并保证与现有渠道别名不冲突 */
+function slugifySiteName(name: string): string {
+  const base = (name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 24)) || "site";
+  return base;
+}
+
+function uniqueChannelAlias(base: string): string {
+  const existing = new Set(proxyConfig.value.channels.map((c) => channelAlias(c)));
+  if (!existing.has(base)) return base;
+  let i = 2;
+  while (existing.has(`${base}-${i}`)) i += 1;
+  return `${base}-${i}`;
+}
+
+function maskApiKey(key: string): string {
+  const value = key.trim();
+  if (!value) return "—";
+  if (value.length <= 6) return `${"•".repeat(6)}`;
+  const prefixLength = value.startsWith("sk-") ? 7 : 4;
+  const suffixLength = Math.min(4, Math.max(2, Math.floor(value.length / 8)));
+  if (value.length <= prefixLength + suffixLength) {
+    return `${value.slice(0, 4)}${"•".repeat(6)}`;
+  }
+  return `${value.slice(0, prefixLength)}${"•".repeat(8)}${value.slice(-suffixLength)}`;
+}
+
+function openSiteConvertDialog() {
+  convertSelectedSite.value = null;
+  convertAlias.value = "";
+  convertApiBaseUrl.value = "";
+  convertAliasError.value = "";
+  convertSiteKeys.value = [];
+  convertManualKey.value = "";
+  siteConvertDialogOpen.value = true;
+  if (librarySites.value.length === 0) {
+    void loadLibrary();
+  }
+}
+
+function closeSiteConvertDialog() {
+  siteConvertDialogOpen.value = false;
+}
+
+/** 选择站点：预填 API 地址、自动生成唯一别名，并读取站点同步的全部原 Key（继承，无需选择） */
+async function selectConvertSite(site: SiteRecord) {
+  convertSelectedSite.value = site;
+  convertApiBaseUrl.value = site.apiBaseUrl.trim();
+  convertAlias.value = uniqueChannelAlias(slugifySiteName(site.name));
+  convertAliasError.value = "";
+  convertSiteKeys.value = [];
+  convertManualKey.value = "";
+  convertKeyLoading.value = true;
+  try {
+    const cache = await runCommand<{
+      accounts?: { username?: string; accountName?: string; profileName?: string; keys?: string[] }[];
+    }>("get_site_model_cache", { siteId: site.id });
+    const accounts = Array.isArray(cache?.accounts) ? cache.accounts : [];
+    const keys: { account: string; key: string }[] = [];
+    for (const acc of accounts) {
+      const accName = acc.username || acc.accountName || acc.profileName || "账号";
+      for (const k of Array.isArray(acc.keys) ? acc.keys : []) {
+        if (k.trim()) keys.push({ account: accName, key: k });
+      }
+    }
+    convertSiteKeys.value = keys;
+  } catch {
+    /* 忽略：无本地缓存时由用户手动填写 */
+  } finally {
+    convertKeyLoading.value = false;
+  }
+}
+
+watch(convertAlias, (val) => {
+  convertAliasError.value = validateAlias(val);
+});
+
+async function confirmConvertSite() {
+  const site = convertSelectedSite.value;
+  if (!site) return;
+  const err = validateAlias(convertAlias.value);
+  if (err) {
+    convertAliasError.value = err;
+    return;
+  }
+  if (!convertApiBaseUrl.value.trim()) {
+    convertAliasError.value = "请填写 API 地址";
+    return;
+  }
+  // 继承站点同步的全部原 Key（请求时自动轮换尝试）；未读取到用手动兜底输入
+  const keys = convertSiteKeys.value.map((item) => item.key.trim()).filter(Boolean);
+  const manualKey = convertManualKey.value.trim();
+  const apiKeys = keys.length > 0 ? keys : manualKey ? [manualKey] : [];
+  const channel: ChannelConfig = {
+    id: `site_${site.id}`,
+    name: site.name,
+    description: `由站点「${site.name}」转换而来的反代渠道（继承站点原 Key ×${apiKeys.length || 1}）`,
+    enabled: true,
+    protocol: "openai",
+    upstreamUrl: convertApiBaseUrl.value.trim(),
+    apiKey: apiKeys[0] ?? "",
+    apiKeys,
+    // 站点转换渠道不支持「内部代理池轮询」，仅可在渠道设置中开启「代理池固定通道」
+    useProxyPool: false,
+    alias: convertAlias.value.trim().toLowerCase(),
+    siteId: site.id,
+    useFixedProxy: false,
+    enabledModels: null,
+  };
+  proxyConfig.value.channels.push(channel);
+  const ok = await saveConfig(proxyConfig.value);
+  if (ok) {
+    showToast(`已将「${site.name}」转换为反代渠道（别名 ${channel.alias}）`);
+    siteConvertDialogOpen.value = false;
+    void refreshModels();
+  } else {
+    proxyConfig.value.channels = proxyConfig.value.channels.filter((c) => c.id !== channel.id);
+  }
+}
+
+// —— 渠道卡片底部使用统计 ——
+const emptyChannelStats: ChannelUsageStats = {
+  channelId: "",
+  totalRequests: 0,
+  successfulRequests: 0,
+  failedRequests: 0,
+  totalTokens: 0,
+  todayTotalTokens: 0,
+};
+
+function channelStatsFor(channel: ChannelConfig): ChannelUsageStats {
+  return channelStats.value[channel.id] ?? emptyChannelStats;
+}
+
+function channelSuccessRate(channel: ChannelConfig): string {
+  const s = channelStatsFor(channel);
+  if (s.totalRequests <= 0) return "—";
+  return `${((s.successfulRequests / s.totalRequests) * 100).toFixed(1)}%`;
+}
+
+/** 有请求但成功率低于 90% 时标红提示 */
+function channelSuccessRateBad(channel: ChannelConfig): boolean {
+  const s = channelStatsFor(channel);
+  return s.totalRequests > 0 && s.successfulRequests / s.totalRequests < 0.9;
 }
 
 const detailActiveTab = ref<"tokens" | "request" | "response" | "reasoning" | "meta" | "error">("tokens");
@@ -449,10 +802,12 @@ export interface ChannelModelGroup {
 const gatewayGroupedModels = computed<ChannelModelGroup[]>(() => {
   const q = gatewaySearchQuery.value.trim().toLowerCase();
   return proxyConfig.value.channels.map((channel) => {
-    let models = channel.id === "opencode" ? modelsList.value : [];
+    // 该渠道对外可见的模型：按渠道拉取的模型再经白名单勾选结果过滤
+    let models = filterChannelModels(channel, modelsForChannel(channel.id));
+    const alias = channelAlias(channel);
     if (q) {
       models = models.filter(
-        (m) => m.toLowerCase().includes(q) || `opencode/${m}`.toLowerCase().includes(q)
+        (m) => m.toLowerCase().includes(q) || `${alias}/${m}`.toLowerCase().includes(q)
       );
     }
     return {
@@ -466,11 +821,23 @@ const totalGatewayModelsCount = computed(() => {
   return gatewayGroupedModels.value.reduce((acc, g) => acc + g.models.length, 0);
 });
 
+/** 渠道卡片上对外可见（白名单内）的模型数量 */
+function channelEnabledModelsCount(channel: ChannelConfig): number {
+  return filterChannelModels(channel, modelsForChannel(channel.id)).length;
+}
+
+/** 顶栏「可用模型」徽标数量：优先取后端已按白名单过滤的计数，其次按前端白名单过滤结果兜底 */
+const availableModelsCount = computed(() => {
+  if (proxyStatus.value.modelsCount > 0) return proxyStatus.value.modelsCount;
+  return proxyConfig.value.channels.reduce((acc, c) => acc + channelEnabledModelsCount(c), 0);
+});
+
 const filteredChannelModels = computed(() => {
   const q = channelSearchQuery.value.trim().toLowerCase();
-  const list = modelsList.value;
+  const list = selectedChannelModels();
+  const alias = channelAlias(selectedChannel.value);
   if (!q) return list;
-  return list.filter((m) => m.toLowerCase().includes(q) || `opencode/${m}`.toLowerCase().includes(q));
+  return list.filter((m) => m.toLowerCase().includes(q) || `${alias}/${m}`.toLowerCase().includes(q));
 });
 
 /** 当前页数据：筛选/搜索/排序已由后端 SQL 处理，前端仅透传展示 */
@@ -532,8 +899,8 @@ function formatUptime(seconds: number) {
   return `${hours} 小时 ${mins} 分`;
 }
 
-async function copyModel(modelId: string) {
-  const fullId = `opencode/${modelId}`;
+async function copyModel(modelId: string, channel: ChannelConfig) {
+  const fullId = `${channelAlias(channel)}/${modelId}`;
   try {
     await navigator.clipboard.writeText(fullId);
     copiedModelId.value = modelId;
@@ -593,8 +960,8 @@ async function copyModel(modelId: string) {
         >
           <span v-html="icons.cpu" />
           <span>{{ fetchingModels ? "加载中…" : "可用模型" }}</span>
-          <span v-if="proxyStatus.modelsCount || modelsList.length" class="mp-btn-badge">
-            {{ proxyStatus.modelsCount || modelsList.length }}
+          <span v-if="availableModelsCount > 0" class="mp-btn-badge">
+            {{ availableModelsCount }}
           </span>
         </button>
 
@@ -812,7 +1179,18 @@ async function copyModel(modelId: string) {
           <span class="mp-card-icon" v-html="icons.shield" />
           <h2>反代上游渠道 ({{ proxyConfig.channels.length }})</h2>
         </div>
-        <small class="text-muted">独立管理各个上游反代通道与内部代理池轮询</small>
+        <div class="mp-section-actions">
+          <small class="text-muted">独立管理各个上游反代通道与内部代理池轮询</small>
+          <button
+            type="button"
+            class="mp-btn mp-btn-ghost mp-btn-sm"
+            title="从站点库「在用且存活」的站点创建反代渠道"
+            @click="openSiteConvertDialog"
+          >
+            <span v-html="icons.globe" />
+            <span>站点转换</span>
+          </button>
+        </div>
       </div>
 
       <div class="mp-channels-grid">
@@ -830,7 +1208,20 @@ async function copyModel(modelId: string) {
               </div>
               <div>
                 <h3>{{ channel.name }}</h3>
-                <span class="mp-proto-tag">{{ channel.protocol.toUpperCase() }} 协议</span>
+                <span class="mp-card-tags">
+                  <span class="mp-proto-tag">{{ channel.protocol.toUpperCase() }} 协议</span>
+                  <span class="mp-alias-tag" :title="`英文别名：${channelAlias(channel)}（作为网关模型前缀）`">{{ channelAlias(channel) }}</span>
+                  <span
+                    v-if="channel.siteId"
+                    class="mp-alias-tag is-site"
+                    title="与站点库原纪录关联，使用该站点同步的原 Key"
+                  >站点关联</span>
+                  <span
+                    v-if="(channel.apiKeys?.length ?? 0) > 1"
+                    class="mp-alias-tag"
+                    :title="`继承该站点 ${channel.apiKeys!.length} 个原 Key，请求时自动轮换`"
+                  >Key ×{{ channel.apiKeys!.length }}</span>
+                </span>
               </div>
             </div>
 
@@ -848,46 +1239,68 @@ async function copyModel(modelId: string) {
             {{ channel.description }}
           </p>
 
-          <!-- 内部代理池轮询配置项 -->
-          <div class="mp-proxy-pool-box">
-            <div class="mp-proxy-pool-row">
-              <div class="mp-proxy-pool-label">
-                <span class="mp-pp-icon" v-html="icons.repeat" />
-                <span>内部代理池轮询</span>
-              </div>
-              <label class="mp-switch-wrap" :title="channel.useProxyPool ? '点击关闭代理池轮询' : '点击开启内部代理池轮询'">
-                <input
-                  v-model="channel.useProxyPool"
-                  type="checkbox"
-                  @change="handleChannelSave(channel)"
-                />
-                <span class="mp-switch-round" />
-              </label>
-            </div>
-
-            <div v-if="channel.useProxyPool" class="mp-proxy-pool-status is-active">
-              <span class="mp-status-dot-sm" />
-              <span>优先直连，报错自动按速度切换至代理池 <strong>≤ 1000ms</strong> 节点（粘性保持）</span>
-            </div>
-            <div v-else class="mp-proxy-pool-status is-inactive">
-              <span>当前网络模式：直接连接 (直连上游通道)</span>
-            </div>
+          <!-- 渠道快捷状态：网络模式 / 在线模型数（点击进入对应弹窗） -->
+          <div class="mp-channel-meta-row">
+            <button
+              type="button"
+              class="mp-channel-meta-chip"
+              :class="{ 'is-active': channel.useProxyPool || channel.useFixedProxy }"
+              title="点击打开渠道设置：网络模式与英文别名"
+              @click="handleOpenChannelSettingsDialog(channel)"
+            >
+              <span v-html="icons.repeat" />
+              <span>{{ channel.useFixedProxy ? "固定通道" : (channel.useProxyPool ? "代理池轮询" : "直连上游") }}</span>
+            </button>
+            <button
+              type="button"
+              class="mp-channel-meta-chip"
+              :class="{ 'is-active': channel.enabledModels != null }"
+              title="管理此渠道对外暴露的可用模型"
+              @click="handleOpenChannelModelsModal(channel)"
+            >
+              <span v-html="icons.cpu" />
+              <span>模型 {{ channelEnabledModelsCount(channel) }}</span>
+            </button>
           </div>
 
           <div class="mp-channel-card-footer">
-            <div class="mp-channel-stat">
-              <span>在线可用模型</span>
-              <strong class="font-mono text-brand">{{ modelsList.length }} 个</strong>
+            <!-- 该渠道使用统计 -->
+            <div class="mp-channel-stats">
+              <div class="mp-channel-stat" title="该渠道累计请求次数">
+                <span>累计请求</span>
+                <strong class="font-mono">{{ channelStatsFor(channel).totalRequests }}</strong>
+              </div>
+              <div class="mp-channel-stat" title="该渠道累计成功请求占比">
+                <span>成功率</span>
+                <strong :class="{ 'is-bad': channelSuccessRateBad(channel) }">{{ channelSuccessRate(channel) }}</strong>
+              </div>
+              <div class="mp-channel-stat" title="该渠道累计消耗 Token（含缓存命中）">
+                <span>累计 Token</span>
+                <strong class="font-mono text-brand">{{ formatCompactToken(channelStatsFor(channel).totalTokens) }}</strong>
+              </div>
             </div>
-            <button
-              type="button"
-              class="mp-action-btn"
-              title="查看此渠道的模型目录"
-              @click="handleOpenChannelModelsModal(channel)"
-            >
-              <span v-html="icons.search" />
-              <span>查看模型</span>
-            </button>
+
+            <div class="mp-channel-actions">
+              <button
+                type="button"
+                class="mp-action-btn"
+                :class="{ 'is-active': channel.enabledModels != null }"
+                title="勾选此渠道对外暴露的模型，选中的体现在可用模型列表"
+                @click="handleOpenChannelModelsModal(channel)"
+              >
+                <span v-html="icons.edit" />
+                <span>管理模型</span>
+              </button>
+              <button
+                type="button"
+                class="mp-action-btn"
+                title="打开渠道设置：内部代理池轮询开关"
+                @click="handleOpenChannelSettingsDialog(channel)"
+              >
+                <span v-html="icons.settings" />
+                <span>设置</span>
+              </button>
+            </div>
           </div>
         </div>
       </div>
@@ -1118,16 +1531,14 @@ async function copyModel(modelId: string) {
         <footer v-if="logTotal > 0" class="app-table-pagination">
           <label>
             <span>每页</span>
-            <select
+            <CustomSelect
               class="app-table-page-size"
-              :value="logPageSize"
+              placement="top"
+              :options="logPageSizeOptions"
+              :model-value="logPageSize"
               aria-label="每页条数"
-              @change="logPageSize = Number(($event.target as HTMLSelectElement).value); goLogPage(1, { filter: logStatusFilter, q: logSearchQuery.trim() })"
-            >
-              <option :value="25">25</option>
-              <option :value="50">50</option>
-              <option :value="100">100</option>
-            </select>
+              @update:model-value="logPageSize = Number($event); goLogPage(1, { filter: logStatusFilter, q: logSearchQuery.trim() })"
+            />
             <span>条</span>
           </label>
           <div class="app-table-page-buttons">
@@ -1238,22 +1649,24 @@ async function copyModel(modelId: string) {
         </form>
 
         <div class="mp-modal-footer">
-          <button
-            type="button"
-            class="mp-btn mp-btn-ghost"
-            @click="configModalOpen = false"
-          >
-            取消
-          </button>
-          <button
-            type="button"
-            class="mp-btn mp-btn-primary"
-            :disabled="savingConfig"
-            @click="handleSave"
-          >
-            <span v-html="icons.check" />
-            <span>{{ savingConfig ? "保存中…" : "保存并应用" }}</span>
-          </button>
+          <div class="mp-modal-footer-buttons">
+            <button
+              type="button"
+              class="mp-btn mp-btn-ghost"
+              @click="configModalOpen = false"
+            >
+              取消
+            </button>
+            <button
+              type="button"
+              class="mp-btn mp-btn-primary"
+              :disabled="savingConfig"
+              @click="handleSave"
+            >
+              <span v-html="icons.check" />
+              <span>{{ savingConfig ? "保存中…" : "保存并应用" }}</span>
+            </button>
+          </div>
         </div>
       </div>
     </div>
@@ -1779,6 +2192,11 @@ async function copyModel(modelId: string) {
                     <h4 class="mp-group-name">{{ group.channel.name }} 渠道</h4>
                     <span class="mp-proto-tag">{{ group.channel.protocol.toUpperCase() }} 协议</span>
                     <span class="mp-group-count-badge">{{ group.models.length }} 个模型</span>
+                    <span
+                      v-if="group.channel.enabledModels != null"
+                      class="mp-group-count-badge is-filtered"
+                      title="该渠道已在「管理模型」中勾选白名单，未勾选的模型不在此展示"
+                    >已管理</span>
                   </div>
                 </div>
                 <div class="mp-group-meta">
@@ -1800,16 +2218,16 @@ async function copyModel(modelId: string) {
                   :key="model"
                   class="mp-model-elegant-card"
                   :class="{ 'is-copied': copiedModelId === model }"
-                  @click="copyModel(model)"
+                  @click="copyModel(model, group.channel)"
                 >
                   <div class="mp-mec-left">
                     <div class="mp-mec-title-row">
-                      <span class="mp-model-free-badge">免费</span>
+                      <span class="mp-model-free-badge">{{ channelAlias(group.channel) }}</span>
                       <span class="mp-model-name-title">{{ model }}</span>
                     </div>
                     <div class="mp-mec-id-row">
                       <span class="mp-mec-id-label">调用 ID:</span>
-                      <code class="mp-mec-id-code">opencode/{{ model }}</code>
+                      <code class="mp-mec-id-code">{{ channelAlias(group.channel) }}/{{ model }}</code>
                     </div>
                   </div>
 
@@ -1818,8 +2236,8 @@ async function copyModel(modelId: string) {
                       type="button"
                       class="mp-copy-action-btn"
                       :class="{ 'copied': copiedModelId === model }"
-                      :title="`复制 opencode/${model}`"
-                      @click.stop="copyModel(model)"
+                      :title="`复制 ${channelAlias(group.channel)}/${model}`"
+                      @click.stop="copyModel(model, group.channel)"
                     >
                       <span v-html="copiedModelId === model ? icons.check : icons.copy" />
                       <span>{{ copiedModelId === model ? '已复制' : '复制 ID' }}</span>
@@ -1858,7 +2276,7 @@ async function copyModel(modelId: string) {
       </div>
     </div>
 
-    <!-- 弹窗 2: 渠道卡片「查看模型」- 单个渠道专属模型目录 (Channel Models Modal) -->
+    <!-- 弹窗 2: 渠道卡片「管理模型」- 勾选该渠道对外暴露的可用模型 (Channel Models Modal) -->
     <div
       v-if="channelModelsModalOpen"
       class="mp-modal-backdrop"
@@ -1875,11 +2293,11 @@ async function copyModel(modelId: string) {
             </div>
             <div>
               <div class="mp-modal-title-wrap">
-                <h3 id="mp-channel-models-title">{{ selectedChannel?.name || 'OpenCode' }} · 上游模型目录</h3>
-                <span class="mp-header-chip">{{ filteredChannelModels.length }} 个在线模型</span>
+                <h3 id="mp-channel-models-title">{{ selectedChannel?.name || 'OpenCode' }} · 管理可用模型</h3>
+                <span class="mp-header-chip">{{ channelCheckedCount }} / {{ selectedChannelModels().length }} 个已启用</span>
                 <span class="mp-header-endpoint-chip font-mono">{{ selectedChannel?.upstreamUrl }}</span>
               </div>
-              <small class="text-muted">上游 Public 免费通道支持的在线模型 · 自动映射为网关调用 ID</small>
+              <small class="text-muted">勾选需要对外暴露的模型 · 未勾选的模型将不在可用模型列表与网关目录中展示</small>
             </div>
           </div>
           <button
@@ -1915,6 +2333,26 @@ async function copyModel(modelId: string) {
             <button
               type="button"
               class="mp-btn mp-btn-ghost"
+              :class="{ 'is-active': channelModelAllChecked }"
+              title="勾选全部模型（对外暴露全部）"
+              @click="selectAllChannelModels"
+            >
+              <span v-html="icons.check" />
+              <span>全选</span>
+            </button>
+            <button
+              type="button"
+              class="mp-btn mp-btn-ghost"
+              :class="{ 'is-active': !channelModelAllChecked && channelCheckedCount === 0 }"
+              title="取消全部勾选（不对外暴露任何模型）"
+              @click="clearChannelModels"
+            >
+              <span v-html="icons.close" />
+              <span>清空</span>
+            </button>
+            <button
+              type="button"
+              class="mp-btn mp-btn-ghost"
               :disabled="fetchingModels"
               title="从该上游渠道重新获取模型列表"
               @click="refreshModels"
@@ -1924,37 +2362,32 @@ async function copyModel(modelId: string) {
             </button>
           </div>
 
-          <!-- 精致双列模型卡片矩阵 -->
+          <!-- 可勾选的模型卡片矩阵 -->
           <div class="mp-model-cards-grid">
             <div
               v-for="model in filteredChannelModels"
               :key="model"
               class="mp-model-elegant-card"
-              :class="{ 'is-copied': copiedModelId === model }"
-              @click="copyModel(model)"
+              :class="{ 'is-selected': isModelChecked(model) }"
+              role="checkbox"
+              :aria-checked="isModelChecked(model)"
+              :tabindex="0"
+              :title="isModelChecked(model) ? `已启用：${model}` : `未启用：${model}`"
+              @click="toggleModel(model)"
+              @keydown.enter.space.prevent="toggleModel(model)"
             >
+              <div class="mp-mec-check" aria-hidden="true">
+                <span v-html="isModelChecked(model) ? icons.check : ''" />
+              </div>
               <div class="mp-mec-left">
                 <div class="mp-mec-title-row">
-                  <span class="mp-model-free-badge">免费</span>
+                  <span class="mp-model-free-badge">{{ channelAlias(selectedChannel) }}</span>
                   <span class="mp-model-name-title">{{ model }}</span>
                 </div>
                 <div class="mp-mec-id-row">
                   <span class="mp-mec-id-label">网关 ID:</span>
-                  <code class="mp-mec-id-code">opencode/{{ model }}</code>
+                  <code class="mp-mec-id-code">{{ channelAlias(selectedChannel) }}/{{ model }}</code>
                 </div>
-              </div>
-
-              <div class="mp-mec-right">
-                <button
-                  type="button"
-                  class="mp-copy-action-btn"
-                  :class="{ 'copied': copiedModelId === model }"
-                  :title="`复制 opencode/${model}`"
-                  @click.stop="copyModel(model)"
-                >
-                  <span v-html="copiedModelId === model ? icons.check : icons.copy" />
-                  <span>{{ copiedModelId === model ? '已复制' : '复制网关 ID' }}</span>
-                </button>
               </div>
             </div>
           </div>
@@ -1962,21 +2395,309 @@ async function copyModel(modelId: string) {
           <div v-if="filteredChannelModels.length === 0" class="mp-empty-box">
             <div class="mp-empty-icon" v-html="icons.shield" />
             <p v-if="fetchingModels">正在从上游渠道拉取最新模型…</p>
-            <p v-else>暂无匹配的渠道模型</p>
+            <p v-else-if="channelSearchQuery">未检索到匹配的模型</p>
+            <p v-else>暂无模型数据，请先点击「刷新上游模型」</p>
           </div>
         </div>
 
         <div class="mp-modal-footer">
           <div class="mp-modal-footer-hint text-muted text-xs">
-            <span>💡 提示：该渠道所有模型均无需 API Key，通过网关即可免密高速调用</span>
+            <span v-if="channelModelAllChecked">💡 当前为全选状态：该渠道全部模型对外可用</span>
+            <span v-else-if="channelCheckedCount > 0">💡 已勾选 {{ channelCheckedCount }} 个模型，仅这些会出现在可用模型列表</span>
+            <span v-else>⚠️ 未勾选任何模型：保存后该渠道将不对外暴露模型</span>
+          </div>
+          <div class="mp-modal-footer-buttons">
+            <button
+              type="button"
+              class="mp-btn mp-btn-ghost"
+              @click="closeChannelModelsModal"
+            >
+              取消
+            </button>
+            <button
+              type="button"
+              class="mp-btn mp-btn-primary"
+              :disabled="savingConfig"
+              title="保存当前勾选结果到渠道配置"
+              @click="saveChannelModelSelection"
+            >
+              <span v-html="icons.check" />
+              <span>{{ savingConfig ? "保存中…" : "保存所选模型" }}</span>
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 弹窗 3: 渠道设置 - 内部代理池轮询开关 (Channel Settings Modal) -->
+    <div
+      v-if="channelSettingsDialogOpen"
+      class="mp-modal-backdrop"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="mp-channel-settings-title"
+      @click.self="closeChannelSettingsDialog"
+    >
+      <div class="mp-modal-box">
+        <div class="mp-modal-header">
+          <div class="mp-modal-title-group">
+            <div class="mp-modal-badge-icon">
+              <span v-html="icons.settings" />
+            </div>
+            <div>
+              <div class="mp-modal-title-wrap">
+                <h3 id="mp-channel-settings-title">{{ channelSettingsTarget?.name || 'OpenCode' }} · 渠道设置</h3>
+                <span class="mp-header-endpoint-chip font-mono">{{ channelSettingsTarget?.upstreamUrl }}</span>
+              </div>
+              <small class="text-muted">{{ channelSettingsTarget?.siteId ? "站点转换渠道 · 配置代理池固定通道" : "官方免费通道 · 配置内部代理池轮询" }}</small>
+            </div>
           </div>
           <button
             type="button"
-            class="mp-btn mp-btn-primary"
-            @click="closeChannelModelsModal"
+            class="mp-modal-close"
+            title="关闭弹窗 (Esc)"
+            @click="closeChannelSettingsDialog"
           >
-            完成
+            <span v-html="icons.close" />
           </button>
+        </div>
+
+        <div class="mp-modal-body">
+          <!-- 英文别名 -->
+          <div class="mp-settings-field">
+            <div class="mp-settings-field-head">
+              <div class="mp-proxy-pool-label">
+                <span class="mp-pp-icon" v-html="icons.globe" />
+                <span>英文别名</span>
+              </div>
+              <small class="text-muted">网关模型前缀，如 {{ channelSettingsDraft.alias || "alias" }}/model</small>
+            </div>
+            <input
+              v-model="channelSettingsDraft.alias"
+              type="text"
+              class="mp-settings-input"
+              :class="{ 'has-error': channelSettingsError }"
+              placeholder="仅限英文、数字、- 与 _"
+              @input="channelSettingsError = validateAlias(channelSettingsDraft.alias, channelSettingsTarget?.id)"
+            />
+            <p v-if="channelSettingsError" class="mp-settings-error">{{ channelSettingsError }}</p>
+            <p v-else class="mp-settings-hint">所有渠道别名不能重复（含 opencode）</p>
+          </div>
+
+          <!-- 内部代理池轮询（仅官方免费通道，如 OpenCode） -->
+          <div v-if="!channelSettingsTarget?.siteId" class="mp-proxy-pool-box">
+            <div class="mp-proxy-pool-row">
+              <div class="mp-proxy-pool-label">
+                <span class="mp-pp-icon" v-html="icons.repeat" />
+                <span>内部代理池轮询</span>
+              </div>
+              <label class="mp-switch-wrap" :title="channelSettingsDraft.useProxyPool ? '点击关闭代理池轮询' : '点击开启内部代理池轮询'">
+                <input
+                  v-model="channelSettingsDraft.useProxyPool"
+                  type="checkbox"
+                />
+                <span class="mp-switch-round" />
+              </label>
+            </div>
+
+            <div v-if="channelSettingsDraft.useProxyPool" class="mp-proxy-pool-status is-active">
+              <span class="mp-status-dot-sm" />
+              <span>优先直连，报错自动按速度切换至代理池 <strong>≤ 1000ms</strong> 节点（粘性保持）</span>
+            </div>
+            <div v-else class="mp-proxy-pool-status is-inactive">
+              <span>当前网络模式：直接连接 (直连上游通道)</span>
+            </div>
+          </div>
+
+          <!-- 代理池固定通道（仅站点转换渠道） -->
+          <div v-if="channelSettingsTarget?.siteId" class="mp-proxy-pool-box">
+            <div class="mp-proxy-pool-row">
+              <div class="mp-proxy-pool-label">
+                <span class="mp-pp-icon" v-html="icons.shield" />
+                <span>代理池固定通道</span>
+              </div>
+              <label class="mp-switch-wrap" :title="channelSettingsDraft.useFixedProxy ? '点击关闭固定通道' : '点击开启代理池固定通道'">
+                <input
+                  v-model="channelSettingsDraft.useFixedProxy"
+                  type="checkbox"
+                />
+                <span class="mp-switch-round" />
+              </label>
+            </div>
+
+            <div v-if="channelSettingsDraft.useFixedProxy" class="mp-proxy-pool-status is-active">
+              <span class="mp-status-dot-sm" />
+              <span>始终经代理池出口节点转发（不直连），适合直连被限制的站点渠道</span>
+            </div>
+            <div v-else class="mp-proxy-pool-status is-inactive">
+              <span>默认出口：直连上游通道</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="mp-modal-footer">
+          <div class="mp-modal-footer-hint text-muted text-xs">
+            <span>💡 遇到上游频次限制或连接错误时，网关会自动切换代理池出口节点重试</span>
+          </div>
+          <div class="mp-modal-footer-buttons">
+            <button
+              type="button"
+              class="mp-btn mp-btn-ghost"
+              @click="closeChannelSettingsDialog"
+            >
+              取消
+            </button>
+            <button
+              type="button"
+              class="mp-btn mp-btn-primary"
+              :disabled="savingConfig"
+              title="保存渠道设置"
+              @click="saveChannelSettings"
+            >
+              <span v-html="icons.check" />
+              <span>{{ savingConfig ? "保存中…" : "保存设置" }}</span>
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 弹窗 4: 站点转换 - 从站点库「在用且存活」站点创建反代渠道 (Site Convert Modal) -->
+    <div
+      v-if="siteConvertDialogOpen"
+      class="mp-modal-backdrop"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="mp-site-convert-title"
+      @click.self="closeSiteConvertDialog"
+    >
+      <div class="mp-modal-box mp-modal-box-wide">
+        <div class="mp-modal-header">
+          <div class="mp-modal-title-group">
+            <div class="mp-modal-badge-icon">
+              <span v-html="icons.globe" />
+            </div>
+            <div>
+              <div class="mp-modal-title-wrap">
+                <h3 id="mp-site-convert-title">站点转换</h3>
+                <span class="mp-header-chip">{{ convertibleSites.length }} 个可用站点</span>
+              </div>
+              <small class="text-muted">从站点库「在用且存活」的站点创建反代渠道 · 所有渠道英文别名不能重复（含 opencode）</small>
+            </div>
+          </div>
+          <button
+            type="button"
+            class="mp-modal-close"
+            title="关闭弹窗 (Esc)"
+            @click="closeSiteConvertDialog"
+          >
+            <span v-html="icons.close" />
+          </button>
+        </div>
+
+        <div class="mp-modal-body">
+          <!-- 站点列表 -->
+          <div class="mp-site-list">
+            <button
+              v-for="site in convertibleSites"
+              :key="site.id"
+              type="button"
+              class="mp-site-item"
+              :class="{ 'is-selected': convertSelectedSite?.id === site.id }"
+              @click="selectConvertSite(site)"
+            >
+              <span class="mp-site-item-name">{{ site.name }}</span>
+              <span class="mp-site-item-url font-mono">{{ site.apiBaseUrl }}</span>
+            </button>
+            <div v-if="convertibleSites.length === 0" class="mp-empty-box">
+              <div class="mp-empty-icon" v-html="icons.globe" />
+              <p>暂无「在用且存活」的站点可转换</p>
+            </div>
+          </div>
+
+          <!-- 转换配置 -->
+          <div v-if="convertSelectedSite" class="mp-convert-config">
+            <div class="mp-settings-field">
+              <div class="mp-settings-field-head">
+                <div class="mp-proxy-pool-label">
+                  <span class="mp-pp-icon" v-html="icons.globe" />
+                  <span>英文别名（唯一）</span>
+                </div>
+                <small class="text-muted">网关模型前缀，如 {{ convertAlias || "alias" }}/model</small>
+              </div>
+              <input
+                v-model="convertAlias"
+                type="text"
+                class="mp-settings-input"
+                :class="{ 'has-error': convertAliasError }"
+                placeholder="仅限英文、数字、- 与 _"
+              />
+              <p v-if="convertAliasError" class="mp-settings-error">{{ convertAliasError }}</p>
+            </div>
+            <div class="mp-settings-field">
+              <div class="mp-settings-field-head">
+                <span>API 地址</span>
+              </div>
+              <input
+                v-model="convertApiBaseUrl"
+                type="text"
+                class="mp-settings-input"
+                placeholder="https://example.com/v1"
+              />
+            </div>
+
+            <!-- 站点原 Key：全部继承，无需选择 -->
+            <div class="mp-settings-field">
+              <div class="mp-settings-field-head">
+                <span>站点 API Key（继承全部）</span>
+                <small v-if="convertKeyLoading" class="text-muted">正在读取站点 Key…</small>
+              </div>
+              <div v-if="convertSiteKeys.length > 0" class="mp-convert-keys">
+                <span
+                  v-for="(item, i) in convertSiteKeys"
+                  :key="i"
+                  class="mp-convert-key-chip"
+                  :title="`${item.account} 的原 Key`"
+                >{{ maskApiKey(item.key) }}</span>
+              </div>
+              <input
+                v-else
+                v-model="convertManualKey"
+                type="password"
+                class="mp-settings-input"
+                placeholder="未读取到站点 Key，可手动填写（留空则发送 Bearer public）"
+              />
+              <p v-if="convertSiteKeys.length > 0" class="mp-settings-hint">已继承该站点 {{ convertSiteKeys.length }} 个原 Key，请求时自动轮换尝试</p>
+              <p v-else-if="convertKeyLoading" class="mp-settings-hint">正在从本地同步数据读取站点原 Key…</p>
+              <p v-else class="mp-settings-hint">未在本地同步数据中找到该站点的 Key</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="mp-modal-footer">
+          <div class="mp-modal-footer-hint text-muted text-xs">
+            <span v-if="convertSelectedSite">💡 转换后可在「管理模型」中勾选该渠道对外暴露的模型</span>
+            <span v-else>💡 选择上方一个在用且存活的站点开始转换</span>
+          </div>
+          <div class="mp-modal-footer-buttons">
+            <button
+              type="button"
+              class="mp-btn mp-btn-ghost"
+              @click="closeSiteConvertDialog"
+            >
+              取消
+            </button>
+            <button
+              type="button"
+              class="mp-btn mp-btn-primary"
+              :disabled="savingConfig || !convertSelectedSite"
+              title="将该站点转换为一个反代渠道"
+              @click="confirmConvertSite"
+            >
+              <span v-html="icons.plus" />
+              <span>{{ savingConfig ? "转换中…" : "转换为渠道" }}</span>
+            </button>
+          </div>
         </div>
       </div>
     </div>
@@ -2918,6 +3639,13 @@ async function copyModel(modelId: string) {
   border-color: var(--line-strong);
 }
 
+/* 已配置模型白名单的渠道：管理模型按钮高亮提示 */
+.mp-action-btn.is-active {
+  color: var(--brand-deep);
+  border-color: var(--brand);
+  background: var(--brand-soft);
+}
+
 .mp-btn-icon-only {
   width: 26px;
   padding: 0;
@@ -3025,6 +3753,162 @@ async function copyModel(modelId: string) {
   display: inline-block;
 }
 
+/* 渠道卡片标题标签行 */
+.mp-card-tags {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.mp-alias-tag {
+  font-size: 10.5px;
+  font-weight: 700;
+  font-family: var(--font-mono, monospace);
+  color: var(--text);
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  padding: 1px 6px;
+  border-radius: 4px;
+  display: inline-block;
+}
+
+/* 站点转换渠道标记：与站点库原纪录关联 */
+.mp-alias-tag.is-site {
+  color: var(--brand-deep);
+  background: var(--brand-soft);
+  border-color: var(--brand);
+}
+
+/* 分区头部操作区 */
+.mp-section-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+/* 设置弹窗表单字段 */
+.mp-settings-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.mp-settings-field-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12px;
+  font-weight: 650;
+  color: var(--text);
+}
+
+.mp-settings-input {
+  height: 36px;
+  padding: 0 12px;
+  border-radius: var(--r-md, 8px);
+  border: 1px solid var(--line);
+  background: var(--surface);
+  color: var(--text);
+  font-size: 13px;
+  font-family: var(--font-mono, monospace);
+  outline: none;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.mp-settings-input:focus {
+  border-color: var(--brand);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--brand) 15%, transparent);
+}
+
+.mp-settings-input.has-error {
+  border-color: var(--danger, #e5484d);
+}
+
+.mp-settings-error {
+  font-size: 11.5px;
+  color: var(--danger, #e5484d);
+  margin: 0;
+}
+
+.mp-settings-hint {
+  font-size: 11.5px;
+  color: var(--muted);
+  margin: 0;
+}
+
+/* 站点转换：站点列表 */
+.mp-site-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 260px;
+  overflow-y: auto;
+}
+
+.mp-site-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: var(--r-md, 8px);
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.mp-site-item:hover {
+  border-color: var(--line-strong);
+  background: var(--surface);
+}
+
+.mp-site-item.is-selected {
+  border-color: var(--brand);
+  background: var(--brand-soft);
+}
+
+.mp-site-item-name {
+  font-size: 13px;
+  font-weight: 650;
+  color: var(--text);
+}
+
+.mp-site-item-url {
+  font-size: 11.5px;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 55%;
+}
+
+.mp-convert-config {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding-top: 4px;
+}
+
+/* 转换弹窗：继承的站点 Key 列表 */
+.mp-convert-keys {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.mp-convert-key-chip {
+  font-family: var(--font-mono, monospace);
+  font-size: 12px;
+  padding: 4px 10px;
+  border-radius: 6px;
+  background: var(--brand-soft);
+  border: 1px solid var(--brand);
+  color: var(--brand-deep);
+}
+
 .mp-channel-desc {
   font-size: 12.5px;
   color: var(--muted);
@@ -3094,12 +3978,57 @@ async function copyModel(modelId: string) {
   color: var(--muted);
 }
 
+/* 渠道快捷状态行 */
+.mp-channel-meta-row {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.mp-channel-meta-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 11.5px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.mp-channel-meta-chip :deep(svg) {
+  width: 12px;
+  height: 12px;
+}
+
+.mp-channel-meta-chip:hover {
+  color: var(--text);
+  border-color: var(--line-strong);
+}
+
+.mp-channel-meta-chip.is-active {
+  color: var(--brand-deep);
+  border-color: var(--brand);
+  background: var(--brand-soft);
+}
+
 .mp-channel-card-footer {
   display: flex;
-  justify-content: space-between;
-  align-items: center;
-  padding-top: 10px;
+  flex-direction: column;
+  gap: 10px;
+  padding-top: 12px;
   border-top: 1px solid var(--line);
+}
+
+/* 渠道使用统计：三格均分 */
+.mp-channel-stats {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
 }
 
 .mp-channel-stat {
@@ -3115,7 +4044,21 @@ async function copyModel(modelId: string) {
 
 .mp-channel-stat strong {
   font-size: 13px;
-  color: var(--brand);
+  color: var(--text);
+}
+
+.mp-channel-stat strong.is-bad {
+  color: var(--danger, #e5484d);
+}
+
+.mp-channel-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.mp-channel-actions .mp-action-btn {
+  flex: 1;
+  justify-content: center;
 }
 
 /* 开关组件 */
@@ -3381,6 +4324,14 @@ async function copyModel(modelId: string) {
   color: var(--muted);
 }
 
+/* 底部操作按钮组：靠右相邻排布，避免被 space-between 撑散 */
+.mp-modal-footer-buttons {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-shrink: 0;
+}
+
 /* 模型弹窗高级工具栏 */
 .mp-models-modal-toolbar {
   display: flex;
@@ -3528,6 +4479,13 @@ async function copyModel(modelId: string) {
   color: var(--muted);
 }
 
+/* 已配置模型白名单的渠道标记 */
+.mp-group-count-badge.is-filtered {
+  background: var(--brand-soft);
+  border-color: var(--brand);
+  color: var(--brand-deep);
+}
+
 .mp-group-meta {
   display: flex;
   align-items: center;
@@ -3590,6 +4548,44 @@ async function copyModel(modelId: string) {
 .mp-model-elegant-card.is-copied {
   border-color: var(--brand);
   background: var(--brand-soft);
+}
+
+/* 管理模型：勾选态高亮，未勾选态降低透明度 */
+.mp-model-elegant-card.is-selected {
+  border-color: var(--brand);
+  background: var(--brand-soft);
+}
+
+.mp-model-elegant-card:not(.is-selected) {
+  opacity: 0.68;
+}
+
+.mp-model-elegant-card:not(.is-selected):hover {
+  opacity: 0.9;
+}
+
+.mp-mec-check {
+  flex-shrink: 0;
+  width: 20px;
+  height: 20px;
+  border-radius: 6px;
+  border: 1.5px solid var(--line-strong);
+  background: var(--surface);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.18s ease;
+}
+
+.mp-mec-check :deep(svg) {
+  width: 12px;
+  height: 12px;
+  color: #fff;
+}
+
+.mp-model-elegant-card.is-selected .mp-mec-check {
+  background: var(--brand);
+  border-color: var(--brand);
 }
 
 .mp-mec-left {

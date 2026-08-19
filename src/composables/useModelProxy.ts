@@ -10,7 +10,43 @@ export interface ChannelConfig {
   protocol: string;
   upstreamUrl: string;
   apiKey?: string;
+  /** 站点转换继承的多个原 Key，请求时自动轮换尝试；为空时回退 apiKey */
+  apiKeys?: string[];
   useProxyPool: boolean;
+  /** 英文别名：网关模型前缀（如 opencode/*）；全渠道唯一，含 opencode。为空回退为渠道 id。 */
+  alias?: string;
+  /** 通过「站点转换」创建时关联的站点库站点 id */
+  siteId?: string | null;
+  /** 代理池固定通道：始终经代理池出口节点转发，不优先直连 */
+  useFixedProxy?: boolean;
+  /**
+   * 该渠道对外暴露的模型白名单：
+   * - undefined / null（默认，兼容旧配置）= 全部启用
+   * - [] = 不暴露任何模型
+   * - 非空数组 = 仅勾选的模型体现在可用模型列表
+   */
+  enabledModels?: string[] | null;
+}
+
+/** 渠道的生效别名：显式配置为空时回退为渠道 id，统一小写。 */
+export function channelAlias(channel: ChannelConfig | null | undefined): string {
+  const a = channel?.alias?.trim().toLowerCase();
+  return a || channel?.id || "";
+}
+
+/** 按渠道白名单过滤模型列表：未配置白名单时返回全量。 */
+export function filterChannelModels(
+  channel: ChannelConfig | null | undefined,
+  models: string[],
+): string[] {
+  const allow = channel?.enabledModels;
+  if (!allow) return models;
+  return models.filter((m) => allow.includes(m));
+}
+
+/** 校验英文别名合法性：仅限英文字母、数字、- 与 _。 */
+export function isValidChannelAlias(alias: string): boolean {
+  return /^[a-zA-Z0-9_-]+$/.test(alias.trim());
 }
 
 export interface OpencodeProxyConfig {
@@ -66,6 +102,28 @@ export interface ProxyRequestLog {
   nodeName?: string;
 }
 
+/** 单个渠道的累计使用统计（渠道卡片底部展示）。 */
+export interface ChannelUsageStats {
+  channelId: string;
+  totalRequests: number;
+  successfulRequests: number;
+  failedRequests: number;
+  totalPromptTokens?: number;
+  totalCompletionTokens?: number;
+  totalReasoningTokens?: number;
+  totalReasoningRequests?: number;
+  totalCacheHitTokens?: number;
+  totalTokens?: number;
+  todayTotalTokens?: number;
+}
+
+/** 单个渠道拉取到的模型列表（含别名前缀）。 */
+export interface ChannelModelList {
+  channelId: string;
+  alias: string;
+  models: string[];
+}
+
 const proxyConfig = ref<OpencodeProxyConfig>({
   enabled: true,
   port: 8088,
@@ -80,6 +138,10 @@ const proxyConfig = ref<OpencodeProxyConfig>({
       upstreamUrl: "https://opencode.ai/zen/v1",
       apiKey: "public",
       useProxyPool: false,
+      alias: "opencode",
+      siteId: null,
+      useFixedProxy: false,
+      enabledModels: null,
     },
   ],
   timeoutSeconds: 300,
@@ -110,7 +172,10 @@ const savingConfig = ref(false);
 const togglingServer = ref(false);
 const testingHealth = ref(false);
 const fetchingModels = ref(false);
-const modelsList = ref<string[]>([]);
+/** 各渠道拉取到的模型列表（key = channelId，值为裸模型名数组） */
+const channelModels = ref<Record<string, string[]>>({});
+/** 按渠道 id 索引的累计使用统计 */
+const channelStats = ref<Record<string, ChannelUsageStats>>({});
 const healthResult = ref<any>(null);
 const healthResultTime = ref<string>("");
 const proxyLogs = ref<ProxyRequestLog[]>([]);
@@ -163,16 +228,34 @@ export function useModelProxy() {
               upstreamUrl: "https://opencode.ai/zen/v1",
               apiKey: "public",
               useProxyPool: false,
+              alias: "opencode",
+              siteId: null,
+              useFixedProxy: false,
+              enabledModels: null,
             },
           ];
         }
         proxyConfig.value = cfg;
       }
       if (status) proxyStatus.value = status;
+      await refreshChannelStats();
     } catch (e) {
       console.error("加载模型反代配置失败:", e);
     } finally {
       proxyLoading.value = false;
+    }
+  }
+
+  async function refreshChannelStats() {
+    try {
+      const list = await runCommand<ChannelUsageStats[]>("get_opencode_channel_stats");
+      if (Array.isArray(list)) {
+        const map: Record<string, ChannelUsageStats> = {};
+        for (const item of list) map[item.channelId] = item;
+        channelStats.value = map;
+      }
+    } catch (e) {
+      console.warn("获取渠道使用统计失败:", e);
     }
   }
 
@@ -235,15 +318,22 @@ export function useModelProxy() {
   async function refreshModels() {
     fetchingModels.value = true;
     try {
-      const list = await runCommand<string[]>("fetch_opencode_models");
+      const list = await runCommand<ChannelModelList[]>("fetch_opencode_models");
       if (Array.isArray(list)) {
-        modelsList.value = list;
+        const map: Record<string, string[]> = {};
+        for (const item of list) map[item.channelId] = item.models;
+        channelModels.value = map;
       }
     } catch (e) {
       console.warn("拉取模型失败:", e);
     } finally {
       fetchingModels.value = false;
     }
+  }
+
+  /** 某渠道的模型列表（未拉取到时为空数组）。 */
+  function modelsForChannel(channelId: string): string[] {
+    return channelModels.value[channelId] ?? [];
   }
 
   async function fetchLogs(options: { filter?: string; q?: string } = {}) {
@@ -382,7 +472,9 @@ export function useModelProxy() {
     togglingServer,
     testingHealth,
     fetchingModels,
-    modelsList,
+    channelModels,
+    modelsForChannel,
+    channelStats,
     healthResult,
     healthResultTime,
     proxyLogs,
@@ -402,6 +494,7 @@ export function useModelProxy() {
     logSortOrder,
     loadProxyData,
     refreshStatus,
+    refreshChannelStats,
     saveConfig,
     toggleServer,
     testHealth,
