@@ -587,7 +587,7 @@ fn openai_to_anthropic_sse_stream(
     async_stream::stream! {
         let mut stream = stream;
         let mut buffer = String::new();
-        let mut started = false;
+        let mut msg_started = false;
         let mut finished = false;
         let mut collected_content = String::new();
         let mut collected_reasoning = String::new();
@@ -599,6 +599,12 @@ fn openai_to_anthropic_sse_stream(
         let mut completion_tokens: Option<u64> = None;
         let mut reasoning_tokens: Option<u64> = None;
         let mut total_tokens: Option<u64> = None;
+        let mut upstream_finish_reason: Option<String> = None;
+
+        // Block 状态跟踪
+        let mut current_block_index: usize = 0;
+        let mut active_block: Option<String> = None; // None, Some("text"), Some("tool_use")
+        let mut had_tool_use = false;
 
         let msg_id = format!(
             "msg_{:x}",
@@ -665,9 +671,9 @@ fn openai_to_anthropic_sse_stream(
                                         }
                                     }
 
-                                    // 首个 chunk 发送 message_start 与 content_block_start
-                                    if !started {
-                                        started = true;
+                                    // 首个数据包发出 message_start
+                                    if !msg_started {
+                                        msg_started = true;
                                         if ttft_ms.is_none() {
                                             ttft_ms = Some(start_time.elapsed().as_millis() as u64);
                                         }
@@ -679,7 +685,7 @@ fn openai_to_anthropic_sse_stream(
                                                 "id": msg_id.clone(),
                                                 "type": "message",
                                                 "role": "assistant",
-                                                "model": model_name.clone(),
+                                                "model": format!("opencode/{}", model_name),
                                                 "content": [],
                                                 "stop_reason": null,
                                                 "stop_sequence": null,
@@ -687,30 +693,91 @@ fn openai_to_anthropic_sse_stream(
                                             }
                                         });
                                         yield Ok(bytes::Bytes::from(format!("event: message_start\ndata: {msg_start}\n\n")));
-
-                                        let block_start = json!({
-                                            "type": "content_block_start",
-                                            "index": 0,
-                                            "content_block": { "type": "text", "text": "" }
-                                        });
-                                        yield Ok(bytes::Bytes::from(format!("event: content_block_start\ndata: {block_start}\n\n")));
                                     }
 
-                                    // 提取 content / reasoning 分片并发送 content_block_delta
+                                    if let Some(finish) = val.pointer("/choices/0/finish_reason").and_then(JsonValue::as_str) {
+                                        upstream_finish_reason = Some(finish.to_string());
+                                    }
+
                                     if let Some(delta) = val.pointer("/choices/0/delta") {
                                         if ttft_ms.is_none() {
                                             ttft_ms = Some(start_time.elapsed().as_millis() as u64);
                                         }
 
+                                        // 提取 content 文本流
                                         if let Some(c) = delta.get("content").and_then(JsonValue::as_str) {
                                             if !c.is_empty() {
                                                 collected_content.push_str(c);
+
+                                                if active_block.as_deref() != Some("text") {
+                                                    if active_block.is_some() {
+                                                        let stop = json!({ "type": "content_block_stop", "index": current_block_index });
+                                                        yield Ok(bytes::Bytes::from(format!("event: content_block_stop\ndata: {stop}\n\n")));
+                                                        current_block_index += 1;
+                                                    }
+                                                    active_block = Some("text".to_string());
+                                                    let start = json!({
+                                                        "type": "content_block_start",
+                                                        "index": current_block_index,
+                                                        "content_block": { "type": "text", "text": "" }
+                                                    });
+                                                    yield Ok(bytes::Bytes::from(format!("event: content_block_start\ndata: {start}\n\n")));
+                                                }
+
                                                 let block_delta = json!({
                                                     "type": "content_block_delta",
-                                                    "index": 0,
+                                                    "index": current_block_index,
                                                     "delta": { "type": "text_delta", "text": c }
                                                 });
                                                 yield Ok(bytes::Bytes::from(format!("event: content_block_delta\ndata: {block_delta}\n\n")));
+                                            }
+                                        }
+
+                                        // 提取 tool_calls 工具调用流
+                                        if let Some(tool_calls) = delta.get("tool_calls").and_then(JsonValue::as_array) {
+                                            for tc in tool_calls {
+                                                had_tool_use = true;
+                                                let tc_id = tc.get("id").and_then(JsonValue::as_str);
+                                                let tc_name = tc.pointer("/function/name").and_then(JsonValue::as_str);
+                                                let tc_args = tc.pointer("/function/arguments").and_then(JsonValue::as_str);
+
+                                                if tc_id.is_some() || tc_name.is_some() {
+                                                    let new_id = tc_id.unwrap_or("call_default").to_string();
+                                                    let new_name = tc_name.unwrap_or_default().to_string();
+
+                                                    if active_block.is_some() {
+                                                        let stop = json!({ "type": "content_block_stop", "index": current_block_index });
+                                                        yield Ok(bytes::Bytes::from(format!("event: content_block_stop\ndata: {stop}\n\n")));
+                                                        current_block_index += 1;
+                                                    }
+
+                                                    active_block = Some("tool_use".to_string());
+                                                    let start = json!({
+                                                        "type": "content_block_start",
+                                                        "index": current_block_index,
+                                                        "content_block": {
+                                                            "type": "tool_use",
+                                                            "id": new_id,
+                                                            "name": new_name,
+                                                            "input": {}
+                                                        }
+                                                    });
+                                                    yield Ok(bytes::Bytes::from(format!("event: content_block_start\ndata: {start}\n\n")));
+                                                }
+
+                                                if let Some(args_chunk) = tc_args {
+                                                    if !args_chunk.is_empty() {
+                                                        let block_delta = json!({
+                                                            "type": "content_block_delta",
+                                                            "index": current_block_index,
+                                                            "delta": {
+                                                                "type": "input_json_delta",
+                                                                "partial_json": args_chunk
+                                                            }
+                                                        });
+                                                        yield Ok(bytes::Bytes::from(format!("event: content_block_delta\ndata: {block_delta}\n\n")));
+                                                    }
+                                                }
                                             }
                                         }
 
@@ -730,9 +797,9 @@ fn openai_to_anthropic_sse_stream(
                     let total_dur = start_time.elapsed().as_millis() as u64;
                     let mut interrupted_preview = String::new();
                     if !collected_reasoning.is_empty() {
-                        interrupted_preview.push_str(" thinking\n");
+                        interrupted_preview.push_str("<think>\n");
                         interrupted_preview.push_str(&collected_reasoning);
-                        interrupted_preview.push_str("\n response\n\n");
+                        interrupted_preview.push_str("\n</think>\n\n");
                     }
                     interrupted_preview.push_str(&collected_content);
                     ctx.record_log(ProxyRequestLog {
@@ -766,15 +833,29 @@ fn openai_to_anthropic_sse_stream(
 
         let out_tokens = completion_tokens.unwrap_or_else(|| (collected_content.len() / 4).max(1) as u64);
 
-        if started {
-            // content_block_stop
-            let block_stop = json!({ "type": "content_block_stop", "index": 0 });
-            yield Ok(bytes::Bytes::from(format!("event: content_block_stop\ndata: {block_stop}\n\n")));
+        if msg_started {
+            // 如果还处于某个 content block，发送 content_block_stop
+            if active_block.is_some() {
+                let block_stop = json!({ "type": "content_block_stop", "index": current_block_index });
+                yield Ok(bytes::Bytes::from(format!("event: content_block_stop\ndata: {block_stop}\n\n")));
+            }
+
+            let stop_reason = match upstream_finish_reason.as_deref() {
+                Some("tool_calls") => "tool_use",
+                Some("length") => "max_tokens",
+                _ => {
+                    if had_tool_use {
+                        "tool_use"
+                    } else {
+                        "end_turn"
+                    }
+                }
+            };
 
             // message_delta
             let msg_delta = json!({
                 "type": "message_delta",
-                "delta": { "stop_reason": "end_turn", "stop_sequence": null },
+                "delta": { "stop_reason": stop_reason, "stop_sequence": null },
                 "usage": { "output_tokens": out_tokens }
             });
             yield Ok(bytes::Bytes::from(format!("event: message_delta\ndata: {msg_delta}\n\n")));
@@ -1974,13 +2055,54 @@ async fn handle_messages(
         .unwrap_or("deepseek-v4-flash-free");
     let stripped_model = strip_opencode_prefix(raw_model);
 
+    let mut openai_tools = Vec::new();
+    if let Some(tools_arr) = body.get("tools").and_then(JsonValue::as_array) {
+        for t in tools_arr {
+            let name = t.get("name").and_then(JsonValue::as_str).unwrap_or_default();
+            let desc = t.get("description").and_then(JsonValue::as_str).unwrap_or_default();
+            let schema = t.get("input_schema").cloned().unwrap_or_else(|| json!({"type": "object"}));
+            openai_tools.push(json!({
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": desc,
+                    "parameters": schema
+                }
+            }));
+        }
+    }
+
+    let mut tool_choice_val = None;
+    if let Some(tc) = body.get("tool_choice") {
+        if let Some(tc_str) = tc.as_str() {
+            tool_choice_val = Some(json!(tc_str));
+        } else if let Some(tc_obj) = tc.as_object() {
+            let tc_type = tc_obj.get("type").and_then(JsonValue::as_str).unwrap_or_default();
+            match tc_type {
+                "auto" => tool_choice_val = Some(json!("auto")),
+                "any" => tool_choice_val = Some(json!("required")),
+                "tool" => {
+                    if let Some(name) = tc_obj.get("name").and_then(JsonValue::as_str) {
+                        tool_choice_val = Some(json!({
+                            "type": "function",
+                            "function": { "name": name }
+                        }));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     let mut openai_messages = Vec::new();
     if let Some(sys_val) = body.get("system") {
         if let Some(s) = sys_val.as_str() {
-            openai_messages.push(json!({
-                "role": "system",
-                "content": s
-            }));
+            if !s.is_empty() {
+                openai_messages.push(json!({
+                    "role": "system",
+                    "content": s
+                }));
+            }
         } else if let Some(arr) = sys_val.as_array() {
             let mut text = String::new();
             for block in arr {
@@ -2000,50 +2122,132 @@ async fn handle_messages(
     if let Some(anthropic_msgs) = body.get("messages").and_then(JsonValue::as_array) {
         for msg in anthropic_msgs {
             let role = msg.get("role").and_then(JsonValue::as_str).unwrap_or("user");
-            let content = msg.get("content");
-            let text_content = if let Some(s) = content.and_then(JsonValue::as_str) {
-                s.to_string()
-            } else if let Some(arr) = content.and_then(JsonValue::as_array) {
-                let mut text = String::new();
-                for block in arr {
-                    if let Some(t) = block.get("text").and_then(JsonValue::as_str) {
-                        if !text.is_empty() {
-                            text.push('\n');
-                        }
-                        text.push_str(t);
-                    } else if block.get("type").and_then(JsonValue::as_str) == Some("image")
-                        || block.get("type").and_then(JsonValue::as_str) == Some("image_url")
-                    {
-                        if !text.is_empty() {
-                            text.push('\n');
-                        }
-                        text.push_str("[图片输入]");
-                    }
-                }
-                text
-            } else {
-                String::new()
-            };
+            let content_val = msg.get("content");
 
-            if role == "assistant" {
-                let mut reasoning = String::new();
-                let mut final_content = text_content;
-                if let (Some(start), Some(end)) = (final_content.find("<think>"), final_content.find("</think>")) {
-                    if start < end {
-                        reasoning = final_content[start + 7..end].trim().to_string();
-                        final_content = final_content[end + 8..].trim_start().to_string();
-                    }
-                }
-                openai_messages.push(json!({
-                    "role": "assistant",
-                    "content": final_content,
-                    "reasoning_content": reasoning
-                }));
-            } else {
+            if let Some(s) = content_val.and_then(JsonValue::as_str) {
                 openai_messages.push(json!({
                     "role": role,
-                    "content": text_content
+                    "content": s
                 }));
+            } else if let Some(arr) = content_val.and_then(JsonValue::as_array) {
+                if role == "assistant" {
+                    let mut text = String::new();
+                    let mut tool_calls = Vec::new();
+                    let mut thinking = String::new();
+
+                    for block in arr {
+                        let block_type = block.get("type").and_then(JsonValue::as_str).unwrap_or_default();
+                        match block_type {
+                            "text" => {
+                                if let Some(t) = block.get("text").and_then(JsonValue::as_str) {
+                                    text.push_str(t);
+                                }
+                            }
+                            "thinking" | "redacted_thinking" => {
+                                if let Some(th) = block.get("thinking").and_then(JsonValue::as_str) {
+                                    thinking.push_str(th);
+                                }
+                            }
+                            "tool_use" => {
+                                let id = block.get("id").and_then(JsonValue::as_str).unwrap_or("call_default");
+                                let name = block.get("name").and_then(JsonValue::as_str).unwrap_or_default();
+                                let input = block.get("input").cloned().unwrap_or_else(|| json!({}));
+                                let args_str = serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_string());
+                                tool_calls.push(json!({
+                                    "id": id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": name,
+                                        "arguments": args_str
+                                    }
+                                }));
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    let mut asst_msg = json!({
+                        "role": "assistant",
+                        "content": if text.is_empty() && !tool_calls.is_empty() { JsonValue::Null } else { JsonValue::String(text) }
+                    });
+                    if !tool_calls.is_empty() {
+                        asst_msg["tool_calls"] = json!(tool_calls);
+                    }
+                    if !thinking.is_empty() {
+                        asst_msg["reasoning_content"] = json!(thinking);
+                    }
+                    openai_messages.push(asst_msg);
+                } else {
+                    // role == "user"
+                    let mut user_text = String::new();
+                    let mut user_contents = Vec::new();
+                    let mut tool_results = Vec::new();
+
+                    for block in arr {
+                        let block_type = block.get("type").and_then(JsonValue::as_str).unwrap_or_default();
+                        match block_type {
+                            "text" => {
+                                if let Some(t) = block.get("text").and_then(JsonValue::as_str) {
+                                    user_text.push_str(t);
+                                    user_contents.push(json!({ "type": "text", "text": t }));
+                                }
+                            }
+                            "image" => {
+                                if let Some(src) = block.get("source") {
+                                    let media_type = src.get("media_type").and_then(JsonValue::as_str).unwrap_or("image/png");
+                                    let data = src.get("data").and_then(JsonValue::as_str).unwrap_or_default();
+                                    user_contents.push(json!({
+                                        "type": "image_url",
+                                        "image_url": {
+                                            "url": format!("data:{media_type};base64,{data}")
+                                        }
+                                    }));
+                                }
+                            }
+                            "tool_result" => {
+                                let tool_use_id = block.get("tool_use_id").and_then(JsonValue::as_str).unwrap_or_default();
+                                let content_raw = block.get("content");
+                                let result_text = if let Some(s) = content_raw.and_then(JsonValue::as_str) {
+                                    s.to_string()
+                                } else if let Some(sub_arr) = content_raw.and_then(JsonValue::as_array) {
+                                    let mut st = String::new();
+                                    for sub in sub_arr {
+                                        if let Some(t) = sub.get("text").and_then(JsonValue::as_str) {
+                                            st.push_str(t);
+                                        }
+                                    }
+                                    st
+                                } else {
+                                    content_raw.map(|v| v.to_string()).unwrap_or_default()
+                                };
+                                tool_results.push((tool_use_id.to_string(), result_text));
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    if !user_contents.is_empty() {
+                        if user_contents.len() == 1 && user_contents[0].get("type").and_then(JsonValue::as_str) == Some("text") {
+                            openai_messages.push(json!({
+                                "role": "user",
+                                "content": user_text
+                            }));
+                        } else {
+                            openai_messages.push(json!({
+                                "role": "user",
+                                "content": user_contents
+                            }));
+                        }
+                    }
+
+                    for (tool_call_id, res_content) in tool_results {
+                        openai_messages.push(json!({
+                            "role": "tool",
+                            "tool_call_id": tool_call_id,
+                            "content": res_content
+                        }));
+                    }
+                }
             }
         }
     }
@@ -2053,13 +2257,33 @@ async fn handle_messages(
         .and_then(JsonValue::as_bool)
         .unwrap_or(false);
 
-    let openai_body = json!({
+    let mut openai_body = json!({
         "model": stripped_model,
         "messages": openai_messages,
         "stream": is_stream,
-        "temperature": body.get("temperature").unwrap_or(&json!(0.7)),
-        "max_tokens": body.get("max_tokens").unwrap_or(&json!(4096))
     });
+    if let Some(t) = body.get("temperature") {
+        openai_body["temperature"] = t.clone();
+    } else {
+        openai_body["temperature"] = json!(0.7);
+    }
+    if let Some(mt) = body.get("max_tokens") {
+        openai_body["max_tokens"] = mt.clone();
+    } else {
+        openai_body["max_tokens"] = json!(4096);
+    }
+    if let Some(top_p) = body.get("top_p") {
+        openai_body["top_p"] = top_p.clone();
+    }
+    if let Some(stop) = body.get("stop_sequences") {
+        openai_body["stop"] = stop.clone();
+    }
+    if !openai_tools.is_empty() {
+        openai_body["tools"] = json!(openai_tools);
+    }
+    if let Some(tc) = tool_choice_val {
+        openai_body["tool_choice"] = tc;
+    }
 
     let chan = match config.channels.iter().find(|c| c.id == "opencode" && c.enabled) {
         Some(c) => c,
@@ -2315,20 +2539,46 @@ async fn handle_messages(
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_nanos();
-                // 思考过程一并透传：Anthropic 原生 thinking 块（OpenCode 客户端可展示），
-                // 同时让本地日志的「思考过程」详情有内容可看。
                 let mut content_items = Vec::new();
                 if !reasoning.trim().is_empty() {
                     content_items.push(json!({ "type": "thinking", "thinking": reasoning }));
                 }
-                content_items.push(json!({ "type": "text", "text": text }));
+                if !text.is_empty() {
+                    content_items.push(json!({ "type": "text", "text": text }));
+                }
+
+                let mut stop_reason = "end_turn";
+                if let Some(finish) = chat_val.pointer("/choices/0/finish_reason").and_then(JsonValue::as_str) {
+                    match finish {
+                        "tool_calls" => stop_reason = "tool_use",
+                        "length" => stop_reason = "max_tokens",
+                        _ => {}
+                    }
+                }
+
+                if let Some(tool_calls) = chat_val.pointer("/choices/0/message/tool_calls").and_then(JsonValue::as_array) {
+                    stop_reason = "tool_use";
+                    for tc in tool_calls {
+                        let id = tc.get("id").and_then(JsonValue::as_str).unwrap_or("call_default");
+                        let name = tc.pointer("/function/name").and_then(JsonValue::as_str).unwrap_or_default();
+                        let args_raw = tc.pointer("/function/arguments").and_then(JsonValue::as_str).unwrap_or("{}");
+                        let args_parsed: JsonValue = serde_json::from_str(args_raw).unwrap_or_else(|_| json!({}));
+                        content_items.push(json!({
+                            "type": "tool_use",
+                            "id": id,
+                            "name": name,
+                            "input": args_parsed
+                        }));
+                    }
+                }
+
                 let anthropic_res = json!({
                     "id": format!("msg_{nanos:x}"),
                     "type": "message",
                     "role": "assistant",
                     "model": format!("opencode/{}", stripped_model),
                     "content": content_items,
-                    "stop_reason": "end_turn",
+                    "stop_reason": stop_reason,
                     "usage": {
                         "input_tokens": prompt_tokens.unwrap_or(0),
                         "output_tokens": completion_tokens.unwrap_or(0)
