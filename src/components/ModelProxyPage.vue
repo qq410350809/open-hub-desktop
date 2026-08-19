@@ -227,7 +227,7 @@ function extractThinkFromText(rawText: string): { thinking: string; content: str
   };
 }
 
-/** 解析后端保存的响应正文，彻底剥离思考过程（reasoning / <think>）与最终正文两部分 */
+/** 解析后端保存的响应正文，彻底剥离思考过程（reasoning / <think>）与最终正文（含工具调用） */
 function parseResponseBody(body: string | undefined | null): { thinking: string; content: string } {
   if (!body) return { thinking: "", content: "" };
 
@@ -249,17 +249,33 @@ function parseResponseBody(body: string | undefined | null): { thinking: string;
           .map((part: any) => (typeof part === "string" ? part : part?.text ?? ""))
           .join("");
       }
+
+      // 提取工具调用
+      const toolCalls = Array.isArray(message.tool_calls)
+        ? message.tool_calls
+            .map((tc: any) => {
+              const name = tc?.function?.name || tc?.name || "未知工具";
+              const args = tc?.function?.arguments || tc?.arguments || "{}";
+              return `[工具调用] ${name}(${typeof args === "string" ? args : JSON.stringify(args)})`;
+            })
+            .join("\n\n")
+        : "";
+
       const extracted = extractThinkFromText(rawContent);
       const combinedThinking = [thinking.trim(), extracted.thinking.trim()]
         .filter(Boolean)
         .join("\n\n");
+      const combinedContent = [extracted.content.trim(), toolCalls.trim()]
+        .filter(Boolean)
+        .join("\n\n");
+
       return {
         thinking: combinedThinking,
-        content: extracted.content,
+        content: combinedContent,
       };
     }
 
-    // 2. Anthropic messages 格式 (content: [{type: "thinking", ...}, {type: "text", ...}])
+    // 2. Anthropic messages 格式 (content: [{type: "thinking", ...}, {type: "text", ...}, {type: "tool_use", ...}])
     if (Array.isArray(parsed?.content)) {
       const parts = parsed.content.map((part: any) =>
         typeof part === "string" ? { type: "text", text: part } : part
@@ -272,19 +288,27 @@ function parseResponseBody(body: string | undefined | null): { thinking: string;
         .filter((p: any) => p?.type === "text")
         .map((p: any) => p?.text ?? "")
         .join("");
+      const toolUses = parts
+        .filter((p: any) => p?.type === "tool_use")
+        .map((p: any) => `[工具调用] ${p?.name || "工具"}(${JSON.stringify(p?.input || {})})`)
+        .join("\n\n");
       const topThinking = typeof parsed.thinking === "string" ? parsed.thinking : "";
 
       const extracted = extractThinkFromText(rawText);
       const combinedThinking = [topThinking.trim(), thinkingFromBlocks.trim(), extracted.thinking.trim()]
         .filter(Boolean)
         .join("\n\n");
+      const combinedContent = [extracted.content.trim(), toolUses.trim()]
+        .filter(Boolean)
+        .join("\n\n");
+
       return {
         thinking: combinedThinking,
-        content: extracted.content,
+        content: combinedContent,
       };
     }
 
-    // 3. Responses API 格式 (output: [{type: "reasoning", ...}, {type: "message", ...}])
+    // 3. Responses API 格式 (output: [{type: "reasoning", ...}, {type: "message", ...}, {type: "function_call", ...}])
     if (Array.isArray(parsed?.output)) {
       const thinkingFromOutput = parsed.output
         .filter((o: any) => o?.type === "reasoning")
@@ -301,14 +325,22 @@ function parseResponseBody(body: string | undefined | null): { thinking: string;
         .flatMap((o: any) => (Array.isArray(o?.content) ? o.content : []))
         .map((p: any) => (typeof p === "string" ? p : p?.text ?? ""))
         .join("");
+      const functionCalls = parsed.output
+        .filter((o: any) => o?.type === "function_call")
+        .map((o: any) => `[工具调用] ${o?.name || "工具"}(${typeof o?.arguments === "string" ? o.arguments : JSON.stringify(o?.arguments || {})})`)
+        .join("\n\n");
 
       const extracted = extractThinkFromText(rawContent);
       const combinedThinking = [thinkingFromOutput.trim(), extracted.thinking.trim()]
         .filter(Boolean)
         .join("\n\n");
+      const combinedContent = [extracted.content.trim(), functionCalls.trim()]
+        .filter(Boolean)
+        .join("\n\n");
+
       return {
         thinking: combinedThinking,
-        content: extracted.content,
+        content: combinedContent,
       };
     }
   } catch {

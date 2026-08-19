@@ -387,6 +387,12 @@ fn clean_sse_stream(
         let mut reasoning_tokens: Option<u64> = None;
         let mut total_tokens: Option<u64> = None;
 
+        struct ToolCallAccumulator {
+            name: String,
+            arguments: String,
+        }
+        let mut collected_tools: std::collections::BTreeMap<usize, ToolCallAccumulator> = std::collections::BTreeMap::new();
+
         while let Some(item) = stream.next().await {
             if finished {
                 break;
@@ -445,7 +451,7 @@ fn clean_sse_stream(
                                         }
                                     }
 
-                                    // 提取 content / reasoning_content 分片
+                                    // 提取 content / reasoning_content / tool_calls 分片
                                     if let Some(delta) = val.pointer("/choices/0/delta") {
                                         if ttft_ms.is_none() {
                                             ttft_ms = Some(start_time.elapsed().as_millis() as u64);
@@ -459,6 +465,18 @@ fn clean_sse_stream(
                                             .and_then(JsonValue::as_str)
                                         {
                                             collected_reasoning.push_str(rc);
+                                        }
+                                        if let Some(tool_calls_arr) = delta.get("tool_calls").and_then(JsonValue::as_array) {
+                                            for tc in tool_calls_arr {
+                                                let index = tc.get("index").and_then(JsonValue::as_u64).unwrap_or(0) as usize;
+                                                let name = tc.pointer("/function/name").and_then(JsonValue::as_str);
+                                                let args = tc.pointer("/function/arguments").and_then(JsonValue::as_str).unwrap_or_default();
+                                                let entry = collected_tools.entry(index).or_insert_with(|| ToolCallAccumulator { name: String::new(), arguments: String::new() });
+                                                if let Some(n) = name {
+                                                    if entry.name.is_empty() { entry.name = n.to_string(); }
+                                                }
+                                                entry.arguments.push_str(args);
+                                            }
                                         }
                                     }
 
@@ -497,6 +515,12 @@ fn clean_sse_stream(
                         interrupted_preview.push_str("\n</think>\n\n");
                     }
                     interrupted_preview.push_str(&collected_content);
+                    if !collected_tools.is_empty() {
+                        if !interrupted_preview.is_empty() { interrupted_preview.push_str("\n\n"); }
+                        for (_idx, tc) in &collected_tools {
+                            interrupted_preview.push_str(&format!("[工具调用] {}({})\n", tc.name, tc.arguments));
+                        }
+                    }
                     ctx.record_log(ProxyRequestLog {
                         id: req_id.clone(),
                         timestamp: current_timestamp(),
@@ -541,6 +565,12 @@ fn clean_sse_stream(
             response_preview.push_str("\n</think>\n\n");
         }
         response_preview.push_str(&collected_content);
+        if !collected_tools.is_empty() {
+            if !response_preview.is_empty() { response_preview.push_str("\n\n"); }
+            for (_idx, tc) in &collected_tools {
+                response_preview.push_str(&format!("[工具调用] {}({})\n", tc.name, tc.arguments));
+            }
+        }
 
         let final_out_tokens = completion_tokens.unwrap_or_else(|| (collected_content.len() / 4).max(1) as u64);
         let final_reason_tokens = reasoning_tokens.or_else(|| {
@@ -1196,7 +1226,62 @@ fn openai_to_responses_sse_stream(
         let out_tokens = completion_tokens.unwrap_or_else(|| (collected_content.len() / 4).max(1) as u64);
 
         if resp_created_sent {
+            // 如果 content 为空但 reasoning 不为空，将 reasoning 兜底作为 content，避免客户端拿到空 output
+            let fallback_content = if collected_content.is_empty() && !collected_reasoning.is_empty() {
+                collected_reasoning.clone()
+            } else {
+                collected_content.clone()
+            };
+
+            // 如果在此之前尚未发送过 message item，且存在文本内容
+            if !msg_item_added && !fallback_content.is_empty() {
+                msg_item_added = true;
+                msg_output_index = next_output_index;
+                let item_added_ev = json!({
+                    "type": "response.output_item.added",
+                    "output_index": msg_output_index,
+                    "item": {
+                        "id": msg_item_id.clone(),
+                        "type": "message",
+                        "role": "assistant",
+                        "content": []
+                    }
+                });
+                yield Ok(bytes::Bytes::from(format!("event: response.output_item.added\ndata: {item_added_ev}\n\n")));
+
+                let part_added_ev = json!({
+                    "type": "response.content_part.added",
+                    "item_id": msg_item_id.clone(),
+                    "output_index": msg_output_index,
+                    "content_index": 0,
+                    "part": {
+                        "type": "output_text",
+                        "text": ""
+                    }
+                });
+                yield Ok(bytes::Bytes::from(format!("event: response.content_part.added\ndata: {part_added_ev}\n\n")));
+
+                let text_delta_ev = json!({
+                    "type": "response.output_text.delta",
+                    "item_id": msg_item_id.clone(),
+                    "output_index": msg_output_index,
+                    "content_index": 0,
+                    "delta": fallback_content.clone()
+                });
+                yield Ok(bytes::Bytes::from(format!("event: response.output_text.delta\ndata: {text_delta_ev}\n\n")));
+                content_part_added = true;
+            }
+
             if content_part_added {
+                let text_done_ev = json!({
+                    "type": "response.output_text.done",
+                    "item_id": msg_item_id.clone(),
+                    "output_index": msg_output_index,
+                    "content_index": 0,
+                    "text": fallback_content.clone()
+                });
+                yield Ok(bytes::Bytes::from(format!("event: response.output_text.done\ndata: {text_done_ev}\n\n")));
+
                 let part_done_ev = json!({
                     "type": "response.content_part.done",
                     "item_id": msg_item_id.clone(),
@@ -1204,7 +1289,7 @@ fn openai_to_responses_sse_stream(
                     "content_index": 0,
                     "part": {
                         "type": "output_text",
-                        "text": collected_content.clone()
+                        "text": fallback_content.clone()
                     }
                 });
                 yield Ok(bytes::Bytes::from(format!("event: response.content_part.done\ndata: {part_done_ev}\n\n")));
@@ -1217,11 +1302,12 @@ fn openai_to_responses_sse_stream(
                     "item": {
                         "id": msg_item_id.clone(),
                         "type": "message",
+                        "status": "completed",
                         "role": "assistant",
                         "content": [
                             {
                                 "type": "output_text",
-                                "text": collected_content.clone()
+                                "text": fallback_content.clone()
                             }
                         ]
                     }
@@ -1234,11 +1320,12 @@ fn openai_to_responses_sse_stream(
                 output_items.push(json!({
                     "id": msg_item_id.clone(),
                     "type": "message",
+                    "status": "completed",
                     "role": "assistant",
                     "content": [
                         {
                             "type": "output_text",
-                            "text": collected_content.clone()
+                            "text": fallback_content.clone()
                         }
                     ]
                 }));
@@ -1252,6 +1339,7 @@ fn openai_to_responses_sse_stream(
                     "item": {
                         "id": tc.item_id.clone(),
                         "type": "function_call",
+                        "status": "completed",
                         "name": tc.name.clone(),
                         "call_id": tc.call_id.clone(),
                         "arguments": tc.arguments.clone()
@@ -1262,26 +1350,37 @@ fn openai_to_responses_sse_stream(
                 output_items.push(json!({
                     "id": tc.item_id.clone(),
                     "type": "function_call",
+                    "status": "completed",
                     "name": tc.name.clone(),
                     "call_id": tc.call_id.clone(),
                     "arguments": tc.arguments.clone()
                 }));
             }
 
+            let response_payload = json!({
+                "id": resp_id.clone(),
+                "object": "response",
+                "status": "completed",
+                "model": format!("opencode/{}", model_name),
+                "output": output_items,
+                "usage": {
+                    "input_tokens": prompt_tokens.unwrap_or(0),
+                    "output_tokens": out_tokens,
+                    "total_tokens": total_tokens.unwrap_or_else(|| prompt_tokens.unwrap_or(0) + out_tokens)
+                }
+            });
+
+            // 1. 标准 Responses API 完成事件 response.done
+            let done_ev = json!({
+                "type": "response.done",
+                "response": response_payload.clone()
+            });
+            yield Ok(bytes::Bytes::from(format!("event: response.done\ndata: {done_ev}\n\n")));
+
+            // 2. 兼容 response.completed 完成事件
             let completed_ev = json!({
                 "type": "response.completed",
-                "response": {
-                    "id": resp_id.clone(),
-                    "object": "response",
-                    "status": "completed",
-                    "model": format!("opencode/{}", model_name),
-                    "output": output_items,
-                    "usage": {
-                        "input_tokens": prompt_tokens.unwrap_or(0),
-                        "output_tokens": out_tokens,
-                        "total_tokens": total_tokens.unwrap_or_else(|| prompt_tokens.unwrap_or(0) + out_tokens)
-                    }
-                }
+                "response": response_payload
             });
             yield Ok(bytes::Bytes::from(format!("event: response.completed\ndata: {completed_ev}\n\n")));
             yield Ok(bytes::Bytes::from("data: [DONE]\n\n"));
@@ -1294,6 +1393,12 @@ fn openai_to_responses_sse_stream(
             response_preview.push_str("\n</think>\n\n");
         }
         response_preview.push_str(&collected_content);
+        if !active_tool_calls.is_empty() {
+            if !response_preview.is_empty() { response_preview.push_str("\n\n"); }
+            for (_idx, tc) in &active_tool_calls {
+                response_preview.push_str(&format!("[工具调用] {}({})\n", tc.name, tc.arguments));
+            }
+        }
 
         let final_reason_tokens = reasoning_tokens.or_else(|| {
             if collected_reasoning.is_empty() { None } else { Some((collected_reasoning.len() / 4).max(1) as u64) }
