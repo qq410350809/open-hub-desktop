@@ -322,9 +322,7 @@ async function syncAllModelKeys(
   let keyCount = 0;
   let modelCount = 0;
   try {
-    for (const siteId of siteIds) {
-      await runCommand("clear_site_model_cache_for_site", { siteId });
-    }
+    const clearedSites = new Set<string>();
     // Each account is independent; keep a small bound so slow sites do not serialize the whole sync.
     let nextTargetIndex = 0;
     const workerCount = Math.min(3, targets.length);
@@ -338,6 +336,11 @@ async function syncAllModelKeys(
           let baseUrl = site.apiBaseUrl.trim();
           if (!baseUrl.endsWith("/")) baseUrl += "/";
           const result = await runCommand<SyncedSiteModelsResult>("fetch_site_models_json", { url: baseUrl, siteId: site.id, profileId: session.profileId });
+          // 同步 Key 成功获取数据后，首次保存前清理掉这个站点原来的对应旧数据，避免数据冲突与旧 Key 残留
+          if (!clearedSites.has(site.id)) {
+            await runCommand("clear_site_model_cache_for_site", { siteId: site.id });
+            clearedSites.add(site.id);
+          }
           await runCommand("save_site_model_cache_for_account", {
             siteId: site.id,
             account: {

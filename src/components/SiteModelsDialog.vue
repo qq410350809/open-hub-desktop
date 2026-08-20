@@ -200,6 +200,10 @@ async function refreshModels(mode: "cache" | "keys" | "models" = "cache") {
             url: baseUrl,
             siteId: requestedSite.id,
           });
+          // 同步 Key 成功获取数据后，保存前清理掉这个站点原来的对应旧数据，避免数据冲突与旧 Key 残留
+          if (mode === "keys") {
+            await runCommand("clear_site_model_cache_for_site", { siteId: requestedSite.id });
+          }
           await runCommand("save_site_model_cache_for_account", {
             siteId: requestedSite.id,
             account: {
@@ -213,12 +217,13 @@ async function refreshModels(mode: "cache" | "keys" | "models" = "cache") {
               error: "",
             },
             result,
-            preserveKeys: false,
+            preserveKeys: mode === "models",
           });
         } catch {
           /* 忽略，继续读缓存 */
         }
       } else {
+        let clearedOldSiteData = false;
         for (const session of sessions) {
           if (requestId !== liveFetchRequestId) return;
           if (mode === "models" && (!session.apiKeyCount || session.apiKeyCount === 0)) continue;
@@ -228,6 +233,11 @@ async function refreshModels(mode: "cache" | "keys" | "models" = "cache") {
               siteId: requestedSite.id,
               profileId: session.profileId,
             });
+            // 同步 Key 成功获取数据后，首次保存前清理掉这个站点原来的对应旧数据，避免数据冲突与旧 Key 残留
+            if (mode === "keys" && !clearedOldSiteData) {
+              await runCommand("clear_site_model_cache_for_site", { siteId: requestedSite.id });
+              clearedOldSiteData = true;
+            }
             await runCommand("save_site_model_cache_for_account", {
               siteId: requestedSite.id,
               account: {
@@ -241,7 +251,7 @@ async function refreshModels(mode: "cache" | "keys" | "models" = "cache") {
                 error: "",
               },
               result,
-              preserveKeys: false,
+              preserveKeys: mode === "models",
             });
           } catch (error) {
             await runCommand("save_site_model_cache_for_account", {
@@ -257,7 +267,7 @@ async function refreshModels(mode: "cache" | "keys" | "models" = "cache") {
                 error: String(error),
               },
               result: null,
-              preserveKeys: false,
+              preserveKeys: mode === "models",
             });
           }
         }

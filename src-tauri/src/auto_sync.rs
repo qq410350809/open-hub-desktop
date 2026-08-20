@@ -568,6 +568,7 @@ async fn run_auto_sync_round(app: &AppHandle) -> AutoSyncRoundSummary {
             ),
         );
     }
+    let mut cleared_sites = std::collections::HashSet::new();
     for target in &model_targets {
         let mut base_url = target.api_base_url.trim().to_string();
         if !base_url.starts_with("http://") && !base_url.starts_with("https://") {
@@ -586,6 +587,11 @@ async fn run_auto_sync_round(app: &AppHandle) -> AutoSyncRoundSummary {
         .await
         {
             Ok(result) => {
+                // 同步 Key 成功获取数据后，首次保存前清理掉这个站点原来的对应旧数据，避免数据冲突与旧 Key 残留
+                if !cleared_sites.contains(&target.site_id) {
+                    let _ = models_fetch::clear_site_model_cache(&database, &target.site_id);
+                    cleared_sites.insert(target.site_id.clone());
+                }
                 let account = SiteModelCacheAccount {
                     profile_id: target.profile_id.clone(),
                     profile_name: target.profile_name.clone(),

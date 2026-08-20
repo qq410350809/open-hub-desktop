@@ -501,6 +501,10 @@ async function triggerDrawerSync(mode: "keys" | "models") {
         url: baseUrl,
         siteId: site.id,
       });
+      // 同步 Key 成功获取数据后，保存前清理掉这个站点原来的对应旧数据，避免数据冲突
+      if (mode === "keys") {
+        await runCommand("clear_site_model_cache_for_site", { siteId: site.id });
+      }
       await runCommand("save_site_model_cache_for_account", {
         siteId: site.id,
         account: {
@@ -514,9 +518,10 @@ async function triggerDrawerSync(mode: "keys" | "models") {
           error: "",
         },
         result,
-        preserveKeys: false,
+        preserveKeys: mode === "models",
       });
     } else {
+      let clearedOldSiteData = false;
       for (const session of sessions) {
         if (mode === "models" && (!session.apiKeyCount || session.apiKeyCount === 0)) continue;
         try {
@@ -525,6 +530,11 @@ async function triggerDrawerSync(mode: "keys" | "models") {
             siteId: site.id,
             profileId: session.profileId,
           });
+          // 同步 Key 成功获取数据后，首次保存前清理掉这个站点原来的对应旧数据，避免数据冲突
+          if (mode === "keys" && !clearedOldSiteData) {
+            await runCommand("clear_site_model_cache_for_site", { siteId: site.id });
+            clearedOldSiteData = true;
+          }
           await runCommand("save_site_model_cache_for_account", {
             siteId: site.id,
             account: {
@@ -538,7 +548,7 @@ async function triggerDrawerSync(mode: "keys" | "models") {
               error: "",
             },
             result,
-            preserveKeys: false,
+            preserveKeys: mode === "models",
           });
         } catch (err) {
           console.warn("同步账号模型失败:", err);
