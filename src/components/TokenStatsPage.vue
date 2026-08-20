@@ -23,7 +23,6 @@ import {
   estimateRequestCount,
   mergeModelTotals,
   formatCompact,
-  formatCost,
   formatRate,
   formatTokens,
   isKnownModel,
@@ -291,13 +290,14 @@ async function exportDataAsJson() {
       inputTokens: rangeSplits.value.input,
       outputTokens: rangeSplits.value.output,
       cacheTokens: rangeSplits.value.cache,
+      cacheReadTokens: cacheBreakdown.value.read,
+      cacheWriteTokens: cacheBreakdown.value.write,
       cacheHitRate: cacheHitRate.value,
       dailyAverage: dailyAverage.value,
       activeDays: activeDays.value,
       streakDays: streakDays.value,
       dialogues: healthTimeline.value.totalDialogues,
       requests: healthTimeline.value.totalRequests,
-      estimatedCostUsd: estimatedCost.value,
     },
     sources: bySource.value,
     models: byModel.value,
@@ -341,31 +341,29 @@ const dailyColumns: AppTableColumn[] = [
 ];
 
 const projectColumns: AppTableColumn[] = [
-  { key: "project", title: "项目 / 工作区", width: "minmax(120px, 1.4fr)", sortable: true },
-  { key: "totalTokens", title: "消耗总计", width: "88px", align: "right", sortable: true },
+  { key: "project", title: "项目 / 工作区", width: "minmax(130px, 1.5fr)", sortable: true },
+  { key: "totalTokens", title: "消耗总计", width: "90px", align: "right", sortable: true },
   { key: "share", title: "占比", width: "78px", align: "right", sortable: false },
-  { key: "input", title: "输入", width: "72px", align: "right", sortable: true },
-  { key: "output", title: "输出", width: "72px", align: "right", sortable: true },
-  { key: "cache", title: "缓存", width: "72px", align: "right", sortable: true },
-  { key: "cacheHitRate", title: "缓存命中率", width: "80px", align: "right", sortable: true },
-  { key: "reasoning", title: "推理", width: "72px", align: "right", sortable: true },
-  { key: "sessions", title: "对话轮次", width: "72px", align: "right", sortable: true },
-  { key: "requests", title: "请求数", width: "72px", align: "right", sortable: true },
-  { key: "costUsd", title: "估算成本", width: "90px", align: "right", sortable: true },
+  { key: "input", title: "输入", width: "74px", align: "right", sortable: true },
+  { key: "output", title: "输出", width: "74px", align: "right", sortable: true },
+  { key: "cache", title: "缓存", width: "74px", align: "right", sortable: true },
+  { key: "cacheHitRate", title: "缓存命中率", width: "82px", align: "right", sortable: true },
+  { key: "reasoning", title: "推理", width: "74px", align: "right", sortable: true },
+  { key: "sessions", title: "对话轮次", width: "74px", align: "right", sortable: true },
+  { key: "requests", title: "请求数", width: "74px", align: "right", sortable: true },
 ];
 
 const sourceColumns: AppTableColumn[] = [
-  { key: "source", title: "工具 / 来源", width: "minmax(120px, 1.3fr)", sortable: true },
-  { key: "totalTokens", title: "总量 Tokens", width: "88px", align: "right", sortable: true },
+  { key: "source", title: "工具 / 来源", width: "minmax(130px, 1.4fr)", sortable: true },
+  { key: "totalTokens", title: "总量 Tokens", width: "90px", align: "right", sortable: true },
   { key: "share", title: "占比", width: "78px", align: "right", sortable: false },
-  { key: "inputTokens", title: "输入", width: "72px", align: "right", sortable: true },
-  { key: "outputTokens", title: "输出", width: "72px", align: "right", sortable: true },
-  { key: "cacheTokens", title: "缓存", width: "72px", align: "right", sortable: true },
-  { key: "cacheHitRate", title: "缓存命中率", width: "80px", align: "right", sortable: true },
-  { key: "reasoningTokens", title: "推理", width: "72px", align: "right", sortable: true },
-  { key: "conversations", title: "对话数", width: "72px", align: "right", sortable: true },
-  { key: "requests", title: "请求数", width: "72px", align: "right", sortable: true },
-  { key: "costUsd", title: "成本 (USD)", width: "90px", align: "right", sortable: true },
+  { key: "inputTokens", title: "输入", width: "74px", align: "right", sortable: true },
+  { key: "outputTokens", title: "输出", width: "74px", align: "right", sortable: true },
+  { key: "cacheTokens", title: "缓存", width: "74px", align: "right", sortable: true },
+  { key: "cacheHitRate", title: "缓存命中率", width: "82px", align: "right", sortable: true },
+  { key: "reasoningTokens", title: "推理", width: "74px", align: "right", sortable: true },
+  { key: "conversations", title: "对话数", width: "74px", align: "right", sortable: true },
+  { key: "requests", title: "请求数", width: "74px", align: "right", sortable: true },
 ];
 
 const healthColumns: AppTableColumn[] = [
@@ -387,17 +385,16 @@ const healthTableRows = computed(() =>
 );
 
 const modelColumns: AppTableColumn[] = [
-  { key: "model", title: "模型名称 / 家族", width: "minmax(130px, 1.5fr)", sortable: true },
-  { key: "totalTokens", title: "总量 Tokens", width: "88px", align: "right", sortable: true },
+  { key: "model", title: "模型名称 / 家族", width: "minmax(140px, 1.6fr)", sortable: true },
+  { key: "totalTokens", title: "总量 Tokens", width: "90px", align: "right", sortable: true },
   { key: "share", title: "占比", width: "78px", align: "right", sortable: false },
-  { key: "inputTokens", title: "输入", width: "72px", align: "right", sortable: true },
-  { key: "outputTokens", title: "输出", width: "72px", align: "right", sortable: true },
-  { key: "cacheTokens", title: "缓存", width: "72px", align: "right", sortable: true },
-  { key: "cacheHitRate", title: "缓存命中率", width: "80px", align: "right", sortable: true },
-  { key: "reasoningTokens", title: "推理", width: "72px", align: "right", sortable: true },
-  { key: "conversations", title: "对话", width: "72px", align: "right", sortable: true },
-  { key: "requests", title: "请求数", width: "72px", align: "right", sortable: true },
-  { key: "costUsd", title: "成本 (USD)", width: "90px", align: "right", sortable: true },
+  { key: "inputTokens", title: "输入", width: "74px", align: "right", sortable: true },
+  { key: "outputTokens", title: "输出", width: "74px", align: "right", sortable: true },
+  { key: "cacheTokens", title: "缓存", width: "74px", align: "right", sortable: true },
+  { key: "cacheHitRate", title: "缓存命中率", width: "82px", align: "right", sortable: true },
+  { key: "reasoningTokens", title: "推理", width: "74px", align: "right", sortable: true },
+  { key: "conversations", title: "对话", width: "74px", align: "right", sortable: true },
+  { key: "requests", title: "请求数", width: "74px", align: "right", sortable: true },
 ];
 
 const sessions = computed(() => store.tokenStats.value?.sessions ?? []);
@@ -411,7 +408,7 @@ const PROVIDER_COLORS: Record<string, string> = {
   gemini: "#2196f3",
   antigravity: "#ff6900",
   kiro: "#a78bfa",
-  copilot: "#6b7280",
+  copilot: "#0969da",
   openclaw: "#facc15",
   goose: "#ef4444",
   zed: "#14b8a6",
@@ -437,7 +434,7 @@ const sourceNameMap: Record<string, string> = {
   gemini: "Gemini CLI",
   opencode: "OpenCode",
   kiro: "Kiro",
-  copilot: "GitHub Copilot",
+  copilot: "GitHub Copilot (VS Code)",
   openclaw: "OpenClaw",
   goose: "Goose AI",
   antigravity: "Google Antigravity",
@@ -518,7 +515,8 @@ const rangeSplits = computed(() => {
   return { input, output, cache, reasoning };
 });
 
-const cacheHitRate = computed(() => {
+// 缓存效能细分与命中率
+const cacheBreakdown = computed(() => {
   let cacheRead = 0;
   let cacheWrite = 0;
   let fresh = 0;
@@ -529,8 +527,22 @@ const cacheHitRate = computed(() => {
     fresh += bucket.inputTokens || 0;
     estimatedInput += bucket.estimatedInputTokens || 0;
   }
-  return cacheHitRateOf(cacheRead, cacheWrite, fresh, estimatedInput);
+  const hitRate = cacheHitRateOf(cacheRead, cacheWrite, fresh, estimatedInput);
+  const totalCached = cacheRead + cacheWrite;
+  const reuseSpeedup = fresh > 0 && cacheRead > 0
+    ? ((fresh + cacheRead) / fresh).toFixed(1)
+    : null;
+  return {
+    read: cacheRead,
+    write: cacheWrite,
+    total: totalCached,
+    fresh,
+    hitRate,
+    speedup: reuseSpeedup,
+  };
 });
+
+const cacheHitRate = computed(() => cacheBreakdown.value.hitRate);
 
 // 缓存命中率评级
 const cacheHitRateRating = computed(() => {
@@ -539,41 +551,6 @@ const cacheHitRateRating = computed(() => {
   if (rate >= 0.7) return { label: "极高效率 ⚡", class: "is-excellent" };
   if (rate >= 0.4) return { label: "良好 ✦", class: "is-good" };
   return { label: "偏低 · 可优化", class: "is-fair" };
-});
-
-// Prompt Caching 节约估算（Prompt 缓存平均每 100 万 Token 节约 ~$2.70）
-const estimatedCacheSavings = computed(() => {
-  const cachedTokens = rangeSplits.value.cache;
-  if (cachedTokens <= 0) return 0;
-  return (cachedTokens / 1_000_000) * 2.70;
-});
-
-// 成本汇总
-const costSummary = computed(() => {
-  let costUsd = 0;
-  let pricedTokens = 0;
-  let totalTokens = 0;
-  for (const bucket of filteredBuckets.value) {
-    const tokens = Math.max(0, bucket.totalTokens || 0);
-    totalTokens += tokens;
-    costUsd += Math.max(0, bucket.costUsd || 0);
-    if (bucket.pricingAvailable) pricedTokens += tokens;
-  }
-  return {
-    costUsd,
-    pricedTokens,
-    totalTokens,
-    coverage: totalTokens > 0 ? pricedTokens / totalTokens : null,
-  };
-});
-
-const estimatedCost = computed(() => costSummary.value.costUsd);
-const costCaption = computed(() => {
-  const { coverage, pricedTokens, totalTokens } = costSummary.value;
-  if (totalTokens <= 0) return "按模型标准价估算";
-  if (pricedTokens <= 0 || coverage == null) return "暂无定价上报";
-  if (coverage >= 0.9995) return "多端日志实际账单 · 100% 覆盖";
-  return `来源上报覆盖率 ${(coverage * 100).toFixed(1)}%`;
 });
 
 const totalTokensAll = computed(() => bucketTotal.value.total);
@@ -643,12 +620,97 @@ const projectUsage = computed<ProjectUsageItem[]>(() => {
     }
   >();
 
+  const isSessionUuid = (s: string) =>
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s.trim()) ||
+    s.startsWith("rollout-") ||
+    s.startsWith("session-");
+
+  const isCommonSubfolderName = (name: string) => {
+    const lower = name.toLowerCase();
+    return [
+      "src",
+      "src-tauri",
+      "docs",
+      "target",
+      "bin",
+      "node_modules",
+      "pkg",
+      "app",
+      "core",
+      "client",
+      "server",
+      "ui",
+      "web",
+      "sys",
+      "staff",
+      "third",
+      "controller",
+      "controllers",
+      "model",
+      "models",
+      "view",
+      "views",
+      "service",
+      "services",
+      "scripts",
+      "frontend",
+      "backend",
+      "dist",
+      "build",
+      "test",
+      "tests",
+      "public",
+      "custom",
+      "applications",
+    ].includes(lower);
+  };
+
   const normalizeProject = (rawKey?: string) => {
-    const value = rawKey?.trim() || "默认工作区";
-    if (value.toLowerCase().includes("books")) return "books";
-    return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value)
-      ? "其他临时任务"
-      : value;
+    let value = rawKey?.trim() || "";
+    if (!value) return "全局 / 独立会话";
+
+    if (isSessionUuid(value)) return "临时任务 / 独立会话";
+
+    if (value.startsWith("file://")) {
+      try {
+        value = decodeURIComponent(value.replace(/^file:\/\//, ""));
+      } catch {
+        value = value.replace(/^file:\/\//, "");
+      }
+    }
+
+    value = value.replace(/\\/g, "/").replace(/\/+$/, "");
+
+    if (value.endsWith(".code-workspace")) {
+      const parts = value.split("/");
+      return parts[parts.length - 1].replace(/\.code-workspace$/, "");
+    }
+
+    if (value.includes("/")) {
+      const parts = value.split("/").filter(Boolean);
+      for (let i = parts.length - 1; i >= 0; i--) {
+        const part = parts[i];
+        if (
+          !isCommonSubfolderName(part) &&
+          part !== "Users" &&
+          part !== "Applications" &&
+          !isSessionUuid(part)
+        ) {
+          return part;
+        }
+      }
+      return parts[parts.length - 1] || "全局 / 独立会话";
+    }
+
+    if (
+      ["VS Code", "Copilot CLI", "Antigravity IDE", "Antigravity CLI", "DSH", "Codex"].includes(
+        value
+      )
+    ) {
+      return "全局 / 独立会话";
+    }
+
+    return value;
   };
 
   const ensureGroup = (rawKey?: string) => {
@@ -1328,8 +1390,8 @@ onBeforeUnmount(() => {
                   <span v-html="icons.chart" />
                   <span>总用量</span>
                 </span>
-                <span class="tt-kpi-badge-hit" :class="cacheHitRateRating.class">
-                  ⚡ 缓存命中率 {{ formatRate(cacheHitRate) }}
+                <span class="tt-kpi-badge-hit is-good">
+                  输出占比 {{ shareOf(rangeSplits.output, bucketTotal.total).toFixed(1) }}%
                 </span>
               </div>
               <div class="tt-kpi-main-val">
@@ -1413,35 +1475,46 @@ onBeforeUnmount(() => {
             </div>
           </div>
 
-          <!-- KPI 4: 成本估算与价值洞察 -->
+          <!-- KPI 4: 缓存与复用效能 -->
           <div class="tt-kpi-card">
             <div class="tt-kpi-card-inner">
               <div class="tt-kpi-header">
                 <span class="tt-kpi-tag is-purple">
-                  <span v-html="icons.card" />
-                  <span>经济价值</span>
+                  <span v-html="icons.sparkles" />
+                  <span>缓存与效能</span>
                 </span>
-                <span v-if="estimatedCacheSavings > 0" class="tt-kpi-savings-pill">
-                  ⚡ 缓存节约 ≈ ${{ estimatedCacheSavings.toFixed(2) }}
+                <span
+                  v-if="cacheHitRate != null && cacheHitRate > 0"
+                  class="tt-kpi-badge-hit"
+                  :class="cacheHitRateRating.class"
+                >
+                  {{ cacheHitRateRating.label }}
                 </span>
+                <span v-else class="tt-kpi-badge-hit is-none">暂无缓存</span>
               </div>
               <div class="tt-kpi-main-val">
-                <template v-if="costSummary.pricedTokens > 0">
-                  <strong>{{ formatCost(estimatedCost) }}</strong>
-                  <span class="tt-kpi-unit">USD</span>
+                <template v-if="cacheHitRate != null && cacheHitRate > 0">
+                  <strong>{{ (cacheHitRate * 100).toFixed(1) }}</strong>
+                  <span class="tt-kpi-unit">% 命中率</span>
                 </template>
                 <template v-else>
-                  <strong class="tt-val-unpriced">未定价 / 来源未上报</strong>
+                  <strong>0.0</strong>
+                  <span class="tt-kpi-unit">% 命中率</span>
                 </template>
               </div>
               <div class="tt-kpi-meta-text">
-                <span>{{ costCaption }}</span>
+                <span>读取复用 <strong>{{ formatCompact(cacheBreakdown.read) }}</strong> · 创建写入 <strong>{{ formatCompact(cacheBreakdown.write) }}</strong></span>
               </div>
               <div class="tt-kpi-footer-note">
-                <span v-if="bucketTotal.total > 0 && costSummary.costUsd > 0">
-                  均价 ≈ ${{ ((costSummary.costUsd / bucketTotal.total) * 1_000_000).toFixed(3) }} / 1M Tokens
+                <span v-if="cacheBreakdown.speedup">
+                  ⚡ 吞吐加速 ≈ <strong>{{ cacheBreakdown.speedup }}x</strong> · 减少重复传输与响应延迟
                 </span>
-                <span v-else>多端日志自动提取实际账单金额</span>
+                <span v-else-if="cacheBreakdown.read > 0">
+                  ⚡ 命中复用 {{ formatTokens(cacheBreakdown.read) }} Tokens
+                </span>
+                <span v-else>
+                  Prompt Caching 命中可大幅加速首字与响应时间
+                </span>
               </div>
             </div>
           </div>
@@ -1666,7 +1739,6 @@ onBeforeUnmount(() => {
                 <template #cell-reasoningTokens="{ row }">{{ formatCompact(row.reasoningTokens) }}</template>
                 <template #cell-conversations="{ row }">{{ formatTokens(row.conversations) }}</template>
                 <template #cell-requests="{ row }">{{ formatTokens(row.requests) }}</template>
-                <template #cell-costUsd="{ row }">{{ row.costUsd > 0 ? formatCost(row.costUsd) : "—" }}</template>
               </AppTable>
             </div>
           </div>
@@ -1718,7 +1790,6 @@ onBeforeUnmount(() => {
                 <template #cell-reasoningTokens="{ row }">{{ formatCompact(row.reasoningTokens) }}</template>
                 <template #cell-conversations="{ row }">{{ formatTokens(row.conversations) }}</template>
                 <template #cell-requests="{ row }">{{ formatTokens(row.requests) }}</template>
-                <template #cell-costUsd="{ row }">{{ row.costUsd > 0 ? formatCost(row.costUsd) : "—" }}</template>
               </AppTable>
             </div>
           </div>
@@ -1757,7 +1828,8 @@ onBeforeUnmount(() => {
               >
                 <template #cell-project="{ row }">
                   <div class="tt-project-cell" :title="row.project">
-                    <span v-html="icons.folder" />
+                    <span v-if="row.project.includes('临时') || row.project.includes('独立') || row.project.includes('全局')" v-html="icons.chat" />
+                    <span v-else v-html="icons.folder" />
                     <strong>{{ row.project }}</strong>
                   </div>
                 </template>
@@ -1770,7 +1842,6 @@ onBeforeUnmount(() => {
                 <template #cell-reasoning="{ row }">{{ formatCompact(row.reasoning) }}</template>
                 <template #cell-sessions="{ row }">{{ formatTokens(row.sessions) }}</template>
                 <template #cell-requests="{ row }">{{ row.requestsEstimated ? "≈" : "" }}{{ formatTokens(row.requests) }}</template>
-                <template #cell-costUsd="{ row }">{{ row.costUsd > 0 ? formatCost(row.costUsd) : "—" }}</template>
               </AppTable>
             </div>
           </div>
@@ -2422,6 +2493,7 @@ onBeforeUnmount(() => {
 .tt-kpi-badge-hit.is-none { background: rgba(148, 163, 184, 0.12); color: #94a3b8; }
 
 .tt-kpi-streak-pill,
+.tt-kpi-speedup-pill,
 .tt-kpi-savings-pill {
   padding: 1px 6px;
   border-radius: var(--r-full);
@@ -2431,6 +2503,7 @@ onBeforeUnmount(() => {
   color: #f97316;
 }
 
+.tt-kpi-speedup-pill,
 .tt-kpi-savings-pill {
   background: rgba(168, 85, 247, 0.12);
   color: #a855f7;

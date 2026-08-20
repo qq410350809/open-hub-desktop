@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
-// v13：修复 ZCode/OpenCode 用户消息嵌套 modelID 导致的对话轮次无法归属到具体模型（如 GLM-5.3）的问题；
-const CACHE_VERSION: i64 = 13;
+// v15：全软件工作区智能归一化与工程根回溯，修复带连字符项目解码、VS Code 工作区关联、子目录覆写与长路径清洗；
+const CACHE_VERSION: i64 = 15;
 const CACHE_TTL: Duration = Duration::from_secs(5);
 const UNKNOWN_CODEX_MODEL: &str = "codex-unknown-model";
 const UNKNOWN_CLAUDE_MODEL: &str = "claude-unknown-model";
@@ -21,6 +21,7 @@ const UNKNOWN_COMMAND_CODE_MODEL: &str = "command-code-unknown-model";
 const UNKNOWN_ANTIGRAVITY_MODEL: &str = "antigravity-unknown-model";
 const UNKNOWN_KIRO_MODEL: &str = "kiro-auto-model";
 const UNKNOWN_DSH_MODEL: &str = "dsh-unknown-model";
+const UNKNOWN_COPILOT_MODEL: &str = "copilot-auto-model";
 const LOCAL_ESTIMATED_CONTEXT_LIMIT: i64 = 64_000;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -576,19 +577,263 @@ fn float_number(value: &JsonValue, keys: &[&str]) -> f64 {
     0.0
 }
 
-fn basename_or_fallback(path: &str, fallback: &str) -> String {
-    let trimmed = path.trim().trim_end_matches(['/', '\\']);
-    if !trimmed.is_empty() {
-        if let Some(name) = Path::new(trimmed)
-            .file_name()
-            .and_then(|name| name.to_str())
+fn is_common_subfolder(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "src"
+            | "src-tauri"
+            | "docs"
+            | "target"
+            | "bin"
+            | "node_modules"
+            | "pkg"
+            | "app"
+            | "core"
+            | "client"
+            | "server"
+            | "ui"
+            | "web"
+            | "sys"
+            | "staff"
+            | "third"
+            | "controller"
+            | "controllers"
+            | "model"
+            | "models"
+            | "view"
+            | "views"
+            | "service"
+            | "services"
+            | "scripts"
+            | "frontend"
+            | "backend"
+            | "dist"
+            | "build"
+            | "test"
+            | "tests"
+            | "public"
+            | "custom"
+            | "applications"
+    )
+}
+
+fn is_session_uuid(s: &str) -> bool {
+    let s = s.trim();
+    if s.len() == 36
+        && s.as_bytes()[8] == b'-'
+        && s.as_bytes()[13] == b'-'
+        && s.as_bytes()[18] == b'-'
+        && s.as_bytes()[23] == b'-'
+    {
+        return s.chars().all(|c| c.is_ascii_hexdigit() || c == '-');
+    }
+    false
+}
+
+fn find_project_root_from_path(path: &Path) -> Option<String> {
+    let current = if path.is_file() {
+        path.parent()?
+    } else {
+        path
+    };
+
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let mut top_matched: Option<String> = None;
+    let mut curr_opt: Option<&Path> = Some(current);
+
+    while let Some(dir) = curr_opt {
+        if dir.as_os_str().is_empty()
+            || dir == Path::new("/")
+            || dir == Path::new("/Applications")
+            || dir == Path::new("/Applications/custom")
         {
-            if !name.trim().is_empty() {
-                return name.trim().to_string();
+            break;
+        }
+        if let Some(ref h) = home {
+            if dir == h {
+                break;
+            }
+        }
+
+        let has_marker = dir.join(".git").exists()
+            || dir.join("Cargo.toml").exists()
+            || dir.join("package.json").exists()
+            || dir.join("pom.xml").exists()
+            || dir.join("go.mod").exists()
+            || dir.join("pyproject.toml").exists()
+            || dir.join("build.gradle").exists()
+            || dir.join(".code-workspace").exists();
+
+        let dir_name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if has_marker && !dir_name.is_empty() && !is_common_subfolder(dir_name) {
+            top_matched = Some(dir_name.to_string());
+        }
+
+        curr_opt = dir.parent();
+    }
+
+    if let Some(name) = top_matched {
+        return Some(name);
+    }
+
+    let mut p = current;
+    while let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+        if is_common_subfolder(name) {
+            if let Some(parent) = p.parent() {
+                p = parent;
+                continue;
+            }
+        }
+        if !name.trim().is_empty() && name != "/" && name != "Users" && name != "Applications" {
+            if let Some(ref h) = home {
+                if p == h {
+                    return None;
+                }
+            }
+            return Some(name.to_string());
+        }
+        break;
+    }
+
+    None
+}
+
+pub(crate) fn normalize_workspace_project_key(raw: &str, fallback: &str) -> String {
+    let s = raw.trim();
+    if s.is_empty() {
+        return fallback.to_string();
+    }
+
+    if is_session_uuid(s) || s.starts_with("session-") || s.starts_with("rollout-") {
+        return "临时任务 / 独立会话".to_string();
+    }
+
+    let cleaned = if let Some(stripped) = s.strip_prefix("file://") {
+        percent_encoding::percent_decode_str(stripped)
+            .decode_utf8_lossy()
+            .to_string()
+    } else {
+        s.to_string()
+    };
+    let cleaned = cleaned.trim().trim_end_matches(['/', '\\']);
+
+    if cleaned.ends_with(".code-workspace") {
+        let name = Path::new(&cleaned)
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("");
+        if !name.is_empty() {
+            return name.to_string();
+        }
+    }
+
+    if cleaned.starts_with('/')
+        || cleaned.starts_with('\\')
+        || (cleaned.len() >= 2 && cleaned.as_bytes()[1] == b':')
+    {
+        let path = Path::new(&cleaned);
+        if let Some(root_name) = find_project_root_from_path(path) {
+            return root_name;
+        }
+    }
+
+    let name = Path::new(&cleaned)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(&cleaned);
+
+    if is_session_uuid(name) {
+        return "临时任务 / 独立会话".to_string();
+    }
+
+    if is_common_subfolder(name)
+        && !fallback.is_empty()
+        && fallback != name
+        && fallback != "Claude"
+        && fallback != "Codex"
+        && fallback != "Command Code"
+        && fallback != "Antigravity"
+        && fallback != "OpenCode"
+        && fallback != "CatPawAI"
+        && fallback != "Kiro"
+        && fallback != "DSH"
+    {
+        return fallback.to_string();
+    }
+
+    if name.is_empty() {
+        fallback.to_string()
+    } else {
+        name.to_string()
+    }
+}
+
+fn decode_encoded_dash_path(raw: &str) -> String {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return String::new();
+    }
+    if raw.contains("-copilot-chats-") || is_session_uuid(raw.trim_matches('-')) {
+        return "临时任务 / 独立会话".to_string();
+    }
+
+    let candidate = if raw.starts_with('-') {
+        format!("/{}", raw.trim_start_matches('-'))
+    } else {
+        raw.to_string()
+    };
+
+    let parts: Vec<&str> = candidate.split('/').filter(|s| !s.is_empty()).collect();
+    if !parts.is_empty() {
+        let sub_parts: Vec<&str> = parts[0].split('-').filter(|s| !s.is_empty()).collect();
+        let mut curr_path = PathBuf::from("/");
+        let mut idx = 0;
+        while idx < sub_parts.len() {
+            let mut matched = false;
+            for end in (idx + 1..=sub_parts.len()).rev() {
+                let segment = sub_parts[idx..end].join("-");
+                let test_dir = curr_path.join(&segment);
+                if test_dir.exists() {
+                    curr_path = test_dir;
+                    idx = end;
+                    matched = true;
+                    break;
+                }
+            }
+            if !matched {
+                curr_path = curr_path.join(sub_parts[idx..].join("-"));
+                break;
+            }
+        }
+        if curr_path.exists() {
+            if let Some(root_name) = find_project_root_from_path(&curr_path) {
+                return root_name;
+            }
+            if let Some(name) = curr_path.file_name().and_then(|n| n.to_str()) {
+                if !is_common_subfolder(name) && name != "/" {
+                    return name.to_string();
+                }
             }
         }
     }
-    fallback.to_string()
+
+    let parts: Vec<&str> = raw.split('-').filter(|s| !s.is_empty()).collect();
+    if let Some(&last) = parts.last() {
+        if !is_common_subfolder(last) && !is_session_uuid(last) {
+            return last.to_string();
+        }
+    }
+    if parts.len() >= 2 {
+        let tail_2 = format!("{}-{}", parts[parts.len() - 2], parts[parts.len() - 1]);
+        if !is_common_subfolder(&tail_2) {
+            return tail_2;
+        }
+    }
+    String::new()
+}
+
+fn basename_or_fallback(path: &str, fallback: &str) -> String {
+    normalize_workspace_project_key(path, fallback)
 }
 
 fn claude_project_from_path(path: &Path) -> String {
@@ -605,12 +850,13 @@ fn claude_project_from_path(path: &Path) -> String {
     let raw = parent
         .and_then(Path::file_name)
         .and_then(|name| name.to_str())
-        .unwrap_or("")
-        .trim_matches('-');
-    raw.rsplit('-')
-        .find(|part| !part.trim().is_empty())
-        .unwrap_or("Claude")
-        .to_string()
+        .unwrap_or("");
+    let decoded = decode_encoded_dash_path(raw);
+    if !decoded.is_empty() {
+        decoded
+    } else {
+        "Claude".to_string()
+    }
 }
 
 fn command_code_project_from_path(path: &Path) -> String {
@@ -618,12 +864,77 @@ fn command_code_project_from_path(path: &Path) -> String {
         .parent()
         .and_then(Path::file_name)
         .and_then(|name| name.to_str())
-        .unwrap_or("")
-        .trim_matches('-');
-    raw.rsplit('-')
-        .find(|part| !part.trim().is_empty())
-        .unwrap_or("Command Code")
-        .to_string()
+        .unwrap_or("");
+    let decoded = decode_encoded_dash_path(raw);
+    if !decoded.is_empty() {
+        decoded
+    } else {
+        "Command Code".to_string()
+    }
+}
+
+fn vscode_workspace_project_from_path(path: &Path) -> String {
+    if path.components().any(|c| c.as_os_str() == "emptyWindowChatSessions") {
+        return "临时任务 / 独立会话".to_string();
+    }
+    let mut parent = path.parent();
+    while let Some(p) = parent {
+        if p.file_name().and_then(|n| n.to_str()) == Some("chatSessions") {
+            if let Some(ws_dir) = p.parent() {
+                let ws_json = ws_dir.join("workspace.json");
+                if let Ok(text) = fs::read_to_string(&ws_json) {
+                    if let Ok(val) = serde_json::from_str::<JsonValue>(&text) {
+                        if let Some(folder_uri) = val
+                            .get("folder")
+                            .or_else(|| val.get("workspace"))
+                            .and_then(JsonValue::as_str)
+                        {
+                            let resolved = normalize_workspace_project_key(folder_uri, "VS Code");
+                            if !resolved.is_empty() && resolved != "VS Code" {
+                                return resolved;
+                            }
+                        }
+                    }
+                }
+            }
+            break;
+        }
+        parent = p.parent();
+    }
+    "VS Code".to_string()
+}
+
+fn extract_antigravity_project_from_transcript(text: &str) -> Option<String> {
+    for line in text.lines().take(25) {
+        if let Ok(val) = serde_json::from_str::<JsonValue>(line) {
+            if let Some(content) = val.get("content").and_then(JsonValue::as_str) {
+                if let Some(pos) = content.find("Active Document: ") {
+                    let sub = &content[pos + "Active Document: ".len()..];
+                    let path_str = sub.lines().next().unwrap_or("").trim();
+                    let clean = path_str.split('(').next().unwrap_or(path_str).trim();
+                    if !clean.is_empty() {
+                        let resolved = normalize_workspace_project_key(clean, "");
+                        if !resolved.is_empty() && !is_common_subfolder(&resolved) {
+                            return Some(resolved);
+                        }
+                    }
+                }
+                if let Some(pos) = content.find(" -> ") {
+                    let before = &content[..pos];
+                    if let Some(line_start) = before.rfind('\n') {
+                        let cand = before[line_start + 1..].trim();
+                        if cand.starts_with('/') {
+                            let resolved = normalize_workspace_project_key(cand, "");
+                            if !resolved.is_empty() && !is_common_subfolder(&resolved) {
+                                return Some(resolved);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 fn command_code_sidecar_model(path: &Path) -> String {
@@ -757,7 +1068,7 @@ fn civil_from_days(days: i64) -> (i32, u32, u32) {
     (y as i32, m as u32, d as u32)
 }
 
-fn iso_from_millis(ms: i64) -> String {
+pub(crate) fn iso_from_millis(ms: i64) -> String {
     if ms <= 0 {
         return String::new();
     }
@@ -990,7 +1301,14 @@ fn parse_claude_file(path: &Path) -> CachedFile {
             .and_then(JsonValue::as_str)
             .filter(|value| !value.trim().is_empty())
         {
-            project_key = basename_or_fallback(cwd, &project_key);
+            let resolved = normalize_workspace_project_key(cwd, &project_key);
+            if !resolved.is_empty()
+                && (project_key == "Claude"
+                    || is_common_subfolder(&project_key)
+                    || (!is_common_subfolder(&resolved) && resolved != "Claude"))
+            {
+                project_key = resolved;
+            }
         }
         let kind = value.get("type").and_then(JsonValue::as_str).unwrap_or("");
         if kind != "user" && kind != "assistant" {
@@ -1216,7 +1534,14 @@ fn parse_command_code_file(path: &Path) -> CachedFile {
                 .and_then(JsonValue::as_str)
                 .filter(|value| !value.trim().is_empty())
             {
-                project_key = basename_or_fallback(cwd, &project_key);
+                let resolved = normalize_workspace_project_key(cwd, &project_key);
+                if !resolved.is_empty()
+                    && (project_key == "Command Code"
+                        || is_common_subfolder(&project_key)
+                        || (!is_common_subfolder(&resolved) && resolved != "Command Code"))
+                {
+                    project_key = resolved;
+                }
             }
             continue;
         }
@@ -2040,10 +2365,13 @@ fn parse_antigravity_file(path: &Path) -> CachedFile {
     } else {
         database_model
     };
-    let project_key = if database_project.is_empty() {
-        antigravity_fallback_project(path)
+    let transcript_project = extract_antigravity_project_from_transcript(&text);
+    let project_key = if let Some(tp) = transcript_project {
+        tp
+    } else if !database_project.is_empty() {
+        normalize_workspace_project_key(&database_project, "Antigravity")
     } else {
-        database_project
+        antigravity_fallback_project(path)
     };
     let mut first_ts = String::new();
     let mut last_ts = String::new();
@@ -2387,7 +2715,7 @@ fn parse_dsh_file(path: &Path) -> CachedFile {
                 .and_then(JsonValue::as_str)
                 .filter(|v| !v.is_empty())
             {
-                project_key = basename_or_fallback(cwd, &project_key);
+                project_key = normalize_workspace_project_key(cwd, "DSH");
             }
             if !timestamp.is_empty() {
                 update_bounds(&mut first_ts, &mut last_ts, &timestamp);
@@ -2496,8 +2824,8 @@ fn parse_dsh_file(path: &Path) -> CachedFile {
             .unwrap_or("dsh-session")
             .to_string();
     }
-    if project_key.is_empty() {
-        project_key = "DSH".to_string();
+    if project_key.is_empty() || project_key == "DSH" {
+        project_key = "临时任务 / 独立会话".to_string();
     }
     if model.is_empty() {
         model = UNKNOWN_DSH_MODEL.to_string();
@@ -2596,6 +2924,475 @@ fn dsh_usage_event(
     })
 }
 
+fn normalize_copilot_model_name(raw: &str) -> String {
+    let s = raw.trim();
+    if s.is_empty() {
+        return UNKNOWN_COPILOT_MODEL.to_string();
+    }
+    if s.contains("@provider=") {
+        let parts: Vec<&str> = s.split(':').collect();
+        if let Some(last) = parts.last() {
+            let last_clean = last.trim();
+            if !last_clean.is_empty() {
+                if last_clean == "sonnet" {
+                    return "claude-3-7-sonnet".to_string();
+                } else if last_clean == "fable" || last_clean == "haiku" {
+                    return "claude-3-5-haiku".to_string();
+                } else if last_clean == "opus" {
+                    return "claude-3-opus".to_string();
+                }
+                return last_clean.to_string();
+            }
+        }
+    }
+    if let Some((_, model)) = s.split_once('/') {
+        let model = model.trim();
+        if !model.is_empty() {
+            if model == "auto" {
+                return UNKNOWN_COPILOT_MODEL.to_string();
+            }
+            return model.to_string();
+        }
+    }
+    if s == "auto" || s == "copilotcli:auto" || s == "agent-host-copilotcli:auto" {
+        return UNKNOWN_COPILOT_MODEL.to_string();
+    }
+    s.to_string()
+}
+
+pub(crate) fn collect_copilot_source_files(home: &Path) -> Vec<(String, PathBuf)> {
+    let mut files = Vec::new();
+    let mut base_dirs = Vec::new();
+
+    #[cfg(target_os = "macos")]
+    {
+        let app_support = home.join("Library").join("Application Support");
+        base_dirs.push(app_support.join("Code").join("User"));
+        base_dirs.push(app_support.join("Code - Insiders").join("User"));
+        base_dirs.push(app_support.join("VSCodium").join("User"));
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(appdata) = std::env::var_os("APPDATA").map(PathBuf::from) {
+            base_dirs.push(appdata.join("Code").join("User"));
+            base_dirs.push(appdata.join("Code - Insiders").join("User"));
+            base_dirs.push(appdata.join("VSCodium").join("User"));
+        }
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let config = home.join(".config");
+        base_dirs.push(config.join("Code").join("User"));
+        base_dirs.push(config.join("Code - Insiders").join("User"));
+        base_dirs.push(config.join("VSCodium").join("User"));
+    }
+
+    for user_dir in base_dirs {
+        if !user_dir.is_dir() {
+            continue;
+        }
+
+        let empty_window_sessions = user_dir.join("globalStorage").join("emptyWindowChatSessions");
+        if empty_window_sessions.is_dir() {
+            collect_jsonl_files(
+                &empty_window_sessions,
+                &|path| path.extension().and_then(|ext| ext.to_str()) == Some("jsonl"),
+                &mut files,
+            );
+        }
+
+        let workspace_storage = user_dir.join("workspaceStorage");
+        if workspace_storage.is_dir() {
+            if let Ok(entries) = fs::read_dir(&workspace_storage) {
+                for entry in entries.flatten() {
+                    let chat_sessions = entry.path().join("chatSessions");
+                    if chat_sessions.is_dir() {
+                        collect_jsonl_files(
+                            &chat_sessions,
+                            &|path| path.extension().and_then(|ext| ext.to_str()) == Some("jsonl"),
+                            &mut files,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    let copilot_cli_root = home.join(".copilot").join("session-state");
+    if copilot_cli_root.is_dir() {
+        collect_jsonl_files(
+            &copilot_cli_root,
+            &|path| path.file_name().and_then(|n| n.to_str()) == Some("events.jsonl"),
+            &mut files,
+        );
+    }
+
+    files
+        .into_iter()
+        .map(|path| ("copilot".to_string(), path))
+        .collect()
+}
+
+fn parse_vscode_chat_session(path: &Path, text: &str, file_fingerprint: FileFingerprint) -> CachedFile {
+    let mut session_id = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("copilot-session")
+        .to_string();
+    let mut session_creation_ts = String::new();
+    let project_key = vscode_workspace_project_from_path(path);
+    let mut model_fallback = UNKNOWN_COPILOT_MODEL.to_string();
+
+    let mut events = Vec::<UsageEvent>::new();
+    let mut first_ts = String::new();
+    let mut last_ts = String::new();
+    let mut turns = 0i64;
+
+    for line in text.lines() {
+        let Ok(root_val) = serde_json::from_str::<JsonValue>(line) else {
+            continue;
+        };
+
+        let v = root_val.get("v").unwrap_or(&root_val);
+
+        if let Some(sid) = v.get("sessionId").and_then(JsonValue::as_str) {
+            if !sid.is_empty() {
+                session_id = sid.to_string();
+            }
+        }
+        if let Some(ms) = v.get("creationDate").and_then(JsonValue::as_i64) {
+            session_creation_ts = iso_from_millis(ms);
+        }
+
+        if let Some(selected) = v.get("inputState").and_then(|is| is.get("selectedModel")) {
+            if let Some(raw_id) = selected.get("identifier").and_then(JsonValue::as_str) {
+                let m = normalize_copilot_model_name(raw_id);
+                if m != UNKNOWN_COPILOT_MODEL {
+                    model_fallback = m;
+                }
+            }
+        }
+
+        let Some(requests) = v.get("requests").and_then(JsonValue::as_array) else {
+            continue;
+        };
+
+        for (req_idx, req) in requests.iter().enumerate() {
+            let req_id = req
+                .get("requestId")
+                .and_then(JsonValue::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("{session_id}:req:{req_idx}"));
+
+            let mut timestamp = req
+                .get("modelState")
+                .and_then(|ms| ms.get("completedAt"))
+                .and_then(JsonValue::as_i64)
+                .map(iso_from_millis)
+                .or_else(|| {
+                    req.get("timeSpentWaiting")
+                        .and_then(JsonValue::as_i64)
+                        .map(iso_from_millis)
+                })
+                .unwrap_or_default();
+            if timestamp.is_empty() {
+                timestamp = session_creation_ts.clone();
+            }
+            update_bounds(&mut first_ts, &mut last_ts, &timestamp);
+
+            let mut req_model = req
+                .get("result")
+                .and_then(|res| res.get("metadata"))
+                .and_then(|meta| meta.get("resolvedModel"))
+                .and_then(JsonValue::as_str)
+                .map(normalize_copilot_model_name)
+                .unwrap_or_else(|| UNKNOWN_COPILOT_MODEL.to_string());
+
+            if req_model == UNKNOWN_COPILOT_MODEL {
+                if let Some(m) = req.get("modelId").and_then(JsonValue::as_str) {
+                    let clean = normalize_copilot_model_name(m);
+                    if clean != UNKNOWN_COPILOT_MODEL {
+                        req_model = clean;
+                    }
+                }
+            }
+            if req_model == UNKNOWN_COPILOT_MODEL {
+                if let Some(m) = req.get("usedModel").and_then(JsonValue::as_str) {
+                    let clean = normalize_copilot_model_name(m);
+                    if clean != UNKNOWN_COPILOT_MODEL {
+                        req_model = clean;
+                    }
+                }
+            }
+            if req_model == UNKNOWN_COPILOT_MODEL {
+                req_model = model_fallback.clone();
+            }
+
+            let user_text = req
+                .get("message")
+                .and_then(|m| m.get("text"))
+                .and_then(JsonValue::as_str)
+                .unwrap_or("");
+            if !user_text.trim().is_empty() {
+                turns += 1;
+                events.push(UsageEvent {
+                    id: format!("u:{req_id}"),
+                    source: "copilot".to_string(),
+                    model: req_model.clone(),
+                    project_key: project_key.clone(),
+                    timestamp: timestamp.clone(),
+                    conversation_count: 1,
+                    ..Default::default()
+                });
+            }
+
+            let mut prompt_tokens = req
+                .get("promptTokens")
+                .and_then(JsonValue::as_i64)
+                .or_else(|| {
+                    req.get("result")
+                        .and_then(|res| res.get("metadata"))
+                        .and_then(|meta| meta.get("promptTokens"))
+                        .and_then(JsonValue::as_i64)
+                })
+                .unwrap_or(0);
+
+            let mut output_tokens = req
+                .get("completionTokens")
+                .or_else(|| req.get("outputTokens"))
+                .and_then(JsonValue::as_i64)
+                .or_else(|| {
+                    req.get("result")
+                        .and_then(|res| res.get("metadata"))
+                        .and_then(|meta| meta.get("outputTokens"))
+                        .and_then(JsonValue::as_i64)
+                })
+                .unwrap_or(0);
+
+            let cached_tokens = req.get("cachedTokens").and_then(JsonValue::as_i64).unwrap_or(0);
+
+            let mut reasoning_tokens = 0i64;
+            if let Some(resp_arr) = req.get("response").and_then(JsonValue::as_array) {
+                for item in resp_arr {
+                    if item.get("kind").and_then(JsonValue::as_str) == Some("thinking") {
+                        let text_len = item.get("value").and_then(JsonValue::as_str).unwrap_or("").len();
+                        reasoning_tokens += (text_len as i64 / 4).max(1);
+                    }
+                }
+            }
+
+            let mut estimated_tokens = 0i64;
+            if prompt_tokens == 0 && output_tokens == 0 {
+                let user_tokens = (user_text.len() as i64 / 4).max(1);
+                prompt_tokens = user_tokens + 128;
+                let mut resp_text_len = 0usize;
+                if let Some(resp_arr) = req.get("response").and_then(JsonValue::as_array) {
+                    for item in resp_arr {
+                        if let Some(v) = item.get("value").and_then(JsonValue::as_str) {
+                            resp_text_len += v.len();
+                        }
+                    }
+                }
+                output_tokens = (resp_text_len as i64 / 4).max(1);
+                estimated_tokens = prompt_tokens + output_tokens + reasoning_tokens;
+            }
+
+            let total_tokens = prompt_tokens.saturating_add(output_tokens).saturating_add(reasoning_tokens);
+
+            if total_tokens > 0 || !user_text.is_empty() {
+                events.push(UsageEvent {
+                    id: req_id,
+                    source: "copilot".to_string(),
+                    model: req_model,
+                    project_key: project_key.clone(),
+                    timestamp,
+                    input_tokens: prompt_tokens,
+                    cached_input_tokens: cached_tokens,
+                    cache_creation_input_tokens: 0,
+                    output_tokens,
+                    reasoning_output_tokens: reasoning_tokens,
+                    total_tokens,
+                    conversation_count: 0,
+                    cost_usd: 0.0,
+                    pricing_available: false,
+                    estimated_tokens,
+                });
+            }
+        }
+    }
+
+    let tokens = events
+        .iter()
+        .fold(TokenSessionTokens::default(), |mut total, event| {
+            total.input_tokens += event.input_tokens;
+            total.cached_input_tokens += event.cached_input_tokens;
+            total.cache_creation_input_tokens += event.cache_creation_input_tokens;
+            total.output_tokens += event.output_tokens;
+            total.reasoning_output_tokens += event.reasoning_output_tokens;
+            total.total_tokens += event.total_tokens;
+            total
+        });
+
+    let session = token_session(
+        session_id,
+        "copilot",
+        project_key,
+        model_fallback,
+        first_ts,
+        last_ts,
+        turns,
+        tokens,
+        0.0,
+    );
+
+    CachedFile {
+        fingerprint: file_fingerprint,
+        events,
+        sessions: vec![session],
+    }
+}
+
+fn parse_copilot_cli_events(path: &Path, text: &str, file_fingerprint: FileFingerprint) -> CachedFile {
+    let session_id = path
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .unwrap_or("copilot-cli-session")
+        .to_string();
+
+    let project_key = "Copilot CLI".to_string();
+    let mut model = UNKNOWN_COPILOT_MODEL.to_string();
+    let mut first_ts = String::new();
+    let mut last_ts = String::new();
+    let mut turns = 0i64;
+    let mut events = Vec::<UsageEvent>::new();
+    let mut visible_context_tokens = 0i64;
+
+    for (index, line) in text.lines().enumerate() {
+        let Ok(value) = serde_json::from_str::<JsonValue>(line) else {
+            continue;
+        };
+        let event_type = value.get("type").and_then(JsonValue::as_str).unwrap_or("");
+        let ts = value.get("timestamp").and_then(JsonValue::as_str).unwrap_or("").to_string();
+        update_bounds(&mut first_ts, &mut last_ts, &ts);
+
+        let data = value.get("data").unwrap_or(&JsonValue::Null);
+
+        match event_type {
+            "session.start" => {
+                if let Some(m) = data.get("selectedModel").and_then(JsonValue::as_str) {
+                    let clean = normalize_copilot_model_name(m);
+                    if clean != UNKNOWN_COPILOT_MODEL {
+                        model = clean;
+                    }
+                }
+            }
+            "user.message" => {
+                let content = data.get("content").and_then(JsonValue::as_str).unwrap_or("");
+                if !content.trim().is_empty() {
+                    turns += 1;
+                    let event_id = value.get("id").and_then(JsonValue::as_str).unwrap_or("");
+                    events.push(UsageEvent {
+                        id: format!("u:{session_id}:{}", if event_id.is_empty() { index.to_string() } else { event_id.to_string() }),
+                        source: "copilot".to_string(),
+                        model: model.clone(),
+                        project_key: project_key.clone(),
+                        timestamp: ts.clone(),
+                        conversation_count: 1,
+                        ..Default::default()
+                    });
+                    visible_context_tokens += (content.len() as i64 / 4).max(1);
+                }
+            }
+            "assistant.message" => {
+                let req_id = data.get("requestId").and_then(JsonValue::as_str).unwrap_or("");
+                let event_id = if !req_id.is_empty() {
+                    format!("{session_id}:{req_id}")
+                } else {
+                    format!("{session_id}:{index}")
+                };
+
+                let output_tokens = data.get("outputTokens").and_then(JsonValue::as_i64).unwrap_or_else(|| {
+                    let content = data.get("content").and_then(JsonValue::as_str).unwrap_or("");
+                    (content.len() as i64 / 4).max(1)
+                });
+
+                let reasoning_tokens = data.get("reasoningText").and_then(JsonValue::as_str).map(|r| (r.len() as i64 / 4).max(1)).unwrap_or(0);
+                let input_tokens = visible_context_tokens.saturating_add(64).min(LOCAL_ESTIMATED_CONTEXT_LIMIT);
+                let total_tokens = input_tokens.saturating_add(output_tokens).saturating_add(reasoning_tokens);
+
+                events.push(UsageEvent {
+                    id: event_id,
+                    source: "copilot".to_string(),
+                    model: model.clone(),
+                    project_key: project_key.clone(),
+                    timestamp: ts,
+                    input_tokens,
+                    cached_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                    output_tokens,
+                    reasoning_output_tokens: reasoning_tokens,
+                    total_tokens,
+                    conversation_count: 0,
+                    cost_usd: 0.0,
+                    pricing_available: false,
+                    estimated_tokens: total_tokens,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    let tokens = events
+        .iter()
+        .fold(TokenSessionTokens::default(), |mut total, event| {
+            total.input_tokens += event.input_tokens;
+            total.cached_input_tokens += event.cached_input_tokens;
+            total.cache_creation_input_tokens += event.cache_creation_input_tokens;
+            total.output_tokens += event.output_tokens;
+            total.reasoning_output_tokens += event.reasoning_output_tokens;
+            total.total_tokens += event.total_tokens;
+            total
+        });
+
+    let session = token_session(
+        session_id.clone(),
+        "copilot",
+        project_key,
+        model,
+        first_ts,
+        last_ts,
+        turns,
+        tokens,
+        0.0,
+    );
+
+    CachedFile {
+        fingerprint: file_fingerprint,
+        events,
+        sessions: vec![session],
+    }
+}
+
+fn parse_copilot_file(path: &Path) -> CachedFile {
+    let file_fingerprint = fingerprint(path);
+    let Ok(text) = fs::read_to_string(path) else {
+        return CachedFile {
+            fingerprint: file_fingerprint,
+            ..Default::default()
+        };
+    };
+
+    let is_cli_events = path.file_name().and_then(|n| n.to_str()) == Some("events.jsonl");
+    if is_cli_events {
+        parse_copilot_cli_events(path, &text, file_fingerprint)
+    } else {
+        parse_vscode_chat_session(path, &text, file_fingerprint)
+    }
+}
+
 fn parse_codex_file(path: &Path) -> CachedFile {
     let Ok(text) = fs::read_to_string(path) else {
         return CachedFile {
@@ -2652,7 +3449,14 @@ fn parse_codex_file(path: &Path) -> CachedFile {
                 session_id = id.to_string();
             }
             if let Some(cwd) = payload.get("cwd").and_then(JsonValue::as_str) {
-                project_key = basename_or_fallback(cwd, &project_key);
+                let resolved = normalize_workspace_project_key(cwd, &project_key);
+                if !resolved.is_empty()
+                    && (project_key == "Codex"
+                        || is_common_subfolder(&project_key)
+                        || (!is_common_subfolder(&resolved) && resolved != "Codex"))
+                {
+                    project_key = resolved;
+                }
             }
             if current_model.is_empty() {
                 if let Some(provider) = payload
@@ -2667,7 +3471,14 @@ fn parse_codex_file(path: &Path) -> CachedFile {
         }
         if kind == "turn_context" {
             if let Some(cwd) = payload.get("cwd").and_then(JsonValue::as_str) {
-                project_key = basename_or_fallback(cwd, &project_key);
+                let resolved = normalize_workspace_project_key(cwd, &project_key);
+                if !resolved.is_empty()
+                    && (project_key == "Codex"
+                        || is_common_subfolder(&project_key)
+                        || (!is_common_subfolder(&resolved) && resolved != "Codex"))
+                {
+                    project_key = resolved;
+                }
             }
             if let Some(model) = payload
                 .get("model")
@@ -2996,7 +3807,14 @@ fn parse_local_database(path: &Path, source: &str) -> CachedDatabase {
                 if session.directory.is_empty() && !directory.is_empty() {
                     session.directory = directory.clone();
                 }
-                let project_key = basename_or_fallback(&directory, fallback_project);
+                let project_key = normalize_workspace_project_key(
+                    if !session.directory.is_empty() {
+                        &session.directory
+                    } else {
+                        &directory
+                    },
+                    fallback_project,
+                );
                 let timestamp = value
                     .get("time")
                     .and_then(|time| time.get("completed").or_else(|| time.get("created")))
@@ -3423,6 +4241,7 @@ fn collect_uncached(force: bool) -> Result<CollectedData, String> {
         &mut dsh_files,
     );
     files.extend(dsh_files.into_iter().map(|path| ("dsh".to_string(), path)));
+    files.extend(collect_copilot_source_files(&home));
     files.sort_by(|left, right| left.1.cmp(&right.1));
 
     let live_paths = files
@@ -3458,6 +4277,7 @@ fn collect_uncached(force: bool) -> Result<CollectedData, String> {
             "antigravity" => parse_antigravity_file(&path),
             "kiro" => parse_kiro_file(&path),
             "kiro-legacy" => parse_kiro_legacy_file(&path),
+            "copilot" => parse_copilot_file(&path),
             _ => parse_claude_file(&path),
         };
         envelope.files.insert(key, parsed);
@@ -3663,7 +4483,7 @@ pub(crate) fn build_token_stats(
             "source": "openhub-token-database",
             "privacy": "metadata-only",
             "independent": true,
-            "sources": ["codex", "claude", "command-code", "antigravity", "kiro", "opencode", "mimo", "zcode", "catpawai"]
+            "sources": ["codex", "claude", "command-code", "antigravity", "kiro", "opencode", "mimo", "zcode", "catpawai", "copilot"]
         }),
     }
 }
@@ -4406,10 +5226,91 @@ mod tests {
         })));
         // 旧格式无 source.kind 时按注入文本前缀兜底
         assert!(!dsh_user_is_human(&json!({
-            "data": {"content": [{"type": "text", "text": "<system-reminder>…</system-reminder>"}]}
-        })));
-        assert!(!dsh_user_is_human(&json!({
             "data": {"content": [{"type": "text", "text": "Current runtime context. This snapshot supersedes…"}]}
         })));
     }
+
+    #[test]
+    fn copilot_model_normalization_cleans_vendor_and_provider_prefixes() {
+        assert_eq!(normalize_copilot_model_name("deepseek/deepseek-v4-flash"), "deepseek-v4-flash");
+        assert_eq!(normalize_copilot_model_name("opencodezen/deepseek-v4-flash-free"), "deepseek-v4-flash-free");
+        assert_eq!(normalize_copilot_model_name("agent-host-claude:@provider=anthropic:sonnet"), "claude-3-7-sonnet");
+        assert_eq!(normalize_copilot_model_name("agent-host-claude:@provider=anthropic:fable"), "claude-3-5-haiku");
+        assert_eq!(normalize_copilot_model_name("claude-haiku-4.5"), "claude-haiku-4.5");
+        assert_eq!(normalize_copilot_model_name("gpt-4o"), "gpt-4o");
+        assert_eq!(normalize_copilot_model_name(""), UNKNOWN_COPILOT_MODEL);
+    }
+
+    #[test]
+    fn copilot_vscode_chat_session_parses_tokens_and_dialogues() {
+        let dir = temp_command_code_dir("copilot");
+        let path = dir.join("chat.jsonl");
+        fs::write(
+            &path,
+            json!({
+                "kind": 0,
+                "v": {
+                    "sessionId": "test-copilot-123",
+                    "creationDate": 1787214440974i64,
+                    "customTitle": "测试 Copilot 会话",
+                    "requests": [
+                        {
+                            "requestId": "req-1",
+                            "message": { "text": "写一个快速排序" },
+                            "promptTokens": 1500,
+                            "completionTokens": 200,
+                            "cachedTokens": 500,
+                            "modelId": "deepseek/deepseek-v4-flash",
+                            "response": [
+                                {
+                                    "kind": "thinking",
+                                    "value": "思考如何用 Rust 写快排..."
+                                },
+                                {
+                                    "value": "这是快速排序的代码..."
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }).to_string(),
+        ).unwrap();
+
+        let parsed = parse_copilot_file(&path);
+        assert_eq!(parsed.sessions.len(), 1);
+        let s = &parsed.sessions[0];
+        assert_eq!(s.source, "copilot");
+        assert_eq!(s.session_hash, "openhub:copilot:test-copilot-123");
+        assert_eq!(s.turns, 1);
+        assert_eq!(s.tokens.input_tokens, 1500);
+        assert_eq!(s.tokens.output_tokens, 200);
+        assert_eq!(s.tokens.cached_input_tokens, 500);
+        assert!(s.tokens.reasoning_output_tokens > 0);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn workspace_project_key_normalization_rules() {
+        assert_eq!(
+            normalize_workspace_project_key("00071cc1-b2c0-46d5-8053-828995d94944", "Codex"),
+            "临时任务 / 独立会话"
+        );
+        assert_eq!(
+            normalize_workspace_project_key("file:///Users/wusuoming/Documents/IdeaProjects/sz-v4.code-workspace", "CatPawAI"),
+            "sz-v4"
+        );
+        assert_eq!(
+            normalize_workspace_project_key("/Applications/custom/OpenHub/src-tauri", "OpenHub"),
+            "OpenHub"
+        );
+        assert_eq!(
+            decode_encoded_dash_path("-Applications-custom-dsh-client"),
+            "dsh-client"
+        );
+        assert_eq!(
+            decode_encoded_dash_path("-Users-wusuoming--copilot-chats-08b47634-e580-4133-b163-2ebefb43f8e3"),
+            "临时任务 / 独立会话"
+        );
+    }
 }
+

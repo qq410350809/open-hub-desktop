@@ -214,10 +214,14 @@ fn load_catpawai_projects(conn: &Connection) -> BTreeMap<String, String> {
             }) {
                 for row in rows.flatten() {
                     let (conversation_id, workspace_id, title) = row;
-                    let project = workspace_id
+                    let raw_project = workspace_id
                         .filter(|value| !value.trim().is_empty())
                         .or_else(|| title.filter(|value| !value.trim().is_empty()))
                         .unwrap_or_else(|| "CatPawAI".to_string());
+                    let project = crate::token_collector::normalize_workspace_project_key(
+                        &raw_project,
+                        "CatPawAI",
+                    );
                     projects.insert(conversation_id, project);
                 }
             }
@@ -238,10 +242,14 @@ fn load_catpawai_projects(conn: &Connection) -> BTreeMap<String, String> {
                 for row in rows.flatten() {
                     let (conversation_id, project_path, title) = row;
                     projects.entry(conversation_id).or_insert_with(|| {
-                        project_path
+                        let raw_project = project_path
                             .filter(|value| !value.trim().is_empty())
                             .or_else(|| title.filter(|value| !value.trim().is_empty()))
-                            .unwrap_or_else(|| "CatPawAI".to_string())
+                            .unwrap_or_else(|| "CatPawAI".to_string());
+                        crate::token_collector::normalize_workspace_project_key(
+                            &raw_project,
+                            "CatPawAI",
+                        )
                     });
                 }
             }
@@ -772,10 +780,14 @@ pub async fn get_token_raw_logs() -> Result<RawLogReport, String> {
                 if !project_dir.is_dir() {
                     continue;
                 }
-                let project = project_dir
+                let raw_name = project_dir
                     .file_name()
                     .map(|name| name.to_string_lossy().to_string())
                     .unwrap_or_default();
+                let project = crate::token_collector::normalize_workspace_project_key(
+                    &raw_name,
+                    "Claude",
+                );
                 if let Ok(files) = fs::read_dir(&project_dir) {
                     for file in files.flatten() {
                         let path = file.path();
@@ -1104,6 +1116,74 @@ fn collect_local_agent_paths(home: &Path) -> LocalAgentPathsReport {
             Some(&root.join("sessions")),
         );
         agents.push(finish_agent("dsh", "DSH (DeepSeek)", Some(&root), entries));
+    }
+
+    // GitHub Copilot / VS Code Copilot
+    {
+        let copilot_root = home.join(".copilot");
+        let mut entries = Vec::new();
+        push_agent_path(
+            &mut entries,
+            "data",
+            "Copilot CLI 运行时",
+            Some(&copilot_root.join("session-state")),
+        );
+        #[cfg(target_os = "macos")]
+        {
+            let code_user = home.join("Library/Application Support/Code/User");
+            push_agent_path(
+                &mut entries,
+                "data",
+                "VS Code 全局会话",
+                Some(&code_user.join("globalStorage/emptyWindowChatSessions")),
+            );
+            push_agent_path(
+                &mut entries,
+                "data",
+                "VS Code 工作区会话",
+                Some(&code_user.join("workspaceStorage")),
+            );
+        }
+        #[cfg(target_os = "windows")]
+        {
+            if let Some(appdata) = std::env::var_os("APPDATA").map(PathBuf::from) {
+                let code_user = appdata.join("Code/User");
+                push_agent_path(
+                    &mut entries,
+                    "data",
+                    "VS Code 全局会话",
+                    Some(&code_user.join("globalStorage/emptyWindowChatSessions")),
+                );
+                push_agent_path(
+                    &mut entries,
+                    "data",
+                    "VS Code 工作区会话",
+                    Some(&code_user.join("workspaceStorage")),
+                );
+            }
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        {
+            let code_user = home.join(".config/Code/User");
+            push_agent_path(
+                &mut entries,
+                "data",
+                "VS Code 全局会话",
+                Some(&code_user.join("globalStorage/emptyWindowChatSessions")),
+            );
+            push_agent_path(
+                &mut entries,
+                "data",
+                "VS Code 工作区会话",
+                Some(&code_user.join("workspaceStorage")),
+            );
+        }
+        agents.push(finish_agent(
+            "copilot",
+            "GitHub Copilot (VS Code)",
+            Some(&copilot_root),
+            entries,
+        ));
     }
 
     // OpenCode
@@ -2183,6 +2263,55 @@ fn dsh_on_line(
     }
 }
 
+fn copilot_on_line(
+    value: &JsonValue,
+    map: &mut BTreeMap<String, HealthAgg>,
+    sources: &mut BTreeMap<String, HealthAgg>,
+) {
+    let v = value.get("v").unwrap_or(value);
+    if let Some(requests) = v.get("requests").and_then(JsonValue::as_array) {
+        for req in requests {
+            let mut ts = req
+                .get("modelState")
+                .and_then(|ms| ms.get("completedAt"))
+                .and_then(JsonValue::as_i64)
+                .map(crate::token_collector::iso_from_millis)
+                .unwrap_or_default();
+            if ts.is_empty() {
+                if let Some(ms) = v.get("creationDate").and_then(JsonValue::as_i64) {
+                    ts = crate::token_collector::iso_from_millis(ms);
+                }
+            }
+            if let Some(hour) = hour_key_from_ts(&ts) {
+                let is_error = req.get("result").and_then(|r| r.get("errorDetails")).is_some();
+                let user_text = req.get("message").and_then(|m| m.get("text")).and_then(JsonValue::as_str).unwrap_or("");
+                let dialogues = if !user_text.trim().is_empty() { 1 } else { 0 };
+                if is_error {
+                    record(map, sources, "copilot", hour, dialogues, 1, 0, 1);
+                } else {
+                    record(map, sources, "copilot", hour, dialogues, 1, 1, 0);
+                }
+            }
+        }
+        return;
+    }
+
+    let type_name = value.get("type").and_then(JsonValue::as_str).unwrap_or("");
+    let ts = value.get("timestamp").and_then(JsonValue::as_str).unwrap_or("");
+    let Some(hour) = hour_key_from_ts(ts) else {
+        return;
+    };
+    match type_name {
+        "user.message" => {
+            record(map, sources, "copilot", hour, 1, 0, 0, 0);
+        }
+        "assistant.message" => {
+            record(map, sources, "copilot", hour, 0, 1, 1, 0);
+        }
+        _ => {}
+    }
+}
+
 fn assistant_tokens_positive(data: &JsonValue) -> bool {
     let Some(tokens) = data.get("tokens") else {
         return false;
@@ -2514,6 +2643,56 @@ fn collect_kiro_activity_incremental(
     );
 }
 
+fn collect_copilot_activity_incremental(
+    home: &Path,
+    map: &mut BTreeMap<String, HealthAgg>,
+    sources: &mut BTreeMap<String, HealthAgg>,
+    cursors: &mut FileCursorMap,
+) {
+    let files = crate::token_collector::collect_copilot_source_files(home);
+    for (_, path) in files {
+        let key = path.to_string_lossy().to_string();
+        let Ok(meta) = fs::metadata(&path) else {
+            continue;
+        };
+        let inode = metadata_ino(&meta);
+        let size = meta.len();
+        let mtime_ms = meta
+            .modified()
+            .ok()
+            .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+            .map(|value| value.as_millis() as u64)
+            .unwrap_or(0);
+
+        if let Some(cursor) = cursors.get(&key) {
+            if cursor.inode == inode && cursor.size == size && cursor.mtime_ms == mtime_ms {
+                continue;
+            }
+        }
+
+        let Ok(file) = fs::File::open(&path) else {
+            continue;
+        };
+        let reader = std::io::BufReader::new(file);
+        use std::io::BufRead;
+        for line in reader.lines().flatten() {
+            if let Ok(value) = serde_json::from_str::<JsonValue>(&line) {
+                copilot_on_line(&value, map, sources);
+            }
+        }
+
+        cursors.insert(
+            key,
+            FileCursor {
+                inode,
+                size,
+                mtime_ms,
+                offset: size,
+            },
+        );
+    }
+}
+
 /// DSH 会话是 zstd 压缩的 JSONL（只会追加）。解压后按「已处理行数」做增量，
 /// 末尾若为未写完的半行则留到下次扫描，避免漏行。
 fn scan_zstd_jsonl_incremental(
@@ -2776,10 +2955,8 @@ fn sqlite_message_provider(value: &JsonValue) -> String {
 // 活动结果持久化（增量游标 + 累计报告）
 // ---------------------------------------------------------------------------
 
-// v7：Claude 请求按 message.id 去重（同一请求多内容块行只计一次）、子代理请求
-// 开始计入、对话轮改用 origin.kind 判定、新增 CatPawAI 来源、时区偏移归一 UTC。
-// 计数口径变更需要全量重扫历史文件，因此提升缓存版本使旧游标失效。
-const ACTIVITY_CACHE_VERSION: u32 = 7;
+// v8：全软件工作区智能归一化，修复带连字符项目解码、VS Code 工作区关联、子目录覆写与长路径清洗。
+const ACTIVITY_CACHE_VERSION: u32 = 8;
 
 /// 请求活动结果缓存：自维护 per-source 增量游标，并覆盖 Codex 归档与 Command Code。
 /// OpenHub 只缓存解析结果与游标，不复制原始日志。
@@ -3178,6 +3355,12 @@ pub(crate) fn collect_request_health_snapshot(force: bool) -> Result<RequestHeal
             .entry("catpawai".to_string())
             .or_default();
         collect_catpawai_activity_incremental(&mut map, &mut sources, cursor);
+    }
+
+    // GitHub Copilot / VS Code Copilot
+    {
+        let cursors = envelope.file_cursors.entry("copilot".to_string()).or_default();
+        collect_copilot_activity_incremental(&home, &mut map, &mut sources, cursors);
     }
 
     let report = maps_to_report(map, sources);
