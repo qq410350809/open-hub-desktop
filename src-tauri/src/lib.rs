@@ -8,6 +8,7 @@ mod chrome_usage;
 mod db;
 mod detect_all;
 mod file_export;
+mod geoip;
 mod mihomo_kernel;
 mod models;
 pub use detect_all::run_library_detect;
@@ -1043,30 +1044,9 @@ pub fn run() {
             if let Err(error) = token_stats::seed_token_database_from_caches(&database) {
                 eprintln!("[OpenHub] Token 缓存迁移到数据库失败：{error}");
             }
-            let bin_dir = app_data_dir.join("bin");
-            let _ = fs::create_dir_all(&bin_dir);
-            let target_mihomo = bin_dir.join(if cfg!(target_os = "windows") { "mihomo.exe" } else { "mihomo" });
-            if !target_mihomo.exists() {
-                for legacy in [
-                    "/Applications/Clash Verge.app/Contents/MacOS/verge-mihomo",
-                    "/Applications/Clash Party.app/Contents/Resources/sidecar/mihomo",
-                ] {
-                    let p = std::path::Path::new(legacy);
-                    if p.is_file() {
-                        if fs::copy(p, &target_mihomo).is_ok() {
-                            #[cfg(unix)]
-                            {
-                                use std::os::unix::fs::PermissionsExt;
-                                if let Ok(meta) = fs::metadata(&target_mihomo) {
-                                    let mut perms = meta.permissions();
-                                    perms.set_mode(0o755);
-                                    let _ = fs::set_permissions(&target_mihomo, perms);
-                                }
-                            }
-                            break;
-                        }
-                    }
-                }
+            // 首次启动时若 AppData 尚无文件，先秒级释放安装包自带的内置基础版内核与 GeoIP 数据库
+            if let Err(e) = crate::mihomo_kernel::ensure_bundled_assets_installed(app.handle()) {
+                eprintln!("[OpenHub] 释放内置资源提示：{e}");
             }
             let proxy_runtime = proxy_pool::ProxyRuntime::new(app_data_dir.join("proxy-runtime"));
             let charity_runtime = charity_monitor::CharityMonitorRuntime::new();
@@ -1141,6 +1121,34 @@ pub fn run() {
                 if proxy_cfg.enabled {
                     if let Err(e) = opencode_proxy::start_opencode_proxy_server(&proxy_state).await {
                         eprintln!("[OpenHub] OpenCode 反代服务启动失败: {e}");
+                    }
+                }
+            });
+
+            // 启动时后台异步检测核心组件是否缺失，若缺失则全自动静默下载
+            let auto_download_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+
+                // 1. 检测 Mihomo 内核
+                let has_mihomo = crate::mihomo_kernel::resolve_mihomo_binary(Some(&auto_download_handle)).is_some();
+                if !has_mihomo {
+                    eprintln!("[OpenHub] 启动组件检测：未检测到 Mihomo 内核，启动后台自动拉取…");
+                    match crate::mihomo_kernel::download_or_update_mihomo_kernel(auto_download_handle.clone(), None).await {
+                        Ok(status) => eprintln!("[OpenHub] Mihomo 内核自动安装成功 ({})", status.version),
+                        Err(e) => eprintln!("[OpenHub] Mihomo 内核自动安装失败：{e}"),
+                    }
+                }
+
+                // 2. 检测 GeoIP 数据库
+                let has_geoip = crate::geoip::get_app_geoip_path(&auto_download_handle)
+                    .map(|p| p.is_file())
+                    .unwrap_or(false);
+                if !has_geoip {
+                    eprintln!("[OpenHub] 启动组件检测：未检测到 GeoIP 数据库，启动后台自动拉取…");
+                    match crate::geoip::download_or_update_geoip(auto_download_handle.clone(), None).await {
+                        Ok(_) => eprintln!("[OpenHub] GeoIP 数据库自动下载成功并已就绪"),
+                        Err(e) => eprintln!("[OpenHub] GeoIP 数据库自动下载失败：{e}"),
                     }
                 }
             });
@@ -1247,7 +1255,9 @@ pub fn run() {
             file_export::save_export_file,
             mihomo_kernel::get_mihomo_kernel_status,
             mihomo_kernel::check_mihomo_kernel_update,
-            mihomo_kernel::download_or_update_mihomo_kernel
+            mihomo_kernel::download_or_update_mihomo_kernel,
+            geoip::get_geoip_status,
+            geoip::download_or_update_geoip
         ])
         .build(tauri::generate_context!())
         .expect("error while building Tauri application")

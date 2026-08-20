@@ -59,6 +59,8 @@
     },
     "resources": {
       "resources/zh-Hans.lproj": "resources/zh-Hans.lproj",
+      "resources/Country.mmdb": "Country.mmdb",
+      "resources/bin/mihomo": "bin/mihomo",
       "../dist": "dist"
     }
   }

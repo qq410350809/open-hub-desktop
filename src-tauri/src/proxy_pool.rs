@@ -8,7 +8,7 @@ use serde_json::{json, Map as JsonMap, Value as JsonValue};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, SocketAddr, TcpListener};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::{
@@ -473,25 +473,27 @@ fn load_state(database: &Database, runtime: &ProxyRuntime) -> Result<ProxyPoolSt
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| error.to_string())?;
 
-    // 旧数据若缺国家字段，导入名推断后写回，避免分组时再全量分析。
+    // 旧数据若缺国家字段，或者为 "ZZ"，且有 GeoIP 时，尝试推断后写回
+    let geoip_reader = open_geoip_reader(runtime);
     let mut rows = rows;
     let mut dirty = false;
     for node in &mut rows {
-        if !node.country_code.trim().is_empty() && !node.country_name.trim().is_empty() {
+        let is_unknown = node.country_code.trim().is_empty() || node.country_code == "ZZ";
+        if !is_unknown && !node.country_name.trim().is_empty() {
             continue;
         }
         let (code, name, class, ip) =
-            classify_node_location(&node.name, &node.server, node.port, None);
-        node.country_code = code;
-        node.country_name = name;
-        if node.classification.trim().is_empty() {
-            node.classification = class;
-        }
-        if node.primary_ip.trim().is_empty() && !ip.is_empty() {
-            node.primary_ip = ip;
-        }
-        connection
-            .execute(
+            classify_node_location(&node.name, &node.server, node.port, geoip_reader.as_ref());
+        if code != "ZZ" && (node.country_code != code || node.country_name != name) {
+            node.country_code = code;
+            node.country_name = name;
+            if node.classification.trim().is_empty() || node.classification == "unresolved" {
+                node.classification = class;
+            }
+            if node.primary_ip.trim().is_empty() && !ip.is_empty() {
+                node.primary_ip = ip;
+            }
+            let _ = connection.execute(
                 "UPDATE proxy_pool_nodes
                  SET country_code=?2, country_name=?3, classification=?4,
                      primary_ip=CASE WHEN ?5 != '' THEN ?5 ELSE primary_ip END
@@ -503,9 +505,9 @@ fn load_state(database: &Database, runtime: &ProxyRuntime) -> Result<ProxyPoolSt
                     node.classification,
                     node.primary_ip
                 ],
-            )
-            .map_err(|error| error.to_string())?;
-        dirty = true;
+            );
+            dirty = true;
+        }
     }
     let _ = dirty;
     let (mut channels, default_channel_id) = load_channels(&connection, &rows)?;
@@ -604,7 +606,7 @@ fn classify_node_location(
     port: i64,
     geoip_reader: Option<&Reader<Vec<u8>>>,
 ) -> (String, String, String, String) {
-    // 导入时优先用节点名推断国家（快）；IP/GeoIP 仅作补充。
+    let _ = port;
     if let Ok(ip) = server.parse::<IpAddr>() {
         let classification = classify_ip(ip).to_string();
         if classification == "local" {
@@ -631,12 +633,14 @@ fn classify_node_location(
         );
     }
 
+    // 域名场景：优先由节点名推断；若名称无地域，尝试由域名推断
     if let Some((code, country_name)) = inferred_country(name) {
-        // 域名场景不在导入时做 DNS，避免 6000+ 节点卡死；仅记名称国家。
-        let _ = port;
         return (code, country_name, "public".to_string(), String::new());
     }
-    let _ = (port, geoip_reader);
+    if let Some((code, country_name)) = inferred_country(server) {
+        return (code, country_name, "public".to_string(), String::new());
+    }
+
     (
         "ZZ".to_string(),
         "未知地区".to_string(),
@@ -645,21 +649,29 @@ fn classify_node_location(
     )
 }
 
-fn find_geoip_database(runtime: &ProxyRuntime) -> Option<PathBuf> {
+pub fn find_geoip_database(runtime: &ProxyRuntime) -> Option<PathBuf> {
     let mut candidates = Vec::new();
     if let Some(path) = std::env::var_os("OPENHUB_GEOIP_DB") {
         candidates.push(PathBuf::from(path));
     }
     candidates.extend([
         runtime.directory.join("Country.mmdb"),
+        runtime.directory.join("country.mmdb"),
         runtime.directory.join("GeoLite2-Country.mmdb"),
     ]);
     if let Some(parent) = runtime.directory.parent() {
-        candidates.push(parent.join("Country.mmdb"));
-        candidates.push(parent.join("GeoLite2-Country.mmdb"));
+        candidates.extend([
+            parent.join("Country.mmdb"),
+            parent.join("country.mmdb"),
+            parent.join("GeoLite2-Country.mmdb"),
+            parent.join("bin").join("Country.mmdb"),
+            parent.join("bin").join("country.mmdb"),
+        ]);
     }
     if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
         candidates.extend([
+            home.join("Library/Application Support/com.dfeer.openhub.desktop/Country.mmdb"),
+            home.join(".config/com.dfeer.openhub.desktop/Country.mmdb"),
             home.join("Library/Application Support/io.github.clash-verge-rev.clash-verge-rev/Country.mmdb"),
             home.join("Library/Application Support/mihomo-party/work/country.mmdb"),
             home.join("Library/Application Support/mihomo-party/test/country.mmdb"),
@@ -674,6 +686,72 @@ fn find_geoip_database(runtime: &ProxyRuntime) -> Option<PathBuf> {
         PathBuf::from("/usr/share/GeoIP/GeoLite2-Country.mmdb"),
     ]);
     candidates.into_iter().find(|path| path.is_file())
+}
+
+pub fn open_geoip_reader(runtime: &ProxyRuntime) -> Option<Reader<Vec<u8>>> {
+    let path = find_geoip_database(runtime)?;
+    Reader::open_readfile(path).ok()
+}
+
+pub fn repair_node_locations_with_geoip(
+    database: &Database,
+    runtime: &ProxyRuntime,
+) -> Result<usize, String> {
+    let geoip_reader = match open_geoip_reader(runtime) {
+        Some(r) => r,
+        None => return Ok(0),
+    };
+
+    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    let mut stmt = connection
+        .prepare("SELECT id, name, server, port, country_code, country_name, classification, primary_ip FROM proxy_pool_nodes")
+        .map_err(|e| e.to_string())?;
+
+    struct Candidate {
+        id: String,
+        name: String,
+        server: String,
+        port: i64,
+        country_code: String,
+        country_name: String,
+        classification: String,
+        primary_ip: String,
+    }
+
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(Candidate {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                server: row.get(2)?,
+                port: row.get(3)?,
+                country_code: row.get(4)?,
+                country_name: row.get(5)?,
+                classification: row.get(6)?,
+                primary_ip: row.get(7)?,
+            })
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+
+    let mut updated = 0;
+    for c in rows {
+        let is_unknown = c.country_code.trim().is_empty() || c.country_code == "ZZ";
+        let (code, name, class, ip) = classify_node_location(&c.name, &c.server, c.port, Some(&geoip_reader));
+        if code != "ZZ" && (is_unknown || c.country_code != code) {
+            let _ = connection.execute(
+                "UPDATE proxy_pool_nodes
+                 SET country_code=?2, country_name=?3, classification=?4,
+                     primary_ip=CASE WHEN ?5 != '' THEN ?5 ELSE primary_ip END
+                 WHERE id=?1",
+                params![c.id, code, name, class, ip],
+            );
+            updated += 1;
+        }
+    }
+
+    Ok(updated)
 }
 
 fn geoip_country(reader: &Reader<Vec<u8>>, ip: IpAddr) -> Option<(String, String)> {
@@ -829,6 +907,7 @@ pub fn analyze_proxy_nodes(
     // 国家信息在导入时已写入；分组只读缓存字段，不再做 6000+ DNS/GeoIP 全量分析。
     let state = load_state(&database, &runtime)?;
     let geoip_path = find_geoip_database(&runtime);
+    let geoip_reader = open_geoip_reader(&runtime);
     let mut groups_map: HashMap<String, ProxyIpGroup> = HashMap::new();
     let mut analyses = Vec::with_capacity(state.nodes.len());
     let mut unique_ips = HashSet::new();
@@ -840,11 +919,13 @@ pub fn analyze_proxy_nodes(
         let mut classification = node.classification.trim().to_string();
         let primary_ip = node.primary_ip.trim().to_string();
 
-        if country_code.is_empty() || country_name.is_empty() {
+        if country_code.is_empty() || country_name.is_empty() || country_code == "ZZ" {
             let (code, name, class, ip) =
-                classify_node_location(&node.name, &node.server, node.port, None);
-            country_code = code;
-            country_name = name;
+                classify_node_location(&node.name, &node.server, node.port, geoip_reader.as_ref());
+            if code != "ZZ" || country_code.is_empty() {
+                country_code = code;
+                country_name = name;
+            }
             if classification.is_empty() {
                 classification = class;
             }
@@ -2906,6 +2987,7 @@ pub async fn refresh_proxy_subscription(
             [&id],
         )
         .map_err(|error| error.to_string())?;
+    let geoip_reader = open_geoip_reader(&runtime);
     let mut used_names = transaction
         .prepare("SELECT name FROM proxy_pool_nodes")
         .map_err(|error| error.to_string())?
@@ -2938,7 +3020,7 @@ pub async fn refresh_proxy_subscription(
             object.insert("name".into(), json!(node.name));
         }
         let (country_code, country_name, classification, primary_ip) =
-            classify_node_location(&node.name, &node.server, node.port, None);
+            classify_node_location(&node.name, &node.server, node.port, geoip_reader.as_ref());
         transaction
             .execute(
                 "INSERT INTO proxy_pool_nodes (

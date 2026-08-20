@@ -3,11 +3,28 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, watch 
 import { icons } from "../icons";
 import { useStore } from "../composables/useStore";
 import { usePreferences } from "../composables/usePreferences";
+import { KERNEL_DOWNLOAD_MIRRORS } from "../composables/useProxyPool";
 import CustomSelect from "./CustomSelect.vue";
 import type { ProxyChannel, ProxyNode, ProxySubscription } from "../types";
 
 const store = useStore();
 const { preferences, updatePreferences } = usePreferences();
+
+const kernelParsedVersion = computed(() => {
+  const raw = store.kernelStatus?.value?.version || "";
+  if (!raw) return { tag: "未安装", arch: "" };
+  const tagMatch = raw.match(/v\d+\.\d+(\.\d+)?/i);
+  const tag = tagMatch ? tagMatch[0] : (raw.split(" ")[0] || raw);
+  let arch = "";
+  if (/darwin/i.test(raw)) arch = "macOS";
+  else if (/windows/i.test(raw)) arch = "Windows";
+  else if (/linux/i.test(raw)) arch = "Linux";
+
+  if (/arm64|aarch64/i.test(raw)) arch += " ARM64";
+  else if (/amd64|x86_64|x64/i.test(raw)) arch += " x64";
+
+  return { tag, arch: arch.trim() };
+});
 
 // —— 来源与过滤状态 ——
 const sourceName = ref("");
@@ -1695,51 +1712,159 @@ watch(nodeViewMode, () => {
             </header>
 
             <div class="pp-modal-body">
-              <!-- 内核管理卡片 -->
-              <div class="pp-settings-field-group" style="padding-bottom: 16px; border-bottom: 1px solid var(--border-color, rgba(255,255,255,0.08)); margin-bottom: 16px;">
-                <label class="pp-label">OpenHub 内置 Mihomo 内核</label>
-                <div style="display: flex; justify-content: space-between; align-items: center; background: rgba(0,0,0,0.04); padding: 12px 14px; border-radius: 8px; border: 1px solid var(--border-color, rgba(255,255,255,0.08));">
-                  <div>
-                    <div v-if="store.kernelLoading?.value" style="font-size: 13px; color: var(--text-dim);">正在检测内核状态…</div>
-                    <div v-else-if="store.kernelStatus?.value?.installed" style="font-size: 13px; font-weight: 500;">
-                      <span>{{ store.kernelStatus.value.version }}</span>
-                      <span v-if="store.kernelStatus.value.latestVersion && store.kernelStatus.value.latestVersion !== store.kernelStatus.value.version" style="color: var(--primary, #3b82f6); margin-left: 6px; font-size: 12px;">
-                        (发现新版本 {{ store.kernelStatus.value.latestVersion }})
-                      </span>
-                      <div style="font-size: 11px; color: var(--text-dim); margin-top: 4px; font-family: monospace;">{{ store.kernelStatus.value.path }}</div>
-                    </div>
-                    <div v-else style="font-size: 13px; color: var(--danger, #ef4444); font-weight: 500;">
-                      未检测到内置内核，请一键下载
-                    </div>
+              <!-- 核心组件下载加速源选择栏（共用于内核与 GeoIP） -->
+              <div class="pp-mirror-banner">
+                <div class="pp-mirror-header">
+                  <span class="pp-mirror-title">组件下载加速源</span>
+                  <small class="pp-mirror-subtitle">共用于内置 Mihomo 内核与 GeoIP 数据库的极速拉取与在线更新</small>
+                </div>
+                <div class="component-mirror-controls">
+                  <select v-model="store.kernelSelectedMirror.value" class="kernel-mirror-select">
+                    <option v-for="m in KERNEL_DOWNLOAD_MIRRORS" :key="m.value" :value="m.value">
+                      {{ m.text }}
+                    </option>
+                  </select>
+                  <input
+                    v-if="store.kernelSelectedMirror?.value === 'custom'"
+                    v-model="store.kernelCustomMirror.value"
+                    type="text"
+                    class="kernel-custom-mirror-input"
+                    placeholder="https://your-mirror.com/"
+                  />
+                </div>
+              </div>
 
-                    <div v-if="store.kernelDownloading?.value" style="margin-top: 8px;">
-                      <div style="background: rgba(0,0,0,0.1); border-radius: 4px; height: 5px; overflow: hidden; width: 220px;">
-                        <div style="background: var(--primary, #3b82f6); height: 100%; transition: width 0.2s;" :style="{ width: `${Math.max(5, Math.round((store.kernelDownloadProgress?.value?.progress ?? 0) * 100))}%` }" />
+              <!-- 专属美化版 Mihomo 内核卡片 -->
+              <div class="kernel-card">
+                <div class="kernel-card-header">
+                  <div class="kernel-card-identity">
+                    <div class="kernel-icon-badge">
+                      <span v-html="icons.wifi" />
+                    </div>
+                    <div class="kernel-identity-text">
+                      <div class="kernel-title-row">
+                        <span class="kernel-title">内置 Mihomo 内核</span>
+                        <span v-if="store.kernelLoading?.value" class="kernel-badge is-loading">检测中…</span>
+                        <span v-else-if="store.kernelStatus?.value?.installed" class="kernel-badge is-ready">
+                          <i class="dot" /> 运行就绪
+                        </span>
+                        <span v-else class="kernel-badge is-missing">
+                          <i class="dot" /> 待安装
+                        </span>
                       </div>
-                      <div style="color: var(--primary, #3b82f6); font-size: 11px; margin-top: 4px;">{{ store.kernelDownloadProgress?.value?.message }}</div>
+                      <div class="kernel-subtitle">
+                        <template v-if="store.kernelStatus?.value?.installed">
+                          <span>版本</span>
+                          <strong class="kernel-version-tag">{{ kernelParsedVersion.tag }}</strong>
+                          <span v-if="kernelParsedVersion.arch" class="kernel-arch-tag">{{ kernelParsedVersion.arch }}</span>
+                          <span
+                            v-if="store.kernelStatus?.value?.latestVersion && store.kernelStatus.value.latestVersion !== kernelParsedVersion.tag"
+                            class="kernel-update-pill"
+                          >
+                            发现新版本 {{ store.kernelStatus.value.latestVersion }}
+                          </span>
+                        </template>
+                        <span v-else class="kernel-missing-text">未检测到内置内核，点击右侧按钮一键下载</span>
+                      </div>
                     </div>
                   </div>
 
-                  <div style="display: flex; gap: 8px; align-items: center;">
+                  <!-- 操作按钮组 -->
+                  <div class="kernel-card-actions">
                     <button
                       v-if="store.kernelStatus?.value?.installed"
                       type="button"
-                      class="pp-btn-cancel"
-                      style="font-size: 12px; padding: 4px 10px; height: 28px;"
+                      class="kernel-btn-secondary"
                       :disabled="store.kernelLoading?.value || store.kernelChecking?.value || store.kernelDownloading?.value"
                       @click="store.checkMihomoKernelUpdate()"
                     >
-                      {{ store.kernelChecking?.value ? "检查中…" : "检查更新" }}
+                      <span class="btn-icon" :class="{ 'is-spinning': store.kernelChecking?.value }" v-html="icons.restore" />
+                      <span>{{ store.kernelChecking?.value ? "检查中…" : "检查更新" }}</span>
                     </button>
+
                     <button
                       type="button"
-                      class="pp-btn-primary"
-                      style="font-size: 12px; padding: 4px 12px; height: 28px;"
+                      class="kernel-btn-primary"
+                      :class="{ 'is-accent': !store.kernelStatus?.value?.installed }"
                       :disabled="store.kernelLoading?.value || store.kernelDownloading?.value"
                       @click="store.downloadOrUpdateMihomoKernel()"
                     >
-                      {{ store.kernelDownloading?.value ? "下载中…" : (store.kernelStatus?.value?.installed ? "重新下载 / 更新" : "一键下载内核") }}
+                      <span class="btn-icon" v-html="icons.download || icons.restore" />
+                      <span>{{ store.kernelDownloading?.value ? "正在下载…" : (store.kernelStatus?.value?.installed ? "重新下载 / 更新" : "一键下载内核") }}</span>
                     </button>
+                  </div>
+                </div>
+
+                <!-- 下载进度条 -->
+                <div v-if="store.kernelDownloading?.value" class="kernel-progress-wrapper">
+                  <div class="kernel-progress-track">
+                    <div
+                      class="kernel-progress-fill"
+                      :style="{ width: `${Math.max(4, Math.round((store.kernelDownloadProgress?.value?.progress ?? 0) * 100))}%` }"
+                    />
+                  </div>
+                    <div class="kernel-progress-meta">
+                      <span class="kernel-progress-msg">{{ store.kernelDownloadProgress?.value?.message }}</span>
+                      <span class="kernel-progress-pct">{{ Math.round((store.kernelDownloadProgress?.value?.progress ?? 0) * 100) }}%</span>
+                    </div>
+                </div>
+              </div>
+
+              <!-- 专属 GeoIP 数据库管理卡片 -->
+              <div class="kernel-card geoip-card">
+                <div class="kernel-card-header">
+                  <div class="kernel-card-identity">
+                    <div class="kernel-icon-badge is-geoip">
+                      <span v-html="icons.globe" />
+                    </div>
+                    <div class="kernel-identity-text">
+                      <div class="kernel-title-row">
+                        <span class="kernel-title">GeoIP 国家与地域数据库</span>
+                        <span v-if="store.geoipLoading?.value" class="kernel-badge is-loading">检测中…</span>
+                        <span v-else-if="store.geoipStatus?.value?.installed" class="kernel-badge is-ready">
+                          <i class="dot" /> 运行就绪
+                        </span>
+                        <span v-else class="kernel-badge is-missing">
+                          <i class="dot" /> 待安装
+                        </span>
+                      </div>
+                      <div class="kernel-subtitle">
+                        <template v-if="store.geoipStatus?.value?.installed">
+                          <span>数据库大小</span>
+                          <strong class="kernel-version-tag">{{ store.geoipStatus.value.fileSizeFormatted }}</strong>
+                          <span v-if="store.geoipStatus.value.updatedAt" class="kernel-arch-tag">更新于 {{ store.geoipStatus.value.updatedAt }}</span>
+                        </template>
+                        <span v-else class="kernel-missing-text">未检测到本地 GeoIP 数据库，建议下载以获得精准节点国旗与地域解析</span>
+                      </div>
+                    </div>
+                  </div>
+
+                  <!-- 操作按钮组 -->
+                  <div class="kernel-card-actions">
+                    <button
+                      type="button"
+                      class="kernel-btn-primary"
+                      :class="{ 'is-accent': !store.geoipStatus?.value?.installed }"
+                      :disabled="store.geoipLoading?.value || store.geoipDownloading?.value"
+                      @click="store.downloadOrUpdateGeoip()"
+                    >
+                      <span class="btn-icon" :class="{ 'is-spinning': store.geoipDownloading?.value }" v-html="icons.download || icons.restore" />
+                      <span>{{ store.geoipDownloading?.value ? "正在下载…" : (store.geoipStatus?.value?.installed ? "重新下载 / 更新" : "一键下载 GeoIP") }}</span>
+                    </button>
+                  </div>
+                </div>
+
+                <!-- 下载进度条 -->
+                <div v-if="store.geoipDownloading?.value" class="kernel-progress-wrapper">
+                  <div class="kernel-progress-track">
+                    <div
+                      class="kernel-progress-fill"
+                      :style="{ width: `${Math.max(4, Math.round((store.geoipDownloadProgress?.value?.progress ?? 0) * 100))}%` }"
+                    />
+                  </div>
+                  <div class="kernel-progress-meta">
+                    <span class="kernel-progress-msg">{{ store.geoipDownloadProgress?.value?.message }}</span>
+                    <span class="kernel-progress-pct">{{ Math.round((store.geoipDownloadProgress?.value?.progress ?? 0) * 100) }}%</span>
                   </div>
                 </div>
               </div>
@@ -3301,5 +3426,399 @@ watch(nodeViewMode, () => {
 .pp-modal-fade-enter-from,
 .pp-modal-fade-leave-to {
   opacity: 0;
+}
+
+/* Kernel Card Styling */
+.kernel-card {
+  margin-bottom: 16px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  padding: 16px 18px;
+  box-shadow: var(--shadow-xs);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  transition: border-color 0.2s, box-shadow 0.2s;
+}
+
+.kernel-card:hover {
+  border-color: var(--line-strong);
+  box-shadow: var(--shadow-sm);
+}
+
+.kernel-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.kernel-card-identity {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+.kernel-icon-badge {
+  width: 38px;
+  height: 38px;
+  border-radius: var(--r-md);
+  background: linear-gradient(135deg, rgba(59, 130, 246, 0.14), rgba(99, 102, 241, 0.08));
+  border: 1px solid rgba(59, 130, 246, 0.22);
+  color: #3b82f6;
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+}
+
+.kernel-icon-badge.is-geoip {
+  background: linear-gradient(135deg, rgba(16, 185, 129, 0.14), rgba(6, 182, 212, 0.08));
+  border-color: rgba(16, 185, 129, 0.25);
+  color: #10b981;
+}
+
+.kernel-icon-badge :deep(svg) {
+  width: 18px;
+  height: 18px;
+}
+
+.kernel-identity-text {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.kernel-title-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.kernel-title {
+  font-size: 13.5px;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.kernel-badge {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 12px;
+  font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  line-height: 1.2;
+}
+
+.kernel-badge.is-ready {
+  background: rgba(16, 185, 129, 0.12);
+  color: #10b981;
+  border: 1px solid rgba(16, 185, 129, 0.25);
+}
+
+.kernel-badge.is-ready .dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #10b981;
+  box-shadow: 0 0 6px rgba(16, 185, 129, 0.6);
+}
+
+.kernel-badge.is-missing {
+  background: rgba(239, 68, 68, 0.12);
+  color: #ef4444;
+  border: 1px solid rgba(239, 68, 68, 0.25);
+}
+
+.kernel-badge.is-missing .dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #ef4444;
+  box-shadow: 0 0 6px rgba(239, 68, 68, 0.6);
+}
+
+.kernel-badge.is-loading {
+  background: var(--surface-soft);
+  color: var(--muted);
+  border: 1px solid var(--line);
+}
+
+.kernel-subtitle {
+  font-size: 12px;
+  color: var(--muted);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.kernel-version-tag {
+  background: var(--surface-soft);
+  padding: 1px 6px;
+  border-radius: 4px;
+  border: 1px solid var(--line);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.kernel-arch-tag {
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--faint);
+  background: var(--surface-soft);
+  padding: 1px 5px;
+  border-radius: 3px;
+  border: 1px solid var(--line-soft);
+}
+
+.kernel-update-pill {
+  background: linear-gradient(135deg, #3b82f6, #6366f1);
+  color: #fff;
+  font-size: 10.5px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 10px;
+  box-shadow: 0 2px 8px rgba(59, 130, 246, 0.35);
+  animation: pulse-subtle 2s infinite;
+}
+
+.kernel-missing-text {
+  color: var(--danger, #ef4444);
+  font-size: 11.5px;
+}
+
+.kernel-card-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.kernel-btn-secondary,
+.kernel-btn-primary {
+  height: 32px;
+  padding: 0 13px;
+  font-size: 12px;
+  font-weight: 600;
+  border-radius: var(--r-md);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  cursor: pointer;
+  white-space: nowrap;
+  flex-shrink: 0;
+  transition: all 0.15s var(--ease);
+}
+
+.kernel-btn-secondary {
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  color: var(--text);
+}
+
+.kernel-btn-secondary:hover:not(:disabled) {
+  background: var(--surface-hover);
+  border-color: var(--line-strong);
+  box-shadow: var(--shadow-xs);
+}
+
+.kernel-btn-primary {
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  color: var(--text);
+}
+
+.kernel-btn-primary:hover:not(:disabled) {
+  background: var(--surface-hover);
+  border-color: var(--line-strong);
+}
+
+.kernel-btn-primary.is-accent {
+  background: linear-gradient(135deg, #3b82f6, #2563eb);
+  border: 1px solid #2563eb;
+  color: #fff;
+  box-shadow: 0 2px 8px rgba(37, 99, 235, 0.3);
+}
+
+.kernel-btn-primary.is-accent:hover:not(:disabled) {
+  background: linear-gradient(135deg, #2563eb, #1d4ed8);
+  box-shadow: 0 4px 12px rgba(37, 99, 235, 0.4);
+}
+
+.kernel-btn-secondary:disabled,
+.kernel-btn-primary:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.btn-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.btn-icon :deep(svg) {
+  width: 14px;
+  height: 14px;
+}
+
+.btn-icon.is-spinning :deep(svg) {
+  animation: spin 1s linear infinite;
+}
+
+.kernel-progress-wrapper {
+  background: var(--surface-soft);
+  border: 1px solid var(--line-soft);
+  border-radius: var(--r-md);
+  padding: 10px 12px;
+}
+
+.kernel-progress-track {
+  height: 6px;
+  border-radius: 3px;
+  background: rgba(0, 0, 0, 0.08);
+  overflow: hidden;
+}
+
+.kernel-progress-fill {
+  height: 100%;
+  border-radius: 3px;
+  background: linear-gradient(90deg, #3b82f6, #6366f1);
+  transition: width 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.kernel-progress-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 11px;
+  color: var(--muted);
+  margin-top: 6px;
+}
+
+.kernel-progress-pct {
+  font-weight: 700;
+  color: #3b82f6;
+  font-family: ui-monospace, monospace;
+}
+
+.kernel-path-footer {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-top: 10px;
+  border-top: 1px dashed var(--line-soft);
+  font-size: 11px;
+  color: var(--faint);
+}
+
+.kernel-path-label {
+  flex-shrink: 0;
+  font-weight: 500;
+}
+
+.kernel-path-value {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+  background: var(--surface-soft);
+  padding: 2px 6px;
+  border-radius: 4px;
+  border: 1px solid var(--line-soft);
+  max-width: 100%;
+}
+
+.pp-mirror-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  padding: 10px 14px;
+  margin-bottom: 2px;
+  flex-wrap: wrap;
+}
+
+.pp-mirror-header {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.pp-mirror-title {
+  font-size: 12.5px;
+  font-weight: 650;
+  color: var(--text);
+}
+
+.pp-mirror-subtitle {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.component-mirror-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.kernel-mirror-select {
+  height: 28px;
+  padding: 0 8px 0 10px;
+  border-radius: var(--r-sm);
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  color: var(--text);
+  font-size: 11.5px;
+  font-weight: 500;
+  outline: none;
+  cursor: pointer;
+  transition: border-color 0.15s;
+}
+
+.kernel-mirror-select:hover {
+  border-color: var(--line-strong);
+}
+
+.kernel-custom-mirror-input {
+  height: 28px;
+  padding: 0 10px;
+  border-radius: var(--r-sm);
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  color: var(--text);
+  font-size: 11.5px;
+  outline: none;
+  width: 220px;
+  transition: border-color 0.15s;
+}
+
+.kernel-custom-mirror-input:focus {
+  border-color: var(--primary, #3b82f6);
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+@keyframes pulse-subtle {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.88; transform: scale(1.03); }
 }
 </style>

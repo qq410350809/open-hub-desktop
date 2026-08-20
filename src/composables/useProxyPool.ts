@@ -1,6 +1,6 @@
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { computed, ref } from "vue";
-import type { MihomoDownloadProgress, MihomoKernelStatus, ProxyIpAnalysis, ProxyNode, ProxyNodeTestProgress, ProxyPoolRefreshResult, ProxyPoolState, ProxySourceProgress } from "../types";
+import type { GeoipDownloadProgress, GeoipStatus, MihomoDownloadProgress, MihomoKernelStatus, ProxyIpAnalysis, ProxyNode, ProxyNodeTestProgress, ProxyPoolRefreshResult, ProxyPoolState, ProxySourceProgress } from "../types";
 import { runCommand } from "./useLibrary";
 
 const isTauri = "__TAURI_INTERNALS__" in window;
@@ -42,9 +42,22 @@ const kernelDownloadProgress = ref<MihomoDownloadProgress>({
   message: "",
 });
 
+// —— GeoIP 数据库自管理状态 ——
+const geoipStatus = ref<GeoipStatus | null>(null);
+const geoipLoading = ref(false);
+const geoipDownloading = ref(false);
+const geoipDownloadProgress = ref<GeoipDownloadProgress>({
+  stage: "",
+  progress: 0,
+  message: "",
+});
+
 if (isTauri) {
   listen<MihomoDownloadProgress>("mihomo-kernel-progress", (event) => {
     kernelDownloadProgress.value = event.payload;
+  });
+  listen<GeoipDownloadProgress>("geoip-download-progress", (event) => {
+    geoipDownloadProgress.value = event.payload;
   });
 }
 
@@ -57,6 +70,8 @@ async function loadProxyPool() {
   try {
     proxyPool.value = await runCommand<ProxyPoolState>("get_proxy_pool_state");
     bumpProxyNodesRevision();
+    loadMihomoKernelStatus();
+    loadGeoipStatus();
   } catch (error) {
     proxyPoolError.value = String(error);
   } finally {
@@ -601,6 +616,21 @@ async function deleteInvalidProxyNodes() {
   }
 }
 
+export const KERNEL_DOWNLOAD_MIRRORS = [
+  { value: "auto", text: "⚡ 智能全网竞速 (推荐 · 4线程并发)" },
+  { value: "https://gh-proxy.com", text: "🚀 gh-proxy.com (亚太 CDN)" },
+  { value: "https://ghfast.top", text: "🚀 ghfast.top (Cloudflare 边缘加速)" },
+  { value: "https://gh.ddlc.top", text: "🚀 gh.ddlc.top (国内边缘加速)" },
+  { value: "https://ghps.cc", text: "🚀 ghps.cc (国内镜像)" },
+  { value: "https://github.boki.moe", text: "🚀 github.boki.moe (镜像加速)" },
+  { value: "https://ghproxy.net", text: "🚀 ghproxy.net (备用镜像)" },
+  { value: "direct", text: "🌐 GitHub 官方直连 (适合 VPN/代理)" },
+  { value: "custom", text: "⚙️ 自定义镜像源前缀" },
+] as const;
+
+const kernelSelectedMirror = ref<string>("auto");
+const kernelCustomMirror = ref<string>("");
+
 async function loadMihomoKernelStatus() {
   kernelLoading.value = true;
   try {
@@ -612,10 +642,11 @@ async function loadMihomoKernelStatus() {
   }
 }
 
-async function checkMihomoKernelUpdate() {
+async function checkMihomoKernelUpdate(mirror?: string) {
+  const m = mirror ?? (kernelSelectedMirror.value === "custom" ? kernelCustomMirror.value : kernelSelectedMirror.value);
   kernelChecking.value = true;
   try {
-    kernelStatus.value = await runCommand<MihomoKernelStatus>("check_mihomo_kernel_update");
+    kernelStatus.value = await runCommand<MihomoKernelStatus>("check_mihomo_kernel_update", { mirror: m || null });
     return kernelStatus.value;
   } catch (err) {
     proxyPoolError.value = String(err);
@@ -625,11 +656,12 @@ async function checkMihomoKernelUpdate() {
   }
 }
 
-async function downloadOrUpdateMihomoKernel() {
+async function downloadOrUpdateMihomoKernel(mirror?: string) {
+  const m = mirror ?? (kernelSelectedMirror.value === "custom" ? kernelCustomMirror.value : kernelSelectedMirror.value);
   kernelDownloading.value = true;
   kernelDownloadProgress.value = { stage: "starting", progress: 0, message: "准备下载…" };
   try {
-    kernelStatus.value = await runCommand<MihomoKernelStatus>("download_or_update_mihomo_kernel");
+    kernelStatus.value = await runCommand<MihomoKernelStatus>("download_or_update_mihomo_kernel", { mirror: m || null });
     await loadProxyPool();
     return kernelStatus.value;
   } catch (err) {
@@ -640,10 +672,39 @@ async function downloadOrUpdateMihomoKernel() {
   }
 }
 
+async function loadGeoipStatus() {
+  geoipLoading.value = true;
+  try {
+    geoipStatus.value = await runCommand<GeoipStatus>("get_geoip_status");
+  } catch (err) {
+    console.error("读取 GeoIP 状态失败", err);
+  } finally {
+    geoipLoading.value = false;
+  }
+}
+
+async function downloadOrUpdateGeoip(mirror?: string) {
+  const m = mirror ?? (kernelSelectedMirror.value === "custom" ? kernelCustomMirror.value : kernelSelectedMirror.value);
+  geoipDownloading.value = true;
+  geoipDownloadProgress.value = { stage: "starting", progress: 0, message: "准备下载 GeoIP 数据库…" };
+  try {
+    geoipStatus.value = await runCommand<GeoipStatus>("download_or_update_geoip", { mirror: m || null });
+    await loadProxyPool();
+    return geoipStatus.value;
+  } catch (err) {
+    proxyPoolError.value = String(err);
+    throw err;
+  } finally {
+    geoipDownloading.value = false;
+  }
+}
+
 export function useProxyPool() {
   return {
     proxyPool, proxyPoolLoading, proxyPoolError, proxyPoolBusyId, channelTestBusyId, proxyPoolSwitchingNodeId, testingNodeIds, proxyTestProgress, proxyTestCancelling, proxyNodesRevision, proxySourceProgress, proxyPoolActive,
     kernelStatus, kernelLoading, kernelChecking, kernelDownloading, kernelDownloadProgress,
+    geoipStatus, geoipLoading, geoipDownloading, geoipDownloadProgress,
+    kernelSelectedMirror, kernelCustomMirror,
     loadProxyPool, saveProxySubscription, deleteProxySubscription, refreshProxySubscription,
     refreshAllProxySubscriptions, saveProxyPoolSettings, activateProxyNode, clearActiveProxyNode,
     analyzeProxyNodes,
@@ -652,5 +713,6 @@ export function useProxyPool() {
     saveProxyChannel, deleteProxyChannel, setProxyChannelNode,
     assignAccountProxyChannel, unassignAccountProxyChannel, testProxyChannelNodes,
     loadMihomoKernelStatus, checkMihomoKernelUpdate, downloadOrUpdateMihomoKernel,
+    loadGeoipStatus, downloadOrUpdateGeoip,
   };
 }

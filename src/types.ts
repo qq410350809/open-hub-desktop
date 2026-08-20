@@ -876,3 +876,18 @@ export interface ModelCatalogSyncResult {
   message: string;
   snapshot: ModelCatalogSnapshot;
 }
+
+export interface GeoipStatus {
+  installed: boolean;
+  path: string;
+  fileSize: number;
+  fileSizeFormatted: string;
+  updatedAt?: string | null;
+}
+
+export interface GeoipDownloadProgress {
+  stage: string;
+  progress: number;
+  message: string;
+}
+
