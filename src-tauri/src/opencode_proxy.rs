@@ -534,6 +534,7 @@ async fn record_failover_event(
     ctx: &OpencodeProxyContext,
     req_id: &str,
     path: &str,
+    channel_id: &str,
     model: &str,
     is_stream: bool,
     status_code: u16,
@@ -547,7 +548,7 @@ async fn record_failover_event(
         timestamp: current_timestamp(),
         method: "POST".to_string(),
         path: path.to_string(),
-        channel_id: "opencode".to_string(),
+        channel_id: channel_id.to_string(),
         model: model.to_string(),
         stream: is_stream,
         status_code,
@@ -567,11 +568,140 @@ async fn record_failover_event(
     .await;
 }
 
+// ---------------------------------------------------------------------------
+// SSE 流式帧提取器（支持字节级 UTF-8 拼包、CRLF / LF 混合换行与完整 JSON 校验）
+// ---------------------------------------------------------------------------
+
+#[derive(Default)]
+struct SseFrameExtractor {
+    byte_buffer: Vec<u8>,
+}
+
+struct SseEventBlock {
+    event_type: Option<String>,
+    data_lines: Vec<String>,
+    raw_block: String,
+    is_done: bool,
+}
+
+impl SseFrameExtractor {
+    fn new() -> Self {
+        Self {
+            byte_buffer: Vec::new(),
+        }
+    }
+
+    fn push_bytes(&mut self, chunk: &[u8]) {
+        self.byte_buffer.extend_from_slice(chunk);
+    }
+
+    /// 从字节缓冲区中提取所有已就绪的完整 SSE 事件块
+    fn extract_blocks(&mut self) -> Vec<SseEventBlock> {
+        let mut blocks = Vec::new();
+
+        loop {
+            let valid_len = match std::str::from_utf8(&self.byte_buffer) {
+                Ok(_) => self.byte_buffer.len(),
+                Err(e) => e.valid_up_to(),
+            };
+
+            if valid_len == 0 {
+                break;
+            }
+
+            let valid_str = match std::str::from_utf8(&self.byte_buffer[..valid_len]) {
+                Ok(s) => s,
+                Err(_) => break,
+            };
+
+            // 识别各类标准与非标准 SSE 分隔符：\r\n\r\n, \n\n, \n\r\n
+            let block_end = if let Some(pos) = valid_str.find("\r\n\r\n") {
+                Some((pos, pos + 4))
+            } else if let Some(pos) = valid_str.find("\n\n") {
+                Some((pos, pos + 2))
+            } else if let Some(pos) = valid_str.find("\n\r\n") {
+                Some((pos, pos + 3))
+            } else {
+                None
+            };
+
+            if let Some((content_end, total_end)) = block_end {
+                let block_text = valid_str[..content_end].to_string();
+                self.byte_buffer.drain(..total_end);
+
+                if let Some(b) = Self::parse_block(&block_text) {
+                    blocks.push(b);
+                }
+            } else {
+                break;
+            }
+        }
+
+        blocks
+    }
+
+    /// 流终止时刷新并提取剩余数据块（若为完整格式）
+    fn flush_remaining(&mut self) -> Option<SseEventBlock> {
+        let valid_len = match std::str::from_utf8(&self.byte_buffer) {
+            Ok(_) => self.byte_buffer.len(),
+            Err(e) => e.valid_up_to(),
+        };
+        if valid_len == 0 {
+            self.byte_buffer.clear();
+            return None;
+        }
+        let valid_str = std::str::from_utf8(&self.byte_buffer[..valid_len]).unwrap_or("");
+        let block_text = valid_str.to_string();
+        self.byte_buffer.clear();
+        Self::parse_block(&block_text)
+    }
+
+    fn parse_block(text: &str) -> Option<SseEventBlock> {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        let mut event_type = None;
+        let mut data_lines = Vec::new();
+        let mut is_done = false;
+
+        for raw_line in text.lines() {
+            let line = raw_line.trim_end_matches(['\r', '\n']).trim();
+            if line.is_empty() || line.starts_with(':') {
+                continue;
+            }
+            if let Some(ev) = line.strip_prefix("event:") {
+                event_type = Some(ev.trim().to_string());
+            } else if let Some(data) = line.strip_prefix("data:") {
+                let d = data.trim();
+                if d == "[DONE]" {
+                    is_done = true;
+                } else if !d.is_empty() {
+                    data_lines.push(d.to_string());
+                }
+            }
+        }
+
+        if !data_lines.is_empty() || is_done || event_type.is_some() {
+            Some(SseEventBlock {
+                event_type,
+                data_lines,
+                raw_block: trimmed.to_string(),
+                is_done,
+            })
+        } else {
+            None
+        }
+    }
+}
+
 fn clean_sse_stream(
     ctx: OpencodeProxyContext,
     req_id: String,
     start_time: Instant,
     path: String,
+    channel_id: String,
     model: String,
     req_body_str: Option<String>,
     node_name: Option<String>,
@@ -579,7 +709,7 @@ fn clean_sse_stream(
 ) -> impl futures_util::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send + 'static {
     async_stream::stream! {
         let mut stream = stream;
-        let mut buffer = String::new();
+        let mut extractor = SseFrameExtractor::new();
         let mut finished = false;
         let mut collected_content = String::new();
         let mut collected_reasoning = String::new();
@@ -593,6 +723,7 @@ fn clean_sse_stream(
         let mut total_tokens: Option<u64> = None;
 
         struct ToolCallAccumulator {
+            id: String,
             name: String,
             arguments: String,
         }
@@ -604,111 +735,155 @@ fn clean_sse_stream(
             }
             match item {
                 Ok(chunk) => {
-                    if let Ok(text) = std::str::from_utf8(&chunk) {
-                        buffer.push_str(text);
+                    extractor.push_bytes(&chunk);
+                    let blocks = extractor.extract_blocks();
 
-                        while let Some(pos) = buffer.find("\n\n") {
-                            let block = buffer[..pos].to_string();
-                            buffer = buffer[pos + 2..].to_string();
+                    for block in blocks {
+                        if block.is_done {
+                            finished = true;
+                            yield Ok(bytes::Bytes::from("data: [DONE]\n\n"));
+                            break;
+                        }
 
-                            let trimmed = block.trim();
-                            if trimmed.is_empty() {
-                                continue;
-                            }
+                        if !block.data_lines.is_empty() {
+                            let json_payload = block.data_lines.join("\n");
+                            if let Ok(mut val) = serde_json::from_str::<JsonValue>(&json_payload) {
+                                // 提取 usage 统计
+                                if let Some(u) = val.get("usage").and_then(JsonValue::as_object) {
+                                    if let Some(pt) = u.get("prompt_tokens").and_then(JsonValue::as_u64) {
+                                        prompt_tokens = Some(pt);
+                                    }
+                                    if let Some(hit) = u.get("prompt_cache_hit_tokens")
+                                        .or_else(|| u.get("prompt_tokens_details").and_then(|d| d.get("cached_tokens")))
+                                        .or_else(|| u.get("prompt_tokens_details").and_then(|d| d.get("cache_read")))
+                                        .or_else(|| u.get("cache_read_input_tokens"))
+                                        .or_else(|| u.get("cached_tokens"))
+                                        .or_else(|| u.get("cache_hit_tokens"))
+                                        .and_then(JsonValue::as_u64)
+                                    {
+                                        prompt_cache_hit = Some(hit);
+                                    }
+                                    if let Some(miss) = u.get("prompt_cache_miss_tokens").and_then(JsonValue::as_u64) {
+                                        prompt_cache_miss = Some(miss);
+                                    }
+                                    if let Some(ct) = u.get("completion_tokens").and_then(JsonValue::as_u64) {
+                                        completion_tokens = Some(ct);
+                                    }
+                                    if let Some(rt) = u.get("completion_tokens_details").and_then(|d| d.get("reasoning_tokens"))
+                                        .or_else(|| u.get("reasoning_tokens"))
+                                        .and_then(JsonValue::as_u64)
+                                    {
+                                        reasoning_tokens = Some(rt);
+                                    }
+                                    if let Some(tt) = u.get("total_tokens").and_then(JsonValue::as_u64) {
+                                        total_tokens = Some(tt);
+                                    }
+                                }
 
-                            if trimmed == "data: [DONE]" {
-                                finished = true;
-                                yield Ok(bytes::Bytes::from("data: [DONE]\n\n"));
-                                break;
-                            }
-
-                            if let Some(json_payload) = trimmed.strip_prefix("data: ") {
-                                if let Ok(mut val) = serde_json::from_str::<JsonValue>(json_payload) {
-                                    // 提取 usage 统计
-                                    if let Some(u) = val.get("usage").and_then(JsonValue::as_object) {
-                                        if let Some(pt) = u.get("prompt_tokens").and_then(JsonValue::as_u64) {
-                                            prompt_tokens = Some(pt);
-                                        }
-                                        if let Some(hit) = u.get("prompt_cache_hit_tokens")
-                                            .or_else(|| u.get("prompt_tokens_details").and_then(|d| d.get("cached_tokens")))
-                                            .or_else(|| u.get("prompt_tokens_details").and_then(|d| d.get("cache_read")))
-                                            .or_else(|| u.get("cache_read_input_tokens"))
-                                            .or_else(|| u.get("cached_tokens"))
-                                            .or_else(|| u.get("cache_hit_tokens"))
-                                            .and_then(JsonValue::as_u64)
-                                        {
-                                            prompt_cache_hit = Some(hit);
-                                        }
-                                        if let Some(miss) = u.get("prompt_cache_miss_tokens").and_then(JsonValue::as_u64) {
-                                            prompt_cache_miss = Some(miss);
-                                        }
-                                        if let Some(ct) = u.get("completion_tokens").and_then(JsonValue::as_u64) {
-                                            completion_tokens = Some(ct);
-                                        }
-                                        if let Some(rt) = u.get("completion_tokens_details").and_then(|d| d.get("reasoning_tokens"))
-                                            .or_else(|| u.get("reasoning_tokens"))
-                                            .and_then(JsonValue::as_u64)
-                                        {
-                                            reasoning_tokens = Some(rt);
-                                        }
-                                        if let Some(tt) = u.get("total_tokens").and_then(JsonValue::as_u64) {
-                                            total_tokens = Some(tt);
-                                        }
+                                // 提取 content / reasoning_content / tool_calls 分片
+                                if let Some(delta) = val.pointer("/choices/0/delta") {
+                                    if ttft_ms.is_none() {
+                                        ttft_ms = Some(start_time.elapsed().as_millis() as u64);
                                     }
 
-                                    // 提取 content / reasoning_content / tool_calls 分片
-                                    if let Some(delta) = val.pointer("/choices/0/delta") {
-                                        if ttft_ms.is_none() {
-                                            ttft_ms = Some(start_time.elapsed().as_millis() as u64);
-                                        }
-
-                                        if let Some(c) = delta.get("content").and_then(JsonValue::as_str) {
-                                            collected_content.push_str(c);
-                                        }
-                                        if let Some(rc) = delta.get("reasoning_content")
-                                            .or_else(|| delta.get("reasoning"))
-                                            .and_then(JsonValue::as_str)
-                                        {
-                                            collected_reasoning.push_str(rc);
-                                        }
-                                        if let Some(tool_calls_arr) = delta.get("tool_calls").and_then(JsonValue::as_array) {
-                                            for tc in tool_calls_arr {
-                                                let index = tc.get("index").and_then(JsonValue::as_u64).unwrap_or(0) as usize;
-                                                let name = tc.pointer("/function/name").and_then(JsonValue::as_str);
-                                                let args = tc.pointer("/function/arguments").and_then(JsonValue::as_str).unwrap_or_default();
-                                                let entry = collected_tools.entry(index).or_insert_with(|| ToolCallAccumulator { name: String::new(), arguments: String::new() });
-                                                if let Some(n) = name {
-                                                    if entry.name.is_empty() { entry.name = n.to_string(); }
-                                                }
-                                                entry.arguments.push_str(args);
+                                    if let Some(c) = delta.get("content").and_then(JsonValue::as_str) {
+                                        collected_content.push_str(c);
+                                    }
+                                    if let Some(rc) = delta.get("reasoning_content")
+                                        .or_else(|| delta.get("reasoning"))
+                                        .and_then(JsonValue::as_str)
+                                    {
+                                        collected_reasoning.push_str(rc);
+                                    }
+                                    if let Some(tool_calls_arr) = delta.get("tool_calls").and_then(JsonValue::as_array) {
+                                        for tc in tool_calls_arr {
+                                            let index = tc.get("index").and_then(JsonValue::as_u64).unwrap_or(0) as usize;
+                                            let id = tc.get("id").and_then(JsonValue::as_str);
+                                            let name = tc.pointer("/function/name").and_then(JsonValue::as_str);
+                                            let args = tc.pointer("/function/arguments").and_then(JsonValue::as_str).unwrap_or_default();
+                                            let entry = collected_tools.entry(index).or_insert_with(|| ToolCallAccumulator {
+                                                id: String::new(),
+                                                name: String::new(),
+                                                arguments: String::new(),
+                                            });
+                                            if let Some(id_str) = id {
+                                                if !id_str.is_empty() { entry.id = id_str.to_string(); }
                                             }
+                                            if let Some(n) = name {
+                                                if !n.is_empty() { entry.name = n.to_string(); }
+                                            }
+                                            entry.arguments.push_str(args);
                                         }
                                     }
+                                }
 
-                                    // 过滤 DeepSeek-R1 / V3 等 choices 偶发的空 content null 字段
-                                    if let Some(choices) = val.get_mut("choices").and_then(JsonValue::as_array_mut) {
-                                        for choice in choices {
-                                            if let Some(delta) = choice.get_mut("delta").and_then(JsonValue::as_object_mut) {
-                                                if delta.get("content").map_or(false, |c| c.is_null()) {
-                                                    if delta.get("reasoning_content").is_none() {
-                                                        delta["content"] = JsonValue::String(String::new());
+                                // 规范化 choices 中的 delta（补全 function.name 字符串，防止客户端 Zod 校验报 Expected 'function.name' to be a string）
+                                if let Some(choices) = val.get_mut("choices").and_then(JsonValue::as_array_mut) {
+                                    for choice in choices {
+                                        if let Some(delta) = choice.get_mut("delta").and_then(JsonValue::as_object_mut) {
+                                            // 过滤 DeepSeek-R1 / V3 等 choices 偶发的空 content null 字段
+                                            if delta.get("content").map_or(false, |c| c.is_null()) {
+                                                if delta.get("reasoning_content").is_none() {
+                                                    delta["content"] = JsonValue::String(String::new());
+                                                }
+                                            }
+
+                                            // 规范化 tool_calls：确保 function 存在且 function.name 始终为合法 string
+                                            if let Some(tool_calls_arr) = delta.get_mut("tool_calls").and_then(JsonValue::as_array_mut) {
+                                                for tc in tool_calls_arr {
+                                                    let index = tc.get("index").and_then(JsonValue::as_u64).unwrap_or(0) as usize;
+                                                    let accum_name = collected_tools.get(&index).map(|a| a.name.clone()).unwrap_or_default();
+                                                    let accum_id = collected_tools.get(&index).map(|a| a.id.clone()).unwrap_or_default();
+
+                                                    if let Some(tc_obj) = tc.as_object_mut() {
+                                                        if !tc_obj.contains_key("index") {
+                                                            tc_obj.insert("index".to_string(), json!(index));
+                                                        }
+                                                        if !tc_obj.contains_key("type") {
+                                                            tc_obj.insert("type".to_string(), json!("function"));
+                                                        }
+                                                        if !accum_id.is_empty() && !tc_obj.contains_key("id") {
+                                                            tc_obj.insert("id".to_string(), json!(accum_id));
+                                                        }
+
+                                                        if let Some(func) = tc_obj.get_mut("function").and_then(JsonValue::as_object_mut) {
+                                                            if func.get("name").map_or(true, |v| v.is_null() || v.as_str().map_or(true, |s| s.is_empty())) {
+                                                                func.insert("name".to_string(), json!(accum_name));
+                                                            }
+                                                            if func.get("arguments").map_or(true, |v| v.is_null()) {
+                                                                func.insert("arguments".to_string(), json!(""));
+                                                            }
+                                                        } else {
+                                                            tc_obj.insert("function".to_string(), json!({
+                                                                "name": accum_name,
+                                                                "arguments": ""
+                                                            }));
+                                                        }
                                                     }
                                                 }
                                             }
                                         }
                                     }
-
-                                    if let Ok(serialized) = serde_json::to_string(&val) {
-                                        yield Ok(bytes::Bytes::from(format!("data: {serialized}\n\n")));
-                                        continue;
-                                    }
                                 }
-                            }
 
-                            yield Ok(bytes::Bytes::from(format!("{block}\n\n")));
+                                if let Ok(serialized) = serde_json::to_string(&val) {
+                                    if let Some(ref ev) = block.event_type {
+                                        yield Ok(bytes::Bytes::from(format!("event: {ev}\ndata: {serialized}\n\n")));
+                                    } else {
+                                        yield Ok(bytes::Bytes::from(format!("data: {serialized}\n\n")));
+                                    }
+                                    continue;
+                                }
+                            } else if json_payload.starts_with('{') || json_payload.starts_with('[') {
+                                // 截断或残缺 JSON 分片，不向客户端转发残片，避免破坏客户端解析器
+                                continue;
+                            }
                         }
-                    } else {
-                        yield Ok(chunk);
+
+                        // 如果非 JSON 事件且有 raw_block，保持标准 SSE 格式输出
+                        if !block.raw_block.is_empty() {
+                            yield Ok(bytes::Bytes::from(format!("{}\n\n", block.raw_block)));
+                        }
                     }
                 }
                 Err(e) => {
@@ -731,7 +906,7 @@ fn clean_sse_stream(
                         timestamp: current_timestamp(),
                         method: "POST".to_string(),
                         path: path.clone(),
-                        channel_id: "opencode".to_string(),
+                        channel_id: channel_id.clone(),
                         model: model.clone(),
                         stream: true,
                         status_code: 500,
@@ -755,10 +930,16 @@ fn clean_sse_stream(
             }
         }
 
-        if !finished && !buffer.trim().is_empty() {
-            let trimmed = buffer.trim();
-            if trimmed != "data: [DONE]" && !trimmed.contains("\"choices\":[]") {
-                yield Ok(bytes::Bytes::from(format!("{trimmed}\n\n")));
+        if !finished {
+            if let Some(rem_block) = extractor.flush_remaining() {
+                if !rem_block.data_lines.is_empty() {
+                    let payload = rem_block.data_lines.join("\n");
+                    if let Ok(val) = serde_json::from_str::<JsonValue>(&payload) {
+                        if let Ok(serialized) = serde_json::to_string(&val) {
+                            yield Ok(bytes::Bytes::from(format!("data: {serialized}\n\n")));
+                        }
+                    }
+                }
             }
             yield Ok(bytes::Bytes::from("data: [DONE]\n\n"));
         }
@@ -789,7 +970,7 @@ fn clean_sse_stream(
             timestamp: current_timestamp(),
             method: "POST".to_string(),
             path,
-            channel_id: "opencode".to_string(),
+            channel_id,
             model,
             stream: true,
             status_code: 200,
@@ -814,6 +995,7 @@ fn openai_to_anthropic_sse_stream(
     req_id: String,
     start_time: Instant,
     path: String,
+    channel_id: String,
     model_name: String,
     req_body_str: Option<String>,
     node_name: Option<String>,
@@ -821,7 +1003,7 @@ fn openai_to_anthropic_sse_stream(
 ) -> impl futures_util::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send + 'static {
     async_stream::stream! {
         let mut stream = stream;
-        let mut buffer = String::new();
+        let mut extractor = SseFrameExtractor::new();
         let mut msg_started = false;
         let mut finished = false;
         let mut collected_content = String::new();
@@ -855,172 +1037,189 @@ fn openai_to_anthropic_sse_stream(
             }
             match item {
                 Ok(chunk) => {
-                    if let Ok(text) = std::str::from_utf8(&chunk) {
-                        buffer.push_str(text);
+                    extractor.push_bytes(&chunk);
+                    let blocks = extractor.extract_blocks();
 
-                        while let Some(pos) = buffer.find("\n\n") {
-                            let block = buffer[..pos].to_string();
-                            buffer = buffer[pos + 2..].to_string();
+                    for block in blocks {
+                        if block.is_done {
+                            finished = true;
+                            break;
+                        }
 
-                            let trimmed = block.trim();
-                            if trimmed.is_empty() {
-                                continue;
-                            }
+                        if !block.data_lines.is_empty() {
+                            let json_payload = block.data_lines.join("\n");
+                            if let Ok(val) = serde_json::from_str::<JsonValue>(&json_payload) {
+                                // 提取 usage
+                                if let Some(u) = val.get("usage").and_then(JsonValue::as_object) {
+                                    if let Some(pt) = u.get("prompt_tokens").and_then(JsonValue::as_u64) {
+                                        prompt_tokens = Some(pt);
+                                    }
+                                    if let Some(hit) = u.get("prompt_cache_hit_tokens")
+                                        .or_else(|| u.get("prompt_tokens_details").and_then(|d| d.get("cached_tokens")))
+                                        .or_else(|| u.get("prompt_tokens_details").and_then(|d| d.get("cache_read")))
+                                        .or_else(|| u.get("cache_read_input_tokens"))
+                                        .or_else(|| u.get("cached_tokens"))
+                                        .or_else(|| u.get("cache_hit_tokens"))
+                                        .and_then(JsonValue::as_u64)
+                                    {
+                                        prompt_cache_hit = Some(hit);
+                                    }
+                                    if let Some(miss) = u.get("prompt_cache_miss_tokens").and_then(JsonValue::as_u64) {
+                                        prompt_cache_miss = Some(miss);
+                                    }
+                                    if let Some(ct) = u.get("completion_tokens").and_then(JsonValue::as_u64) {
+                                        completion_tokens = Some(ct);
+                                    }
+                                    if let Some(rt) = u.get("completion_tokens_details").and_then(|d| d.get("reasoning_tokens"))
+                                        .or_else(|| u.get("reasoning_tokens"))
+                                        .and_then(JsonValue::as_u64)
+                                    {
+                                        reasoning_tokens = Some(rt);
+                                    }
+                                    if let Some(tt) = u.get("total_tokens").and_then(JsonValue::as_u64) {
+                                        total_tokens = Some(tt);
+                                    }
+                                }
 
-                            if trimmed == "data: [DONE]" {
-                                finished = true;
-                                break;
-                            }
-
-                            if let Some(json_payload) = trimmed.strip_prefix("data: ") {
-                                if let Ok(val) = serde_json::from_str::<JsonValue>(json_payload) {
-                                    // 提取 usage
-                                    if let Some(u) = val.get("usage").and_then(JsonValue::as_object) {
-                                        if let Some(pt) = u.get("prompt_tokens").and_then(JsonValue::as_u64) {
-                                            prompt_tokens = Some(pt);
-                                        }
-                                        if let Some(hit) = u.get("prompt_cache_hit_tokens")
-                                            .or_else(|| u.get("prompt_tokens_details").and_then(|d| d.get("cached_tokens")))
-                                            .or_else(|| u.get("prompt_tokens_details").and_then(|d| d.get("cache_read")))
-                                            .or_else(|| u.get("cache_read_input_tokens"))
-                                            .or_else(|| u.get("cached_tokens"))
-                                            .or_else(|| u.get("cache_hit_tokens"))
-                                            .and_then(JsonValue::as_u64)
-                                        {
-                                            prompt_cache_hit = Some(hit);
-                                        }
-                                        if let Some(miss) = u.get("prompt_cache_miss_tokens").and_then(JsonValue::as_u64) {
-                                            prompt_cache_miss = Some(miss);
-                                        }
-                                        if let Some(ct) = u.get("completion_tokens").and_then(JsonValue::as_u64) {
-                                            completion_tokens = Some(ct);
-                                        }
-                                        if let Some(rt) = u.get("completion_tokens_details").and_then(|d| d.get("reasoning_tokens"))
-                                            .or_else(|| u.get("reasoning_tokens"))
-                                            .and_then(JsonValue::as_u64)
-                                        {
-                                            reasoning_tokens = Some(rt);
-                                        }
-                                        if let Some(tt) = u.get("total_tokens").and_then(JsonValue::as_u64) {
-                                            total_tokens = Some(tt);
-                                        }
+                                // 首个数据包发出 message_start
+                                if !msg_started {
+                                    msg_started = true;
+                                    if ttft_ms.is_none() {
+                                        ttft_ms = Some(start_time.elapsed().as_millis() as u64);
                                     }
 
-                                    // 首个数据包发出 message_start
-                                    if !msg_started {
-                                        msg_started = true;
-                                        if ttft_ms.is_none() {
-                                            ttft_ms = Some(start_time.elapsed().as_millis() as u64);
+                                    let in_tokens = prompt_tokens.unwrap_or(0);
+                                    let msg_start = json!({
+                                        "type": "message_start",
+                                        "message": {
+                                            "id": msg_id.clone(),
+                                            "type": "message",
+                                            "role": "assistant",
+                                            "model": format!("opencode/{}", model_name),
+                                            "content": [],
+                                            "stop_reason": null,
+                                            "stop_sequence": null,
+                                            "usage": { "input_tokens": in_tokens, "output_tokens": 0 }
                                         }
+                                    });
+                                    yield Ok(bytes::Bytes::from(format!("event: message_start\ndata: {msg_start}\n\n")));
+                                }
 
-                                        let in_tokens = prompt_tokens.unwrap_or(0);
-                                        let msg_start = json!({
-                                            "type": "message_start",
-                                            "message": {
-                                                "id": msg_id.clone(),
-                                                "type": "message",
-                                                "role": "assistant",
-                                                "model": format!("opencode/{}", model_name),
-                                                "content": [],
-                                                "stop_reason": null,
-                                                "stop_sequence": null,
-                                                "usage": { "input_tokens": in_tokens, "output_tokens": 0 }
-                                            }
-                                        });
-                                        yield Ok(bytes::Bytes::from(format!("event: message_start\ndata: {msg_start}\n\n")));
+                                if let Some(finish) = val.pointer("/choices/0/finish_reason").and_then(JsonValue::as_str) {
+                                    upstream_finish_reason = Some(finish.to_string());
+                                }
+
+                                if let Some(delta) = val.pointer("/choices/0/delta") {
+                                    if ttft_ms.is_none() {
+                                        ttft_ms = Some(start_time.elapsed().as_millis() as u64);
                                     }
 
-                                    if let Some(finish) = val.pointer("/choices/0/finish_reason").and_then(JsonValue::as_str) {
-                                        upstream_finish_reason = Some(finish.to_string());
-                                    }
+                                    // 提取 reasoning_content 思考流
+                                    if let Some(rc) = delta.get("reasoning_content")
+                                        .or_else(|| delta.get("reasoning"))
+                                        .and_then(JsonValue::as_str)
+                                    {
+                                        if !rc.is_empty() {
+                                            collected_reasoning.push_str(rc);
 
-                                    if let Some(delta) = val.pointer("/choices/0/delta") {
-                                        if ttft_ms.is_none() {
-                                            ttft_ms = Some(start_time.elapsed().as_millis() as u64);
-                                        }
-
-                                        // 提取 content 文本流
-                                        if let Some(c) = delta.get("content").and_then(JsonValue::as_str) {
-                                            if !c.is_empty() {
-                                                collected_content.push_str(c);
-
-                                                if active_block.as_deref() != Some("text") {
-                                                    if active_block.is_some() {
-                                                        let stop = json!({ "type": "content_block_stop", "index": current_block_index });
-                                                        yield Ok(bytes::Bytes::from(format!("event: content_block_stop\ndata: {stop}\n\n")));
-                                                        current_block_index += 1;
-                                                    }
-                                                    active_block = Some("text".to_string());
-                                                    let start = json!({
-                                                        "type": "content_block_start",
-                                                        "index": current_block_index,
-                                                        "content_block": { "type": "text", "text": "" }
-                                                    });
-                                                    yield Ok(bytes::Bytes::from(format!("event: content_block_start\ndata: {start}\n\n")));
+                                            if active_block.as_deref() != Some("thinking") {
+                                                if active_block.is_some() {
+                                                    let stop = json!({ "type": "content_block_stop", "index": current_block_index });
+                                                    yield Ok(bytes::Bytes::from(format!("event: content_block_stop\ndata: {stop}\n\n")));
+                                                    current_block_index += 1;
                                                 }
-
-                                                let block_delta = json!({
-                                                    "type": "content_block_delta",
+                                                active_block = Some("thinking".to_string());
+                                                let start = json!({
+                                                    "type": "content_block_start",
                                                     "index": current_block_index,
-                                                    "delta": { "type": "text_delta", "text": c }
+                                                    "content_block": { "type": "thinking", "thinking": "" }
                                                 });
-                                                yield Ok(bytes::Bytes::from(format!("event: content_block_delta\ndata: {block_delta}\n\n")));
+                                                yield Ok(bytes::Bytes::from(format!("event: content_block_start\ndata: {start}\n\n")));
                                             }
+
+                                            let block_delta = json!({
+                                                "type": "content_block_delta",
+                                                "index": current_block_index,
+                                                "delta": { "type": "thinking_delta", "thinking": rc }
+                                            });
+                                            yield Ok(bytes::Bytes::from(format!("event: content_block_delta\ndata: {block_delta}\n\n")));
                                         }
+                                    }
 
-                                        // 提取 tool_calls 工具调用流
-                                        if let Some(tool_calls) = delta.get("tool_calls").and_then(JsonValue::as_array) {
-                                            for tc in tool_calls {
-                                                had_tool_use = true;
-                                                let tc_id = tc.get("id").and_then(JsonValue::as_str);
-                                                let tc_name = tc.pointer("/function/name").and_then(JsonValue::as_str);
-                                                let tc_args = tc.pointer("/function/arguments").and_then(JsonValue::as_str);
+                                    // 提取 content 文本流
+                                    if let Some(c) = delta.get("content").and_then(JsonValue::as_str) {
+                                        if !c.is_empty() {
+                                            collected_content.push_str(c);
 
-                                                if tc_id.is_some() || tc_name.is_some() {
-                                                    let new_id = tc_id.unwrap_or("call_default").to_string();
-                                                    let new_name = tc_name.unwrap_or_default().to_string();
+                                            if active_block.as_deref() != Some("text") {
+                                                if active_block.is_some() {
+                                                    let stop = json!({ "type": "content_block_stop", "index": current_block_index });
+                                                    yield Ok(bytes::Bytes::from(format!("event: content_block_stop\ndata: {stop}\n\n")));
+                                                    current_block_index += 1;
+                                                }
+                                                active_block = Some("text".to_string());
+                                                let start = json!({
+                                                    "type": "content_block_start",
+                                                    "index": current_block_index,
+                                                    "content_block": { "type": "text", "text": "" }
+                                                });
+                                                yield Ok(bytes::Bytes::from(format!("event: content_block_start\ndata: {start}\n\n")));
+                                            }
 
-                                                    if active_block.is_some() {
-                                                        let stop = json!({ "type": "content_block_stop", "index": current_block_index });
-                                                        yield Ok(bytes::Bytes::from(format!("event: content_block_stop\ndata: {stop}\n\n")));
-                                                        current_block_index += 1;
+                                            let block_delta = json!({
+                                                "type": "content_block_delta",
+                                                "index": current_block_index,
+                                                "delta": { "type": "text_delta", "text": c }
+                                            });
+                                            yield Ok(bytes::Bytes::from(format!("event: content_block_delta\ndata: {block_delta}\n\n")));
+                                        }
+                                    }
+
+                                    // 提取 tool_calls 工具调用流
+                                    if let Some(tool_calls) = delta.get("tool_calls").and_then(JsonValue::as_array) {
+                                        for tc in tool_calls {
+                                            had_tool_use = true;
+                                            let tc_id = tc.get("id").and_then(JsonValue::as_str);
+                                            let tc_name = tc.pointer("/function/name").and_then(JsonValue::as_str);
+                                            let tc_args = tc.pointer("/function/arguments").and_then(JsonValue::as_str);
+
+                                            if tc_id.is_some() || tc_name.is_some() {
+                                                let new_id = tc_id.unwrap_or("call_default").to_string();
+                                                let new_name = tc_name.unwrap_or("tool").to_string();
+
+                                                if active_block.is_some() {
+                                                    let stop = json!({ "type": "content_block_stop", "index": current_block_index });
+                                                    yield Ok(bytes::Bytes::from(format!("event: content_block_stop\ndata: {stop}\n\n")));
+                                                    current_block_index += 1;
+                                                }
+                                                active_block = Some("tool_use".to_string());
+
+                                                let start = json!({
+                                                    "type": "content_block_start",
+                                                    "index": current_block_index,
+                                                    "content_block": {
+                                                        "type": "tool_use",
+                                                        "id": new_id,
+                                                        "name": new_name,
+                                                        "input": {}
                                                     }
+                                                });
+                                                yield Ok(bytes::Bytes::from(format!("event: content_block_start\ndata: {start}\n\n")));
+                                            }
 
-                                                    active_block = Some("tool_use".to_string());
-                                                    let start = json!({
-                                                        "type": "content_block_start",
+                                            if let Some(args_chunk) = tc_args {
+                                                if !args_chunk.is_empty() {
+                                                    let block_delta = json!({
+                                                        "type": "content_block_delta",
                                                         "index": current_block_index,
-                                                        "content_block": {
-                                                            "type": "tool_use",
-                                                            "id": new_id,
-                                                            "name": new_name,
-                                                            "input": {}
+                                                        "delta": {
+                                                            "type": "input_json_delta",
+                                                            "partial_json": args_chunk
                                                         }
                                                     });
-                                                    yield Ok(bytes::Bytes::from(format!("event: content_block_start\ndata: {start}\n\n")));
-                                                }
-
-                                                if let Some(args_chunk) = tc_args {
-                                                    if !args_chunk.is_empty() {
-                                                        let block_delta = json!({
-                                                            "type": "content_block_delta",
-                                                            "index": current_block_index,
-                                                            "delta": {
-                                                                "type": "input_json_delta",
-                                                                "partial_json": args_chunk
-                                                            }
-                                                        });
-                                                        yield Ok(bytes::Bytes::from(format!("event: content_block_delta\ndata: {block_delta}\n\n")));
-                                                    }
+                                                    yield Ok(bytes::Bytes::from(format!("event: content_block_delta\ndata: {block_delta}\n\n")));
                                                 }
                                             }
-                                        }
-
-                                        if let Some(rc) = delta.get("reasoning_content")
-                                            .or_else(|| delta.get("reasoning"))
-                                            .and_then(JsonValue::as_str)
-                                        {
-                                            collected_reasoning.push_str(rc);
                                         }
                                     }
                                 }
@@ -1042,7 +1241,7 @@ fn openai_to_anthropic_sse_stream(
                         timestamp: current_timestamp(),
                         method: "POST".to_string(),
                         path: path.clone(),
-                        channel_id: "opencode".to_string(),
+                        channel_id: channel_id.clone(),
                         model: model_name.clone(),
                         stream: true,
                         status_code: 500,
@@ -1054,7 +1253,7 @@ fn openai_to_anthropic_sse_stream(
                         completion_tokens,
                         reasoning_tokens,
                         total_tokens,
-                        error_message: Some(format!("Anthropic 流式转换传输中断: {e}")),
+                        error_message: Some(format!("Anthropic 流式响应传输中断: {e}")),
                         request_body: req_body_str.clone(),
                         response_body: if interrupted_preview.is_empty() { None } else { Some(interrupted_preview) },
                         node_name: node_name.clone(),
@@ -1118,7 +1317,7 @@ fn openai_to_anthropic_sse_stream(
             timestamp: current_timestamp(),
             method: "POST".to_string(),
             path,
-            channel_id: "opencode".to_string(),
+            channel_id,
             model: model_name,
             stream: true,
             status_code: 200,
@@ -1143,6 +1342,7 @@ fn openai_to_responses_sse_stream(
     req_id: String,
     start_time: Instant,
     path: String,
+    channel_id: String,
     model_name: String,
     req_body_str: Option<String>,
     node_name: Option<String>,
@@ -1150,7 +1350,7 @@ fn openai_to_responses_sse_stream(
 ) -> impl futures_util::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send + 'static {
     async_stream::stream! {
         let mut stream = stream;
-        let mut buffer = String::new();
+        let mut extractor = SseFrameExtractor::new();
         let mut resp_created_sent = false;
         let mut msg_item_added = false;
         let mut content_part_added = false;
@@ -1191,196 +1391,188 @@ fn openai_to_responses_sse_stream(
             }
             match item {
                 Ok(chunk) => {
-                    if let Ok(text) = std::str::from_utf8(&chunk) {
-                        buffer.push_str(text);
+                    extractor.push_bytes(&chunk);
+                    let blocks = extractor.extract_blocks();
 
-                        while let Some(pos) = buffer.find("\n\n") {
-                            let block = buffer[..pos].to_string();
-                            buffer = buffer[pos + 2..].to_string();
+                    for block in blocks {
+                        if block.is_done {
+                            finished = true;
+                            break;
+                        }
 
-                            let trimmed = block.trim();
-                            if trimmed.is_empty() {
-                                continue;
-                            }
+                        if !block.data_lines.is_empty() {
+                            let json_payload = block.data_lines.join("\n");
+                            if let Ok(val) = serde_json::from_str::<JsonValue>(&json_payload) {
+                                // 提取 usage
+                                if let Some(u) = val.get("usage").and_then(JsonValue::as_object) {
+                                    if let Some(pt) = u.get("prompt_tokens").and_then(JsonValue::as_u64) {
+                                        prompt_tokens = Some(pt);
+                                    }
+                                    if let Some(hit) = u.get("prompt_cache_hit_tokens")
+                                        .or_else(|| u.get("prompt_tokens_details").and_then(|d| d.get("cached_tokens")))
+                                        .or_else(|| u.get("prompt_tokens_details").and_then(|d| d.get("cache_read")))
+                                        .or_else(|| u.get("cache_read_input_tokens"))
+                                        .or_else(|| u.get("cached_tokens"))
+                                        .or_else(|| u.get("cache_hit_tokens"))
+                                        .and_then(JsonValue::as_u64)
+                                    {
+                                        prompt_cache_hit = Some(hit);
+                                    }
+                                    if let Some(miss) = u.get("prompt_cache_miss_tokens").and_then(JsonValue::as_u64) {
+                                        prompt_cache_miss = Some(miss);
+                                    }
+                                    if let Some(ct) = u.get("completion_tokens").and_then(JsonValue::as_u64) {
+                                        completion_tokens = Some(ct);
+                                    }
+                                    if let Some(rt) = u.get("completion_tokens_details").and_then(|d| d.get("reasoning_tokens"))
+                                        .or_else(|| u.get("reasoning_tokens"))
+                                        .and_then(JsonValue::as_u64)
+                                    {
+                                        reasoning_tokens = Some(rt);
+                                    }
+                                    if let Some(tt) = u.get("total_tokens").and_then(JsonValue::as_u64) {
+                                        total_tokens = Some(tt);
+                                    }
+                                }
 
-                            if trimmed == "data: [DONE]" {
-                                finished = true;
-                                break;
-                            }
+                                // 首包发出 response.created
+                                if !resp_created_sent {
+                                    resp_created_sent = true;
+                                    if ttft_ms.is_none() {
+                                        ttft_ms = Some(start_time.elapsed().as_millis() as u64);
+                                    }
+                                    let created_ev = json!({
+                                        "type": "response.created",
+                                        "response": {
+                                            "id": resp_id.clone(),
+                                            "object": "response",
+                                            "status": "in_progress",
+                                            "model": format!("opencode/{}", model_name),
+                                            "output": [],
+                                            "usage": null
+                                        }
+                                    });
+                                    yield Ok(bytes::Bytes::from(format!("event: response.created\ndata: {created_ev}\n\n")));
+                                }
 
-                            if let Some(json_payload) = trimmed.strip_prefix("data: ") {
-                                if let Ok(val) = serde_json::from_str::<JsonValue>(json_payload) {
-                                    // 提取 usage
-                                    if let Some(u) = val.get("usage").and_then(JsonValue::as_object) {
-                                        if let Some(pt) = u.get("prompt_tokens").and_then(JsonValue::as_u64) {
-                                            prompt_tokens = Some(pt);
-                                        }
-                                        if let Some(hit) = u.get("prompt_cache_hit_tokens")
-                                            .or_else(|| u.get("prompt_tokens_details").and_then(|d| d.get("cached_tokens")))
-                                            .or_else(|| u.get("prompt_tokens_details").and_then(|d| d.get("cache_read")))
-                                            .or_else(|| u.get("cache_read_input_tokens"))
-                                            .or_else(|| u.get("cached_tokens"))
-                                            .or_else(|| u.get("cache_hit_tokens"))
-                                            .and_then(JsonValue::as_u64)
-                                        {
-                                            prompt_cache_hit = Some(hit);
-                                        }
-                                        if let Some(miss) = u.get("prompt_cache_miss_tokens").and_then(JsonValue::as_u64) {
-                                            prompt_cache_miss = Some(miss);
-                                        }
-                                        if let Some(ct) = u.get("completion_tokens").and_then(JsonValue::as_u64) {
-                                            completion_tokens = Some(ct);
-                                        }
-                                        if let Some(rt) = u.get("completion_tokens_details").and_then(|d| d.get("reasoning_tokens"))
-                                            .or_else(|| u.get("reasoning_tokens"))
-                                            .and_then(JsonValue::as_u64)
-                                        {
-                                            reasoning_tokens = Some(rt);
-                                        }
-                                        if let Some(tt) = u.get("total_tokens").and_then(JsonValue::as_u64) {
-                                            total_tokens = Some(tt);
-                                        }
+                                if let Some(delta) = val.pointer("/choices/0/delta") {
+                                    if ttft_ms.is_none() {
+                                        ttft_ms = Some(start_time.elapsed().as_millis() as u64);
                                     }
 
-                                    // 首包发出 response.created
-                                    if !resp_created_sent {
-                                        resp_created_sent = true;
-                                        if ttft_ms.is_none() {
-                                            ttft_ms = Some(start_time.elapsed().as_millis() as u64);
-                                        }
-                                        let created_ev = json!({
-                                            "type": "response.created",
-                                            "response": {
-                                                "id": resp_id.clone(),
-                                                "object": "response",
-                                                "status": "in_progress",
-                                                "model": format!("opencode/{}", model_name),
-                                                "output": [],
-                                                "usage": null
+                                    if let Some(rc) = delta.get("reasoning_content")
+                                        .or_else(|| delta.get("reasoning"))
+                                        .and_then(JsonValue::as_str)
+                                    {
+                                        collected_reasoning.push_str(rc);
+                                    }
+
+                                    // 处理文本增量
+                                    if let Some(c) = delta.get("content").and_then(JsonValue::as_str) {
+                                        if !c.is_empty() {
+                                            collected_content.push_str(c);
+
+                                            if !msg_item_added {
+                                                msg_item_added = true;
+                                                msg_output_index = next_output_index;
+                                                next_output_index += 1;
+                                                let item_added_ev = json!({
+                                                    "type": "response.output_item.added",
+                                                    "output_index": msg_output_index,
+                                                    "item": {
+                                                        "id": msg_item_id.clone(),
+                                                        "type": "message",
+                                                        "role": "assistant",
+                                                        "content": []
+                                                    }
+                                                });
+                                                yield Ok(bytes::Bytes::from(format!("event: response.output_item.added\ndata: {item_added_ev}\n\n")));
                                             }
-                                        });
-                                        yield Ok(bytes::Bytes::from(format!("event: response.created\ndata: {created_ev}\n\n")));
-                                    }
 
-                                    if let Some(delta) = val.pointer("/choices/0/delta") {
-                                        if ttft_ms.is_none() {
-                                            ttft_ms = Some(start_time.elapsed().as_millis() as u64);
-                                        }
-
-                                        if let Some(rc) = delta.get("reasoning_content")
-                                            .or_else(|| delta.get("reasoning"))
-                                            .and_then(JsonValue::as_str)
-                                        {
-                                            collected_reasoning.push_str(rc);
-                                        }
-
-                                        // 处理文本增量
-                                        if let Some(c) = delta.get("content").and_then(JsonValue::as_str) {
-                                            if !c.is_empty() {
-                                                collected_content.push_str(c);
-
-                                                if !msg_item_added {
-                                                    msg_item_added = true;
-                                                    msg_output_index = next_output_index;
-                                                    next_output_index += 1;
-                                                    let item_added_ev = json!({
-                                                        "type": "response.output_item.added",
-                                                        "output_index": msg_output_index,
-                                                        "item": {
-                                                            "id": msg_item_id.clone(),
-                                                            "type": "message",
-                                                            "role": "assistant",
-                                                            "content": []
-                                                        }
-                                                    });
-                                                    yield Ok(bytes::Bytes::from(format!("event: response.output_item.added\ndata: {item_added_ev}\n\n")));
-                                                }
-
-                                                if !content_part_added {
-                                                    content_part_added = true;
-                                                    let part_added_ev = json!({
-                                                        "type": "response.content_part.added",
-                                                        "item_id": msg_item_id.clone(),
-                                                        "output_index": msg_output_index,
-                                                        "content_index": 0,
-                                                        "part": {
-                                                            "type": "output_text",
-                                                            "text": ""
-                                                        }
-                                                    });
-                                                    yield Ok(bytes::Bytes::from(format!("event: response.content_part.added\ndata: {part_added_ev}\n\n")));
-                                                }
-
-                                                let text_delta_ev = json!({
-                                                    "type": "response.output_text.delta",
+                                            if !content_part_added {
+                                                content_part_added = true;
+                                                let part_added_ev = json!({
+                                                    "type": "response.content_part.added",
                                                     "item_id": msg_item_id.clone(),
                                                     "output_index": msg_output_index,
                                                     "content_index": 0,
-                                                    "delta": c
+                                                    "part": {
+                                                        "type": "output_text",
+                                                        "text": ""
+                                                    }
                                                 });
-                                                yield Ok(bytes::Bytes::from(format!("event: response.output_text.delta\ndata: {text_delta_ev}\n\n")));
+                                                yield Ok(bytes::Bytes::from(format!("event: response.content_part.added\ndata: {part_added_ev}\n\n")));
                                             }
+
+                                            let text_delta_ev = json!({
+                                                "type": "response.output_text.delta",
+                                                "item_id": msg_item_id.clone(),
+                                                "output_index": msg_output_index,
+                                                "content_index": 0,
+                                                "delta": c
+                                            });
+                                            yield Ok(bytes::Bytes::from(format!("event: response.output_text.delta\ndata: {text_delta_ev}\n\n")));
                                         }
+                                    }
 
-                                        // 处理工具调用 tool_calls (Agent 工具流式事件)
-                                        if let Some(tool_calls_arr) = delta.get("tool_calls").and_then(JsonValue::as_array) {
-                                            for tc in tool_calls_arr {
-                                                let index = tc.get("index").and_then(JsonValue::as_u64).unwrap_or(0) as usize;
-                                                let call_id = tc.get("id").and_then(JsonValue::as_str);
-                                                let name = tc.pointer("/function/name").and_then(JsonValue::as_str);
-                                                let args_chunk = tc.pointer("/function/arguments").and_then(JsonValue::as_str).unwrap_or_default();
+                                    // 处理工具调用 tool_calls (Agent 工具流式事件)
+                                    if let Some(tool_calls_arr) = delta.get("tool_calls").and_then(JsonValue::as_array) {
+                                        for tc in tool_calls_arr {
+                                            let index = tc.get("index").and_then(JsonValue::as_u64).unwrap_or(0) as usize;
+                                            let call_id = tc.get("id").and_then(JsonValue::as_str);
+                                            let name = tc.pointer("/function/name").and_then(JsonValue::as_str);
+                                            let args_chunk = tc.pointer("/function/arguments").and_then(JsonValue::as_str).unwrap_or_default();
 
-                                                if !active_tool_calls.contains_key(&index) {
-                                                    let item_call_id = format!("item_call_{:x}_{index}", nanos);
-                                                    let c_id = call_id.unwrap_or("call_default").to_string();
-                                                    let fn_name = name.unwrap_or_default().to_string();
-                                                    let cur_idx = next_output_index;
-                                                    next_output_index += 1;
+                                            if !active_tool_calls.contains_key(&index) {
+                                                let item_call_id = format!("item_call_{:x}_{index}", nanos);
+                                                let c_id = call_id.unwrap_or("call_default").to_string();
+                                                let fn_name = name.unwrap_or_default().to_string();
+                                                let cur_idx = next_output_index;
+                                                next_output_index += 1;
 
-                                                    let added_ev = json!({
-                                                        "type": "response.output_item.added",
-                                                        "output_index": cur_idx,
-                                                        "item": {
-                                                            "id": item_call_id.clone(),
-                                                            "type": "function_call",
-                                                            "name": fn_name.clone(),
-                                                            "call_id": c_id.clone(),
-                                                            "arguments": ""
-                                                        }
-                                                    });
-                                                    yield Ok(bytes::Bytes::from(format!("event: response.output_item.added\ndata: {added_ev}\n\n")));
+                                                let added_ev = json!({
+                                                    "type": "response.output_item.added",
+                                                    "output_index": cur_idx,
+                                                    "item": {
+                                                        "id": item_call_id.clone(),
+                                                        "type": "function_call",
+                                                        "name": fn_name.clone(),
+                                                        "call_id": c_id.clone(),
+                                                        "arguments": ""
+                                                    }
+                                                });
+                                                yield Ok(bytes::Bytes::from(format!("event: response.output_item.added\ndata: {added_ev}\n\n")));
 
-                                                    active_tool_calls.insert(index, ActiveCall {
-                                                        item_id: item_call_id,
-                                                        call_id: c_id,
-                                                        name: fn_name,
-                                                        arguments: String::new(),
-                                                        output_index: cur_idx,
-                                                    });
+                                                active_tool_calls.insert(index, ActiveCall {
+                                                    item_id: item_call_id,
+                                                    call_id: c_id,
+                                                    name: fn_name,
+                                                    arguments: String::new(),
+                                                    output_index: cur_idx,
+                                                });
+                                            }
+
+                                            if let Some(active_tc) = active_tool_calls.get_mut(&index) {
+                                                if let Some(n) = name {
+                                                    if active_tc.name.is_empty() {
+                                                        active_tc.name = n.to_string();
+                                                    }
                                                 }
-
-                                                if let Some(active_tc) = active_tool_calls.get_mut(&index) {
-                                                    if let Some(n) = name {
-                                                        if active_tc.name.is_empty() {
-                                                            active_tc.name = n.to_string();
-                                                        }
+                                                if let Some(c) = call_id {
+                                                    if active_tc.call_id.is_empty() || active_tc.call_id == "call_default" {
+                                                        active_tc.call_id = c.to_string();
                                                     }
-                                                    if let Some(c) = call_id {
-                                                        if active_tc.call_id.is_empty() || active_tc.call_id == "call_default" {
-                                                            active_tc.call_id = c.to_string();
-                                                        }
-                                                    }
-                                                    if !args_chunk.is_empty() {
-                                                        active_tc.arguments.push_str(args_chunk);
-                                                        let delta_ev = json!({
-                                                            "type": "response.function_call_arguments.delta",
-                                                            "item_id": active_tc.item_id.clone(),
-                                                            "output_index": active_tc.output_index,
-                                                            "call_id": active_tc.call_id.clone(),
-                                                            "delta": args_chunk
-                                                        });
-                                                        yield Ok(bytes::Bytes::from(format!("event: response.function_call_arguments.delta\ndata: {delta_ev}\n\n")));
-                                                    }
+                                                }
+                                                if !args_chunk.is_empty() {
+                                                    active_tc.arguments.push_str(args_chunk);
+                                                    let delta_ev = json!({
+                                                        "type": "response.function_call_arguments.delta",
+                                                        "item_id": active_tc.item_id.clone(),
+                                                        "output_index": active_tc.output_index,
+                                                        "call_id": active_tc.call_id.clone(),
+                                                        "delta": args_chunk
+                                                    });
+                                                    yield Ok(bytes::Bytes::from(format!("event: response.function_call_arguments.delta\ndata: {delta_ev}\n\n")));
                                                 }
                                             }
                                         }
@@ -1404,7 +1596,7 @@ fn openai_to_responses_sse_stream(
                         timestamp: current_timestamp(),
                         method: "POST".to_string(),
                         path: path.clone(),
-                        channel_id: "opencode".to_string(),
+                        channel_id: channel_id.clone(),
                         model: model_name.clone(),
                         stream: true,
                         status_code: 500,
@@ -1615,7 +1807,7 @@ fn openai_to_responses_sse_stream(
             timestamp: current_timestamp(),
             method: "POST".to_string(),
             path,
-            channel_id: "opencode".to_string(),
+            channel_id,
             model: model_name,
             stream: true,
             status_code: 200,
@@ -1685,11 +1877,11 @@ impl OpenAiProtocolAdapter {
                             let mut description = String::new();
                             let mut parameters = json!({ "type": "object", "properties": {} });
 
-                            // 格式 A: 嵌套在 function 内部
+                            // 格式 A: 嵌套在 function 内部 (OpenAI 格式)
                             if let Some(f_val) = item_obj.get("function") {
                                 if let Some(f_obj) = f_val.as_object() {
                                     if let Some(n) = f_obj.get("name").and_then(JsonValue::as_str) {
-                                        name = n.to_string();
+                                        name = n.trim().to_string();
                                     }
                                     if let Some(d) = f_obj.get("description").and_then(JsonValue::as_str) {
                                         description = d.to_string();
@@ -1700,10 +1892,10 @@ impl OpenAiProtocolAdapter {
                                 }
                             }
 
-                            // 格式 B: 扁平格式 (name / input_schema 等直接位于顶层)
+                            // 格式 B: 扁平格式 (Anthropic 格式，name / input_schema 等直接位于顶层)
                             if name.is_empty() {
                                 if let Some(n) = item_obj.get("name").and_then(JsonValue::as_str) {
-                                    name = n.to_string();
+                                    name = n.trim().to_string();
                                 }
                                 if let Some(d) = item_obj.get("description").and_then(JsonValue::as_str) {
                                     description = d.to_string();
@@ -1713,15 +1905,15 @@ impl OpenAiProtocolAdapter {
                                 }
                             }
 
-                            // 只有提取到非空名称时才保留
-                            if !name.trim().is_empty() {
+                            // 只有提取到非空名称时才保留（防止上游抛 Expected 'function.name' to be a string）
+                            if !name.is_empty() {
                                 if !parameters.is_object() {
                                     parameters = json!({ "type": "object", "properties": {} });
                                 }
                                 valid_tools.push(json!({
                                     "type": "function",
                                     "function": {
-                                        "name": name.trim(),
+                                        "name": name,
                                         "description": description,
                                         "parameters": parameters
                                     }
@@ -1797,22 +1989,66 @@ impl OpenAiProtocolAdapter {
                     }
                 }
 
-                // 规范化 tool_calls
-                if let Some(tool_calls) = msg.get_mut("tool_calls").and_then(JsonValue::as_array_mut) {
-                    for tc in tool_calls {
-                        if let Some(tc_obj) = tc.as_object_mut() {
-                            if !tc_obj.contains_key("function") {
-                                let name = tc_obj.get("name").cloned().unwrap_or_else(|| json!(""));
-                                let args = tc_obj.get("arguments").cloned().unwrap_or_else(|| json!("{}"));
-                                let id = tc_obj.get("id").cloned().unwrap_or_else(|| json!("call_default"));
-                                tc_obj.clear();
-                                tc_obj.insert("id".to_string(), id);
-                                tc_obj.insert("type".to_string(), json!("function"));
-                                tc_obj.insert("function".to_string(), json!({
-                                    "name": name,
-                                    "arguments": args
-                                }));
+                // 规范化 tool_calls，严格过滤掉空 name 的残缺调用
+                if let Some(tc_val) = msg.get_mut("tool_calls") {
+                    if let Some(tool_calls_arr) = tc_val.as_array() {
+                        let mut valid_tc = Vec::new();
+                        for tc in tool_calls_arr {
+                            if let Some(tc_obj) = tc.as_object() {
+                                let mut name = String::new();
+                                let mut args_str = String::new();
+                                let id = tc_obj.get("id").and_then(JsonValue::as_str).unwrap_or("call_default").to_string();
+
+                                if let Some(f_val) = tc_obj.get("function") {
+                                    if let Some(f_obj) = f_val.as_object() {
+                                        if let Some(n) = f_obj.get("name").and_then(JsonValue::as_str) {
+                                            name = n.trim().to_string();
+                                        }
+                                        if let Some(a) = f_obj.get("arguments") {
+                                            args_str = if let Some(s) = a.as_str() { s.to_string() } else { a.to_string() };
+                                        }
+                                    }
+                                }
+                                if name.is_empty() {
+                                    if let Some(n) = tc_obj.get("name").and_then(JsonValue::as_str) {
+                                        name = n.trim().to_string();
+                                    }
+                                    if let Some(a) = tc_obj.get("arguments") {
+                                        args_str = if let Some(s) = a.as_str() { s.to_string() } else { a.to_string() };
+                                    }
+                                }
+
+                                if !name.is_empty() {
+                                    if args_str.trim().is_empty() {
+                                        args_str = "{}".to_string();
+                                    }
+                                    valid_tc.push(json!({
+                                        "id": id,
+                                        "type": "function",
+                                        "function": {
+                                            "name": name,
+                                            "arguments": args_str
+                                        }
+                                    }));
+                                }
                             }
+                        }
+
+                        if valid_tc.is_empty() {
+                            msg.as_object_mut().map(|o| o.remove("tool_calls"));
+                        } else {
+                            *tc_val = json!(valid_tc);
+                        }
+                    } else {
+                        msg.as_object_mut().map(|o| o.remove("tool_calls"));
+                    }
+                }
+
+                // 规范化 role: "tool"，保证包含非空 tool_call_id
+                if msg.get("role").and_then(JsonValue::as_str) == Some("tool") {
+                    if let Some(msg_obj) = msg.as_object_mut() {
+                        if !msg_obj.contains_key("tool_call_id") || msg_obj.get("tool_call_id").map_or(true, |v| v.is_null()) {
+                            msg_obj.insert("tool_call_id".to_string(), json!("call_default"));
                         }
                     }
                 }
@@ -2427,25 +2663,48 @@ fn strip_opencode_prefix(model: &str) -> &str {
 }
 
 /// 根据请求模型名解析目标渠道与发送给上游的裸模型名。
-/// 规则：`alias/裸模型` 按别名前缀匹配启用渠道；无前缀或前缀未匹配时回退 opencode 渠道。
+/// 规则：
+/// 1. `alias/裸模型` 优先按别名前缀精确匹配启用渠道；
+/// 2. 无前缀时，若某个启用渠道的白名单（enabled_models）中包含该模型，则优先分发给该渠道；
+/// 3. 若无匹配，回退至启用的默认 opencode 渠道；
+/// 4. 若默认 opencode 未启用，回退至首个已启用的自定义渠道。
 fn resolve_channel<'a>(
     config: &'a OpencodeProxyConfig,
     raw_model: &str,
 ) -> Option<(&'a ChannelConfig, String)> {
+    // 1. 带前缀别名匹配 (如 x666/claude-sonnet-5)
     if let Some((prefix, rest)) = raw_model.split_once('/') {
         if let Some(ch) = config
             .channels
             .iter()
-            .find(|c| c.enabled && c.effective_alias() == prefix)
+            .find(|c| c.enabled && c.effective_alias().eq_ignore_ascii_case(prefix))
         {
             return Some((ch, rest.to_string()));
         }
     }
-    config
-        .channels
-        .iter()
-        .find(|c| c.id == "opencode" && c.enabled)
-        .map(|ch| (ch, strip_opencode_prefix(raw_model).to_string()))
+
+    let stripped = strip_opencode_prefix(raw_model);
+
+    // 2. 检查是否有启用渠道显式在 enabled_models 中勾选/包含了该模型
+    if let Some(ch) = config.channels.iter().find(|c| {
+        c.enabled && c.enabled_models.as_ref().map_or(false, |models| {
+            models.iter().any(|m| m.eq_ignore_ascii_case(stripped) || m.eq_ignore_ascii_case(raw_model))
+        })
+    }) {
+        return Some((ch, stripped.to_string()));
+    }
+
+    // 3. 回退默认 opencode 渠道（如果已启用）
+    if let Some(ch) = config.channels.iter().find(|c| c.id == "opencode" && c.enabled) {
+        return Some((ch, stripped.to_string()));
+    }
+
+    // 4. 若 opencode 渠道未启用，回退到首个已启用的自定义渠道
+    if let Some(ch) = config.channels.iter().find(|c| c.enabled) {
+        return Some((ch, stripped.to_string()));
+    }
+
+    None
 }
 
 /// POST /v1/chat/completions (直连优先 + 代理池按速排序粘性轮询故障转移，全流完结后记录完整日志)
@@ -2546,6 +2805,8 @@ async fn handle_chat_completions(
         }
     };
 
+    let chan_alias = chan.effective_alias();
+
     if let Some(model_val) = body.get_mut("model") {
         *model_val = JsonValue::String(model_to_send.clone());
     }
@@ -2611,6 +2872,7 @@ async fn handle_chat_completions(
                         &ctx,
                         &req_id,
                         "/v1/chat/completions",
+                        &chan_alias,
                         &model_to_send,
                         is_stream,
                         status.as_u16(),
@@ -2648,6 +2910,7 @@ async fn handle_chat_completions(
                         &ctx,
                         &req_id,
                         "/v1/chat/completions",
+                        &chan_alias,
                         &model_to_send,
                         is_stream,
                         502,
@@ -2679,7 +2942,7 @@ async fn handle_chat_completions(
                 timestamp: current_timestamp(),
                 method: "POST".to_string(),
                 path: "/v1/chat/completions".to_string(),
-                channel_id: "opencode".to_string(),
+                channel_id: chan_alias.clone(),
                 model: model_to_send,
                 stream: is_stream,
                 status_code: 502,
@@ -2723,7 +2986,7 @@ async fn handle_chat_completions(
             timestamp: current_timestamp(),
             method: "POST".to_string(),
             path: "/v1/chat/completions".to_string(),
-            channel_id: "opencode".to_string(),
+            channel_id: chan_alias.clone(),
             model: model_to_send,
             stream: is_stream,
             status_code: status.as_u16(),
@@ -2753,6 +3016,7 @@ async fn handle_chat_completions(
             req_id,
             start_time,
             "/v1/chat/completions".to_string(),
+            chan_alias,
             model_to_send,
             req_body_str,
             node_name,
@@ -2773,8 +3037,8 @@ async fn handle_chat_completions(
         let data = res.bytes().await.unwrap_or_default();
         let dur = start_time.elapsed().as_millis() as u64;
 
-        let (prompt_tokens, prompt_cache_hit_tokens, prompt_cache_miss_tokens, completion_tokens, reasoning_tokens, total_tokens, resp_str) =
-            if let Ok(json_val) = serde_json::from_slice::<JsonValue>(&data) {
+        let (prompt_tokens, prompt_cache_hit_tokens, prompt_cache_miss_tokens, completion_tokens, reasoning_tokens, total_tokens, resp_str, final_body_bytes) =
+            if let Ok(mut json_val) = serde_json::from_slice::<JsonValue>(&data) {
                 let pt = json_val.pointer("/usage/prompt_tokens").and_then(JsonValue::as_u64);
                 let hit = json_val.pointer("/usage/prompt_cache_hit_tokens")
                     .or_else(|| json_val.pointer("/usage/prompt_tokens_details/cached_tokens"))
@@ -2789,10 +3053,48 @@ async fn handle_chat_completions(
                     .or_else(|| json_val.pointer("/usage/reasoning_tokens"))
                     .and_then(JsonValue::as_u64);
                 let tt = json_val.pointer("/usage/total_tokens").and_then(JsonValue::as_u64);
+
+                // 规范化 non-streaming choices[i].message 中的 tool_calls
+                if let Some(choices) = json_val.get_mut("choices").and_then(JsonValue::as_array_mut) {
+                    for choice in choices {
+                        if let Some(msg) = choice.get_mut("message").and_then(JsonValue::as_object_mut) {
+                            if let Some(tc_val) = msg.get_mut("tool_calls") {
+                                if let Some(tc_arr) = tc_val.as_array_mut() {
+                                    for tc in tc_arr {
+                                        if let Some(tc_obj) = tc.as_object_mut() {
+                                            if !tc_obj.contains_key("type") {
+                                                tc_obj.insert("type".to_string(), json!("function"));
+                                            }
+                                            if !tc_obj.contains_key("id") {
+                                                tc_obj.insert("id".to_string(), json!("call_default"));
+                                            }
+                                            if let Some(func) = tc_obj.get_mut("function").and_then(JsonValue::as_object_mut) {
+                                                if func.get("name").map_or(true, |v| v.is_null()) {
+                                                    func.insert("name".to_string(), json!("tool"));
+                                                }
+                                                if func.get("arguments").map_or(true, |v| v.is_null()) {
+                                                    func.insert("arguments".to_string(), json!("{}"));
+                                                }
+                                            } else {
+                                                tc_obj.insert("function".to_string(), json!({
+                                                    "name": "tool",
+                                                    "arguments": "{}"
+                                                }));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 let formatted = serde_json::to_string_pretty(&json_val).unwrap_or_else(|_| json_val.to_string());
-                (pt, hit, miss, ct, rt, tt, Some(formatted))
+                let serialized_bytes = serde_json::to_vec(&json_val).unwrap_or_else(|_| data.to_vec());
+                (pt, hit, miss, ct, rt, tt, Some(formatted), serialized_bytes)
             } else {
-                (None, None, None, None, None, None, String::from_utf8(data.to_vec()).ok())
+                let d_vec = data.to_vec();
+                (None, None, None, None, None, None, String::from_utf8(d_vec.clone()).ok(), d_vec)
             };
 
         ctx.record_log(ProxyRequestLog {
@@ -2800,7 +3102,7 @@ async fn handle_chat_completions(
             timestamp: current_timestamp(),
             method: "POST".to_string(),
             path: "/v1/chat/completions".to_string(),
-            channel_id: "opencode".to_string(),
+            channel_id: chan_alias,
             model: model_to_send,
             stream: false,
             status_code: 200,
@@ -2821,7 +3123,7 @@ async fn handle_chat_completions(
         (
             StatusCode::OK,
             [(axum::http::header::CONTENT_TYPE, "application/json")],
-            data,
+            final_body_bytes,
         )
             .into_response()
     }
@@ -2900,6 +3202,8 @@ async fn handle_responses(
         }
     };
 
+    let chan_alias = chan.effective_alias();
+
     if let Some(model_val) = body.get_mut("model") {
         *model_val = JsonValue::String(model_to_send.clone());
     }
@@ -2965,6 +3269,7 @@ async fn handle_responses(
                         &ctx,
                         &req_id,
                         "/v1/responses",
+                        &chan_alias,
                         &model_to_send,
                         is_stream,
                         status.as_u16(),
@@ -3001,6 +3306,7 @@ async fn handle_responses(
                         &ctx,
                         &req_id,
                         "/v1/responses",
+                        &chan_alias,
                         &model_to_send,
                         is_stream,
                         502,
@@ -3032,7 +3338,7 @@ async fn handle_responses(
                 timestamp: current_timestamp(),
                 method: "POST".to_string(),
                 path: "/v1/responses".to_string(),
-                channel_id: "opencode".to_string(),
+                channel_id: chan_alias.clone(),
                 model: model_to_send,
                 stream: is_stream,
                 status_code: 502,
@@ -3075,7 +3381,7 @@ async fn handle_responses(
             timestamp: current_timestamp(),
             method: "POST".to_string(),
             path: "/v1/responses".to_string(),
-            channel_id: "opencode".to_string(),
+            channel_id: chan_alias.clone(),
             model: model_to_send,
             stream: is_stream,
             status_code: status.as_u16(),
@@ -3104,6 +3410,7 @@ async fn handle_responses(
             req_id,
             start_time,
             "/v1/responses".to_string(),
+            chan_alias,
             model_to_send,
             req_body_str,
             node_name,
@@ -3217,7 +3524,7 @@ async fn handle_responses(
             timestamp: current_timestamp(),
             method: "POST".to_string(),
             path: "/v1/responses".to_string(),
-            channel_id: "opencode".to_string(),
+            channel_id: chan_alias,
             model: model_to_send,
             stream: false,
             status_code: 200,
@@ -3321,38 +3628,81 @@ async fn handle_messages(
     let mut openai_tools = Vec::new();
     if let Some(tools_arr) = body.get("tools").and_then(JsonValue::as_array) {
         for t in tools_arr {
-            let name = t.get("name").and_then(JsonValue::as_str).unwrap_or_default();
-            let desc = t.get("description").and_then(JsonValue::as_str).unwrap_or_default();
-            let schema = t.get("input_schema").cloned().unwrap_or_else(|| json!({"type": "object"}));
-            openai_tools.push(json!({
-                "type": "function",
-                "function": {
-                    "name": name,
-                    "description": desc,
-                    "parameters": schema
+            let mut name = String::new();
+            let mut desc = String::new();
+            let mut schema = json!({"type": "object", "properties": {}});
+
+            // 1. Anthropic 格式: { name: "...", description: "...", input_schema: {...} }
+            if let Some(n) = t.get("name").and_then(JsonValue::as_str) {
+                name = n.trim().to_string();
+            }
+            if let Some(d) = t.get("description").and_then(JsonValue::as_str) {
+                desc = d.to_string();
+            }
+            if let Some(s) = t.get("input_schema").or_else(|| t.get("parameters")) {
+                schema = s.clone();
+            }
+
+            // 2. 兼容嵌套在 function 中的格式: { type: "function", function: { name: "...", ... } }
+            if name.is_empty() {
+                if let Some(f) = t.get("function").and_then(JsonValue::as_object) {
+                    if let Some(n) = f.get("name").and_then(JsonValue::as_str) {
+                        name = n.trim().to_string();
+                    }
+                    if let Some(d) = f.get("description").and_then(JsonValue::as_str) {
+                        desc = d.to_string();
+                    }
+                    if let Some(s) = f.get("parameters").or_else(|| f.get("input_schema")) {
+                        schema = s.clone();
+                    }
                 }
-            }));
+            }
+
+            if !name.is_empty() {
+                if !schema.is_object() {
+                    schema = json!({"type": "object", "properties": {}});
+                }
+                openai_tools.push(json!({
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "description": desc,
+                        "parameters": schema
+                    }
+                }));
+            }
         }
     }
 
     let mut tool_choice_val = None;
-    if let Some(tc) = body.get("tool_choice") {
-        if let Some(tc_str) = tc.as_str() {
-            tool_choice_val = Some(json!(tc_str));
-        } else if let Some(tc_obj) = tc.as_object() {
-            let tc_type = tc_obj.get("type").and_then(JsonValue::as_str).unwrap_or_default();
-            match tc_type {
-                "auto" => tool_choice_val = Some(json!("auto")),
-                "any" => tool_choice_val = Some(json!("required")),
-                "tool" => {
-                    if let Some(name) = tc_obj.get("name").and_then(JsonValue::as_str) {
-                        tool_choice_val = Some(json!({
-                            "type": "function",
-                            "function": { "name": name }
-                        }));
-                    }
+    if !openai_tools.is_empty() {
+        if let Some(tc) = body.get("tool_choice") {
+            if let Some(tc_str) = tc.as_str() {
+                match tc_str {
+                    "auto" => tool_choice_val = Some(json!("auto")),
+                    "any" => tool_choice_val = Some(json!("required")),
+                    "none" => tool_choice_val = Some(json!("none")),
+                    _ => {}
                 }
-                _ => {}
+            } else if let Some(tc_obj) = tc.as_object() {
+                let tc_type = tc_obj.get("type").and_then(JsonValue::as_str).unwrap_or_default();
+                match tc_type {
+                    "auto" => tool_choice_val = Some(json!("auto")),
+                    "any" => tool_choice_val = Some(json!("required")),
+                    "none" => tool_choice_val = Some(json!("none")),
+                    "tool" => {
+                        let name = tc_obj.get("name").and_then(JsonValue::as_str)
+                            .or_else(|| tc.pointer("/function/name").and_then(JsonValue::as_str))
+                            .unwrap_or_default().trim();
+                        if !name.is_empty() {
+                            tool_choice_val = Some(json!({
+                                "type": "function",
+                                "function": { "name": name }
+                            }));
+                        }
+                    }
+                    _ => {}
+                }
             }
         }
     }
@@ -3413,17 +3763,25 @@ async fn handle_messages(
                             }
                             "tool_use" => {
                                 let id = block.get("id").and_then(JsonValue::as_str).unwrap_or("call_default");
-                                let name = block.get("name").and_then(JsonValue::as_str).unwrap_or_default();
-                                let input = block.get("input").cloned().unwrap_or_else(|| json!({}));
-                                let args_str = serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_string());
-                                tool_calls.push(json!({
-                                    "id": id,
-                                    "type": "function",
-                                    "function": {
-                                        "name": name,
-                                        "arguments": args_str
-                                    }
-                                }));
+                                let name = block.get("name").and_then(JsonValue::as_str)
+                                    .or_else(|| block.pointer("/function/name").and_then(JsonValue::as_str))
+                                    .unwrap_or_default().trim();
+                                let input = block.get("input").or_else(|| block.get("arguments")).cloned().unwrap_or_else(|| json!({}));
+                                let args_str = if let Some(s) = input.as_str() {
+                                    s.to_string()
+                                } else {
+                                    serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_string())
+                                };
+                                if !name.is_empty() {
+                                    tool_calls.push(json!({
+                                        "id": id,
+                                        "type": "function",
+                                        "function": {
+                                            "name": name,
+                                            "arguments": args_str
+                                        }
+                                    }));
+                                }
                             }
                             _ => {}
                         }
@@ -3608,6 +3966,7 @@ async fn handle_messages(
                         &ctx,
                         &req_id,
                         "/v1/messages",
+                        &chan_alias,
                         &stripped_model,
                         is_stream,
                         status.as_u16(),
@@ -3644,6 +4003,7 @@ async fn handle_messages(
                         &ctx,
                         &req_id,
                         "/v1/messages",
+                        &chan_alias,
                         &stripped_model,
                         is_stream,
                         502,
@@ -3675,7 +4035,7 @@ async fn handle_messages(
                 timestamp: current_timestamp(),
                 method: "POST".to_string(),
                 path: "/v1/messages".to_string(),
-                channel_id: "opencode".to_string(),
+                channel_id: chan_alias.clone(),
                 model: stripped_model.to_string(),
                 stream: is_stream,
                 status_code: 502,
@@ -3718,7 +4078,7 @@ async fn handle_messages(
             timestamp: current_timestamp(),
             method: "POST".to_string(),
             path: "/v1/messages".to_string(),
-            channel_id: "opencode".to_string(),
+            channel_id: chan_alias.clone(),
             model: stripped_model.to_string(),
             stream: is_stream,
             status_code: status.as_u16(),
@@ -3751,6 +4111,7 @@ async fn handle_messages(
             req_id,
             start_time,
             "/v1/messages".to_string(),
+            chan_alias,
             stripped_model.to_string(),
             req_body_str,
             node_name,
@@ -3849,7 +4210,7 @@ async fn handle_messages(
                     timestamp: current_timestamp(),
                     method: "POST".to_string(),
                     path: "/v1/messages".to_string(),
-                    channel_id: "opencode".to_string(),
+                    channel_id: chan_alias.clone(),
                     model: stripped_model.to_string(),
                     stream: false,
                     status_code: 200,
@@ -3875,7 +4236,7 @@ async fn handle_messages(
                     timestamp: current_timestamp(),
                     method: "POST".to_string(),
                     path: "/v1/messages".to_string(),
-                    channel_id: "opencode".to_string(),
+                    channel_id: chan_alias,
                     model: stripped_model.to_string(),
                     stream: false,
                     status_code: 502,
@@ -4543,3 +4904,273 @@ pub async fn clear_opencode_proxy_logs(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sse_frame_extractor_standard_and_crlf() {
+        let mut extractor = SseFrameExtractor::new();
+
+        // 1. 测试标准 LF: \n\n
+        let chunk1 = b"data: {\"id\":\"1\",\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n";
+        extractor.push_bytes(chunk1);
+        let blocks = extractor.extract_blocks();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].data_lines.len(), 1);
+        assert_eq!(blocks[0].data_lines[0], "{\"id\":\"1\",\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}");
+
+        // 2. 测试 Windows CRLF: \r\n\r\n
+        let chunk2 = b"data: {\"id\":\"2\",\"choices\":[{\"delta\":{\"content\":\"World\"}}]}\r\n\r\n";
+        extractor.push_bytes(chunk2);
+        let blocks = extractor.extract_blocks();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].data_lines[0], "{\"id\":\"2\",\"choices\":[{\"delta\":{\"content\":\"World\"}}]}");
+    }
+
+    #[test]
+    fn test_sse_frame_extractor_utf8_multibyte_boundary_split() {
+        let mut extractor = SseFrameExtractor::new();
+
+        // 中文字符 "你好" (E4 BD A0, E5 A5 BD)
+        let full_text = "data: {\"content\":\"你好世界\"}\n\n";
+        let bytes = full_text.as_bytes();
+
+        // 将字节在多字节中文字符中间切片（如在 '好' 的第 1 字节后切割）
+        let split_pos = 20; // 落在 UTF-8 多字节序列内部
+        let part1 = &bytes[..split_pos];
+        let part2 = &bytes[split_pos..];
+
+        extractor.push_bytes(part1);
+        let blocks1 = extractor.extract_blocks();
+        assert_eq!(blocks1.len(), 0, "分片未完成时不应误解析残缺数据");
+
+        extractor.push_bytes(part2);
+        let blocks2 = extractor.extract_blocks();
+        assert_eq!(blocks2.len(), 1, "两片拼接后应正确提取完整事件");
+        assert_eq!(blocks2[0].data_lines[0], "{\"content\":\"你好世界\"}");
+    }
+
+    #[test]
+    fn test_sse_frame_extractor_event_done_and_comments() {
+        let mut extractor = SseFrameExtractor::new();
+
+        let sse_data = b": ping keep-alive\n\nevent: completion\ndata: {\"id\":\"msg_01\"}\n\ndata: [DONE]\n\n";
+        extractor.push_bytes(sse_data);
+        let blocks = extractor.extract_blocks();
+
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].event_type.as_deref(), Some("completion"));
+        assert_eq!(blocks[0].data_lines[0], "{\"id\":\"msg_01\"}");
+        assert!(blocks[1].is_done);
+    }
+
+    #[test]
+    fn test_sse_frame_extractor_flush_remaining() {
+        let mut extractor = SseFrameExtractor::new();
+        let partial = b"data: {\"id\":\"msg_final\"}";
+        extractor.push_bytes(partial);
+        assert_eq!(extractor.extract_blocks().len(), 0);
+
+        let rem = extractor.flush_remaining();
+        assert!(rem.is_some());
+        let block = rem.unwrap();
+        assert_eq!(block.data_lines[0], "{\"id\":\"msg_final\"}");
+    }
+
+    #[test]
+    fn test_resolve_channel_routing() {
+        let mut config = OpencodeProxyConfig::default();
+        config.channels = vec![
+            ChannelConfig {
+                id: "opencode".to_string(),
+                name: "OpenCode".to_string(),
+                description: String::new(),
+                enabled: true,
+                protocol: "openai".to_string(),
+                upstream_url: "https://api.opencode.ai/v1".to_string(),
+                api_key: "sk-default".to_string(),
+                api_keys: Vec::new(),
+                use_proxy_pool: false,
+                alias: "opencode".to_string(),
+                site_id: None,
+                use_fixed_proxy: false,
+                enabled_models: Some(vec!["gpt-4o".to_string()]),
+            },
+            ChannelConfig {
+                id: "x666".to_string(),
+                name: "薄荷 API".to_string(),
+                description: String::new(),
+                enabled: true,
+                protocol: "openai".to_string(),
+                upstream_url: "https://x666.me/v1".to_string(),
+                api_key: "sk-x666".to_string(),
+                api_keys: Vec::new(),
+                use_proxy_pool: false,
+                alias: "x666".to_string(),
+                site_id: None,
+                use_fixed_proxy: false,
+                enabled_models: Some(vec!["claude-sonnet-5".to_string(), "gemini-2.5-pro".to_string()]),
+            },
+        ];
+
+        // 1. 带别名前缀解析
+        let (ch, model) = resolve_channel(&config, "x666/claude-sonnet-5").expect("should resolve x666");
+        assert_eq!(ch.id, "x666");
+        assert_eq!(model, "claude-sonnet-5");
+
+        // 2. 裸模型匹配 enabled_models 白名单
+        let (ch2, model2) = resolve_channel(&config, "claude-sonnet-5").expect("should resolve x666 by model whitelist");
+        assert_eq!(ch2.id, "x666");
+        assert_eq!(model2, "claude-sonnet-5");
+
+        // 3. 裸模型无特殊匹配时回退默认 opencode
+        let (ch3, model3) = resolve_channel(&config, "unknown-model").expect("should fallback to opencode");
+        assert_eq!(ch3.id, "opencode");
+        assert_eq!(model3, "unknown-model");
+
+        // 4. opencode 禁用后回退首个启用渠道
+        config.channels[0].enabled = false;
+        let (ch4, model4) = resolve_channel(&config, "unknown-model").expect("should fallback to x666");
+        assert_eq!(ch4.id, "x666");
+        assert_eq!(model4, "unknown-model");
+    }
+
+    #[test]
+    fn test_sanitize_and_normalize_tools_and_calls() {
+        let mut body = json!({
+            "model": "claude-sonnet-5",
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "", // 残缺无名称 tool
+                        "description": "empty name"
+                    }
+                },
+                {
+                    "name": "get_weather",
+                    "description": "Get current weather",
+                    "input_schema": { "type": "object", "properties": { "city": { "type": "string" } } }
+                }
+            ],
+            "tool_choice": "auto",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": "Let me check the weather.",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "get_weather",
+                                "arguments": "{\"city\":\"Beijing\"}"
+                            }
+                        },
+                        {
+                            "id": "call_bad",
+                            "function": {
+                                "name": "" // 空名称 tool call
+                            }
+                        }
+                    ]
+                },
+                {
+                    "role": "tool",
+                    "content": "{\"temp\": 25}"
+                }
+            ]
+        });
+
+        OpenAiProtocolAdapter::sanitize_and_normalize(&mut body);
+
+        // 验证 tools 中空名称被剔除，仅保留有效工具
+        let tools = body["tools"].as_array().expect("tools should be array");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["function"]["name"], "get_weather");
+
+        // 验证 assistant 消息中 tool_calls 残缺项被剔除
+        let tc = body["messages"][0]["tool_calls"].as_array().expect("tool_calls should be array");
+        assert_eq!(tc.len(), 1);
+        assert_eq!(tc[0]["function"]["name"], "get_weather");
+
+        // 验证 tool 消息补充了默认 tool_call_id
+        assert_eq!(body["messages"][1]["tool_call_id"], "call_default");
+    }
+
+    #[test]
+    fn test_stream_chunk_tool_calls_normalization() {
+        // 模拟上游返回的第 2 个分片：只有 arguments，没有 name 或 name 为 null
+        let mut chunk_val = json!({
+            "id": "chatcmpl-123",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "function": {
+                                    "arguments": "{\"path\":"
+                                }
+                            }
+                        ]
+                    }
+                }
+            ]
+        });
+
+        let mut collected_tools = std::collections::BTreeMap::new();
+        collected_tools.insert(0, ("call_abc123".to_string(), "read_file".to_string()));
+
+        if let Some(choices) = chunk_val.get_mut("choices").and_then(JsonValue::as_array_mut) {
+            for choice in choices {
+                if let Some(delta) = choice.get_mut("delta").and_then(JsonValue::as_object_mut) {
+                    if let Some(tool_calls_arr) = delta.get_mut("tool_calls").and_then(JsonValue::as_array_mut) {
+                        for tc in tool_calls_arr {
+                            let index = tc.get("index").and_then(JsonValue::as_u64).unwrap_or(0) as usize;
+                            let (accum_id, accum_name) = collected_tools.get(&index).cloned().unwrap_or_default();
+
+                            if let Some(tc_obj) = tc.as_object_mut() {
+                                if !tc_obj.contains_key("index") {
+                                    tc_obj.insert("index".to_string(), json!(index));
+                                }
+                                if !tc_obj.contains_key("type") {
+                                    tc_obj.insert("type".to_string(), json!("function"));
+                                }
+                                if !accum_id.is_empty() && !tc_obj.contains_key("id") {
+                                    tc_obj.insert("id".to_string(), json!(accum_id));
+                                }
+
+                                if let Some(func) = tc_obj.get_mut("function").and_then(JsonValue::as_object_mut) {
+                                    if func.get("name").map_or(true, |v| v.is_null() || v.as_str().map_or(true, |s| s.is_empty())) {
+                                        func.insert("name".to_string(), json!(accum_name));
+                                    }
+                                    if func.get("arguments").map_or(true, |v| v.is_null()) {
+                                        func.insert("arguments".to_string(), json!(""));
+                                    }
+                                } else {
+                                    tc_obj.insert("function".to_string(), json!({
+                                        "name": accum_name,
+                                        "arguments": ""
+                                    }));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let tc = &chunk_val["choices"][0]["delta"]["tool_calls"][0];
+        assert_eq!(tc["type"], "function");
+        assert_eq!(tc["id"], "call_abc123");
+        assert_eq!(tc["function"]["name"], "read_file");
+        assert_eq!(tc["function"]["arguments"], "{\"path\":");
+    }
+}
+
+
+
