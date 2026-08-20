@@ -5,7 +5,7 @@ use serde_json::Value as JsonValue;
 use std::collections::{HashMap, HashSet};
 use tauri::Emitter;
 
-pub(crate) const SEED_JSON: &str = include_str!("../resources/sites.json");
+pub(crate) const SEED_JSON: &str = include_str!("../../resources/sites.json");
 pub(crate) const NOW_SQL: &str = "strftime('%Y-%m-%dT%H:%M:%fZ','now')";
 pub(crate) const REMOTE_ROOT_URL: &str = "https://ldoh.105117.xyz/";
 pub(crate) const REMOTE_USER_URL: &str = "https://ldoh.105117.xyz/api/ld/user";

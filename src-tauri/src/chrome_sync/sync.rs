@@ -528,6 +528,7 @@ pub(crate) fn is_checkin_disabled_message(message: &str) -> bool {
         || lower.contains("checkin_disabled")
 }
 
+#[allow(dead_code)]
 pub(crate) fn is_turnstile_checkin_error(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
     lower.contains("turnstile")

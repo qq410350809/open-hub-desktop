@@ -449,6 +449,27 @@ export function useModelProxy() {
       showToast("复制失败", true);
     }
   }
+  async function copyGeminiUrl() {
+    const port = proxyStatus.value.port || proxyConfig.value.port;
+    const url = `http://127.0.0.1:${port}/v1beta`;
+    try {
+      await navigator.clipboard.writeText(url);
+      showToast(`已复制 Google Gemini Base URL: ${url}`);
+    } catch {
+      showToast("复制失败", true);
+    }
+  }
+
+  async function copyClaudeUrl() {
+    const port = proxyStatus.value.port || proxyConfig.value.port;
+    const url = `http://127.0.0.1:${port}/v1/messages`;
+    try {
+      await navigator.clipboard.writeText(url);
+      showToast(`已复制 Claude Messages URL: ${url}`);
+    } catch {
+      showToast("复制失败", true);
+    }
+  }
 
   async function copyProxyKey() {
     const key = proxyConfig.value.apiKey || "";
@@ -504,6 +525,8 @@ export function useModelProxy() {
     toggleLogSort,
     clearLogs,
     copyProxyUrl,
+    copyGeminiUrl,
+    copyClaudeUrl,
     copyProxyKey,
   };
 }

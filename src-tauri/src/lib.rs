@@ -1,44 +1,55 @@
-mod account_sync;
-pub mod app_menu;
-mod auto_sync;
-mod charity_monitor;
-mod chrome_local_storage;
-mod chrome_session;
-mod chrome_usage;
-mod db;
-mod detect_all;
-mod file_export;
-mod geoip;
-mod mihomo_kernel;
-mod models;
-pub use detect_all::run_library_detect;
-mod model_catalog;
+pub(crate) mod charity_monitor;
+pub(crate) mod chrome_sync;
+pub(crate) mod core;
+pub(crate) mod kernel;
+pub(crate) mod model_catalog;
+pub(crate) mod model_proxy;
+pub(crate) mod proxy_pool;
+pub(crate) mod site_library;
+pub(crate) mod token_collector;
+pub(crate) mod token_stats;
+
+// Core shared exports
+#[allow(unused_imports)]
+pub(crate) use core::*;
+#[allow(unused_imports)]
+pub(crate) use kernel::*;
+#[allow(unused_imports)]
+pub(crate) use site_library::*;
+#[allow(unused_imports)]
+pub(crate) use chrome_sync::*;
+
+// Module aliases for seamless backward compatibility
+pub(crate) use site_library as site_crud;
+pub(crate) use site_library as site_ops;
+pub(crate) use site_library as system_detect;
+pub(crate) use site_library as platform_detect;
+pub(crate) use site_library as remote_sync;
+pub(crate) use chrome_sync as chrome_usage;
+pub(crate) use chrome_sync as account_sync;
+pub(crate) use chrome_sync as auto_sync;
+pub(crate) use chrome_sync as chrome_session;
+pub(crate) use chrome_sync as chrome_local_storage;
+pub(crate) use model_catalog as models_fetch;
+pub(crate) use kernel as mihomo_kernel;
+pub(crate) use kernel as geoip;
+pub(crate) use model_proxy as opencode_proxy;
+
+pub use core::app_menu;
+pub use site_library::run_library_detect;
 pub use model_catalog::sync_model_catalog_once;
-mod models_fetch;
-mod opencode_proxy;
-mod platform_detect;
-mod proxy_pool;
-mod remote_sync;
-mod single_instance;
-mod site_crud;
-mod site_ops;
-mod system_detect;
-mod token_collector;
-mod token_stats;
-mod web_server;
-
-use models::*;
 
 #[cfg(test)]
-use account_sync::*;
+#[allow(unused_imports)]
+use chrome_sync::*;
 #[cfg(test)]
-use db::*;
+#[allow(unused_imports)]
+use core::*;
 #[cfg(test)]
-use models_fetch::*;
+use model_catalog::*;
 #[cfg(test)]
-use platform_detect::*;
-#[cfg(test)]
-use site_ops::*;
+#[allow(unused_imports)]
+use site_library::*;
 
 use std::fs;
 use tauri::Manager;
@@ -1052,14 +1063,14 @@ pub fn run() {
             let charity_runtime = charity_monitor::CharityMonitorRuntime::new();
             let auto_sync_runtime = auto_sync::AutoSyncRuntime::default();
             let model_catalog_runtime = model_catalog::ModelCatalogRuntime::new();
-            let opencode_proxy_state =
-                opencode_proxy::OpencodeProxyState::new_with_app(Some(app.handle().clone()));
+            let model_proxy_state =
+                model_proxy::ModelProxyState::new_with_app(Some(app.handle().clone()));
             app.manage(database);
             app.manage(proxy_runtime);
             app.manage(charity_runtime);
             app.manage(auto_sync_runtime);
             app.manage(model_catalog_runtime);
-            app.manage(opencode_proxy_state);
+            app.manage(model_proxy_state);
             // 启动时清理历史订阅里遗留的测速结果后缀，避免旧库节点名继续显示脏数据。
             if let Err(error) =
                 proxy_pool::repair_stored_node_names(&app.state::<crate::models::Database>())
@@ -1110,17 +1121,17 @@ pub fn run() {
                 // 与公益监听错开启动（调度器内部还有首轮延迟）。
                 auto_sync::start_auto_sync(restore_handle.clone());
 
-                // 启动 OpenCode 独立反代服务
+                // 启动模型网关 (Model Proxy) 独立反代服务
                 let database = restore_handle.state::<crate::models::Database>();
-                let proxy_state = restore_handle.state::<crate::opencode_proxy::OpencodeProxyState>();
+                let proxy_state = restore_handle.state::<crate::model_proxy::ModelProxyState>();
                 let proxy_cfg = {
                     let conn = database.0.lock().ok();
-                    conn.map(|c| opencode_proxy::load_opencode_proxy_config(&c)).unwrap_or_default()
+                    conn.map(|c| model_proxy::load_model_proxy_config(&c)).unwrap_or_default()
                 };
                 *proxy_state.context.config.write().await = proxy_cfg.clone();
                 if proxy_cfg.enabled {
-                    if let Err(e) = opencode_proxy::start_opencode_proxy_server(&proxy_state).await {
-                        eprintln!("[OpenHub] OpenCode 反代服务启动失败: {e}");
+                    if let Err(e) = model_proxy::start_model_proxy_server(&proxy_state).await {
+                        eprintln!("[OpenHub] 模型网关服务启动失败: {e}");
                     }
                 }
             });
@@ -1242,6 +1253,17 @@ pub fn run() {
             web_server::get_lightweight_mode_state,
             web_server::enter_lightweight_mode,
             web_server::show_main_window,
+            model_proxy::get_model_proxy_config,
+            model_proxy::save_model_proxy_config_cmd,
+            model_proxy::get_model_proxy_status,
+            model_proxy::start_model_proxy,
+            model_proxy::stop_model_proxy,
+            model_proxy::fetch_model_proxy_models,
+            model_proxy::test_model_proxy_health,
+            model_proxy::get_model_proxy_logs,
+            model_proxy::get_model_proxy_channel_stats,
+            model_proxy::clear_model_proxy_logs,
+            model_proxy::sync_model_proxy_site_channels,
             opencode_proxy::get_opencode_proxy_config,
             opencode_proxy::save_opencode_proxy_config_cmd,
             opencode_proxy::get_opencode_proxy_status,

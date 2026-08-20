@@ -47,6 +47,8 @@ const {
   goLogPage,
   clearLogs,
   copyProxyUrl,
+  copyGeminiUrl,
+  copyClaudeUrl,
   copyProxyKey,
   logPage,
   logPageSize,
@@ -1180,13 +1182,41 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
 
         <div class="mp-endpoint-list">
           <div class="mp-endpoint-item">
-            <span class="mp-ep-label">Base URL</span>
+            <span class="mp-ep-label">OpenAI Base URL</span>
             <code class="mp-ep-code">{{ proxyStatus.url || `http://127.0.0.1:${proxyConfig.port}/v1` }}</code>
             <button
               type="button"
               class="mp-action-btn"
-              title="复制 Base URL"
+              title="复制 OpenAI Base URL"
               @click="copyProxyUrl"
+            >
+              <span v-html="icons.copy" />
+              <span>复制</span>
+            </button>
+          </div>
+
+          <div class="mp-endpoint-item">
+            <span class="mp-ep-label">Gemini Base URL</span>
+            <code class="mp-ep-code">http://127.0.0.1:{{ proxyStatus.port || proxyConfig.port }}/v1beta</code>
+            <button
+              type="button"
+              class="mp-action-btn"
+              title="复制 Google Gemini 原生 Base URL"
+              @click="copyGeminiUrl"
+            >
+              <span v-html="icons.copy" />
+              <span>复制</span>
+            </button>
+          </div>
+
+          <div class="mp-endpoint-item">
+            <span class="mp-ep-label">Claude Messages</span>
+            <code class="mp-ep-code">http://127.0.0.1:{{ proxyStatus.port || proxyConfig.port }}/v1/messages</code>
+            <button
+              type="button"
+              class="mp-action-btn"
+              title="复制 Claude Messages 端点 URL"
+              @click="copyClaudeUrl"
             >
               <span v-html="icons.copy" />
               <span>复制</span>
