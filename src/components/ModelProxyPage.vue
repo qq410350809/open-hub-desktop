@@ -179,7 +179,7 @@ function closeGatewayModelsModal() {
   gatewayModelsModalOpen.value = false;
 }
 
-function handleOpenChannelModelsModal(channel: ChannelConfig) {
+async function handleOpenChannelModelsModal(channel: ChannelConfig) {
   selectedChannel.value = channel;
   channelModelsModalOpen.value = true;
   // 初始化勾选状态：白名单为 null（全部启用）时默认全选；否则仅勾选白名单中的模型
@@ -194,7 +194,21 @@ function handleOpenChannelModelsModal(channel: ChannelConfig) {
     channelModelSelection.value = map;
   }
   if (modelsForChannel(channel.id).length === 0) {
-    refreshModels();
+    if (channel.siteId) {
+      try {
+        const cache = await runCommand<{ models?: { id: string }[] }>("get_site_model_cache", {
+          siteId: channel.siteId,
+        });
+        if (Array.isArray(cache?.models) && cache.models.length > 0) {
+          channelModels.value[channel.id] = cache.models.map((m) => m.id).filter(Boolean);
+        }
+      } catch {
+        /* 忽略 */
+      }
+    }
+    if (modelsForChannel(channel.id).length === 0) {
+      void refreshModels();
+    }
   }
 }
 
@@ -334,6 +348,38 @@ async function saveChannelSettings() {
   }
 }
 
+// —— 渠道删除 ——
+const deleteChannelModalOpen = ref(false);
+const deletingChannel = ref<ChannelConfig | null>(null);
+
+function handleOpenDeleteChannelModal(channel: ChannelConfig) {
+  deletingChannel.value = channel;
+  deleteChannelModalOpen.value = true;
+}
+
+function closeDeleteChannelModal() {
+  deleteChannelModalOpen.value = false;
+  deletingChannel.value = null;
+}
+
+async function confirmDeleteChannel() {
+  if (!deletingChannel.value) return;
+  const channel = deletingChannel.value;
+  const targetId = channel.id;
+  const name = channel.name;
+
+  proxyConfig.value.channels = proxyConfig.value.channels.filter((c) => c.id !== targetId);
+  if (channelModels.value[targetId]) {
+    delete channelModels.value[targetId];
+  }
+
+  const ok = await saveConfig(proxyConfig.value);
+  if (ok) {
+    showToast(`已删除反代渠道「${name}」`);
+    closeDeleteChannelModal();
+  }
+}
+
 // —— 站点转换：从站点库「在用且存活」的站点创建反代渠道 ——
 const { sites: librarySites, loadLibrary } = useLibrary();
 const siteConvertDialogOpen = ref(false);
@@ -413,6 +459,7 @@ async function selectConvertSite(site: SiteRecord) {
   convertKeyLoading.value = true;
   try {
     const cache = await runCommand<{
+      models?: { id: string }[];
       accounts?: { username?: string; accountName?: string; profileName?: string; keys?: string[] }[];
     }>("get_site_model_cache", { siteId: site.id });
     const accounts = Array.isArray(cache?.accounts) ? cache.accounts : [];
@@ -424,6 +471,10 @@ async function selectConvertSite(site: SiteRecord) {
       }
     }
     convertSiteKeys.value = keys;
+    if (Array.isArray(cache?.models) && cache.models.length > 0) {
+      const modelIds = cache.models.map((m) => m.id).filter(Boolean);
+      channelModels.value[`site_${site.id}`] = modelIds;
+    }
   } catch {
     /* 忽略：无本地缓存时由用户手动填写 */
   } finally {
@@ -1299,6 +1350,16 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
               >
                 <span v-html="icons.settings" />
                 <span>设置</span>
+              </button>
+              <button
+                v-if="channel.siteId || channel.id !== 'opencode'"
+                type="button"
+                class="mp-action-btn is-danger"
+                title="删除此反代渠道"
+                @click="handleOpenDeleteChannelModal(channel)"
+              >
+                <span v-html="icons.trash" />
+                <span>删除</span>
               </button>
             </div>
           </div>
@@ -2562,6 +2623,68 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
       </div>
     </div>
 
+    <!-- 弹窗: 删除反代渠道确认 (Delete Channel Confirmation Modal) -->
+    <div
+      v-if="deleteChannelModalOpen && deletingChannel"
+      class="mp-modal-backdrop"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="mp-delete-channel-title"
+      @click.self="closeDeleteChannelModal"
+    >
+      <div class="mp-modal-box mp-modal-box-sm">
+        <div class="mp-modal-header">
+          <div class="mp-modal-title-group">
+            <div class="mp-modal-badge-icon is-error">
+              <span v-html="icons.trash" />
+            </div>
+            <div>
+              <h3 id="mp-delete-channel-title">删除反代渠道</h3>
+              <small class="text-muted">移除该渠道及对外暴露的模型路由</small>
+            </div>
+          </div>
+          <button
+            type="button"
+            class="mp-modal-close"
+            title="关闭弹窗 (Esc)"
+            @click="closeDeleteChannelModal"
+          >
+            <span v-html="icons.close" />
+          </button>
+        </div>
+
+        <div class="mp-modal-body">
+          <p class="text-sm">
+            确定要删除反代渠道<strong>「{{ deletingChannel.name }}」</strong>（别名 <code>{{ channelAlias(deletingChannel) }}</code>）吗？
+          </p>
+          <p v-if="deletingChannel.siteId" class="text-xs text-muted" style="margin-top: 8px;">
+            💡 该渠道是由站点库转换生成的，删除后不会影响站点库中的站点记录，您后续可随时通过「站点转换」重新添加。
+          </p>
+        </div>
+
+        <div class="mp-modal-footer">
+          <div class="mp-modal-footer-buttons">
+            <button
+              type="button"
+              class="mp-btn mp-btn-ghost"
+              @click="closeDeleteChannelModal"
+            >
+              取消
+            </button>
+            <button
+              type="button"
+              class="mp-btn mp-btn-danger"
+              :disabled="savingConfig"
+              @click="confirmDeleteChannel"
+            >
+              <span v-html="icons.trash" />
+              <span>{{ savingConfig ? "正在删除…" : "确认删除" }}</span>
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <!-- 弹窗 4: 站点转换 - 从站点库「在用且存活」站点创建反代渠道 (Site Convert Modal) -->
     <div
       v-if="siteConvertDialogOpen"
@@ -3637,6 +3760,16 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
   background: var(--surface-hover);
   color: var(--text);
   border-color: var(--line-strong);
+}
+
+.mp-action-btn.is-danger {
+  color: var(--color-danger, #ef4444);
+}
+
+.mp-action-btn.is-danger:hover {
+  background: rgba(239, 68, 68, 0.1);
+  border-color: var(--color-danger, #ef4444);
+  color: var(--color-danger, #ef4444);
 }
 
 /* 已配置模型白名单的渠道：管理模型按钮高亮提示 */

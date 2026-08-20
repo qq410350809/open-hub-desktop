@@ -22,7 +22,6 @@ import CharityMonitorPage from "./components/CharityMonitorPage.vue";
 import ProxyPoolPage from "./components/ProxyPoolPage.vue";
 import TokenStatsPage from "./components/TokenStatsPage.vue";
 import ModelCatalogPage from "./components/ModelCatalogPage.vue";
-import ModelAggregatePage from "./components/ModelAggregatePage.vue";
 import ModelProxyPage from "./components/ModelProxyPage.vue";
 
 const store = useStore();
@@ -80,7 +79,7 @@ function onKeydown(event: KeyboardEvent) {
     else if (store.linkDialogOpen.value) store.closeLinkDialog();
     else if (store.modalOpen.value) store.closeModal();
     else if (store.page.value === "settings") store.closeSettings();
-    else if (["library", "modelparams", "modelagg", "charity", "proxy", "tokenstats"].includes(store.page.value)) store.openTokenStats();
+    else if (["library", "modelparams", "charity", "proxy", "tokenstats"].includes(store.page.value)) store.openTokenStats();
   }
 }
 
@@ -94,7 +93,6 @@ function onMenuNavigate(event: Event) {
   const page = detail?.page;
   if (page === "library") store.openLibrary();
   else if (page === "modelparams") store.openModelParams();
-  else if (page === "modelagg") store.openModelAgg();
   else if (page === "modelproxy") store.openModelProxy();
   else if (page === "charity") store.openCharityMonitor();
   else if (page === "proxy") store.openProxyPool();
@@ -129,7 +127,6 @@ onMounted(async () => {
     store.loadLibrary(),
     store.loadProxyPool(),
     store.initializeModelCatalog(),
-    store.loadModelAggregation(),
   ]);
   store.startDailyRefresh();
   store.startCharityMonitor();
@@ -185,14 +182,6 @@ onUnmounted(() => {
           aria-labelledby="modelparams-nav"
         >
           <ModelCatalogPage />
-        </div>
-        <div
-          v-else-if="store.page.value === 'modelagg'"
-          id="model-agg-panel"
-          class="modelagg-panel"
-          aria-labelledby="modelagg-nav"
-        >
-          <ModelAggregatePage />
         </div>
         <div
           v-else-if="store.page.value === 'modelproxy'"

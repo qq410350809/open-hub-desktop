@@ -8,12 +8,12 @@ mod chrome_usage;
 mod db;
 mod detect_all;
 mod file_export;
+mod mihomo_kernel;
 mod models;
 pub use detect_all::run_library_detect;
 mod model_catalog;
 pub use model_catalog::sync_model_catalog_once;
 mod models_fetch;
-mod gateway;
 mod opencode_proxy;
 mod platform_detect;
 mod proxy_pool;
@@ -211,6 +211,9 @@ mod tests {
                     site_id TEXT NOT NULL,
                     profile_id TEXT NOT NULL,
                     error TEXT NOT NULL DEFAULT '',
+                    keys_json TEXT NOT NULL DEFAULT '[]',
+                    models_json TEXT NOT NULL DEFAULT '[]',
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     PRIMARY KEY (site_id, profile_id)
                 );",
             )
@@ -717,53 +720,6 @@ mod tests {
     }
 
     #[test]
-    fn chrome_models_bridge_keeps_keys_inside_the_same_origin_script() {
-        let script = chrome_models_bridge_script("NewAPI", Some("10288"), "openhub-models-123");
-
-        assert!(script.contains("keyPath = \"/api/token/?p=1&size=20\""));
-        assert!(script.contains("keyPath = \"/api/v1/keys?page=1\""));
-        assert!(!script.contains("keyPath = \"/api/token?p=0&size=100\""));
-        assert!(!script.contains("keyPath = \"/v1/keys\""));
-        assert!(script.contains("`/api/token/${encodeURIComponent(tokenId)}/key`"));
-        assert!(script.contains(
-            "`/api/token/${encodeURIComponent(tokenId)}/key`, { method: \"POST\", headers }"
-        ));
-        assert!(!script.contains(
-            "`/api/token/${encodeURIComponent(tokenId)}/key`, { method: \"GET\", headers }"
-        ));
-        assert!(script.contains("readJson(\"/v1/models\""));
-        assert!(script.contains("const useRefreshAuth = false"));
-        assert!(script.contains("readJson(\"/api/user/auth/refresh\""));
-        assert!(script.contains("if (useRefreshAuth && keyResponse.status === 401)"));
-        assert!(script.contains(
-            "if (systemType === \"sub2api\" && dashboardAccessToken) keys.push(dashboardAccessToken)"
-        ));
-        assert!(!script.contains("if (dashboardAccessToken) keys.push(dashboardAccessToken)"));
-        assert!(!script.contains("!keyResponse.ok || extractKeys(keyResponse.data).length === 0"));
-        assert!(script.contains("return \"__OPENHUB_PROFILE_MISMATCH__\""));
-        assert!(!script.contains("http://"));
-        assert!(!script.contains("https://"));
-
-        let refresh_script = chrome_models_bridge_script("newapi2", None, "openhub-models-refresh");
-        assert!(refresh_script.contains("const useRefreshAuth = true"));
-
-        let result = parse_chrome_models_result(
-            r#"{"ok":true,"source":"newapi-key","keys":["sk-model-key"],"models":[{"id":"gpt-5","ownedBy":"openai"}]}"#,
-        )
-        .unwrap();
-        assert_eq!(result.source, "newapi-key");
-        assert_eq!(result.keys, ["sk-model-key"]);
-        assert_eq!(result.models[0].id, "gpt-5");
-
-        assert_eq!(
-            parse_chrome_models_keys(
-                r#"{"ok":false,"error":"模型接口 HTTP 401","keys":["sk-partial-key"]}"#,
-            ),
-            ["sk-partial-key"]
-        );
-    }
-
-    #[test]
     fn normalizes_remote_optional_urls_without_rejecting_the_sync() {
         let base_url = "https://magic.example/api/v1";
 
@@ -935,7 +891,7 @@ mod tests {
         assert!(script.contains("fetch(\"/api/user/self\""));
         assert!(script.contains("`/api/user/checkin?month=${encodeURIComponent(\"2026-08\")}`"));
         assert!(script.contains("fetch(\"/api/user/checkin\""));
-        assert!(script.contains("`/api/log/self?p=1&page_size=20&type=4&start_timestamp="));
+        assert!(script.contains("`/api/log/self?p=1&page_size=20&type="));
         assert_eq!(script.matches("fetch(").count(), 6);
         assert!(!script.contains("http://"));
         assert!(!script.contains("https://"));
@@ -1087,11 +1043,35 @@ pub fn run() {
             if let Err(error) = token_stats::seed_token_database_from_caches(&database) {
                 eprintln!("[OpenHub] Token 缓存迁移到数据库失败：{error}");
             }
+            let bin_dir = app_data_dir.join("bin");
+            let _ = fs::create_dir_all(&bin_dir);
+            let target_mihomo = bin_dir.join(if cfg!(target_os = "windows") { "mihomo.exe" } else { "mihomo" });
+            if !target_mihomo.exists() {
+                for legacy in [
+                    "/Applications/Clash Verge.app/Contents/MacOS/verge-mihomo",
+                    "/Applications/Clash Party.app/Contents/Resources/sidecar/mihomo",
+                ] {
+                    let p = std::path::Path::new(legacy);
+                    if p.is_file() {
+                        if fs::copy(p, &target_mihomo).is_ok() {
+                            #[cfg(unix)]
+                            {
+                                use std::os::unix::fs::PermissionsExt;
+                                if let Ok(meta) = fs::metadata(&target_mihomo) {
+                                    let mut perms = meta.permissions();
+                                    perms.set_mode(0o755);
+                                    let _ = fs::set_permissions(&target_mihomo, perms);
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
             let proxy_runtime = proxy_pool::ProxyRuntime::new(app_data_dir.join("proxy-runtime"));
             let charity_runtime = charity_monitor::CharityMonitorRuntime::new();
             let auto_sync_runtime = auto_sync::AutoSyncRuntime::default();
             let model_catalog_runtime = model_catalog::ModelCatalogRuntime::new();
-            let gateway_state = gateway::GatewayState::new();
             let opencode_proxy_state =
                 opencode_proxy::OpencodeProxyState::new_with_app(Some(app.handle().clone()));
             app.manage(database);
@@ -1099,7 +1079,6 @@ pub fn run() {
             app.manage(charity_runtime);
             app.manage(auto_sync_runtime);
             app.manage(model_catalog_runtime);
-            app.manage(gateway_state);
             app.manage(opencode_proxy_state);
             // 启动时清理历史订阅里遗留的测速结果后缀，避免旧库节点名继续显示脏数据。
             if let Err(error) =
@@ -1151,14 +1130,8 @@ pub fn run() {
                 // 与公益监听错开启动（调度器内部还有首轮延迟）。
                 auto_sync::start_auto_sync(restore_handle.clone());
 
-                // 启动本地 Key 聚合轮询代理网关
-                let database = restore_handle.state::<crate::models::Database>();
-                let gw_state = restore_handle.state::<crate::gateway::GatewayState>();
-                if let Err(e) = gateway::start_gateway(database.clone(), gw_state, None).await {
-                    eprintln!("[OpenHub] 本地聚合网关启动失败: {e}");
-                }
-
                 // 启动 OpenCode 独立反代服务
+                let database = restore_handle.state::<crate::models::Database>();
                 let proxy_state = restore_handle.state::<crate::opencode_proxy::OpencodeProxyState>();
                 let proxy_cfg = {
                     let conn = database.0.lock().ok();
@@ -1261,11 +1234,6 @@ pub fn run() {
             web_server::get_lightweight_mode_state,
             web_server::enter_lightweight_mode,
             web_server::show_main_window,
-            gateway::get_gateway_status,
-            gateway::start_gateway,
-            gateway::stop_gateway,
-            gateway::update_gateway_config,
-            gateway::reload_gateway_candidates,
             opencode_proxy::get_opencode_proxy_config,
             opencode_proxy::save_opencode_proxy_config_cmd,
             opencode_proxy::get_opencode_proxy_status,
@@ -1276,7 +1244,10 @@ pub fn run() {
             opencode_proxy::get_opencode_proxy_logs,
             opencode_proxy::get_opencode_channel_stats,
             opencode_proxy::clear_opencode_proxy_logs,
-            file_export::save_export_file
+            file_export::save_export_file,
+            mihomo_kernel::get_mihomo_kernel_status,
+            mihomo_kernel::check_mihomo_kernel_update,
+            mihomo_kernel::download_or_update_mihomo_kernel
         ])
         .build(tauri::generate_context!())
         .expect("error while building Tauri application")

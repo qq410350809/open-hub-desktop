@@ -390,6 +390,7 @@ pub(crate) struct ProxyChannel {
     pub(crate) name: String,
     pub(crate) node_id: String,
     pub(crate) node: Option<ProxyNode>,
+    pub(crate) port: Option<u16>,
     pub(crate) test_url: String,
     pub(crate) account_count: i64,
     pub(crate) accounts: Vec<ProxyChannelAccount>,

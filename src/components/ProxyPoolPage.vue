@@ -3,6 +3,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, watch 
 import { icons } from "../icons";
 import { useStore } from "../composables/useStore";
 import { usePreferences } from "../composables/usePreferences";
+import CustomSelect from "./CustomSelect.vue";
 import type { ProxyChannel, ProxyNode, ProxySubscription } from "../types";
 
 const store = useStore();
@@ -18,12 +19,20 @@ const nodeSearchQuery = ref("");
 // 延迟级别过滤
 const latencyFilter = ref<"500" | "1000" | "2000" | "error" | "all">("1000");
 const latencyFilterOptions = [
-  { value: "500", label: "≤ 500ms" },
-  { value: "1000", label: "≤ 1000ms" },
-  { value: "2000", label: "≤ 2000ms" },
-  { value: "error", label: "失败/超时" },
-  { value: "all", label: "全部节点" },
-] as const;
+  { value: "500", text: "≤ 500ms" },
+  { value: "1000", text: "≤ 1000ms" },
+  { value: "2000", text: "≤ 2000ms" },
+  { value: "error", text: "失败/超时" },
+  { value: "all", text: "全部节点" },
+];
+
+const sourceOptions = computed(() => [
+  { value: "all", text: `全部来源 (${store.proxyPool.value.nodeCount})` },
+  ...store.proxyPool.value.subscriptions.map((sub) => ({
+    value: sub.id,
+    text: `${sub.name} (${sub.nodeCount})`,
+  })),
+]);
 
 const channels = computed(() => store.proxyPool.value.channels);
 const settingsOpen = ref(false);
@@ -291,6 +300,7 @@ function syncSettings() {
 function openSettings() {
   settingsOpen.value = true;
   document.body.classList.add("modal-open");
+  void store.loadMihomoKernelStatus();
 }
 function closeSettings() {
   settingsOpen.value = false;
@@ -1095,43 +1105,25 @@ watch(nodeViewMode, () => {
 
           <div class="pp-strip-divider" />
 
-          <!-- 来源快速切换胶囊 -->
-          <div class="pp-source-pills-slider">
-            <button
-              type="button"
-              class="pp-filter-pill"
-              :class="{ active: selectedSource === 'all' }"
-              @click="selectedSource = 'all'"
-            >
-              全部来源 ({{ store.proxyPool.value.nodeCount }})
-            </button>
-            <button
-              v-for="sub in store.proxyPool.value.subscriptions"
-              :key="sub.id"
-              type="button"
-              class="pp-filter-pill"
-              :class="{ active: selectedSource === sub.id }"
-              @click="selectedSource = sub.id"
-            >
-              {{ sub.name }} ({{ sub.nodeCount }})
-            </button>
-          </div>
+          <!-- 来源快速切换下拉框 -->
+          <CustomSelect
+            class="pp-strip-dropdown"
+            :options="sourceOptions"
+            :model-value="selectedSource"
+            aria-label="来源筛选"
+            @update:model-value="selectedSource = String($event)"
+          />
 
           <div class="pp-strip-divider" />
 
-          <!-- 延迟范围快捷胶囊 -->
-          <div class="pp-latency-pills">
-            <button
-              v-for="opt in latencyFilterOptions"
-              :key="opt.value"
-              type="button"
-              class="pp-latency-btn"
-              :class="{ active: latencyFilter === opt.value }"
-              @click="latencyFilter = opt.value"
-            >
-              {{ opt.label }}
-            </button>
-          </div>
+          <!-- 延迟范围下拉框 -->
+          <CustomSelect
+            class="pp-strip-dropdown"
+            :options="latencyFilterOptions"
+            :model-value="latencyFilter"
+            aria-label="延迟范围筛选"
+            @update:model-value="latencyFilter = $event as any"
+          />
         </div>
 
         <div class="pp-strip-right">
@@ -1703,6 +1695,55 @@ watch(nodeViewMode, () => {
             </header>
 
             <div class="pp-modal-body">
+              <!-- 内核管理卡片 -->
+              <div class="pp-settings-field-group" style="padding-bottom: 16px; border-bottom: 1px solid var(--border-color, rgba(255,255,255,0.08)); margin-bottom: 16px;">
+                <label class="pp-label">OpenHub 内置 Mihomo 内核</label>
+                <div style="display: flex; justify-content: space-between; align-items: center; background: rgba(0,0,0,0.04); padding: 12px 14px; border-radius: 8px; border: 1px solid var(--border-color, rgba(255,255,255,0.08));">
+                  <div>
+                    <div v-if="store.kernelLoading?.value" style="font-size: 13px; color: var(--text-dim);">正在检测内核状态…</div>
+                    <div v-else-if="store.kernelStatus?.value?.installed" style="font-size: 13px; font-weight: 500;">
+                      <span>{{ store.kernelStatus.value.version }}</span>
+                      <span v-if="store.kernelStatus.value.latestVersion && store.kernelStatus.value.latestVersion !== store.kernelStatus.value.version" style="color: var(--primary, #3b82f6); margin-left: 6px; font-size: 12px;">
+                        (发现新版本 {{ store.kernelStatus.value.latestVersion }})
+                      </span>
+                      <div style="font-size: 11px; color: var(--text-dim); margin-top: 4px; font-family: monospace;">{{ store.kernelStatus.value.path }}</div>
+                    </div>
+                    <div v-else style="font-size: 13px; color: var(--danger, #ef4444); font-weight: 500;">
+                      未检测到内置内核，请一键下载
+                    </div>
+
+                    <div v-if="store.kernelDownloading?.value" style="margin-top: 8px;">
+                      <div style="background: rgba(0,0,0,0.1); border-radius: 4px; height: 5px; overflow: hidden; width: 220px;">
+                        <div style="background: var(--primary, #3b82f6); height: 100%; transition: width 0.2s;" :style="{ width: `${Math.max(5, Math.round((store.kernelDownloadProgress?.value?.progress ?? 0) * 100))}%` }" />
+                      </div>
+                      <div style="color: var(--primary, #3b82f6); font-size: 11px; margin-top: 4px;">{{ store.kernelDownloadProgress?.value?.message }}</div>
+                    </div>
+                  </div>
+
+                  <div style="display: flex; gap: 8px; align-items: center;">
+                    <button
+                      v-if="store.kernelStatus?.value?.installed"
+                      type="button"
+                      class="pp-btn-cancel"
+                      style="font-size: 12px; padding: 4px 10px; height: 28px;"
+                      :disabled="store.kernelLoading?.value || store.kernelChecking?.value || store.kernelDownloading?.value"
+                      @click="store.checkMihomoKernelUpdate()"
+                    >
+                      {{ store.kernelChecking?.value ? "检查中…" : "检查更新" }}
+                    </button>
+                    <button
+                      type="button"
+                      class="pp-btn-primary"
+                      style="font-size: 12px; padding: 4px 12px; height: 28px;"
+                      :disabled="store.kernelLoading?.value || store.kernelDownloading?.value"
+                      @click="store.downloadOrUpdateMihomoKernel()"
+                    >
+                      {{ store.kernelDownloading?.value ? "下载中…" : (store.kernelStatus?.value?.installed ? "重新下载 / 更新" : "一键下载内核") }}
+                    </button>
+                  </div>
+                </div>
+              </div>
+
               <div class="pp-settings-field-group">
                 <label class="pp-label">直连与忽略地址名单</label>
                 <textarea
@@ -2285,17 +2326,9 @@ watch(nodeViewMode, () => {
   display: flex;
   align-items: center;
   gap: 8px;
-  overflow-x: auto;
-  scrollbar-width: none;
-  -ms-overflow-style: none;
   min-width: 0;
   flex: 1;
-}
-
-.pp-strip-left::-webkit-scrollbar {
-  display: none;
-  width: 0;
-  height: 0;
+  flex-wrap: wrap;
 }
 
 .pp-view-switcher {
@@ -2348,77 +2381,33 @@ watch(nodeViewMode, () => {
   flex-shrink: 0;
 }
 
-.pp-source-pills-slider {
-  display: inline-flex;
-  align-items: center;
-  gap: 3px;
-  overflow-x: auto;
-  scrollbar-width: none;
-  -ms-overflow-style: none;
+.pp-strip-dropdown {
+  min-width: 130px;
+  flex-shrink: 0;
 }
 
-.pp-source-pills-slider::-webkit-scrollbar {
-  display: none;
-  width: 0;
-  height: 0;
+.pp-strip-dropdown.select-box {
+  height: 30px;
 }
 
-.pp-filter-pill {
-  display: inline-flex;
-  align-items: center;
-  height: 26px;
+.pp-strip-dropdown .select-trigger {
   padding: 0 8px;
-  border-radius: 5px;
-  border: 1px solid transparent;
-  background: transparent;
-  color: var(--muted);
   font-size: 11px;
   font-weight: 600;
-  cursor: pointer;
-  transition: all 0.12s ease;
-  white-space: nowrap;
 }
 
-.pp-filter-pill:hover {
-  color: var(--text);
-  background: var(--surface-hover);
+.pp-strip-dropdown .select-trigger svg {
+  width: 12px;
 }
 
-.pp-filter-pill.active {
-  background: var(--page-bg);
-  border-color: var(--line);
-  color: var(--brand);
+.pp-strip-dropdown .select-menu {
+  z-index: 200;
 }
 
-.pp-latency-pills {
-  display: inline-flex;
-  align-items: center;
-  gap: 2px;
-}
-
-.pp-latency-btn {
-  height: 26px;
-  padding: 0 8px;
-  border-radius: 5px;
-  border: 1px solid transparent;
-  background: transparent;
-  color: var(--muted);
+.pp-strip-dropdown .select-option {
+  min-height: 30px;
+  padding: 5px 8px;
   font-size: 11px;
-  font-weight: 600;
-  cursor: pointer;
-  transition: all 0.12s ease;
-  white-space: nowrap;
-}
-
-.pp-latency-btn:hover {
-  color: var(--text);
-  background: var(--surface-hover);
-}
-
-.pp-latency-btn.active {
-  background: var(--page-bg);
-  border-color: var(--line);
-  color: var(--text);
 }
 
 .pp-strip-right {

@@ -377,11 +377,11 @@ onUnmounted(() => {
               :title="session.hasAccessToken ? '此账号已缓存 NewAPI 访问令牌' : '此账号尚未取得 NewAPI 访问令牌'"
             >{{ session.hasAccessToken ? "有访问令牌" : "无访问令牌" }}</span>
             <span
-              v-if="session.checkinEnabled || session.checkinError"
+              v-if="session.checkinEnabled || site.supportsCheckin || session.checkinError"
               class="usage-account-checkin"
-              :class="{ 'is-checked': session.checkedInToday, 'has-error': session.checkinError }"
-              :title="session.checkinError || (session.checkedInToday ? '今日已签到' : '今日未签到')"
-            >{{ session.checkinError ? "签到异常" : (session.checkedInToday ? "已签到" : "未签到") }}</span>
+              :class="{ 'is-checked': session.checkedInToday, 'has-error': session.checkinError, 'is-disabled': !session.checkedInToday && !session.checkinEnabled }"
+              :title="session.checkinError || (session.checkedInToday ? '今日已签到' : (session.checkinEnabled ? '今日未签到' : '无法自动签到（404/403/未启用）'))"
+            >{{ session.checkinError ? "签到异常" : (session.checkedInToday ? "已签到" : (session.checkinEnabled ? "未签到" : "无法签到")) }}</span>
             <span v-if="session.apiCountsSynced && !session.apiSyncError">
               {{ session.apiKeyCount ?? 0 }} 个 Key · {{ session.apiModelCount ?? 0 }} 个模型
             </span>

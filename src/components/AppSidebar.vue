@@ -44,18 +44,6 @@ const navItems = computed(() => [
     onClick: () => store.openModelParams(),
   },
   {
-    id: "modelagg",
-    label: "模型聚合",
-    icon: icons.layers,
-    active: store.page.value === "modelagg",
-    badge: store.modelAggModelCount.value
-      ? store.modelAggModelCount.value >= 1_000
-        ? `${(store.modelAggModelCount.value / 1_000).toFixed(1)}K`
-        : String(store.modelAggModelCount.value)
-      : "",
-    onClick: () => store.openModelAgg(),
-  },
-  {
     id: "modelproxy",
     label: "模型反代",
     icon: icons.repeat,

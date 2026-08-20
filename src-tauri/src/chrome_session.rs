@@ -372,10 +372,11 @@ pub(crate) fn run_javascript_in_chrome_profile(
     marker: &str,
     javascript: &str,
     timeout: Duration,
+    proxy_url: Option<&str>,
 ) -> Result<String, String> {
     validate_chrome_bridge_marker(marker)?;
     let existing_tab_ids = chrome_tab_ids();
-    open_url_in_chrome_profile_blocking_with_mode(target_url, profile_id, false)?;
+    open_url_in_chrome_profile_blocking_with_mode(target_url, profile_id, false, proxy_url)?;
     let target_tab_id =
         wait_for_new_chrome_tab(&existing_tab_ids, target_url, Duration::from_secs(8));
     run_javascript_in_marked_chrome_tab(marker, javascript, target_tab_id.as_deref(), timeout)
@@ -388,10 +389,11 @@ pub(crate) fn run_javascript_in_background_chrome_profile(
     marker: &str,
     javascript: &str,
     timeout: Duration,
+    proxy_url: Option<&str>,
 ) -> Result<String, String> {
     validate_chrome_bridge_marker(marker)?;
     let existing_tab_ids = chrome_tab_ids();
-    open_url_in_chrome_profile_blocking_with_mode(target_url, profile_id, true)?;
+    open_url_in_chrome_profile_blocking_with_mode(target_url, profile_id, true, proxy_url)?;
     let target_tab_id =
         wait_for_new_chrome_tab(&existing_tab_ids, target_url, Duration::from_secs(8));
     let result =
@@ -679,6 +681,7 @@ pub(crate) fn run_javascript_in_chrome_profile(
     _marker: &str,
     _javascript: &str,
     _timeout: Duration,
+    _proxy_url: Option<&str>,
 ) -> Result<String, String> {
     Err("当前仅支持在 macOS 上通过 Chrome 同步账号".into())
 }
@@ -690,13 +693,14 @@ pub(crate) fn run_javascript_in_background_chrome_profile(
     _marker: &str,
     _javascript: &str,
     _timeout: Duration,
+    _proxy_url: Option<&str>,
 ) -> Result<String, String> {
     Err("当前仅支持在 macOS 上通过 Chrome 同步账号".into())
 }
 
 #[cfg(target_os = "macos")]
 fn open_url_in_chrome_profile_blocking(url: &str, profile_id: &str) -> Result<(), String> {
-    open_url_in_chrome_profile_blocking_with_mode(url, profile_id, false)
+    open_url_in_chrome_profile_blocking_with_mode(url, profile_id, false, None)
 }
 
 #[cfg(target_os = "macos")]
@@ -704,6 +708,7 @@ fn open_url_in_chrome_profile_blocking_with_mode(
     url: &str,
     profile_id: &str,
     background: bool,
+    proxy_url: Option<&str>,
 ) -> Result<(), String> {
     if !is_safe_profile_dir(profile_id) {
         return Err("Chrome Profile 标识无效".into());
@@ -713,9 +718,15 @@ fn open_url_in_chrome_profile_blocking_with_mode(
     if background {
         command.arg("-g");
     }
-    let status = command
+    command
         .args(["-na", "Google Chrome", "--args"])
-        .arg(format!("--profile-directory={profile_id}"))
+        .arg(format!("--profile-directory={profile_id}"));
+    if let Some(proxy) = proxy_url {
+        if !proxy.trim().is_empty() {
+            command.arg(format!("--proxy-server={proxy}"));
+        }
+    }
+    let status = command
         .arg(parsed.as_str())
         .status()
         .map_err(|error| format!("无法启动 Google Chrome：{error}"))?;

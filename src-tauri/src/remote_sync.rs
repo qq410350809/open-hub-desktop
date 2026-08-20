@@ -2,7 +2,6 @@ use crate::chrome_session;
 use crate::db::*;
 use crate::models::*;
 use crate::site_ops::*;
-use rusqlite::OptionalExtension;
 use std::{collections::HashSet, time::Duration};
 use tauri::{Manager, State};
 
@@ -182,11 +181,50 @@ pub async fn get_remote_user(
     })
 }
 
+pub(crate) fn normalize_url_key(url: &str) -> String {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if let Ok(parsed) = url::Url::parse(trimmed) {
+        let scheme = parsed.scheme().to_lowercase();
+        let host = parsed.host_str().unwrap_or("").to_lowercase();
+        let port = parsed.port();
+        let path = parsed.path().trim_end_matches('/').to_string();
+        let port_str = match (scheme.as_str(), port) {
+            ("http", Some(80)) | ("https", Some(443)) | (_, None) => String::new(),
+            (_, Some(p)) => format!(":{}", p),
+        };
+        let query_str = parsed
+            .query()
+            .map(|q| format!("?{}", q))
+            .unwrap_or_default();
+        format!("{}://{}{}{}{}", scheme, host, port_str, path, query_str)
+    } else {
+        let mut s = trimmed.to_string();
+        while s.ends_with('/') {
+            s.pop();
+        }
+        s
+    }
+}
+
+struct ExistingLocalSite {
+    id: String,
+    favorite: bool,
+    hidden: bool,
+    is_personal: bool,
+    is_pending: bool,
+    use_system_proxy: bool,
+    use_proxy_pool: bool,
+    system_type: String,
+}
+
 #[tauri::command]
 pub async fn sync_remote_sites(
     app: tauri::AppHandle,
     database: State<'_, Database>,
-    runaway: bool,
+    _runaway: Option<bool>,
     run_id: u64,
 ) -> Result<SyncSitesResult, String> {
     emit_sync_progress(
@@ -207,145 +245,246 @@ pub async fn sync_remote_sites(
     let client = build_http_client(&database, Duration::from_secs(30), 5, "同步请求")?;
     let cookie = reqwest::header::HeaderValue::from_str(&session.cookie_header)
         .map_err(|_| "Chrome 登录 Cookie 格式无效".to_string())?;
-    let sites_url = if runaway {
-        format!("{REMOTE_SITES_URL}?mode=runaway")
-    } else {
-        REMOTE_SITES_URL.to_string()
-    };
+
     emit_sync_progress(
         &app,
         run_id,
         "download",
         "running",
-        format!("正在请求{}站点列表", if runaway { "跑路" } else { "存活" }),
+        "正在同时请求存活站点与跑路站点列表".into(),
     );
-    let response = client
-        .get(sites_url)
+
+    let alive_request = client
+        .get(REMOTE_SITES_URL)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .header(reqwest::header::USER_AGENT, "OpenHub-Desktop/0.3")
+        .header(reqwest::header::COOKIE, cookie.clone())
+        .send();
+
+    let runaway_url = format!("{REMOTE_SITES_URL}?mode=runaway");
+    let runaway_request = client
+        .get(runaway_url)
         .header(reqwest::header::ACCEPT, "application/json")
         .header(reqwest::header::USER_AGENT, "OpenHub-Desktop/0.3")
         .header(reqwest::header::COOKIE, cookie)
-        .send()
-        .await
+        .send();
+
+    let (alive_response, runaway_response) = tokio::try_join!(alive_request, runaway_request)
         .map_err(|error| format!("无法连接站点同步接口：{error}"))?;
+
     if matches!(
-        response.status(),
+        alive_response.status(),
+        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+    ) || matches!(
+        runaway_response.status(),
         reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
     ) {
         return Err("Chrome 登录会话已失效，请重新登录后重试".into());
     }
-    if !response.status().is_success() {
+
+    if !alive_response.status().is_success() {
         return Err(format!(
-            "站点同步接口请求失败（HTTP {}）",
-            response.status().as_u16()
+            "存活站点同步接口请求失败（HTTP {}）",
+            alive_response.status().as_u16()
         ));
     }
+    if !runaway_response.status().is_success() {
+        return Err(format!(
+            "跑路站点同步接口请求失败（HTTP {}）",
+            runaway_response.status().as_u16()
+        ));
+    }
+
     emit_sync_progress(
         &app,
         run_id,
         "download",
         "success",
-        format!("站点接口响应正常（HTTP {}）", response.status().as_u16()),
+        "存活与跑路站点接口响应正常".into(),
     );
     emit_sync_progress(
         &app,
         run_id,
         "parse",
         "running",
-        "正在解析并校验远端站点数据".into(),
+        "正在解析并校验远端存活与跑路站点数据".into(),
     );
-    let response_json = response
-        .json::<serde_json::Value>()
-        .await
-        .map_err(|error| format!("站点同步接口返回格式不正确：{error}"))?;
-    let remote_sites = remote_sites_from_json(response_json)?;
+
+    let (alive_json, runaway_json) = tokio::try_join!(
+        async {
+            alive_response
+                .json::<serde_json::Value>()
+                .await
+                .map_err(|error| format!("存活站点接口返回格式不正确：{error}"))
+        },
+        async {
+            runaway_response
+                .json::<serde_json::Value>()
+                .await
+                .map_err(|error| format!("跑路站点接口返回格式不正确：{error}"))
+        }
+    )?;
+
+    let mut alive_sites = remote_sites_from_json(alive_json)?;
+    for site in &mut alive_sites {
+        site.is_runaway = false;
+    }
+
+    let mut runaway_sites = remote_sites_from_json(runaway_json)?;
+    for site in &mut runaway_sites {
+        site.is_runaway = true;
+    }
+
+    let alive_count = alive_sites.len();
+    let runaway_count = runaway_sites.len();
+    let mut all_remote_sites = Vec::with_capacity(alive_count + runaway_count);
+    all_remote_sites.extend(alive_sites);
+    all_remote_sites.extend(runaway_sites);
+
     emit_sync_progress(
         &app,
         run_id,
         "parse",
         "success",
-        format!("已解析 {} 条远端站点记录", remote_sites.len()),
+        format!(
+            "已解析 {} 条远端站点记录（存活 {} 条，跑路 {} 条）",
+            all_remote_sites.len(),
+            alive_count,
+            runaway_count
+        ),
     );
     emit_sync_progress(
         &app,
         run_id,
         "save",
         "running",
-        "正在写入本地数据库并保留本地状态".into(),
+        "正在写入本地数据库并保留本地类型与在用状态".into(),
     );
 
     let mut connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
     let transaction = connection
         .transaction()
         .map_err(|error| error.to_string())?;
+
+    let mut existing_map: std::collections::HashMap<String, ExistingLocalSite> =
+        std::collections::HashMap::new();
+    let mut existing_ids: HashSet<String> = HashSet::new();
+
+    {
+        let mut statement = transaction
+            .prepare(
+                "SELECT id, api_base_url, favorite, hidden, is_personal, is_pending, use_system_proxy, use_proxy_pool, system_type FROM directory_sites",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)? != 0,
+                    row.get::<_, i64>(3)? != 0,
+                    row.get::<_, i64>(4)? != 0,
+                    row.get::<_, i64>(5)? != 0,
+                    row.get::<_, i64>(6)? != 0,
+                    row.get::<_, i64>(7)? != 0,
+                    row.get::<_, String>(8)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?;
+
+        for item in rows {
+            let (
+                id,
+                api_base_url,
+                favorite,
+                hidden,
+                is_personal,
+                is_pending,
+                use_system_proxy,
+                use_proxy_pool,
+                system_type,
+            ) = item.map_err(|error| error.to_string())?;
+            existing_ids.insert(id.clone());
+            let key = normalize_url_key(&api_base_url);
+            if !key.is_empty() {
+                existing_map.insert(
+                    key,
+                    ExistingLocalSite {
+                        id,
+                        favorite,
+                        hidden,
+                        is_personal,
+                        is_pending,
+                        use_system_proxy,
+                        use_proxy_pool,
+                        system_type,
+                    },
+                );
+            }
+        }
+    }
+
     let mut added = 0_usize;
     let mut updated = 0_usize;
     let mut synced_ids = HashSet::new();
+    let mut processed_url_keys = HashSet::new();
 
-    for mut site in remote_sites {
-        site.id = site.id.trim().to_string();
-        if site.id.is_empty() {
-            return Err("远端站点数据包含空 ID，已取消本次同步".into());
+    for mut site in all_remote_sites {
+        let url_key = normalize_url_key(&site.api_base_url);
+        if url_key.is_empty() && site.id.trim().is_empty() {
+            continue;
         }
-        if !synced_ids.insert(site.id.clone()) {
+        if !url_key.is_empty() && !processed_url_keys.insert(url_key.clone()) {
+            // 同一批次中重复出现的站点地址，跳过后续重复项
             continue;
         }
 
-        let existing = transaction
-            .query_row(
-                "SELECT favorite, hidden, is_personal, is_pending, use_system_proxy, use_proxy_pool, system_type FROM directory_sites WHERE id = ?1",
-                [&site.id],
-                |row| {
-                    Ok((
-                        row.get::<_, i64>(0)? != 0,
-                        row.get::<_, i64>(1)? != 0,
-                        row.get::<_, i64>(2)? != 0,
-                        row.get::<_, i64>(3)? != 0,
-                        row.get::<_, i64>(4)? != 0,
-                        row.get::<_, i64>(5)? != 0,
-                        row.get::<_, String>(6)?,
-                    ))
-                },
-            )
-            .optional()
-            .map_err(|error| error.to_string())?;
-        if let Some((
-            favorite,
-            hidden,
-            is_personal,
-            is_pending,
-            use_system_proxy,
-            use_proxy_pool,
-            system_type,
-        )) = existing
-        {
-            site.favorite = favorite;
-            site.hidden = hidden;
-            site.is_personal = is_personal;
-            site.is_pending = is_pending && !is_personal;
-            site.use_system_proxy = use_system_proxy;
-            site.use_proxy_pool = use_proxy_pool;
-            // 已存在站点的类型一律冻结：本地类型可能来自用户手工调整或既有证据，
+        let existing_match = if !url_key.is_empty() {
+            existing_map.get(&url_key)
+        } else {
+            None
+        };
+
+        if let Some(existing) = existing_match {
+            site.id = existing.id.clone();
+            site.favorite = existing.favorite;
+            site.hidden = existing.hidden;
+            site.is_personal = existing.is_personal;
+            site.is_pending = existing.is_pending && !existing.is_personal;
+            site.use_system_proxy = existing.use_system_proxy;
+            site.use_proxy_pool = existing.use_proxy_pool;
+            // 已存在站点的类型一律冻结保留：本地类型可能来自用户手工调整或既有证据，
             // 全量同步只允许为“新增站点”提供类型；本地非空时绝不改写，
-            // 本地为空（历史遗留缺类型）时才用远端值补齐——补缺不算修改。
-            if !system_type.trim().is_empty() {
-                site.system_type = system_type;
+            // 本地为空（历史遗留缺类型）时才用远端值补齐。
+            if !existing.system_type.trim().is_empty() {
+                site.system_type = existing.system_type.clone();
             }
             updated += 1;
         } else {
+            site.id = site.id.trim().to_string();
+            if site.id.is_empty() || existing_ids.contains(&site.id) {
+                site.id = generated_id();
+            }
+            existing_ids.insert(site.id.clone());
             site.favorite = false;
             site.hidden = false;
+            site.is_personal = false;
             site.is_pending = false;
             site.use_system_proxy = false;
             site.use_proxy_pool = false;
             added += 1;
         }
-        site.is_runaway = runaway;
+
+        if !synced_ids.insert(site.id.clone()) {
+            continue;
+        }
 
         let site_name = site.name.clone();
         let site = normalize_remote_site(site)
             .map_err(|error| format!("同步站点「{site_name}」失败：{error}"))?;
         insert_site_transaction(&transaction, &site)?;
     }
+
     transaction.commit().map_err(|error| error.to_string())?;
     emit_sync_progress(
         &app,
@@ -373,7 +512,7 @@ pub async fn sync_remote_sites(
         profile_name: session.profile_name,
         account_name: session.account_name,
         user_name,
-        runaway,
+        runaway: false,
         site_ids,
     })
 }

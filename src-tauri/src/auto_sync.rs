@@ -322,8 +322,8 @@ fn load_stale_model_targets(
          JOIN directory_sites ds ON ds.id = sa.site_id
          LEFT JOIN site_model_cache smc
            ON smc.site_id = sa.site_id AND smc.profile_id = sa.profile_id
-         WHERE sa.is_valid = 1 AND ds.is_personal = 1
-           AND (smc.profile_id IS NULL
+          WHERE sa.is_valid = 1 AND ds.is_personal = 1 AND sa.api_key_count > 0
+            AND (smc.profile_id IS NULL
                 OR strftime('%s', smc.updated_at) IS NULL
                 OR strftime('%s', 'now') - strftime('%s', smc.updated_at) >= ?1)
          ORDER BY smc.updated_at IS NOT NULL, smc.updated_at ASC

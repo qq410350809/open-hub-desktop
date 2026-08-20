@@ -271,57 +271,26 @@ export interface ModelItem {
 export type ThemePreference = "system" | "light" | "dark";
 export type ProxyNodeViewModePreference = "list" | "country";
 
-/** 模型聚合页：同名分组的展示模式（聚合 = 跨站合并，独立 = 各站分开）。 */
-export type ModelAggGroupMode = "aggregate" | "independent";
-
-export interface GatewayStatus {
-  running: boolean;
-  port: number;
-  url: string;
-  activeKeysCount: number;
-  activeModelsCount: number;
-  totalRequests: number;
-  successfulRequests: number;
-  failedRequests: number;
-}
-
-export interface GatewayApiKeyItem {
-  id: string;
-  name: string;
-  key: string;
-  enabled?: boolean;
-  createdAt?: number;
-}
-
-export interface GatewayConfig {
-  enabled: boolean;
-  port: number;
-  apiKey?: string;
-  apiKeys?: GatewayApiKeyItem[];
-  modelAggGroupModes?: Record<string, string>;
-  modelAggHiddenNodes?: string[];
-}
-
 export interface Preferences {
   theme: ThemePreference;
   defaultRunawayFilter: string;
   defaultUsageFilter: string;
   proxyNodeViewMode: ProxyNodeViewModePreference;
   sidebarCollapsed: boolean;
-  /** 模型聚合页右侧条目顺序（独立站点 = site id，聚合块 = `group:<分组名>`）。 */
-  modelAggSiteOrder: string[];
-  /** 模型聚合页：分组名 → 聚合/独立模式。 */
-  modelAggGroupModes: Record<string, ModelAggGroupMode>;
-  /** 模型聚合页：手动取消勾选（隐藏）的树节点键；默认空 = 全部选中。 */
-  modelAggHiddenModels: string[];
-  /** 本地聚合网关开关。 */
-  gatewayEnabled: boolean;
-  /** 本地聚合网关端口。 */
-  gatewayPort: number;
-  /** 本地聚合网关访问 API Key（旧单 Key 兼容）。 */
-  gatewayApiKey: string;
-  /** 本地聚合网关维护的多个 API Key 列表。 */
-  gatewayApiKeys: GatewayApiKeyItem[];
+}
+
+export interface MihomoKernelStatus {
+  installed: boolean;
+  path: string;
+  version: string;
+  isCustom: boolean;
+  latestVersion?: string | null;
+}
+
+export interface MihomoDownloadProgress {
+  stage: string;
+  progress: number;
+  message: string;
 }
 
 // —— 站点模型缓存（与 Rust 侧 models.rs 的同名结构对齐，camelCase）——
@@ -478,6 +447,7 @@ export interface ProxyChannel {
   name: string;
   nodeId: string;
   node: ProxyNode | null;
+  port?: number;
   testUrl: string;
   accountCount: number;
   accounts: ProxyChannelAccount[];

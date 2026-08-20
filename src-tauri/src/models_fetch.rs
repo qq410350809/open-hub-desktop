@@ -390,7 +390,13 @@ pub(crate) async fn fetch_models_with_keys(
     newapi_user_id: Option<&str>,
 ) -> Result<SiteModelsResult, String> {
     if keys.is_empty() {
-        return Err("Key 接口没有返回可用 Key".into());
+        return Ok(SiteModelsResult {
+            models: Vec::new(),
+            source: source.into(),
+            keys: visible_keys,
+            key_groups: visible_key_groups,
+            key_models: HashMap::new(),
+        });
     }
     let models_url = base_url
         .join("/v1/models")
@@ -450,199 +456,7 @@ pub(crate) async fn fetch_models_with_keys(
     })
 }
 
-pub(crate) fn chrome_models_bridge_script(
-    system_type: &str,
-    legacy_user_id: Option<&str>,
-    marker: &str,
-) -> String {
-    let use_refresh_auth = is_newapi_refresh(system_type);
-    let system_type = serde_json::to_string(system_type).unwrap_or_else(|_| "\"\"".into());
-    let user_id =
-        serde_json::to_string(legacy_user_id.unwrap_or_default()).unwrap_or_else(|_| "\"\"".into());
-    let marker = serde_json::to_string(marker).unwrap_or_else(|_| "\"\"".into());
-    r#"(() => {
-  const bridgeToken = __OPENHUB_MARKER__;
-  const systemType = __OPENHUB_SYSTEM_TYPE__.toLowerCase();
-  const useRefreshAuth = __OPENHUB_USE_REFRESH_AUTH__;
-  const legacyUserId = __OPENHUB_USER_ID__;
-  const pending = "__OPENHUB_PENDING__";
-  if (!/^https?:$/.test(window.location.protocol)) return pending;
-  if (legacyUserId) {
-    try {
-      let storedUser = localStorage.getItem("user") || "null";
-      for (let depth = 0; depth < 2 && typeof storedUser === "string"; depth += 1) {
-        storedUser = JSON.parse(storedUser);
-      }
-      const storedUserId = storedUser?.id ?? storedUser?.data?.id ?? "";
-      if (String(storedUserId) !== String(legacyUserId)) {
-        return "__OPENHUB_PROFILE_MISMATCH__";
-      }
-    } catch (_) {
-      return "__OPENHUB_PROFILE_MISMATCH__";
-    }
-  }
-  const previous = window.__openHubModelsSync;
-  if (previous && previous.token === bridgeToken) {
-    if (previous.result) return JSON.stringify(previous.result);
-    return pending;
-  }
-  const bridge = { token: bridgeToken, result: null };
-  window.__openHubModelsSync = bridge;
-  const scalar = (value) => {
-    if (!value) return "";
-    try { const parsed = JSON.parse(value); return typeof parsed === "string" ? parsed : value; }
-    catch (_) { return value; }
-  };
-  const readJson = async (path, options) => {
-    const response = await fetch(path, { credentials: "include", cache: "no-store", signal: AbortSignal.timeout(30000), ...options });
-    const text = await response.text();
-    let data = null;
-    try { data = JSON.parse(text); } catch (_) {}
-    return { ok: response.ok, status: response.status, data };
-  };
-  const arrays = (value, paths) => {
-    for (const path of paths) {
-      let current = value;
-      for (const part of path) current = current && current[part];
-      if (Array.isArray(current)) return current;
-    }
-    return [];
-  };
-  const activeKeyItems = (value) => arrays(value, [[], ["data"], ["data","items"], ["data","keys"], ["keys"], ["items"], ["result","items"], ["result","keys"]])
-    .filter((item) => item && item.enabled !== false && item.is_active !== false && ![0, "0", "disabled", "inactive", "expired", "revoked"].includes(item.status));
-  const keyGroup = (item) => typeof item === "object" && item ? String(item.group || item.group_name || item.groupName || item.token_group || item.tokenGroup || item.name || item.token_name || item.tokenName || "").trim() : "";
-  const extractKeyEntries = (value) => activeKeyItems(value)
-    .flatMap((item) => {
-      const key = String(typeof item === "string" ? item : item.key || item.api_key || item.apiKey || item.plain_key || item.plainKey || item.secret_key || item.secretKey || item.token || item.secret || item.value || "").replace(/^Bearer\s+/i, "").trim();
-      const prefix = typeof item === "object" && item ? String(item.key_prefix || item.keyPrefix || item.prefix || "") : "";
-      const group = keyGroup(item);
-      return (prefix && !key.startsWith(prefix) ? [key, `${prefix}${key}`] : [key]).map((value) => ({ key: value, group }));
-    })
-    .filter((item) => item.key.length >= 8 && !/\s|\*|…|\.\.\./.test(item.key));
-  const extractKeys = (value) => extractKeyEntries(value).map((item) => item.key);
-  const extractKeyGroups = (value) => Object.fromEntries(extractKeyEntries(value).filter((item) => item.group).map((item) => [item.key, item.group]));
-  const extractTokenIds = (value) => activeKeyItems(value)
-    .map((item) => typeof item === "object" && item ? item.id ?? item.token_id ?? item.tokenId ?? "" : "")
-    .map((id) => String(id))
-    .filter((id) => id.length > 0 && id.length <= 64 && /^[A-Za-z0-9_-]+$/.test(id));
-  const extractTokenGroups = (value) => Object.fromEntries(activeKeyItems(value)
-    .map((item) => [String(item && (item.id ?? item.token_id ?? item.tokenId) || ""), keyGroup(item)])
-    .filter(([id, group]) => id && group));
-  const extractRevealedKey = (value) => {
-    const key = String(value?.data?.key || value?.data?.api_key || value?.data?.apiKey || value?.data?.secret_key || value?.data?.secretKey ||
-      (typeof value?.data === "string" ? value.data : "") || value?.key || value?.api_key || value?.apiKey || value?.secret_key || value?.secretKey || "")
-      .replace(/^Bearer\s+/i, "").trim();
-    return key.length >= 8 && !/\s|\*|…|\.\.\./.test(key) ? key : "";
-  };
-  const extractModels = (value) => arrays(value, [[], ["data"], ["data","items"], ["data","models"], ["models"], ["items"], ["result","data"], ["result","models"]])
-    .map((item) => typeof item === "string" ? { id: item } : {
-      id: String(item && (item.model_name || item.id || item.name || item.model || item.slug) || ""),
-      ownedBy: item && (item.owner || item.owned_by || item.vendor) || undefined
-    })
-    .filter((item) => item.id);
-  let visibleKeys = [];
-  let visibleKeyGroups = {};
-  (async () => {
-    const headers = { Accept: "application/json, text/plain, */*" };
-    let keyPath = "/api/token/?p=1&size=20";
-    let source = "newapi-key";
-    let dashboardAccessToken = "";
-    if (systemType === "sub2api") {
-      keyPath = "/api/v1/keys?page=1";
-      source = "sub2api-key";
-      const authToken = scalar(localStorage.getItem("auth_token"));
-      if (!authToken) throw new Error("Chrome Local Storage 中没有 auth_token");
-      dashboardAccessToken = authToken;
-      headers.Authorization = `Bearer ${authToken}`;
-    } else if (legacyUserId) {
-      headers["New-Api-User"] = legacyUserId;
-    }
-    let keyResponse = await readJson(keyPath, { method: "GET", headers });
-    // 只有认证明确返回 401 才允许 refresh。403、超时、HTML、解析失败或空 Key
-    // 都不能证明访问令牌失效，避免有效会话被无谓刷新并触发 Chrome。
-    if (useRefreshAuth && keyResponse.status === 401) {
-      const refreshResponse = await readJson("/api/user/auth/refresh", { method: "POST", headers: { Accept: "application/json" } });
-      const accessToken = refreshResponse.data?.data?.access_token || refreshResponse.data?.data?.accessToken ||
-        refreshResponse.data?.data?.token || refreshResponse.data?.access_token || refreshResponse.data?.accessToken || refreshResponse.data?.token || "";
-      if (accessToken) {
-        dashboardAccessToken = accessToken;
-        headers.Authorization = `Bearer ${accessToken}`;
-        keyResponse = await readJson(keyPath, { method: "GET", headers });
-      }
-    }
-    const keys = extractKeys(keyResponse.data);
-    visibleKeyGroups = extractKeyGroups(keyResponse.data);
-    if (systemType !== "sub2api" && !keys.length) {
-      const tokenGroups = extractTokenGroups(keyResponse.data);
-      for (const tokenId of extractTokenIds(keyResponse.data)) {
-        const revealResponse = await readJson(`/api/token/${encodeURIComponent(tokenId)}/key`, { method: "POST", headers });
-        const revealedKey = extractRevealedKey(revealResponse.data);
-        if (revealResponse.ok && revealedKey) {
-          keys.push(revealedKey);
-          if (tokenGroups[tokenId]) visibleKeyGroups[revealedKey] = tokenGroups[tokenId];
-        }
-      }
-    }
-    visibleKeys = [...new Set(keys)];
-    // Sub2API auth_token 可直接用于模型接口；NewAPI 访问令牌只能管理 Key，不能冒充模型 Key。
-    if (systemType === "sub2api" && dashboardAccessToken) keys.push(dashboardAccessToken);
-    if (!keys.length) throw new Error(`${keyPath} 没有返回可用 Key（HTTP ${keyResponse.status}）`);
-    let lastStatus = 0;
-    let lastError = "";
-    for (const key of keys) {
-      const candidates = key.startsWith("sk-") || key.includes(".") ? [key] : [key, `sk-${key}`];
-      for (const candidate of candidates) {
-        const modelHeaders = { Accept: "application/json", Authorization: `Bearer ${candidate}` };
-        if (legacyUserId) modelHeaders["New-Api-User"] = legacyUserId;
-        const response = await readJson("/v1/models", { method: "GET", headers: modelHeaders });
-        lastStatus = response.status;
-        lastError = response.data?.error?.message || response.data?.message || response.data?.msg || response.data?.detail || "";
-        const models = extractModels(response.data);
-        if (response.ok && models.length) {
-          bridge.result = { ok: true, models, source, keys: visibleKeys, keyGroups: visibleKeyGroups };
-          return;
-        }
-      }
-    }
-    throw new Error(`/v1/models 未返回模型（HTTP ${lastStatus}${lastError ? `：${lastError}` : ""}）`);
-  })().catch((error) => {
-    bridge.result = { ok: false, error: error && error.message || String(error), keys: visibleKeys, keyGroups: visibleKeyGroups };
-  });
-  return pending;
-})()"#
-    .replace("__OPENHUB_SYSTEM_TYPE__", &system_type)
-    .replace(
-        "__OPENHUB_USE_REFRESH_AUTH__",
-        if use_refresh_auth { "true" } else { "false" },
-    )
-    .replace("__OPENHUB_USER_ID__", &user_id)
-    .replace("__OPENHUB_MARKER__", &marker)
-}
 
-pub(crate) fn parse_chrome_models_result(value: &str) -> Result<SiteModelsResult, String> {
-    let value = serde_json::from_str::<serde_json::Value>(value)
-        .map_err(|error| format!("Chrome 模型数据无法解析：{error}"))?;
-    if value.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
-        return Err(api_error_message(&value, "Chrome 没有返回模型"));
-    }
-    let models = parse_site_models(&value);
-    if models.is_empty() {
-        return Err("Chrome 返回的模型列表为空".into());
-    }
-    Ok(SiteModelsResult {
-        models,
-        source: json_string(&value, &["/source"]),
-        keys: parse_api_keys(&value),
-        key_groups: parse_api_key_groups(&value),
-        key_models: HashMap::new(),
-    })
-}
-
-pub(crate) fn parse_chrome_models_keys(value: &str) -> Vec<String> {
-    serde_json::from_str::<serde_json::Value>(value)
-        .map(|value| parse_api_keys(&value))
-        .unwrap_or_default()
-}
 
 pub(crate) fn merge_api_keys(target: &mut Vec<String>, keys: impl IntoIterator<Item = String>) {
     target.extend(keys);
@@ -820,10 +634,30 @@ pub(crate) fn save_site_model_cache(
                 serde_json::to_string(&key_groups).map_err(|error| error.to_string())?,
                 serde_json::to_string(&models).map_err(|error| error.to_string())?,
                 serde_json::to_string(&key_models).map_err(|error| error.to_string())?,
-                account.error,
+                if !keys.is_empty() || !models.is_empty() {
+                    ""
+                } else {
+                    account.error.as_str()
+                },
             ],
         )
         .map_err(|error| error.to_string())?;
+
+    if result.is_some() && account.error.is_empty() {
+        let _ = connection.execute(
+            "UPDATE site_accounts 
+             SET is_valid = 1, 
+                 api_sync_error = '', 
+                 sync_error = CASE 
+                     WHEN sync_error LIKE '%NewAPI%' OR sync_error LIKE '%权限不足%' OR sync_error LIKE '%失效%' 
+                     THEN '' 
+                     ELSE sync_error 
+                 END 
+             WHERE site_id = ?1 AND profile_id = ?2",
+            params![site_id, account.profile_id],
+        );
+    }
+
     Ok(())
 }
 
@@ -1076,7 +910,7 @@ async fn fetch_site_models_json_inner(
     site_id: Option<String>,
     profile_id: Option<String>,
     client: reqwest::Client,
-    auto_mode: bool,
+    _auto_mode: bool,
 ) -> Result<SiteModelsResult, String> {
     let mut base = url.trim().to_string();
     if !base.starts_with("http://") && !base.starts_with("https://") {
@@ -1173,9 +1007,6 @@ async fn fetch_site_models_json_inner(
     let mut discovered_keys = Vec::new();
     let mut discovered_key_groups = HashMap::new();
     let mut no_browser_fallback_profiles = HashSet::new();
-    // 认证被明确拒绝（登录令牌失效）后，匿名 /v1/models 必然同样 401，
-    // 用它决定是否跳过无意义的匿名兜底请求。
-    let mut auth_rejected = false;
 
     for profile_id in &profile_ids {
         let values = local_values.get(profile_id).cloned().unwrap_or_default();
@@ -1533,9 +1364,6 @@ async fn fetch_site_models_json_inner(
                     .iter()
                     .all(|error| access_token_was_rejected(error))
                 {
-                    // 模型与 Key 接口都被认证拒绝：登录令牌（auth_token）已失效。
-                    // Chrome 兜底同样依赖 auth_token，重试无意义，只保留一条精简提示。
-                    auth_rejected = true;
                     no_browser_fallback_profiles.insert(profile_id.clone());
                     errors.push(format!(
                         "{profile_id}：Sub2API 登录令牌（auth_token）已失效或过期，请重新登录后同步账号"
@@ -1551,281 +1379,21 @@ async fn fetch_site_models_json_inner(
         }
     }
 
-    for profile_id in &profile_ids {
-        if no_browser_fallback_profiles.contains(profile_id) {
-            continue;
-        }
-        let values = local_values.get(profile_id).cloned().unwrap_or_default();
-        let inferred_type = if system_type.trim().is_empty() {
-            if parse_sub2api_local_account(&values).is_ok() {
-                "sub2api"
-            } else {
-                "new-api"
-            }
-        } else {
-            system_type.as_str()
-        };
-        // 类型已有明确值（Sub2API）：不走 Chrome 兜底。
-        // Sub2API 靠 auth_token 直连接口，Chrome 兜底脚本同样需要 auth_token；
-        // 本地没有就直接报错跳过，避免无意义地弹出浏览器。
-        if matches!(
-            inferred_type.trim().to_ascii_lowercase().as_str(),
-            "sub2api"
-        ) {
-            errors.push(format!(
-                "{profile_id}：{inferred_type} 不通过 Chrome 兜底，已在前面按类型直连"
-            ));
-            continue;
-        }
-        let legacy_user_id = newapi_user_id(&values);
-        if legacy_user_id.is_some() {
-            let marker = format!(
-                "openhub-models-silent-{}",
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos()
-            );
-            let script =
-                chrome_models_bridge_script(inferred_type, legacy_user_id.as_deref(), &marker);
-            let silent_base_url = base_url.to_string();
-            match tauri::async_runtime::spawn_blocking(move || {
-                chrome_session::run_javascript_in_existing_chrome_tab(
-                    &silent_base_url,
-                    &script,
-                    Duration::from_secs(8),
-                )
-            })
-            .await
-            .map_err(|error| format!("Chrome 静默模型同步任务失败：{error}"))?
-            {
-                Ok(Some(value)) => {
-                    merge_api_keys(&mut discovered_keys, parse_chrome_models_keys(&value));
-                    match parse_chrome_models_result(&value) {
-                        Ok(result) => {
-                            return cache_profile_api_counts(
-                                database,
-                                site_id.as_deref(),
-                                requested_profile_id.as_deref(),
-                                result,
-                            )
-                        }
-                        Err(error) => errors.push(format!("{profile_id} 静默请求：{error}")),
-                    }
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    if chrome_session::is_blocking_chrome_automation_error(&error) {
-                        return Err(error);
-                    }
-                    errors.push(format!("{profile_id} 静默请求：{error}"));
-                }
-            }
-        }
-        let background_marker = format!(
-            "openhub-models-background-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        );
-        let background_script = chrome_models_bridge_script(
-            inferred_type,
-            legacy_user_id.as_deref(),
-            &background_marker,
-        );
-        let background_url = base_url
-            .join(&format!("/#{}", background_marker))
-            .map_err(|_| "无法生成 Chrome 后台模型同步地址")?
-            .to_string();
-        let background_profile = profile_id.clone();
-        let background_marker_for_task = background_marker.clone();
-        match tauri::async_runtime::spawn_blocking(move || {
-            chrome_session::run_javascript_in_background_chrome_profile(
-                &background_url,
-                &background_profile,
-                &background_marker_for_task,
-                &background_script,
-                Duration::from_secs(15),
-            )
-        })
-        .await
-        .map_err(|error| format!("Chrome 后台模型同步任务失败：{error}"))?
-        {
-            Ok(value) => {
-                merge_api_keys(&mut discovered_keys, parse_chrome_models_keys(&value));
-                match parse_chrome_models_result(&value) {
-                    Ok(result) => {
-                        return cache_profile_api_counts(
-                            database,
-                            site_id.as_deref(),
-                            requested_profile_id.as_deref(),
-                            result,
-                        )
-                    }
-                    Err(error) => errors.push(format!("{profile_id} 后台请求：{error}")),
-                }
-            }
-            Err(error) => {
-                if chrome_session::is_blocking_chrome_automation_error(&error) {
-                    return Err(error);
-                }
-                errors.push(format!("{profile_id} 后台请求：{error}"));
-            }
-        }
-        if auto_mode {
-            // 自动调度不弹前台 Chrome：静默与后台两级失败说明需要人工过盾，
-            // 保留错误信息进入公开端点回退，由下一轮或手动流程再恢复。
-            errors.push(format!(
-                "{profile_id}：自动模式跳过前台 Chrome 模型同步（静默与后台均未成功）"
-            ));
-            continue;
-        }
-        let marker = format!(
-            "openhub-models-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        );
-        let script = chrome_models_bridge_script(inferred_type, legacy_user_id.as_deref(), &marker);
-        let target_url = base_url
-            .join(&format!("/#{}", marker))
-            .map_err(|_| "无法生成 Chrome 模型同步地址")?
-            .to_string();
-        let bridge_profile = profile_id.clone();
-        let bridge_marker = marker.clone();
-        match tauri::async_runtime::spawn_blocking(move || {
-            chrome_session::run_javascript_in_chrome_profile(
-                &target_url,
-                &bridge_profile,
-                &bridge_marker,
-                &script,
-                Duration::from_secs(30),
-            )
-        })
-        .await
-        .map_err(|error| format!("Chrome 模型同步任务失败：{error}"))?
-        {
-            Ok(value) => {
-                merge_api_keys(&mut discovered_keys, parse_chrome_models_keys(&value));
-                match parse_chrome_models_result(&value) {
-                    Ok(result) => {
-                        return cache_profile_api_counts(
-                            database,
-                            site_id.as_deref(),
-                            requested_profile_id.as_deref(),
-                            result,
-                        )
-                    }
-                    Err(error) => errors.push(format!("{profile_id}：{error}")),
-                }
-            }
-            Err(error) => {
-                if chrome_session::is_blocking_chrome_automation_error(&error) {
-                    return Err(error);
-                }
-                errors.push(format!("{profile_id}：{error}"));
-            }
-        }
-    }
-
-    // /api/pricing 是 NewAPI 系列站点的公开端点；Sub2API 没有该端点，
-    // 直接请求只会得到非 JSON 响应，产生误导性的解析失败提示。
-    if !is_sub2api(&system_type) {
-        let pricing_url = base_url
-            .join("/api/pricing")
-            .map_err(|_| "无法生成 /api/pricing 地址")?;
-        match request_json(
-            chrome_request_headers(client.get(pricing_url), base_url.as_str(), &user_agent),
-            "公开模型接口",
-        )
-        .await
-        {
-            Ok(value) => {
-                let models = parse_site_models(&value);
-                if !models.is_empty() {
-                    return cache_profile_api_counts(
-                        database,
-                        site_id.as_deref(),
-                        requested_profile_id.as_deref(),
-                        SiteModelsResult {
-                            models,
-                            source: "pricing".into(),
-                            keys: discovered_keys.clone(),
-                            key_groups: discovered_key_groups.clone(),
-                            key_models: HashMap::new(),
-                        },
-                    );
-                }
-                errors.push("/api/pricing 返回空模型列表".into());
-            }
-            Err(error) => errors.push(error),
-        }
-    }
-
-    // 认证已被明确拒绝（登录令牌失效）时，匿名 /v1/models 必然同样 401，
-    // 跳过无意义的兜底请求，避免错误信息堆叠。
-    let auth_conclusively_rejected = auth_rejected
-        || (!errors.is_empty() && errors.iter().all(|error| access_token_was_rejected(error)));
-    if !auth_conclusively_rejected {
-        let models_url = base_url
-            .join("/v1/models")
-            .map_err(|_| "无法生成 /v1/models 地址")?;
-        match request_json_with_hint(
-            chrome_request_headers(client.get(models_url), base_url.as_str(), &user_agent),
-            "无鉴权模型接口",
-            "（模型接口需要 API Key 或登录态）",
-        )
-        .await
-        {
-            Ok(value) => {
-                let models = parse_site_models(&value);
-                if !models.is_empty() {
-                    return cache_profile_api_counts(
-                        database,
-                        site_id.as_deref(),
-                        requested_profile_id.as_deref(),
-                        SiteModelsResult {
-                            models,
-                            source: "models".into(),
-                            keys: discovered_keys,
-                            key_groups: discovered_key_groups,
-                            key_models: HashMap::new(),
-                        },
-                    );
-                }
-                errors.push("/v1/models 返回空模型列表".into());
-            }
-            Err(error) => errors.push(error),
-        }
-    }
-    if !discovered_keys.is_empty() {
-        let source = if is_sub2api(&system_type) {
-            "sub2api-key"
-        } else {
-            "newapi-key"
-        };
-        return cache_profile_api_counts(
-            database,
-            site_id.as_deref(),
-            requested_profile_id.as_deref(),
-            SiteModelsResult {
-                models: Vec::new(),
-                source: source.into(),
-                keys: discovered_keys,
-                key_groups: discovered_key_groups,
-                key_models: HashMap::new(),
-            },
-        );
-    }
-    errors.dedup();
-    if errors.is_empty() {
-        Err("站点没有返回可用模型".into())
+    let source = if is_sub2api(&system_type) {
+        "sub2api-key"
     } else {
-        Err(format!(
-            "获取模型失败：{}",
-            errors.into_iter().take(4).collect::<Vec<_>>().join("；")
-        ))
-    }
+        "newapi-key"
+    };
+    cache_profile_api_counts(
+        database,
+        site_id.as_deref(),
+        requested_profile_id.as_deref(),
+        SiteModelsResult {
+            models: Vec::new(),
+            source: source.into(),
+            keys: discovered_keys,
+            key_groups: discovered_key_groups,
+            key_models: HashMap::new(),
+        },
+    )
 }

@@ -96,33 +96,64 @@ function appendSyncLog(
   const now = Date.now();
   const delta = syncLastLogAt ? now - syncLastLogAt : 0;
   syncLastLogAt = now;
+
   if (progress.status === "error") {
     if (progress.stage === "failed") {
       for (const entry of syncLogs.value) {
         if (entry.status === "running") entry.status = "error";
       }
     } else {
-      const runningEntry = [...syncLogs.value]
+      const existingEntry = [...syncLogs.value]
         .reverse()
-        .find((entry) => entry.stage === progress.stage && entry.status === "running");
-      if (runningEntry) {
-        runningEntry.status = "error";
+        .find((entry) => entry.stage === progress.stage);
+      if (existingEntry) {
+        if (existingEntry.status === "running") {
+          existingEntry.status = "error";
+          existingEntry.message = progress.message;
+          existingEntry.elapsedMs = delta;
+          return;
+        }
+        if (existingEntry.message === progress.message) {
+          return;
+        }
+      }
+    }
+  } else if (progress.status === "success") {
+    const existingEntry = [...syncLogs.value]
+      .reverse()
+      .find((entry) => entry.stage === progress.stage);
+    if (existingEntry) {
+      if (existingEntry.status === "running") {
+        existingEntry.status = "success";
+        existingEntry.message = progress.message;
+        existingEntry.elapsedMs = delta;
+        return;
+      }
+      if (existingEntry.message === progress.message) {
+        return;
+      }
+    }
+  } else if (progress.status === "running") {
+    const runningEntry = [...syncLogs.value]
+      .reverse()
+      .find((entry) => entry.stage === progress.stage);
+    if (runningEntry) {
+      if (runningEntry.status === "running") {
         runningEntry.message = progress.message;
         runningEntry.elapsedMs = delta;
         return;
       }
+      if (runningEntry.message === progress.message) {
+        return;
+      }
     }
-  } else if (progress.status === "success") {
-    const runningEntry = [...syncLogs.value]
-      .reverse()
-      .find((entry) => entry.stage === progress.stage && entry.status === "running");
-    if (runningEntry) {
-      runningEntry.status = "success";
-      runningEntry.message = progress.message;
-      runningEntry.elapsedMs = delta;
+  } else if (progress.status === "info") {
+    const lastEntry = syncLogs.value[syncLogs.value.length - 1];
+    if (lastEntry && lastEntry.stage === progress.stage && lastEntry.message === progress.message) {
       return;
     }
   }
+
   syncLogs.value.push({
     ...progress,
     id: ++syncLogId,
@@ -260,7 +291,7 @@ async function syncAllModelKeys(
       const site = siteMap.get(usageSite.siteId);
       if (!site) return [];
       return usageSite.sessions
-        .filter((session) => session.isValid)
+        .filter((session) => session.isValid && session.apiKeyCount > 0)
         .map((session) => ({ site, session }));
     })
     .filter((target, index, items) =>
@@ -369,7 +400,6 @@ async function syncAllModelKeys(
 
 async function syncSites() {
   if (syncingSites.value || syncingModelKeys.value || (syncDialogMode.value === "remote" && !remoteUser.value)) return;
-  const runaway = syncDialogRunaway.value;
   const mode = syncDialogMode.value;
   const runId = ++syncRunId;
   resetSyncLog();
@@ -413,13 +443,12 @@ async function syncSites() {
       showToast(`已同步 ${usageLabel}站点额度：${accountResult.accounts} 个账号${accountResult.warnings ? `，${accountResult.warnings} 个警告` : ""}`);
       return;
     }
-    const result = await runCommand<SyncSitesResult>("sync_remote_sites", { runaway, runId });
+    const result = await runCommand<SyncSitesResult>("sync_remote_sites", { runId });
     await loadLibrary();
-    const scope = result.runaway ? "跑路站点" : "存活站点";
     const account = result.userName ? `账号 ${result.userName}` : `Chrome ${result.profileName}`;
-    showToast(`${account} 已同步 ${result.total} 个${scope}（新增 ${result.added}，更新 ${result.updated}）`);
+    showToast(`${account} 已同步 ${result.total} 个公共站点（新增 ${result.added}，更新 ${result.updated}）`);
     syncRunState.value = "detecting";
-    appendSyncLog({ stage: "available", status: "success", message: `站点数据已可用，共 ${result.total} 条；类型检测将在后台继续` });
+    appendSyncLog({ stage: "available", status: "success", message: `站点数据已可用，共 ${result.total} 条（存活与跑路全量同步）；类型检测将在后台继续` });
     void detectSyncedSiteTypes(result.siteIds, runId);
   } catch (error) {
     remoteUserError.value = `同步失败：${String(error)}`;

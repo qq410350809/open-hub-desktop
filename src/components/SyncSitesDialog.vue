@@ -17,11 +17,11 @@ const scopeLabel = computed(() => {
     const usageLabel = store.syncDialogUsage.value === "pending" ? "待定" : "在用";
     return `当前筛选中的 ${store.syncDialogSiteIds.value.length} 个${usageLabel}站点`;
   }
-  return store.syncDialogRunaway.value ? "跑路站点" : "存活站点";
+  return "全量公共站点（存活与跑路）";
 });
 
 const dialogTitle = computed(() =>
-  store.syncDialogMode.value === "quota" ? "额度同步" : "同步站点",
+  store.syncDialogMode.value === "quota" ? "额度同步" : "同步公共库",
 );
 
 const runStateLabel = computed(() => {
@@ -45,6 +45,10 @@ let isDialogMounted = true;
 
 onMounted(() => {
   if (!isTauri) return;
+  unlistenProgress?.();
+  unlistenChromeProgress?.();
+  unlistenProgress = undefined;
+  unlistenChromeProgress = undefined;
   isDialogMounted = true;
   listen<SyncSitesProgress>("sync-sites-progress", (event) => {
     store.receiveSyncProgress(event.payload);
@@ -181,11 +185,11 @@ function onBackdropClick(event: MouseEvent) {
             <div class="sync-scope-row">
               <span
                 class="sync-scope-icon"
-                v-html="store.syncDialogRunaway.value ? icons.flag : icons.globe"
+                v-html="store.syncDialogMode.value === 'remote' ? icons.globe : (store.syncDialogRunaway.value ? icons.flag : icons.globe)"
               />
               <div>
                 <strong>本次同步范围</strong>
-                <p v-if="store.syncDialogMode.value === 'remote'">{{ scopeLabel }} · 同名远端记录会更新，本地在用状态会保留</p>
+                <p v-if="store.syncDialogMode.value === 'remote'">{{ scopeLabel }} · 匹配站点地址更新已有记录（保留站点类型与在用状态），新站点将自动录入</p>
                 <p v-else-if="store.syncDialogMode.value === 'quota'">{{ scopeLabel }} · 仅刷新额度与账号缓存，站点归类保持不变</p>
               </div>
             </div>
@@ -259,7 +263,7 @@ function onBackdropClick(event: MouseEvent) {
             </button>
             <button class="primary-button" type="button" @click="store.syncSites()">
               <span v-html="icons.restore" />
-              <span>{{ store.syncDialogMode.value === 'quota' ? '开始额度同步' : `同步${scopeLabel}` }}</span>
+              <span>{{ store.syncDialogMode.value === 'quota' ? '开始额度同步' : '同步公共库' }}</span>
             </button>
           </template>
           <template v-else>

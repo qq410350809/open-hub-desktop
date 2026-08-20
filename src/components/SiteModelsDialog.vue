@@ -189,10 +189,6 @@ async function refreshModels(mode: "cache" | "keys" | "models" = "cache") {
   }
   try {
     if (mode !== "cache") {
-      // "keys"：只同步 Key 列表（不保存 keyModels 映射）
-      // "models"：用已有缓存 Key 逐个拉取 /v1/models 并保存 keyModels（不动已有 Key）
-      // 两者都调 fetch_site_models_json，区别在于保存时是否包含 keyModels / 是否覆盖 Key
-      const saveKeyModels = mode === "models";
       const siteUsage = usageSites.value.find((item) => item.siteId === requestedSite.id);
       const sessions = siteUsage?.sessions?.filter((s) => s.isValid) ?? [];
       let baseUrl = requestedSite.apiBaseUrl.trim();
@@ -213,7 +209,7 @@ async function refreshModels(mode: "cache" | "keys" | "models" = "cache") {
               username: "",
               keys: result.keys ?? [],
               keyGroups: result.keyGroups ?? {},
-              keyModels: saveKeyModels ? result.keyModels ?? {} : {},
+              keyModels: result.keyModels ?? {},
               error: "",
             },
             result,
@@ -225,6 +221,7 @@ async function refreshModels(mode: "cache" | "keys" | "models" = "cache") {
       } else {
         for (const session of sessions) {
           if (requestId !== liveFetchRequestId) return;
+          if (mode === "models" && (!session.apiKeyCount || session.apiKeyCount === 0)) continue;
           try {
             const result = await runCommand<FetchSiteModelsResult>("fetch_site_models_json", {
               url: baseUrl,
@@ -260,12 +257,13 @@ async function refreshModels(mode: "cache" | "keys" | "models" = "cache") {
                 error: String(error),
               },
               result: null,
-              preserveKeys: saveKeyModels,
+              preserveKeys: false,
             });
           }
         }
       }
     }
+    await store.loadLibrary();
     const cached = await readCachedModels(requestedSite.id);
     if (requestId !== liveFetchRequestId) return;
     if (!cached) {

@@ -163,15 +163,13 @@ const metrics = computed(() => {
   for (const siteId of Object.keys(usageMap)) {
     const sessions = usageMap[siteId] ?? [];
     for (const session of sessions) {
-      if (session.isValid) {
-        totalAccounts += 1;
-        if (session.hasAccessToken) accountsWithTokens += 1;
-        if (session.checkedInToday) checkedInAccounts += 1;
-        if (session.syncError || session.checkinError) errorAccounts += 1;
-        if (session.remaining !== null && Number.isFinite(session.remaining)) {
-          totalQuotaNumber += session.remaining;
-          accountsWithQuota += 1;
-        }
+      totalAccounts += 1;
+      if (session.hasAccessToken) accountsWithTokens += 1;
+      if (session.checkedInToday) checkedInAccounts += 1;
+      if (session.syncError || session.checkinError) errorAccounts += 1;
+      if (session.remaining !== null && Number.isFinite(session.remaining)) {
+        totalQuotaNumber += session.remaining;
+        accountsWithQuota += 1;
       }
     }
   }
@@ -320,7 +318,7 @@ const filteredSites = computed(() => {
       if (!checked) return false;
     }
     if (featureFilters.value.syncError) {
-      const hasErr = sessions.some((s) => s.syncError || s.checkinError || s.apiSyncError);
+      const hasErr = sessions.some((s) => s.syncError || s.checkinError || (s.apiSyncError && !s.apiKeyCount && !s.apiModelCount));
       if (!hasErr) return false;
     }
 
@@ -386,7 +384,17 @@ const tableColumns = computed<AppTableColumn[]>(() => [
 
 // —— 辅助格式化方法 ——
 function getSiteSessions(siteId: string): ChromeSessionInfo[] {
-  return (store.chromeUsageAccounts.value[siteId] ?? []).filter((s) => s.isValid);
+  return store.chromeUsageAccounts.value[siteId] ?? [];
+}
+
+function getSiteErrorMessage(siteId: string): string {
+  const sessions = getSiteSessions(siteId);
+  for (const s of sessions) {
+    if (s.syncError) return s.syncError;
+    if (s.checkinError) return s.checkinError;
+    if (s.apiSyncError && !s.apiKeyCount && !s.apiModelCount) return s.apiSyncError;
+  }
+  return "";
 }
 
 function getSiteQuotaText(siteId: string): string {
@@ -397,6 +405,12 @@ function getSiteQuotaText(siteId: string): string {
   const total = validWithQuota.reduce((acc, cur) => acc + (cur.remaining ?? 0), 0);
   const unit = validWithQuota[0]?.unit || "";
   const num = new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 2 }).format(total);
+  return unit ? `${num} ${unit}` : num;
+}
+
+function formatAccountQuota(remaining: number | null | undefined, unit?: string): string {
+  if (remaining === null || remaining === undefined || !Number.isFinite(remaining)) return "未同步额度";
+  const num = new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 2 }).format(remaining);
   return unit ? `${num} ${unit}` : num;
 }
 
@@ -496,7 +510,7 @@ async function triggerDrawerSync(mode: "keys" | "models") {
           username: "",
           keys: result.keys ?? [],
           keyGroups: result.keyGroups ?? {},
-          keyModels: mode === "models" ? result.keyModels ?? {} : {},
+          keyModels: result.keyModels ?? {},
           error: "",
         },
         result,
@@ -504,6 +518,7 @@ async function triggerDrawerSync(mode: "keys" | "models") {
       });
     } else {
       for (const session of sessions) {
+        if (mode === "models" && (!session.apiKeyCount || session.apiKeyCount === 0)) continue;
         try {
           const result = await runCommand<any>("fetch_site_models_json", {
             url: baseUrl,
@@ -531,12 +546,19 @@ async function triggerDrawerSync(mode: "keys" | "models") {
       }
     }
     await readDrawerModelCache(site.id);
-    store.showToast(mode === "keys" ? "Key 列表同步完成" : "模型列表同步完成");
+    store.showToast(mode === "keys" ? "Key 与支持模型已同步完成" : "模型列表已同步完成");
   } catch (err) {
     store.showToast(`同步失败：${String(err)}`, true);
   } finally {
     drawerLiveFetchingKind.value = null;
   }
+}
+
+async function handleTopologyBatchModelSync() {
+  if (store.syncingModelKeys.value) return;
+  const siteIds = filteredSites.value.map((s) => s.id);
+  store.showToast("开始根据 API Key 批量同步模型…");
+  await store.syncAllModelKeys(siteIds);
 }
 
 async function copyText(text: string, label = "内容") {
@@ -663,12 +685,14 @@ watch(currentView, (mode) => {
     if (selectedUsageTab.value === "all") {
       selectedUsageTab.value = "personal";
     }
-    selectedAliveTab.value = "active";
+    if (selectedAliveTab.value === "all" || selectedAliveTab.value === "runaway") {
+      selectedAliveTab.value = "active";
+    }
   }
 });
 
 watch(
-  [query, selectedUsageTab, selectedAliveTab, selectedSystemType, selectedLevel, selectedTag, sortBy, popularChip],
+  [query, selectedUsageTab, selectedAliveTab, selectedSystemType, selectedLevel, selectedTag, sortBy, popularChip, currentView],
   () => {
     currentPage.value = 1;
   },
@@ -676,7 +700,7 @@ watch(
 
 onMounted(() => {
   window.addEventListener("keydown", handleGlobalKeydown);
-  if (!store.sites.value.length && !store.loading.value) {
+  if (!store.loading.value) {
     void store.loadLibrary();
   }
 });
@@ -820,13 +844,14 @@ onUnmounted(() => {
       <div class="sl-control-top-row">
         <!-- 左侧多维筛选组：使用状态维度 + 运营存活维度 -->
         <div class="sl-control-tabs-group">
-          <!-- 维度 1：使用状态分类 Tab (拓扑模式下仅提供在用与待定) -->
+          <!-- 维度 1：使用状态分类 Tab -->
           <nav class="sl-usage-tabs" role="tablist" aria-label="使用状态筛选">
             <button
-              v-if="currentView !== 'topology'"
               type="button"
               role="tab"
+              :disabled="currentView === 'topology'"
               :class="{ active: selectedUsageTab === 'all' }"
+              :title="currentView === 'topology' ? '账号拓扑矩阵下已禁用全部' : '全部使用状态'"
               @click="selectedUsageTab = 'all'"
             >
               <span v-html="icons.layers" />
@@ -857,13 +882,13 @@ onUnmounted(() => {
 
           <span class="sl-tabs-divider" />
 
-          <!-- 维度 2：存活与健康状态分段开关 (拓扑模式下仅展示存活) -->
+          <!-- 维度 2：存活与健康状态分段开关 -->
           <div class="sl-alive-tabs" role="group" aria-label="站点存活状态筛选">
             <button
-              v-if="currentView !== 'topology'"
               type="button"
+              :disabled="currentView === 'topology'"
               :class="{ active: selectedAliveTab === 'all' }"
-              title="全部站点状态"
+              :title="currentView === 'topology' ? '账号拓扑矩阵下已禁用全部状态' : '全部站点状态'"
               @click="selectedAliveTab = 'all'"
             >
               <span>全部状态</span>
@@ -881,11 +906,11 @@ onUnmounted(() => {
               <b class="sl-tab-badge">{{ tabCounts.active }}</b>
             </button>
             <button
-              v-if="currentView !== 'topology'"
               type="button"
               class="sl-alive-btn is-runaway"
+              :disabled="currentView === 'topology'"
               :class="{ active: selectedAliveTab === 'runaway' }"
-              title="筛选已跑路或失效站点"
+              :title="currentView === 'topology' ? '账号拓扑矩阵下已禁用跑路选项' : '筛选已跑路或失效站点'"
               @click="selectedAliveTab = 'runaway'"
             >
               <span class="sl-alive-dot is-dead" />
@@ -1130,8 +1155,14 @@ onUnmounted(() => {
                 </div>
               </div>
 
-              <!-- 右上角多选与操作 -->
+              <!-- 右上角多选与告警 -->
               <div class="sl-card-head-tools" @click.stop>
+                <span
+                  v-if="getSiteErrorMessage(site.id)"
+                  class="sl-card-err-badge"
+                  :title="getSiteErrorMessage(site.id)"
+                  v-html="icons.info"
+                />
                 <button
                   type="button"
                   class="sl-card-select-btn"
@@ -1225,23 +1256,30 @@ onUnmounted(() => {
                 </button>
               </div>
 
-              <div class="sl-card-footer-actions">
+              <div class="sl-card-footer-actions" @click.stop>
                 <button
                   type="button"
-                  class="sl-card-models-btn"
+                  class="sl-action-icon-btn"
                   title="查看支持模型与 Key"
                   @click.stop="store.openSiteModelsDialog(site)"
                 >
                   <span v-html="icons.cpu" />
-                  <span>模型与 Key</span>
                 </button>
                 <button
                   type="button"
-                  class="sl-card-detail-btn"
+                  class="sl-action-icon-btn"
+                  title="全景详情"
                   @click.stop="openModelDetail(site)"
                 >
-                  <span>全景参数</span>
-                  <span v-html="icons.chevron" />
+                  <span v-html="icons.info" />
+                </button>
+                <button
+                  type="button"
+                  class="sl-action-icon-btn"
+                  title="编辑站点"
+                  @click.stop="store.openModal(site)"
+                >
+                  <span v-html="icons.edit" />
                 </button>
               </div>
             </div>
@@ -1317,7 +1355,7 @@ onUnmounted(() => {
           <template #cell-accounts="{ row }">
             <div class="sl-table-accounts-cell">
               <span>{{ getSiteSessions(row.id).length }} 个账号</span>
-              <small v-if="getSiteSessions(row.id).some((s: ChromeSessionInfo) => s.hasAccessToken)" class="text-brand">含刷新令牌</small>
+              <small v-if="normalizeSystemType(row.systemType) === 'newapi2' && getSiteSessions(row.id).some((s: ChromeSessionInfo) => s.hasAccessToken)" class="text-brand">含刷新令牌</small>
             </div>
           </template>
 
@@ -1391,10 +1429,27 @@ onUnmounted(() => {
             <h2>全网站点与 Chrome 账号拓扑矩阵</h2>
             <p>实时监控并管理各个站点的 Chrome 授权会话、Access Token、额度消耗与签到状态</p>
           </div>
-          <button type="button" class="sl-btn-secondary" @click="store.openSyncDialog()">
-            <span v-html="icons.sessionImport" />
-            <span>提取并导入 Chrome 会话</span>
-          </button>
+          <div class="sl-topology-header-actions">
+            <button
+              type="button"
+              class="sl-btn-secondary"
+              title="同步拓扑站点的 Chrome 账号会话与可用额度"
+              @click="store.openSyncDialog('quota', 'personal')"
+            >
+              <span v-html="icons.restore" />
+              <span>同步额度</span>
+            </button>
+            <button
+              type="button"
+              class="sl-btn-primary"
+              :disabled="store.syncingModelKeys.value"
+              title="根据 API Key 调用 /v1/models 批量同步站点与账号支持模型"
+              @click="handleTopologyBatchModelSync"
+            >
+              <span v-html="icons.cpu" :class="{ 'is-spinning': store.syncingModelKeys.value }" />
+              <span>{{ store.syncingModelKeys.value ? '正在同步模型…' : '同步模型' }}</span>
+            </button>
+          </div>
         </div>
 
         <div v-if="!filteredSites.length" class="sl-empty-state">
@@ -1442,6 +1497,12 @@ onUnmounted(() => {
               </div>
 
               <div class="sl-topo-head-actions">
+                <span
+                  v-if="getSiteErrorMessage(site.id)"
+                  class="sl-card-err-badge"
+                  :title="getSiteErrorMessage(site.id)"
+                  v-html="icons.info"
+                />
                 <!-- 批量选择按钮 -->
                 <button
                   type="button"
@@ -1463,16 +1524,6 @@ onUnmounted(() => {
                 >
                   <span v-html="icons.restore" />
                 </button>
-
-                <!-- 编辑站点 -->
-                <button
-                  type="button"
-                  class="sl-topo-head-btn sl-topo-edit-btn"
-                  title="编辑此站点信息"
-                  @click.stop="store.openModal(site)"
-                >
-                  <span v-html="icons.edit" />
-                </button>
               </div>
             </div>
 
@@ -1484,7 +1535,7 @@ onUnmounted(() => {
                   v-for="session in getSiteSessions(site.id)"
                   :key="session.profileId"
                   class="sl-topo-session-row"
-                  :class="{ 'has-error': session.syncError || session.checkinError || session.apiSyncError }"
+                  :class="{ 'has-error': session.syncError || session.checkinError || (session.apiSyncError && !session.apiKeyCount && !session.apiModelCount) }"
                 >
                   <div class="sl-topo-session-meta">
                     <span class="sl-topo-user-icon" v-html="icons.user" />
@@ -1492,26 +1543,27 @@ onUnmounted(() => {
                       <div class="sl-topo-user-line">
                         <strong>{{ session.username || session.accountName || session.profileName }}</strong>
                         <span v-if="session.newapiUserId" class="sl-user-id-pill">ID: {{ session.newapiUserId }}</span>
-                        <span v-if="session.hasAccessToken" class="sl-token-pill active" title="已从 Chrome 会话中获取访问令牌">已取令牌</span>
-                        <span v-else class="sl-token-pill" title="未获取到访问令牌，需刷新">无令牌</span>
-                        <span v-if="session.checkedInToday" class="sl-token-pill sl-token-checked">今日已签到</span>
-                        <span v-else-if="session.checkinEnabled" class="sl-token-pill sl-token-uncheck">今日未签到</span>
+                        <template v-if="normalizeSystemType(site.systemType) === 'newapi2'">
+                          <span v-if="session.hasAccessToken" class="sl-token-pill active" title="已从 Chrome 会话中获取访问令牌">已取令牌</span>
+                          <span v-else class="sl-token-pill" title="未获取到访问令牌，需刷新">无令牌</span>
+                        </template>
+                        <template v-if="site.supportsCheckin || session.checkinEnabled">
+                          <span v-if="session.checkedInToday" class="sl-token-pill sl-token-checked" title="今日已成功签到">今日已签到</span>
+                          <span v-else-if="session.checkinEnabled" class="sl-token-pill sl-token-uncheck" title="站点开启签到，今日尚未签到">今日未签到</span>
+                          <span v-else class="sl-token-pill sl-token-disabled" title="站点接口返回404/403/人机验证或功能未启用，无法签到">无法签到</span>
+                        </template>
+                        <span v-if="session.syncError || session.checkinError" class="sl-token-pill sl-token-err" :title="session.syncError || session.checkinError">异常</span>
                       </div>
                       <small class="sl-topo-subline">
                         <span>配置：{{ session.profileName || "默认配置" }}</span>
                         <span v-if="session.accountUpdatedAt" class="sl-topo-subtime">· {{ formatDate(session.accountUpdatedAt) }}</span>
                       </small>
-                      <!-- 错误提示 -->
-                      <div v-if="session.syncError || session.checkinError" class="sl-topo-err-hint" :title="session.syncError || session.checkinError">
-                        <span v-html="icons.info" />
-                        <span>{{ session.syncError || session.checkinError }}</span>
-                      </div>
                     </div>
                   </div>
 
                   <div class="sl-topo-session-right">
                     <div class="sl-topo-session-quota">
-                      <strong class="font-mono text-brand">{{ session.remaining !== null ? `${session.remaining} ${session.unit || ''}` : '未同步额度' }}</strong>
+                      <strong class="font-mono text-brand">{{ formatAccountQuota(session.remaining, session.unit) }}</strong>
                       <small v-if="session.apiKeyCount || session.apiModelCount">
                         {{ session.apiKeyCount || 0 }} Key · {{ session.apiModelCount || 0 }} 模型
                       </small>
@@ -1602,16 +1654,35 @@ onUnmounted(() => {
                 </button>
               </div>
 
-              <div class="sl-topo-footer-actions">
-                <!-- 全景详情 / 查看模型 -->
+              <div class="sl-topo-footer-actions" @click.stop>
+                <!-- 查看支持模型与 Key -->
                 <button
                   type="button"
-                  class="sl-btn-xs sl-btn-detail"
-                  title="打开全景详情抽屉，查看 Key 与支持模型列表"
-                  @click="openModelDetail(site)"
+                  class="sl-action-icon-btn"
+                  title="查看支持模型与 Key"
+                  @click.stop="store.openSiteModelsDialog(site)"
                 >
                   <span v-html="icons.cpu" />
-                  <span>模型详情</span>
+                </button>
+
+                <!-- 全景详情 -->
+                <button
+                  type="button"
+                  class="sl-action-icon-btn"
+                  title="全景详情"
+                  @click.stop="openModelDetail(site)"
+                >
+                  <span v-html="icons.info" />
+                </button>
+
+                <!-- 编辑站点 -->
+                <button
+                  type="button"
+                  class="sl-action-icon-btn"
+                  title="编辑站点"
+                  @click.stop="store.openModal(site)"
+                >
+                  <span v-html="icons.edit" />
                 </button>
               </div>
             </div>
@@ -1943,8 +2014,16 @@ onUnmounted(() => {
                           <strong>{{ session.username || session.accountName || session.profileName }}</strong>
                           <div class="sl-acc-chips-row">
                             <span v-if="session.newapiUserId" class="sl-user-id-pill">UID: {{ session.newapiUserId }}</span>
-                            <span v-if="session.hasAccessToken" class="sl-token-pill active">已缓存访问令牌</span>
-                            <span v-if="session.checkedInToday" class="sl-token-pill sl-token-checked">今日已签到</span>
+                            <template v-if="normalizeSystemType(selectedSite.systemType) === 'newapi2'">
+                              <span v-if="session.hasAccessToken" class="sl-token-pill active" title="已从 Chrome 会话中获取访问令牌">已取令牌</span>
+                              <span v-else class="sl-token-pill" title="未获取到访问令牌，需刷新">无令牌</span>
+                            </template>
+                            <template v-if="selectedSite.supportsCheckin || session.checkinEnabled">
+                              <span v-if="session.checkedInToday" class="sl-token-pill sl-token-checked" title="今日已成功签到">今日已签到</span>
+                              <span v-else-if="session.checkinEnabled" class="sl-token-pill sl-token-uncheck" title="站点开启签到，今日尚未签到">今日未签到</span>
+                              <span v-else class="sl-token-pill sl-token-disabled" title="站点接口返回404/403/人机验证或功能未启用，无法签到">无法签到</span>
+                            </template>
+                            <span v-if="session.syncError || session.checkinError" class="sl-token-pill sl-token-err" :title="session.syncError || session.checkinError">异常</span>
                           </div>
                         </div>
                       </div>
@@ -1952,7 +2031,7 @@ onUnmounted(() => {
                       <div class="sl-drawer-acc-quota-block">
                         <div class="sl-drawer-acc-quota">
                           <span class="sl-acc-quota-k">可用额度</span>
-                          <strong class="sl-acc-quota-v text-brand">{{ session.remaining !== null ? `${session.remaining} ${session.unit || ''}` : '未读取' }}</strong>
+                          <strong class="sl-acc-quota-v text-brand">{{ formatAccountQuota(session.remaining, session.unit) }}</strong>
                         </div>
                         <div class="sl-drawer-acc-btn-group">
                           <button
@@ -2587,6 +2666,13 @@ onUnmounted(() => {
   background: var(--surface-hover);
 }
 
+.sl-usage-tabs button:disabled,
+.sl-alive-tabs button:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+  pointer-events: none;
+}
+
 .sl-alive-tabs button.active {
   background: var(--brand-soft);
   border-color: var(--brand);
@@ -3016,6 +3102,34 @@ onUnmounted(() => {
   background: var(--brand, #1f6feb);
   color: #fff;
   border-color: var(--brand, #1f6feb);
+}
+
+.sl-card-err-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--danger, #f85149) 14%, transparent);
+  border: 1px solid color-mix(in srgb, var(--danger, #f85149) 35%, transparent);
+  color: var(--danger, #f85149);
+  cursor: help;
+  flex-shrink: 0;
+  box-sizing: border-box;
+}
+
+.sl-card-err-badge svg {
+  width: 13px;
+  height: 13px;
+  display: block;
+}
+
+.sl-token-pill.sl-token-err {
+  background: color-mix(in srgb, var(--danger, #f85149) 15%, transparent);
+  color: var(--danger, #f85149);
+  border: 1px solid color-mix(in srgb, var(--danger, #f85149) 30%, transparent);
+  cursor: help;
 }
 
 /* 药丸与徽章 */
@@ -3462,6 +3576,14 @@ onUnmounted(() => {
   background: var(--surface);
   border: 1px solid var(--line);
   border-radius: var(--r-md);
+  gap: 12px;
+}
+
+.sl-topology-header-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
 }
 
 .sl-topology-header h2 {
@@ -3754,6 +3876,13 @@ onUnmounted(() => {
   background: var(--warning-soft);
   color: var(--warning);
   border-color: color-mix(in srgb, var(--warning) 28%, transparent);
+}
+
+.sl-token-pill.sl-token-disabled {
+  background: var(--bg-card-muted, rgba(148, 163, 184, 0.12));
+  color: var(--text-tertiary, #94a3b8);
+  border-color: rgba(148, 163, 184, 0.25);
+  font-weight: 500;
 }
 
 .sl-topo-subline {

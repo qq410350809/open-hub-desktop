@@ -177,7 +177,7 @@ export function useContextMenu() {
       { id: "sep-1", label: "", enabled: false, separator: true },
       { id: "nav-library", label: "站点库", enabled: true },
       { id: "nav-modelparams", label: "模型参数", enabled: true },
-      { id: "nav-modelagg", label: "模型聚合", enabled: true },
+      { id: "nav-modelproxy", label: "模型反代", enabled: true },
       { id: "nav-charity", label: "公益监听", enabled: true },
       { id: "nav-proxy", label: "代理池", enabled: true },
       { id: "nav-tokenstats", label: "Token 统计", enabled: true },
@@ -289,7 +289,7 @@ export function useContextMenu() {
       }
       case "nav-library":
       case "nav-modelparams":
-      case "nav-modelagg":
+      case "nav-modelproxy":
       case "nav-charity":
       case "nav-proxy":
       case "nav-tokenstats":

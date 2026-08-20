@@ -550,6 +550,7 @@ pub(crate) async fn probe_site_system_type_via_chrome(
                 &marker,
                 &script,
                 Duration::from_secs(20),
+                None,
             )
         }
     })

@@ -1,6 +1,6 @@
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { computed, ref } from "vue";
-import type { ProxyIpAnalysis, ProxyNode, ProxyNodeTestProgress, ProxyPoolRefreshResult, ProxyPoolState, ProxySourceProgress } from "../types";
+import type { MihomoDownloadProgress, MihomoKernelStatus, ProxyIpAnalysis, ProxyNode, ProxyNodeTestProgress, ProxyPoolRefreshResult, ProxyPoolState, ProxySourceProgress } from "../types";
 import { runCommand } from "./useLibrary";
 
 const isTauri = "__TAURI_INTERNALS__" in window;
@@ -30,6 +30,23 @@ const proxyTestCancelling = ref(false);
 const proxyTestCancelRequested = ref(false);
 const proxyNodesRevision = ref(0);
 const proxySourceProgress = ref<Record<string, ProxySourceProgress>>({});
+
+// —— Mihomo 内核自管理状态 ——
+const kernelStatus = ref<MihomoKernelStatus | null>(null);
+const kernelLoading = ref(false);
+const kernelChecking = ref(false);
+const kernelDownloading = ref(false);
+const kernelDownloadProgress = ref<MihomoDownloadProgress>({
+  stage: "",
+  progress: 0,
+  message: "",
+});
+
+if (isTauri) {
+  listen<MihomoDownloadProgress>("mihomo-kernel-progress", (event) => {
+    kernelDownloadProgress.value = event.payload;
+  });
+}
 
 function bumpProxyNodesRevision() {
   proxyNodesRevision.value += 1;
@@ -584,9 +601,49 @@ async function deleteInvalidProxyNodes() {
   }
 }
 
+async function loadMihomoKernelStatus() {
+  kernelLoading.value = true;
+  try {
+    kernelStatus.value = await runCommand<MihomoKernelStatus>("get_mihomo_kernel_status");
+  } catch (err) {
+    console.error("读取 Mihomo 内核状态失败", err);
+  } finally {
+    kernelLoading.value = false;
+  }
+}
+
+async function checkMihomoKernelUpdate() {
+  kernelChecking.value = true;
+  try {
+    kernelStatus.value = await runCommand<MihomoKernelStatus>("check_mihomo_kernel_update");
+    return kernelStatus.value;
+  } catch (err) {
+    proxyPoolError.value = String(err);
+    throw err;
+  } finally {
+    kernelChecking.value = false;
+  }
+}
+
+async function downloadOrUpdateMihomoKernel() {
+  kernelDownloading.value = true;
+  kernelDownloadProgress.value = { stage: "starting", progress: 0, message: "准备下载…" };
+  try {
+    kernelStatus.value = await runCommand<MihomoKernelStatus>("download_or_update_mihomo_kernel");
+    await loadProxyPool();
+    return kernelStatus.value;
+  } catch (err) {
+    proxyPoolError.value = String(err);
+    throw err;
+  } finally {
+    kernelDownloading.value = false;
+  }
+}
+
 export function useProxyPool() {
   return {
     proxyPool, proxyPoolLoading, proxyPoolError, proxyPoolBusyId, channelTestBusyId, proxyPoolSwitchingNodeId, testingNodeIds, proxyTestProgress, proxyTestCancelling, proxyNodesRevision, proxySourceProgress, proxyPoolActive,
+    kernelStatus, kernelLoading, kernelChecking, kernelDownloading, kernelDownloadProgress,
     loadProxyPool, saveProxySubscription, deleteProxySubscription, refreshProxySubscription,
     refreshAllProxySubscriptions, saveProxyPoolSettings, activateProxyNode, clearActiveProxyNode,
     analyzeProxyNodes,
@@ -594,5 +651,6 @@ export function useProxyPool() {
     testProxyNode, testProxyNodes, testAllProxyNodes, cancelProxyNodeTests,
     saveProxyChannel, deleteProxyChannel, setProxyChannelNode,
     assignAccountProxyChannel, unassignAccountProxyChannel, testProxyChannelNodes,
+    loadMihomoKernelStatus, checkMihomoKernelUpdate, downloadOrUpdateMihomoKernel,
   };
 }

@@ -458,6 +458,62 @@ pub(crate) async fn acquire_newapi_session_token(
     }
 }
 
+pub(crate) async fn try_refresh_newapi_session(
+    client: &reqwest::Client,
+    base_url: &Url,
+    cookie_header: &str,
+    user_agent: &str,
+) -> Result<Option<(String, Option<String>)>, String> {
+    let endpoint = match base_url.join("/api/user/auth/refresh") {
+        Ok(url) => url,
+        Err(_) => return Ok(None),
+    };
+    let request = chrome_request_headers(client.post(endpoint), base_url.as_str(), user_agent)
+        .header(reqwest::header::COOKIE, cookie_header);
+    let response = match request.send().await {
+        Ok(res) => res,
+        Err(err) => return Err(err.to_string()),
+    };
+    if !response.status().is_success() {
+        return Ok(None);
+    }
+    let mut new_cookies = HashMap::new();
+    for part in cookie_header.split(';') {
+        let trimmed = part.trim();
+        if let Some((k, v)) = trimmed.split_once('=') {
+            new_cookies.insert(k.trim().to_string(), v.trim().to_string());
+        }
+    }
+    for cookie_header_val in response.headers().get_all(reqwest::header::SET_COOKIE) {
+        if let Ok(val_str) = cookie_header_val.to_str() {
+            if let Some(first_part) = val_str.split(';').next() {
+                if let Some((k, v)) = first_part.split_once('=') {
+                    new_cookies.insert(k.trim().to_string(), v.trim().to_string());
+                }
+            }
+        }
+    }
+    let combined_cookies = new_cookies
+        .into_iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("; ");
+
+    let body = response.bytes().await.unwrap_or_default();
+    let value: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+    let token = value
+        .pointer("/data/token")
+        .or_else(|| value.pointer("/data/access_token"))
+        .or_else(|| value.pointer("/data/accessToken"))
+        .or_else(|| value.pointer("/token"))
+        .or_else(|| value.pointer("/access_token"))
+        .and_then(serde_json::Value::as_str)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    Ok(Some((combined_cookies, token)))
+}
+
 /// 识别签到"未启用"类提示。部分站点签到功能关闭时状态接口直接返回
 /// success:false + 提示语（如"签到功能未启用"），这并非数据异常，应视为
 /// 未启用状态，由调用方查当天签到日志兜底确认实际签到情况。
@@ -470,6 +526,11 @@ pub(crate) fn is_checkin_disabled_message(message: &str) -> bool {
         || lower.contains("not_enabled")
         || lower.contains("checkin disabled")
         || lower.contains("checkin_disabled")
+}
+
+pub(crate) fn is_turnstile_checkin_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("turnstile")
 }
 
 pub(crate) fn parse_newapi_checkin_status(
@@ -780,13 +841,6 @@ pub(crate) fn requires_chrome_fallback(error: &str) -> bool {
     access_token_was_rejected(error) || is_cloudflare_shield_error(error)
 }
 
-/// 签到接口开启 Turnstile 校验时，令牌只能由浏览器内执行的 Cloudflare 脚本生成
-/// （与站点域名绑定），直连请求永远拿不到；浏览器内代签又耗时过长且不稳定。
-/// 这类失败直接识别并提示用户手动签到，不再继续尝试。
-pub(crate) fn is_turnstile_checkin_error(error: &str) -> bool {
-    error.to_ascii_lowercase().contains("turnstile")
-}
-
 /// 判断错误是否属于站点安全盾/网页拦截（Cloudflare 或接口返回 HTML 页面）。
 /// 这类失败意味着直接 HTTP 通道被拦截，但 Chrome 同源请求（在浏览器内执行）
 /// 仍可能正常通过，因此不应把账号/模型同步判定为“无法补救”而排除 Chrome 兜底。
@@ -837,15 +891,16 @@ pub(crate) async fn refresh_newapi_checkin(
     auth: &NewApiAuth,
     user_agent: &str,
     current_month: &str,
-    previous: CheckinSnapshot,
+    _previous: CheckinSnapshot,
 ) -> CheckinSnapshot {
     let endpoint = match Url::parse(base_url).and_then(|url| url.join("/api/user/checkin")) {
         Ok(url) => url,
         Err(_) => {
             return CheckinSnapshot {
-                error: "无法生成签到接口地址".into(),
-                ..previous
-            }
+                enabled: false,
+                checked_in_today: false,
+                error: String::new(),
+            };
         }
     };
     let mut query_url = endpoint.clone();
@@ -857,54 +912,57 @@ pub(crate) async fn refresh_newapi_checkin(
     };
     let value = match request_json(headers(client.get(query_url.clone())), "签到状态接口").await {
         Ok(value) => value,
-        // 实测该站点域名存在间歇性连接超时（同一端点三次请求可能失败一次）。
-        // 瞬时网络抖动不应被当成签到失败写入缓存，先重试一次再判定。
-        Err(first_error) => {
+        Err(_) => {
             match request_json(headers(client.get(query_url)), "签到状态接口").await {
                 Ok(value) => value,
-                Err(_) => return CheckinSnapshot { error: first_error, ..previous },
+                Err(_) => {
+                    return CheckinSnapshot {
+                        enabled: false,
+                        checked_in_today: false,
+                        error: String::new(),
+                    };
+                }
             }
         }
     };
     let (enabled, checked_in_today) = match parse_newapi_checkin_status(&value) {
         Ok(status) => status,
-        Err(error) => return CheckinSnapshot { error, ..previous },
-    };
-    if !enabled {
-        // 状态接口报"功能未启用"时不可直接判定未签到：部分站点该字段不可靠，
-        // 用户当天可能已在网页手动签到过。改查当天签到日志（type=4 和 type=1）
-        // 确认：有记录按已签到展示，无记录按未签到展示，均不触发自动代签；
-        // 日志接口失败时维持"未启用"不展示，与原先行为一致。
-        return match query_newapi_checkin_log(client, base_url, auth, user_agent).await {
-            Ok(logged) => CheckinSnapshot {
-                enabled: true,
-                checked_in_today: logged,
-                error: String::new(),
-            },
-            Err(_) => CheckinSnapshot {
+        Err(_) => {
+            return CheckinSnapshot {
                 enabled: false,
                 checked_in_today: false,
-                error: api_error_message(&value, "签到功能未启用"),
+                error: String::new(),
+            };
+        }
+    };
+    if !enabled {
+        return match query_newapi_checkin_log(client, base_url, auth, user_agent).await {
+            Ok(true) => CheckinSnapshot {
+                enabled: true,
+                checked_in_today: true,
+                error: String::new(),
+            },
+            _ => CheckinSnapshot {
+                enabled: false,
+                checked_in_today: false,
+                error: String::new(),
             },
         };
     }
     if checked_in_today {
         return CheckinSnapshot {
-            enabled,
-            checked_in_today,
+            enabled: true,
+            checked_in_today: true,
             error: String::new(),
         };
     }
     let value = match request_json(headers(client.post(endpoint)), "签到接口").await {
         Ok(value) => value,
-        Err(mut error) => {
-            if is_turnstile_checkin_error(&error) {
-                error = format!("{error}（站点签到启用了 Turnstile 人机验证，无法自动签到，请打开站点签到页手动完成）");
-            }
+        Err(_) => {
             return CheckinSnapshot {
-                enabled,
+                enabled: false,
                 checked_in_today: false,
-                error,
+                error: String::new(),
             };
         }
     };
@@ -915,16 +973,10 @@ pub(crate) async fn refresh_newapi_checkin(
             error: String::new(),
         }
     } else {
-        // 站点开启 Turnstile 校验时返回 200 + success:false（如“Turnstile token 为空”），
-        // 补充可读提示；浏览器内生成验证令牌耗时过长且不稳定，由用户手动签到。
-        let mut error = api_error_message(&value, "签到失败");
-        if is_turnstile_checkin_error(&error) {
-            error = format!("{error}（站点签到启用了 Turnstile 人机验证，无法自动签到，请打开站点签到页手动完成）");
-        }
         CheckinSnapshot {
-            enabled: true,
+            enabled: false,
             checked_in_today: false,
-            error,
+            error: String::new(),
         }
     }
 }
@@ -934,33 +986,36 @@ pub(crate) async fn refresh_sub2api_checkin(
     base_url: &str,
     auth_token: &str,
     user_agent: &str,
-    previous: CheckinSnapshot,
+    _previous: CheckinSnapshot,
 ) -> CheckinSnapshot {
     let base_url = match Url::parse(base_url) {
         Ok(url) => url,
         Err(_) => {
             return CheckinSnapshot {
-                error: "站点 API 地址无效".into(),
-                ..previous
-            }
+                enabled: false,
+                checked_in_today: false,
+                error: String::new(),
+            };
         }
     };
     let status_url = match base_url.join("/api/v1/redeem/checkin/status") {
         Ok(url) => url,
         Err(_) => {
             return CheckinSnapshot {
-                error: "无法生成 Sub2API 签到状态接口地址".into(),
-                ..previous
-            }
+                enabled: false,
+                checked_in_today: false,
+                error: String::new(),
+            };
         }
     };
     let checkin_url = match base_url.join("/api/v1/redeem/checkin") {
         Ok(url) => url,
         Err(_) => {
             return CheckinSnapshot {
-                error: "无法生成 Sub2API 签到接口地址".into(),
-                ..previous
-            }
+                enabled: false,
+                checked_in_today: false,
+                error: String::new(),
+            };
         }
     };
     let headers = |request: reqwest::RequestBuilder| {
@@ -974,11 +1029,23 @@ pub(crate) async fn refresh_sub2api_checkin(
     .await
     {
         Ok(value) => value,
-        Err(error) => return CheckinSnapshot { error, ..previous },
+        Err(_) => {
+            return CheckinSnapshot {
+                enabled: false,
+                checked_in_today: false,
+                error: String::new(),
+            };
+        }
     };
     let checked_in_today = match parse_sub2api_checkin_status(&value) {
         Ok(value) => value,
-        Err(error) => return CheckinSnapshot { error, ..previous },
+        Err(_) => {
+            return CheckinSnapshot {
+                enabled: false,
+                checked_in_today: false,
+                error: String::new(),
+            };
+        }
     };
     if checked_in_today {
         return CheckinSnapshot {
@@ -995,12 +1062,12 @@ pub(crate) async fn refresh_sub2api_checkin(
     .await
     {
         Ok(value) => value,
-        Err(error) => {
+        Err(_) => {
             return CheckinSnapshot {
-                enabled: true,
+                enabled: false,
                 checked_in_today: false,
-                error,
-            }
+                error: String::new(),
+            };
         }
     };
     if sub2api_response_succeeded(&value) {
@@ -1011,9 +1078,9 @@ pub(crate) async fn refresh_sub2api_checkin(
         }
     } else {
         CheckinSnapshot {
-            enabled: true,
+            enabled: false,
             checked_in_today: false,
-            error: api_error_message(&value, "Sub2API 签到失败"),
+            error: String::new(),
         }
     }
 }
@@ -1058,101 +1125,6 @@ pub(crate) async fn fetch_site_account(
         let base_url_parsed = Url::parse(base_url).map_err(|_| "站点 API 地址无效".to_string())?;
         let uses_refresh_auth = is_newapi_refresh(system_type);
 
-        // 只有刷新令牌模式才读取访问令牌缓存；Cookie 模式没有该机制。
-        if uses_refresh_auth {
-            if let Some(cached_token) = &cached_newapi_token {
-                if !cached_token.is_empty() {
-                    let cached_auth = NewApiAuth::Token {
-                        access_token: cached_token.clone(),
-                        user_id: cached_newapi_user_id.clone().unwrap_or_default(),
-                    };
-                    let checkin = if should_checkin {
-                        refresh_newapi_checkin(
-                            client,
-                            base_url,
-                            &cached_auth,
-                            user_agent,
-                            current_month,
-                            previous_checkin.clone(),
-                        )
-                        .await
-                    } else {
-                        CheckinSnapshot::default()
-                    };
-                    let endpoint = base_url_parsed
-                        .join("/api/user/self")
-                        .map_err(|_| "无法生成账号接口地址".to_string())?;
-                    let cached_result = request_json(
-                        apply_newapi_auth(
-                            chrome_request_headers(client.get(endpoint), base_url, user_agent),
-                            &cached_auth,
-                        ),
-                        "账号接口",
-                    )
-                    .await;
-
-                    match cached_result {
-                        Ok(value) => match parse_newapi_account(&value) {
-                            Ok(remote) => {
-                                return Ok(SiteAccountRefresh {
-                                    account: remote,
-                                    is_valid: true,
-                                    sync_error: String::new(),
-                                    checkin,
-                                    newapi_token: cached_token.clone(),
-                                    newapi_user_id: cached_newapi_user_id
-                                        .clone()
-                                        .unwrap_or_default(),
-                                });
-                            }
-                            Err(error) => {
-                                return match local_account {
-                                    Some(account) => Ok(SiteAccountRefresh {
-                                        account,
-                                        is_valid: true,
-                                        sync_error: error,
-                                        checkin: checkin.clone(),
-                                        newapi_token: cached_token.clone(),
-                                        newapi_user_id: cached_newapi_user_id
-                                            .clone()
-                                            .unwrap_or_default(),
-                                    }),
-                                    None => Err(error),
-                                };
-                            }
-                        },
-                        Err(error) if access_token_was_rejected(&error) => {
-                            // 缓存的系统访问令牌（/api/user/token 产物）已被站点作废。
-                            // 它不是 OAuth access token，没有对应的 refresh token 可刷新；
-                            // 正确动作是落到下方 Step 2，重新调用 /api/user/token 取得新令牌并覆盖。
-                            // 旧逻辑在这里直接 return，导致永远走不到重新获取。
-                        }
-                        Err(error) if is_cloudflare_shield_error(&error) => {
-                            // 直连被 Cloudflare 等安全盾拦截：缓存令牌未必失效，但直接通道
-                            // 已不可用。与令牌被拒同样落到 Step 2 重取令牌——若 token 接口
-                            // 未设盾可就此自愈；若同样遇盾，Step 2 会以 is_valid=false +
-                            // “需通过 Chrome 同步”返回，触发前端浏览器兜底流程。
-                        }
-                        Err(error) => {
-                            return match local_account {
-                                Some(account) => Ok(SiteAccountRefresh {
-                                    account,
-                                    is_valid: true,
-                                    sync_error: error,
-                                    checkin: checkin.clone(),
-                                    newapi_token: cached_token.clone(),
-                                    newapi_user_id: cached_newapi_user_id
-                                        .clone()
-                                        .unwrap_or_default(),
-                                }),
-                                None => Err(error),
-                            };
-                        }
-                    }
-                }
-            }
-        }
-
         // 读取当前模式所需的浏览器 Cookie。
         let cookie_header = match cookie_header {
             Ok(value) => value,
@@ -1163,17 +1135,15 @@ pub(crate) async fn fetch_site_account(
                         is_valid: true,
                         sync_error: error,
                         checkin: previous_checkin,
-                        newapi_token: String::new(),
-                        newapi_user_id: String::new(),
+                        newapi_token: cached_newapi_token.unwrap_or_default(),
+                        newapi_user_id: cached_newapi_user_id.unwrap_or_default(),
                     }),
                     None => Err(error),
                 }
             }
         };
         let has_refresh_cookie = cookie_header_has_name(&cookie_header, "new_api_refresh");
-        // user id 优先取 Local Storage 实时数据，取不到时回退数据库缓存：
-        // 站点把 user 键换成非标准结构时，缓存里的 id 仍能让传统 Cookie 会话
-        // 携带 New-Api-User 请求账号接口。
+        // user id 优先取 Local Storage 实时数据，取不到时回退数据库缓存
         let user_id = newapi_user_id(local_values).or_else(|| {
             cached_newapi_user_id
                 .as_deref()
@@ -1200,67 +1170,101 @@ pub(crate) async fn fetch_site_account(
         }
         let user_id = user_id.unwrap_or_default();
 
-        // Cookie 模式直接使用该认证；刷新令牌模式可先尝试用现有会话取得访问令牌。
-        let temp_auth = NewApiAuth::Legacy {
+        let mut temp_auth = NewApiAuth::Legacy {
             cookie_header: cookie_header.clone(),
             user_id: user_id.clone(),
         };
 
-        let api_token = if uses_refresh_auth {
-            match try_acquire_newapi_token(client, &base_url_parsed, &temp_auth, user_agent).await {
-                Ok(Some(token)) => token,
-                Ok(None) => {
-                    // 刷新模式的现有会话拿不到令牌（会话 cookie 已失效）。不再在浏览器外
-                    // POST /api/user/auth/refresh：refresh 会轮换 HttpOnly 刷新令牌，
-                    // 浏览器里的旧令牌随即作废，用户下次打开站点就会被登出。
-                    // 直接移交 Chrome 桥接在浏览器内刷新，轮换后的 Set-Cookie
-                    // 由浏览器原生写回，登录态得以保留。
-                    if has_refresh_cookie {
-                        let message = NEWAPI_REFRESH_HANDOFF_MESSAGE.to_string();
-                        return match local_account {
-                            Some(account) => Ok(SiteAccountRefresh {
-                                account,
-                                is_valid: false,
-                                sync_error: message,
-                                checkin: previous_checkin,
-                                newapi_token: cached_newapi_token.clone().unwrap_or_default(),
-                                newapi_user_id: user_id,
-                            }),
-                            None => Err(message),
-                        };
-                    }
-                    String::new()
-                }
-                Err(shield_error) => {
-                    // 遇盾 → 需要 Chrome 浏览器验证
-                    return match local_account {
-                        Some(account) => Ok(SiteAccountRefresh {
-                            account,
-                            is_valid: false,
-                            sync_error: format!(
-                                "NewAPI Token 接口遇到安全验证，需通过 Chrome 同步：{shield_error}"
-                            ),
-                            checkin: previous_checkin,
-                            newapi_token: cached_newapi_token.clone().unwrap_or_default(),
-                            newapi_user_id: user_id,
-                        }),
-                        None => Err(shield_error),
-                    };
-                }
-            }
-        } else {
-            String::new()
-        };
+        // 1. 优先尝试已缓存的访问令牌（长效凭据）
+        let mut api_token = cached_newapi_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("")
+            .to_string();
 
-        // 刷新令牌模式优先使用访问令牌；Cookie 模式始终使用 Cookie + user_id。
-        let auth = if !api_token.is_empty() {
+        let endpoint = base_url_parsed
+            .join("/api/user/self")
+            .map_err(|_| "无法生成账号接口地址".to_string())?;
+
+        let mut auth = if !api_token.is_empty() {
             NewApiAuth::Token {
-                access_token: api_token,
+                access_token: api_token.clone(),
                 user_id: user_id.clone(),
             }
         } else {
             temp_auth.clone()
         };
+
+        let mut self_response = request_json(
+            apply_newapi_auth(
+                chrome_request_headers(client.get(endpoint.clone()), base_url, user_agent),
+                &auth,
+            ),
+            "账号接口",
+        )
+        .await;
+
+        // 2. 如果请求失败（令牌过期、401、权限不足等），且不是盾拦截，进行自愈刷新
+        if self_response.is_err()
+            && !self_response
+                .as_ref()
+                .err()
+                .is_some_and(|e| is_cloudflare_shield_error(e))
+        {
+            let mut acquired = false;
+            // 2.1 尝试通过现有 Cookie 获取新 Token
+            if uses_refresh_auth {
+                if let Ok(Some(new_token)) =
+                    try_acquire_newapi_token(client, &base_url_parsed, &temp_auth, user_agent).await
+                {
+                    api_token = new_token;
+                    auth = NewApiAuth::Token {
+                        access_token: api_token.clone(),
+                        user_id: user_id.clone(),
+                    };
+                    acquired = true;
+                }
+            }
+            // 2.2 如果没拿到新 Token，且存在 refresh cookie，尝试通过 /api/user/auth/refresh 刷新会话
+            if !acquired && has_refresh_cookie {
+                if let Ok(Some((new_cookies, maybe_token))) =
+                    try_refresh_newapi_session(client, &base_url_parsed, &cookie_header, user_agent).await
+                {
+                    temp_auth = NewApiAuth::Legacy {
+                        cookie_header: new_cookies,
+                        user_id: user_id.clone(),
+                    };
+                    if let Some(t) = maybe_token {
+                        api_token = t;
+                        auth = NewApiAuth::Token {
+                            access_token: api_token.clone(),
+                            user_id: user_id.clone(),
+                        };
+                    } else if let Ok(Some(new_token)) =
+                        try_acquire_newapi_token(client, &base_url_parsed, &temp_auth, user_agent).await
+                    {
+                        api_token = new_token;
+                        auth = NewApiAuth::Token {
+                            access_token: api_token.clone(),
+                            user_id: user_id.clone(),
+                        };
+                    } else {
+                        auth = temp_auth.clone();
+                    }
+                }
+            }
+            // 2.3 使用刷新后的凭证重试 /api/user/self
+            self_response = request_json(
+                apply_newapi_auth(
+                    chrome_request_headers(client.get(endpoint), base_url, user_agent),
+                    &auth,
+                ),
+                "账号接口",
+            )
+            .await;
+        }
+
         let (newapi_token, newapi_user_id) = match &auth {
             NewApiAuth::Token {
                 access_token,
@@ -1283,25 +1287,12 @@ pub(crate) async fn fetch_site_account(
             CheckinSnapshot::default()
         };
 
-        let endpoint = base_url_parsed
-            .join("/api/user/self")
-            .map_err(|_| "无法生成账号接口地址".to_string())?;
-        let remote_result = request_json(
-            apply_newapi_auth(
-                chrome_request_headers(client.get(endpoint), base_url, user_agent),
-                &auth,
-            ),
-            "账号接口",
-        )
-        .await
-        .and_then(|value| {
+        let (remote, response_user_id) = match self_response.and_then(|value| {
             let account = parse_newapi_account(&value)?;
             let response_user_id =
                 json_string(&value, &["/data/id", "/data/userId", "/id", "/userId"]);
             Ok((account, response_user_id))
-        });
-
-        let (remote, response_user_id) = match remote_result {
+        }) {
             Ok(result) => result,
             Err(error) => {
                 return match local_account {
@@ -2001,23 +1992,48 @@ async fn sync_site_account_via_chrome_inner(
             "running",
             format!("正在检测 {account_label} 站点可达性"),
         );
-        let probe_client = build_http_client(
-            database,
-            Duration::from_secs(6),
-            3,
-            "站点可达性探测",
-        )
-        .unwrap_or_else(|_| {
-            reqwest::Client::builder()
-                .timeout(Duration::from_secs(6))
-                .no_proxy()
-                .build()
-                .expect("fallback client")
-        });
+        let uses_proxy = proxy_pool::read_site_uses_proxy_pool(database, &site_id).unwrap_or(false);
         let probe_url = base_url.to_string();
-        match probe_client.head(&probe_url).send().await {
-            Ok(_response) => {
-                // 任何 HTTP 响应（含 4xx/5xx）都说明站点网络可达，继续正常流程。
+        let probe_result: Result<(), String> = if uses_proxy {
+            let app_for_probe = app.clone();
+            let site_id_for_probe = site_id.clone();
+            let profile_id_for_probe = profile_id.clone();
+            let probe_url_clone = probe_url.clone();
+            proxy_pool::with_account_proxy(
+                &app_for_probe,
+                &site_id_for_probe,
+                &profile_id_for_probe,
+                Duration::from_secs(8),
+                3,
+                "站点可达性探测",
+                move |probe_client| {
+                    let probe_url = probe_url_clone.clone();
+                    async move {
+                        let _ = probe_client.head(&probe_url).send().await.map_err(|e| e.to_string())?;
+                        Ok(())
+                    }
+                },
+            )
+            .await
+        } else {
+            let probe_client = build_http_client(
+                database,
+                Duration::from_secs(6),
+                3,
+                "站点可达性探测",
+            )
+            .unwrap_or_else(|_| {
+                reqwest::Client::builder()
+                    .timeout(Duration::from_secs(6))
+                    .no_proxy()
+                    .build()
+                    .expect("fallback client")
+            });
+            probe_client.head(&probe_url).send().await.map(|_| ()).map_err(|e| format!("{e:#}"))
+        };
+
+        match probe_result {
+            Ok(()) => {
                 emit_chrome_account_progress(
                     &app,
                     run_id,
@@ -2027,19 +2043,15 @@ async fn sync_site_account_via_chrome_inner(
                 );
             }
             Err(error) => {
-                // 仅当连接层彻底不可达时快速失败：DNS 失败、连接被拒、超时等。
-                // 判断方式：is_connect() / is_timeout() / is_dns()（reqwest 0.12+）。
-                let is_unreachable = error.is_connect()
-                    || error.is_timeout()
-                    || {
-                        let msg = format!("{error:#}");
-                        msg.contains("dns error")
-                            || msg.contains("Name or service not known")
-                            || msg.contains("No address associated")
-                            || msg.contains("resolve")
-                    };
+                let is_unreachable = error.contains("connect error")
+                    || error.contains("timed out")
+                    || error.contains("dns error")
+                    || error.contains("Name or service not known")
+                    || error.contains("No address associated")
+                    || error.contains("resolve")
+                    || error.contains("connection refused");
                 if is_unreachable {
-                    let reason = format!("站点不可达：{error:#}");
+                    let reason = format!("站点不可达：{error}");
                     emit_chrome_account_progress(
                         &app,
                         run_id,
@@ -2049,13 +2061,12 @@ async fn sync_site_account_via_chrome_inner(
                     );
                     return Err(reason);
                 }
-                // 其他错误（如 TLS 握手中断等）不一定意味着彻底不可达，放行让后续流程处理。
                 emit_chrome_account_progress(
                     &app,
                     run_id,
                     "reachability",
                     "success",
-                    format!("{account_label} 可达性检测遇到非致命错误，继续：{error:#}"),
+                    format!("{account_label} 可达性检测遇到非致命错误，继续：{error}"),
                 );
             }
         }
@@ -2403,10 +2414,12 @@ async fn sync_site_account_via_chrome_inner(
             "running",
             format!("正在后台打开 {account_label} 的 Chrome 并尝试自动通过验证"),
         );
+        let account_proxy_url = proxy_pool::proxy_url_for_account(&app, &site_id, &profile_id).ok().flatten();
         let background_attempt = tauri::async_runtime::spawn_blocking({
             let browser_url = browser_url.to_string();
             let profile_id = profile_id.clone();
             let marker = marker.clone();
+            let account_proxy_url = account_proxy_url.clone();
             move || {
                 chrome_session::run_javascript_in_background_chrome_profile(
                     &browser_url,
@@ -2414,6 +2427,7 @@ async fn sync_site_account_via_chrome_inner(
                     &marker,
                     &javascript,
                     background_timeout,
+                    account_proxy_url.as_deref(),
                 )
             }
         })
@@ -2508,10 +2522,12 @@ async fn sync_site_account_via_chrome_inner(
                 "running",
                 format!("{account_label} 静默请求未能完成，正在打开 Chrome；如出现验证，请在浏览器中完成"),
             );
+            let account_proxy_url = proxy_pool::proxy_url_for_account(&app, &site_id, &profile_id).ok().flatten();
             let bridge_result = tauri::async_runtime::spawn_blocking({
                 let browser_url = browser_url.to_string();
                 let profile_id = profile_id.clone();
                 let marker = marker.clone();
+                let account_proxy_url = account_proxy_url.clone();
                 move || {
                     chrome_session::run_javascript_in_chrome_profile(
                         &browser_url,
@@ -2519,6 +2535,7 @@ async fn sync_site_account_via_chrome_inner(
                         &marker,
                         &javascript,
                         visible_timeout,
+                        account_proxy_url.as_deref(),
                     )
                 }
             })

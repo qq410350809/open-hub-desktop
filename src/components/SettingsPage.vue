@@ -4,12 +4,23 @@ import { icons } from "../icons";
 import { useStore } from "../composables/useStore";
 import { usePreferences } from "../composables/usePreferences";
 import { useTheme } from "../composables/useTheme";
+import { useProxyPool } from "../composables/useProxyPool";
 import { runCommand } from "../composables/useLibrary";
 import type { LightweightState, ThemePreference, ProxyNodeViewModePreference } from "../types";
 
 const store = useStore();
 const { preferences, updatePreferences } = usePreferences();
 const { setThemePreference } = useTheme();
+const {
+  kernelStatus,
+  kernelLoading,
+  kernelChecking,
+  kernelDownloading,
+  kernelDownloadProgress,
+  loadMihomoKernelStatus,
+  checkMihomoKernelUpdate,
+  downloadOrUpdateMihomoKernel,
+} = useProxyPool();
 
 const AUTO_SYNC_INTERVAL_CHOICES = [15, 30, 60] as const;
 
@@ -38,6 +49,7 @@ watch(
       nextTick(() => closeBtnRef.value?.focus());
       void loadLightweightState();
       void store.loadAutoSyncState();
+      void loadMihomoKernelStatus();
     }
   },
 );
@@ -326,16 +338,61 @@ async function enterLightweightMode() {
               </div>
             </section>
 
-            <!-- 代理池 -->
+            <!-- 代理池与内核 -->
             <section class="settings-section">
               <div class="settings-section-title">
                 <span v-html="icons.wifi" />
                 <div>
-                  <h2>代理池</h2>
-                  <p>节点列表的默认展示方式</p>
+                  <h2>代理池与内核</h2>
+                  <p>OpenHub 内置独立代理内核与节点设置</p>
                 </div>
               </div>
               <div class="settings-rows">
+                <div class="settings-row">
+                  <div>
+                    <strong>内置 Mihomo 内核</strong>
+                    <small v-if="kernelLoading">正在检测内核状态…</small>
+                    <small v-else-if="kernelStatus?.installed">
+                      版本：<code>{{ kernelStatus.version }}</code>
+                      <span v-if="kernelStatus.latestVersion && kernelStatus.latestVersion !== kernelStatus.version" style="color: var(--primary, #3b82f6); font-weight: 500">
+                        · 发现新版本 {{ kernelStatus.latestVersion }}
+                      </span>
+                      <br />
+                      路径：<code class="lightweight-address">{{ kernelStatus.path }}</code>
+                    </small>
+                    <small v-else style="color: var(--danger, #ef4444)">
+                      尚未安装内置内核，请点击右侧按钮一键下载
+                    </small>
+                    <div v-if="kernelDownloading" class="kernel-progress-box" style="margin-top: 8px;">
+                      <div style="background: rgba(0,0,0,0.1); border-radius: 4px; height: 6px; overflow: hidden; width: 100%; max-width: 320px;">
+                        <div style="background: var(--primary, #3b82f6); height: 100%; transition: width 0.2s;" :style="{ width: `${Math.max(5, Math.round(kernelDownloadProgress.progress * 100))}%` }" />
+                      </div>
+                      <small style="color: var(--primary, #3b82f6); margin-top: 4px; display: block;">{{ kernelDownloadProgress.message }}</small>
+                    </div>
+                  </div>
+                  <div style="display: flex; gap: 8px; align-items: center">
+                    <button
+                      v-if="kernelStatus?.installed"
+                      type="button"
+                      class="secondary-button"
+                      :disabled="kernelLoading || kernelChecking || kernelDownloading"
+                      @click="checkMihomoKernelUpdate"
+                    >
+                      <span v-html="icons.restore" /><span>{{ kernelChecking ? "检查中…" : "检查更新" }}</span>
+                    </button>
+                    <button
+                      type="button"
+                      class="secondary-button"
+                      :style="!kernelStatus?.installed ? 'background: var(--primary, #3b82f6); color: white; border-color: transparent;' : ''"
+                      :disabled="kernelLoading || kernelDownloading"
+                      @click="downloadOrUpdateMihomoKernel"
+                    >
+                      <span v-html="icons.download || icons.restore" />
+                      <span>{{ kernelDownloading ? "正在下载…" : (kernelStatus?.installed ? "重新下载 / 更新" : "一键下载内核") }}</span>
+                    </button>
+                  </div>
+                </div>
+
                 <div class="settings-row">
                   <div>
                     <strong>节点列表显示</strong>

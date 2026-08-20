@@ -730,7 +730,7 @@ pub async fn mark_sites_with_chrome_sessions(
                 details.push(if session.checked_in_today {
                     "今日已签到".into()
                 } else {
-                    "今日未签到".into()
+                    "今日未自动签到".into()
                 });
             }
             // 刷新令牌移交（本地会话失效 → 交 Chrome 同源刷新）不是失败，

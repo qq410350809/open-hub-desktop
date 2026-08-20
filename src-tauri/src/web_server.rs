@@ -678,12 +678,15 @@ fn dispatch(app: &AppHandle, command: &str, args: &Value) -> Result<Value, Strin
         "set_proxy_channel_node" => {
             let channel_id = take_string(args, &["channelId", "channel_id"])?;
             let node_id = take_string(args, &["nodeId", "node_id"])?;
-            Ok(json!(proxy_pool::set_proxy_channel_node(
-                app.state::<Database>(),
-                app.state::<ProxyRuntime>(),
-                channel_id,
-                node_id,
-            )))
+            Ok(json!(tauri::async_runtime::block_on(async move {
+                proxy_pool::set_proxy_channel_node(
+                    app.state::<Database>(),
+                    app.state::<ProxyRuntime>(),
+                    channel_id,
+                    node_id,
+                )
+                .await
+            })))
         }
         "assign_account_proxy_channel" => {
             let profile_id = take_string(args, &["profileId", "profile_id"])?;

@@ -896,7 +896,12 @@ pub(crate) fn read_cached_usage_sites(
                     sa.checkin_error, sa.updated_at, sa.newapi_token, sa.newapi_user_id,
                     sa.browser_fallback_failed_at, sa.browser_fallback_fail_count,
                     CASE WHEN smc.profile_id IS NULL THEN 0 ELSE 1 END,
-                    COALESCE(smc.error, '')
+                    CASE 
+                        WHEN (smc.keys_json IS NOT NULL AND smc.keys_json NOT IN ('', '[]'))
+                          OR (smc.models_json IS NOT NULL AND smc.models_json NOT IN ('', '[]'))
+                        THEN ''
+                        ELSE COALESCE(smc.error, '')
+                    END
              FROM site_accounts sa
              LEFT JOIN site_model_cache smc
                ON smc.site_id = sa.site_id AND smc.profile_id = sa.profile_id

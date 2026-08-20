@@ -85,6 +85,24 @@ impl ChannelConfig {
             keys.into_iter().map(|k| format!("Bearer {k}")).collect()
         }
     }
+
+    /// 上游 OpenAI 兼容 API 根地址：路径已以 /vN（如 /v1、/zen/v1）结尾时原样返回；
+    /// 否则（如站点首页地址 https://x666.me/）补全 /v1，保证 /models、/chat/completions
+    /// 等子路径可访问。与站点库拉取模型时 join("/v1/models") 的语义保持一致。
+    pub fn upstream_api_base(&self) -> String {
+        let url = self.upstream_url.trim();
+        let trimmed = url.trim_end_matches('/');
+        let path = trimmed.split(['?', '#']).next().unwrap_or(trimmed);
+        let last_seg = path.rsplit('/').find(|s| !s.is_empty()).unwrap_or("");
+        let has_version = last_seg.len() > 1
+            && last_seg.starts_with('v')
+            && last_seg[1..].chars().all(|c| c.is_ascii_digit());
+        if has_version {
+            trimmed.to_string()
+        } else {
+            format!("{trimmed}/v1")
+        }
+    }
 }
 
 /// 将空别名补全为渠道 id，并统一小写化；把单 Key 回填进多 Key 列表，保证配置语义一致。
@@ -280,6 +298,24 @@ pub struct ChannelModelList {
     pub channel_id: String,
     pub alias: String,
     pub models: Vec<String>,
+}
+
+/// 单个渠道拉取模型失败的原因（供前端弹窗空态展示）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelModelFetchError {
+    pub channel_id: String,
+    pub channel_name: String,
+    pub error: String,
+}
+
+/// `fetch_opencode_models` 的返回：各渠道模型列表 + 拉取失败明细。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+pub struct ChannelModelsFetchResult {
+    pub channels: Vec<ChannelModelList>,
+    pub errors: Vec<ChannelModelFetchError>,
 }
 
 #[derive(Clone)]
@@ -2113,7 +2149,7 @@ async fn fetch_channel_models_raw(
     let candidates = get_sorted_egress_candidates(ctx, chan).await;
     let candidate = candidates.first().map(|s| s.as_str()).unwrap_or("__direct__");
     let client = build_client_for_candidate(ctx, candidate).await;
-    let models_url = format!("{}/models", chan.upstream_url.trim_end_matches('/'));
+    let models_url = format!("{}/models", chan.upstream_api_base());
     let auth_vals = chan.auth_values();
 
     let mut merged: Vec<String> = Vec::new();
@@ -2186,41 +2222,145 @@ async fn fetch_opencode_channel_models(
     Ok(model_ids)
 }
 
+/// 从本地数据库读取站点模型缓存（默认优先从库中读取）
+async fn read_site_model_cache_for_site(
+    ctx: &OpencodeProxyContext,
+    site_id: &str,
+) -> Option<Vec<String>> {
+    let app_opt = ctx.app_handle.read().await.clone();
+    let app = app_opt?;
+    let database = app.state::<crate::models::Database>();
+    let all_models = {
+        let conn = database.0.lock().ok()?;
+        let mut stmt = conn
+            .prepare("SELECT models_json FROM site_model_cache WHERE site_id = ?1")
+            .ok()?;
+        let mut models = Vec::new();
+        let rows = stmt
+            .query_map([site_id], |row| {
+                let json_str: String = row.get(0)?;
+                Ok(json_str)
+            })
+            .ok()?;
+        for r in rows.flatten() {
+            if let Ok(items) = serde_json::from_str::<Vec<crate::models::SiteModelItem>>(&r) {
+                for it in items {
+                    if !it.id.is_empty() && !models.contains(&it.id) {
+                        models.push(it.id);
+                    }
+                }
+            }
+        }
+        models
+    };
+    if all_models.is_empty() {
+        None
+    } else {
+        Some(all_models)
+    }
+}
+
+/// 将拉取到的最新上游模型和 Key 落库到本地数据库
+async fn save_site_channel_models_to_db(
+    ctx: &OpencodeProxyContext,
+    site_id: &str,
+    channel_name: &str,
+    models: &[String],
+    keys: &[String],
+) {
+    let app_opt = ctx.app_handle.read().await.clone();
+    if let Some(app) = app_opt {
+        let database = app.state::<crate::models::Database>();
+        let model_items: Vec<crate::models::SiteModelItem> = models
+            .iter()
+            .map(|m| crate::models::SiteModelItem {
+                id: m.clone(),
+                owned_by: None,
+            })
+            .collect();
+        let models_json = serde_json::to_string(&model_items).unwrap_or_else(|_| "[]".to_string());
+        let keys_json = serde_json::to_string(keys).unwrap_or_else(|_| "[]".to_string());
+
+        if let Ok(conn) = database.0.lock() {
+            let _ = conn.execute(
+                "INSERT INTO site_model_cache (site_id, profile_id, profile_name, account_name, username, api_source, keys_json, groups_json, models_json, key_models_json, error, updated_at)
+                 VALUES (?1, '', ?2, '', '', 'proxy_fetch', ?3, '{}', ?4, '{}', '', CURRENT_TIMESTAMP)
+                 ON CONFLICT(site_id, profile_id) DO UPDATE SET
+                    models_json = excluded.models_json,
+                    keys_json = CASE WHEN excluded.keys_json != '[]' THEN excluded.keys_json ELSE site_model_cache.keys_json END,
+                    error = '',
+                    updated_at = CURRENT_TIMESTAMP",
+                rusqlite::params![site_id, channel_name, keys_json, models_json],
+            );
+        };
+    }
+}
+
 /// 从站点转换渠道抓取模型（OpenAI 兼容 /v1/models，保留全部模型 id）
+/// force_refresh = false 时默认优先读取本地库中的模型缓存；
+/// force_refresh = true 时（点击刷新上游模型）强制向远端请求并落库结果。
 async fn fetch_site_channel_models(
     ctx: &OpencodeProxyContext,
     chan: &ChannelConfig,
+    force_refresh: bool,
 ) -> Result<Vec<String>, String> {
+    if !force_refresh {
+        if let Some(site_id) = &chan.site_id {
+            if let Some(cached_models) = read_site_model_cache_for_site(ctx, site_id).await {
+                if !cached_models.is_empty() {
+                    return Ok(cached_models);
+                }
+            }
+        }
+    }
+
     let ids = fetch_channel_models_raw(ctx, chan, &[]).await?;
     if ids.is_empty() {
         return Err(format!("渠道「{}」未返回模型列表", chan.name));
     }
+
+    if let Some(site_id) = &chan.site_id {
+        save_site_channel_models_to_db(ctx, site_id, &chan.name, &ids, &chan.api_keys).await;
+    }
+
     Ok(ids)
 }
 
-/// 拉取全部启用渠道的模型列表（单个渠道失败不影响其他渠道）
+/// 拉取全部启用渠道的模型列表（单个渠道失败不影响其他渠道，失败原因随返回值透传）
 async fn fetch_upstream_models_inner(
     ctx: &OpencodeProxyContext,
     config: &OpencodeProxyConfig,
-) -> Vec<ChannelModelList> {
+    force_refresh: bool,
+) -> (Vec<ChannelModelList>, Vec<ChannelModelFetchError>) {
     let mut result = Vec::new();
+    let mut errors = Vec::new();
     for chan in config.channels.iter().filter(|c| c.enabled) {
         let fetched = if chan.id == "opencode" {
             fetch_opencode_channel_models(ctx, chan).await
         } else {
-            fetch_site_channel_models(ctx, chan).await
+            fetch_site_channel_models(ctx, chan, force_refresh).await
         };
-        if let Ok(models) = fetched {
-            if !models.is_empty() {
+        match fetched {
+            Ok(models) if !models.is_empty() => {
                 result.push(ChannelModelList {
                     channel_id: chan.id.clone(),
                     alias: chan.effective_alias(),
                     models,
                 });
             }
+            Ok(_) => errors.push(ChannelModelFetchError {
+                channel_id: chan.id.clone(),
+                channel_name: chan.name.clone(),
+                error: format!("渠道「{}」上游未返回任何模型", chan.name),
+            }),
+            Err(e) => errors.push(ChannelModelFetchError {
+                channel_id: chan.id.clone(),
+                channel_name: chan.name.clone(),
+                error: e,
+            }),
         }
     }
-    result
+    (result, errors)
 }
 
 /// GET /v1/models (ID 统一为 {alias}/原id)
@@ -2236,7 +2376,7 @@ async fn handle_models(headers: HeaderMap, State(ctx): State<OpencodeProxyContex
     };
 
     if need_refresh {
-        let models = fetch_upstream_models_inner(&ctx, &config).await;
+        let (models, _errors) = fetch_upstream_models_inner(&ctx, &config, false).await;
         let mut cached = ctx.cached_channel_models.write().await;
         *cached = models;
         let mut updated = ctx.cached_models_updated_at.write().await;
@@ -2412,7 +2552,7 @@ async fn handle_chat_completions(
 
     normalize_chat_messages(&mut body);
 
-    let target_url = format!("{}/chat/completions", chan.upstream_url.trim_end_matches('/'));
+    let target_url = format!("{}/chat/completions", chan.upstream_api_base());
     let auth_vals = chan.auth_values();
 
     let candidates = get_sorted_egress_candidates(&ctx, chan).await;
@@ -2767,7 +2907,7 @@ async fn handle_responses(
     normalize_chat_messages(&mut body);
 
     // 默认转发至上游标准的 /chat/completions 端点
-    let target_url = format!("{}/chat/completions", chan.upstream_url.trim_end_matches('/'));
+    let target_url = format!("{}/chat/completions", chan.upstream_api_base());
     let auth_vals = chan.auth_values();
 
     let candidates = get_sorted_egress_candidates(&ctx, chan).await;
@@ -3410,7 +3550,7 @@ async fn handle_messages(
 
     normalize_chat_messages(&mut openai_body);
 
-    let target_url = format!("{}/chat/completions", chan.upstream_url.trim_end_matches('/'));
+    let target_url = format!("{}/chat/completions", chan.upstream_api_base());
     let auth_vals = chan.auth_values();
 
     let candidates = get_sorted_egress_candidates(&ctx, chan).await;
@@ -3824,7 +3964,7 @@ pub async fn start_opencode_proxy_server(state: &OpencodeProxyState) -> Result<(
     let ctx_clone = state.context.clone();
     tokio::spawn(async move {
         let cfg = ctx_clone.config.read().await.clone();
-        let models = fetch_upstream_models_inner(&ctx_clone, &cfg).await;
+        let (models, _errors) = fetch_upstream_models_inner(&ctx_clone, &cfg, false).await;
         let mut cached = ctx_clone.cached_channel_models.write().await;
         *cached = models;
         let mut updated = ctx_clone.cached_models_updated_at.write().await;
@@ -4053,7 +4193,7 @@ pub async fn fetch_opencode_models(
     state: tauri::State<'_, OpencodeProxyState>,
 ) -> Result<Vec<ChannelModelList>, String> {
     let cfg = state.context.config.read().await.clone();
-    let models = fetch_upstream_models_inner(&state.context, &cfg).await;
+    let (models, _errors) = fetch_upstream_models_inner(&state.context, &cfg, true).await;
     let mut cached = state.context.cached_channel_models.write().await;
     *cached = models.clone();
     let mut updated = state.context.cached_models_updated_at.write().await;
