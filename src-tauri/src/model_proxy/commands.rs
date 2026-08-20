@@ -165,7 +165,7 @@ pub async fn get_model_proxy_logs(
     q: Option<String>,
     sort_by: Option<String>,
     sort_order: Option<String>,
-) -> Result<(Vec<ProxyRequestLog>, usize, usize, usize, usize), String> {
+) -> Result<super::types::ProxyLogsResponse, String> {
     let p = page.unwrap_or(1).max(1);
     let ps = page_size.unwrap_or(50).clamp(1, 200);
     let offset = (p - 1) * ps;
@@ -254,15 +254,13 @@ pub async fn get_model_proxy_logs(
         .prepare(&query_sql)
         .map_err(|e| format!("查询日志失败: {e}"))?;
 
-    let mut query_params: Vec<&dyn rusqlite::ToSql> =
-        params_vec.iter().map(|b| b.as_ref()).collect();
-    let ps_i64 = ps as i64;
-    let offset_i64 = offset as i64;
-    query_params.push(&ps_i64);
-    query_params.push(&offset_i64);
+    let mut query_params: Vec<Box<dyn rusqlite::ToSql>> = params_vec;
+    query_params.push(Box::new(ps as i64));
+    query_params.push(Box::new(offset as i64));
 
+    let query_refs: Vec<&dyn rusqlite::ToSql> = query_params.iter().map(|b| b.as_ref()).collect();
     let rows = stmt
-        .query_map(query_params.as_slice(), |row| {
+        .query_map(query_refs.as_slice(), |row| {
             let stream_int: i64 = row.get(6)?;
             let status_int: i64 = row.get(7)?;
             let dur_int: i64 = row.get(8)?;
@@ -293,7 +291,13 @@ pub async fn get_model_proxy_logs(
         .map_err(|e| format!("解析日志失败: {e}"))?;
 
     let logs = rows.filter_map(Result::ok).collect();
-    Ok((logs, count_filtered, count_all, count_succ, count_err))
+    Ok(super::types::ProxyLogsResponse {
+        items: logs,
+        total: count_filtered,
+        global_total: count_all,
+        success_total: count_succ,
+        error_total: count_err,
+    })
 }
 
 #[tauri::command]
@@ -305,7 +309,7 @@ pub async fn get_opencode_proxy_logs(
     q: Option<String>,
     sort_by: Option<String>,
     sort_order: Option<String>,
-) -> Result<(Vec<ProxyRequestLog>, usize, usize, usize, usize), String> {
+) -> Result<super::types::ProxyLogsResponse, String> {
     get_model_proxy_logs(database, page, page_size, filter, q, sort_by, sort_order).await
 }
 
@@ -480,3 +484,13 @@ pub async fn sync_model_proxy_site_channels(
 
     Ok(updated_config)
 }
+
+#[tauri::command]
+pub async fn sync_opencode_site_channels(
+    database: State<'_, Database>,
+    state: State<'_, OpencodeProxyState>,
+    site_ids: Option<Vec<String>>,
+) -> Result<OpencodeProxyConfig, String> {
+    sync_model_proxy_site_channels(database, state, site_ids).await
+}
+

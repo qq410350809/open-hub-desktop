@@ -1274,6 +1274,7 @@ pub fn run() {
             opencode_proxy::get_opencode_proxy_logs,
             opencode_proxy::get_opencode_channel_stats,
             opencode_proxy::clear_opencode_proxy_logs,
+            opencode_proxy::sync_opencode_site_channels,
             file_export::save_export_file,
             mihomo_kernel::get_mihomo_kernel_status,
             mihomo_kernel::check_mihomo_kernel_update,

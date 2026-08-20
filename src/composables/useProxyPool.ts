@@ -559,13 +559,14 @@ async function unassignAccountProxyChannel(profileId: string) {
   }
 }
 
-async function testProxyChannelNodes(channelId: string) {
-  const busyId = `test-channel-${channelId}`;
+async function testProxyChannelNodes(channelId?: string, nodeIds?: string[]) {
+  const busyId = `test-channel-${channelId || "all"}`;
   channelTestBusyId.value = busyId;
   proxyPoolError.value = "";
   try {
     proxyPool.value = await runCommand<ProxyPoolState>("test_proxy_channel_nodes", {
-      channelId,
+      channelId: channelId || undefined,
+      nodeIds: nodeIds && nodeIds.length > 0 ? nodeIds : undefined,
     });
     bumpProxyNodesRevision();
     return proxyPool.value;

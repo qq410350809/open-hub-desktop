@@ -33,11 +33,29 @@ pub fn create_model_proxy_router(ctx: ModelProxyContext) -> Router {
         .allow_headers(Any);
 
     Router::new()
+        // Health / Gateway info
+        .route("/", get(handle_healthz))
+        .route("/health", get(handle_healthz))
         .route("/healthz", get(handle_healthz))
+        .route("/v1/health", get(handle_healthz))
+        // OpenAI Models
         .route("/v1/models", get(handle_models))
+        .route("/models", get(handle_models))
+        .route("/v1/models/:model_id", get(handle_single_model))
+        .route("/models/:model_id", get(handle_single_model))
+        // OpenAI Chat Completions
         .route("/v1/chat/completions", post(handle_chat_completions))
+        .route("/chat/completions", post(handle_chat_completions))
+        // OpenAI Responses
         .route("/v1/responses", post(handle_responses))
+        .route("/responses", post(handle_responses))
+        // OpenAI Embeddings
+        .route("/v1/embeddings", post(handle_embeddings))
+        .route("/embeddings", post(handle_embeddings))
+        // Anthropic Messages
         .route("/v1/messages", post(handle_messages))
+        .route("/messages", post(handle_messages))
+        // Google Gemini
         .route("/v1beta/models", get(handle_gemini_models))
         .route("/v1beta/models/*model_action", post(handle_gemini_generate))
         .layer(cors)
@@ -197,7 +215,7 @@ pub async fn handle_models(
     let channel_models = ctx.cached_channel_models.read().await.clone();
     let mut model_items = Vec::new();
 
-    for entry in channel_models {
+    for entry in &channel_models {
         let channel = config.channels.iter().find(|c| c.id == entry.channel_id);
         if let Some(ch) = channel {
             if !ch.enabled {
@@ -206,9 +224,9 @@ pub async fn handle_models(
             let eff_alias = ch.effective_alias();
             let allowed_models = ch.enabled_models.as_ref();
 
-            for m in entry.models {
+            for m in &entry.models {
                 if let Some(allowed) = allowed_models {
-                    if !allowed.contains(&m) {
+                    if !allowed.contains(m) {
                         continue;
                     }
                 }
@@ -240,11 +258,157 @@ pub async fn handle_models(
         }
     }
 
+    // 补充显式配置的 enabled_models（若尚未从上游拉取到）
+    for ch in &config.channels {
+        if !ch.enabled {
+            continue;
+        }
+        let eff_alias = ch.effective_alias();
+        if let Some(explicit_models) = &ch.enabled_models {
+            for m in explicit_models {
+                let full_id = format!("{eff_alias}/{m}");
+                if !model_items.iter().any(|item| item.get("id").and_then(JsonValue::as_str) == Some(&full_id)) {
+                    model_items.push(json!({
+                        "id": full_id,
+                        "object": "model",
+                        "created": 1700000000,
+                        "owned_by": eff_alias,
+                        "permission": [],
+                        "root": m,
+                        "parent": null
+                    }));
+                    if ch.id == "opencode" {
+                        model_items.push(json!({
+                            "id": m,
+                            "object": "model",
+                            "created": 1700000000,
+                            "owned_by": "opencode",
+                            "permission": [],
+                            "root": m,
+                            "parent": null
+                        }));
+                    }
+                }
+            }
+        }
+    }
+
+    // 兜底保底模型：避免任何情况下返回空数组给客户端
+    if model_items.is_empty() {
+        let defaults = [
+            "deepseek-v4-flash-free",
+            "glm-4-flash-free",
+            "qwen-2.5-coder-32b",
+            "claude-3-7-sonnet",
+            "gpt-4o",
+        ];
+        for m in defaults {
+            model_items.push(json!({
+                "id": format!("opencode/{m}"),
+                "object": "model",
+                "created": 1700000000,
+                "owned_by": "opencode",
+                "permission": [],
+                "root": m,
+                "parent": null
+            }));
+            model_items.push(json!({
+                "id": m,
+                "object": "model",
+                "created": 1700000000,
+                "owned_by": "opencode",
+                "permission": [],
+                "root": m,
+                "parent": null
+            }));
+        }
+    }
+
     Json(json!({
         "object": "list",
         "data": model_items
     }))
     .into_response()
+}
+
+/// GET /v1/models/:model_id (单个模型查询)
+pub async fn handle_single_model(
+    headers: HeaderMap,
+    uri: Uri,
+    Path(model_id): Path<String>,
+    State(ctx): State<ModelProxyContext>,
+) -> Response {
+    let config = ctx.config.read().await;
+    if let Err(res) = check_auth(&headers, &uri, &config).await {
+        return res;
+    }
+    Json(json!({
+        "id": model_id,
+        "object": "model",
+        "created": 1700000000,
+        "owned_by": "openhub",
+        "permission": [],
+        "root": model_id,
+        "parent": null
+    }))
+    .into_response()
+}
+
+/// POST /v1/embeddings (OpenAI Embeddings 转发)
+pub async fn handle_embeddings(
+    headers: HeaderMap,
+    uri: Uri,
+    State(ctx): State<ModelProxyContext>,
+    Json(mut body): Json<JsonValue>,
+) -> Response {
+    let config = ctx.config.read().await;
+    if let Err(res) = check_auth(&headers, &uri, &config).await {
+        return res;
+    }
+
+    let raw_model = body
+        .get("model")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("text-embedding-3-small")
+        .to_string();
+    let (chan, model_to_send) = match resolve_channel(&config, &raw_model) {
+        Some((c, m)) => (c, m),
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": { "type": "api_error", "message": "未找到可用的上游渠道" } })),
+            )
+                .into_response();
+        }
+    };
+    body["model"] = JsonValue::String(model_to_send);
+    let upstream_url = format!("{}/embeddings", chan.base_url.trim_end_matches('/'));
+    let channel_api_key = select_channel_api_key(&ctx, chan);
+    let candidates = get_sorted_egress_candidates(&ctx, chan).await;
+    let candidate_id = candidates.first().map(|s| s.as_str()).unwrap_or("__direct__");
+    let client = build_client_for_candidate(&ctx, candidate_id).await;
+
+    let mut req_builder = client
+        .post(&upstream_url)
+        .header("Content-Type", "application/json")
+        .json(&body);
+
+    if !channel_api_key.is_empty() {
+        req_builder = req_builder.header("Authorization", format!("Bearer {channel_api_key}"));
+    }
+
+    match req_builder.send().await {
+        Ok(resp) => {
+            let status = resp.status();
+            let bytes = resp.bytes().await.unwrap_or_default();
+            (status, [("content-type", "application/json")], bytes).into_response()
+        }
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({ "error": { "message": format!("上游 Embeddings 请求失败: {e}") } })),
+        )
+            .into_response(),
+    }
 }
 
 /// GET /v1beta/models (Google Gemini 格式)

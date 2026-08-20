@@ -319,6 +319,8 @@ impl Database {
                     country_name TEXT NOT NULL DEFAULT '',
                     classification TEXT NOT NULL DEFAULT '',
                     primary_ip TEXT NOT NULL DEFAULT '',
+                    is_enabled INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
 
@@ -1168,6 +1170,8 @@ pub(crate) fn ensure_proxy_pool_node_columns(connection: &Connection) -> Result<
         ("channel_latency_ms", "INTEGER"),
         ("channel_test_status", "TEXT NOT NULL DEFAULT ''"),
         ("channel_tested_at", "TEXT NOT NULL DEFAULT ''"),
+        ("is_enabled", "INTEGER NOT NULL DEFAULT 1"),
+        ("created_at", "TEXT NOT NULL DEFAULT ''"),
     ] {
         let exists = connection
             .query_row(
@@ -1193,6 +1197,10 @@ pub(crate) fn ensure_proxy_pool_node_columns(connection: &Connection) -> Result<
              SET country_code = CASE
                 WHEN country_code IS NULL OR TRIM(country_code) = '' THEN ''
                 ELSE country_code
+             END,
+             created_at = CASE
+                WHEN created_at IS NULL OR TRIM(created_at) = '' THEN CURRENT_TIMESTAMP
+                ELSE created_at
              END",
             [],
         )
@@ -1439,5 +1447,38 @@ mod account_proxy_channel_tests {
             })
             .unwrap();
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn ensures_is_enabled_column_added_to_legacy_proxy_pool_nodes() {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE proxy_pool_nodes (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL
+                );",
+            )
+            .unwrap();
+
+        ensure_proxy_pool_node_columns(&connection).unwrap();
+
+        let has_is_enabled: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('proxy_pool_nodes') WHERE name = 'is_enabled'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_is_enabled, 1);
+
+        let has_created_at: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('proxy_pool_nodes') WHERE name = 'created_at'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_created_at, 1);
     }
 }

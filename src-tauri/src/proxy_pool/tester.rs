@@ -188,179 +188,103 @@ pub async fn run_proxy_node_pool(
         Ok(())
     };
 
-    for chunk in testable_nodes.chunks(BATCH_PROXY_TEST_NODE_CHUNK) {
-        if cancellation.is_cancelled() {
+    let testable_ids = testable_nodes
+        .iter()
+        .map(|(id, _)| id.clone())
+        .collect::<HashSet<_>>();
+
+    tokio::task::block_in_place(|| {
+        ensure_runtime(
+            database,
+            &speed_runtime,
+            Some(&testable_ids),
+            Some(&cancellation),
+        )
+    })?;
+
+    let controller_port = runtime_controller_port(&speed_runtime)?;
+
+    tokio::task::block_in_place(|| {
+        wait_runtime_ready(controller_port, total, Some(&cancellation))
+    })?;
+
+    let mut results = stream::iter(testable_nodes)
+        .map(|(id, _status)| {
+            let client = client.clone();
+            let targets = targets.clone();
+            let app = app.clone();
+            let cancellation = cancellation.clone();
+            async move {
+                if cancellation.is_cancelled() {
+                    return (id, None, true);
+                }
+                let _ = app.emit(
+                    progress_event,
+                    ProxyNodeTestProgress {
+                        node_id: id.clone(),
+                        phase: "started".to_string(),
+                        status: "testing".to_string(),
+                        total,
+                        ..Default::default()
+                    },
+                );
+                if cancellation.is_cancelled() {
+                    return (id, None, true);
+                }
+                let target = targets
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| DEFAULT_PROXY_SPEED_TEST_URL.to_string());
+                let request =
+                    test_controller_proxy_delay(client, controller_port, id.clone(), target);
+                let cancelled = cancellation.cancelled();
+                pin_mut!(request, cancelled);
+                match future::select(request, cancelled).await {
+                    future::Either::Left((delay, _)) => (id, delay, false),
+                    future::Either::Right((_, _)) => (id, None, true),
+                }
+            }
+        })
+        .buffer_unordered(std::cmp::min(BATCH_PROXY_TEST_CONCURRENCY, total).max(1));
+
+    while let Some((id, delay, node_cancelled)) = results.next().await {
+        if node_cancelled || cancellation.is_cancelled() {
             cancelled = true;
-            break;
-        }
-        let chunk_ids = chunk
-            .iter()
-            .map(|(id, _)| id.clone())
-            .collect::<HashSet<_>>();
-        if let Err(error) = tokio::task::block_in_place(|| {
-            ensure_runtime(
-                database,
-                &speed_runtime,
-                Some(&chunk_ids),
-                Some(&cancellation),
-            )
-        }) {
-            if cancellation.is_cancelled() || error.contains("已取消") {
-                cancelled = true;
-                break;
-            }
-            for (id, _) in chunk {
-                completed += 1;
-                pending_writes.push((id.clone(), None));
-                let _ = app.emit(
-                    progress_event,
-                    ProxyNodeTestProgress {
-                        node_id: id.clone(),
-                        phase: "completed".to_string(),
-                        latency_ms: None,
-                        status: "error".to_string(),
-                        completed,
-                        total,
-                    },
-                );
-            }
-            eprintln!("OpenHub 测速分块装载失败：{error}");
-            if pending_writes.len() >= 40 || last_flush.elapsed() >= Duration::from_millis(100) {
-                flush_writes(&mut pending_writes)?;
-                last_flush = Instant::now();
-            }
-            continue;
-        }
-        let controller_port = match runtime_controller_port(&speed_runtime) {
-            Ok(port) => port,
-            Err(error) => {
-                for (id, _) in chunk {
-                    completed += 1;
-                    pending_writes.push((id.clone(), None));
-                    let _ = app.emit(
-                        progress_event,
-                        ProxyNodeTestProgress {
-                            node_id: id.clone(),
-                            phase: "completed".to_string(),
-                            latency_ms: None,
-                            status: "error".to_string(),
-                            completed,
-                            total,
-                        },
-                    );
-                }
-                eprintln!("OpenHub 测速读取控制器失败：{error}");
-                continue;
-            }
-        };
-        if let Err(error) = tokio::task::block_in_place(|| {
-            wait_runtime_ready(controller_port, chunk.len(), Some(&cancellation))
-        }) {
-            if cancellation.is_cancelled() || error.contains("已取消") {
-                cancelled = true;
-                break;
-            }
-            for (id, _) in chunk {
-                completed += 1;
-                pending_writes.push((id.clone(), None));
-                let _ = app.emit(
-                    progress_event,
-                    ProxyNodeTestProgress {
-                        node_id: id.clone(),
-                        phase: "completed".to_string(),
-                        latency_ms: None,
-                        status: "error".to_string(),
-                        completed,
-                        total,
-                    },
-                );
-            }
-            eprintln!("OpenHub 测速等待内核就绪失败：{error}");
-            continue;
-        }
-
-        let mut results = stream::iter(chunk.to_vec())
-            .map(|(id, _status)| {
-                let client = client.clone();
-                let targets = targets.clone();
-                let app = app.clone();
-                let cancellation = cancellation.clone();
-                async move {
-                    if cancellation.is_cancelled() {
-                        return (id, None, true);
-                    }
-                    let _ = app.emit(
-                        progress_event,
-                        ProxyNodeTestProgress {
-                            node_id: id.clone(),
-                            phase: "started".to_string(),
-                            status: "testing".to_string(),
-                            total,
-                            ..Default::default()
-                        },
-                    );
-                    if cancellation.is_cancelled() {
-                        return (id, None, true);
-                    }
-                    let target = targets
-                        .first()
-                        .cloned()
-                        .unwrap_or_else(|| DEFAULT_PROXY_SPEED_TEST_URL.to_string());
-                    let request =
-                        test_controller_proxy_delay(client, controller_port, id.clone(), target);
-                    let cancelled = cancellation.cancelled();
-                    pin_mut!(request, cancelled);
-                    match future::select(request, cancelled).await {
-                        future::Either::Left((delay, _)) => (id, delay, false),
-                        future::Either::Right((_, _)) => (id, None, true),
-                    }
-                }
-            })
-            .buffer_unordered(std::cmp::min(BATCH_PROXY_TEST_CONCURRENCY, chunk.len()).max(1));
-
-        while let Some((id, delay, node_cancelled)) = results.next().await {
-            if node_cancelled || cancellation.is_cancelled() {
-                cancelled = true;
-                let _ = app.emit(
-                    progress_event,
-                    ProxyNodeTestProgress {
-                        node_id: id,
-                        phase: "completed".to_string(),
-                        latency_ms: None,
-                        status: "cancelled".to_string(),
-                        completed,
-                        total,
-                    },
-                );
-                drop(results);
-                break;
-            }
-            completed += 1;
-            let status = if delay.is_some() { "success" } else { "error" };
-            if delay.is_some() {
-                succeeded += 1;
-            }
-            pending_writes.push((id.clone(), delay));
-            if pending_writes.len() >= 40 || last_flush.elapsed() >= Duration::from_millis(100) {
-                flush_writes(&mut pending_writes)?;
-                last_flush = Instant::now();
-            }
             let _ = app.emit(
                 progress_event,
                 ProxyNodeTestProgress {
                     node_id: id,
                     phase: "completed".to_string(),
-                    latency_ms: delay,
-                    status: status.to_string(),
+                    latency_ms: None,
+                    status: "cancelled".to_string(),
                     completed,
                     total,
                 },
             );
-        }
-        if cancellation.is_cancelled() {
-            cancelled = true;
+            drop(results);
             break;
         }
+        completed += 1;
+        let status = if delay.is_some() { "success" } else { "error" };
+        if delay.is_some() {
+            succeeded += 1;
+        }
+        pending_writes.push((id.clone(), delay));
+        if pending_writes.len() >= 20 || last_flush.elapsed() >= Duration::from_millis(150) {
+            flush_writes(&mut pending_writes)?;
+            last_flush = Instant::now();
+        }
+        let _ = app.emit(
+            progress_event,
+            ProxyNodeTestProgress {
+                node_id: id,
+                phase: "completed".to_string(),
+                latency_ms: delay,
+                status: status.to_string(),
+                completed,
+                total,
+            },
+        );
     }
 
     flush_writes(&mut pending_writes)?;

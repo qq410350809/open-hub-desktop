@@ -484,24 +484,43 @@ const accountChannelLabels = computed(() => {
 
 const channelCandidateNodes = computed(() => {
   const query = channelNodeQuery.value.trim().toLowerCase();
-  return store.proxyPool.value.nodes
-    .filter(
-      (node) =>
-        node.channelTestStatus === "success" &&
-        node.channelLatencyMs != null &&
-        node.channelLatencyMs <= 500,
-    )
+  // 基础候选池：优先使用主界面已筛选的节点（displayNodes），若无筛选则使用全部节点
+  const baseNodes = (displayNodes.value && displayNodes.value.length > 0)
+    ? displayNodes.value
+    : store.proxyPool.value.nodes;
+
+  const result = baseNodes
+    .filter((node) => {
+      const latency = node.channelLatencyMs ?? node.latencyMs;
+      const isTestedSuccess = (node.channelTestStatus === "success" || node.testStatus === "success") && latency != null;
+      const isEligible = (isTestedSuccess && latency <= 500) || (channelSelectedNodeId.value && node.id === channelSelectedNodeId.value);
+      return isEligible;
+    })
     .filter((node) => {
       if (!query) return true;
-      return [node.name, node.countryName, node.countryCode, node.server].some((value) =>
-        value.toLowerCase().includes(query),
-      );
+      return [
+        node.name,
+        node.countryName,
+        node.countryCode,
+        node.server,
+        String(node.port),
+        node.proxyType,
+      ].some((value) => value && String(value).toLowerCase().includes(query));
     })
-    .sort(
-      (left, right) =>
-        (left.channelLatencyMs ?? Number.POSITIVE_INFINITY) -
-        (right.channelLatencyMs ?? Number.POSITIVE_INFINITY),
-    );
+    .sort((left, right) => {
+      const leftLatency = left.channelLatencyMs ?? left.latencyMs ?? Number.POSITIVE_INFINITY;
+      const rightLatency = right.channelLatencyMs ?? right.latencyMs ?? Number.POSITIVE_INFINITY;
+      return leftLatency - rightLatency;
+    });
+
+  if (channelSelectedNodeId.value && !result.some((node) => node.id === channelSelectedNodeId.value)) {
+    const selectedNode = store.proxyPool.value.nodes.find((node) => node.id === channelSelectedNodeId.value);
+    if (selectedNode) {
+      result.unshift(selectedNode);
+    }
+  }
+
+  return result;
 });
 
 function openChannelDialog(channel?: ProxyChannel) {
@@ -542,10 +561,16 @@ function selectChannelNode(nodeId: string) {
 async function testChannelNodes() {
   message.value = "";
   try {
-    await store.testProxyChannelNodes(channelEditingId.value || "");
-    message.value = "测速完成，请选择节点后保存";
-  } catch {
-    /* store error */
+    const targetNodeIds = (channelCandidateNodes.value && channelCandidateNodes.value.length > 0)
+      ? channelCandidateNodes.value.map((n) => n.id)
+      : (displayNodes.value && displayNodes.value.length > 0)
+        ? displayNodes.value.map((n) => n.id)
+        : [];
+
+    await store.testProxyChannelNodes(channelEditingId.value || "", targetNodeIds);
+    message.value = "通道节点网速测试完成，请选择节点后保存";
+  } catch (error) {
+    message.value = `通道测速失败: ${error}`;
   }
 }
 async function saveChannel() {
@@ -757,7 +782,11 @@ function latencyClass(node: ProxyNode) {
   return latencyClassForMs(node.latencyMs, node.testStatus);
 }
 function channelLatencyClass(node: ProxyNode) {
-  return latencyClassForMs(node.channelLatencyMs, node.channelTestStatus);
+  const latency = node.channelLatencyMs ?? node.latencyMs;
+  const status = (node.channelTestStatus === "success" || node.testStatus === "success") && latency != null
+    ? "success"
+    : (node.channelTestStatus || node.testStatus || "untested");
+  return latencyClassForMs(latency, status);
 }
 function latencyClassForMs(latencyMs: number | null | undefined, testStatus: string) {
   if (testStatus === "error" || testStatus === "invalid") return "bad";
@@ -1592,7 +1621,7 @@ watch(nodeViewMode, () => {
                       @click="testChannelNodes"
                     >
                       <span v-html="icons.pulse" />
-                      <span>{{ store.channelTestBusyId.value ? "测速中…" : "刷新通道候选测速" }}</span>
+                      <span>{{ store.channelTestBusyId.value ? "测速中…" : "刷新列表节点网速测速" }}</span>
                     </button>
                   </div>
 
@@ -1628,7 +1657,7 @@ watch(nodeViewMode, () => {
                           <small>{{ [nodeCountryLabel(node), endpoint(node)].filter(Boolean).join(" · ") }}</small>
                         </div>
                         <span class="pp-candidate-rate-badge" :class="channelLatencyClass(node)">
-                          {{ downloadRateText(node.channelLatencyMs) }}
+                          {{ downloadRateText(node.channelLatencyMs ?? node.latencyMs) }}
                         </span>
                       </label>
 

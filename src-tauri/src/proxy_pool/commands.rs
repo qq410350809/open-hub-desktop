@@ -8,7 +8,7 @@ use crate::proxy_pool::rotator::{
 use crate::proxy_pool::runtime::{
     controller_client, ensure_channel_instance, ensure_default_proxy_channel, ensure_runtime,
     is_slow_or_blocked_speed_test_url, load_state, row_subscription, runtime_controller_port,
-    runtime_proxy_url, select_runtime_node, write_meta,
+    runtime_nodes, runtime_proxy_url, select_runtime_node, wait_runtime_ready, write_meta,
 };
 use crate::proxy_pool::tester::{
     normalize_ignore_addresses, run_proxy_node_pool, speed_test_candidates,
@@ -547,25 +547,31 @@ pub async fn test_proxy_channel_nodes(
     app: AppHandle,
     database: State<'_, Database>,
     runtime: State<'_, ProxyRuntime>,
-    channel_id: String,
+    channel_id: Option<String>,
+    node_ids: Option<Vec<String>>,
 ) -> Result<ProxyPoolState, String> {
-    let channel_id = channel_id.trim();
     let _ = channel_id;
-    let candidates = list_channel_candidate_nodes(&database, ACCOUNT_PROXY_MAX_LATENCY_MS)?;
-    let candidates = if candidates.is_empty() {
-        list_prioritized_fast_proxy_nodes(&database, ACCOUNT_PROXY_MAX_LATENCY_MS)?
+    let requested = if let Some(ids) = node_ids.filter(|list| !list.is_empty()) {
+        ids.into_iter().filter(|id| !id.trim().is_empty()).collect::<HashSet<_>>()
     } else {
-        candidates
+        let candidates = list_channel_candidate_nodes(&database, ACCOUNT_PROXY_MAX_LATENCY_MS)?;
+        let candidates = if candidates.is_empty() {
+            list_prioritized_fast_proxy_nodes(&database, ACCOUNT_PROXY_MAX_LATENCY_MS)?
+        } else {
+            candidates
+        };
+        if candidates.is_empty() {
+            let (all_nodes, _) = runtime_nodes(&database, None)?;
+            all_nodes.into_iter().map(|n| n.id).collect::<HashSet<_>>()
+        } else {
+            candidates.into_iter().map(|(id, _, _)| id).collect::<HashSet<_>>()
+        }
     };
-    if candidates.is_empty() {
-        return Err(format!(
-            "没有 ≤{ACCOUNT_PROXY_MAX_LATENCY_MS}ms 的候选节点，请先在节点列表完成测速"
-        ));
+
+    if requested.is_empty() {
+        return Err("代理池中没有可测试的节点，请先添加或启用节点".to_string());
     }
-    let requested = candidates
-        .into_iter()
-        .map(|(id, _, _)| id)
-        .collect::<HashSet<_>>();
+
     run_proxy_node_pool(
         &app,
         &database,
@@ -657,6 +663,7 @@ pub async fn test_proxy_node(
     let only = HashSet::from([node_id.clone()]);
     tokio::task::block_in_place(|| ensure_runtime(&database, &test_runtime, Some(&only), None))?;
     let controller_port = runtime_controller_port(&test_runtime)?;
+    tokio::task::block_in_place(|| wait_runtime_ready(controller_port, 1, None))?;
     let configured = {
         let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
         let exists = connection

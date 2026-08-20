@@ -341,4 +341,19 @@ mod tests {
         assert_eq!(msgs[1]["reasoning_content"], "thinking here");
         assert_eq!(msgs[1]["content"], "final answer");
     }
+
+    #[test]
+    fn channel_config_upstream_url_serialization_roundtrip() {
+        let json_input = json!({
+            "id": "test",
+            "name": "Test Channel",
+            "enabled": true,
+            "upstreamUrl": "https://api.openai.com/v1"
+        });
+        let parsed: ChannelConfig = serde_json::from_value(json_input).expect("should parse upstreamUrl");
+        assert_eq!(parsed.base_url, "https://api.openai.com/v1");
+
+        let serialized = serde_json::to_value(&parsed).expect("should serialize");
+        assert_eq!(serialized["upstreamUrl"], "https://api.openai.com/v1");
+    }
 }

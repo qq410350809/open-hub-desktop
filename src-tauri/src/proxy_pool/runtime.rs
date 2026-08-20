@@ -437,13 +437,17 @@ pub fn runtime_config(
         "unified-delay": true,
         "tcp-concurrent": true,
         "find-process-mode": "off",
+        "profile": {
+            "store-selected": false,
+            "store-fake-ip": false
+        },
         "dns": {
             "enable": true,
             "ipv6": false,
             "use-system-hosts": true,
             "enhanced-mode": "redir-host",
-            "default-nameserver": ["8.8.8.8", "1.1.1.1"],
-            "nameserver": ["8.8.8.8", "1.1.1.1", "system"]
+            "default-nameserver": ["223.5.5.5", "119.29.29.29", "8.8.8.8", "1.1.1.1"],
+            "nameserver": ["223.5.5.5", "119.29.29.29", "180.76.76.76", "8.8.8.8", "1.1.1.1", "system"]
         },
         "listeners": listeners,
         "proxies": configs,
@@ -545,10 +549,54 @@ pub fn simple_http_get(port: u16, path: &str, secret: &str, timeout: Duration) -
         path, port, secret
     );
     stream.write_all(request.as_bytes()).map_err(|e| e.to_string())?;
-    let mut response = String::new();
-    stream.read_to_string(&mut response).map_err(|e| e.to_string())?;
 
-    let mut lines = response.lines();
+    let mut buf = Vec::with_capacity(8192);
+    let mut chunk = [0u8; 4096];
+    let mut header_end = None;
+    let mut content_length = None;
+
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if header_end.is_none() {
+                    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        header_end = Some(pos + 4);
+                        if let Ok(headers_str) = std::str::from_utf8(&buf[..pos]) {
+                            for line in headers_str.lines() {
+                                if let Some((k, v)) = line.split_once(':') {
+                                    if k.trim().eq_ignore_ascii_case("content-length") {
+                                        if let Ok(cl) = v.trim().parse::<usize>() {
+                                            content_length = Some(cl);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(h_end) = header_end {
+                    if let Some(cl) = content_length {
+                        if buf.len() >= h_end + cl {
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(_) => {
+                if header_end.is_some() {
+                    break;
+                } else {
+                    return Err("HTTP 读取响应超时或失败".to_string());
+                }
+            }
+        }
+    }
+
+    let h_end = header_end.ok_or_else(|| "未读取到有效 HTTP 响应头".to_string())?;
+    let headers_str = std::str::from_utf8(&buf[..h_end - 4]).map_err(|e| e.to_string())?;
+    let mut lines = headers_str.lines();
     let status_line = lines.next().ok_or_else(|| "空响应".to_string())?;
     let status_code = status_line
         .split_whitespace()
@@ -556,12 +604,8 @@ pub fn simple_http_get(port: u16, path: &str, secret: &str, timeout: Duration) -
         .and_then(|s| s.parse::<u16>().ok())
         .ok_or_else(|| format!("无效状态行: {status_line}"))?;
 
-    let body = response
-        .split_once("\r\n\r\n")
-        .map(|(_, b)| b)
-        .or_else(|| response.split_once("\n\n").map(|(_, b)| b))
-        .unwrap_or("");
-    Ok((status_code, body.to_string()))
+    let body = String::from_utf8_lossy(&buf[h_end..]).to_string();
+    Ok((status_code, body))
 }
 
 pub fn controller_url(port: u16, path: &str) -> String {
@@ -624,6 +668,18 @@ pub fn spawn_dedicated_single_node_instance(
         "mode": "rule",
         "log-level": "warning",
         "ipv6": false,
+        "profile": {
+            "store-selected": false,
+            "store-fake-ip": false
+        },
+        "dns": {
+            "enable": true,
+            "ipv6": false,
+            "use-system-hosts": true,
+            "enhanced-mode": "redir-host",
+            "default-nameserver": ["223.5.5.5", "119.29.29.29", "8.8.8.8", "1.1.1.1"],
+            "nameserver": ["223.5.5.5", "119.29.29.29", "180.76.76.76", "8.8.8.8", "1.1.1.1", "system"]
+        },
         "proxies": [config],
         "proxy-groups": [
             {
@@ -857,11 +913,20 @@ pub fn ensure_account_instance(
     Ok(port)
 }
 
+#[allow(dead_code)]
 pub fn ensure_shared_instance(
     database: &Database,
     runtime: &ProxyRuntime,
 ) -> Result<u16, String> {
-    let (nodes, initial_hash) = runtime_nodes(database, None)?;
+    ensure_shared_instance_with_nodes(database, runtime, None)
+}
+
+pub fn ensure_shared_instance_with_nodes(
+    database: &Database,
+    runtime: &ProxyRuntime,
+    only_ids: Option<&HashSet<String>>,
+) -> Result<u16, String> {
+    let (nodes, initial_hash) = runtime_nodes(database, only_ids)?;
     if nodes.is_empty() {
         return Err("代理池中没有配置有效的节点".into());
     }
@@ -957,15 +1022,15 @@ pub fn ensure_shared_instance(
 pub fn ensure_runtime(
     database: &Database,
     runtime: &ProxyRuntime,
-    _only_ids: Option<&HashSet<String>>,
+    only_ids: Option<&HashSet<String>>,
     _cancelled: Option<&CancellationToken>,
 ) -> Result<(), String> {
-    ensure_shared_instance(database, runtime).map(|_| ())
+    ensure_shared_instance_with_nodes(database, runtime, only_ids).map(|_| ())
 }
 
 pub fn wait_runtime_ready(
     controller_port: u16,
-    expected_nodes: usize,
+    _expected_nodes: usize,
     cancelled: Option<&CancellationToken>,
 ) -> Result<(), String> {
     let started = Instant::now();
@@ -977,39 +1042,16 @@ pub fn wait_runtime_ready(
                 return Err("测速已取消".into());
             }
         }
-        let (v_ok, v_err) = match simple_http_get(controller_port, "/version", RUNTIME_SECRET, Duration::from_millis(400)) {
-            Ok((200..=299, _)) => (true, String::new()),
-            Ok((code, _)) => (false, format!("Mihomo /version 返回 HTTP {code}")),
-            Err(e) => (false, format!("Mihomo /version 未就绪: {e}")),
-        };
-        if !v_ok {
-            last_error = v_err;
-            std::thread::sleep(Duration::from_millis(100));
-            continue;
-        }
-
-        match simple_http_get(controller_port, "/proxies", RUNTIME_SECRET, Duration::from_millis(800)) {
-            Ok((200..=299, body)) => {
-                let count = serde_json::from_str::<JsonValue>(&body)
-                    .ok()
-                    .and_then(|value| value.get("proxies")?.as_object().map(|obj| obj.len()))
-                    .unwrap_or(0);
-                let min_required = if expected_nodes <= 40 {
-                    expected_nodes.saturating_add(6)
-                } else {
-                    expected_nodes.min(40).saturating_add(6)
-                };
-                if expected_nodes == 0 || count >= min_required {
-                    std::thread::sleep(Duration::from_millis(100));
-                    return Ok(());
-                }
-                last_error = format!("proxies 仅 {count} 个，等待至少 {min_required} 个就绪(目标 {expected_nodes})");
+        match simple_http_get(controller_port, "/version", RUNTIME_SECRET, Duration::from_millis(400)) {
+            Ok((200..=299, _)) => {
+                std::thread::sleep(Duration::from_millis(50));
+                return Ok(());
             }
             Ok((code, _)) => {
-                last_error = format!("读取 /proxies 失败：HTTP {code}");
+                last_error = format!("Mihomo /version 返回 HTTP {code}");
             }
-            Err(error) => {
-                last_error = format!("读取 /proxies 失败：{error}");
+            Err(e) => {
+                last_error = format!("Mihomo /version 未就绪: {e}");
             }
         }
         std::thread::sleep(Duration::from_millis(100));

@@ -707,7 +707,11 @@ fn dispatch(app: &AppHandle, command: &str, args: &Value) -> Result<Value, Strin
             )))
         }
         "test_proxy_channel_nodes" => {
-            let channel_id = take_string(args, &["channelId", "channel_id"])?;
+            let channel_id = take_string(args, &["channelId", "channel_id"]).ok();
+            let node_ids = args
+                .get("nodeIds")
+                .or_else(|| args.get("node_ids"))
+                .and_then(|v| serde_json::from_value::<Vec<String>>(v.clone()).ok());
             let app = app.clone();
             Ok(json!(tauri::async_runtime::block_on(async move {
                 proxy_pool::test_proxy_channel_nodes(
@@ -715,6 +719,7 @@ fn dispatch(app: &AppHandle, command: &str, args: &Value) -> Result<Value, Strin
                     app.state::<Database>(),
                     app.state::<ProxyRuntime>(),
                     channel_id,
+                    node_ids,
                 )
                 .await
             })))

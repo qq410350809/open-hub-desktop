@@ -12,9 +12,10 @@ use tokio_util::sync::CancellationToken;
 
 pub const RUNTIME_SECRET: &str = "openhub-local-proxy-runtime";
 pub const RUNTIME_GROUP: &str = "OpenHub";
-pub const BATCH_PROXY_TEST_TIMEOUT_MS: &str = "10000";
-pub const BATCH_PROXY_TEST_CONCURRENCY: usize = 10;
-pub const BATCH_PROXY_TEST_NODE_CHUNK: usize = 120;
+pub const BATCH_PROXY_TEST_TIMEOUT_MS: &str = "5000";
+pub const BATCH_PROXY_TEST_CONCURRENCY: usize = 24;
+#[allow(dead_code)]
+pub const BATCH_PROXY_TEST_NODE_CHUNK: usize = 5000;
 pub const ACCOUNT_PROXY_MAX_LATENCY_MS: i64 = 500;
 pub const ACCOUNT_PROXY_MAX_ATTEMPTS: usize = 2;
 pub const ACCOUNT_PROXY_BAN_TIMEOUT: Duration = Duration::from_secs(30 * 60);

@@ -21,6 +21,7 @@ pub struct ChannelConfig {
     pub enabled: bool,
     #[serde(default = "default_protocol")]
     pub protocol: String,
+    #[serde(rename = "upstreamUrl", alias = "base_url", alias = "baseUrl")]
     pub base_url: String,
     #[serde(default)]
     pub api_key: String,
@@ -282,4 +283,14 @@ pub fn current_timestamp() -> String {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     format!("{now}")
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyLogsResponse {
+    pub items: Vec<ProxyRequestLog>,
+    pub total: usize,
+    pub global_total: usize,
+    pub success_total: usize,
+    pub error_total: usize,
 }
