@@ -5,7 +5,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use tauri::{AppHandle, Emitter, Manager};
 
-use crate::mihomo_kernel::{download_bytes_with_dynamic_racing, get_app_bin_dir};
+use crate::kernel::{download_bytes_with_dynamic_racing, get_app_bin_dir};
 
 const GEOIP_PRIMARY_URL: &str = "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/country.mmdb";
 

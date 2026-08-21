@@ -1,7 +1,7 @@
-use crate::chrome_session;
+use crate::chrome_sync;
 use crate::db::*;
 use crate::models::*;
-use crate::site_ops::*;
+use crate::site_library::*;
 use std::{collections::HashSet, time::Duration};
 use tauri::{Manager, State};
 
@@ -99,13 +99,13 @@ pub(crate) fn remote_sites_from_json(value: serde_json::Value) -> Result<Vec<Sit
 pub(crate) async fn authenticated_remote_session(
     app: &tauri::AppHandle,
     database: &Database,
-) -> Result<(chrome_session::ChromeCookieSession, serde_json::Value), String> {
+) -> Result<(chrome_sync::ChromeCookieSession, serde_json::Value), String> {
     let home_dir = app
         .path()
         .home_dir()
         .map_err(|error| format!("无法定位用户目录：{error}"))?;
     let sessions = tauri::async_runtime::spawn_blocking(move || {
-        chrome_session::read_chrome_cookie_sessions_from_home(
+        chrome_sync::read_chrome_cookie_sessions_from_home(
             &home_dir,
             REMOTE_ROOT_URL,
             REMOTE_SESSION_COOKIE,

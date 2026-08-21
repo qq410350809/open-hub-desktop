@@ -1,4 +1,4 @@
-use crate::chrome_session;
+use crate::chrome_sync;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -132,7 +132,7 @@ pub(crate) struct SeedPayload {
 pub(crate) struct LibraryData {
     pub(crate) sites: Vec<SiteRecord>,
     pub(crate) suggested_tags: Vec<String>,
-    pub(crate) usage_sites: Vec<chrome_session::ChromeSiteSessionMatch>,
+    pub(crate) usage_sites: Vec<chrome_sync::ChromeSiteSessionMatch>,
 }
 
 #[derive(Debug, Serialize)]
@@ -223,7 +223,7 @@ pub(crate) struct ChromeUsageScanResult {
     pub(crate) accounts: usize,
     pub(crate) warnings: usize,
     pub(crate) newly_marked: usize,
-    pub(crate) sites: Vec<chrome_session::ChromeSiteSessionMatch>,
+    pub(crate) sites: Vec<chrome_sync::ChromeSiteSessionMatch>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

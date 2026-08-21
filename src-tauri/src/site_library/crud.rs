@@ -1,7 +1,7 @@
 use crate::db::*;
 use crate::models::*;
-use crate::platform_detect::{detect_platform, is_newapi, is_sub2api};
-use crate::site_ops::*;
+use crate::site_library::{detect_platform, is_newapi, is_sub2api};
+use crate::site_library::*;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::time::Duration;
 use tauri::State;

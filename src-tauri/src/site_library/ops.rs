@@ -1,6 +1,6 @@
-use crate::chrome_session;
+use crate::chrome_sync;
 use crate::models::*;
-use crate::platform_detect;
+use crate::site_library;
 use serde_json;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -105,14 +105,14 @@ pub(crate) fn normalize_site(mut site: SiteRecord) -> Result<SiteRecord, String>
 }
 
 pub(crate) fn canonical_system_type(value: &str) -> String {
-    platform_detect::canonical_platform(value)
+    site_library::canonical_platform(value)
 }
 
 /// 仅基于 URL 中明确出现的产品名提供高置信度提示。
 /// 不把通用的 `api`、`new-api` 等模糊命名当成类型依据，避免误判。
 pub(crate) fn system_type_hint_from_url(value: &str) -> Option<&'static str> {
-    platform_detect::detect_platform_by_url_hint(value)
-        .or_else(|| platform_detect::low_priority_url_hint(value))
+    site_library::detect_platform_by_url_hint(value)
+        .or_else(|| site_library::low_priority_url_hint(value))
 }
 
 pub(crate) fn infer_remote_system_type(
@@ -438,7 +438,7 @@ pub(crate) async fn probe_site_system_type_details(
     base_url: &str,
 ) -> (Option<String>, bool) {
     // 移植自 metapi 的 detectPlatform 流水线：URL 提示 → title 提示 → 端点探测。
-    let detection = platform_detect::detect_platform(client, base_url).await;
+    let detection = site_library::detect_platform(client, base_url).await;
     (detection.platform, detection.challenge)
 }
 
@@ -522,7 +522,7 @@ pub(crate) async fn probe_site_system_type_via_chrome(
         let base_url = base_url.to_string();
         let script = script.clone();
         move || {
-            chrome_session::run_javascript_in_existing_chrome_tab(
+            chrome_sync::run_javascript_in_existing_chrome_tab(
                 &base_url,
                 &script,
                 Duration::from_secs(15),
@@ -544,7 +544,7 @@ pub(crate) async fn probe_site_system_type_via_chrome(
         let target_url = target_url.to_string();
         let marker = marker.clone();
         move || {
-            chrome_session::run_javascript_in_background_chrome_profile(
+            chrome_sync::run_javascript_in_background_chrome_profile(
                 &target_url,
                 &profile_id,
                 &marker,

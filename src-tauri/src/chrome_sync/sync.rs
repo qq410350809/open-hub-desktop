@@ -1,10 +1,9 @@
-use crate::chrome_local_storage;
-use crate::chrome_session;
+use crate::chrome_sync;
 use crate::db::*;
 use crate::models::*;
-use crate::platform_detect::{is_newapi, is_newapi_refresh, is_sub2api};
+use crate::site_library::{is_newapi, is_newapi_refresh, is_sub2api};
 use crate::proxy_pool;
-use crate::site_ops::*;
+use crate::site_library::*;
 use rusqlite::{params, OptionalExtension};
 use serde_json;
 use std::collections::HashMap;
@@ -1767,7 +1766,7 @@ pub async fn sync_site_account_via_chrome(
     site_id: String,
     profile_id: String,
     run_id: u64,
-) -> Result<chrome_session::ChromeSessionInfo, String> {
+) -> Result<chrome_sync::ChromeSessionInfo, String> {
     sync_site_account_via_chrome_command(
         app,
         &database,
@@ -1788,7 +1787,7 @@ pub(crate) async fn sync_site_account_via_chrome_command(
     profile_id: String,
     run_id: u64,
     mode: ChromeSyncMode,
-) -> Result<chrome_session::ChromeSessionInfo, String> {
+) -> Result<chrome_sync::ChromeSessionInfo, String> {
     let outcome = match tokio::time::timeout(
         SITE_SYNC_TIMEOUT,
         sync_site_account_via_chrome_inner(
@@ -1839,7 +1838,7 @@ async fn sync_site_account_via_chrome_inner(
     profile_id: String,
     run_id: u64,
     mode: ChromeSyncMode,
-) -> Result<chrome_session::ChromeSessionInfo, String> {
+) -> Result<chrome_sync::ChromeSessionInfo, String> {
     let site_id = site_id.trim().to_string();
     let profile_id = profile_id.trim().to_string();
     if site_id.is_empty() || profile_id.is_empty() {
@@ -2077,14 +2076,14 @@ async fn sync_site_account_via_chrome_inner(
         .path()
         .home_dir()
         .map_err(|error| format!("无法定位用户目录：{error}"))?;
-    let local_target = chrome_local_storage::LocalStorageTarget {
+    let local_target = chrome_sync::LocalStorageTarget {
         site_id: site_id.clone(),
         profile_id: profile_id.clone(),
         origin,
     };
     let local_match = tauri::async_runtime::spawn_blocking({
         let home_dir = home_dir.clone();
-        move || chrome_local_storage::read_local_storage_from_home(&home_dir, &[local_target])
+        move || chrome_sync::read_local_storage_from_home(&home_dir, &[local_target])
     })
     .await
     .map_err(|error| format!("读取 Chrome Local Storage 任务失败：{error}"))?
@@ -2180,7 +2179,7 @@ async fn sync_site_account_via_chrome_inner(
                             let endpoint = base_url
                                 .join("/api/user/self")
                                 .map_err(|_| "无法生成账号接口地址".to_string())?;
-                            let user_agent = chrome_session::chrome_user_agent();
+                            let user_agent = chrome_sync::chrome_user_agent();
                             let checkin = if supports_checkin {
                                 refresh_newapi_checkin(
                                     &client,
@@ -2314,7 +2313,7 @@ async fn sync_site_account_via_chrome_inner(
         let silent_attempt = tauri::async_runtime::spawn_blocking({
             let base_url = base_url.to_string();
             move || {
-                chrome_session::run_javascript_in_existing_chrome_tab(
+                chrome_sync::run_javascript_in_existing_chrome_tab(
                     &base_url,
                     &silent_javascript,
                     silent_timeout,
@@ -2350,7 +2349,7 @@ async fn sync_site_account_via_chrome_inner(
                 "没有找到已打开的同账号站点页面，继续尝试后台 Chrome",
             ),
             Ok(Err(error)) => {
-                if chrome_session::is_blocking_chrome_automation_error(&error) {
+                if chrome_sync::is_blocking_chrome_automation_error(&error) {
                     return Err(error);
                 }
                 emit_chrome_account_progress(
@@ -2422,7 +2421,7 @@ async fn sync_site_account_via_chrome_inner(
             let marker = marker.clone();
             let account_proxy_url = account_proxy_url.clone();
             move || {
-                chrome_session::run_javascript_in_background_chrome_profile(
+                chrome_sync::run_javascript_in_background_chrome_profile(
                     &browser_url,
                     &profile_id,
                     &marker,
@@ -2454,7 +2453,7 @@ async fn sync_site_account_via_chrome_inner(
                 ),
             },
             Ok(Err(error)) => {
-                if chrome_session::is_blocking_chrome_automation_error(&error) {
+                if chrome_sync::is_blocking_chrome_automation_error(&error) {
                     return Err(error);
                 }
                 emit_chrome_account_progress(
@@ -2530,7 +2529,7 @@ async fn sync_site_account_via_chrome_inner(
                 let marker = marker.clone();
                 let account_proxy_url = account_proxy_url.clone();
                 move || {
-                    chrome_session::run_javascript_in_chrome_profile(
+                    chrome_sync::run_javascript_in_chrome_profile(
                         &browser_url,
                         &profile_id,
                         &marker,

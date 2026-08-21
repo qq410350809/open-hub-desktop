@@ -1,9 +1,8 @@
-use crate::account_sync::*;
-use crate::chrome_local_storage;
-use crate::chrome_session;
+use crate::chrome_sync::*;
+use crate::chrome_sync;
 use crate::db::*;
 use crate::models::*;
-use crate::platform_detect::{is_newapi, is_newapi_refresh, is_sub2api};
+use crate::site_library::{is_newapi, is_newapi_refresh, is_sub2api};
 use crate::proxy_pool;
 use rusqlite::{params, OptionalExtension};
 use serde_json;
@@ -277,7 +276,7 @@ pub async fn mark_sites_with_chrome_sessions(
     } else {
         let scan_home_dir = home_dir.clone();
         tauri::async_runtime::spawn_blocking(move || {
-            chrome_session::site_sessions_from_home(&scan_home_dir, &scan_targets)
+            chrome_sync::site_sessions_from_home(&scan_home_dir, &scan_targets)
         })
         .await
         .map_err(|error| format!("分析 Chrome 会话任务失败：{error}"))?
@@ -292,7 +291,7 @@ pub async fn mark_sites_with_chrome_sessions(
         .collect::<HashSet<_>>();
     let profiles = tauri::async_runtime::spawn_blocking({
         let home_dir = home_dir.clone();
-        move || chrome_session::profile_identities_from_home(&home_dir)
+        move || chrome_sync::profile_identities_from_home(&home_dir)
     })
     .await
     .map_err(|error| format!("读取 Chrome Profile 任务失败：{error}"))??;
@@ -316,7 +315,7 @@ pub async fn mark_sites_with_chrome_sessions(
                 .map(|url| url.origin().ascii_serialization())
                 .filter(|origin| origin != "null");
             profiles.iter().filter_map(move |profile| {
-                Some(chrome_local_storage::LocalStorageTarget {
+                Some(chrome_sync::LocalStorageTarget {
                     site_id: site_id.clone(),
                     profile_id: profile.id.clone(),
                     origin: origin.clone()?,
@@ -326,7 +325,7 @@ pub async fn mark_sites_with_chrome_sessions(
         .collect::<Vec<_>>();
     let local_storage = tauri::async_runtime::spawn_blocking({
         let home_dir = home_dir.clone();
-        move || chrome_local_storage::read_local_storage_from_home(&home_dir, &local_targets)
+        move || chrome_sync::read_local_storage_from_home(&home_dir, &local_targets)
     })
     .await
     .map_err(|error| format!("读取 Chrome Local Storage 任务失败：{error}"))?
@@ -403,7 +402,7 @@ pub async fn mark_sites_with_chrome_sessions(
             .iter()
             .position(|site| site.site_id == *site_id)
             .unwrap_or_else(|| {
-                matched_sites.push(chrome_session::ChromeSiteSessionMatch {
+                matched_sites.push(chrome_sync::ChromeSiteSessionMatch {
                     site_id: site_id.clone(),
                     sessions: Vec::new(),
                 });
@@ -418,7 +417,7 @@ pub async fn mark_sites_with_chrome_sessions(
         }
         matched_sites[site_index]
             .sessions
-            .push(chrome_session::ChromeSessionInfo {
+            .push(chrome_sync::ChromeSessionInfo {
                 profile_id: profile.id.clone(),
                 domain,
                 cookie_count: 0,
@@ -538,7 +537,7 @@ pub async fn mark_sites_with_chrome_sessions(
         ),
     );
     if !extract_only && !matched_sites.is_empty() {
-        let chrome_user_agent = chrome_session::chrome_user_agent();
+        let chrome_user_agent = chrome_sync::chrome_user_agent();
         let mut jobs = Vec::new();
         for (site_index, site) in matched_sites.iter().enumerate() {
             // 额度/签到接口只刷新“在用”站点，避免全库会话比对时打爆外部接口。
@@ -630,7 +629,7 @@ pub async fn mark_sites_with_chrome_sessions(
                     let cookie_header = if needs_cookie {
                         let profile_id_for_cookie = profile_id.clone();
                         tauri::async_runtime::spawn_blocking(move || {
-                            chrome_session::read_chrome_cookie_header_from_home(
+                            chrome_sync::read_chrome_cookie_header_from_home(
                                 &cookie_home_dir,
                                 &cookie_base_url,
                                 &profile_id_for_cookie,

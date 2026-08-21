@@ -27,11 +27,10 @@ use tauri::{AppHandle, Manager};
 
 use crate::charity_monitor::CharityMonitorRuntime;
 use crate::models::{Database, SiteModelCacheAccount, SiteRecord};
-use crate::models_fetch::SiteModelsResult;
+use crate::model_catalog::SiteModelsResult;
 use crate::proxy_pool::ProxyRuntime;
 use crate::{
-    auto_sync, charity_monitor, chrome_usage, model_catalog, models_fetch, proxy_pool, site_crud,
-    token_stats,
+    charity_monitor, chrome_sync, model_catalog, proxy_pool, site_library, token_stats,
 };
 
 /// 首选端口；被占用时向后顺延。
@@ -516,10 +515,10 @@ fn take_string(args: &Value, names: &[&str]) -> Result<String, String> {
 fn dispatch(app: &AppHandle, command: &str, args: &Value) -> Result<Value, String> {
     match command {
         // —— 站点库 ——
-        "list_library" => Ok(json!(site_crud::list_library(app.state::<Database>()))),
+        "list_library" => Ok(json!(site_library::list_library(app.state::<Database>()))),
         "create_site" => {
             let input: SiteRecord = take(args, &["input"])?;
-            Ok(json!(site_crud::create_site(
+            Ok(json!(site_library::create_site(
                 app.state::<Database>(),
                 input
             )))
@@ -527,7 +526,7 @@ fn dispatch(app: &AppHandle, command: &str, args: &Value) -> Result<Value, Strin
         "update_site" => {
             let id = take_string(args, &["id"])?;
             let input: SiteRecord = take(args, &["input"])?;
-            Ok(json!(site_crud::update_site(
+            Ok(json!(site_library::update_site(
                 app.state::<Database>(),
                 id,
                 input
@@ -535,25 +534,25 @@ fn dispatch(app: &AppHandle, command: &str, args: &Value) -> Result<Value, Strin
         }
         "delete_site" => {
             let id = take_string(args, &["id"])?;
-            Ok(json!(site_crud::delete_site(app.state::<Database>(), id)))
+            Ok(json!(site_library::delete_site(app.state::<Database>(), id)))
         }
         "toggle_personal" => {
             let id = take_string(args, &["id"])?;
-            Ok(json!(site_crud::toggle_personal(
+            Ok(json!(site_library::toggle_personal(
                 app.state::<Database>(),
                 id
             )))
         }
         "toggle_pending" => {
             let id = take_string(args, &["id"])?;
-            Ok(json!(site_crud::toggle_pending(
+            Ok(json!(site_library::toggle_pending(
                 app.state::<Database>(),
                 id
             )))
         }
         "cycle_usage_state" => {
             let id = take_string(args, &["id"])?;
-            Ok(json!(site_crud::cycle_usage_state(
+            Ok(json!(site_library::cycle_usage_state(
                 app.state::<Database>(),
                 id
             )))
@@ -561,7 +560,7 @@ fn dispatch(app: &AppHandle, command: &str, args: &Value) -> Result<Value, Strin
         "set_usage_state" => {
             let id = take_string(args, &["id"])?;
             let state = take_string(args, &["state"])?;
-            Ok(json!(site_crud::set_usage_state(
+            Ok(json!(site_library::set_usage_state(
                 app.state::<Database>(),
                 id,
                 state
@@ -569,11 +568,11 @@ fn dispatch(app: &AppHandle, command: &str, args: &Value) -> Result<Value, Strin
         }
         "toggle_hidden" => {
             let id = take_string(args, &["id"])?;
-            Ok(json!(site_crud::toggle_hidden(app.state::<Database>(), id)))
+            Ok(json!(site_library::toggle_hidden(app.state::<Database>(), id)))
         }
         "toggle_runaway" => {
             let id = take_string(args, &["id"])?;
-            Ok(json!(site_crud::toggle_runaway(
+            Ok(json!(site_library::toggle_runaway(
                 app.state::<Database>(),
                 id
             )))
@@ -583,7 +582,7 @@ fn dispatch(app: &AppHandle, command: &str, args: &Value) -> Result<Value, Strin
             let usage_state: Option<String> = take_opt(args, &["usageState", "usage_state"])?;
             let app = app.clone();
             Ok(json!(tauri::async_runtime::block_on(async move {
-                site_crud::import_site(app.state::<Database>(), site_url, usage_state).await
+                site_library::import_site(app.state::<Database>(), site_url, usage_state).await
             })))
         }
         "mark_sites_with_chrome_sessions" => {
@@ -595,7 +594,7 @@ fn dispatch(app: &AppHandle, command: &str, args: &Value) -> Result<Value, Strin
                 take_opt(args, &["refreshPending", "refresh_pending"])?;
             let app = app.clone();
             Ok(json!(tauri::async_runtime::block_on(async move {
-                chrome_usage::mark_sites_with_chrome_sessions(
+                chrome_sync::mark_sites_with_chrome_sessions(
                     app.clone(),
                     app.state::<Database>(),
                     site_id,
@@ -820,20 +819,20 @@ fn dispatch(app: &AppHandle, command: &str, args: &Value) -> Result<Value, Strin
         ))),
 
         // —— 模型缓存 ——
-        "get_system_fonts" => Ok(json!(models_fetch::get_system_fonts())),
+        "get_system_fonts" => Ok(json!(model_catalog::get_system_fonts())),
         "get_site_model_cache" => {
             let site_id = take_string(args, &["siteId", "site_id"])?;
-            Ok(json!(models_fetch::get_site_model_cache(
+            Ok(json!(model_catalog::get_site_model_cache(
                 app.state::<Database>(),
                 site_id,
             )))
         }
-        "get_all_site_model_caches" => Ok(json!(models_fetch::get_all_site_model_caches(
+        "get_all_site_model_caches" => Ok(json!(model_catalog::get_all_site_model_caches(
             app.state::<Database>(),
         ))),
         "clear_site_model_cache_for_site" => {
             let site_id = take_string(args, &["siteId", "site_id"])?;
-            Ok(json!(models_fetch::clear_site_model_cache_for_site(
+            Ok(json!(model_catalog::clear_site_model_cache_for_site(
                 app.state::<Database>(),
                 site_id,
             )))
@@ -843,7 +842,7 @@ fn dispatch(app: &AppHandle, command: &str, args: &Value) -> Result<Value, Strin
             let account: SiteModelCacheAccount = take(args, &["account"])?;
             let result: Option<SiteModelsResult> = take_opt(args, &["result"])?;
             let preserve_keys: Option<bool> = take_opt(args, &["preserveKeys", "preserve_keys"])?;
-            Ok(json!(models_fetch::save_site_model_cache_for_account(
+            Ok(json!(model_catalog::save_site_model_cache_for_account(
                 app.state::<Database>(),
                 site_id,
                 account,
@@ -880,7 +879,7 @@ fn dispatch(app: &AppHandle, command: &str, args: &Value) -> Result<Value, Strin
             let profile_id: Option<String> = take_opt(args, &["profileId", "profile_id"])?;
             let app = app.clone();
             Ok(json!(tauri::async_runtime::block_on(async move {
-                models_fetch::fetch_site_models_json(
+                model_catalog::fetch_site_models_json(
                     app.clone(),
                     app.state::<Database>(),
                     url,
@@ -892,10 +891,10 @@ fn dispatch(app: &AppHandle, command: &str, args: &Value) -> Result<Value, Strin
         }
 
         // —— 自动会话同步 ——
-        "get_auto_sync_settings" => Ok(json!(auto_sync::get_auto_sync_settings(
+        "get_auto_sync_settings" => Ok(json!(chrome_sync::get_auto_sync_settings(
             app.state::<Database>(),
         ))),
-        "get_auto_sync_status" => Ok(json!(auto_sync::get_auto_sync_status(
+        "get_auto_sync_status" => Ok(json!(chrome_sync::get_auto_sync_status(
             app.state::<Database>(),
         ))),
         "set_auto_sync_settings" => {
@@ -903,14 +902,14 @@ fn dispatch(app: &AppHandle, command: &str, args: &Value) -> Result<Value, Strin
             let interval_minutes: Option<u64> =
                 take_opt(args, &["intervalMinutes", "interval_minutes"])?;
             let app = app.clone();
-            Ok(json!(auto_sync::set_auto_sync_settings(
+            Ok(json!(chrome_sync::set_auto_sync_settings(
                 app.clone(),
                 app.state::<Database>(),
                 enabled,
                 interval_minutes,
             )))
         }
-        "request_auto_sync_round" => Ok(json!(auto_sync::request_auto_sync_round(app.clone(),))),
+        "request_auto_sync_round" => Ok(json!(chrome_sync::request_auto_sync_round(app.clone(),))),
 
         // —— 公益监听 ——
         "get_charity_today_count" => Ok(json!(tauri::async_runtime::block_on(

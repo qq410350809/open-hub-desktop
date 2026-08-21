@@ -1,7 +1,7 @@
 use crate::charity_monitor::db::*;
 use crate::charity_monitor::feed::items_from_topic_list;
 use crate::charity_monitor::types::*;
-use crate::chrome_session;
+use crate::chrome_sync;
 use crate::models::Database;
 use crate::proxy_pool::{self, is_http_forbidden_error, is_transport_error, ProxyRuntime};
 use std::sync::{atomic::Ordering, Arc, Mutex};
@@ -118,7 +118,7 @@ pub async fn request_topic_list(
         .header(reqwest::header::ACCEPT_LANGUAGE, "zh-CN,zh;q=0.9,en;q=0.8")
         .header(
             reqwest::header::USER_AGENT,
-            chrome_session::chrome_user_agent(),
+            chrome_sync::chrome_user_agent(),
         )
         .header("Sec-Fetch-Dest", "empty")
         .header("Sec-Fetch-Mode", "cors")
@@ -171,7 +171,7 @@ pub async fn fetch_topic_body(
 
     let profiles = tauri::async_runtime::spawn_blocking({
         let home_dir = home_dir.clone();
-        move || chrome_session::profile_identities_from_home(&home_dir)
+        move || chrome_sync::profile_identities_from_home(&home_dir)
     })
     .await
     .map_err(|error| format!("读取 Chrome Profile 任务失败：{error}"))??;
@@ -186,7 +186,7 @@ pub async fn fetch_topic_body(
                 let profile_id = profile.id.clone();
                 let json_url_for_cookie = source_clone.json_url.clone();
                 let cookie_header = tauri::async_runtime::spawn_blocking(move || {
-                    chrome_session::read_chrome_cookie_header_from_home(
+                    chrome_sync::read_chrome_cookie_header_from_home(
                         &home_dir,
                         &json_url_for_cookie,
                         &profile_id,

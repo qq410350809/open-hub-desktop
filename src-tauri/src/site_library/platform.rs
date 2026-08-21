@@ -10,7 +10,7 @@
 //!   4. `<title>` 兜底（new-api / one-api）
 //!   5. URL 低置信兜底（保留旧 OpenHub 行为：域名含 newapi/one-api）
 
-use crate::site_ops::{html_title, shield_page_response};
+use crate::site_library::{html_title, shield_page_response};
 use reqwest::header;
 use serde_json::Value;
 use std::time::Duration;

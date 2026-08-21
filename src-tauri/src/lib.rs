@@ -19,22 +19,6 @@ pub(crate) use site_library::*;
 #[allow(unused_imports)]
 pub(crate) use chrome_sync::*;
 
-// Module aliases for seamless backward compatibility
-pub(crate) use site_library as site_crud;
-pub(crate) use site_library as site_ops;
-pub(crate) use site_library as system_detect;
-pub(crate) use site_library as platform_detect;
-pub(crate) use site_library as remote_sync;
-pub(crate) use chrome_sync as chrome_usage;
-pub(crate) use chrome_sync as account_sync;
-pub(crate) use chrome_sync as auto_sync;
-pub(crate) use chrome_sync as chrome_session;
-pub(crate) use chrome_sync as chrome_local_storage;
-pub(crate) use model_catalog as models_fetch;
-pub(crate) use kernel as mihomo_kernel;
-pub(crate) use kernel as geoip;
-pub(crate) use model_proxy as opencode_proxy;
-
 pub use core::app_menu;
 
 #[cfg(test)]
@@ -1054,12 +1038,12 @@ pub fn run() {
                 eprintln!("[OpenHub] Token 缓存迁移到数据库失败：{error}");
             }
             // 首次启动时若 AppData 尚无文件，先秒级释放安装包自带的内置基础版内核与 GeoIP 数据库
-            if let Err(e) = crate::mihomo_kernel::ensure_bundled_assets_installed(app.handle()) {
+            if let Err(e) = crate::kernel::ensure_bundled_assets_installed(app.handle()) {
                 eprintln!("[OpenHub] 释放内置资源提示：{e}");
             }
             let proxy_runtime = proxy_pool::ProxyRuntime::new(app_data_dir.join("proxy-runtime"));
             let charity_runtime = charity_monitor::CharityMonitorRuntime::new();
-            let auto_sync_runtime = auto_sync::AutoSyncRuntime::default();
+            let auto_sync_runtime = chrome_sync::AutoSyncRuntime::default();
             let model_catalog_runtime = model_catalog::ModelCatalogRuntime::new();
             let model_proxy_state =
                 model_proxy::ModelProxyState::new_with_app(Some(app.handle().clone()));
@@ -1117,7 +1101,7 @@ pub fn run() {
                 charity_monitor::start_charity_monitor(restore_handle.clone());
                 // 自动会话同步：账号保活 / 失效恢复 / 模型刷新全程后台化，
                 // 与公益监听错开启动（调度器内部还有首轮延迟）。
-                auto_sync::start_auto_sync(restore_handle.clone());
+                chrome_sync::start_auto_sync(restore_handle.clone());
 
                 // 启动模型网关 (Model Proxy) 独立反代服务
                 let database = restore_handle.state::<crate::models::Database>();
@@ -1140,22 +1124,22 @@ pub fn run() {
                 tokio::time::sleep(std::time::Duration::from_millis(600)).await;
 
                 // 1. 检测 Mihomo 内核
-                let has_mihomo = crate::mihomo_kernel::resolve_mihomo_binary(Some(&auto_download_handle)).is_some();
+                let has_mihomo = crate::kernel::resolve_mihomo_binary(Some(&auto_download_handle)).is_some();
                 if !has_mihomo {
                     eprintln!("[OpenHub] 启动组件检测：未检测到 Mihomo 内核，启动后台自动拉取…");
-                    match crate::mihomo_kernel::download_or_update_mihomo_kernel(auto_download_handle.clone(), None).await {
+                    match crate::kernel::download_or_update_mihomo_kernel(auto_download_handle.clone(), None).await {
                         Ok(status) => eprintln!("[OpenHub] Mihomo 内核自动安装成功 ({})", status.version),
                         Err(e) => eprintln!("[OpenHub] Mihomo 内核自动安装失败：{e}"),
                     }
                 }
 
                 // 2. 检测 GeoIP 数据库
-                let has_geoip = crate::geoip::get_app_geoip_path(&auto_download_handle)
+                let has_geoip = crate::kernel::get_app_geoip_path(&auto_download_handle)
                     .map(|p| p.is_file())
                     .unwrap_or(false);
                 if !has_geoip {
                     eprintln!("[OpenHub] 启动组件检测：未检测到 GeoIP 数据库，启动后台自动拉取…");
-                    match crate::geoip::download_or_update_geoip(auto_download_handle.clone(), None).await {
+                    match crate::kernel::download_or_update_geoip(auto_download_handle.clone(), None).await {
                         Ok(_) => eprintln!("[OpenHub] GeoIP 数据库自动下载成功并已就绪"),
                         Err(e) => eprintln!("[OpenHub] GeoIP 数据库自动下载失败：{e}"),
                     }
@@ -1174,17 +1158,17 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
-            site_crud::list_library,
-            site_crud::create_site,
-            site_crud::import_site,
-            site_crud::update_site,
-            site_crud::delete_site,
-            site_crud::toggle_personal,
-            site_crud::toggle_pending,
-            site_crud::cycle_usage_state,
-            site_crud::set_usage_state,
-            site_crud::toggle_hidden,
-            site_crud::toggle_runaway,
+            site_library::list_library,
+            site_library::create_site,
+            site_library::import_site,
+            site_library::update_site,
+            site_library::delete_site,
+            site_library::toggle_personal,
+            site_library::toggle_pending,
+            site_library::cycle_usage_state,
+            site_library::set_usage_state,
+            site_library::toggle_hidden,
+            site_library::toggle_runaway,
             proxy_pool::get_proxy_pool_state,
             proxy_pool::analyze_proxy_nodes,
             proxy_pool::save_proxy_subscription,
@@ -1204,29 +1188,29 @@ pub fn run() {
             proxy_pool::test_proxy_nodes,
             proxy_pool::test_all_proxy_nodes,
             proxy_pool::cancel_proxy_node_tests,
-            remote_sync::get_remote_user,
-            chrome_usage::mark_sites_with_chrome_sessions,
-            chrome_usage::delete_site_account,
-            account_sync::sync_site_account_via_chrome,
-            auto_sync::get_auto_sync_settings,
-            auto_sync::set_auto_sync_settings,
-            auto_sync::get_auto_sync_status,
-            auto_sync::request_auto_sync_round,
-            remote_sync::sync_remote_sites,
-            system_detect::detect_site_system_types,
-            models_fetch::get_system_fonts,
-            models_fetch::fetch_site_models_json,
-            models_fetch::get_site_model_cache,
-            models_fetch::get_all_site_model_caches,
-            models_fetch::clear_site_model_cache_for_site,
-            models_fetch::save_site_model_cache_for_account,
+            site_library::get_remote_user,
+            chrome_sync::mark_sites_with_chrome_sessions,
+            chrome_sync::delete_site_account,
+            chrome_sync::sync_site_account_via_chrome,
+            chrome_sync::get_auto_sync_settings,
+            chrome_sync::set_auto_sync_settings,
+            chrome_sync::get_auto_sync_status,
+            chrome_sync::request_auto_sync_round,
+            site_library::sync_remote_sites,
+            site_library::detect_site_system_types,
+            model_catalog::get_system_fonts,
+            model_catalog::fetch_site_models_json,
+            model_catalog::get_site_model_cache,
+            model_catalog::get_all_site_model_caches,
+            model_catalog::clear_site_model_cache_for_site,
+            model_catalog::save_site_model_cache_for_account,
             model_catalog::get_model_catalog,
             model_catalog::get_model_catalog_detail,
             model_catalog::sync_model_catalog,
-            chrome_session::list_chrome_sessions,
-            chrome_session::read_chrome_session,
-            chrome_session::open_url_in_chrome_profile,
-            chrome_session::close_chrome_sync_tabs,
+            chrome_sync::list_chrome_sessions,
+            chrome_sync::read_chrome_session,
+            chrome_sync::open_url_in_chrome_profile,
+            chrome_sync::close_chrome_sync_tabs,
             charity_monitor::get_charity_feed,
             charity_monitor::fetch_charity_feed,
             charity_monitor::mark_charity_feed_read,
@@ -1262,23 +1246,23 @@ pub fn run() {
             model_proxy::get_model_proxy_channel_stats,
             model_proxy::clear_model_proxy_logs,
             model_proxy::sync_model_proxy_site_channels,
-            opencode_proxy::get_opencode_proxy_config,
-            opencode_proxy::save_opencode_proxy_config_cmd,
-            opencode_proxy::get_opencode_proxy_status,
-            opencode_proxy::start_opencode_proxy,
-            opencode_proxy::stop_opencode_proxy,
-            opencode_proxy::fetch_opencode_models,
-            opencode_proxy::test_opencode_proxy_health,
-            opencode_proxy::get_opencode_proxy_logs,
-            opencode_proxy::get_opencode_channel_stats,
-            opencode_proxy::clear_opencode_proxy_logs,
-            opencode_proxy::sync_opencode_site_channels,
+            model_proxy::get_opencode_proxy_config,
+            model_proxy::save_opencode_proxy_config_cmd,
+            model_proxy::get_opencode_proxy_status,
+            model_proxy::start_opencode_proxy,
+            model_proxy::stop_opencode_proxy,
+            model_proxy::fetch_opencode_models,
+            model_proxy::test_opencode_proxy_health,
+            model_proxy::get_opencode_proxy_logs,
+            model_proxy::get_opencode_channel_stats,
+            model_proxy::clear_opencode_proxy_logs,
+            model_proxy::sync_opencode_site_channels,
             file_export::save_export_file,
-            mihomo_kernel::get_mihomo_kernel_status,
-            mihomo_kernel::check_mihomo_kernel_update,
-            mihomo_kernel::download_or_update_mihomo_kernel,
-            geoip::get_geoip_status,
-            geoip::download_or_update_geoip
+            kernel::get_mihomo_kernel_status,
+            kernel::check_mihomo_kernel_update,
+            kernel::download_or_update_mihomo_kernel,
+            kernel::get_geoip_status,
+            kernel::download_or_update_geoip
         ])
         .build(tauri::generate_context!())
         .expect("error while building Tauri application")

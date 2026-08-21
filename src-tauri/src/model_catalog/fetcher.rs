@@ -1,9 +1,8 @@
-use crate::account_sync::*;
-use crate::chrome_local_storage;
-use crate::chrome_session;
+use crate::chrome_sync::*;
+use crate::chrome_sync;
 use crate::db::*;
 use crate::models::*;
-use crate::platform_detect::{is_newapi, is_newapi_refresh, is_sub2api};
+use crate::site_library::{is_newapi, is_newapi_refresh, is_sub2api};
 use crate::proxy_pool;
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
@@ -920,7 +919,7 @@ async fn fetch_site_models_json_inner(
         base.push('/');
     }
     let base_url = Url::parse(&base).map_err(|_| "站点 API 地址无效".to_string())?;
-    let user_agent = chrome_session::chrome_user_agent();
+    let user_agent = chrome_sync::chrome_user_agent();
     let requested_profile_id = profile_id.clone();
     let (system_type, mut profile_ids, cached_model_keys) = if let Some(site_id) =
         site_id.as_deref()
@@ -981,7 +980,7 @@ async fn fetch_site_models_json_inner(
         .map(|site_id| {
             profile_ids
                 .iter()
-                .map(|profile_id| chrome_local_storage::LocalStorageTarget {
+                .map(|profile_id| chrome_sync::LocalStorageTarget {
                     site_id: site_id.clone(),
                     profile_id: profile_id.clone(),
                     origin: origin.clone(),
@@ -994,7 +993,7 @@ async fn fetch_site_models_json_inner(
     } else {
         let local_home = home_dir.clone();
         tauri::async_runtime::spawn_blocking(move || {
-            chrome_local_storage::read_local_storage_from_home(&local_home, &local_targets)
+            chrome_sync::read_local_storage_from_home(&local_home, &local_targets)
         })
         .await
         .map_err(|error| format!("读取 Chrome Local Storage 任务失败：{error}"))?
@@ -1059,7 +1058,7 @@ async fn fetch_site_models_json_inner(
                     let cookie_target = token_url.to_string();
                     let cookie_profile = profile_id.clone();
                     let cookie_header_result = tauri::async_runtime::spawn_blocking(move || {
-                        chrome_session::read_chrome_cookie_header_from_home(
+                        chrome_sync::read_chrome_cookie_header_from_home(
                             &cookie_home,
                             &cookie_target,
                             &cookie_profile,

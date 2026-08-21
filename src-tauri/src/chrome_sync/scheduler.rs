@@ -3,19 +3,18 @@
 //! 自动走 Chrome 桥接恢复，不再依赖用户手动点击「Chrome 会话」。
 //!
 //! 每轮三个阶段：
-//! 1. 直连保活：复用 chrome_usage 的扫描+账号刷新（无浏览器介入）。
+//! 1. 直连保活：复用 chrome_sync 的扫描+账号刷新（无浏览器介入）。
 //! 2. 失效恢复：对 is_valid=0 且 requires_chrome_fallback 的 NewAPI 账号，
 //!    以 Auto 模式走 Chrome 静默→后台两级桥接（绝不弹前台窗口）。
 //! 3. 模型刷新：本轮恢复成功的账号立即刷新 Key/模型；其余有效账号的缓存
 //!    超过 24 小时也顺带刷新（每轮限量，按最旧优先）。
 //!
-//! 浏览器兜底失败后进入持久化指数退避冷却（见 account_sync），冷却内的
+//! 浏览器兜底失败后进入持久化指数退避冷却（见 chrome_sync），冷却内的
 //! 账号本轮直接跳过；确需人工过盾时通过事件通知前端引导手动处理一次。
 
-use crate::account_sync::{self, ChromeSyncMode};
-use crate::chrome_usage;
+use crate::chrome_sync::{self, ChromeSyncMode};
 use crate::models::*;
-use crate::models_fetch;
+use crate::model_catalog;
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -74,7 +73,7 @@ pub struct AutoSyncAccountChange {
 pub struct AutoSyncRoundSummary {
     pub started_at: i64,
     pub finished_at: i64,
-    /// 直连保活阶段刷新成功的账号数（chrome_usage 扫描结果）。
+    /// 直连保活阶段刷新成功的账号数（chrome_sync 扫描结果）。
     pub refreshed_accounts: usize,
     /// 自动恢复成功（失效 → 有效）的账号列表。
     pub recovered: Vec<AutoSyncAccountChange>,
@@ -261,10 +260,10 @@ fn load_recovery_targets(connection: &rusqlite::Connection) -> Result<Vec<Recove
     {
         // 只有“直连通道确实死了”（令牌被拒/安全盾）才动浏览器；
         // 普通网络抖动保留缓存等下一轮直连重试。
-        if !account_sync::requires_chrome_fallback(&sync_error) {
+        if !chrome_sync::requires_chrome_fallback(&sync_error) {
             continue;
         }
-        if account_sync::browser_fallback_cooldown_remaining_ms(failed_at, fail_count) > 0 {
+        if chrome_sync::browser_fallback_cooldown_remaining_ms(failed_at, fail_count) > 0 {
             continue;
         }
         let account_label = if username.is_empty() {
@@ -418,7 +417,7 @@ async fn run_auto_sync_round(app: &AppHandle) -> AutoSyncRoundSummary {
         "running",
         "自动同步：正在刷新在用站点的账号资料".into(),
     );
-    let scan_result = chrome_usage::mark_sites_with_chrome_sessions(
+    let scan_result = chrome_sync::mark_sites_with_chrome_sessions(
         app.clone(),
         database.clone(),
         None,
@@ -480,7 +479,7 @@ async fn run_auto_sync_round(app: &AppHandle) -> AutoSyncRoundSummary {
             "running",
             format!("自动同步：正在通过 Chrome 恢复 {label}"),
         );
-        match account_sync::sync_site_account_via_chrome_command(
+        match chrome_sync::sync_site_account_via_chrome_command(
             app.clone(),
             &database,
             target.site_id.clone(),
@@ -564,7 +563,7 @@ async fn run_auto_sync_round(app: &AppHandle) -> AutoSyncRoundSummary {
         if !base_url.ends_with('/') {
             base_url.push('/');
         }
-        match models_fetch::auto_fetch_site_models_json(
+        match model_catalog::auto_fetch_site_models_json(
             app,
             &database,
             base_url,
@@ -576,7 +575,7 @@ async fn run_auto_sync_round(app: &AppHandle) -> AutoSyncRoundSummary {
             Ok(result) => {
                 // 同步 Key 成功获取数据后，首次保存前清理掉这个站点原来的对应旧数据，避免数据冲突与旧 Key 残留
                 if !cleared_sites.contains(&target.site_id) {
-                    let _ = models_fetch::clear_site_model_cache(&database, &target.site_id);
+                    let _ = model_catalog::clear_site_model_cache(&database, &target.site_id);
                     cleared_sites.insert(target.site_id.clone());
                 }
                 let account = SiteModelCacheAccount {
@@ -589,7 +588,7 @@ async fn run_auto_sync_round(app: &AppHandle) -> AutoSyncRoundSummary {
                     key_models: result.key_models.clone(),
                     error: String::new(),
                 };
-                match models_fetch::save_site_model_cache(
+                match model_catalog::save_site_model_cache(
                     &database,
                     &target.site_id,
                     &account,
