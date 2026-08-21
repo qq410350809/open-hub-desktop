@@ -1,60 +1,178 @@
-
 <svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
   <defs>
-    <linearGradient id="aiBlue" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" stop-color="#38bdf8" />
-      <stop offset="100%" stop-color="#0284c7" />
-    </linearGradient>
-    <linearGradient id="aiPurple" x1="0%" y1="100%" x2="100%" y2="0%">
-      <stop offset="0%" stop-color="#10b981" />
-      <stop offset="100%" stop-color="#047857" />
-    </linearGradient>
-    <linearGradient id="aiAccent" x1="100%" y1="0%" x2="0%" y2="100%">
-      <stop offset="0%" stop-color="#34d399" />
-      <stop offset="100%" stop-color="#059669" />
-    </linearGradient>
-    <linearGradient id="glass" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.85" />
-      <stop offset="100%" stop-color="#ffffff" stop-opacity="0.1" />
+    <!-- 1. 背景底板：深邃极光翡翠 (88%~92% 饱满占比，无多余留白) -->
+    <linearGradient id="bgD" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#093d2e" />
+      <stop offset="40%" stop-color="#042319" />
+      <stop offset="100%" stop-color="#01130d" />
     </linearGradient>
 
-    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
-      <feDropShadow dx="0" dy="20" stdDeviation="24" flood-color="#000000" flood-opacity="0.3" />
+    <!-- 2. 边框高光倒角渐变 -->
+    <linearGradient id="borderD" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#34d399" stop-opacity="0.85" />
+      <stop offset="35%" stop-color="#059669" stop-opacity="0.3" />
+      <stop offset="100%" stop-color="#38bdf8" stop-opacity="0.75" />
+    </linearGradient>
+
+    <!-- 3. 外环实心渐变 (O - Open) -->
+    <linearGradient id="ringTopD" x1="0%" y1="100%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#059669" />
+      <stop offset="30%" stop-color="#10b981" />
+      <stop offset="70%" stop-color="#34d399" />
+      <stop offset="100%" stop-color="#06b6d4" />
+    </linearGradient>
+    <linearGradient id="ringBottomD" x1="100%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#06b6d4" />
+      <stop offset="35%" stop-color="#0ea5e9" />
+      <stop offset="75%" stop-color="#0284c7" />
+      <stop offset="100%" stop-color="#059669" />
+    </linearGradient>
+
+    <!-- 4. 内部实心底盘渐变 (100% 内部实心填充) -->
+    <radialGradient id="innerPlateD" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#0d523e" />
+      <stop offset="60%" stop-color="#062b20" />
+      <stop offset="100%" stop-color="#021711" />
+    </radialGradient>
+
+    <!-- 5. H 路由双立柱渐变 (Hub & Dispatch) -->
+    <linearGradient id="pillarLeftD" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#6ee7b7" />
+      <stop offset="25%" stop-color="#10b981" />
+      <stop offset="100%" stop-color="#047857" />
+    </linearGradient>
+    <linearGradient id="pillarRightD" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#7dd3fc" />
+      <stop offset="25%" stop-color="#0ea5e9" />
+      <stop offset="100%" stop-color="#0369a1" />
+    </linearGradient>
+
+    <!-- 6. 横向数据总线桥梁 -->
+    <linearGradient id="bridgeD" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#10b981" />
+      <stop offset="50%" stop-color="#38bdf8" />
+      <stop offset="100%" stop-color="#0ea5e9" />
+    </linearGradient>
+
+    <!-- 7. 中心 AI 棱镜多面晶体渐变 -->
+    <linearGradient id="prismTopLeft" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#ffffff" />
+      <stop offset="100%" stop-color="#a7f3d0" />
+    </linearGradient>
+    <linearGradient id="prismTopRight" x1="100%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#e0f2fe" />
+      <stop offset="100%" stop-color="#38bdf8" />
+    </linearGradient>
+    <linearGradient id="prismBottomLeft" x1="0%" y1="100%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#047857" />
+      <stop offset="100%" stop-color="#10b981" />
+    </linearGradient>
+    <linearGradient id="prismBottomRight" x1="100%" y1="100%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#0369a1" />
+      <stop offset="100%" stop-color="#0284c7" />
+    </linearGradient>
+
+    <!-- 8. 阴影与光晕滤镜 -->
+    <filter id="shadowPlate" x="-15%" y="-15%" width="130%" height="130%">
+      <feDropShadow dx="0" dy="24" stdDeviation="28" flood-color="#000000" flood-opacity="0.55" />
     </filter>
-    <filter id="glow" x="-30%" y="-30%" width="160%" height="160%">
-      <feGaussianBlur stdDeviation="24" result="blur" />
+    <filter id="shadowEmblem" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="16" stdDeviation="18" flood-color="#000000" flood-opacity="0.5" />
+    </filter>
+    <filter id="glowCenter" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="22" result="blur" />
+      <feComposite in="SourceGraphic" in2="blur" operator="over" />
+    </filter>
+    <filter id="glowDot" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="8" result="blur" />
       <feComposite in="SourceGraphic" in2="blur" operator="over" />
     </filter>
   </defs>
 
-  <g transform="translate(512, 512)">
-    <circle cx="0" cy="0" r="340" fill="none" stroke="url(#aiPurple)" stroke-width="80" filter="url(#shadow)" />
-    
-    <path d="M 0 -340 A 340 340 0 0 1 340 0" fill="none" stroke="url(#aiBlue)" stroke-width="80" stroke-linecap="round" filter="url(#shadow)" />
-    <path d="M -340 0 A 340 340 0 0 0 0 340" fill="none" stroke="url(#aiAccent)" stroke-width="80" stroke-linecap="round" filter="url(#shadow)" />
-    
-    <circle cx="0" cy="0" r="220" fill="none" stroke="url(#glass)" stroke-width="6" stroke-dasharray="2 16" stroke-linecap="round" />
-    <circle cx="0" cy="0" r="220" fill="none" stroke="#ffffff" stroke-width="8" stroke-dasharray="160 800" stroke-linecap="round" transform="rotate(30)" />
-    <circle cx="0" cy="0" r="220" fill="none" stroke="url(#aiBlue)" stroke-width="8" stroke-dasharray="60 800" stroke-linecap="round" transform="rotate(-70)" />
-    <circle cx="0" cy="0" r="220" fill="none" stroke="url(#aiAccent)" stroke-width="8" stroke-dasharray="100 800" stroke-linecap="round" transform="rotate(160)" />
+  <!-- 1. 底板：920x920 饱满圆角方块 (四周紧凑自然，消除多余空白) -->
+  <rect x="52" y="52" width="920" height="920" rx="212" fill="url(#bgD)" filter="url(#shadowPlate)" />
+  <rect x="52" y="52" width="920" height="920" rx="212" fill="none" stroke="url(#borderD)" stroke-width="4" opacity="0.9" />
 
-    <circle cx="155.56" cy="-155.56" r="28" fill="#ffffff" filter="url(#shadow)" />
-    <circle cx="155.56" cy="-155.56" r="16" fill="url(#aiPurple)" />
-    
-    <circle cx="-190.5" cy="110" r="24" fill="#ffffff" filter="url(#shadow)" />
-    <circle cx="-190.5" cy="110" r="12" fill="url(#aiAccent)" />
-    
-    <circle cx="68" cy="209.2" r="20" fill="#ffffff" filter="url(#shadow)" />
-    <circle cx="68" cy="209.2" r="10" fill="url(#aiBlue)" />
+  <!-- 2. 实心内部底盘 (完全实心填充，沉稳科技感) -->
+  <circle cx="512" cy="512" r="390" fill="url(#innerPlateD)" stroke="#065f46" stroke-width="3" />
+  <!-- 内部多重能量光晕 -->
+  <circle cx="512" cy="512" r="310" fill="#10b981" opacity="0.16" filter="url(#glowCenter)" />
+  <circle cx="512" cy="512" r="170" fill="#38bdf8" opacity="0.25" filter="url(#glowCenter)" />
 
-    <circle cx="0" cy="0" r="120" fill="url(#aiPurple)" opacity="0.3" filter="url(#glow)" />
+  <!-- 3. 实心外环 O 体系 (厚度 140px，饱满厚重，外径 390，内径 250) -->
+  <g filter="url(#shadowEmblem)">
+    <!-- 上半环 -->
+    <path d="M 122 512 A 390 390 0 0 1 902 512 L 762 512 A 250 250 0 0 0 262 512 Z" fill="url(#ringTopD)" />
+    <!-- 下半环 -->
+    <path d="M 902 512 A 390 390 0 0 1 122 512 L 262 512 A 250 250 0 0 0 762 512 Z" fill="url(#ringBottomD)" />
 
-    <path d="M 0 -110 Q 0 0 110 0 Q 0 0 0 110 Q 0 0 -110 0 Q 0 0 0 -110 Z" fill="url(#aiBlue)" filter="url(#shadow)" />
-    <path d="M 0 -80 Q 0 0 80 0 Q 0 0 0 80 Q 0 0 -80 0 Q 0 0 0 -80 Z" fill="url(#aiAccent)" transform="rotate(45)" opacity="0.9" />
-    <path d="M 0 -50 Q 0 0 50 0 Q 0 0 0 50 Q 0 0 -50 0 Q 0 0 0 -50 Z" fill="#ffffff" filter="url(#glow)" />
-    <circle cx="0" cy="0" r="16" fill="#ffffff" filter="url(#glow)" />
-
-    <circle cx="0" cy="0" r="140" fill="url(#glass)" stroke="#ffffff" stroke-width="4" opacity="0.75" filter="url(#shadow)" />
-    <path d="M -99 -99 A 140 140 0 0 1 99 -99 A 120 120 0 0 0 -99 -99 Z" fill="#ffffff" opacity="0.6" />
+    <!-- 环体立体高光边缘 -->
+    <path d="M 262 512 A 250 250 0 0 1 762 512" fill="none" stroke="#ffffff" stroke-width="4" stroke-linecap="round" opacity="0.45" />
+    <path d="M 122 512 A 390 390 0 0 1 902 512" fill="none" stroke="#ffffff" stroke-width="2" opacity="0.3" />
   </g>
+
+  <!-- 4. 纵向与横向实体路由汇聚梁 (将外环与中心紧密咬合) -->
+  <g filter="url(#shadowEmblem)">
+    <!-- 顶部能量汇聚梁 -->
+    <path d="M 486 250 L 538 250 L 526 390 L 498 390 Z" fill="#34d399" opacity="0.9" />
+    <!-- 底部能量汇聚梁 -->
+    <path d="M 486 774 L 538 774 L 526 634 L 498 634 Z" fill="#0ea5e9" opacity="0.9" />
+    <!-- 中部横向数据总线 -->
+    <rect x="360" y="464" width="304" height="96" rx="22" fill="url(#bridgeD)" />
+    <rect x="372" y="472" width="280" height="22" rx="8" fill="#ffffff" opacity="0.35" />
+  </g>
+
+  <!-- 5. 实体立体 H 路由双立柱 (饱满圆角、立体倒角高光) -->
+  <g filter="url(#shadowEmblem)">
+    <!-- 左立柱 -->
+    <rect x="330" y="270" width="112" height="484" rx="40" fill="url(#pillarLeftD)" />
+    <!-- 左立柱高光反光面 -->
+    <path d="M 338 308 C 338 284 354 276 374 276 L 414 276 C 392 276 380 288 380 312 L 380 712 C 380 732 368 742 352 742 C 344 734 338 724 338 708 Z" fill="#ffffff" opacity="0.35" />
+
+    <!-- 右立柱 -->
+    <rect x="582" y="270" width="112" height="484" rx="40" fill="url(#pillarRightD)" />
+    <!-- 右立柱高光反光面 -->
+    <path d="M 590 308 C 590 284 606 276 626 276 L 666 276 C 644 276 632 288 632 312 L 632 712 C 632 732 620 742 604 742 C 596 734 590 724 590 708 Z" fill="#ffffff" opacity="0.35" />
+  </g>
+
+  <!-- 6. 核心 AI 路由多面能量晶体 (AI Gateway Prism Core) -->
+  <g filter="url(#glowCenter)">
+    <!-- 承托基座 -->
+    <polygon points="512,380 622,512 512,644 402,512" fill="#034e38" />
+    
+    <!-- 4 大立体折射切面 -->
+    <!-- 左上切面 (极光白高光) -->
+    <polygon points="406,512 512,384 512,512" fill="url(#prismTopLeft)" />
+    <!-- 右上切面 (天青晶蓝) -->
+    <polygon points="512,384 618,512 512,512" fill="url(#prismTopRight)" />
+    <!-- 左下切面 (祖母绿) -->
+    <polygon points="406,512 512,512 512,640" fill="url(#prismBottomLeft)" />
+    <!-- 右下切面 (深海蓝) -->
+    <polygon points="512,512 618,512 512,640" fill="url(#prismBottomRight)" />
+
+    <!-- 棱角高光分割线 -->
+    <line x1="406" y1="512" x2="618" y2="512" stroke="#ffffff" stroke-width="2" opacity="0.6" />
+    <line x1="512" y1="384" x2="512" y2="640" stroke="#ffffff" stroke-width="2" opacity="0.7" />
+
+    <!-- 核心能量发射源点 -->
+    <circle cx="512" cy="512" r="26" fill="#ffffff" filter="url(#glowDot)" />
+    <circle cx="512" cy="512" r="14" fill="#0ea5e9" />
+    <circle cx="512" cy="512" r="6" fill="#ffffff" />
+  </g>
+
+  <!-- 7. 四方微型数据端口 (代表 Model, Proxy, Token, Charity 4 大服务) -->
+  <circle cx="512" cy="187" r="22" fill="#34d399" filter="url(#shadowEmblem)" />
+  <circle cx="512" cy="187" r="9" fill="#ffffff" />
+
+  <circle cx="837" cy="512" r="22" fill="#38bdf8" filter="url(#shadowEmblem)" />
+  <circle cx="837" cy="512" r="9" fill="#ffffff" />
+
+  <circle cx="512" cy="837" r="22" fill="#0ea5e9" filter="url(#shadowEmblem)" />
+  <circle cx="512" cy="837" r="9" fill="#ffffff" />
+
+  <circle cx="187" cy="512" r="22" fill="#10b981" filter="url(#shadowEmblem)" />
+  <circle cx="187" cy="512" r="9" fill="#ffffff" />
+
+  <!-- 8. 顶部通透 Apple 玻璃穹顶光泽 -->
+  <path d="M 52 238 C 52 135 135 52 238 52 L 786 52 C 889 52 972 135 972 238 C 972 350 772 290 512 290 C 252 290 52 350 52 238 Z" fill="#ffffff" opacity="0.11" />
 </svg>
