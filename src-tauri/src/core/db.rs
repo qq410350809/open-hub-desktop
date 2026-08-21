@@ -1,4 +1,4 @@
-use crate::chrome_sync;
+use crate::site::sync;
 use crate::models::*;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{de::DeserializeOwned, Serialize};
@@ -889,7 +889,7 @@ fn ensure_charity_sync_log_columns(connection: &Connection) -> Result<(), String
 
 pub(crate) fn read_cached_usage_sites(
     connection: &Connection,
-) -> Result<Vec<chrome_sync::ChromeSiteSessionMatch>, String> {
+) -> Result<Vec<sync::ChromeSiteSessionMatch>, String> {
     // 运行中跨过午夜时也要即时归零，不能只依赖应用启动时的迁移。
     reset_expired_checkin_states(connection)?;
     let mut statement = connection
@@ -923,7 +923,7 @@ pub(crate) fn read_cached_usage_sites(
             let browser_fallback_fail_count = row.get::<_, i64>(23)?;
             Ok((
                 row.get::<_, String>(0)?,
-                chrome_sync::ChromeSessionInfo {
+                sync::ChromeSessionInfo {
                     profile_id: row.get(1)?,
                     domain: row.get(2)?,
                     cookie_count: row.get::<_, i64>(3)?.max(0) as usize,
@@ -955,7 +955,7 @@ pub(crate) fn read_cached_usage_sites(
                     checkin_error: row.get(18)?,
                     account_updated_at: row.get(19)?,
                     browser_fallback_cooldown_ms:
-                        crate::chrome_sync::browser_fallback_cooldown_remaining_ms(
+                        crate::site::sync::browser_fallback_cooldown_remaining_ms(
                             browser_fallback_failed_at,
                             browser_fallback_fail_count,
                         ),
@@ -970,12 +970,12 @@ pub(crate) fn read_cached_usage_sites(
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| error.to_string())?;
 
-    let mut sites: Vec<chrome_sync::ChromeSiteSessionMatch> = Vec::new();
+    let mut sites: Vec<sync::ChromeSiteSessionMatch> = Vec::new();
     for (site_id, session) in rows {
         if let Some(site) = sites.iter_mut().find(|site| site.site_id == site_id) {
             site.sessions.push(session);
         } else {
-            sites.push(chrome_sync::ChromeSiteSessionMatch {
+            sites.push(sync::ChromeSiteSessionMatch {
                 site_id,
                 sessions: vec![session],
             });

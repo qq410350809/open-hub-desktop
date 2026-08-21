@@ -1,0 +1,531 @@
+import { ref, computed } from "vue";
+import { runCommand } from "../core/ipc";
+import { useToast } from "../core/useToast";
+import {
+  DEFAULT_PROXY_PORT,
+  OPENCODE_UPSTREAM_URL,
+  buildProxyBaseUrl,
+  buildProxyGeminiUrl,
+  buildProxyMessagesUrl,
+} from "../../constants";
+import type {
+  ChannelConfig,
+  OpencodeProxyConfig,
+  OpencodeProxyStatus,
+  ProxyRequestLog,
+  ChannelUsageStats,
+  ChannelModelList,
+} from "./types";
+
+export * from "./types";
+
+export function channelAlias(channel: ChannelConfig | null | undefined): string {
+  const a = channel?.alias?.trim().toLowerCase();
+  return a || channel?.id || "";
+}
+
+export function isOpenCodeFreeChannel(channel: ChannelConfig | null | undefined): boolean {
+  if (!channel) return false;
+  const isOpencode =
+    channel.id === "opencode" ||
+    channel.protocol === "opencode" ||
+    channel.alias === "opencode" ||
+    (channel.upstreamUrl && channel.upstreamUrl.includes("opencode.ai")) ||
+    (channel.name && channel.name.toLowerCase().includes("opencode"));
+  if (!isOpencode) return false;
+  const hasKey = !!(channel.apiKey?.trim() || channel.apiKeys?.some((k) => k.trim()));
+  return !hasKey;
+}
+
+export function filterFreeModelsOnly(models: string[]): string[] {
+  return models.filter((m) => {
+    const lower = m.toLowerCase();
+    return lower.includes("free") || lower === "big-pickle";
+  });
+}
+
+export function filterChannelModels(
+  channel: ChannelConfig | null | undefined,
+  models: string[],
+): string[] {
+  let list = models;
+  if (isOpenCodeFreeChannel(channel)) {
+    list = filterFreeModelsOnly(list);
+  }
+  const allow = channel?.enabledModels;
+  if (!allow) return list;
+  return list.filter((m) => allow.includes(m));
+}
+
+export function isValidChannelAlias(alias: string): boolean {
+  return /^[a-zA-Z0-9_-]+$/.test(alias.trim());
+}
+
+export const proxyConfig = ref<OpencodeProxyConfig>({
+  enabled: true,
+  port: DEFAULT_PROXY_PORT,
+  apiKey: "",
+  channels: [
+    {
+      id: "opencode",
+      name: "OpenCode",
+      description: "OpenCode 官方 Public 免费直连通道，免 Key 访问在线优质编码与推理模型",
+      enabled: true,
+      protocol: "opencode",
+      upstreamUrl: OPENCODE_UPSTREAM_URL,
+      apiKey: "public",
+      useProxyPool: false,
+      alias: "opencode",
+      siteId: null,
+      useFixedProxy: false,
+      enabledModels: null,
+    },
+  ],
+  timeoutSeconds: 300,
+  maxRetries: 0,
+});
+
+export const proxyStatus = ref<OpencodeProxyStatus>({
+  running: false,
+  port: DEFAULT_PROXY_PORT,
+  url: buildProxyBaseUrl(DEFAULT_PROXY_PORT),
+  totalRequests: 0,
+  successfulRequests: 0,
+  failedRequests: 0,
+  uptimeSeconds: 0,
+  modelsCount: 0,
+  channelsCount: 1,
+  totalPromptTokens: 0,
+  totalCompletionTokens: 0,
+  totalReasoningTokens: 0,
+  totalReasoningRequests: 0,
+  totalCacheHitTokens: 0,
+  totalTokens: 0,
+  todayTotalTokens: 0,
+});
+
+export const proxyLoading = ref(false);
+export const savingConfig = ref(false);
+export const togglingServer = ref(false);
+export const testingHealth = ref(false);
+export const fetchingModels = ref(false);
+export const channelModels = ref<Record<string, string[]>>({});
+export const channelStats = ref<Record<string, ChannelUsageStats>>({});
+export const healthResult = ref<any>(null);
+export const healthResultTime = ref<string>("");
+export const proxyLogs = ref<ProxyRequestLog[]>([]);
+export const loadingLogs = ref(false);
+export const logPage = ref(1);
+export const logPageSize = ref(50);
+export const logTotal = ref(0);
+export const logSuccessTotal = ref(0);
+export const logErrorTotal = ref(0);
+export const logGlobalTotal = ref(0);
+export const logGlobalSuccess = ref(0);
+export const logGlobalError = ref(0);
+export const logPageCount = computed(() => Math.max(1, Math.ceil(logTotal.value / logPageSize.value)));
+export const logRangeStart = computed(() => (logTotal.value === 0 ? 0 : (logPage.value - 1) * logPageSize.value + 1));
+export const logRangeEnd = computed(() => Math.min(logPage.value * logPageSize.value, logTotal.value));
+export const logSortBy = ref<"timestamp" | "status" | "tokens" | "duration" | null>(null);
+export const logSortOrder = ref<"asc" | "desc">("desc");
+
+export function useModelProxy() {
+  const { showToast } = useToast();
+
+  async function refreshStatus() {
+    try {
+      const status = await runCommand<OpencodeProxyStatus>("get_opencode_proxy_status");
+      if (status) proxyStatus.value = status;
+    } catch {
+      // background polling
+    }
+  }
+
+  async function loadProxyData() {
+    proxyLoading.value = true;
+    try {
+      const [cfg, status] = await Promise.all([
+        runCommand<OpencodeProxyConfig>("get_opencode_proxy_config"),
+        runCommand<OpencodeProxyStatus>("get_opencode_proxy_status"),
+      ]);
+      if (cfg) {
+        if (!cfg.channels || cfg.channels.length === 0) {
+          cfg.channels = [
+            {
+              id: "opencode",
+              name: "OpenCode",
+              description: "OpenCode 官方 Public 免费直连通道，免 Key 访问在线优质编码与推理模型",
+              enabled: true,
+              protocol: "opencode",
+              upstreamUrl: OPENCODE_UPSTREAM_URL,
+              apiKey: "public",
+              useProxyPool: false,
+              alias: "opencode",
+              siteId: null,
+              useFixedProxy: false,
+              enabledModels: null,
+            },
+          ];
+        }
+        proxyConfig.value = cfg;
+      }
+      if (status) proxyStatus.value = status;
+      await refreshChannelStats();
+      await loadCachedModels();
+    } catch (e) {
+      console.error("加载模型反代配置失败:", e);
+    } finally {
+      proxyLoading.value = false;
+    }
+  }
+
+  async function refreshChannelStats() {
+    try {
+      const list = await runCommand<ChannelUsageStats[]>("get_opencode_channel_stats");
+      if (Array.isArray(list)) {
+        const map: Record<string, ChannelUsageStats> = {};
+        for (const item of list) map[item.channelId] = item;
+        channelStats.value = map;
+      }
+    } catch (e) {
+      console.warn("获取渠道使用统计失败:", e);
+    }
+  }
+
+  async function saveConfig(newConfig: OpencodeProxyConfig) {
+    savingConfig.value = true;
+    try {
+      const status = await runCommand<OpencodeProxyStatus>("save_opencode_proxy_config_cmd", {
+        config: newConfig,
+      });
+      if (status) proxyStatus.value = status;
+      proxyConfig.value = { ...newConfig };
+      showToast("反代配置与渠道设置已保存");
+      return true;
+    } catch (e) {
+      showToast(`保存配置失败: ${String(e)}`, true);
+      return false;
+    } finally {
+      savingConfig.value = false;
+    }
+  }
+
+  async function toggleServer() {
+    togglingServer.value = true;
+    try {
+      if (proxyStatus.value.running) {
+        const status = await runCommand<OpencodeProxyStatus>("stop_opencode_proxy");
+        if (status) proxyStatus.value = status;
+        showToast("模型反代服务已停止");
+      } else {
+        const status = await runCommand<OpencodeProxyStatus>("start_opencode_proxy");
+        if (status) proxyStatus.value = status;
+        showToast(`模型反代服务已在端口 ${proxyStatus.value.port} 启动`);
+      }
+    } catch (e) {
+      showToast(`操作服务失败: ${String(e)}`, true);
+    } finally {
+      togglingServer.value = false;
+    }
+  }
+
+  async function testHealth() {
+    testingHealth.value = true;
+    healthResult.value = null;
+    try {
+      const res = await runCommand<any>("test_opencode_proxy_health");
+      healthResult.value = res;
+      healthResultTime.value = new Date().toLocaleTimeString();
+      showToast("健康检查通过 (200 OK)");
+      return res;
+    } catch (e) {
+      healthResult.value = { error: String(e) };
+      healthResultTime.value = new Date().toLocaleTimeString();
+      showToast(`健康检查未通过: ${String(e)}`, true);
+      return null;
+    } finally {
+      testingHealth.value = false;
+    }
+  }
+
+  async function fetchUpstreamModels(options: { setGlobalFetching?: boolean } = {}): Promise<Record<string, string[]>> {
+    if (options.setGlobalFetching) {
+      fetchingModels.value = true;
+    }
+    try {
+      const res = await runCommand<any>("fetch_opencode_models");
+      const list: ChannelModelList[] =
+        Array.isArray(res) && Array.isArray(res[0])
+          ? res[0]
+          : Array.isArray(res)
+          ? res
+          : [];
+      const map: Record<string, string[]> = {};
+      if (Array.isArray(list)) {
+        for (const item of list) {
+          const cid = item.channelId || (item as any).channel_id;
+          if (cid) {
+            let mList = item.models || [];
+            const channel = proxyConfig.value.channels.find((c) => c.id === cid);
+            if (isOpenCodeFreeChannel(channel)) {
+              mList = filterFreeModelsOnly(mList);
+            }
+            map[cid] = mList;
+          }
+        }
+      }
+      return map;
+    } catch (e) {
+      console.warn("拉取模型失败:", e);
+      return {};
+    } finally {
+      if (options.setGlobalFetching) {
+        fetchingModels.value = false;
+      }
+    }
+  }
+
+  async function refreshModels() {
+    const map = await fetchUpstreamModels({ setGlobalFetching: true });
+    if (Object.keys(map).length > 0) {
+      channelModels.value = map;
+    }
+  }
+
+  async function loadCachedModels() {
+    try {
+      const res = await runCommand<any>("get_opencode_cached_channel_models");
+      const list: ChannelModelList[] =
+        Array.isArray(res) && Array.isArray(res[0])
+          ? res[0]
+          : Array.isArray(res)
+          ? res
+          : [];
+      const map: Record<string, string[]> = {};
+      if (Array.isArray(list)) {
+        for (const item of list) {
+          const cid = item.channelId || (item as any).channel_id;
+          if (cid) {
+            let mList = item.models || [];
+            const channel = proxyConfig.value.channels.find((c) => c.id === cid);
+            if (isOpenCodeFreeChannel(channel)) {
+              mList = filterFreeModelsOnly(mList);
+            }
+            map[cid] = mList;
+          }
+        }
+      }
+      if (Object.keys(map).length > 0) {
+        channelModels.value = map;
+      }
+    } catch (e) {
+      console.warn("读取已缓存渠道模型失败:", e);
+    }
+  }
+
+  function modelsForChannel(channelId: string): string[] {
+    let list = channelModels.value[channelId] ?? [];
+    const channel = proxyConfig.value.channels.find((c) => c.id === channelId);
+    if (isOpenCodeFreeChannel(channel)) {
+      list = filterFreeModelsOnly(list);
+    }
+    return list;
+  }
+
+  async function fetchLogs(options: {
+    page?: number;
+    pageSize?: number;
+    filter?: string;
+    q?: string;
+    sortBy?: "timestamp" | "status" | "tokens" | "duration" | null;
+    sortOrder?: "asc" | "desc";
+  } = {}) {
+    loadingLogs.value = true;
+    try {
+      const p = options.page ?? logPage.value;
+      const ps = options.pageSize ?? logPageSize.value;
+      const f = options.filter ?? "";
+      const query = options.q ?? "";
+      const sortBy = options.sortBy !== undefined ? options.sortBy : logSortBy.value;
+      const sortOrder = options.sortOrder !== undefined ? options.sortOrder : logSortOrder.value;
+
+      const payload: Record<string, unknown> = {
+        page: p,
+        pageSize: ps,
+      };
+      if (f && f !== "all") payload.filter = f;
+      if (query.trim()) payload.q = query.trim();
+      if (sortBy) {
+        payload.sortBy = sortBy;
+        payload.sortOrder = sortOrder;
+      }
+
+      const res = await runCommand<{
+        items: ProxyRequestLog[];
+        total: number;
+        successTotal: number;
+        errorTotal: number;
+      }>("get_opencode_proxy_logs", payload);
+
+      if (res && Array.isArray(res.items)) {
+        proxyLogs.value = res.items;
+        logPage.value = p;
+        logPageSize.value = ps;
+        logTotal.value = res.total ?? res.items.length;
+        logSuccessTotal.value = res.successTotal ?? 0;
+        logErrorTotal.value = res.errorTotal ?? 0;
+        if (!f && !query.trim()) {
+          logGlobalTotal.value = res.total ?? 0;
+          logGlobalSuccess.value = res.successTotal ?? 0;
+          logGlobalError.value = res.errorTotal ?? 0;
+        }
+      } else if (Array.isArray(res)) {
+        proxyLogs.value = res;
+        logTotal.value = (res as any).length;
+      }
+    } catch (e) {
+      console.warn("获取请求日志失败:", e);
+    } finally {
+      loadingLogs.value = false;
+    }
+  }
+
+  function goLogPage(page: number, extraOptions: { filter?: string; q?: string } = {}) {
+    const target = Math.max(1, Math.min(page, logPageCount.value || 1));
+    return fetchLogs({ page: target, ...extraOptions });
+  }
+
+  function toggleLogSort(column: "timestamp" | "status" | "tokens" | "duration", extraOptions: { filter?: string; q?: string } = {}) {
+    if (logSortBy.value === column) {
+      if (logSortOrder.value === "desc") {
+        logSortOrder.value = "asc";
+      } else {
+        logSortBy.value = null;
+        logSortOrder.value = "desc";
+      }
+    } else {
+      logSortBy.value = column;
+      logSortOrder.value = "desc";
+    }
+    return fetchLogs({ page: 1, ...extraOptions });
+  }
+
+  async function clearLogs(mode: "payload_only" | "all" = "all") {
+    try {
+      await runCommand("clear_opencode_proxy_logs", { mode });
+      if (mode === "payload_only") {
+        await fetchLogs();
+        showToast("已清空所有日志的请求与响应报文详细内容");
+      } else {
+        proxyLogs.value = [];
+        logTotal.value = 0;
+        logSuccessTotal.value = 0;
+        logErrorTotal.value = 0;
+        logPage.value = 1;
+        await refreshStatus();
+        showToast("所有请求日志记录已清空");
+      }
+      return true;
+    } catch (e) {
+      showToast(`清空日志失败: ${String(e)}`, true);
+      return false;
+    }
+  }
+
+  async function copyProxyUrl(alias?: any) {
+    const aliasStr = typeof alias === "string" ? alias : undefined;
+    const base = buildProxyBaseUrl(proxyStatus.value.port);
+    const text = aliasStr ? `${base.replace(/\/+$/, "")}/${aliasStr}` : base;
+    try {
+      await navigator.clipboard.writeText(text);
+      showToast(`Base URL 已复制: ${text}`);
+    } catch {
+      showToast("复制失败，请手动复制", true);
+    }
+  }
+
+  async function copyGeminiUrl(alias?: any) {
+    const aliasStr = typeof alias === "string" ? alias : undefined;
+    const base = buildProxyGeminiUrl(proxyStatus.value.port);
+    const text = aliasStr ? `${base.replace(/\/+$/, "")}/${aliasStr}` : base;
+    try {
+      await navigator.clipboard.writeText(text);
+      showToast(`Gemini Base URL 已复制: ${text}`);
+    } catch {
+      showToast("复制失败，请手动复制", true);
+    }
+  }
+
+  async function copyClaudeUrl(alias?: any) {
+    const aliasStr = typeof alias === "string" ? alias : undefined;
+    const base = buildProxyMessagesUrl(proxyStatus.value.port);
+    const text = aliasStr ? `${base.replace(/\/+$/, "")}/${aliasStr}` : base;
+    try {
+      await navigator.clipboard.writeText(text);
+      showToast(`Claude Messages URL 已复制: ${text}`);
+    } catch {
+      showToast("复制失败，请手动复制", true);
+    }
+  }
+
+  async function copyProxyKey() {
+    const key = proxyConfig.value.apiKey?.trim() || "";
+    if (!key) {
+      showToast("当前未配置访问密钥（免密直连）");
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(key);
+      showToast("API Key 已复制");
+    } catch {
+      showToast("复制失败，请手动复制", true);
+    }
+  }
+
+  return {
+    proxyConfig,
+    proxyStatus,
+    proxyLoading,
+    savingConfig,
+    togglingServer,
+    testingHealth,
+    fetchingModels,
+    channelModels,
+    channelStats,
+    modelsForChannel,
+    healthResult,
+    healthResultTime,
+    proxyLogs,
+    loadingLogs,
+    logPage,
+    logPageSize,
+    logTotal,
+    logSuccessTotal,
+    logErrorTotal,
+    logGlobalTotal,
+    logGlobalSuccess,
+    logGlobalError,
+    logPageCount,
+    logRangeStart,
+    logRangeEnd,
+    logSortBy,
+    logSortOrder,
+    loadProxyData,
+    refreshStatus,
+    refreshChannelStats,
+    saveConfig,
+    toggleServer,
+    testHealth,
+    fetchUpstreamModels,
+    refreshModels,
+    loadCachedModels,
+    fetchLogs,
+    goLogPage,
+    toggleLogSort,
+    clearLogs,
+    copyProxyUrl,
+    copyGeminiUrl,
+    copyClaudeUrl,
+    copyProxyKey,
+  };
+}

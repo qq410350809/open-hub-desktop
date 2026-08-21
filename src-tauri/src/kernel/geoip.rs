@@ -125,9 +125,9 @@ pub async fn download_or_update_geoip(
     // 自动使用新下载的 GeoIP 数据库重新解析并修复已有节点的国家与地域映射
     if let (Some(db), Some(runtime)) = (
         app.try_state::<crate::models::Database>(),
-        app.try_state::<crate::proxy_pool::ProxyRuntime>(),
+        app.try_state::<crate::proxypool::ProxyRuntime>(),
     ) {
-        let _ = crate::proxy_pool::repair_node_locations_with_geoip(&db, &runtime);
+        let _ = crate::proxypool::repair_node_locations_with_geoip(&db, &runtime);
         let _ = app.emit("proxy-nodes-updated", ());
     }
 

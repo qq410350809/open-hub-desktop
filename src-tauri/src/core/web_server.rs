@@ -25,12 +25,12 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use tauri::{AppHandle, Manager};
 
-use crate::charity_monitor::CharityMonitorRuntime;
+use crate::charity::CharityMonitorRuntime;
 use crate::models::{Database, SiteModelCacheAccount, SiteRecord};
-use crate::model_catalog::SiteModelsResult;
-use crate::proxy_pool::ProxyRuntime;
+use crate::model::catalog::SiteModelsResult;
+use crate::proxypool::ProxyRuntime;
 use crate::{
-    charity_monitor, chrome_sync, model_catalog, proxy_pool, site_library, token_stats,
+    charity, model::catalog, proxypool, site::library, site::sync, token::stats,
 };
 
 /// 首选端口；被占用时向后顺延。
@@ -515,10 +515,10 @@ fn take_string(args: &Value, names: &[&str]) -> Result<String, String> {
 fn dispatch(app: &AppHandle, command: &str, args: &Value) -> Result<Value, String> {
     match command {
         // —— 站点库 ——
-        "list_library" => Ok(json!(site_library::list_library(app.state::<Database>()))),
+        "list_library" => Ok(json!(crate::site::library::list_library(app.state::<Database>()))),
         "create_site" => {
             let input: SiteRecord = take(args, &["input"])?;
-            Ok(json!(site_library::create_site(
+            Ok(json!(crate::site::library::create_site(
                 app.state::<Database>(),
                 input
             )))
@@ -526,7 +526,7 @@ fn dispatch(app: &AppHandle, command: &str, args: &Value) -> Result<Value, Strin
         "update_site" => {
             let id = take_string(args, &["id"])?;
             let input: SiteRecord = take(args, &["input"])?;
-            Ok(json!(site_library::update_site(
+            Ok(json!(crate::site::library::update_site(
                 app.state::<Database>(),
                 id,
                 input
@@ -534,25 +534,25 @@ fn dispatch(app: &AppHandle, command: &str, args: &Value) -> Result<Value, Strin
         }
         "delete_site" => {
             let id = take_string(args, &["id"])?;
-            Ok(json!(site_library::delete_site(app.state::<Database>(), id)))
+            Ok(json!(crate::site::library::delete_site(app.state::<Database>(), id)))
         }
         "toggle_personal" => {
             let id = take_string(args, &["id"])?;
-            Ok(json!(site_library::toggle_personal(
+            Ok(json!(crate::site::library::toggle_personal(
                 app.state::<Database>(),
                 id
             )))
         }
         "toggle_pending" => {
             let id = take_string(args, &["id"])?;
-            Ok(json!(site_library::toggle_pending(
+            Ok(json!(crate::site::library::toggle_pending(
                 app.state::<Database>(),
                 id
             )))
         }
         "cycle_usage_state" => {
             let id = take_string(args, &["id"])?;
-            Ok(json!(site_library::cycle_usage_state(
+            Ok(json!(crate::site::library::cycle_usage_state(
                 app.state::<Database>(),
                 id
             )))
@@ -560,7 +560,7 @@ fn dispatch(app: &AppHandle, command: &str, args: &Value) -> Result<Value, Strin
         "set_usage_state" => {
             let id = take_string(args, &["id"])?;
             let state = take_string(args, &["state"])?;
-            Ok(json!(site_library::set_usage_state(
+            Ok(json!(crate::site::library::set_usage_state(
                 app.state::<Database>(),
                 id,
                 state
@@ -568,11 +568,11 @@ fn dispatch(app: &AppHandle, command: &str, args: &Value) -> Result<Value, Strin
         }
         "toggle_hidden" => {
             let id = take_string(args, &["id"])?;
-            Ok(json!(site_library::toggle_hidden(app.state::<Database>(), id)))
+            Ok(json!(crate::site::library::toggle_hidden(app.state::<Database>(), id)))
         }
         "toggle_runaway" => {
             let id = take_string(args, &["id"])?;
-            Ok(json!(site_library::toggle_runaway(
+            Ok(json!(crate::site::library::toggle_runaway(
                 app.state::<Database>(),
                 id
             )))
@@ -582,7 +582,7 @@ fn dispatch(app: &AppHandle, command: &str, args: &Value) -> Result<Value, Strin
             let usage_state: Option<String> = take_opt(args, &["usageState", "usage_state"])?;
             let app = app.clone();
             Ok(json!(tauri::async_runtime::block_on(async move {
-                site_library::import_site(app.state::<Database>(), site_url, usage_state).await
+                crate::site::library::import_site(app.state::<Database>(), site_url, usage_state).await
             })))
         }
         "mark_sites_with_chrome_sessions" => {
@@ -594,7 +594,7 @@ fn dispatch(app: &AppHandle, command: &str, args: &Value) -> Result<Value, Strin
                 take_opt(args, &["refreshPending", "refresh_pending"])?;
             let app = app.clone();
             Ok(json!(tauri::async_runtime::block_on(async move {
-                chrome_sync::mark_sites_with_chrome_sessions(
+                crate::site::sync::mark_sites_with_chrome_sessions(
                     app.clone(),
                     app.state::<Database>(),
                     site_id,
@@ -608,11 +608,11 @@ fn dispatch(app: &AppHandle, command: &str, args: &Value) -> Result<Value, Strin
         }
 
         // —— 代理池 ——
-        "get_proxy_pool_state" => Ok(json!(proxy_pool::get_proxy_pool_state(
+        "get_proxy_pool_state" => Ok(json!(proxypool::get_proxy_pool_state(
             app.state::<Database>(),
             app.state::<ProxyRuntime>(),
         ))),
-        "analyze_proxy_nodes" => Ok(json!(proxy_pool::analyze_proxy_nodes(
+        "analyze_proxy_nodes" => Ok(json!(proxypool::analyze_proxy_nodes(
             app.state::<Database>(),
             app.state::<ProxyRuntime>(),
         ))),
@@ -620,7 +620,7 @@ fn dispatch(app: &AppHandle, command: &str, args: &Value) -> Result<Value, Strin
             let id: Option<String> = take_opt(args, &["id"])?;
             let name = take_string(args, &["name"])?;
             let url = take_string(args, &["url"])?;
-            Ok(json!(proxy_pool::save_proxy_subscription(
+            Ok(json!(proxypool::save_proxy_subscription(
                 app.state::<Database>(),
                 id,
                 name,
@@ -629,7 +629,7 @@ fn dispatch(app: &AppHandle, command: &str, args: &Value) -> Result<Value, Strin
         }
         "delete_proxy_subscription" => {
             let id = take_string(args, &["id"])?;
-            Ok(json!(proxy_pool::delete_proxy_subscription(
+            Ok(json!(proxypool::delete_proxy_subscription(
                 app.state::<Database>(),
                 app.state::<ProxyRuntime>(),
                 id,
@@ -639,7 +639,7 @@ fn dispatch(app: &AppHandle, command: &str, args: &Value) -> Result<Value, Strin
             let id = take_string(args, &["id"])?;
             let app = app.clone();
             Ok(json!(tauri::async_runtime::block_on(async move {
-                proxy_pool::refresh_proxy_subscription(
+                proxypool::refresh_proxy_subscription(
                     app.clone(),
                     app.state::<Database>(),
                     app.state::<ProxyRuntime>(),
@@ -650,7 +650,7 @@ fn dispatch(app: &AppHandle, command: &str, args: &Value) -> Result<Value, Strin
         }
         "set_proxy_pool_settings" => {
             let ignore_addresses = take_string(args, &["ignoreAddresses", "ignore_addresses"])?;
-            Ok(json!(proxy_pool::set_proxy_pool_settings(
+            Ok(json!(proxypool::set_proxy_pool_settings(
                 app.state::<Database>(),
                 app.state::<ProxyRuntime>(),
                 ignore_addresses,
@@ -659,7 +659,7 @@ fn dispatch(app: &AppHandle, command: &str, args: &Value) -> Result<Value, Strin
         "save_proxy_channel" => {
             let id: Option<String> = take_opt(args, &["id"])?;
             let name = take_string(args, &["name"])?;
-            Ok(json!(proxy_pool::save_proxy_channel(
+            Ok(json!(proxypool::save_proxy_channel(
                 app.state::<Database>(),
                 app.state::<ProxyRuntime>(),
                 id,
@@ -668,7 +668,7 @@ fn dispatch(app: &AppHandle, command: &str, args: &Value) -> Result<Value, Strin
         }
         "delete_proxy_channel" => {
             let id = take_string(args, &["id"])?;
-            Ok(json!(proxy_pool::delete_proxy_channel(
+            Ok(json!(proxypool::delete_proxy_channel(
                 app.state::<Database>(),
                 app.state::<ProxyRuntime>(),
                 id,
@@ -678,7 +678,7 @@ fn dispatch(app: &AppHandle, command: &str, args: &Value) -> Result<Value, Strin
             let channel_id = take_string(args, &["channelId", "channel_id"])?;
             let node_id = take_string(args, &["nodeId", "node_id"])?;
             Ok(json!(tauri::async_runtime::block_on(async move {
-                proxy_pool::set_proxy_channel_node(
+                proxypool::set_proxy_channel_node(
                     app.state::<Database>(),
                     app.state::<ProxyRuntime>(),
                     channel_id,
@@ -690,7 +690,7 @@ fn dispatch(app: &AppHandle, command: &str, args: &Value) -> Result<Value, Strin
         "assign_account_proxy_channel" => {
             let profile_id = take_string(args, &["profileId", "profile_id"])?;
             let channel_id = take_string(args, &["channelId", "channel_id"])?;
-            Ok(json!(proxy_pool::assign_account_proxy_channel(
+            Ok(json!(proxypool::assign_account_proxy_channel(
                 app.state::<Database>(),
                 app.state::<ProxyRuntime>(),
                 profile_id,
@@ -699,7 +699,7 @@ fn dispatch(app: &AppHandle, command: &str, args: &Value) -> Result<Value, Strin
         }
         "unassign_account_proxy_channel" => {
             let profile_id = take_string(args, &["profileId", "profile_id"])?;
-            Ok(json!(proxy_pool::unassign_account_proxy_channel(
+            Ok(json!(proxypool::unassign_account_proxy_channel(
                 app.state::<Database>(),
                 app.state::<ProxyRuntime>(),
                 profile_id,
@@ -713,7 +713,7 @@ fn dispatch(app: &AppHandle, command: &str, args: &Value) -> Result<Value, Strin
                 .and_then(|v| serde_json::from_value::<Vec<String>>(v.clone()).ok());
             let app = app.clone();
             Ok(json!(tauri::async_runtime::block_on(async move {
-                proxy_pool::test_proxy_channel_nodes(
+                proxypool::test_proxy_channel_nodes(
                     app.clone(),
                     app.state::<Database>(),
                     app.state::<ProxyRuntime>(),
@@ -727,7 +727,7 @@ fn dispatch(app: &AppHandle, command: &str, args: &Value) -> Result<Value, Strin
             let node_id = take_string(args, &["nodeId", "node_id"])?;
             let app = app.clone();
             Ok(json!(tauri::async_runtime::block_on(async move {
-                proxy_pool::set_active_proxy_node(
+                proxypool::set_active_proxy_node(
                     app.state::<Database>(),
                     app.state::<ProxyRuntime>(),
                     node_id,
@@ -735,11 +735,11 @@ fn dispatch(app: &AppHandle, command: &str, args: &Value) -> Result<Value, Strin
                 .await
             })))
         }
-        "clear_active_proxy_node" => Ok(json!(proxy_pool::clear_active_proxy_node(
+        "clear_active_proxy_node" => Ok(json!(proxypool::clear_active_proxy_node(
             app.state::<Database>(),
             app.state::<ProxyRuntime>(),
         ))),
-        "delete_invalid_proxy_nodes" => Ok(json!(proxy_pool::delete_invalid_proxy_nodes(
+        "delete_invalid_proxy_nodes" => Ok(json!(proxypool::delete_invalid_proxy_nodes(
             app.state::<Database>(),
             app.state::<ProxyRuntime>(),
         ))),
@@ -747,7 +747,7 @@ fn dispatch(app: &AppHandle, command: &str, args: &Value) -> Result<Value, Strin
             let node_id = take_string(args, &["nodeId", "node_id"])?;
             let app = app.clone();
             Ok(json!(tauri::async_runtime::block_on(async move {
-                proxy_pool::test_proxy_node(
+                proxypool::test_proxy_node(
                     app.state::<Database>(),
                     app.state::<ProxyRuntime>(),
                     node_id,
@@ -759,7 +759,7 @@ fn dispatch(app: &AppHandle, command: &str, args: &Value) -> Result<Value, Strin
             let node_ids: Vec<String> = take(args, &["nodeIds", "node_ids"])?;
             let app = app.clone();
             Ok(json!(tauri::async_runtime::block_on(async move {
-                proxy_pool::test_proxy_nodes(
+                proxypool::test_proxy_nodes(
                     app.clone(),
                     app.state::<Database>(),
                     app.state::<ProxyRuntime>(),
@@ -771,7 +771,7 @@ fn dispatch(app: &AppHandle, command: &str, args: &Value) -> Result<Value, Strin
         "test_all_proxy_nodes" => {
             let app = app.clone();
             Ok(json!(tauri::async_runtime::block_on(async move {
-                proxy_pool::test_all_proxy_nodes(
+                proxypool::test_all_proxy_nodes(
                     app.clone(),
                     app.state::<Database>(),
                     app.state::<ProxyRuntime>(),
@@ -779,7 +779,7 @@ fn dispatch(app: &AppHandle, command: &str, args: &Value) -> Result<Value, Strin
                 .await
             })))
         }
-        "cancel_proxy_node_tests" => Ok(json!(proxy_pool::cancel_proxy_node_tests(
+        "cancel_proxy_node_tests" => Ok(json!(proxypool::cancel_proxy_node_tests(
             app.state::<ProxyRuntime>(),
         ))),
 
@@ -789,7 +789,7 @@ fn dispatch(app: &AppHandle, command: &str, args: &Value) -> Result<Value, Strin
             let to: Option<String> = take_opt(args, &["to"])?;
             let refresh: Option<bool> = take_opt(args, &["refresh"])?;
             let _ = refresh;
-            Ok(json!(token_stats::query_token_stats(
+            Ok(json!(crate::token::stats::query_token_stats(
                 &*app.state::<Database>(),
                 from,
                 to,
@@ -798,41 +798,41 @@ fn dispatch(app: &AppHandle, command: &str, args: &Value) -> Result<Value, Strin
         "sync_token_data" => {
             let force: Option<bool> = take_opt(args, &["force"])?;
             Ok(json!(tauri::async_runtime::block_on(
-                token_stats::sync_token_data(app.clone(), force)
+                crate::token::stats::sync_token_data(app.clone(), force)
             )))
         }
-        "get_token_usage" => Ok(json!(token_stats::query_token_usage(
+        "get_token_usage" => Ok(json!(crate::token::stats::query_token_usage(
             &*app.state::<Database>()
         ))),
         "get_token_raw_logs" => Ok(json!(tauri::async_runtime::block_on(
-            token_stats::get_token_raw_logs()
+            crate::token::stats::get_token_raw_logs()
         ))),
         "get_token_request_health" => {
             let refresh: Option<bool> = take_opt(args, &["refresh"])?;
             let _ = refresh;
-            Ok(json!(token_stats::query_token_health(
+            Ok(json!(crate::token::stats::query_token_health(
                 &*app.state::<Database>()
             )))
         }
         "get_local_agent_paths" => Ok(json!(tauri::async_runtime::block_on(
-            token_stats::get_local_agent_paths()
+            crate::token::stats::get_local_agent_paths()
         ))),
 
         // —— 模型缓存 ——
-        "get_system_fonts" => Ok(json!(model_catalog::get_system_fonts())),
+        "get_system_fonts" => Ok(json!(crate::model::catalog::get_system_fonts())),
         "get_site_model_cache" => {
             let site_id = take_string(args, &["siteId", "site_id"])?;
-            Ok(json!(model_catalog::get_site_model_cache(
+            Ok(json!(crate::model::catalog::get_site_model_cache(
                 app.state::<Database>(),
                 site_id,
             )))
         }
-        "get_all_site_model_caches" => Ok(json!(model_catalog::get_all_site_model_caches(
+        "get_all_site_model_caches" => Ok(json!(crate::model::catalog::get_all_site_model_caches(
             app.state::<Database>(),
         ))),
         "clear_site_model_cache_for_site" => {
             let site_id = take_string(args, &["siteId", "site_id"])?;
-            Ok(json!(model_catalog::clear_site_model_cache_for_site(
+            Ok(json!(crate::model::catalog::clear_site_model_cache_for_site(
                 app.state::<Database>(),
                 site_id,
             )))
@@ -842,7 +842,7 @@ fn dispatch(app: &AppHandle, command: &str, args: &Value) -> Result<Value, Strin
             let account: SiteModelCacheAccount = take(args, &["account"])?;
             let result: Option<SiteModelsResult> = take_opt(args, &["result"])?;
             let preserve_keys: Option<bool> = take_opt(args, &["preserveKeys", "preserve_keys"])?;
-            Ok(json!(model_catalog::save_site_model_cache_for_account(
+            Ok(json!(crate::model::catalog::save_site_model_cache_for_account(
                 app.state::<Database>(),
                 site_id,
                 account,
@@ -850,24 +850,24 @@ fn dispatch(app: &AppHandle, command: &str, args: &Value) -> Result<Value, Strin
                 preserve_keys,
             )))
         }
-        "get_model_catalog" => Ok(json!(model_catalog::get_model_catalog_inner(
+        "get_model_catalog" => Ok(json!(crate::model::catalog::get_model_catalog_inner(
             &*app.state::<Database>()
         ))),
         "get_model_catalog_detail" => {
             let key = take_string(args, &["id", "canonicalKey", "canonical_key"])?;
             let db = app.state::<Database>();
             Ok(json!(tauri::async_runtime::block_on(async move {
-                model_catalog::get_model_catalog_detail_inner(&*db, &key).await
+                crate::model::catalog::get_model_catalog_detail_inner(&*db, &key).await
             })?))
         }
         "sync_model_catalog" => {
             let force: Option<bool> = take_opt(args, &["force"])?;
             let app = app.clone();
             Ok(json!(tauri::async_runtime::block_on(async move {
-                model_catalog::sync_model_catalog_inner(
+                crate::model::catalog::sync_model_catalog_inner(
                     &app,
                     &app.state::<Database>(),
-                    &app.state::<model_catalog::ModelCatalogRuntime>(),
+                    &app.state::<crate::model::catalog::ModelCatalogRuntime>(),
                     force.unwrap_or(false),
                 )
                 .await
@@ -879,7 +879,7 @@ fn dispatch(app: &AppHandle, command: &str, args: &Value) -> Result<Value, Strin
             let profile_id: Option<String> = take_opt(args, &["profileId", "profile_id"])?;
             let app = app.clone();
             Ok(json!(tauri::async_runtime::block_on(async move {
-                model_catalog::fetch_site_models_json(
+                crate::model::catalog::fetch_site_models_json(
                     app.clone(),
                     app.state::<Database>(),
                     url,
@@ -891,10 +891,10 @@ fn dispatch(app: &AppHandle, command: &str, args: &Value) -> Result<Value, Strin
         }
 
         // —— 自动会话同步 ——
-        "get_auto_sync_settings" => Ok(json!(chrome_sync::get_auto_sync_settings(
+        "get_auto_sync_settings" => Ok(json!(crate::site::sync::get_auto_sync_settings(
             app.state::<Database>(),
         ))),
-        "get_auto_sync_status" => Ok(json!(chrome_sync::get_auto_sync_status(
+        "get_auto_sync_status" => Ok(json!(crate::site::sync::get_auto_sync_status(
             app.state::<Database>(),
         ))),
         "set_auto_sync_settings" => {
@@ -902,34 +902,34 @@ fn dispatch(app: &AppHandle, command: &str, args: &Value) -> Result<Value, Strin
             let interval_minutes: Option<u64> =
                 take_opt(args, &["intervalMinutes", "interval_minutes"])?;
             let app = app.clone();
-            Ok(json!(chrome_sync::set_auto_sync_settings(
+            Ok(json!(crate::site::sync::set_auto_sync_settings(
                 app.clone(),
                 app.state::<Database>(),
                 enabled,
                 interval_minutes,
             )))
         }
-        "request_auto_sync_round" => Ok(json!(chrome_sync::request_auto_sync_round(app.clone(),))),
+        "request_auto_sync_round" => Ok(json!(crate::site::sync::request_auto_sync_round(app.clone(),))),
 
         // —— 公益监听 ——
         "get_charity_today_count" => Ok(json!(tauri::async_runtime::block_on(
-            charity_monitor::get_charity_today_count(app.state::<Database>())
+            charity::get_charity_today_count(app.state::<Database>())
         ))),
         "get_charity_unread_total" => Ok(json!(tauri::async_runtime::block_on(
-            charity_monitor::get_charity_unread_total(app.state::<Database>())
+            charity::get_charity_unread_total(app.state::<Database>())
         ))),
         "clear_charity_sync_logs" => Ok(json!(tauri::async_runtime::block_on(
-            charity_monitor::clear_charity_sync_logs(app.state::<Database>())
+            charity::clear_charity_sync_logs(app.state::<Database>())
         ))),
         "list_charity_sources" => Ok(json!(tauri::async_runtime::block_on(
-            charity_monitor::list_charity_sources(app.state::<Database>())
+            charity::list_charity_sources(app.state::<Database>())
         ))),
         "add_charity_source" => {
             let id = take_string(args, &["id"])?;
             let name = take_string(args, &["name"])?;
             let json_url: Option<String> = take_opt(args, &["jsonUrl", "json_url"])?;
             Ok(json!(tauri::async_runtime::block_on(
-                charity_monitor::add_charity_source(app.state::<Database>(), id, name, json_url)
+                charity::add_charity_source(app.state::<Database>(), id, name, json_url)
             )))
         }
         "update_charity_source" => {
@@ -938,7 +938,7 @@ fn dispatch(app: &AppHandle, command: &str, args: &Value) -> Result<Value, Strin
             let json_url: Option<String> = take_opt(args, &["jsonUrl", "json_url"])?;
             let enabled: Option<bool> = take_opt(args, &["enabled"])?;
             Ok(json!(tauri::async_runtime::block_on(
-                charity_monitor::update_charity_source(
+                charity::update_charity_source(
                     app.state::<Database>(),
                     id,
                     name,
@@ -950,13 +950,13 @@ fn dispatch(app: &AppHandle, command: &str, args: &Value) -> Result<Value, Strin
         "remove_charity_source" => {
             let id = take_string(args, &["id"])?;
             Ok(json!(tauri::async_runtime::block_on(
-                charity_monitor::remove_charity_source(app.state::<Database>(), id)
+                charity::remove_charity_source(app.state::<Database>(), id)
             )))
         }
         "mark_charity_feed_read" => {
             let feed_id: Option<String> = take_opt(args, &["feedId", "feed_id"])?;
             Ok(json!(tauri::async_runtime::block_on(
-                charity_monitor::mark_charity_feed_read(app.state::<Database>(), feed_id)
+                charity::mark_charity_feed_read(app.state::<Database>(), feed_id)
             )))
         }
         "get_charity_feed" => {
@@ -966,7 +966,7 @@ fn dispatch(app: &AppHandle, command: &str, args: &Value) -> Result<Value, Strin
             let keyword: Option<String> = take_opt(args, &["keyword"])?;
             let app = app.clone();
             Ok(json!(tauri::async_runtime::block_on(async move {
-                charity_monitor::get_charity_feed(
+                charity::get_charity_feed(
                     app.state::<Database>(),
                     app.state::<CharityMonitorRuntime>(),
                     feed_id,
@@ -978,7 +978,7 @@ fn dispatch(app: &AppHandle, command: &str, args: &Value) -> Result<Value, Strin
             })))
         }
         "get_charity_proxy_pool_summary" => Ok(json!(tauri::async_runtime::block_on(
-            charity_monitor::get_charity_proxy_pool_summary(
+            charity::get_charity_proxy_pool_summary(
                 app.state::<Database>(),
                 app.state::<CharityMonitorRuntime>(),
             )
@@ -986,21 +986,21 @@ fn dispatch(app: &AppHandle, command: &str, args: &Value) -> Result<Value, Strin
         "get_charity_sync_logs" => {
             let limit: Option<usize> = take_opt(args, &["limit"])?;
             Ok(json!(tauri::async_runtime::block_on(
-                charity_monitor::get_charity_sync_logs(app.state::<Database>(), limit)
+                charity::get_charity_sync_logs(app.state::<Database>(), limit)
             )))
         }
         "refresh_all_charity_feeds" => Ok(json!(tauri::async_runtime::block_on(
-            charity_monitor::refresh_all_charity_feeds(
+            charity::refresh_all_charity_feeds(
                 app.state::<Database>(),
                 app.state::<CharityMonitorRuntime>(),
             )
         ))),
-        "request_charity_round" => Ok(json!(charity_monitor::request_charity_round(
+        "request_charity_round" => Ok(json!(charity::request_charity_round(
             app.state::<CharityMonitorRuntime>(),
         ))),
         "set_charity_monitor_visible" => {
             let visible: bool = take(args, &["visible"])?;
-            Ok(json!(charity_monitor::set_charity_monitor_visible(
+            Ok(json!(charity::set_charity_monitor_visible(
                 app.state::<CharityMonitorRuntime>(),
                 visible,
             )))
@@ -1009,7 +1009,7 @@ fn dispatch(app: &AppHandle, command: &str, args: &Value) -> Result<Value, Strin
             let feed_id: Option<String> = take_opt(args, &["feedId", "feed_id"])?;
             let app = app.clone();
             Ok(json!(tauri::async_runtime::block_on(async move {
-                charity_monitor::fetch_charity_feed(
+                charity::fetch_charity_feed(
                     app.clone(),
                     app.state::<Database>(),
                     app.state::<ProxyRuntime>(),
