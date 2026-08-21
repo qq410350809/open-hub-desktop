@@ -3,7 +3,8 @@ use super::adapters::{
     OpenAiProtocolAdapter, ResponsesProtocolAdapter,
 };
 use super::balancer::{
-    is_free_opencode_model, is_opencode_channel, resolve_channel, select_channel_api_key,
+    check_model_channel_compatibility, is_free_opencode_model, is_opencode_channel,
+    resolve_channel, select_channel_api_key,
 };
 use super::dispatcher::{execute_resilient_egress, EgressRequestMeta};
 use super::logger::{record_attempt_failure, record_auth_failure_log, ProxyLogParams};
@@ -122,6 +123,77 @@ pub async fn check_auth(
         )
             .into_response())
     }
+}
+
+/// 统一校验渠道与模型兼容性，未通过时记录日志并返回对应的协议错误响应
+async fn validate_model_channel_request(
+    ctx: &ModelProxyContext,
+    channel: &super::types::ChannelConfig,
+    model_to_send: &str,
+    raw_model: &str,
+    channel_api_key: &str,
+    path: &str,
+    req_id: &str,
+    is_stream: bool,
+    start_time: Instant,
+    req_body_str: &Option<String>,
+) -> Result<(), Response> {
+    if let Err(err_msg) = check_model_channel_compatibility(channel, model_to_send, channel_api_key) {
+        let dur = start_time.elapsed().as_millis() as u64;
+        record_attempt_failure(
+            ctx,
+            ProxyLogParams::new_failure(
+                req_id.to_string(),
+                path.to_string(),
+                channel.effective_alias(),
+                raw_model.to_string(),
+                is_stream,
+                400,
+                dur,
+                Some(err_msg.clone()),
+                req_body_str.clone(),
+                None,
+            ),
+        ).await;
+
+        let err_resp = if path.contains("/gemini/") || path.contains("/v1beta/") {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": {
+                        "code": 400,
+                        "message": err_msg,
+                        "status": "INVALID_ARGUMENT"
+                    }
+                })),
+            ).into_response()
+        } else if path.contains("/messages") {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "type": "error",
+                    "error": {
+                        "type": "invalid_request_error",
+                        "message": err_msg
+                    }
+                })),
+            ).into_response()
+        } else {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": {
+                        "message": err_msg,
+                        "type": "invalid_request_error",
+                        "code": "unsupported_free_model"
+                    }
+                })),
+            ).into_response()
+        };
+
+        return Err(err_resp);
+    }
+    Ok(())
 }
 
 /// GET /healthz
@@ -477,10 +549,17 @@ pub async fn handle_embeddings(
         }
     };
 
-    body["model"] = JsonValue::String(model_to_send);
+    body["model"] = JsonValue::String(model_to_send.clone());
     let upstream_url = format!("{}/embeddings", chan.base_url.trim_end_matches('/'));
     let channel_api_key = select_channel_api_key(&ctx, chan);
     let chan_alias = chan.effective_alias();
+
+    if let Err(err_resp) = validate_model_channel_request(
+        &ctx, chan, &model_to_send, &raw_model, &channel_api_key,
+        "/v1/embeddings", &req_id, false, start_time, &req_body_str,
+    ).await {
+        return err_resp;
+    }
 
     let meta = EgressRequestMeta {
         req_id: req_id.clone(),
@@ -609,12 +688,19 @@ pub async fn handle_gemini_generate(
         }
     };
 
-    let mut openai_body = GeminiProtocolAdapter::gemini_request_to_openai(&body, &model_to_send, is_stream);
-    OpenAiProtocolAdapter::sanitize_and_normalize(&mut openai_body);
-
     let upstream_url = format!("{}/chat/completions", chan.base_url.trim_end_matches('/'));
     let channel_api_key = select_channel_api_key(&ctx, chan);
     let chan_alias = chan.effective_alias();
+
+    if let Err(err_resp) = validate_model_channel_request(
+        &ctx, chan, &model_to_send, raw_model, &channel_api_key,
+        &log_path, &req_id, is_stream, start_time, &req_body_str,
+    ).await {
+        return err_resp;
+    }
+
+    let mut openai_body = GeminiProtocolAdapter::gemini_request_to_openai(&body, &model_to_send, is_stream);
+    OpenAiProtocolAdapter::sanitize_and_normalize(&mut openai_body);
 
     let meta = EgressRequestMeta {
         req_id: req_id.clone(),
@@ -770,7 +856,7 @@ pub async fn handle_chat_completions(
         }
     };
 
-    body["model"] = JsonValue::String(model_to_send);
+    body["model"] = JsonValue::String(model_to_send.clone());
     OpenAiProtocolAdapter::sanitize_and_normalize(&mut body);
     if let Some(msgs) = body.get_mut("messages") {
         normalize_chat_messages(msgs);
@@ -779,6 +865,13 @@ pub async fn handle_chat_completions(
     let upstream_url = format!("{}/chat/completions", chan.base_url.trim_end_matches('/'));
     let channel_api_key = select_channel_api_key(&ctx, chan);
     let chan_alias = chan.effective_alias();
+
+    if let Err(err_resp) = validate_model_channel_request(
+        &ctx, chan, &model_to_send, &raw_model, &channel_api_key,
+        "/v1/chat/completions", &req_id, is_stream, start_time, &req_body_str,
+    ).await {
+        return err_resp;
+    }
 
     let meta = EgressRequestMeta {
         req_id: req_id.clone(),
@@ -1001,13 +1094,21 @@ pub async fn handle_responses(
         }
     };
 
+    let upstream_url = format!("{}/chat/completions", chan.base_url.trim_end_matches('/'));
+    let channel_api_key = select_channel_api_key(&ctx, chan);
+    let chan_alias = chan.effective_alias();
+
+    if let Err(err_resp) = validate_model_channel_request(
+        &ctx, chan, &model_to_send, &raw_model, &channel_api_key,
+        "/v1/responses", &req_id, is_stream, start_time, &req_body_str,
+    ).await {
+        return err_resp;
+    }
+
     let mut openai_body = body.clone();
     openai_body["model"] = JsonValue::String(model_to_send);
     ResponsesProtocolAdapter::convert_input_to_messages(&mut openai_body);
     OpenAiProtocolAdapter::sanitize_and_normalize(&mut openai_body);
-    let upstream_url = format!("{}/chat/completions", chan.base_url.trim_end_matches('/'));
-    let channel_api_key = select_channel_api_key(&ctx, chan);
-    let chan_alias = chan.effective_alias();
 
     let meta = EgressRequestMeta {
         req_id: req_id.clone(),
@@ -1186,11 +1287,19 @@ pub async fn handle_messages(
         }
     };
 
-    let mut openai_payload = AnthropicProtocolAdapter::anthropic_request_to_openai(&body, &model_to_send, is_stream);
-    OpenAiProtocolAdapter::sanitize_and_normalize(&mut openai_payload);
     let upstream_url = format!("{}/chat/completions", chan.base_url.trim_end_matches('/'));
     let channel_api_key = select_channel_api_key(&ctx, chan);
     let chan_alias = chan.effective_alias();
+
+    if let Err(err_resp) = validate_model_channel_request(
+        &ctx, chan, &model_to_send, &raw_model, &channel_api_key,
+        "/v1/messages", &req_id, is_stream, start_time, &req_body_str,
+    ).await {
+        return err_resp;
+    }
+
+    let mut openai_payload = AnthropicProtocolAdapter::anthropic_request_to_openai(&body, &model_to_send, is_stream);
+    OpenAiProtocolAdapter::sanitize_and_normalize(&mut openai_payload);
 
     let meta = EgressRequestMeta {
         req_id: req_id.clone(),
@@ -1293,6 +1402,13 @@ pub async fn fetch_upstream_models_inner(ctx: &ModelProxyContext) {
         let client = &ctx.default_http_client;
 
         let mut req = client.get(&models_url);
+        if is_opencode_channel(ch) || ch.base_url.contains("opencode.ai") {
+            req = req
+                .header("User-Agent", "opencode/1.18.18/cli")
+                .header("x-opencode-client", "cli");
+        } else {
+            req = req.header("User-Agent", "OpenHub-Gateway/0.3.0");
+        }
         if !api_key.is_empty() {
             req = req.header("Authorization", format!("Bearer {api_key}"));
         }

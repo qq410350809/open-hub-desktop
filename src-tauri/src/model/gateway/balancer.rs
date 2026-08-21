@@ -67,12 +67,25 @@ pub fn is_opencode_channel(channel: &ChannelConfig) -> bool {
         || channel.name.to_lowercase().contains("opencode")
 }
 
-/// 判断是否为 OpenCode 官方免费模型
+/// 判断是否为 OpenCode 官方免费模型（除 big-pickle 外均包含 free）
 pub fn is_free_opencode_model(model: &str) -> bool {
     let lower = model.to_lowercase();
-    lower.ends_with("-free")
-        || lower == "big-pickle"
-        || lower.contains("free")
+    let name = strip_opencode_prefix(&lower);
+    name == "big-pickle" || name.contains("free")
+}
+
+/// 校验请求的模型在目标渠道上是否合法可用（例如在未配置 Key 的 OpenCode 免费渠道上拦截付费模型）
+pub fn check_model_channel_compatibility(
+    channel: &ChannelConfig,
+    model_to_send: &str,
+    channel_api_key: &str,
+) -> Result<(), String> {
+    if is_opencode_channel(channel) && channel_api_key.is_empty() && !is_free_opencode_model(model_to_send) {
+        return Err(format!(
+            "模型 '{model_to_send}' 为 OpenCode 付费模型，当前未配置 API Key。请使用官方免费模型（如 deepseek-v4-flash-free, mimo-v2.5-free, big-pickle 等）或在渠道设置中配置 API Key。"
+        ));
+    }
+    Ok(())
 }
 
 /// 渠道多 Key 轮询选择器：原子递增索引并在有效 API Keys 中轮流选取

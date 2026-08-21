@@ -536,5 +536,72 @@ use serde_json::json;
         assert!(meta.stream);
     }
 
+    #[test]
+    fn opencode_free_and_non_free_model_classification() {
+        // 免费模型
+        assert!(is_free_opencode_model("deepseek-v4-flash-free"));
+        assert!(is_free_opencode_model("opencode/deepseek-v4-flash-free"));
+        assert!(is_free_opencode_model("big-pickle"));
+        assert!(is_free_opencode_model("opencode/big-pickle"));
+        assert!(is_free_opencode_model("mimo-v2.5-free"));
+        assert!(is_free_opencode_model("nemotron-3-ultra-free"));
+        assert!(is_free_opencode_model("x-preview-f-free"));
+
+        // 付费模型（需携带 Key）
+        assert!(!is_free_opencode_model("gpt-4o"));
+        assert!(!is_free_opencode_model("opencode/gpt-4o"));
+        assert!(!is_free_opencode_model("claude-3-7-sonnet"));
+        assert!(!is_free_opencode_model("claude-sonnet-5"));
+        assert!(!is_free_opencode_model("deepseek-v4-pro"));
+        assert!(!is_free_opencode_model("glm-5.2"));
+    }
+
+    #[test]
+    fn opencode_model_compatibility_and_anonymous_mode() {
+        let ch_no_key = ChannelConfig {
+            id: "opencode".to_string(),
+            name: "OpenCode".to_string(),
+            description: "".to_string(),
+            enabled: true,
+            protocol: "openai".to_string(),
+            base_url: "https://opencode.ai/zen/v1".to_string(),
+            api_key: "".to_string(),
+            api_keys: None,
+            use_proxy_pool: false,
+            alias: Some("opencode".to_string()),
+            site_id: None,
+            use_fixed_proxy: false,
+            fixed_proxy_node: None,
+            priority: None,
+            weight: None,
+            enabled_models: None,
+            model_redirects: None,
+            rate_limit_rpm: None,
+        };
+
+        let state = ModelProxyState::new_with_app(None);
+        let selected_key = select_channel_api_key(&state.context, &ch_no_key);
+        // 匿名模式：未配置 Key 时始终为空字符串
+        assert!(selected_key.is_empty());
+
+        // 免费模型在无 Key 匿名模式下通过校验
+        assert!(check_model_channel_compatibility(&ch_no_key, "deepseek-v4-flash-free", &selected_key).is_ok());
+        assert!(check_model_channel_compatibility(&ch_no_key, "big-pickle", &selected_key).is_ok());
+        assert!(check_model_channel_compatibility(&ch_no_key, "mimo-v2.5-free", &selected_key).is_ok());
+
+        // 付费模型在无 Key 匿名模式下前置拦截
+        assert!(check_model_channel_compatibility(&ch_no_key, "gpt-4o", &selected_key).is_err());
+        assert!(check_model_channel_compatibility(&ch_no_key, "claude-3-7-sonnet", &selected_key).is_err());
+
+        // 配置了 Key 后付费模型通过校验
+        let ch_explicit_key = ChannelConfig {
+            api_key: "sk-custom-key".to_string(),
+            ..ch_no_key
+        };
+        let selected_explicit = select_channel_api_key(&state.context, &ch_explicit_key);
+        assert_eq!(selected_explicit, "sk-custom-key");
+        assert!(check_model_channel_compatibility(&ch_explicit_key, "gpt-4o", &selected_explicit).is_ok());
+    }
+
 
 

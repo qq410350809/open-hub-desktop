@@ -1,6 +1,6 @@
 use super::balancer::{
     build_client_for_candidate, format_upstream_error_message, get_node_display_name,
-    get_sorted_egress_candidates,
+    get_sorted_egress_candidates, is_opencode_channel,
 };
 use super::logger::{record_attempt_failure, ProxyLogParams};
 use super::types::{ChannelConfig, ModelProxyConfig, ModelProxyContext};
@@ -71,10 +71,25 @@ pub async fn execute_resilient_egress(
             format!("{}#{}", meta.req_id, attempt_idx + 1)
         };
 
+        let is_opencode = is_opencode_channel(channel) || upstream_url.contains("opencode.ai");
         let mut req_builder = client
             .post(upstream_url)
             .header("Content-Type", "application/json")
             .json(body);
+
+        if is_opencode {
+            // OpenCode 官方 CLI 身份与会话请求头模拟：抹平 CLI 与反代差异，享受官方正常会话配额
+            let session_id = format!("sess_{}", meta.req_id.replace('-', ""));
+            let project_id = "proj_openhub_gateway".to_string();
+            req_builder = req_builder
+                .header("User-Agent", "opencode/1.18.18/cli")
+                .header("x-opencode-client", "cli")
+                .header("x-opencode-session", session_id)
+                .header("x-opencode-project", project_id)
+                .header("x-opencode-request", attempt_req_id.clone());
+        } else {
+            req_builder = req_builder.header("User-Agent", "OpenHub-Gateway/0.3.0");
+        }
 
         if !channel_api_key.is_empty() {
             req_builder = req_builder.header("Authorization", format!("Bearer {channel_api_key}"));
@@ -147,6 +162,9 @@ pub async fn execute_resilient_egress(
 
                     if count_429 <= max_retries {
                         ctx.node_round_robin.fetch_add(1, Ordering::Relaxed);
+                        // 遭遇 429 时增加动态指数退避延迟（500ms ~ 1500ms），避免瞬时重试风暴击穿后续所有节点
+                        let backoff_ms = 500 + 300 * (attempt_idx as u64).min(3);
+                        tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
                         continue;
                     } else {
                         break;
@@ -185,6 +203,7 @@ pub async fn execute_resilient_egress(
 
                     if attempt_idx < max_retries {
                         ctx.node_round_robin.fetch_add(1, Ordering::Relaxed);
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                         continue;
                     } else {
                         break;
@@ -214,6 +233,7 @@ pub async fn execute_resilient_egress(
 
                 if attempt_idx < max_retries {
                     ctx.node_round_robin.fetch_add(1, Ordering::Relaxed);
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                     continue;
                 } else {
                     break;
