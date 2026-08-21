@@ -20,12 +20,14 @@ import {
   formatLogFull,
 } from "../../utils";
 import CustomSelect from "../common/CustomSelect.vue";
+import LogRangeDropdown from "../common/LogRangeDropdown.vue";
 import type { SiteRecord } from "../../types";
 import { DEFAULT_PROXY_PORT, LOCALHOST, API_PATH_V1, API_PATH_GEMINI, API_PATH_MESSAGES } from "../../constants";
 
 const proxyPortPlaceholder = String(DEFAULT_PROXY_PORT);
 
 const logPageSizeOptions = [
+  { value: 10, text: "10" },
   { value: 25, text: "25" },
   { value: 50, text: "50" },
   { value: 100, text: "100" },
@@ -64,6 +66,8 @@ fetchLogs,
   copyProxyKey,
   logPage,
   logPageSize,
+  logDateFrom,
+  logDateTo,
   logTotal,
   logGlobalTotal,
   logGlobalSuccess,
@@ -848,7 +852,7 @@ function getErrorSuggestion(log: ProxyRequestLog): string {
     return "请求体参数格式不正确，或传入了上游不支持的模型名称与特殊参数。";
   }
   if (log.statusCode === 429) {
-    return "OpenCode Public 免费通道对单出口 IP 存在频次限制 (Rate limit exceeded)。解决方案：① 在对应渠道卡片开启「内部代理池轮询」，网关将自动通过系统代理池中 ≤1000ms 的多个健康节点轮询出口 IP，并在遭遇频次限制时自动秒级重试切换；② 切换其他免费模型（如 deepseek-v4-flash-free / nemotron-3-ultra-free / mimo-v2.5-free / laguna-s-2.1-free）；③ 稍候 30 秒后自动恢复。";
+    return "OpenCode 免费通道对未认证单出口 IP 存在频次限制。网关已自动注入官方 CLI 指纹并支持本地凭据探测。若仍遇频次限制：① 在渠道设置中配置 OpenCode API Key；② 开启「内部代理池轮询」自动多节点切换与动态退避重试；③ 切换其他可用免费模型（如 mimo-v2.5-free / deepseek-v4-flash-free / big-pickle / nemotron-3-ultra-free）；④ 稍候 30 秒后自动恢复。";
   }
   return "请根据下方原始错误响应体排查上游返回的具体原因。";
 }
@@ -975,7 +979,7 @@ function sortLogsBy(by: "timestamp" | "status" | "tokens" | "duration") {
   toggleLogSort(by, { filter: logStatusFilter.value, q: logSearchQuery.value.trim() });
 }
 
-/** 全量计数：来自后端全库计数，不随 filter/搜索变化，供标签固定显示 */
+/** 顶部标签计数：后端按所选日期区间统计，不随状态筛选/搜索变化 */
 const logCounts = computed(() => ({
   all: logGlobalTotal.value,
   success: logGlobalSuccess.value,
@@ -986,6 +990,11 @@ const logCounts = computed(() => ({
 function switchLogFilter(filter: "all" | "success" | "error") {
   logStatusFilter.value = filter;
   goLogPage(1, { filter, q: logSearchQuery.value.trim() });
+}
+
+/** 时间范围筛选变更后：回到第一页并按新日期重新拉取 */
+async function applyLogRange() {
+  await goLogPage(1, { filter: logStatusFilter.value, q: logSearchQuery.value.trim() });
 }
 
 /** 搜索防抖：停笔 350ms 后回到第一页重查 */
@@ -1494,8 +1503,16 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
             </button>
           </div>
 
+          <div class="mp-logs-range">
+            <LogRangeDropdown
+              v-model:from="logDateFrom"
+              v-model:to="logDateTo"
+              @apply="applyLogRange"
+            />
+          </div>
+
           <div class="mp-search-box flex-1">
-            <span v-html="icons.search" />
+            <span class="mp-search-icon" v-html="icons.search" />
             <input
               v-model="logSearchQuery"
               type="search"
@@ -2300,7 +2317,7 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
         <div class="mp-modal-body">
           <div class="mp-models-modal-toolbar">
             <div class="mp-search-box flex-1">
-              <span v-html="icons.search" />
+              <span class="mp-search-icon" v-html="icons.search" />
               <input
                 v-model="gatewaySearchQuery"
                 type="search"
@@ -2467,7 +2484,7 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
         <div class="mp-modal-body">
           <div class="mp-models-modal-toolbar">
             <div class="mp-search-box flex-1">
-              <span v-html="icons.search" />
+              <span class="mp-search-icon" v-html="icons.search" />
               <input
                 v-model="channelSearchQuery"
                 type="search"
@@ -4573,11 +4590,20 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
 
 .mp-search-box.flex-1 {
   flex: 1;
+  min-width: 200px;
 }
 
-.mp-search-box :deep(svg) {
+/* 放大镜图标：以包裹 span 定位并精确垂直居中 */
+.mp-search-icon {
   position: absolute;
   left: 12px;
+  top: 50%;
+  transform: translateY(-50%);
+  display: inline-flex;
+  pointer-events: none;
+}
+
+.mp-search-icon :deep(svg) {
   width: 16px;
   height: 16px;
   color: var(--muted);
@@ -4620,7 +4646,6 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
 }
 
 .mp-search-clear-btn :deep(svg) {
-  position: static;
   width: 12px;
   height: 12px;
 }
@@ -5145,6 +5170,11 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
   align-items: center;
   gap: 12px;
   flex-wrap: wrap;
+}
+
+.mp-logs-range {
+  display: inline-flex;
+  flex-shrink: 0;
 }
 
 .mp-log-filter-tabs {

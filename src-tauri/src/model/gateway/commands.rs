@@ -202,12 +202,16 @@ pub async fn get_model_proxy_logs(
     q: Option<String>,
     sort_by: Option<String>,
     sort_order: Option<String>,
+    from: Option<String>,
+    to: Option<String>,
 ) -> Result<super::types::ProxyLogsResponse, String> {
     let p = page.unwrap_or(1).max(1);
     let ps = page_size.unwrap_or(50).clamp(1, 200);
     let offset = (p - 1) * ps;
     let filter_str = filter.unwrap_or_else(|| "all".to_string());
     let query_str = q.unwrap_or_default().trim().to_string();
+    let date_from_str = from.unwrap_or_default().trim().to_string();
+    let date_to_str = to.unwrap_or_default().trim().to_string();
 
     let sort_col = match sort_by.as_deref() {
         Some("status_code") | Some("statusCode") => "status_code",
@@ -235,6 +239,30 @@ pub async fn get_model_proxy_logs(
     } else if filter_str == "error" {
         where_clauses.push("status_code >= 400".to_string());
     }
+
+    // 时间范围过滤：from/to 均为 YYYY-MM-DD 日期，精确到日，闭区间。
+    // 纯日期条件单独留存一份，供全局计数使用（顶部标签数随所选区间变化）
+    let mut date_conds: Vec<&'static str> = Vec::new();
+    let mut date_only_params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    if !date_from_str.is_empty() {
+        date_conds.push("timestamp >= ?");
+        where_clauses.push("timestamp >= ?".to_string());
+        let bound = format!("{date_from_str} 00:00:00");
+        params_vec.push(Box::new(bound.clone()));
+        date_only_params.push(Box::new(bound));
+    }
+    if !date_to_str.is_empty() {
+        date_conds.push("timestamp <= ?");
+        where_clauses.push("timestamp <= ?".to_string());
+        let bound = format!("{date_to_str} 23:59:59");
+        params_vec.push(Box::new(bound.clone()));
+        date_only_params.push(Box::new(bound));
+    }
+    let date_where_sql = if date_conds.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", date_conds.join(" AND "))
+    };
 
     if !query_str.is_empty() {
         where_clauses.push("(model LIKE ? OR channel_id LIKE ? OR node_name LIKE ? OR error_message LIKE ?)".to_string());
@@ -284,24 +312,35 @@ pub async fn get_model_proxy_logs(
             .unwrap_or(0)
     };
 
-    // 全库（不受 filter/搜索影响）的成功与错误计数，供顶部固定统计展示
-    let global_total: usize = conn
-        .query_row("SELECT COUNT(*) FROM opencode_proxy_logs", [], |r| r.get(0))
-        .unwrap_or(0);
-    let global_succ: usize = conn
-        .query_row(
-            "SELECT COUNT(*) FROM opencode_proxy_logs WHERE status_code >= 200 AND status_code < 300",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap_or(0);
-    let global_err: usize = conn
-        .query_row(
-            "SELECT COUNT(*) FROM opencode_proxy_logs WHERE status_code >= 400",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap_or(0);
+    // 顶部标签统计：不受状态筛选与搜索关键词影响，但随所选日期区间变化
+    let global_total: usize = {
+        let sql = format!("SELECT COUNT(*) FROM opencode_proxy_logs {date_where_sql}");
+        let params_refs: Vec<&dyn rusqlite::ToSql> = date_only_params.iter().map(|b| b.as_ref()).collect();
+        conn.query_row(&sql, params_refs.as_slice(), |r| r.get(0))
+            .unwrap_or(0)
+    };
+    let global_succ: usize = {
+        let status_sql = "status_code >= 200 AND status_code < 300";
+        let sql = if date_where_sql.is_empty() {
+            format!("SELECT COUNT(*) FROM opencode_proxy_logs WHERE {status_sql}")
+        } else {
+            format!("SELECT COUNT(*) FROM opencode_proxy_logs {date_where_sql} AND {status_sql}")
+        };
+        let params_refs: Vec<&dyn rusqlite::ToSql> = date_only_params.iter().map(|b| b.as_ref()).collect();
+        conn.query_row(&sql, params_refs.as_slice(), |r| r.get(0))
+            .unwrap_or(0)
+    };
+    let global_err: usize = {
+        let status_sql = "status_code >= 400";
+        let sql = if date_where_sql.is_empty() {
+            format!("SELECT COUNT(*) FROM opencode_proxy_logs WHERE {status_sql}")
+        } else {
+            format!("SELECT COUNT(*) FROM opencode_proxy_logs {date_where_sql} AND {status_sql}")
+        };
+        let params_refs: Vec<&dyn rusqlite::ToSql> = date_only_params.iter().map(|b| b.as_ref()).collect();
+        conn.query_row(&sql, params_refs.as_slice(), |r| r.get(0))
+            .unwrap_or(0)
+    };
 
     let query_sql = format!(
         "SELECT id, timestamp, method, path, channel_id, model, stream, status_code,
@@ -375,8 +414,10 @@ pub async fn get_opencode_proxy_logs(
     q: Option<String>,
     sort_by: Option<String>,
     sort_order: Option<String>,
+    from: Option<String>,
+    to: Option<String>,
 ) -> Result<super::types::ProxyLogsResponse, String> {
-    get_model_proxy_logs(database, page, page_size, filter, q, sort_by, sort_order).await
+    get_model_proxy_logs(database, page, page_size, filter, q, sort_by, sort_order, from, to).await
 }
 
 #[tauri::command]

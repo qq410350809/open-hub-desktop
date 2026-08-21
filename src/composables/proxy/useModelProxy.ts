@@ -116,7 +116,7 @@ export const healthResultTime = ref<string>("");
 export const proxyLogs = ref<ProxyRequestLog[]>([]);
 export const loadingLogs = ref(false);
 export const logPage = ref(1);
-export const logPageSize = ref(50);
+export const logPageSize = ref(10);
 export const logTotal = ref(0);
 export const logSuccessTotal = ref(0);
 export const logErrorTotal = ref(0);
@@ -128,6 +128,16 @@ export const logRangeStart = computed(() => (logTotal.value === 0 ? 0 : (logPage
 export const logRangeEnd = computed(() => Math.min(logPage.value * logPageSize.value, logTotal.value));
 export const logSortBy = ref<"timestamp" | "status" | "tokens" | "duration" | null>(null);
 export const logSortOrder = ref<"asc" | "desc">("desc");
+// 日志日期区间默认「今日」
+function toLocalDate(value: Date): string {
+  const year = value.getFullYear();
+  const month = String(value.getMonth() + 1).padStart(2, "0");
+  const day = String(value.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+const today = toLocalDate(new Date());
+export const logDateFrom = ref(today);
+export const logDateTo = ref(today);
 
 export function useModelProxy() {
   const { showToast } = useToast();
@@ -337,6 +347,8 @@ export function useModelProxy() {
     pageSize?: number;
     filter?: string;
     q?: string;
+    from?: string;
+    to?: string;
     sortBy?: "timestamp" | "status" | "tokens" | "duration" | null;
     sortOrder?: "asc" | "desc";
   } = {}) {
@@ -346,6 +358,8 @@ export function useModelProxy() {
       const ps = options.pageSize ?? logPageSize.value;
       const f = options.filter ?? "";
       const query = options.q ?? "";
+      const dateFrom = options.from !== undefined ? options.from : logDateFrom.value;
+      const dateTo = options.to !== undefined ? options.to : logDateTo.value;
       const sortBy = options.sortBy !== undefined ? options.sortBy : logSortBy.value;
       const sortOrder = options.sortOrder !== undefined ? options.sortOrder : logSortOrder.value;
 
@@ -355,6 +369,8 @@ export function useModelProxy() {
       };
       if (f && f !== "all") payload.filter = f;
       if (query.trim()) payload.q = query.trim();
+      if (dateFrom) payload.from = dateFrom;
+      if (dateTo) payload.to = dateTo;
       if (sortBy) {
         payload.sortBy = sortBy;
         payload.sortOrder = sortOrder;
@@ -377,7 +393,7 @@ export function useModelProxy() {
         logTotal.value = res.total ?? res.items.length;
         logSuccessTotal.value = res.successTotal ?? 0;
         logErrorTotal.value = res.errorTotal ?? 0;
-        // 全局计数由后端全库统计，不受当前 filter/搜索影响，每次拉取都刷新
+        // 顶部标签计数由后端按当前日期区间统计（不受 filter/搜索影响），每次拉取都刷新
         logGlobalTotal.value = res.globalTotal ?? logGlobalTotal.value;
         logGlobalSuccess.value = res.globalSuccess ?? logGlobalSuccess.value;
         logGlobalError.value = res.globalError ?? logGlobalError.value;
@@ -515,6 +531,8 @@ export function useModelProxy() {
     logRangeEnd,
     logSortBy,
     logSortOrder,
+    logDateFrom,
+    logDateTo,
     loadProxyData,
     refreshStatus,
     refreshChannelStats,
