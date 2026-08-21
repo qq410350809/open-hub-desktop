@@ -855,6 +855,14 @@ pub(crate) fn ensure_opencode_proxy_logs_table(connection: &Connection) -> Resul
         )
         .map_err(|e| e.to_string())?;
 
+    // 自动迁移旧版存留的秒级数字时间戳为标准可读时间格式 (YYYY-MM-DD HH:MM:SS)
+    let _ = connection.execute(
+        "UPDATE opencode_proxy_logs 
+         SET timestamp = datetime(CAST(timestamp AS INTEGER), 'unixepoch', 'localtime') 
+         WHERE timestamp GLOB '[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]'",
+        [],
+    );
+
     let has_node_name: i64 = connection
         .query_row(
             "SELECT COUNT(*) FROM pragma_table_info('opencode_proxy_logs') WHERE name='node_name'",
@@ -908,11 +916,28 @@ pub(crate) fn read_cached_usage_sites(
                           OR (smc.models_json IS NOT NULL AND smc.models_json NOT IN ('', '[]'))
                         THEN ''
                         ELSE COALESCE(smc.error, '')
-                    END
+                    END,
+                    COALESCE(smc.keys_json, ''),
+                    COALESCE(smc.models_json, '')
              FROM site_accounts sa
              LEFT JOIN site_model_cache smc
                ON smc.site_id = sa.site_id AND smc.profile_id = sa.profile_id
-             ORDER BY sa.site_id, sa.rowid",
+             UNION ALL
+             SELECT smc.site_id, smc.profile_id, '' as domain, 0 as cookie_count, '[]' as cookie_names,
+                    smc.profile_name, smc.account_name, smc.username,
+                    0 as api_key_count, 0 as api_model_count,
+                    NULL as remaining, NULL as used, NULL as total, '' as unit, 1 as is_valid, '' as sync_error,
+                    0 as checkin_enabled, 0 as checked_in_today, '' as checkin_error,
+                    COALESCE(smc.updated_at, '') as updated_at, '' as newapi_token, '' as newapi_user_id,
+                    0 as browser_fallback_failed_at, 0 as browser_fallback_fail_count,
+                    1 as api_counts_synced, COALESCE(smc.error, '') as api_sync_error,
+                    COALESCE(smc.keys_json, ''),
+                    COALESCE(smc.models_json, '')
+             FROM site_model_cache smc
+             LEFT JOIN site_accounts sa
+               ON sa.site_id = smc.site_id AND sa.profile_id = smc.profile_id
+             WHERE sa.profile_id IS NULL
+             ORDER BY 1, 2",
         )
         .map_err(|error| error.to_string())?;
     let rows = statement
@@ -921,6 +946,22 @@ pub(crate) fn read_cached_usage_sites(
             let newapi_token = row.get::<_, String>(20)?;
             let browser_fallback_failed_at = row.get::<_, i64>(22)?;
             let browser_fallback_fail_count = row.get::<_, i64>(23)?;
+            let keys_json: String = row.get(26)?;
+            let models_json: String = row.get(27)?;
+
+            let mut api_key_count = row.get::<_, i64>(8)?.max(0) as usize;
+            if api_key_count == 0 && !keys_json.is_empty() {
+                api_key_count = serde_json::from_str::<Vec<serde_json::Value>>(&keys_json)
+                    .map(|v| v.len())
+                    .unwrap_or(0);
+            }
+            let mut api_model_count = row.get::<_, i64>(9)?.max(0) as usize;
+            if api_model_count == 0 && !models_json.is_empty() {
+                api_model_count = serde_json::from_str::<Vec<serde_json::Value>>(&models_json)
+                    .map(|v| v.len())
+                    .unwrap_or(0);
+            }
+
             Ok((
                 row.get::<_, String>(0)?,
                 sync::ChromeSessionInfo {
@@ -939,8 +980,8 @@ pub(crate) fn read_cached_usage_sites(
                     },
                     account_name: row.get(6)?,
                     username: row.get(7)?,
-                    api_key_count: row.get::<_, i64>(8)?.max(0) as usize,
-                    api_model_count: row.get::<_, i64>(9)?.max(0) as usize,
+                    api_key_count,
+                    api_model_count,
                     api_counts_synced: row.get::<_, i64>(24)? != 0,
                     api_sync_error: row.get(25)?,
                     has_access_token: !newapi_token.is_empty(),

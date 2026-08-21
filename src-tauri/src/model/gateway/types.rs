@@ -256,6 +256,7 @@ pub struct ModelProxyContext {
     pub default_http_client: Client,
     pub app_handle: Arc<RwLock<Option<AppHandle>>>,
     pub key_round_robin: Arc<AtomicUsize>,
+    pub node_round_robin: Arc<AtomicUsize>,
 }
 
 #[allow(dead_code)]
@@ -264,6 +265,8 @@ pub type OpencodeProxyContext = ModelProxyContext;
 pub struct ModelProxyState {
     pub context: ModelProxyContext,
     pub shutdown_sender: Arc<RwLock<Option<tokio::sync::oneshot::Sender<()>>>>,
+    /// 正在运行的服务任务句柄，stop 时等待其退出以确保端口真正释放
+    pub server_task: Arc<RwLock<Option<tauri::async_runtime::JoinHandle<()>>>>,
     pub current_port: Arc<RwLock<u16>>,
 }
 
@@ -278,11 +281,7 @@ pub fn generate_req_id() -> String {
 }
 
 pub fn current_timestamp() -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    format!("{now}")
+    chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -291,6 +290,8 @@ pub struct ProxyLogsResponse {
     pub items: Vec<ProxyRequestLog>,
     pub total: usize,
     pub global_total: usize,
+    pub global_success: usize,
+    pub global_error: usize,
     pub success_total: usize,
     pub error_total: usize,
 }

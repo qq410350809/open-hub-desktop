@@ -5,22 +5,69 @@ export function escapeHtml(value: unknown): string {
   );
 }
 
-export function formatDate(value: string): string {
+export function parseTimestampToDate(value: string | number | Date | null | undefined): Date | null {
+  if (value === null || value === undefined || value === "") return null;
+  if (value instanceof Date) {
+    return Number.isNaN(value.getTime()) ? null : value;
+  }
+  if (typeof value === "number") {
+    const ms = value < 100_000_000_000 ? value * 1000 : value;
+    const d = new Date(ms);
+    return Number.isNaN(d.getTime()) ? null : d;
+  }
+  const str = String(value).trim();
+  if (/^\d{9,11}$/.test(str)) {
+    const d = new Date(Number(str) * 1000);
+    return Number.isNaN(d.getTime()) ? null : d;
+  }
+  if (/^\d{12,14}$/.test(str)) {
+    const d = new Date(Number(str));
+    return Number.isNaN(d.getTime()) ? null : d;
+  }
+  if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(str)) {
+    const d = new Date(str.replace(" ", "T"));
+    return Number.isNaN(d.getTime()) ? null : d;
+  }
+  const d = new Date(str);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+export function formatDate(value: string | number | Date | null | undefined): string {
   if (!value) return "未知";
-  const normalized = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(value)
-    ? `${value.replace(" ", "T")}Z`
-    : value;
-  const date = new Date(normalized);
-  if (Number.isNaN(date.getTime())) return value;
-  return new Intl.DateTimeFormat("zh-CN", {
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-  })
-    .format(date)
-    .replace(/\//g, "-");
+  const d = parseTimestampToDate(value);
+  if (!d) return String(value);
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  const h = String(d.getHours()).padStart(2, "0");
+  const min = String(d.getMinutes()).padStart(2, "0");
+  return `${y}-${m}-${day} ${h}:${min}`;
+}
+
+export function formatLogDate(value: string | number | Date | null | undefined): string {
+  const d = parseTimestampToDate(value);
+  if (!d) return typeof value === "string" && value ? value.split(" ")[0] : "--";
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+export function formatLogTime(value: string | number | Date | null | undefined): string {
+  const d = parseTimestampToDate(value);
+  if (!d) return "--";
+  const h = String(d.getHours()).padStart(2, "0");
+  const min = String(d.getMinutes()).padStart(2, "0");
+  const sec = String(d.getSeconds()).padStart(2, "0");
+  return `${h}:${min}:${sec}`;
+}
+
+export function formatLogFull(value: string | number | Date | null | undefined): string {
+  const d = parseTimestampToDate(value);
+  if (!d) return typeof value === "string" && value ? value : "未知时间";
+  const dateStr = formatLogDate(d);
+  const timeStr = formatLogTime(d);
+  return `${dateStr} ${timeStr}`;
 }
 
 export function formatRateLimit(value: string): string {

@@ -21,7 +21,6 @@ const pendingMode = computed(() => store.usageFilter.value === "pending");
 const usageCardMode = computed(() => personalMode.value || pendingMode.value);
 const accountSessions = computed(() =>
   (store.chromeUsageAccounts.value[props.site.id] ?? [])
-    .filter((session) => session.isValid)
     .slice()
     .sort((a, b) =>
       (a.username || a.accountName || a.profileName || "").localeCompare(

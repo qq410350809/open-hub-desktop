@@ -349,8 +349,13 @@ const filteredSites = computed(() => {
   } else if (sortBy.value === "name_asc") {
     list = [...list].sort((a, b) => a.name.localeCompare(b.name, "zh-CN"));
   } else {
-    // 默认综合排序：在用 > 待定 > 存活，再按更新时间
+    // 默认综合排序：拓扑视图下优先展示包含账号数据的站点；再按在用 > 待定 > 存活，更新时间
     list = [...list].sort((a, b) => {
+      if (currentView.value === "topology") {
+        const hasAccA = (store.chromeUsageAccounts.value[a.id]?.length ?? 0) > 0 ? 1 : 0;
+        const hasAccB = (store.chromeUsageAccounts.value[b.id]?.length ?? 0) > 0 ? 1 : 0;
+        if (hasAccA !== hasAccB) return hasAccB - hasAccA;
+      }
       const scoreA = (a.isPersonal ? 100 : a.isPending ? 50 : 0) - (a.isRunaway ? 200 : 0);
       const scoreB = (b.isPersonal ? 100 : b.isPending ? 50 : 0) - (b.isRunaway ? 200 : 0);
       if (scoreA !== scoreB) return scoreB - scoreA;
@@ -690,17 +695,6 @@ watch(selectedAliveTab, (tab) => {
   }
 });
 
-watch(currentView, (mode) => {
-  if (mode === "topology") {
-    if (selectedUsageTab.value === "all") {
-      selectedUsageTab.value = "personal";
-    }
-    if (selectedAliveTab.value === "all" || selectedAliveTab.value === "runaway") {
-      selectedAliveTab.value = "active";
-    }
-  }
-});
-
 watch(
   [query, selectedUsageTab, selectedAliveTab, selectedSystemType, selectedLevel, selectedTag, sortBy, popularChip, currentView],
   () => {
@@ -859,9 +853,8 @@ onUnmounted(() => {
             <button
               type="button"
               role="tab"
-              :disabled="currentView === 'topology'"
               :class="{ active: selectedUsageTab === 'all' }"
-              :title="currentView === 'topology' ? '账号拓扑矩阵下已禁用全部' : '全部使用状态'"
+              title="全部使用状态"
               @click="selectedUsageTab = 'all'"
             >
               <span v-html="icons.layers" />
@@ -872,6 +865,7 @@ onUnmounted(() => {
               type="button"
               role="tab"
               :class="{ active: selectedUsageTab === 'personal' }"
+              title="在用站点"
               @click="selectedUsageTab = 'personal'"
             >
               <span v-html="icons.bookmark" />
@@ -882,6 +876,7 @@ onUnmounted(() => {
               type="button"
               role="tab"
               :class="{ active: selectedUsageTab === 'pending' }"
+              title="待定站点"
               @click="selectedUsageTab = 'pending'"
             >
               <span v-html="icons.clock" />
@@ -896,9 +891,8 @@ onUnmounted(() => {
           <div class="sl-alive-tabs" role="group" aria-label="站点存活状态筛选">
             <button
               type="button"
-              :disabled="currentView === 'topology'"
               :class="{ active: selectedAliveTab === 'all' }"
-              :title="currentView === 'topology' ? '账号拓扑矩阵下已禁用全部状态' : '全部站点状态'"
+              title="全部站点状态"
               @click="selectedAliveTab = 'all'"
             >
               <span>全部状态</span>
@@ -918,9 +912,8 @@ onUnmounted(() => {
             <button
               type="button"
               class="sl-alive-btn is-runaway"
-              :disabled="currentView === 'topology'"
               :class="{ active: selectedAliveTab === 'runaway' }"
-              :title="currentView === 'topology' ? '账号拓扑矩阵下已禁用跑路选项' : '筛选已跑路或失效站点'"
+              title="筛选已跑路或失效站点"
               @click="selectedAliveTab = 'runaway'"
             >
               <span class="sl-alive-dot is-dead" />
@@ -1444,7 +1437,7 @@ onUnmounted(() => {
               type="button"
               class="sl-btn-secondary"
               title="同步拓扑站点的 Chrome 账号会话与可用额度"
-              @click="store.openSyncDialog('quota', 'personal')"
+              @click="store.openSyncDialog('quota', selectedUsageTab === 'pending' ? 'pending' : 'personal')"
             >
               <span v-html="icons.restore" />
               <span>同步额度</span>

@@ -13,7 +13,10 @@ impl ModelProxyContext {
         let app_handle_opt = self.app_handle.read().await.clone();
         if let Some(app) = app_handle_opt {
             let database = app.state::<crate::models::Database>();
-            let now_ts = log.timestamp.clone();
+            let now_millis = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
             let _ = (move || -> Result<(), rusqlite::Error> {
                 let conn = database
                     .0
@@ -47,7 +50,7 @@ impl ModelProxyContext {
                         log.request_body,
                         log.response_body,
                         log.node_name,
-                        now_ts,
+                        now_millis,
                     ],
                 )?;
                 conn.execute(

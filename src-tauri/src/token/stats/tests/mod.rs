@@ -267,7 +267,13 @@ use std::time::UNIX_EPOCH;
         })
         .to_string();
 
-        let tmp = std::env::temp_dir().join("openhub-catpawai-dedup-test.sqlite");
+        let tmp = std::env::temp_dir().join(format!(
+            "openhub-catpawai-dedup-test-{}.sqlite",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         {
             let conn = rusqlite::Connection::open(&tmp).unwrap();
             conn.execute_batch(

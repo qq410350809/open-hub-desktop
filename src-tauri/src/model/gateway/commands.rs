@@ -46,10 +46,12 @@ pub async fn save_model_proxy_config_cmd(
 
     let is_running = state.shutdown_sender.read().await.is_some();
     if config.enabled {
-        if is_running {
-            stop_model_proxy_server(&state).await?;
+        // 端口未变化时无需重启：白名单等配置均在请求时热读取，重建 listener 反而引入端口释放竞态
+        let port_changed = *state.current_port.read().await != config.port;
+        if !is_running {
             start_model_proxy_server(&state).await?;
-        } else {
+        } else if port_changed {
+            stop_model_proxy_server(&state).await?;
             start_model_proxy_server(&state).await?;
         }
     } else if is_running {
@@ -256,22 +258,49 @@ pub async fn get_model_proxy_logs(
             .unwrap_or(0)
     };
 
+    // 当前筛选条件下的成功/错误计数（供表格底部/当前视图使用）
     let count_succ: usize = {
-        let sql = format!("SELECT COUNT(*) FROM opencode_proxy_logs {where_sql} AND status_code >= 200 AND status_code < 300");
+        let status_sql = "status_code >= 200 AND status_code < 300";
+        let sql = if where_sql.is_empty() {
+            format!("SELECT COUNT(*) FROM opencode_proxy_logs WHERE {status_sql}")
+        } else {
+            format!("SELECT COUNT(*) FROM opencode_proxy_logs {where_sql} AND {status_sql}")
+        };
         let params_refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|b| b.as_ref()).collect();
         conn.query_row(&sql, params_refs.as_slice(), |r| r.get(0))
             .unwrap_or(0)
     };
 
+    // 当前筛选条件下的错误计数
     let count_err: usize = {
-        let sql = format!("SELECT COUNT(*) FROM opencode_proxy_logs {where_sql} AND status_code >= 400");
+        let status_sql = "status_code >= 400";
+        let sql = if where_sql.is_empty() {
+            format!("SELECT COUNT(*) FROM opencode_proxy_logs WHERE {status_sql}")
+        } else {
+            format!("SELECT COUNT(*) FROM opencode_proxy_logs {where_sql} AND {status_sql}")
+        };
         let params_refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|b| b.as_ref()).collect();
         conn.query_row(&sql, params_refs.as_slice(), |r| r.get(0))
             .unwrap_or(0)
     };
 
-    let count_all: usize = conn
+    // 全库（不受 filter/搜索影响）的成功与错误计数，供顶部固定统计展示
+    let global_total: usize = conn
         .query_row("SELECT COUNT(*) FROM opencode_proxy_logs", [], |r| r.get(0))
+        .unwrap_or(0);
+    let global_succ: usize = conn
+        .query_row(
+            "SELECT COUNT(*) FROM opencode_proxy_logs WHERE status_code >= 200 AND status_code < 300",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let global_err: usize = conn
+        .query_row(
+            "SELECT COUNT(*) FROM opencode_proxy_logs WHERE status_code >= 400",
+            [],
+            |r| r.get(0),
+        )
         .unwrap_or(0);
 
     let query_sql = format!(
@@ -329,7 +358,9 @@ pub async fn get_model_proxy_logs(
     Ok(super::types::ProxyLogsResponse {
         items: logs,
         total: count_filtered,
-        global_total: count_all,
+        global_total,
+        global_success: global_succ,
+        global_error: global_err,
         success_total: count_succ,
         error_total: count_err,
     })

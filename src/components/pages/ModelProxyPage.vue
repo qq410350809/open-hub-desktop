@@ -12,7 +12,13 @@ import {
 } from "../../composables/useModelProxy";
 import { useLibrary, runCommand } from "../../composables/useLibrary";
 import { useToast } from "../../composables/useToast";
-import { formatNumber as formatNumberUtil, formatUptime as formatUptimeUtil } from "../../utils";
+import {
+  formatNumber as formatNumberUtil,
+  formatUptime as formatUptimeUtil,
+  formatLogDate,
+  formatLogTime,
+  formatLogFull,
+} from "../../utils";
 import CustomSelect from "../common/CustomSelect.vue";
 import type { SiteRecord } from "../../types";
 import { DEFAULT_PROXY_PORT, LOCALHOST, API_PATH_V1, API_PATH_GEMINI, API_PATH_MESSAGES } from "../../constants";
@@ -1562,8 +1568,8 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
               >
                 <td>
                   <div class="mp-log-time-col font-mono">
-                    <span class="mp-log-date">{{ log.timestamp ? log.timestamp.split(' ')[0] : '--' }}</span>
-                    <strong class="mp-log-time">{{ log.timestamp && log.timestamp.split(' ')[1] ? log.timestamp.split(' ')[1] : log.timestamp }}</strong>
+                    <span class="mp-log-date">{{ formatLogDate(log.timestamp) }}</span>
+                    <strong class="mp-log-time">{{ formatLogTime(log.timestamp) }}</strong>
                   </div>
                 </td>
                 <td>
@@ -1849,7 +1855,7 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
                 <span class="mp-header-chip font-mono" :class="selectedLogForDetail.nodeName && selectedLogForDetail.nodeName !== '直连通道' ? 'is-proxy-chip' : ''">🌐 {{ selectedLogForDetail.nodeName || '直连通道' }}</span>
                 <span v-if="selectedLogForDetail.stream" class="mp-stream-tag is-stream">流式实时流</span>
               </div>
-              <small class="text-muted">请求 ID: {{ selectedLogForDetail.id }} · 记录时间: {{ selectedLogForDetail.timestamp }}</small>
+              <small class="text-muted">请求 ID: {{ selectedLogForDetail.id }} · 记录时间: {{ formatLogFull(selectedLogForDetail.timestamp) }}</small>
             </div>
           </div>
           <button
@@ -2234,9 +2240,9 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
               </div>
 
               <div class="mp-ld-item">
-                <label>请求时间戳</label>
+                <label>请求时间</label>
                 <div class="mp-ld-val font-mono text-muted">
-                  <span>{{ selectedLogForDetail.timestamp }}</span>
+                  <span>{{ formatLogFull(selectedLogForDetail.timestamp) }}</span>
                 </div>
               </div>
             </div>

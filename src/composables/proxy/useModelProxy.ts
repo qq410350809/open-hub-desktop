@@ -363,6 +363,9 @@ export function useModelProxy() {
       const res = await runCommand<{
         items: ProxyRequestLog[];
         total: number;
+        globalTotal: number;
+        globalSuccess: number;
+        globalError: number;
         successTotal: number;
         errorTotal: number;
       }>("get_opencode_proxy_logs", payload);
@@ -374,11 +377,10 @@ export function useModelProxy() {
         logTotal.value = res.total ?? res.items.length;
         logSuccessTotal.value = res.successTotal ?? 0;
         logErrorTotal.value = res.errorTotal ?? 0;
-        if (!f && !query.trim()) {
-          logGlobalTotal.value = res.total ?? 0;
-          logGlobalSuccess.value = res.successTotal ?? 0;
-          logGlobalError.value = res.errorTotal ?? 0;
-        }
+        // 全局计数由后端全库统计，不受当前 filter/搜索影响，每次拉取都刷新
+        logGlobalTotal.value = res.globalTotal ?? logGlobalTotal.value;
+        logGlobalSuccess.value = res.globalSuccess ?? logGlobalSuccess.value;
+        logGlobalError.value = res.globalError ?? logGlobalError.value;
       } else if (Array.isArray(res)) {
         proxyLogs.value = res;
         logTotal.value = (res as any).length;
@@ -421,6 +423,9 @@ export function useModelProxy() {
         logTotal.value = 0;
         logSuccessTotal.value = 0;
         logErrorTotal.value = 0;
+        logGlobalTotal.value = 0;
+        logGlobalSuccess.value = 0;
+        logGlobalError.value = 0;
         logPage.value = 1;
         await refreshStatus();
         showToast("所有请求日志记录已清空");

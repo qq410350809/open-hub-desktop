@@ -58,6 +58,23 @@ pub fn resolve_channel<'a>(
     None
 }
 
+/// 判断渠道是否为 OpenCode 渠道
+pub fn is_opencode_channel(channel: &ChannelConfig) -> bool {
+    channel.id == "opencode"
+        || channel.protocol.eq_ignore_ascii_case("opencode")
+        || channel.alias.as_deref().map_or(false, |a| a.eq_ignore_ascii_case("opencode"))
+        || channel.base_url.contains("opencode.ai")
+        || channel.name.to_lowercase().contains("opencode")
+}
+
+/// 判断是否为 OpenCode 官方免费模型
+pub fn is_free_opencode_model(model: &str) -> bool {
+    let lower = model.to_lowercase();
+    lower.ends_with("-free")
+        || lower == "big-pickle"
+        || lower.contains("free")
+}
+
 /// 渠道多 Key 轮询选择器：原子递增索引并在有效 API Keys 中轮流选取
 pub fn select_channel_api_key(ctx: &ModelProxyContext, channel: &ChannelConfig) -> String {
     let keys = channel.get_effective_keys();
@@ -101,6 +118,7 @@ pub fn format_upstream_error_message(status: u16, error_body: &str) -> String {
 }
 
 /// 记录节点/渠道自动切换事件
+#[allow(dead_code)]
 pub async fn record_failover_event(
     ctx: &ModelProxyContext,
     req_id: &str,

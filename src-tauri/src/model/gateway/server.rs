@@ -28,11 +28,13 @@ impl ModelProxyState {
             default_http_client: http_client,
             app_handle: Arc::new(RwLock::new(app)),
             key_round_robin: Arc::new(AtomicUsize::new(0)),
+            node_round_robin: Arc::new(AtomicUsize::new(0)),
         };
 
         Self {
             context,
             shutdown_sender: Arc::new(RwLock::new(None)),
+            server_task: Arc::new(RwLock::new(None)),
             current_port: Arc::new(RwLock::new(DEFAULT_MODEL_PROXY_PORT)),
         }
     }
@@ -61,16 +63,14 @@ pub async fn start_model_proxy_server(state: &ModelProxyState) -> Result<(), Str
 
     let router = create_model_proxy_router(state.context.clone());
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .map_err(|e| format!("绑定端口 {port} 失败: {e}"))?;
+    let listener = bind_with_retry(addr).await?;
 
     let (tx, rx) = oneshot::channel::<()>();
     *sender_guard = Some(tx);
     *state.context.started_at.write().await = Some(Instant::now());
 
     let ctx_clone = state.context.clone();
-    tauri::async_runtime::spawn(async move {
+    let handle = tauri::async_runtime::spawn(async move {
         let server = axum::serve(listener, router).with_graceful_shutdown(async move {
             let _ = rx.await;
         });
@@ -80,6 +80,7 @@ pub async fn start_model_proxy_server(state: &ModelProxyState) -> Result<(), Str
         }
         *ctx_clone.started_at.write().await = None;
     });
+    *state.server_task.write().await = Some(handle);
 
     let ctx_for_models = state.context.clone();
     tauri::async_runtime::spawn(async move {
@@ -94,10 +95,40 @@ pub async fn start_opencode_proxy_server(state: &OpencodeProxyState) -> Result<(
     start_model_proxy_server(state).await
 }
 
+/// 绑定端口，遇到 AddrInUse（旧服务端口尚未完全释放）时短暂重试
+async fn bind_with_retry(addr: SocketAddr) -> Result<tokio::net::TcpListener, String> {
+    const MAX_ATTEMPTS: usize = 15;
+    let mut last_err = None;
+    for attempt in 0..MAX_ATTEMPTS {
+        match tokio::net::TcpListener::bind(addr).await {
+            Ok(listener) => return Ok(listener),
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && attempt + 1 < MAX_ATTEMPTS => {
+                last_err = Some(e);
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            Err(e) => return Err(format!("绑定端口 {} 失败: {e}", addr.port())),
+        }
+    }
+    Err(format!(
+        "绑定端口 {} 失败: {}",
+        addr.port(),
+        last_err.expect("retry loop must capture last error")
+    ))
+}
+
 pub async fn stop_model_proxy_server(state: &ModelProxyState) -> Result<(), String> {
-    let mut sender_guard = state.shutdown_sender.write().await;
-    if let Some(sender) = sender_guard.take() {
-        let _ = sender.send(());
+    {
+        let mut sender_guard = state.shutdown_sender.write().await;
+        if let Some(sender) = sender_guard.take() {
+            let _ = sender.send(());
+        }
+    }
+    if let Some(handle) = state.server_task.write().await.take() {
+        // 等待旧服务任务退出（优雅关闭需等在途连接结束），确保端口释放后再返回，
+        // 避免保存配置后立即重启时 bind 报端口占用冲突
+        if tokio::time::timeout(Duration::from_secs(5), handle).await.is_err() {
+            eprintln!("[OpenHub] 模型网关停止超时（可能仍有在途长连接），继续执行");
+        }
     }
     *state.context.started_at.write().await = None;
     Ok(())

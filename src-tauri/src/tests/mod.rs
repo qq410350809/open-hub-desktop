@@ -166,9 +166,14 @@ use std::collections::{HashMap, HashSet};
                 CREATE TABLE site_model_cache (
                     site_id TEXT NOT NULL,
                     profile_id TEXT NOT NULL,
-                    error TEXT NOT NULL DEFAULT '',
+                    profile_name TEXT NOT NULL DEFAULT '',
+                    account_name TEXT NOT NULL DEFAULT '',
+                    username TEXT NOT NULL DEFAULT '',
+                    api_source TEXT NOT NULL DEFAULT '',
                     keys_json TEXT NOT NULL DEFAULT '[]',
+                    groups_json TEXT NOT NULL DEFAULT '{}',
                     models_json TEXT NOT NULL DEFAULT '[]',
+                    error TEXT NOT NULL DEFAULT '',
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     PRIMARY KEY (site_id, profile_id)
                 );",

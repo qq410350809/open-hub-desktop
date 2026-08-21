@@ -182,7 +182,13 @@ pub fn clean_sse_stream(
 
         let dur = start_time.elapsed().as_millis() as u64;
         log.duration_ms = dur;
-        log.status_code = 200;
+        if log.error_message.is_some() {
+            log.status_code = 502;
+            ctx.metrics.successful_requests.fetch_sub(1, Ordering::Relaxed);
+            ctx.metrics.failed_requests.fetch_add(1, Ordering::Relaxed);
+        } else {
+            log.status_code = 200;
+        }
         if has_reasoning {
             stats.has_reasoning = true;
         }
@@ -321,7 +327,13 @@ pub fn openai_to_anthropic_sse_stream(
 
         let dur = start_time.elapsed().as_millis() as u64;
         log.duration_ms = dur;
-        log.status_code = 200;
+        if log.error_message.is_some() {
+            log.status_code = 502;
+            ctx.metrics.successful_requests.fetch_sub(1, Ordering::Relaxed);
+            ctx.metrics.failed_requests.fetch_add(1, Ordering::Relaxed);
+        } else {
+            log.status_code = 200;
+        }
         log.prompt_tokens = (total_prompt_tokens > 0).then_some(total_prompt_tokens);
         log.completion_tokens = (total_completion_tokens > 0).then_some(total_completion_tokens);
         log.total_tokens = (total_prompt_tokens + total_completion_tokens > 0).then_some(total_prompt_tokens + total_completion_tokens);
@@ -397,7 +409,13 @@ pub fn openai_to_gemini_sse_stream(
 
         let dur = start_time.elapsed().as_millis() as u64;
         log.duration_ms = dur;
-        log.status_code = 200;
+        if log.error_message.is_some() {
+            log.status_code = 502;
+            ctx.metrics.successful_requests.fetch_sub(1, Ordering::Relaxed);
+            ctx.metrics.failed_requests.fetch_add(1, Ordering::Relaxed);
+        } else {
+            log.status_code = 200;
+        }
         log.prompt_tokens = (total_prompt_tokens > 0).then_some(total_prompt_tokens);
         log.completion_tokens = (total_completion_tokens > 0).then_some(total_completion_tokens);
         log.total_tokens = (total_prompt_tokens + total_completion_tokens > 0).then_some(total_prompt_tokens + total_completion_tokens);
@@ -495,7 +513,13 @@ pub fn openai_to_responses_sse_stream(
 
         let dur = start_time.elapsed().as_millis() as u64;
         log.duration_ms = dur;
-        log.status_code = 200;
+        if log.error_message.is_some() {
+            log.status_code = 502;
+            ctx.metrics.successful_requests.fetch_sub(1, Ordering::Relaxed);
+            ctx.metrics.failed_requests.fetch_add(1, Ordering::Relaxed);
+        } else {
+            log.status_code = 200;
+        }
         log.prompt_tokens = (total_prompt_tokens > 0).then_some(total_prompt_tokens);
         log.completion_tokens = (total_completion_tokens > 0).then_some(total_completion_tokens);
         log.total_tokens = (total_prompt_tokens + total_completion_tokens > 0).then_some(total_prompt_tokens + total_completion_tokens);
