@@ -488,7 +488,7 @@ pub(crate) fn cache_profile_api_counts(
     let should_cache_keys =
         !result.keys.is_empty() || matches!(result.source.as_str(), "newapi-key" | "sub2api-key");
     if let (Some(site_id), Some(profile_id)) = (site_id, profile_id) {
-        let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+        let connection = database.lock_conn()?;
         if should_cache_keys {
             connection
                 .execute(
@@ -518,7 +518,7 @@ pub(crate) fn cache_profile_api_counts(
 }
 
 pub(crate) fn clear_site_model_cache(database: &Database, site_id: &str) -> Result<(), String> {
-    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    let connection = database.lock_conn()?;
     connection
         .execute("DELETE FROM site_model_cache WHERE site_id = ?1", [site_id])
         .map_err(|error| error.to_string())?;
@@ -532,7 +532,7 @@ pub(crate) fn save_site_model_cache(
     result: Option<&SiteModelsResult>,
     preserve_keys: bool,
 ) -> Result<(), String> {
-    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    let connection = database.lock_conn()?;
     // 同步模型（preserve_keys）时：保留库中已有 Key/分组；拉取失败时模型数据也一并保留，
     // 只更新错误信息，避免把左侧 Key 树或右侧模型列表清空。
     let existing = if preserve_keys {
@@ -691,7 +691,7 @@ pub fn get_site_model_cache(
     database: State<'_, Database>,
     site_id: String,
 ) -> Result<SiteModelCache, String> {
-    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    let connection = database.lock_conn()?;
     let mut statement = connection
         .prepare(
             "SELECT profile_id, profile_name, account_name, username, api_source, keys_json, groups_json, models_json, key_models_json, error
@@ -747,7 +747,7 @@ pub fn get_site_model_cache(
 pub fn get_all_site_model_caches(
     database: State<'_, Database>,
 ) -> Result<Vec<SiteModelCacheEntry>, String> {
-    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    let connection = database.lock_conn()?;
     let mut statement = connection
         .prepare(
             "SELECT site_id, profile_id, profile_name, account_name, username, api_source, keys_json, groups_json, models_json, key_models_json, error
@@ -925,7 +925,7 @@ async fn fetch_site_models_json_inner(
     let (system_type, mut profile_ids, cached_model_keys) = if let Some(site_id) =
         site_id.as_deref()
     {
-        let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+        let connection = database.lock_conn()?;
         let system_type = connection
             .query_row(
                 "SELECT system_type FROM directory_sites WHERE id = ?1",
@@ -1028,7 +1028,7 @@ async fn fetch_site_models_json_inner(
                 .map_err(|_| "无法生成 /api/token 地址")?;
 
             let (cached_token, cached_uid) = if let Some(site_id) = site_id.as_deref() {
-                let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+                let connection = database.lock_conn()?;
                 connection
                     .query_row(
                         "SELECT newapi_token, newapi_user_id FROM site_accounts WHERE site_id = ?1 AND profile_id = ?2",

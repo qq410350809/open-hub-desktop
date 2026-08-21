@@ -15,7 +15,6 @@ pub(crate) const NETWORK_PROXY_KEY: &str = "network_proxy";
 pub(crate) const ACTIVE_PROXY_NODE_KEY: &str = "active_proxy_node";
 pub(crate) const PROXY_IGNORE_KEY: &str = "proxy_ignore_addresses";
 pub(crate) const PROXY_SPEED_TEST_URL_KEY: &str = "proxy_speed_test_url";
-pub(crate) const PROXY_RUNTIME_URL: &str = "http://127.0.0.1:17890";
 pub(crate) const DEFAULT_PROXY_IGNORE: &str =
     "localhost,127.0.0.1,::1,.local,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16";
 pub(crate) const DEFAULT_PROXY_SPEED_TEST_URL: &str = "http://www.gstatic.com/generate_204";

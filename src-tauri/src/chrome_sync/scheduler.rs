@@ -94,13 +94,7 @@ fn now_secs() -> i64 {
 }
 
 fn read_meta_string(connection: &rusqlite::Connection, key: &str) -> Option<String> {
-    connection
-        .query_row("SELECT value FROM app_meta WHERE key = ?1", [key], |row| {
-            row.get::<_, String>(0)
-        })
-        .optional()
-        .ok()
-        .flatten()
+    crate::db::read_meta_conn(connection, key).ok().filter(|s| !s.is_empty())
 }
 
 fn write_meta_string(
@@ -108,14 +102,7 @@ fn write_meta_string(
     key: &str,
     value: &str,
 ) -> Result<(), String> {
-    connection
-        .execute(
-            "INSERT INTO app_meta(key, value) VALUES (?1, ?2)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            params![key, value],
-        )
-        .map(|_| ())
-        .map_err(|error| error.to_string())
+    crate::db::write_meta(connection, key, value)
 }
 
 fn read_settings(connection: &rusqlite::Connection) -> AutoSyncSettings {
@@ -134,7 +121,7 @@ fn read_settings(connection: &rusqlite::Connection) -> AutoSyncSettings {
 
 #[tauri::command]
 pub fn get_auto_sync_settings(database: State<'_, Database>) -> Result<AutoSyncSettings, String> {
-    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    let connection = database.lock_conn()?;
     Ok(read_settings(&connection))
 }
 
@@ -146,7 +133,7 @@ pub fn set_auto_sync_settings(
     interval_minutes: Option<u64>,
 ) -> Result<AutoSyncSettings, String> {
     let settings = {
-        let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+        let connection = database.lock_conn()?;
         if let Some(enabled) = enabled {
             write_meta_string(&connection, ENABLED_KEY, if enabled { "1" } else { "0" })?;
         }
@@ -172,7 +159,7 @@ pub struct AutoSyncStatus {
 
 #[tauri::command]
 pub fn get_auto_sync_status(database: State<'_, Database>) -> Result<AutoSyncStatus, String> {
-    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    let connection = database.lock_conn()?;
     let settings = read_settings(&connection);
     let last_round_at = read_meta_string(&connection, LAST_ROUND_AT_KEY)
         .and_then(|value| value.trim().parse::<i64>().ok())

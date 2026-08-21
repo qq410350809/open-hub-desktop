@@ -79,7 +79,7 @@ pub async fn mark_charity_feed_read(
 pub async fn get_charity_today_count(database: State<'_, Database>) -> Result<usize, String> {
     tokio::task::block_in_place(|| {
         let (utc_start, utc_end) = local_day_utc_range_secs();
-        let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+        let connection = database.lock_conn()?;
         let count = connection
             .query_row(
                 "SELECT COUNT(*) FROM charity_feed_items
@@ -189,7 +189,7 @@ pub async fn get_charity_proxy_pool_summary(
     monitor: State<'_, CharityMonitorRuntime>,
 ) -> Result<CharityProxyPoolSummary, String> {
     tokio::task::block_in_place(|| {
-        let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+        let connection = database.lock_conn()?;
         let valid_count = connection
             .query_row(
                 "SELECT COUNT(*) FROM proxy_pool_nodes

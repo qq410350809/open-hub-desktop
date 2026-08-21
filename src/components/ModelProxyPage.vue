@@ -12,6 +12,7 @@ import {
 } from "../composables/useModelProxy";
 import { useLibrary, runCommand } from "../composables/useLibrary";
 import { useToast } from "../composables/useToast";
+import { formatNumber as formatNumberUtil, formatUptime as formatUptimeUtil } from "../utils";
 import CustomSelect from "./CustomSelect.vue";
 import type { SiteRecord } from "../types";
 
@@ -940,16 +941,11 @@ const logPageNumbers = computed<Array<number | "…">>(() => {
 });
 
 function formatNumber(num: number | undefined | null): string {
-  if (num === undefined || num === null) return "0";
-  return num.toLocaleString();
+  return formatNumberUtil(num);
 }
 
 function formatUptime(seconds: number) {
-  if (seconds < 60) return `${seconds} 秒`;
-  if (seconds < 3600) return `${Math.floor(seconds / 60)} 分钟`;
-  const hours = Math.floor(seconds / 3600);
-  const mins = Math.floor((seconds % 3600) / 60);
-  return `${hours} 小时 ${mins} 分`;
+  return formatUptimeUtil(seconds);
 }
 
 async function copyModel(modelId: string, channel: ChannelConfig) {
@@ -1197,7 +1193,7 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
 
           <div class="mp-endpoint-item">
             <span class="mp-ep-label">Gemini Base URL</span>
-            <code class="mp-ep-code">http://127.0.0.1:{{ proxyStatus.port || proxyConfig.port }}/v1beta</code>
+            <code class="mp-ep-code">http://127.0.0.1:{{ proxyStatus.port || proxyConfig.port }}/v1/gemini</code>
             <button
               type="button"
               class="mp-action-btn"

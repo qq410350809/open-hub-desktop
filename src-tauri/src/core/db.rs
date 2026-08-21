@@ -482,6 +482,11 @@ impl Database {
             .map_err(|error| error.to_string())?;
         Ok(Self(std::sync::Mutex::new(connection)))
     }
+
+    /// 获取数据库连接的互斥锁，封装统一的错误处理。
+    pub(crate) fn lock_conn(&self) -> Result<std::sync::MutexGuard<'_, Connection>, String> {
+        self.0.lock().map_err(|_| "本地数据库锁定失败".to_string())
+    }
 }
 
 const TOKEN_USAGE_SNAPSHOT: &str = "usage";
@@ -497,7 +502,7 @@ fn read_snapshot<T: DeserializeOwned>(
     kind: &str,
 ) -> Result<Option<T>, String> {
     let payload = {
-        let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+        let connection = database.lock_conn()?;
         connection
             .query_row(
                 "SELECT payload_json FROM token_cache_snapshots WHERE kind = ?1",
@@ -516,7 +521,7 @@ fn read_snapshot<T: DeserializeOwned>(
 }
 
 pub(crate) fn has_token_snapshots(database: &Database) -> Result<bool, String> {
-    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    let connection = database.lock_conn()?;
     connection
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM token_cache_snapshots WHERE kind = ?1)",
@@ -528,7 +533,7 @@ pub(crate) fn has_token_snapshots(database: &Database) -> Result<bool, String> {
 }
 
 pub(crate) fn clear_token_snapshots(database: &Database) -> Result<usize, String> {
-    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    let connection = database.lock_conn()?;
     connection
         .execute("DELETE FROM token_cache_snapshots", [])
         .map_err(|error| error.to_string())
@@ -545,7 +550,7 @@ pub(crate) fn write_token_snapshots(
         (TOKEN_SESSIONS_SNAPSHOT, serialize_snapshot(&sessions)?),
         (TOKEN_HEALTH_SNAPSHOT, serialize_snapshot(health)?),
     ];
-    let mut connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    let mut connection = database.lock_conn()?;
     let transaction = connection
         .transaction()
         .map_err(|error| error.to_string())?;
@@ -979,12 +984,21 @@ pub(crate) fn read_cached_usage_sites(
     Ok(sites)
 }
 
-pub(crate) fn read_network_proxy(database: &Database) -> Result<String, String> {
-    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+/// 通用 app_meta 读取：返回指定 key 的值，key 不存在时返回空字符串。
+pub(crate) fn read_meta(database: &Database, key: &str) -> Result<String, String> {
+    let connection = database.lock_conn()?;
+    read_meta_conn(&connection, key)
+}
+
+/// 通用 app_meta 读取（Connection 级别）：避免重复获取锁。
+pub(crate) fn read_meta_conn(
+    connection: &rusqlite::Connection,
+    key: &str,
+) -> Result<String, String> {
     connection
         .query_row(
             "SELECT value FROM app_meta WHERE key = ?1",
-            [NETWORK_PROXY_KEY],
+            [key],
             |row| row.get(0),
         )
         .optional()
@@ -992,8 +1006,38 @@ pub(crate) fn read_network_proxy(database: &Database) -> Result<String, String> 
         .map_err(|error| error.to_string())
 }
 
+/// 通用 app_meta 写入：upsert 语义（key 存在则更新，不存在则插入）。
+pub(crate) fn write_meta(
+    connection: &rusqlite::Connection,
+    key: &str,
+    value: &str,
+) -> Result<(), String> {
+    connection
+        .execute(
+            "INSERT INTO app_meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+/// 通用 app_meta 写入（Database 级别）：先获取锁再调用 write_meta。
+pub(crate) fn write_meta_database(
+    database: &Database,
+    key: &str,
+    value: &str,
+) -> Result<(), String> {
+    let connection = database.lock_conn()?;
+    write_meta(&connection, key, value)
+}
+
+pub(crate) fn read_network_proxy(database: &Database) -> Result<String, String> {
+    read_meta(database, NETWORK_PROXY_KEY)
+}
+
 pub(crate) fn read_proxy_ignore_addresses(database: &Database) -> Result<String, String> {
-    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    let connection = database.lock_conn()?;
     connection
         .query_row(
             "SELECT value FROM app_meta WHERE key = ?1",

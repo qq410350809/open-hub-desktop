@@ -5,7 +5,7 @@ use crate::proxy_pool::runtime::{
 };
 use crate::proxy_pool::types::*;
 use futures_util::{future, pin_mut, stream, StreamExt};
-use rusqlite::{params, OptionalExtension};
+use rusqlite::params;
 use serde_json::Value as JsonValue;
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
@@ -91,20 +91,16 @@ pub async fn run_proxy_node_pool(
         }
         override_url
     } else {
-        let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
-        connection
-            .query_row(
-                "SELECT value FROM app_meta WHERE key=?1",
-                [PROXY_SPEED_TEST_URL_KEY],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(|error| error.to_string())?
-            .filter(|item| !item.is_empty() && !is_slow_or_blocked_speed_test_url(item))
-            .unwrap_or_else(|| DEFAULT_PROXY_SPEED_TEST_URL.to_string())
+        let value = crate::db::read_meta(database, PROXY_SPEED_TEST_URL_KEY)?;
+        let trimmed = value.trim();
+        if !trimmed.is_empty() && !is_slow_or_blocked_speed_test_url(trimmed) {
+            trimmed.to_string()
+        } else {
+            DEFAULT_PROXY_SPEED_TEST_URL.to_string()
+        }
     };
     let nodes = {
-        let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+        let connection = database.lock_conn()?;
         let mut statement = connection
             .prepare("SELECT id, test_status FROM proxy_pool_nodes")
             .map_err(|error| error.to_string())?;
@@ -171,7 +167,7 @@ pub async fn run_proxy_node_pool(
         if pending.is_empty() {
             return Ok(());
         }
-        let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+        let connection = database.lock_conn()?;
         let tx = connection
             .unchecked_transaction()
             .map_err(|error| error.to_string())?;

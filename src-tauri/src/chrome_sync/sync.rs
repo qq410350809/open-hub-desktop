@@ -1860,7 +1860,7 @@ async fn sync_site_account_via_chrome_inner(
         fallback_failed_at,
         fallback_fail_count,
     ) = {
-        let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+        let connection = database.lock_conn()?;
         let site = connection
             .query_row(
                 // 待定（is_pending）站点同样允许 Chrome 账号同步：
@@ -2562,7 +2562,7 @@ async fn sync_site_account_via_chrome_inner(
         format!("正在更新 {account_label} 的 SQLite 账号缓存"),
     );
 
-    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    let connection = database.lock_conn()?;
     let changed = connection
         .execute(
             "UPDATE site_accounts

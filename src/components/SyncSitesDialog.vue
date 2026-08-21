@@ -4,6 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import { icons } from "../icons";
 import { useStore } from "../composables/useStore";
 import type { SyncSitesProgress } from "../types";
+import { formatElapsed } from "../utils";
 
 const store = useStore();
 const closeBtnRef = ref<HTMLButtonElement>();
@@ -33,13 +34,6 @@ const runStateLabel = computed(() => {
     default: return "等待开始";
   }
 });
-
-function formatElapsed(milliseconds: number) {
-  if (milliseconds < 1000) {
-    return `+${milliseconds}ms`;
-  }
-  return `+${(milliseconds / 1000).toFixed(1)}s`;
-}
 
 let isDialogMounted = true;
 

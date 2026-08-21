@@ -7,6 +7,100 @@ use serde_json::{json, Value as JsonValue};
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
+/// SSE 流解析过程中的 token 统计
+struct SseTokenStats {
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    reasoning_tokens: u64,
+    cache_hit_tokens: u64,
+    total_tokens: u64,
+    has_reasoning: bool,
+}
+
+impl SseTokenStats {
+    fn new() -> Self {
+        Self {
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            reasoning_tokens: 0,
+            cache_hit_tokens: 0,
+            total_tokens: 0,
+            has_reasoning: false,
+        }
+    }
+
+    /// 从 OpenAI usage 对象中提取 token 统计
+    fn extract_from_usage(&mut self, jv: &JsonValue) {
+        if let Some(usage) = jv.get("usage").and_then(JsonValue::as_object) {
+            if let Some(p) = usage.get("prompt_tokens").and_then(JsonValue::as_u64) {
+                self.prompt_tokens = p;
+            }
+            if let Some(c) = usage.get("completion_tokens").and_then(JsonValue::as_u64) {
+                self.completion_tokens = c;
+            }
+            if let Some(t) = usage.get("total_tokens").and_then(JsonValue::as_u64) {
+                self.total_tokens = t;
+            }
+            if let Some(details) = usage.get("prompt_tokens_details").and_then(JsonValue::as_object) {
+                if let Some(h) = details.get("cached_tokens").and_then(JsonValue::as_u64) {
+                    self.cache_hit_tokens = h;
+                }
+            }
+            if let Some(details) = usage.get("completion_tokens_details").and_then(JsonValue::as_object) {
+                if let Some(r) = details.get("reasoning_tokens").and_then(JsonValue::as_u64) {
+                    self.reasoning_tokens = r;
+                    self.has_reasoning = true;
+                }
+            }
+        }
+    }
+
+    /// 将统计写入日志并更新指标
+    async fn finalize(&self, ctx: &ModelProxyContext, log: &mut ProxyRequestLog) {
+        log.prompt_tokens = (self.prompt_tokens > 0).then_some(self.prompt_tokens);
+        log.completion_tokens = (self.completion_tokens > 0).then_some(self.completion_tokens);
+        log.reasoning_tokens = (self.reasoning_tokens > 0).then_some(self.reasoning_tokens);
+        log.prompt_cache_hit_tokens = (self.cache_hit_tokens > 0).then_some(self.cache_hit_tokens);
+        log.total_tokens = if self.total_tokens > 0 {
+            Some(self.total_tokens)
+        } else if self.prompt_tokens + self.completion_tokens > 0 {
+            Some(self.prompt_tokens + self.completion_tokens)
+        } else {
+            None
+        };
+
+        if self.has_reasoning {
+            ctx.metrics.total_reasoning_requests.fetch_add(1, Ordering::Relaxed);
+        }
+        if self.prompt_tokens > 0 {
+            ctx.metrics.total_prompt_tokens.fetch_add(self.prompt_tokens, Ordering::Relaxed);
+        }
+        if self.completion_tokens > 0 {
+            ctx.metrics.total_completion_tokens.fetch_add(self.completion_tokens, Ordering::Relaxed);
+        }
+        if self.reasoning_tokens > 0 {
+            ctx.metrics.total_reasoning_tokens.fetch_add(self.reasoning_tokens, Ordering::Relaxed);
+        }
+        if self.cache_hit_tokens > 0 {
+            ctx.metrics.total_cache_hit_tokens.fetch_add(self.cache_hit_tokens, Ordering::Relaxed);
+        }
+        if let Some(t) = log.total_tokens {
+            ctx.metrics.total_tokens.fetch_add(t, Ordering::Relaxed);
+        }
+    }
+}
+
+/// 从 SSE 行中提取 data 内容，返回 (data_str, is_done)
+/// 如果不是 data 行，返回 None
+fn parse_sse_data_line(line: &str) -> Option<(&str, bool)> {
+    if !line.starts_with("data: ") {
+        return None;
+    }
+    let data = &line["data: ".len()..];
+    let is_done = data == "[DONE]";
+    Some((data, is_done))
+}
+
 /// OpenAI 标准 SSE 流清洗与指标统计
 pub fn clean_sse_stream(
     stream: impl futures_util::Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
@@ -18,11 +112,7 @@ pub fn clean_sse_stream(
     let s = async_stream::stream! {
         let mut buffer = String::new();
         let mut ttft_recorded = false;
-        let mut total_prompt_tokens = 0u64;
-        let mut total_completion_tokens = 0u64;
-        let mut total_reasoning_tokens = 0u64;
-        let mut total_cache_hit_tokens = 0u64;
-        let mut total_all_tokens = 0u64;
+        let mut stats = SseTokenStats::new();
         let mut has_reasoning = false;
 
         tokio::pin!(stream);
@@ -37,9 +127,8 @@ pub fn clean_sse_stream(
                             let line = buffer[..newline_pos].trim_end_matches('\r').to_string();
                             buffer = buffer[newline_pos + 1..].to_string();
 
-                            if line.starts_with("data: ") {
-                                let data = &line["data: ".len()..];
-                                if data == "[DONE]" {
+                            if let Some((data, is_done)) = parse_sse_data_line(&line) {
+                                if is_done {
                                     yield Ok::<Bytes, std::io::Error>(Bytes::from("data: [DONE]\n\n"));
                                     continue;
                                 }
@@ -51,28 +140,7 @@ pub fn clean_sse_stream(
                                         ttft_recorded = true;
                                     }
 
-                                    if let Some(usage) = jv.get("usage").and_then(JsonValue::as_object) {
-                                        if let Some(p) = usage.get("prompt_tokens").and_then(JsonValue::as_u64) {
-                                            total_prompt_tokens = p;
-                                        }
-                                        if let Some(c) = usage.get("completion_tokens").and_then(JsonValue::as_u64) {
-                                            total_completion_tokens = c;
-                                        }
-                                        if let Some(t) = usage.get("total_tokens").and_then(JsonValue::as_u64) {
-                                            total_all_tokens = t;
-                                        }
-                                        if let Some(details) = usage.get("prompt_tokens_details").and_then(JsonValue::as_object) {
-                                            if let Some(h) = details.get("cached_tokens").and_then(JsonValue::as_u64) {
-                                                total_cache_hit_tokens = h;
-                                            }
-                                        }
-                                        if let Some(details) = usage.get("completion_tokens_details").and_then(JsonValue::as_object) {
-                                            if let Some(r) = details.get("reasoning_tokens").and_then(JsonValue::as_u64) {
-                                                total_reasoning_tokens = r;
-                                                has_reasoning = true;
-                                            }
-                                        }
-                                    }
+                                    stats.extract_from_usage(&jv);
 
                                     if let Some(delta) = jv.pointer_mut("/choices/0/delta") {
                                         let mut extracted_reasoning = None;
@@ -115,36 +183,10 @@ pub fn clean_sse_stream(
         let dur = start_time.elapsed().as_millis() as u64;
         log.duration_ms = dur;
         log.status_code = 200;
-        log.prompt_tokens = (total_prompt_tokens > 0).then_some(total_prompt_tokens);
-        log.completion_tokens = (total_completion_tokens > 0).then_some(total_completion_tokens);
-        log.reasoning_tokens = (total_reasoning_tokens > 0).then_some(total_reasoning_tokens);
-        log.prompt_cache_hit_tokens = (total_cache_hit_tokens > 0).then_some(total_cache_hit_tokens);
-        log.total_tokens = if total_all_tokens > 0 {
-            Some(total_all_tokens)
-        } else if total_prompt_tokens + total_completion_tokens > 0 {
-            Some(total_prompt_tokens + total_completion_tokens)
-        } else {
-            None
-        };
-
         if has_reasoning {
-            ctx.metrics.total_reasoning_requests.fetch_add(1, Ordering::Relaxed);
+            stats.has_reasoning = true;
         }
-        if total_prompt_tokens > 0 {
-            ctx.metrics.total_prompt_tokens.fetch_add(total_prompt_tokens, Ordering::Relaxed);
-        }
-        if total_completion_tokens > 0 {
-            ctx.metrics.total_completion_tokens.fetch_add(total_completion_tokens, Ordering::Relaxed);
-        }
-        if total_reasoning_tokens > 0 {
-            ctx.metrics.total_reasoning_tokens.fetch_add(total_reasoning_tokens, Ordering::Relaxed);
-        }
-        if total_cache_hit_tokens > 0 {
-            ctx.metrics.total_cache_hit_tokens.fetch_add(total_cache_hit_tokens, Ordering::Relaxed);
-        }
-        if let Some(t) = log.total_tokens {
-            ctx.metrics.total_tokens.fetch_add(t, Ordering::Relaxed);
-        }
+        stats.finalize(&ctx, &mut log).await;
 
         ctx.record_log(log).await;
     };
@@ -180,9 +222,8 @@ pub fn openai_to_anthropic_sse_stream(
                             let line = buffer[..newline_pos].trim_end_matches('\r').to_string();
                             buffer = buffer[newline_pos + 1..].to_string();
 
-                            if line.starts_with("data: ") {
-                                let data = &line["data: ".len()..];
-                                if data == "[DONE]" {
+                            if let Some((data, is_done)) = parse_sse_data_line(&line) {
+                                if is_done {
                                     let stop_event = json!({
                                         "type": "message_stop"
                                     });
@@ -317,9 +358,8 @@ pub fn openai_to_gemini_sse_stream(
                             let line = buffer[..newline_pos].trim_end_matches('\r').to_string();
                             buffer = buffer[newline_pos + 1..].to_string();
 
-                            if line.starts_with("data: ") {
-                                let data = &line["data: ".len()..];
-                                if data == "[DONE]" {
+                            if let Some((data, is_done)) = parse_sse_data_line(&line) {
+                                if is_done {
                                     continue;
                                 }
 
@@ -395,9 +435,8 @@ pub fn openai_to_responses_sse_stream(
                             let line = buffer[..newline_pos].trim_end_matches('\r').to_string();
                             buffer = buffer[newline_pos + 1..].to_string();
 
-                            if line.starts_with("data: ") {
-                                let data = &line["data: ".len()..];
-                                if data == "[DONE]" {
+                            if let Some((data, is_done)) = parse_sse_data_line(&line) {
+                                if is_done {
                                     yield Ok::<Bytes, std::io::Error>(Bytes::from(format!("event: response.done\ndata: {}\n\n", json!({"type": "response.done"}))));
                                     continue;
                                 }

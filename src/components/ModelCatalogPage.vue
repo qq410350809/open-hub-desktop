@@ -5,6 +5,7 @@ import { useStore } from "../composables/useStore";
 import type { ModelCatalogDetail, ModelCatalogItem, ModelCatalogProvider, ModelCatalogHostItem } from "../types";
 import AppTable, { type AppTableColumn } from "./AppTable.vue";
 import CustomSelect from "./CustomSelect.vue";
+import { formatTokens as formatTokensUtil, formatTokensFull as formatTokensFullUtil, formatPrice as formatPriceUtil } from "../utils";
 
 const store = useStore();
 
@@ -433,15 +434,11 @@ function modalityLabel(mod: string) {
 }
 
 function formatTokens(value: number): string {
-  if (!value) return "—";
-  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(value % 1_000_000 ? 1 : 0)}M`;
-  if (value >= 1_000) return `${(value / 1_000).toFixed(value % 1_000 ? 1 : 0)}K`;
-  return String(value);
+  return formatTokensUtil(value);
 }
 
 function formatTokensFull(value: number): string {
-  if (!value) return "—";
-  return value.toLocaleString("zh-CN");
+  return formatTokensFullUtil(value);
 }
 
 function formatHugeTokens(value: number): string {
@@ -453,10 +450,7 @@ function formatHugeTokens(value: number): string {
 }
 
 function formatPrice(cost: number | undefined | null): string {
-  if (cost === undefined || cost === null || cost <= 0) return "—";
-  if (cost < 0.01) return `$${cost.toFixed(4)}`;
-  if (cost < 1) return `$${cost.toFixed(3)}`;
-  return `$${cost.toFixed(2)}`;
+  return formatPriceUtil(cost);
 }
 
 function dateText(value: string) {

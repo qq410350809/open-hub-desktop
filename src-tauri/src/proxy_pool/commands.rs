@@ -45,7 +45,7 @@ pub fn save_proxy_subscription(
     let id = id
         .filter(|item| !item.trim().is_empty())
         .unwrap_or_else(|| stable_id(&["proxy-source", &source]));
-    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    let connection = database.lock_conn()?;
     connection.execute(
         "INSERT INTO proxy_subscriptions (id, name, url, created_at, updated_at) VALUES (?1, ?2, ?3, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
          ON CONFLICT(id) DO UPDATE SET name = excluded.name, url = excluded.url, updated_at = CURRENT_TIMESTAMP",
@@ -60,7 +60,7 @@ pub fn delete_proxy_subscription(
     runtime: State<'_, ProxyRuntime>,
     id: String,
 ) -> Result<ProxyPoolState, String> {
-    let mut connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    let mut connection = database.lock_conn()?;
     let transaction = connection
         .transaction()
         .map_err(|error| error.to_string())?;
@@ -77,15 +77,7 @@ pub fn delete_proxy_subscription(
         .execute("DELETE FROM proxy_subscriptions WHERE id = ?1", [&id])
         .map_err(|error| error.to_string())?;
     transaction.execute("DELETE FROM proxy_pool_nodes WHERE id NOT IN (SELECT node_id FROM proxy_subscription_nodes)", []).map_err(|error| error.to_string())?;
-    let active = transaction
-        .query_row(
-            "SELECT value FROM app_meta WHERE key = ?1",
-            [ACTIVE_PROXY_NODE_KEY],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()
-        .map_err(|error| error.to_string())?
-        .unwrap_or_default();
+    let active = crate::db::read_meta_conn(&transaction, ACTIVE_PROXY_NODE_KEY)?;
     if !active.is_empty() {
         let exists = transaction
             .query_row(
@@ -140,7 +132,7 @@ pub async fn refresh_proxy_subscription(
     emit_progress("queued", "running", "来源已加入解析队列".into(), 0, 0, 0, 0);
 
     let source = {
-        let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+        let connection = database.lock_conn()?;
         connection
             .query_row(
                 "SELECT url FROM proxy_subscriptions WHERE id = ?1",
@@ -221,7 +213,7 @@ pub async fn refresh_proxy_subscription(
     let nodes = match parsed {
         Ok(nodes) => nodes,
         Err(error) => {
-            let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+            let connection = database.lock_conn()?;
             connection
                 .execute(
                     "UPDATE proxy_subscriptions SET last_error = ?2, updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
@@ -269,7 +261,7 @@ pub async fn refresh_proxy_subscription(
         discarded,
     );
 
-    let mut connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    let mut connection = database.lock_conn()?;
     let transaction = connection
         .transaction()
         .map_err(|error| error.to_string())?;
@@ -353,7 +345,7 @@ pub async fn refresh_proxy_subscription(
     let _ = tokio::task::block_in_place(|| ensure_runtime(&database, &runtime, None, None));
 
     let subscription = {
-        let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+        let connection = database.lock_conn()?;
         connection
             .query_row(
                 "SELECT id, name, url, node_count, last_error, created_at, updated_at FROM proxy_subscriptions WHERE id = ?1",
@@ -388,7 +380,7 @@ pub fn set_proxy_pool_settings(
     ignore_addresses: String,
 ) -> Result<ProxyPoolState, String> {
     let ignore = normalize_ignore_addresses(&ignore_addresses);
-    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    let connection = database.lock_conn()?;
     write_meta(&connection, PROXY_IGNORE_KEY, &ignore)?;
     drop(connection);
     load_state(&database, &runtime)
@@ -408,7 +400,7 @@ pub fn save_proxy_channel(
     let channel_id = id
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| stable_id(&["proxy-channel", name]));
-    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    let connection = database.lock_conn()?;
     ensure_default_proxy_channel(&connection)?;
     connection
         .execute(
@@ -435,7 +427,7 @@ pub fn delete_proxy_channel(
     if id == DEFAULT_PROXY_CHANNEL_ID {
         return Err("默认通道不能删除".into());
     }
-    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    let connection = database.lock_conn()?;
     ensure_default_proxy_channel(&connection)?;
     let count: i64 = connection
         .query_row("SELECT COUNT(*) FROM proxy_channels", [], |row| row.get(0))
@@ -490,7 +482,7 @@ pub fn assign_account_proxy_channel(
     if profile_id.is_empty() || channel_id.is_empty() {
         return Err("账号或通道标识为空".into());
     }
-    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    let connection = database.lock_conn()?;
     ensure_default_proxy_channel(&connection)?;
     let current_channel: Option<String> = connection
         .query_row(
@@ -531,7 +523,7 @@ pub fn unassign_account_proxy_channel(
     if profile_id.is_empty() {
         return Err("账号标识为空".into());
     }
-    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    let connection = database.lock_conn()?;
     connection
         .execute(
             "DELETE FROM account_proxy_channels WHERE profile_id = ?1",
@@ -591,7 +583,7 @@ pub async fn set_active_proxy_node(
     node_id: String,
 ) -> Result<ProxyPoolState, String> {
     let runtime_name = {
-        let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+        let connection = database.lock_conn()?;
         connection
             .query_row(
                 "SELECT id FROM proxy_pool_nodes WHERE id=?1",
@@ -607,7 +599,7 @@ pub async fn set_active_proxy_node(
     tokio::task::block_in_place(|| ensure_runtime(&database, &runtime, Some(&only), None))?;
     select_runtime_node(&runtime, &runtime_name).await?;
     let proxy_url = runtime_proxy_url(&runtime);
-    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    let connection = database.lock_conn()?;
     write_meta(&connection, ACTIVE_PROXY_NODE_KEY, &node_id)?;
     write_meta(&connection, NETWORK_PROXY_KEY, &proxy_url)?;
     drop(connection);
@@ -619,7 +611,7 @@ pub fn clear_active_proxy_node(
     database: State<'_, Database>,
     runtime: State<'_, ProxyRuntime>,
 ) -> Result<ProxyPoolState, String> {
-    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    let connection = database.lock_conn()?;
     write_meta(&connection, ACTIVE_PROXY_NODE_KEY, "")?;
     write_meta(&connection, NETWORK_PROXY_KEY, "")?;
     drop(connection);
@@ -631,7 +623,7 @@ pub fn delete_invalid_proxy_nodes(
     database: State<'_, Database>,
     runtime: State<'_, ProxyRuntime>,
 ) -> Result<ProxyPoolState, String> {
-    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    let connection = database.lock_conn()?;
     connection
         .execute(
             "DELETE FROM proxy_pool_nodes WHERE test_status = 'invalid'",
@@ -665,7 +657,7 @@ pub async fn test_proxy_node(
     let controller_port = runtime_controller_port(&test_runtime)?;
     tokio::task::block_in_place(|| wait_runtime_ready(controller_port, 1, None))?;
     let configured = {
-        let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+        let connection = database.lock_conn()?;
         let exists = connection
             .query_row(
                 "SELECT 1 FROM proxy_pool_nodes WHERE id=?1",
@@ -678,16 +670,13 @@ pub async fn test_proxy_node(
         if !exists {
             return Err("代理节点不存在".into());
         }
-        connection
-            .query_row(
-                "SELECT value FROM app_meta WHERE key=?1",
-                [PROXY_SPEED_TEST_URL_KEY],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(|error| error.to_string())?
-            .filter(|item| !item.is_empty() && !is_slow_or_blocked_speed_test_url(item))
-            .unwrap_or_else(|| DEFAULT_PROXY_SPEED_TEST_URL.to_string())
+        let value = crate::db::read_meta_conn(&connection, PROXY_SPEED_TEST_URL_KEY)?;
+        let trimmed = value.trim();
+        if !trimmed.is_empty() && !is_slow_or_blocked_speed_test_url(trimmed) {
+            trimmed.to_string()
+        } else {
+            DEFAULT_PROXY_SPEED_TEST_URL.to_string()
+        }
     };
     let client = controller_client()?;
     let mut latency = None;
@@ -712,7 +701,7 @@ pub async fn test_proxy_node(
         Some(format!("测速失败，已尝试 {} 个测速地址", attempted.len()))
     };
     {
-        let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+        let connection = database.lock_conn()?;
         connection
             .execute(
                 "UPDATE proxy_pool_nodes SET latency_ms=?2, test_status=?3, tested_at=CURRENT_TIMESTAMP WHERE id=?1",
@@ -887,7 +876,7 @@ pub fn analyze_proxy_nodes(
         .cloned()
         .collect::<Vec<_>>();
     if !missing.is_empty() {
-        let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+        let connection = database.lock_conn()?;
         for node in missing {
             let (code, name, class, ip) =
                 classify_node_location(&node.name, &node.server, node.port, None);

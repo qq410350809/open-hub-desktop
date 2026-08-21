@@ -568,7 +568,7 @@ pub(crate) fn cached_profile_ids_for_sites(
     if site_ids.is_empty() {
         return Ok(HashMap::new());
     }
-    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    let connection = database.lock_conn()?;
     let mut statement = connection
         .prepare(
             "SELECT site_id, profile_id FROM site_accounts

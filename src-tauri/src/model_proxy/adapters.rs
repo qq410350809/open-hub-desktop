@@ -583,6 +583,283 @@ impl ResponsesProtocolAdapter {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Anthropic Claude Messages 协议适配器 (Anthropic ↔ OpenAI 双向转换)
+// ---------------------------------------------------------------------------
+
+pub struct AnthropicProtocolAdapter;
+
+impl AnthropicProtocolAdapter {
+    /// 将 Anthropic tools 格式转换为 OpenAI tools 格式
+    fn convert_tools(anthropic_body: &JsonValue) -> Vec<JsonValue> {
+        let mut openai_tools = Vec::new();
+        if let Some(tools_arr) = anthropic_body.get("tools").and_then(JsonValue::as_array) {
+            for t in tools_arr {
+                let mut name = String::new();
+                let mut desc = String::new();
+                let mut schema = json!({"type": "object", "properties": {}});
+
+                if let Some(n) = t.get("name").and_then(JsonValue::as_str) {
+                    name = n.trim().to_string();
+                }
+                if let Some(d) = t.get("description").and_then(JsonValue::as_str) {
+                    desc = d.to_string();
+                }
+                if let Some(s) = t.get("input_schema").or_else(|| t.get("parameters")) {
+                    schema = s.clone();
+                }
+
+                // 兼容 OpenAI 嵌套格式
+                if name.is_empty() {
+                    if let Some(f) = t.get("function").and_then(JsonValue::as_object) {
+                        if let Some(n) = f.get("name").and_then(JsonValue::as_str) {
+                            name = n.trim().to_string();
+                        }
+                        if let Some(d) = f.get("description").and_then(JsonValue::as_str) {
+                            desc = d.to_string();
+                        }
+                        if let Some(p) = f.get("parameters") {
+                            schema = p.clone();
+                        }
+                    }
+                }
+
+                if !name.is_empty() {
+                    openai_tools.push(json!({
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "description": desc,
+                            "parameters": schema
+                        }
+                    }));
+                }
+            }
+        }
+        openai_tools
+    }
+
+    /// 将 Anthropic system 字段提取为 OpenAI system message
+    fn convert_system(anthropic_body: &JsonValue) -> Option<JsonValue> {
+        if let Some(system_val) = anthropic_body.get("system") {
+            if let Some(sys_str) = system_val.as_str() {
+                if !sys_str.is_empty() {
+                    return Some(json!({ "role": "system", "content": sys_str }));
+                }
+            } else if let Some(sys_arr) = system_val.as_array() {
+                let mut combined = String::new();
+                for item in sys_arr {
+                    if let Some(t) = item.get("text").and_then(JsonValue::as_str) {
+                        if !combined.is_empty() {
+                            combined.push('\n');
+                        }
+                        combined.push_str(t);
+                    }
+                }
+                if !combined.is_empty() {
+                    return Some(json!({ "role": "system", "content": combined }));
+                }
+            }
+        }
+        None
+    }
+
+    /// 将 Anthropic messages 转换为 OpenAI messages
+    fn convert_messages(anthropic_body: &JsonValue) -> Vec<JsonValue> {
+        let mut messages = Vec::new();
+        if let Some(msgs_arr) = anthropic_body.get("messages").and_then(JsonValue::as_array) {
+            for msg in msgs_arr {
+                let role = msg.get("role").and_then(JsonValue::as_str).unwrap_or("user");
+                if let Some(content_val) = msg.get("content") {
+                    if let Some(c_str) = content_val.as_str() {
+                        messages.push(json!({ "role": role, "content": c_str }));
+                    } else if let Some(c_arr) = content_val.as_array() {
+                        let mut text_parts = String::new();
+                        let mut tool_calls = Vec::new();
+                        let mut tool_results = Vec::new();
+
+                        for block in c_arr {
+                            let b_type = block.get("type").and_then(JsonValue::as_str).unwrap_or("");
+                            match b_type {
+                                "text" => {
+                                    if let Some(t) = block.get("text").and_then(JsonValue::as_str) {
+                                        if !text_parts.is_empty() {
+                                            text_parts.push('\n');
+                                        }
+                                        text_parts.push_str(t);
+                                    }
+                                }
+                                "tool_use" => {
+                                    let id = block.get("id").and_then(JsonValue::as_str).unwrap_or("call_default").to_string();
+                                    let name = block.get("name").and_then(JsonValue::as_str).unwrap_or("").to_string();
+                                    let input_val = block.get("input").cloned().unwrap_or_else(|| json!({}));
+                                    if !name.is_empty() {
+                                        tool_calls.push(json!({
+                                            "id": id,
+                                            "type": "function",
+                                            "function": {
+                                                "name": name,
+                                                "arguments": input_val.to_string()
+                                            }
+                                        }));
+                                    }
+                                }
+                                "tool_result" => {
+                                    let tool_use_id = block.get("tool_use_id").and_then(JsonValue::as_str).unwrap_or("call_default");
+                                    let mut res_str = String::new();
+                                    if let Some(c) = block.get("content") {
+                                        if let Some(s) = c.as_str() {
+                                            res_str = s.to_string();
+                                        } else if let Some(arr) = c.as_array() {
+                                            for part in arr {
+                                                if let Some(t) = part.get("text").and_then(JsonValue::as_str) {
+                                                    res_str.push_str(t);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    tool_results.push(json!({
+                                        "role": "tool",
+                                        "tool_call_id": tool_use_id,
+                                        "content": res_str
+                                    }));
+                                }
+                                _ => {}
+                            }
+                        }
+
+                        if !tool_results.is_empty() {
+                            for tr in tool_results {
+                                messages.push(tr);
+                            }
+                        } else if !tool_calls.is_empty() {
+                            messages.push(json!({
+                                "role": "assistant",
+                                "content": if text_parts.is_empty() { JsonValue::Null } else { JsonValue::String(text_parts) },
+                                "tool_calls": tool_calls
+                            }));
+                        } else {
+                            messages.push(json!({
+                                "role": role,
+                                "content": text_parts
+                            }));
+                        }
+                    }
+                }
+            }
+        }
+        messages
+    }
+
+    /// 将 Anthropic Messages API 请求体转换为 OpenAI Chat Completions 请求体
+    pub fn anthropic_request_to_openai(anthropic_body: &JsonValue, target_model: &str, stream: bool) -> JsonValue {
+        let mut messages = Vec::new();
+
+        // 1. 提取 system
+        if let Some(sys_msg) = Self::convert_system(anthropic_body) {
+            messages.push(sys_msg);
+        }
+
+        // 2. 转换 messages
+        messages.extend(Self::convert_messages(anthropic_body));
+
+        // 3. 构建基础 OpenAI 请求
+        let mut openai_req = json!({
+            "model": target_model,
+            "messages": messages,
+            "stream": stream
+        });
+
+        // 4. 映射参数
+        if let Some(temp) = anthropic_body.get("temperature").and_then(JsonValue::as_f64) {
+            openai_req["temperature"] = json!(temp);
+        }
+        if let Some(max_tokens) = anthropic_body.get("max_tokens").and_then(JsonValue::as_i64) {
+            openai_req["max_tokens"] = json!(max_tokens);
+        }
+
+        // 5. 转换 tools
+        let openai_tools = Self::convert_tools(anthropic_body);
+        if !openai_tools.is_empty() {
+            openai_req["tools"] = json!(openai_tools);
+        }
+
+        OpenAiProtocolAdapter::sanitize_and_normalize(&mut openai_req);
+        openai_req
+    }
+
+    /// 将 OpenAI 非流式响应转换为 Anthropic Messages 响应格式
+    pub fn openai_response_to_anthropic(openai_resp: &JsonValue, req_id: &str, model: &str) -> JsonValue {
+        let mut content_blocks = Vec::new();
+
+        // 提取文本内容
+        let text = openai_resp
+            .pointer("/choices/0/message/content")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("");
+        if !text.is_empty() {
+            content_blocks.push(json!({ "type": "text", "text": text }));
+        }
+
+        // 提取 tool_calls
+        if let Some(tool_calls) = openai_resp
+            .pointer("/choices/0/message/tool_calls")
+            .and_then(JsonValue::as_array)
+        {
+            for tc in tool_calls {
+                let id = tc.get("id").and_then(JsonValue::as_str).unwrap_or("call_default");
+                let name = tc.pointer("/function/name").and_then(JsonValue::as_str).unwrap_or("tool");
+                let args_str = tc.pointer("/function/arguments").and_then(JsonValue::as_str).unwrap_or("{}");
+                let args_val = serde_json::from_str::<JsonValue>(args_str).unwrap_or_else(|_| json!({}));
+                content_blocks.push(json!({
+                    "type": "tool_use",
+                    "id": id,
+                    "name": name,
+                    "input": args_val
+                }));
+            }
+        }
+
+        // 映射 stop_reason
+        let finish_reason = openai_resp
+            .pointer("/choices/0/finish_reason")
+            .and_then(JsonValue::as_str);
+        let stop_reason = match finish_reason {
+            Some("stop") => "end_turn",
+            Some("length") => "max_tokens",
+            Some("tool_calls") => "tool_use",
+            _ => "end_turn",
+        };
+
+        // 映射 usage
+        let usage = openai_resp.get("usage");
+        let p_tok = usage.and_then(|u| u.get("prompt_tokens")).and_then(JsonValue::as_u64).unwrap_or(0);
+        let c_tok = usage.and_then(|u| u.get("completion_tokens")).and_then(JsonValue::as_u64).unwrap_or(0);
+
+        json!({
+            "id": format!("msg_{req_id}"),
+            "type": "message",
+            "role": "assistant",
+            "model": model,
+            "content": content_blocks,
+            "stop_reason": stop_reason,
+            "stop_sequence": null,
+            "usage": {
+                "input_tokens": p_tok,
+                "output_tokens": c_tok
+            }
+        })
+    }
+
+    /// 提取 OpenAI 响应中的 token 用量信息，供日志记录使用
+    pub fn extract_token_usage(openai_resp: &JsonValue) -> (u64, u64) {
+        let usage = openai_resp.get("usage");
+        let p_tok = usage.and_then(|u| u.get("prompt_tokens")).and_then(JsonValue::as_u64).unwrap_or(0);
+        let c_tok = usage.and_then(|u| u.get("completion_tokens")).and_then(JsonValue::as_u64).unwrap_or(0);
+        (p_tok, c_tok)
+    }
+}
+
 #[inline]
 pub fn normalize_chat_messages(body: &mut JsonValue) {
     OpenAiProtocolAdapter::sanitize_and_normalize(body);

@@ -6,6 +6,7 @@ import { useConfirm } from "../composables/useConfirm";
 import AppTable, { type AppTableColumn } from "./AppTable.vue";
 import type { CharityFeedItem } from "../types";
 import type { SortingState } from "@tanstack/table-core";
+import { formatCompactCount as formatCompactCountUtil, formatDuration as formatDurationUtil } from "../utils";
 
 const store = useStore();
 const { confirm } = useConfirm();
@@ -217,15 +218,7 @@ function formatPublishedAt(value?: string) {
 }
 
 function formatCompactCount(value?: number | null) {
-  const amount = Number(value ?? 0);
-  if (!Number.isFinite(amount) || amount <= 0) return "0";
-  if (amount < 1000) return String(Math.round(amount));
-  if (amount < 10000) {
-    const text = (amount / 1000).toFixed(1).replace(/\.0$/, "");
-    return `${text}k`;
-  }
-  if (amount < 1000000) return `${Math.round(amount / 1000)}k`;
-  return `${(amount / 1000000).toFixed(1).replace(/\.0$/, "")}m`;
+  return formatCompactCountUtil(value);
 }
 
 function formatRelativeActivity(value?: string, fallback?: string) {
@@ -261,9 +254,7 @@ function formatLogTime(value: string) {
 }
 
 function formatDuration(ms?: number) {
-  if (ms == null || ms < 0) return "—";
-  if (ms < 1000) return `${ms}ms`;
-  return `${(ms / 1000).toFixed(1)}s`;
+  return formatDurationUtil(ms);
 }
 
 function statusText(status: string) {

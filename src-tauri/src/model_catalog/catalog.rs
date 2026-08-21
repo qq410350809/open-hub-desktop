@@ -363,15 +363,7 @@ fn clear_legacy_catalog_if_needed(connection: &mut rusqlite::Connection) -> Resu
         )
         .map_err(|error| error.to_string())?;
 
-    let schema_version = connection
-        .query_row(
-            "SELECT value FROM app_meta WHERE key = ?1",
-            [CATALOG_SCHEMA_META_KEY],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()
-        .map_err(|error| error.to_string())?
-        .unwrap_or_default();
+    let schema_version = crate::db::read_meta_conn(&connection, CATALOG_SCHEMA_META_KEY)?;
 
     if schema_version != CATALOG_SCHEMA_VERSION {
         let transaction = connection
@@ -382,13 +374,7 @@ fn clear_legacy_catalog_if_needed(connection: &mut rusqlite::Connection) -> Resu
         let _ = transaction.execute("DROP TABLE IF EXISTS model_catalog_providers", []);
         let _ = transaction.execute("DROP TABLE IF EXISTS model_catalog_sources", []);
 
-        transaction
-            .execute(
-                "INSERT INTO app_meta (key, value) VALUES (?1, ?2)
-                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                params![CATALOG_SCHEMA_META_KEY, CATALOG_SCHEMA_VERSION],
-            )
-            .map_err(|error| error.to_string())?;
+        crate::db::write_meta(&transaction, CATALOG_SCHEMA_META_KEY, CATALOG_SCHEMA_VERSION)?;
         transaction.commit().map_err(|error| error.to_string())?;
     }
 
@@ -396,7 +382,7 @@ fn clear_legacy_catalog_if_needed(connection: &mut rusqlite::Connection) -> Resu
 }
 
 fn is_synced_today(database: &Database) -> Result<bool, String> {
-    let mut connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    let mut connection = database.lock_conn()?;
     clear_legacy_catalog_if_needed(&mut connection)?;
     let count = connection
         .query_row(
@@ -609,7 +595,7 @@ fn persist_catalog_llmpricing(
     manifest: &Value,
     shards_data: &[(String, String, Value)],
 ) -> Result<CatalogSyncReport, String> {
-    let mut connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    let mut connection = database.lock_conn()?;
     ensure_catalog_schema(&mut connection)?;
 
     let transaction = connection
@@ -806,13 +792,7 @@ fn persist_catalog_llmpricing(
         model_count += 1;
     }
 
-    transaction
-        .execute(
-            "INSERT INTO app_meta (key, value) VALUES (?1, ?2)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            params![CATALOG_SCHEMA_META_KEY, CATALOG_SCHEMA_VERSION],
-        )
-        .map_err(|error| error.to_string())?;
+    crate::db::write_meta(&transaction, CATALOG_SCHEMA_META_KEY, CATALOG_SCHEMA_VERSION)?;
 
     transaction.commit().map_err(|error| error.to_string())?;
 
@@ -829,7 +809,7 @@ pub fn get_model_catalog(database: State<'_, Database>) -> Result<ModelCatalogSn
 }
 
 pub(crate) fn get_model_catalog_inner(database: &Database) -> Result<ModelCatalogSnapshot, String> {
-    let mut connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    let mut connection = database.lock_conn()?;
     clear_legacy_catalog_if_needed(&mut connection)?;
 
     let mut statement = connection
@@ -1009,7 +989,7 @@ pub(crate) async fn get_model_catalog_detail_inner(
     key: &str,
 ) -> Result<ModelCatalogDetail, String> {
     let (model, raw, cached_hosts_json, all_providers_map) = {
-        let mut connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+        let mut connection = database.lock_conn()?;
         clear_legacy_catalog_if_needed(&mut connection)?;
 
         let model_res = connection.query_row(
@@ -1326,6 +1306,7 @@ pub(crate) async fn sync_model_catalog_inner(
 }
 
 /// 一次性同步入口（供 `cargo run --example sync_model_catalog` 使用）
+#[allow(dead_code)]
 pub fn sync_model_catalog_once(db_path: &str) -> Result<CatalogSyncReport, String> {
     let database = Database::open(std::path::Path::new(db_path))?;
     let runtime = ModelCatalogRuntime::new();

@@ -219,7 +219,7 @@ pub fn list_charity_sync_logs(
     limit: usize,
 ) -> Result<Vec<CharitySyncLogEntry>, String> {
     let limit = limit.clamp(1, CHARITY_SYNC_LOG_LIMIT);
-    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    let connection = database.lock_conn()?;
     let mut statement = connection
         .prepare(
             "SELECT id, created_at, feed_id, feed_name, stage, status, message, node_name, duration_ms
@@ -259,7 +259,7 @@ pub fn persist_feed(
     let initialized_key = keys.initialized.clone();
     let source_key = keys.source_url.clone();
     let fetched_key = keys.fetched_at.clone();
-    let mut connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    let mut connection = database.lock_conn()?;
     let initialized = connection
         .query_row(
             "SELECT value FROM app_meta WHERE key = ?1",
@@ -436,7 +436,7 @@ pub fn load_all_feed_items_from_db(
     keyword: &str,
 ) -> Result<CharityFeedResult, String> {
     let limit = limit.clamp(1, CHARITY_PAGE_LIMIT_MAX);
-    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    let connection = database.lock_conn()?;
     let key_pat = format!("%{}%", keyword.trim());
     let has_key = !keyword.trim().is_empty();
     let total_count = if has_key {
@@ -602,15 +602,9 @@ pub fn load_feed_items_from_db(
 ) -> Result<CharityFeedResult, String> {
     let limit = limit.clamp(1, CHARITY_PAGE_LIMIT_MAX);
     let keys = feed_meta_keys(&source.id);
-    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    let connection = database.lock_conn()?;
     let read_meta = |key: &str| -> Result<String, String> {
-        connection
-            .query_row("SELECT value FROM app_meta WHERE key = ?1", [key], |row| {
-                row.get(0)
-            })
-            .optional()
-            .map(|value| value.unwrap_or_default())
-            .map_err(|error| error.to_string())
+        crate::db::read_meta_conn(&connection, key)
     };
     let initialized = !read_meta(&keys.initialized)?.is_empty();
     let fetched_at = read_meta(&keys.fetched_at)?;
@@ -739,7 +733,7 @@ pub fn load_feed_items_from_db(
 }
 
 pub fn cancel_running_charity_sync_logs(database: &Database, reason: &str) -> Result<usize, String> {
-    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    let connection = database.lock_conn()?;
     connection
         .execute(
             "UPDATE charity_sync_logs
@@ -756,7 +750,7 @@ pub fn cancel_running_charity_sync_logs(database: &Database, reason: &str) -> Re
 }
 
 pub fn clear_charity_sync_logs_db(database: &Database) -> Result<(), String> {
-    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    let connection = database.lock_conn()?;
     connection
         .execute("DELETE FROM charity_sync_logs", [])
         .map_err(|error| error.to_string())?;
@@ -789,45 +783,25 @@ pub fn write_feed_sync_meta(
     updated_count: usize,
 ) -> Result<(), String> {
     let keys = feed_meta_keys(feed_id);
-    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    let connection = database.lock_conn()?;
     for (key, value) in [
         (keys.last_status, status.to_string()),
         (keys.last_message, message.to_string()),
         (keys.last_node, node_name.to_string()),
         (keys.last_updated, updated_count.to_string()),
     ] {
-        connection
-            .execute(
-                "INSERT INTO app_meta (key, value) VALUES (?1, ?2)
-                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                params![key, value],
-            )
-            .map_err(|error| error.to_string())?;
+        crate::db::write_meta(&connection, &key, &value)?;
     }
     Ok(())
 }
 
 pub fn read_app_meta(database: &Database, key: &str) -> Result<String, String> {
-    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
-    connection
-        .query_row("SELECT value FROM app_meta WHERE key = ?1", [key], |row| {
-            row.get(0)
-        })
-        .optional()
-        .map(|value| value.unwrap_or_default())
-        .map_err(|error| error.to_string())
+    crate::db::read_meta(database, key)
 }
 
 pub fn write_app_meta(database: &Database, key: &str, value: &str) -> Result<(), String> {
-    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
-    connection
-        .execute(
-            "INSERT INTO app_meta (key, value) VALUES (?1, ?2)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            params![key, value],
-        )
-        .map_err(|error| error.to_string())?;
-    Ok(())
+    let connection = database.lock_conn()?;
+    crate::db::write_meta(&connection, key, value)
 }
 
 pub fn unread_count_for_feed(database: &Database, feed_id: &str) -> Result<usize, String> {
@@ -836,7 +810,7 @@ pub fn unread_count_for_feed(database: &Database, feed_id: &str) -> Result<usize
     if read_at.trim().is_empty() {
         return Ok(0);
     }
-    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    let connection = database.lock_conn()?;
     let count = connection
         .query_row(
             "SELECT COUNT(*) FROM charity_feed_items

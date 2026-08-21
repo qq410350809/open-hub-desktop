@@ -103,7 +103,7 @@ pub(crate) fn read_site(connection: &Connection, id: &str) -> Result<Option<Site
 
 #[tauri::command]
 pub fn list_library(database: State<'_, Database>) -> Result<LibraryData, String> {
-    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    let connection = database.lock_conn()?;
     let mut statement = connection
         .prepare(
             "SELECT id, name, description, registration_limit, icon, api_base_url, system_type,
@@ -235,7 +235,7 @@ pub fn create_site(
     input.favorite = false;
     input.hidden = false;
     let input = normalize_site(input)?;
-    let mut connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    let mut connection = database.lock_conn()?;
 
     let transaction = connection.transaction().map_err(|e| e.to_string())?;
     insert_site_transaction(&transaction, &input)?;
@@ -253,7 +253,7 @@ pub async fn import_site(
     let base_url = normalize_import_base_url(&site_url)?;
     let canonical_url = base_url.to_string();
     {
-        let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+        let connection = database.lock_conn()?;
         let existing = connection
             .query_row(
                 "SELECT name FROM directory_sites
@@ -421,7 +421,7 @@ pub async fn import_site(
     };
     site = normalize_site(site)?;
 
-    let mut connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    let mut connection = database.lock_conn()?;
     let transaction = connection
         .transaction()
         .map_err(|error| error.to_string())?;
@@ -450,7 +450,7 @@ pub fn update_site(
 ) -> Result<SiteRecord, String> {
     input.id = id.clone();
     let mut input = normalize_site(input)?;
-    let mut connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    let mut connection = database.lock_conn()?;
 
     let old_site = read_site(&connection, &id)?.ok_or_else(|| "找不到要更新的站点".to_string())?;
     input.favorite = old_site.favorite;
@@ -523,7 +523,7 @@ pub fn update_site(
 
 #[tauri::command]
 pub fn delete_site(database: State<'_, Database>, id: String) -> Result<(), String> {
-    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    let connection = database.lock_conn()?;
     let changed = connection
         .execute("DELETE FROM directory_sites WHERE id = ?1", [id])
         .map_err(|error| error.to_string())?;
@@ -535,7 +535,7 @@ pub fn delete_site(database: State<'_, Database>, id: String) -> Result<(), Stri
 
 #[tauri::command]
 pub fn toggle_personal(database: State<'_, Database>, id: String) -> Result<SiteRecord, String> {
-    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    let connection = database.lock_conn()?;
     let changed = connection
         .execute(
             &format!(
@@ -572,7 +572,7 @@ fn next_usage_state(is_personal: bool, is_pending: bool) -> (bool, bool) {
 
 #[tauri::command]
 pub fn cycle_usage_state(database: State<'_, Database>, id: String) -> Result<SiteRecord, String> {
-    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    let connection = database.lock_conn()?;
     let site = read_site(&connection, &id)?.ok_or_else(|| "找不到该站点".to_string())?;
     let (is_personal, is_pending) = next_usage_state(site.is_personal, site.is_pending);
 
@@ -592,7 +592,7 @@ pub fn cycle_usage_state(database: State<'_, Database>, id: String) -> Result<Si
 
 #[tauri::command]
 pub fn toggle_pending(database: State<'_, Database>, id: String) -> Result<SiteRecord, String> {
-    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    let connection = database.lock_conn()?;
     // 待定与在用互斥：标为待定时清除在用；取消待定仅清待定。
     let changed = connection
         .execute(
@@ -627,7 +627,7 @@ pub fn set_usage_state(
         "unused" => (false, false),
         _ => return Err("未知的使用状态".into()),
     };
-    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    let connection = database.lock_conn()?;
     let changed = connection
         .execute(
             &format!(
@@ -646,7 +646,7 @@ pub fn set_usage_state(
 
 #[tauri::command]
 pub fn toggle_hidden(database: State<'_, Database>, id: String) -> Result<SiteRecord, String> {
-    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    let connection = database.lock_conn()?;
     let changed = connection
         .execute(
             "UPDATE directory_sites SET hidden = CASE hidden WHEN 0 THEN 1 ELSE 0 END WHERE id = ?1",
@@ -661,7 +661,7 @@ pub fn toggle_hidden(database: State<'_, Database>, id: String) -> Result<SiteRe
 
 #[tauri::command]
 pub fn toggle_runaway(database: State<'_, Database>, id: String) -> Result<SiteRecord, String> {
-    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    let connection = database.lock_conn()?;
     let changed = connection
         .execute(
             &format!("UPDATE directory_sites SET is_runaway = CASE is_runaway WHEN 0 THEN 1 ELSE 0 END, updated_at = {NOW_SQL} WHERE id = ?1"),

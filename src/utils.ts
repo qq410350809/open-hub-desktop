@@ -80,3 +80,66 @@ export function logoText(apiBaseUrl: string, name: string): string {
   const host = hostname(apiBaseUrl).replace(/^www\./, "");
   return (host.split(".")[0] || name).slice(0, 6);
 }
+
+/** 格式化毫秒时长：<1s 显示 ms，否则显示秒（带一位小数）。 */
+export function formatDuration(ms?: number | null): string {
+  if (ms == null || ms < 0) return "—";
+  if (ms < 1000) return `${ms}ms`;
+  return `${(ms / 1000).toFixed(1)}s`;
+}
+
+/** 带正号前缀的时长格式化，用于显示耗时增量。 */
+export function formatElapsed(milliseconds: number): string {
+  if (milliseconds < 1000) return `+${milliseconds}ms`;
+  return `+${(milliseconds / 1000).toFixed(1)}s`;
+}
+
+/** 数字本地化（千分位）。null/undefined 返回 "0"。 */
+export function formatNumber(num: number | undefined | null): string {
+  if (num === undefined || num === null) return "0";
+  return num.toLocaleString();
+}
+
+/** 将秒数格式化为可读的运行时间。 */
+export function formatUptime(seconds: number): string {
+  if (seconds < 60) return `${seconds} 秒`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)} 分钟`;
+  const hours = Math.floor(seconds / 3600);
+  const mins = Math.floor((seconds % 3600) / 60);
+  return `${hours} 小时 ${mins} 分`;
+}
+
+/** 紧凑数字格式：<1k 显示原数，<10k 显示如 1.2k，<1M 显示如 12k，≥1M 显示如 1.5m。 */
+export function formatCompactCount(value?: number | null): string {
+  const amount = Number(value ?? 0);
+  if (!Number.isFinite(amount) || amount <= 0) return "0";
+  if (amount < 1000) return String(Math.round(amount));
+  if (amount < 10000) {
+    const text = (amount / 1000).toFixed(1).replace(/\.0$/, "");
+    return `${text}k`;
+  }
+  if (amount < 1000000) return `${Math.round(amount / 1000)}k`;
+  return `${(amount / 1000000).toFixed(1).replace(/\.0$/, "")}m`;
+}
+
+/** Token 数格式化：≥1M 显示 M，≥1K 显示 K。 */
+export function formatTokens(value: number): string {
+  if (!value) return "—";
+  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(value % 1_000_000 ? 1 : 0)}M`;
+  if (value >= 1_000) return `${(value / 1_000).toFixed(value % 1_000 ? 1 : 0)}K`;
+  return String(value);
+}
+
+/** Token 数完整格式化（千分位）。 */
+export function formatTokensFull(value: number): string {
+  if (!value) return "—";
+  return value.toLocaleString("zh-CN");
+}
+
+/** 价格格式化：<$0.01 显示4位小数，<$1 显示3位，否则2位。 */
+export function formatPrice(cost: number | undefined | null): string {
+  if (cost === undefined || cost === null || cost <= 0) return "—";
+  if (cost < 0.01) return `$${cost.toFixed(4)}`;
+  if (cost < 1) return `$${cost.toFixed(3)}`;
+  return `$${cost.toFixed(2)}`;
+}

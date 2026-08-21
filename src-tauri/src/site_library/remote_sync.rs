@@ -361,7 +361,7 @@ pub async fn sync_remote_sites(
         "正在写入本地数据库并保留本地类型与在用状态".into(),
     );
 
-    let mut connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    let mut connection = database.lock_conn()?;
     let transaction = connection
         .transaction()
         .map_err(|error| error.to_string())?;

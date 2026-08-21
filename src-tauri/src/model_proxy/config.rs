@@ -1,5 +1,5 @@
 use super::types::{default_channels, ChannelConfig, ModelProxyConfig, OpencodeProxyConfig};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::Connection;
 
 pub fn sanitize_channel_config(channel: &mut ChannelConfig) {
     if let Some(alias) = &channel.alias {
@@ -29,17 +29,9 @@ pub fn sanitize_model_proxy_config(config: &mut ModelProxyConfig) {
 }
 
 pub fn load_model_proxy_config(conn: &Connection) -> ModelProxyConfig {
-    let raw: Option<String> = conn
-        .query_row(
-            "SELECT value FROM app_meta WHERE key = 'opencode_proxy_config'",
-            [],
-            |row| row.get(0),
-        )
-        .optional()
-        .unwrap_or(None);
+    let raw = crate::db::read_meta_conn(conn, "opencode_proxy_config").unwrap_or_default();
 
-    let mut cfg = raw
-        .and_then(|json_str| serde_json::from_str::<ModelProxyConfig>(&json_str).ok())
+    let mut cfg = serde_json::from_str::<ModelProxyConfig>(&raw)
         .unwrap_or_default();
 
     sanitize_model_proxy_config(&mut cfg);
@@ -56,13 +48,7 @@ pub fn save_model_proxy_config(conn: &Connection, config: &ModelProxyConfig) -> 
     sanitize_model_proxy_config(&mut c);
     let json_str =
         serde_json::to_string(&c).map_err(|e| format!("序列化模型网关配置失败: {e}"))?;
-    conn.execute(
-        "INSERT INTO app_meta (key, value) VALUES ('opencode_proxy_config', ?1)
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        params![json_str],
-    )
-    .map_err(|e| format!("保存模型网关配置失败: {e}"))?;
-    Ok(())
+    crate::db::write_meta(conn, "opencode_proxy_config", &json_str)
 }
 
 #[allow(dead_code)]

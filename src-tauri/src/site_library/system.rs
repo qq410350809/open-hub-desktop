@@ -18,7 +18,7 @@ pub async fn detect_site_system_types(
         return Ok(0);
     }
     let targets = {
-        let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+        let connection = database.lock_conn()?;
         let mut statement = connection
             .prepare(
                 "SELECT id, api_base_url, system_type FROM directory_sites
@@ -60,7 +60,7 @@ pub async fn detect_site_system_types(
     let profile_ids = cached_profile_ids_for_sites(&database, &target_site_ids)?;
     let detected = probe_site_system_types(&client, targets, profile_ids).await;
     let detected_count = detected.len();
-    let mut connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    let mut connection = database.lock_conn()?;
     let transaction = connection
         .transaction()
         .map_err(|error| error.to_string())?;

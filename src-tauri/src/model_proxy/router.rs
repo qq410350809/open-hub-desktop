@@ -1,5 +1,6 @@
 use super::adapters::{
-    normalize_chat_messages, GeminiProtocolAdapter, ResponsesProtocolAdapter,
+    normalize_chat_messages, AnthropicProtocolAdapter, GeminiProtocolAdapter,
+    ResponsesProtocolAdapter,
 };
 use super::balancer::{
     build_client_for_candidate, format_upstream_error_message, get_node_display_name,
@@ -25,6 +26,7 @@ use serde_json::{json, Value as JsonValue};
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 use tower_http::cors::{Any, CorsLayer};
+use tauri::Manager;
 
 pub fn create_model_proxy_router(ctx: ModelProxyContext) -> Router {
     let cors = CorsLayer::new()
@@ -41,8 +43,8 @@ pub fn create_model_proxy_router(ctx: ModelProxyContext) -> Router {
         // OpenAI Models
         .route("/v1/models", get(handle_models))
         .route("/models", get(handle_models))
-        .route("/v1/models/:model_id", get(handle_single_model))
-        .route("/models/:model_id", get(handle_single_model))
+        .route("/v1/models/{model_id}", get(handle_single_model))
+        .route("/models/{model_id}", get(handle_single_model))
         // OpenAI Chat Completions
         .route("/v1/chat/completions", post(handle_chat_completions))
         .route("/chat/completions", post(handle_chat_completions))
@@ -56,8 +58,8 @@ pub fn create_model_proxy_router(ctx: ModelProxyContext) -> Router {
         .route("/v1/messages", post(handle_messages))
         .route("/messages", post(handle_messages))
         // Google Gemini
-        .route("/v1beta/models", get(handle_gemini_models))
-        .route("/v1beta/models/*model_action", post(handle_gemini_generate))
+        .route("/v1/gemini/models", get(handle_gemini_models))
+        .route("/v1/gemini/models/{*model_action}", post(handle_gemini_generate))
         .layer(cors)
         .with_state(ctx)
 }
@@ -121,6 +123,132 @@ pub async fn check_auth(
     }
 }
 
+/// 构建鉴权失败的 ProxyRequestLog 并记录到上下文
+async fn record_auth_failure(
+    ctx: &ModelProxyContext,
+    req_id: &str,
+    path: &str,
+    model: &str,
+    stream: bool,
+    dur: u64,
+    req_body_str: Option<String>,
+) {
+    ctx.metrics.total_requests.fetch_add(1, Ordering::Relaxed);
+    ctx.metrics.failed_requests.fetch_add(1, Ordering::Relaxed);
+    ctx.record_log(ProxyRequestLog {
+        id: req_id.to_string(),
+        timestamp: current_timestamp(),
+        method: "POST".to_string(),
+        path: path.to_string(),
+        channel_id: "opencode".to_string(),
+        model: model.to_string(),
+        stream,
+        status_code: 401,
+        duration_ms: dur,
+        ttft_ms: None,
+        prompt_tokens: None,
+        prompt_cache_hit_tokens: None,
+        prompt_cache_miss_tokens: None,
+        completion_tokens: None,
+        reasoning_tokens: None,
+        total_tokens: None,
+        error_message: Some("鉴权未通过：请求未携带有效的 API Key".to_string()),
+        request_body: req_body_str,
+        response_body: None,
+        node_name: Some("直连通道".to_string()),
+    })
+    .await;
+}
+
+/// 构建请求基础 ProxyRequestLog（成功路径）
+#[allow(dead_code)]
+fn build_request_log(
+    req_id: &str,
+    path: &str,
+    chan_alias: &str,
+    model: &str,
+    stream: bool,
+    status_code: u16,
+    duration_ms: u64,
+    req_body_str: Option<String>,
+    node_name: String,
+) -> ProxyRequestLog {
+    ProxyRequestLog {
+        id: req_id.to_string(),
+        timestamp: current_timestamp(),
+        method: "POST".to_string(),
+        path: path.to_string(),
+        channel_id: chan_alias.to_string(),
+        model: model.to_string(),
+        stream,
+        status_code,
+        duration_ms,
+        ttft_ms: None,
+        prompt_tokens: None,
+        prompt_cache_hit_tokens: None,
+        prompt_cache_miss_tokens: None,
+        completion_tokens: None,
+        reasoning_tokens: None,
+        total_tokens: None,
+        error_message: None,
+        request_body: req_body_str,
+        response_body: None,
+        node_name: Some(node_name),
+    }
+}
+
+/// 所有候选节点耗尽后，记录失败日志并返回错误响应
+#[allow(dead_code)]
+async fn record_exhausted_error(
+    ctx: &ModelProxyContext,
+    req_id: &str,
+    path: &str,
+    chan_alias: &str,
+    model: &str,
+    stream: bool,
+    last_status: StatusCode,
+    last_error: &str,
+    dur: u64,
+    req_body_str: Option<String>,
+) -> Response {
+    ctx.metrics.failed_requests.fetch_add(1, Ordering::Relaxed);
+    ctx.record_log(ProxyRequestLog {
+        id: req_id.to_string(),
+        timestamp: current_timestamp(),
+        method: "POST".to_string(),
+        path: path.to_string(),
+        channel_id: chan_alias.to_string(),
+        model: model.to_string(),
+        stream,
+        status_code: last_status.as_u16(),
+        duration_ms: dur,
+        ttft_ms: None,
+        prompt_tokens: None,
+        prompt_cache_hit_tokens: None,
+        prompt_cache_miss_tokens: None,
+        completion_tokens: None,
+        reasoning_tokens: None,
+        total_tokens: None,
+        error_message: Some(last_error.to_string()),
+        request_body: req_body_str,
+        response_body: None,
+        node_name: Some("已尝试所有候选节点".to_string()),
+    })
+    .await;
+
+    (
+        last_status,
+        Json(json!({
+            "error": {
+                "message": last_error,
+                "type": "upstream_error",
+                "code": last_status.as_u16()
+            }
+        })),
+    )
+        .into_response()
+}
+
 /// GET /healthz
 pub async fn handle_healthz(State(ctx): State<ModelProxyContext>) -> Response {
     let config = ctx.config.read().await;
@@ -158,36 +286,39 @@ pub async fn handle_healthz(State(ctx): State<ModelProxyContext>) -> Response {
         _ => "直接连接 (直连)",
     };
 
-    let checks = json!([
-        {
-            "name": "本地模型反代网关 (Gateway)",
-            "endpoint": format!("http://127.0.0.1:{}/v1", config.port),
-            "status": "ok",
-            "message": format!("网关正常运行中，已运行 {} 秒", uptime),
-            "auth": auth_desc
-        },
-        {
-            "name": "Google Gemini 兼容端点",
-            "endpoint": format!("http://127.0.0.1:{}/v1beta", config.port),
-            "status": "ok",
-            "message": "已支持 /v1beta/models/* 原生请求",
-            "auth": "Header 或 ?key="
-        },
-        {
-            "name": "Anthropic Claude 兼容端点",
-            "endpoint": format!("http://127.0.0.1:{}/v1/messages", config.port),
-            "status": "ok",
-            "message": "已支持 Claude Desktop / Cline / Cursor 等工具直连",
-            "auth": "x-api-key 或 Bearer"
-        },
-        {
-            "name": "多渠道负载均衡与代理池",
-            "endpoint": proxy_pool_desc,
-            "status": "ok",
-            "message": format!("共配置 {} 个上游渠道，聚合 {} 个模型", config.channels.len(), models_count),
-            "auth": "多 Key 自动轮询"
-        }
-    ]);
+    // 端点配置：数据驱动，新增端点只需在此添加一行
+    let endpoints: &[(&str, &str, &str, &str)] = &[
+        ("本地模型反代网关 (Gateway)", "/v1", "网关正常运行中，已运行 {uptime} 秒", "auth"),
+        ("Google Gemini 兼容端点", "/v1/gemini", "已支持 /v1/gemini/models/* 原生请求", "Header 或 ?key="),
+        ("Anthropic Claude 兼容端点", "/v1/messages", "已支持 Claude Desktop / Cline / Cursor 等工具直连", "x-api-key 或 Bearer"),
+    ];
+
+    let mut checks: Vec<JsonValue> = endpoints
+        .iter()
+        .map(|(name, path, msg_tmpl, auth)| {
+            let message = if msg_tmpl.contains("{uptime}") {
+                msg_tmpl.replace("{uptime}", &uptime.to_string())
+            } else {
+                msg_tmpl.to_string()
+            };
+            json!({
+                "name": name,
+                "endpoint": format!("http://127.0.0.1:{}{}", config.port, path),
+                "status": "ok",
+                "message": message,
+                "auth": if auth == &"auth" { auth_desc } else { auth }
+            })
+        })
+        .collect();
+
+    // 动态端点：多渠道负载均衡信息
+    checks.push(json!({
+        "name": "多渠道负载均衡与代理池",
+        "endpoint": proxy_pool_desc,
+        "status": "ok",
+        "message": format!("共配置 {} 个上游渠道，聚合 {} 个模型", config.channels.len(), models_count),
+        "auth": "多 Key 自动轮询"
+    }));
 
     Json(json!({
         "status": "ok",
@@ -411,7 +542,7 @@ pub async fn handle_embeddings(
     }
 }
 
-/// GET /v1beta/models (Google Gemini 格式)
+/// GET /v1/gemini/models (Google Gemini 格式)
 pub async fn handle_gemini_models(
     headers: HeaderMap,
     uri: Uri,
@@ -459,7 +590,7 @@ pub async fn handle_gemini_models(
     .into_response()
 }
 
-/// POST /v1beta/models/* (Google Gemini 原生协议端点)
+/// POST /v1/gemini/models/* (Google Gemini 原生协议端点)
 pub async fn handle_gemini_generate(
     headers: HeaderMap,
     uri: Uri,
@@ -493,7 +624,7 @@ pub async fn handle_gemini_generate(
             id: req_id,
             timestamp: current_timestamp(),
             method: "POST".to_string(),
-            path: format!("/v1beta/models/{model_action}"),
+            path: format!("/v1/gemini/models/{model_action}"),
             channel_id: "opencode".to_string(),
             model: raw_model.to_string(),
             stream: is_stream,
@@ -566,7 +697,7 @@ pub async fn handle_gemini_generate(
                         id: req_id.clone(),
                         timestamp: current_timestamp(),
                         method: "POST".to_string(),
-                        path: format!("/v1beta/models/{model_action}"),
+                        path: format!("/v1/gemini/models/{model_action}"),
                         channel_id: chan_alias.clone(),
                         model: raw_model.to_string(),
                         stream: is_stream,
@@ -630,7 +761,7 @@ pub async fn handle_gemini_generate(
                         record_failover_event(
                             &ctx,
                             &req_id,
-                            &format!("/v1beta/models/{model_action}"),
+                            &format!("/v1/gemini/models/{model_action}"),
                             &chan_alias,
                             raw_model,
                             is_stream,
@@ -653,7 +784,7 @@ pub async fn handle_gemini_generate(
                     record_failover_event(
                         &ctx,
                         &req_id,
-                        &format!("/v1beta/models/{model_action}"),
+                        &format!("/v1/gemini/models/{model_action}"),
                         &chan_alias,
                         raw_model,
                         is_stream,
@@ -675,7 +806,7 @@ pub async fn handle_gemini_generate(
         id: req_id,
         timestamp: current_timestamp(),
         method: "POST".to_string(),
-        path: format!("/v1beta/models/{model_action}"),
+        path: format!("/v1/gemini/models/{model_action}"),
         channel_id: chan_alias,
         model: raw_model.to_string(),
         stream: is_stream,
@@ -1362,37 +1493,15 @@ pub async fn handle_messages(
 
     if let Err(res) = check_auth(&headers, &uri, &config).await {
         let dur = start_time.elapsed().as_millis() as u64;
-        ctx.metrics.total_requests.fetch_add(1, Ordering::Relaxed);
-        ctx.metrics.failed_requests.fetch_add(1, Ordering::Relaxed);
-        ctx.record_log(ProxyRequestLog {
-            id: req_id,
-            timestamp: current_timestamp(),
-            method: "POST".to_string(),
-            path: "/v1/messages".to_string(),
-            channel_id: "opencode".to_string(),
-            model: body
-                .get("model")
-                .and_then(JsonValue::as_str)
-                .unwrap_or("free-claude-3-5-sonnet")
-                .to_string(),
-            stream: body
-                .get("stream")
-                .and_then(JsonValue::as_bool)
-                .unwrap_or(false),
-            status_code: 401,
-            duration_ms: dur,
-            ttft_ms: None,
-            prompt_tokens: None,
-            prompt_cache_hit_tokens: None,
-            prompt_cache_miss_tokens: None,
-            completion_tokens: None,
-            reasoning_tokens: None,
-            total_tokens: None,
-            error_message: Some("鉴权未通过：请求未携带有效的 Bearer API Key".to_string()),
-            request_body: req_body_str,
-            response_body: None,
-            node_name: Some("直连通道".to_string()),
-        })
+        record_auth_failure(
+            &ctx,
+            &req_id,
+            "/v1/messages",
+            body.get("model").and_then(JsonValue::as_str).unwrap_or("free-claude-3-5-sonnet"),
+            body.get("stream").and_then(JsonValue::as_bool).unwrap_or(false),
+            dur,
+            req_body_str,
+        )
         .await;
         return res;
     }
@@ -1417,181 +1526,9 @@ pub async fn handle_messages(
     let stripped_model = model_to_send;
     let chan_alias = chan.effective_alias();
 
-    let mut openai_tools = Vec::new();
-    if let Some(tools_arr) = body.get("tools").and_then(JsonValue::as_array) {
-        for t in tools_arr {
-            let mut name = String::new();
-            let mut desc = String::new();
-            let mut schema = json!({"type": "object", "properties": {}});
-
-            if let Some(n) = t.get("name").and_then(JsonValue::as_str) {
-                name = n.trim().to_string();
-            }
-            if let Some(d) = t.get("description").and_then(JsonValue::as_str) {
-                desc = d.to_string();
-            }
-            if let Some(s) = t.get("input_schema").or_else(|| t.get("parameters")) {
-                schema = s.clone();
-            }
-
-            if name.is_empty() {
-                if let Some(f) = t.get("function").and_then(JsonValue::as_object) {
-                    if let Some(n) = f.get("name").and_then(JsonValue::as_str) {
-                        name = n.trim().to_string();
-                    }
-                    if let Some(d) = f.get("description").and_then(JsonValue::as_str) {
-                        desc = d.to_string();
-                    }
-                    if let Some(p) = f.get("parameters") {
-                        schema = p.clone();
-                    }
-                }
-            }
-
-            if !name.is_empty() {
-                openai_tools.push(json!({
-                    "type": "function",
-                    "function": {
-                        "name": name,
-                        "description": desc,
-                        "parameters": schema
-                    }
-                }));
-            }
-        }
-    }
-
-    let mut messages = Vec::new();
-
-    if let Some(system_val) = body.get("system") {
-        if let Some(sys_str) = system_val.as_str() {
-            if !sys_str.is_empty() {
-                messages.push(json!({
-                    "role": "system",
-                    "content": sys_str
-                }));
-            }
-        } else if let Some(sys_arr) = system_val.as_array() {
-            let mut combined = String::new();
-            for item in sys_arr {
-                if let Some(t) = item.get("text").and_then(JsonValue::as_str) {
-                    if !combined.is_empty() {
-                        combined.push('\n');
-                    }
-                    combined.push_str(t);
-                }
-            }
-            if !combined.is_empty() {
-                messages.push(json!({
-                    "role": "system",
-                    "content": combined
-                }));
-            }
-        }
-    }
-
-    if let Some(msgs_arr) = body.get("messages").and_then(JsonValue::as_array) {
-        for msg in msgs_arr {
-            let role = msg.get("role").and_then(JsonValue::as_str).unwrap_or("user");
-            if let Some(content_val) = msg.get("content") {
-                if let Some(c_str) = content_val.as_str() {
-                    messages.push(json!({
-                        "role": role,
-                        "content": c_str
-                    }));
-                } else if let Some(c_arr) = content_val.as_array() {
-                    let mut text_parts = String::new();
-                    let mut tool_calls = Vec::new();
-                    let mut tool_results = Vec::new();
-
-                    for block in c_arr {
-                        let b_type = block.get("type").and_then(JsonValue::as_str).unwrap_or("");
-                        match b_type {
-                            "text" => {
-                                if let Some(t) = block.get("text").and_then(JsonValue::as_str) {
-                                    if !text_parts.is_empty() {
-                                        text_parts.push('\n');
-                                    }
-                                    text_parts.push_str(t);
-                                }
-                            }
-                            "tool_use" => {
-                                let id = block.get("id").and_then(JsonValue::as_str).unwrap_or("call_default").to_string();
-                                let name = block.get("name").and_then(JsonValue::as_str).unwrap_or("").to_string();
-                                let input_val = block.get("input").cloned().unwrap_or_else(|| json!({}));
-                                if !name.is_empty() {
-                                    tool_calls.push(json!({
-                                        "id": id,
-                                        "type": "function",
-                                        "function": {
-                                            "name": name,
-                                            "arguments": input_val.to_string()
-                                        }
-                                    }));
-                                }
-                            }
-                            "tool_result" => {
-                                let tool_use_id = block.get("tool_use_id").and_then(JsonValue::as_str).unwrap_or("call_default");
-                                let mut res_str = String::new();
-                                if let Some(c) = block.get("content") {
-                                    if let Some(s) = c.as_str() {
-                                        res_str = s.to_string();
-                                    } else if let Some(arr) = c.as_array() {
-                                        for part in arr {
-                                            if let Some(t) = part.get("text").and_then(JsonValue::as_str) {
-                                                res_str.push_str(t);
-                                            }
-                                        }
-                                    }
-                                }
-                                tool_results.push(json!({
-                                    "role": "tool",
-                                    "tool_call_id": tool_use_id,
-                                    "content": res_str
-                                }));
-                            }
-                            _ => {}
-                        }
-                    }
-
-                    if !tool_results.is_empty() {
-                        for tr in tool_results {
-                            messages.push(tr);
-                        }
-                    } else if !tool_calls.is_empty() {
-                        messages.push(json!({
-                            "role": "assistant",
-                            "content": if text_parts.is_empty() { JsonValue::Null } else { JsonValue::String(text_parts) },
-                            "tool_calls": tool_calls
-                        }));
-                    } else {
-                        messages.push(json!({
-                            "role": role,
-                            "content": text_parts
-                        }));
-                    }
-                }
-            }
-        }
-    }
-
     let is_stream = body.get("stream").and_then(JsonValue::as_bool).unwrap_or(false);
-    let mut openai_payload = json!({
-        "model": stripped_model,
-        "messages": messages,
-        "stream": is_stream
-    });
-
-    if let Some(temp) = body.get("temperature").and_then(JsonValue::as_f64) {
-        openai_payload["temperature"] = json!(temp);
-    }
-    if let Some(max_tokens) = body.get("max_tokens").and_then(JsonValue::as_i64) {
-        openai_payload["max_tokens"] = json!(max_tokens);
-    }
-    if !openai_tools.is_empty() {
-        openai_payload["tools"] = json!(openai_tools);
-    }
-
+    let mut openai_payload =
+        AnthropicProtocolAdapter::anthropic_request_to_openai(&body, &stripped_model, is_stream);
     normalize_chat_messages(&mut openai_payload);
 
     let upstream_url = format!("{}/chat/completions", chan.base_url.trim_end_matches('/'));
@@ -1670,63 +1607,8 @@ pub async fn handle_messages(
                         let dur = start_time.elapsed().as_millis() as u64;
 
                         if let Ok(jv) = serde_json::from_slice::<JsonValue>(&resp_bytes) {
-                            let text = jv
-                                .pointer("/choices/0/message/content")
-                                .and_then(JsonValue::as_str)
-                                .unwrap_or("");
-                            let mut content_blocks = Vec::new();
-                            if !text.is_empty() {
-                                content_blocks.push(json!({
-                                    "type": "text",
-                                    "text": text
-                                }));
-                            }
-
-                            if let Some(tool_calls) = jv
-                                .pointer("/choices/0/message/tool_calls")
-                                .and_then(JsonValue::as_array)
-                            {
-                                for tc in tool_calls {
-                                    let id = tc.get("id").and_then(JsonValue::as_str).unwrap_or("call_default");
-                                    let name = tc.pointer("/function/name").and_then(JsonValue::as_str).unwrap_or("tool");
-                                    let args_str = tc.pointer("/function/arguments").and_then(JsonValue::as_str).unwrap_or("{}");
-                                    let args_val = serde_json::from_str::<JsonValue>(args_str).unwrap_or_else(|_| json!({}));
-                                    content_blocks.push(json!({
-                                        "type": "tool_use",
-                                        "id": id,
-                                        "name": name,
-                                        "input": args_val
-                                    }));
-                                }
-                            }
-
-                            let finish_reason = jv
-                                .pointer("/choices/0/finish_reason")
-                                .and_then(JsonValue::as_str);
-                            let stop_reason = match finish_reason {
-                                Some("stop") => "end_turn",
-                                Some("length") => "max_tokens",
-                                Some("tool_calls") => "tool_use",
-                                _ => "end_turn",
-                            };
-
-                            let usage = jv.get("usage");
-                            let p_tok = usage.and_then(|u| u.get("prompt_tokens")).and_then(JsonValue::as_u64).unwrap_or(0);
-                            let c_tok = usage.and_then(|u| u.get("completion_tokens")).and_then(JsonValue::as_u64).unwrap_or(0);
-
-                            let anthropic_resp = json!({
-                                "id": format!("msg_{req_id}"),
-                                "type": "message",
-                                "role": "assistant",
-                                "model": raw_model,
-                                "content": content_blocks,
-                                "stop_reason": stop_reason,
-                                "stop_sequence": null,
-                                "usage": {
-                                    "input_tokens": p_tok,
-                                    "output_tokens": c_tok
-                                }
-                            });
+                            let (p_tok, c_tok) = AnthropicProtocolAdapter::extract_token_usage(&jv);
+                            let anthropic_resp = AnthropicProtocolAdapter::openai_response_to_anthropic(&jv, &req_id, raw_model);
 
                             let mut final_log = log;
                             final_log.duration_ms = dur;
@@ -1832,6 +1714,53 @@ pub async fn handle_messages(
         .into_response()
 }
 
+fn resolve_candidate_models_urls(base_url: &str) -> Vec<String> {
+    let clean = base_url.trim().trim_end_matches('/');
+    if clean.ends_with("/v1") {
+        vec![
+            format!("{clean}/models"),
+            format!("{}/models", clean.trim_end_matches("/v1")),
+        ]
+    } else {
+        vec![
+            format!("{clean}/v1/models"),
+            format!("{clean}/models"),
+        ]
+    }
+}
+
+fn extract_models_from_json(jv: &JsonValue) -> Vec<String> {
+    let mut models = Vec::new();
+    if let Some(arr) = jv.get("data").and_then(JsonValue::as_array) {
+        for item in arr {
+            if let Some(id) = item.get("id").and_then(JsonValue::as_str) {
+                models.push(id.to_string());
+            } else if let Some(s) = item.as_str() {
+                models.push(s.to_string());
+            }
+        }
+    } else if let Some(arr) = jv.get("models").and_then(JsonValue::as_array) {
+        for item in arr {
+            if let Some(id) = item.get("id").and_then(JsonValue::as_str) {
+                models.push(id.to_string());
+            } else if let Some(s) = item.as_str() {
+                models.push(s.to_string());
+            }
+        }
+    } else if let Some(arr) = jv.as_array() {
+        for item in arr {
+            if let Some(id) = item.get("id").and_then(JsonValue::as_str) {
+                models.push(id.to_string());
+            } else if let Some(s) = item.as_str() {
+                models.push(s.to_string());
+            }
+        }
+    }
+    models.sort();
+    models.dedup();
+    models
+}
+
 pub async fn fetch_upstream_models_inner(ctx: &ModelProxyContext) {
     let channels = {
         let cfg = ctx.config.read().await;
@@ -1850,60 +1779,104 @@ pub async fn fetch_upstream_models_inner(ctx: &ModelProxyContext) {
         let candidate_id = candidates.first().map(|s| s.as_str()).unwrap_or("__direct__");
         let client = build_client_for_candidate(ctx, candidate_id).await;
 
-        let models_url = format!("{}/models", ch.base_url.trim_end_matches('/'));
-        let mut req = client.get(&models_url);
+        let candidate_urls = resolve_candidate_models_urls(&ch.base_url);
         let api_key = select_channel_api_key(ctx, &ch);
-        if !api_key.is_empty() {
-            req = req.header("Authorization", format!("Bearer {api_key}"));
-        }
 
-        match req.send().await {
-            Ok(resp) => {
-                if resp.status().is_success() {
-                    if let Ok(jv) = resp.json::<JsonValue>().await {
-                        let mut models = Vec::new();
-                        if let Some(arr) = jv.get("data").and_then(JsonValue::as_array) {
-                            for item in arr {
-                                if let Some(id) = item.get("id").and_then(JsonValue::as_str) {
-                                    models.push(id.to_string());
-                                }
+        let mut fetched_models: Option<Vec<String>> = None;
+        let mut fetch_err: Option<String> = None;
+
+        for url in candidate_urls {
+            let mut req = client.get(&url);
+            if !api_key.is_empty() {
+                req = req.header("Authorization", format!("Bearer {api_key}"));
+            }
+            req = req.header("User-Agent", "OpenHub-ModelProxy/1.0");
+
+            match req.send().await {
+                Ok(resp) => {
+                    if resp.status().is_success() {
+                        if let Ok(jv) = resp.json::<JsonValue>().await {
+                            let models = extract_models_from_json(&jv);
+                            if !models.is_empty() {
+                                fetched_models = Some(models);
+                                break;
                             }
                         }
-                        models.sort();
-                        models.dedup();
-                        result_list.push(ChannelModelList {
-                            channel_id: ch.id.clone(),
-                            channel_name: ch.name.clone(),
-                            alias: ch.effective_alias(),
-                            models,
-                        });
                     } else {
-                        error_list.push(ChannelModelFetchError {
-                            channel_id: ch.id.clone(),
-                            channel_name: ch.name.clone(),
-                            alias: ch.effective_alias(),
-                            error: "模型列表 JSON 解析失败".to_string(),
-                        });
+                        let status = resp.status();
+                        let body_text = resp.text().await.unwrap_or_default();
+                        fetch_err = Some(format!("HTTP {} 接口错误: {}", status.as_u16(), body_text));
                     }
-                } else {
-                    let status = resp.status();
-                    let body_text = resp.text().await.unwrap_or_default();
-                    error_list.push(ChannelModelFetchError {
-                        channel_id: ch.id.clone(),
-                        channel_name: ch.name.clone(),
-                        alias: ch.effective_alias(),
-                        error: format!("HTTP {} 接口错误: {}", status.as_u16(), body_text),
-                    });
+                }
+                Err(e) => {
+                    fetch_err = Some(format!("网络连接失败: {e}"));
                 }
             }
-            Err(e) => {
-                error_list.push(ChannelModelFetchError {
-                    channel_id: ch.id.clone(),
-                    channel_name: ch.name.clone(),
-                    alias: ch.effective_alias(),
-                    error: format!("网络连接失败: {e}"),
+        }
+
+        if fetched_models.is_none() {
+            if let Some(site_id) = &ch.site_id {
+                if let Some(app) = ctx.app_handle.read().await.as_ref() {
+                    let database = app.state::<crate::models::Database>();
+                    let local_models = {
+                        if let Ok(conn) = database.0.lock() {
+                            let mut list = Vec::new();
+                            if let Ok(mut stmt) = conn.prepare("SELECT models_json FROM site_model_cache WHERE site_id = ?1") {
+                                if let Ok(rows) = stmt.query_map([site_id.as_str()], |row| row.get::<_, String>(0)) {
+                                    for r in rows.flatten() {
+                                        if let Ok(items) = serde_json::from_str::<Vec<serde_json::Value>>(&r) {
+                                            for it in items {
+                                                if let Some(id) = it.get("id").and_then(|v| v.as_str()) {
+                                                    list.push(id.to_string());
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            list
+                        } else {
+                            Vec::new()
+                        }
+                    };
+                    if !local_models.is_empty() {
+                        let mut sorted = local_models;
+                        sorted.sort();
+                        sorted.dedup();
+                        fetched_models = Some(sorted);
+                    }
+                }
+            }
+        }
+
+        if let Some(mut models) = fetched_models {
+            // 如果是 OpenCode 且未配置有效 API Key（免 Key 免费通道），仅展示免 Key 可用的免费模型
+            let is_opencode = ch.id == "opencode"
+                || ch.protocol == "opencode"
+                || ch.alias.as_deref() == Some("opencode")
+                || ch.base_url.contains("opencode.ai")
+                || ch.name.to_lowercase().contains("opencode");
+            let has_key = !ch.get_effective_keys().is_empty();
+            if is_opencode && !has_key {
+                models.retain(|m| {
+                    let lower = m.to_lowercase();
+                    lower.contains("free") || lower == "big-pickle"
                 });
             }
+
+            result_list.push(ChannelModelList {
+                channel_id: ch.id.clone(),
+                channel_name: ch.name.clone(),
+                alias: ch.effective_alias(),
+                models,
+            });
+        } else if let Some(error) = fetch_err {
+            error_list.push(ChannelModelFetchError {
+                channel_id: ch.id.clone(),
+                channel_name: ch.name.clone(),
+                alias: ch.effective_alias(),
+                error,
+            });
         }
     }
 

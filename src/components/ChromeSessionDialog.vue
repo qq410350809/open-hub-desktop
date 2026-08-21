@@ -4,6 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import { icons } from "../icons";
 import { useStore } from "../composables/useStore";
 import type { ChromeSessionInfo, SyncSitesProgress } from "../types";
+import { formatElapsed } from "../utils";
 
 const store = useStore();
 const closeBtnRef = ref<HTMLButtonElement>();
@@ -20,13 +21,6 @@ const browserSyncStateLabel = computed(() => {
   if (store.chromeBrowserSyncError.value) return "同步失败";
   return "已完成";
 });
-
-function formatElapsed(milliseconds: number) {
-  if (milliseconds < 1000) {
-    return `+${milliseconds}ms`;
-  }
-  return `+${(milliseconds / 1000).toFixed(1)}s`;
-}
 
 let isDialogMounted = true;
 let unlistenChromeProgress: (() => void) | undefined;

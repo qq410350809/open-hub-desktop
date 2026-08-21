@@ -139,7 +139,7 @@ pub fn repair_node_locations_with_geoip(
         None => return Ok(0),
     };
 
-    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    let connection = database.lock_conn()?;
     let mut stmt = connection
         .prepare("SELECT id, name, server, port, country_code, country_name, classification, primary_ip FROM proxy_pool_nodes")
         .map_err(|e| e.to_string())?;

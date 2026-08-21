@@ -1,3 +1,4 @@
+pub(crate) use crate::db::{read_meta, write_meta};
 use crate::models::*;
 use crate::proxy_pool::geoip::{classify_node_location, open_geoip_reader};
 use crate::proxy_pool::parser::{
@@ -15,28 +16,6 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use url::Url;
-
-pub fn read_meta(database: &Database, key: &str) -> Result<String, String> {
-    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
-    connection
-        .query_row("SELECT value FROM app_meta WHERE key = ?1", [key], |row| {
-            row.get(0)
-        })
-        .optional()
-        .map(|value| value.unwrap_or_default())
-        .map_err(|error| error.to_string())
-}
-
-pub fn write_meta(connection: &rusqlite::Connection, key: &str, value: &str) -> Result<(), String> {
-    connection
-        .execute(
-            "INSERT INTO app_meta (key, value) VALUES (?1, ?2)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            params![key, value],
-        )
-        .map_err(|error| error.to_string())?;
-    Ok(())
-}
 
 pub fn row_subscription(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProxySubscription> {
     Ok(ProxySubscription {
@@ -150,7 +129,7 @@ pub fn load_channels(
 }
 
 pub fn load_state(database: &Database, runtime: &ProxyRuntime) -> Result<ProxyPoolState, String> {
-    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    let connection = database.lock_conn()?;
     let subscriptions = connection
         .prepare(
             "SELECT id, name, url, node_count, last_error, created_at, updated_at
@@ -250,23 +229,14 @@ pub fn load_state(database: &Database, runtime: &ProxyRuntime) -> Result<ProxyPo
         channel.port = runtime.channel_port(&channel.id);
     }
 
-    let meta = |key: &str| -> Result<String, String> {
-        connection
-            .query_row("SELECT value FROM app_meta WHERE key = ?1", [key], |row| {
-                row.get(0)
-            })
-            .optional()
-            .map(|value| value.unwrap_or_default())
-            .map_err(|error| error.to_string())
-    };
-    let mut active_node_id = meta(ACTIVE_PROXY_NODE_KEY)?;
+    let mut active_node_id = crate::db::read_meta_conn(&connection, ACTIVE_PROXY_NODE_KEY)?;
     let active_node = rows.iter().find(|node| node.id == active_node_id).cloned();
     if active_node.is_none() {
         active_node_id.clear();
     }
-    let network_proxy = meta(NETWORK_PROXY_KEY)?;
+    let network_proxy = crate::db::read_meta_conn(&connection, NETWORK_PROXY_KEY)?;
     let ignore_addresses = {
-        let value = meta(PROXY_IGNORE_KEY)?;
+        let value = crate::db::read_meta_conn(&connection, PROXY_IGNORE_KEY)?;
         if value.trim().is_empty() {
             DEFAULT_PROXY_IGNORE.to_string()
         } else {
@@ -274,7 +244,7 @@ pub fn load_state(database: &Database, runtime: &ProxyRuntime) -> Result<ProxyPo
         }
     };
     let speed_test_url = {
-        let value = meta(PROXY_SPEED_TEST_URL_KEY)?;
+        let value = crate::db::read_meta_conn(&connection, PROXY_SPEED_TEST_URL_KEY)?;
         if value.trim().is_empty() || is_slow_or_blocked_speed_test_url(&value) {
             DEFAULT_PROXY_SPEED_TEST_URL.to_string()
         } else {
@@ -354,7 +324,7 @@ pub fn runtime_proxy_url(runtime: &ProxyRuntime) -> String {
         .ok()
         .filter(|state| state.proxy_port > 0)
         .map(|state| format!("http://127.0.0.1:{}", state.proxy_port))
-        .unwrap_or_else(|| PROXY_RUNTIME_URL.to_string())
+        .unwrap_or_default()
 }
 
 pub fn runtime_controller_port(runtime: &ProxyRuntime) -> Result<u16, String> {
@@ -466,16 +436,8 @@ pub fn runtime_nodes(
     database: &Database,
     only_ids: Option<&HashSet<String>>,
 ) -> Result<(Vec<RuntimeNode>, String), String> {
-    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
-    let active = connection
-        .query_row(
-            "SELECT value FROM app_meta WHERE key = ?1",
-            [ACTIVE_PROXY_NODE_KEY],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()
-        .map_err(|error| error.to_string())?
-        .unwrap_or_default();
+    let connection = database.lock_conn()?;
+    let active = crate::db::read_meta_conn(&connection, ACTIVE_PROXY_NODE_KEY)?;
     let rows = connection
         .prepare("SELECT id, raw_json FROM proxy_pool_nodes ORDER BY CASE WHEN id = ?1 THEN 0 ELSE 1 END, name COLLATE NOCASE")
         .map_err(|error| error.to_string())?
@@ -756,7 +718,7 @@ pub fn read_account_proxy_channel_id(
     database: &Database,
     profile_id: &str,
 ) -> Result<Option<String>, String> {
-    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    let connection = database.lock_conn()?;
     connection
         .query_row(
             "SELECT channel_id FROM account_proxy_channels WHERE profile_id = ?1",
@@ -772,7 +734,7 @@ pub fn ensure_channel_instance(
     runtime: &ProxyRuntime,
     channel_id: &str,
 ) -> Result<u16, String> {
-    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    let connection = database.lock_conn()?;
     ensure_default_proxy_channel(&connection)?;
     let node_id: Option<String> = connection
         .query_row(
@@ -897,7 +859,7 @@ pub fn ensure_account_instance(
         .cloned()
         .ok_or_else(|| "代理池中没有可用的候选节点".to_string())?;
 
-    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    let connection = database.lock_conn()?;
     let raw_json: String = connection
         .query_row(
             "SELECT raw_json FROM proxy_pool_nodes WHERE id = ?1",

@@ -36,8 +36,6 @@ pub(crate) use kernel as geoip;
 pub(crate) use model_proxy as opencode_proxy;
 
 pub use core::app_menu;
-pub use site_library::run_library_detect;
-pub use model_catalog::sync_model_catalog_once;
 
 #[cfg(test)]
 #[allow(unused_imports)]

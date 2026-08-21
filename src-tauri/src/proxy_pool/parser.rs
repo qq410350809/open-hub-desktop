@@ -313,7 +313,7 @@ pub fn unique_name(base: &str, used: &mut HashSet<String>) -> String {
 }
 
 pub fn repair_stored_node_names(database: &Database) -> Result<usize, String> {
-    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    let connection = database.lock_conn()?;
     let rows = connection
         .prepare("SELECT id, name, raw_json FROM proxy_pool_nodes ORDER BY name COLLATE NOCASE")
         .map_err(|error| error.to_string())?

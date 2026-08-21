@@ -1133,29 +1133,14 @@ fn open_in_browser(app: &AppHandle, url: &str) {
 // —— 持久化（app_meta 表） ——
 
 fn meta_get(database: &Database, key: &str) -> Result<Option<String>, String> {
-    use rusqlite::OptionalExtension;
-    let connection = database
-        .0
-        .lock()
-        .map_err(|_| "本地数据库锁定失败".to_string())?;
-    connection
-        .query_row("SELECT value FROM app_meta WHERE key = ?1", [key], |row| {
-            row.get(0)
-        })
-        .optional()
-        .map_err(|error| error.to_string())
+    let value = crate::db::read_meta(database, key)?;
+    if value.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(value))
+    }
 }
 
 fn meta_set(database: &Database, key: &str, value: &str) -> Result<(), String> {
-    let connection = database
-        .0
-        .lock()
-        .map_err(|_| "本地数据库锁定失败".to_string())?;
-    connection
-        .execute(
-            "INSERT OR REPLACE INTO app_meta (key, value) VALUES (?1, ?2)",
-            [key, value],
-        )
-        .map_err(|error| error.to_string())?;
-    Ok(())
+    crate::db::write_meta_database(database, key, value)
 }

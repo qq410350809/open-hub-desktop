@@ -14,7 +14,7 @@ pub fn list_prioritized_fast_proxy_nodes(
     database: &Database,
     max_latency_ms: i64,
 ) -> Result<Vec<(String, String, i64)>, String> {
-    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    let connection = database.lock_conn()?;
     let mut statement = connection
         .prepare(
             "SELECT n.id, n.name, n.latency_ms
@@ -49,7 +49,7 @@ pub fn list_channel_candidate_nodes(
     database: &Database,
     max_latency_ms: i64,
 ) -> Result<Vec<(String, String, i64)>, String> {
-    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    let connection = database.lock_conn()?;
     let mut statement = connection
         .prepare(
             "SELECT id, name, channel_latency_ms
@@ -130,7 +130,7 @@ pub async fn restore_proxy_node_transient(
         return Ok(());
     }
     let runtime_name = {
-        let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+        let connection = database.lock_conn()?;
         connection
             .query_row(
                 "SELECT id FROM proxy_pool_nodes WHERE id=?1",
@@ -198,7 +198,7 @@ pub fn read_site_uses_proxy_pool(
     database: &Database,
     site_id: &str,
 ) -> Result<bool, String> {
-    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    let connection = database.lock_conn()?;
     connection
         .query_row(
             "SELECT use_proxy_pool FROM directory_sites WHERE id = ?1",
@@ -211,7 +211,7 @@ pub fn read_site_uses_proxy_pool(
 }
 
 pub fn write_channel_node(database: &Database, channel_id: &str, node_id: &str) -> Result<(), String> {
-    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    let connection = database.lock_conn()?;
     ensure_default_proxy_channel(&connection)?;
     connection
         .execute(

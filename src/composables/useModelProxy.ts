@@ -34,14 +34,40 @@ export function channelAlias(channel: ChannelConfig | null | undefined): string 
   return a || channel?.id || "";
 }
 
+/** 判断是否为 OpenCode 免 Key 免费通道（未填有效 Key）。 */
+export function isOpenCodeFreeChannel(channel: ChannelConfig | null | undefined): boolean {
+  if (!channel) return false;
+  const isOpencode =
+    channel.id === "opencode" ||
+    channel.protocol === "opencode" ||
+    channel.alias === "opencode" ||
+    (channel.upstreamUrl && channel.upstreamUrl.includes("opencode.ai")) ||
+    (channel.name && channel.name.toLowerCase().includes("opencode"));
+  if (!isOpencode) return false;
+  const hasKey = !!(channel.apiKey?.trim() || channel.apiKeys?.some((k) => k.trim()));
+  return !hasKey;
+}
+
+/** 过滤 OpenCode 免 Key 渠道支持的模型（包含 free 关键词或 big-pickle） */
+export function filterFreeModelsOnly(models: string[]): string[] {
+  return models.filter((m) => {
+    const lower = m.toLowerCase();
+    return lower.includes("free") || lower === "big-pickle";
+  });
+}
+
 /** 按渠道白名单过滤模型列表：未配置白名单时返回全量。 */
 export function filterChannelModels(
   channel: ChannelConfig | null | undefined,
   models: string[],
 ): string[] {
+  let list = models;
+  if (isOpenCodeFreeChannel(channel)) {
+    list = filterFreeModelsOnly(list);
+  }
   const allow = channel?.enabledModels;
-  if (!allow) return models;
-  return models.filter((m) => allow.includes(m));
+  if (!allow) return list;
+  return list.filter((m) => allow.includes(m));
 }
 
 /** 校验英文别名合法性：仅限英文字母、数字、- 与 _。 */
@@ -318,10 +344,26 @@ export function useModelProxy() {
   async function refreshModels() {
     fetchingModels.value = true;
     try {
-      const list = await runCommand<ChannelModelList[]>("fetch_opencode_models");
+      const res = await runCommand<any>("fetch_opencode_models");
+      const list: ChannelModelList[] =
+        Array.isArray(res) && Array.isArray(res[0])
+          ? res[0]
+          : Array.isArray(res)
+          ? res
+          : [];
       if (Array.isArray(list)) {
         const map: Record<string, string[]> = {};
-        for (const item of list) map[item.channelId] = item.models;
+        for (const item of list) {
+          const cid = item.channelId || (item as any).channel_id;
+          if (cid) {
+            let mList = item.models || [];
+            const channel = proxyConfig.value.channels.find((c) => c.id === cid);
+            if (isOpenCodeFreeChannel(channel)) {
+              mList = filterFreeModelsOnly(mList);
+            }
+            map[cid] = mList;
+          }
+        }
         channelModels.value = map;
       }
     } catch (e) {
@@ -333,7 +375,12 @@ export function useModelProxy() {
 
   /** 某渠道的模型列表（未拉取到时为空数组）。 */
   function modelsForChannel(channelId: string): string[] {
-    return channelModels.value[channelId] ?? [];
+    let list = channelModels.value[channelId] ?? [];
+    const channel = proxyConfig.value.channels.find((c) => c.id === channelId);
+    if (isOpenCodeFreeChannel(channel)) {
+      list = filterFreeModelsOnly(list);
+    }
+    return list;
   }
 
   async function fetchLogs(options: { filter?: string; q?: string } = {}) {
@@ -451,7 +498,7 @@ export function useModelProxy() {
   }
   async function copyGeminiUrl() {
     const port = proxyStatus.value.port || proxyConfig.value.port;
-    const url = `http://127.0.0.1:${port}/v1beta`;
+    const url = `http://127.0.0.1:${port}/v1/gemini`;
     try {
       await navigator.clipboard.writeText(url);
       showToast(`已复制 Google Gemini Base URL: ${url}`);

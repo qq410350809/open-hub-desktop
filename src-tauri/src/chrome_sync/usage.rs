@@ -18,7 +18,7 @@ pub fn delete_site_account(
     site_id: String,
     profile_id: String,
 ) -> Result<(), String> {
-    let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    let connection = database.lock_conn()?;
     let deleted = connection
         .execute(
             "DELETE FROM site_accounts WHERE site_id = ?1 AND profile_id = ?2",
@@ -65,7 +65,7 @@ pub async fn mark_sites_with_chrome_sessions(
         .collect::<HashSet<_>>();
     let has_site_scope = site_id_was_supplied || site_ids_were_supplied;
     let mut targets = {
-        let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+        let connection = database.lock_conn()?;
         let mut statement = connection
             .prepare(
                 "SELECT id, name, checkin_url, api_base_url, system_type
@@ -143,7 +143,7 @@ pub async fn mark_sites_with_chrome_sessions(
             .collect::<Vec<_>>()
     };
     let account_refresh_site_ids = {
-        let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+        let connection = database.lock_conn()?;
         let condition = if refresh_pending {
             "is_pending = 1"
         } else {
@@ -166,7 +166,7 @@ pub async fn mark_sites_with_chrome_sessions(
         ids
     };
     let checkin_site_ids = {
-        let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+        let connection = database.lock_conn()?;
         let mut statement = connection
             .prepare(
                 "SELECT id FROM directory_sites
@@ -208,7 +208,7 @@ pub async fn mark_sites_with_chrome_sessions(
         format!("开始提取 {} 个本地站点的 Chrome 会话数据", targets.len()),
     );
     let (current_month, previous_checkins, cached_accounts, cached_model_keys) = {
-        let connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+        let connection = database.lock_conn()?;
         let current_month: String = connection
             .query_row("SELECT strftime('%Y-%m', 'now', 'localtime')", [], |row| {
                 row.get(0)
@@ -776,7 +776,7 @@ pub async fn mark_sites_with_chrome_sessions(
         })
         .count();
 
-    let mut connection = database.0.lock().map_err(|_| "本地数据库锁定失败")?;
+    let mut connection = database.lock_conn()?;
     let transaction = connection
         .transaction()
         .map_err(|error| error.to_string())?;
