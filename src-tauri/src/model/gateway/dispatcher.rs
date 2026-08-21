@@ -48,7 +48,7 @@ pub async fn execute_resilient_egress(
     let candidates = get_sorted_egress_candidates(ctx, channel).await;
     let max_retries = config.max_retries as usize;
     let total_attempts_allowed = max_retries + 1;
-    let base_node_idx = ctx.node_round_robin.fetch_add(1, Ordering::Relaxed);
+    let base_node_idx = ctx.node_round_robin.load(Ordering::Relaxed);
 
     let mut last_error = String::new();
     let mut last_status = StatusCode::BAD_GATEWAY;

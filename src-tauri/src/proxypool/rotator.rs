@@ -114,8 +114,7 @@ pub async fn select_proxy_node_transient(
 ) -> Result<(), String> {
     let _guard = runtime.runtime_op_lock.lock().await;
     if select_runtime_node(runtime, node_id).await.is_err() {
-        let only = HashSet::from([node_id.to_string()]);
-        tokio::task::block_in_place(|| ensure_runtime(database, runtime, Some(&only), None))?;
+        tokio::task::block_in_place(|| ensure_runtime(database, runtime, None, None))?;
         select_runtime_node(runtime, node_id).await?;
     }
     Ok(())

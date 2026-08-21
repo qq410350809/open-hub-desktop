@@ -165,6 +165,14 @@ pub async fn get_sorted_egress_candidates(
     ctx: &ModelProxyContext,
     channel: &ChannelConfig,
 ) -> Vec<String> {
+    if channel.use_fixed_proxy {
+        if let Some(ref node) = channel.fixed_proxy_node {
+            if !node.trim().is_empty() {
+                return vec![node.trim().to_string()];
+            }
+        }
+    }
+
     if !channel.use_proxy_pool && !channel.use_fixed_proxy {
         return vec!["__direct__".to_string()];
     }
@@ -181,9 +189,11 @@ pub async fn get_sorted_egress_candidates(
                 Ok(conn) => {
                     let stmt_res = conn.prepare(
                         "SELECT id FROM proxy_pool_nodes
-                         WHERE (latency_ms > 0 AND latency_ms <= 1000)
-                            OR (channel_latency_ms > 0 AND channel_latency_ms <= 1000)
-                         ORDER BY COALESCE(NULLIF(latency_ms, 0), channel_latency_ms, 999) ASC",
+                         WHERE (is_enabled IS NULL OR is_enabled = 1)
+                         ORDER BY
+                           (CASE WHEN test_status = 'success' OR channel_test_status = 'success' THEN 0 ELSE 1 END) ASC,
+                           COALESCE(NULLIF(channel_latency_ms, 0), NULLIF(latency_ms, 0), 99999) ASC,
+                           rowid ASC",
                     );
                     if let Ok(mut stmt) = stmt_res {
                         if let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) {
@@ -201,6 +211,10 @@ pub async fn get_sorted_egress_candidates(
         candidates.extend(nodes);
     }
 
+    if candidates.is_empty() {
+        candidates.push("__direct__".to_string());
+    }
+
     candidates
 }
 
@@ -216,16 +230,22 @@ pub async fn build_client_for_candidate(
         let database = app.state::<crate::models::Database>();
         let runtime = app.state::<crate::proxypool::ProxyRuntime>();
 
-        let _ =
-            crate::proxypool::select_proxy_node_transient(&database, &runtime, candidate).await;
+        if let Err(e) =
+            crate::proxypool::select_proxy_node_transient(&database, &runtime, candidate).await
+        {
+            eprintln!("[ModelGateway] 切换代理节点 {candidate} 失败: {e}");
+        }
         let proxy_url = crate::proxypool::runtime_proxy_url_pub(&runtime);
-        if let Ok(proxy) = reqwest::Proxy::all(&proxy_url) {
-            if let Ok(client) = reqwest::Client::builder()
-                .proxy(proxy)
-                .timeout(Duration::from_secs(300))
-                .build()
-            {
-                return client;
+        if !proxy_url.is_empty() {
+            if let Ok(proxy) = reqwest::Proxy::all(&proxy_url) {
+                if let Ok(client) = reqwest::Client::builder()
+                    .proxy(proxy)
+                    .pool_max_idle_per_host(0)
+                    .timeout(Duration::from_secs(300))
+                    .build()
+                {
+                    return client;
+                }
             }
         }
     }

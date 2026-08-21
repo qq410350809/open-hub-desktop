@@ -458,7 +458,7 @@ use serde_json::json;
     }
 
     #[test]
-    fn continuous_round_robin_candidate_selection_across_requests() {
+    fn node_switching_only_on_429_and_persists_for_next_requests() {
         let state = ModelProxyState::new_with_app(None);
         let candidates = vec![
             "__direct__".to_string(),
@@ -466,26 +466,32 @@ use serde_json::json;
             "proxy_node_2".to_string(),
         ];
 
-        // 连续 5 次独立请求，每次成功后 node_round_robin 推进
-        let mut selected_first_nodes = Vec::new();
-        for _ in 0..6 {
-            let base_idx = state.context.node_round_robin.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let selected = candidates[base_idx % candidates.len()].clone();
-            selected_first_nodes.push(selected);
-        }
+        // 1. 正常成功请求：保持当前活跃节点（直连）不变
+        let base_idx_req1 = state.context.node_round_robin.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(candidates[base_idx_req1 % candidates.len()], "__direct__");
 
-        // 验证：直连 -> 节点1 -> 节点2 -> 直连 -> 节点1 -> 节点2（用完循环一轮后再从直连开始）
-        assert_eq!(
-            selected_first_nodes,
-            vec![
-                "__direct__",
-                "proxy_node_1",
-                "proxy_node_2",
-                "__direct__",
-                "proxy_node_1",
-                "proxy_node_2",
-            ]
-        );
+        let base_idx_req2 = state.context.node_round_robin.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(candidates[base_idx_req2 % candidates.len()], "__direct__");
+
+        // 2. 发生 429：推进活跃节点游标
+        state.context.node_round_robin.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        // 3. 下一次新请求到来：自动继承并使用新节点（proxy_node_1）
+        let base_idx_req3 = state.context.node_round_robin.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(candidates[base_idx_req3 % candidates.len()], "proxy_node_1");
+
+        let base_idx_req4 = state.context.node_round_robin.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(candidates[base_idx_req4 % candidates.len()], "proxy_node_1");
+
+        // 4. 再次遇到 429：切换到 proxy_node_2
+        state.context.node_round_robin.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let base_idx_req5 = state.context.node_round_robin.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(candidates[base_idx_req5 % candidates.len()], "proxy_node_2");
+
+        // 5. 循环回直连
+        state.context.node_round_robin.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let base_idx_req6 = state.context.node_round_robin.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(candidates[base_idx_req6 % candidates.len()], "__direct__");
     }
 
     #[tokio::test]
