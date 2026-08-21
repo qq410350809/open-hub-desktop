@@ -1,11 +1,101 @@
 use super::adapters::GeminiProtocolAdapter;
+use super::logger::cap_log_body;
 use super::types::{ModelProxyContext, ProxyRequestLog};
 use axum::body::Body;
 use bytes::Bytes;
 use futures_util::stream::StreamExt;
 use serde_json::{json, Value as JsonValue};
+use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
+
+/// 单个工具调用参数的流式累积
+#[derive(Default)]
+struct ToolCallAccum {
+    id: String,
+    name: String,
+    arguments: String,
+}
+
+/// 流式响应内容累积器：从 OpenAI SSE delta 中重建一份完整响应全文，供日志详情展示
+#[derive(Default)]
+struct StreamResponseAccumulator {
+    content: String,
+    reasoning: String,
+    finish_reason: Option<String>,
+    tool_calls: BTreeMap<u64, ToolCallAccum>,
+}
+
+impl StreamResponseAccumulator {
+    fn observe_chunk(&mut self, jv: &JsonValue) {
+        if let Some(fr) = jv.pointer("/choices/0/finish_reason").and_then(JsonValue::as_str) {
+            self.finish_reason = Some(fr.to_string());
+        }
+        let Some(delta) = jv.pointer("/choices/0/delta") else {
+            return;
+        };
+        if let Some(s) = delta.get("content").and_then(JsonValue::as_str) {
+            self.content.push_str(s);
+        }
+        if let Some(s) = delta
+            .get("reasoning_content")
+            .or_else(|| delta.get("reasoning"))
+            .and_then(JsonValue::as_str)
+        {
+            self.reasoning.push_str(s);
+        }
+        if let Some(tcs) = delta.get("tool_calls").and_then(JsonValue::as_array) {
+            for tc in tcs {
+                let idx = tc.get("index").and_then(JsonValue::as_u64).unwrap_or(0);
+                let entry = self.tool_calls.entry(idx).or_default();
+                if let Some(id) = tc.get("id").and_then(JsonValue::as_str) {
+                    entry.id.push_str(id);
+                }
+                if let Some(name) = tc.pointer("/function/name").and_then(JsonValue::as_str) {
+                    entry.name.push_str(name);
+                }
+                if let Some(args) = tc.pointer("/function/arguments").and_then(JsonValue::as_str) {
+                    entry.arguments.push_str(args);
+                }
+            }
+        }
+    }
+
+    /// 重建 OpenAI 格式响应全文；流式期间未产生任何内容时返回 None
+    fn build_response_body(&self) -> Option<String> {
+        if self.content.is_empty() && self.reasoning.is_empty() && self.tool_calls.is_empty() {
+            return None;
+        }
+        let mut message = json!({ "role": "assistant", "content": self.content });
+        if !self.reasoning.is_empty() {
+            message["reasoning_content"] = JsonValue::String(self.reasoning.clone());
+        }
+        if !self.tool_calls.is_empty() {
+            let calls: Vec<JsonValue> = self
+                .tool_calls
+                .iter()
+                .map(|(idx, tc)| {
+                    json!({
+                        "id": tc.id,
+                        "type": "function",
+                        "index": idx,
+                        "function": { "name": tc.name, "arguments": tc.arguments }
+                    })
+                })
+                .collect();
+            message["tool_calls"] = JsonValue::Array(calls);
+        }
+        let body = json!({
+            "choices": [{
+                "index": 0,
+                "message": message,
+                "finish_reason": self.finish_reason,
+            }]
+        });
+        cap_log_body(body.to_string())
+    }
+}
+
 
 /// SSE 流解析过程中的 token 统计
 struct SseTokenStats {
@@ -114,6 +204,7 @@ pub fn clean_sse_stream(
         let mut ttft_recorded = false;
         let mut stats = SseTokenStats::new();
         let mut has_reasoning = false;
+        let mut accum = StreamResponseAccumulator::default();
 
         tokio::pin!(stream);
 
@@ -141,6 +232,7 @@ pub fn clean_sse_stream(
                                     }
 
                                     stats.extract_from_usage(&jv);
+                                    accum.observe_chunk(&jv);
 
                                     if let Some(delta) = jv.pointer_mut("/choices/0/delta") {
                                         let mut extracted_reasoning = None;
@@ -193,6 +285,7 @@ pub fn clean_sse_stream(
             stats.has_reasoning = true;
         }
         stats.finalize(&ctx, &mut log).await;
+        log.response_body = accum.build_response_body();
 
         ctx.record_log(log).await;
     };
@@ -215,6 +308,7 @@ pub fn openai_to_anthropic_sse_stream(
         let mut ttft_recorded = false;
         let mut total_prompt_tokens = 0u64;
         let mut total_completion_tokens = 0u64;
+        let mut accum = StreamResponseAccumulator::default();
 
         tokio::pin!(stream);
 
@@ -243,6 +337,7 @@ pub fn openai_to_anthropic_sse_stream(
                                         log.ttft_ms = Some(ttft);
                                         ttft_recorded = true;
                                     }
+                                    accum.observe_chunk(&jv);
 
                                     if !message_started {
                                         let start_event = json!({
@@ -337,6 +432,7 @@ pub fn openai_to_anthropic_sse_stream(
         log.prompt_tokens = (total_prompt_tokens > 0).then_some(total_prompt_tokens);
         log.completion_tokens = (total_completion_tokens > 0).then_some(total_completion_tokens);
         log.total_tokens = (total_prompt_tokens + total_completion_tokens > 0).then_some(total_prompt_tokens + total_completion_tokens);
+        log.response_body = accum.build_response_body();
 
         ctx.record_log(log).await;
     };
@@ -357,6 +453,7 @@ pub fn openai_to_gemini_sse_stream(
         let mut ttft_recorded = false;
         let mut total_prompt_tokens = 0u64;
         let mut total_completion_tokens = 0u64;
+        let mut accum = StreamResponseAccumulator::default();
 
         tokio::pin!(stream);
 
@@ -381,6 +478,7 @@ pub fn openai_to_gemini_sse_stream(
                                         log.ttft_ms = Some(ttft);
                                         ttft_recorded = true;
                                     }
+                                    accum.observe_chunk(&jv);
 
                                     if let Some(usage) = jv.get("usage").and_then(JsonValue::as_object) {
                                         if let Some(p) = usage.get("prompt_tokens").and_then(JsonValue::as_u64) {
@@ -419,6 +517,7 @@ pub fn openai_to_gemini_sse_stream(
         log.prompt_tokens = (total_prompt_tokens > 0).then_some(total_prompt_tokens);
         log.completion_tokens = (total_completion_tokens > 0).then_some(total_completion_tokens);
         log.total_tokens = (total_prompt_tokens + total_completion_tokens > 0).then_some(total_prompt_tokens + total_completion_tokens);
+        log.response_body = accum.build_response_body();
 
         ctx.record_log(log).await;
     };
@@ -440,6 +539,7 @@ pub fn openai_to_responses_sse_stream(
         let mut ttft_recorded = false;
         let mut total_prompt_tokens = 0u64;
         let mut total_completion_tokens = 0u64;
+        let mut accum = StreamResponseAccumulator::default();
 
         tokio::pin!(stream);
 
@@ -465,6 +565,7 @@ pub fn openai_to_responses_sse_stream(
                                         log.ttft_ms = Some(ttft);
                                         ttft_recorded = true;
                                     }
+                                    accum.observe_chunk(&jv);
 
                                     if !response_started {
                                         let created = json!({
@@ -523,9 +624,48 @@ pub fn openai_to_responses_sse_stream(
         log.prompt_tokens = (total_prompt_tokens > 0).then_some(total_prompt_tokens);
         log.completion_tokens = (total_completion_tokens > 0).then_some(total_completion_tokens);
         log.total_tokens = (total_prompt_tokens + total_completion_tokens > 0).then_some(total_prompt_tokens + total_completion_tokens);
+        log.response_body = accum.build_response_body();
 
         ctx.record_log(log).await;
     };
 
     Body::from_stream(s)
+}
+
+#[cfg(test)]
+mod stream_accumulator_tests {
+    use super::*;
+
+    fn feed(acc: &mut StreamResponseAccumulator, data: &str) {
+        let jv: JsonValue = serde_json::from_str(data).unwrap();
+        acc.observe_chunk(&jv);
+    }
+
+    #[test]
+    fn accumulates_content_reasoning_and_tool_calls() {
+        let mut acc = StreamResponseAccumulator::default();
+        feed(&mut acc, r#"{"choices":[{"delta":{"reasoning_content":"思考A"}}]}"#);
+        feed(&mut acc, r#"{"choices":[{"delta":{"content":"你"}}]}"#);
+        feed(&mut acc, r#"{"choices":[{"delta":{"content":"好"}}]}"#);
+        feed(&mut acc, r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"get_weather","arguments":"{\"city\":"}}]}}]}"#);
+        feed(&mut acc, r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"北京\"}"}}]}}]}"#);
+        feed(&mut acc, r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10}}"#);
+
+        let body = acc.build_response_body().unwrap();
+        let jv: JsonValue = serde_json::from_str(&body).unwrap();
+        assert_eq!(jv.pointer("/choices/0/message/content").unwrap(), "你好");
+        assert_eq!(jv.pointer("/choices/0/message/reasoning_content").unwrap(), "思考A");
+        assert_eq!(jv.pointer("/choices/0/finish_reason").unwrap(), "tool_calls");
+        let tcs = jv.pointer("/choices/0/message/tool_calls").unwrap().as_array().unwrap();
+        assert_eq!(tcs.len(), 1);
+        assert_eq!(tcs[0]["function"]["name"], "get_weather");
+        assert_eq!(tcs[0]["function"]["arguments"], r#"{"city":"北京"}"#);
+    }
+
+    #[test]
+    fn empty_stream_yields_no_response_body() {
+        let mut acc = StreamResponseAccumulator::default();
+        feed(&mut acc, r#"{"choices":[{"delta":{}}]}"#);
+        assert!(acc.build_response_body().is_none());
+    }
 }

@@ -2,7 +2,7 @@ use super::balancer::{
     build_client_for_candidate, format_upstream_error_message, get_node_display_name,
     get_sorted_egress_candidates, is_opencode_channel,
 };
-use super::logger::{record_attempt_failure, ProxyLogParams};
+use super::logger::{cap_log_body, record_attempt_failure, ProxyLogParams};
 use super::types::{ChannelConfig, ModelProxyConfig, ModelProxyContext};
 use axum::{
     http::StatusCode,
@@ -127,7 +127,8 @@ pub async fn execute_resilient_egress(
                             Some(formatted),
                             meta.req_body_str.clone(),
                             Some(node_display),
-                        ),
+                        )
+                        .with_response_body(cap_log_body(err_text)),
                     ).await;
 
                     return Err((
@@ -157,7 +158,8 @@ pub async fn execute_resilient_egress(
                             Some(formatted),
                             meta.req_body_str.clone(),
                             Some(node_display),
-                        ),
+                        )
+                        .with_response_body(cap_log_body(err_text.clone())),
                     ).await;
 
                     if count_429 <= max_retries {
@@ -190,7 +192,8 @@ pub async fn execute_resilient_egress(
                             Some(formatted),
                             meta.req_body_str.clone(),
                             Some(node_display),
-                        ),
+                        )
+                        .with_response_body(cap_log_body(err_text)),
                     ).await;
 
                     if status.is_client_error() {

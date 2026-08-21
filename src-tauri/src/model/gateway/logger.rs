@@ -1,6 +1,22 @@
 use super::types::{current_timestamp, ModelProxyContext, ProxyRequestLog};
 use std::sync::atomic::Ordering;
 
+/// 日志中保存的单条报文（请求/响应）最大字符数，防止超大响应撑爆数据库与前端渲染
+pub const MAX_LOG_BODY_CHARS: usize = 128 * 1024;
+
+/// 截断超长正文并追加省略标记；空文本返回 None
+pub fn cap_log_body(text: String) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.chars().count() <= MAX_LOG_BODY_CHARS {
+        return Some(trimmed.to_string());
+    }
+    let truncated: String = trimmed.chars().take(MAX_LOG_BODY_CHARS).collect();
+    Some(format!("{truncated}\n\n…[内容过长已截断，原始长度 {} 字符]", trimmed.chars().count()))
+}
+
 #[derive(Clone, Debug)]
 pub struct ProxyLogParams {
     pub id: String,
@@ -56,6 +72,11 @@ impl ProxyLogParams {
             response_body: None,
             node_name,
         }
+    }
+
+    pub fn with_response_body(mut self, body: Option<String>) -> Self {
+        self.response_body = body;
+        self
     }
 
     pub fn into_log(self) -> ProxyRequestLog {
@@ -119,4 +140,20 @@ pub async fn record_auth_failure_log(
             None,
         ),
     ).await;
+}
+
+#[cfg(test)]
+mod logger_tests {
+    use super::*;
+
+    #[test]
+    fn cap_log_body_trims_and_truncates() {
+        assert!(cap_log_body("  ".to_string()).is_none());
+        assert_eq!(cap_log_body(" hello ".to_string()).as_deref(), Some("hello"));
+
+        let long = "a".repeat(MAX_LOG_BODY_CHARS + 10);
+        let capped = cap_log_body(long).unwrap();
+        assert!(capped.chars().count() < MAX_LOG_BODY_CHARS + 60);
+        assert!(capped.contains("内容过长已截断"));
+    }
 }

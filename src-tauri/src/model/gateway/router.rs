@@ -7,7 +7,7 @@ use super::balancer::{
     resolve_channel, select_channel_api_key,
 };
 use super::dispatcher::{execute_resilient_egress, EgressRequestMeta};
-use super::logger::{record_attempt_failure, record_auth_failure_log, ProxyLogParams};
+use super::logger::{cap_log_body, record_attempt_failure, record_auth_failure_log, ProxyLogParams};
 use super::stream::{
     clean_sse_stream, openai_to_anthropic_sse_stream, openai_to_gemini_sse_stream,
     openai_to_responses_sse_stream,
@@ -584,6 +584,7 @@ pub async fn handle_embeddings(
     };
 
     let bytes = success.response.bytes().await.unwrap_or_default();
+    let resp_body = cap_log_body(String::from_utf8_lossy(&bytes).to_string());
     ctx.record_log(ProxyRequestLog {
         id: success.attempt_req_id,
         timestamp: current_timestamp(),
@@ -603,7 +604,7 @@ pub async fn handle_embeddings(
         total_tokens: None,
         error_message: None,
         request_body: req_body_str,
-        response_body: None,
+        response_body: resp_body,
         node_name: Some(success.node_display),
     }).await;
 
@@ -770,6 +771,7 @@ pub async fn handle_gemini_generate(
         let dur = success.cand_start.elapsed().as_millis() as u64;
         let mut final_log = log;
         final_log.duration_ms = dur;
+        final_log.response_body = cap_log_body(String::from_utf8_lossy(&resp_bytes).to_string());
         if let Some(usage) = gemini_resp.get("usageMetadata") {
             final_log.prompt_tokens = usage.get("promptTokenCount").and_then(JsonValue::as_u64);
             final_log.completion_tokens = usage.get("candidatesTokenCount").and_then(JsonValue::as_u64);
@@ -936,6 +938,7 @@ pub async fn handle_chat_completions(
     } else {
         let resp_bytes = success.response.bytes().await.unwrap_or_default();
         let dur = success.cand_start.elapsed().as_millis() as u64;
+        let resp_body = cap_log_body(String::from_utf8_lossy(&resp_bytes).to_string());
 
         let mut prompt_toks = None;
         let mut comp_toks = None;
@@ -983,6 +986,7 @@ pub async fn handle_chat_completions(
 
             let mut final_log = log;
             final_log.duration_ms = dur;
+            final_log.response_body = resp_body.clone();
             final_log.prompt_tokens = prompt_toks;
             final_log.completion_tokens = comp_toks;
             final_log.reasoning_tokens = reas_toks;
@@ -1014,6 +1018,7 @@ pub async fn handle_chat_completions(
 
         let mut final_log = log;
         final_log.duration_ms = dur;
+        final_log.response_body = resp_body;
         ctx.record_log(final_log).await;
         (StatusCode::OK, resp_bytes).into_response()
     }
@@ -1173,6 +1178,7 @@ pub async fn handle_responses(
     } else {
         let resp_bytes = success.response.bytes().await.unwrap_or_default();
         let dur = success.cand_start.elapsed().as_millis() as u64;
+        let resp_body = cap_log_body(String::from_utf8_lossy(&resp_bytes).to_string());
 
         if let Ok(jv) = serde_json::from_slice::<JsonValue>(&resp_bytes) {
             let text = jv
@@ -1201,12 +1207,14 @@ pub async fn handle_responses(
 
             let mut final_log = log;
             final_log.duration_ms = dur;
+            final_log.response_body = resp_body.clone();
             ctx.record_log(final_log).await;
             return Json(responses_output).into_response();
         }
 
         let mut final_log = log;
         final_log.duration_ms = dur;
+        final_log.response_body = resp_body;
         ctx.record_log(final_log).await;
         (StatusCode::OK, resp_bytes).into_response()
     }
@@ -1364,6 +1372,7 @@ pub async fn handle_messages(
     } else {
         let resp_bytes = success.response.bytes().await.unwrap_or_default();
         let dur = success.cand_start.elapsed().as_millis() as u64;
+        let resp_body = cap_log_body(String::from_utf8_lossy(&resp_bytes).to_string());
 
         if let Ok(jv) = serde_json::from_slice::<JsonValue>(&resp_bytes) {
             let (p_tok, c_tok) = AnthropicProtocolAdapter::extract_token_usage(&jv);
@@ -1371,6 +1380,7 @@ pub async fn handle_messages(
 
             let mut final_log = log;
             final_log.duration_ms = dur;
+            final_log.response_body = resp_body.clone();
             final_log.prompt_tokens = Some(p_tok);
             final_log.completion_tokens = Some(c_tok);
             final_log.total_tokens = Some(p_tok + c_tok);
@@ -1381,6 +1391,7 @@ pub async fn handle_messages(
 
         let mut final_log = log;
         final_log.duration_ms = dur;
+        final_log.response_body = resp_body;
         ctx.record_log(final_log).await;
         (StatusCode::OK, resp_bytes).into_response()
     }
