@@ -5,6 +5,7 @@ import {
   DEFAULT_PROXY_PORT,
   OPENCODE_UPSTREAM_URL,
   buildProxyBaseUrl,
+  buildProxyResponsesUrl,
   buildProxyGeminiUrl,
   buildProxyMessagesUrl,
 } from "../../constants";
@@ -15,6 +16,7 @@ import type {
   ProxyRequestLog,
   ChannelUsageStats,
   ChannelModelList,
+  GatewayOverviewStats,
 } from "./types";
 
 export * from "./types";
@@ -22,6 +24,11 @@ export * from "./types";
 export function channelAlias(channel: ChannelConfig | null | undefined): string {
   const a = channel?.alias?.trim().toLowerCase();
   return a || channel?.id || "";
+}
+
+/** 渠道统计维度键：稳定数字 ID（后端日统计表维度），未分配时回退别名 */
+export function channelStatsKey(channel: ChannelConfig | null | undefined): string {
+  return channel?.statsId != null ? String(channel.statsId) : channelAlias(channel);
 }
 
 export function isOpenCodeFreeChannel(channel: ChannelConfig | null | undefined): boolean {
@@ -111,6 +118,7 @@ export const testingHealth = ref(false);
 export const fetchingModels = ref(false);
 export const channelModels = ref<Record<string, string[]>>({});
 export const channelStats = ref<Record<string, ChannelUsageStats>>({});
+export const gatewayOverview = ref<GatewayOverviewStats | null>(null);
 export const healthResult = ref<any>(null);
 export const healthResultTime = ref<string>("");
 export const proxyLogs = ref<ProxyRequestLog[]>([]);
@@ -138,6 +146,15 @@ function toLocalDate(value: Date): string {
 const today = toLocalDate(new Date());
 export const logDateFrom = ref(today);
 export const logDateTo = ref(today);
+
+// 控制台总览日期区间默认「近14天」（与原趋势图默认窗口一致）；空串 = 全部（全量累计）
+function daysAgo(n: number): string {
+  const d = new Date();
+  d.setDate(d.getDate() - n);
+  return toLocalDate(d);
+}
+export const overviewDateFrom = ref(daysAgo(13));
+export const overviewDateTo = ref(today);
 
 export function useModelProxy() {
   const { showToast } = useToast();
@@ -194,11 +211,26 @@ export function useModelProxy() {
       const list = await runCommand<ChannelUsageStats[]>("get_opencode_channel_stats");
       if (Array.isArray(list)) {
         const map: Record<string, ChannelUsageStats> = {};
+        // 后端按渠道生效别名归集，这里同样以别名为键（channelAlias 回退 id，两端一致）
         for (const item of list) map[item.channelId] = item;
         channelStats.value = map;
       }
     } catch (e) {
       console.warn("获取渠道使用统计失败:", e);
+    }
+  }
+
+  /** 控制台「全渠道数据总览」：按所选日期区间逐日聚合 + 区间累计（持久化日统计表）；
+   *  未选区间（全部）时后端回退近 N 天窗口（90 天，受后端 1-90 钳制）+ 全量累计 */
+  async function refreshGatewayOverview() {
+    const payload: Record<string, unknown> = {};
+    if (overviewDateFrom.value) payload.from = overviewDateFrom.value;
+    if (overviewDateTo.value) payload.to = overviewDateTo.value;
+    if (!payload.from && !payload.to) payload.days = 90;
+    try {
+      gatewayOverview.value = await runCommand<GatewayOverviewStats>("get_model_proxy_overview_stats", payload);
+    } catch (e) {
+      console.warn("获取全渠道数据总览失败:", e);
     }
   }
 
@@ -465,6 +497,18 @@ export function useModelProxy() {
     }
   }
 
+  async function copyResponsesUrl(alias?: any) {
+    const aliasStr = typeof alias === "string" ? alias : undefined;
+    const base = buildProxyResponsesUrl(proxyStatus.value.port);
+    const text = aliasStr ? `${base.replace(/\/+$/, "")}/${aliasStr}` : base;
+    try {
+      await navigator.clipboard.writeText(text);
+      showToast(`Responses API URL 已复制: ${text}`);
+    } catch {
+      showToast("复制失败，请手动复制", true);
+    }
+  }
+
   async function copyGeminiUrl(alias?: any) {
     const aliasStr = typeof alias === "string" ? alias : undefined;
     const base = buildProxyGeminiUrl(proxyStatus.value.port);
@@ -513,6 +557,7 @@ export function useModelProxy() {
     fetchingModels,
     channelModels,
     channelStats,
+    gatewayOverview,
     modelsForChannel,
     healthResult,
     healthResultTime,
@@ -533,9 +578,12 @@ export function useModelProxy() {
     logSortOrder,
     logDateFrom,
     logDateTo,
+    overviewDateFrom,
+    overviewDateTo,
     loadProxyData,
     refreshStatus,
     refreshChannelStats,
+    refreshGatewayOverview,
     saveConfig,
     toggleServer,
     testHealth,
@@ -547,6 +595,7 @@ export function useModelProxy() {
     toggleLogSort,
     clearLogs,
     copyProxyUrl,
+    copyResponsesUrl,
     copyGeminiUrl,
     copyClaudeUrl,
     copyProxyKey,

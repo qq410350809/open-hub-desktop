@@ -8,10 +8,16 @@ import {
   filterChannelModels,
   type ChannelConfig,
   type ChannelUsageStats,
+  type GatewayDailyPoint,
+  type GatewayHourlyPoint,
+  type GatewayOverviewTotals,
   type ProxyRequestLog,
 } from "../../composables/useModelProxy";
 import { useLibrary, runCommand } from "../../composables/useLibrary";
 import { useToast } from "../../composables/useToast";
+import { usePreferences } from "../../composables/usePreferences";
+import EChart from "../common/EChart.vue";
+import type { EChartsOption } from "../../echarts";
 import {
   formatNumber as formatNumberUtil,
   formatUptime as formatUptimeUtil,
@@ -51,6 +57,9 @@ const {
   loadProxyData,
   refreshStatus,
   refreshChannelStats,
+  refreshGatewayOverview,
+  gatewayOverview,
+  copyResponsesUrl,
   saveConfig,
   toggleServer,
   testHealth,
@@ -68,6 +77,8 @@ fetchLogs,
   logPageSize,
   logDateFrom,
   logDateTo,
+  overviewDateFrom,
+  overviewDateTo,
   logTotal,
   logGlobalTotal,
   logGlobalSuccess,
@@ -111,14 +122,32 @@ let uptimeTicker: number | null = null;
 let statusPollTimer: number | null = null;
 let channelStatsTimer: number | null = null;
 
-// 切换到「反代渠道」标签时刷新一次渠道使用统计
-watch(currentMainTab, (tab) => {
-  if (tab === "channels") {
-    void refreshChannelStats();
-  }
-});
+// 标签页切换刷新对应统计；immediate 保证首次进入控制台也必定拉取总览
+// （否则页面挂载时序竞态会导致首屏空数据，需手动切一次标签才出现）
+watch(
+  currentMainTab,
+  (tab) => {
+    if (tab === "channels") {
+      void refreshChannelStats();
+    } else if (tab === "console") {
+      void refreshGatewayOverview();
+    }
+  },
+  { immediate: true },
+);
+
+// 服务（自启动完成）转为运行时，控制台补拉一次总览
+watch(
+  () => proxyStatus.value.running,
+  (running) => {
+    if (running && currentMainTab.value === "console") {
+      void refreshGatewayOverview();
+    }
+  },
+);
 
 onMounted(async () => {
+void refreshGatewayOverview();
 await loadProxyData();
 await loadCachedModels();
 await fetchLogs({ filter: logStatusFilter.value, q: logSearchQuery.value.trim() });
@@ -135,10 +164,13 @@ await fetchLogs({ filter: logStatusFilter.value, q: logSearchQuery.value.trim() 
     }
   }, 3000);
 
-  // 反代渠道标签处于激活且服务运行时，每 5s 刷新一次渠道使用统计
+  // 每 5s 刷新当前标签页统计。总览/渠道统计读持久化日统计表，
+  // 服务未运行（历史数据仍在）也需要刷新，故不再以 running 为前置条件
   channelStatsTimer = window.setInterval(async () => {
-    if (currentMainTab.value === "channels" && proxyStatus.value.running) {
+    if (currentMainTab.value === "channels") {
       await refreshChannelStats();
+    } else if (currentMainTab.value === "console") {
+      await refreshGatewayOverview();
     }
   }, 5000);
 });
@@ -857,16 +889,24 @@ function getErrorSuggestion(log: ProxyRequestLog): string {
   return "请根据下方原始错误响应体排查上游返回的具体原因。";
 }
 
-function formatCompactToken(val?: number | null): string {
+function formatTokenBMK(val?: number | null): string {
   const num = Number(val ?? 0);
   if (!Number.isFinite(num) || num <= 0) return "0";
   if (num < 1000) return String(Math.round(num));
   if (num < 1_000_000) {
     const k = (num / 1000).toFixed(num < 100_000 ? 1 : 0).replace(/\.0$/, "");
-    return `${k}k`;
+    return `${k}K`;
   }
-  const m = (num / 1_000_000).toFixed(num < 100_000_000 ? 1 : 0).replace(/\.0$/, "");
-  return `${m}m`;
+  if (num < 1_000_000_000) {
+    const m = (num / 1_000_000).toFixed(num < 100_000_000 ? 1 : 0).replace(/\.0$/, "");
+    return `${m}M`;
+  }
+  const b = (num / 1_000_000_000).toFixed(num < 100_000_000_000 ? 2 : 1).replace(/\.0+$/, "");
+  return `${b}B`;
+}
+
+function formatCompactToken(val?: number | null): string {
+  return formatTokenBMK(val);
 }
 
 function formatSec(ms?: number | null): string {
@@ -918,6 +958,334 @@ const healthAllPassed = computed(() => {
   if (healthCheckList.value.length === 0) return false;
   return healthCheckList.value.every((item: HealthCheckItem) => item.status === "ok");
 });
+
+// —— 控制台端点快速复制与指标聚合 ——
+const openAiBaseUrl = computed(
+  () => proxyStatus.value.url || `http://${LOCALHOST}:${proxyConfig.value.port}${API_PATH_V1}`
+);
+const claudeMessagesUrl = computed(
+  () => `http://${LOCALHOST}:${proxyStatus.value.port || proxyConfig.value.port}${API_PATH_MESSAGES}`
+);
+const geminiBaseUrl = computed(
+  () => `http://${LOCALHOST}:${proxyStatus.value.port || proxyConfig.value.port}${API_PATH_GEMINI}`
+);
+
+const responsesApiUrl = computed(
+  () => `${openAiBaseUrl.value.replace(/\/+$/, "")}/responses`
+);
+const chatCompletionsUrl = computed(
+  () => `${openAiBaseUrl.value.replace(/\/+$/, "")}/chat/completions`
+);
+
+async function copyChatCompletionsUrl() {
+  await copyText(chatCompletionsUrl.value, "Chat Completions URL");
+}
+
+// —— 统计展示口径：优先持久化全渠道累计（日统计表汇总，重启不丢、不受日志裁剪影响），
+//    概览未加载完成时回退本次运行计数器 ——
+const statTotals = computed<GatewayOverviewTotals>(
+  () =>
+    gatewayOverview.value?.totals ?? {
+      totalRequests: proxyStatus.value.totalRequests,
+      successfulRequests: proxyStatus.value.successfulRequests,
+      failedRequests: proxyStatus.value.failedRequests,
+      avgDurationMs: 0,
+      avgTtftMs: null,
+      promptTokens: proxyStatus.value.totalPromptTokens ?? 0,
+      completionTokens: proxyStatus.value.totalCompletionTokens ?? 0,
+      reasoningTokens: proxyStatus.value.totalReasoningTokens ?? 0,
+      cacheHitTokens: proxyStatus.value.totalCacheHitTokens ?? 0,
+      totalTokens: proxyStatus.value.totalTokens ?? 0,
+    },
+);
+
+/** 今日（本地时区）全渠道聚合：后端与所选区间解耦单独返回，切走今日区间时角标仍有数据 */
+const todayStats = computed(() => gatewayOverview.value?.today ?? null);
+
+async function copyAuthHeader() {
+  const header = `Authorization: Bearer ${proxyConfig.value.apiKey || "sk-proxy"}`;
+  await copyText(header, "Authorization Header");
+}
+
+const liveSuccessRate = computed(() => {
+  const total = statTotals.value.totalRequests;
+  if (!total) return "100%";
+  return `${((statTotals.value.successfulRequests / total) * 100).toFixed(1)}%`;
+});
+
+const liveCacheHitRate = computed(() => {
+  const prompt = statTotals.value.promptTokens || 0;
+  const hit = statTotals.value.cacheHitTokens || 0;
+  if (!prompt) return "0%";
+  return `${Math.round((hit / prompt) * 100)}%`;
+});
+
+// —— 全渠道趋势图表（持久化日统计 · 跟随亮暗主题）——
+const { preferences } = usePreferences();
+
+const overviewDays = computed(() => gatewayOverview.value?.days ?? 14);
+const overviewHasData = computed(() =>
+  (gatewayOverview.value?.daily ?? []).some((d) => d.totalRequests > 0),
+);
+
+/** 小时级趋势：区间 ≤3 天且有小时数据时后端返回，否则回退按日视图 */
+const overviewHourly = computed<GatewayHourlyPoint[] | null>(
+  () => gatewayOverview.value?.hourly ?? null,
+);
+const overviewIsHourly = computed(() => (overviewHourly.value?.length ?? 0) > 0);
+
+/** 月级趋势：区间总天数 > 92（超过一个季度，如「今年」）时后端返回，否则按日 */
+const overviewMonthly = computed<GatewayDailyPoint[] | null>(
+  () => gatewayOverview.value?.monthly ?? null,
+);
+const overviewIsMonthly = computed(() => (overviewMonthly.value?.length ?? 0) > 0);
+
+function localTodayStr(): string {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
+const overviewIsAll = computed(() => !overviewDateFrom.value && !overviewDateTo.value);
+const overviewIsToday = computed(
+  () => overviewDateFrom.value === localTodayStr() && overviewDateTo.value === localTodayStr(),
+);
+
+/** 总览卡片头部的统计范围徽章：全部 / 今日 / 日期（区间），KPI 数字均按此口径 */
+const overviewScopeLabel = computed(() => {
+  if (overviewIsAll.value) return "全部";
+  const f = overviewDateFrom.value;
+  const t = overviewDateTo.value;
+  if (f && t && f === t) return f === localTodayStr() ? "今日" : f;
+  return `${f || "…"} ~ ${t || "…"}`;
+});
+
+/** 趋势卡聚合口径文案：区间模式显示日期区间，「全部」显示近 N 天窗口 */
+const overviewRangeText = computed(() => {
+  const f = overviewDateFrom.value;
+  const t = overviewDateTo.value;
+  if (!f && !t) return `近 ${overviewDays.value} 天按日聚合`;
+  if (overviewIsHourly.value) {
+    return f && t && f === t ? `${f} 按小时聚合` : `${f || "…"} ~ ${t || "…"} 按小时聚合`;
+  }
+  if (overviewIsMonthly.value) return `${f || "…"} ~ ${t || "…"} 按月聚合`;
+  if (f && t && f === t) return `${f} 按日聚合`;
+  return `${f || "…"} ~ ${t || "…"} 按日聚合`;
+});
+
+function overviewChartTheme() {
+  const isDark =
+    preferences.theme === "dark" ||
+    (preferences.theme === "system" && window.matchMedia("(prefers-color-scheme: dark)").matches);
+  return {
+    textColor: isDark ? "#94a3b8" : "#64748b",
+    gridLineColor: isDark ? "rgba(255, 255, 255, 0.06)" : "rgba(0, 0, 0, 0.06)",
+    tooltipBg: isDark ? "rgba(15, 23, 42, 0.95)" : "rgba(255, 255, 255, 0.95)",
+    tooltipBorder: isDark ? "rgba(255, 255, 255, 0.15)" : "rgba(0, 0, 0, 0.1)",
+    tooltipText: isDark ? "#f8fafc" : "#0f172a",
+    brand: isDark ? "#10b981" : "#059669",
+  };
+}
+
+function overviewAxisCompact(v: number): string {
+  if (v >= 1_000_000) return `${Number((v / 1_000_000).toFixed(1))}M`;
+  if (v >= 10_000) return `${Number((v / 1000).toFixed(1))}k`;
+  return String(v);
+}
+
+/** 趋势图数据点：日粒度标签 MM-DD，小时粒度标签 HH 时，字段与图表系列一一对应 */
+interface OverviewChartPoint {
+  label: string;
+  successfulRequests: number;
+  failedRequests: number;
+  promptTokens: number;
+  completionTokens: number;
+  reasoningTokens: number;
+  cacheHitTokens: number;
+}
+
+function toDailyChartPoints(points: GatewayDailyPoint[]): OverviewChartPoint[] {
+  return points.map((p) => ({
+    label: p.date.slice(5),
+    successfulRequests: p.successfulRequests,
+    failedRequests: p.failedRequests,
+    promptTokens: p.promptTokens,
+    completionTokens: p.completionTokens,
+    reasoningTokens: p.reasoningTokens,
+    cacheHitTokens: p.cacheHitTokens,
+  }));
+}
+
+/** 小时粒度标签：单日只显「14时」；多天（≤3 天）带日期前缀「08-21 14时」 */
+function toHourlyChartPoints(points: GatewayHourlyPoint[]): OverviewChartPoint[] {
+  const dates = new Set(points.map((p) => p.date));
+  const multiDay = dates.size > 1;
+  return points.map((p) => ({
+    label: multiDay
+      ? `${p.date.slice(5)} ${String(p.hour).padStart(2, "0")}时`
+      : `${String(p.hour).padStart(2, "0")}时`,
+    successfulRequests: p.successfulRequests,
+    failedRequests: p.failedRequests,
+    promptTokens: p.promptTokens,
+    completionTokens: p.completionTokens,
+    reasoningTokens: p.reasoningTokens,
+    cacheHitTokens: p.cacheHitTokens,
+  }));
+}
+
+/** 月粒度标签：同一年用「8月」，跨年用「25-12」避免歧义 */
+function toMonthlyChartPoints(points: GatewayDailyPoint[]): OverviewChartPoint[] {
+  const years = new Set(points.map((p) => p.date.slice(0, 4)));
+  const sameYear = years.size === 1;
+  return points.map((p) => ({
+    label: sameYear ? `${parseInt(p.date.slice(5, 7), 10)}月` : p.date.slice(2),
+    successfulRequests: p.successfulRequests,
+    failedRequests: p.failedRequests,
+    promptTokens: p.promptTokens,
+    completionTokens: p.completionTokens,
+    reasoningTokens: p.reasoningTokens,
+    cacheHitTokens: p.cacheHitTokens,
+  }));
+}
+
+function buildRequestsChartOption(points: OverviewChartPoint[]): EChartsOption {
+  const th = overviewChartTheme();
+  return {
+    tooltip: {
+      trigger: "axis",
+      axisPointer: { type: "shadow" },
+      backgroundColor: th.tooltipBg,
+      borderColor: th.tooltipBorder,
+      textStyle: { color: th.tooltipText, fontSize: 12 },
+    },
+    legend: {
+      data: ["成功", "失败"],
+      textStyle: { color: th.textColor, fontSize: 11 },
+      top: 0,
+      right: 4,
+      itemWidth: 10,
+      itemHeight: 10,
+    },
+    grid: { left: 40, right: 8, top: 28, bottom: 22 },
+    xAxis: {
+      type: "category",
+      data: points.map((p) => p.label),
+      axisLine: { lineStyle: { color: th.gridLineColor } },
+      axisLabel: { color: th.textColor, fontSize: 10 },
+      axisTick: { show: false },
+    },
+    yAxis: {
+      type: "value",
+      minInterval: 1,
+      axisLabel: { color: th.textColor, fontSize: 10, formatter: (v: number) => overviewAxisCompact(v) },
+      splitLine: { lineStyle: { color: th.gridLineColor, type: "dashed" } },
+    },
+    series: [
+      {
+        name: "成功",
+        type: "bar",
+        stack: "requests",
+        barMaxWidth: 18,
+        data: points.map((p) => p.successfulRequests),
+        itemStyle: { color: th.brand },
+      },
+      {
+        name: "失败",
+        type: "bar",
+        stack: "requests",
+        barMaxWidth: 18,
+        data: points.map((p) => p.failedRequests),
+        itemStyle: { color: "#f43f5e", borderRadius: [3, 3, 0, 0] },
+      },
+    ],
+  };
+}
+
+function buildTokensChartOption(points: OverviewChartPoint[]): EChartsOption {
+  const th = overviewChartTheme();
+  const series = [
+    { name: "净增输入", color: "#3b82f6", data: points.map((p) => Math.max(0, p.promptTokens - p.cacheHitTokens)) },
+    { name: "缓存命中", color: "#f59e0b", data: points.map((p) => p.cacheHitTokens) },
+    { name: "思考推理", color: "#8b5cf6", data: points.map((p) => p.reasoningTokens) },
+    { name: "纯文本输出", color: th.brand, data: points.map((p) => Math.max(0, p.completionTokens - p.reasoningTokens)) },
+  ];
+  return {
+    tooltip: {
+      trigger: "axis",
+      axisPointer: { type: "shadow" },
+      backgroundColor: th.tooltipBg,
+      borderColor: th.tooltipBorder,
+      textStyle: { color: th.tooltipText, fontSize: 12 },
+      valueFormatter: (v) => formatNumberUtil(Number(v ?? 0)),
+    },
+    legend: {
+      data: series.map((s) => s.name),
+      textStyle: { color: th.textColor, fontSize: 10.5 },
+      top: 0,
+      right: 4,
+      itemWidth: 10,
+      itemHeight: 10,
+    },
+    grid: { left: 46, right: 8, top: 28, bottom: 22 },
+    xAxis: {
+      type: "category",
+      data: points.map((p) => p.label),
+      axisLine: { lineStyle: { color: th.gridLineColor } },
+      axisLabel: { color: th.textColor, fontSize: 10 },
+      axisTick: { show: false },
+    },
+    yAxis: {
+      type: "value",
+      axisLabel: { color: th.textColor, fontSize: 10, formatter: (v: number) => overviewAxisCompact(v) },
+      splitLine: { lineStyle: { color: th.gridLineColor, type: "dashed" } },
+    },
+    series: series.map((s, idx) => ({
+      name: s.name,
+      type: "bar" as const,
+      stack: "tokens",
+      barMaxWidth: 18,
+      data: s.data,
+      itemStyle: { color: s.color, borderRadius: idx === series.length - 1 ? [3, 3, 0, 0] : undefined },
+    })),
+  };
+}
+
+const overviewRequestsChart = computed(() =>
+  buildRequestsChartOption(toDailyChartPoints(gatewayOverview.value?.daily ?? [])),
+);
+const overviewTokensChart = computed(() =>
+  buildTokensChartOption(toDailyChartPoints(gatewayOverview.value?.daily ?? [])),
+);
+const overviewHourlyRequestsChart = computed(() =>
+  buildRequestsChartOption(toHourlyChartPoints(overviewHourly.value ?? [])),
+);
+const overviewHourlyTokensChart = computed(() =>
+  buildTokensChartOption(toHourlyChartPoints(overviewHourly.value ?? [])),
+);
+const overviewMonthlyRequestsChart = computed(() =>
+  buildRequestsChartOption(toMonthlyChartPoints(overviewMonthly.value ?? [])),
+);
+const overviewMonthlyTokensChart = computed(() =>
+  buildTokensChartOption(toMonthlyChartPoints(overviewMonthly.value ?? [])),
+);
+
+/** 趋势图粒度自动选择：单日 → 小时；>92 天 → 月；其余 → 日 */
+const overviewGranularityLabel = computed(() =>
+  overviewIsHourly.value ? "· 按小时" : overviewIsMonthly.value ? "· 按月" : "",
+);
+const overviewActiveRequestsChart = computed(() =>
+  overviewIsHourly.value
+    ? overviewHourlyRequestsChart.value
+    : overviewIsMonthly.value
+      ? overviewMonthlyRequestsChart.value
+      : overviewRequestsChart.value,
+);
+const overviewActiveTokensChart = computed(() =>
+  overviewIsHourly.value
+    ? overviewHourlyTokensChart.value
+    : overviewIsMonthly.value
+      ? overviewMonthlyTokensChart.value
+      : overviewTokensChart.value,
+);
 
 export interface ChannelModelGroup {
   channel: ChannelConfig;
@@ -995,6 +1363,11 @@ function switchLogFilter(filter: "all" | "success" | "error") {
 /** 时间范围筛选变更后：回到第一页并按新日期重新拉取 */
 async function applyLogRange() {
   await goLogPage(1, { filter: logStatusFilter.value, q: logSearchQuery.value.trim() });
+}
+
+/** 控制台总览时间范围变更后：按新日期区间重拉 KPI 与趋势图 */
+async function applyOverviewRange() {
+  await refreshGatewayOverview();
 }
 
 /** 搜索防抖：停笔 350ms 后回到第一页重查 */
@@ -1158,169 +1531,319 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
       </button>
     </div>
 
-    <!-- 选项卡 1: 反代控制台 (Console / Overview) -->
-    <div v-if="currentMainTab === 'console'" class="mp-tab-pane">
-      <!-- 运行概览与连接参数 -->
-      <section class="mp-card mp-overview-card">
+    <!-- 选项卡 1: 反代控制台 (Gateway Console) -->
+    <div v-if="currentMainTab === 'console'" class="mp-tab-pane mp-console-hub">
+      <!-- 1. 网关端点与访问密钥 (Connection Matrix) -->
+      <section class="mp-card mp-endpoints-card">
         <div class="mp-card-header">
           <div class="mp-card-title-group">
             <span class="mp-card-icon" v-html="icons.activity" />
-            <h2>服务连接与状态</h2>
+            <h2>网关连接端点与鉴权</h2>
           </div>
-          <span class="mp-tag font-mono">http://{{ LOCALHOST }}:{{ proxyStatus.port || proxyConfig.port }}</span>
-        </div>
-
-        <div class="mp-metrics-row">
-          <div class="mp-metric-box">
-            <label>服务端口</label>
-            <strong class="font-mono text-brand">{{ proxyStatus.port || proxyConfig.port }}</strong>
-          </div>
-          <div class="mp-metric-box">
-            <label>累计请求</label>
-            <strong class="font-mono">{{ proxyStatus.totalRequests }}</strong>
-          </div>
-          <div class="mp-metric-box">
-            <label>成功 / 失败</label>
-            <strong class="font-mono text-success">{{ proxyStatus.successfulRequests }} <span class="text-muted">/</span> <span class="text-danger">{{ proxyStatus.failedRequests }}</span></strong>
-          </div>
-          <div class="mp-metric-box">
-            <label>运行时长</label>
-            <strong>{{ proxyStatus.running ? formatUptime(proxyStatus.uptimeSeconds) : '--' }}</strong>
+          <div class="mp-endpoints-summary-chips">
+            <span class="mp-ep-chip font-mono">
+              <span class="text-muted">端口</span>
+              <strong class="text-brand">{{ proxyStatus.port || proxyConfig.port }}</strong>
+            </span>
+            <span class="mp-ep-chip font-mono">
+              <span class="text-muted">运行</span>
+              <strong>{{ proxyStatus.running ? formatUptime(proxyStatus.uptimeSeconds) : '已停止' }}</strong>
+            </span>
+            <span class="mp-ep-chip font-mono">
+              <span class="text-muted">渠道</span>
+              <strong>{{ proxyConfig.channels.length }} 个</strong>
+            </span>
+            <span class="mp-ep-chip font-mono">
+              <span class="text-muted">模型</span>
+              <strong>{{ availableModelsCount }} 个就绪</strong>
+            </span>
           </div>
         </div>
 
-        <!-- 累计 Token 使用统计 (累加总量) -->
-        <div class="mp-metrics-tokens-panel">
-          <div class="mp-mtp-head">
-            <div class="mp-mtp-title-wrap">
-              <span class="mp-mtp-icon">⚡</span>
-              <span class="mp-mtp-title">累计 Token 使用统计 (累加总量)</span>
-            </div>
-            <div class="mp-mtp-total-badge" title="累计所有请求消耗的 Token 总量">
-              <span class="text-muted">总计消耗:</span>
-              <strong class="font-mono text-brand">{{ formatNumber(proxyStatus.totalTokens || 0) }}</strong>
-              <span class="text-muted text-xs">Tokens</span>
-            </div>
-          </div>
-
-          <div class="mp-mtp-grid">
-            <div class="mp-mtp-card is-in" title="累计实际新增的输入 Token（总输入 − 缓存命中）">
-              <div class="mp-mtp-card-head">
-                <span class="mp-mtp-dot is-in" />
-                <span class="mp-mtp-card-label">累计输入</span>
-              </div>
-              <strong class="mp-mtp-card-val font-mono">{{ formatNumber(Math.max(0, (proxyStatus.totalPromptTokens || 0) - (proxyStatus.totalCacheHitTokens || 0))) }}</strong>
-              <small class="mp-mtp-card-sub text-muted">新增输入（已扣除缓存命中）</small>
-            </div>
-
-            <div class="mp-mtp-card is-hit" title="累计命中的前缀缓存 Token（极大节省延迟与算力）">
-              <div class="mp-mtp-card-head">
-                <span class="mp-mtp-dot is-hit" />
-                <span class="mp-mtp-card-label">累计缓存命中</span>
-              </div>
-              <strong class="mp-mtp-card-val font-mono text-brand">{{ formatNumber(proxyStatus.totalCacheHitTokens || 0) }}</strong>
-              <small class="mp-mtp-card-sub">
-                <span v-if="(proxyStatus.totalPromptTokens || 0) > 0" class="text-brand font-semibold font-mono">
-                  命中率 {{ Math.round(((proxyStatus.totalCacheHitTokens || 0) / (proxyStatus.totalPromptTokens || 1)) * 100) }}%
+        <div class="mp-endpoint-rows">
+          <!-- 合并行：OpenAI Base URL（客户端最常填）与 API Key 并排 -->
+          <div class="mp-endpoint-row mp-epr-merged">
+            <div class="mp-epr-half is-gw">
+              <div class="mp-epr-key-head">
+                <div class="mp-epr-label">
+                  <span class="mp-proto-badge is-key">Gateway</span>
+                  <span>Base URL</span>
+                </div>
+                <span
+                  class="mp-epr-key-state is-on"
+                  title="同一端口支持 OpenAI / Responses / Claude / Gemini 四种协议请求"
+                >
+                  四协议入口
                 </span>
-                <span v-else class="text-muted">前缀缓存极速复用</span>
-              </small>
+              </div>
+              <div class="mp-epr-key-line">
+                <code class="mp-epr-code font-mono" :title="openAiBaseUrl">{{ openAiBaseUrl }}</code>
+                <button
+                  type="button"
+                  class="mp-action-btn mp-btn-icon-only"
+                  title="复制网关 Base URL"
+                  @click="copyProxyUrl"
+                >
+                  <span v-html="icons.copy" />
+                </button>
+              </div>
             </div>
 
-            <div class="mp-mtp-card is-think" title="累计模型深度思考与思维链 Token">
-              <div class="mp-mtp-card-head">
-                <span class="mp-mtp-dot is-think" />
-                <span class="mp-mtp-card-label">累计思考推理</span>
-              </div>
-              <strong class="mp-mtp-card-val font-mono">{{ formatNumber(proxyStatus.totalReasoningTokens || 0) }}</strong>
-              <small class="mp-mtp-card-sub text-muted">
-                <span v-if="proxyStatus.totalRequests > 0" class="font-mono">
-                  触发思维 {{ proxyStatus.totalReasoningRequests ?? 0 }} / {{ proxyStatus.totalRequests }} 次 · 占比 {{ Math.round(((proxyStatus.totalReasoningRequests || 0) / proxyStatus.totalRequests) * 100) }}%
+            <div class="mp-epr-half is-key">
+              <div class="mp-epr-key-head">
+                <div class="mp-epr-label">
+                  <span class="mp-proto-badge is-key">API Key</span>
+                  <span>访问密钥</span>
+                </div>
+                <span class="mp-epr-key-state" :class="proxyConfig.apiKey ? 'is-on' : 'is-off'">
+                  {{ proxyConfig.apiKey ? '本地鉴权已启用' : '免密模式' }}
                 </span>
-                <span v-else>深度思考推理消耗</span>
-              </small>
-            </div>
-
-            <div class="mp-mtp-card is-out" title="累计纯文本输出 Token = 生成输出 − 思考推理（已剥离重复计数）">
-              <div class="mp-mtp-card-head">
-                <span class="mp-mtp-dot is-out" />
-                <span class="mp-mtp-card-label">累计生成输出</span>
               </div>
-              <strong class="mp-mtp-card-val font-mono">{{ formatNumber(Math.max(0, (proxyStatus.totalCompletionTokens || 0) - (proxyStatus.totalReasoningTokens || 0))) }}</strong>
-              <small class="mp-mtp-card-sub text-muted">纯文本输出（已剥离思考推理）</small>
+              <div class="mp-epr-key-line">
+                <code
+                  class="mp-epr-code font-mono"
+                  :title="proxyConfig.apiKey || '免密直接访问'"
+                >
+                  {{ showKey ? (proxyConfig.apiKey || '(未配置密钥，免密直接访问)') : (proxyConfig.apiKey ? '••••••••••••••••••••' : '(未配置密钥，免密直接访问)') }}
+                </code>
+                <div class="mp-epr-btns">
+                  <button
+                    v-if="proxyConfig.apiKey"
+                    type="button"
+                    class="mp-action-btn mp-btn-icon-only"
+                    :title="showKey ? '隐藏密钥' : '显示密钥'"
+                    @click="showKey = !showKey"
+                  >
+                    <span v-html="showKey ? icons.eyeOff : icons.eye" />
+                  </button>
+                  <button
+                    type="button"
+                    class="mp-action-btn"
+                    title="复制 API Key"
+                    @click="copyProxyKey"
+                  >
+                    <span v-html="icons.copy" />
+                    <span>复制 Key</span>
+                  </button>
+                  <button
+                    v-if="proxyConfig.apiKey"
+                    type="button"
+                    class="mp-action-btn"
+                    title="复制标准 Authorization Header"
+                    @click="copyAuthHeader"
+                  >
+                    <span>复制 Header</span>
+                  </button>
+                </div>
+              </div>
             </div>
           </div>
-        </div>
 
-        <div class="mp-endpoint-list">
-          <div class="mp-endpoint-item">
-            <span class="mp-ep-label">OpenAI Base URL</span>
-            <code class="mp-ep-code">{{ proxyStatus.url || `http://${LOCALHOST}:${proxyConfig.port}${API_PATH_V1}` }}</code>
-            <button
-              type="button"
-              class="mp-action-btn"
-              title="复制 OpenAI Base URL"
-              @click="copyProxyUrl"
-            >
-              <span v-html="icons.copy" />
-              <span>复制</span>
-            </button>
-          </div>
-
-          <div class="mp-endpoint-item">
-            <span class="mp-ep-label">Gemini Base URL</span>
-            <code class="mp-ep-code">http://{{ LOCALHOST }}:{{ proxyStatus.port || proxyConfig.port }}{{ API_PATH_GEMINI }}</code>
-            <button
-              type="button"
-              class="mp-action-btn"
-              title="复制 Google Gemini 原生 Base URL"
-              @click="copyGeminiUrl"
-            >
-              <span v-html="icons.copy" />
-              <span>复制</span>
-            </button>
-          </div>
-
-          <div class="mp-endpoint-item">
-            <span class="mp-ep-label">Claude Messages</span>
-            <code class="mp-ep-code">http://{{ LOCALHOST }}:{{ proxyStatus.port || proxyConfig.port }}{{ API_PATH_MESSAGES }}</code>
-            <button
-              type="button"
-              class="mp-action-btn"
-              title="复制 Claude Messages 端点 URL"
-              @click="copyClaudeUrl"
-            >
-              <span v-html="icons.copy" />
-              <span>复制</span>
-            </button>
-          </div>
-
-          <div class="mp-endpoint-item">
-            <span class="mp-ep-label">API Key</span>
-            <code class="mp-ep-code">
-              {{ showKey ? (proxyConfig.apiKey || '(未配置密钥，免密直接访问)') : (proxyConfig.apiKey ? '••••••••••••••••••••' : '(未配置密钥，免密直接访问)') }}
-            </code>
-            <div class="mp-ep-btns">
+          <!-- 四个对话端点：2×2 紧凑网格 -->
+          <div class="mp-epr-grid">
+            <!-- OpenAI Chat Completions（完整请求地址） -->
+            <div class="mp-endpoint-row mp-epr-cell">
+              <div class="mp-epr-label">
+                <span class="mp-proto-badge is-openai">Chat</span>
+                <span>Completions URL</span>
+              </div>
+              <code class="mp-epr-code font-mono" :title="chatCompletionsUrl">{{ chatCompletionsUrl }}</code>
               <button
-                v-if="proxyConfig.apiKey"
                 type="button"
                 class="mp-action-btn mp-btn-icon-only"
-                :title="showKey ? '隐藏密钥' : '显示密钥'"
-                @click="showKey = !showKey"
-              >
-                <span v-html="showKey ? icons.eyeOff : icons.eye" />
-              </button>
-              <button
-                type="button"
-                class="mp-action-btn"
-                title="复制 API Key"
-                @click="copyProxyKey"
+                title="复制 OpenAI Chat Completions 完整请求地址"
+                @click="copyChatCompletionsUrl"
               >
                 <span v-html="icons.copy" />
-                <span>复制</span>
+              </button>
+            </div>
+
+            <!-- OpenAI Responses (Codex 等) -->
+            <div class="mp-endpoint-row mp-epr-cell">
+              <div class="mp-epr-label">
+                <span class="mp-proto-badge is-openai">Responses</span>
+                <span>API URL</span>
+              </div>
+              <code class="mp-epr-code font-mono" :title="responsesApiUrl">{{ responsesApiUrl }}</code>
+              <button
+                type="button"
+                class="mp-action-btn mp-btn-icon-only"
+                title="复制 OpenAI Responses API 端点 URL（Codex 等使用）"
+                @click="copyResponsesUrl()"
+              >
+                <span v-html="icons.copy" />
+              </button>
+            </div>
+
+            <!-- Claude Messages -->
+            <div class="mp-endpoint-row mp-epr-cell">
+              <div class="mp-epr-label">
+                <span class="mp-proto-badge is-claude">Claude</span>
+                <span>Messages URL</span>
+              </div>
+              <code class="mp-epr-code font-mono" :title="claudeMessagesUrl">{{ claudeMessagesUrl }}</code>
+              <button
+                type="button"
+                class="mp-action-btn mp-btn-icon-only"
+                title="复制 Claude Messages URL"
+                @click="copyClaudeUrl"
+              >
+                <span v-html="icons.copy" />
+              </button>
+            </div>
+
+            <!-- Gemini Base URL -->
+            <div class="mp-endpoint-row mp-epr-cell">
+              <div class="mp-epr-label">
+                <span class="mp-proto-badge is-gemini">Gemini</span>
+                <span>Base URL</span>
+              </div>
+              <code class="mp-epr-code font-mono" :title="geminiBaseUrl">{{ geminiBaseUrl }}</code>
+              <button
+                type="button"
+                class="mp-action-btn mp-btn-icon-only"
+                title="复制 Google Gemini 原生 Base URL"
+                @click="copyGeminiUrl"
+              >
+                <span v-html="icons.copy" />
               </button>
             </div>
           </div>
+        </div>
+      </section>
+
+      <!-- 2. 全渠道数据总览（KPI 四宫格 + 时间范围切换，卡片内所有数字按所选范围统计） -->
+      <section class="mp-card mp-overview-card">
+        <div class="mp-card-header">
+          <div class="mp-card-title-group">
+            <span class="mp-card-icon">📊</span>
+            <h2>全渠道数据总览</h2>
+            <span
+              class="mp-overview-scope font-mono"
+              :title="`当前统计范围：${overviewScopeLabel}，下方 KPI 与趋势图均按此范围统计`"
+            >{{ overviewScopeLabel }}</span>
+          </div>
+          <LogRangeDropdown
+            v-model:from="overviewDateFrom"
+            v-model:to="overviewDateTo"
+            @apply="applyOverviewRange"
+          />
+        </div>
+
+        <section class="mp-kpi-matrix-grid">
+          <!-- KPI 1: 请求量与成功率（按所选范围） -->
+          <div class="mp-kpi-card is-traffic">
+            <div class="mp-kpi-top">
+              <span class="mp-kpi-label">请求量 / 成功率</span>
+              <span class="mp-kpi-badge" :class="liveSuccessRate.startsWith('100') || parseFloat(liveSuccessRate) >= 95 ? 'is-good' : 'is-warn'">
+                {{ liveSuccessRate }} 成功率
+              </span>
+            </div>
+            <div class="mp-kpi-main">
+              <strong class="mp-kpi-number font-mono">{{ formatNumber(statTotals.totalRequests) }}</strong>
+              <span class="mp-kpi-unit">次调用</span>
+            </div>
+            <div class="mp-kpi-footer font-mono">
+              <span class="text-success font-semibold">✓ {{ formatNumber(statTotals.successfulRequests) }} 成功</span>
+              <span class="mp-kpi-sep">·</span>
+              <span :class="statTotals.failedRequests > 0 ? 'text-danger font-semibold' : 'text-muted'">✗ {{ formatNumber(statTotals.failedRequests) }} 异常</span>
+              <!-- 区间即今日时主数字已含今日，避免重复；其余范围附今日快照（与区间解耦） -->
+              <template v-if="!overviewIsToday">
+                <span class="mp-kpi-sep">·</span>
+                <span class="text-brand">今日 {{ formatNumber(todayStats?.totalRequests ?? 0) }} 次</span>
+              </template>
+            </div>
+          </div>
+
+          <!-- KPI 2: 平均响应耗时 / 首字 TTFT（所选范围全渠道均值） -->
+          <div class="mp-kpi-card is-latency" title="所选时间范围内已完结请求的端到端平均耗时；TTFT 为流式请求首个 Token 时延均值">
+            <div class="mp-kpi-top">
+              <span class="mp-kpi-label">平均响应耗时 / TTFT</span>
+              <span class="mp-kpi-badge is-good">全渠道均值</span>
+            </div>
+            <div class="mp-kpi-main">
+              <strong class="mp-kpi-number font-mono">{{ formatSec(statTotals.avgDurationMs) }}</strong>
+              <span class="mp-kpi-unit">端到端</span>
+            </div>
+            <div class="mp-kpi-footer font-mono">
+              <span class="text-brand">⚡ 首字 TTFT {{ formatSec(statTotals.avgTtftMs) }}</span>
+              <span class="mp-kpi-sep">·</span>
+              <span class="text-muted">样本 {{ formatNumber(statTotals.totalRequests) }} 次</span>
+            </div>
+          </div>
+
+          <!-- KPI 3: Token 消耗总量 (BMK 格式化，按所选范围) -->
+          <div class="mp-kpi-card is-tokens" :title="`当前范围精确计费: ${formatNumber(statTotals.totalTokens)} Tokens`">
+            <div class="mp-kpi-top">
+              <span class="mp-kpi-label">Token 消耗总量</span>
+              <span class="mp-kpi-badge is-brand">聚合计费</span>
+            </div>
+            <div class="mp-kpi-main">
+              <strong class="mp-kpi-number font-mono text-brand">{{ formatTokenBMK(statTotals.totalTokens) }}</strong>
+              <span class="mp-kpi-unit">Tokens</span>
+            </div>
+            <div class="mp-kpi-footer font-mono">
+              <span class="text-muted">精确计费 {{ formatNumber(statTotals.totalTokens) }}</span>
+              <template v-if="!overviewIsToday">
+                <span class="mp-kpi-sep">·</span>
+                <span class="text-brand">今日 {{ formatTokenBMK(todayStats?.totalTokens ?? 0) }}</span>
+              </template>
+            </div>
+          </div>
+
+          <!-- KPI 4: 前缀缓存与算力节省 (BMK 格式化，按所选范围) -->
+          <div class="mp-kpi-card is-cache" :title="`当前范围缓存命中: ${formatNumber(statTotals.cacheHitTokens)} Tokens`">
+            <div class="mp-kpi-top">
+              <span class="mp-kpi-label">KV Cache 缓存复用</span>
+              <span class="mp-kpi-badge is-hit">命中率 {{ liveCacheHitRate }}</span>
+            </div>
+            <div class="mp-kpi-main">
+              <strong class="mp-kpi-number font-mono" style="color: #f59e0b;">{{ formatTokenBMK(statTotals.cacheHitTokens) }}</strong>
+              <span class="mp-kpi-unit">Tokens</span>
+            </div>
+            <div class="mp-kpi-footer font-mono">
+              <span style="color: #f59e0b;" class="font-semibold">⚡ 节省重复上下文计算</span>
+            </div>
+          </div>
+        </section>
+      </section>
+
+      <!-- 4. 趋势图表（持久化统计 · 跨渠道汇总 · 单日区间自动切换小时粒度） -->
+      <section class="mp-card mp-trend-card">
+        <div class="mp-card-header">
+          <div class="mp-card-title-group">
+            <span class="mp-card-icon">📈</span>
+            <h2>请求与 Token 趋势</h2>
+          </div>
+          <div class="mp-trend-badges">
+            <span class="mp-deck-badge font-mono" title="数据来自持久化统计表，重启不丢失、不受日志裁剪影响">
+              <span class="text-muted">{{ overviewIsAll ? "总消耗" : "区间消耗" }}</span>
+              <strong class="text-brand">{{ formatTokenBMK(statTotals.totalTokens) }}</strong>
+              <span class="text-muted text-xs">Tokens</span>
+              <span class="text-muted">· {{ overviewRangeText }}</span>
+            </span>
+            <span
+              v-if="proxyStatus.totalRequests > 0"
+              class="mp-deck-badge font-mono"
+              title="本次进程运行以来的实时计数，与所选时间范围无关"
+            >
+              <span class="text-muted">本次运行思维触发</span>
+              <strong>{{ proxyStatus.totalReasoningRequests ?? 0 }}/{{ proxyStatus.totalRequests }}</strong>
+            </span>
+          </div>
+        </div>
+        <div v-if="overviewHasData || overviewIsHourly" class="mp-trend-grid">
+          <div class="mp-trend-box">
+            <div class="mp-trend-title">请求量（成功 / 失败）{{ overviewGranularityLabel }}</div>
+            <EChart :option="overviewActiveRequestsChart" height="150px" />
+          </div>
+          <div class="mp-trend-box">
+            <div class="mp-trend-title">Token 构成消耗{{ overviewGranularityLabel }}</div>
+            <EChart :option="overviewActiveTokensChart" height="150px" />
+          </div>
+        </div>
+        <div v-else class="mp-trend-empty">
+          所选时间范围内暂无请求数据 · 可切换更长时间范围，或通过网关发起请求后查看全渠道请求量与 Token 消耗趋势
         </div>
       </section>
     </div>
@@ -1565,12 +2088,12 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
             <thead>
               <tr>
                 <th style="width: 105px;" class="mp-th-sortable" title="点击切换：升序 / 降序 / 默认排序" :class="{ 'is-sorted': logSortBy === 'timestamp' }" @click="sortLogsBy('timestamp')">请求时间<span class="mp-sort-arrow">{{ logSortIndicator('timestamp') }}</span></th>
-                <th style="width: 135px;">方法与路径</th>
-                <th style="width: 180px;">渠道 / 模型</th>
+                <th style="width: 170px;">方法与路径</th>
+                <th>渠道 / 模型</th>
                 <th style="width: 125px;">出网节点</th>
                 <th style="width: 82px;">模式 / 速率</th>
                 <th style="width: 70px;" class="mp-th-sortable" title="点击切换：升序 / 降序 / 默认排序" :class="{ 'is-sorted': logSortBy === 'status' }" @click="sortLogsBy('status')">状态<span class="mp-sort-arrow">{{ logSortIndicator('status') }}</span></th>
-                <th style="min-width: 175px;" class="mp-th-sortable" title="点击切换：升序 / 降序 / 默认排序" :class="{ 'is-sorted': logSortBy === 'tokens' }" @click="sortLogsBy('tokens')">Token 统计<span class="mp-sort-arrow">{{ logSortIndicator('tokens') }}</span></th>
+                <th style="width: 175px;" class="mp-th-sortable" title="点击切换：升序 / 降序 / 默认排序" :class="{ 'is-sorted': logSortBy === 'tokens' }" @click="sortLogsBy('tokens')">Token 分布<span class="mp-sort-arrow">{{ logSortIndicator('tokens') }}</span></th>
                 <th style="width: 90px;" class="mp-th-sortable" title="点击切换：升序 / 降序 / 默认排序" :class="{ 'is-sorted': logSortBy === 'duration' }" @click="sortLogsBy('duration')">耗时<span class="mp-sort-arrow">{{ logSortIndicator('duration') }}</span></th>
                 <th style="width: 65px; text-align: center;">操作</th>
               </tr>
@@ -1592,7 +2115,7 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
                 <td>
                   <div class="mp-log-method-path">
                     <span class="mp-method-tag" :class="`method-${log.method.toLowerCase()}`">{{ log.method }}</span>
-                    <code class="mp-path-code">{{ log.path }}</code>
+                    <code class="mp-path-code" :title="log.path">{{ log.path }}</code>
                   </div>
                 </td>
                 <td>
@@ -1635,7 +2158,7 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
                   </span>
                 </td>
                 <td>
-                  <!-- Token 统计列：输入 / 缓存 / 输出 / 思考，两行两列等宽卡片 -->
+                  <!-- Token 分布列：输入 / 缓存 / 输出 / 思考，两行两列等宽卡片 -->
                   <div v-if="log.promptTokens !== undefined || log.completionTokens !== undefined" class="mp-log-tokens-cell font-mono">
                     <div class="mp-token-pill-row">
                       <span class="mp-token-tag is-in" :title="`新增输入 Token: ${getNewInputTokens(log)}（总输入 ${log.promptTokens ?? 0} − 缓存命中 ${log.promptCacheHitTokens ?? 0}）`">
@@ -1872,7 +2395,7 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
                 <span class="mp-header-chip font-mono" :class="selectedLogForDetail.nodeName && selectedLogForDetail.nodeName !== '直连通道' ? 'is-proxy-chip' : ''">🌐 {{ selectedLogForDetail.nodeName || '直连通道' }}</span>
                 <span v-if="selectedLogForDetail.stream" class="mp-stream-tag is-stream">流式实时流</span>
               </div>
-              <small class="text-muted">请求 ID: {{ selectedLogForDetail.id }} · 记录时间: {{ formatLogFull(selectedLogForDetail.timestamp) }}</small>
+              <small class="text-muted">请求 ID {{ selectedLogForDetail.id }} · 记录时间 {{ formatLogFull(selectedLogForDetail.timestamp) }}</small>
             </div>
           </div>
           <button
@@ -1900,9 +2423,9 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
                 {{ getNewInputTokens(selectedLogForDetail) }}
               </div>
               <div class="mp-tc-foot font-mono">
-                <span>⚡ 命中: <strong>{{ selectedLogForDetail.promptCacheHitTokens ?? 0 }}</strong></span>
+                <span>⚡ 命中 <strong>{{ selectedLogForDetail.promptCacheHitTokens ?? 0 }}</strong></span>
                 <span class="mp-tc-divider">·</span>
-                <span>总输入: <strong>{{ selectedLogForDetail.promptTokens ?? 0 }}</strong></span>
+                <span>总输入 <strong>{{ selectedLogForDetail.promptTokens ?? 0 }}</strong></span>
               </div>
             </div>
 
@@ -1951,7 +2474,7 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
                 {{ getOutputTextTokens(selectedLogForDetail) }}
               </div>
               <div class="mp-tc-foot font-mono">
-                <span>生成速率: <strong>~{{ getEstimatedTps(selectedLogForDetail) }}</strong> Token/秒</span>
+                <span>生成速率 <strong>~{{ getEstimatedTps(selectedLogForDetail) }}</strong> Token/秒</span>
                 <span v-if="selectedLogForDetail.ttftMs" class="mp-tc-divider">·</span>
                 <span v-if="selectedLogForDetail.ttftMs">首字 <strong>{{ selectedLogForDetail.ttftMs }}ms</strong></span>
               </div>
@@ -2397,7 +2920,7 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
                       <span class="mp-model-name-title">{{ model }}</span>
                     </div>
                     <div class="mp-mec-id-row">
-                      <span class="mp-mec-id-label">调用 ID:</span>
+                      <span class="mp-mec-id-label">调用 ID</span>
                       <code class="mp-mec-id-code">{{ channelAlias(group.channel) }}/{{ model }}</code>
                     </div>
                   </div>
@@ -2556,7 +3079,7 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
                   <span class="mp-model-name-title">{{ model }}</span>
                 </div>
                 <div class="mp-mec-id-row">
-                  <span class="mp-mec-id-label">网关 ID:</span>
+                  <span class="mp-mec-id-label">网关 ID</span>
                   <code class="mp-mec-id-code">{{ channelAlias(selectedChannel) }}/{{ model }}</code>
                 </div>
               </div>
@@ -2950,7 +3473,7 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
             <span class="mp-modal-icon" v-html="icons.pulse" />
             <div>
               <h3 id="mp-health-modal-title">服务连接状态与健康检查报告</h3>
-              <small class="text-muted">检测时间：{{ healthResultTime || '刚刚' }} · 端点：http://{{ LOCALHOST }}:{{ proxyStatus.port || proxyConfig.port }}</small>
+              <small class="text-muted">检测时间 {{ healthResultTime || '刚刚' }} · 端点 http://{{ LOCALHOST }}:{{ proxyStatus.port || proxyConfig.port }}</small>
             </div>
           </div>
           <button
@@ -3360,11 +3883,6 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
   margin-left: 2px;
 }
 
-.mp-btn-badge-danger {
-  background: color-mix(in srgb, var(--danger) 15%, transparent);
-  color: var(--danger);
-}
-
 .mp-btn-primary {
   background: var(--brand);
   color: #fff;
@@ -3490,12 +4008,8 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
   flex: 1 1 auto;
   min-height: 0;
   overflow: hidden;
-  /* 抵消 .mp-page 底部留白，让分页条真正贴到视口底边 */
-  margin-bottom: -40px;
-}
-
-.mp-logs-page-view .mp-logs-summary-bar {
-  flex-shrink: 0;
+  /* .mp-page 底边距 40px，这里收回 24px，给分页条留 16px 呼吸空间 */
+  margin-bottom: -24px;
 }
 
 .mp-logs-main-card .app-table-pagination {
@@ -3503,50 +4017,6 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
 }
 
 /* 请求日志全屏视图样式 */
-.mp-logs-summary-bar {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: 12px;
-  width: 100%;
-  box-sizing: border-box;
-  flex-wrap: wrap;
-}
-
-.mp-lsb-left {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  flex-wrap: wrap;
-}
-
-.mp-lsb-badge-group {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
-}
-
-.mp-lsb-pill {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--brand-deep);
-  background: var(--brand-soft);
-  padding: 3px 10px;
-  border-radius: 999px;
-  border: 1px solid color-mix(in srgb, var(--brand) 25%, transparent);
-}
-
-.mp-lsb-dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: var(--brand);
-}
-
 .mp-card.mp-logs-main-card {
   padding: 0;
   gap: 0;
@@ -3640,17 +4110,414 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
   margin: 0;
 }
 
-.mp-tag {
-  font-size: 11.5px;
-  padding: 2px 8px;
-  border-radius: var(--r-xs);
+/* 指标卡片 */
+/* ==========================================================================
+   控制台重构样式 (mp-console-hub / 端点鉴权卡 / KPI 4宫格 / Token深度洞察)
+   ========================================================================== */
+.mp-console-hub {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.mp-console-hub .mp-card {
+  padding: 13px 14px;
+  gap: 10px;
+}
+
+/* 1. 网关连接端点卡 */
+.mp-endpoints-card {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.mp-endpoints-summary-chips {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.mp-ep-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
   background: var(--surface-soft);
-  color: var(--muted);
   border: 1px solid var(--line);
+  padding: 3px 8px;
+  border-radius: 999px;
+  font-size: 11.5px;
+}
+
+.mp-endpoint-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+/* 四协议端点双列网格：短 URL 不再独占整行留白 */
+.mp-epr-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  min-width: 0;
+}
+
+/* 合并行：Base URL 与 API Key 并排，中缝分隔 */
+.mp-epr-merged {
+  display: flex;
+  align-items: stretch;
+  padding: 0;
+  gap: 0;
+}
+
+.mp-epr-half {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 9px;
+}
+
+.mp-epr-half.is-gw,
+.mp-epr-half.is-key {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 4px;
+}
+
+.mp-epr-half.is-key {
+  border-left: 1px solid var(--line);
+}
+
+.mp-epr-key-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+}
+
+.mp-epr-key-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.mp-epr-key-line .mp-epr-code {
+  flex: 1;
+}
+
+@media (max-width: 1080px) {
+  .mp-epr-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .mp-epr-merged {
+    flex-direction: column;
+  }
+
+  .mp-epr-half.is-key {
+    border-left: none;
+    border-top: 1px solid var(--line);
+  }
+}
+
+.mp-endpoint-row.mp-epr-cell {
+  padding: 6px 9px;
+  gap: 8px;
+}
+
+.mp-epr-cell .mp-epr-label {
+  min-width: 0;
+}
+
+.mp-epr-cell .mp-epr-code {
+  font-size: 12px;
+}
+
+@media (max-width: 1080px) {
+  .mp-epr-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.mp-endpoint-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md, 8px);
+  padding: 8px 12px;
+  min-width: 0;
+  transition: border-color 0.15s ease;
+}
+
+.mp-endpoint-row:hover {
+  border-color: color-mix(in srgb, var(--brand) 40%, var(--line));
+}
+
+.mp-epr-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 130px;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text);
+  flex-shrink: 0;
+}
+
+.mp-proto-badge {
+  font-size: 10.5px;
+  font-weight: 700;
+  padding: 1px 6px;
+  border-radius: 4px;
+  white-space: nowrap;
+}
+
+.mp-proto-badge.is-openai {
+  background: rgba(16, 185, 129, 0.12);
+  color: #10b981;
+}
+
+.mp-proto-badge.is-claude {
+  background: rgba(217, 119, 6, 0.12);
+  color: #d97706;
+}
+
+.mp-proto-badge.is-gemini {
+  background: rgba(59, 130, 246, 0.12);
+  color: #3b82f6;
+}
+
+.mp-proto-badge.is-key {
+  background: rgba(139, 92, 246, 0.12);
+  color: #8b5cf6;
+}
+
+.mp-epr-code {
+  flex: 1;
+  font-size: 12.5px;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+  background: transparent;
+  padding: 0;
+}
+
+.mp-epr-btns {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+/* 密钥行鉴权状态徽标：填充长行留白并即时反映鉴权模式 */
+.mp-epr-key-state {
+  flex-shrink: 0;
+  font-size: 10.5px;
+  font-weight: 700;
+  padding: 2px 8px;
+  border-radius: 999px;
+}
+
+.mp-epr-key-state.is-on {
+  color: var(--brand);
+  background: color-mix(in srgb, var(--brand) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--brand) 30%, transparent);
+}
+
+.mp-epr-key-state.is-off {
+  color: var(--muted);
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+}
+
+/* 全渠道数据总览卡：卡片头（标题 + 范围徽章 + 时间下拉）+ KPI 四宫格同容器 */
+.mp-overview-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+/* 统计范围徽章：明示 KPI 数字的统计口径 */
+.mp-overview-scope {
+  padding: 2px 9px;
+  border-radius: 999px;
+  background: var(--brand-soft);
+  color: var(--brand-deep);
+  font-size: 11px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+/* 嵌入总览卡后的 KPI 砖块改用页面底色，与卡片表面区分层次 */
+.mp-overview-card .mp-kpi-card {
+  background: var(--page-bg);
+}
+
+/* 趋势卡双徽章：区间统计与本次运行计数分列，避免口径混淆 */
+.mp-trend-badges {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+/* 2. 关键性能 KPI 仪表盘 (4 宫格) */
+.mp-kpi-matrix-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 12px;
+  min-width: 0;
+}
+
+.mp-kpi-card {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg, 12px);
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  transition: all 0.2s var(--ease);
+  box-shadow: 0 2px 8px rgba(16, 35, 25, 0.02);
+  min-width: 0;
+}
+
+.mp-kpi-card:hover {
+  border-color: color-mix(in srgb, var(--brand) 40%, var(--line));
+  transform: translateY(-2px);
+  box-shadow: 0 6px 16px color-mix(in srgb, var(--brand) 8%, transparent);
+}
+
+.mp-kpi-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.mp-kpi-label {
+  font-size: 12px;
+  font-weight: 650;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.mp-kpi-badge {
+  font-size: 10.5px;
+  font-weight: 700;
+  padding: 1px 6px;
+  border-radius: 999px;
+  white-space: nowrap;
+}
+
+.mp-kpi-badge.is-good {
+  background: rgba(16, 185, 129, 0.12);
+  color: #10b981;
+}
+
+.mp-kpi-badge.is-warn {
+  background: rgba(245, 158, 11, 0.12);
+  color: #f59e0b;
+}
+
+.mp-kpi-badge.is-brand {
+  background: var(--brand-soft);
+  color: var(--brand-deep);
+}
+
+.mp-kpi-badge.is-hit {
+  background: rgba(245, 158, 11, 0.12);
+  color: #f59e0b;
+}
+
+.mp-kpi-main {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.mp-kpi-number {
+  font-size: 21px;
+  font-weight: 800;
+  color: var(--text);
+  line-height: 1.1;
+  letter-spacing: -0.02em;
+}
+
+.mp-kpi-unit {
+  font-size: 11px;
+  color: var(--muted);
   font-weight: 600;
 }
 
-/* 指标卡片 */
+.mp-kpi-footer {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.mp-kpi-sep {
+  opacity: 0.4;
+}
+
+/* 3. Token 深度洞察卡 */
+/* Token 深度洞察精简行 */
+/* —— 全渠道趋势图表卡 —— */
+.mp-trend-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  min-width: 0;
+}
+
+.mp-trend-box {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm, 6px);
+  padding: 6px 8px 4px;
+  min-width: 0;
+}
+
+.mp-trend-title {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--muted);
+  margin-bottom: 2px;
+}
+
+.mp-trend-empty {
+  border: 1px dashed var(--line);
+  border-radius: var(--r-sm, 6px);
+  padding: 16px 12px;
+  text-align: center;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+@media (max-width: 1080px) {
+  .mp-trend-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* 兼容弹窗内部旧通用样式 */
 .mp-metrics-row {
   display: grid;
   grid-template-columns: repeat(4, 1fr);
@@ -3676,134 +4543,6 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
   font-size: 16px;
   font-weight: 750;
   color: var(--text);
-}
-
-/* 累计 Token 消耗与缓存统计面板 */
-.mp-metrics-tokens-panel {
-  background: var(--surface-soft);
-  border: 1px solid color-mix(in srgb, var(--brand) 20%, var(--line));
-  border-radius: var(--r-md);
-  padding: 12px 14px;
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
-
-.mp-mtp-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-}
-
-.mp-mtp-title-wrap {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-
-.mp-mtp-icon {
-  color: var(--brand);
-  font-size: 14px;
-}
-
-.mp-mtp-title {
-  font-size: 12px;
-  font-weight: 700;
-  color: var(--text);
-}
-
-.mp-mtp-total-badge {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  background: var(--brand-soft);
-  border: 1px solid color-mix(in srgb, var(--brand) 25%, transparent);
-  padding: 2px 8px;
-  border-radius: 999px;
-  font-size: 11.5px;
-}
-
-.mp-mtp-total-badge strong {
-  font-size: 13px;
-}
-
-.mp-mtp-grid {
-  display: grid;
-  grid-template-columns: repeat(4, 1fr);
-  gap: 8px;
-}
-
-.mp-mtp-card {
-  background: var(--surface);
-  border: 1px solid var(--line);
-  border-radius: var(--r-sm, 6px);
-  padding: 8px 10px;
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  transition: all 0.15s ease;
-}
-
-.mp-mtp-card:hover {
-  border-color: color-mix(in srgb, var(--brand) 40%, var(--line));
-  transform: translateY(-1px);
-}
-
-.mp-mtp-card-head {
-  display: flex;
-  align-items: center;
-  gap: 5px;
-}
-
-.mp-mtp-dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  flex-shrink: 0;
-}
-
-.mp-mtp-dot.is-in {
-  background: #3b82f6;
-}
-
-.mp-mtp-dot.is-hit {
-  background: var(--brand);
-}
-
-.mp-mtp-dot.is-think {
-  background: #8b5cf6;
-}
-
-.mp-mtp-dot.is-out {
-  background: #10b981;
-}
-
-.mp-mtp-card-label {
-  font-size: 10.5px;
-  font-weight: 650;
-  color: var(--muted);
-}
-
-.mp-mtp-card-val {
-  font-size: 15px;
-  font-weight: 750;
-  color: var(--text);
-}
-
-.mp-mtp-card.is-hit .mp-mtp-card-val {
-  color: var(--brand-deep);
-}
-
-.mp-mtp-card-sub {
-  font-size: 10.5px;
-  line-height: 1.2;
-}
-
-@media (max-width: 860px) {
-  .mp-mtp-grid {
-    grid-template-columns: repeat(2, 1fr);
-  }
 }
 
 /* 端点展示条目 */
@@ -5054,6 +5793,8 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
 .mp-logs-table {
   width: 100%;
   border-collapse: collapse;
+  /* 固定布局：其余列精确定宽，渠道/模型列（未设宽）弹性吃满剩余空间 */
+  table-layout: fixed;
   font-size: 12.5px;
   text-align: left;
 }
@@ -5167,7 +5908,8 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
 /* 请求日志专用样式 */
 .mp-logs-toolbar {
   display: flex;
-  align-items: center;
+  /* 工具栏控件高度不一（筛选页签/搜索框/按钮），统一以底边对齐 */
+  align-items: flex-end;
   gap: 12px;
   flex-wrap: wrap;
 }
@@ -5230,8 +5972,11 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
 
 .mp-log-method-path {
   display: flex;
-  align-items: center;
-  gap: 6px;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 3px;
+  line-height: 1.25;
+  min-width: 0;
 }
 
 .mp-method-tag {
@@ -5253,8 +5998,12 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
 
 .mp-path-code {
   font-family: var(--font-mono, monospace);
-  font-size: 11.5px;
+  font-size: 11px;
   color: var(--text);
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .mp-log-time-col {
@@ -5299,7 +6048,10 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
   font-size: 12px;
   font-weight: 650;
   color: var(--text);
-  word-break: break-all;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
 }
 
 .mp-log-node-wrap {
@@ -5378,23 +6130,6 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
   font-size: 10px;
   color: var(--faint);
   white-space: nowrap;
-}
-
-.mp-log-err-preview {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  color: var(--danger);
-  font-size: 11.5px;
-  max-width: 320px;
-}
-
-.mp-err-dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: var(--danger);
-  flex-shrink: 0;
 }
 
 .truncate {
@@ -5501,41 +6236,6 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
   font-weight: 700;
   color: var(--brand-deep);
   flex-shrink: 0;
-}
-
-.mp-log-success-banner {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  background: var(--brand-soft);
-  border: 1px solid color-mix(in srgb, var(--brand) 40%, transparent);
-  border-radius: var(--r-md);
-  padding: 12px 16px;
-}
-
-.mp-lsb-icon {
-  width: 22px;
-  height: 22px;
-  color: var(--brand);
-  display: inline-flex;
-  flex-shrink: 0;
-}
-
-.mp-lsb-icon :deep(svg) {
-  width: 100%;
-  height: 100%;
-}
-
-.mp-lsb-content strong {
-  font-size: 13.5px;
-  color: var(--brand-deep);
-  display: block;
-}
-
-.mp-lsb-content p {
-  margin: 2px 0 0;
-  font-size: 12px;
-  color: var(--muted);
 }
 
 .mp-log-detail-grid {

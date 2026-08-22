@@ -16,6 +16,9 @@ export const LOCALHOST = "127.0.0.1";
 /** OpenAI 兼容 API 路径前缀 */
 export const API_PATH_V1 = "/v1";
 
+/** OpenAI Responses API 路径 */
+export const API_PATH_RESPONSES = "/v1/responses";
+
 /** Gemini 兼容 API 路径 */
 export const API_PATH_GEMINI = "/v1/gemini";
 
@@ -25,6 +28,11 @@ export const API_PATH_MESSAGES = "/v1/messages";
 /** 构建本地反代 Base URL */
 export function buildProxyBaseUrl(port: number): string {
   return `http://${LOCALHOST}:${port}${API_PATH_V1}`;
+}
+
+/** 构建本地反代 Responses API URL */
+export function buildProxyResponsesUrl(port: number): string {
+  return `http://${LOCALHOST}:${port}${API_PATH_RESPONSES}`;
 }
 
 /** 构建本地反代 Gemini URL */
