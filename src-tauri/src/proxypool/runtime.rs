@@ -1,4 +1,5 @@
 pub(crate) use crate::db::{read_meta, write_meta};
+use tracing::warn;
 use crate::models::*;
 use crate::proxypool::geoip::{classify_node_location, open_geoip_reader};
 use crate::proxypool::parser::{
@@ -491,7 +492,7 @@ pub fn runtime_nodes(
             write_meta(&connection, ACTIVE_PROXY_NODE_KEY, "")?;
             write_meta(&connection, NETWORK_PROXY_KEY, "")?;
         }
-        eprintln!("OpenHub 代理节点已跳过：{id}：{error}");
+        warn!("OpenHub 代理节点已跳过：{id}：{error}");
     }
     let hash = stable_id(&[&serde_json::to_string(
         &nodes.iter().map(|node| &node.config).collect::<Vec<_>>(),

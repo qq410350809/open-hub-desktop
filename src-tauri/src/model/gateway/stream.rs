@@ -192,8 +192,8 @@ fn parse_sse_data_line(line: &str) -> Option<(&str, bool)> {
 }
 
 /// OpenAI 标准 SSE 流清洗与指标统计
-pub fn clean_sse_stream(
-    stream: impl futures_util::Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+pub fn clean_sse_stream<E: std::fmt::Display + Send + 'static>(
+    stream: impl futures_util::Stream<Item = Result<Bytes, E>> + Send + 'static,
     ctx: ModelProxyContext,
     mut log: ProxyRequestLog,
     start_time: Instant,
@@ -294,8 +294,8 @@ pub fn clean_sse_stream(
 }
 
 /// OpenAI SSE -> Anthropic Messages SSE
-pub fn openai_to_anthropic_sse_stream(
-    stream: impl futures_util::Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+pub fn openai_to_anthropic_sse_stream<E: std::fmt::Display + Send + 'static>(
+    stream: impl futures_util::Stream<Item = Result<Bytes, E>> + Send + 'static,
     ctx: ModelProxyContext,
     mut log: ProxyRequestLog,
     start_time: Instant,
@@ -441,8 +441,8 @@ pub fn openai_to_anthropic_sse_stream(
 }
 
 /// OpenAI SSE -> Google Gemini SSE
-pub fn openai_to_gemini_sse_stream(
-    stream: impl futures_util::Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+pub fn openai_to_gemini_sse_stream<E: std::fmt::Display + Send + 'static>(
+    stream: impl futures_util::Stream<Item = Result<Bytes, E>> + Send + 'static,
     ctx: ModelProxyContext,
     mut log: ProxyRequestLog,
     start_time: Instant,
@@ -526,8 +526,8 @@ pub fn openai_to_gemini_sse_stream(
 }
 
 /// OpenAI SSE -> Responses SSE
-pub fn openai_to_responses_sse_stream(
-    stream: impl futures_util::Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+pub fn openai_to_responses_sse_stream<E: std::fmt::Display + Send + 'static>(
+    stream: impl futures_util::Stream<Item = Result<Bytes, E>> + Send + 'static,
     ctx: ModelProxyContext,
     mut log: ProxyRequestLog,
     start_time: Instant,

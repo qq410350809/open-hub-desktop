@@ -1,3 +1,4 @@
+use tracing::{error, warn};
 use super::config::load_model_proxy_config;
 use super::router::{create_model_proxy_router, fetch_upstream_models_inner};
 use super::types::{
@@ -76,7 +77,7 @@ pub async fn start_model_proxy_server(state: &ModelProxyState) -> Result<(), Str
         });
 
         if let Err(e) = server.await {
-            eprintln!("[OpenHub] 模型网关运行发生异常: {e}");
+            error!("[OpenHub] 模型网关运行发生异常: {e}");
         }
         *ctx_clone.started_at.write().await = None;
     });
@@ -127,7 +128,7 @@ pub async fn stop_model_proxy_server(state: &ModelProxyState) -> Result<(), Stri
         // 等待旧服务任务退出（优雅关闭需等在途连接结束），确保端口释放后再返回，
         // 避免保存配置后立即重启时 bind 报端口占用冲突
         if tokio::time::timeout(Duration::from_secs(5), handle).await.is_err() {
-            eprintln!("[OpenHub] 模型网关停止超时（可能仍有在途长连接），继续执行");
+            warn!("[OpenHub] 模型网关停止超时（可能仍有在途长连接），继续执行");
         }
     }
     *state.context.started_at.write().await = None;

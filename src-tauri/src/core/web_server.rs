@@ -12,6 +12,7 @@
 //! - POST /api/rpc 把命令分发到与桌面端完全相同的内核实现；
 //! - 无新增第三方依赖（纯 std + 现有 tokio/tauri 运行时）。
 
+use tracing::warn;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -1124,7 +1125,7 @@ fn open_in_browser(app: &AppHandle, url: &str) {
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     let result = std::process::Command::new("xdg-open").arg(url).spawn();
     if let Err(error) = result {
-        eprintln!("OpenHub 打开浏览器失败：{error}");
+        warn!("OpenHub 打开浏览器失败：{error}");
         let _ = app;
     }
 }

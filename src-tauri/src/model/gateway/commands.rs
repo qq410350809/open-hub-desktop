@@ -1,11 +1,13 @@
 use super::config::{load_model_proxy_config, save_model_proxy_config};
 use super::router::fetch_upstream_models_inner;
 use super::server::{start_model_proxy_server, stop_model_proxy_server};
-use super::stats::{get_channel_usage_stats_summary, get_model_proxy_status_summary};
+use super::stats::{
+    get_channel_usage_stats_summary, get_gateway_overview_stats, get_model_proxy_status_summary,
+};
 use super::types::{
-    ChannelConfig, ChannelModelFetchError, ChannelModelList, ChannelUsageStats, ModelProxyConfig,
-    ModelProxyState, ModelProxyStatus, OpencodeProxyConfig, OpencodeProxyState, OpencodeProxyStatus,
-    ProxyRequestLog,
+    ChannelConfig, ChannelModelFetchError, ChannelModelList, ChannelUsageStats, GatewayOverviewStats,
+    ModelProxyConfig, ModelProxyState, ModelProxyStatus, OpencodeProxyConfig, OpencodeProxyState,
+    OpencodeProxyStatus, ProxyRequestLog,
 };
 use crate::models::Database;
 use serde_json::Value as JsonValue;
@@ -374,6 +376,8 @@ pub async fn get_model_proxy_logs(
                 method: row.get(2)?,
                 path: row.get(3)?,
                 channel_id: row.get(4)?,
+                // 日志表不落统计 ID：该结构仅供前端展示，不再回写日统计
+                channel_stats_id: None,
                 model: row.get(5)?,
                 stream: stream_int == 1,
                 status_code: status_int as u16,
@@ -432,6 +436,17 @@ pub async fn get_opencode_channel_stats(
     state: State<'_, OpencodeProxyState>,
 ) -> Result<Vec<ChannelUsageStats>, String> {
     get_model_proxy_channel_stats(state).await
+}
+
+/// 控制台「全渠道数据总览」：日期区间逐日聚合 + 区间累计（未传区间时为近 N 天 + 全量，默认 14 天）
+#[tauri::command]
+pub async fn get_model_proxy_overview_stats(
+    state: State<'_, ModelProxyState>,
+    days: Option<u32>,
+    from: Option<String>,
+    to: Option<String>,
+) -> Result<GatewayOverviewStats, String> {
+    get_gateway_overview_stats(&state, days, from, to).await
 }
 
 #[tauri::command]
@@ -579,6 +594,7 @@ pub async fn sync_model_proxy_site_channels(
                     enabled_models: if parsed_models.is_empty() { None } else { Some(parsed_models) },
                     model_redirects: None,
                     rate_limit_rpm: None,
+                    stats_id: None,
                 });
             }
         }

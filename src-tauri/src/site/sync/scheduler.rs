@@ -12,6 +12,7 @@
 //! 浏览器兜底失败后进入持久化指数退避冷却（见 chrome_sync），冷却内的
 //! 账号本轮直接跳过；确需人工过盾时通过事件通知前端引导手动处理一次。
 
+use tracing::warn;
 use crate::site::sync::{self, ChromeSyncMode};
 use crate::models::*;
 use crate::model::catalog;
@@ -710,7 +711,7 @@ pub(crate) fn start_auto_sync(app: AppHandle) {
             let _ = forced; // 到点与手动触发走同一条轮次逻辑
             let summary = run_auto_sync_round(&app).await;
             if !summary.error.is_empty() {
-                eprintln!("[OpenHub] 自动会话同步：{}", summary.error);
+                warn!("[OpenHub] 自动会话同步：{}", summary.error);
             }
         }
     });

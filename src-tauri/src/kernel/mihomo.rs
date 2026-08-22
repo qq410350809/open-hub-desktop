@@ -1,3 +1,4 @@
+use tracing::info;
 use flate2::read::GzDecoder;
 use futures_util::future::join_all;
 use futures_util::StreamExt;
@@ -111,7 +112,7 @@ pub fn ensure_bundled_assets_installed(app: &AppHandle) -> Result<(), String> {
                             let _ = fs::set_permissions(&target_binary, perms);
                         }
                     }
-                    eprintln!("[OpenHub] 已成功从安装包内置资源释放 Mihomo 内核");
+                    info!("[OpenHub] 已成功从安装包内置资源释放 Mihomo 内核");
                     break;
                 }
             }
@@ -132,7 +133,7 @@ pub fn ensure_bundled_assets_installed(app: &AppHandle) -> Result<(), String> {
             if src.is_file() {
                 if fs::copy(&src, &target_geoip).is_ok() {
                     let _ = fs::copy(&target_geoip, bin_dir.join("Country.mmdb"));
-                    eprintln!("[OpenHub] 已成功从安装包内置资源释放 GeoIP 国家数据库");
+                    info!("[OpenHub] 已成功从安装包内置资源释放 GeoIP 国家数据库");
                     break;
                 }
             }

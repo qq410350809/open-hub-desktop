@@ -1,3 +1,4 @@
+use tracing::info;
 use crate::db::build_http_client;
 use crate::models::Database;
 use rusqlite::{params, OptionalExtension};
@@ -1336,7 +1337,7 @@ async fn fetch_and_persist_once(
     let _guard = SyncGuard(&runtime.syncing);
     let client = build_http_client(database, Duration::from_secs(60), 5, "模型参数同步")?;
 
-    println!("正在获取 LLMPricing Manifest: {LLMPRICING_MANIFEST_URL} ...");
+    info!(target: "openhub::catalog", "正在获取 LLMPricing Manifest: {LLMPRICING_MANIFEST_URL} ...");
     let (manifest_raw, manifest) = fetch_json(&client, "LLMPricing Manifest", LLMPRICING_MANIFEST_URL).await?;
 
     let shards_array = manifest
@@ -1348,12 +1349,12 @@ async fn fetch_and_persist_once(
     for (idx, shard_val) in shards_array.iter().enumerate() {
         let shard_name = shard_val.as_str().ok_or_else(|| "Shard 名称格式无效".to_string())?;
         let shard_url = format!("{LLMPRICING_BASE_URL}/{shard_name}");
-        println!("正在获取分片 [{}/{}]: {} ...", idx + 1, shards_array.len(), shard_name);
+        info!(target: "openhub::catalog", "正在获取分片 [{}/{}]: {} ...", idx + 1, shards_array.len(), shard_name);
         let (shard_raw, shard_json) = fetch_json(&client, shard_name, &shard_url).await?;
         shards_data.push((shard_name.to_string(), shard_raw, shard_json));
     }
 
-    println!("正在入库并更新本地模型参数缓存 ...");
+    info!(target: "openhub::catalog", "正在入库并更新本地模型参数缓存 ...");
     persist_catalog_llmpricing(database, &manifest_raw, &manifest, &shards_data)
 }
 

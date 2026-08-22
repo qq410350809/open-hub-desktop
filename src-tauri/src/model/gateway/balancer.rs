@@ -1,3 +1,4 @@
+use tracing::warn;
 use super::types::{
     current_timestamp, ChannelConfig, ModelProxyConfig, ModelProxyContext, ProxyRequestLog,
 };
@@ -165,6 +166,7 @@ pub async fn record_failover_event(
         error_message: Some(error_message),
         request_body: req_body_str,
         response_body: None,
+        channel_stats_id: None,
         node_name: Some(get_node_display_name(ctx, cand_id).await),
     })
     .await;
@@ -246,7 +248,7 @@ pub async fn build_client_for_candidate(
         if let Err(e) =
             crate::proxypool::select_proxy_node_transient(&database, &runtime, candidate).await
         {
-            eprintln!("[ModelGateway] 切换代理节点 {candidate} 失败: {e}");
+            warn!("[ModelGateway] 切换代理节点 {candidate} 失败: {e}");
         }
         let proxy_url = crate::proxypool::runtime_proxy_url_pub(&runtime);
         if !proxy_url.is_empty() {

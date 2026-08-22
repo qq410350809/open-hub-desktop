@@ -1,0 +1,1159 @@
+//! 出网协议适配层：实现 4×4 协议矩阵的上游半边。
+//!
+//! 网关内部统一以 OpenAI Chat Completions 格式为中枢：
+//! - 客户端侧（adapters.rs）：任意协议入口 → OpenAI 中枢格式
+//! - 出网侧（本模块）：OpenAI 中枢格式 → 渠道配置的目标协议请求上游，
+//!   并把上游响应（JSON 或 SSE 流）归一化回 OpenAI 中枢格式
+//!
+//! 两者组合即可覆盖「客户端任意协议 × 上游任意协议」的完整转换矩阵。
+
+use super::types::ChannelConfig;
+use bytes::Bytes;
+use futures_util::StreamExt;
+use serde_json::{json, Value as JsonValue};
+
+/// 渠道上游目标协议
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TargetProtocol {
+    /// OpenAI · Chat Completions（默认，历史遗留值 opencode 也归入此类）
+    OpenAiChat,
+    /// OpenAI · Responses API
+    OpenAiResponses,
+    /// Claude · Anthropic Messages
+    AnthropicMessages,
+    /// Google · Gemini generateContent
+    Gemini,
+}
+
+impl TargetProtocol {
+    /// 从渠道配置解析目标协议；未知/历史遗留值一律回退为 OpenAI 兼容
+    pub fn from_channel(channel: &ChannelConfig) -> Self {
+        Self::from_str(&channel.protocol)
+    }
+
+    pub fn from_str(raw: &str) -> Self {
+        match raw.trim().to_lowercase().as_str() {
+            "openai-responses" | "responses" => Self::OpenAiResponses,
+            "anthropic" | "claude" => Self::AnthropicMessages,
+            "gemini" => Self::Gemini,
+            _ => Self::OpenAiChat,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::OpenAiChat => "OpenAI Chat",
+            Self::OpenAiResponses => "OpenAI Responses",
+            Self::AnthropicMessages => "Anthropic Messages",
+            Self::Gemini => "Gemini",
+        }
+    }
+}
+
+/// 根据渠道目标协议，把内部 OpenAI 中枢请求转换为出网 URL 与请求体。
+///
+/// 返回 `(upstream_url, egress_body)`；OpenAI 协议为原样透传。
+#[allow(dead_code)]
+pub fn prepare_egress(
+    channel: &ChannelConfig,
+    api_key: &str,
+    model: &str,
+    openai_body: &JsonValue,
+    is_stream: bool,
+) -> (String, JsonValue) {
+    prepare_egress_with(channel, api_key, model, openai_body, is_stream, true)
+}
+
+/// `prepare_egress` 的完整版本：`convert = false` 表示 body 已是目标协议原生格式
+/// （同协议快速通道），只构建 URL、跳过请求体转换。
+pub fn prepare_egress_with(
+    channel: &ChannelConfig,
+    api_key: &str,
+    model: &str,
+    body: &JsonValue,
+    is_stream: bool,
+    convert: bool,
+) -> (String, JsonValue) {
+    let base = channel.base_url.trim_end_matches('/');
+    let target = TargetProtocol::from_channel(channel);
+    if !convert {
+        let url = match target {
+            TargetProtocol::OpenAiChat => format!("{base}/chat/completions"),
+            TargetProtocol::OpenAiResponses => format!("{base}/responses"),
+            TargetProtocol::AnthropicMessages => format!("{base}/v1/messages"),
+            TargetProtocol::Gemini => {
+                let action = if is_stream {
+                    "streamGenerateContent?alt=sse"
+                } else {
+                    "generateContent"
+                };
+                let mut url = format!("{base}/v1beta/models/{model}:{action}");
+                if !api_key.trim().is_empty() {
+                    url.push(if url.contains('?') { '&' } else { '?' });
+                    url.push_str("key=");
+                    url.push_str(api_key.trim());
+                }
+                url
+            }
+        };
+        return (url, body.clone());
+    }
+    match target {
+        TargetProtocol::OpenAiChat => (format!("{base}/chat/completions"), body.clone()),
+        TargetProtocol::OpenAiResponses => (
+            format!("{base}/responses"),
+            chat_to_responses_body(body, model, is_stream),
+        ),
+        TargetProtocol::AnthropicMessages => (
+            format!("{base}/v1/messages"),
+            chat_to_anthropic_body(body, model, is_stream),
+        ),
+        TargetProtocol::Gemini => {
+            let action = if is_stream {
+                "streamGenerateContent?alt=sse"
+            } else {
+                "generateContent"
+            };
+            let mut url = format!("{base}/v1beta/models/{model}:{action}");
+            // Google 原生 API 只认 query key / x-goog-api-key，聚合网关则走 Bearer，两者兼容
+            if !api_key.trim().is_empty() {
+                url.push(if url.contains('?') { '&' } else { '?' });
+                url.push_str("key=");
+                url.push_str(api_key.trim());
+            }
+            (url, chat_to_gemini_body(body))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 请求体转换：OpenAI Chat → 目标协议
+// ---------------------------------------------------------------------------
+
+fn message_text(content: &JsonValue) -> String {
+    match content {
+        JsonValue::String(s) => s.clone(),
+        JsonValue::Array(parts) => parts
+            .iter()
+            .filter_map(|p| p.get("text").and_then(JsonValue::as_str))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+/// OpenAI Chat 请求体 → Anthropic Messages 请求体
+pub fn chat_to_anthropic_body(openai_body: &JsonValue, model: &str, stream: bool) -> JsonValue {
+    let mut system_parts: Vec<String> = Vec::new();
+    let mut messages: Vec<JsonValue> = Vec::new();
+
+    if let Some(msgs) = openai_body.get("messages").and_then(JsonValue::as_array) {
+        for m in msgs {
+            let role = m.get("role").and_then(JsonValue::as_str).unwrap_or("user");
+            match role {
+                "system" | "developer" => {
+                    let text = message_text(m.get("content").unwrap_or(&JsonValue::Null));
+                    if !text.trim().is_empty() {
+                        system_parts.push(text);
+                    }
+                }
+                "tool" => {
+                    // 工具结果 → user 消息中的 tool_result 块
+                    messages.push(json!({
+                        "role": "user",
+                        "content": [{
+                            "type": "tool_result",
+                            "tool_use_id": m.get("tool_call_id").cloned().unwrap_or(JsonValue::Null),
+                            "content": m.get("content").cloned().unwrap_or(json!("")),
+                        }]
+                    }));
+                }
+                "assistant" => {
+                    let mut blocks: Vec<JsonValue> = Vec::new();
+                    let text = message_text(m.get("content").unwrap_or(&JsonValue::Null));
+                    if !text.is_empty() {
+                        blocks.push(json!({ "type": "text", "text": text }));
+                    }
+                    if let Some(tcs) = m.get("tool_calls").and_then(JsonValue::as_array) {
+                        for tc in tcs {
+                            let args = tc.pointer("/function/arguments").cloned().unwrap_or(json!("{}"));
+                            let input = if let Some(s) = args.as_str() {
+                                serde_json::from_str::<JsonValue>(s).unwrap_or(json!({}))
+                            } else {
+                                args
+                            };
+                            blocks.push(json!({
+                                "type": "tool_use",
+                                "id": tc.get("id").cloned().unwrap_or(json!("toolu_unknown")),
+                                "name": tc.pointer("/function/name").cloned().unwrap_or(json!("tool")),
+                                "input": input,
+                            }));
+                        }
+                    }
+                    if blocks.is_empty() {
+                        continue;
+                    }
+                    messages.push(json!({ "role": "assistant", "content": blocks }));
+                }
+                _ => {
+                    messages.push(json!({
+                        "role": "user",
+                        "content": m.get("content").cloned().unwrap_or(json!("")),
+                    }));
+                }
+            }
+        }
+    }
+
+    let mut body = json!({
+        "model": model,
+        "max_tokens": openai_body.get("max_tokens").and_then(JsonValue::as_u64).filter(|v| *v > 0).unwrap_or(4096),
+        "stream": stream,
+        "messages": messages,
+    });
+    if !system_parts.is_empty() {
+        body["system"] = json!(system_parts.join("\n\n"));
+    }
+    for (from, to) in [("temperature", "temperature"), ("top_p", "top_p")] {
+        if let Some(v) = openai_body.get(from) {
+            if v.is_number() {
+                body[to] = v.clone();
+            }
+        }
+    }
+    if let Some(stop) = openai_body.get("stop") {
+        match stop {
+            JsonValue::String(s) => body["stop_sequences"] = json!([s]),
+            JsonValue::Array(arr) if !arr.is_empty() => body["stop_sequences"] = stop.clone(),
+            _ => {}
+        }
+    }
+    if let Some(tools) = openai_body.get("tools").and_then(JsonValue::as_array) {
+        let mapped: Vec<JsonValue> = tools
+            .iter()
+            .filter_map(|t| {
+                let name = t.pointer("/function/name").and_then(JsonValue::as_str)?;
+                Some(json!({
+                    "name": name,
+                    "description": t.pointer("/function/description").cloned().unwrap_or(json!("")),
+                    "input_schema": t.pointer("/function/parameters").cloned().unwrap_or(json!({"type": "object"})),
+                }))
+            })
+            .collect();
+        if !mapped.is_empty() {
+            body["tools"] = json!(mapped);
+        }
+    }
+    body
+}
+
+/// OpenAI Chat 请求体 → Gemini generateContent 请求体
+pub fn chat_to_gemini_body(openai_body: &JsonValue) -> JsonValue {
+    let mut contents: Vec<JsonValue> = Vec::new();
+    let mut system_instruction: Option<JsonValue> = None;
+
+    if let Some(msgs) = openai_body.get("messages").and_then(JsonValue::as_array) {
+        for m in msgs {
+            let role = m.get("role").and_then(JsonValue::as_str).unwrap_or("user");
+            let text = message_text(m.get("content").unwrap_or(&JsonValue::Null));
+            match role {
+                "system" | "developer" => {
+                    if !text.trim().is_empty() {
+                        system_instruction = Some(json!({ "parts": [{ "text": text }] }));
+                    }
+                }
+                "assistant" => {
+                    let mut parts: Vec<JsonValue> = Vec::new();
+                    if !text.is_empty() {
+                        parts.push(json!({ "text": text }));
+                    }
+                    if let Some(tcs) = m.get("tool_calls").and_then(JsonValue::as_array) {
+                        for tc in tcs {
+                            let args = tc.pointer("/function/arguments").cloned().unwrap_or(json!("{}"));
+                            let args_val = if let Some(s) = args.as_str() {
+                                serde_json::from_str::<JsonValue>(s).unwrap_or(json!({}))
+                            } else {
+                                args
+                            };
+                            parts.push(json!({
+                                "functionCall": {
+                                    "name": tc.pointer("/function/name").cloned().unwrap_or(json!("tool")),
+                                    "args": args_val,
+                                }
+                            }));
+                        }
+                    }
+                    if !parts.is_empty() {
+                        contents.push(json!({ "role": "model", "parts": parts }));
+                    }
+                }
+                "tool" => {
+                    contents.push(json!({
+                        "role": "user",
+                        "parts": [{
+                            "functionResponse": {
+                                "name": m.get("tool_call_id").and_then(JsonValue::as_str).unwrap_or("tool"),
+                                "response": { "result": m.get("content").cloned().unwrap_or(json!("")) },
+                            }
+                        }]
+                    }));
+                }
+                _ => {
+                    if !text.is_empty() {
+                        contents.push(json!({ "role": "user", "parts": [{ "text": text }] }));
+                    }
+                }
+            }
+        }
+    }
+
+    let mut generation_config = json!({});
+    if let Some(v) = openai_body.get("max_tokens").and_then(JsonValue::as_u64).filter(|v| *v > 0) {
+        generation_config["maxOutputTokens"] = json!(v);
+    }
+    for (from, to) in [("temperature", "temperature"), ("top_p", "topP")] {
+        if let Some(v) = openai_body.get(from) {
+            if v.is_number() {
+                generation_config[to] = v.clone();
+            }
+        }
+    }
+    if let Some(stop) = openai_body.get("stop") {
+        match stop {
+            JsonValue::String(s) => generation_config["stopSequences"] = json!([s]),
+            JsonValue::Array(arr) if !arr.is_empty() => generation_config["stopSequences"] = stop.clone(),
+            _ => {}
+        }
+    }
+
+    let mut body = json!({ "contents": contents, "generationConfig": generation_config });
+    if let Some(si) = system_instruction {
+        body["systemInstruction"] = si;
+    }
+    if let Some(tools) = openai_body.get("tools").and_then(JsonValue::as_array) {
+        let decls: Vec<JsonValue> = tools
+            .iter()
+            .filter_map(|t| {
+                let name = t.pointer("/function/name").and_then(JsonValue::as_str)?;
+                Some(json!({
+                    "name": name,
+                    "description": t.pointer("/function/description").cloned().unwrap_or(json!("")),
+                    "parameters": t.pointer("/function/parameters").cloned().unwrap_or(json!({"type": "object"})),
+                }))
+            })
+            .collect();
+        if !decls.is_empty() {
+            body["tools"] = json!([{ "functionDeclarations": decls }]);
+        }
+    }
+    body
+}
+
+/// OpenAI Chat 请求体 → OpenAI Responses API 请求体
+pub fn chat_to_responses_body(openai_body: &JsonValue, model: &str, stream: bool) -> JsonValue {
+    let mut instructions = String::new();
+    let mut input: Vec<JsonValue> = Vec::new();
+
+    if let Some(msgs) = openai_body.get("messages").and_then(JsonValue::as_array) {
+        for m in msgs {
+            let role = m.get("role").and_then(JsonValue::as_str).unwrap_or("user");
+            let text = message_text(m.get("content").unwrap_or(&JsonValue::Null));
+            match role {
+                "system" | "developer" => {
+                    if !text.trim().is_empty() {
+                        if !instructions.is_empty() {
+                            instructions.push('\n');
+                        }
+                        instructions.push_str(&text);
+                    }
+                }
+                "assistant" => {
+                    if !text.is_empty() {
+                        input.push(json!({
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{ "type": "output_text", "text": text }],
+                        }));
+                    }
+                    if let Some(tcs) = m.get("tool_calls").and_then(JsonValue::as_array) {
+                        for tc in tcs {
+                            let args = tc.pointer("/function/arguments").cloned().unwrap_or(json!("{}"));
+                            input.push(json!({
+                                "type": "function_call",
+                                "call_id": tc.get("id").cloned().unwrap_or(json!("call_unknown")),
+                                "name": tc.pointer("/function/name").cloned().unwrap_or(json!("tool")),
+                                "arguments": if args.is_string() { args } else { json!(args.to_string()) },
+                            }));
+                        }
+                    }
+                }
+                "tool" => {
+                    input.push(json!({
+                        "type": "function_call_output",
+                        "call_id": m.get("tool_call_id").cloned().unwrap_or(json!("call_unknown")),
+                        "output": m.get("content").cloned().unwrap_or(json!("")),
+                    }));
+                }
+                _ => {
+                    if !text.is_empty() {
+                        input.push(json!({
+                            "type": "message",
+                            "role": "user",
+                            "content": [{ "type": "input_text", "text": text }],
+                        }));
+                    }
+                }
+            }
+        }
+    }
+
+    let mut body = json!({ "model": model, "stream": stream, "input": input });
+    if !instructions.is_empty() {
+        body["instructions"] = json!(instructions);
+    }
+    if let Some(v) = openai_body.get("max_tokens").and_then(JsonValue::as_u64).filter(|v| *v > 0) {
+        body["max_output_tokens"] = json!(v);
+    }
+    if let Some(v) = openai_body.get("temperature") {
+        if v.is_number() {
+            body["temperature"] = v.clone();
+        }
+    }
+    body
+}
+
+// ---------------------------------------------------------------------------
+// 非流式响应归一化：目标协议 JSON → OpenAI Chat 响应
+// ---------------------------------------------------------------------------
+
+/// 把上游非流式响应字节归一化为 OpenAI Chat 格式；解析失败时原样透传（便于错误排查）
+pub fn normalize_response_bytes(target: TargetProtocol, model: &str, raw: &[u8]) -> Vec<u8> {
+    if matches!(target, TargetProtocol::OpenAiChat) {
+        return raw.to_vec();
+    }
+    let Ok(jv) = serde_json::from_slice::<JsonValue>(raw) else {
+        return raw.to_vec();
+    };
+    let converted = match target {
+        TargetProtocol::AnthropicMessages => anthropic_response_to_openai(&jv),
+        TargetProtocol::Gemini => gemini_response_to_openai(&jv, model),
+        TargetProtocol::OpenAiResponses => responses_response_to_openai(&jv),
+        TargetProtocol::OpenAiChat => unreachable!(),
+    };
+    serde_json::to_vec(&converted).unwrap_or_else(|_| raw.to_vec())
+}
+
+fn empty_chat_response(model: &str) -> JsonValue {
+    json!({
+        "choices": [{ "index": 0, "message": { "role": "assistant", "content": "" }, "finish_reason": null }],
+        "model": model,
+    })
+}
+
+/// Anthropic Messages 响应 → OpenAI Chat 响应
+pub fn anthropic_response_to_openai(resp: &JsonValue) -> JsonValue {
+    let model = resp.get("model").and_then(JsonValue::as_str).unwrap_or("");
+    let mut content = String::new();
+    let mut reasoning = String::new();
+    let mut tool_calls: Vec<JsonValue> = Vec::new();
+
+    if let Some(blocks) = resp.get("content").and_then(JsonValue::as_array) {
+        for b in blocks {
+            match b.get("type").and_then(JsonValue::as_str) {
+                Some("text") => {
+                    if let Some(t) = b.get("text").and_then(JsonValue::as_str) {
+                        content.push_str(t);
+                    }
+                }
+                Some("thinking") => {
+                    if let Some(t) = b.get("thinking").and_then(JsonValue::as_str) {
+                        reasoning.push_str(t);
+                    }
+                }
+                Some("tool_use") => {
+                    tool_calls.push(json!({
+                        "id": b.get("id").cloned().unwrap_or(json!("toolu_unknown")),
+                        "type": "function",
+                        "function": {
+                            "name": b.get("name").cloned().unwrap_or(json!("tool")),
+                            "arguments": json!(b.get("input").map(|i| i.to_string()).unwrap_or_default()),
+                        }
+                    }));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let finish_reason = match resp.get("stop_reason").and_then(JsonValue::as_str) {
+        Some("max_tokens") => "length",
+        Some("tool_use") => "tool_calls",
+        Some(_) | None => "stop",
+    };
+
+    let usage = resp.get("usage");
+    let prompt_tokens = usage.and_then(|u| u.get("input_tokens")).and_then(JsonValue::as_u64).unwrap_or(0);
+    let completion_tokens = usage.and_then(|u| u.get("output_tokens")).and_then(JsonValue::as_u64).unwrap_or(0);
+
+    let mut out = empty_chat_response(model);
+    let msg = out.pointer_mut("/choices/0/message").expect("message exists");
+    msg["content"] = json!(content);
+    if !reasoning.is_empty() {
+        msg["reasoning_content"] = json!(reasoning);
+    }
+    if !tool_calls.is_empty() {
+        msg["tool_calls"] = json!(tool_calls);
+    }
+    out["choices"][0]["finish_reason"] = json!(finish_reason);
+    out["usage"] = json!({
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+    });
+    out
+}
+
+/// Gemini generateContent 响应 → OpenAI Chat 响应
+pub fn gemini_response_to_openai(resp: &JsonValue, model: &str) -> JsonValue {
+    let mut content = String::new();
+    let mut reasoning = String::new();
+    let mut tool_calls: Vec<JsonValue> = Vec::new();
+    let mut finish_reason = "stop";
+
+    if let Some(candidates) = resp.get("candidates").and_then(JsonValue::as_array) {
+        if let Some(c0) = candidates.first() {
+            if let Some(parts) = c0.pointer("/content/parts").and_then(JsonValue::as_array) {
+                for p in parts {
+                    let is_thought = p.get("thought").and_then(JsonValue::as_bool).unwrap_or(false);
+                    if let Some(t) = p.get("text").and_then(JsonValue::as_str) {
+                        if is_thought {
+                            reasoning.push_str(t);
+                        } else {
+                            content.push_str(t);
+                        }
+                    }
+                    if let Some(fc) = p.get("functionCall") {
+                        tool_calls.push(json!({
+                            "id": format!("call_{}", tool_calls.len()),
+                            "type": "function",
+                            "function": {
+                                "name": fc.get("name").cloned().unwrap_or(json!("tool")),
+                                "arguments": json!(fc.get("args").map(|a| a.to_string()).unwrap_or_default()),
+                            }
+                        }));
+                    }
+                }
+            }
+            finish_reason = match c0.get("finishReason").and_then(JsonValue::as_str) {
+                Some("MAX_TOKENS") => "length",
+                Some("SAFETY") | Some("RECITATION") => "content_filter",
+                _ => "stop",
+            };
+        }
+    }
+
+    let usage = resp.get("usageMetadata");
+    let prompt_tokens = usage.and_then(|u| u.get("promptTokenCount")).and_then(JsonValue::as_u64).unwrap_or(0);
+    let completion_tokens = usage
+        .and_then(|u| u.get("candidatesTokenCount"))
+        .and_then(JsonValue::as_u64)
+        .unwrap_or(0)
+        + usage.and_then(|u| u.get("thoughtsTokenCount")).and_then(JsonValue::as_u64).unwrap_or(0);
+
+    let mut out = empty_chat_response(model);
+    let msg = out.pointer_mut("/choices/0/message").expect("message exists");
+    msg["content"] = json!(content);
+    if !reasoning.is_empty() {
+        msg["reasoning_content"] = json!(reasoning);
+    }
+    if !tool_calls.is_empty() {
+        msg["tool_calls"] = json!(tool_calls);
+    }
+    out["choices"][0]["finish_reason"] = json!(finish_reason);
+    out["usage"] = json!({
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": usage.and_then(|u| u.get("totalTokenCount")).and_then(JsonValue::as_u64).unwrap_or(prompt_tokens + completion_tokens),
+    });
+    out
+}
+
+/// OpenAI Responses API 响应 → OpenAI Chat 响应
+pub fn responses_response_to_openai(resp: &JsonValue) -> JsonValue {
+    let model = resp.get("model").and_then(JsonValue::as_str).unwrap_or("");
+    let mut content = String::new();
+    let mut reasoning = String::new();
+    let mut tool_calls: Vec<JsonValue> = Vec::new();
+
+    if let Some(output) = resp.get("output").and_then(JsonValue::as_array) {
+        for item in output {
+            match item.get("type").and_then(JsonValue::as_str) {
+                Some("message") => {
+                    if let Some(parts) = item.get("content").and_then(JsonValue::as_array) {
+                        for p in parts {
+                            if let Some(t) = p.get("text").and_then(JsonValue::as_str) {
+                                content.push_str(t);
+                            }
+                        }
+                    }
+                }
+                Some("reasoning") => {
+                    if let Some(summaries) = item.get("summary").and_then(JsonValue::as_array) {
+                        for s in summaries {
+                            if let Some(t) = s.get("text").and_then(JsonValue::as_str) {
+                                reasoning.push_str(t);
+                            }
+                        }
+                    }
+                }
+                Some("function_call") => {
+                    tool_calls.push(json!({
+                        "id": item.get("call_id").or_else(|| item.get("id")).cloned().unwrap_or(json!("call_unknown")),
+                        "type": "function",
+                        "function": {
+                            "name": item.get("name").cloned().unwrap_or(json!("tool")),
+                            "arguments": item.get("arguments").cloned().unwrap_or(json!("{}")),
+                        }
+                    }));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let usage = resp.get("usage");
+    let prompt_tokens = usage.and_then(|u| u.get("input_tokens")).and_then(JsonValue::as_u64).unwrap_or(0);
+    let completion_tokens = usage.and_then(|u| u.get("output_tokens")).and_then(JsonValue::as_u64).unwrap_or(0);
+
+    let mut out = empty_chat_response(model);
+    let msg = out.pointer_mut("/choices/0/message").expect("message exists");
+    msg["content"] = json!(content);
+    if !reasoning.is_empty() {
+        msg["reasoning_content"] = json!(reasoning);
+    }
+    if !tool_calls.is_empty() {
+        msg["tool_calls"] = json!(tool_calls);
+    }
+    out["choices"][0]["finish_reason"] = json!("stop");
+    out["usage"] = json!({
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+    });
+    out
+}
+
+// ---------------------------------------------------------------------------
+// 流式响应归一化：目标协议 SSE → OpenAI Chat SSE
+// ---------------------------------------------------------------------------
+
+/// 单个发往客户端的 OpenAI delta 分片（不含 data: 前缀）
+fn delta_chunk(delta: JsonValue, finish_reason: Option<&str>, usage: Option<JsonValue>) -> String {
+    let mut chunk = json!({
+        "id": "chatcmpl-egress",
+        "object": "chat.completion.chunk",
+        "choices": [{
+            "index": 0,
+            "delta": delta,
+            "finish_reason": finish_reason.map(JsonValue::from),
+        }]
+    });
+    if let Some(u) = usage {
+        chunk["usage"] = u;
+    }
+    format!("data: {}\n\n", chunk)
+}
+
+#[derive(Default)]
+struct AnthropicSseState {
+    input_tokens: u64,
+    output_tokens: u64,
+    /// 块索引 → ("text" | "thinking" | "tool_use")
+    block_kinds: std::collections::HashMap<u64, String>,
+    /// 工具块索引 → (id, name)
+    tool_meta: std::collections::HashMap<u64, (String, String)>,
+    stop_reason: Option<String>,
+}
+
+impl AnthropicSseState {
+    fn feed(&mut self, jv: &JsonValue) -> Vec<String> {
+        let mut out = Vec::new();
+        match jv.get("type").and_then(JsonValue::as_str) {
+            Some("message_start") => {
+                self.input_tokens = jv
+                    .pointer("/message/usage/input_tokens")
+                    .and_then(JsonValue::as_u64)
+                    .unwrap_or(0);
+            }
+            Some("content_block_start") => {
+                let idx = jv.get("index").and_then(JsonValue::as_u64).unwrap_or(0);
+                let kind = jv
+                    .pointer("/content_block/type")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or("text")
+                    .to_string();
+                if kind == "tool_use" {
+                    let id = jv.pointer("/content_block/id").and_then(JsonValue::as_str).unwrap_or("toolu_unknown");
+                    let name = jv.pointer("/content_block/name").and_then(JsonValue::as_str).unwrap_or("tool");
+                    self.tool_meta.insert(idx, (id.to_string(), name.to_string()));
+                }
+                self.block_kinds.insert(idx, kind);
+            }
+            Some("content_block_delta") => {
+                let idx = jv.get("index").and_then(JsonValue::as_u64).unwrap_or(0);
+                match self.block_kinds.get(&idx).map(String::as_str) {
+                    Some("thinking") => {
+                        if let Some(t) = jv.pointer("/delta/thinking").and_then(JsonValue::as_str) {
+                            out.push(delta_chunk(json!({ "reasoning_content": t }), None, None));
+                        }
+                    }
+                    Some("tool_use") => {
+                        if let Some(frag) = jv.pointer("/delta/partial_json").and_then(JsonValue::as_str) {
+                            out.push(delta_chunk(
+                                json!({ "tool_calls": [{ "index": idx, "function": { "arguments": frag } }] }),
+                                None,
+                                None,
+                            ));
+                        }
+                    }
+                    _ => {
+                        if let Some(t) = jv.pointer("/delta/text").and_then(JsonValue::as_str) {
+                            out.push(delta_chunk(json!({ "content": t }), None, None));
+                        }
+                    }
+                }
+            }
+            Some("message_delta") => {
+                if let Some(r) = jv.pointer("/delta/stop_reason").and_then(JsonValue::as_str) {
+                    self.stop_reason = Some(r.to_string());
+                }
+                if let Some(o) = jv.pointer("/usage/output_tokens").and_then(JsonValue::as_u64) {
+                    self.output_tokens = o;
+                }
+            }
+            _ => {}
+        }
+        out
+    }
+
+    fn finish(&self) -> Vec<String> {
+        let finish_reason = match self.stop_reason.as_deref() {
+            Some("max_tokens") => "length",
+            Some("tool_use") => "tool_calls",
+            _ => "stop",
+        };
+        vec![
+            delta_chunk(
+                json!({}),
+                Some(finish_reason),
+                Some(json!({
+                    "prompt_tokens": self.input_tokens,
+                    "completion_tokens": self.output_tokens,
+                    "total_tokens": self.input_tokens + self.output_tokens,
+                })),
+            ),
+            "data: [DONE]\n\n".to_string(),
+        ]
+    }
+}
+
+#[derive(Default)]
+struct GeminiSseState {
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    total_tokens: u64,
+    finish_reason: Option<String>,
+}
+
+impl GeminiSseState {
+    fn feed(&mut self, jv: &JsonValue) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Some(candidates) = jv.get("candidates").and_then(JsonValue::as_array) {
+            if let Some(c0) = candidates.first() {
+                if let Some(parts) = c0.pointer("/content/parts").and_then(JsonValue::as_array) {
+                    for p in parts {
+                        let is_thought = p.get("thought").and_then(JsonValue::as_bool).unwrap_or(false);
+                        if let Some(t) = p.get("text").and_then(JsonValue::as_str) {
+                            let key = if is_thought { "reasoning_content" } else { "content" };
+                            out.push(delta_chunk(json!({ key: t }), None, None));
+                        }
+                        if let Some(fc) = p.get("functionCall") {
+                            out.push(delta_chunk(
+                                json!({ "tool_calls": [{
+                                    "index": 0,
+                                    "function": {
+                                        "name": fc.get("name").cloned().unwrap_or(json!("tool")),
+                                        "arguments": json!(fc.get("args").map(|a| a.to_string()).unwrap_or_default()),
+                                    }
+                                }] }),
+                                None,
+                                None,
+                            ));
+                        }
+                    }
+                }
+                if let Some(fr) = c0.get("finishReason").and_then(JsonValue::as_str) {
+                    self.finish_reason = Some(fr.to_string());
+                }
+            }
+        }
+        if let Some(u) = jv.get("usageMetadata") {
+            self.prompt_tokens = u.get("promptTokenCount").and_then(JsonValue::as_u64).unwrap_or(self.prompt_tokens);
+            self.completion_tokens = u.get("candidatesTokenCount").and_then(JsonValue::as_u64).unwrap_or(self.completion_tokens)
+                + u.get("thoughtsTokenCount").and_then(JsonValue::as_u64).unwrap_or(0);
+            self.total_tokens = u.get("totalTokenCount").and_then(JsonValue::as_u64).unwrap_or(self.total_tokens);
+        }
+        out
+    }
+
+    fn finish(&self) -> Vec<String> {
+        let finish_reason = match self.finish_reason.as_deref() {
+            Some("MAX_TOKENS") => "length",
+            Some("SAFETY") | Some("RECITATION") => "content_filter",
+            _ => "stop",
+        };
+        vec![
+            delta_chunk(
+                json!({}),
+                Some(finish_reason),
+                Some(json!({
+                    "prompt_tokens": self.prompt_tokens,
+                    "completion_tokens": self.completion_tokens,
+                    "total_tokens": if self.total_tokens > 0 { self.total_tokens } else { self.prompt_tokens + self.completion_tokens },
+                })),
+            ),
+            "data: [DONE]\n\n".to_string(),
+        ]
+    }
+}
+
+#[derive(Default)]
+struct ResponsesSseState {
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    tool_count: u64,
+}
+
+impl ResponsesSseState {
+    fn feed(&mut self, jv: &JsonValue) -> Vec<String> {
+        let mut out = Vec::new();
+        match jv.get("type").and_then(JsonValue::as_str) {
+            Some("response.output_text.delta") => {
+                if let Some(t) = jv.get("delta").and_then(JsonValue::as_str) {
+                    out.push(delta_chunk(json!({ "content": t }), None, None));
+                }
+            }
+            Some("response.reasoning_summary_text.delta") => {
+                if let Some(t) = jv.get("delta").and_then(JsonValue::as_str) {
+                    out.push(delta_chunk(json!({ "reasoning_content": t }), None, None));
+                }
+            }
+            Some("response.output_item.done") => {
+                if jv.pointer("/item/type").and_then(JsonValue::as_str) == Some("function_call") {
+                    let idx = self.tool_count;
+                    self.tool_count += 1;
+                    out.push(delta_chunk(
+                        json!({ "tool_calls": [{
+                            "index": idx,
+                            "id": jv.pointer("/item/call_id").or_else(|| jv.pointer("/item/id")).cloned().unwrap_or(json!("call_unknown")),
+                            "function": {
+                                "name": jv.pointer("/item/name").cloned().unwrap_or(json!("tool")),
+                                "arguments": jv.pointer("/item/arguments").cloned().unwrap_or(json!("{}")),
+                            }
+                        }] }),
+                        None,
+                        None,
+                    ));
+                }
+            }
+            Some("response.completed") | Some("response.incomplete") => {
+                self.prompt_tokens = jv.pointer("/response/usage/input_tokens").and_then(JsonValue::as_u64).unwrap_or(self.prompt_tokens);
+                self.completion_tokens = jv.pointer("/response/usage/output_tokens").and_then(JsonValue::as_u64).unwrap_or(self.completion_tokens);
+            }
+            _ => {}
+        }
+        out
+    }
+
+    fn finish(&self) -> Vec<String> {
+        vec![
+            delta_chunk(
+                json!({}),
+                Some("stop"),
+                Some(json!({
+                    "prompt_tokens": self.prompt_tokens,
+                    "completion_tokens": self.completion_tokens,
+                    "total_tokens": self.prompt_tokens + self.completion_tokens,
+                })),
+            ),
+            "data: [DONE]\n\n".to_string(),
+        ]
+    }
+}
+
+enum SseNormalizer {
+    Anthropic(AnthropicSseState),
+    Gemini(GeminiSseState),
+    Responses(ResponsesSseState),
+}
+
+impl SseNormalizer {
+    fn new(target: TargetProtocol) -> Self {
+        match target {
+            TargetProtocol::AnthropicMessages => Self::Anthropic(AnthropicSseState::default()),
+            TargetProtocol::Gemini => Self::Gemini(GeminiSseState::default()),
+            _ => Self::Responses(ResponsesSseState::default()),
+        }
+    }
+
+    fn feed(&mut self, data: &str) -> Vec<String> {
+        let Ok(jv) = serde_json::from_str::<JsonValue>(data) else {
+            return Vec::new();
+        };
+        match self {
+            Self::Anthropic(s) => s.feed(&jv),
+            Self::Gemini(s) => s.feed(&jv),
+            Self::Responses(s) => s.feed(&jv),
+        }
+    }
+
+    fn finish(self) -> Vec<String> {
+        match self {
+            Self::Anthropic(s) => s.finish(),
+            Self::Gemini(s) => s.finish(),
+            Self::Responses(s) => s.finish(),
+        }
+    }
+}
+
+/// 把上游目标协议的 SSE 字节流归一化为 OpenAI Chat SSE 字节流。
+/// OpenAI 协议无需调用本函数（直接透传原始流）。
+pub fn normalized_sse_stream<E, S>(stream: S, target: TargetProtocol) -> impl futures_util::Stream<Item = Result<Bytes, E>> + Send
+where
+    S: futures_util::Stream<Item = Result<Bytes, E>> + Send + 'static,
+    E: Send + 'static,
+{
+    let mut normalizer = SseNormalizer::new(target);
+    async_stream::stream! {
+        let mut buffer = String::new();
+        tokio::pin!(stream);
+
+        while let Some(chunk_res) = stream.next().await {
+            match chunk_res {
+                Ok(bytes) => {
+                    let Ok(text) = std::str::from_utf8(&bytes) else { continue };
+                    buffer.push_str(text);
+                    while let Some(pos) = buffer.find('\n') {
+                        let line = buffer[..pos].trim_end_matches('\r').to_string();
+                        buffer = buffer[pos + 1..].to_string();
+                        let Some(data) = line.strip_prefix("data:") else { continue };
+                        let data = data.trim();
+                        if data.is_empty() || data == "[DONE]" {
+                            continue;
+                        }
+                        for payload in normalizer.feed(data) {
+                            yield Ok::<Bytes, E>(Bytes::from(payload));
+                        }
+                    }
+                }
+                Err(err) => {
+                    yield Err(err);
+                    return;
+                }
+            }
+        }
+
+        for payload in normalizer.finish() {
+            yield Ok::<Bytes, E>(Bytes::from(payload));
+        }
+    }
+}
+
+#[cfg(test)]
+mod egress_tests {
+    use super::*;
+
+    fn channel_with_protocol(protocol: &str) -> ChannelConfig {
+        ChannelConfig {
+            id: "test".to_string(),
+            name: "Test".to_string(),
+            description: String::new(),
+            enabled: true,
+            protocol: protocol.to_string(),
+            base_url: "https://upstream.example/v1".to_string(),
+            api_key: String::new(),
+            api_keys: None,
+            use_proxy_pool: false,
+            alias: None,
+            site_id: None,
+            use_fixed_proxy: false,
+            fixed_proxy_node: None,
+            priority: None,
+            weight: None,
+            enabled_models: None,
+            model_redirects: None,
+            rate_limit_rpm: None,
+            stats_id: None,
+        }
+    }
+
+    #[test]
+    fn target_protocol_from_channel_maps_legacy_values() {
+        assert_eq!(TargetProtocol::from_channel(&channel_with_protocol("openai")), TargetProtocol::OpenAiChat);
+        assert_eq!(TargetProtocol::from_channel(&channel_with_protocol("opencode")), TargetProtocol::OpenAiChat);
+        assert_eq!(TargetProtocol::from_channel(&channel_with_protocol("responses")), TargetProtocol::OpenAiResponses);
+        assert_eq!(TargetProtocol::from_channel(&channel_with_protocol("claude")), TargetProtocol::AnthropicMessages);
+        assert_eq!(TargetProtocol::from_channel(&channel_with_protocol("gemini")), TargetProtocol::Gemini);
+        assert_eq!(TargetProtocol::from_channel(&channel_with_protocol("unknown")), TargetProtocol::OpenAiChat);
+    }
+
+    #[test]
+    fn prepare_egress_builds_url_per_protocol() {
+        let body = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]});
+
+        let (url, _) = prepare_egress(&channel_with_protocol("openai"), "sk-x", "m", &body, false);
+        assert_eq!(url, "https://upstream.example/v1/chat/completions");
+
+        let (url, _) = prepare_egress(&channel_with_protocol("openai-responses"), "sk-x", "m", &body, false);
+        assert_eq!(url, "https://upstream.example/v1/responses");
+
+        let (url, _) = prepare_egress(&channel_with_protocol("anthropic"), "sk-x", "m", &body, true);
+        assert_eq!(url, "https://upstream.example/v1/v1/messages");
+
+        let (url, _) = prepare_egress(&channel_with_protocol("gemini"), "sk-123", "gemini-2.5-pro", &body, false);
+        assert_eq!(url, "https://upstream.example/v1/v1beta/models/gemini-2.5-pro:generateContent?key=sk-123");
+
+        let (url, _) = prepare_egress(&channel_with_protocol("gemini"), "", "g", &body, true);
+        assert_eq!(url, "https://upstream.example/v1/v1beta/models/g:streamGenerateContent?alt=sse");
+    }
+
+    #[test]
+    fn chat_to_anthropic_body_maps_system_tools_and_defaults() {
+        let body = json!({
+            "model": "m",
+            "max_tokens": 0,
+            "temperature": 0.7,
+            "messages": [
+                {"role": "system", "content": "你是助手"},
+                {"role": "user", "content": "你好"},
+            ],
+            "tools": [{"type": "function", "function": {"name": "get_weather", "description": "查天气", "parameters": {"type": "object"}}}],
+        });
+        let out = chat_to_anthropic_body(&body, "claude-4", true);
+        assert_eq!(out["system"], json!("你是助手"));
+        assert_eq!(out["max_tokens"], json!(4096));
+        assert_eq!(out["model"], json!("claude-4"));
+        assert_eq!(out["stream"], json!(true));
+        assert_eq!(out["messages"][0]["role"], json!("user"));
+        assert_eq!(out["tools"][0]["name"], json!("get_weather"));
+        assert!(out["tools"][0]["input_schema"].is_object());
+    }
+
+    #[test]
+    fn anthropic_response_to_openai_extracts_blocks_and_usage() {
+        let resp = json!({
+            "model": "claude-4",
+            "content": [
+                {"type": "thinking", "thinking": "让我想想"},
+                {"type": "text", "text": "答案是 42"},
+                {"type": "tool_use", "id": "toolu_1", "name": "search", "input": {"q": "hi"}},
+            ],
+            "stop_reason": "tool_use",
+            "usage": {"input_tokens": 100, "output_tokens": 50},
+        });
+        let out = anthropic_response_to_openai(&resp);
+        assert_eq!(out.pointer("/choices/0/message/content").unwrap(), "答案是 42");
+        assert_eq!(out.pointer("/choices/0/message/reasoning_content").unwrap(), "让我想想");
+        assert_eq!(out.pointer("/choices/0/finish_reason").unwrap(), "tool_calls");
+        assert_eq!(out.pointer("/usage/prompt_tokens").unwrap(), 100);
+        assert_eq!(out.pointer("/usage/completion_tokens").unwrap(), 50);
+        let tc = out.pointer("/choices/0/message/tool_calls/0").unwrap();
+        assert_eq!(tc["function"]["name"], json!("search"));
+        assert_eq!(tc["function"]["arguments"], json!(r#"{"q":"hi"}"#));
+    }
+
+    #[test]
+    fn gemini_response_roundtrip_keeps_text_and_thought() {
+        let chat = json!({
+            "model": "m",
+            "messages": [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "hi"},
+            ],
+            "max_tokens": 128,
+        });
+        let gemini_req = chat_to_gemini_body(&chat);
+        assert_eq!(gemini_req.pointer("/systemInstruction/parts/0/text").unwrap(), "sys");
+        assert_eq!(gemini_req.pointer("/contents/0/role").unwrap(), "user");
+        assert_eq!(gemini_req.pointer("/generationConfig/maxOutputTokens").unwrap(), 128);
+
+        let gemini_resp = json!({
+            "candidates": [{
+                "content": {"parts": [
+                    {"text": "思考中", "thought": true},
+                    {"text": "你好！"},
+                    {"functionCall": {"name": "search", "args": {"q": 1}}},
+                ]},
+                "finishReason": "STOP",
+            }],
+            "usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 5, "totalTokenCount": 15},
+        });
+        let out = gemini_response_to_openai(&gemini_resp, "gemini-2.5");
+        assert_eq!(out.pointer("/choices/0/message/content").unwrap(), "你好！");
+        assert_eq!(out.pointer("/choices/0/message/reasoning_content").unwrap(), "思考中");
+        assert_eq!(out.pointer("/choices/0/finish_reason").unwrap(), "stop");
+        assert_eq!(out.pointer("/usage/total_tokens").unwrap(), 15);
+    }
+
+    #[test]
+    fn responses_response_to_openai_extracts_output_items() {
+        let resp = json!({
+            "model": "gpt-x",
+            "output": [
+                {"type": "reasoning", "summary": [{"type": "summary_text", "text": "推理过程"}]},
+                {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "最终回答"}]},
+                {"type": "function_call", "call_id": "call_1", "name": "calc", "arguments": "{\"a\":1}"},
+            ],
+            "usage": {"input_tokens": 8, "output_tokens": 6},
+        });
+        let out = responses_response_to_openai(&resp);
+        assert_eq!(out.pointer("/choices/0/message/content").unwrap(), "最终回答");
+        assert_eq!(out.pointer("/choices/0/message/reasoning_content").unwrap(), "推理过程");
+        assert_eq!(out.pointer("/choices/0/message/tool_calls/0/function/name").unwrap(), "calc");
+        assert_eq!(out.pointer("/usage/prompt_tokens").unwrap(), 8);
+    }
+
+    #[test]
+    fn anthropic_sse_sequence_converts_to_openai_chunks() {
+        let mut s = AnthropicSseState::default();
+        let mut collected = String::new();
+        for data in [
+            r#"{"type":"message_start","message":{"usage":{"input_tokens":20}}}"#,
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"你"}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"好"}}"#,
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":9}}"#,
+        ] {
+            for chunk in s.feed(&serde_json::from_str::<JsonValue>(data).unwrap()) {
+                collected.push_str(&chunk);
+            }
+        }
+        for chunk in s.finish() {
+            collected.push_str(&chunk);
+        }
+
+        assert!(collected.contains("你好") || (collected.contains("你") && collected.contains("好")));
+        assert!(collected.contains("\"prompt_tokens\":20"));
+        assert!(collected.contains("\"completion_tokens\":9"));
+        assert!(collected.contains("\"finish_reason\":\"stop\""));
+        assert!(collected.ends_with("data: [DONE]\n\n"));
+    }
+
+    #[test]
+    fn normalize_response_bytes_passthrough_on_invalid_json() {
+        let raw = b"<html>Bad Gateway</html>".to_vec();
+        let out = normalize_response_bytes(TargetProtocol::AnthropicMessages, "m", &raw);
+        assert_eq!(out, raw);
+    }
+}

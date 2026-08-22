@@ -5,10 +5,7 @@ use std::collections::HashMap;
 use tauri::{AppHandle, Emitter};
 
 pub fn load_charity_sources(database: &Database) -> Result<Vec<CharityFeedSource>, String> {
-    let connection = database
-        .0
-        .lock()
-        .map_err(|_| "本地数据库锁定失败".to_string())?;
+    let connection = database.lock_db();
     let mut statement = connection
         .prepare(
             "SELECT id, name, json_url, enabled, sort_order FROM charity_feed_sources
@@ -31,10 +28,7 @@ pub fn load_charity_sources(database: &Database) -> Result<Vec<CharityFeedSource
 }
 
 pub fn load_all_charity_sources(database: &Database) -> Result<Vec<CharityFeedSource>, String> {
-    let connection = database
-        .0
-        .lock()
-        .map_err(|_| "本地数据库锁定失败".to_string())?;
+    let connection = database.lock_db();
     let mut statement = connection
         .prepare(
             "SELECT id, name, json_url, enabled, sort_order FROM charity_feed_sources
@@ -58,10 +52,7 @@ pub fn load_all_charity_sources(database: &Database) -> Result<Vec<CharityFeedSo
 
 pub fn charity_feed_source(database: &Database, feed_id: &str) -> Result<CharityFeedSource, String> {
     let feed_id = feed_id.trim();
-    let connection = database
-        .0
-        .lock()
-        .map_err(|_| "本地数据库锁定失败".to_string())?;
+    let connection = database.lock_db();
     connection
         .query_row(
             "SELECT id, name, json_url, enabled, sort_order FROM charity_feed_sources WHERE id = ?1",
@@ -88,9 +79,7 @@ pub fn append_charity_sync_log(
     message: &str,
     node_name: &str,
 ) -> Option<i64> {
-    let Ok(connection) = database.0.lock() else {
-        return None;
-    };
+    let connection = database.lock_db();
     if connection
         .execute(
             "INSERT INTO charity_sync_logs
@@ -123,9 +112,7 @@ pub fn update_charity_sync_log(
     node_name: &str,
     duration_ms: i64,
 ) {
-    let Ok(connection) = database.0.lock() else {
-        return;
-    };
+    let connection = database.lock_db();
     let _ = connection.execute(
         "UPDATE charity_sync_logs
          SET status = ?1, message = ?2, node_name = ?3, duration_ms = ?4
@@ -141,9 +128,7 @@ pub fn touch_running_charity_sync_log(
     node_name: &str,
     duration_ms: i64,
 ) {
-    let Ok(connection) = database.0.lock() else {
-        return;
-    };
+    let connection = database.lock_db();
     let _ = connection.execute(
         "UPDATE charity_sync_logs
          SET message = ?1, node_name = ?2, duration_ms = ?3
@@ -525,10 +510,7 @@ pub fn load_all_feed_items_from_db(
     ) in all
     {
         let feed_name = {
-            let conn = database
-                .0
-                .lock()
-                .map_err(|_| "本地数据库锁定失败".to_string())?;
+            let conn = database.lock_db();
             conn.query_row(
                 "SELECT name FROM charity_feed_sources WHERE id = ?1",
                 params![&feed_id],
@@ -758,9 +740,7 @@ pub fn clear_charity_sync_logs_db(database: &Database) -> Result<(), String> {
 }
 
 pub fn abandon_running_charity_sync_logs(database: &Database) {
-    let Ok(connection) = database.0.lock() else {
-        return;
-    };
+    let connection = database.lock_db();
     let _ = connection.execute(
         "UPDATE charity_sync_logs
          SET status = 'failed',

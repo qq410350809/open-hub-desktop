@@ -57,6 +57,10 @@ pub struct ChannelConfig {
     /// 渠道 RPM 限制
     #[serde(default)]
     pub rate_limit_rpm: Option<u32>,
+    /// 统计维度稳定数字 ID：内置固化渠道占用 1-100（opencode=1），动态渠道从 101 递增。
+    /// 与可修改的英文别名解耦，改名/改编码后历史统计不错位。
+    #[serde(default)]
+    pub stats_id: Option<u32>,
 }
 
 fn default_protocol() -> String {
@@ -64,6 +68,13 @@ fn default_protocol() -> String {
 }
 
 impl ChannelConfig {
+    /// 日统计/汇总表的渠道维度键：优先稳定数字 ID，未分配时回退别名
+    pub fn stats_key(&self) -> String {
+        self.stats_id
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| self.effective_alias())
+    }
+
     /// 获取当前渠道的生效英文别名：如果显式配置了 alias 则返回其小写去空格版本，否则回退为 id。
     pub fn effective_alias(&self) -> String {
         self.alias
@@ -114,6 +125,7 @@ pub fn default_channels() -> Vec<ChannelConfig> {
         enabled_models: None,
         model_redirects: None,
         rate_limit_rpm: None,
+        stats_id: Some(1),
     }]
 }
 
@@ -129,12 +141,19 @@ pub struct ModelProxyConfig {
     pub record_request_body: bool,
     #[serde(default)]
     pub max_retries: u32,
+    /// 动态渠道统计 ID 分配计数器（从 101 起，1-100 预留给内置固化渠道）
+    #[serde(default = "default_next_channel_stats_id")]
+    pub next_channel_stats_id: u64,
 }
 
 pub type OpencodeProxyConfig = ModelProxyConfig;
 
 fn default_timeout_seconds() -> u64 {
     300
+}
+
+fn default_next_channel_stats_id() -> u64 {
+    101
 }
 
 impl Default for ModelProxyConfig {
@@ -147,6 +166,7 @@ impl Default for ModelProxyConfig {
             timeout_seconds: default_timeout_seconds(),
             record_request_body: false,
             max_retries: 0,
+            next_channel_stats_id: default_next_channel_stats_id(),
         }
     }
 }
@@ -158,7 +178,11 @@ pub struct ProxyRequestLog {
     pub timestamp: String,
     pub method: String,
     pub path: String,
+    /// 展示用渠道维度：生效别名（请求日志表列，可变、仅短期保留）
     pub channel_id: String,
+    /// 统计用渠道维度：稳定数字 ID 字符串；None 时日统计回退用 channel_id
+    #[serde(default)]
+    pub channel_stats_id: Option<String>,
     pub model: String,
     pub stream: bool,
     pub status_code: u16,
@@ -213,6 +237,16 @@ pub struct ChannelUsageStats {
     pub total_reasoning_tokens: u64,
     pub total_cache_hit_tokens: u64,
     pub total_tokens: u64,
+    /// 今日（本地时区）双通道数据
+    pub today_requests: u64,
+    pub today_successful_requests: u64,
+    pub today_failed_requests: u64,
+    pub today_avg_duration_ms: u64,
+    pub today_avg_ttft_ms: Option<u64>,
+    pub today_prompt_tokens: u64,
+    pub today_completion_tokens: u64,
+    pub today_cache_hit_tokens: u64,
+    pub today_total_tokens: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -222,6 +256,76 @@ pub struct ChannelModelList {
     pub channel_name: String,
     pub alias: String,
     pub models: Vec<String>,
+}
+
+/// 「日 × 全渠道」聚合数据点（来自 channel_daily_stats，跨渠道求和）
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayDailyPoint {
+    /// 本地日期，格式 YYYY-MM-DD
+    pub date: String,
+    pub total_requests: u64,
+    pub successful_requests: u64,
+    pub failed_requests: u64,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub reasoning_tokens: u64,
+    pub cache_hit_tokens: u64,
+    pub total_tokens: u64,
+}
+
+/// 「时 × 全渠道」聚合数据点（≤3 天区间趋势用，来自 channel_hourly_stats 跨渠道求和）
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayHourlyPoint {
+    /// 本地日期，格式 YYYY-MM-DD（多天区间时用于区分小时桶归属）
+    pub date: String,
+    /// 0-23（本地时间）
+    pub hour: u32,
+    pub total_requests: u64,
+    pub successful_requests: u64,
+    pub failed_requests: u64,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub reasoning_tokens: u64,
+    pub cache_hit_tokens: u64,
+    pub total_tokens: u64,
+}
+
+/// 全渠道累计汇总（不限于图表窗口，含平均耗时/首 Token 时延）
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayOverviewTotals {
+    pub total_requests: u64,
+    pub successful_requests: u64,
+    pub failed_requests: u64,
+    pub avg_duration_ms: u64,
+    pub avg_ttft_ms: Option<u64>,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub reasoning_tokens: u64,
+    pub cache_hit_tokens: u64,
+    pub total_tokens: u64,
+}
+
+/// 控制台「全渠道数据总览」：区间逐日数据（缺日补零）+ 区间累计汇总 + 今日聚合。
+/// 日期区间模式（from/to）下 totals/daily 均按区间统计；未提供区间时为近 N 天窗口 + 全量累计。
+/// 粒度自动适配：区间 ≤3 天且有小时数据时附带 hourly（每天 24 点缺时补零）；
+/// 跨度超过一个季度（92 天）时附带 monthly（缺月补零，date 为 YYYY-MM）；其余按日。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayOverviewStats {
+    pub days: u32,
+    pub daily: Vec<GatewayDailyPoint>,
+    pub totals: GatewayOverviewTotals,
+    /// 今日（本地时区）全渠道聚合，与所选区间解耦，供 KPI「今日」角标使用
+    pub today: GatewayDailyPoint,
+    /// ≤3 天区间的小时级趋势（每天 24 点）；不满足条件或无小时数据时为 None
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hourly: Option<Vec<GatewayHourlyPoint>>,
+    /// 长区间（>92 天）的月级趋势；date 为 YYYY-MM；区间内有数据时才返回
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub monthly: Option<Vec<GatewayDailyPoint>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

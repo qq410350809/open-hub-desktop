@@ -37,6 +37,8 @@ pub struct ProxyLogParams {
     pub request_body: Option<String>,
     pub response_body: Option<String>,
     pub node_name: Option<String>,
+    /// 统计维度稳定数字 ID（字符串形式）；未设置时日统计回退 channel_id
+    pub channel_stats_id: Option<String>,
 }
 
 impl ProxyLogParams {
@@ -71,11 +73,17 @@ impl ProxyLogParams {
             request_body,
             response_body: None,
             node_name,
+            channel_stats_id: None,
         }
     }
 
     pub fn with_response_body(mut self, body: Option<String>) -> Self {
         self.response_body = body;
+        self
+    }
+
+    pub fn with_channel_stats_id(mut self, stats_id: Option<String>) -> Self {
+        self.channel_stats_id = stats_id;
         self
     }
 
@@ -101,6 +109,7 @@ impl ProxyLogParams {
             request_body: self.request_body,
             response_body: self.response_body,
             node_name: self.node_name,
+            channel_stats_id: self.channel_stats_id,
         }
     }
 }
@@ -125,6 +134,16 @@ pub async fn record_auth_failure_log(
     req_body_str: Option<String>,
 ) {
     ctx.metrics.total_requests.fetch_add(1, Ordering::Relaxed);
+    // 鉴权失败发生在渠道解析前，沿用既有惯例计入 opencode 通道（含其统计 ID）
+    let opencode_stats_id = ctx
+        .config
+        .read()
+        .await
+        .channels
+        .iter()
+        .find(|c| c.id == "opencode")
+        .and_then(|c| c.stats_id)
+        .map(|v| v.to_string());
     record_attempt_failure(
         ctx,
         ProxyLogParams::new_failure(
@@ -138,7 +157,8 @@ pub async fn record_auth_failure_log(
             Some("本地 API Key 鉴权失败 (Unauthorized)".to_string()),
             req_body_str,
             None,
-        ),
+        )
+        .with_channel_stats_id(opencode_stats_id),
     ).await;
 }
 

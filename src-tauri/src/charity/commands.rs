@@ -50,10 +50,7 @@ pub async fn mark_charity_feed_read(
     let requested = feed_id.as_deref().unwrap_or(DEFAULT_CHARITY_FEED_ID);
     tokio::task::block_in_place(|| {
         let now = {
-            let connection = database
-                .0
-                .lock()
-                .map_err(|_| "本地数据库锁定失败".to_string())?;
+            let connection = database.lock_db();
             connection
                 .query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now')", [], |row| {
                     row.get::<_, String>(0)
@@ -329,10 +326,7 @@ pub async fn add_charity_source(
         .filter(|u| !u.trim().is_empty())
         .unwrap_or_else(|| charity_tag_json_url(&id));
     tokio::task::block_in_place(|| {
-        let connection = database
-            .0
-            .lock()
-            .map_err(|_| "本地数据库锁定失败".to_string())?;
+        let connection = database.lock_db();
         let max_sort: i64 = connection
             .query_row(
                 "SELECT COALESCE(MAX(sort_order), 0) FROM charity_feed_sources",
@@ -366,10 +360,7 @@ pub async fn update_charity_source(
     enabled: Option<bool>,
 ) -> Result<(), String> {
     tokio::task::block_in_place(|| {
-        let connection = database
-            .0
-            .lock()
-            .map_err(|_| "本地数据库锁定失败".to_string())?;
+        let connection = database.lock_db();
         if let Some(name) = name {
             let name = name.trim().to_string();
             if !name.is_empty() {
@@ -410,10 +401,7 @@ pub async fn remove_charity_source(
     id: String,
 ) -> Result<(), String> {
     tokio::task::block_in_place(|| {
-        let connection = database
-            .0
-            .lock()
-            .map_err(|_| "本地数据库锁定失败".to_string())?;
+        let connection = database.lock_db();
         connection
             .execute(
                 "DELETE FROM charity_feed_sources WHERE id = ?1",

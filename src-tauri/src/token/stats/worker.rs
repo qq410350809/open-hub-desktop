@@ -1,3 +1,4 @@
+use tracing::{error, info};
 use crate::models::Database;
 use crate::token::stats::db::collect_token_data;
 use crate::token::stats::types::{local_timestamp, TOKEN_COLLECT_INTERVAL};
@@ -18,18 +19,21 @@ pub fn start_token_collector(app: AppHandle) {
             match result {
                 Ok(Ok(report)) => {
                     if report.changed {
-                        eprintln!(
+                        info!(
+                            target: "openhub::token",
                             "[OpenHub] {} Token 后台采集完成：{}",
                             local_timestamp(),
                             report.message
                         );
                     }
                 }
-                Ok(Err(error)) => eprintln!(
+                Ok(Err(error)) => error!(
+                    target: "openhub::token",
                     "[OpenHub] {} Token 后台采集失败：{error}",
                     local_timestamp()
                 ),
-                Err(error) => eprintln!(
+                Err(error) => error!(
+                    target: "openhub::token",
                     "[OpenHub] {} Token 后台任务异常：{error}",
                     local_timestamp()
                 ),

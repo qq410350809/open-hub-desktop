@@ -1,3 +1,4 @@
+use tracing::warn;
 use crate::models::{Database, ACTIVE_PROXY_NODE_KEY};
 use crate::proxypool::runtime::{
     ensure_channel_instance, ensure_default_proxy_channel, ensure_runtime, read_account_proxy_channel_id,
@@ -437,7 +438,7 @@ where
                             continue;
                         }
                         Err(rotate_err) => {
-                            eprintln!("账号 {profile_id} 代理节点切换失败: {rotate_err}");
+                            warn!("账号 {profile_id} 代理节点切换失败: {rotate_err}");
                         }
                     }
                 }

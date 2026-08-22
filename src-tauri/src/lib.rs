@@ -25,12 +25,26 @@ pub use core::app_menu;
 #[cfg(test)]
 mod tests;
 
+use tracing::{error, info, warn};
 use std::fs;
 use tauri::Manager;
 
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // 统一日志：本地时间 + 级别 + 模块定位，支持 RUST_LOG 环境变量过滤（默认 info）
+    use tracing_subscriber::EnvFilter;
+    tracing_subscriber::fmt()
+        .compact()
+        .with_target(true)
+        .with_timer(tracing_subscriber::fmt::time::ChronoLocal::new(
+            "%Y-%m-%d %H:%M:%S%.3f".into(),
+        ))
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .init();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
@@ -53,7 +67,7 @@ pub fn run() {
             // 菜单刷新：文件 → 刷新 → 后端直接全量刷新 + 通知前端刷新 UI。
             app.on_menu_event(move |app_handle, event| {
                 if event.id() == "file-refresh" {
-                    eprintln!("[OpenHub] 菜单 file-refresh 触发");
+                    info!("[OpenHub] 菜单 file-refresh 触发");
                     let handle = app_handle.clone();
                     tauri::async_runtime::spawn(async move {
                         let database = handle.state::<crate::models::Database>();
@@ -63,10 +77,10 @@ pub fn run() {
                             .await
                         {
                             Ok(_) => {
-                                eprintln!("[OpenHub] 全量刷新已提交");
+                                info!("[OpenHub] 全量刷新已提交");
                             }
                             Err(err) => {
-                                eprintln!("[OpenHub] 全量刷新失败：{err}");
+                                error!("[OpenHub] 全量刷新失败：{err}");
                             }
                         }
                         let _ = tauri::Emitter::emit(&handle, "menu-refresh-requested", ());
@@ -85,11 +99,11 @@ pub fn run() {
                 .map_err(std::io::Error::other)?;
             // 升级阶段先把现有采集缓存迁入 SQLite，页面首次查询即可得到完整快照。
             if let Err(error) = token::stats::seed_token_database_from_caches(&database) {
-                eprintln!("[OpenHub] Token 缓存迁移到数据库失败：{error}");
+                error!("[OpenHub] Token 缓存迁移到数据库失败：{error}");
             }
             // 首次启动时若 AppData 尚无文件，先秒级释放安装包自带的内置基础版内核与 GeoIP 数据库
             if let Err(e) = crate::kernel::ensure_bundled_assets_installed(app.handle()) {
-                eprintln!("[OpenHub] 释放内置资源提示：{e}");
+                warn!("[OpenHub] 释放内置资源提示：{e}");
             }
             let proxy_runtime = proxypool::ProxyRuntime::new(app_data_dir.join("proxy-runtime"));
             let charity_runtime = charity::CharityMonitorRuntime::new();
@@ -107,7 +121,7 @@ pub fn run() {
             if let Err(error) =
                 proxypool::repair_stored_node_names(&app.state::<crate::models::Database>())
             {
-                eprintln!("[OpenHub] 修复代理节点名称失败：{error}");
+                warn!("[OpenHub] 修复代理节点名称失败：{error}");
             }
             // Token 采集与页面查询完全解耦：后台每 20 秒增量入库。
             token::stats::start_token_collector(app.handle().clone());
@@ -116,7 +130,7 @@ pub fn run() {
             let web_server = match web_server::start(app.handle().clone()) {
                 Ok(handle) => handle,
                 Err(error) => {
-                    eprintln!("OpenHub 轻量模式服务启动失败：{error}");
+                    error!("OpenHub 轻量模式服务启动失败：{error}");
                     web_server::WebServerHandle::disabled()
                 }
             };
@@ -143,7 +157,7 @@ pub fn run() {
                 })
                 .await;
                 if let Err(error) = result {
-                    eprintln!("OpenHub 后台恢复代理失败：{error}");
+                    error!("OpenHub 后台恢复代理失败：{error}");
                 }
                 // 代理恢复后再启动公益监听，避免启动瞬间抢锁/抢内核。
                 // 前端 onMounted 会 request_charity_round，循环启动后立刻消费 force。
@@ -163,7 +177,7 @@ pub fn run() {
                 *proxy_state.context.config.write().await = proxy_cfg.clone();
                 if proxy_cfg.enabled {
                     if let Err(e) = crate::model::gateway::start_model_proxy_server(&proxy_state).await {
-                        eprintln!("[OpenHub] 模型网关服务启动失败: {e}");
+                        error!("[OpenHub] 模型网关服务启动失败: {e}");
                     }
                 }
             });
@@ -176,10 +190,10 @@ pub fn run() {
                 // 1. 检测 Mihomo 内核
                 let has_mihomo = crate::kernel::resolve_mihomo_binary(Some(&auto_download_handle)).is_some();
                 if !has_mihomo {
-                    eprintln!("[OpenHub] 启动组件检测：未检测到 Mihomo 内核，启动后台自动拉取…");
+                    info!("[OpenHub] 启动组件检测：未检测到 Mihomo 内核，启动后台自动拉取…");
                     match crate::kernel::download_or_update_mihomo_kernel(auto_download_handle.clone(), None).await {
-                        Ok(status) => eprintln!("[OpenHub] Mihomo 内核自动安装成功 ({})", status.version),
-                        Err(e) => eprintln!("[OpenHub] Mihomo 内核自动安装失败：{e}"),
+                        Ok(status) => info!("[OpenHub] Mihomo 内核自动安装成功 ({})", status.version),
+                        Err(e) => error!("[OpenHub] Mihomo 内核自动安装失败：{e}"),
                     }
                 }
 
@@ -188,10 +202,10 @@ pub fn run() {
                     .map(|p| p.is_file())
                     .unwrap_or(false);
                 if !has_geoip {
-                    eprintln!("[OpenHub] 启动组件检测：未检测到 GeoIP 数据库，启动后台自动拉取…");
+                    info!("[OpenHub] 启动组件检测：未检测到 GeoIP 数据库，启动后台自动拉取…");
                     match crate::kernel::download_or_update_geoip(auto_download_handle.clone(), None).await {
-                        Ok(_) => eprintln!("[OpenHub] GeoIP 数据库自动下载成功并已就绪"),
-                        Err(e) => eprintln!("[OpenHub] GeoIP 数据库自动下载失败：{e}"),
+                        Ok(_) => info!("[OpenHub] GeoIP 数据库自动下载成功并已就绪"),
+                        Err(e) => error!("[OpenHub] GeoIP 数据库自动下载失败：{e}"),
                     }
                 }
             });
@@ -294,6 +308,7 @@ pub fn run() {
             crate::model::gateway::test_model_proxy_health,
             crate::model::gateway::get_model_proxy_logs,
             crate::model::gateway::get_model_proxy_channel_stats,
+            crate::model::gateway::get_model_proxy_overview_stats,
             crate::model::gateway::clear_model_proxy_logs,
             crate::model::gateway::sync_model_proxy_site_channels,
             crate::model::gateway::get_opencode_proxy_config,

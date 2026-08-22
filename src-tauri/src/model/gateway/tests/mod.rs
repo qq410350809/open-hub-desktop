@@ -32,6 +32,7 @@ use serde_json::json;
             enabled_models: None,
             model_redirects: None,
             rate_limit_rpm: None,
+            stats_id: None,
         };
         assert_eq!(ch.effective_alias(), "vip_channel");
         ch.alias = None;
@@ -64,6 +65,7 @@ use serde_json::json;
                     enabled_models: None,
                     model_redirects: None,
                     rate_limit_rpm: None,
+                    stats_id: None,
                 },
                 ChannelConfig {
                     id: "vip".to_string(),
@@ -84,11 +86,13 @@ use serde_json::json;
                     enabled_models: Some(vec!["claude-3-5-sonnet-20241022".to_string()]),
                     model_redirects: None,
                     rate_limit_rpm: None,
+                    stats_id: None,
                 },
             ],
             timeout_seconds: 300,
             record_request_body: false,
             max_retries: 0,
+            next_channel_stats_id: 101,
         };
 
         // 1. 显式别名前缀
@@ -128,6 +132,7 @@ use serde_json::json;
             enabled_models: None,
             model_redirects: None,
             rate_limit_rpm: None,
+            stats_id: None,
         };
 
         let keys = ch.get_effective_keys();
@@ -351,6 +356,7 @@ use serde_json::json;
             enabled_models: None,
             model_redirects: None,
             rate_limit_rpm: None,
+            stats_id: None,
         };
 
         assert!(is_opencode_channel(&make("opencode", "openai", None, "https://example.com/v1", "任意名称")));
@@ -528,6 +534,7 @@ use serde_json::json;
             req_id: "req_abc".to_string(),
             path: "/v1/chat/completions".to_string(),
             channel_id: "chan_1".to_string(),
+            channel_stats_id: Some("101".to_string()),
             model: "claude-3-7-sonnet".to_string(),
             stream: true,
             req_body_str: Some("{}".to_string()),
@@ -577,6 +584,7 @@ use serde_json::json;
             enabled_models: None,
             model_redirects: None,
             rate_limit_rpm: None,
+            stats_id: None,
         };
 
         let state = ModelProxyState::new_with_app(None);
@@ -605,3 +613,92 @@ use serde_json::json;
 
 
 
+    fn stats_channel(id: &str, alias: Option<&str>, stats_id: Option<u32>) -> ChannelConfig {
+        ChannelConfig {
+            id: id.to_string(),
+            name: format!("Channel {id}"),
+            description: String::new(),
+            enabled: true,
+            protocol: "openai".to_string(),
+            base_url: "https://api.example.com/v1".to_string(),
+            api_key: String::new(),
+            api_keys: None,
+            use_proxy_pool: false,
+            alias: alias.map(|s| s.to_string()),
+            site_id: None,
+            use_fixed_proxy: false,
+            fixed_proxy_node: None,
+            priority: None,
+            weight: None,
+            enabled_models: None,
+            model_redirects: None,
+            rate_limit_rpm: None,
+            stats_id,
+        }
+    }
+
+    #[test]
+    fn assigns_stable_stats_ids_with_reserved_builtin_band() {
+        use crate::model::gateway::config::sanitize_model_proxy_config;
+
+        // opencode 固定为 1（即便被篡改），动态渠道从 101 起分配
+        let mut cfg = ModelProxyConfig {
+            channels: vec![
+                stats_channel("site_a", Some("alpha"), None),
+                {
+                    let mut oc = stats_channel("opencode", Some("tampered"), Some(999));
+                    oc.base_url = "https://opencode.ai/zen/v1".to_string();
+                    oc
+                },
+                stats_channel("site_b", Some("beta"), None),
+            ],
+            ..ModelProxyConfig::default()
+        };
+        sanitize_model_proxy_config(&mut cfg);
+
+        let by_id = |id: &str| cfg.channels.iter().find(|c| c.id == id).unwrap();
+        assert_eq!(by_id("opencode").stats_id, Some(1));
+        assert_eq!(by_id("site_a").stats_id, Some(101));
+        assert_eq!(by_id("site_b").stats_id, Some(102));
+        assert_eq!(cfg.next_channel_stats_id, 103);
+        // 统计维度键与别名解耦
+        assert_eq!(by_id("site_a").stats_key(), "101");
+
+        // 改别名后 ID 不变；重复 sanitize 幂等，计数器不回退
+        let mut renamed = cfg.clone();
+        renamed.channels[0].alias = Some("renamed".to_string());
+        renamed.channels[0].stats_id = None;
+        renamed.channels.pop();
+        sanitize_model_proxy_config(&mut renamed);
+        assert_eq!(renamed.channels[0].stats_id, Some(103));
+        assert_eq!(renamed.channels[0].stats_key(), "103");
+        assert_eq!(renamed.channels[1].stats_id, Some(1));
+        assert!(renamed.next_channel_stats_id >= 103);
+
+        // 已分配 ID 的渠道保持不变
+        let mut again = renamed.clone();
+        sanitize_model_proxy_config(&mut again);
+        assert_eq!(again.channels[0].stats_id, Some(103));
+        assert_eq!(again.channels[1].stats_id, Some(1));
+    }
+
+    #[test]
+    fn legacy_config_json_without_stats_id_still_parses() {
+        let raw = serde_json::json!({
+            "enabled": true,
+            "port": 8088,
+            "apiKey": "",
+            "timeoutSeconds": 300,
+            "channels": [{
+                "id": "legacy",
+                "name": "Legacy",
+                "enabled": true,
+                "upstreamUrl": "https://api.example.com/v1",
+                "alias": "old-alias"
+            }]
+        });
+        let cfg: ModelProxyConfig = serde_json::from_value(raw).expect("legacy config should parse");
+        assert!(cfg.channels[0].stats_id.is_none());
+        assert_eq!(cfg.next_channel_stats_id, 101);
+        assert_eq!(cfg.channels[0].stats_key(), "old-alias");
+    }

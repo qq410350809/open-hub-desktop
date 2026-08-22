@@ -19,11 +19,14 @@ pub struct EgressRequestMeta {
     pub req_id: String,
     pub path: String,
     pub channel_id: String,
+    /// 统计维度稳定数字 ID（字符串形式），随失败日志落库
+    pub channel_stats_id: Option<String>,
     pub model: String,
     pub stream: bool,
     pub req_body_str: Option<String>,
 }
 
+#[allow(dead_code)]
 pub struct EgressSuccess {
     pub status: StatusCode,
     pub response: reqwest::Response,
@@ -128,6 +131,7 @@ pub async fn execute_resilient_egress(
                             meta.req_body_str.clone(),
                             Some(node_display),
                         )
+                        .with_channel_stats_id(meta.channel_stats_id.clone())
                         .with_response_body(cap_log_body(err_text)),
                     ).await;
 
@@ -159,6 +163,7 @@ pub async fn execute_resilient_egress(
                             meta.req_body_str.clone(),
                             Some(node_display),
                         )
+                        .with_channel_stats_id(meta.channel_stats_id.clone())
                         .with_response_body(cap_log_body(err_text.clone())),
                     ).await;
 
@@ -193,6 +198,7 @@ pub async fn execute_resilient_egress(
                             meta.req_body_str.clone(),
                             Some(node_display),
                         )
+                        .with_channel_stats_id(meta.channel_stats_id.clone())
                         .with_response_body(cap_log_body(err_text)),
                     ).await;
 
@@ -231,7 +237,8 @@ pub async fn execute_resilient_egress(
                         Some(formatted),
                         meta.req_body_str.clone(),
                         Some(node_display),
-                    ),
+                    )
+                    .with_channel_stats_id(meta.channel_stats_id.clone()),
                 ).await;
 
                 if attempt_idx < max_retries {

@@ -7,6 +7,7 @@
 //! OpenHub，先杀掉旧实例再继续，保证新启动的一定是最新构建、独占端口。
 //! 旧进程崩溃留下的死锁会在下次启动被 `ps` 校验识破并覆盖，无需额外清理。
 
+use tracing::info;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -19,7 +20,7 @@ pub fn claim(app_data_dir: &Path) {
     if let Ok(content) = fs::read_to_string(&lock_path) {
         if let Ok(pid) = content.trim().parse::<u32>() {
             if is_openhub_process(pid) {
-                eprintln!("OpenHub 检测到旧实例（pid {pid}），正在自动关闭…");
+                info!("OpenHub 检测到旧实例（pid {pid}），正在自动关闭…");
                 kill_process(pid);
             }
         }

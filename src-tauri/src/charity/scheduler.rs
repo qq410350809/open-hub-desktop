@@ -1,3 +1,4 @@
+use tracing::error;
 use crate::charity::db::*;
 use crate::charity::fetcher::*;
 use crate::charity::types::*;
@@ -198,7 +199,7 @@ pub fn start_charity_monitor(app: AppHandle) {
                             }
                         }
                     }
-                    Err(error) => eprintln!("公益监听并行任务失败：{error}"),
+                    Err(error) => error!("公益监听并行任务失败：{error}"),
                 }
             }
             let _ = proxypool::restore_proxy_node_transient(&database, &runtime).await;

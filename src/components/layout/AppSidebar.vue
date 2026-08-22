@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted } from "vue";
+import { computed, onMounted, onUnmounted } from "vue";
 import { icons } from "../../icons";
 import { useStore } from "../../composables/useStore";
 import { usePreferences } from "../../composables/usePreferences";
@@ -10,8 +10,17 @@ const store = useStore();
 const { preferences, updatePreferences } = usePreferences();
 const { proxyStatus, refreshStatus: refreshProxyStatus } = useModelProxy();
 
+// 状态与「今日 Token」徽标：挂载即取一次，此后每 60s 轻量刷新（后端为单行聚合查询）
+let proxyStatusTimer: number | null = null;
 onMounted(() => {
   refreshProxyStatus();
+  proxyStatusTimer = window.setInterval(() => refreshProxyStatus(), 60_000);
+});
+onUnmounted(() => {
+  if (proxyStatusTimer !== null) {
+    clearInterval(proxyStatusTimer);
+    proxyStatusTimer = null;
+  }
 });
 
 const navItems = computed(() => [
@@ -91,7 +100,7 @@ const todayTokenBadge = computed(() =>
   todayTokenTotal.value > 0 ? formatCompact(todayTokenTotal.value) : "",
 );
 
-// 模型反代今日消耗的 Token 统计（用于侧边栏模型反代徽标，0 不显示）
+// 模型反代今日消耗的 Token 统计（持久化日统计口径，用于侧边栏徽标，0 不显示）
 const todayProxyTokenTotal = computed(() => {
   return proxyStatus.value?.todayTotalTokens || 0;
 });

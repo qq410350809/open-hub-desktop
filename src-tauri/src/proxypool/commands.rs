@@ -1,3 +1,4 @@
+use tracing::warn;
 use crate::db::build_http_client;
 use crate::models::*;
 use crate::proxypool::geoip::{classify_node_location, find_geoip_database, open_geoip_reader};
@@ -242,7 +243,7 @@ pub async fn refresh_proxy_subscription(
         .filter_map(|node| {
             if let Some(error) = basic_node_config_error(&node.raw_json) {
                 discarded += 1;
-                eprintln!("OpenHub 刷新来源时过滤非法节点：{}：{}", node.name, error);
+                warn!("OpenHub 刷新来源时过滤非法节点：{}：{}", node.name, error);
                 None
             } else {
                 Some(node)
@@ -728,7 +729,7 @@ pub fn cancel_proxy_node_tests(runtime: State<'_, ProxyRuntime>) -> Result<bool,
     match runtime.cancel_proxy_test() {
         Ok(v) => Ok(v),
         Err(error) => {
-            eprintln!("OpenHub 取消测速内部警告：{error}");
+            warn!("OpenHub 取消测速内部警告：{error}");
             Ok(false)
         }
     }

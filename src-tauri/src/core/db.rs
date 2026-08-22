@@ -1,3 +1,4 @@
+use tracing::warn;
 use crate::site::sync;
 use crate::models::*;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -370,6 +371,8 @@ impl Database {
         ensure_charity_feed_sources_table(&connection)?;
         ensure_proxy_pool_node_columns(&connection)?;
         ensure_opencode_proxy_logs_table(&connection)?;
+        ensure_channel_daily_stats_table(&connection)?;
+        ensure_channel_hourly_stats_table(&connection)?;
         reset_expired_checkin_states(&connection)?;
 
         let has_system_type: i64 = connection
@@ -485,9 +488,34 @@ impl Database {
 
     /// 获取数据库连接的互斥锁，封装统一的错误处理。
     pub(crate) fn lock_conn(&self) -> Result<std::sync::MutexGuard<'_, Connection>, String> {
-        self.0.lock().map_err(|_| "本地数据库锁定失败".to_string())
+        Ok(self.lock_db())
+    }
+
+    /// 获取数据库连接锁（毒化自愈，绝不失败）。
+    ///
+    /// std Mutex 毒化标记一旦置位将永久保持——若只 into_inner() 而不 clear_poison()，
+    /// 之后每次加锁都会走毒化分支。这里真正清除标记实现一次性自愈：
+    /// SQLite 连接在 panic 后仍可用，至多残留未提交事务，回滚即可。
+    pub(crate) fn lock_db(&self) -> std::sync::MutexGuard<'_, Connection> {
+        let guard = match self.0.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                self.0.clear_poison();
+                if !DB_POISON_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    warn!("[db] 数据库互斥锁毒化，已自愈并清除标记（此前某线程持锁 panic，请检查上方 panic 日志定位源头）");
+                }
+                poisoned.into_inner()
+            }
+        };
+        if !guard.is_autocommit() {
+            let _ = guard.execute("ROLLBACK", []);
+        }
+        guard
     }
 }
+
+/// 数据库互斥锁毒化自愈：仅首次恢复时打印日志，避免刷屏
+static DB_POISON_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 const TOKEN_USAGE_SNAPSHOT: &str = "usage";
 const TOKEN_SESSIONS_SNAPSHOT: &str = "sessions";
@@ -872,6 +900,122 @@ pub(crate) fn ensure_opencode_proxy_logs_table(connection: &Connection) -> Resul
         .unwrap_or(0);
     if has_node_name == 0 {
         let _ = connection.execute("ALTER TABLE opencode_proxy_logs ADD COLUMN node_name TEXT", []);
+    }
+
+    Ok(())
+}
+
+/// 渠道日统计表：每个渠道每天一条聚合数据，总量 = 全部日数据汇总。
+/// 请求日志表会裁剪到最近 1000 条，长期统计依赖本表持久化。
+/// channel_id 列存渠道稳定数字 ID（字符串形式）；此处回填沿用日志的别名维度，
+/// 由统计查询侧（stats.rs）负责把旧别名行幂等迁移为数字 ID。
+pub(crate) fn ensure_channel_daily_stats_table(connection: &Connection) -> Result<(), String> {
+    connection
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS channel_daily_stats (
+                date TEXT NOT NULL,
+                channel_id TEXT NOT NULL,
+                total_requests INTEGER NOT NULL DEFAULT 0,
+                successful_requests INTEGER NOT NULL DEFAULT 0,
+                failed_requests INTEGER NOT NULL DEFAULT 0,
+                duration_ms_total INTEGER NOT NULL DEFAULT 0,
+                ttft_ms_total INTEGER NOT NULL DEFAULT 0,
+                ttft_count INTEGER NOT NULL DEFAULT 0,
+                prompt_tokens INTEGER NOT NULL DEFAULT 0,
+                completion_tokens INTEGER NOT NULL DEFAULT 0,
+                reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_hit_tokens INTEGER NOT NULL DEFAULT 0,
+                total_tokens INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (date, channel_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_channel_daily_stats_date ON channel_daily_stats(date DESC);",
+        )
+        .map_err(|e| e.to_string())?;
+
+    // 一次性回填：把既有请求日志按「日 × 渠道」聚合进日统计表（仅当日表为空时执行）
+    let existing: i64 = connection
+        .query_row("SELECT COUNT(*) FROM channel_daily_stats", [], |row| row.get(0))
+        .unwrap_or(0);
+    if existing == 0 {
+        let _ = connection.execute(
+            "INSERT OR REPLACE INTO channel_daily_stats (
+                date, channel_id, total_requests, successful_requests, failed_requests,
+                duration_ms_total, ttft_ms_total, ttft_count,
+                prompt_tokens, completion_tokens, reasoning_tokens, cache_hit_tokens, total_tokens
+            )
+            SELECT
+                substr(timestamp, 1, 10),
+                channel_id,
+                COUNT(*),
+                SUM(CASE WHEN status_code < 400 THEN 1 ELSE 0 END),
+                SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END),
+                SUM(duration_ms),
+                COALESCE(SUM(ttft_ms), 0),
+                COUNT(ttft_ms),
+                COALESCE(SUM(prompt_tokens), 0),
+                COALESCE(SUM(completion_tokens), 0),
+                COALESCE(SUM(reasoning_tokens), 0),
+                COALESCE(SUM(prompt_cache_hit_tokens), 0),
+                COALESCE(SUM(total_tokens), 0)
+            FROM opencode_proxy_logs
+            GROUP BY substr(timestamp, 1, 10), channel_id",
+            [],
+        );
+    }
+
+    Ok(())
+}
+
+/// 渠道小时统计表：每渠道每小时一条聚合，供单日区间的 24 小时粒度趋势图。
+/// 与日统计表同源的持久化设计（日志表裁剪不影响长期数据）。timestamp 为本地时间文本。
+pub(crate) fn ensure_channel_hourly_stats_table(connection: &Connection) -> Result<(), String> {
+    connection
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS channel_hourly_stats (
+                date TEXT NOT NULL,
+                hour INTEGER NOT NULL,
+                channel_id TEXT NOT NULL,
+                total_requests INTEGER NOT NULL DEFAULT 0,
+                successful_requests INTEGER NOT NULL DEFAULT 0,
+                failed_requests INTEGER NOT NULL DEFAULT 0,
+                prompt_tokens INTEGER NOT NULL DEFAULT 0,
+                completion_tokens INTEGER NOT NULL DEFAULT 0,
+                reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_hit_tokens INTEGER NOT NULL DEFAULT 0,
+                total_tokens INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (date, hour, channel_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_channel_hourly_stats_date ON channel_hourly_stats(date DESC, hour);",
+        )
+        .map_err(|e| e.to_string())?;
+
+    // 一次性回填：把既有请求日志按「日 × 时 × 渠道」聚合进小时表（仅当小时表为空时执行）。
+    // 日志表上限 1000 条，回填仅覆盖近期；更早历史只有日粒度，前端届时回退日视图
+    let existing: i64 = connection
+        .query_row("SELECT COUNT(*) FROM channel_hourly_stats", [], |row| row.get(0))
+        .unwrap_or(0);
+    if existing == 0 {
+        let _ = connection.execute(
+            "INSERT OR REPLACE INTO channel_hourly_stats (
+                date, hour, channel_id, total_requests, successful_requests, failed_requests,
+                prompt_tokens, completion_tokens, reasoning_tokens, cache_hit_tokens, total_tokens
+            )
+            SELECT
+                substr(timestamp, 1, 10),
+                CAST(substr(timestamp, 12, 2) AS INTEGER),
+                channel_id,
+                COUNT(*),
+                SUM(CASE WHEN status_code < 400 THEN 1 ELSE 0 END),
+                SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END),
+                COALESCE(SUM(prompt_tokens), 0),
+                COALESCE(SUM(completion_tokens), 0),
+                COALESCE(SUM(reasoning_tokens), 0),
+                COALESCE(SUM(prompt_cache_hit_tokens), 0),
+                COALESCE(SUM(total_tokens), 0)
+            FROM opencode_proxy_logs
+            GROUP BY substr(timestamp, 1, 10), substr(timestamp, 12, 2), channel_id",
+            [],
+        );
     }
 
     Ok(())

@@ -12,12 +12,28 @@ pub fn sanitize_channel_config(channel: &mut ChannelConfig) {
     }
 }
 
+/// 渠道上游目标协议白名单
+const VALID_CHANNEL_PROTOCOLS: [&str; 4] = ["openai", "openai-responses", "anthropic", "gemini"];
+
 pub fn sanitize_model_proxy_config(config: &mut ModelProxyConfig) {
     if config.channels.is_empty() {
         config.channels = default_channels();
     }
     let mut seen_aliases = std::collections::HashSet::new();
     for ch in &mut config.channels {
+        // OpenCode 官方渠道别名固定为 opencode（网关模型前缀依赖它），禁止自定义
+        if ch.id == "opencode" {
+            ch.alias = None;
+            ch.protocol = "openai".to_string();
+            ch.stats_id = Some(1);
+        }
+        // 目标协议白名单校验：非法/历史遗留值回退为 OpenAI 兼容
+        let p = ch.protocol.trim().to_lowercase();
+        ch.protocol = if VALID_CHANNEL_PROTOCOLS.contains(&p.as_str()) {
+            p
+        } else {
+            "openai".to_string()
+        };
         sanitize_channel_config(ch);
         let eff = ch.effective_alias();
         if seen_aliases.contains(&eff) {
@@ -26,6 +42,24 @@ pub fn sanitize_model_proxy_config(config: &mut ModelProxyConfig) {
         }
         seen_aliases.insert(ch.effective_alias());
     }
+
+    // 统计维度稳定数字 ID：opencode 固定为 1，动态渠道从 101 递增（1-100 预留给内置渠道）。
+    // 已分配的 ID 永不改动，改别名/改编码不影响历史统计；计数器只前进不回退。
+    let mut next = config.next_channel_stats_id.max(101);
+    for ch in &mut config.channels {
+        if ch.id == "opencode" {
+            continue;
+        }
+        if ch.stats_id.is_none() {
+            ch.stats_id = Some(next as u32);
+            next += 1;
+        } else if let Some(sid) = ch.stats_id {
+            if sid as u64 >= 101 {
+                next = next.max(sid as u64 + 1);
+            }
+        }
+    }
+    config.next_channel_stats_id = next;
 }
 
 pub fn load_model_proxy_config(conn: &Connection) -> ModelProxyConfig {

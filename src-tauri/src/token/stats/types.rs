@@ -12,7 +12,6 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter};
 
 pub const CATPAWAI_SOURCE: &str = "catpawai";
-pub use crate::token::collector::sources::catpawai::CATPAWAI_UNKNOWN_MODEL;
 pub const ACTIVITY_CACHE_VERSION: u32 = 8;
 pub const ACTIVITY_CACHE_TTL: Duration = Duration::from_secs(15);
 pub const TOKEN_COLLECT_INTERVAL: Duration = Duration::from_secs(20);
