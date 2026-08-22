@@ -237,11 +237,16 @@ export function useModelProxy() {
   async function saveConfig(newConfig: OpencodeProxyConfig) {
     savingConfig.value = true;
     try {
+      // 明细保留天数：空值归一为 0（= 永久保留），避免空串破坏后端反序列化
+      const normalized: OpencodeProxyConfig = {
+        ...newConfig,
+        logRetentionDays: Number(newConfig.logRetentionDays ?? 0) || 0,
+      };
       const status = await runCommand<OpencodeProxyStatus>("save_opencode_proxy_config_cmd", {
-        config: newConfig,
+        config: normalized,
       });
       if (status) proxyStatus.value = status;
-      proxyConfig.value = { ...newConfig };
+      proxyConfig.value = { ...normalized };
       showToast("反代配置与渠道设置已保存");
       return true;
     } catch (e) {
@@ -460,27 +465,45 @@ export function useModelProxy() {
     return fetchLogs({ page: 1, ...extraOptions });
   }
 
-  async function clearLogs(mode: "payload_only" | "all" = "all") {
+  /**
+   * 清理请求明细日志。统计聚合表（渠道统计/总览/反代模式报表）持久化，不受影响。
+   * @param mode  "payload_only" 仅清报文全文；"all" 删除明细行
+   * @param before 可选 YYYY-MM-DD：只清理该日期之前的明细；缺省清理全部
+   */
+  async function clearLogs(mode: "payload_only" | "all" = "all", before?: string) {
     try {
-      await runCommand("clear_opencode_proxy_logs", { mode });
+      const removed = await runCommand<number>("clear_opencode_proxy_logs", {
+        mode,
+        before: before || null,
+      });
       if (mode === "payload_only") {
         await fetchLogs();
-        showToast("已清空所有日志的请求与响应报文详细内容");
+        showToast(
+          before
+            ? `已清理 ${removed} 条该日期前日志的请求与响应报文`
+            : "已清空所有日志的请求与响应报文详细内容",
+        );
       } else {
-        proxyLogs.value = [];
-        logTotal.value = 0;
-        logSuccessTotal.value = 0;
-        logErrorTotal.value = 0;
-        logGlobalTotal.value = 0;
-        logGlobalSuccess.value = 0;
-        logGlobalError.value = 0;
-        logPage.value = 1;
+        if (before) {
+          await fetchLogs();
+        } else {
+          proxyLogs.value = [];
+          logTotal.value = 0;
+          logSuccessTotal.value = 0;
+          logErrorTotal.value = 0;
+          logGlobalTotal.value = 0;
+          logGlobalSuccess.value = 0;
+          logGlobalError.value = 0;
+          logPage.value = 1;
+        }
         await refreshStatus();
-        showToast("所有请求日志记录已清空");
+        showToast(
+          before ? `已删除 ${removed} 条该日期前的明细日志（统计不受影响）` : "所有请求明细日志已清空（统计不受影响）",
+        );
       }
       return true;
     } catch (e) {
-      showToast(`清空日志失败: ${String(e)}`, true);
+      showToast(`清理日志失败: ${String(e)}`, true);
       return false;
     }
   }

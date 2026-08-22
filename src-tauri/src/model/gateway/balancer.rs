@@ -168,6 +168,8 @@ pub async fn record_failover_event(
         response_body: None,
         channel_stats_id: None,
         node_name: Some(get_node_display_name(ctx, cand_id).await),
+        cache_creation_tokens: None,
+        client_name: None,
     })
     .await;
 }

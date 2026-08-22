@@ -144,6 +144,17 @@ pub struct ModelProxyConfig {
     /// 动态渠道统计 ID 分配计数器（从 101 起，1-100 预留给内置固化渠道）
     #[serde(default = "default_next_channel_stats_id")]
     pub next_channel_stats_id: u64,
+    /// 请求明细日志保留天数：超期日志由网关自动清理（统计聚合表不受影响）。
+    /// None 或 0 表示永久保留，由用户手动通过范围清理管理。
+    #[serde(default)]
+    pub log_retention_days: Option<u32>,
+}
+
+impl ModelProxyConfig {
+    /// 生效的日志保留天数（0 或未配置 = 永久保留）
+    pub fn effective_log_retention_days(&self) -> u32 {
+        self.log_retention_days.unwrap_or(0)
+    }
 }
 
 pub type OpencodeProxyConfig = ModelProxyConfig;
@@ -167,6 +178,7 @@ impl Default for ModelProxyConfig {
             record_request_body: false,
             max_retries: 0,
             next_channel_stats_id: default_next_channel_stats_id(),
+            log_retention_days: None,
         }
     }
 }
@@ -191,6 +203,8 @@ pub struct ProxyRequestLog {
     pub prompt_tokens: Option<u64>,
     pub prompt_cache_hit_tokens: Option<u64>,
     pub prompt_cache_miss_tokens: Option<u64>,
+    /// Prompt 缓存写入量（Anthropic cache_creation_input_tokens 等）
+    pub cache_creation_tokens: Option<u64>,
     pub completion_tokens: Option<u64>,
     pub reasoning_tokens: Option<u64>,
     pub total_tokens: Option<u64>,
@@ -198,6 +212,8 @@ pub struct ProxyRequestLog {
     pub request_body: Option<String>,
     pub response_body: Option<String>,
     pub node_name: Option<String>,
+    /// 发起请求的客户端标识（由 User-Agent / 端点推断，如 claude / codex / cursor）
+    pub client_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -361,6 +377,8 @@ pub struct ModelProxyContext {
     pub app_handle: Arc<RwLock<Option<AppHandle>>>,
     pub key_round_robin: Arc<AtomicUsize>,
     pub node_round_robin: Arc<AtomicUsize>,
+    /// 上次执行明细保留期清理的时刻（epoch 毫秒），用于节流避免每次写入全表扫描
+    pub log_retention_last_run: Arc<std::sync::atomic::AtomicU64>,
 }
 
 #[allow(dead_code)]
@@ -398,4 +416,14 @@ pub struct ProxyLogsResponse {
     pub global_error: usize,
     pub success_total: usize,
     pub error_total: usize,
+}
+
+/// 反代模式 Token 报表：与本地模式同构的用量桶（TokenUsageReport）+ 请求健康，
+/// 由 channel_daily_stats / channel_hourly_stats 聚合表生成，
+/// 供 Token 统计中心「反代模式」标签直接复用本地模式的前端聚合层。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyTokenUsageReport {
+    pub usage: crate::core::models::TokenUsageReport,
+    pub health: crate::core::models::RequestHealthReport,
 }

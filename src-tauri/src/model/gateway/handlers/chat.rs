@@ -5,7 +5,7 @@
 
 use super::super::adapters::{normalize_chat_messages, OpenAiProtocolAdapter};
 use super::super::egress;
-use super::super::logger::cap_log_body;
+use super::super::logger::{cap_log_body, client_name_from_headers};
 use super::super::pipeline::{
     auth_and_count, dispatch_protocol_egress, resolve_channel_or_404, ClientProtocol,
 };
@@ -106,7 +106,8 @@ pub async fn handle_chat_completions(
         Err(res) => return res,
     };
 
-    let log = outcome.base_log(PATH, &raw_model, is_stream, req_body_str);
+    let mut log = outcome.base_log(PATH, &raw_model, is_stream, req_body_str);
+    log.client_name = Some(client_name_from_headers(&headers, PATH));
 
     if is_stream {
         let stream_body = clean_sse_stream(
@@ -137,6 +138,7 @@ pub async fn handle_chat_completions(
         let mut comp_toks = None;
         let mut reas_toks = None;
         let mut cache_toks = None;
+        let mut cache_creation_toks = None;
         let mut total_toks = None;
         let mut has_reasoning = false;
 
@@ -147,6 +149,7 @@ pub async fn handle_chat_completions(
                 total_toks = usage.get("total_tokens").and_then(JsonValue::as_u64);
                 if let Some(details) = usage.get("prompt_tokens_details").and_then(JsonValue::as_object) {
                     cache_toks = details.get("cached_tokens").and_then(JsonValue::as_u64);
+                    cache_creation_toks = details.get("cache_creation_tokens").and_then(JsonValue::as_u64);
                 }
                 if let Some(details) = usage.get("completion_tokens_details").and_then(JsonValue::as_object) {
                     reas_toks = details.get("reasoning_tokens").and_then(JsonValue::as_u64);
@@ -184,6 +187,7 @@ pub async fn handle_chat_completions(
             final_log.completion_tokens = comp_toks;
             final_log.reasoning_tokens = reas_toks;
             final_log.prompt_cache_hit_tokens = cache_toks;
+            final_log.cache_creation_tokens = cache_creation_toks;
             final_log.total_tokens = total_toks;
             ctx.record_log(final_log).await;
 

@@ -104,6 +104,8 @@ const channelModelsModalOpen = ref(false);
 const channelSettingsDialogOpen = ref(false);
 const clearLogsModalOpen = ref(false);
 const clearingLogs = ref(false);
+// 范围清理：为空时清理全部；填写日期时仅清理该日期之前的明细
+const clearBeforeDate = ref("");
 const selectedLogForDetail = ref<ProxyRequestLog | null>(null);
 const selectedChannel = ref<ChannelConfig | null>(null);
 const copiedModelId = ref<string | null>(null);
@@ -111,8 +113,9 @@ const copiedModelId = ref<string | null>(null);
 async function handleClearLogs(mode: "payload_only" | "all") {
   clearingLogs.value = true;
   try {
-    await clearLogs(mode);
+    await clearLogs(mode, clearBeforeDate.value || undefined);
     clearLogsModalOpen.value = false;
+    clearBeforeDate.value = "";
   } finally {
     clearingLogs.value = false;
   }
@@ -2326,6 +2329,21 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
             <small>开启后在请求日志中保存客户端传入的完整 JSON 报文（默认关闭以节省内存）</small>
           </div>
 
+          <!-- 明细日志保留天数（0 = 永久保留） -->
+          <div class="mp-field">
+            <label for="mp-log-retention">明细日志保留天数</label>
+            <input
+              id="mp-log-retention"
+              v-model.number="proxyConfig.logRetentionDays"
+              type="number"
+              min="0"
+              max="3650"
+              class="mp-input font-mono"
+              placeholder="0"
+            />
+            <small>超过保留期的请求明细由网关自动删除并同步清空更早日志的报文全文（0 = 永久保留，靠手动范围清理管理）；渠道统计与长期聚合数据不受清理影响</small>
+          </div>
+
           <!-- 失败重试次数 -->
           <div class="mp-field">
             <label for="mp-max-retries">失败重试次数</label>
@@ -3666,6 +3684,18 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
             请选择要执行的本地 SQLite 数据库日志清理模式：
           </p>
 
+          <!-- 范围清理：可选日期，仅清理该日期之前的明细 -->
+          <div class="mp-field" style="margin-bottom: 14px;">
+            <label for="mp-clear-before">清理范围（可选）</label>
+            <input
+              id="mp-clear-before"
+              v-model="clearBeforeDate"
+              type="date"
+              class="mp-input"
+            />
+            <small>填写日期时只清理该日期之前（不含当日）的明细；留空则作用于全部明细。渠道统计、全渠道总览与 Token 统计中心的反代模式报表均来自独立聚合表，<strong>不受清理影响</strong>。</small>
+          </div>
+
           <div class="mp-clear-options-grid">
             <!-- 选项 1: 仅清空请求/响应报文 -->
             <div class="mp-clear-option-card">
@@ -3699,13 +3729,16 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
                 <div class="mp-coc-title-wrap">
                   <span class="mp-coc-icon text-danger">🗑️</span>
                   <div>
-                    <strong class="text-danger">彻底清空全部记录与统计</strong>
-                    <span class="mp-coc-badge is-danger">全部删除</span>
+                    <strong class="text-danger">删除明细记录</strong>
+                    <span class="mp-coc-badge is-danger">{{ clearBeforeDate ? '按日期删除' : '全部删除' }}</span>
                   </div>
                 </div>
               </div>
               <p class="mp-coc-desc">
-                从本地 SQLite 数据库中永久删除所有反代调用日志记录，并将控制台运行时计数器与 Token 统计归零。
+                {{ clearBeforeDate
+                  ? `永久删除 ${clearBeforeDate} 之前的反代请求明细日志。`
+                  : '从本地 SQLite 数据库中删除所有反代请求明细日志。' }}
+                渠道统计与长期聚合数据持久保存在统计表中，<strong>不会被清空</strong>；运行时计数器不受影响。
               </p>
               <div class="mp-coc-action">
                 <button
@@ -3714,7 +3747,7 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
                   :disabled="clearingLogs"
                   @click="handleClearLogs('all')"
                 >
-                  <span>{{ clearingLogs ? "清空中…" : "彻底清空所有记录" }}</span>
+                  <span>{{ clearingLogs ? "清理中…" : (clearBeforeDate ? "删除该日期前明细" : "删除全部明细") }}</span>
                 </button>
               </div>
             </div>

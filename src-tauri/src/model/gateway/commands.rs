@@ -282,7 +282,7 @@ pub async fn get_model_proxy_logs(
     };
 
     let count_filtered: usize = {
-        let sql = format!("SELECT COUNT(*) FROM opencode_proxy_logs {where_sql}");
+        let sql = format!("SELECT COUNT(*) FROM model_proxy_logs {where_sql}");
         let params_refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|b| b.as_ref()).collect();
         conn.query_row(&sql, params_refs.as_slice(), |r| r.get(0))
             .unwrap_or(0)
@@ -292,9 +292,9 @@ pub async fn get_model_proxy_logs(
     let count_succ: usize = {
         let status_sql = "status_code >= 200 AND status_code < 300";
         let sql = if where_sql.is_empty() {
-            format!("SELECT COUNT(*) FROM opencode_proxy_logs WHERE {status_sql}")
+            format!("SELECT COUNT(*) FROM model_proxy_logs WHERE {status_sql}")
         } else {
-            format!("SELECT COUNT(*) FROM opencode_proxy_logs {where_sql} AND {status_sql}")
+            format!("SELECT COUNT(*) FROM model_proxy_logs {where_sql} AND {status_sql}")
         };
         let params_refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|b| b.as_ref()).collect();
         conn.query_row(&sql, params_refs.as_slice(), |r| r.get(0))
@@ -305,9 +305,9 @@ pub async fn get_model_proxy_logs(
     let count_err: usize = {
         let status_sql = "status_code >= 400";
         let sql = if where_sql.is_empty() {
-            format!("SELECT COUNT(*) FROM opencode_proxy_logs WHERE {status_sql}")
+            format!("SELECT COUNT(*) FROM model_proxy_logs WHERE {status_sql}")
         } else {
-            format!("SELECT COUNT(*) FROM opencode_proxy_logs {where_sql} AND {status_sql}")
+            format!("SELECT COUNT(*) FROM model_proxy_logs {where_sql} AND {status_sql}")
         };
         let params_refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|b| b.as_ref()).collect();
         conn.query_row(&sql, params_refs.as_slice(), |r| r.get(0))
@@ -316,7 +316,7 @@ pub async fn get_model_proxy_logs(
 
     // 顶部标签统计：不受状态筛选与搜索关键词影响，但随所选日期区间变化
     let global_total: usize = {
-        let sql = format!("SELECT COUNT(*) FROM opencode_proxy_logs {date_where_sql}");
+        let sql = format!("SELECT COUNT(*) FROM model_proxy_logs {date_where_sql}");
         let params_refs: Vec<&dyn rusqlite::ToSql> = date_only_params.iter().map(|b| b.as_ref()).collect();
         conn.query_row(&sql, params_refs.as_slice(), |r| r.get(0))
             .unwrap_or(0)
@@ -324,9 +324,9 @@ pub async fn get_model_proxy_logs(
     let global_succ: usize = {
         let status_sql = "status_code >= 200 AND status_code < 300";
         let sql = if date_where_sql.is_empty() {
-            format!("SELECT COUNT(*) FROM opencode_proxy_logs WHERE {status_sql}")
+            format!("SELECT COUNT(*) FROM model_proxy_logs WHERE {status_sql}")
         } else {
-            format!("SELECT COUNT(*) FROM opencode_proxy_logs {date_where_sql} AND {status_sql}")
+            format!("SELECT COUNT(*) FROM model_proxy_logs {date_where_sql} AND {status_sql}")
         };
         let params_refs: Vec<&dyn rusqlite::ToSql> = date_only_params.iter().map(|b| b.as_ref()).collect();
         conn.query_row(&sql, params_refs.as_slice(), |r| r.get(0))
@@ -335,9 +335,9 @@ pub async fn get_model_proxy_logs(
     let global_err: usize = {
         let status_sql = "status_code >= 400";
         let sql = if date_where_sql.is_empty() {
-            format!("SELECT COUNT(*) FROM opencode_proxy_logs WHERE {status_sql}")
+            format!("SELECT COUNT(*) FROM model_proxy_logs WHERE {status_sql}")
         } else {
-            format!("SELECT COUNT(*) FROM opencode_proxy_logs {date_where_sql} AND {status_sql}")
+            format!("SELECT COUNT(*) FROM model_proxy_logs {date_where_sql} AND {status_sql}")
         };
         let params_refs: Vec<&dyn rusqlite::ToSql> = date_only_params.iter().map(|b| b.as_ref()).collect();
         conn.query_row(&sql, params_refs.as_slice(), |r| r.get(0))
@@ -347,9 +347,10 @@ pub async fn get_model_proxy_logs(
     let query_sql = format!(
         "SELECT id, timestamp, method, path, channel_id, model, stream, status_code,
                 duration_ms, ttft_ms, prompt_tokens, prompt_cache_hit_tokens,
-                prompt_cache_miss_tokens, completion_tokens, reasoning_tokens, total_tokens,
-                error_message, request_body, response_body, node_name
-         FROM opencode_proxy_logs
+                prompt_cache_miss_tokens, cache_creation_tokens, completion_tokens,
+                reasoning_tokens, total_tokens,
+                error_message, request_body, response_body, node_name, client_name
+         FROM model_proxy_logs
          {where_sql}
          ORDER BY {sort_col} {sort_dir}, rowid DESC
          LIMIT ? OFFSET ?",
@@ -386,13 +387,15 @@ pub async fn get_model_proxy_logs(
                 prompt_tokens: row.get::<_, Option<i64>>(10)?.map(|v| v as u64),
                 prompt_cache_hit_tokens: row.get::<_, Option<i64>>(11)?.map(|v| v as u64),
                 prompt_cache_miss_tokens: row.get::<_, Option<i64>>(12)?.map(|v| v as u64),
-                completion_tokens: row.get::<_, Option<i64>>(13)?.map(|v| v as u64),
-                reasoning_tokens: row.get::<_, Option<i64>>(14)?.map(|v| v as u64),
-                total_tokens: row.get::<_, Option<i64>>(15)?.map(|v| v as u64),
-                error_message: row.get(16)?,
-                request_body: row.get(17)?,
-                response_body: row.get(18)?,
-                node_name: row.get(19)?,
+                cache_creation_tokens: row.get::<_, Option<i64>>(13)?.map(|v| v as u64),
+                completion_tokens: row.get::<_, Option<i64>>(14)?.map(|v| v as u64),
+                reasoning_tokens: row.get::<_, Option<i64>>(15)?.map(|v| v as u64),
+                total_tokens: row.get::<_, Option<i64>>(16)?.map(|v| v as u64),
+                error_message: row.get(17)?,
+                request_body: row.get(18)?,
+                response_body: row.get(19)?,
+                node_name: row.get(20)?,
+                client_name: row.get(21)?,
             })
         })
         .map_err(|e| format!("解析日志失败: {e}"))?;
@@ -431,6 +434,17 @@ pub async fn get_model_proxy_channel_stats(
     get_channel_usage_stats_summary(&state).await
 }
 
+/// Token 统计中心「反代模式」数据源：与本地模式同构的用量桶 + 请求健康报表。
+/// from/to 均为 YYYY-MM-DD（可省略，默认全部已聚合数据）。
+#[tauri::command]
+pub async fn get_proxy_token_usage(
+    state: State<'_, ModelProxyState>,
+    from: Option<String>,
+    to: Option<String>,
+) -> Result<super::types::ProxyTokenUsageReport, String> {
+    super::stats::get_proxy_token_usage_report(&state, from, to).await
+}
+
 #[tauri::command]
 pub async fn get_opencode_channel_stats(
     state: State<'_, OpencodeProxyState>,
@@ -449,36 +463,59 @@ pub async fn get_model_proxy_overview_stats(
     get_gateway_overview_stats(&state, days, from, to).await
 }
 
+/// 清理请求明细日志。统计聚合表（channel_daily_stats / channel_hourly_stats）独立持久化，不受影响。
+/// - mode="all"（默认）：删除明细行；mode="payload_only"：仅置空请求/响应正文，保留元数据
+/// - before（YYYY-MM-DD）：只清理该日期之前（不含当日）的明细；未提供时清理全部
+/// 返回受影响的行数。
 #[tauri::command]
 pub async fn clear_model_proxy_logs(
     database: State<'_, Database>,
     mode: Option<String>,
-) -> Result<(), String> {
+    before: Option<String>,
+) -> Result<u64, String> {
     let conn = database
         .0
         .lock()
         .map_err(|_| "获取数据库连接失败".to_string())?;
     let clear_mode = mode.as_deref().unwrap_or("all");
 
-    if clear_mode == "payload_only" {
-        conn.execute(
-            "UPDATE opencode_proxy_logs SET request_body = NULL, response_body = NULL",
-            [],
-        )
-        .map_err(|e| format!("清理日志载荷失败: {e}"))?;
-    } else {
-        conn.execute("DELETE FROM opencode_proxy_logs", [])
-            .map_err(|e| format!("清空日志记录失败: {e}"))?;
-    }
-    Ok(())
+    // 归一化边界：before 为纯日期，统一转成「当日 00:00:00」开区间（清理该日之前的内容）
+    let cutoff = before
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| format!("{s} 00:00:00"));
+
+    let (sql, params): (&str, Vec<Box<dyn rusqlite::ToSql>>) = match (clear_mode, &cutoff) {
+        ("payload_only", Some(bound)) => (
+            "UPDATE model_proxy_logs SET request_body = NULL, response_body = NULL WHERE timestamp < ?",
+            vec![Box::new(bound.clone())],
+        ),
+        ("payload_only", None) => (
+            "UPDATE model_proxy_logs SET request_body = NULL, response_body = NULL",
+            vec![],
+        ),
+        (_, Some(bound)) => (
+            "DELETE FROM model_proxy_logs WHERE timestamp < ?",
+            vec![Box::new(bound.clone())],
+        ),
+        (_, None) => ("DELETE FROM model_proxy_logs", vec![]),
+    };
+
+    let params_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
+    let affected = conn
+        .execute(sql, params_refs.as_slice())
+        .map_err(|e| format!("清理日志记录失败: {e}"))?;
+    Ok(affected as u64)
 }
 
 #[tauri::command]
 pub async fn clear_opencode_proxy_logs(
     database: State<'_, Database>,
     mode: Option<String>,
-) -> Result<(), String> {
-    clear_model_proxy_logs(database, mode).await
+    before: Option<String>,
+) -> Result<u64, String> {
+    clear_model_proxy_logs(database, mode, before).await
 }
 
 /// 从站点库 (Site Library) 深度同步渠道配置：自动读取已存活站点的 Base URL、API Keys 与可用模型

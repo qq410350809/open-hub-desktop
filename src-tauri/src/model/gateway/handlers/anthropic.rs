@@ -6,7 +6,7 @@
 
 use super::super::adapters::{AnthropicProtocolAdapter, OpenAiProtocolAdapter};
 use super::super::egress::{self, TargetProtocol};
-use super::super::logger::cap_log_body;
+use super::super::logger::{cap_log_body, client_name_from_headers};
 use super::super::pipeline::{
     auth_and_count, dispatch_protocol_egress, resolve_channel_or_404, ClientProtocol,
 };
@@ -113,7 +113,8 @@ pub async fn handle_messages(
         Err(res) => return res,
     };
 
-    let log = outcome.base_log(PATH, &raw_model, is_stream, req_body_str);
+    let mut log = outcome.base_log(PATH, &raw_model, is_stream, req_body_str);
+    log.client_name = Some(client_name_from_headers(&headers, PATH));
 
     // 流式：即使同协议也经「归一化 → 回转」链路，保住 Token 统计/思考捕获/日志重建
     if is_stream {
@@ -145,9 +146,15 @@ pub async fn handle_messages(
         if let Ok(jv) = serde_json::from_slice::<JsonValue>(&raw_bytes) {
             let p = jv.pointer("/usage/input_tokens").and_then(JsonValue::as_u64).unwrap_or(0);
             let c = jv.pointer("/usage/output_tokens").and_then(JsonValue::as_u64).unwrap_or(0);
-            final_log.prompt_tokens = Some(p);
+            let cache_read = jv.pointer("/usage/cache_read_input_tokens").and_then(JsonValue::as_u64).unwrap_or(0);
+            let cache_creation = jv.pointer("/usage/cache_creation_input_tokens").and_then(JsonValue::as_u64).unwrap_or(0);
+            // OpenAI 口径：prompt_tokens 含缓存读+写
+            let prompt = p + cache_read + cache_creation;
+            final_log.prompt_tokens = Some(prompt);
             final_log.completion_tokens = Some(c);
-            final_log.total_tokens = Some(p + c);
+            final_log.prompt_cache_hit_tokens = (cache_read > 0).then_some(cache_read);
+            final_log.cache_creation_tokens = (cache_creation > 0).then_some(cache_creation);
+            final_log.total_tokens = Some(prompt + c);
         }
         ctx.record_log(final_log).await;
         return (StatusCode::OK, raw_bytes).into_response();
@@ -158,6 +165,10 @@ pub async fn handle_messages(
 
     if let Ok(jv) = serde_json::from_slice::<JsonValue>(&resp_bytes) {
         let (p_tok, c_tok) = AnthropicProtocolAdapter::extract_token_usage(&jv);
+        // 归一化后的 usage 已带缓存/推理明细（Anthropic 上游时）
+        let cache_hit = jv.pointer("/usage/prompt_tokens_details/cached_tokens").and_then(JsonValue::as_u64);
+        let cache_creation = jv.pointer("/usage/prompt_tokens_details/cache_creation_tokens").and_then(JsonValue::as_u64);
+        let reasoning = jv.pointer("/usage/completion_tokens_details/reasoning_tokens").and_then(JsonValue::as_u64);
         let anthropic_resp = AnthropicProtocolAdapter::openai_response_to_anthropic(&jv, &req_id, &raw_model);
 
         let mut final_log = log;
@@ -165,6 +176,9 @@ pub async fn handle_messages(
         final_log.response_body = resp_body;
         final_log.prompt_tokens = Some(p_tok);
         final_log.completion_tokens = Some(c_tok);
+        final_log.prompt_cache_hit_tokens = cache_hit.filter(|v| *v > 0);
+        final_log.cache_creation_tokens = cache_creation.filter(|v| *v > 0);
+        final_log.reasoning_tokens = reasoning.filter(|v| *v > 0);
         final_log.total_tokens = Some(p_tok + c_tok);
         ctx.record_log(final_log).await;
 

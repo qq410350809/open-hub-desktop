@@ -129,44 +129,6 @@ export interface SyncSitesProgress {
   message: string;
 }
 
-export interface AutoSyncSettings {
-  enabled: boolean;
-  intervalMinutes: number;
-}
-
-export interface AutoSyncAccountChange {
-  siteId: string;
-  siteName: string;
-  profileId: string;
-  accountLabel: string;
-  error: string;
-}
-
-export interface AutoSyncRoundSummary {
-  startedAt: number;
-  finishedAt: number;
-  refreshedAccounts: number;
-  recovered: AutoSyncAccountChange[];
-  pendingManual: AutoSyncAccountChange[];
-  modelsRefreshed: number;
-  modelsFailed: number;
-  error: string;
-}
-
-export interface AutoSyncStatus {
-  enabled: boolean;
-  intervalMinutes: number;
-  lastRoundAt: number;
-  lastSummary: AutoSyncRoundSummary | null;
-}
-
-export interface AutoSyncProgress {
-  stage: string;
-  status: SyncProgressStatus;
-  message: string;
-  at: number;
-}
-
 export interface SyncLogEntry {
   id: number;
   elapsedMs: number;

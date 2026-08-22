@@ -370,7 +370,7 @@ impl Database {
         ensure_charity_sync_log_columns(&connection)?;
         ensure_charity_feed_sources_table(&connection)?;
         ensure_proxy_pool_node_columns(&connection)?;
-        ensure_opencode_proxy_logs_table(&connection)?;
+        ensure_model_proxy_logs_table(&connection)?;
         ensure_channel_daily_stats_table(&connection)?;
         ensure_channel_hourly_stats_table(&connection)?;
         reset_expired_checkin_states(&connection)?;
@@ -853,10 +853,32 @@ pub(crate) fn ensure_charity_feed_metric_columns(connection: &Connection) -> Res
     Ok(())
 }
 
-pub(crate) fn ensure_opencode_proxy_logs_table(connection: &Connection) -> Result<(), String> {
+/// 请求明细日志表（曾名 opencode_proxy_logs，已更名为 model_proxy_logs）。
+/// 明细仅按「保留天数」自动清理或手动范围清理；统计聚合表独立持久化，不受影响。
+pub(crate) fn ensure_model_proxy_logs_table(connection: &Connection) -> Result<(), String> {
+    // 一次性更名迁移：SQLite 原生 RENAME 数据无损；旧索引随表带过，删除后以新名重建
+    let old_exists: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='opencode_proxy_logs'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    let new_exists: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='model_proxy_logs'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    if old_exists > 0 && new_exists == 0 {
+        let _ = connection.execute("ALTER TABLE opencode_proxy_logs RENAME TO model_proxy_logs", []);
+    }
+    let _ = connection.execute("DROP INDEX IF EXISTS idx_opencode_proxy_logs_created", []);
+
     connection
         .execute_batch(
-            "CREATE TABLE IF NOT EXISTS opencode_proxy_logs (
+            "CREATE TABLE IF NOT EXISTS model_proxy_logs (
                 id TEXT PRIMARY KEY,
                 timestamp TEXT NOT NULL,
                 method TEXT NOT NULL,
@@ -870,6 +892,7 @@ pub(crate) fn ensure_opencode_proxy_logs_table(connection: &Connection) -> Resul
                 prompt_tokens INTEGER,
                 prompt_cache_hit_tokens INTEGER,
                 prompt_cache_miss_tokens INTEGER,
+                cache_creation_tokens INTEGER,
                 completion_tokens INTEGER,
                 reasoning_tokens INTEGER,
                 total_tokens INTEGER,
@@ -877,44 +900,70 @@ pub(crate) fn ensure_opencode_proxy_logs_table(connection: &Connection) -> Resul
                 request_body TEXT,
                 response_body TEXT,
                 node_name TEXT,
+                client_name TEXT,
                 created_at INTEGER NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_opencode_proxy_logs_created ON opencode_proxy_logs(created_at DESC);",
+            CREATE INDEX IF NOT EXISTS idx_model_proxy_logs_created ON model_proxy_logs(created_at DESC);",
         )
         .map_err(|e| e.to_string())?;
 
     // 自动迁移旧版存留的秒级数字时间戳为标准可读时间格式 (YYYY-MM-DD HH:MM:SS)
     let _ = connection.execute(
-        "UPDATE opencode_proxy_logs 
-         SET timestamp = datetime(CAST(timestamp AS INTEGER), 'unixepoch', 'localtime') 
+        "UPDATE model_proxy_logs
+         SET timestamp = datetime(CAST(timestamp AS INTEGER), 'unixepoch', 'localtime')
          WHERE timestamp GLOB '[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]'",
         [],
     );
 
-    let has_node_name: i64 = connection
-        .query_row(
-            "SELECT COUNT(*) FROM pragma_table_info('opencode_proxy_logs') WHERE name='node_name'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
-    if has_node_name == 0 {
-        let _ = connection.execute("ALTER TABLE opencode_proxy_logs ADD COLUMN node_name TEXT", []);
+    // 兼容旧结构：逐列探测补齐（升级安装路径）
+    for column in ["node_name", "client_name", "cache_creation_tokens"] {
+        let has: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('model_proxy_logs') WHERE name=?1",
+                [column],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        if has == 0 {
+            let _ = connection.execute(
+                &format!("ALTER TABLE model_proxy_logs ADD COLUMN {column} TEXT"),
+                [],
+            );
+        }
     }
 
     Ok(())
 }
 
-/// 渠道日统计表：每个渠道每天一条聚合数据，总量 = 全部日数据汇总。
-/// 请求日志表会裁剪到最近 1000 条，长期统计依赖本表持久化。
+/// 渠道日统计表：每「渠道 × 模型 × 客户端」每天一条聚合数据，总量 = 全部日数据汇总。
+/// 统计维度独立于明细日志表（明细可清理/裁剪，本表长期持久化）。
 /// channel_id 列存渠道稳定数字 ID（字符串形式）；此处回填沿用日志的别名维度，
 /// 由统计查询侧（stats.rs）负责把旧别名行幂等迁移为数字 ID。
+/// model/client_name 为空串表示旧版本聚合的历史行（升级迁移归并），前端显示为「历史聚合」。
 pub(crate) fn ensure_channel_daily_stats_table(connection: &Connection) -> Result<(), String> {
-    connection
-        .execute_batch(
-            "CREATE TABLE IF NOT EXISTS channel_daily_stats (
+    // 结构迁移：旧表（无 model 维度，PK=date×channel）→ 新表（PK=date×channel×model×client）
+    let has_model_dim: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('channel_daily_stats') WHERE name='model'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    let table_exists: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='channel_daily_stats'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    if table_exists > 0 && has_model_dim == 0 {
+        let _ = connection.execute_batch(
+            "ALTER TABLE channel_daily_stats RENAME TO channel_daily_stats_legacy;
+             CREATE TABLE channel_daily_stats (
                 date TEXT NOT NULL,
                 channel_id TEXT NOT NULL,
+                model TEXT NOT NULL DEFAULT '',
+                client_name TEXT NOT NULL DEFAULT '',
                 total_requests INTEGER NOT NULL DEFAULT 0,
                 successful_requests INTEGER NOT NULL DEFAULT 0,
                 failed_requests INTEGER NOT NULL DEFAULT 0,
@@ -925,27 +974,69 @@ pub(crate) fn ensure_channel_daily_stats_table(connection: &Connection) -> Resul
                 completion_tokens INTEGER NOT NULL DEFAULT 0,
                 reasoning_tokens INTEGER NOT NULL DEFAULT 0,
                 cache_hit_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
                 total_tokens INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY (date, channel_id)
+                PRIMARY KEY (date, channel_id, model, client_name)
+            );
+             INSERT OR REPLACE INTO channel_daily_stats (
+                date, channel_id, model, client_name,
+                total_requests, successful_requests, failed_requests,
+                duration_ms_total, ttft_ms_total, ttft_count,
+                prompt_tokens, completion_tokens, reasoning_tokens,
+                cache_hit_tokens, cache_creation_tokens, total_tokens
+             )
+             SELECT
+                date, channel_id, '', '',
+                total_requests, successful_requests, failed_requests,
+                duration_ms_total, ttft_ms_total, ttft_count,
+                prompt_tokens, completion_tokens, reasoning_tokens,
+                cache_hit_tokens, 0, total_tokens
+             FROM channel_daily_stats_legacy;
+             DROP TABLE channel_daily_stats_legacy;",
+        );
+    }
+
+    connection
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS channel_daily_stats (
+                date TEXT NOT NULL,
+                channel_id TEXT NOT NULL,
+                model TEXT NOT NULL DEFAULT '',
+                client_name TEXT NOT NULL DEFAULT '',
+                total_requests INTEGER NOT NULL DEFAULT 0,
+                successful_requests INTEGER NOT NULL DEFAULT 0,
+                failed_requests INTEGER NOT NULL DEFAULT 0,
+                duration_ms_total INTEGER NOT NULL DEFAULT 0,
+                ttft_ms_total INTEGER NOT NULL DEFAULT 0,
+                ttft_count INTEGER NOT NULL DEFAULT 0,
+                prompt_tokens INTEGER NOT NULL DEFAULT 0,
+                completion_tokens INTEGER NOT NULL DEFAULT 0,
+                reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_hit_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+                total_tokens INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (date, channel_id, model, client_name)
             );
             CREATE INDEX IF NOT EXISTS idx_channel_daily_stats_date ON channel_daily_stats(date DESC);",
         )
         .map_err(|e| e.to_string())?;
 
-    // 一次性回填：把既有请求日志按「日 × 渠道」聚合进日统计表（仅当日表为空时执行）
+    // 一次性回填：把既有请求日志按「日 × 渠道 × 模型 × 客户端」聚合进日统计表（仅当日表为空时执行）
     let existing: i64 = connection
         .query_row("SELECT COUNT(*) FROM channel_daily_stats", [], |row| row.get(0))
         .unwrap_or(0);
     if existing == 0 {
         let _ = connection.execute(
             "INSERT OR REPLACE INTO channel_daily_stats (
-                date, channel_id, total_requests, successful_requests, failed_requests,
+                date, channel_id, model, client_name, total_requests, successful_requests, failed_requests,
                 duration_ms_total, ttft_ms_total, ttft_count,
-                prompt_tokens, completion_tokens, reasoning_tokens, cache_hit_tokens, total_tokens
+                prompt_tokens, completion_tokens, reasoning_tokens, cache_hit_tokens, cache_creation_tokens, total_tokens
             )
             SELECT
                 substr(timestamp, 1, 10),
                 channel_id,
+                COALESCE(model, ''),
+                COALESCE(client_name, ''),
                 COUNT(*),
                 SUM(CASE WHEN status_code < 400 THEN 1 ELSE 0 END),
                 SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END),
@@ -956,9 +1047,10 @@ pub(crate) fn ensure_channel_daily_stats_table(connection: &Connection) -> Resul
                 COALESCE(SUM(completion_tokens), 0),
                 COALESCE(SUM(reasoning_tokens), 0),
                 COALESCE(SUM(prompt_cache_hit_tokens), 0),
+                COALESCE(SUM(cache_creation_tokens), 0),
                 COALESCE(SUM(total_tokens), 0)
-            FROM opencode_proxy_logs
-            GROUP BY substr(timestamp, 1, 10), channel_id",
+            FROM model_proxy_logs
+            GROUP BY substr(timestamp, 1, 10), channel_id, COALESCE(model, ''), COALESCE(client_name, '')",
             [],
         );
     }
@@ -966,15 +1058,33 @@ pub(crate) fn ensure_channel_daily_stats_table(connection: &Connection) -> Resul
     Ok(())
 }
 
-/// 渠道小时统计表：每渠道每小时一条聚合，供单日区间的 24 小时粒度趋势图。
-/// 与日统计表同源的持久化设计（日志表裁剪不影响长期数据）。timestamp 为本地时间文本。
+/// 渠道小时统计表：每「渠道 × 模型 × 客户端」每小时一条聚合，供小时粒度趋势图。
+/// 与日统计表同源的持久化设计（明细日志清理不影响长期数据）。timestamp 为本地时间文本。
 pub(crate) fn ensure_channel_hourly_stats_table(connection: &Connection) -> Result<(), String> {
-    connection
-        .execute_batch(
-            "CREATE TABLE IF NOT EXISTS channel_hourly_stats (
+    // 结构迁移：旧表（无 model 维度）→ 新表；旧数据归并为 model='' 历史行
+    let has_model_dim: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('channel_hourly_stats') WHERE name='model'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    let table_exists: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='channel_hourly_stats'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    if table_exists > 0 && has_model_dim == 0 {
+        let _ = connection.execute_batch(
+            "ALTER TABLE channel_hourly_stats RENAME TO channel_hourly_stats_legacy;
+             CREATE TABLE channel_hourly_stats (
                 date TEXT NOT NULL,
                 hour INTEGER NOT NULL,
                 channel_id TEXT NOT NULL,
+                model TEXT NOT NULL DEFAULT '',
+                client_name TEXT NOT NULL DEFAULT '',
                 total_requests INTEGER NOT NULL DEFAULT 0,
                 successful_requests INTEGER NOT NULL DEFAULT 0,
                 failed_requests INTEGER NOT NULL DEFAULT 0,
@@ -982,28 +1092,66 @@ pub(crate) fn ensure_channel_hourly_stats_table(connection: &Connection) -> Resu
                 completion_tokens INTEGER NOT NULL DEFAULT 0,
                 reasoning_tokens INTEGER NOT NULL DEFAULT 0,
                 cache_hit_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
                 total_tokens INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY (date, hour, channel_id)
+                PRIMARY KEY (date, hour, channel_id, model, client_name)
+            );
+             INSERT OR REPLACE INTO channel_hourly_stats (
+                date, hour, channel_id, model, client_name,
+                total_requests, successful_requests, failed_requests,
+                prompt_tokens, completion_tokens, reasoning_tokens,
+                cache_hit_tokens, cache_creation_tokens, total_tokens
+             )
+             SELECT
+                date, hour, channel_id, '', '',
+                total_requests, successful_requests, failed_requests,
+                prompt_tokens, completion_tokens, reasoning_tokens,
+                cache_hit_tokens, 0, total_tokens
+             FROM channel_hourly_stats_legacy;
+             DROP TABLE channel_hourly_stats_legacy;",
+        );
+    }
+
+    connection
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS channel_hourly_stats (
+                date TEXT NOT NULL,
+                hour INTEGER NOT NULL,
+                channel_id TEXT NOT NULL,
+                model TEXT NOT NULL DEFAULT '',
+                client_name TEXT NOT NULL DEFAULT '',
+                total_requests INTEGER NOT NULL DEFAULT 0,
+                successful_requests INTEGER NOT NULL DEFAULT 0,
+                failed_requests INTEGER NOT NULL DEFAULT 0,
+                prompt_tokens INTEGER NOT NULL DEFAULT 0,
+                completion_tokens INTEGER NOT NULL DEFAULT 0,
+                reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_hit_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+                total_tokens INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (date, hour, channel_id, model, client_name)
             );
             CREATE INDEX IF NOT EXISTS idx_channel_hourly_stats_date ON channel_hourly_stats(date DESC, hour);",
         )
         .map_err(|e| e.to_string())?;
 
-    // 一次性回填：把既有请求日志按「日 × 时 × 渠道」聚合进小时表（仅当小时表为空时执行）。
-    // 日志表上限 1000 条，回填仅覆盖近期；更早历史只有日粒度，前端届时回退日视图
+    // 一次性回填：把既有请求日志按「日 × 时 × 渠道 × 模型 × 客户端」聚合进小时表（仅当小时表为空时执行）。
+    // 明细表按保留天数留存，回填仅覆盖保留期内的数据；更早历史只有日粒度
     let existing: i64 = connection
         .query_row("SELECT COUNT(*) FROM channel_hourly_stats", [], |row| row.get(0))
         .unwrap_or(0);
     if existing == 0 {
         let _ = connection.execute(
             "INSERT OR REPLACE INTO channel_hourly_stats (
-                date, hour, channel_id, total_requests, successful_requests, failed_requests,
-                prompt_tokens, completion_tokens, reasoning_tokens, cache_hit_tokens, total_tokens
+                date, hour, channel_id, model, client_name, total_requests, successful_requests, failed_requests,
+                prompt_tokens, completion_tokens, reasoning_tokens, cache_hit_tokens, cache_creation_tokens, total_tokens
             )
             SELECT
                 substr(timestamp, 1, 10),
                 CAST(substr(timestamp, 12, 2) AS INTEGER),
                 channel_id,
+                COALESCE(model, ''),
+                COALESCE(client_name, ''),
                 COUNT(*),
                 SUM(CASE WHEN status_code < 400 THEN 1 ELSE 0 END),
                 SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END),
@@ -1011,9 +1159,10 @@ pub(crate) fn ensure_channel_hourly_stats_table(connection: &Connection) -> Resu
                 COALESCE(SUM(completion_tokens), 0),
                 COALESCE(SUM(reasoning_tokens), 0),
                 COALESCE(SUM(prompt_cache_hit_tokens), 0),
+                COALESCE(SUM(cache_creation_tokens), 0),
                 COALESCE(SUM(total_tokens), 0)
-            FROM opencode_proxy_logs
-            GROUP BY substr(timestamp, 1, 10), substr(timestamp, 12, 2), channel_id",
+            FROM model_proxy_logs
+            GROUP BY substr(timestamp, 1, 10), substr(timestamp, 12, 2), channel_id, COALESCE(model, ''), COALESCE(client_name, '')",
             [],
         );
     }

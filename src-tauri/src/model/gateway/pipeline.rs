@@ -7,7 +7,7 @@
 use super::balancer::{check_model_channel_compatibility, resolve_channel, select_channel_api_key};
 use super::dispatcher::{execute_resilient_egress, EgressRequestMeta, EgressSuccess};
 use super::egress::{self, TargetProtocol};
-use super::logger::{record_attempt_failure, ProxyLogParams};
+use super::logger::{client_name_from_headers, record_attempt_failure, ProxyLogParams};
 use super::router::check_auth;
 use super::types::{
     current_timestamp, ChannelConfig, ModelProxyConfig, ModelProxyContext, ProxyRequestLog,
@@ -214,6 +214,7 @@ impl EgressOutcome {
             prompt_tokens: None,
             prompt_cache_hit_tokens: None,
             prompt_cache_miss_tokens: None,
+            cache_creation_tokens: None,
             completion_tokens: None,
             reasoning_tokens: None,
             total_tokens: None,
@@ -221,6 +222,7 @@ impl EgressOutcome {
             request_body: req_body_str,
             response_body: None,
             node_name: Some(self.success.node_display.clone()),
+            client_name: None,
         }
     }
 }
@@ -333,6 +335,7 @@ pub async fn auth_and_count(
             is_stream,
             start_time.elapsed().as_millis() as u64,
             req_body_str.clone(),
+            Some(client_name_from_headers(headers, path)),
         )
         .await;
         return Err(res);

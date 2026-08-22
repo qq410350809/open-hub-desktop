@@ -26,6 +26,8 @@ export interface OpencodeProxyConfig {
   maxRetries?: number;
   /** 动态渠道统计 ID 分配计数器（101 起，1-100 预留内置渠道） */
   nextChannelStatsId?: number;
+  /** 请求明细保留天数：超期自动清理明细（统计聚合不受影响）；0 或缺省 = 永久保留 */
+  logRetentionDays?: number;
 }
 
 export interface OpencodeProxyStatus {
@@ -61,6 +63,8 @@ export interface ProxyRequestLog {
   promptTokens?: number;
   promptCacheHitTokens?: number;
   promptCacheMissTokens?: number;
+  /** Prompt 缓存写入量（Anthropic cache_creation_input_tokens） */
+  cacheCreationTokens?: number;
   completionTokens?: number;
   reasoningTokens?: number;
   totalTokens?: number;
@@ -68,6 +72,8 @@ export interface ProxyRequestLog {
   requestBody?: string;
   responseBody?: string;
   nodeName?: string;
+  /** 发起请求的客户端标识（User-Agent / 端点推断，如 claude / codex） */
+  clientName?: string | null;
 }
 
 export interface ChannelUsageStats {

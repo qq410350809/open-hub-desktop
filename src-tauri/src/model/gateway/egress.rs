@@ -492,9 +492,15 @@ pub fn anthropic_response_to_openai(resp: &JsonValue) -> JsonValue {
         Some(_) | None => "stop",
     };
 
+    // Anthropic 口径：input_tokens 不含缓存部分；归一化为 OpenAI 口径时
+    // prompt_tokens = input + cache_read + cache_creation，缓存明细放 details。
+    // cache_creation_tokens 为本网关的扩展键（OpenAI 协议无此概念），供统计层提取。
     let usage = resp.get("usage");
-    let prompt_tokens = usage.and_then(|u| u.get("input_tokens")).and_then(JsonValue::as_u64).unwrap_or(0);
+    let input_tokens = usage.and_then(|u| u.get("input_tokens")).and_then(JsonValue::as_u64).unwrap_or(0);
+    let cache_read = usage.and_then(|u| u.get("cache_read_input_tokens")).and_then(JsonValue::as_u64).unwrap_or(0);
+    let cache_creation = usage.and_then(|u| u.get("cache_creation_input_tokens")).and_then(JsonValue::as_u64).unwrap_or(0);
     let completion_tokens = usage.and_then(|u| u.get("output_tokens")).and_then(JsonValue::as_u64).unwrap_or(0);
+    let prompt_tokens = input_tokens + cache_read + cache_creation;
 
     let mut out = empty_chat_response(model);
     let msg = out.pointer_mut("/choices/0/message").expect("message exists");
@@ -510,6 +516,10 @@ pub fn anthropic_response_to_openai(resp: &JsonValue) -> JsonValue {
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
         "total_tokens": prompt_tokens + completion_tokens,
+        "prompt_tokens_details": {
+            "cached_tokens": cache_read,
+            "cache_creation_tokens": cache_creation,
+        },
     });
     out
 }
@@ -555,11 +565,13 @@ pub fn gemini_response_to_openai(resp: &JsonValue, model: &str) -> JsonValue {
 
     let usage = resp.get("usageMetadata");
     let prompt_tokens = usage.and_then(|u| u.get("promptTokenCount")).and_then(JsonValue::as_u64).unwrap_or(0);
+    let thoughts_tokens = usage.and_then(|u| u.get("thoughtsTokenCount")).and_then(JsonValue::as_u64).unwrap_or(0);
+    let cached_tokens = usage.and_then(|u| u.get("cachedContentTokenCount")).and_then(JsonValue::as_u64).unwrap_or(0);
     let completion_tokens = usage
         .and_then(|u| u.get("candidatesTokenCount"))
         .and_then(JsonValue::as_u64)
         .unwrap_or(0)
-        + usage.and_then(|u| u.get("thoughtsTokenCount")).and_then(JsonValue::as_u64).unwrap_or(0);
+        + thoughts_tokens;
 
     let mut out = empty_chat_response(model);
     let msg = out.pointer_mut("/choices/0/message").expect("message exists");
@@ -575,6 +587,8 @@ pub fn gemini_response_to_openai(resp: &JsonValue, model: &str) -> JsonValue {
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
         "total_tokens": usage.and_then(|u| u.get("totalTokenCount")).and_then(JsonValue::as_u64).unwrap_or(prompt_tokens + completion_tokens),
+        "prompt_tokens_details": { "cached_tokens": cached_tokens },
+        "completion_tokens_details": { "reasoning_tokens": thoughts_tokens },
     });
     out
 }
@@ -625,6 +639,14 @@ pub fn responses_response_to_openai(resp: &JsonValue) -> JsonValue {
     let usage = resp.get("usage");
     let prompt_tokens = usage.and_then(|u| u.get("input_tokens")).and_then(JsonValue::as_u64).unwrap_or(0);
     let completion_tokens = usage.and_then(|u| u.get("output_tokens")).and_then(JsonValue::as_u64).unwrap_or(0);
+    let cached_tokens = usage
+        .and_then(|u| u.pointer("/input_tokens_details/cached_tokens"))
+        .and_then(JsonValue::as_u64)
+        .unwrap_or(0);
+    let reasoning_tokens = usage
+        .and_then(|u| u.pointer("/output_tokens_details/reasoning_tokens"))
+        .and_then(JsonValue::as_u64)
+        .unwrap_or(0);
 
     let mut out = empty_chat_response(model);
     let msg = out.pointer_mut("/choices/0/message").expect("message exists");
@@ -640,6 +662,8 @@ pub fn responses_response_to_openai(resp: &JsonValue) -> JsonValue {
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
         "total_tokens": prompt_tokens + completion_tokens,
+        "prompt_tokens_details": { "cached_tokens": cached_tokens },
+        "completion_tokens_details": { "reasoning_tokens": reasoning_tokens },
     });
     out
 }
@@ -669,6 +693,8 @@ fn delta_chunk(delta: JsonValue, finish_reason: Option<&str>, usage: Option<Json
 struct AnthropicSseState {
     input_tokens: u64,
     output_tokens: u64,
+    cache_read_tokens: u64,
+    cache_creation_tokens: u64,
     /// 块索引 → ("text" | "thinking" | "tool_use")
     block_kinds: std::collections::HashMap<u64, String>,
     /// 工具块索引 → (id, name)
@@ -683,6 +709,14 @@ impl AnthropicSseState {
             Some("message_start") => {
                 self.input_tokens = jv
                     .pointer("/message/usage/input_tokens")
+                    .and_then(JsonValue::as_u64)
+                    .unwrap_or(0);
+                self.cache_read_tokens = jv
+                    .pointer("/message/usage/cache_read_input_tokens")
+                    .and_then(JsonValue::as_u64)
+                    .unwrap_or(0);
+                self.cache_creation_tokens = jv
+                    .pointer("/message/usage/cache_creation_input_tokens")
                     .and_then(JsonValue::as_u64)
                     .unwrap_or(0);
             }
@@ -731,6 +765,13 @@ impl AnthropicSseState {
                 if let Some(o) = jv.pointer("/usage/output_tokens").and_then(JsonValue::as_u64) {
                     self.output_tokens = o;
                 }
+                // 部分上游在 message_delta 里才给出（或更新）缓存计数
+                if let Some(v) = jv.pointer("/usage/cache_read_input_tokens").and_then(JsonValue::as_u64) {
+                    self.cache_read_tokens = self.cache_read_tokens.max(v);
+                }
+                if let Some(v) = jv.pointer("/usage/cache_creation_input_tokens").and_then(JsonValue::as_u64) {
+                    self.cache_creation_tokens = self.cache_creation_tokens.max(v);
+                }
             }
             _ => {}
         }
@@ -743,14 +784,20 @@ impl AnthropicSseState {
             Some("tool_use") => "tool_calls",
             _ => "stop",
         };
+        // 与非流式归一化同口径：prompt_tokens 含缓存读+写，明细放 details
+        let prompt_tokens = self.input_tokens + self.cache_read_tokens + self.cache_creation_tokens;
         vec![
             delta_chunk(
                 json!({}),
                 Some(finish_reason),
                 Some(json!({
-                    "prompt_tokens": self.input_tokens,
+                    "prompt_tokens": prompt_tokens,
                     "completion_tokens": self.output_tokens,
-                    "total_tokens": self.input_tokens + self.output_tokens,
+                    "total_tokens": prompt_tokens + self.output_tokens,
+                    "prompt_tokens_details": {
+                        "cached_tokens": self.cache_read_tokens,
+                        "cache_creation_tokens": self.cache_creation_tokens,
+                    },
                 })),
             ),
             "data: [DONE]\n\n".to_string(),
@@ -762,6 +809,8 @@ impl AnthropicSseState {
 struct GeminiSseState {
     prompt_tokens: u64,
     completion_tokens: u64,
+    reasoning_tokens: u64,
+    cached_tokens: u64,
     total_tokens: u64,
     finish_reason: Option<String>,
 }
@@ -800,8 +849,11 @@ impl GeminiSseState {
         }
         if let Some(u) = jv.get("usageMetadata") {
             self.prompt_tokens = u.get("promptTokenCount").and_then(JsonValue::as_u64).unwrap_or(self.prompt_tokens);
+            let thoughts = u.get("thoughtsTokenCount").and_then(JsonValue::as_u64).unwrap_or(0);
+            self.reasoning_tokens = self.reasoning_tokens.max(thoughts);
             self.completion_tokens = u.get("candidatesTokenCount").and_then(JsonValue::as_u64).unwrap_or(self.completion_tokens)
-                + u.get("thoughtsTokenCount").and_then(JsonValue::as_u64).unwrap_or(0);
+                + thoughts;
+            self.cached_tokens = u.get("cachedContentTokenCount").and_then(JsonValue::as_u64).unwrap_or(self.cached_tokens);
             self.total_tokens = u.get("totalTokenCount").and_then(JsonValue::as_u64).unwrap_or(self.total_tokens);
         }
         out
@@ -821,6 +873,8 @@ impl GeminiSseState {
                     "prompt_tokens": self.prompt_tokens,
                     "completion_tokens": self.completion_tokens,
                     "total_tokens": if self.total_tokens > 0 { self.total_tokens } else { self.prompt_tokens + self.completion_tokens },
+                    "prompt_tokens_details": { "cached_tokens": self.cached_tokens },
+                    "completion_tokens_details": { "reasoning_tokens": self.reasoning_tokens },
                 })),
             ),
             "data: [DONE]\n\n".to_string(),
@@ -832,6 +886,8 @@ impl GeminiSseState {
 struct ResponsesSseState {
     prompt_tokens: u64,
     completion_tokens: u64,
+    cached_tokens: u64,
+    reasoning_tokens: u64,
     tool_count: u64,
 }
 
@@ -870,6 +926,8 @@ impl ResponsesSseState {
             Some("response.completed") | Some("response.incomplete") => {
                 self.prompt_tokens = jv.pointer("/response/usage/input_tokens").and_then(JsonValue::as_u64).unwrap_or(self.prompt_tokens);
                 self.completion_tokens = jv.pointer("/response/usage/output_tokens").and_then(JsonValue::as_u64).unwrap_or(self.completion_tokens);
+                self.cached_tokens = jv.pointer("/response/usage/input_tokens_details/cached_tokens").and_then(JsonValue::as_u64).unwrap_or(self.cached_tokens);
+                self.reasoning_tokens = jv.pointer("/response/usage/output_tokens_details/reasoning_tokens").and_then(JsonValue::as_u64).unwrap_or(self.reasoning_tokens);
             }
             _ => {}
         }
@@ -885,6 +943,8 @@ impl ResponsesSseState {
                     "prompt_tokens": self.prompt_tokens,
                     "completion_tokens": self.completion_tokens,
                     "total_tokens": self.prompt_tokens + self.completion_tokens,
+                    "prompt_tokens_details": { "cached_tokens": self.cached_tokens },
+                    "completion_tokens_details": { "reasoning_tokens": self.reasoning_tokens },
                 })),
             ),
             "data: [DONE]\n\n".to_string(),

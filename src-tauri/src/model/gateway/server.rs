@@ -30,6 +30,7 @@ impl ModelProxyState {
             app_handle: Arc::new(RwLock::new(app)),
             key_round_robin: Arc::new(AtomicUsize::new(0)),
             node_round_robin: Arc::new(AtomicUsize::new(0)),
+            log_retention_last_run: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
 
         Self {

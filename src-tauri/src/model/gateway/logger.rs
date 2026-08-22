@@ -30,6 +30,7 @@ pub struct ProxyLogParams {
     pub prompt_tokens: Option<u64>,
     pub prompt_cache_hit_tokens: Option<u64>,
     pub prompt_cache_miss_tokens: Option<u64>,
+    pub cache_creation_tokens: Option<u64>,
     pub completion_tokens: Option<u64>,
     pub reasoning_tokens: Option<u64>,
     pub total_tokens: Option<u64>,
@@ -39,6 +40,8 @@ pub struct ProxyLogParams {
     pub node_name: Option<String>,
     /// 统计维度稳定数字 ID（字符串形式）；未设置时日统计回退 channel_id
     pub channel_stats_id: Option<String>,
+    /// 发起请求的客户端标识（User-Agent / 端点推断）
+    pub client_name: Option<String>,
 }
 
 impl ProxyLogParams {
@@ -66,6 +69,7 @@ impl ProxyLogParams {
             prompt_tokens: None,
             prompt_cache_hit_tokens: None,
             prompt_cache_miss_tokens: None,
+            cache_creation_tokens: None,
             completion_tokens: None,
             reasoning_tokens: None,
             total_tokens: None,
@@ -74,6 +78,7 @@ impl ProxyLogParams {
             response_body: None,
             node_name,
             channel_stats_id: None,
+            client_name: None,
         }
     }
 
@@ -84,6 +89,11 @@ impl ProxyLogParams {
 
     pub fn with_channel_stats_id(mut self, stats_id: Option<String>) -> Self {
         self.channel_stats_id = stats_id;
+        self
+    }
+
+    pub fn with_client_name(mut self, client_name: Option<String>) -> Self {
+        self.client_name = client_name;
         self
     }
 
@@ -102,6 +112,7 @@ impl ProxyLogParams {
             prompt_tokens: self.prompt_tokens,
             prompt_cache_hit_tokens: self.prompt_cache_hit_tokens,
             prompt_cache_miss_tokens: self.prompt_cache_miss_tokens,
+            cache_creation_tokens: self.cache_creation_tokens,
             completion_tokens: self.completion_tokens,
             reasoning_tokens: self.reasoning_tokens,
             total_tokens: self.total_tokens,
@@ -110,7 +121,56 @@ impl ProxyLogParams {
             response_body: self.response_body,
             node_name: self.node_name,
             channel_stats_id: self.channel_stats_id,
+            client_name: self.client_name,
         }
+    }
+}
+
+/// 客户端 User-Agent 前缀 → 本地模式同名的来源标识（sourceNameMap 可直接复用）。
+/// 命名刻意避开 "unknown" 字样：前端 isKnownSource 会过滤含 unknown 的来源。
+const USER_AGENT_SOURCE_PREFIXES: &[(&str, &str)] = &[
+    ("claude", "claude"),
+    ("codex", "codex"),
+    ("cursor", "cursor"),
+    ("gemini", "gemini"),
+    ("opencode", "opencode"),
+    ("kiro", "kiro"),
+    ("copilot", "copilot"),
+    ("goose", "goose"),
+    ("cline", "cline"),
+    ("aider", "aider"),
+    ("continue", "continue"),
+    ("windsurf", "windsurf"),
+    ("zcode", "zcode"),
+    ("zed", "zed"),
+    ("catpawai", "catpawai"),
+    ("antigravity", "antigravity"),
+];
+
+/// 从请求头 User-Agent 与端点路径推断客户端标识。
+/// 优先 User-Agent 前缀匹配（与本地模式来源命名一致），退化为按端点协议推断，
+/// 最终兜底 "other"（前端显示为「其他客户端」）。
+pub fn client_name_from_headers(headers: &axum::http::HeaderMap, path: &str) -> String {
+    let user_agent = headers
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_lowercase();
+    for (prefix, name) in USER_AGENT_SOURCE_PREFIXES {
+        if user_agent.contains(prefix) {
+            return name.to_string();
+        }
+    }
+    if user_agent.contains("python") || user_agent.contains("node") || user_agent.contains("axios")
+    {
+        return "sdk".to_string();
+    }
+    match path {
+        "/v1/messages" => "anthropic-api".to_string(),
+        "/v1/responses" => "responses-api".to_string(),
+        p if p.starts_with("/v1/gemini") => "gemini-api".to_string(),
+        p if p.starts_with("/v1/chat") => "openai-api".to_string(),
+        _ => "other".to_string(),
     }
 }
 
@@ -132,6 +192,7 @@ pub async fn record_auth_failure_log(
     stream: bool,
     dur: u64,
     req_body_str: Option<String>,
+    client_name: Option<String>,
 ) {
     ctx.metrics.total_requests.fetch_add(1, Ordering::Relaxed);
     // 鉴权失败发生在渠道解析前，沿用既有惯例计入 opencode 通道（含其统计 ID）
@@ -158,7 +219,8 @@ pub async fn record_auth_failure_log(
             req_body_str,
             None,
         )
-        .with_channel_stats_id(opencode_stats_id),
+        .with_channel_stats_id(opencode_stats_id)
+        .with_client_name(client_name),
     ).await;
 }
 

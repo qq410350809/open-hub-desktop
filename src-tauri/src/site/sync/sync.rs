@@ -36,15 +36,6 @@ pub(crate) fn browser_fallback_cooldown_remaining_ms(failed_at_ms: i64, fail_cou
     (failed_at_ms + browser_fallback_total_cooldown_ms(fail_count) - now_ms).max(0)
 }
 
-/// Chrome 兜底的执行档位：手动流程允许三级递进（静默 → 后台 → 前台可见，
-/// 前台需用户配合完成 Cloudflare 验证）；自动调度只允许静默与后台，
-/// 绝不抢占用户焦点，失败后进入持久化冷却并等待下一轮。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ChromeSyncMode {
-    Manual,
-    Auto,
-}
-
 pub(crate) fn json_number(value: &serde_json::Value, pointer: &str) -> Option<f64> {
     let value = value.pointer(pointer)?;
     let number = value
@@ -1773,20 +1764,18 @@ pub async fn sync_site_account_via_chrome(
         site_id,
         profile_id,
         run_id,
-        ChromeSyncMode::Manual,
     )
     .await
 }
 
-/// 手动 / 自动两种模式共用的 Chrome 账号同步入口：统一 60 秒总超时、
-/// 失败原因与浏览器兜底冷却计数落库。自动模式由 auto_sync 调度器调用。
+/// 手动 Chrome 账号同步入口：统一 60 秒总超时、
+/// 失败原因与浏览器兜底冷却计数落库。
 pub(crate) async fn sync_site_account_via_chrome_command(
     app: tauri::AppHandle,
     database: &Database,
     site_id: String,
     profile_id: String,
     run_id: u64,
-    mode: ChromeSyncMode,
 ) -> Result<sync::ChromeSessionInfo, String> {
     let outcome = match tokio::time::timeout(
         SITE_SYNC_TIMEOUT,
@@ -1796,7 +1785,6 @@ pub(crate) async fn sync_site_account_via_chrome_command(
             site_id.clone(),
             profile_id.clone(),
             run_id,
-            mode,
         ),
     )
     .await
@@ -1805,13 +1793,9 @@ pub(crate) async fn sync_site_account_via_chrome_command(
         Err(_) => Err("账号同步超过 60 秒，已强制终止".to_string()),
     };
     if let Err(error) = &outcome {
-        // 冷却跳过是“本轮不做”而非失败：不覆盖 sync_error、不推进退避计数。
-        if error.starts_with("AUTO_SYNC_COOLDOWN:") {
-            return outcome;
-        }
         // 浏览器兜底的失败原因落库：失败详情原本只出现在当次弹窗日志里，过后无从追溯；
         // 写入 sync_error 后界面和后续诊断都能看到最后一次尝试究竟错在哪。
-        // 同时推进持久化冷却计数（手动失败同样计数，避免自动调度紧接着再拉起浏览器）。
+        // 同时推进持久化冷却计数，避免短时间内反复拉起浏览器。
         if let Ok(connection) = database.0.lock() {
             let now_ms = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -1837,7 +1821,6 @@ async fn sync_site_account_via_chrome_inner(
     site_id: String,
     profile_id: String,
     run_id: u64,
-    mode: ChromeSyncMode,
 ) -> Result<sync::ChromeSessionInfo, String> {
     let site_id = site_id.trim().to_string();
     let profile_id = profile_id.trim().to_string();
@@ -1856,8 +1839,6 @@ async fn sync_site_account_via_chrome_inner(
         account_name,
         cached_token,
         cached_uid,
-        fallback_failed_at,
-        fallback_fail_count,
     ) = {
         let connection = database.lock_conn()?;
         let site = connection
@@ -1887,13 +1868,10 @@ async fn sync_site_account_via_chrome_inner(
             cookie_names: Vec<String>,
             cached_token: Option<String>,
             cached_uid: Option<String>,
-            fallback_failed_at: i64,
-            fallback_fail_count: i64,
         }
         let account_row = connection
             .query_row(
-                "SELECT profile_name, account_name, cookie_names, newapi_token, newapi_user_id,
-                        browser_fallback_failed_at, browser_fallback_fail_count
+                "SELECT profile_name, account_name, cookie_names, newapi_token, newapi_user_id
                  FROM site_accounts WHERE site_id = ?1 AND profile_id = ?2",
                 params![site_id, profile_id],
                 |row| {
@@ -1905,8 +1883,6 @@ async fn sync_site_account_via_chrome_inner(
                             .unwrap_or_default(),
                         cached_token: row.get(3)?,
                         cached_uid: row.get(4)?,
-                        fallback_failed_at: row.get(5)?,
-                        fallback_fail_count: row.get(6)?,
                     })
                 },
             )
@@ -1921,8 +1897,6 @@ async fn sync_site_account_via_chrome_inner(
             cookie_names,
             cached_token,
             cached_uid,
-            fallback_failed_at,
-            fallback_fail_count,
         } = account;
         let current_month: String = connection
             .query_row("SELECT strftime('%Y-%m', 'now', 'localtime')", [], |row| {
@@ -1941,22 +1915,8 @@ async fn sync_site_account_via_chrome_inner(
             account_name,
             cached_token,
             cached_uid,
-            fallback_failed_at,
-            fallback_fail_count,
         )
     };
-    // 自动模式尊重持久化冷却（指数退避）：冷却内直接放弃本轮，不写新的失败记录，
-    // 也不把错误算作新失败——这是“跳过”而不是“失败”。
-    if mode == ChromeSyncMode::Auto {
-        let cooldown_ms =
-            browser_fallback_cooldown_remaining_ms(fallback_failed_at, fallback_fail_count);
-        if cooldown_ms > 0 {
-            return Err(format!(
-                "AUTO_SYNC_COOLDOWN:{}",
-                (cooldown_ms + 59_999) / 60_000
-            ));
-        }
-    }
     let account_label = if account_name.is_empty() {
         profile_name.clone()
     } else {
@@ -2477,16 +2437,6 @@ async fn sync_site_account_via_chrome_inner(
     let (account, result) = match resolved_account {
         Some(parsed) => parsed,
         None => {
-            // 自动模式到此为止：静默与后台两级都没拿到数据，说明 Cloudflare 验证
-            // 需要真人交互。绝不弹前台窗口抢焦点，落库进入指数退避冷却，
-            // 由通知引导用户手动点一次“使用 Chrome 同步”（手动模式不受冷却限制）。
-            if mode == ChromeSyncMode::Auto {
-                return Err(
-                    "自动同步已完成静默与后台两级尝试，仍需人工完成 Cloudflare 验证；\
-                     已进入冷却，可手动点击该账号的 Chrome 同步按钮立即处理"
-                        .to_string(),
-                );
-            }
             let marker = format!(
                 "openhub-sync-{}",
                 SystemTime::now()

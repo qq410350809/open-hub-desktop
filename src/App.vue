@@ -130,8 +130,6 @@ onMounted(async () => {
   ]);
   store.startDailyRefresh();
   store.startCharityMonitor();
-  // 自动会话同步：读取设置并订阅轮次事件（恢复成功/需人工过盾时 toast 提醒）。
-  store.initializeAutoSync();
 });
 
 onUnmounted(() => {
@@ -149,7 +147,6 @@ onUnmounted(() => {
   store.stopDailyRefresh();
   store.stopTokenDatabaseRefresh();
   store.stopModelCatalogEvents();
-  store.unbindAutoSyncListeners();
 });
 
 </script>

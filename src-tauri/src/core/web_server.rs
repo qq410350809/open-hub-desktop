@@ -891,27 +891,6 @@ fn dispatch(app: &AppHandle, command: &str, args: &Value) -> Result<Value, Strin
             })))
         }
 
-        // —— 自动会话同步 ——
-        "get_auto_sync_settings" => Ok(json!(crate::site::sync::get_auto_sync_settings(
-            app.state::<Database>(),
-        ))),
-        "get_auto_sync_status" => Ok(json!(crate::site::sync::get_auto_sync_status(
-            app.state::<Database>(),
-        ))),
-        "set_auto_sync_settings" => {
-            let enabled: Option<bool> = take_opt(args, &["enabled"])?;
-            let interval_minutes: Option<u64> =
-                take_opt(args, &["intervalMinutes", "interval_minutes"])?;
-            let app = app.clone();
-            Ok(json!(crate::site::sync::set_auto_sync_settings(
-                app.clone(),
-                app.state::<Database>(),
-                enabled,
-                interval_minutes,
-            )))
-        }
-        "request_auto_sync_round" => Ok(json!(crate::site::sync::request_auto_sync_round(app.clone(),))),
-
         // —— 公益监听 ——
         "get_charity_today_count" => Ok(json!(tauri::async_runtime::block_on(
             charity::get_charity_today_count(app.state::<Database>())

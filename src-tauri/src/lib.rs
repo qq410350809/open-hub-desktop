@@ -107,14 +107,12 @@ pub fn run() {
             }
             let proxy_runtime = proxypool::ProxyRuntime::new(app_data_dir.join("proxy-runtime"));
             let charity_runtime = charity::CharityMonitorRuntime::new();
-            let auto_sync_runtime = crate::site::sync::AutoSyncRuntime::default();
             let model_catalog_runtime = crate::model::catalog::ModelCatalogRuntime::new();
             let model_proxy_state =
                 crate::model::gateway::ModelProxyState::new_with_app(Some(app.handle().clone()));
             app.manage(database);
             app.manage(proxy_runtime);
             app.manage(charity_runtime);
-            app.manage(auto_sync_runtime);
             app.manage(model_catalog_runtime);
             app.manage(model_proxy_state);
             // 启动时清理历史订阅里遗留的测速结果后缀，避免旧库节点名继续显示脏数据。
@@ -163,9 +161,6 @@ pub fn run() {
                 // 前端 onMounted 会 request_charity_round，循环启动后立刻消费 force。
                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                 charity::start_charity_monitor(restore_handle.clone());
-                // 自动会话同步：账号保活 / 失效恢复 / 模型刷新全程后台化，
-                // 与公益监听错开启动（调度器内部还有首轮延迟）。
-                crate::site::sync::start_auto_sync(restore_handle.clone());
 
                 // 启动模型网关 (Model Proxy) 独立反代服务
                 let database = restore_handle.state::<crate::models::Database>();
@@ -256,10 +251,6 @@ pub fn run() {
             crate::site::sync::mark_sites_with_chrome_sessions,
             crate::site::sync::delete_site_account,
             crate::site::sync::sync_site_account_via_chrome,
-            crate::site::sync::get_auto_sync_settings,
-            crate::site::sync::set_auto_sync_settings,
-            crate::site::sync::get_auto_sync_status,
-            crate::site::sync::request_auto_sync_round,
             crate::site::library::sync_remote_sites,
             crate::site::library::detect_site_system_types,
             crate::model::catalog::get_system_fonts,
@@ -307,6 +298,7 @@ pub fn run() {
             crate::model::gateway::fetch_model_proxy_models,
             crate::model::gateway::test_model_proxy_health,
             crate::model::gateway::get_model_proxy_logs,
+            crate::model::gateway::get_proxy_token_usage,
             crate::model::gateway::get_model_proxy_channel_stats,
             crate::model::gateway::get_model_proxy_overview_stats,
             crate::model::gateway::clear_model_proxy_logs,

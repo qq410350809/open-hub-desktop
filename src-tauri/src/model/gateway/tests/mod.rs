@@ -93,6 +93,7 @@ use serde_json::json;
             record_request_body: false,
             max_retries: 0,
             next_channel_stats_id: 101,
+            log_retention_days: None,
         };
 
         // 1. 显式别名前缀

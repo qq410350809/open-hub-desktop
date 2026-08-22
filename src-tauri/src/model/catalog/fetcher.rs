@@ -830,24 +830,7 @@ pub async fn fetch_site_models_json(
 ) -> Result<SiteModelsResult, String> {
     tokio::time::timeout(
         SITE_SYNC_TIMEOUT,
-        fetch_site_models_json_impl(&app, &*database, url, site_id, profile_id, false),
-    )
-    .await
-    .map_err(|_| "站点模型同步超过 60 秒，已强制终止".to_string())?
-}
-
-/// 自动调度专用的模型同步入口：与手动命令同一条认证回退链，但浏览器兜底
-/// 只允许静默与后台档位，绝不弹出前台窗口抢焦点。
-pub(crate) async fn auto_fetch_site_models_json(
-    app: &tauri::AppHandle,
-    database: &Database,
-    url: String,
-    site_id: String,
-    profile_id: String,
-) -> Result<SiteModelsResult, String> {
-    tokio::time::timeout(
-        SITE_SYNC_TIMEOUT,
-        fetch_site_models_json_impl(app, database, url, Some(site_id), Some(profile_id), true),
+        fetch_site_models_json_impl(&app, &*database, url, site_id, profile_id),
     )
     .await
     .map_err(|_| "站点模型同步超过 60 秒，已强制终止".to_string())?
@@ -859,14 +842,10 @@ async fn fetch_site_models_json_impl(
     url: String,
     site_id: Option<String>,
     profile_id: Option<String>,
-    auto_mode: bool,
 ) -> Result<SiteModelsResult, String> {
     let Some(site_id) = site_id.clone() else {
         let client = build_http_client(database, Duration::from_secs(6), 3, "站点模型请求")?;
-        return fetch_site_models_json_inner(
-            app, database, url, None, profile_id, client, auto_mode,
-        )
-        .await;
+        return fetch_site_models_json_inner(app, database, url, None, profile_id, client).await;
     };
     let profile_key = profile_id.clone().unwrap_or_default();
     let app_ref = app;
@@ -893,7 +872,6 @@ async fn fetch_site_models_json_impl(
                     Some(site_id),
                     profile_id,
                     client,
-                    auto_mode,
                 )
                 .await
             }
@@ -909,7 +887,6 @@ async fn fetch_site_models_json_inner(
     site_id: Option<String>,
     profile_id: Option<String>,
     client: reqwest::Client,
-    _auto_mode: bool,
 ) -> Result<SiteModelsResult, String> {
     let mut base = url.trim().to_string();
     if !base.starts_with("http://") && !base.starts_with("https://") {

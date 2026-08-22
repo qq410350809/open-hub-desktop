@@ -6,7 +6,7 @@
 
 use super::super::adapters::{GeminiProtocolAdapter, OpenAiProtocolAdapter};
 use super::super::egress::{self, TargetProtocol};
-use super::super::logger::cap_log_body;
+use super::super::logger::{cap_log_body, client_name_from_headers};
 use super::super::pipeline::{
     auth_and_count, dispatch_protocol_egress, resolve_channel_or_404, ClientProtocol,
 };
@@ -115,7 +115,8 @@ pub async fn handle_gemini_generate(
         Err(res) => return res,
     };
 
-    let log = outcome.base_log(&log_path, raw_model, is_stream, req_body_str);
+    let mut log = outcome.base_log(&log_path, raw_model, is_stream, req_body_str);
+    log.client_name = Some(client_name_from_headers(&headers, &log_path));
 
     if is_stream {
         let stream_body = openai_to_gemini_sse_stream(
@@ -146,9 +147,13 @@ pub async fn handle_gemini_generate(
         if let Ok(jv) = serde_json::from_slice::<JsonValue>(&raw_bytes) {
             let p = jv.pointer("/usageMetadata/promptTokenCount").and_then(JsonValue::as_u64).unwrap_or(0);
             let c = jv.pointer("/usageMetadata/candidatesTokenCount").and_then(JsonValue::as_u64).unwrap_or(0);
+            let thoughts = jv.pointer("/usageMetadata/thoughtsTokenCount").and_then(JsonValue::as_u64).unwrap_or(0);
+            let cached = jv.pointer("/usageMetadata/cachedContentTokenCount").and_then(JsonValue::as_u64);
             final_log.prompt_tokens = Some(p);
-            final_log.completion_tokens = Some(c);
-            final_log.total_tokens = jv.pointer("/usageMetadata/totalTokenCount").and_then(JsonValue::as_u64).or(Some(p + c));
+            final_log.completion_tokens = Some(c + thoughts);
+            final_log.prompt_cache_hit_tokens = cached.filter(|v| *v > 0);
+            final_log.reasoning_tokens = (thoughts > 0).then_some(thoughts);
+            final_log.total_tokens = jv.pointer("/usageMetadata/totalTokenCount").and_then(JsonValue::as_u64).or(Some(p + c + thoughts));
         }
         ctx.record_log(final_log).await;
         return (
@@ -166,11 +171,12 @@ pub async fn handle_gemini_generate(
     let mut final_log = log;
     final_log.duration_ms = dur;
     final_log.response_body = cap_log_body(String::from_utf8_lossy(&resp_bytes).to_string());
-    if let Some(usage) = gemini_resp.get("usageMetadata") {
-        final_log.prompt_tokens = usage.get("promptTokenCount").and_then(JsonValue::as_u64);
-        final_log.completion_tokens = usage.get("candidatesTokenCount").and_then(JsonValue::as_u64);
-        final_log.total_tokens = usage.get("totalTokenCount").and_then(JsonValue::as_u64);
-    }
+    // 归一化后的 OpenAI usage 已带缓存/推理明细
+    final_log.prompt_tokens = openai_resp.pointer("/usage/prompt_tokens").and_then(JsonValue::as_u64).filter(|v| *v > 0);
+    final_log.completion_tokens = openai_resp.pointer("/usage/completion_tokens").and_then(JsonValue::as_u64).filter(|v| *v > 0);
+    final_log.prompt_cache_hit_tokens = openai_resp.pointer("/usage/prompt_tokens_details/cached_tokens").and_then(JsonValue::as_u64).filter(|v| *v > 0);
+    final_log.reasoning_tokens = openai_resp.pointer("/usage/completion_tokens_details/reasoning_tokens").and_then(JsonValue::as_u64).filter(|v| *v > 0);
+    final_log.total_tokens = openai_resp.pointer("/usage/total_tokens").and_then(JsonValue::as_u64).filter(|v| *v > 0);
     ctx.record_log(final_log).await;
 
     Json(gemini_resp).into_response()

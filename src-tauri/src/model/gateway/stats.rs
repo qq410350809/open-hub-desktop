@@ -1,7 +1,7 @@
 use super::types::{
     ChannelUsageStats, GatewayDailyPoint, GatewayHourlyPoint, GatewayOverviewStats,
     GatewayOverviewTotals, ModelProxyContext, ModelProxyStatus, ModelProxyState,
-    OpencodeProxyState, OpencodeProxyStatus, ProxyRequestLog,
+    OpencodeProxyState, OpencodeProxyStatus, ProxyRequestLog, ProxyTokenUsageReport,
 };
 use chrono::Datelike;
 use rusqlite::params;
@@ -10,7 +10,8 @@ use std::sync::atomic::Ordering;
 use tauri::Manager;
 
 impl ModelProxyContext {
-    /// 异步记录请求日志至本地数据库，并同步累加「渠道 × 日」聚合统计
+    /// 异步记录请求日志至本地数据库，并同步累加「渠道 × 模型 × 客户端 × 日/时」聚合统计。
+    /// 明细日志按保留天数节流清理（默认永久保留）；统计聚合表独立持久化，不受清理影响。
     pub async fn record_log(&self, log: ProxyRequestLog) {
         let app_handle_opt = self.app_handle.read().await.clone();
         if let Some(app) = app_handle_opt {
@@ -19,15 +20,38 @@ impl ModelProxyContext {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as i64)
                 .unwrap_or(0);
+
+            // 保留期清理节流：至多每小时执行一次，避免每次写入都全表扫描
+            const RETENTION_CHECK_INTERVAL_MS: u64 = 3_600_000;
+            let retention_cutoff: Option<String> = {
+                let days = self.config.read().await.effective_log_retention_days();
+                if days == 0 {
+                    None
+                } else {
+                    let last_run = self.log_retention_last_run.load(Ordering::Relaxed);
+                    let due = now_millis.max(0) as u64 >= last_run
+                        && (now_millis.max(0) as u64).saturating_sub(last_run) >= RETENTION_CHECK_INTERVAL_MS;
+                    if due {
+                        let cutoff = chrono::Local::now().date_naive()
+                            - chrono::Duration::days(days as i64);
+                        Some(cutoff.format("%Y-%m-%d").to_string())
+                    } else {
+                        None
+                    }
+                }
+            };
+
+            let retention_clock = self.log_retention_last_run.clone();
             let _ = (move || -> Result<(), rusqlite::Error> {
                 let conn = database.lock_db();
                 conn.execute(
-                    "INSERT OR REPLACE INTO opencode_proxy_logs (
+                    "INSERT OR REPLACE INTO model_proxy_logs (
                         id, timestamp, method, path, channel_id, model, stream, status_code,
                         duration_ms, ttft_ms, prompt_tokens, prompt_cache_hit_tokens,
-                        prompt_cache_miss_tokens, completion_tokens, reasoning_tokens, total_tokens,
-                        error_message, request_body, response_body, node_name, created_at
-                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+                        prompt_cache_miss_tokens, cache_creation_tokens, completion_tokens,
+                        reasoning_tokens, total_tokens,
+                        error_message, request_body, response_body, node_name, client_name, created_at
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
                     params![
                         log.id,
                         log.timestamp,
@@ -42,6 +66,7 @@ impl ModelProxyContext {
                         log.prompt_tokens.map(|v| v as i64),
                         log.prompt_cache_hit_tokens.map(|v| v as i64),
                         log.prompt_cache_miss_tokens.map(|v| v as i64),
+                        log.cache_creation_tokens.map(|v| v as i64),
                         log.completion_tokens.map(|v| v as i64),
                         log.reasoning_tokens.map(|v| v as i64),
                         log.total_tokens.map(|v| v as i64),
@@ -49,18 +74,22 @@ impl ModelProxyContext {
                         log.request_body,
                         log.response_body,
                         log.node_name,
+                        log.client_name,
                         now_millis,
                     ],
                 )?;
-                conn.execute(
-                    "DELETE FROM opencode_proxy_logs WHERE id NOT IN (
-                        SELECT id FROM opencode_proxy_logs ORDER BY created_at DESC, rowid DESC LIMIT 1000
-                    )",
-                    [],
-                )?;
 
-                // 「渠道 × 日」与「渠道 × 时」聚合：日志表会裁剪，长期统计依赖这两表。
-                // 维度为渠道稳定数字 ID（channel_stats_id），改别名不错位；缺省回退日志渠道列
+                // 明细保留期清理：删除保留窗口之外的明细（统计聚合表不受影响）
+                if let Some(cutoff) = &retention_cutoff {
+                    conn.execute(
+                        "DELETE FROM model_proxy_logs WHERE timestamp < ?1",
+                        [cutoff.as_str()],
+                    )?;
+                    retention_clock.store(now_millis.max(0) as u64, Ordering::Relaxed);
+                }
+
+                // 「渠道 × 模型 × 客户端 × 日」与「× 时」聚合：长期统计依赖这两表。
+                // 渠道维度为稳定数字 ID（channel_stats_id），改别名不错位；缺省回退日志渠道列
                 let today = chrono::Local::now().format("%Y-%m-%d").to_string();
                 let is_success = if log.status_code < 400 { 1 } else { 0 };
                 let is_failure = 1 - is_success;
@@ -68,13 +97,20 @@ impl ModelProxyContext {
                     .channel_stats_id
                     .clone()
                     .unwrap_or_else(|| log.channel_id.clone());
+                let model_dim = if log.model.trim().is_empty() { "" } else { log.model.as_str() };
+                let client_dim = log
+                    .client_name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("");
                 conn.execute(
                     "INSERT INTO channel_daily_stats (
-                        date, channel_id, total_requests, successful_requests, failed_requests,
+                        date, channel_id, model, client_name, total_requests, successful_requests, failed_requests,
                         duration_ms_total, ttft_ms_total, ttft_count,
-                        prompt_tokens, completion_tokens, reasoning_tokens, cache_hit_tokens, total_tokens
-                    ) VALUES (?1, ?2, 1, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
-                    ON CONFLICT(date, channel_id) DO UPDATE SET
+                        prompt_tokens, completion_tokens, reasoning_tokens, cache_hit_tokens, cache_creation_tokens, total_tokens
+                    ) VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+                    ON CONFLICT(date, channel_id, model, client_name) DO UPDATE SET
                         total_requests = total_requests + 1,
                         successful_requests = successful_requests + excluded.successful_requests,
                         failed_requests = failed_requests + excluded.failed_requests,
@@ -85,10 +121,13 @@ impl ModelProxyContext {
                         completion_tokens = completion_tokens + excluded.completion_tokens,
                         reasoning_tokens = reasoning_tokens + excluded.reasoning_tokens,
                         cache_hit_tokens = cache_hit_tokens + excluded.cache_hit_tokens,
+                        cache_creation_tokens = cache_creation_tokens + excluded.cache_creation_tokens,
                         total_tokens = total_tokens + excluded.total_tokens",
                     params![
                         today,
                         stats_key.clone(),
+                        model_dim,
+                        client_dim,
                         is_success,
                         is_failure,
                         log.duration_ms as i64,
@@ -98,10 +137,11 @@ impl ModelProxyContext {
                         log.completion_tokens.unwrap_or(0) as i64,
                         log.reasoning_tokens.unwrap_or(0) as i64,
                         log.prompt_cache_hit_tokens.unwrap_or(0) as i64,
+                        log.cache_creation_tokens.unwrap_or(0) as i64,
                         log.total_tokens.unwrap_or(0) as i64,
                     ],
                 )?;
-                // 小时粒度：供单日区间 24 小时趋势。小时取自日志时间戳（本地时间文本）
+                // 小时粒度：供小时趋势。小时取自日志时间戳（本地时间文本）
                 let hour: i64 = log
                     .timestamp
                     .get(11..13)
@@ -109,10 +149,10 @@ impl ModelProxyContext {
                     .unwrap_or(0);
                 conn.execute(
                     "INSERT INTO channel_hourly_stats (
-                        date, hour, channel_id, total_requests, successful_requests, failed_requests,
-                        prompt_tokens, completion_tokens, reasoning_tokens, cache_hit_tokens, total_tokens
-                    ) VALUES (?1, ?2, ?3, 1, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-                    ON CONFLICT(date, hour, channel_id) DO UPDATE SET
+                        date, hour, channel_id, model, client_name, total_requests, successful_requests, failed_requests,
+                        prompt_tokens, completion_tokens, reasoning_tokens, cache_hit_tokens, cache_creation_tokens, total_tokens
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                    ON CONFLICT(date, hour, channel_id, model, client_name) DO UPDATE SET
                         total_requests = total_requests + 1,
                         successful_requests = successful_requests + excluded.successful_requests,
                         failed_requests = failed_requests + excluded.failed_requests,
@@ -120,17 +160,21 @@ impl ModelProxyContext {
                         completion_tokens = completion_tokens + excluded.completion_tokens,
                         reasoning_tokens = reasoning_tokens + excluded.reasoning_tokens,
                         cache_hit_tokens = cache_hit_tokens + excluded.cache_hit_tokens,
+                        cache_creation_tokens = cache_creation_tokens + excluded.cache_creation_tokens,
                         total_tokens = total_tokens + excluded.total_tokens",
                     params![
                         today,
                         hour,
                         stats_key,
+                        model_dim,
+                        client_dim,
                         is_success,
                         is_failure,
                         log.prompt_tokens.unwrap_or(0) as i64,
                         log.completion_tokens.unwrap_or(0) as i64,
                         log.reasoning_tokens.unwrap_or(0) as i64,
                         log.prompt_cache_hit_tokens.unwrap_or(0) as i64,
+                        log.cache_creation_tokens.unwrap_or(0) as i64,
                         log.total_tokens.unwrap_or(0) as i64,
                     ],
                 )?;
@@ -213,14 +257,17 @@ pub async fn get_model_proxy_status_summary(state: &ModelProxyState) -> ModelPro
             let database = app.state::<crate::models::Database>();
             let res: Result<(i64, i64, i64, i64, i64, i64), rusqlite::Error> = (|| {
                 let conn = database.0.lock().map_err(|_| rusqlite::Error::ExecuteReturnedResults)?;
+                // 累计与今日 Token 均取自持久化日统计表。
+                // 不能走明细日志表——明细按保留天数清理，且历史上限 1000 条，
+                // 清理/裁剪都会让「累计」缩水；日统计表才是长期统计的唯一事实来源。
                 let total_row = conn.query_row(
-                    "SELECT 
+                    "SELECT
                         COALESCE(SUM(prompt_tokens), 0),
                         COALESCE(SUM(completion_tokens), 0),
                         COALESCE(SUM(reasoning_tokens), 0),
-                        COALESCE(SUM(prompt_cache_hit_tokens), 0),
+                        COALESCE(SUM(cache_hit_tokens), 0),
                         COALESCE(SUM(total_tokens), 0)
-                     FROM opencode_proxy_logs",
+                     FROM channel_daily_stats",
                     [],
                     |r| Ok((
                         r.get::<_, i64>(0)?,
@@ -231,9 +278,6 @@ pub async fn get_model_proxy_status_summary(state: &ModelProxyState) -> ModelPro
                     ))
                 ).unwrap_or((0, 0, 0, 0, 0));
 
-                // 今日 Token：从持久化日统计表取「今日 × 全渠道」汇总。
-                // 不能走日志表——timestamp 为本地时间文本，按 epoch 秒比较会恒为 0，
-                // 且日志表会裁剪到最近 1000 条，长期数据不可靠。
                 let today = chrono::Local::now().format("%Y-%m-%d").to_string();
                 let today_tokens = conn
                     .query_row(
@@ -762,6 +806,281 @@ pub async fn get_gateway_overview_stats(
 /// 必须用惰性闭包 `then`——`then_some` 的参数是急切求值，除零会在条件判断前就 panic。
 pub(crate) fn avg_or_none(total: i64, count: i64) -> Option<u64> {
     (count > 0).then(|| (total / count) as u64)
+}
+
+/// 反代模式 Token 报表：从日/时聚合表生成与本地模式同构的用量桶 + 请求健康，
+/// 供 Token 统计中心「反代模式」标签直接复用本地模式的前端聚合层。
+///
+/// 维度映射（对齐本地模式语义）：
+/// - source     = client_name（User-Agent 推断的客户端标识，空 → "其他客户端"）
+/// - model      = 模型名（旧版聚合行无模型维度 → "历史聚合"）
+/// - projectKey = 渠道显示名（本地模式为项目工作区，反代以渠道维度替代）
+/// - input      = prompt - 缓存读 - 缓存写（对齐 Anthropic 本地日志的「未缓存输入」口径）
+/// 区间 ≤ 7 天用小时表（逐时桶），更长区间用日表（逐日桶），与前端粒度自动切换一致。
+pub async fn get_proxy_token_usage_report(
+    state: &ModelProxyState,
+    from: Option<String>,
+    to: Option<String>,
+) -> Result<ProxyTokenUsageReport, String> {
+    use crate::models::{
+        RequestHealthBucket, RequestHealthReport, RequestHealthSourceSummary, TokenUsageBucket,
+        TokenUsageReport,
+    };
+
+    let empty_report = || ProxyTokenUsageReport {
+        usage: TokenUsageReport {
+            available: false,
+            buckets: Vec::new(),
+            start_date: String::new(),
+            end_date: String::new(),
+            pricing_source: String::new(),
+        },
+        health: RequestHealthReport {
+            available: false,
+            buckets: Vec::new(),
+            by_source: Vec::new(),
+        },
+    };
+
+    let app_handle_opt = state.context.app_handle.read().await.clone();
+    let Some(app) = app_handle_opt else {
+        return Ok(empty_report());
+    };
+
+    // 渠道稳定统计 ID → 展示名映射（projectKey 维度）
+    let channel_names: HashMap<String, String> = {
+        let cfg = state.context.config.read().await;
+        cfg.channels
+            .iter()
+            .map(|c| (c.stats_key(), c.name.clone()))
+            .collect()
+    };
+
+    tokio::task::block_in_place(move || {
+        let database = app.state::<crate::models::Database>();
+        let conn = database.lock_db();
+
+        let today = chrono::Local::now().date_naive();
+        let parse = |s: &str| {
+            chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+                .map_err(|e| format!("日期格式无效（应为 YYYY-MM-DD）: {s}, {e}"))
+        };
+        let end = match to.as_deref() {
+            Some(s) => parse(s)?.min(today),
+            None => today,
+        };
+        let start = match from.as_deref() {
+            Some(s) => parse(s)?.min(end),
+            None => conn
+                .query_row(
+                    "SELECT COALESCE(MIN(date), '') FROM channel_daily_stats",
+                    [],
+                    |r| r.get::<_, String>(0),
+                )
+                .ok()
+                .and_then(|d| chrono::NaiveDate::parse_from_str(&d, "%Y-%m-%d").ok())
+                .unwrap_or(today),
+        };
+        let start_str = start.format("%Y-%m-%d").to_string();
+        let end_str = end.format("%Y-%m-%d").to_string();
+        // 与前端粒度切换一致：< 7 天逐小时，≥ 7 天逐日
+        let hourly_mode = (end - start).num_days() + 1 < 7;
+
+        let mut buckets: Vec<TokenUsageBucket> = Vec::new();
+        let mut health_map: std::collections::BTreeMap<String, RequestHealthBucket> =
+            std::collections::BTreeMap::new();
+        let mut by_client: HashMap<String, RequestHealthSourceSummary> = HashMap::new();
+
+        fn ensure_client_summary<'a>(
+            map: &'a mut HashMap<String, RequestHealthSourceSummary>,
+            client: &str,
+        ) -> &'a mut RequestHealthSourceSummary {
+            map.entry(client.to_string())
+                .or_insert_with(|| RequestHealthSourceSummary {
+                    source: client.to_string(),
+                    dialogues: 0,
+                    requests: 0,
+                    success: 0,
+                    failed: 0,
+                })
+        }
+
+        if hourly_mode {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT date, hour, channel_id, model, client_name,
+                        SUM(total_requests), SUM(successful_requests), SUM(failed_requests),
+                        SUM(prompt_tokens), SUM(completion_tokens), SUM(reasoning_tokens),
+                        SUM(cache_hit_tokens), SUM(cache_creation_tokens), SUM(total_tokens)
+                     FROM channel_hourly_stats
+                     WHERE date >= ?1 AND date <= ?2
+                     GROUP BY date, hour, channel_id, model, client_name",
+                )
+                .map_err(|e| format!("查询反代小时统计失败: {e}"))?;
+            let rows = stmt
+                .query_map([&start_str, &end_str], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, i64>(7)?,
+                        row.get::<_, i64>(8)?,
+                        row.get::<_, i64>(9)?,
+                        row.get::<_, i64>(10)?,
+                        row.get::<_, i64>(11)?,
+                        row.get::<_, i64>(12)?,
+                        row.get::<_, i64>(13)?,
+                    ))
+                })
+                .map_err(|e| format!("解析反代小时统计失败: {e}"))?;
+
+            for (date, hour, channel, model, client, reqs, succ, fail, prompt, comp, reasoning, hit, creation, total) in
+                rows.flatten()
+            {
+                let client_key = if client.trim().is_empty() { "其他客户端".to_string() } else { client };
+                let model_key = if model.trim().is_empty() { "历史聚合".to_string() } else { model };
+                let input = (prompt - hit - creation).max(0);
+                buckets.push(TokenUsageBucket {
+                    source: client_key.clone(),
+                    model: model_key,
+                    project_key: channel_names
+                        .get(&channel)
+                        .cloned()
+                        .unwrap_or(channel),
+                    timestamp: format!("{date}T{hour:02}:00:00"),
+                    total_tokens: total,
+                    billable_total_tokens: total,
+                    input_tokens: input,
+                    cached_input_tokens: hit,
+                    cache_creation_input_tokens: creation,
+                    output_tokens: comp,
+                    reasoning_output_tokens: reasoning,
+                    conversation_count: 0,
+                    request_count: reqs,
+                    ..Default::default()
+                });
+
+                let hour_key = format!("{date}T{hour:02}:00:00");
+                let hb = health_map.entry(hour_key).or_insert_with(|| RequestHealthBucket {
+                    hour: String::new(),
+                    dialogues: 0,
+                    requests: 0,
+                    success: 0,
+                    failed: 0,
+                });
+                hb.requests += reqs;
+                hb.success += succ;
+                hb.failed += fail;
+
+                let summary = ensure_client_summary(&mut by_client, &client_key);
+                summary.requests += reqs;
+                summary.success += succ;
+                summary.failed += fail;
+            }
+        } else {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT date, channel_id, model, client_name,
+                        SUM(total_requests), SUM(successful_requests), SUM(failed_requests),
+                        SUM(prompt_tokens), SUM(completion_tokens), SUM(reasoning_tokens),
+                        SUM(cache_hit_tokens), SUM(cache_creation_tokens), SUM(total_tokens)
+                     FROM channel_daily_stats
+                     WHERE date >= ?1 AND date <= ?2
+                     GROUP BY date, channel_id, model, client_name",
+                )
+                .map_err(|e| format!("查询反代日统计失败: {e}"))?;
+            let rows = stmt
+                .query_map([&start_str, &end_str], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, i64>(7)?,
+                        row.get::<_, i64>(8)?,
+                        row.get::<_, i64>(9)?,
+                        row.get::<_, i64>(10)?,
+                        row.get::<_, i64>(11)?,
+                        row.get::<_, i64>(12)?,
+                    ))
+                })
+                .map_err(|e| format!("解析反代日统计失败: {e}"))?;
+
+            for (date, channel, model, client, reqs, succ, fail, prompt, comp, reasoning, hit, creation, total) in
+                rows.flatten()
+            {
+                let client_key = if client.trim().is_empty() { "其他客户端".to_string() } else { client };
+                let model_key = if model.trim().is_empty() { "历史聚合".to_string() } else { model };
+                let input = (prompt - hit - creation).max(0);
+                buckets.push(TokenUsageBucket {
+                    source: client_key.clone(),
+                    model: model_key,
+                    project_key: channel_names
+                        .get(&channel)
+                        .cloned()
+                        .unwrap_or(channel),
+                    timestamp: format!("{date}T00:00:00"),
+                    total_tokens: total,
+                    billable_total_tokens: total,
+                    input_tokens: input,
+                    cached_input_tokens: hit,
+                    cache_creation_input_tokens: creation,
+                    output_tokens: comp,
+                    reasoning_output_tokens: reasoning,
+                    conversation_count: 0,
+                    request_count: reqs,
+                    ..Default::default()
+                });
+
+                let hb = health_map.entry(format!("{date}T00:00:00")).or_insert_with(|| RequestHealthBucket {
+                    hour: String::new(),
+                    dialogues: 0,
+                    requests: 0,
+                    success: 0,
+                    failed: 0,
+                });
+                hb.requests += reqs;
+                hb.success += succ;
+                hb.failed += fail;
+
+                let summary = ensure_client_summary(&mut by_client, &client_key);
+                summary.requests += reqs;
+                summary.success += succ;
+                summary.failed += fail;
+            }
+        }
+
+        let health_buckets: Vec<RequestHealthBucket> = health_map
+            .into_iter()
+            .map(|(key, mut b)| {
+                b.hour = key;
+                b
+            })
+            .collect();
+        let has_data = !buckets.is_empty() || health_buckets.iter().any(|b| b.requests > 0);
+
+        Ok(ProxyTokenUsageReport {
+            usage: TokenUsageReport {
+                available: has_data,
+                buckets,
+                start_date: start_str,
+                end_date: end_str,
+                pricing_source: String::new(),
+            },
+            health: RequestHealthReport {
+                available: has_data,
+                buckets: health_buckets,
+                by_source: by_client.into_values().collect(),
+            },
+        })
+    })
 }
 
 #[cfg(test)]

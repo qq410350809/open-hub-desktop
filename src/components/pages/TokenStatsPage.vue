@@ -8,6 +8,7 @@ import AppTable, { type AppTableColumn } from "../common/AppTable.vue";
 import { icons } from "../../icons";
 import { useStore } from "../../composables/useStore";
 import { usePreferences } from "../../composables/usePreferences";
+import { useProxyTokenStats } from "../../composables/proxy/useProxyTokenStats";
 import {
   bucketModelTotals,
   bucketSourceTotals,
@@ -36,6 +37,48 @@ import { isTauri, runCommand } from "../../composables/useLibrary";
 
 const store = useStore();
 const { preferences } = usePreferences();
+
+// —— 数据模式：本地日志采集 / 反代网关聚合 ——
+// 两种模式共用同一套聚合层与视图；切换仅替换数据源与部分文案
+type StatsMode = "local" | "proxy";
+const statsMode = ref<StatsMode>("local");
+const proxyStore = useProxyTokenStats();
+const activeUsage = computed(
+  () =>
+    (statsMode.value === "local"
+      ? store.tokenUsage.value
+      : proxyStore.proxyTokenReport.value?.usage) ?? null,
+);
+const activeHealth = computed(
+  () =>
+    (statsMode.value === "local"
+      ? store.requestHealth.value
+      : proxyStore.proxyTokenReport.value?.health) ?? null,
+);
+const activeLoading = computed(() =>
+  statsMode.value === "local" ? store.tokenUsageLoading.value : proxyStore.proxyTokenLoading.value,
+);
+const activeError = computed(() =>
+  statsMode.value === "local" ? store.tokenUsageError.value : proxyStore.proxyTokenError.value,
+);
+
+function switchStatsMode(mode: StatsMode) {
+  if (statsMode.value === mode) return;
+  statsMode.value = mode;
+  if (mode === "proxy" && !proxyStore.proxyTokenReport.value) {
+    void proxyStore.loadProxyTokenUsage(store.tokenStatsFrom.value, store.tokenStatsTo.value);
+  }
+}
+
+// 反代模式：时间范围变化即重新拉取（本地模式由 useTokenStats 自身处理）
+watch(
+  [() => store.tokenStatsFrom.value, () => store.tokenStatsTo.value],
+  ([from, to]) => {
+    if (statsMode.value === "proxy") {
+      void proxyStore.loadProxyTokenUsage(from, to);
+    }
+  },
+);
 
 // —— 4 大深度分析弹窗状态 ——
 const toolsModalOpen = ref(false);
@@ -328,53 +371,76 @@ async function exportDataAsCsv() {
 }
 
 // —— 表格列配置（宽度总和需控制在弹窗内容宽 ~920px 内，避免横向滚动条） ——
-const dailyColumns: AppTableColumn[] = [
-  { key: "label", title: "时间节点", width: "minmax(120px, 1.2fr)", sortable: true },
-  { key: "total", title: "总量 Tokens", width: "88px", align: "right", sortable: true },
-  { key: "input", title: "输入", width: "72px", align: "right", sortable: true },
-  { key: "output", title: "输出", width: "72px", align: "right", sortable: true },
-  { key: "cache", title: "缓存 (读+写)", width: "76px", align: "right", sortable: true },
-  { key: "cacheHitRate", title: "缓存命中率", width: "80px", align: "right", sortable: true },
-  { key: "reasoning", title: "深度推理", width: "72px", align: "right", sortable: true },
-  { key: "sessions", title: "对话轮次", width: "72px", align: "right", sortable: true },
-  { key: "requests", title: "API 请求数", width: "80px", align: "right", sortable: true },
-];
+// 反代模式无对话/轮次概念，自动剔除对话类列
+const dailyColumns = computed<AppTableColumn[]>(() => {
+  const cols: AppTableColumn[] = [
+    { key: "label", title: "时间节点", width: "minmax(120px, 1.2fr)", sortable: true },
+    { key: "total", title: "总量 Tokens", width: "88px", align: "right", sortable: true },
+    { key: "input", title: "输入", width: "72px", align: "right", sortable: true },
+    { key: "output", title: "输出", width: "72px", align: "right", sortable: true },
+    { key: "cache", title: "缓存 (读+写)", width: "76px", align: "right", sortable: true },
+    { key: "cacheHitRate", title: "缓存命中率", width: "80px", align: "right", sortable: true },
+    { key: "reasoning", title: "深度推理", width: "72px", align: "right", sortable: true },
+  ];
+  if (statsMode.value === "local") {
+    cols.push({ key: "sessions", title: "对话轮次", width: "72px", align: "right", sortable: true });
+  }
+  cols.push({ key: "requests", title: "API 请求数", width: "80px", align: "right", sortable: true });
+  return cols;
+});
 
-const projectColumns: AppTableColumn[] = [
-  { key: "project", title: "项目 / 工作区", width: "minmax(130px, 1.5fr)", sortable: true },
-  { key: "totalTokens", title: "消耗总计", width: "90px", align: "right", sortable: true },
-  { key: "share", title: "占比", width: "78px", align: "right", sortable: false },
-  { key: "input", title: "输入", width: "74px", align: "right", sortable: true },
-  { key: "output", title: "输出", width: "74px", align: "right", sortable: true },
-  { key: "cache", title: "缓存", width: "74px", align: "right", sortable: true },
-  { key: "cacheHitRate", title: "缓存命中率", width: "82px", align: "right", sortable: true },
-  { key: "reasoning", title: "推理", width: "74px", align: "right", sortable: true },
-  { key: "sessions", title: "对话轮次", width: "74px", align: "right", sortable: true },
-  { key: "requests", title: "请求数", width: "74px", align: "right", sortable: true },
-];
+const projectColumns = computed<AppTableColumn[]>(() => {
+  const cols: AppTableColumn[] = [
+    { key: "project", title: statsMode.value === "local" ? "项目 / 工作区" : "渠道", width: "minmax(130px, 1.5fr)", sortable: true },
+    { key: "totalTokens", title: "消耗总计", width: "90px", align: "right", sortable: true },
+    { key: "share", title: "占比", width: "78px", align: "right", sortable: false },
+    { key: "input", title: "输入", width: "74px", align: "right", sortable: true },
+    { key: "output", title: "输出", width: "74px", align: "right", sortable: true },
+    { key: "cache", title: "缓存", width: "74px", align: "right", sortable: true },
+    { key: "cacheHitRate", title: "缓存命中率", width: "82px", align: "right", sortable: true },
+    { key: "reasoning", title: "推理", width: "74px", align: "right", sortable: true },
+  ];
+  if (statsMode.value === "local") {
+    cols.push({ key: "sessions", title: "对话轮次", width: "74px", align: "right", sortable: true });
+  }
+  cols.push({ key: "requests", title: "请求数", width: "74px", align: "right", sortable: true });
+  return cols;
+});
 
-const sourceColumns: AppTableColumn[] = [
-  { key: "source", title: "工具 / 来源", width: "minmax(130px, 1.4fr)", sortable: true },
-  { key: "totalTokens", title: "总量 Tokens", width: "90px", align: "right", sortable: true },
-  { key: "share", title: "占比", width: "78px", align: "right", sortable: false },
-  { key: "inputTokens", title: "输入", width: "74px", align: "right", sortable: true },
-  { key: "outputTokens", title: "输出", width: "74px", align: "right", sortable: true },
-  { key: "cacheTokens", title: "缓存", width: "74px", align: "right", sortable: true },
-  { key: "cacheHitRate", title: "缓存命中率", width: "82px", align: "right", sortable: true },
-  { key: "reasoningTokens", title: "推理", width: "74px", align: "right", sortable: true },
-  { key: "conversations", title: "对话数", width: "74px", align: "right", sortable: true },
-  { key: "requests", title: "请求数", width: "74px", align: "right", sortable: true },
-];
+const sourceColumns = computed<AppTableColumn[]>(() => {
+  const cols: AppTableColumn[] = [
+    { key: "source", title: "工具 / 来源", width: "minmax(130px, 1.4fr)", sortable: true },
+    { key: "totalTokens", title: "总量 Tokens", width: "90px", align: "right", sortable: true },
+    { key: "share", title: "占比", width: "78px", align: "right", sortable: false },
+    { key: "inputTokens", title: "输入", width: "74px", align: "right", sortable: true },
+    { key: "outputTokens", title: "输出", width: "74px", align: "right", sortable: true },
+    { key: "cacheTokens", title: "缓存", width: "74px", align: "right", sortable: true },
+    { key: "cacheHitRate", title: "缓存命中率", width: "82px", align: "right", sortable: true },
+    { key: "reasoningTokens", title: "推理", width: "74px", align: "right", sortable: true },
+  ];
+  if (statsMode.value === "local") {
+    cols.push({ key: "conversations", title: "对话数", width: "74px", align: "right", sortable: true });
+  }
+  cols.push({ key: "requests", title: "请求数", width: "74px", align: "right", sortable: true });
+  return cols;
+});
 
-const healthColumns: AppTableColumn[] = [
-  { key: "label", title: "时段", width: "minmax(120px, 1.2fr)", sortable: true },
-  { key: "dialogues", title: "对话数", width: "80px", align: "right", sortable: true },
-  { key: "requests", title: "请求数", width: "82px", align: "right", sortable: true },
-  { key: "success", title: "成功", width: "78px", align: "right", sortable: true },
-  { key: "failed", title: "失败", width: "78px", align: "right", sortable: true },
-  { key: "successRate", title: "成功率", width: "84px", align: "right", sortable: true },
-  { key: "level", title: "健康等级", width: "86px", align: "center", sortable: true },
-];
+const healthColumns = computed<AppTableColumn[]>(() => {
+  const cols: AppTableColumn[] = [
+    { key: "label", title: "时段", width: "minmax(120px, 1.2fr)", sortable: true },
+  ];
+  if (statsMode.value === "local") {
+    cols.push({ key: "dialogues", title: "对话数", width: "80px", align: "right", sortable: true });
+  }
+  cols.push(
+    { key: "requests", title: "请求数", width: "82px", align: "right", sortable: true },
+    { key: "success", title: "成功", width: "78px", align: "right", sortable: true },
+    { key: "failed", title: "失败", width: "78px", align: "right", sortable: true },
+    { key: "successRate", title: "成功率", width: "84px", align: "right", sortable: true },
+    { key: "level", title: "健康等级", width: "86px", align: "center", sortable: true },
+  );
+  return cols;
+});
 
 const healthTableRows = computed(() =>
   healthDisplayCells.value
@@ -384,18 +450,23 @@ const healthTableRows = computed(() =>
     })),
 );
 
-const modelColumns: AppTableColumn[] = [
-  { key: "model", title: "模型名称 / 家族", width: "minmax(140px, 1.6fr)", sortable: true },
-  { key: "totalTokens", title: "总量 Tokens", width: "90px", align: "right", sortable: true },
-  { key: "share", title: "占比", width: "78px", align: "right", sortable: false },
-  { key: "inputTokens", title: "输入", width: "74px", align: "right", sortable: true },
-  { key: "outputTokens", title: "输出", width: "74px", align: "right", sortable: true },
-  { key: "cacheTokens", title: "缓存", width: "74px", align: "right", sortable: true },
-  { key: "cacheHitRate", title: "缓存命中率", width: "82px", align: "right", sortable: true },
-  { key: "reasoningTokens", title: "推理", width: "74px", align: "right", sortable: true },
-  { key: "conversations", title: "对话", width: "74px", align: "right", sortable: true },
-  { key: "requests", title: "请求数", width: "74px", align: "right", sortable: true },
-];
+const modelColumns = computed<AppTableColumn[]>(() => {
+  const cols: AppTableColumn[] = [
+    { key: "model", title: "模型名称 / 家族", width: "minmax(140px, 1.6fr)", sortable: true },
+    { key: "totalTokens", title: "总量 Tokens", width: "90px", align: "right", sortable: true },
+    { key: "share", title: "占比", width: "78px", align: "right", sortable: false },
+    { key: "inputTokens", title: "输入", width: "74px", align: "right", sortable: true },
+    { key: "outputTokens", title: "输出", width: "74px", align: "right", sortable: true },
+    { key: "cacheTokens", title: "缓存", width: "74px", align: "right", sortable: true },
+    { key: "cacheHitRate", title: "缓存命中率", width: "82px", align: "right", sortable: true },
+    { key: "reasoningTokens", title: "推理", width: "74px", align: "right", sortable: true },
+  ];
+  if (statsMode.value === "local") {
+    cols.push({ key: "conversations", title: "对话", width: "74px", align: "right", sortable: true });
+  }
+  cols.push({ key: "requests", title: "请求数", width: "74px", align: "right", sortable: true });
+  return cols;
+});
 
 const sessions = computed(() => store.tokenStats.value?.sessions ?? []);
 
@@ -441,6 +512,13 @@ const sourceNameMap: Record<string, string> = {
   zed: "Zed Editor",
   "command-code": "Command Code",
   dsh: "DeepSeek CLI (DSH)",
+  // —— 反代模式：按端点/SDK 推断的客户端标识 ——
+  sdk: "SDK / 脚本",
+  "anthropic-api": "Anthropic 协议客户端",
+  "responses-api": "Responses 协议客户端",
+  "openai-api": "OpenAI 协议客户端",
+  "gemini-api": "Gemini 协议客户端",
+  other: "其他客户端",
 };
 
 function sourceLabel(source: string): string {
@@ -451,8 +529,8 @@ function shareOf(value: number, total: number): number {
   return total > 0 ? Math.min(100, (value / total) * 100) : 0;
 }
 
-// —— 小时用量桶过滤 ——
-const allBuckets = computed(() => store.tokenUsage.value?.buckets ?? []);
+// —— 小时用量桶过滤（数据源随模式切换：本地采集快照 / 反代网关聚合表） ——
+const allBuckets = computed(() => activeUsage.value?.buckets ?? []);
 const filteredBuckets = computed(() => {
   const buckets = allBuckets.value;
   const from = store.tokenStatsFrom.value;
@@ -765,29 +843,32 @@ const projectUsage = computed<ProjectUsageItem[]>(() => {
     current.estimatedInput += bucket.estimatedInputTokens || 0;
   }
 
-  for (const session of sessions.value) {
-    if (projectBucketSources.has((session.source || "").toLowerCase())) continue;
-    const current = ensureGroup(session.projectKey);
-    const sessionTurns = session.turns || 0;
-    current.sessions += sessionTurns;
-    current.requests += estimateRequestCount({
-      conversationCount: sessionTurns,
-      outputTokens: session.tokens?.outputTokens,
-      reasoningOutputTokens: session.tokens?.reasoningOutputTokens,
-    });
-    current.requestsEstimated = true;
-    current.totalTokens += session.totalTokens || 0;
-    current.input += session.tokens?.inputTokens || 0;
-    current.output += session.tokens?.outputTokens || 0;
-    current.cache += (session.tokens?.cachedInputTokens || 0) + (session.tokens?.cacheCreationInputTokens || 0);
-    current.cacheRead += session.tokens?.cachedInputTokens || 0;
-    current.cacheWrite += session.tokens?.cacheCreationInputTokens || 0;
-    current.reasoning += session.tokens?.reasoningOutputTokens || 0;
-    current.costUsd += session.costUsd || 0;
-    const usageKind = String(session.provenance?.tokenUsage || "");
-    if (usageKind.includes("estimated")) {
-      current.estimatedTokens += session.totalTokens || 0;
-      current.estimatedInput += session.tokens?.inputTokens || 0;
+  // 会话级兜底仅本地模式可用（反代请求无会话概念，项目维度直接来自桶的渠道维度）
+  if (statsMode.value === "local") {
+    for (const session of sessions.value) {
+      if (projectBucketSources.has((session.source || "").toLowerCase())) continue;
+      const current = ensureGroup(session.projectKey);
+      const sessionTurns = session.turns || 0;
+      current.sessions += sessionTurns;
+      current.requests += estimateRequestCount({
+        conversationCount: sessionTurns,
+        outputTokens: session.tokens?.outputTokens,
+        reasoningOutputTokens: session.tokens?.reasoningOutputTokens,
+      });
+      current.requestsEstimated = true;
+      current.totalTokens += session.totalTokens || 0;
+      current.input += session.tokens?.inputTokens || 0;
+      current.output += session.tokens?.outputTokens || 0;
+      current.cache += (session.tokens?.cachedInputTokens || 0) + (session.tokens?.cacheCreationInputTokens || 0);
+      current.cacheRead += session.tokens?.cachedInputTokens || 0;
+      current.cacheWrite += session.tokens?.cacheCreationInputTokens || 0;
+      current.reasoning += session.tokens?.reasoningOutputTokens || 0;
+      current.costUsd += session.costUsd || 0;
+      const usageKind = String(session.provenance?.tokenUsage || "");
+      if (usageKind.includes("estimated")) {
+        current.estimatedTokens += session.totalTokens || 0;
+        current.estimatedInput += session.tokens?.inputTokens || 0;
+      }
     }
   }
 
@@ -840,14 +921,14 @@ function formatDetailTime(label: string): string {
   }
 }
 
-// —— 请求健康时间线 ——
+// —— 请求健康时间线（反代模式下来自网关聚合表：真实 status_code 口径） ——
 const healthTimeline = computed(() =>
   buildHealthTimeline(
-    store.requestHealth.value?.buckets ?? [],
+    activeHealth.value?.buckets ?? [],
     trendGranularity.value,
     store.tokenStatsFrom.value || undefined,
     store.tokenStatsTo.value || undefined,
-    (store.tokenUsage.value?.buckets ?? []).map((b) => ({
+    allBuckets.value.map((b) => ({
       timestamp: b.timestamp,
       conversationCount: b.conversationCount || 0,
       outputTokens: b.outputTokens || 0,
@@ -931,7 +1012,7 @@ type HealthDisplayCell = {
 
 const healthBucketMap = computed(() => {
   const map = new Map<string, { dialogues: number; requests: number; success: number; failed: number; usage: number; usageEstimated: boolean }>();
-  for (const b of store.requestHealth.value?.buckets ?? []) {
+  for (const b of activeHealth.value?.buckets ?? []) {
     const { key } = bucketKeyFor(trendGranularity.value, b.hour);
     if (!key) continue;
     const cur = map.get(key) || { dialogues: 0, requests: 0, success: 0, failed: 0, usage: 0, usageEstimated: false };
@@ -941,7 +1022,7 @@ const healthBucketMap = computed(() => {
     cur.failed += b.failed || 0;
     map.set(key, cur);
   }
-  for (const b of store.tokenUsage.value?.buckets ?? []) {
+  for (const b of allBuckets.value) {
     const { key } = bucketKeyFor(trendGranularity.value, b.timestamp);
     if (!key) continue;
     const cur = map.get(key) || { dialogues: 0, requests: 0, success: 0, failed: 0, usage: 0, usageEstimated: false };
@@ -1222,8 +1303,16 @@ watch(
   }),
 );
 
+// 反代模式轮询：与本地模式 5 秒快照刷新节奏一致
+let proxyRefreshTimer: number | null = null;
+
 onMounted(() => {
   tokenStatsPageMounted = true;
+  proxyRefreshTimer = window.setInterval(() => {
+    if (statsMode.value === "proxy") {
+      void proxyStore.loadProxyTokenUsage(store.tokenStatsFrom.value, store.tokenStatsTo.value);
+    }
+  }, 5_000);
   if (isTauri) {
     listen<TokenCollectorProgress>("token-collector-progress", ({ payload }) => {
       appendRefreshLog(payload);
@@ -1245,6 +1334,10 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   tokenStatsPageMounted = false;
+  if (proxyRefreshTimer != null) {
+    window.clearInterval(proxyRefreshTimer);
+    proxyRefreshTimer = null;
+  }
   unlistenTokenCollectorProgress?.();
   unlistenTokenCollectorProgress = undefined;
   healthRo?.disconnect();
@@ -1265,15 +1358,40 @@ onBeforeUnmount(() => {
           </div>
           <div class="tt-title-row">
             <h1>Token 统计中心</h1>
+            <!-- 数据模式标签：本地日志采集 / 反代网关聚合 -->
+            <div class="tt-mode-tabs" role="tablist" aria-label="统计数据来源">
+              <button
+                type="button"
+                role="tab"
+                class="tt-mode-tab"
+                :class="{ active: statsMode === 'local' }"
+                title="扫描本机各 AI 工具的本地日志文件"
+                @click="switchStatsMode('local')"
+              >本地模式</button>
+              <button
+                type="button"
+                role="tab"
+                class="tt-mode-tab"
+                :class="{ active: statsMode === 'proxy' }"
+                title="模型反代网关的转发记账统计"
+                @click="switchStatsMode('proxy')"
+              >反代模式</button>
+            </div>
           </div>
           <p class="tt-cockpit-subtitle">
-            全端本地日志采集 · SQLite 快照 · 覆盖 <strong>{{ bySource.length }}</strong> 款 AI 工具与 <strong>{{ byModel.length }}</strong> 个模型
+            <template v-if="statsMode === 'local'">
+              全端本地日志采集 · SQLite 快照 · 覆盖 <strong>{{ bySource.length }}</strong> 款 AI 工具与 <strong>{{ byModel.length }}</strong> 个模型
+            </template>
+            <template v-else>
+              反代网关转发记账 · 聚合表持久化 · 覆盖 <strong>{{ bySource.length }}</strong> 类客户端 · <strong>{{ byModel.length }}</strong> 个模型 · <strong>{{ projectUsage.length }}</strong> 个渠道
+            </template>
           </p>
         </div>
       </div>
 
       <div class="tt-cockpit-right">
         <button
+          v-if="statsMode === 'local'"
           type="button"
           class="tt-btn-rebuild"
           :disabled="!store.tokenCollectorSyncing.value && (store.tokenStatsLoading.value || store.tokenUsageLoading.value)"
@@ -1284,6 +1402,7 @@ onBeforeUnmount(() => {
         </button>
 
         <button
+          v-if="statsMode === 'local'"
           type="button"
           class="tt-btn-secondary"
           @click="openAgentDialog"
@@ -1332,11 +1451,11 @@ onBeforeUnmount(() => {
         <button
           type="button"
           class="tt-pill-btn"
-          title="查看各项目与工作区用量透视"
+          :title="statsMode === 'local' ? '查看各项目与工作区用量透视' : '查看各渠道用量透视'"
           @click="projectsModalOpen = true"
         >
           <span v-html="icons.folder" />
-          <span>项目 ({{ projectUsage.length }})</span>
+          <span>{{ statsMode === 'local' ? '项目' : '渠道' }} ({{ projectUsage.length }})</span>
         </button>
 
         <button
@@ -1364,22 +1483,23 @@ onBeforeUnmount(() => {
     <!-- 首页零滚动条主视口 (No-Scroll Viewport Layout) -->
     <div class="tt-dashboard-body">
       <!-- 错误提示 -->
-      <div v-if="store.tokenUsageError.value" class="tt-error-banner" role="alert">
+      <div v-if="activeError" class="tt-error-banner" role="alert">
         <span class="tt-error-icon" v-html="icons.alert" />
         <div class="tt-error-content">
-          <strong>读取 Token 数据异常</strong>
-          <p>{{ store.tokenUsageError.value }}</p>
-          <small>OpenHub 会直接读取 Codex, Claude, Cursor, Antigravity, OpenCode, Kiro, Goose, Zed, Copilot 与 CatPawAI 的本地记录。</small>
+          <strong>{{ statsMode === 'local' ? '读取 Token 数据异常' : '读取反代统计数据异常' }}</strong>
+          <p>{{ activeError }}</p>
+          <small v-if="statsMode === 'local'">OpenHub 会直接读取 Codex, Claude, Cursor, Antigravity, OpenCode, Kiro, Goose, Zed, Copilot 与 CatPawAI 的本地记录。</small>
+          <small v-else>反代统计数据来自模型反代网关的 channel_daily_stats / channel_hourly_stats 聚合表，请确认网关已启用并产生过转发请求。</small>
         </div>
       </div>
 
       <!-- 加载中 -->
-      <div v-if="store.tokenUsageLoading.value && !store.tokenUsage.value" class="tt-loading-card">
+      <div v-if="activeLoading && !activeUsage" class="tt-loading-card">
         <div class="tt-loading-spinner" />
-        <p>正在读取本地 SQLite 数据库用量快照…</p>
+        <p>{{ statsMode === 'local' ? '正在读取本地 SQLite 数据库用量快照…' : '正在读取反代网关聚合统计数据…' }}</p>
       </div>
 
-      <template v-else-if="store.tokenUsage.value">
+      <template v-else-if="activeUsage">
         <!-- ROW 1: 4 大核心 KPI 指标卡 (Compact Bento Deck) -->
         <section class="tt-kpi-deck" aria-label="核心指标大盘">
           <!-- KPI 1: Token 消耗大盘 -->
@@ -1450,28 +1570,42 @@ onBeforeUnmount(() => {
             </div>
           </div>
 
-          <!-- KPI 3: 会话与并发 API 调用 -->
+          <!-- KPI 3: 会话与并发 API 调用（反代模式无对话概念，替换为请求成败口径） -->
           <div class="tt-kpi-card">
             <div class="tt-kpi-card-inner">
               <div class="tt-kpi-header">
                 <span class="tt-kpi-tag is-blue">
                   <span v-html="icons.activity" />
-                  <span>对话与请求</span>
+                  <span>{{ statsMode === 'local' ? '对话与请求' : '请求与成功率' }}</span>
                 </span>
                 <span class="tt-kpi-badge-rate">
                   {{ healthTimeline.successRate != null ? (healthTimeline.successRate * 100).toFixed(1) + "% 成功率" : "—" }}
                 </span>
               </div>
-              <div class="tt-kpi-main-val">
-                <strong>{{ formatTokens(healthTimeline.totalDialogues) }}</strong>
-                <span class="tt-kpi-unit">轮对话</span>
-              </div>
-              <div class="tt-kpi-meta-text">
-                <span>真实 API 调用 <strong>{{ formatTokens(healthTimeline.totalRequests) }}</strong> 次</span>
-              </div>
-              <div class="tt-kpi-multiplier-pill">
-                <span>平均每轮触发 <strong>{{ requestsPerTurnLabel }}</strong> 次模型调用</span>
-              </div>
+              <template v-if="statsMode === 'local'">
+                <div class="tt-kpi-main-val">
+                  <strong>{{ formatTokens(healthTimeline.totalDialogues) }}</strong>
+                  <span class="tt-kpi-unit">轮对话</span>
+                </div>
+                <div class="tt-kpi-meta-text">
+                  <span>真实 API 调用 <strong>{{ formatTokens(healthTimeline.totalRequests) }}</strong> 次</span>
+                </div>
+                <div class="tt-kpi-multiplier-pill">
+                  <span>平均每轮触发 <strong>{{ requestsPerTurnLabel }}</strong> 次模型调用</span>
+                </div>
+              </template>
+              <template v-else>
+                <div class="tt-kpi-main-val">
+                  <strong>{{ formatTokens(healthTimeline.totalRequests) }}</strong>
+                  <span class="tt-kpi-unit">次转发请求</span>
+                </div>
+                <div class="tt-kpi-meta-text">
+                  <span>成功 <strong class="text-success">{{ formatTokens(healthTimeline.totalSuccess) }}</strong> · 失败 <strong :class="{ 'text-danger': healthTimeline.totalFailed > 0 }">{{ formatTokens(healthTimeline.totalFailed) }}</strong></span>
+                </div>
+                <div class="tt-kpi-multiplier-pill">
+                  <span>反代按真实 HTTP 状态码记账 · 成功率口径比本地估算更精确</span>
+                </div>
+              </template>
             </div>
           </div>
 
@@ -1803,8 +1937,8 @@ onBeforeUnmount(() => {
         <section class="tt-modal-card is-wide" role="dialog" aria-modal="true">
           <header class="tt-modal-header">
             <div>
-              <h2>项目与工作区透视</h2>
-              <p>从本地日志中自动提取的项目目录与工作区用量</p>
+              <h2>{{ statsMode === 'local' ? '项目与工作区透视' : '渠道用量透视' }}</h2>
+              <p>{{ statsMode === 'local' ? '从本地日志中自动提取的项目目录与工作区用量' : '反代转发按渠道维度汇总的用量透视' }}</p>
             </div>
             <button type="button" class="tt-modal-close-btn" aria-label="关闭" @click="projectsModalOpen = false">×</button>
           </header>
@@ -2228,12 +2362,54 @@ onBeforeUnmount(() => {
   color: var(--brand);
 }
 
+.tt-title-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
 .tt-title-row h1 {
   font-size: 18px;
   font-weight: 750;
   color: var(--text);
   margin: 0;
   line-height: 1.2;
+}
+
+/* 数据模式标签（本地模式 / 反代模式） */
+.tt-mode-tabs {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  border-radius: 8px;
+  background: var(--bg-soft, rgba(148, 163, 184, 0.15));
+  border: 1px solid rgba(148, 163, 184, 0.25);
+}
+
+.tt-mode-tab {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 650;
+  padding: 3px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+  white-space: nowrap;
+}
+
+.tt-mode-tab:hover {
+  color: var(--text);
+}
+
+.tt-mode-tab.active {
+  background: var(--brand, #10b981);
+  color: #fff;
+  box-shadow: 0 1px 4px rgba(16, 185, 129, 0.35);
 }
 
 .tt-cockpit-subtitle {

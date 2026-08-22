@@ -103,6 +103,7 @@ struct SseTokenStats {
     completion_tokens: u64,
     reasoning_tokens: u64,
     cache_hit_tokens: u64,
+    cache_creation_tokens: u64,
     total_tokens: u64,
     has_reasoning: bool,
 }
@@ -114,12 +115,13 @@ impl SseTokenStats {
             completion_tokens: 0,
             reasoning_tokens: 0,
             cache_hit_tokens: 0,
+            cache_creation_tokens: 0,
             total_tokens: 0,
             has_reasoning: false,
         }
     }
 
-    /// 从 OpenAI usage 对象中提取 token 统计
+    /// 从 OpenAI usage 对象中提取 token 统计（含网关扩展的 cache_creation_tokens）
     fn extract_from_usage(&mut self, jv: &JsonValue) {
         if let Some(usage) = jv.get("usage").and_then(JsonValue::as_object) {
             if let Some(p) = usage.get("prompt_tokens").and_then(JsonValue::as_u64) {
@@ -135,6 +137,9 @@ impl SseTokenStats {
                 if let Some(h) = details.get("cached_tokens").and_then(JsonValue::as_u64) {
                     self.cache_hit_tokens = h;
                 }
+                if let Some(w) = details.get("cache_creation_tokens").and_then(JsonValue::as_u64) {
+                    self.cache_creation_tokens = w;
+                }
             }
             if let Some(details) = usage.get("completion_tokens_details").and_then(JsonValue::as_object) {
                 if let Some(r) = details.get("reasoning_tokens").and_then(JsonValue::as_u64) {
@@ -145,12 +150,13 @@ impl SseTokenStats {
         }
     }
 
-    /// 将统计写入日志并更新指标
-    async fn finalize(&self, ctx: &ModelProxyContext, log: &mut ProxyRequestLog) {
+    /// 将统计写入日志字段（不触碰内存指标）
+    fn apply_to_log(&self, log: &mut ProxyRequestLog) {
         log.prompt_tokens = (self.prompt_tokens > 0).then_some(self.prompt_tokens);
         log.completion_tokens = (self.completion_tokens > 0).then_some(self.completion_tokens);
         log.reasoning_tokens = (self.reasoning_tokens > 0).then_some(self.reasoning_tokens);
         log.prompt_cache_hit_tokens = (self.cache_hit_tokens > 0).then_some(self.cache_hit_tokens);
+        log.cache_creation_tokens = (self.cache_creation_tokens > 0).then_some(self.cache_creation_tokens);
         log.total_tokens = if self.total_tokens > 0 {
             Some(self.total_tokens)
         } else if self.prompt_tokens + self.completion_tokens > 0 {
@@ -158,6 +164,11 @@ impl SseTokenStats {
         } else {
             None
         };
+    }
+
+    /// 将统计写入日志并更新指标
+    async fn finalize(&self, ctx: &ModelProxyContext, log: &mut ProxyRequestLog) {
+        self.apply_to_log(log);
 
         if self.has_reasoning {
             ctx.metrics.total_reasoning_requests.fetch_add(1, Ordering::Relaxed);
@@ -306,8 +317,7 @@ pub fn openai_to_anthropic_sse_stream<E: std::fmt::Display + Send + 'static>(
         let mut message_started = false;
         let mut content_block_started = false;
         let mut ttft_recorded = false;
-        let mut total_prompt_tokens = 0u64;
-        let mut total_completion_tokens = 0u64;
+        let mut stats = SseTokenStats::new();
         let mut accum = StreamResponseAccumulator::default();
 
         tokio::pin!(stream);
@@ -338,6 +348,7 @@ pub fn openai_to_anthropic_sse_stream<E: std::fmt::Display + Send + 'static>(
                                         ttft_recorded = true;
                                     }
                                     accum.observe_chunk(&jv);
+                                    stats.extract_from_usage(&jv);
 
                                     if !message_started {
                                         let start_event = json!({
@@ -355,15 +366,6 @@ pub fn openai_to_anthropic_sse_stream<E: std::fmt::Display + Send + 'static>(
                                         });
                                         yield Ok::<Bytes, std::io::Error>(Bytes::from(format!("event: message_start\ndata: {start_event}\n\n")));
                                         message_started = true;
-                                    }
-
-                                    if let Some(usage) = jv.get("usage").and_then(JsonValue::as_object) {
-                                        if let Some(p) = usage.get("prompt_tokens").and_then(JsonValue::as_u64) {
-                                            total_prompt_tokens = p;
-                                        }
-                                        if let Some(c) = usage.get("completion_tokens").and_then(JsonValue::as_u64) {
-                                            total_completion_tokens = c;
-                                        }
                                     }
 
                                     if let Some(delta) = jv.pointer("/choices/0/delta") {
@@ -403,7 +405,7 @@ pub fn openai_to_anthropic_sse_stream<E: std::fmt::Display + Send + 'static>(
                                                 "stop_sequence": null
                                             },
                                             "usage": {
-                                                "output_tokens": total_completion_tokens
+                                                "output_tokens": stats.completion_tokens
                                             }
                                         });
                                         yield Ok::<Bytes, std::io::Error>(Bytes::from(format!("event: message_delta\ndata: {msg_delta}\n\n")));
@@ -429,9 +431,7 @@ pub fn openai_to_anthropic_sse_stream<E: std::fmt::Display + Send + 'static>(
         } else {
             log.status_code = 200;
         }
-        log.prompt_tokens = (total_prompt_tokens > 0).then_some(total_prompt_tokens);
-        log.completion_tokens = (total_completion_tokens > 0).then_some(total_completion_tokens);
-        log.total_tokens = (total_prompt_tokens + total_completion_tokens > 0).then_some(total_prompt_tokens + total_completion_tokens);
+        stats.apply_to_log(&mut log);
         log.response_body = accum.build_response_body();
 
         ctx.record_log(log).await;
@@ -451,8 +451,7 @@ pub fn openai_to_gemini_sse_stream<E: std::fmt::Display + Send + 'static>(
     let s = async_stream::stream! {
         let mut buffer = String::new();
         let mut ttft_recorded = false;
-        let mut total_prompt_tokens = 0u64;
-        let mut total_completion_tokens = 0u64;
+        let mut stats = SseTokenStats::new();
         let mut accum = StreamResponseAccumulator::default();
 
         tokio::pin!(stream);
@@ -479,15 +478,7 @@ pub fn openai_to_gemini_sse_stream<E: std::fmt::Display + Send + 'static>(
                                         ttft_recorded = true;
                                     }
                                     accum.observe_chunk(&jv);
-
-                                    if let Some(usage) = jv.get("usage").and_then(JsonValue::as_object) {
-                                        if let Some(p) = usage.get("prompt_tokens").and_then(JsonValue::as_u64) {
-                                            total_prompt_tokens = p;
-                                        }
-                                        if let Some(c) = usage.get("completion_tokens").and_then(JsonValue::as_u64) {
-                                            total_completion_tokens = c;
-                                        }
-                                    }
+                                    stats.extract_from_usage(&jv);
 
                                     if let Some(gemini_chunk) = GeminiProtocolAdapter::openai_chunk_to_gemini_chunk(&jv, &model_name) {
                                         let out_str = serde_json::to_string(&gemini_chunk).unwrap_or_default();
@@ -514,9 +505,7 @@ pub fn openai_to_gemini_sse_stream<E: std::fmt::Display + Send + 'static>(
         } else {
             log.status_code = 200;
         }
-        log.prompt_tokens = (total_prompt_tokens > 0).then_some(total_prompt_tokens);
-        log.completion_tokens = (total_completion_tokens > 0).then_some(total_completion_tokens);
-        log.total_tokens = (total_prompt_tokens + total_completion_tokens > 0).then_some(total_prompt_tokens + total_completion_tokens);
+        stats.apply_to_log(&mut log);
         log.response_body = accum.build_response_body();
 
         ctx.record_log(log).await;
@@ -537,8 +526,7 @@ pub fn openai_to_responses_sse_stream<E: std::fmt::Display + Send + 'static>(
         let mut buffer = String::new();
         let mut response_started = false;
         let mut ttft_recorded = false;
-        let mut total_prompt_tokens = 0u64;
-        let mut total_completion_tokens = 0u64;
+        let mut stats = SseTokenStats::new();
         let mut accum = StreamResponseAccumulator::default();
 
         tokio::pin!(stream);
@@ -566,6 +554,7 @@ pub fn openai_to_responses_sse_stream<E: std::fmt::Display + Send + 'static>(
                                         ttft_recorded = true;
                                     }
                                     accum.observe_chunk(&jv);
+                                    stats.extract_from_usage(&jv);
 
                                     if !response_started {
                                         let created = json!({
@@ -578,15 +567,6 @@ pub fn openai_to_responses_sse_stream<E: std::fmt::Display + Send + 'static>(
                                         });
                                         yield Ok::<Bytes, std::io::Error>(Bytes::from(format!("event: response.created\ndata: {created}\n\n")));
                                         response_started = true;
-                                    }
-
-                                    if let Some(usage) = jv.get("usage").and_then(JsonValue::as_object) {
-                                        if let Some(p) = usage.get("prompt_tokens").and_then(JsonValue::as_u64) {
-                                            total_prompt_tokens = p;
-                                        }
-                                        if let Some(c) = usage.get("completion_tokens").and_then(JsonValue::as_u64) {
-                                            total_completion_tokens = c;
-                                        }
                                     }
 
                                     if let Some(delta) = jv.pointer("/choices/0/delta") {
@@ -621,9 +601,7 @@ pub fn openai_to_responses_sse_stream<E: std::fmt::Display + Send + 'static>(
         } else {
             log.status_code = 200;
         }
-        log.prompt_tokens = (total_prompt_tokens > 0).then_some(total_prompt_tokens);
-        log.completion_tokens = (total_completion_tokens > 0).then_some(total_completion_tokens);
-        log.total_tokens = (total_prompt_tokens + total_completion_tokens > 0).then_some(total_prompt_tokens + total_completion_tokens);
+        stats.apply_to_log(&mut log);
         log.response_body = accum.build_response_body();
 
         ctx.record_log(log).await;
