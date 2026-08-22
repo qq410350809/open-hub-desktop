@@ -318,42 +318,42 @@ function applyCustomRange() {
 </script>
 
 <template>
-  <div ref="rootRef" class="lrd-dd" :class="{ open, 'is-custom': customMode }">
+  <div ref="rootRef" class="drd-dd" :class="{ open, 'is-custom': customMode }">
     <button
       v-if="activeRangeText"
       type="button"
-      class="lrd-range-arrow lrd-range-arrow-prev"
+      class="drd-range-arrow drd-range-arrow-prev"
       title="前一天"
       @click.stop.prevent="applyShift(-1)"
     >
-      <span v-html="icons.chevron" class="lrd-arrow-icon is-prev" />
+      <span v-html="icons.chevron" class="drd-arrow-icon is-prev" />
     </button>
-    <button type="button" class="lrd-range-trigger" :class="{ active: customMode }" @click="toggle">
-      <span class="lrd-range-label">{{ activeLabel }}</span>
-      <span v-if="activeRangeText" class="lrd-range-sub">{{ activeRangeText }}</span>
-      <span class="lrd-range-caret" v-html="icons.chevron" />
+    <button type="button" class="drd-range-trigger" :class="{ active: customMode }" @click="toggle">
+      <span class="drd-range-label">{{ activeLabel }}</span>
+      <span v-if="activeRangeText" class="drd-range-sub">{{ activeRangeText }}</span>
+      <span class="drd-range-caret" v-html="icons.chevron" />
     </button>
     <button
       v-if="activeRangeText"
       type="button"
-      class="lrd-range-arrow lrd-range-arrow-next"
+      class="drd-range-arrow drd-range-arrow-next"
       title="后一天"
       @click.stop.prevent="applyShift(1)"
     >
-      <span v-html="icons.chevron" class="lrd-arrow-icon is-next" />
+      <span v-html="icons.chevron" class="drd-arrow-icon is-next" />
     </button>
 
-    <div v-if="open" class="lrd-range-pop" @click.stop>
+    <div v-if="open" class="drd-range-pop" @click.stop>
       <template v-if="!customMode">
-        <div class="lrd-rp-groups">
-          <div v-for="g in groups" :key="g.title" class="lrd-rp-group">
-            <div class="lrd-rp-group-title">{{ g.title }}</div>
-            <div class="lrd-rp-group-items">
+        <div class="drd-rp-groups">
+          <div v-for="g in groups" :key="g.title" class="drd-rp-group">
+            <div class="drd-rp-group-title">{{ g.title }}</div>
+            <div class="drd-rp-group-items">
               <button
                 v-for="it in g.items"
                 :key="it.label"
                 type="button"
-                class="lrd-rp-item"
+                class="drd-rp-item"
                 :class="{ active: !it.custom && isCurrentRange(it.days) }"
                 @click="pick(it)"
               >{{ it.label }}</button>
@@ -363,41 +363,41 @@ function applyCustomRange() {
       </template>
 
       <template v-else>
-        <div class="lrd-rp-custom-head">
-          <button type="button" class="lrd-rp-back" @click="customMode = false">‹ 返回</button>
-          <div class="lrd-rp-custom-range">
-            <span class="lrd-rp-val">{{ pickedFrom || "起" }}</span>
-            <span class="lrd-rp-sep">→</span>
-            <span class="lrd-rp-val">{{ pickedTo || "止" }}</span>
+        <div class="drd-rp-custom-head">
+          <button type="button" class="drd-rp-back" @click="customMode = false">‹ 返回</button>
+          <div class="drd-rp-custom-range">
+            <span class="drd-rp-val">{{ pickedFrom || "起" }}</span>
+            <span class="drd-rp-sep">→</span>
+            <span class="drd-rp-val">{{ pickedTo || "止" }}</span>
           </div>
-          <button type="button" class="lrd-rp-clear" @click="resetPicker">清空</button>
+          <button type="button" class="drd-rp-clear" @click="resetPicker">清空</button>
         </div>
-        <div class="lrd-rp-calendars">
-          <div v-for="mk in [viewStart, viewEnd]" :key="mk" class="lrd-rp-cal">
-            <div class="lrd-rp-cal-head">
+        <div class="drd-rp-calendars">
+          <div v-for="mk in [viewStart, viewEnd]" :key="mk" class="drd-rp-cal">
+            <div class="drd-rp-cal-head">
               <button
                 type="button"
-                class="lrd-rp-nav"
+                class="drd-rp-nav"
                 :disabled="mk === viewStart && !canShiftMonth(-1)"
                 @click="shiftMonth(-1)"
               >‹</button>
-              <span class="lrd-rp-cal-title">{{ parseInt(mk.slice(0,4)) }}年{{ parseInt(mk.slice(5,7)) }}月</span>
+              <span class="drd-rp-cal-title">{{ parseInt(mk.slice(0,4)) }}年{{ parseInt(mk.slice(5,7)) }}月</span>
               <button
                 type="button"
-                class="lrd-rp-nav"
+                class="drd-rp-nav"
                 :disabled="mk === viewEnd && !canShiftMonth(1)"
                 @click="shiftMonth(1)"
               >›</button>
             </div>
-            <div class="lrd-rp-week">
+            <div class="drd-rp-week">
               <span v-for="w in weekLabels" :key="w">{{ w }}</span>
             </div>
-            <div class="lrd-rp-cells">
+            <div class="drd-rp-cells">
               <button
                 v-for="(c, ci) in monthCells(mk)"
                 :key="ci"
                 type="button"
-                class="lrd-rp-cell"
+                class="drd-rp-cell"
                 :class="{ empty: !c.date, inrange: c.inRange, start: c.isStart, end: c.isEnd, today: c.today }"
                 :disabled="!c.date"
                 @click="c.date && clickDay(c.date)"
@@ -405,12 +405,12 @@ function applyCustomRange() {
             </div>
           </div>
         </div>
-        <div class="lrd-rp-custom-foot">
-          <span v-if="pickedFrom && pickedTo" class="lrd-rp-hint">{{ pickedFrom }} ~ {{ pickedTo }}（已选好，点击应用）</span>
-          <span v-else class="lrd-rp-hint">先点起始日，再点结束日</span>
-          <div class="lrd-rp-actions">
-            <button type="button" class="lrd-rp-apply" :disabled="!pickedFrom || !pickedTo" @click="applyCustomRange">应用</button>
-            <button type="button" class="lrd-rp-cancel" @click="close">取消</button>
+        <div class="drd-rp-custom-foot">
+          <span v-if="pickedFrom && pickedTo" class="drd-rp-hint">{{ pickedFrom }} ~ {{ pickedTo }}（已选好，点击应用）</span>
+          <span v-else class="drd-rp-hint">先点起始日，再点结束日</span>
+          <div class="drd-rp-actions">
+            <button type="button" class="drd-rp-apply" :disabled="!pickedFrom || !pickedTo" @click="applyCustomRange">应用</button>
+            <button type="button" class="drd-rp-cancel" @click="close">取消</button>
           </div>
         </div>
       </template>
@@ -419,7 +419,7 @@ function applyCustomRange() {
 </template>
 
 <style scoped>
-.lrd-dd {
+.drd-dd {
   position: relative;
   display: inline-flex;
   align-items: stretch;
@@ -427,7 +427,7 @@ function applyCustomRange() {
   flex-shrink: 0;
 }
 
-.lrd-range-arrow {
+.drd-range-arrow {
   width: 28px;
   height: 34px;
   display: flex;
@@ -441,27 +441,27 @@ function applyCustomRange() {
   transition: all 0.15s ease;
 }
 
-.lrd-range-arrow:hover {
+.drd-range-arrow:hover {
   background: var(--surface-hover);
   color: var(--text);
   border-color: var(--line-hover);
 }
 
-.lrd-arrow-icon {
+.drd-arrow-icon {
   display: inline-flex;
 }
-.lrd-arrow-icon :deep(svg) {
+.drd-arrow-icon :deep(svg) {
   width: 13px;
   height: 13px;
 }
-.lrd-arrow-icon.is-prev :deep(svg) {
+.drd-arrow-icon.is-prev :deep(svg) {
   transform: rotate(90deg);
 }
-.lrd-arrow-icon.is-next :deep(svg) {
+.drd-arrow-icon.is-next :deep(svg) {
   transform: rotate(-90deg);
 }
 
-.lrd-range-trigger {
+.drd-range-trigger {
   height: 34px;
   padding: 0 12px;
   display: flex;
@@ -479,37 +479,37 @@ function applyCustomRange() {
   flex-shrink: 0;
 }
 
-.lrd-range-trigger:hover {
+.drd-range-trigger:hover {
   background: var(--surface-hover);
   border-color: var(--line-hover);
 }
 
-.lrd-range-label {
+.drd-range-label {
   color: var(--brand);
   font-weight: 700;
 }
 
-.lrd-range-sub {
+.drd-range-sub {
   color: var(--muted);
   font-size: 11px;
   font-variant-numeric: tabular-nums;
 }
 
-.lrd-range-caret {
+.drd-range-caret {
   display: inline-flex;
   color: var(--muted);
   transition: transform 0.2s ease;
 }
-.lrd-range-caret :deep(svg) {
+.drd-range-caret :deep(svg) {
   width: 12px;
   height: 12px;
 }
-.lrd-dd.open .lrd-range-caret {
+.drd-dd.open .drd-range-caret {
   transform: rotate(180deg);
 }
 
 /* 弹出层 */
-.lrd-range-pop {
+.drd-range-pop {
   position: absolute;
   top: calc(100% + 6px);
   right: 0;
@@ -522,13 +522,13 @@ function applyCustomRange() {
   min-width: 240px;
 }
 
-.lrd-rp-groups {
+.drd-rp-groups {
   display: flex;
   flex-direction: column;
   gap: 10px;
 }
 
-.lrd-rp-group-title {
+.drd-rp-group-title {
   font-size: 10px;
   font-weight: 700;
   color: var(--muted);
@@ -537,13 +537,13 @@ function applyCustomRange() {
   margin-bottom: 4px;
 }
 
-.lrd-rp-group-items {
+.drd-rp-group-items {
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 4px;
 }
 
-.lrd-rp-item {
+.drd-rp-item {
   height: 28px;
   padding: 0 8px;
   border-radius: var(--r-md, 6px);
@@ -557,12 +557,12 @@ function applyCustomRange() {
   text-align: center;
 }
 
-.lrd-rp-item:hover {
+.drd-rp-item:hover {
   background: var(--surface-hover);
   border-color: var(--line);
 }
 
-.lrd-rp-item.active {
+.drd-rp-item.active {
   background: var(--brand-soft);
   color: var(--brand-deep);
   border-color: var(--brand-line);
@@ -570,7 +570,7 @@ function applyCustomRange() {
 }
 
 /* 自定义日历 */
-.lrd-rp-custom-head {
+.drd-rp-custom-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -579,8 +579,8 @@ function applyCustomRange() {
   font-size: 12px;
 }
 
-.lrd-rp-back,
-.lrd-rp-clear {
+.drd-rp-back,
+.drd-rp-clear {
   border: none;
   background: transparent;
   color: var(--brand);
@@ -589,7 +589,7 @@ function applyCustomRange() {
   cursor: pointer;
 }
 
-.lrd-rp-custom-range {
+.drd-rp-custom-range {
   display: flex;
   align-items: center;
   gap: 6px;
@@ -598,28 +598,28 @@ function applyCustomRange() {
   font-size: 11px;
 }
 
-.lrd-rp-calendars {
+.drd-rp-calendars {
   display: flex;
   gap: 12px;
 }
 
-.lrd-rp-cal {
+.drd-rp-cal {
   width: 190px;
 }
 
-.lrd-rp-cal-head {
+.drd-rp-cal-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
   margin-bottom: 6px;
 }
 
-.lrd-rp-cal-title {
+.drd-rp-cal-title {
   font-size: 12px;
   font-weight: 700;
 }
 
-.lrd-rp-nav {
+.drd-rp-nav {
   border: none;
   background: transparent;
   color: var(--text);
@@ -628,7 +628,7 @@ function applyCustomRange() {
   padding: 0 4px;
 }
 
-.lrd-rp-week {
+.drd-rp-week {
   display: grid;
   grid-template-columns: repeat(7, 1fr);
   text-align: center;
@@ -637,13 +637,13 @@ function applyCustomRange() {
   margin-bottom: 4px;
 }
 
-.lrd-rp-cells {
+.drd-rp-cells {
   display: grid;
   grid-template-columns: repeat(7, 1fr);
   gap: 2px;
 }
 
-.lrd-rp-cell {
+.drd-rp-cell {
   height: 22px;
   border-radius: 4px;
   border: none;
@@ -656,27 +656,27 @@ function applyCustomRange() {
   justify-content: center;
 }
 
-.lrd-rp-cell:hover:not(:disabled) {
+.drd-rp-cell:hover:not(:disabled) {
   background: var(--surface-hover);
 }
 
-.lrd-rp-cell.inrange {
+.drd-rp-cell.inrange {
   background: var(--brand-soft);
   color: var(--brand-deep);
 }
 
-.lrd-rp-cell.start,
-.lrd-rp-cell.end {
+.drd-rp-cell.start,
+.drd-rp-cell.end {
   background: var(--brand);
   color: #fff;
   font-weight: 700;
 }
 
-.lrd-rp-cell.today {
+.drd-rp-cell.today {
   border: 1px solid var(--brand);
 }
 
-.lrd-rp-custom-foot {
+.drd-rp-custom-foot {
   margin-top: 10px;
   padding-top: 8px;
   border-top: 1px solid var(--line);
@@ -685,17 +685,17 @@ function applyCustomRange() {
   justify-content: space-between;
 }
 
-.lrd-rp-hint {
+.drd-rp-hint {
   font-size: 10px;
   color: var(--muted);
 }
 
-.lrd-rp-actions {
+.drd-rp-actions {
   display: flex;
   gap: 6px;
 }
 
-.lrd-rp-apply {
+.drd-rp-apply {
   height: 26px;
   padding: 0 10px;
   border-radius: var(--r-md, 6px);
@@ -707,7 +707,7 @@ function applyCustomRange() {
   cursor: pointer;
 }
 
-.lrd-rp-cancel {
+.drd-rp-cancel {
   height: 26px;
   padding: 0 8px;
   border-radius: var(--r-md, 6px);

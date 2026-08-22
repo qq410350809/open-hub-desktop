@@ -26,7 +26,7 @@ import {
   formatLogFull,
 } from "../../utils";
 import CustomSelect from "../common/CustomSelect.vue";
-import LogRangeDropdown from "../common/LogRangeDropdown.vue";
+import DateRangeDropdown from "../common/DateRangeDropdown.vue";
 import type { SiteRecord } from "../../types";
 import { DEFAULT_PROXY_PORT, LOCALHOST, API_PATH_V1, API_PATH_GEMINI, API_PATH_MESSAGES } from "../../constants";
 
@@ -980,6 +980,9 @@ const chatCompletionsUrl = computed(
   () => `${openAiBaseUrl.value.replace(/\/+$/, "")}/chat/completions`
 );
 
+// 四个对话端点在卡片里只展示路径，完整地址悬停可见、复制时带上
+const stripOrigin = (url: string) => url.replace(/^https?:\/\/[^/]+/, "");
+
 async function copyChatCompletionsUrl() {
   await copyText(chatCompletionsUrl.value, "Chat Completions URL");
 }
@@ -1422,21 +1425,26 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
     <!-- 顶栏标题与快捷控制 -->
     <header class="mp-header">
       <div class="mp-header-left">
-        <div class="mp-header-title-row">
-          <span class="mp-icon" v-html="icons.repeat" />
-          <h1>模型反代</h1>
-          <span
-            class="mp-status-pill"
-            :class="{ active: proxyStatus.running }"
-          >
-            <span class="mp-status-dot" />
-            <span>{{ proxyStatus.running ? "运行中" : "已停止" }}</span>
-          </span>
-          <span class="mp-channel-pill">多渠道架构</span>
+        <div class="mp-brand-section">
+          <div class="mp-eyebrow-row">
+            <span class="mp-live-dot" :class="{ 'is-off': !proxyStatus.running }" />
+            <span class="mp-eyebrow-text">本地模型反向代理网关</span>
+          </div>
+          <div class="mp-header-title-row">
+            <h1>模型反代</h1>
+            <span
+              class="mp-status-pill"
+              :class="{ active: proxyStatus.running }"
+            >
+              <span class="mp-status-dot" />
+              <span>{{ proxyStatus.running ? "运行中" : "已停止" }}</span>
+            </span>
+            <span class="mp-channel-pill">多渠道架构</span>
+          </div>
+          <p class="mp-subtitle">
+            对外提供标准兼容的 OpenAI 和 Anthropic API · 监听端口 <strong>{{ proxyStatus.port || proxyConfig.port }}</strong>
+          </p>
         </div>
-        <p class="mp-subtitle">
-          本地模型反向代理网关 · 对外提供标准兼容的 OpenAI 和 Anthropic API
-        </p>
       </div>
 
       <div class="mp-header-actions">
@@ -1650,7 +1658,7 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
                 <span class="mp-proto-badge is-openai">Chat</span>
                 <span>Completions URL</span>
               </div>
-              <code class="mp-epr-code font-mono" :title="chatCompletionsUrl">{{ chatCompletionsUrl }}</code>
+              <code class="mp-epr-code font-mono" :title="chatCompletionsUrl">{{ stripOrigin(chatCompletionsUrl) }}</code>
               <button
                 type="button"
                 class="mp-action-btn mp-btn-icon-only"
@@ -1667,7 +1675,7 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
                 <span class="mp-proto-badge is-openai">Responses</span>
                 <span>API URL</span>
               </div>
-              <code class="mp-epr-code font-mono" :title="responsesApiUrl">{{ responsesApiUrl }}</code>
+              <code class="mp-epr-code font-mono" :title="responsesApiUrl">{{ stripOrigin(responsesApiUrl) }}</code>
               <button
                 type="button"
                 class="mp-action-btn mp-btn-icon-only"
@@ -1684,7 +1692,7 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
                 <span class="mp-proto-badge is-claude">Claude</span>
                 <span>Messages URL</span>
               </div>
-              <code class="mp-epr-code font-mono" :title="claudeMessagesUrl">{{ claudeMessagesUrl }}</code>
+              <code class="mp-epr-code font-mono" :title="claudeMessagesUrl">{{ stripOrigin(claudeMessagesUrl) }}</code>
               <button
                 type="button"
                 class="mp-action-btn mp-btn-icon-only"
@@ -1701,7 +1709,7 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
                 <span class="mp-proto-badge is-gemini">Gemini</span>
                 <span>Base URL</span>
               </div>
-              <code class="mp-epr-code font-mono" :title="geminiBaseUrl">{{ geminiBaseUrl }}</code>
+              <code class="mp-epr-code font-mono" :title="geminiBaseUrl">{{ stripOrigin(geminiBaseUrl) }}</code>
               <button
                 type="button"
                 class="mp-action-btn mp-btn-icon-only"
@@ -1726,7 +1734,7 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
               :title="`当前统计范围：${overviewScopeLabel}，下方 KPI 与趋势图均按此范围统计`"
             >{{ overviewScopeLabel }}</span>
           </div>
-          <LogRangeDropdown
+          <DateRangeDropdown
             v-model:from="overviewDateFrom"
             v-model:to="overviewDateTo"
             @apply="applyOverviewRange"
@@ -2030,7 +2038,7 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
           </div>
 
           <div class="mp-logs-range">
-            <LogRangeDropdown
+            <DateRangeDropdown
               v-model:from="logDateFrom"
               v-model:to="logDateTo"
               @apply="applyLogRange"
@@ -3770,7 +3778,7 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
 
 <style scoped>
 .mp-page {
-  padding: 20px 24px 40px;
+  padding: 16px 20px 40px;
   width: 100%;
   max-width: 100%;
   box-sizing: border-box;
@@ -3783,7 +3791,7 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
   min-height: 0;
 }
 
-/* 顶栏 */
+/* 顶栏（与其他页面统一的驾驶舱横条） */
 .mp-header {
   display: flex;
   justify-content: space-between;
@@ -3792,6 +3800,47 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
   width: 100%;
   box-sizing: border-box;
   flex-wrap: wrap;
+  margin: -16px -20px 0;
+  padding: 12px 20px 14px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--line);
+}
+
+/* 左侧三行：眉标 / 标题 / 副标题 */
+.mp-brand-section {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
+.mp-eyebrow-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.mp-live-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #10b981;
+  box-shadow: 0 0 8px #10b981;
+  animation: mp-pulse 2s infinite ease-in-out;
+}
+
+.mp-live-dot.is-off {
+  background: var(--muted);
+  box-shadow: none;
+  animation: none;
+}
+
+.mp-eyebrow-text {
+  font-size: 10px;
+  font-weight: 750;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--brand);
 }
 
 .mp-header-title-row {
@@ -3801,30 +3850,24 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
   flex-wrap: wrap;
 }
 
-.mp-header-title-row .mp-icon {
-  width: 28px;
-  height: 28px;
-  color: var(--brand);
-  display: inline-flex;
-}
-
-.mp-header-title-row .mp-icon :deep(svg) {
-  width: 100%;
-  height: 100%;
-}
-
 .mp-header h1 {
-  font-size: 24px;
-  font-weight: 800;
+  font-size: 18px;
+  font-weight: 750;
   color: var(--text);
   margin: 0;
-  letter-spacing: -0.02em;
+  line-height: 1.2;
+  letter-spacing: -0.01em;
 }
 
 .mp-subtitle {
-  margin: 6px 0 0;
-  font-size: 13px;
+  margin: 0;
+  font-size: 11px;
   color: var(--muted);
+}
+
+.mp-subtitle strong {
+  color: var(--text);
+  font-weight: 600;
 }
 
 .mp-status-pill {
@@ -3878,6 +3921,13 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
   display: flex;
   align-items: center;
   gap: 10px;
+}
+
+/* 头部按钮与其他页面驾驶舱横条对齐（32px 高度） */
+.mp-header-actions .mp-btn {
+  height: 32px;
+  padding: 0 12px;
+  font-size: 12px;
 }
 
 /* 按钮规范 */

@@ -817,6 +817,11 @@ pub(crate) fn avg_or_none(total: i64, count: i64) -> Option<u64> {
 /// - projectKey = 渠道显示名（本地模式为项目工作区，反代以渠道维度替代）
 /// - input      = prompt - 缓存读 - 缓存写（对齐 Anthropic 本地日志的「未缓存输入」口径）
 /// 区间 ≤ 7 天用小时表（逐时桶），更长区间用日表（逐日桶），与前端粒度自动切换一致。
+///
+/// 前置补偿：本地模式的健康报表是全量历史扫描，健康矩阵在所选区间起点前补位时
+/// 仍能取到历史数据；反代模式按区间裁剪后需通过 preceding_buckets 单独带回
+/// 区间之前（回看 ≤ 366 天）的请求健康聚合。区间内「有日行但无小时行」的日期
+/// （小时表晚于日表启用）以当日 00:00 单桶回退，避免矩阵/趋势前段整体空白。
 pub async fn get_proxy_token_usage_report(
     state: &ModelProxyState,
     from: Option<String>,
@@ -838,6 +843,7 @@ pub async fn get_proxy_token_usage_report(
         health: RequestHealthReport {
             available: false,
             buckets: Vec::new(),
+            preceding_buckets: Vec::new(),
             by_source: Vec::new(),
         },
     };
@@ -938,6 +944,9 @@ pub async fn get_proxy_token_usage_report(
                 })
                 .map_err(|e| format!("解析反代小时统计失败: {e}"))?;
 
+            // 区间内出现过小时行的日期（供下方日表回退判断）
+            let mut hourly_covered: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
             for (date, hour, channel, model, client, reqs, succ, fail, prompt, comp, reasoning, hit, creation, total) in
                 rows.flatten()
             {
@@ -966,6 +975,86 @@ pub async fn get_proxy_token_usage_report(
 
                 let hour_key = format!("{date}T{hour:02}:00:00");
                 let hb = health_map.entry(hour_key).or_insert_with(|| RequestHealthBucket {
+                    hour: String::new(),
+                    dialogues: 0,
+                    requests: 0,
+                    success: 0,
+                    failed: 0,
+                });
+                hb.requests += reqs;
+                hb.success += succ;
+                hb.failed += fail;
+
+                let summary = ensure_client_summary(&mut by_client, &client_key);
+                summary.requests += reqs;
+                summary.success += succ;
+                summary.failed += fail;
+                hourly_covered.insert(date);
+            }
+
+            // 区间内补偿：日表有聚合但小时表无行的日期（小时表晚于日表启用），
+            // 以当日 00:00 单桶回退，避免区间前段在健康矩阵/趋势中整体空白
+            let mut fallback_stmt = conn
+                .prepare(
+                    "SELECT date, channel_id, model, client_name,
+                        SUM(total_requests), SUM(successful_requests), SUM(failed_requests),
+                        SUM(prompt_tokens), SUM(completion_tokens), SUM(reasoning_tokens),
+                        SUM(cache_hit_tokens), SUM(cache_creation_tokens), SUM(total_tokens)
+                     FROM channel_daily_stats
+                     WHERE date >= ?1 AND date <= ?2
+                     GROUP BY date, channel_id, model, client_name",
+                )
+                .map_err(|e| format!("查询反代日统计失败: {e}"))?;
+            let fallback_rows = fallback_stmt
+                .query_map([&start_str, &end_str], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, i64>(7)?,
+                        row.get::<_, i64>(8)?,
+                        row.get::<_, i64>(9)?,
+                        row.get::<_, i64>(10)?,
+                        row.get::<_, i64>(11)?,
+                        row.get::<_, i64>(12)?,
+                    ))
+                })
+                .map_err(|e| format!("解析反代日统计失败: {e}"))?;
+
+            for (date, channel, model, client, reqs, succ, fail, prompt, comp, reasoning, hit, creation, total) in
+                fallback_rows.flatten()
+            {
+                if hourly_covered.contains(&date) {
+                    continue;
+                }
+                let client_key = if client.trim().is_empty() { "其他客户端".to_string() } else { client };
+                let model_key = if model.trim().is_empty() { "历史聚合".to_string() } else { model };
+                let input = (prompt - hit - creation).max(0);
+                buckets.push(TokenUsageBucket {
+                    source: client_key.clone(),
+                    model: model_key,
+                    project_key: channel_names
+                        .get(&channel)
+                        .cloned()
+                        .unwrap_or(channel),
+                    timestamp: format!("{date}T00:00:00"),
+                    total_tokens: total,
+                    billable_total_tokens: total,
+                    input_tokens: input,
+                    cached_input_tokens: hit,
+                    cache_creation_input_tokens: creation,
+                    output_tokens: comp,
+                    reasoning_output_tokens: reasoning,
+                    conversation_count: 0,
+                    request_count: reqs,
+                    ..Default::default()
+                });
+
+                let hb = health_map.entry(format!("{date}T00:00:00")).or_insert_with(|| RequestHealthBucket {
                     hour: String::new(),
                     dialogues: 0,
                     requests: 0,
@@ -1057,6 +1146,91 @@ pub async fn get_proxy_token_usage_report(
             }
         }
 
+        // —— 前置补偿：所选区间之前的请求健康聚合（preceding_buckets）——
+        // 健康矩阵在区间起点前补位时由此取数（对齐本地模式的全量历史行为）。
+        // 回看上限 366 天，远超矩阵可视容量；小时粒度优先取小时表，
+        // 无小时行的日期（含小时表启用前）以日表 00:00 单桶回退。
+        let lookback_str = (start - chrono::Duration::days(366))
+            .format("%Y-%m-%d")
+            .to_string();
+        let mut preceding_map: std::collections::BTreeMap<String, RequestHealthBucket> =
+            std::collections::BTreeMap::new();
+        let mut preceding_hourly_covered: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        if hourly_mode {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT date, hour,
+                        SUM(total_requests), SUM(successful_requests), SUM(failed_requests)
+                     FROM channel_hourly_stats
+                     WHERE date >= ?1 AND date < ?2
+                     GROUP BY date, hour",
+                )
+                .map_err(|e| format!("查询前置小时统计失败: {e}"))?;
+            let rows = stmt
+                .query_map([&lookback_str, &start_str], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                })
+                .map_err(|e| format!("解析前置小时统计失败: {e}"))?;
+            for (date, hour, reqs, succ, fail) in rows.flatten() {
+                preceding_hourly_covered.insert(date.clone());
+                let hb = preceding_map
+                    .entry(format!("{date}T{hour:02}:00:00"))
+                    .or_insert_with(|| RequestHealthBucket {
+                        hour: String::new(),
+                        dialogues: 0,
+                        requests: 0,
+                        success: 0,
+                        failed: 0,
+                    });
+                hb.requests += reqs;
+                hb.success += succ;
+                hb.failed += fail;
+            }
+        }
+        let mut stmt = conn
+            .prepare(
+                "SELECT date,
+                    SUM(total_requests), SUM(successful_requests), SUM(failed_requests)
+                 FROM channel_daily_stats
+                 WHERE date >= ?1 AND date < ?2
+                 GROUP BY date",
+            )
+            .map_err(|e| format!("查询前置日统计失败: {e}"))?;
+        let rows = stmt
+            .query_map([&lookback_str, &start_str], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })
+            .map_err(|e| format!("解析前置日统计失败: {e}"))?;
+        for (date, reqs, succ, fail) in rows.flatten() {
+            if preceding_hourly_covered.contains(&date) {
+                continue;
+            }
+            let hb = preceding_map
+                .entry(format!("{date}T00:00:00"))
+                .or_insert_with(|| RequestHealthBucket {
+                    hour: String::new(),
+                    dialogues: 0,
+                    requests: 0,
+                    success: 0,
+                    failed: 0,
+                });
+            hb.requests += reqs;
+            hb.success += succ;
+            hb.failed += fail;
+        }
+
         let health_buckets: Vec<RequestHealthBucket> = health_map
             .into_iter()
             .map(|(key, mut b)| {
@@ -1077,6 +1251,13 @@ pub async fn get_proxy_token_usage_report(
             health: RequestHealthReport {
                 available: has_data,
                 buckets: health_buckets,
+                preceding_buckets: preceding_map
+                    .into_iter()
+                    .map(|(key, mut b)| {
+                        b.hour = key;
+                        b
+                    })
+                    .collect(),
                 by_source: by_client.into_values().collect(),
             },
         })

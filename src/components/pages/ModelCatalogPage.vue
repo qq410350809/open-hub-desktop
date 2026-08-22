@@ -612,15 +612,17 @@ onMounted(() => {
     <!-- 1. 顶部宏观数据驾驶舱 -->
     <header class="mc-cockpit-bar">
       <div class="mc-cockpit-header">
-        <div class="mc-brand-title">
-          <div class="mc-brand-logo" v-html="icons.sparkles" />
-          <div>
-            <div class="mc-eyebrow">
-              <span>LLMPricing · 全球大模型全景基准</span>
-              <span class="mc-live-dot" />
-            </div>
+        <div class="mc-brand-section">
+          <div class="mc-eyebrow-row">
+            <span class="mc-live-dot" />
+            <span class="mc-eyebrow-text">LLMPricing · 全球大模型全景基准</span>
+          </div>
+          <div class="mc-title-row">
             <h1>模型全景控制台</h1>
           </div>
+          <p class="mc-cockpit-subtitle">
+            全网价格与质量基准 · 收录 <strong>{{ metrics.totalModels.toLocaleString() }}</strong> 款模型 · <strong>{{ metrics.totalProviders }}</strong> 家供应商渠道
+          </p>
         </div>
 
         <div class="mc-cockpit-actions">
@@ -2010,7 +2012,7 @@ onMounted(() => {
 
 /* —— 1. 顶部宏观驾驶舱 —— */
 .mc-cockpit-bar {
-  padding: 14px 20px 10px;
+  padding: 12px 20px 10px;
   background: var(--surface);
   border-bottom: 1px solid var(--line);
   display: flex;
@@ -2027,45 +2029,33 @@ onMounted(() => {
   flex-wrap: wrap;
 }
 
-.mc-brand-title {
+.mc-brand-section {
   display: flex;
-  align-items: center;
-  gap: 12px;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
 }
 
-.mc-brand-logo {
-  width: 42px;
-  height: 42px;
-  border-radius: var(--r-lg);
-  background: linear-gradient(135deg, var(--brand), #0284c7);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  color: #fff;
-  box-shadow: 0 4px 12px var(--brand-glow);
-}
-.mc-brand-logo :deep(svg) {
-  width: 22px;
-  height: 22px;
-}
-
-.mc-eyebrow {
+.mc-eyebrow-row {
   display: flex;
   align-items: center;
   gap: 6px;
-  font-size: 11px;
-  font-weight: 600;
+}
+
+.mc-eyebrow-text {
+  font-size: 10px;
+  font-weight: 750;
   color: var(--brand);
   text-transform: uppercase;
-  letter-spacing: 0.04em;
+  letter-spacing: 0.06em;
 }
 
 .mc-live-dot {
-  width: 6px;
-  height: 6px;
+  width: 7px;
+  height: 7px;
   border-radius: 50%;
   background: var(--success);
-  box-shadow: 0 0 0 3px rgba(18, 166, 101, 0.2);
+  box-shadow: 0 0 8px var(--success);
   animation: pulse-dot 2s infinite;
 }
 
@@ -2074,11 +2064,30 @@ onMounted(() => {
   50% { transform: scale(1.3); opacity: 0.6; }
 }
 
-.mc-brand-title h1 {
-  margin: 2px 0 0;
-  font-size: 20px;
-  font-weight: 700;
-  letter-spacing: -0.02em;
+.mc-title-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.mc-title-row h1 {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 750;
+  letter-spacing: -0.01em;
+  line-height: 1.2;
+}
+
+.mc-cockpit-subtitle {
+  margin: 0;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.mc-cockpit-subtitle strong {
+  color: var(--text);
+  font-weight: 600;
 }
 
 .mc-cockpit-actions {
@@ -2125,7 +2134,8 @@ onMounted(() => {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  padding: 8px 14px;
+  height: 32px;
+  padding: 0 12px;
   border-radius: var(--r-md);
   font-size: 12px;
   font-weight: 600;

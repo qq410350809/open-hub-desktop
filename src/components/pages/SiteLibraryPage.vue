@@ -719,15 +719,15 @@ onUnmounted(() => {
     <!-- 1. 顶部宏观数据驾驶舱 -->
     <header class="sl-cockpit-bar">
       <div class="sl-cockpit-header">
-        <div class="sl-brand-title">
-          <div class="sl-brand-logo" v-html="icons.database" />
-          <div>
-            <div class="sl-eyebrow">
-              <span>OpenHub · 站点资料库全景控制台</span>
-              <span class="sl-live-dot" />
-            </div>
+        <div class="sl-brand-section">
+          <div class="sl-eyebrow-row">
+            <span class="sl-live-dot" />
+            <span class="sl-eyebrow-text">OpenHub · 站点资料库全景控制台</span>
+          </div>
+          <div class="sl-title-row">
             <h1>站点库控制台</h1>
           </div>
+          <p class="sl-cockpit-subtitle">本地站点资料库 · 公共库一键同步 · 账号额度与健康签到监控</p>
         </div>
 
         <div class="sl-cockpit-actions">
@@ -2217,9 +2217,9 @@ onUnmounted(() => {
 
 /* 1. 顶部驾驶舱 */
 .sl-cockpit-bar {
-  padding: 16px 24px 12px;
-  background: var(--page-header, #161b22);
-  border-bottom: 1px solid var(--page-line, #30363d);
+  padding: 12px 20px 10px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--line);
   flex-shrink: 0;
   display: flex;
   flex-direction: column;
@@ -2233,36 +2233,24 @@ onUnmounted(() => {
   gap: 16px;
 }
 
-.sl-brand-title {
+.sl-brand-section {
   display: flex;
-  align-items: center;
-  gap: 12px;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
 }
 
-.sl-brand-logo {
-  width: 40px;
-  height: 40px;
-  border-radius: var(--r-md, 8px);
-  background: color-mix(in srgb, var(--brand, #388bfd) 15%, transparent);
-  color: var(--brand, #58a6ff);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-}
-
-.sl-brand-logo svg {
-  width: 22px;
-  height: 22px;
-}
-
-.sl-eyebrow {
+.sl-eyebrow-row {
   display: flex;
   align-items: center;
   gap: 6px;
-  font-size: 11px;
+}
+
+.sl-eyebrow-text {
+  font-size: 10px;
   color: var(--brand, #58a6ff);
-  font-weight: 700;
-  letter-spacing: 0.05em;
+  font-weight: 750;
+  letter-spacing: 0.06em;
   text-transform: uppercase;
 }
 
@@ -2280,17 +2268,44 @@ onUnmounted(() => {
   50% { opacity: 0.5; transform: scale(1.2); }
 }
 
-.sl-brand-title h1 {
-  margin: 2px 0 0;
-  font-size: 20px;
+.sl-title-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.sl-title-row h1 {
+  margin: 0;
+  font-size: 18px;
   font-weight: 750;
   color: var(--text, #f0f6fc);
+  line-height: 1.2;
+}
+
+.sl-cockpit-subtitle {
+  margin: 0;
+  font-size: 11px;
+  color: var(--muted, #8b949e);
+}
+
+.sl-cockpit-subtitle strong {
+  color: var(--text, #f0f6fc);
+  font-weight: 600;
 }
 
 .sl-cockpit-actions {
   display: flex;
   align-items: center;
   gap: 12px;
+}
+
+/* 头部按钮与其他页面驾驶舱横条对齐（32px 高度） */
+.sl-cockpit-actions .sl-btn-secondary,
+.sl-cockpit-actions .sl-btn-primary {
+  height: 32px;
+  padding: 0 12px;
+  font-size: 12px;
 }
 
 .sl-sync-status-card {

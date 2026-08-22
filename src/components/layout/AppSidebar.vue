@@ -57,7 +57,10 @@ const navItems = computed(() => [
     label: "模型反代",
     icon: icons.repeat,
     active: store.page.value === "modelproxy",
-    badge: todayProxyTokenBadge.value,
+    // 菜单徽标：反代渠道数（与页面「反代渠道」标签的计数同口径）
+    badge: proxyStatus.value?.channelsCount
+      ? String(proxyStatus.value.channelsCount)
+      : "",
     onClick: () => store.openModelProxy(),
   },
   {
@@ -98,14 +101,6 @@ const todayTokenTotal = computed(() => {
 // 徽标文案：0 不显示
 const todayTokenBadge = computed(() =>
   todayTokenTotal.value > 0 ? formatCompact(todayTokenTotal.value) : "",
-);
-
-// 模型反代今日消耗的 Token 统计（持久化日统计口径，用于侧边栏徽标，0 不显示）
-const todayProxyTokenTotal = computed(() => {
-  return proxyStatus.value?.todayTotalTokens || 0;
-});
-const todayProxyTokenBadge = computed(() =>
-  todayProxyTokenTotal.value > 0 ? formatCompact(todayProxyTokenTotal.value) : "",
 );
 
 function toggleSidebar() {

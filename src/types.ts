@@ -636,6 +636,8 @@ export interface RequestHealthSourceSummary {
 export interface RequestHealthReport {
   available: boolean;
   buckets: RequestHealthBucket[];
+  /** 反代模式：所选区间之前的历史健康桶（健康矩阵前置补位取数）；本地模式为空 */
+  precedingBuckets?: RequestHealthBucket[];
   bySource?: RequestHealthSourceSummary[];
 }
 

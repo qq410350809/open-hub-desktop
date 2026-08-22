@@ -3,7 +3,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue"
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { EChartsOption } from "../../echarts";
 import EChart from "../common/EChart.vue";
-import QuickRangeDropdown from "../common/QuickRangeDropdown.vue";
+import DateRangeDropdown from "../common/DateRangeDropdown.vue";
 import AppTable, { type AppTableColumn } from "../common/AppTable.vue";
 import { icons } from "../../icons";
 import { useStore } from "../../composables/useStore";
@@ -37,6 +37,20 @@ import { isTauri, runCommand } from "../../composables/useLibrary";
 
 const store = useStore();
 const { preferences } = usePreferences();
+
+// 全局日期范围（useTokenStats 持有）：以 computed 代理给 DateRangeDropdown 的 v-model
+const rangeFrom = computed({
+  get: () => store.tokenStatsFrom.value,
+  set: (v: string) => {
+    store.tokenStatsFrom.value = v;
+  },
+});
+const rangeTo = computed({
+  get: () => store.tokenStatsTo.value,
+  set: (v: string) => {
+    store.tokenStatsTo.value = v;
+  },
+});
 
 // —— 数据模式：本地日志采集 / 反代网关聚合 ——
 // 两种模式共用同一套聚合层与视图；切换仅替换数据源与部分文案
@@ -1012,7 +1026,12 @@ type HealthDisplayCell = {
 
 const healthBucketMap = computed(() => {
   const map = new Map<string, { dialogues: number; requests: number; success: number; failed: number; usage: number; usageEstimated: boolean }>();
-  for (const b of activeHealth.value?.buckets ?? []) {
+  // 反代模式：合并区间前历史桶（precedingBuckets），矩阵前置补位格才能取到历史数据
+  const healthBuckets = [
+    ...(activeHealth.value?.buckets ?? []),
+    ...(activeHealth.value?.precedingBuckets ?? []),
+  ];
+  for (const b of healthBuckets) {
     const { key } = bucketKeyFor(trendGranularity.value, b.hour);
     if (!key) continue;
     const cur = map.get(key) || { dialogues: 0, requests: 0, success: 0, failed: 0, usage: 0, usageEstimated: false };
@@ -1425,7 +1444,11 @@ onBeforeUnmount(() => {
 
     <!-- 标题下方的筛选工具条：日期选择 + 维度弹窗按钮 -->
     <div class="tt-filter-toolbar">
-      <QuickRangeDropdown />
+      <DateRangeDropdown
+        v-model:from="rangeFrom"
+        v-model:to="rangeTo"
+        @apply="store.onRangeChange()"
+      />
 
       <div class="tt-cockpit-pills-group">
         <button
@@ -2440,11 +2463,6 @@ onBeforeUnmount(() => {
   flex-shrink: 0;
 }
 
-/* 让 QuickRangeDropdown 在工具条中不被压缩 */
-.tt-filter-toolbar :deep(.tt-range-dd) {
-  flex-shrink: 0;
-}
-
 /* 顶部快速视角气泡群组 */
 .tt-cockpit-pills-group {
   display: inline-flex;
@@ -2491,11 +2509,6 @@ onBeforeUnmount(() => {
   height: 20px;
   background: var(--line);
   margin: 0 2px;
-  flex-shrink: 0;
-}
-
-/* 让 QuickRangeDropdown 在 cockpit-right 中不被压缩 */
-.tt-cockpit-right :deep(.tt-range-dd) {
   flex-shrink: 0;
 }
 

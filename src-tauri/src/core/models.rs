@@ -768,6 +768,8 @@ pub(crate) struct RequestHealthSourceSummary {
 pub(crate) struct RequestHealthReport {
     pub(crate) available: bool,
     pub(crate) buckets: Vec<RequestHealthBucket>,
+    /// 所选区间之前的健康桶（反代模式补偿：健康矩阵在区间起点前补位时取数；本地模式为空）
+    pub(crate) preceding_buckets: Vec<RequestHealthBucket>,
     /// 分工具汇总（便于对账；UI 可先不展示）
     pub(crate) by_source: Vec<RequestHealthSourceSummary>,
 }

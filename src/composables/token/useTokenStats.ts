@@ -125,68 +125,6 @@ async function loadTokenStats(from?: string, to?: string, refresh = false) {
   }
 }
 
-const quickRanges = [
-  { label: "今日", days: -2 },
-  { label: "昨日", days: -3 },
-  { label: "近7天", days: 7 },
-  { label: "近14天", days: 14 },
-  { label: "近30天", days: 30 },
-  { label: "近90天", days: 90 },
-  { label: "本月", days: 0 },
-  { label: "本季度", days: -4 },
-  { label: "今年", days: -5 },
-  { label: "全部", days: -1 },
-] as const;
-
-function isCurrentRange(days: number) {
-  if (days === -1) return !tokenStatsFrom.value && !tokenStatsTo.value;
-
-  const today = new Date();
-  const from = new Date(today);
-  const to = new Date(today);
-
-  if (days === -2) {
-    // 今日
-  } else if (days === -3) {
-    from.setDate(from.getDate() - 1);
-    to.setDate(to.getDate() - 1);
-  } else if (days === 0) {
-    from.setDate(1);
-  } else if (days === -4) {
-    // 本季度（季度首日至今）
-    from.setDate(1);
-    from.setMonth(Math.floor(from.getMonth() / 3) * 3);
-  } else if (days === -5) {
-    // 今年（1月1日至今）
-    from.setDate(1);
-    from.setMonth(0);
-  } else if (days === -6) {
-    // 前一天（今天 - 2 天）
-    from.setDate(from.getDate() - 2);
-    to.setDate(to.getDate() - 2);
-  } else if (days === -8) {
-    // 后一天（明天）
-    from.setDate(from.getDate() + 1);
-    to.setDate(to.getDate() + 1);
-  } else if (days === -10) {
-    // 本周（周一起至今）
-    const offset = (from.getDay() + 6) % 7;
-    from.setDate(from.getDate() - offset);
-  } else {
-    from.setDate(from.getDate() - (days - 1));
-  }
-
-  return (
-    tokenStatsFrom.value === toLocalDate(from) &&
-    tokenStatsTo.value === toLocalDate(to)
-  );
-}
-
-function applyQuickRange(days: number) {
-  setQuickRange(days);
-  void loadTokenStats();
-}
-
 function onRangeChange() {
   void loadTokenStats();
 }
@@ -362,9 +300,6 @@ export function useTokenStats() {
     localAgentPathsError,
     loadLocalAgentPaths,
     syncTokenCollector,
-    quickRanges,
-    isCurrentRange,
-    applyQuickRange,
     onRangeChange,
     refreshTokenStats,
     loadTokenStats,
@@ -374,6 +309,5 @@ export function useTokenStats() {
     refreshTokenDatabaseView,
     startTokenDatabaseRefresh,
     stopTokenDatabaseRefresh,
-    setQuickRange,
   };
 }

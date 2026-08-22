@@ -431,6 +431,7 @@ pub fn maps_to_report(
     RequestHealthReport {
         available: !buckets.is_empty(),
         buckets,
+        preceding_buckets: Vec::new(),
         by_source,
     }
 }

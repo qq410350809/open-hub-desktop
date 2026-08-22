@@ -1675,6 +1675,7 @@ mod token_snapshot_tests {
                 success: 2,
                 failed: 0,
             }],
+            ..Default::default()
         };
 
         write_token_snapshots(&database, &usage, &sessions, &health).unwrap();
