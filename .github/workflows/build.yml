@@ -1,0 +1,155 @@
+name: OpenHub Build
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      server_only:
+        description: "Build only the standalone server"
+        required: false
+        default: false
+        type: boolean
+  workflow_call:
+    inputs:
+      server_only:
+        description: "Build only the standalone server"
+        required: false
+        default: false
+        type: boolean
+      ref:
+        description: "Git ref to build"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS Intel
+            label: macos-x64
+            runner: macos-13
+          - name: macOS Apple Silicon
+            label: macos-arm64
+            runner: macos-14
+          - name: Windows x64
+            label: windows-x64
+            runner: windows-latest
+          - name: Linux x64
+            label: linux-x64
+            runner: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            rpm \
+            file
+
+      - name: Install JavaScript dependencies
+        run: npm ci
+
+      - name: Check project version
+        env:
+          RELEASE_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
+        run: npm run check:version
+
+      - name: Build frontend
+        run: npm run build
+
+      - name: Build Tauri desktop bundle
+        if: inputs.server_only != true
+        run: npm run desktop:build
+
+      - name: Build standalone server
+        shell: bash
+        run: cargo build --manifest-path src-tauri/Cargo.toml --release --no-default-features --features server --bin openhub-server
+
+      - name: Prepare artifact directory
+        shell: bash
+        env:
+          ARTIFACT_LABEL: ${{ matrix.label }}
+          SERVER_PLATFORM: ${{ runner.os == 'Windows' && 'win32' || runner.os == 'macOS' && 'darwin' || 'linux' }}
+          SERVER_ARCH: ${{ matrix.label == 'macos-arm64' && 'arm64' || matrix.label == 'macos-x64' && 'x64' || 'x64' }}
+        run: |
+          set -euo pipefail
+          mkdir -p "release-artifacts/${ARTIFACT_LABEL}"
+          if [ "${RUNNER_OS}" = "Windows" ]; then
+            cp "src-tauri/target/release/openhub-server.exe" "release-artifacts/${ARTIFACT_LABEL}/"
+          else
+            cp "src-tauri/target/release/openhub-server" "release-artifacts/${ARTIFACT_LABEL}/"
+          fi
+          cp -R dist "release-artifacts/${ARTIFACT_LABEL}/dist"
+          if [ "${RUNNER_OS}" != "Windows" ]; then
+            cp -R src-tauri/target/release/bundle/. "release-artifacts/${ARTIFACT_LABEL}/" 2>/dev/null || true
+          else
+            cp -R src-tauri/target/release/bundle/. "release-artifacts/${ARTIFACT_LABEL}/" 2>/dev/null || true
+          fi
+          npm run package:server
+
+      - name: Archive standalone server
+        shell: bash
+        env:
+          ARTIFACT_LABEL: ${{ matrix.label }}
+          SERVER_PLATFORM: ${{ runner.os == 'Windows' && 'win32' || runner.os == 'macOS' && 'darwin' || 'linux' }}
+          SERVER_ARCH: ${{ matrix.label == 'macos-arm64' && 'arm64' || matrix.label == 'macos-x64' && 'x64' || 'x64' }}
+        run: |
+          set -euo pipefail
+          package_dir="dist-server/openhub-server-${SERVER_PLATFORM}-${SERVER_ARCH}"
+          if [ "${RUNNER_OS}" = "Windows" ]; then
+            7z a "release-artifacts/${ARTIFACT_LABEL}/openhub-server-${ARTIFACT_LABEL}.zip" "${package_dir}"
+          else
+            tar -C dist-server -czf "release-artifacts/${ARTIFACT_LABEL}/openhub-server-${ARTIFACT_LABEL}.tar.gz" "openhub-server-${SERVER_PLATFORM}-${SERVER_ARCH}"
+          fi
+
+      - name: Generate checksums
+        shell: bash
+        env:
+          ARTIFACT_LABEL: ${{ matrix.label }}
+        run: |
+          set -euo pipefail
+          cd "release-artifacts/${ARTIFACT_LABEL}"
+          find . -type f ! -name '*.sha256' -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: openhub-${{ matrix.label }}
+          path: release-artifacts/${{ matrix.label }}
+          if-no-files-found: error
+          retention-days: 14

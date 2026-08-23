@@ -1,0 +1,73 @@
+name: OpenHub Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing version tag to release, for example v0.3.0"
+        required: true
+        type: string
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build release packages
+    uses: ./.github/workflows/build.yml
+    with:
+      ref: ${{ inputs.tag || github.ref }}
+    permissions:
+      contents: read
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout release ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Check tag and project version
+        env:
+          RELEASE_VERSION: ${{ inputs.tag || github.ref_name }}
+        run: node scripts/check-version.mjs
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: openhub-*
+          path: release-assets
+          merge-multiple: false
+
+      - name: Flatten release assets and generate checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-upload
+          find release-assets -type f \( 
+            -name '*.dmg' -o -name '*.msi' -o -name '*.exe' -o 
+            -name '*.AppImage' -o -name '*.deb' -o -name '*.rpm' -o 
+            -name '*.tar.gz' -o -name '*.zip' 
+          \) -exec cp {} release-upload/ \;
+          cd release-upload
+          find . -type f ! -name 'SHA256SUMS' -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS
+          ls -lah
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          name: OpenHub ${{ inputs.tag || github.ref_name }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: release-upload/*

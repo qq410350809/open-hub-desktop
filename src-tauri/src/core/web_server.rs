@@ -973,7 +973,8 @@ fn safe_join(base: &Path, relative: &str) -> Option<PathBuf> {
         .then_some(candidate)
 }
 
-#[cfg(test)]
+// 该测试组依赖 server 形态的 ServerShared 构造（desktop 形态需要 Tauri AppHandle，单测无法提供）
+#[cfg(all(test, not(feature = "desktop")))]
 mod tests {
     use super::safe_join;
     use std::path::Path;
