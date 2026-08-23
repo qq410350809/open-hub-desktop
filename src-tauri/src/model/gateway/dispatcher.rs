@@ -13,6 +13,7 @@ use bytes::Bytes;
 use serde_json::{json, Value as JsonValue};
 use std::sync::atomic::Ordering;
 use std::time::Instant;
+use tracing::warn;
 
 #[derive(Clone, Debug)]
 pub struct EgressRequestMeta {
@@ -35,6 +36,41 @@ pub struct EgressSuccess {
     pub cand_start: Instant,
     pub attempt_req_id: String,
     pub attempt_idx: usize,
+}
+
+/// 构建出网请求（含 OpenCode CLI 身份头模拟与鉴权头），供常规发送与 503 原地重试复用，
+/// 保证两次发出的请求完全一致。
+fn build_egress_request(
+    client: &reqwest::Client,
+    upstream_url: &str,
+    body: &JsonValue,
+    channel_api_key: &str,
+    is_opencode: bool,
+    attempt_req_id: &str,
+    session_seed: &str,
+) -> reqwest::RequestBuilder {
+    let mut req_builder = client
+        .post(upstream_url)
+        .header("Content-Type", "application/json")
+        .json(body);
+
+    if is_opencode {
+        // OpenCode 官方 CLI 身份与会话请求头模拟：抹平 CLI 与反代差异，享受官方正常会话配额
+        let session_id = format!("sess_{}", session_seed.replace('-', ""));
+        req_builder = req_builder
+            .header("User-Agent", "opencode/1.18.18/cli")
+            .header("x-opencode-client", "cli")
+            .header("x-opencode-session", session_id)
+            .header("x-opencode-project", "proj_openhub_gateway")
+            .header("x-opencode-request", attempt_req_id.to_string());
+    } else {
+        req_builder = req_builder.header("User-Agent", "OpenHub-Gateway/0.3.0");
+    }
+
+    if !channel_api_key.is_empty() {
+        req_builder = req_builder.header("Authorization", format!("Bearer {channel_api_key}"));
+    }
+    req_builder
 }
 
 /// 通用弹性出网请求调度引擎
@@ -75,30 +111,73 @@ pub async fn execute_resilient_egress(
         };
 
         let is_opencode = is_opencode_channel(channel) || upstream_url.contains("opencode.ai");
-        let mut req_builder = client
-            .post(upstream_url)
-            .header("Content-Type", "application/json")
-            .json(body);
 
-        if is_opencode {
-            // OpenCode 官方 CLI 身份与会话请求头模拟：抹平 CLI 与反代差异，享受官方正常会话配额
-            let session_id = format!("sess_{}", meta.req_id.replace('-', ""));
-            let project_id = "proj_openhub_gateway".to_string();
-            req_builder = req_builder
-                .header("User-Agent", "opencode/1.18.18/cli")
-                .header("x-opencode-client", "cli")
-                .header("x-opencode-session", session_id)
-                .header("x-opencode-project", project_id)
-                .header("x-opencode-request", attempt_req_id.clone());
-        } else {
-            req_builder = req_builder.header("User-Agent", "OpenHub-Gateway/0.3.0");
-        }
+        // OpenCode 渠道专属：503 时在当前节点原地重试一次（等待 1 秒）。
+        // 该次重试不受 max_retries 名额约束、不切换节点；每个候选节点各享一次机会。
+        let mut inplace_503_retried = false;
 
-        if !channel_api_key.is_empty() {
-            req_builder = req_builder.header("Authorization", format!("Bearer {channel_api_key}"));
-        }
+        // 内层循环仅在触发 503 原地重试时多转一圈，其余情况原样返回发送结果
+        let send_result = loop {
+            let result = build_egress_request(
+                &client,
+                upstream_url,
+                body,
+                channel_api_key,
+                is_opencode,
+                &attempt_req_id,
+                &meta.req_id,
+            )
+            .send()
+            .await;
 
-        match req_builder.send().await {
+            let hit_503 = matches!(
+                &result,
+                Ok(resp) if resp.status() == StatusCode::SERVICE_UNAVAILABLE
+            );
+            if !is_opencode || inplace_503_retried || !hit_503 {
+                break result;
+            }
+            inplace_503_retried = true;
+
+            let resp = match result {
+                Ok(r) => r,
+                Err(_) => unreachable!("hit_503 仅在 result 为 Ok 时成立"),
+            };
+            let err_bytes = resp.bytes().await.unwrap_or_default();
+            let err_text = String::from_utf8_lossy(&err_bytes).to_string();
+            let formatted = format_upstream_error_message(503, &err_text);
+            // last_* 不在此处更新：原地重试的结果必然进入下方常规分支并统一赋值；
+            // 仅保留错误体快照，供重试本身也网络失败的极端场景兜底返回
+            last_err_bytes = err_bytes.clone();
+
+            record_attempt_failure(
+                ctx,
+                ProxyLogParams::new_failure(
+                    attempt_req_id.clone(),
+                    meta.path.clone(),
+                    meta.channel_id.clone(),
+                    meta.model.clone(),
+                    meta.stream,
+                    503,
+                    cand_start.elapsed().as_millis() as u64,
+                    Some(format!(
+                        "OpenCode 上游 503，1 秒后在当前节点原地重试（不占重试名额）: {formatted}"
+                    )),
+                    meta.req_body_str.clone(),
+                    Some(node_display.clone()),
+                )
+                .with_channel_stats_id(meta.channel_stats_id.clone())
+                .with_response_body(cap_log_body(err_text)),
+            )
+            .await;
+
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            warn!(
+                "[ModelGateway] OpenCode 上游 503，节点 {node_display} 1 秒后原地重试"
+            );
+        };
+
+        match send_result {
             Ok(resp) => {
                 let status = resp.status();
                 if status.is_success() {

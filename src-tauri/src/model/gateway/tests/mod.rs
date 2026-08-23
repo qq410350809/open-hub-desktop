@@ -870,3 +870,178 @@ fn legacy_config_json_without_stats_id_still_parses() {
     assert_eq!(cfg.next_channel_stats_id, 101);
     assert_eq!(cfg.channels[0].stats_key(), "old-alias");
 }
+
+// ---------------------------------------------------------------------------
+// OpenCode 503 同节点原地重试（不受 max_retries 名额约束）
+// ---------------------------------------------------------------------------
+
+/// 启动一个计数型本地 mock 上游，返回其地址与请求计数器
+async fn spawn_counting_upstream(
+    always_503: bool,
+) -> (std::net::SocketAddr, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use axum::{routing::post, Router};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let counter = Arc::new(AtomicUsize::new(0));
+    let counter_for_route = counter.clone();
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(move || {
+            let counter = counter_for_route.clone();
+            async move {
+                let n = counter.fetch_add(1, Ordering::SeqCst);
+                if !always_503 && n > 0 {
+                    (
+                        axum::http::StatusCode::OK,
+                        axum::Json(json!({ "choices": [], "usage": {} })),
+                    )
+                } else {
+                    (
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                        axum::Json(json!({ "error": { "message": "upstream unavailable" } })),
+                    )
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (addr, counter)
+}
+
+fn egress_test_channel(id: &str, base_url: String) -> ChannelConfig {
+    ChannelConfig {
+        id: id.to_string(),
+        name: id.to_string(),
+        description: String::new(),
+        enabled: true,
+        protocol: "openai".to_string(),
+        base_url,
+        api_key: String::new(),
+        api_keys: None,
+        // 直连：避免单测触碰代理池运行时
+        use_proxy_pool: false,
+        alias: None,
+        site_id: None,
+        use_fixed_proxy: false,
+        fixed_proxy_node: None,
+        priority: None,
+        weight: None,
+        enabled_models: None,
+        model_redirects: None,
+        rate_limit_rpm: None,
+        stats_id: None,
+    }
+}
+
+async fn run_egress(
+    channel: &ChannelConfig,
+    max_retries: u32,
+) -> Result<EgressSuccess, axum::response::Response> {
+    use std::sync::atomic::Ordering;
+    let state = ModelProxyState::new_with_app(None);
+    let ctx = &state.context;
+    ctx.route_enabled.store(true, Ordering::Release);
+    let config = ModelProxyConfig {
+        enabled: true,
+        max_retries,
+        ..ModelProxyConfig::default()
+    };
+    let upstream_url = format!("{}/chat/completions", channel.base_url.trim_end_matches('/'));
+    let meta = EgressRequestMeta {
+        req_id: "req_503test".to_string(),
+        path: "/v1/chat/completions".to_string(),
+        channel_id: channel.id.clone(),
+        channel_stats_id: None,
+        model: "deepseek-v4-flash-free".to_string(),
+        stream: false,
+        req_body_str: None,
+    };
+    execute_resilient_egress(
+        ctx,
+        channel,
+        &config,
+        meta,
+        &upstream_url,
+        "",
+        &json!({ "model": "deepseek-v4-flash-free" }),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn opencode_503_retries_inplace_once_then_succeeds_without_consuming_retry_budget() {
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+
+    // max_retries=0：常规预算只有 1 次尝试，503 原地重试必须独立于该预算生效
+    let (addr, counter) = spawn_counting_upstream(false).await;
+    let channel = egress_test_channel("opencode", format!("http://{addr}/v1"));
+
+    let started = Instant::now();
+    let success = run_egress(&channel, 0)
+        .await
+        .expect("首次 503 后原地重试应成功");
+    let elapsed = started.elapsed();
+
+    assert_eq!(success.status, 200);
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        2,
+        "同一节点应恰好发送 2 次（首次 + 原地重试），且不切换节点"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(1000),
+        "原地重试前必须等待 1 秒"
+    );
+    assert!(elapsed < Duration::from_millis(3000));
+}
+
+#[tokio::test]
+async fn opencode_persistent_503_gets_one_inplace_retry_per_node_before_switching() {
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+
+    // max_retries=1：两轮尝试（两个候选位），每轮各享一次免费原地重试 → 共 4 次请求
+    let (addr, counter) = spawn_counting_upstream(true).await;
+    let channel = egress_test_channel("opencode", format!("http://{addr}/v1"));
+
+    let started = Instant::now();
+    let result = run_egress(&channel, 1).await;
+
+    assert!(result.is_err(), "持续 503 最终必须返回错误");
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        4,
+        "每轮尝试应含一次 503 原地重试（2 轮 × 2 次），随后才切换节点"
+    );
+    assert!(started.elapsed() >= Duration::from_millis(2000));
+}
+
+#[tokio::test]
+async fn non_opencode_channel_does_not_inplace_retry_on_503() {
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+
+    // 非 OpenCode 渠道：503 直接走常规分支切节点，不做同节点原地重试
+    let (addr, counter) = spawn_counting_upstream(true).await;
+    let channel = egress_test_channel("plain-upstream", format!("http://{addr}/v1"));
+
+    let started = Instant::now();
+    let result = run_egress(&channel, 1).await;
+
+    assert!(result.is_err());
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        2,
+        "无原地重试：仅按 max_retries 预算发送（1+1 次）"
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(900),
+        "不应出现 1 秒原地重试等待"
+    );
+}
