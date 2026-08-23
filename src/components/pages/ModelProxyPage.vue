@@ -1717,38 +1717,38 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
               </button>
             </div>
 
-            <!-- Gemini Base URL (v1) -->
+            <!-- Gemini (兼容入口 v1 / 原生 SDK v1beta) -->
             <div class="mp-endpoint-row mp-epr-cell">
               <div class="mp-epr-label">
                 <span class="mp-proto-badge is-gemini">Gemini</span>
-                <span>Base URL (v1)</span>
+                <span>Base URL</span>
               </div>
-              <code class="mp-epr-code font-mono" :title="geminiV1Url">{{ stripOrigin(geminiV1Url) }}</code>
-              <button
-                type="button"
-                class="mp-action-btn mp-btn-icon-only"
-                title="复制 Google Gemini v1 Base URL"
-                @click="copyGeminiUrl"
-              >
-                <span v-html="icons.copy" />
-              </button>
-            </div>
-
-            <!-- Gemini Base URL (v1beta) -->
-            <div class="mp-endpoint-row mp-epr-cell">
-              <div class="mp-epr-label">
-                <span class="mp-proto-badge is-gemini">Gemini</span>
-                <span>Base URL (v1beta)</span>
+              <div class="mp-gemini-dual">
+                <div class="mp-gemini-item">
+                  <code class="mp-epr-code font-mono" :title="geminiV1Url">{{ stripOrigin(geminiV1Url) }}</code>
+                  <button
+                    type="button"
+                    class="mp-action-btn mp-btn-icon-only"
+                    title="复制 Gemini 兼容入口 Base URL (/v1/gemini)"
+                    @click="copyGeminiUrl"
+                  >
+                    <span v-html="icons.copy" />
+                  </button>
+                  <span class="mp-gemini-tag">兼容入口</span>
+                </div>
+                <div class="mp-gemini-item">
+                  <code class="mp-epr-code font-mono" :title="geminiV1BetaUrl">{{ stripOrigin(geminiV1BetaUrl) }}</code>
+                  <button
+                    type="button"
+                    class="mp-action-btn mp-btn-icon-only"
+                    title="复制 Google Gemini 原生 SDK Base URL (/v1beta)"
+                    @click="copyGeminiV1BetaUrl"
+                  >
+                    <span v-html="icons.copy" />
+                  </button>
+                  <span class="mp-gemini-tag">原生 SDK</span>
+                </div>
               </div>
-              <code class="mp-epr-code font-mono" :title="geminiV1BetaUrl">{{ stripOrigin(geminiV1BetaUrl) }}</code>
-              <button
-                type="button"
-                class="mp-action-btn mp-btn-icon-only"
-                title="复制 Google Gemini v1beta Base URL (原生 SDK 使用)"
-                @click="copyGeminiV1BetaUrl"
-              >
-                <span v-html="icons.copy" />
-              </button>
             </div>
           </div>
         </div>
@@ -4344,6 +4344,42 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
 
 .mp-epr-cell .mp-epr-code {
   font-size: 12px;
+}
+
+/* Gemini 合并行：双版本并排 */
+.mp-gemini-dual {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 1;
+  min-width: 0;
+}
+
+.mp-gemini-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1;
+  min-width: 0;
+}
+
+.mp-gemini-item .mp-epr-code {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mp-gemini-tag {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--muted);
+  background: var(--bg-soft);
+  padding: 1px 5px;
+  border-radius: 3px;
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 
 @media (max-width: 1080px) {

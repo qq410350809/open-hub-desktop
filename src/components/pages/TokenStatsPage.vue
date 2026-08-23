@@ -983,9 +983,10 @@ const trendDetailList = computed(() =>
 );
 
 // —— 健康时间线网格测量 ——
-const HEALTH_ROWS = 8;
-const HEALTH_CELL = 12;
-const HEALTH_GAP = 3;
+// 六行排列；HEALTH_CELL 为单列目标宽度，值越大列越少、方块越宽；HEALTH_GAP 与 CSS column-gap 保持一致
+const HEALTH_ROWS = 6;
+const HEALTH_CELL = 16;
+const HEALTH_GAP = 4;
 const healthGridRef = ref<HTMLElement | null>(null);
 const healthCols = ref(24);
 let healthRo: ResizeObserver | null = null;
@@ -2955,8 +2956,8 @@ onBeforeUnmount(() => {
   display: grid;
   grid-auto-flow: column;
   grid-auto-columns: minmax(0, 1fr);
-  column-gap: 3px;
-  row-gap: 4px;
+  column-gap: 4px;
+  row-gap: 5px;
   width: 100%;
   flex: 1;
   min-height: 0;
@@ -2966,7 +2967,7 @@ onBeforeUnmount(() => {
 .tt-health-cell {
   width: 100%;
   height: 100%;
-  border-radius: 2.5px;
+  border-radius: 3.5px;
   transition: transform 0.1s ease, box-shadow 0.1s ease;
 }
 .tt-health-cell:hover {

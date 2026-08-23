@@ -414,7 +414,7 @@ onUnmounted(() => {
           <div class="cm-stat-header">
             <span class="cm-stat-tag is-orange">
               <span v-html="icons.flame" />
-              <span>TODAY'S POSTS</span>
+              <span>今日新帖</span>
             </span>
             <span class="cm-stat-pill is-orange">近 24 小时</span>
           </div>

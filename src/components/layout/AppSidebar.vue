@@ -118,11 +118,9 @@ const todayTokenBadge = computed(() =>
   todayTokenTotal.value > 0 ? formatCompact(todayTokenTotal.value) : "",
 );
 
-// 今天反代网关转发的 token 数（后端单行聚合，用于「网关统计」菜单徽标）
+// 今天反代网关转发的 token 数（后端单行聚合，用于「网关统计」菜单徽标；无数据时显示 0）
 const gatewayTokenBadge = computed(() =>
-  (proxyStatus.value?.todayTotalTokens ?? 0) > 0
-    ? formatCompact(proxyStatus.value.todayTotalTokens)
-    : "",
+  formatCompact(proxyStatus.value?.todayTotalTokens ?? 0),
 );
 
 function toggleSidebar() {
