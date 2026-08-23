@@ -185,7 +185,9 @@ pub async fn refresh_proxy_subscription(
             let client = build_http_client(&database, Duration::from_secs(30), 5, "代理订阅请求")?;
             let response = client
                 .get(&source)
-                .header("User-Agent", "OpenHub/0.3 ProxyPool")
+                // 部分订阅服务按 UA 区分客户端，非 Clash UA 会被拒绝（HTTP 404）。
+                // 这里伪装成 Clash 内核 UA，确保能拉取到 Clash YAML / Base64 订阅内容。
+                .header("User-Agent", "clash-verge/v2.2.3")
                 .send()
                 .await
                 .map_err(|error| format!("获取订阅失败：{error}"))?;
