@@ -1,5 +1,16 @@
 use super::types::{default_channels, ChannelConfig, ModelProxyConfig, OpencodeProxyConfig};
+use getrandom::fill as fill_random;
 use rusqlite::Connection;
+
+fn ensure_gateway_api_key(config: &mut ModelProxyConfig) {
+    if !config.api_key.trim().is_empty() {
+        return;
+    }
+    let mut bytes = [0u8; 24];
+    if fill_random(&mut bytes).is_ok() {
+        config.api_key = format!("sk-openhub-{}", hex::encode(bytes));
+    }
+}
 
 pub fn sanitize_channel_config(channel: &mut ChannelConfig) {
     if let Some(alias) = &channel.alias {
@@ -16,6 +27,8 @@ pub fn sanitize_channel_config(channel: &mut ChannelConfig) {
 const VALID_CHANNEL_PROTOCOLS: [&str; 4] = ["openai", "openai-responses", "anthropic", "gemini"];
 
 pub fn sanitize_model_proxy_config(config: &mut ModelProxyConfig) {
+    ensure_gateway_api_key(config);
+    config.listen_host = "127.0.0.1".to_string();
     if config.channels.is_empty() {
         config.channels = default_channels();
     }
@@ -65,10 +78,17 @@ pub fn sanitize_model_proxy_config(config: &mut ModelProxyConfig) {
 pub fn load_model_proxy_config(conn: &Connection) -> ModelProxyConfig {
     let raw = crate::db::read_meta_conn(conn, "opencode_proxy_config").unwrap_or_default();
 
-    let mut cfg = serde_json::from_str::<ModelProxyConfig>(&raw)
-        .unwrap_or_default();
+    let had_api_key = serde_json::from_str::<ModelProxyConfig>(&raw)
+        .ok()
+        .is_some_and(|config| !config.api_key.trim().is_empty());
+    let mut cfg = serde_json::from_str::<ModelProxyConfig>(&raw).unwrap_or_default();
 
     sanitize_model_proxy_config(&mut cfg);
+    if !had_api_key {
+        if let Ok(serialized) = serde_json::to_string(&cfg) {
+            let _ = crate::db::write_meta(conn, "opencode_proxy_config", &serialized);
+        }
+    }
     cfg
 }
 
@@ -80,8 +100,7 @@ pub fn load_opencode_proxy_config(conn: &Connection) -> OpencodeProxyConfig {
 pub fn save_model_proxy_config(conn: &Connection, config: &ModelProxyConfig) -> Result<(), String> {
     let mut c = config.clone();
     sanitize_model_proxy_config(&mut c);
-    let json_str =
-        serde_json::to_string(&c).map_err(|e| format!("序列化模型网关配置失败: {e}"))?;
+    let json_str = serde_json::to_string(&c).map_err(|e| format!("序列化模型网关配置失败: {e}"))?;
     crate::db::write_meta(conn, "opencode_proxy_config", &json_str)
 }
 

@@ -7,10 +7,10 @@
 //! OpenHub，先杀掉旧实例再继续，保证新启动的一定是最新构建、独占端口。
 //! 旧进程崩溃留下的死锁会在下次启动被 `ps` 校验识破并覆盖，无需额外清理。
 
-use tracing::info;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
+use tracing::info;
 
 const LOCK_FILENAME: &str = "openhub.pid";
 

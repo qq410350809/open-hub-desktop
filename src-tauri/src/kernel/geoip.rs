@@ -3,12 +3,13 @@ use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::context::{AppContext, Managed};
 use crate::kernel::{download_bytes_with_dynamic_racing, get_app_bin_dir};
 
-const GEOIP_PRIMARY_URL: &str = "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/country.mmdb";
+const GEOIP_PRIMARY_URL: &str =
+    "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/country.mmdb";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -71,11 +72,19 @@ fn geoip_status_from_path(target_path: &PathBuf) -> GeoipStatus {
     }
 }
 
+pub async fn get_geoip_status_impl(ctx: &Arc<AppContext>) -> Result<GeoipStatus, String> {
+    Ok(geoip_status_from_path(&get_app_geoip_path(ctx)))
+}
+
 #[cfg_attr(feature = "desktop", tauri::command)]
-pub async fn get_geoip_status(
-    ctx: Managed<'_, Arc<AppContext>>,
-) -> Result<GeoipStatus, String> {
-    Ok(geoip_status_from_path(&get_app_geoip_path(&ctx)))
+pub async fn get_geoip_status(ctx: Managed<'_, Arc<AppContext>>) -> Result<GeoipStatus, String> {
+    get_geoip_status_impl(&ctx).await
+}
+
+static GEOIP_DOWNLOAD_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+
+fn geoip_download_lock() -> &'static tokio::sync::Mutex<()> {
+    GEOIP_DOWNLOAD_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
 /// 下载并更新 GeoIP 数据库；完成后基于新库修复已有节点的国家/地区映射。
@@ -86,6 +95,7 @@ pub async fn download_or_update_geoip_inner(
     proxy_runtime: Option<&crate::proxypool::ProxyRuntime>,
     mirror: Option<String>,
 ) -> Result<GeoipStatus, String> {
+    let _download_guard = geoip_download_lock().lock().await;
     let bus = ctx.event_bus.clone();
     let emit_progress = |stage: &str, progress: f64, message: &str| {
         bus.emit(
@@ -110,7 +120,8 @@ pub async fn download_or_update_geoip_inner(
         &bus,
         "geoip-download-progress",
         "GeoIP 数据库",
-    ).await?;
+    )
+    .await?;
 
     emit_progress("verifying", 0.92, "正在校验 GeoIP MMDB 数据库有效性…");
 
@@ -119,12 +130,26 @@ pub async fn download_or_update_geoip_inner(
         .map_err(|e| format!("校验下载的 GeoIP 数据库格式失败：{e}"))?;
 
     // 写入临时文件并原子覆盖
-    let mut temp_file = File::create(&temp_download_path).map_err(|e| format!("创建临时文件失败：{e}"))?;
-    temp_file.write_all(&mmdb_bytes).map_err(|e| format!("写入 GeoIP 数据库失败：{e}"))?;
+    let mut temp_file =
+        File::create(&temp_download_path).map_err(|e| format!("创建临时文件失败：{e}"))?;
+    temp_file
+        .write_all(&mmdb_bytes)
+        .map_err(|e| format!("写入 GeoIP 数据库失败：{e}"))?;
     drop(temp_file);
 
-    let _ = fs::remove_file(&target_path);
-    fs::rename(&temp_download_path, &target_path).map_err(|e| format!("保存 GeoIP 数据库失败：{e}"))?;
+    let backup_path = target_path.with_extension("bak");
+    let _ = fs::remove_file(&backup_path);
+    if target_path.is_file() {
+        fs::rename(&target_path, &backup_path)
+            .map_err(|e| format!("暂存旧版 GeoIP 数据库失败：{e}"))?;
+    }
+    if let Err(error) = fs::rename(&temp_download_path, &target_path) {
+        if backup_path.is_file() {
+            let _ = fs::rename(&backup_path, &target_path);
+        }
+        return Err(format!("保存 GeoIP 数据库失败：{error}"));
+    }
+    let _ = fs::remove_file(&backup_path);
 
     // 如果 bin 目录存在，也同步备份一份到 bin/ 目录
     let bin_dir = get_app_bin_dir(ctx);
@@ -146,5 +171,6 @@ pub async fn download_or_update_geoip(
     ctx: Managed<'_, Arc<AppContext>>,
     mirror: Option<String>,
 ) -> Result<GeoipStatus, String> {
-    download_or_update_geoip_inner(&ctx, Some(&ctx.database), Some(&ctx.proxy_runtime), mirror).await
+    download_or_update_geoip_inner(&ctx, Some(&ctx.database), Some(&ctx.proxy_runtime), mirror)
+        .await
 }

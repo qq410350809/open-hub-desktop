@@ -1,13 +1,12 @@
 import { ref, computed } from "vue";
-import { runCommand } from "../core/ipc";
+import { isTauri, runCommand } from "../core/ipc";
 import { useToast } from "../core/useToast";
 import {
-  DEFAULT_PROXY_PORT,
+  API_PATH_V1,
+  API_PATH_RESPONSES,
+  API_PATH_GEMINI,
+  API_PATH_MESSAGES,
   OPENCODE_UPSTREAM_URL,
-  buildProxyBaseUrl,
-  buildProxyResponsesUrl,
-  buildProxyGeminiUrl,
-  buildProxyMessagesUrl,
 } from "../../constants";
 import type {
   ChannelConfig,
@@ -20,6 +19,16 @@ import type {
 } from "./types";
 
 export * from "./types";
+
+/**
+ * 模型 API Origin：桌面端访问本机内嵌服务（实际端口来自后端状态），
+ * 浏览器/瘦客户端与 Web 服务同源。
+ */
+function modelApiOrigin(): string {
+  return isTauri
+    ? `http://127.0.0.1:${proxyStatus.value.port || 17896}`
+    : window.location.origin;
+}
 
 export function channelAlias(channel: ChannelConfig | null | undefined): string {
   const a = channel?.alias?.trim().toLowerCase();
@@ -70,7 +79,8 @@ export function isValidChannelAlias(alias: string): boolean {
 
 export const proxyConfig = ref<OpencodeProxyConfig>({
   enabled: true,
-  port: DEFAULT_PROXY_PORT,
+  listenHost: "127.0.0.1",
+  port: 17896,
   apiKey: "",
   channels: [
     {
@@ -94,8 +104,8 @@ export const proxyConfig = ref<OpencodeProxyConfig>({
 
 export const proxyStatus = ref<OpencodeProxyStatus>({
   running: false,
-  port: DEFAULT_PROXY_PORT,
-  url: buildProxyBaseUrl(DEFAULT_PROXY_PORT),
+  port: 17896,
+  url: "http://127.0.0.1:17896/v1",
   totalRequests: 0,
   successfulRequests: 0,
   failedRequests: 0,
@@ -240,6 +250,7 @@ export function useModelProxy() {
       // 明细保留天数：空值归一为 0（= 永久保留），避免空串破坏后端反序列化
       const normalized: OpencodeProxyConfig = {
         ...newConfig,
+        listenHost: newConfig.listenHost?.trim() || "127.0.0.1",
         logRetentionDays: Number(newConfig.logRetentionDays ?? 0) || 0,
       };
       const status = await runCommand<OpencodeProxyStatus>("save_opencode_proxy_config_cmd", {
@@ -510,7 +521,7 @@ export function useModelProxy() {
 
   async function copyProxyUrl(alias?: any) {
     const aliasStr = typeof alias === "string" ? alias : undefined;
-    const base = buildProxyBaseUrl(proxyStatus.value.port);
+    const base = `${modelApiOrigin()}${API_PATH_V1}`;
     const text = aliasStr ? `${base.replace(/\/+$/, "")}/${aliasStr}` : base;
     try {
       await navigator.clipboard.writeText(text);
@@ -522,7 +533,7 @@ export function useModelProxy() {
 
   async function copyResponsesUrl(alias?: any) {
     const aliasStr = typeof alias === "string" ? alias : undefined;
-    const base = buildProxyResponsesUrl(proxyStatus.value.port);
+    const base = `${modelApiOrigin()}${API_PATH_RESPONSES}`;
     const text = aliasStr ? `${base.replace(/\/+$/, "")}/${aliasStr}` : base;
     try {
       await navigator.clipboard.writeText(text);
@@ -534,7 +545,7 @@ export function useModelProxy() {
 
   async function copyGeminiUrl(alias?: any) {
     const aliasStr = typeof alias === "string" ? alias : undefined;
-    const base = buildProxyGeminiUrl(proxyStatus.value.port);
+    const base = `${modelApiOrigin()}${API_PATH_GEMINI}`;
     const text = aliasStr ? `${base.replace(/\/+$/, "")}/${aliasStr}` : base;
     try {
       await navigator.clipboard.writeText(text);
@@ -544,9 +555,21 @@ export function useModelProxy() {
     }
   }
 
+  async function copyGeminiV1BetaUrl(alias?: any) {
+    const aliasStr = typeof alias === "string" ? alias : undefined;
+    const base = `${modelApiOrigin()}/v1beta`;
+    const text = aliasStr ? `${base.replace(/\/+$/, "")}/${aliasStr}` : base;
+    try {
+      await navigator.clipboard.writeText(text);
+      showToast(`Gemini v1beta Base URL 已复制: ${text}`);
+    } catch {
+      showToast("复制失败，请手动复制", true);
+    }
+  }
+
   async function copyClaudeUrl(alias?: any) {
     const aliasStr = typeof alias === "string" ? alias : undefined;
-    const base = buildProxyMessagesUrl(proxyStatus.value.port);
+    const base = `${modelApiOrigin()}${API_PATH_MESSAGES}`;
     const text = aliasStr ? `${base.replace(/\/+$/, "")}/${aliasStr}` : base;
     try {
       await navigator.clipboard.writeText(text);
@@ -559,7 +582,7 @@ export function useModelProxy() {
   async function copyProxyKey() {
     const key = proxyConfig.value.apiKey?.trim() || "";
     if (!key) {
-      showToast("当前未配置访问密钥（免密直连）");
+      showToast("模型接口 API Key 由服务自动管理");
       return;
     }
     try {
@@ -620,6 +643,7 @@ export function useModelProxy() {
     copyProxyUrl,
     copyResponsesUrl,
     copyGeminiUrl,
+    copyGeminiV1BetaUrl,
     copyClaudeUrl,
     copyProxyKey,
   };

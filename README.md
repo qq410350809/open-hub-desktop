@@ -1,27 +1,31 @@
 # OpenHub
 
-使用 Tauri 2 + Vue 3 + SQLite 构建的本地站点资料库，支持「桌面壳」与「单文件 Web 服务」双形态。
+使用 Tauri 2 + Vue 3 + SQLite 构建的本地站点资料库，支持一体式桌面客户端与独立 Web 服务。瘦客户端的双通道运行时已经在前端协议层就绪：远程业务走 HTTP RPC/SSE，本地 Token 统计走客户端 IPC；独立瘦客户端壳和物理 LocalTokenStore 拆分仍属于后续发布阶段。
 
-## 产品定位
+## 产品与数据边界
 
-这不是线上网站套壳，也不是远程服务状态导航。应用启动后直接进入本地资料库，站点记录只保存在当前设备（或你自托管的服务上）。
+OpenHub 有两套互不默认合并的数据平面：
+
+- **本地终端 Token**：读取当前客户端所在设备上的 Claude、Codex、Cursor、Cline、Continue 等 AI 工具日志，仅在客户端本地展示，永不上传到 Web 服务；直连第三方的 AI 终端只能通过这套本地日志统计。
+- **反代网关 Token**：只统计经过 OpenHub 模型网关的请求，由服务端保存并通过桌面端、瘦客户端和浏览器展示。它不覆盖终端绕过 OpenHub 的直连流量，也不与本地终端统计自动相加。
+
+独立 Web 浏览器只能访问服务端数据平面。Web 服务不会读取访问者本机的 AI 日志、Chrome Profile、Cookie、桌面文件或系统字体。
 
 ## 双形态架构
 
 ```
-┌────────────────────────────────────────────┐
-│ 壳（Tauri 桌面）                            │
-│ 窗口/托盘/菜单 → 加载内嵌 HTTP 服务           │
-└──────────────┬─────────────────────────────┘
-               │ RPC + SSE（与浏览器完全同构）
-┌──────────────▼─────────────────────────────┐
-│ openhub-server 单文件跨平台服务              │
-│  /            静态 dist + SPA fallback      │
-│  /api/rpc     全量命令（与桌面 IPC 同名）     │
-│  /api/events  SSE 事件总线                   │
-│  /api/caps    能力协商（本机功能自动降级）     │
-│  /v1/*        模型网关反代                   │
-└────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────┐
+│ 一体式桌面客户端                                         │
+│ 本地业务内核 + 本地终端 Token + Chrome + 网关 + Tauri IPC │
+└──────────────────────────────────────────────────────────┘
+
+┌──────────────────────┐       HTTP RPC + SSE       ┌──────────────────────┐
+│ 瘦客户端（双通道）   │ ─────────────────────────▶ │ openhub-server       │
+│ 本地 Token → IPC     │                            │ Web UI + 反代统计    │
+│ 远程业务 → HTTP      │                            │ 站点/代理/模型网关    │
+└──────────────────────┘                            └──────────────────────┘
+
+独立浏览器直接访问 openhub-server 时，只使用右侧服务端能力。
 ```
 
 - **桌面形态**（默认）：`npm run desktop:build`，体验与常规桌面应用一致；
@@ -30,14 +34,24 @@
   可部署到本机、NAS 或 VPS：
 
 ```bash
-openhub-server --listen 17896                       # 本机回环，无鉴权
-openhub-server --host-all --listen 17896 --token <t> # 对外服务（务必配令牌）
+# 服务端 API/UI：默认回环监听 17896；打开 Web 页面后登录
+openhub-server --listen 17896
+
+# 对外监听仍要求登录会话
+openhub-server --host-all --listen 17896
+
+# 也可以显式指定监听地址（IPv6 使用方括号）
+openhub-server --listen 192.0.2.10:17896
+openhub-server --listen "[::1]:17896"
+
 openhub-server --data-dir ~/openhub-data --help      # 查看全部参数
 ```
 
-浏览器访问 `http://<host>:<port>/?token=<t>` 即可使用完整界面。
-Chrome 会话同步、Token 本地日志解析等「依赖用户本机文件」的能力，
-会按 `/api/caps` 探测结果自动降级隐藏。
+浏览器访问 `http://<host>:<port>/` 使用服务端界面，登录成功后 Session 会保存在浏览器本地，默认有效期 7 天。所有 Web RPC 和事件流请求都必须携带有效登录 Session。
+
+服务端模型接口与 Web UI/API 共享 `openhub-server` 的监听端口。Web UI 和 `/api/*` 使用登录 Session；`/v1/*` 与 `/v1beta/*` 使用独立模型 API Key。API Key 只能通过请求头发送，不支持 URL 查询参数。
+
+Chrome 会话同步、本地终端 Token 日志等依赖客户端本机文件的能力不会通过 `/api/rpc` 暴露；`/api/caps` 对 Web 固定返回这些能力为关闭。
 
 ## 核心功能
 
@@ -79,10 +93,13 @@ Chrome 会话同步、Token 本地日志解析等「依赖用户本机文件」�
 - 代理池状态联动
 
 ### Token 统计
-- 多工具本地日志解析
-- 会话/对话/请求三级统计
-- 按模型/来源维度分析
-- 成本估算与效率指标
+
+页面提供两个明确的数据来源标签：
+
+- **本地终端**：当前客户端本机 AI 工具日志与本地 SQLite 快照；一体式客户端和瘦客户端可用，独立 Web 不可用。
+- **反代网关**：OpenHub 模型网关请求明细与日/小时聚合；桌面端、瘦客户端和独立 Web 均可用。
+
+两套数据源共用展示组件，但不共用采集任务，不默认相加，也不把同一终端经网关转发时产生的两份记录强行去重。
 
 ### 界面特性
 - 明暗主题切换
@@ -112,8 +129,7 @@ Chrome 会话同步、Token 本地日志解析等「依赖用户本机文件」�
 - **压缩**: zstd 0.13
 
 ### 系统集成
-- **内核**: Mihomo (代理核心)
-- **地理数据库**: MaxMind GeoIP
+- **系统集成**: Mihomo 代理内核和 GeoIP 数据库采用首次使用时按需下载，不随安装包内置；
 - **文件对话框**: rfd 0.17
 - **字体检测**: font-kit 0.14
 
@@ -196,20 +212,30 @@ macOS 通常位于：
 ### 安装依赖
 
 ```bash
-npm install
+npm ci
 ```
 
-### 开发模式
+开发环境也可以使用 `npm install`，但 CI 和发布构建必须使用已提交的 `package-lock.json` 执行 `npm ci`。
+
+### 一体式客户端开发
+
+调试完整的一体式 Tauri 客户端请使用：
 
 ```bash
-npm run desktop
+npm run integrated:dev
 ```
+
+该命令启动默认的 `open-hub-desktop` 二进制，包含本地 SQLite、Tauri IPC、本地 Token 日志采集、模型网关和内嵌 HTTP 服务。首次启动时 Mihomo 和 GeoIP 会通过组件初始化引导按需下载。
+
+`npm run desktop` 仍然保留为兼容别名，效果相同。
 
 ### 构建应用
 
 ```bash
-npm run desktop:build
+npm run integrated:build
 ```
+
+`npm run desktop:build` 仍然保留为兼容别名。
 
 构建产物位于：
 
@@ -224,7 +250,37 @@ npm run clean:target      # 清理旧二进制和增量缓存
 npm run clean:deep        # 深度清理（包括 .o 文件）
 ```
 
-## 快捷键
+## GitHub Actions 自动打包
+
+仓库包含两条发布工作流：
+
+- `.github/workflows/build.yml`：推送到 `main`、创建 Pull Request 或手动运行时，在原生 runner 上构建 macOS Intel、macOS Apple Silicon、Windows x64 和 Linux x64 产物，并上传 GitHub Actions artifact。
+- `.github/workflows/release.yml`：推送 `v0.3.0` 形式的版本标签时，复用同一套矩阵构建并创建 GitHub Release；也可以通过 Actions 页面手动指定已有 tag。
+
+每个平台会生成：
+
+- Tauri 桌面安装包（macOS `.dmg`、Windows `.msi`/NSIS、Linux `.AppImage`/`.deb`/`.rpm`，以 runner 实际生成结果为准）；
+- `openhub-server` 与同目录 `dist/` 前端资源的压缩包；
+- `SHA256SUMS` 校验文件。
+
+发布前请先把 `package.json`、`src-tauri/Cargo.toml` 和 `src-tauri/tauri.conf.json` 的版本统一，再创建 tag：
+
+```bash
+npm run check:version
+git tag v0.3.0
+git push origin v0.3.0
+```
+
+工作流不会把 Mihomo 或 GeoIP 二进制资源写入安装包。首次打开时由组件初始化引导按当前平台和架构按需下载；组件版本和下载地址由 Rust 运行时管理，更新失败不会影响主程序启动。
+
+当前发布包仍使用开发/未签名策略：macOS 为 ad-hoc 签名，Windows 未配置 Authenticode，Linux 包未签名。公开分发前应在 GitHub Secrets 中配置 Apple Developer ID/公证凭据和 Windows 代码签名证书，并在工作流中启用对应签名步骤。当前没有启用 Tauri updater，因此不需要 updater 私钥。
+
+## 独立 server 包
+
+`openhub-server` 包不是把 Web 页面嵌入二进制，而是和 sibling `dist/` 目录一起发布。解压后应在包含 `dist/` 的目录运行二进制，或通过 `--dist-dir` 指定前端目录。
+
+独立 server 默认启动登录门禁；对外监听与回环监听都必须使用有效登录会话，Session 默认有效期 7 天。
+
 
 | 快捷键 | 功能 |
 |--------|------|
@@ -302,19 +358,9 @@ npm run clean:deep        # 深度清理（包括 .o 文件）
 
 ## 资源文件
 
-应用内置以下资源：
-- Mihomo 内核二进制
-- GeoIP 数据库 (Country.mmdb)
-- 本地化资源 (zh-Hans.lproj)
+安装包只内置本地化资源。Mihomo 代理内核和 GeoIP 数据库在首次打开时由组件初始化引导按当前平台和架构按需下载，安装后保存在应用数据目录的 `bin/` 与 `Country.mmdb` 路径中，不进入源码仓库和安装包。
 
-首次启动时会自动释放到应用数据目录。
-
-## 轻量模式
-
-应用支持轻量模式，通过本地 HTTP 服务提供浏览器访问：
-- 启动本地服务器（默认端口 1420）
-- 支持浏览器直接访问内核功能
-- 可通过菜单切换桌面窗口
+无网络时主界面仍可启动，但代理池、测速和节点地域解析会在组件初始化完成前不可用；可在代理池管理中重试下载。
 
 ## 开发脚本
 
@@ -452,7 +498,6 @@ rm -rf ~/.local/share/com.dfeer.openhub.desktop/
 #### 新增
 - 模型网关反向代理服务
 - OpenCode 代理支持
-- 轻量模式浏览器访问
 
 #### 改进
 - 代理池测速性能优化

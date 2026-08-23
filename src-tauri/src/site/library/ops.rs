@@ -1,6 +1,6 @@
-use crate::site::sync;
 use crate::models::*;
 use crate::site::library;
+use crate::site::sync;
 use serde_json;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -110,8 +110,7 @@ pub(crate) fn canonical_system_type(value: &str) -> String {
 /// 仅基于 URL 中明确出现的产品名提供高置信度提示。
 /// 不把通用的 `api`、`new-api` 等模糊命名当成类型依据，避免误判。
 pub(crate) fn system_type_hint_from_url(value: &str) -> Option<&'static str> {
-    library::detect_platform_by_url_hint(value)
-        .or_else(|| library::low_priority_url_hint(value))
+    library::detect_platform_by_url_hint(value).or_else(|| library::low_priority_url_hint(value))
 }
 
 pub(crate) fn infer_remote_system_type(
@@ -521,11 +520,7 @@ pub(crate) async fn probe_site_system_type_via_chrome(
         let base_url = base_url.to_string();
         let script = script.clone();
         move || {
-            sync::run_javascript_in_existing_chrome_tab(
-                &base_url,
-                &script,
-                Duration::from_secs(15),
-            )
+            sync::run_javascript_in_existing_chrome_tab(&base_url, &script, Duration::from_secs(15))
         }
     })
     .await

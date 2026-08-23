@@ -1,10 +1,10 @@
-use tracing::warn;
 use super::types::{
     current_timestamp, ChannelConfig, ModelProxyConfig, ModelProxyContext, ProxyRequestLog,
 };
 use serde_json::Value as JsonValue;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
+use tracing::warn;
 
 pub fn strip_opencode_prefix(model: &str) -> &str {
     model.strip_prefix("opencode/").unwrap_or(model)
@@ -46,7 +46,11 @@ pub fn resolve_channel<'a>(
     }
 
     // 3. 回退默认 opencode 渠道（如果已启用）
-    if let Some(ch) = config.channels.iter().find(|c| c.id == "opencode" && c.enabled) {
+    if let Some(ch) = config
+        .channels
+        .iter()
+        .find(|c| c.id == "opencode" && c.enabled)
+    {
         return Some((ch, stripped.to_string()));
     }
 
@@ -62,7 +66,10 @@ pub fn resolve_channel<'a>(
 pub fn is_opencode_channel(channel: &ChannelConfig) -> bool {
     channel.id == "opencode"
         || channel.protocol.eq_ignore_ascii_case("opencode")
-        || channel.alias.as_deref().map_or(false, |a| a.eq_ignore_ascii_case("opencode"))
+        || channel
+            .alias
+            .as_deref()
+            .map_or(false, |a| a.eq_ignore_ascii_case("opencode"))
         || channel.base_url.contains("opencode.ai")
         || channel.name.to_lowercase().contains("opencode")
 }
@@ -80,7 +87,10 @@ pub fn check_model_channel_compatibility(
     model_to_send: &str,
     channel_api_key: &str,
 ) -> Result<(), String> {
-    if is_opencode_channel(channel) && channel_api_key.is_empty() && !is_free_opencode_model(model_to_send) {
+    if is_opencode_channel(channel)
+        && channel_api_key.is_empty()
+        && !is_free_opencode_model(model_to_send)
+    {
         return Err(format!(
             "模型 '{model_to_send}' 为 OpenCode 付费模型，当前未配置 API Key。请使用官方免费模型（如 deepseek-v4-flash-free, mimo-v2.5-free, big-pickle 等）或在渠道设置中配置 API Key。"
         ));

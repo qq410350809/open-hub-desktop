@@ -1,15 +1,15 @@
-use crate::site::sync::*;
-use crate::site::sync;
+use crate::context::{spawn, spawn_blocking, AppContext, EventBus, Managed};
 use crate::db::*;
 use crate::models::*;
-use crate::site::library::{is_newapi, is_newapi_refresh, is_sub2api};
 use crate::proxypool;
+use crate::site::library::{is_newapi, is_newapi_refresh, is_sub2api};
+use crate::site::sync;
+use crate::site::sync::*;
 use rusqlite::{params, OptionalExtension};
 use serde_json;
 use std::collections::{HashMap, HashSet};
-use std::time::Duration;
-use crate::context::{spawn, spawn_blocking, AppContext, EventBus, Managed};
 use std::sync::Arc;
+use std::time::Duration;
 use url::Url;
 
 #[cfg_attr(feature = "desktop", tauri::command)]
@@ -275,12 +275,10 @@ pub async fn mark_sites_with_chrome_sessions(
         Vec::new()
     } else {
         let scan_home_dir = home_dir.clone();
-        spawn_blocking(move || {
-            sync::site_sessions_from_home(&scan_home_dir, &scan_targets)
-        })
-        .await
-        .map_err(|error| format!("分析 Chrome 会话任务失败：{error}"))?
-        .unwrap_or_default()
+        spawn_blocking(move || sync::site_sessions_from_home(&scan_home_dir, &scan_targets))
+            .await
+            .map_err(|error| format!("分析 Chrome 会话任务失败：{error}"))?
+            .unwrap_or_default()
     };
     // 待定判定用“浏览器里是否有该站点会话”，不能用后面的账号候选强过滤。
     // Cookie 命中 或 后续 Local Storage 命中 都算有会话。

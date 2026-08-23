@@ -144,10 +144,20 @@ pub async fn handle_responses(
         final_log.duration_ms = dur;
         final_log.response_body = resp_body;
         if let Ok(jv) = serde_json::from_slice::<JsonValue>(&raw_bytes) {
-            let p = jv.pointer("/usage/input_tokens").and_then(JsonValue::as_u64).unwrap_or(0);
-            let c = jv.pointer("/usage/output_tokens").and_then(JsonValue::as_u64).unwrap_or(0);
-            let cached = jv.pointer("/usage/input_tokens_details/cached_tokens").and_then(JsonValue::as_u64);
-            let reasoning = jv.pointer("/usage/output_tokens_details/reasoning_tokens").and_then(JsonValue::as_u64);
+            let p = jv
+                .pointer("/usage/input_tokens")
+                .and_then(JsonValue::as_u64)
+                .unwrap_or(0);
+            let c = jv
+                .pointer("/usage/output_tokens")
+                .and_then(JsonValue::as_u64)
+                .unwrap_or(0);
+            let cached = jv
+                .pointer("/usage/input_tokens_details/cached_tokens")
+                .and_then(JsonValue::as_u64);
+            let reasoning = jv
+                .pointer("/usage/output_tokens_details/reasoning_tokens")
+                .and_then(JsonValue::as_u64);
             final_log.prompt_tokens = Some(p);
             final_log.completion_tokens = Some(c);
             final_log.prompt_cache_hit_tokens = cached.filter(|v| *v > 0);
@@ -163,7 +173,8 @@ pub async fn handle_responses(
             .into_response();
     }
 
-    let resp_bytes = egress::normalize_response_bytes(outcome.target, &outcome.model_to_send, &raw_bytes);
+    let resp_bytes =
+        egress::normalize_response_bytes(outcome.target, &outcome.model_to_send, &raw_bytes);
     let resp_body = cap_log_body(String::from_utf8_lossy(&resp_bytes).to_string());
 
     if let Ok(jv) = serde_json::from_slice::<JsonValue>(&resp_bytes) {
@@ -194,11 +205,26 @@ pub async fn handle_responses(
         let mut final_log = log;
         final_log.duration_ms = dur;
         final_log.response_body = resp_body;
-        final_log.prompt_tokens = jv.pointer("/usage/prompt_tokens").and_then(JsonValue::as_u64).filter(|v| *v > 0);
-        final_log.completion_tokens = jv.pointer("/usage/completion_tokens").and_then(JsonValue::as_u64).filter(|v| *v > 0);
-        final_log.prompt_cache_hit_tokens = jv.pointer("/usage/prompt_tokens_details/cached_tokens").and_then(JsonValue::as_u64).filter(|v| *v > 0);
-        final_log.reasoning_tokens = jv.pointer("/usage/completion_tokens_details/reasoning_tokens").and_then(JsonValue::as_u64).filter(|v| *v > 0);
-        final_log.total_tokens = jv.pointer("/usage/total_tokens").and_then(JsonValue::as_u64).filter(|v| *v > 0);
+        final_log.prompt_tokens = jv
+            .pointer("/usage/prompt_tokens")
+            .and_then(JsonValue::as_u64)
+            .filter(|v| *v > 0);
+        final_log.completion_tokens = jv
+            .pointer("/usage/completion_tokens")
+            .and_then(JsonValue::as_u64)
+            .filter(|v| *v > 0);
+        final_log.prompt_cache_hit_tokens = jv
+            .pointer("/usage/prompt_tokens_details/cached_tokens")
+            .and_then(JsonValue::as_u64)
+            .filter(|v| *v > 0);
+        final_log.reasoning_tokens = jv
+            .pointer("/usage/completion_tokens_details/reasoning_tokens")
+            .and_then(JsonValue::as_u64)
+            .filter(|v| *v > 0);
+        final_log.total_tokens = jv
+            .pointer("/usage/total_tokens")
+            .and_then(JsonValue::as_u64)
+            .filter(|v| *v > 0);
         ctx.record_log(final_log).await;
         return Json(responses_output).into_response();
     }

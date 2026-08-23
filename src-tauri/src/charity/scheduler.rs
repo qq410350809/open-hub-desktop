@@ -1,4 +1,3 @@
-use tracing::error;
 use crate::charity::db::*;
 use crate::charity::fetcher::*;
 use crate::charity::types::*;
@@ -6,6 +5,7 @@ use crate::context::{spawn, AppContext};
 use crate::proxypool;
 use std::sync::{atomic::Ordering, Arc, Mutex};
 use std::time::Duration;
+use tracing::error;
 
 pub fn local_hms() -> (u32, u32, u32) {
     if let Ok(output) = std::process::Command::new("/bin/date")
@@ -74,11 +74,7 @@ pub fn start_charity_monitor(ctx: Arc<AppContext>) {
             if !force {
                 let mut wait_secs = seconds_until_next_scheduled_run();
                 while wait_secs > 0 {
-                    if ctx
-                        .charity_runtime
-                        .force_round
-                        .load(Ordering::Relaxed)
-                    {
+                    if ctx.charity_runtime.force_round.load(Ordering::Relaxed) {
                         break;
                     }
                     let step = wait_secs.min(CHARITY_SCHEDULER_TICK.as_secs().max(1));
@@ -179,17 +175,13 @@ pub fn start_charity_monitor(ctx: Arc<AppContext>) {
             for handle in handles {
                 match handle.await {
                     Ok((feed_id, Ok(_))) => {
-                        if let Ok(mut errors) =
-                            ctx.charity_runtime.last_errors.lock()
-                        {
+                        if let Ok(mut errors) = ctx.charity_runtime.last_errors.lock() {
                             errors.remove(&feed_id);
                         }
                     }
                     Ok((feed_id, Err(error))) => {
                         if !is_charity_sync_cancelled(&error) {
-                            if let Ok(mut errors) =
-                                ctx.charity_runtime.last_errors.lock()
-                            {
+                            if let Ok(mut errors) = ctx.charity_runtime.last_errors.lock() {
                                 errors.insert(feed_id, error);
                             }
                         }

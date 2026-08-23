@@ -1,8 +1,7 @@
 use crate::models::TokenSessionTokens;
 use crate::token::collector::time_utils::{iso_from_millis, update_bounds};
 use crate::token::collector::types::{
-    database_fingerprint, number, open_readonly_sqlite, token_session, CachedDatabase,
-    UsageEvent,
+    database_fingerprint, number, open_readonly_sqlite, token_session, CachedDatabase, UsageEvent,
 };
 use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
@@ -25,9 +24,17 @@ pub fn collect_cursor_db_paths(home: &Path) -> Vec<PathBuf> {
     let mut paths = Vec::new();
 
     #[cfg(target_os = "macos")]
-    let base = home.join("Library").join("Application Support").join("Cursor").join("User");
+    let base = home
+        .join("Library")
+        .join("Application Support")
+        .join("Cursor")
+        .join("User");
     #[cfg(target_os = "windows")]
-    let base = home.join("AppData").join("Roaming").join("Cursor").join("User");
+    let base = home
+        .join("AppData")
+        .join("Roaming")
+        .join("Cursor")
+        .join("User");
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     let base = home.join(".config").join("Cursor").join("User");
 
@@ -90,31 +97,56 @@ pub fn parse_cursor_database(path: &Path) -> CachedDatabase {
             // A. composer.composerData / aichat.chatdata
             if let Some(tabs) = val_json.get("tabs").and_then(JsonValue::as_array) {
                 for tab in tabs {
-                    let tab_id = tab.get("tabId").and_then(JsonValue::as_str).unwrap_or("cursor_tab");
-                    let mut model_name = tab.get("selectedModel").and_then(JsonValue::as_str).unwrap_or("cursor-fast").to_string();
+                    let tab_id = tab
+                        .get("tabId")
+                        .and_then(JsonValue::as_str)
+                        .unwrap_or("cursor_tab");
+                    let mut model_name = tab
+                        .get("selectedModel")
+                        .and_then(JsonValue::as_str)
+                        .unwrap_or("cursor-fast")
+                        .to_string();
                     if model_name.is_empty() {
                         model_name = "cursor-default".to_string();
                     }
                     let bubbles = tab.get("bubbles").and_then(JsonValue::as_array);
                     if let Some(bubbles) = bubbles {
                         for bubble in bubbles {
-                            let b_type = bubble.get("type").and_then(JsonValue::as_str).unwrap_or("");
-                            let created_at = bubble.get("createdAt").and_then(JsonValue::as_i64).unwrap_or(0);
-                            let iso_ts = if created_at > 0 { iso_from_millis(created_at) } else { String::new() };
+                            let b_type =
+                                bubble.get("type").and_then(JsonValue::as_str).unwrap_or("");
+                            let created_at = bubble
+                                .get("createdAt")
+                                .and_then(JsonValue::as_i64)
+                                .unwrap_or(0);
+                            let iso_ts = if created_at > 0 {
+                                iso_from_millis(created_at)
+                            } else {
+                                String::new()
+                            };
 
                             if b_type == "ai" || bubble.get("tokenCount").is_some() {
-                                let total_tokens = number(bubble, &["tokenCount", "tokens", "totalTokens"]);
-                                let input_tokens = number(bubble, &["inputTokens", "promptTokens"]).max(total_tokens * 3 / 4);
-                                let output_tokens = number(bubble, &["outputTokens", "completionTokens"]).max(total_tokens.saturating_sub(input_tokens));
+                                let total_tokens =
+                                    number(bubble, &["tokenCount", "tokens", "totalTokens"]);
+                                let input_tokens = number(bubble, &["inputTokens", "promptTokens"])
+                                    .max(total_tokens * 3 / 4);
+                                let output_tokens =
+                                    number(bubble, &["outputTokens", "completionTokens"])
+                                        .max(total_tokens.saturating_sub(input_tokens));
 
-                                let group = session_groups.entry(tab_id.to_string()).or_insert_with(|| CursorSessionAccumulator {
-                                    session_id: tab_id.to_string(),
-                                    project_key: "cursor-workspace".to_string(),
-                                    model: model_name.clone(),
-                                    ..Default::default()
-                                });
+                                let group = session_groups
+                                    .entry(tab_id.to_string())
+                                    .or_insert_with(|| CursorSessionAccumulator {
+                                        session_id: tab_id.to_string(),
+                                        project_key: "cursor-workspace".to_string(),
+                                        model: model_name.clone(),
+                                        ..Default::default()
+                                    });
 
-                                update_bounds(&mut group.first_timestamp, &mut group.last_timestamp, &iso_ts);
+                                update_bounds(
+                                    &mut group.first_timestamp,
+                                    &mut group.last_timestamp,
+                                    &iso_ts,
+                                );
                                 group.input_tokens += input_tokens;
                                 group.output_tokens += output_tokens;
                                 group.total_tokens += total_tokens;
@@ -137,12 +169,14 @@ pub fn parse_cursor_database(path: &Path) -> CachedDatabase {
                                     estimated_tokens: 0,
                                 });
                             } else if b_type == "user" {
-                                let group = session_groups.entry(tab_id.to_string()).or_insert_with(|| CursorSessionAccumulator {
-                                    session_id: tab_id.to_string(),
-                                    project_key: "cursor-workspace".to_string(),
-                                    model: model_name.clone(),
-                                    ..Default::default()
-                                });
+                                let group = session_groups
+                                    .entry(tab_id.to_string())
+                                    .or_insert_with(|| CursorSessionAccumulator {
+                                        session_id: tab_id.to_string(),
+                                        project_key: "cursor-workspace".to_string(),
+                                        model: model_name.clone(),
+                                        ..Default::default()
+                                    });
                                 group.user_message_count += 1;
                             }
                         }
@@ -153,12 +187,23 @@ pub fn parse_cursor_database(path: &Path) -> CachedDatabase {
             // B. aiService.prompts (数组形式的请求记录)
             if let Some(prompts) = val_json.as_array() {
                 for (idx, p) in prompts.iter().enumerate() {
-                    let model = p.get("model").and_then(JsonValue::as_str).unwrap_or("cursor-default");
+                    let model = p
+                        .get("model")
+                        .and_then(JsonValue::as_str)
+                        .unwrap_or("cursor-default");
                     let ts_ms = p.get("timestamp").and_then(JsonValue::as_i64).unwrap_or(0);
-                    let iso_ts = if ts_ms > 0 { iso_from_millis(ts_ms) } else { String::new() };
+                    let iso_ts = if ts_ms > 0 {
+                        iso_from_millis(ts_ms)
+                    } else {
+                        String::new()
+                    };
                     let in_tok = number(p, &["inputTokens", "promptTokens"]);
                     let out_tok = number(p, &["outputTokens", "completionTokens"]);
-                    let total = if in_tok + out_tok > 0 { in_tok + out_tok } else { number(p, &["totalTokens", "tokens"]) };
+                    let total = if in_tok + out_tok > 0 {
+                        in_tok + out_tok
+                    } else {
+                        number(p, &["totalTokens", "tokens"])
+                    };
 
                     if total > 0 {
                         events.push(UsageEvent {

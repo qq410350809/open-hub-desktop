@@ -327,8 +327,15 @@ pub fn copilot_on_line(
                 }
             }
             if let Some(hour) = hour_key_from_ts(&ts) {
-                let is_error = req.get("result").and_then(|r| r.get("errorDetails")).is_some();
-                let user_text = req.get("message").and_then(|m| m.get("text")).and_then(JsonValue::as_str).unwrap_or("");
+                let is_error = req
+                    .get("result")
+                    .and_then(|r| r.get("errorDetails"))
+                    .is_some();
+                let user_text = req
+                    .get("message")
+                    .and_then(|m| m.get("text"))
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or("");
                 let dialogues = if !user_text.trim().is_empty() { 1 } else { 0 };
                 if is_error {
                     record(map, sources, "copilot", hour, dialogues, 1, 0, 1);
@@ -341,7 +348,10 @@ pub fn copilot_on_line(
     }
 
     let type_name = value.get("type").and_then(JsonValue::as_str).unwrap_or("");
-    let ts = value.get("timestamp").and_then(JsonValue::as_str).unwrap_or("");
+    let ts = value
+        .get("timestamp")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("");
     let Some(hour) = hour_key_from_ts(ts) else {
         return;
     };
@@ -1057,7 +1067,10 @@ pub fn collect_request_health_snapshot(force: bool) -> Result<RequestHealthRepor
     }
 
     {
-        let cursors = envelope.file_cursors.entry("copilot".to_string()).or_default();
+        let cursors = envelope
+            .file_cursors
+            .entry("copilot".to_string())
+            .or_default();
         collect_copilot_activity_incremental(&home, &mut map, &mut sources, cursors);
     }
 

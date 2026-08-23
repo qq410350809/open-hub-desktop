@@ -56,11 +56,7 @@ pub fn is_session_uuid(s: &str) -> bool {
 }
 
 pub fn find_project_root_from_path(path: &Path) -> Option<String> {
-    let current = if path.is_file() {
-        path.parent()?
-    } else {
-        path
-    };
+    let current = if path.is_file() { path.parent()? } else { path };
 
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let mut top_matched: Option<String> = None;
@@ -298,7 +294,10 @@ pub fn command_code_project_from_path(path: &Path) -> String {
 }
 
 pub fn vscode_workspace_project_from_path(path: &Path) -> String {
-    if path.components().any(|c| c.as_os_str() == "emptyWindowChatSessions") {
+    if path
+        .components()
+        .any(|c| c.as_os_str() == "emptyWindowChatSessions")
+    {
         return "临时任务 / 独立会话".to_string();
     }
     let mut parent = path.parent();

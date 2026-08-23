@@ -1,7 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { listen, type UnlistenFn } from "../../composables/core/events";
-import { capabilities } from "../../composables/core/capabilities";
 import type { EChartsOption } from "../../echarts";
 import EChart from "../common/EChart.vue";
 import DateRangeDropdown from "../common/DateRangeDropdown.vue";
@@ -34,7 +33,14 @@ import {
   toLocalDate,
 } from "../../composables/tokenStatsAgg";
 import type { TrendGranularity } from "../../composables/tokenStatsAgg";
-import { isTauri, runCommand } from "../../composables/useLibrary";
+import { isTauri, localTokenStatsAvailable, runLocalCommand } from "../../composables/useLibrary";
+
+// 页面形态由路由决定：「本地统计」扫描本机 AI 工具日志（客户端能力），
+// 「网关统计」读取反代网关记账（服务端能力）；同一套聚合视图按 mode 渲染。
+const props = defineProps<{
+  /** 统计数据来源：local = 本地终端日志采集；proxy = 反代网关聚合 */
+  mode: "local" | "proxy";
+}>();
 
 const store = useStore();
 const { preferences } = usePreferences();
@@ -54,9 +60,8 @@ const rangeTo = computed({
 });
 
 // —— 数据模式：本地日志采集 / 反代网关聚合 ——
-// 两种模式共用同一套聚合层与视图；切换仅替换数据源与部分文案
-type StatsMode = "local" | "proxy";
-const statsMode = ref<StatsMode>("local");
+// 两种模式共用同一套聚合层与视图；mode 由父级路由（菜单）固定传入
+const statsMode = computed(() => props.mode);
 const proxyStore = useProxyTokenStats();
 const activeUsage = computed(
   () =>
@@ -76,14 +81,6 @@ const activeLoading = computed(() =>
 const activeError = computed(() =>
   statsMode.value === "local" ? store.tokenUsageError.value : proxyStore.proxyTokenError.value,
 );
-
-function switchStatsMode(mode: StatsMode) {
-  if (statsMode.value === mode) return;
-  statsMode.value = mode;
-  if (mode === "proxy" && !proxyStore.proxyTokenReport.value) {
-    void proxyStore.loadProxyTokenUsage(store.tokenStatsFrom.value, store.tokenStatsTo.value);
-  }
-}
 
 // 反代模式：时间范围变化即重新拉取（本地模式由 useTokenStats 自身处理）
 watch(
@@ -315,7 +312,7 @@ async function downloadFile(filename: string, content: string, mimeType: string)
       let binary = "";
       for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
       const base64 = btoa(binary);
-      const result = await runCommand<{ path: string | null; cancelled: boolean }>("save_export_file", {
+      const result = await runLocalCommand<{ path: string | null; cancelled: boolean }>("save_export_file", {
         args: { filename, content: base64 },
       });
       if (result.cancelled) return;
@@ -1323,24 +1320,22 @@ watch(
   }),
 );
 
-// 反代模式轮询：与本地模式 5 秒快照刷新节奏一致
+// 反代网关模式轮询：与本地终端模式 5 秒快照刷新节奏一致
 let proxyRefreshTimer: number | null = null;
 
 onMounted(() => {
   tokenStatsPageMounted = true;
-  // 远程服务部署且本机无 AI 工具日志：本地模式不可用，自动落到反代模式。
-  if (!capabilities.value.tokenLocalLogs && statsMode.value === "local") {
-    statsMode.value = "proxy";
-  }
-  proxyRefreshTimer = window.setInterval(() => {
-    if (statsMode.value === "proxy") {
+  // 反代网关页：挂载即拉取一次，此后 5 秒轮询保持近实时
+  if (statsMode.value === "proxy") {
+    void proxyStore.loadProxyTokenUsage(store.tokenStatsFrom.value, store.tokenStatsTo.value);
+    proxyRefreshTimer = window.setInterval(() => {
       void proxyStore.loadProxyTokenUsage(store.tokenStatsFrom.value, store.tokenStatsTo.value);
-    }
-  }, 5_000);
-  if (isTauri) {
+    }, 5_000);
+  }
+  if (localTokenStatsAvailable && statsMode.value === "local") {
     listen<TokenCollectorProgress>("token-collector-progress", ({ payload }) => {
       appendRefreshLog(payload);
-    }).then((unlisten) => {
+    }, { local: true }).then((unlisten) => {
       if (!tokenStatsPageMounted) unlisten();
       else unlistenTokenCollectorProgress = unlisten;
     });
@@ -1381,34 +1376,20 @@ onBeforeUnmount(() => {
             <span class="tt-eyebrow-text">Token 用量分析中心</span>
           </div>
           <div class="tt-title-row">
-            <h1>Token 统计中心</h1>
-            <!-- 数据模式标签：本地日志采集 / 反代网关聚合 -->
-            <div class="tt-mode-tabs" role="tablist" aria-label="统计数据来源">
-              <button
-                v-if="capabilities.tokenLocalLogs"
-                type="button"
-                role="tab"
-                class="tt-mode-tab"
-                :class="{ active: statsMode === 'local' }"
-                title="扫描本机各 AI 工具的本地日志文件"
-                @click="switchStatsMode('local')"
-              >本地模式</button>
-              <button
-                type="button"
-                role="tab"
-                class="tt-mode-tab"
-                :class="{ active: statsMode === 'proxy' }"
-                title="模型反代网关的转发记账统计"
-                @click="switchStatsMode('proxy')"
-              >反代模式</button>
-            </div>
+            <h1>{{ statsMode === 'local' ? '本地 Token 统计' : '网关 Token 统计' }}</h1>
+            <!-- 数据来源标签：客户端日志采集（本地）/ 服务端网关记账（网关） -->
+            <span
+              class="tt-mode-tab active"
+              role="status"
+              :title="statsMode === 'local' ? '扫描本机各 AI 工具的本地日志文件' : '模型反代网关的转发记账统计'"
+            >{{ statsMode === 'local' ? '客户端 · 本地采集' : '服务端 · 反代网关' }}</span>
           </div>
           <p class="tt-cockpit-subtitle">
             <template v-if="statsMode === 'local'">
-              全端本地日志采集 · SQLite 快照 · 覆盖 <strong>{{ bySource.length }}</strong> 款 AI 工具与 <strong>{{ byModel.length }}</strong> 个模型
+              本地终端日志采集 · SQLite 快照 · 覆盖 <strong>{{ bySource.length }}</strong> 款 AI 工具与 <strong>{{ byModel.length }}</strong> 个模型
             </template>
             <template v-else>
-              反代网关转发记账 · 聚合表持久化 · 覆盖 <strong>{{ bySource.length }}</strong> 类客户端 · <strong>{{ byModel.length }}</strong> 个模型 · <strong>{{ projectUsage.length }}</strong> 个渠道
+              反代网关请求记账 · 聚合表持久化 · 覆盖 <strong>{{ bySource.length }}</strong> 类客户端 · <strong>{{ byModel.length }}</strong> 个模型 · <strong>{{ projectUsage.length }}</strong> 个渠道
             </template>
           </p>
         </div>
@@ -2406,17 +2387,7 @@ onBeforeUnmount(() => {
   line-height: 1.2;
 }
 
-/* 数据模式标签（本地模式 / 反代模式） */
-.tt-mode-tabs {
-  display: inline-flex;
-  align-items: center;
-  gap: 2px;
-  padding: 2px;
-  border-radius: 8px;
-  background: var(--bg-soft, rgba(148, 163, 184, 0.15));
-  border: 1px solid rgba(148, 163, 184, 0.25);
-}
-
+/* 数据来源标签（本地采集 / 反代网关） */
 .tt-mode-tab {
   appearance: none;
   border: 0;

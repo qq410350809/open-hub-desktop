@@ -7,7 +7,7 @@ import type {
   TokenUsageReport,
   LocalAgentPathsReport,
 } from "../../types";
-import { runCommand } from "../core/ipc";
+import { localTokenStatsAvailable, runLocalCommand } from "../core/ipc";
 
 const tokenStats = ref<TokenStatsReport | null>(null);
 const tokenStatsLoading = ref(false);
@@ -108,11 +108,20 @@ function setQuickRange(days: number) {
 // 默认「今日」
 setQuickRange(-2);
 
+function localTokenUnavailable(): Error {
+  return new Error("本地 Token 统计只在客户端本地可用；当前浏览器服务仅提供反代统计");
+}
+
+async function localCommand<T>(command: string, args: Record<string, unknown> = {}): Promise<T> {
+  if (!localTokenStatsAvailable) throw localTokenUnavailable();
+  return runLocalCommand<T>(command, args);
+}
+
 async function loadTokenStats(from?: string, to?: string, refresh = false) {
   tokenStatsLoading.value = true;
   tokenStatsError.value = "";
   try {
-    tokenStats.value = await runCommand<TokenStatsReport>("get_token_stats", {
+    tokenStats.value = await localCommand<TokenStatsReport>("get_token_stats", {
       from: (from ?? tokenStatsFrom.value) || null,
       to: (to ?? tokenStatsTo.value) || null,
       refresh,
@@ -139,7 +148,7 @@ async function syncTokenCollector(force = false): Promise<TokenCollectorSyncRepo
   }
   tokenCollectorSyncing.value = true;
   tokenCollectorSyncError.value = "";
-  const promise = runCommand<TokenCollectorSyncReport>("sync_token_data", { force })
+  const promise = localCommand<TokenCollectorSyncReport>("sync_token_data", { force })
     .then((report) => {
       tokenCollectorSyncReport.value = report;
       return report;
@@ -160,7 +169,7 @@ async function loadTokenUsage() {
   tokenUsageLoading.value = true;
   tokenUsageError.value = "";
   try {
-    tokenUsage.value = await runCommand<TokenUsageReport>("get_token_usage");
+    tokenUsage.value = await localCommand<TokenUsageReport>("get_token_usage");
   } catch (error) {
     tokenUsageError.value = String(error);
     tokenUsage.value = null;
@@ -173,7 +182,7 @@ async function loadTokenRawLogs() {
   rawLogsLoading.value = true;
   rawLogsError.value = "";
   try {
-    rawLogs.value = await runCommand<RawLogReport>("get_token_raw_logs");
+    rawLogs.value = await localCommand<RawLogReport>("get_token_raw_logs");
   } catch (error) {
     rawLogsError.value = String(error);
     rawLogs.value = null;
@@ -189,7 +198,7 @@ async function loadRequestHealth(refresh = false) {
   }
   requestHealthError.value = "";
   try {
-    requestHealth.value = await runCommand<RequestHealthReport>("get_token_request_health", {
+    requestHealth.value = await localCommand<RequestHealthReport>("get_token_request_health", {
       refresh,
     });
   } catch (error) {
@@ -206,7 +215,7 @@ async function loadLocalAgentPaths() {
   localAgentPathsLoading.value = true;
   localAgentPathsError.value = "";
   try {
-    localAgentPaths.value = await runCommand<LocalAgentPathsReport>("get_local_agent_paths");
+    localAgentPaths.value = await localCommand<LocalAgentPathsReport>("get_local_agent_paths");
   } catch (error) {
     localAgentPathsError.value = String(error);
     localAgentPaths.value = null;
@@ -237,13 +246,13 @@ async function refreshTokenDatabaseView(showLoading = false) {
     }
 
     await Promise.all([
-      runCommand<TokenUsageReport>("get_token_usage").then((value) => { tokenUsage.value = value; }),
-      runCommand<TokenStatsReport>("get_token_stats", {
+      localCommand<TokenUsageReport>("get_token_usage").then((value) => { tokenUsage.value = value; }),
+      localCommand<TokenStatsReport>("get_token_stats", {
         from: tokenStatsFrom.value || null,
         to: tokenStatsTo.value || null,
         refresh: false,
       }).then((value) => { tokenStats.value = value; }),
-      runCommand<RequestHealthReport>("get_token_request_health", { refresh: false })
+      localCommand<RequestHealthReport>("get_token_request_health", { refresh: false })
         .then((value) => { requestHealth.value = value; }),
     ]);
   })();
@@ -262,7 +271,7 @@ async function refreshTokenDatabaseView(showLoading = false) {
 }
 
 function startTokenDatabaseRefresh() {
-  if (tokenDatabaseRefreshTimer != null) return;
+  if (!localTokenStatsAvailable || tokenDatabaseRefreshTimer != null) return;
   void refreshTokenDatabaseView(true).catch(() => {});
   tokenDatabaseRefreshTimer = window.setInterval(() => {
     void refreshTokenDatabaseView(false).catch(() => {});

@@ -102,7 +102,9 @@ pub async fn execute_resilient_egress(
             Ok(resp) => {
                 let status = resp.status();
                 if status.is_success() {
-                    ctx.metrics.successful_requests.fetch_add(1, Ordering::Relaxed);
+                    ctx.metrics
+                        .successful_requests
+                        .fetch_add(1, Ordering::Relaxed);
                     return Ok(EgressSuccess {
                         status,
                         response: resp,
@@ -133,13 +135,15 @@ pub async fn execute_resilient_egress(
                         )
                         .with_channel_stats_id(meta.channel_stats_id.clone())
                         .with_response_body(cap_log_body(err_text)),
-                    ).await;
+                    )
+                    .await;
 
                     return Err((
                         StatusCode::UNAUTHORIZED,
                         [("content-type", "application/json")],
                         err_bytes,
-                    ).into_response());
+                    )
+                        .into_response());
                 } else if status == StatusCode::TOO_MANY_REQUESTS {
                     let err_bytes = resp.bytes().await.unwrap_or_default();
                     let err_text = String::from_utf8_lossy(&err_bytes).to_string();
@@ -165,7 +169,8 @@ pub async fn execute_resilient_egress(
                         )
                         .with_channel_stats_id(meta.channel_stats_id.clone())
                         .with_response_body(cap_log_body(err_text.clone())),
-                    ).await;
+                    )
+                    .await;
 
                     if count_429 <= max_retries {
                         ctx.node_round_robin.fetch_add(1, Ordering::Relaxed);
@@ -200,14 +205,16 @@ pub async fn execute_resilient_egress(
                         )
                         .with_channel_stats_id(meta.channel_stats_id.clone())
                         .with_response_body(cap_log_body(err_text)),
-                    ).await;
+                    )
+                    .await;
 
                     if status.is_client_error() {
                         return Err((
                             status,
                             [("content-type", "application/json")],
                             last_err_bytes,
-                        ).into_response());
+                        )
+                            .into_response());
                     }
 
                     if attempt_idx < max_retries {
@@ -239,7 +246,8 @@ pub async fn execute_resilient_egress(
                         Some(node_display),
                     )
                     .with_channel_stats_id(meta.channel_stats_id.clone()),
-                ).await;
+                )
+                .await;
 
                 if attempt_idx < max_retries {
                     ctx.node_round_robin.fetch_add(1, Ordering::Relaxed);
@@ -253,7 +261,12 @@ pub async fn execute_resilient_egress(
     }
 
     if !last_err_bytes.is_empty() {
-        Err((last_status, [("content-type", "application/json")], last_err_bytes).into_response())
+        Err((
+            last_status,
+            [("content-type", "application/json")],
+            last_err_bytes,
+        )
+            .into_response())
     } else {
         Err((
             last_status,
@@ -265,6 +278,7 @@ pub async fn execute_resilient_egress(
                     "status": "UNAVAILABLE"
                 }
             })),
-        ).into_response())
+        )
+            .into_response())
     }
 }

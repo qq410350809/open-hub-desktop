@@ -1,16 +1,16 @@
-use crate::site::sync::*;
-use crate::site::sync;
+use crate::context::{home_dir, spawn_blocking, AppContext, Managed};
 use crate::db::*;
 use crate::models::*;
-use crate::site::library::{is_newapi, is_newapi_refresh, is_sub2api};
 use crate::proxypool;
+use crate::site::library::{is_newapi, is_newapi_refresh, is_sub2api};
+use crate::site::sync;
+use crate::site::sync::*;
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use serde_json;
 use std::collections::{HashMap, HashSet};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use crate::context::{home_dir, spawn_blocking, AppContext, Managed};
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use url::Url;
 
 #[cfg_attr(feature = "desktop", tauri::command)]
@@ -463,8 +463,6 @@ pub(crate) async fn fetch_models_with_keys(
     })
 }
 
-
-
 pub(crate) fn merge_api_keys(target: &mut Vec<String>, keys: impl IntoIterator<Item = String>) {
     target.extend(keys);
     target.sort();
@@ -874,15 +872,8 @@ async fn fetch_site_models_json_impl<'a>(
             let site_id = site_id_for_closure.clone();
             let profile_id = profile_id.clone();
             async move {
-                fetch_site_models_json_inner(
-                    ctx,
-                    database,
-                    url,
-                    Some(site_id),
-                    profile_id,
-                    client,
-                )
-                .await
+                fetch_site_models_json_inner(ctx, database, url, Some(site_id), profile_id, client)
+                    .await
             }
         },
     )
@@ -975,11 +966,9 @@ async fn fetch_site_models_json_inner(
         Vec::new()
     } else {
         let local_home = home_dir.clone();
-        spawn_blocking(move || {
-            sync::read_local_storage_from_home(&local_home, &local_targets)
-        })
-        .await
-        .map_err(|error| format!("读取 Chrome Local Storage 任务失败：{error}"))?
+        spawn_blocking(move || sync::read_local_storage_from_home(&local_home, &local_targets))
+            .await
+            .map_err(|error| format!("读取 Chrome Local Storage 任务失败：{error}"))?
     };
     let local_values = local_matches
         .into_iter()

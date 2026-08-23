@@ -1,6 +1,6 @@
 use super::types::{
     ChannelUsageStats, GatewayDailyPoint, GatewayHourlyPoint, GatewayOverviewStats,
-    GatewayOverviewTotals, ModelProxyContext, ModelProxyStatus, ModelProxyState,
+    GatewayOverviewTotals, ModelProxyContext, ModelProxyState, ModelProxyStatus,
     OpencodeProxyState, OpencodeProxyStatus, ProxyRequestLog, ProxyTokenUsageReport,
 };
 use chrono::Datelike;
@@ -29,10 +29,11 @@ impl ModelProxyContext {
                 } else {
                     let last_run = self.log_retention_last_run.load(Ordering::Relaxed);
                     let due = now_millis.max(0) as u64 >= last_run
-                        && (now_millis.max(0) as u64).saturating_sub(last_run) >= RETENTION_CHECK_INTERVAL_MS;
+                        && (now_millis.max(0) as u64).saturating_sub(last_run)
+                            >= RETENTION_CHECK_INTERVAL_MS;
                     if due {
-                        let cutoff = chrono::Local::now().date_naive()
-                            - chrono::Duration::days(days as i64);
+                        let cutoff =
+                            chrono::Local::now().date_naive() - chrono::Duration::days(days as i64);
                         Some(cutoff.format("%Y-%m-%d").to_string())
                     } else {
                         None
@@ -96,7 +97,11 @@ impl ModelProxyContext {
                     .channel_stats_id
                     .clone()
                     .unwrap_or_else(|| log.channel_id.clone());
-                let model_dim = if log.model.trim().is_empty() { "" } else { log.model.as_str() };
+                let model_dim = if log.model.trim().is_empty() {
+                    ""
+                } else {
+                    log.model.as_str()
+                };
                 let client_dim = log
                     .client_name
                     .as_deref()
@@ -184,9 +189,17 @@ impl ModelProxyContext {
 }
 
 pub async fn get_model_proxy_status_summary(state: &ModelProxyState) -> ModelProxyStatus {
-    let running = state.shutdown_sender.read().await.is_some();
-    let port = *state.current_port.read().await;
-    let url = format!("http://127.0.0.1:{port}/v1");
+    let running = state
+        .context
+        .route_enabled
+        .load(std::sync::atomic::Ordering::Acquire);
+    let port = *state.context.current_port.read().await;
+    let config = state.context.config.read().await;
+    let url = if port == 0 {
+        "/v1".to_string()
+    } else {
+        format!("http://127.0.0.1:{port}/v1")
+    };
     let uptime_seconds = state
         .context
         .started_at
@@ -194,8 +207,6 @@ pub async fn get_model_proxy_status_summary(state: &ModelProxyState) -> ModelPro
         .await
         .map(|t| t.elapsed().as_secs())
         .unwrap_or(0);
-
-    let config = state.context.config.read().await;
     let channels_count = config.channels.len();
     let models_count = {
         let models = state.context.cached_channel_models.read().await;
@@ -250,32 +261,46 @@ pub async fn get_model_proxy_status_summary(state: &ModelProxyState) -> ModelPro
         .load(Ordering::Relaxed);
     let total_toks = state.context.metrics.total_tokens.load(Ordering::Relaxed);
 
-    let (db_total_prompt, db_total_comp, db_total_reas, db_total_cache, db_total_all, db_today_tokens) = {
+    let (
+        db_total_prompt,
+        db_total_comp,
+        db_total_reas,
+        db_total_cache,
+        db_total_all,
+        db_today_tokens,
+    ) = {
         let app_handle_opt = state.context.app_ctx.read().await.clone();
         if let Some(ctx) = app_handle_opt {
             let database = &ctx.database;
             let res: Result<(i64, i64, i64, i64, i64, i64), rusqlite::Error> = (|| {
-                let conn = database.0.lock().map_err(|_| rusqlite::Error::ExecuteReturnedResults)?;
+                let conn = database
+                    .0
+                    .lock()
+                    .map_err(|_| rusqlite::Error::ExecuteReturnedResults)?;
                 // 累计与今日 Token 均取自持久化日统计表。
                 // 不能走明细日志表——明细按保留天数清理，且历史上限 1000 条，
                 // 清理/裁剪都会让「累计」缩水；日统计表才是长期统计的唯一事实来源。
-                let total_row = conn.query_row(
-                    "SELECT
+                let total_row = conn
+                    .query_row(
+                        "SELECT
                         COALESCE(SUM(prompt_tokens), 0),
                         COALESCE(SUM(completion_tokens), 0),
                         COALESCE(SUM(reasoning_tokens), 0),
                         COALESCE(SUM(cache_hit_tokens), 0),
                         COALESCE(SUM(total_tokens), 0)
                      FROM channel_daily_stats",
-                    [],
-                    |r| Ok((
-                        r.get::<_, i64>(0)?,
-                        r.get::<_, i64>(1)?,
-                        r.get::<_, i64>(2)?,
-                        r.get::<_, i64>(3)?,
-                        r.get::<_, i64>(4)?,
-                    ))
-                ).unwrap_or((0, 0, 0, 0, 0));
+                        [],
+                        |r| {
+                            Ok((
+                                r.get::<_, i64>(0)?,
+                                r.get::<_, i64>(1)?,
+                                r.get::<_, i64>(2)?,
+                                r.get::<_, i64>(3)?,
+                                r.get::<_, i64>(4)?,
+                            ))
+                        },
+                    )
+                    .unwrap_or((0, 0, 0, 0, 0));
 
                 let today = chrono::Local::now().format("%Y-%m-%d").to_string();
                 let today_tokens = conn
@@ -288,7 +313,14 @@ pub async fn get_model_proxy_status_summary(state: &ModelProxyState) -> ModelPro
                     )
                     .unwrap_or(0);
 
-                Ok((total_row.0, total_row.1, total_row.2, total_row.3, total_row.4, today_tokens))
+                Ok((
+                    total_row.0,
+                    total_row.1,
+                    total_row.2,
+                    total_row.3,
+                    total_row.4,
+                    today_tokens,
+                ))
             })();
             res.unwrap_or((0, 0, 0, 0, 0, 0))
         } else {
@@ -529,7 +561,11 @@ pub async fn get_gateway_overview_stats(
             (start, end, true)
         } else {
             let days = days.unwrap_or(14).clamp(1, 90);
-            (today - chrono::Duration::days(days as i64 - 1), today, false)
+            (
+                today - chrono::Duration::days(days as i64 - 1),
+                today,
+                false,
+            )
         };
 
         let start_str = start.format("%Y-%m-%d").to_string();
@@ -775,7 +811,19 @@ pub async fn get_gateway_overview_stats(
                 stmt.query_row([], map_row)
                     .map_err(|e| format!("解析汇总失败: {e}"))?
             };
-            let (reqs, succ, fail, dur_total, ttft_total, ttft_count, prompt, comp, reasoning, cache, tokens) = row;
+            let (
+                reqs,
+                succ,
+                fail,
+                dur_total,
+                ttft_total,
+                ttft_count,
+                prompt,
+                comp,
+                reasoning,
+                cache,
+                tokens,
+            ) = row;
             GatewayOverviewTotals {
                 total_requests: reqs,
                 successful_requests: succ,
@@ -946,19 +994,38 @@ pub async fn get_proxy_token_usage_report(
             // 区间内出现过小时行的日期（供下方日表回退判断）
             let mut hourly_covered: std::collections::HashSet<String> =
                 std::collections::HashSet::new();
-            for (date, hour, channel, model, client, reqs, succ, fail, prompt, comp, reasoning, hit, creation, total) in
-                rows.flatten()
+            for (
+                date,
+                hour,
+                channel,
+                model,
+                client,
+                reqs,
+                succ,
+                fail,
+                prompt,
+                comp,
+                reasoning,
+                hit,
+                creation,
+                total,
+            ) in rows.flatten()
             {
-                let client_key = if client.trim().is_empty() { "其他客户端".to_string() } else { client };
-                let model_key = if model.trim().is_empty() { "历史聚合".to_string() } else { model };
+                let client_key = if client.trim().is_empty() {
+                    "其他客户端".to_string()
+                } else {
+                    client
+                };
+                let model_key = if model.trim().is_empty() {
+                    "历史聚合".to_string()
+                } else {
+                    model
+                };
                 let input = (prompt - hit - creation).max(0);
                 buckets.push(TokenUsageBucket {
                     source: client_key.clone(),
                     model: model_key,
-                    project_key: channel_names
-                        .get(&channel)
-                        .cloned()
-                        .unwrap_or(channel),
+                    project_key: channel_names.get(&channel).cloned().unwrap_or(channel),
                     timestamp: format!("{date}T{hour:02}:00:00"),
                     total_tokens: total,
                     billable_total_tokens: total,
@@ -973,13 +1040,15 @@ pub async fn get_proxy_token_usage_report(
                 });
 
                 let hour_key = format!("{date}T{hour:02}:00:00");
-                let hb = health_map.entry(hour_key).or_insert_with(|| RequestHealthBucket {
-                    hour: String::new(),
-                    dialogues: 0,
-                    requests: 0,
-                    success: 0,
-                    failed: 0,
-                });
+                let hb = health_map
+                    .entry(hour_key)
+                    .or_insert_with(|| RequestHealthBucket {
+                        hour: String::new(),
+                        dialogues: 0,
+                        requests: 0,
+                        success: 0,
+                        failed: 0,
+                    });
                 hb.requests += reqs;
                 hb.success += succ;
                 hb.failed += fail;
@@ -1024,22 +1093,40 @@ pub async fn get_proxy_token_usage_report(
                 })
                 .map_err(|e| format!("解析反代日统计失败: {e}"))?;
 
-            for (date, channel, model, client, reqs, succ, fail, prompt, comp, reasoning, hit, creation, total) in
-                fallback_rows.flatten()
+            for (
+                date,
+                channel,
+                model,
+                client,
+                reqs,
+                succ,
+                fail,
+                prompt,
+                comp,
+                reasoning,
+                hit,
+                creation,
+                total,
+            ) in fallback_rows.flatten()
             {
                 if hourly_covered.contains(&date) {
                     continue;
                 }
-                let client_key = if client.trim().is_empty() { "其他客户端".to_string() } else { client };
-                let model_key = if model.trim().is_empty() { "历史聚合".to_string() } else { model };
+                let client_key = if client.trim().is_empty() {
+                    "其他客户端".to_string()
+                } else {
+                    client
+                };
+                let model_key = if model.trim().is_empty() {
+                    "历史聚合".to_string()
+                } else {
+                    model
+                };
                 let input = (prompt - hit - creation).max(0);
                 buckets.push(TokenUsageBucket {
                     source: client_key.clone(),
                     model: model_key,
-                    project_key: channel_names
-                        .get(&channel)
-                        .cloned()
-                        .unwrap_or(channel),
+                    project_key: channel_names.get(&channel).cloned().unwrap_or(channel),
                     timestamp: format!("{date}T00:00:00"),
                     total_tokens: total,
                     billable_total_tokens: total,
@@ -1053,13 +1140,15 @@ pub async fn get_proxy_token_usage_report(
                     ..Default::default()
                 });
 
-                let hb = health_map.entry(format!("{date}T00:00:00")).or_insert_with(|| RequestHealthBucket {
-                    hour: String::new(),
-                    dialogues: 0,
-                    requests: 0,
-                    success: 0,
-                    failed: 0,
-                });
+                let hb = health_map
+                    .entry(format!("{date}T00:00:00"))
+                    .or_insert_with(|| RequestHealthBucket {
+                        hour: String::new(),
+                        dialogues: 0,
+                        requests: 0,
+                        success: 0,
+                        failed: 0,
+                    });
                 hb.requests += reqs;
                 hb.success += succ;
                 hb.failed += fail;
@@ -1101,19 +1190,37 @@ pub async fn get_proxy_token_usage_report(
                 })
                 .map_err(|e| format!("解析反代日统计失败: {e}"))?;
 
-            for (date, channel, model, client, reqs, succ, fail, prompt, comp, reasoning, hit, creation, total) in
-                rows.flatten()
+            for (
+                date,
+                channel,
+                model,
+                client,
+                reqs,
+                succ,
+                fail,
+                prompt,
+                comp,
+                reasoning,
+                hit,
+                creation,
+                total,
+            ) in rows.flatten()
             {
-                let client_key = if client.trim().is_empty() { "其他客户端".to_string() } else { client };
-                let model_key = if model.trim().is_empty() { "历史聚合".to_string() } else { model };
+                let client_key = if client.trim().is_empty() {
+                    "其他客户端".to_string()
+                } else {
+                    client
+                };
+                let model_key = if model.trim().is_empty() {
+                    "历史聚合".to_string()
+                } else {
+                    model
+                };
                 let input = (prompt - hit - creation).max(0);
                 buckets.push(TokenUsageBucket {
                     source: client_key.clone(),
                     model: model_key,
-                    project_key: channel_names
-                        .get(&channel)
-                        .cloned()
-                        .unwrap_or(channel),
+                    project_key: channel_names.get(&channel).cloned().unwrap_or(channel),
                     timestamp: format!("{date}T00:00:00"),
                     total_tokens: total,
                     billable_total_tokens: total,
@@ -1127,13 +1234,15 @@ pub async fn get_proxy_token_usage_report(
                     ..Default::default()
                 });
 
-                let hb = health_map.entry(format!("{date}T00:00:00")).or_insert_with(|| RequestHealthBucket {
-                    hour: String::new(),
-                    dialogues: 0,
-                    requests: 0,
-                    success: 0,
-                    failed: 0,
-                });
+                let hb = health_map
+                    .entry(format!("{date}T00:00:00"))
+                    .or_insert_with(|| RequestHealthBucket {
+                        hour: String::new(),
+                        dialogues: 0,
+                        requests: 0,
+                        success: 0,
+                        failed: 0,
+                    });
                 hb.requests += reqs;
                 hb.success += succ;
                 hb.failed += fail;

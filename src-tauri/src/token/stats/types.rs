@@ -1,6 +1,5 @@
-use crate::models::{
-    RequestHealthBucket, RequestHealthReport, RequestHealthSourceSummary,
-};
+use crate::context::EventBus;
+use crate::models::{RequestHealthBucket, RequestHealthReport, RequestHealthSourceSummary};
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -9,7 +8,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, UNIX_EPOCH};
-use crate::context::EventBus;
 
 pub const CATPAWAI_SOURCE: &str = "catpawai";
 pub const ACTIVITY_CACHE_VERSION: u32 = 8;

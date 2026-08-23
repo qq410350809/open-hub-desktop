@@ -1,3 +1,4 @@
+use crate::context::EventBus;
 use crate::db;
 use crate::models::{
     Database, RequestHealthReport, TokenCollectorSyncReport, TokenStatsReport, TokenUsageReport,
@@ -6,7 +7,6 @@ use crate::token::stats::catpawai::merge_catpawai_usage;
 use crate::token::stats::health::collect_request_health_snapshot;
 use crate::token::stats::types::*;
 use std::time::Instant;
-use crate::context::EventBus;
 
 pub fn query_token_usage(database: &Database) -> Result<TokenUsageReport, String> {
     Ok(db::read_token_usage_snapshot(database)?.unwrap_or_default())
@@ -18,7 +18,9 @@ pub fn query_token_stats(
     to: Option<String>,
 ) -> Result<TokenStatsReport, String> {
     let sessions = db::read_token_sessions_snapshot(database)?.unwrap_or_default();
-    Ok(crate::token::collector::build_token_stats(sessions, from, to))
+    Ok(crate::token::collector::build_token_stats(
+        sessions, from, to,
+    ))
 }
 
 pub fn query_token_health(database: &Database) -> Result<RequestHealthReport, String> {

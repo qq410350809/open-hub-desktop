@@ -1,11 +1,11 @@
 use crate::models::*;
+use crate::proxypool::commands::*;
+use crate::proxypool::geoip::*;
+use crate::proxypool::parser::*;
+use crate::proxypool::rotator::*;
+use crate::proxypool::runtime::*;
 use crate::proxypool::tester::*;
 use crate::proxypool::types::*;
-use crate::proxypool::parser::*;
-use crate::proxypool::runtime::*;
-use crate::proxypool::geoip::*;
-use crate::proxypool::commands::*;
-use crate::proxypool::rotator::*;
 use maxminddb::Reader;
 use std::time::Duration;
 use url::Url;
@@ -47,7 +47,10 @@ fn rejects_incomplete_shadowsocks_nodes_before_runtime_start() {
 
 #[test]
 fn rejects_proxy_nodes_with_out_of_range_ports() {
-    let node = parse_subscription("proxies:\n  - name: bad-port\n    type: http\n    server: example.com\n    port: 70000\n").unwrap();
+    let node = parse_subscription(
+        "proxies:\n  - name: bad-port\n    type: http\n    server: example.com\n    port: 70000\n",
+    )
+    .unwrap();
     assert!(basic_node_config_error(&node[0].raw_json).is_some());
 }
 

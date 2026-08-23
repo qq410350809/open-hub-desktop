@@ -145,15 +145,29 @@ pub async fn handle_gemini_generate(
         final_log.duration_ms = dur;
         final_log.response_body = resp_body;
         if let Ok(jv) = serde_json::from_slice::<JsonValue>(&raw_bytes) {
-            let p = jv.pointer("/usageMetadata/promptTokenCount").and_then(JsonValue::as_u64).unwrap_or(0);
-            let c = jv.pointer("/usageMetadata/candidatesTokenCount").and_then(JsonValue::as_u64).unwrap_or(0);
-            let thoughts = jv.pointer("/usageMetadata/thoughtsTokenCount").and_then(JsonValue::as_u64).unwrap_or(0);
-            let cached = jv.pointer("/usageMetadata/cachedContentTokenCount").and_then(JsonValue::as_u64);
+            let p = jv
+                .pointer("/usageMetadata/promptTokenCount")
+                .and_then(JsonValue::as_u64)
+                .unwrap_or(0);
+            let c = jv
+                .pointer("/usageMetadata/candidatesTokenCount")
+                .and_then(JsonValue::as_u64)
+                .unwrap_or(0);
+            let thoughts = jv
+                .pointer("/usageMetadata/thoughtsTokenCount")
+                .and_then(JsonValue::as_u64)
+                .unwrap_or(0);
+            let cached = jv
+                .pointer("/usageMetadata/cachedContentTokenCount")
+                .and_then(JsonValue::as_u64);
             final_log.prompt_tokens = Some(p);
             final_log.completion_tokens = Some(c + thoughts);
             final_log.prompt_cache_hit_tokens = cached.filter(|v| *v > 0);
             final_log.reasoning_tokens = (thoughts > 0).then_some(thoughts);
-            final_log.total_tokens = jv.pointer("/usageMetadata/totalTokenCount").and_then(JsonValue::as_u64).or(Some(p + c + thoughts));
+            final_log.total_tokens = jv
+                .pointer("/usageMetadata/totalTokenCount")
+                .and_then(JsonValue::as_u64)
+                .or(Some(p + c + thoughts));
         }
         ctx.record_log(final_log).await;
         return (
@@ -164,7 +178,8 @@ pub async fn handle_gemini_generate(
             .into_response();
     }
 
-    let resp_bytes = egress::normalize_response_bytes(outcome.target, &outcome.model_to_send, &raw_bytes);
+    let resp_bytes =
+        egress::normalize_response_bytes(outcome.target, &outcome.model_to_send, &raw_bytes);
     let openai_resp = serde_json::from_slice::<JsonValue>(&resp_bytes).unwrap_or_default();
     let gemini_resp = GeminiProtocolAdapter::openai_response_to_gemini(&openai_resp, raw_model);
 
@@ -172,11 +187,26 @@ pub async fn handle_gemini_generate(
     final_log.duration_ms = dur;
     final_log.response_body = cap_log_body(String::from_utf8_lossy(&resp_bytes).to_string());
     // 归一化后的 OpenAI usage 已带缓存/推理明细
-    final_log.prompt_tokens = openai_resp.pointer("/usage/prompt_tokens").and_then(JsonValue::as_u64).filter(|v| *v > 0);
-    final_log.completion_tokens = openai_resp.pointer("/usage/completion_tokens").and_then(JsonValue::as_u64).filter(|v| *v > 0);
-    final_log.prompt_cache_hit_tokens = openai_resp.pointer("/usage/prompt_tokens_details/cached_tokens").and_then(JsonValue::as_u64).filter(|v| *v > 0);
-    final_log.reasoning_tokens = openai_resp.pointer("/usage/completion_tokens_details/reasoning_tokens").and_then(JsonValue::as_u64).filter(|v| *v > 0);
-    final_log.total_tokens = openai_resp.pointer("/usage/total_tokens").and_then(JsonValue::as_u64).filter(|v| *v > 0);
+    final_log.prompt_tokens = openai_resp
+        .pointer("/usage/prompt_tokens")
+        .and_then(JsonValue::as_u64)
+        .filter(|v| *v > 0);
+    final_log.completion_tokens = openai_resp
+        .pointer("/usage/completion_tokens")
+        .and_then(JsonValue::as_u64)
+        .filter(|v| *v > 0);
+    final_log.prompt_cache_hit_tokens = openai_resp
+        .pointer("/usage/prompt_tokens_details/cached_tokens")
+        .and_then(JsonValue::as_u64)
+        .filter(|v| *v > 0);
+    final_log.reasoning_tokens = openai_resp
+        .pointer("/usage/completion_tokens_details/reasoning_tokens")
+        .and_then(JsonValue::as_u64)
+        .filter(|v| *v > 0);
+    final_log.total_tokens = openai_resp
+        .pointer("/usage/total_tokens")
+        .and_then(JsonValue::as_u64)
+        .filter(|v| *v > 0);
     ctx.record_log(final_log).await;
 
     Json(gemini_resp).into_response()

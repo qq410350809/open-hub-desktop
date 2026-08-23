@@ -1,3 +1,6 @@
+use crate::context::home_dir;
+#[allow(unused_imports)]
+use crate::context::spawn_blocking;
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde::Serialize;
 use std::{
@@ -9,9 +12,6 @@ use std::{
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use crate::context::home_dir;
-#[allow(unused_imports)]
-use crate::context::spawn_blocking;
 use url::Url;
 
 const CHROME_EPOCH_OFFSET_SECONDS: i64 = 11_644_473_600;
@@ -128,11 +128,9 @@ pub async fn read_chrome_session(
 ) -> Result<ChromeSessionValue, String> {
     let home_dir = home_dir().ok_or("无法定位用户目录")?;
 
-    spawn_blocking(move || {
-        read_chrome_session_from_home(&home_dir, &url, &profile_id)
-    })
-    .await
-    .map_err(|error| format!("读取 Chrome 会话任务失败：{error}"))?
+    spawn_blocking(move || read_chrome_session_from_home(&home_dir, &url, &profile_id))
+        .await
+        .map_err(|error| format!("读取 Chrome 会话任务失败：{error}"))?
 }
 
 pub(crate) fn read_chrome_cookie_header_from_home(
@@ -180,11 +178,9 @@ pub(crate) fn chrome_user_agent() -> String {
 
 #[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn open_url_in_chrome_profile(url: String, profile_id: String) -> Result<(), String> {
-    spawn_blocking(move || {
-        open_url_in_chrome_profile_blocking(&url, &profile_id)
-    })
-    .await
-    .map_err(|error| format!("启动 Chrome 任务失败：{error}"))?
+    spawn_blocking(move || open_url_in_chrome_profile_blocking(&url, &profile_id))
+        .await
+        .map_err(|error| format!("启动 Chrome 任务失败：{error}"))?
 }
 
 const CHROME_BRIDGE_TAB_NOT_FOUND: &str = "__OPENHUB_TAB_NOT_FOUND__";

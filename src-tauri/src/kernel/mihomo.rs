@@ -1,15 +1,15 @@
-use tracing::info;
 use flate2::read::GzDecoder;
 use futures_util::future::join_all;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::fs::{self, File};
-use std::io::{copy, Cursor, Write};
+use std::io::{copy, Cursor};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
@@ -58,10 +58,21 @@ pub fn resolve_mihomo_binary(ctx: Option<&AppContext>) -> Option<PathBuf> {
 
     if let Some(ctx) = ctx {
         let bin_dir = ctx.bin_dir();
-        let binary_name = if cfg!(target_os = "windows") { "mihomo.exe" } else { "mihomo" };
+        let binary_name = if cfg!(target_os = "windows") {
+            "mihomo.exe"
+        } else {
+            "mihomo"
+        };
         let candidate = bin_dir.join(binary_name);
         if candidate.is_file() {
             return Some(candidate);
+        }
+
+        if cfg!(target_os = "windows") {
+            let compatibility_candidate = bin_dir.join("mihomo");
+            if compatibility_candidate.is_file() {
+                return Some(compatibility_candidate);
+            }
         }
 
         if let Some(resource_dir) = ctx.resource_dir.as_ref() {
@@ -69,74 +80,16 @@ pub fn resolve_mihomo_binary(ctx: Option<&AppContext>) -> Option<PathBuf> {
             if candidate.is_file() {
                 return Some(candidate);
             }
+            if cfg!(target_os = "windows") {
+                let compatibility_candidate = resource_dir.join("bin").join("mihomo");
+                if compatibility_candidate.is_file() {
+                    return Some(compatibility_candidate);
+                }
+            }
         }
     }
 
     None
-}
-
-/// 启动时若 AppData 目录尚无文件，先自动释放安装包自带的内置基础版内核与 GeoIP 数据库
-pub fn ensure_bundled_assets_installed(ctx: &AppContext) -> Result<(), String> {
-    let app_data = &ctx.data_dir;
-    let _ = std::fs::create_dir_all(app_data);
-    let bin_dir = ctx.bin_dir();
-
-    let binary_name = if cfg!(target_os = "windows") { "mihomo.exe" } else { "mihomo" };
-    let target_binary = bin_dir.join(binary_name);
-    let target_geoip = app_data.join("Country.mmdb");
-
-    // 1. 如果私有 bin/ 目录下没有 mihomo，尝试从安装包内置 resources 释放
-    if !target_binary.is_file() {
-        let mut candidates = Vec::new();
-        if let Some(res_dir) = ctx.resource_dir.as_ref() {
-            candidates.push(res_dir.join("bin").join(binary_name));
-            candidates.push(res_dir.join("resources").join("bin").join(binary_name));
-            candidates.push(res_dir.join(binary_name));
-        }
-        candidates.push(PathBuf::from("resources/bin").join(binary_name));
-        candidates.push(PathBuf::from("src-tauri/resources/bin").join(binary_name));
-
-        for src in candidates {
-            if src.is_file() {
-                if fs::copy(&src, &target_binary).is_ok() {
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        if let Ok(meta) = fs::metadata(&target_binary) {
-                            let mut perms = meta.permissions();
-                            perms.set_mode(0o755);
-                            let _ = fs::set_permissions(&target_binary, perms);
-                        }
-                    }
-                    info!("[OpenHub] 已成功从安装包内置资源释放 Mihomo 内核");
-                    break;
-                }
-            }
-        }
-    }
-
-    // 2. 如果私有 AppData 目录下没有 Country.mmdb，尝试从安装包内置 resources 释放
-    if !target_geoip.is_file() {
-        let mut candidates = Vec::new();
-        if let Some(res_dir) = ctx.resource_dir.as_ref() {
-            candidates.push(res_dir.join("Country.mmdb"));
-            candidates.push(res_dir.join("resources").join("Country.mmdb"));
-        }
-        candidates.push(PathBuf::from("resources/Country.mmdb"));
-        candidates.push(PathBuf::from("src-tauri/resources/Country.mmdb"));
-
-        for src in candidates {
-            if src.is_file() {
-                if fs::copy(&src, &target_geoip).is_ok() {
-                    let _ = fs::copy(&target_geoip, bin_dir.join("Country.mmdb"));
-                    info!("[OpenHub] 已成功从安装包内置资源释放 GeoIP 国家数据库");
-                    break;
-                }
-            }
-        }
-    }
-
-    Ok(())
 }
 
 pub fn read_mihomo_version(binary_path: &Path) -> Option<String> {
@@ -200,7 +153,11 @@ pub async fn query_latest_release(mirror_prefix: Option<&str>) -> Result<(String
             if trimmed == "direct" {
                 prefixes.push("".to_string());
             } else {
-                let p = if trimmed.ends_with('/') { trimmed.to_string() } else { format!("{trimmed}/") };
+                let p = if trimmed.ends_with('/') {
+                    trimmed.to_string()
+                } else {
+                    format!("{trimmed}/")
+                };
                 prefixes.push(p);
             }
         }
@@ -217,18 +174,23 @@ pub async fn query_latest_release(mirror_prefix: Option<&str>) -> Result<(String
         match client.get(&url).send().await {
             Ok(res) if res.status().is_success() => {
                 if let Ok(release) = res.json::<GitHubRelease>().await {
-                    let matched_asset = release.assets.iter().find(|a| {
-                        let name = a.name.to_lowercase();
-                        name.contains(arch_keyword)
-                            && !name.contains("compatible")
-                            && !name.contains("go120")
-                            && (name.ends_with(".gz") || name.ends_with(".zip"))
-                    }).or_else(|| {
-                        release.assets.iter().find(|a| {
+                    let matched_asset = release
+                        .assets
+                        .iter()
+                        .find(|a| {
                             let name = a.name.to_lowercase();
-                            name.contains(arch_keyword) && (name.ends_with(".gz") || name.ends_with(".zip"))
+                            name.contains(arch_keyword)
+                                && !name.contains("compatible")
+                                && !name.contains("go120")
+                                && (name.ends_with(".gz") || name.ends_with(".zip"))
                         })
-                    });
+                        .or_else(|| {
+                            release.assets.iter().find(|a| {
+                                let name = a.name.to_lowercase();
+                                name.contains(arch_keyword)
+                                    && (name.ends_with(".gz") || name.ends_with(".zip"))
+                            })
+                        });
 
                     if let Some(asset) = matched_asset {
                         return Ok((release.tag_name, asset.browser_download_url.clone()));
@@ -301,7 +263,12 @@ async fn rank_fastest_mirrors(raw_url: &str) -> Vec<String> {
         .build()
     {
         Ok(c) => c,
-        Err(_) => return GITHUB_PROXY_PREFIXES.iter().map(|p| format!("{p}{raw_url}")).collect(),
+        Err(_) => {
+            return GITHUB_PROXY_PREFIXES
+                .iter()
+                .map(|p| format!("{p}{raw_url}"))
+                .collect()
+        }
     };
 
     let mut checks = Vec::new();
@@ -311,9 +278,7 @@ async fn rank_fastest_mirrors(raw_url: &str) -> Vec<String> {
         checks.push(async move {
             let t0 = Instant::now();
             match c.head(&full_url).send().await {
-                Ok(res) if res.status().is_success() => {
-                    Some((full_url, t0.elapsed()))
-                }
+                Ok(res) if res.status().is_success() => Some((full_url, t0.elapsed())),
                 _ => None,
             }
         });
@@ -356,7 +321,10 @@ pub async fn download_bytes_with_dynamic_racing(
     let is_direct = chosen_mirror == "direct";
 
     let (ranked_urls, best_url) = if is_direct {
-        (vec![raw_download_url.to_string()], raw_download_url.to_string())
+        (
+            vec![raw_download_url.to_string()],
+            raw_download_url.to_string(),
+        )
     } else if !is_auto {
         let prefix = if chosen_mirror.ends_with('/') {
             chosen_mirror.to_string()
@@ -366,9 +334,16 @@ pub async fn download_bytes_with_dynamic_racing(
         let single_url = format!("{prefix}{raw_download_url}");
         (vec![single_url.clone()], single_url)
     } else {
-        emit_progress("checking", 0.1, &format!("正在智能竞速测试 {item_display_name} 高速节点…"));
+        emit_progress(
+            "checking",
+            0.1,
+            &format!("正在智能竞速测试 {item_display_name} 高速节点…"),
+        );
         let ranked = rank_fastest_mirrors(raw_download_url).await;
-        let first = ranked.first().cloned().unwrap_or_else(|| raw_download_url.to_string());
+        let first = ranked
+            .first()
+            .cloned()
+            .unwrap_or_else(|| raw_download_url.to_string());
         (ranked, first)
     };
 
@@ -379,9 +354,14 @@ pub async fn download_bytes_with_dynamic_racing(
         .map_err(|e| e.to_string())?;
 
     // 1. 获取文件总大小并检测是否支持 Range
-    let head_res = client.head(&best_url).send().await.map_err(|e| e.to_string())?;
+    let head_res = client
+        .head(&best_url)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
     let total_size = head_res.content_length().unwrap_or(0);
-    let accept_ranges = head_res.headers()
+    let accept_ranges = head_res
+        .headers()
         .get(reqwest::header::ACCEPT_RANGES)
         .and_then(|v| v.to_str().ok())
         .map(|v| v.contains("bytes"))
@@ -410,13 +390,21 @@ pub async fn download_bytes_with_dynamic_racing(
             let cur_bytes = downloaded_counter.load(Ordering::Relaxed);
             let cur_time = Instant::now();
             let dt = cur_time.duration_since(last_time).as_secs_f64();
-            let speed_bps = if dt > 0.0 { (cur_bytes.saturating_sub(last_bytes)) as f64 / dt } else { 0.0 };
+            let speed_bps = if dt > 0.0 {
+                (cur_bytes.saturating_sub(last_bytes)) as f64 / dt
+            } else {
+                0.0
+            };
             last_bytes = cur_bytes;
             last_time = cur_time;
 
             let cur_mb = cur_bytes as f64 / 1_048_576.0;
             let speed_mb = speed_bps / 1_048_576.0;
-            let pct = if total_size > 0 { (cur_bytes as f64 / total_size as f64).min(0.99) } else { 0.5 };
+            let pct = if total_size > 0 {
+                (cur_bytes as f64 / total_size as f64).min(0.99)
+            } else {
+                0.5
+            };
 
             let eta_secs = if speed_bps > 1024.0 && total_size > cur_bytes {
                 let s = (total_size - cur_bytes) as f64 / speed_bps;
@@ -426,9 +414,15 @@ pub async fn download_bytes_with_dynamic_racing(
             };
 
             let msg = if speed_mb > 0.05 {
-                format!("正在极速拉取 {}: {:.1}MB / {:.1}MB ({:.1} MB/s{})", display_name_clone, cur_mb, total_mb, speed_mb, eta_secs)
+                format!(
+                    "正在极速拉取 {}: {:.1}MB / {:.1}MB ({:.1} MB/s{})",
+                    display_name_clone, cur_mb, total_mb, speed_mb, eta_secs
+                )
             } else {
-                format!("正在极速拉取 {}: {:.1}MB / {:.1}MB", display_name_clone, cur_mb, total_mb)
+                format!(
+                    "正在极速拉取 {}: {:.1}MB / {:.1}MB",
+                    display_name_clone, cur_mb, total_mb
+                )
             };
 
             bus_for_task.emit(
@@ -448,8 +442,9 @@ pub async fn download_bytes_with_dynamic_racing(
         let num_blocks = ((total_size + block_size - 1) / block_size) as usize;
 
         let block_queue = Arc::new(Mutex::new((0..num_blocks).collect::<VecDeque<usize>>()));
-        let blocks: Arc<Vec<Mutex<Option<Vec<u8>>>>> = Arc::new((0..num_blocks).map(|_| Mutex::new(None)).collect());
-        
+        let blocks: Arc<Vec<Mutex<Option<Vec<u8>>>>> =
+            Arc::new((0..num_blocks).map(|_| Mutex::new(None)).collect());
+
         // 优选前 2 个最快镜像节点进行并发连接
         let top_mirrors = if ranked_urls.len() >= 2 {
             vec![ranked_urls[0].clone(), ranked_urls[1].clone()]
@@ -496,8 +491,12 @@ pub async fn download_bytes_with_dynamic_racing(
 
                     let mut success = false;
                     if let Ok(Ok(res)) = fetch_result {
-                        if res.status().is_success() || res.status() == reqwest::StatusCode::PARTIAL_CONTENT {
-                            if let Ok(Ok(body)) = tokio::time::timeout(Duration::from_millis(3500), res.bytes()).await {
+                        if res.status().is_success()
+                            || res.status() == reqwest::StatusCode::PARTIAL_CONTENT
+                        {
+                            if let Ok(Ok(body)) =
+                                tokio::time::timeout(Duration::from_millis(3500), res.bytes()).await
+                            {
                                 if body.len() == expected_len {
                                     counter.fetch_add(body.len() as u64, Ordering::Relaxed);
                                     let mut slot = blocks_ref[idx].lock().await;
@@ -536,7 +535,11 @@ pub async fn download_bytes_with_dynamic_racing(
         full
     } else {
         // 单流流式下载兜底
-        let res = client.get(&best_url).send().await.map_err(|e| format!("连接镜像失败: {e}"))?;
+        let res = client
+            .get(&best_url)
+            .send()
+            .await
+            .map_err(|e| format!("连接镜像失败: {e}"))?;
         let mut buffer = Vec::with_capacity(total_size as usize);
         let mut stream = res.bytes_stream();
         while let Some(chunk) = stream.next().await {
@@ -552,10 +555,17 @@ pub async fn download_bytes_with_dynamic_racing(
     Ok(final_archive_bytes)
 }
 
+static MIHOMO_DOWNLOAD_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+
+fn mihomo_download_lock() -> &'static tokio::sync::Mutex<()> {
+    MIHOMO_DOWNLOAD_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 pub async fn download_or_update_mihomo_kernel_impl(
     ctx: &Arc<AppContext>,
     mirror: Option<String>,
 ) -> Result<MihomoKernelStatus, String> {
+    let _download_guard = mihomo_download_lock().lock().await;
     let bus = ctx.event_bus.clone();
     let emit_progress = |stage: &str, progress: f64, message: &str| {
         bus.emit(
@@ -582,7 +592,8 @@ pub async fn download_or_update_mihomo_kernel_impl(
         &bus,
         "mihomo-kernel-progress",
         &format!("Mihomo {tag}"),
-    ).await?;
+    )
+    .await?;
 
     emit_progress("extracting", 0.88, "下载完成，正在秒级解压内核…");
 
@@ -591,30 +602,71 @@ pub async fn download_or_update_mihomo_kernel_impl(
     if is_gz {
         let gz_cursor = Cursor::new(final_archive_bytes);
         let mut decoder = GzDecoder::new(gz_cursor);
-        let mut out = File::create(&temp_extracted_path).map_err(|e| format!("创建解压文件失败：{e}"))?;
+        let mut out =
+            File::create(&temp_extracted_path).map_err(|e| format!("创建解压文件失败：{e}"))?;
         copy(&mut decoder, &mut out).map_err(|e| format!("解压 GZ 内核失败：{e}"))?;
     } else {
-        let mut out = File::create(&temp_extracted_path).map_err(|e| format!("创建解压文件失败：{e}"))?;
-        out.write_all(&final_archive_bytes).map_err(|e| format!("写入内核文件失败：{e}"))?;
+        let cursor = Cursor::new(final_archive_bytes);
+        let mut archive =
+            zip::ZipArchive::new(cursor).map_err(|e| format!("读取 Mihomo ZIP 压缩包失败：{e}"))?;
+        let mut found = false;
+        for index in 0..archive.len() {
+            let mut entry = archive
+                .by_index(index)
+                .map_err(|e| format!("读取 Mihomo ZIP 条目失败：{e}"))?;
+            let name = Path::new(entry.name())
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default();
+            if name == binary_filename || name == "mihomo" || name == "mihomo.exe" {
+                let mut out = File::create(&temp_extracted_path)
+                    .map_err(|e| format!("创建解压文件失败：{e}"))?;
+                copy(&mut entry, &mut out).map_err(|e| format!("解压 ZIP 内核失败：{e}"))?;
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            return Err("Mihomo ZIP 压缩包中未找到可执行文件".to_string());
+        }
     }
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut perms = fs::metadata(&temp_extracted_path).map_err(|e| e.to_string())?.permissions();
+        let mut perms = fs::metadata(&temp_extracted_path)
+            .map_err(|e| e.to_string())?
+            .permissions();
         perms.set_mode(0o755);
-        fs::set_permissions(&temp_extracted_path, perms).map_err(|e| format!("赋予执行权限失败：{e}"))?;
+        fs::set_permissions(&temp_extracted_path, perms)
+            .map_err(|e| format!("赋予执行权限失败：{e}"))?;
     }
 
     emit_progress("verifying", 0.96, "正在校验内核有效性…");
 
-    let verified_ver = read_mihomo_version(&temp_extracted_path).ok_or("下载的文件无法作为 Mihomo 内核正常执行")?;
+    let verified_ver = read_mihomo_version(&temp_extracted_path)
+        .ok_or("下载的文件无法作为 Mihomo 内核正常执行")?;
 
-    // 原子替换目标内核文件
-    let _ = fs::remove_file(&target_binary_path);
-    fs::rename(&temp_extracted_path, &target_binary_path).map_err(|e| format!("替换目标内核失败：{e}"))?;
+    // 原子替换目标内核文件，保留当前有效文件直到新文件已经完成校验。
+    let backup_path = target_binary_path.with_extension("bak");
+    let _ = fs::remove_file(&backup_path);
+    if target_binary_path.is_file() {
+        fs::rename(&target_binary_path, &backup_path)
+            .map_err(|e| format!("暂存旧版内核失败：{e}"))?;
+    }
+    if let Err(error) = fs::rename(&temp_extracted_path, &target_binary_path) {
+        if backup_path.is_file() {
+            let _ = fs::rename(&backup_path, &target_binary_path);
+        }
+        return Err(format!("替换目标内核失败：{error}"));
+    }
+    let _ = fs::remove_file(&backup_path);
 
-    emit_progress("completed", 1.0, &format!("Mihomo 内核已成功安装 ({verified_ver})"));
+    emit_progress(
+        "completed",
+        1.0,
+        &format!("Mihomo 内核已成功安装 ({verified_ver})"),
+    );
 
     Ok(MihomoKernelStatus {
         installed: true,

@@ -1,12 +1,8 @@
-use super::balancer::{
-    is_free_opencode_model, is_opencode_channel, select_channel_api_key,
-};
+use super::balancer::{is_free_opencode_model, is_opencode_channel, select_channel_api_key};
 use super::handlers::{
     handle_chat_completions, handle_gemini_generate, handle_messages, handle_responses,
 };
-use super::types::{
-    ChannelModelFetchError, ChannelModelList, ModelProxyConfig, ModelProxyContext,
-};
+use super::types::{ChannelModelFetchError, ChannelModelList, ModelProxyConfig, ModelProxyContext};
 use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode, Uri},
@@ -45,9 +41,44 @@ pub fn create_model_proxy_router(ctx: ModelProxyContext) -> Router {
         .route("/messages", post(handle_messages))
         // Google Gemini
         .route("/v1/gemini/models", get(handle_gemini_models))
-        .route("/v1/gemini/models/{*model_action}", post(handle_gemini_generate))
+        .route(
+            "/v1/gemini/models/{*model_action}",
+            post(handle_gemini_generate),
+        )
         .route("/v1beta/models", get(handle_gemini_models))
-        .route("/v1beta/models/{*model_action}", post(handle_gemini_generate))
+        .route(
+            "/v1beta/models/{*model_action}",
+            post(handle_gemini_generate),
+        )
+        .layer(cors)
+        .with_state(ctx)
+}
+
+/// Router mounted by the main OpenHub service. It intentionally excludes the
+/// root/legacy aliases so `/` and `/api/*` remain owned by the Web service.
+pub fn create_shared_model_proxy_router(ctx: ModelProxyContext) -> Router {
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any);
+
+    Router::new()
+        .route("/v1/health", get(handle_healthz))
+        .route("/v1/models", get(handle_models))
+        .route("/v1/models/{model_id}", get(handle_single_model))
+        .route("/v1/chat/completions", post(handle_chat_completions))
+        .route("/v1/responses", post(handle_responses))
+        .route("/v1/messages", post(handle_messages))
+        .route("/v1/gemini/models", get(handle_gemini_models))
+        .route(
+            "/v1/gemini/models/{*model_action}",
+            post(handle_gemini_generate),
+        )
+        .route("/v1beta/models", get(handle_gemini_models))
+        .route(
+            "/v1beta/models/{*model_action}",
+            post(handle_gemini_generate),
+        )
         .layer(cors)
         .with_state(ctx)
 }
@@ -58,15 +89,25 @@ pub fn create_opencode_proxy_router(ctx: ModelProxyContext) -> Router {
 }
 
 /// 统一鉴权检查
+pub fn gateway_disabled_response() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({
+            "error": {
+                "message": "模型网关当前未启用",
+                "type": "server_error",
+                "code": "gateway_disabled"
+            }
+        })),
+    )
+        .into_response()
+}
+
 pub async fn check_auth(
     headers: &HeaderMap,
-    uri: &Uri,
+    _uri: &Uri,
     config: &ModelProxyConfig,
 ) -> Result<(), Response> {
-    if config.api_key.trim().is_empty() {
-        return Ok(());
-    }
-
     let auth_header = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
@@ -74,34 +115,20 @@ pub async fn check_auth(
         .or_else(|| headers.get("x-goog-api-key").and_then(|v| v.to_str().ok()))
         .unwrap_or_default();
 
-    let mut token = auth_header
+    let token = auth_header
         .strip_prefix("Bearer ")
         .or_else(|| auth_header.strip_prefix("bearer "))
         .unwrap_or(auth_header)
         .trim();
 
-    // 如果 Header 为空，尝试从 Query string (如 ?key=xxx) 读取
-    if token.is_empty() {
-        if let Some(query) = uri.query() {
-            for param in query.split('&') {
-                if let Some((k, v)) = param.split_once('=') {
-                    if k == "key" || k == "api_key" {
-                        token = v.trim();
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    if token == config.api_key.trim() {
+    if !config.api_key.trim().is_empty() && token == config.api_key.trim() {
         Ok(())
     } else {
         Err((
             StatusCode::UNAUTHORIZED,
             Json(json!({
                 "error": {
-                    "message": "Invalid local API Key (本地访问密钥校验未通过)",
+                    "message": "Invalid API key (模型接口 API Key 校验未通过)",
                     "type": "invalid_request_error",
                     "code": "invalid_api_key"
                 }
@@ -112,8 +139,18 @@ pub async fn check_auth(
 }
 
 /// GET /healthz
-pub async fn handle_healthz(State(ctx): State<ModelProxyContext>) -> Response {
+pub async fn handle_healthz(
+    headers: HeaderMap,
+    uri: Uri,
+    State(ctx): State<ModelProxyContext>,
+) -> Response {
     let config = ctx.config.read().await;
+    if !ctx.route_enabled.load(std::sync::atomic::Ordering::Acquire) {
+        return gateway_disabled_response();
+    }
+    if let Err(res) = check_auth(&headers, &uri, &config).await {
+        return res;
+    }
     let models_count = {
         let models = ctx.cached_channel_models.read().await;
         models
@@ -135,29 +172,27 @@ pub async fn handle_healthz(State(ctx): State<ModelProxyContext>) -> Response {
         .map(|t| t.elapsed().as_secs())
         .unwrap_or(0);
 
-    let auth_desc = if config.api_key.is_empty() {
-        "免密直接访问"
-    } else {
-        "Bearer Key 校验"
-    };
-
-    let opencode_chan = config.channels.iter().find(|c| c.id == "opencode");
-    let proxy_pool_desc = match opencode_chan {
-        Some(c) if c.use_proxy_pool => "直连优先 + 代理池按速排序故障转移",
-        Some(c) if c.use_fixed_proxy => "代理池固定通道（不直连）",
-        _ => "直接连接 (直连)",
-    };
-
-    // 端点配置：数据驱动
-    let endpoints: &[(&str, &str, &str, &str)] = &[
-        ("本地模型反代网关 (Gateway)", "/v1", "网关正常运行中，已运行 {uptime} 秒", "auth"),
-        ("Google Gemini 兼容端点", "/v1/gemini", "已支持 /v1/gemini/models/* 原生请求", "Header 或 ?key="),
-        ("Anthropic Claude 兼容端点", "/v1/messages", "已支持 Claude Desktop / Cline / Cursor 等工具直连", "x-api-key 或 Bearer"),
+    let endpoints: &[(&str, &str, &str)] = &[
+        (
+            "本地模型反代网关 (Gateway)",
+            "/v1",
+            "网关正常运行中，已运行 {uptime} 秒",
+        ),
+        (
+            "Google Gemini 兼容端点",
+            "/v1/gemini",
+            "已支持 /v1/gemini/models/* 原生请求",
+        ),
+        (
+            "Anthropic Claude 兼容端点",
+            "/v1/messages",
+            "已支持 Claude Desktop / Cline / Cursor 等工具直连",
+        ),
     ];
 
     let mut checks: Vec<JsonValue> = endpoints
         .iter()
-        .map(|(name, path, msg_tmpl, auth)| {
+        .map(|(name, path, msg_tmpl)| {
             let message = if msg_tmpl.contains("{uptime}") {
                 msg_tmpl.replace("{uptime}", &uptime.to_string())
             } else {
@@ -165,10 +200,10 @@ pub async fn handle_healthz(State(ctx): State<ModelProxyContext>) -> Response {
             };
             json!({
                 "name": name,
-                "endpoint": format!("http://127.0.0.1:{}{}", config.port, path),
+                "endpoint": format!("/v1{}", path.strip_prefix("/v1").unwrap_or(path)),
                 "status": "ok",
                 "message": message,
-                "auth": if auth == &"auth" { auth_desc } else { auth }
+                "auth": "API Key (Authorization: Bearer / x-api-key)",
             })
         })
         .collect();
@@ -176,16 +211,16 @@ pub async fn handle_healthz(State(ctx): State<ModelProxyContext>) -> Response {
     // 动态端点：多渠道负载均衡信息
     checks.push(json!({
         "name": "多渠道负载均衡与代理池",
-        "endpoint": proxy_pool_desc,
+        "endpoint": "/v1",
         "status": "ok",
         "message": format!("共配置 {} 个上游渠道，聚合 {} 个模型", config.channels.len(), models_count),
-        "auth": "多 Key 自动轮询"
+        "auth": "API Key (Authorization: Bearer / x-api-key)"
     }));
 
     Json(json!({
         "status": "ok",
         "service": "OpenHub Local LLM Gateway",
-        "port": config.port,
+        "port": ctx.current_port.read().await.to_owned(),
         "uptimeSeconds": uptime,
         "modelsCount": models_count,
         "channelsCount": config.channels.len(),
@@ -201,6 +236,9 @@ pub async fn handle_models(
     State(ctx): State<ModelProxyContext>,
 ) -> Response {
     let config = ctx.config.read().await;
+    if !ctx.route_enabled.load(std::sync::atomic::Ordering::Acquire) {
+        return gateway_disabled_response();
+    }
     if let Err(res) = check_auth(&headers, &uri, &config).await {
         return res;
     }
@@ -260,7 +298,10 @@ pub async fn handle_models(
         if let Some(explicit_models) = &ch.enabled_models {
             for m in explicit_models {
                 let full_id = format!("{eff_alias}/{m}");
-                if !model_items.iter().any(|item| item.get("id").and_then(JsonValue::as_str) == Some(&full_id)) {
+                if !model_items
+                    .iter()
+                    .any(|item| item.get("id").and_then(JsonValue::as_str) == Some(&full_id))
+                {
                     model_items.push(json!({
                         "id": full_id,
                         "object": "model",
@@ -332,6 +373,9 @@ pub async fn handle_single_model(
     State(ctx): State<ModelProxyContext>,
 ) -> Response {
     let config = ctx.config.read().await;
+    if !ctx.route_enabled.load(std::sync::atomic::Ordering::Acquire) {
+        return gateway_disabled_response();
+    }
     if let Err(res) = check_auth(&headers, &uri, &config).await {
         return res;
     }
@@ -354,6 +398,9 @@ pub async fn handle_gemini_models(
     State(ctx): State<ModelProxyContext>,
 ) -> Response {
     let config = ctx.config.read().await;
+    if !ctx.route_enabled.load(std::sync::atomic::Ordering::Acquire) {
+        return gateway_disabled_response();
+    }
     if let Err(res) = check_auth(&headers, &uri, &config).await {
         return res;
     }
@@ -433,7 +480,8 @@ pub async fn fetch_upstream_models_inner(ctx: &ModelProxyContext) {
                                     list.push(id.to_string());
                                 }
                             }
-                        } else if let Some(models) = jv.get("models").and_then(JsonValue::as_array) {
+                        } else if let Some(models) = jv.get("models").and_then(JsonValue::as_array)
+                        {
                             for item in models {
                                 if let Some(name) = item.get("name").and_then(JsonValue::as_str) {
                                     list.push(name.trim_start_matches("models/").to_string());
@@ -481,4 +529,3 @@ pub async fn fetch_upstream_models_inner(ctx: &ModelProxyContext) {
     *ctx.cached_channel_models.write().await = channel_models;
     *ctx.cached_fetch_errors.write().await = fetch_errors;
 }
-

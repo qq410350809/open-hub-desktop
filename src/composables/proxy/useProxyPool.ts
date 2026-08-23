@@ -30,6 +30,8 @@ const proxyTestCancelling = ref(false);
 const proxyTestCancelRequested = ref(false);
 const proxyNodesRevision = ref(0);
 const proxySourceProgress = ref<Record<string, ProxySourceProgress>>({});
+let componentEventsStarted = false;
+const componentEventUnlisteners: UnlistenFn[] = [];
 
 // —— Mihomo 内核自管理状态 ——
 const kernelStatus = ref<MihomoKernelStatus | null>(null);
@@ -52,13 +54,29 @@ const geoipDownloadProgress = ref<GeoipDownloadProgress>({
   message: "",
 });
 
-if (isTauri) {
-  listen<MihomoDownloadProgress>("mihomo-kernel-progress", (event) => {
-    kernelDownloadProgress.value = event.payload;
-  });
-  listen<GeoipDownloadProgress>("geoip-download-progress", (event) => {
-    geoipDownloadProgress.value = event.payload;
-  });
+async function startComponentEvents() {
+  if (componentEventsStarted) return;
+  componentEventsStarted = true;
+  try {
+    componentEventUnlisteners.push(
+      await listen<MihomoDownloadProgress>("mihomo-kernel-progress", (event) => {
+        kernelDownloadProgress.value = event.payload;
+      }),
+      await listen<GeoipDownloadProgress>("geoip-download-progress", (event) => {
+        geoipDownloadProgress.value = event.payload;
+      }),
+      await listen("proxy-nodes-updated", () => {
+        void loadProxyPool();
+      }),
+    );
+  } catch {
+    // 组件进度监听失败不阻止主界面和手动下载。
+  }
+}
+
+function stopComponentEvents() {
+  componentEventUnlisteners.splice(0).forEach((unlisten) => unlisten());
+  componentEventsStarted = false;
 }
 
 function bumpProxyNodesRevision() {
@@ -70,8 +88,7 @@ async function loadProxyPool() {
   try {
     proxyPool.value = await runCommand<ProxyPoolState>("get_proxy_pool_state");
     bumpProxyNodesRevision();
-    loadMihomoKernelStatus();
-    loadGeoipStatus();
+    await Promise.all([loadMihomoKernelStatus(), loadGeoipStatus()]);
   } catch (error) {
     proxyPoolError.value = String(error);
   } finally {
@@ -706,7 +723,7 @@ export function useProxyPool() {
     kernelStatus, kernelLoading, kernelChecking, kernelDownloading, kernelDownloadProgress,
     geoipStatus, geoipLoading, geoipDownloading, geoipDownloadProgress,
     kernelSelectedMirror, kernelCustomMirror,
-    loadProxyPool, saveProxySubscription, deleteProxySubscription, refreshProxySubscription,
+    loadProxyPool, startComponentEvents, stopComponentEvents, saveProxySubscription, deleteProxySubscription, refreshProxySubscription,
     refreshAllProxySubscriptions, saveProxyPoolSettings, activateProxyNode, clearActiveProxyNode,
     analyzeProxyNodes,
     deleteInvalidProxyNodes,

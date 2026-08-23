@@ -19,9 +19,17 @@ impl OpenAiProtocolAdapter {
                         for f in func_arr {
                             if let Some(f_obj) = f.as_object() {
                                 let name = f_obj.get("name").cloned().unwrap_or_else(|| json!(""));
-                                let desc = f_obj.get("description").cloned().unwrap_or_else(|| json!(""));
-                                let params = f_obj.get("parameters").or_else(|| f_obj.get("input_schema")).cloned()
-                                    .unwrap_or_else(|| json!({ "type": "object", "properties": {} }));
+                                let desc = f_obj
+                                    .get("description")
+                                    .cloned()
+                                    .unwrap_or_else(|| json!(""));
+                                let params = f_obj
+                                    .get("parameters")
+                                    .or_else(|| f_obj.get("input_schema"))
+                                    .cloned()
+                                    .unwrap_or_else(
+                                        || json!({ "type": "object", "properties": {} }),
+                                    );
                                 converted.push(json!({
                                     "type": "function",
                                     "function": {
@@ -56,10 +64,15 @@ impl OpenAiProtocolAdapter {
                                     if let Some(n) = f_obj.get("name").and_then(JsonValue::as_str) {
                                         name = n.trim().to_string();
                                     }
-                                    if let Some(d) = f_obj.get("description").and_then(JsonValue::as_str) {
+                                    if let Some(d) =
+                                        f_obj.get("description").and_then(JsonValue::as_str)
+                                    {
                                         description = d.to_string();
                                     }
-                                    if let Some(p) = f_obj.get("parameters").or_else(|| f_obj.get("input_schema")) {
+                                    if let Some(p) = f_obj
+                                        .get("parameters")
+                                        .or_else(|| f_obj.get("input_schema"))
+                                    {
                                         parameters = p.clone();
                                     }
                                 }
@@ -70,10 +83,15 @@ impl OpenAiProtocolAdapter {
                                 if let Some(n) = item_obj.get("name").and_then(JsonValue::as_str) {
                                     name = n.trim().to_string();
                                 }
-                                if let Some(d) = item_obj.get("description").and_then(JsonValue::as_str) {
+                                if let Some(d) =
+                                    item_obj.get("description").and_then(JsonValue::as_str)
+                                {
                                     description = d.to_string();
                                 }
-                                if let Some(p) = item_obj.get("parameters").or_else(|| item_obj.get("input_schema")) {
+                                if let Some(p) = item_obj
+                                    .get("parameters")
+                                    .or_else(|| item_obj.get("input_schema"))
+                                {
                                     parameters = p.clone();
                                 }
                             }
@@ -141,7 +159,8 @@ impl OpenAiProtocolAdapter {
                                     combined_text.push('\n');
                                 }
                                 combined_text.push_str(t);
-                            } else if part.get("type").and_then(JsonValue::as_str) == Some("image_url")
+                            } else if part.get("type").and_then(JsonValue::as_str)
+                                == Some("image_url")
                                 || part.get("image_url").is_some()
                                 || part.get("type").and_then(JsonValue::as_str) == Some("image")
                             {
@@ -170,24 +189,39 @@ impl OpenAiProtocolAdapter {
                             if let Some(tc_obj) = tc.as_object() {
                                 let mut name = String::new();
                                 let mut args_str = String::new();
-                                let id = tc_obj.get("id").and_then(JsonValue::as_str).unwrap_or("call_default").to_string();
+                                let id = tc_obj
+                                    .get("id")
+                                    .and_then(JsonValue::as_str)
+                                    .unwrap_or("call_default")
+                                    .to_string();
 
                                 if let Some(f_val) = tc_obj.get("function") {
                                     if let Some(f_obj) = f_val.as_object() {
-                                        if let Some(n) = f_obj.get("name").and_then(JsonValue::as_str) {
+                                        if let Some(n) =
+                                            f_obj.get("name").and_then(JsonValue::as_str)
+                                        {
                                             name = n.trim().to_string();
                                         }
                                         if let Some(a) = f_obj.get("arguments") {
-                                            args_str = if let Some(s) = a.as_str() { s.to_string() } else { a.to_string() };
+                                            args_str = if let Some(s) = a.as_str() {
+                                                s.to_string()
+                                            } else {
+                                                a.to_string()
+                                            };
                                         }
                                     }
                                 }
                                 if name.is_empty() {
-                                    if let Some(n) = tc_obj.get("name").and_then(JsonValue::as_str) {
+                                    if let Some(n) = tc_obj.get("name").and_then(JsonValue::as_str)
+                                    {
                                         name = n.trim().to_string();
                                     }
                                     if let Some(a) = tc_obj.get("arguments") {
-                                        args_str = if let Some(s) = a.as_str() { s.to_string() } else { a.to_string() };
+                                        args_str = if let Some(s) = a.as_str() {
+                                            s.to_string()
+                                        } else {
+                                            a.to_string()
+                                        };
                                     }
                                 }
 
@@ -220,7 +254,9 @@ impl OpenAiProtocolAdapter {
                 // 规范化 role: "tool"
                 if msg.get("role").and_then(JsonValue::as_str) == Some("tool") {
                     if let Some(msg_obj) = msg.as_object_mut() {
-                        if !msg_obj.contains_key("tool_call_id") || msg_obj.get("tool_call_id").map_or(true, |v| v.is_null()) {
+                        if !msg_obj.contains_key("tool_call_id")
+                            || msg_obj.get("tool_call_id").map_or(true, |v| v.is_null())
+                        {
                             msg_obj.insert("tool_call_id".to_string(), json!("call_default"));
                         }
                     }
@@ -228,15 +264,20 @@ impl OpenAiProtocolAdapter {
 
                 // 提取 Assistant 思考过程
                 if msg.get("role").and_then(JsonValue::as_str) == Some("assistant") {
-                    let needs_reasoning = msg.get("reasoning_content").map_or(true, |v| v.is_null());
+                    let needs_reasoning =
+                        msg.get("reasoning_content").map_or(true, |v| v.is_null());
                     if needs_reasoning {
                         let mut extracted_reasoning = String::new();
                         if let Some(content_str) = msg.get("content").and_then(JsonValue::as_str) {
-                            if let (Some(start), Some(end)) = (content_str.find("<think>"), content_str.find("</think>")) {
+                            if let (Some(start), Some(end)) =
+                                (content_str.find("<think>"), content_str.find("</think>"))
+                            {
                                 if start < end {
-                                    extracted_reasoning = content_str[start + 7..end].trim().to_string();
+                                    extracted_reasoning =
+                                        content_str[start + 7..end].trim().to_string();
                                     let after_text = &content_str[end + 8..];
-                                    msg["content"] = JsonValue::String(after_text.trim_start().to_string());
+                                    msg["content"] =
+                                        JsonValue::String(after_text.trim_start().to_string());
                                 }
                             }
                         }
@@ -256,7 +297,11 @@ pub struct GeminiProtocolAdapter;
 
 impl GeminiProtocolAdapter {
     /// 将 Gemini contents 格式转换为标准 OpenAI Chat Completions 请求格式
-    pub fn gemini_request_to_openai(gemini_body: &JsonValue, target_model: &str, stream: bool) -> JsonValue {
+    pub fn gemini_request_to_openai(
+        gemini_body: &JsonValue,
+        target_model: &str,
+        stream: bool,
+    ) -> JsonValue {
         let mut messages = Vec::new();
 
         // 1. 处理 systemInstruction
@@ -300,7 +345,11 @@ impl GeminiProtocolAdapter {
                             }
                             text_content.push_str(t);
                         } else if let Some(fc) = p.get("functionCall") {
-                            let name = fc.get("name").and_then(JsonValue::as_str).unwrap_or("tool").to_string();
+                            let name = fc
+                                .get("name")
+                                .and_then(JsonValue::as_str)
+                                .unwrap_or("tool")
+                                .to_string();
                             let args = fc.get("args").cloned().unwrap_or_else(|| json!({}));
                             tool_calls.push(json!({
                                 "id": format!("call_{name}"),
@@ -350,7 +399,10 @@ impl GeminiProtocolAdapter {
         });
 
         // 4. 解析 generationConfig
-        if let Some(cfg) = gemini_body.get("generationConfig").and_then(JsonValue::as_object) {
+        if let Some(cfg) = gemini_body
+            .get("generationConfig")
+            .and_then(JsonValue::as_object)
+        {
             if let Some(temp) = cfg.get("temperature").and_then(JsonValue::as_f64) {
                 openai_req["temperature"] = json!(temp);
             }
@@ -377,8 +429,14 @@ impl GeminiProtocolAdapter {
                 if let Some(decls) = t.get("functionDeclarations").and_then(JsonValue::as_array) {
                     for d in decls {
                         if let Some(name) = d.get("name").and_then(JsonValue::as_str) {
-                            let desc = d.get("description").and_then(JsonValue::as_str).unwrap_or("");
-                            let params = d.get("parameters").cloned().unwrap_or_else(|| json!({"type": "object", "properties": {}}));
+                            let desc = d
+                                .get("description")
+                                .and_then(JsonValue::as_str)
+                                .unwrap_or("");
+                            let params = d
+                                .get("parameters")
+                                .cloned()
+                                .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
                             openai_tools.push(json!({
                                 "type": "function",
                                 "function": {
@@ -416,7 +474,8 @@ impl GeminiProtocolAdapter {
                     for tc in tool_calls {
                         if let Some(f) = tc.get("function") {
                             let name = f.get("name").and_then(JsonValue::as_str).unwrap_or("tool");
-                            let args_val = f.get("arguments")
+                            let args_val = f
+                                .get("arguments")
                                 .and_then(|a| {
                                     if let Some(s) = a.as_str() {
                                         serde_json::from_str::<JsonValue>(s).ok()
@@ -446,9 +505,18 @@ impl GeminiProtocolAdapter {
         }
 
         let usage = openai_resp.get("usage");
-        let prompt_tokens = usage.and_then(|u| u.get("prompt_tokens")).and_then(JsonValue::as_i64).unwrap_or(0);
-        let completion_tokens = usage.and_then(|u| u.get("completion_tokens")).and_then(JsonValue::as_i64).unwrap_or(0);
-        let total_tokens = usage.and_then(|u| u.get("total_tokens")).and_then(JsonValue::as_i64).unwrap_or(prompt_tokens + completion_tokens);
+        let prompt_tokens = usage
+            .and_then(|u| u.get("prompt_tokens"))
+            .and_then(JsonValue::as_i64)
+            .unwrap_or(0);
+        let completion_tokens = usage
+            .and_then(|u| u.get("completion_tokens"))
+            .and_then(JsonValue::as_i64)
+            .unwrap_or(0);
+        let total_tokens = usage
+            .and_then(|u| u.get("total_tokens"))
+            .and_then(JsonValue::as_i64)
+            .unwrap_or(prompt_tokens + completion_tokens);
 
         json!({
             "candidates": [
@@ -486,7 +554,8 @@ impl GeminiProtocolAdapter {
                     if let Some(f) = tc.get("function") {
                         let name = f.get("name").and_then(JsonValue::as_str).unwrap_or("");
                         let args_str = f.get("arguments").and_then(JsonValue::as_str).unwrap_or("");
-                        let args_val = serde_json::from_str::<JsonValue>(args_str).unwrap_or_else(|_| json!({}));
+                        let args_val = serde_json::from_str::<JsonValue>(args_str)
+                            .unwrap_or_else(|_| json!({}));
                         parts.push(json!({
                             "functionCall": {
                                 "name": name,
@@ -498,12 +567,16 @@ impl GeminiProtocolAdapter {
             }
         }
 
-        let finish_reason = choice.get("finish_reason").and_then(JsonValue::as_str).map(|r| match r {
-            "stop" => "STOP",
-            "length" => "MAX_TOKENS",
-            "tool_calls" => "STOP",
-            _ => "STOP",
-        });
+        let finish_reason =
+            choice
+                .get("finish_reason")
+                .and_then(JsonValue::as_str)
+                .map(|r| match r {
+                    "stop" => "STOP",
+                    "length" => "MAX_TOKENS",
+                    "tool_calls" => "STOP",
+                    _ => "STOP",
+                });
 
         if parts.is_empty() && finish_reason.is_none() {
             return None;
@@ -527,9 +600,18 @@ impl GeminiProtocolAdapter {
         });
 
         if let Some(usage) = delta_json.get("usage") {
-            let prompt_tokens = usage.get("prompt_tokens").and_then(JsonValue::as_i64).unwrap_or(0);
-            let completion_tokens = usage.get("completion_tokens").and_then(JsonValue::as_i64).unwrap_or(0);
-            let total_tokens = usage.get("total_tokens").and_then(JsonValue::as_i64).unwrap_or(prompt_tokens + completion_tokens);
+            let prompt_tokens = usage
+                .get("prompt_tokens")
+                .and_then(JsonValue::as_i64)
+                .unwrap_or(0);
+            let completion_tokens = usage
+                .get("completion_tokens")
+                .and_then(JsonValue::as_i64)
+                .unwrap_or(0);
+            let total_tokens = usage
+                .get("total_tokens")
+                .and_then(JsonValue::as_i64)
+                .unwrap_or(prompt_tokens + completion_tokens);
             chunk["usageMetadata"] = json!({
                 "promptTokenCount": prompt_tokens,
                 "candidatesTokenCount": completion_tokens,
@@ -566,8 +648,14 @@ impl ResponsesProtocolAdapter {
                 } else if let Some(input_arr) = input_val.as_array() {
                     for item in input_arr {
                         if let Some(item_obj) = item.as_object() {
-                            let role = item_obj.get("role").and_then(JsonValue::as_str).unwrap_or("user");
-                            let content = item_obj.get("content").cloned().unwrap_or_else(|| json!(""));
+                            let role = item_obj
+                                .get("role")
+                                .and_then(JsonValue::as_str)
+                                .unwrap_or("user");
+                            let content = item_obj
+                                .get("content")
+                                .cloned()
+                                .unwrap_or_else(|| json!(""));
                             msgs.push(json!({
                                 "role": role,
                                 "content": content
@@ -669,7 +757,10 @@ impl AnthropicProtocolAdapter {
         let mut messages = Vec::new();
         if let Some(msgs_arr) = anthropic_body.get("messages").and_then(JsonValue::as_array) {
             for msg in msgs_arr {
-                let role = msg.get("role").and_then(JsonValue::as_str).unwrap_or("user");
+                let role = msg
+                    .get("role")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or("user");
                 if let Some(content_val) = msg.get("content") {
                     if let Some(c_str) = content_val.as_str() {
                         messages.push(json!({ "role": role, "content": c_str }));
@@ -679,7 +770,8 @@ impl AnthropicProtocolAdapter {
                         let mut tool_results = Vec::new();
 
                         for block in c_arr {
-                            let b_type = block.get("type").and_then(JsonValue::as_str).unwrap_or("");
+                            let b_type =
+                                block.get("type").and_then(JsonValue::as_str).unwrap_or("");
                             match b_type {
                                 "text" => {
                                     if let Some(t) = block.get("text").and_then(JsonValue::as_str) {
@@ -690,9 +782,18 @@ impl AnthropicProtocolAdapter {
                                     }
                                 }
                                 "tool_use" => {
-                                    let id = block.get("id").and_then(JsonValue::as_str).unwrap_or("call_default").to_string();
-                                    let name = block.get("name").and_then(JsonValue::as_str).unwrap_or("").to_string();
-                                    let input_val = block.get("input").cloned().unwrap_or_else(|| json!({}));
+                                    let id = block
+                                        .get("id")
+                                        .and_then(JsonValue::as_str)
+                                        .unwrap_or("call_default")
+                                        .to_string();
+                                    let name = block
+                                        .get("name")
+                                        .and_then(JsonValue::as_str)
+                                        .unwrap_or("")
+                                        .to_string();
+                                    let input_val =
+                                        block.get("input").cloned().unwrap_or_else(|| json!({}));
                                     if !name.is_empty() {
                                         tool_calls.push(json!({
                                             "id": id,
@@ -705,14 +806,19 @@ impl AnthropicProtocolAdapter {
                                     }
                                 }
                                 "tool_result" => {
-                                    let tool_use_id = block.get("tool_use_id").and_then(JsonValue::as_str).unwrap_or("call_default");
+                                    let tool_use_id = block
+                                        .get("tool_use_id")
+                                        .and_then(JsonValue::as_str)
+                                        .unwrap_or("call_default");
                                     let mut res_str = String::new();
                                     if let Some(c) = block.get("content") {
                                         if let Some(s) = c.as_str() {
                                             res_str = s.to_string();
                                         } else if let Some(arr) = c.as_array() {
                                             for part in arr {
-                                                if let Some(t) = part.get("text").and_then(JsonValue::as_str) {
+                                                if let Some(t) =
+                                                    part.get("text").and_then(JsonValue::as_str)
+                                                {
                                                     res_str.push_str(t);
                                                 }
                                             }
@@ -752,7 +858,11 @@ impl AnthropicProtocolAdapter {
     }
 
     /// 将 Anthropic Messages API 请求体转换为 OpenAI Chat Completions 请求体
-    pub fn anthropic_request_to_openai(anthropic_body: &JsonValue, target_model: &str, stream: bool) -> JsonValue {
+    pub fn anthropic_request_to_openai(
+        anthropic_body: &JsonValue,
+        target_model: &str,
+        stream: bool,
+    ) -> JsonValue {
         let mut messages = Vec::new();
 
         // 1. 提取 system
@@ -771,7 +881,10 @@ impl AnthropicProtocolAdapter {
         });
 
         // 4. 映射参数
-        if let Some(temp) = anthropic_body.get("temperature").and_then(JsonValue::as_f64) {
+        if let Some(temp) = anthropic_body
+            .get("temperature")
+            .and_then(JsonValue::as_f64)
+        {
             openai_req["temperature"] = json!(temp);
         }
         if let Some(max_tokens) = anthropic_body.get("max_tokens").and_then(JsonValue::as_i64) {
@@ -789,7 +902,11 @@ impl AnthropicProtocolAdapter {
     }
 
     /// 将 OpenAI 非流式响应转换为 Anthropic Messages 响应格式
-    pub fn openai_response_to_anthropic(openai_resp: &JsonValue, req_id: &str, model: &str) -> JsonValue {
+    pub fn openai_response_to_anthropic(
+        openai_resp: &JsonValue,
+        req_id: &str,
+        model: &str,
+    ) -> JsonValue {
         let mut content_blocks = Vec::new();
 
         // 提取文本内容
@@ -807,10 +924,20 @@ impl AnthropicProtocolAdapter {
             .and_then(JsonValue::as_array)
         {
             for tc in tool_calls {
-                let id = tc.get("id").and_then(JsonValue::as_str).unwrap_or("call_default");
-                let name = tc.pointer("/function/name").and_then(JsonValue::as_str).unwrap_or("tool");
-                let args_str = tc.pointer("/function/arguments").and_then(JsonValue::as_str).unwrap_or("{}");
-                let args_val = serde_json::from_str::<JsonValue>(args_str).unwrap_or_else(|_| json!({}));
+                let id = tc
+                    .get("id")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or("call_default");
+                let name = tc
+                    .pointer("/function/name")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or("tool");
+                let args_str = tc
+                    .pointer("/function/arguments")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or("{}");
+                let args_val =
+                    serde_json::from_str::<JsonValue>(args_str).unwrap_or_else(|_| json!({}));
                 content_blocks.push(json!({
                     "type": "tool_use",
                     "id": id,
@@ -833,8 +960,14 @@ impl AnthropicProtocolAdapter {
 
         // 映射 usage
         let usage = openai_resp.get("usage");
-        let p_tok = usage.and_then(|u| u.get("prompt_tokens")).and_then(JsonValue::as_u64).unwrap_or(0);
-        let c_tok = usage.and_then(|u| u.get("completion_tokens")).and_then(JsonValue::as_u64).unwrap_or(0);
+        let p_tok = usage
+            .and_then(|u| u.get("prompt_tokens"))
+            .and_then(JsonValue::as_u64)
+            .unwrap_or(0);
+        let c_tok = usage
+            .and_then(|u| u.get("completion_tokens"))
+            .and_then(JsonValue::as_u64)
+            .unwrap_or(0);
 
         json!({
             "id": format!("msg_{req_id}"),
@@ -854,8 +987,14 @@ impl AnthropicProtocolAdapter {
     /// 提取 OpenAI 响应中的 token 用量信息，供日志记录使用
     pub fn extract_token_usage(openai_resp: &JsonValue) -> (u64, u64) {
         let usage = openai_resp.get("usage");
-        let p_tok = usage.and_then(|u| u.get("prompt_tokens")).and_then(JsonValue::as_u64).unwrap_or(0);
-        let c_tok = usage.and_then(|u| u.get("completion_tokens")).and_then(JsonValue::as_u64).unwrap_or(0);
+        let p_tok = usage
+            .and_then(|u| u.get("prompt_tokens"))
+            .and_then(JsonValue::as_u64)
+            .unwrap_or(0);
+        let c_tok = usage
+            .and_then(|u| u.get("completion_tokens"))
+            .and_then(JsonValue::as_u64)
+            .unwrap_or(0);
         (p_tok, c_tok)
     }
 }

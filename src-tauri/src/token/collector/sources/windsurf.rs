@@ -9,9 +9,17 @@ pub fn collect_windsurf_db_paths(home: &Path) -> Vec<PathBuf> {
     let mut paths = Vec::new();
 
     #[cfg(target_os = "macos")]
-    let base = home.join("Library").join("Application Support").join("Windsurf").join("User");
+    let base = home
+        .join("Library")
+        .join("Application Support")
+        .join("Windsurf")
+        .join("User");
     #[cfg(target_os = "windows")]
-    let base = home.join("AppData").join("Roaming").join("Windsurf").join("User");
+    let base = home
+        .join("AppData")
+        .join("Roaming")
+        .join("Windsurf")
+        .join("User");
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     let base = home.join(".config").join("Windsurf").join("User");
 
@@ -75,12 +83,25 @@ pub fn parse_windsurf_database(path: &Path) -> CachedDatabase {
                 continue;
             };
 
-            if let Some(steps) = val_json.get("steps").or_else(|| val_json.get("messages")).and_then(JsonValue::as_array) {
+            if let Some(steps) = val_json
+                .get("steps")
+                .or_else(|| val_json.get("messages"))
+                .and_then(JsonValue::as_array)
+            {
                 for (idx, step) in steps.iter().enumerate() {
-                    let role = step.get("type").or_else(|| step.get("role")).and_then(JsonValue::as_str).unwrap_or("");
+                    let role = step
+                        .get("type")
+                        .or_else(|| step.get("role"))
+                        .and_then(JsonValue::as_str)
+                        .unwrap_or("");
                     let in_tok = number(step, &["inputTokens", "promptTokens", "input_tokens"]);
-                    let out_tok = number(step, &["outputTokens", "completionTokens", "output_tokens"]);
-                    let total = if in_tok + out_tok > 0 { in_tok + out_tok } else { number(step, &["tokens", "totalTokens"]) };
+                    let out_tok =
+                        number(step, &["outputTokens", "completionTokens", "output_tokens"]);
+                    let total = if in_tok + out_tok > 0 {
+                        in_tok + out_tok
+                    } else {
+                        number(step, &["tokens", "totalTokens"])
+                    };
 
                     if role.contains("user") {
                         user_msg_count += 1;

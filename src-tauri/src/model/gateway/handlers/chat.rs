@@ -111,10 +111,7 @@ pub async fn handle_chat_completions(
 
     if is_stream {
         let stream_body = clean_sse_stream(
-            egress::normalized_sse_stream(
-                outcome.success.response.bytes_stream(),
-                outcome.target,
-            ),
+            egress::normalized_sse_stream(outcome.success.response.bytes_stream(), outcome.target),
             ctx.clone(),
             log,
             start_time,
@@ -147,11 +144,19 @@ pub async fn handle_chat_completions(
                 prompt_toks = usage.get("prompt_tokens").and_then(JsonValue::as_u64);
                 comp_toks = usage.get("completion_tokens").and_then(JsonValue::as_u64);
                 total_toks = usage.get("total_tokens").and_then(JsonValue::as_u64);
-                if let Some(details) = usage.get("prompt_tokens_details").and_then(JsonValue::as_object) {
+                if let Some(details) = usage
+                    .get("prompt_tokens_details")
+                    .and_then(JsonValue::as_object)
+                {
                     cache_toks = details.get("cached_tokens").and_then(JsonValue::as_u64);
-                    cache_creation_toks = details.get("cache_creation_tokens").and_then(JsonValue::as_u64);
+                    cache_creation_toks = details
+                        .get("cache_creation_tokens")
+                        .and_then(JsonValue::as_u64);
                 }
-                if let Some(details) = usage.get("completion_tokens_details").and_then(JsonValue::as_object) {
+                if let Some(details) = usage
+                    .get("completion_tokens_details")
+                    .and_then(JsonValue::as_object)
+                {
                     reas_toks = details.get("reasoning_tokens").and_then(JsonValue::as_u64);
                     if reas_toks.is_some() {
                         has_reasoning = true;
@@ -192,19 +197,29 @@ pub async fn handle_chat_completions(
             ctx.record_log(final_log).await;
 
             if has_reasoning {
-                ctx.metrics.total_reasoning_requests.fetch_add(1, Ordering::Relaxed);
+                ctx.metrics
+                    .total_reasoning_requests
+                    .fetch_add(1, Ordering::Relaxed);
             }
             if let Some(p) = prompt_toks {
-                ctx.metrics.total_prompt_tokens.fetch_add(p, Ordering::Relaxed);
+                ctx.metrics
+                    .total_prompt_tokens
+                    .fetch_add(p, Ordering::Relaxed);
             }
             if let Some(c) = comp_toks {
-                ctx.metrics.total_completion_tokens.fetch_add(c, Ordering::Relaxed);
+                ctx.metrics
+                    .total_completion_tokens
+                    .fetch_add(c, Ordering::Relaxed);
             }
             if let Some(r) = reas_toks {
-                ctx.metrics.total_reasoning_tokens.fetch_add(r, Ordering::Relaxed);
+                ctx.metrics
+                    .total_reasoning_tokens
+                    .fetch_add(r, Ordering::Relaxed);
             }
             if let Some(h) = cache_toks {
-                ctx.metrics.total_cache_hit_tokens.fetch_add(h, Ordering::Relaxed);
+                ctx.metrics
+                    .total_cache_hit_tokens
+                    .fetch_add(h, Ordering::Relaxed);
             }
             if let Some(t) = total_toks {
                 ctx.metrics.total_tokens.fetch_add(t, Ordering::Relaxed);

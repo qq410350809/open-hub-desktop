@@ -1,3 +1,4 @@
+use crate::context::{spawn_blocking, AppContext, EventBus, Managed};
 use crate::models::{
     LocalAgentPathsReport, RawConversation, RawLogReport, RawRequest, RawSession,
     RequestHealthReport, TokenCollectorSyncReport, TokenStatsReport, TokenUsageReport,
@@ -11,7 +12,6 @@ use crate::token::stats::raw_logs::{
 use crate::token::stats::types::emit_token_collector_progress;
 use std::fs;
 use std::path::PathBuf;
-use crate::context::{spawn_blocking, AppContext, EventBus, Managed};
 use std::sync::Arc;
 
 /// Token 查询接口只读取 OpenHub SQLite 快照，不触发日志扫描。
@@ -67,7 +67,9 @@ pub async fn sync_token_data(
 
 /// 只查询 SQLite 中的 Token 用量快照。
 #[cfg_attr(feature = "desktop", tauri::command)]
-pub async fn get_token_usage(ctx: Managed<'_, Arc<AppContext>>) -> Result<TokenUsageReport, String> {
+pub async fn get_token_usage(
+    ctx: Managed<'_, Arc<AppContext>>,
+) -> Result<TokenUsageReport, String> {
     query_token_usage(&ctx.database)
 }
 
@@ -92,10 +94,8 @@ pub async fn get_token_raw_logs() -> Result<RawLogReport, String> {
                     .file_name()
                     .map(|name| name.to_string_lossy().to_string())
                     .unwrap_or_default();
-                let project = crate::token::collector::normalize_workspace_project_key(
-                    &raw_name,
-                    "Claude",
-                );
+                let project =
+                    crate::token::collector::normalize_workspace_project_key(&raw_name, "Claude");
                 if let Ok(files) = fs::read_dir(&project_dir) {
                     for file in files.flatten() {
                         let path = file.path();

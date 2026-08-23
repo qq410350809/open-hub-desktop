@@ -6254,32 +6254,6 @@ kbd { padding: 3px 7px; border: 1px solid var(--line); border-radius: var(--r-xs
   .charity-tag-list li { grid-template-columns: 20px 58px minmax(0,1fr) 34px; }
 }
 
-/* —— 轻量模式 —— */
-.lightweight-banner {
-  position: fixed;
-  left: 50%;
-  transform: translateX(-50%);
-  bottom: 18px;
-  z-index: 900;
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 10px 14px 10px 16px;
-  border-radius: 999px;
-  background: var(--surface-glass);
-  border: 1px solid var(--line-strong);
-  box-shadow: var(--shadow-md);
-  backdrop-filter: blur(12px);
-  color: var(--text);
-  font-size: 13px;
-}
-.lightweight-banner-icon { color: var(--brand); display: inline-flex; }
-.lightweight-banner-icon svg { width: 16px; height: 16px; }
-.lightweight-banner-button { min-height: 32px; padding: 0 14px; font-size: 12.5px; }
-.lightweight-address { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; color: var(--brand-deep); word-break: break-all; }
-.lightweight-enter-button { min-width: 156px; height: 40px; }
-.lightweight-enter-button:disabled { opacity: .45; cursor: not-allowed; }
-
 /* ============================================================
    模型参数目录
    ============================================================ */

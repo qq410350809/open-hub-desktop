@@ -18,6 +18,7 @@ export interface ChannelConfig {
 
 export interface OpencodeProxyConfig {
   enabled: boolean;
+  listenHost: string;
   port: number;
   apiKey: string;
   channels: ChannelConfig[];

@@ -1,15 +1,15 @@
-use crate::site::sync;
+use crate::context::{spawn_blocking, AppContext, EventBus, Managed};
 use crate::db::*;
 use crate::models::*;
-use crate::site::library::{is_newapi, is_newapi_refresh, is_sub2api};
 use crate::proxypool;
 use crate::site::library::*;
+use crate::site::library::{is_newapi, is_newapi_refresh, is_sub2api};
+use crate::site::sync;
 use rusqlite::{params, OptionalExtension};
 use serde_json;
 use std::collections::HashMap;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use crate::context::{spawn_blocking, AppContext, EventBus, Managed};
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use url::Url;
 
 /// 浏览器兜底（Chrome 桥接）失败后的冷却总时长：10 分钟起步，每多失败一次翻倍，
@@ -902,20 +902,19 @@ pub(crate) async fn refresh_newapi_checkin(
     let headers = |request: reqwest::RequestBuilder| {
         apply_newapi_auth(chrome_request_headers(request, base_url, user_agent), auth)
     };
-    let value = match request_json(headers(client.get(query_url.clone())), "签到状态接口").await {
+    let value = match request_json(headers(client.get(query_url.clone())), "签到状态接口").await
+    {
         Ok(value) => value,
-        Err(_) => {
-            match request_json(headers(client.get(query_url)), "签到状态接口").await {
-                Ok(value) => value,
-                Err(_) => {
-                    return CheckinSnapshot {
-                        enabled: false,
-                        checked_in_today: false,
-                        error: String::new(),
-                    };
-                }
+        Err(_) => match request_json(headers(client.get(query_url)), "签到状态接口").await {
+            Ok(value) => value,
+            Err(_) => {
+                return CheckinSnapshot {
+                    enabled: false,
+                    checked_in_today: false,
+                    error: String::new(),
+                };
             }
-        }
+        },
     };
     let (enabled, checked_in_today) = match parse_newapi_checkin_status(&value) {
         Ok(status) => status,
@@ -1221,7 +1220,8 @@ pub(crate) async fn fetch_site_account(
             // 2.2 如果没拿到新 Token，且存在 refresh cookie，尝试通过 /api/user/auth/refresh 刷新会话
             if !acquired && has_refresh_cookie {
                 if let Ok(Some((new_cookies, maybe_token))) =
-                    try_refresh_newapi_session(client, &base_url_parsed, &cookie_header, user_agent).await
+                    try_refresh_newapi_session(client, &base_url_parsed, &cookie_header, user_agent)
+                        .await
                 {
                     temp_auth = NewApiAuth::Legacy {
                         cookie_header: new_cookies,
@@ -1234,7 +1234,8 @@ pub(crate) async fn fetch_site_account(
                             user_id: user_id.clone(),
                         };
                     } else if let Ok(Some(new_token)) =
-                        try_acquire_newapi_token(client, &base_url_parsed, &temp_auth, user_agent).await
+                        try_acquire_newapi_token(client, &base_url_parsed, &temp_auth, user_agent)
+                            .await
                     {
                         api_token = new_token;
                         auth = NewApiAuth::Token {
@@ -1758,13 +1759,7 @@ pub async fn sync_site_account_via_chrome(
     profile_id: String,
     run_id: u64,
 ) -> Result<sync::ChromeSessionInfo, String> {
-    sync_site_account_via_chrome_command(
-        &ctx,
-        site_id,
-        profile_id,
-        run_id,
-    )
-    .await
+    sync_site_account_via_chrome_command(&ctx, site_id, profile_id, run_id).await
 }
 
 /// 手动 Chrome 账号同步入口：统一 60 秒总超时、
@@ -1778,12 +1773,7 @@ pub(crate) async fn sync_site_account_via_chrome_command(
     let database = &*ctx.database;
     let outcome = match tokio::time::timeout(
         SITE_SYNC_TIMEOUT,
-        sync_site_account_via_chrome_inner(
-            ctx,
-            site_id.clone(),
-            profile_id.clone(),
-            run_id,
-        ),
+        sync_site_account_via_chrome_inner(ctx, site_id.clone(), profile_id.clone(), run_id),
     )
     .await
     {
@@ -1969,27 +1959,32 @@ async fn sync_site_account_via_chrome_inner(
                 move |probe_client| {
                     let probe_url = probe_url_clone.clone();
                     async move {
-                        let _ = probe_client.head(&probe_url).send().await.map_err(|e| e.to_string())?;
+                        let _ = probe_client
+                            .head(&probe_url)
+                            .send()
+                            .await
+                            .map_err(|e| e.to_string())?;
                         Ok(())
                     }
                 },
             )
             .await
         } else {
-            let probe_client = build_http_client(
-                database,
-                Duration::from_secs(6),
-                3,
-                "站点可达性探测",
-            )
-            .unwrap_or_else(|_| {
-                reqwest::Client::builder()
-                    .timeout(Duration::from_secs(6))
-                    .no_proxy()
-                    .build()
-                    .expect("fallback client")
-            });
-            probe_client.head(&probe_url).send().await.map(|_| ()).map_err(|e| format!("{e:#}"))
+            let probe_client =
+                build_http_client(database, Duration::from_secs(6), 3, "站点可达性探测")
+                    .unwrap_or_else(|_| {
+                        reqwest::Client::builder()
+                            .timeout(Duration::from_secs(6))
+                            .no_proxy()
+                            .build()
+                            .expect("fallback client")
+                    });
+            probe_client
+                .head(&probe_url)
+                .send()
+                .await
+                .map(|_| ())
+                .map_err(|e| format!("{e:#}"))
         };
 
         match probe_result {
@@ -2371,7 +2366,10 @@ async fn sync_site_account_via_chrome_inner(
             "running",
             format!("正在后台打开 {account_label} 的 Chrome 并尝试自动通过验证"),
         );
-        let account_proxy_url = proxypool::proxy_url_for_account(database, runtime, &site_id, &profile_id).ok().flatten();
+        let account_proxy_url =
+            proxypool::proxy_url_for_account(database, runtime, &site_id, &profile_id)
+                .ok()
+                .flatten();
         let background_attempt = spawn_blocking({
             let browser_url = browser_url.to_string();
             let profile_id = profile_id.clone();
@@ -2469,7 +2467,10 @@ async fn sync_site_account_via_chrome_inner(
                 "running",
                 format!("{account_label} 静默请求未能完成，正在打开 Chrome；如出现验证，请在浏览器中完成"),
             );
-            let account_proxy_url = proxypool::proxy_url_for_account(database, runtime, &site_id, &profile_id).ok().flatten();
+            let account_proxy_url =
+                proxypool::proxy_url_for_account(database, runtime, &site_id, &profile_id)
+                    .ok()
+                    .flatten();
             let bridge_result = spawn_blocking({
                 let browser_url = browser_url.to_string();
                 let profile_id = profile_id.clone();

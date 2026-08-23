@@ -5,12 +5,12 @@ use super::stats::{
     get_channel_usage_stats_summary, get_gateway_overview_stats, get_model_proxy_status_summary,
 };
 use super::types::{
-    ChannelConfig, ChannelModelFetchError, ChannelModelList, ChannelUsageStats, GatewayOverviewStats,
-    ModelProxyConfig, ModelProxyState, ModelProxyStatus, OpencodeProxyConfig, OpencodeProxyState,
-    OpencodeProxyStatus, ProxyRequestLog,
+    ChannelConfig, ChannelModelFetchError, ChannelModelList, ChannelUsageStats,
+    GatewayOverviewStats, ModelProxyConfig, ModelProxyState, ModelProxyStatus, OpencodeProxyConfig,
+    OpencodeProxyState, OpencodeProxyStatus, ProxyRequestLog,
 };
-use serde_json::Value as JsonValue;
 use crate::context::{AppContext, Managed};
+use serde_json::Value as JsonValue;
 use std::sync::Arc;
 
 #[cfg_attr(feature = "desktop", tauri::command)]
@@ -39,6 +39,8 @@ pub async fn save_model_proxy_config_cmd(
     state: Managed<'_, ModelProxyState>,
     config: ModelProxyConfig,
 ) -> Result<ModelProxyStatus, String> {
+    let mut config = config;
+    super::config::sanitize_model_proxy_config(&mut config);
     let database = &*ctx.database;
     {
         let conn = database
@@ -49,14 +51,12 @@ pub async fn save_model_proxy_config_cmd(
     }
     *state.context.config.write().await = config.clone();
 
-    let is_running = state.shutdown_sender.read().await.is_some();
+    let is_running = state
+        .context
+        .route_enabled
+        .load(std::sync::atomic::Ordering::Acquire);
     if config.enabled {
-        // 端口未变化时无需重启：白名单等配置均在请求时热读取，重建 listener 反而引入端口释放竞态
-        let port_changed = *state.current_port.read().await != config.port;
         if !is_running {
-            start_model_proxy_server(&state).await?;
-        } else if port_changed {
-            stop_model_proxy_server(&state).await?;
             start_model_proxy_server(&state).await?;
         }
     } else if is_running {
@@ -175,12 +175,14 @@ pub async fn get_opencode_cached_channel_errors(
 pub async fn test_model_proxy_health(
     state: Managed<'_, ModelProxyState>,
 ) -> Result<serde_json::Value, String> {
-    let port = *state.current_port.read().await;
-    let url = format!("http://127.0.0.1:{port}/healthz");
+    let port = *state.context.current_port.read().await;
+    let url = format!("http://127.0.0.1:{port}/v1/health");
+    let config = state.context.config.read().await.clone();
     let resp = state
         .context
         .default_http_client
         .get(&url)
+        .header("Authorization", format!("Bearer {}", config.api_key))
         .send()
         .await
         .map_err(|e| format!("健康检测请求失败: {e}"))?;
@@ -272,7 +274,10 @@ pub async fn get_model_proxy_logs(
     };
 
     if !query_str.is_empty() {
-        where_clauses.push("(model LIKE ? OR channel_id LIKE ? OR node_name LIKE ? OR error_message LIKE ?)".to_string());
+        where_clauses.push(
+            "(model LIKE ? OR channel_id LIKE ? OR node_name LIKE ? OR error_message LIKE ?)"
+                .to_string(),
+        );
         let pat = format!("%{query_str}%");
         params_vec.push(Box::new(pat.clone()));
         params_vec.push(Box::new(pat.clone()));
@@ -288,7 +293,8 @@ pub async fn get_model_proxy_logs(
 
     let count_filtered: usize = {
         let sql = format!("SELECT COUNT(*) FROM model_proxy_logs {where_sql}");
-        let params_refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|b| b.as_ref()).collect();
+        let params_refs: Vec<&dyn rusqlite::ToSql> =
+            params_vec.iter().map(|b| b.as_ref()).collect();
         conn.query_row(&sql, params_refs.as_slice(), |r| r.get(0))
             .unwrap_or(0)
     };
@@ -301,7 +307,8 @@ pub async fn get_model_proxy_logs(
         } else {
             format!("SELECT COUNT(*) FROM model_proxy_logs {where_sql} AND {status_sql}")
         };
-        let params_refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|b| b.as_ref()).collect();
+        let params_refs: Vec<&dyn rusqlite::ToSql> =
+            params_vec.iter().map(|b| b.as_ref()).collect();
         conn.query_row(&sql, params_refs.as_slice(), |r| r.get(0))
             .unwrap_or(0)
     };
@@ -314,7 +321,8 @@ pub async fn get_model_proxy_logs(
         } else {
             format!("SELECT COUNT(*) FROM model_proxy_logs {where_sql} AND {status_sql}")
         };
-        let params_refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|b| b.as_ref()).collect();
+        let params_refs: Vec<&dyn rusqlite::ToSql> =
+            params_vec.iter().map(|b| b.as_ref()).collect();
         conn.query_row(&sql, params_refs.as_slice(), |r| r.get(0))
             .unwrap_or(0)
     };
@@ -322,7 +330,8 @@ pub async fn get_model_proxy_logs(
     // 顶部标签统计：不受状态筛选与搜索关键词影响，但随所选日期区间变化
     let global_total: usize = {
         let sql = format!("SELECT COUNT(*) FROM model_proxy_logs {date_where_sql}");
-        let params_refs: Vec<&dyn rusqlite::ToSql> = date_only_params.iter().map(|b| b.as_ref()).collect();
+        let params_refs: Vec<&dyn rusqlite::ToSql> =
+            date_only_params.iter().map(|b| b.as_ref()).collect();
         conn.query_row(&sql, params_refs.as_slice(), |r| r.get(0))
             .unwrap_or(0)
     };
@@ -333,7 +342,8 @@ pub async fn get_model_proxy_logs(
         } else {
             format!("SELECT COUNT(*) FROM model_proxy_logs {date_where_sql} AND {status_sql}")
         };
-        let params_refs: Vec<&dyn rusqlite::ToSql> = date_only_params.iter().map(|b| b.as_ref()).collect();
+        let params_refs: Vec<&dyn rusqlite::ToSql> =
+            date_only_params.iter().map(|b| b.as_ref()).collect();
         conn.query_row(&sql, params_refs.as_slice(), |r| r.get(0))
             .unwrap_or(0)
     };
@@ -344,7 +354,8 @@ pub async fn get_model_proxy_logs(
         } else {
             format!("SELECT COUNT(*) FROM model_proxy_logs {date_where_sql} AND {status_sql}")
         };
-        let params_refs: Vec<&dyn rusqlite::ToSql> = date_only_params.iter().map(|b| b.as_ref()).collect();
+        let params_refs: Vec<&dyn rusqlite::ToSql> =
+            date_only_params.iter().map(|b| b.as_ref()).collect();
         conn.query_row(&sql, params_refs.as_slice(), |r| r.get(0))
             .unwrap_or(0)
     };
@@ -430,7 +441,10 @@ pub async fn get_opencode_proxy_logs(
     to: Option<String>,
 ) -> Result<super::types::ProxyLogsResponse, String> {
     let _database = &*ctx.database;
-    get_model_proxy_logs(ctx, page, page_size, filter, q, sort_by, sort_order, from, to).await
+    get_model_proxy_logs(
+        ctx, page, page_size, filter, q, sort_by, sort_order, from, to,
+    )
+    .await
 }
 
 #[cfg_attr(feature = "desktop", tauri::command)]
@@ -562,7 +576,8 @@ pub async fn sync_model_proxy_site_channels(
             })
             .map_err(|e| format!("读取站点记录失败: {e}"))?;
 
-        let filter_set: Option<std::collections::HashSet<String>> = site_ids.map(|s| s.into_iter().collect());
+        let filter_set: Option<std::collections::HashSet<String>> =
+            site_ids.map(|s| s.into_iter().collect());
 
         for item in rows.flatten() {
             let (site_id, site_name, base_url, keys_raw, models_raw) = item;
@@ -608,7 +623,11 @@ pub async fn sync_model_proxy_site_channels(
             }
 
             // 查找或更新对应 channel
-            if let Some(existing) = current_config.channels.iter_mut().find(|c| c.site_id.as_deref() == Some(&site_id) || c.id == site_id) {
+            if let Some(existing) = current_config
+                .channels
+                .iter_mut()
+                .find(|c| c.site_id.as_deref() == Some(&site_id) || c.id == site_id)
+            {
                 existing.base_url = base_url;
                 if !parsed_keys.is_empty() {
                     existing.api_key = parsed_keys[0].clone();
@@ -629,7 +648,11 @@ pub async fn sync_model_proxy_site_channels(
                     protocol: "openai".to_string(),
                     base_url,
                     api_key,
-                    api_keys: if parsed_keys.is_empty() { None } else { Some(parsed_keys) },
+                    api_keys: if parsed_keys.is_empty() {
+                        None
+                    } else {
+                        Some(parsed_keys)
+                    },
                     use_proxy_pool: false,
                     alias: Some(site_id.clone()),
                     site_id: Some(site_id),
@@ -637,7 +660,11 @@ pub async fn sync_model_proxy_site_channels(
                     fixed_proxy_node: None,
                     priority: Some(5),
                     weight: Some(100),
-                    enabled_models: if parsed_models.is_empty() { None } else { Some(parsed_models) },
+                    enabled_models: if parsed_models.is_empty() {
+                        None
+                    } else {
+                        Some(parsed_models)
+                    },
                     model_redirects: None,
                     rate_limit_rpm: None,
                     stats_id: None,
@@ -663,4 +690,3 @@ pub async fn sync_opencode_site_channels(
     let _database = &*ctx.database;
     sync_model_proxy_site_channels(ctx, state, site_ids).await
 }
-

@@ -1,7 +1,6 @@
 import { emptySite, type LibraryData, type ModelCatalogDetail, type ModelCatalogSyncResult, type ProxyIpAnalysis, type ProxyPoolState, type SiteRecord } from "../../types";
 import {
   DEFAULT_IGNORE_ADDRESSES,
-  DEFAULT_PROXY_PORT,
   PROXY_SPEED_TEST_URL,
   buildProxyBaseUrl,
 } from "../../constants";
@@ -688,8 +687,8 @@ export async function browserFallback<T>(
     const sum = (fn: (l: (typeof mockLogs)[number]) => number) => mockLogs.reduce((acc, l) => acc + fn(l), 0);
     return {
       running: true,
-      port: DEFAULT_PROXY_PORT,
-      url: buildProxyBaseUrl(DEFAULT_PROXY_PORT),
+      port: 0,
+      url: buildProxyBaseUrl(),
       totalRequests: mockLogs.length,
       successfulRequests: mockLogs.filter((l) => l.statusCode >= 200 && l.statusCode < 300).length,
       failedRequests: mockLogs.filter((l) => l.statusCode >= 400).length,

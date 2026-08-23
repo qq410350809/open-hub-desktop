@@ -7,7 +7,11 @@
   "scripts": {
     "dev": "vite",
     "build": "vue-tsc && vite build",
+    "check:version": "node scripts/check-version.mjs",
+    "package:server": "node scripts/package-server.mjs",
     "preview": "vite preview",
+    "integrated:dev": "tauri dev",
+    "integrated:build": "tauri build",
     "desktop": "tauri dev",
     "desktop:build": "tauri build",
     "tauri": "tauri",

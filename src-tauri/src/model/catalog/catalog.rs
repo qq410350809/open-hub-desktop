@@ -1,4 +1,4 @@
-use tracing::info;
+use crate::context::{AppContext, Managed};
 use crate::db::build_http_client;
 use crate::models::Database;
 use rusqlite::{params, OptionalExtension};
@@ -6,9 +6,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
-use crate::context::{AppContext, Managed};
 use std::sync::Arc;
+use std::time::Duration;
+use tracing::info;
 
 pub const LLMPRICING_MANIFEST_URL: &str = "https://llmpricing.dev/rows/manifest.json";
 pub const LLMPRICING_BASE_URL: &str = "https://llmpricing.dev/rows";
@@ -429,26 +429,33 @@ fn parse_model_item_from_json(row: &Value) -> Option<ModelCatalogItem> {
     let input_modalities = string_array(obj.get("inputModalities"));
 
     let context_length = integer(obj.get("context"));
-    let (context_min, context_max) = if let Some(arr) = obj.get("contextRange").and_then(Value::as_array) {
-        if arr.len() >= 2 {
-            (integer(arr.first()), integer(arr.get(1)))
+    let (context_min, context_max) =
+        if let Some(arr) = obj.get("contextRange").and_then(Value::as_array) {
+            if arr.len() >= 2 {
+                (integer(arr.first()), integer(arr.get(1)))
+            } else {
+                (context_length, context_length)
+            }
         } else {
             (context_length, context_length)
-        }
-    } else {
-        (context_length, context_length)
-    };
+        };
     let max_output_tokens = integer(obj.get("outputLimit"));
 
     let ref_obj = obj.get("ref").and_then(Value::as_object);
-    let ref_provider = ref_obj.and_then(|r| r.get("provider")).and_then(Value::as_str).map(str::to_string);
+    let ref_provider = ref_obj
+        .and_then(|r| r.get("provider"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
     let ref_official = boolean(obj.get("refOfficial"));
     let ref_input_cost = numeric(ref_obj.and_then(|r| r.get("input")));
     let ref_output_cost = numeric(ref_obj.and_then(|r| r.get("output")));
     let ref_cache_read_cost = numeric(ref_obj.and_then(|r| r.get("cacheRead")));
 
     let min_obj = obj.get("min").and_then(Value::as_object);
-    let min_provider = min_obj.and_then(|r| r.get("provider")).and_then(Value::as_str).map(str::to_string);
+    let min_provider = min_obj
+        .and_then(|r| r.get("provider"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
     let min_input_cost = numeric(min_obj.and_then(|r| r.get("input")));
     let min_output_cost = numeric(min_obj.and_then(|r| r.get("output")));
     let min_cache_read_cost = numeric(min_obj.and_then(|r| r.get("cacheRead")));
@@ -636,7 +643,11 @@ fn persist_catalog_llmpricing(
         let p_api = opt_text(p_val.get("api"));
         let p_doc = opt_text(p_val.get("doc"));
         let p_tier = opt_text(p_val.get("tier"));
-        let p_sub = if boolean(p_val.get("subscription")) { 1 } else { 0 };
+        let p_sub = if boolean(p_val.get("subscription")) {
+            1
+        } else {
+            0
+        };
         let p_count = integer(p_val.get("count"));
         let p_date = opt_text(p_val.get("dateModified"));
 
@@ -705,18 +716,22 @@ fn persist_catalog_llmpricing(
     }
 
     for (item, raw_str) in deduplicated_models.values() {
-        let aa_json = if item.aa_idx.is_some() || item.aa_coding.is_some() || item.aa_speed.is_some() {
-            Some(json!({
-                "idx": item.aa_idx,
-                "coding": item.aa_coding,
-                "agentic": item.aa_agentic,
-                "speed": item.aa_speed,
-                "ttft": item.aa_ttft,
-                "taskCost": item.aa_task_cost,
-            }).to_string())
-        } else {
-            None
-        };
+        let aa_json =
+            if item.aa_idx.is_some() || item.aa_coding.is_some() || item.aa_speed.is_some() {
+                Some(
+                    json!({
+                        "idx": item.aa_idx,
+                        "coding": item.aa_coding,
+                        "agentic": item.aa_agentic,
+                        "speed": item.aa_speed,
+                        "ttft": item.aa_ttft,
+                        "taskCost": item.aa_task_cost,
+                    })
+                    .to_string(),
+                )
+            } else {
+                None
+            };
 
         transaction
             .execute(
@@ -797,7 +812,11 @@ fn persist_catalog_llmpricing(
         model_count += 1;
     }
 
-    crate::db::write_meta(&transaction, CATALOG_SCHEMA_META_KEY, CATALOG_SCHEMA_VERSION)?;
+    crate::db::write_meta(
+        &transaction,
+        CATALOG_SCHEMA_META_KEY,
+        CATALOG_SCHEMA_VERSION,
+    )?;
 
     transaction.commit().map_err(|error| error.to_string())?;
 
@@ -809,7 +828,9 @@ fn persist_catalog_llmpricing(
 }
 
 #[cfg_attr(feature = "desktop", tauri::command)]
-pub fn get_model_catalog(ctx: Managed<'_, Arc<AppContext>>) -> Result<ModelCatalogSnapshot, String> {
+pub fn get_model_catalog(
+    ctx: Managed<'_, Arc<AppContext>>,
+) -> Result<ModelCatalogSnapshot, String> {
     get_model_catalog_inner(&ctx.database)
 }
 
@@ -1088,7 +1109,9 @@ pub(crate) async fn get_model_catalog_detail_inner(
     }
 
     if raw_hosts.is_empty() {
-        if let Ok(client) = build_http_client(database, Duration::from_secs(8), 5, "获取模型渠道明细") {
+        if let Ok(client) =
+            build_http_client(database, Duration::from_secs(8), 5, "获取模型渠道明细")
+        {
             let fetched = fetch_hosts_for_model(&client, &model.id).await;
             if !fetched.is_empty() {
                 if let Ok(hosts_str) = serde_json::to_string(&fetched) {
@@ -1114,26 +1137,39 @@ pub(crate) async fn get_model_catalog_detail_inner(
                 continue;
             }
             let p_meta = all_providers_map.get(&p_id);
-            let name = p_meta.map(|p| p.name.clone()).unwrap_or_else(|| p_id.clone());
-            let tier = p_meta.and_then(|p| p.tier.clone()).or_else(|| opt_text(h.get("tier")));
-            let subscription = p_meta.map(|p| p.subscription).unwrap_or(false) || boolean(h.get("subscription"));
+            let name = p_meta
+                .map(|p| p.name.clone())
+                .unwrap_or_else(|| p_id.clone());
+            let tier = p_meta
+                .and_then(|p| p.tier.clone())
+                .or_else(|| opt_text(h.get("tier")));
+            let subscription =
+                p_meta.map(|p| p.subscription).unwrap_or(false) || boolean(h.get("subscription"));
             let doc = p_meta.and_then(|p| p.doc.clone());
             let model_id = opt_text(h.get("modelId"));
             let input = opt_numeric(h.get("input"));
             let output = opt_numeric(h.get("output"));
             let cache_read = opt_numeric(h.get("cacheRead"));
             let cache_write = opt_numeric(h.get("cacheWrite"));
-            let context = opt_numeric(h.get("context")).map(|c| c as i64).or(Some(model.context_length));
-            let output_limit = opt_numeric(h.get("outputLimit")).map(|c| c as i64).or(Some(model.max_output_tokens));
+            let context = opt_numeric(h.get("context"))
+                .map(|c| c as i64)
+                .or(Some(model.context_length));
+            let output_limit = opt_numeric(h.get("outputLimit"))
+                .map(|c| c as i64)
+                .or(Some(model.max_output_tokens));
             let status = opt_text(h.get("status"));
-            let official = boolean(h.get("official")) || (Some(&p_id) == model.ref_provider.as_ref() && model.ref_official);
+            let official = boolean(h.get("official"))
+                || (Some(&p_id) == model.ref_provider.as_ref() && model.ref_official);
             let is_free = (input == Some(0.0) && output == Some(0.0)) && !subscription;
             let is_min = (Some(&p_id) == model.min_provider.as_ref() && !is_free)
                 || (input == Some(model.min_input_cost) && model.min_input_cost > 0.0);
             let is_ref = Some(&p_id) == model.ref_provider.as_ref() || official;
 
             if let Some(meta) = p_meta {
-                if !matched_providers.iter().any(|p: &ModelCatalogProvider| p.id == meta.id) {
+                if !matched_providers
+                    .iter()
+                    .any(|p: &ModelCatalogProvider| p.id == meta.id)
+                {
                     matched_providers.push(meta.clone());
                 }
             }
@@ -1162,7 +1198,9 @@ pub(crate) async fn get_model_catalog_detail_inner(
         // Fallback using model.host_providers
         for p_id in &model.host_providers {
             let p_meta = all_providers_map.get(p_id);
-            let name = p_meta.map(|p| p.name.clone()).unwrap_or_else(|| p_id.clone());
+            let name = p_meta
+                .map(|p| p.name.clone())
+                .unwrap_or_else(|| p_id.clone());
             let tier = p_meta.and_then(|p| p.tier.clone());
             let subscription = p_meta.map(|p| p.subscription).unwrap_or(false);
             let doc = p_meta.and_then(|p| p.doc.clone());
@@ -1192,7 +1230,10 @@ pub(crate) async fn get_model_catalog_detail_inner(
             let is_free = (input == Some(0.0) && output == Some(0.0)) && !subscription;
 
             if let Some(meta) = p_meta {
-                if !matched_providers.iter().any(|p: &ModelCatalogProvider| p.id == meta.id) {
+                if !matched_providers
+                    .iter()
+                    .any(|p: &ModelCatalogProvider| p.id == meta.id)
+                {
                     matched_providers.push(meta.clone());
                 }
             }
@@ -1263,9 +1304,10 @@ pub(crate) async fn sync_model_catalog_inner(
     bus.emit("model-catalog-sync-status", json!({ "status": "syncing" }));
 
     let client = build_http_client(database, Duration::from_secs(60), 5, "模型参数同步")?;
-    
+
     // 1. Fetch manifest
-    let (manifest_raw, manifest) = fetch_json(&client, "LLMPricing Manifest", LLMPRICING_MANIFEST_URL).await?;
+    let (manifest_raw, manifest) =
+        fetch_json(&client, "LLMPricing Manifest", LLMPRICING_MANIFEST_URL).await?;
 
     let shards_array = manifest
         .get("shards")
@@ -1276,10 +1318,20 @@ pub(crate) async fn sync_model_catalog_inner(
 
     // 2. Fetch each shard
     for (idx, shard_val) in shards_array.iter().enumerate() {
-        let shard_name = shard_val.as_str().ok_or_else(|| "Shard 名称格式无效".to_string())?;
+        let shard_name = shard_val
+            .as_str()
+            .ok_or_else(|| "Shard 名称格式无效".to_string())?;
         let shard_url = format!("{LLMPRICING_BASE_URL}/{shard_name}");
-        let progress_msg = format!("正在下载模型分片 {}/{} ({})", idx + 1, shards_array.len(), shard_name);
-        bus.emit("model-catalog-sync-status", json!({ "status": "syncing", "message": progress_msg }));
+        let progress_msg = format!(
+            "正在下载模型分片 {}/{} ({})",
+            idx + 1,
+            shards_array.len(),
+            shard_name
+        );
+        bus.emit(
+            "model-catalog-sync-status",
+            json!({ "status": "syncing", "message": progress_msg }),
+        );
 
         let (shard_raw, shard_json) = fetch_json(&client, shard_name, &shard_url).await?;
         shards_data.push((shard_name.to_string(), shard_raw, shard_json));
@@ -1291,9 +1343,7 @@ pub(crate) async fn sync_model_catalog_inner(
 
     let message = format!(
         "模型参数同步完成：LLMPricing 收录 {} 个供应商、{} 个模型（共 {} 个分片）",
-        report.provider_count,
-        report.model_count,
-        report.shard_count,
+        report.provider_count, report.model_count, report.shard_count,
     );
 
     bus.emit(
@@ -1341,7 +1391,8 @@ async fn fetch_and_persist_once(
     let client = build_http_client(database, Duration::from_secs(60), 5, "模型参数同步")?;
 
     info!(target: "openhub::catalog", "正在获取 LLMPricing Manifest: {LLMPRICING_MANIFEST_URL} ...");
-    let (manifest_raw, manifest) = fetch_json(&client, "LLMPricing Manifest", LLMPRICING_MANIFEST_URL).await?;
+    let (manifest_raw, manifest) =
+        fetch_json(&client, "LLMPricing Manifest", LLMPRICING_MANIFEST_URL).await?;
 
     let shards_array = manifest
         .get("shards")
@@ -1350,7 +1401,9 @@ async fn fetch_and_persist_once(
 
     let mut shards_data = Vec::with_capacity(shards_array.len());
     for (idx, shard_val) in shards_array.iter().enumerate() {
-        let shard_name = shard_val.as_str().ok_or_else(|| "Shard 名称格式无效".to_string())?;
+        let shard_name = shard_val
+            .as_str()
+            .ok_or_else(|| "Shard 名称格式无效".to_string())?;
         let shard_url = format!("{LLMPRICING_BASE_URL}/{shard_name}");
         info!(target: "openhub::catalog", "正在获取分片 [{}/{}]: {} ...", idx + 1, shards_array.len(), shard_name);
         let (shard_raw, shard_json) = fetch_json(&client, shard_name, &shard_url).await?;
@@ -1465,7 +1518,9 @@ mod tests {
                  INSERT INTO model_catalog_entries (canonical_key) VALUES ('openai/gpt-primary');",
             )
             .unwrap();
-        connection.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        connection
+            .execute_batch("PRAGMA foreign_keys = ON;")
+            .unwrap();
 
         clear_legacy_catalog_if_needed(&mut connection).unwrap();
 

@@ -14,7 +14,10 @@ pub fn cap_log_body(text: String) -> Option<String> {
         return Some(trimmed.to_string());
     }
     let truncated: String = trimmed.chars().take(MAX_LOG_BODY_CHARS).collect();
-    Some(format!("{truncated}\n\n…[内容过长已截断，原始长度 {} 字符]", trimmed.chars().count()))
+    Some(format!(
+        "{truncated}\n\n…[内容过长已截断，原始长度 {} 字符]",
+        trimmed.chars().count()
+    ))
 }
 
 #[derive(Clone, Debug)]
@@ -175,10 +178,7 @@ pub fn client_name_from_headers(headers: &axum::http::HeaderMap, path: &str) -> 
 }
 
 /// 记录单次尝试的失败日志，并原子递增 failed_requests 计数器
-pub async fn record_attempt_failure(
-    ctx: &ModelProxyContext,
-    params: ProxyLogParams,
-) {
+pub async fn record_attempt_failure(ctx: &ModelProxyContext, params: ProxyLogParams) {
     ctx.metrics.failed_requests.fetch_add(1, Ordering::Relaxed);
     ctx.record_log(params.into_log()).await;
 }
@@ -221,7 +221,8 @@ pub async fn record_auth_failure_log(
         )
         .with_channel_stats_id(opencode_stats_id)
         .with_client_name(client_name),
-    ).await;
+    )
+    .await;
 }
 
 #[cfg(test)]
@@ -231,7 +232,10 @@ mod logger_tests {
     #[test]
     fn cap_log_body_trims_and_truncates() {
         assert!(cap_log_body("  ".to_string()).is_none());
-        assert_eq!(cap_log_body(" hello ".to_string()).as_deref(), Some("hello"));
+        assert_eq!(
+            cap_log_body(" hello ".to_string()).as_deref(),
+            Some("hello")
+        );
 
         let long = "a".repeat(MAX_LOG_BODY_CHARS + 10);
         let capped = cap_log_body(long).unwrap();

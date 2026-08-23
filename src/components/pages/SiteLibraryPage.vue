@@ -1286,6 +1286,14 @@ onUnmounted(() => {
                 >
                   <span v-html="icons.edit" />
                 </button>
+                <button
+                  type="button"
+                  class="sl-action-icon-btn sl-action-danger"
+                  title="删除站点"
+                  @click.stop="store.deleteSite(site)"
+                >
+                  <span v-html="icons.trash" />
+                </button>
               </div>
             </div>
           </article>
@@ -1421,6 +1429,14 @@ onUnmounted(() => {
                 @click="store.openModal(row)"
               >
                 <span v-html="icons.edit" />
+              </button>
+              <button
+                type="button"
+                class="sl-action-icon-btn sl-action-danger"
+                title="删除站点"
+                @click="store.deleteSite(row)"
+              >
+                <span v-html="icons.trash" />
               </button>
             </div>
           </template>
@@ -1688,6 +1704,16 @@ onUnmounted(() => {
                   @click.stop="store.openModal(site)"
                 >
                   <span v-html="icons.edit" />
+                </button>
+
+                <!-- 删除站点 -->
+                <button
+                  type="button"
+                  class="sl-action-icon-btn sl-action-danger"
+                  title="删除站点"
+                  @click.stop="store.deleteSite(site)"
+                >
+                  <span v-html="icons.trash" />
                 </button>
               </div>
             </div>

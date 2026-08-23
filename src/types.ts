@@ -722,13 +722,6 @@ export interface LocalAgentPathsReport {
   collectedAt: string;
 }
 
-export interface LightweightState {
-  running: boolean;
-  port: number;
-  enabled: boolean;
-  url: string;
-}
-
 export interface ModelCatalogProvider {
   id: string;
   name: string;

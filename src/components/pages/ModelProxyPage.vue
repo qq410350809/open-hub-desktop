@@ -28,9 +28,15 @@ import {
 import CustomSelect from "../common/CustomSelect.vue";
 import DateRangeDropdown from "../common/DateRangeDropdown.vue";
 import type { SiteRecord } from "../../types";
-import { DEFAULT_PROXY_PORT, LOCALHOST, API_PATH_V1, API_PATH_GEMINI, API_PATH_MESSAGES } from "../../constants";
+import { API_PATH_V1, API_PATH_GEMINI, API_PATH_MESSAGES } from "../../constants";
+import { isTauri } from "../../composables/core/ipc";
 
-const proxyPortPlaceholder = String(DEFAULT_PROXY_PORT);
+/** 模型 API Origin：桌面端访问本机内嵌服务（端口随实际监听顺延），浏览器端与 Web 服务同源。 */
+const serviceOrigin = computed(() =>
+  isTauri
+    ? `http://127.0.0.1:${proxyStatus.value.port || 17896}`
+    : window.location.origin,
+);
 
 const logPageSizeOptions = [
   { value: 10, text: "10" },
@@ -71,6 +77,7 @@ fetchLogs,
   clearLogs,
   copyProxyUrl,
   copyGeminiUrl,
+  copyGeminiV1BetaUrl,
   copyClaudeUrl,
   copyProxyKey,
   logPage,
@@ -939,20 +946,20 @@ const healthCheckList = computed<HealthCheckItem[]>(() => {
     return [
       {
         name: "健康检查连接",
-        endpoint: "/healthz",
+        endpoint: "/v1/health",
         status: "error",
         message: String(healthResult.value.error),
-        auth: "公开",
+        auth: "API Key",
       },
     ];
   }
   return [
     {
       name: "本地服务",
-      endpoint: "/healthz",
+      endpoint: "/v1/health",
       status: "ok",
       message: JSON.stringify(healthResult.value),
-      auth: "公开",
+      auth: "API Key",
     },
   ];
 });
@@ -964,13 +971,16 @@ const healthAllPassed = computed(() => {
 
 // —— 控制台端点快速复制与指标聚合 ——
 const openAiBaseUrl = computed(
-  () => proxyStatus.value.url || `http://${LOCALHOST}:${proxyConfig.value.port}${API_PATH_V1}`
+  () => (isTauri && proxyStatus.value.url) || `${serviceOrigin.value}${API_PATH_V1}`
 );
 const claudeMessagesUrl = computed(
-  () => `http://${LOCALHOST}:${proxyStatus.value.port || proxyConfig.value.port}${API_PATH_MESSAGES}`
+  () => `${serviceOrigin.value}${API_PATH_MESSAGES}`
 );
-const geminiBaseUrl = computed(
-  () => `http://${LOCALHOST}:${proxyStatus.value.port || proxyConfig.value.port}${API_PATH_GEMINI}`
+const geminiV1Url = computed(
+  () => `${serviceOrigin.value}${API_PATH_GEMINI}`
+);
+const geminiV1BetaUrl = computed(
+  () => `${serviceOrigin.value}/v1beta`
 );
 
 const responsesApiUrl = computed(
@@ -1009,8 +1019,12 @@ const statTotals = computed<GatewayOverviewTotals>(
 const todayStats = computed(() => gatewayOverview.value?.today ?? null);
 
 async function copyAuthHeader() {
-  const header = `Authorization: Bearer ${proxyConfig.value.apiKey || "sk-proxy"}`;
-  await copyText(header, "Authorization Header");
+  const key = proxyConfig.value.apiKey?.trim() || "";
+  if (!key) {
+    showToast("API Key 尚未生成，请先保存网关配置或重启服务", true);
+    return;
+  }
+  await copyText(`Authorization: Bearer ${key}`, "Authorization Header");
 }
 
 const liveSuccessRate = computed(() => {
@@ -1442,7 +1456,7 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
             <span class="mp-channel-pill">多渠道架构</span>
           </div>
           <p class="mp-subtitle">
-            对外提供标准兼容的 OpenAI 和 Anthropic API · 监听端口 <strong>{{ proxyStatus.port || proxyConfig.port }}</strong>
+            对外提供标准兼容的 OpenAI 和 Anthropic API · 共享服务端口 <strong>{{ proxyStatus.port || "启动后确定" }}</strong>
           </p>
         </div>
       </div>
@@ -1452,7 +1466,7 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
         <button
           type="button"
           class="mp-btn mp-btn-ghost"
-          title="修改反代端口与访问密钥"
+          title="管理模型接口 API Key 与网关选项"
           @click="configModalOpen = true"
         >
           <span v-html="icons.settings" />
@@ -1554,7 +1568,7 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
           <div class="mp-endpoints-summary-chips">
             <span class="mp-ep-chip font-mono">
               <span class="text-muted">端口</span>
-              <strong class="text-brand">{{ proxyStatus.port || proxyConfig.port }}</strong>
+              <strong class="text-brand">{{ proxyStatus.port || "启动后确定" }}</strong>
             </span>
             <span class="mp-ep-chip font-mono">
               <span class="text-muted">运行</span>
@@ -1607,15 +1621,15 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
                   <span>访问密钥</span>
                 </div>
                 <span class="mp-epr-key-state" :class="proxyConfig.apiKey ? 'is-on' : 'is-off'">
-                  {{ proxyConfig.apiKey ? '本地鉴权已启用' : '免密模式' }}
+                  {{ proxyConfig.apiKey ? '模型接口 API Key 已配置' : '等待生成模型接口 API Key' }}
                 </span>
               </div>
               <div class="mp-epr-key-line">
                 <code
                   class="mp-epr-code font-mono"
-                  :title="proxyConfig.apiKey || '免密直接访问'"
+                  :title="proxyConfig.apiKey || '等待服务生成 API Key'"
                 >
-                  {{ showKey ? (proxyConfig.apiKey || '(未配置密钥，免密直接访问)') : (proxyConfig.apiKey ? '••••••••••••••••••••' : '(未配置密钥，免密直接访问)') }}
+                  {{ showKey ? (proxyConfig.apiKey || '(等待服务生成 API Key)') : (proxyConfig.apiKey ? '••••••••••••••••••••' : '(等待服务生成 API Key)') }}
                 </code>
                 <div class="mp-epr-btns">
                   <button
@@ -1703,18 +1717,35 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
               </button>
             </div>
 
-            <!-- Gemini Base URL -->
+            <!-- Gemini Base URL (v1) -->
             <div class="mp-endpoint-row mp-epr-cell">
               <div class="mp-epr-label">
                 <span class="mp-proto-badge is-gemini">Gemini</span>
-                <span>Base URL</span>
+                <span>Base URL (v1)</span>
               </div>
-              <code class="mp-epr-code font-mono" :title="geminiBaseUrl">{{ stripOrigin(geminiBaseUrl) }}</code>
+              <code class="mp-epr-code font-mono" :title="geminiV1Url">{{ stripOrigin(geminiV1Url) }}</code>
               <button
                 type="button"
                 class="mp-action-btn mp-btn-icon-only"
-                title="复制 Google Gemini 原生 Base URL"
+                title="复制 Google Gemini v1 Base URL"
                 @click="copyGeminiUrl"
+              >
+                <span v-html="icons.copy" />
+              </button>
+            </div>
+
+            <!-- Gemini Base URL (v1beta) -->
+            <div class="mp-endpoint-row mp-epr-cell">
+              <div class="mp-epr-label">
+                <span class="mp-proto-badge is-gemini">Gemini</span>
+                <span>Base URL (v1beta)</span>
+              </div>
+              <code class="mp-epr-code font-mono" :title="geminiV1BetaUrl">{{ stripOrigin(geminiV1BetaUrl) }}</code>
+              <button
+                type="button"
+                class="mp-action-btn mp-btn-icon-only"
+                title="复制 Google Gemini v1beta Base URL (原生 SDK 使用)"
+                @click="copyGeminiV1BetaUrl"
               >
                 <span v-html="icons.copy" />
               </button>
@@ -2280,7 +2311,7 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
             <span class="mp-modal-icon" v-html="icons.settings" />
             <div>
               <h3 id="mp-config-modal-title">反代服务配置</h3>
-              <small class="text-muted">设置本地反代端口与访问密钥</small>
+              <small class="text-muted">管理模型接口 API Key 与渠道行为</small>
             </div>
           </div>
           <button
@@ -2295,18 +2326,9 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
 
         <form class="mp-modal-body" @submit.prevent="handleSave">
           <div class="mp-field">
-            <label for="mp-port">监听端口</label>
-            <input
-              id="mp-port"
-              v-model.number="proxyConfig.port"
-              type="number"
-              min="1024"
-              max="65535"
-              class="mp-input font-mono"
-              :placeholder="proxyPortPlaceholder"
-              required
-            />
-            <small>本地独立绑定的 HTTP 服务端口</small>
+            <label>服务端口</label>
+            <div class="mp-input font-mono" aria-readonly="true">{{ proxyStatus.port || "启动后确定" }}</div>
+            <small>模型接口与 Web UI/API 共用该端口，不能单独修改</small>
           </div>
 
           <div class="mp-field">
@@ -2316,9 +2338,9 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
               v-model="proxyConfig.apiKey"
               type="text"
               class="mp-input font-mono"
-              placeholder="留空表示免密访问，或自定义如 sk-proxy"
+              placeholder="由服务自动生成，如 sk-openhub-…"
             />
-            <small>客户端调用反代服务时的本地 Bearer Key 校验（留空则免密）</small>
+            <small>所有 /v1 模型接口必须携带 API Key；API Key 不放入 URL</small>
           </div>
 
           <!-- 记录请求全文开关 (默认关闭) -->
@@ -3499,7 +3521,7 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
             <span class="mp-modal-icon" v-html="icons.pulse" />
             <div>
               <h3 id="mp-health-modal-title">服务连接状态与健康检查报告</h3>
-              <small class="text-muted">检测时间 {{ healthResultTime || '刚刚' }} · 端点 http://{{ LOCALHOST }}:{{ proxyStatus.port || proxyConfig.port }}</small>
+              <small class="text-muted">检测时间 {{ healthResultTime || '刚刚' }} · 端点 {{ serviceOrigin }}/v1/health</small>
             </div>
           </div>
           <button
@@ -3517,7 +3539,7 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
           <div class="mp-metrics-row">
             <div class="mp-metric-box">
               <label>服务端口</label>
-              <strong class="font-mono text-brand">{{ proxyStatus.port || proxyConfig.port }}</strong>
+              <strong class="font-mono text-brand">{{ proxyStatus.port || "启动后确定" }}</strong>
             </div>
             <div class="mp-metric-box">
               <label>累计请求</label>
@@ -3537,7 +3559,7 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
           <div class="mp-endpoint-list">
             <div class="mp-endpoint-item">
               <span class="mp-ep-label">Base URL</span>
-              <code class="mp-ep-code">{{ proxyStatus.url || `http://${LOCALHOST}:${proxyConfig.port}${API_PATH_V1}` }}</code>
+              <code class="mp-ep-code">{{ openAiBaseUrl }}</code>
               <button
                 type="button"
                 class="mp-action-btn"
@@ -3552,7 +3574,7 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
             <div class="mp-endpoint-item">
               <span class="mp-ep-label">API Key</span>
               <code class="mp-ep-code">
-                {{ showKey ? (proxyConfig.apiKey || '(未配置密钥，免密直接访问)') : (proxyConfig.apiKey ? '••••••••••••••••••••' : '(未配置密钥，免密直接访问)') }}
+                {{ showKey ? (proxyConfig.apiKey || '(等待服务生成 API Key)') : (proxyConfig.apiKey ? '••••••••••••••••••••' : '(等待服务生成 API Key)') }}
               </code>
               <div class="mp-ep-btns">
                 <button

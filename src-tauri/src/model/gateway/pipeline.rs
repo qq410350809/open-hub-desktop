@@ -156,7 +156,8 @@ pub async fn validate_model_channel_request(
     start_time: Instant,
     req_body_str: &Option<String>,
 ) -> Result<(), Response> {
-    if let Err(err_msg) = check_model_channel_compatibility(channel, model_to_send, channel_api_key) {
+    if let Err(err_msg) = check_model_channel_compatibility(channel, model_to_send, channel_api_key)
+    {
         let dur = start_time.elapsed().as_millis() as u64;
         record_attempt_failure(
             ctx,
@@ -326,6 +327,9 @@ pub async fn auth_and_count(
     start_time: Instant,
     req_body_str: &Option<String>,
 ) -> Result<(), Response> {
+    if !ctx.route_enabled.load(Ordering::Acquire) {
+        return Err(super::router::gateway_disabled_response());
+    }
     if let Err(res) = check_auth(headers, uri, config).await {
         super::logger::record_auth_failure_log(
             ctx,

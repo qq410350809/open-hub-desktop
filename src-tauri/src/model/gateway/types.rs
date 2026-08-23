@@ -1,14 +1,14 @@
+use crate::context::AppContext;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, AtomicUsize};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
 use std::sync::Arc;
-use std::time::Instant;
-use crate::context::AppContext;
 use std::sync::Arc as StdArc;
+use std::time::Instant;
 use tokio::sync::RwLock;
 
-pub const DEFAULT_MODEL_PROXY_PORT: u16 = 8088;
+pub const DEFAULT_MODEL_PROXY_PORT: u16 = 17896;
 #[allow(dead_code)]
 pub const DEFAULT_OPENCODE_PROXY_PORT: u16 = DEFAULT_MODEL_PROXY_PORT;
 
@@ -110,7 +110,8 @@ pub fn default_channels() -> Vec<ChannelConfig> {
     vec![ChannelConfig {
         id: "opencode".to_string(),
         name: "OpenCode 官方免费通道".to_string(),
-        description: "由 OpenCode 提供的公益推理加速通道，免 Key 访问多种 Coding/Chat 顶尖模型".to_string(),
+        description: "由 OpenCode 提供的公益推理加速通道，免 Key 访问多种 Coding/Chat 顶尖模型"
+            .to_string(),
         enabled: true,
         protocol: "openai".to_string(),
         base_url: "https://opencode.ai/zen/v1".to_string(),
@@ -134,6 +135,9 @@ pub fn default_channels() -> Vec<ChannelConfig> {
 #[serde(rename_all = "camelCase")]
 pub struct ModelProxyConfig {
     pub enabled: bool,
+    /// 监听地址。默认仅回环；需要局域网/远程访问时必须显式配置 API key。
+    #[serde(default = "default_listen_host")]
+    pub listen_host: String,
     pub port: u16,
     pub api_key: String,
     pub channels: Vec<ChannelConfig>,
@@ -164,6 +168,10 @@ fn default_timeout_seconds() -> u64 {
     300
 }
 
+fn default_listen_host() -> String {
+    "127.0.0.1".to_string()
+}
+
 fn default_next_channel_stats_id() -> u64 {
     101
 }
@@ -172,6 +180,7 @@ impl Default for ModelProxyConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            listen_host: default_listen_host(),
             port: DEFAULT_MODEL_PROXY_PORT,
             api_key: String::new(),
             channels: default_channels(),
@@ -369,9 +378,12 @@ pub struct ProxyMetrics {
 
 #[derive(Clone)]
 pub struct ModelProxyContext {
+    /// 主 HTTP 服务中网关路由的启用状态。
+    pub route_enabled: Arc<AtomicBool>,
     pub config: Arc<RwLock<ModelProxyConfig>>,
     pub metrics: Arc<ProxyMetrics>,
     pub started_at: Arc<RwLock<Option<Instant>>>,
+    pub current_port: Arc<RwLock<u16>>,
     pub cached_channel_models: Arc<RwLock<Vec<ChannelModelList>>>,
     pub cached_fetch_errors: Arc<RwLock<Vec<ChannelModelFetchError>>>,
     pub default_http_client: Client,
@@ -388,10 +400,6 @@ pub type OpencodeProxyContext = ModelProxyContext;
 
 pub struct ModelProxyState {
     pub context: ModelProxyContext,
-    pub shutdown_sender: Arc<RwLock<Option<tokio::sync::oneshot::Sender<()>>>>,
-    /// 正在运行的服务任务句柄，stop 时等待其退出以确保端口真正释放
-    pub server_task: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
-    pub current_port: Arc<RwLock<u16>>,
 }
 
 pub type OpencodeProxyState = ModelProxyState;

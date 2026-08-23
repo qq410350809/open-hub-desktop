@@ -7,13 +7,6 @@ pub(crate) mod site;
 pub mod token;
 
 // context 经由 core 全局再导出；此处显式提升为公开，供 server 二进制使用。
-#[cfg(not(feature = "desktop"))]
-pub use core::context;
-#[cfg(feature = "desktop")]
-pub(crate) use core::context;
-pub(crate) use core::*;
-#[allow(unused_imports)]
-pub(crate) use kernel::*;
 #[allow(unused_imports)]
 pub(crate) use crate::model::catalog::*;
 #[allow(unused_imports)]
@@ -24,6 +17,13 @@ pub(crate) use crate::proxypool::*;
 pub(crate) use crate::site::library::*;
 #[allow(unused_imports)]
 pub(crate) use crate::site::sync::*;
+#[cfg(not(feature = "desktop"))]
+pub use core::context;
+#[cfg(feature = "desktop")]
+pub(crate) use core::context;
+pub(crate) use core::*;
+#[allow(unused_imports)]
+pub(crate) use kernel::*;
 
 #[cfg(feature = "desktop")]
 pub use core::app_menu;
@@ -31,8 +31,11 @@ pub use core::app_menu;
 #[cfg(test)]
 mod tests;
 
+#[cfg(feature = "desktop")]
 use std::fs;
+#[cfg(feature = "desktop")]
 use std::path::PathBuf;
+#[cfg(feature = "desktop")]
 use std::sync::Arc;
 
 #[cfg(feature = "desktop")]
@@ -125,18 +128,19 @@ pub fn run() {
             single_instance::claim(&app_data_dir);
 
             // —— 构建统一运行时上下文 ——
-            let database =
-                Arc::new(crate::models::Database::open(&app_data_dir.join("sites.sqlite3"))
-                    .map_err(std::io::Error::other)?);
+            let database = Arc::new(
+                crate::models::Database::open(&app_data_dir.join("sites.sqlite3"))
+                    .map_err(std::io::Error::other)?,
+            );
             // 升级阶段先把现有采集缓存迁入 SQLite，页面首次查询即可得到完整快照。
             if let Err(error) = token::stats::seed_token_database_from_caches(&database) {
                 error!("[OpenHub] Token 缓存迁移到数据库失败：{error}");
             }
-            let proxy_runtime =
-                Arc::new(proxypool::ProxyRuntime::new(app_data_dir.join("proxy-runtime")));
+            let proxy_runtime = Arc::new(proxypool::ProxyRuntime::new(
+                app_data_dir.join("proxy-runtime"),
+            ));
             let charity_runtime = Arc::new(charity::CharityMonitorRuntime::new());
-            let model_catalog_runtime =
-                Arc::new(crate::model::catalog::ModelCatalogRuntime::new());
+            let model_catalog_runtime = Arc::new(crate::model::catalog::ModelCatalogRuntime::new());
             let event_bus = EventBus::new();
             event_bus.attach_app(app.handle().clone());
             let resource_dir = app.path().resource_dir().ok();
@@ -149,7 +153,7 @@ pub fn run() {
                 data_dir: app_data_dir.clone(),
                 resource_dir,
                 capabilities: crate::context::Capabilities::detect(),
-                login: crate::context::LoginManager::from_env(),
+                login: crate::context::LoginManager::from_env().load_from_data_dir(&app_data_dir),
             });
 
             // —— 模型网关状态：独立管理（命令注入），启动时挂接上下文 ——
@@ -163,22 +167,21 @@ pub fn run() {
             if let Err(error) = proxypool::repair_stored_node_names(&ctx.database) {
                 warn!("[OpenHub] 修复代理节点名称失败：{error}");
             }
-            // 首次启动时若 AppData 尚无文件，先秒级释放安装包自带的内置基础版内核与 GeoIP 数据库
-            if let Err(e) = crate::kernel::ensure_bundled_assets_installed(&ctx) {
-                warn!("[OpenHub] 释放内置资源提示：{e}");
-            }
+            // 组件（Mihomo / GeoIP）不再随安装包释放；首次打开由组件初始化引导按需下载。
             // Token 采集与页面查询完全解耦：后台每 20 秒增量入库。
             token::stats::start_token_collector(ctx.clone());
 
-            // —— 内嵌 HTTP 服务：浏览器访问同一内核（轻量模式 / 套壳数据源）——
+            // —— 内嵌 HTTP 服务：提供登录后的同源 Web UI/API ——
             let shared = web_server::ServerShared::new(
                 ctx.clone(),
                 resolve_dist_dir(app.handle()),
-                web_server::generate_token(),
                 app.handle().clone(),
             );
             app.manage(shared.clone());
-            match web_server::bind_listener(web_server::DEFAULT_PORT, false) {
+            match web_server::bind_listener(
+                web_server::DEFAULT_PORT,
+                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            ) {
                 Ok(listener) => {
                     let shared_for_serve = shared.clone();
                     tauri::async_runtime::spawn(async move {
@@ -189,7 +192,7 @@ pub fn run() {
                 }
                 Err(error) => error!("[OpenHub] 内嵌 HTTP 服务启动失败：{error}"),
             }
-            web_server::apply_startup_lightweight_mode(&shared);
+            // 内嵌 HTTP 服务仅作为同源 Web UI/API 承载，浏览器访问统一使用登录会话。
 
             // 启动阶段禁止阻塞 UI 线程：
             // 1) 恢复代理在后台
@@ -205,7 +208,10 @@ pub fn run() {
                 let result = tauri::async_runtime::spawn_blocking({
                     let restore_ctx = restore_ctx.clone();
                     move || {
-                        proxypool::restore_saved_proxy(&restore_ctx.database, &restore_ctx.proxy_runtime);
+                        proxypool::restore_saved_proxy(
+                            &restore_ctx.database,
+                            &restore_ctx.proxy_runtime,
+                        );
                     }
                 })
                 .await;
@@ -217,7 +223,7 @@ pub fn run() {
                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                 charity::start_charity_monitor(restore_ctx.clone());
 
-                // 启动模型网关 (Model Proxy) 独立反代服务
+                // 共享 HTTP 服务已承载 /v1 模型接口；这里只加载持久化配置并切换共享路由状态。
                 let gw = restore_handle.state::<crate::model::gateway::ModelProxyState>();
                 let proxy_cfg = {
                     let conn = restore_ctx.database.0.lock().ok();
@@ -226,55 +232,19 @@ pub fn run() {
                 };
                 *gw.context.config.write().await = proxy_cfg.clone();
                 if proxy_cfg.enabled {
-                    if let Err(e) =
-                        crate::model::gateway::start_model_proxy_server(&gw).await
-                    {
-                        error!("[OpenHub] 模型网关服务启动失败: {e}");
+                    if let Err(e) = crate::model::gateway::start_model_proxy_server(&gw).await {
+                        error!("[OpenHub] 共享模型网关路由启动失败: {e}");
                     }
                 }
             });
 
-            // 启动时后台异步检测核心组件是否缺失，若缺失则全自动静默下载
-            let auto_download_handle = app.handle().clone();
-            tauri::async_runtime::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_millis(600)).await;
-
-                // 1. 检测 Mihomo 内核
-                {
-                    let ctx = auto_download_handle.state::<Arc<AppContext>>();
-                    let has_mihomo = crate::kernel::resolve_mihomo_binary(Some(&ctx)).is_some();
-                    if !has_mihomo {
-                        info!("[OpenHub] 启动组件检测：未检测到 Mihomo 内核，启动后台自动拉取…");
-                        match crate::kernel::download_or_update_mihomo_kernel_impl(&ctx, None).await {
-                            Ok(status) => info!("[OpenHub] Mihomo 内核自动安装成功 ({})", status.version),
-                            Err(e) => error!("[OpenHub] Mihomo 内核自动安装失败：{e}"),
-                        }
-                    }
-
-                    // 2. 检测 GeoIP 数据库
-                    let has_geoip = ctx.geoip_path().is_file();
-                    if !has_geoip {
-                        info!("[OpenHub] 启动组件检测：未检测到 GeoIP 数据库，启动后台自动拉取…");
-                        match crate::kernel::download_or_update_geoip_inner(
-                            &ctx,
-                            Some(&ctx.database),
-                            Some(&ctx.proxy_runtime),
-                            None,
-                        )
-                        .await
-                        {
-                            Ok(_) => info!("[OpenHub] GeoIP 数据库自动下载成功并已就绪"),
-                            Err(e) => error!("[OpenHub] GeoIP 数据库自动下载失败：{e}"),
-                        }
-                    }
-                }
-            });
+            // 启动时不再静默下载 Mihomo / GeoIP：首次打开由前端组件初始化引导显式触发。
+            // 无网络时主界面仍可进入，代理池和地域识别会显示待初始化状态。
 
             Ok(())
         })
         .on_window_event(|window, event| {
-            // 关闭主窗口视为退出整个应用：macOS 默认关窗不退出，
-            // 若进程常驻，轻量模式服务会一直占用端口。
+            // 关闭主窗口视为退出整个应用，避免内嵌 HTTP 服务继续驻留。
             if window.label() == "main" {
                 if let tauri::WindowEvent::CloseRequested { .. } = event {
                     window.app_handle().exit(0);
@@ -352,12 +322,9 @@ pub fn run() {
             token::stats::get_token_raw_logs,
             token::stats::get_token_request_health,
             token::stats::get_local_agent_paths,
-            web_server::get_lightweight_mode_state,
             web_server::get_login_state,
             web_server::login,
             web_server::logout,
-            web_server::enter_lightweight_mode,
-            web_server::show_main_window,
             crate::model::gateway::get_model_proxy_config,
             crate::model::gateway::save_model_proxy_config_cmd,
             crate::model::gateway::get_model_proxy_status,
@@ -385,6 +352,7 @@ pub fn run() {
             crate::model::gateway::clear_opencode_proxy_logs,
             crate::model::gateway::sync_opencode_site_channels,
             file_export::save_export_file,
+            kernel::get_component_bootstrap_status,
             kernel::get_mihomo_kernel_status,
             kernel::check_mihomo_kernel_update,
             kernel::download_or_update_mihomo_kernel,
@@ -394,12 +362,13 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building Tauri application")
         .run(|app_handle, event| {
-            // macOS：点击 Dock 图标时重新显示轻量模式下隐藏的窗口。
             #[cfg(target_os = "macos")]
             if let tauri::RunEvent::Reopen { .. } = event {
-                let _ = web_server::show_main_window(
-                    app_handle.state::<std::sync::Arc<web_server::ServerShared>>(),
-                );
+                if let Some(window) = app_handle.get_webview_window("main") {
+                    let _ = window.show();
+                    let _ = window.unminimize();
+                    let _ = window.set_focus();
+                }
             }
             #[cfg(not(target_os = "macos"))]
             let _ = (app_handle, event);
@@ -412,8 +381,8 @@ pub fn run() {
 pub mod server_api {
     pub use crate::charity::{start_charity_monitor, CharityMonitorRuntime};
     pub use crate::context;
-    pub use crate::core::single_instance;
     pub use crate::core::models::Database;
+    pub use crate::core::single_instance;
     pub use crate::core::web_server::{self, ServerShared};
     pub use crate::kernel;
     pub use crate::model::catalog::ModelCatalogRuntime;

@@ -1,10 +1,10 @@
-use crate::site::sync;
+use crate::context::{home_dir, spawn_blocking, AppContext, EventBus, Managed};
 use crate::db::*;
 use crate::models::*;
 use crate::site::library::*;
-use std::{collections::HashSet, time::Duration};
-use crate::context::{home_dir, spawn_blocking, AppContext, EventBus, Managed};
+use crate::site::sync;
 use std::sync::Arc;
+use std::{collections::HashSet, time::Duration};
 
 pub(crate) fn remote_user_string(value: &serde_json::Value, paths: &[&str]) -> String {
     paths
@@ -148,9 +148,7 @@ pub(crate) async fn authenticated_remote_session(
 }
 
 #[cfg_attr(feature = "desktop", tauri::command)]
-pub async fn get_remote_user(
-    ctx: Managed<'_, Arc<AppContext>>,
-) -> Result<RemoteUserInfo, String> {
+pub async fn get_remote_user(ctx: Managed<'_, Arc<AppContext>>) -> Result<RemoteUserInfo, String> {
     let (session, user) = authenticated_remote_session(&ctx.database).await?;
     let username = remote_user_username(&user);
     let name = {

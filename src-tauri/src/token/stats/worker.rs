@@ -1,8 +1,8 @@
-use std::sync::Arc;
-use tracing::{error, info};
 use crate::context::{spawn, spawn_blocking, AppContext};
 use crate::token::stats::db::collect_token_data;
 use crate::token::stats::types::{local_timestamp, TOKEN_COLLECT_INTERVAL};
+use std::sync::Arc;
+use tracing::{error, info};
 
 pub fn start_token_collector(ctx: Arc<AppContext>) {
     spawn(async move {

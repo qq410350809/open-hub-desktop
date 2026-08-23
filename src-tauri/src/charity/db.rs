@@ -1,8 +1,8 @@
 use crate::charity::types::*;
+use crate::context::EventBus;
 use crate::models::Database;
 use rusqlite::{params, OptionalExtension};
 use std::collections::HashMap;
-use crate::context::EventBus;
 
 pub fn load_charity_sources(database: &Database) -> Result<Vec<CharityFeedSource>, String> {
     let connection = database.lock_db();
@@ -50,7 +50,10 @@ pub fn load_all_charity_sources(database: &Database) -> Result<Vec<CharityFeedSo
         .map_err(|error| error.to_string())
 }
 
-pub fn charity_feed_source(database: &Database, feed_id: &str) -> Result<CharityFeedSource, String> {
+pub fn charity_feed_source(
+    database: &Database,
+    feed_id: &str,
+) -> Result<CharityFeedSource, String> {
     let feed_id = feed_id.trim();
     let connection = database.lock_db();
     connection
@@ -456,34 +459,27 @@ pub fn load_all_feed_items_from_db(
         )
         .map_err(|error| error.to_string())?;
     let all = statement
-        .query_map(
-            params![
-                (limit * 8) as i64,
-                offset as i64,
-                key_pat
-            ],
-            |row| {
-                let categories: String = row.get(6)?;
-                let posters_raw: String = row.get(13)?;
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, String>(5)?,
-                    serde_json::from_str::<Vec<String>>(&categories).unwrap_or_default(),
-                    row.get::<_, String>(7)?,
-                    row.get::<_, i64>(8)?,
-                    row.get::<_, i64>(9)?,
-                    row.get::<_, i64>(10)?,
-                    row.get::<_, String>(11)?,
-                    row.get::<_, i64>(12)?,
-                    serde_json::from_str::<Vec<String>>(&posters_raw).unwrap_or_default(),
-                    row.get::<_, String>(14)?,
-                ))
-            },
-        )
+        .query_map(params![(limit * 8) as i64, offset as i64, key_pat], |row| {
+            let categories: String = row.get(6)?;
+            let posters_raw: String = row.get(13)?;
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                serde_json::from_str::<Vec<String>>(&categories).unwrap_or_default(),
+                row.get::<_, String>(7)?,
+                row.get::<_, i64>(8)?,
+                row.get::<_, i64>(9)?,
+                row.get::<_, i64>(10)?,
+                row.get::<_, String>(11)?,
+                row.get::<_, i64>(12)?,
+                serde_json::from_str::<Vec<String>>(&posters_raw).unwrap_or_default(),
+                row.get::<_, String>(14)?,
+            ))
+        })
         .map_err(|error| error.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| error.to_string())?;
@@ -585,9 +581,8 @@ pub fn load_feed_items_from_db(
     let limit = limit.clamp(1, CHARITY_PAGE_LIMIT_MAX);
     let keys = feed_meta_keys(&source.id);
     let connection = database.lock_conn()?;
-    let read_meta = |key: &str| -> Result<String, String> {
-        crate::db::read_meta_conn(&connection, key)
-    };
+    let read_meta =
+        |key: &str| -> Result<String, String> { crate::db::read_meta_conn(&connection, key) };
     let initialized = !read_meta(&keys.initialized)?.is_empty();
     let fetched_at = read_meta(&keys.fetched_at)?;
     let read_at = read_meta(&keys.read_at)?;
@@ -714,7 +709,10 @@ pub fn load_feed_items_from_db(
     })
 }
 
-pub fn cancel_running_charity_sync_logs(database: &Database, reason: &str) -> Result<usize, String> {
+pub fn cancel_running_charity_sync_logs(
+    database: &Database,
+    reason: &str,
+) -> Result<usize, String> {
     let connection = database.lock_conn()?;
     connection
         .execute(

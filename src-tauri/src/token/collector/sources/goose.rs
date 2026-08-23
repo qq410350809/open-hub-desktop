@@ -1,8 +1,6 @@
 use crate::models::TokenSessionTokens;
 use crate::token::collector::time_utils::update_bounds;
-use crate::token::collector::types::{
-    fingerprint, number, token_session, CachedFile, UsageEvent,
-};
+use crate::token::collector::types::{fingerprint, number, token_session, CachedFile, UsageEvent};
 use serde_json::Value as JsonValue;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -10,11 +8,21 @@ use std::path::{Path, PathBuf};
 pub fn collect_goose_source_files(home: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
     let mut search_dirs = Vec::new();
-    search_dirs.push(home.join(".local").join("share").join("goose").join("sessions"));
+    search_dirs.push(
+        home.join(".local")
+            .join("share")
+            .join("goose")
+            .join("sessions"),
+    );
     search_dirs.push(home.join(".config").join("goose").join("sessions"));
 
     #[cfg(target_os = "macos")]
-    search_dirs.push(home.join("Library").join("Application Support").join("goose").join("sessions"));
+    search_dirs.push(
+        home.join("Library")
+            .join("Application Support")
+            .join("goose")
+            .join("sessions"),
+    );
 
     for dir in search_dirs {
         if let Ok(entries) = fs::read_dir(dir) {
@@ -60,7 +68,11 @@ pub fn parse_goose_file(path: &Path) -> CachedFile {
             continue;
         };
 
-        if let Some(m) = val.get("model").or_else(|| val.get("model_name")).and_then(JsonValue::as_str) {
+        if let Some(m) = val
+            .get("model")
+            .or_else(|| val.get("model_name"))
+            .and_then(JsonValue::as_str)
+        {
             if !m.is_empty() {
                 model_name = m.to_string();
             }
@@ -73,12 +85,27 @@ pub fn parse_goose_file(path: &Path) -> CachedFile {
 
         if let Some(usage) = val.get("usage") {
             let in_tok = number(usage, &["prompt_tokens", "input_tokens", "promptTokens"]);
-            let out_tok = number(usage, &["completion_tokens", "output_tokens", "completionTokens"]);
-            let total = if in_tok + out_tok > 0 { in_tok + out_tok } else { number(usage, &["total_tokens", "tokens"]) };
+            let out_tok = number(
+                usage,
+                &["completion_tokens", "output_tokens", "completionTokens"],
+            );
+            let total = if in_tok + out_tok > 0 {
+                in_tok + out_tok
+            } else {
+                number(usage, &["total_tokens", "tokens"])
+            };
 
             if total > 0 {
-                let ts_str = val.get("timestamp").or_else(|| val.get("created_at")).and_then(JsonValue::as_str).unwrap_or("");
-                let iso_ts = if !ts_str.is_empty() { ts_str.to_string() } else { String::new() };
+                let ts_str = val
+                    .get("timestamp")
+                    .or_else(|| val.get("created_at"))
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or("");
+                let iso_ts = if !ts_str.is_empty() {
+                    ts_str.to_string()
+                } else {
+                    String::new()
+                };
                 update_bounds(&mut first_ts, &mut last_ts, &iso_ts);
 
                 total_in += in_tok;

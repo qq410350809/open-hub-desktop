@@ -4,6 +4,7 @@ import { icons } from "../../icons";
 import { useStore } from "../../composables/useStore";
 import { usePreferences } from "../../composables/usePreferences";
 import { useModelProxy } from "../../composables/useModelProxy";
+import { capabilities } from "../../composables/core/capabilities";
 import { formatCompact, localDateOf, toLocalDate } from "../../composables/tokenStatsAgg";
 
 const store = useStore();
@@ -24,13 +25,27 @@ onUnmounted(() => {
 });
 
 const navItems = computed(() => [
+  // 本地统计：客户端自带能力，扫描本机各 AI 工具的本地日志（浏览器瘦客户端不可用）
+  ...(capabilities.value.localTokenStats
+    ? [
+        {
+          id: "tokenstats",
+          label: "本地统计",
+          icon: icons.chart,
+          active: store.page.value === "tokenstats",
+          badge: todayTokenBadge.value,
+          onClick: () => store.openTokenStats(),
+        },
+      ]
+    : []),
+  // 网关统计：服务端自带能力，读取模型反代网关的转发记账
   {
-    id: "tokenstats",
-    label: "Token 统计",
-    icon: icons.chart,
-    active: store.page.value === "tokenstats",
-    badge: todayTokenBadge.value,
-    onClick: () => store.openTokenStats(),
+    id: "gatewaystats",
+    label: "网关统计",
+    icon: icons.activity,
+    active: store.page.value === "gatewaystats",
+    badge: gatewayTokenBadge.value,
+    onClick: () => store.openGatewayStats(),
   },
   {
     id: "library",
@@ -101,6 +116,13 @@ const todayTokenTotal = computed(() => {
 // 徽标文案：0 不显示
 const todayTokenBadge = computed(() =>
   todayTokenTotal.value > 0 ? formatCompact(todayTokenTotal.value) : "",
+);
+
+// 今天反代网关转发的 token 数（后端单行聚合，用于「网关统计」菜单徽标）
+const gatewayTokenBadge = computed(() =>
+  (proxyStatus.value?.todayTotalTokens ?? 0) > 0
+    ? formatCompact(proxyStatus.value.todayTotalTokens)
+    : "",
 );
 
 function toggleSidebar() {

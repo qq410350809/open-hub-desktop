@@ -8,9 +8,10 @@
 //!   `AppContext` 字段直接借用（`LocalRef`）；
 //! - 平台目录：桌面有 resource_dir（打包资源），server 为 None。
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use sha2::Digest;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 #[cfg(feature = "desktop")]
 use std::sync::Mutex;
 use std::sync::OnceLock;
@@ -94,22 +95,47 @@ impl Default for EventBus {
 // 能力协商：本机依赖功能在远程部署时自动降级
 // ---------------------------------------------------------------------------
 
-/// 运行环境能力探测结果，通过 `/api/caps` 暴露给前端。
+/// 运行时能力探测结果。
+///
+/// `token_local_logs` 保留为旧前端字段兼容；新代码应使用 `local_token_stats`。
+/// server 形态使用 `server_defaults()`，不会把服务所在主机的本地日志误报给浏览器。
 #[derive(Debug, Clone, Copy, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Capabilities {
-    /// 本机检测到 Chrome 用户数据目录（会话同步可用）
+    /// 本机检测到 Chrome 用户数据目录（仅集成式客户端可用）
     pub chrome_sync: bool,
-    /// 本机检测到至少一个 AI 工具日志根目录（Token 本地统计可用）
+    /// 兼容旧协议：本机检测到 AI 工具日志根目录
     pub token_local_logs: bool,
+    /// 当前客户端是否可读取本机 AI 工具日志
+    pub local_token_stats: bool,
+    /// 当前运行时是否提供 OpenHub 反代统计
+    pub proxy_token_stats: bool,
+    /// 当前进程是否拥有桌面窗口/菜单/文件对话框能力
+    pub desktop_integration: bool,
 }
 
 impl Capabilities {
-    /// 启动时探测一次。探测逻辑刻意保守：只检查知名目录是否存在。
+    /// 集成式客户端：检测本机能力，并开放本地与反代两类统计。
     pub fn detect() -> Self {
+        let chrome_sync = detect_chrome_profile();
+        let token_local_logs = detect_local_agent_logs();
         Self {
-            chrome_sync: detect_chrome_profile(),
-            token_local_logs: detect_local_agent_logs(),
+            chrome_sync,
+            token_local_logs,
+            local_token_stats: token_local_logs,
+            proxy_token_stats: true,
+            desktop_integration: true,
+        }
+    }
+
+    /// 独立 Web 服务：只声明服务端能力，绝不暴露服务进程的本地日志能力。
+    pub fn server_defaults() -> Self {
+        Self {
+            chrome_sync: false,
+            token_local_logs: false,
+            local_token_stats: false,
+            proxy_token_stats: true,
+            desktop_integration: false,
         }
     }
 }
@@ -121,7 +147,8 @@ pub fn home_dir() -> Option<PathBuf> {
         .or_else(|_| std::env::var("USERPROFILE"))
         .map(PathBuf::from)
         .ok()
-}fn detect_chrome_profile() -> bool {
+}
+fn detect_chrome_profile() -> bool {
     let Some(home) = home_dir() else {
         return false;
     };
@@ -161,19 +188,36 @@ fn detect_local_agent_logs() -> bool {
 /// 默认登录凭据（可用环境变量 / CLI 参数覆盖）。
 pub const DEFAULT_LOGIN_USER: &str = "admin";
 pub const DEFAULT_LOGIN_PASSWORD: &str = "Admin@2026";
-/// 会话有效期：24 小时。
-const SESSION_TTL_SECS: u64 = 24 * 60 * 60;
+/// 会话有效期：7 天。
+const SESSION_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 
-/// 内存态登录会话管理：
+/// 会话记录只保存摘要和绝对过期时间，不保存明文令牌。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedSession {
+    token_hash: String,
+    created_at: u64,
+    expires_at: u64,
+}
+
+fn unix_timestamp() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+/// 登录会话管理：
 /// - 凭据支持环境变量 OPENHUB_LOGIN_USER / OPENHUB_LOGIN_PASSWORD 覆盖；
-/// - 会话令牌随机生成，进程重启即失效（服务形态可配合重启轮换）；
-/// - 服务静态访问令牌与登录会话在鉴权层等价。
+/// - 会话令牌由操作系统安全随机源生成；
+/// - 会话记录持久化到数据目录，默认有效期 7 天；
+/// - 所有受保护 HTTP 请求都必须使用有效登录会话。
 pub struct LoginManager {
     pub username: String,
     pub password: String,
-    /// 是否启用登录门禁（--no-auth 可关闭，默认开启）。
+    /// 登录门禁始终开启。
     pub enabled: bool,
-    sessions: std::sync::Mutex<HashMap<String, std::time::Instant>>,
+    sessions: std::sync::Mutex<HashMap<String, PersistedSession>>,
+    storage_path: std::sync::Mutex<Option<PathBuf>>,
 }
 
 impl LoginManager {
@@ -183,9 +227,30 @@ impl LoginManager {
             password,
             enabled: true,
             sessions: std::sync::Mutex::new(HashMap::new()),
+            storage_path: std::sync::Mutex::new(None),
         }
     }
 
+    /// 绑定数据目录并恢复仍未过期的会话。
+    pub fn load_from_data_dir(self, data_dir: &Path) -> Self {
+        let path = data_dir.join("auth-sessions.json");
+        let now = unix_timestamp();
+        let sessions = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<Vec<PersistedSession>>(&raw).ok())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|session| session.expires_at > now && session.token_hash.len() == 64)
+            .map(|session| (session.token_hash.clone(), session))
+            .collect::<HashMap<_, _>>();
+        if let Ok(mut guard) = self.sessions.lock() {
+            *guard = sessions;
+        }
+        if let Ok(mut guard) = self.storage_path.lock() {
+            *guard = Some(path);
+        }
+        self
+    }
     /// 从环境变量读取覆盖值后的默认凭据。
     pub fn from_env() -> Self {
         let username = std::env::var("OPENHUB_LOGIN_USER")
@@ -199,8 +264,41 @@ impl LoginManager {
         Self::new(username, password)
     }
 
-    fn now() -> std::time::Instant {
-        std::time::Instant::now()
+    fn hash_token(token: &str) -> String {
+        hex::encode(sha2::Sha256::digest(token.as_bytes()))
+    }
+
+    fn persist(&self, sessions: &HashMap<String, PersistedSession>) -> Result<(), String> {
+        let path = self
+            .storage_path
+            .lock()
+            .map_err(|_| "登录会话存储不可用".to_string())?
+            .clone();
+        let Some(path) = path else {
+            return Ok(());
+        };
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("创建登录会话目录失败：{error}"))?;
+        let records = sessions.values().cloned().collect::<Vec<_>>();
+        let content = serde_json::to_vec_pretty(&records)
+            .map_err(|error| format!("序列化登录会话失败：{error}"))?;
+        let temp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+        std::fs::write(&temp, content).map_err(|error| format!("写入登录会话失败：{error}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o600));
+        }
+        #[cfg(windows)]
+        if path.exists() {
+            std::fs::remove_file(&path).map_err(|error| format!("替换登录会话失败：{error}"))?;
+        }
+        std::fs::rename(&temp, &path).map_err(|error| format!("保存登录会话失败：{error}"))
+    }
+
+    fn now() -> u64 {
+        unix_timestamp()
     }
 
     /// 校验用户名密码；成功返回 true。比较恒定耗时无必要——本地内存比对。
@@ -210,25 +308,27 @@ impl LoginManager {
 
     /// 创建会话令牌。
     pub fn create_session(&self) -> Result<String, String> {
-        let token = {
-            let nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0);
-            let mut hasher = sha2::Sha256::new();
-            use sha2::Digest;
-            hasher.update(format!(
-                "openhub-session-{}-{}-{}",
-                nanos,
-                std::process::id(),
-                self.sessions.lock().map(|s| s.len()).unwrap_or(0)
-            ));
-            hex::encode(hasher.finalize())
+        let mut bytes = [0u8; 32];
+        getrandom::fill(&mut bytes).map_err(|error| format!("生成登录令牌失败：{error}"))?;
+        let token = hex::encode(bytes);
+        let now = Self::now();
+        let session = PersistedSession {
+            token_hash: Self::hash_token(&token),
+            created_at: now,
+            expires_at: now.saturating_add(SESSION_TTL_SECS),
         };
-        if let Ok(mut sessions) = self.sessions.lock() {
-            // 顺手清理过期会话
-            sessions.retain(|_, created| created.elapsed().as_secs() < SESSION_TTL_SECS);
-            sessions.insert(token.clone(), Self::now());
+        let key = session.token_hash.clone();
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| "登录会话存储不可用".to_string())?;
+        sessions.retain(|_, session| session.expires_at > now);
+        sessions.insert(key, session);
+        if let Err(error) = self.persist(&sessions) {
+            sessions.retain(|_, session| {
+                session.expires_at > now && session.token_hash != Self::hash_token(&token)
+            });
+            return Err(error);
         }
         Ok(token)
     }
@@ -238,10 +338,17 @@ impl LoginManager {
         if token.is_empty() {
             return false;
         }
+        let now = Self::now();
         match self.sessions.lock() {
             Ok(mut sessions) => {
-                sessions.retain(|_, created| created.elapsed().as_secs() < SESSION_TTL_SECS);
-                sessions.contains_key(token)
+                let before = sessions.len();
+                sessions.retain(|_, session| session.expires_at > now);
+                let changed = before != sessions.len();
+                let valid = sessions.contains_key(&Self::hash_token(token));
+                if changed {
+                    let _ = self.persist(&sessions);
+                }
+                valid
             }
             Err(_) => false,
         }
@@ -250,7 +357,8 @@ impl LoginManager {
     /// 注销会话。
     pub fn remove_session(&self, token: &str) {
         if let Ok(mut sessions) = self.sessions.lock() {
-            sessions.remove(token);
+            sessions.remove(&Self::hash_token(token));
+            let _ = self.persist(&sessions);
         }
     }
 }
@@ -314,18 +422,20 @@ pub fn runtime_handle() -> tokio::runtime::Handle {
     }
     #[cfg(not(feature = "desktop"))]
     {
-        let handle = tokio::runtime::Handle::try_current().ok().unwrap_or_else(|| {
-            tracing::warn!("未初始化的异步运行时：临时创建单线程运行时兜底");
-            let rt = std::sync::Arc::new(
-                tokio::runtime::Builder::new_multi_thread()
-                    .enable_all()
-                    .build()
-                    .expect("创建 tokio 运行时失败"),
-            );
-            let handle = rt.handle().clone();
-            std::mem::forget(rt);
-            handle
-        });
+        let handle = tokio::runtime::Handle::try_current()
+            .ok()
+            .unwrap_or_else(|| {
+                tracing::warn!("未初始化的异步运行时：临时创建单线程运行时兜底");
+                let rt = std::sync::Arc::new(
+                    tokio::runtime::Builder::new_multi_thread()
+                        .enable_all()
+                        .build()
+                        .expect("创建 tokio 运行时失败"),
+                );
+                let handle = rt.handle().clone();
+                std::mem::forget(rt);
+                handle
+            });
         init_runtime_handle(handle.clone());
         handle
     }
@@ -390,5 +500,58 @@ impl<'a, T> std::ops::Deref for LocalRef<'a, T> {
 
     fn deref(&self) -> &Self::Target {
         self.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LoginManager;
+
+    #[test]
+    fn sessions_are_random_64_hex_chars_and_can_be_revoked() {
+        let manager = LoginManager::new("admin".into(), "password".into());
+        let first = manager.create_session().unwrap();
+        let second = manager.create_session().unwrap();
+        assert_eq!(first.len(), 64);
+        assert!(first.chars().all(|character| character.is_ascii_hexdigit()));
+        assert_ne!(first, second);
+        assert!(manager.validate_session(&first));
+        manager.remove_session(&first);
+        assert!(!manager.validate_session(&first));
+        assert!(manager.validate_session(&second));
+    }
+
+    #[test]
+    fn expired_sessions_are_not_restored() {
+        let root =
+            std::env::temp_dir().join(format!("openhub-auth-expired-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("auth-sessions.json"),
+            r#"[{"token_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","created_at":1,"expires_at":1}]"#,
+        )
+        .unwrap();
+        let manager =
+            LoginManager::new("admin".into(), "password".into()).load_from_data_dir(&root);
+        assert!(!manager.validate_session("anything"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+    #[test]
+    fn sessions_restore_from_data_directory_without_persisting_plaintext() {
+        let root = std::env::temp_dir().join(format!("openhub-auth-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let manager =
+            LoginManager::new("admin".into(), "password".into()).load_from_data_dir(&root);
+        let token = manager.create_session().unwrap();
+        let raw = std::fs::read_to_string(root.join("auth-sessions.json")).unwrap();
+        assert!(!raw.contains(&token));
+
+        let restored =
+            LoginManager::new("admin".into(), "password".into()).load_from_data_dir(&root);
+        assert!(restored.validate_session(&token));
+        let _ = std::fs::remove_dir_all(root);
     }
 }

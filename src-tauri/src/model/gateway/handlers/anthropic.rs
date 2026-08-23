@@ -144,10 +144,22 @@ pub async fn handle_messages(
         final_log.duration_ms = dur;
         final_log.response_body = resp_body;
         if let Ok(jv) = serde_json::from_slice::<JsonValue>(&raw_bytes) {
-            let p = jv.pointer("/usage/input_tokens").and_then(JsonValue::as_u64).unwrap_or(0);
-            let c = jv.pointer("/usage/output_tokens").and_then(JsonValue::as_u64).unwrap_or(0);
-            let cache_read = jv.pointer("/usage/cache_read_input_tokens").and_then(JsonValue::as_u64).unwrap_or(0);
-            let cache_creation = jv.pointer("/usage/cache_creation_input_tokens").and_then(JsonValue::as_u64).unwrap_or(0);
+            let p = jv
+                .pointer("/usage/input_tokens")
+                .and_then(JsonValue::as_u64)
+                .unwrap_or(0);
+            let c = jv
+                .pointer("/usage/output_tokens")
+                .and_then(JsonValue::as_u64)
+                .unwrap_or(0);
+            let cache_read = jv
+                .pointer("/usage/cache_read_input_tokens")
+                .and_then(JsonValue::as_u64)
+                .unwrap_or(0);
+            let cache_creation = jv
+                .pointer("/usage/cache_creation_input_tokens")
+                .and_then(JsonValue::as_u64)
+                .unwrap_or(0);
             // OpenAI 口径：prompt_tokens 含缓存读+写
             let prompt = p + cache_read + cache_creation;
             final_log.prompt_tokens = Some(prompt);
@@ -160,16 +172,24 @@ pub async fn handle_messages(
         return (StatusCode::OK, raw_bytes).into_response();
     }
 
-    let resp_bytes = egress::normalize_response_bytes(outcome.target, &outcome.model_to_send, &raw_bytes);
+    let resp_bytes =
+        egress::normalize_response_bytes(outcome.target, &outcome.model_to_send, &raw_bytes);
     let resp_body = cap_log_body(String::from_utf8_lossy(&resp_bytes).to_string());
 
     if let Ok(jv) = serde_json::from_slice::<JsonValue>(&resp_bytes) {
         let (p_tok, c_tok) = AnthropicProtocolAdapter::extract_token_usage(&jv);
         // 归一化后的 usage 已带缓存/推理明细（Anthropic 上游时）
-        let cache_hit = jv.pointer("/usage/prompt_tokens_details/cached_tokens").and_then(JsonValue::as_u64);
-        let cache_creation = jv.pointer("/usage/prompt_tokens_details/cache_creation_tokens").and_then(JsonValue::as_u64);
-        let reasoning = jv.pointer("/usage/completion_tokens_details/reasoning_tokens").and_then(JsonValue::as_u64);
-        let anthropic_resp = AnthropicProtocolAdapter::openai_response_to_anthropic(&jv, &req_id, &raw_model);
+        let cache_hit = jv
+            .pointer("/usage/prompt_tokens_details/cached_tokens")
+            .and_then(JsonValue::as_u64);
+        let cache_creation = jv
+            .pointer("/usage/prompt_tokens_details/cache_creation_tokens")
+            .and_then(JsonValue::as_u64);
+        let reasoning = jv
+            .pointer("/usage/completion_tokens_details/reasoning_tokens")
+            .and_then(JsonValue::as_u64);
+        let anthropic_resp =
+            AnthropicProtocolAdapter::openai_response_to_anthropic(&jv, &req_id, &raw_model);
 
         let mut final_log = log;
         final_log.duration_ms = dur;

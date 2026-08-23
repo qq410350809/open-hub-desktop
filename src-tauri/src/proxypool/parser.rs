@@ -666,7 +666,12 @@ pub fn parse_uri_node(line: &str) -> Option<ParsedNode> {
                 "skip-cert-verify": query.get("allowInsecure").is_some_and(|v| v == "1" || v == "true"), "udp": true
             });
             if let Some(alpn) = query.get("alpn") {
-                let items: Vec<String> = alpn.split(',').map(str::trim).filter(|s| !s.is_empty()).map(|s| s.to_string()).collect();
+                let items: Vec<String> = alpn
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
+                    .collect();
                 if !items.is_empty() {
                     obj["alpn"] = json!(items);
                 }
@@ -686,7 +691,12 @@ pub fn parse_uri_node(line: &str) -> Option<ParsedNode> {
                 "servername": query.get("sni").map(|v| v.as_ref()).unwrap_or(&server), "udp": true
             });
             if let Some(alpn) = query.get("alpn") {
-                let items: Vec<String> = alpn.split(',').map(str::trim).filter(|s| !s.is_empty()).map(|s| s.to_string()).collect();
+                let items: Vec<String> = alpn
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
+                    .collect();
                 if !items.is_empty() {
                     obj["alpn"] = json!(items);
                 }
@@ -699,7 +709,12 @@ pub fn parse_uri_node(line: &str) -> Option<ParsedNode> {
                 "password": url.username(), "sni": query.get("sni").map(|v| v.as_ref()).unwrap_or(&server), "udp": true
             });
             if let Some(alpn) = query.get("alpn") {
-                let items: Vec<String> = alpn.split(',').map(str::trim).filter(|s| !s.is_empty()).map(|s| s.to_string()).collect();
+                let items: Vec<String> = alpn
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
+                    .collect();
                 if !items.is_empty() {
                     obj["alpn"] = json!(items);
                 }

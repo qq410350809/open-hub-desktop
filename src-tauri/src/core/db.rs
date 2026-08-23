@@ -1,9 +1,9 @@
-use tracing::warn;
-use crate::site::sync;
 use crate::models::*;
+use crate::site::sync;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{de::DeserializeOwned, Serialize};
 use std::{path::Path, time::Duration};
+use tracing::warn;
 
 impl Database {
     pub fn open(path: &Path) -> Result<Self, String> {
@@ -15,7 +15,8 @@ impl Database {
         // 入库的 DELETE）都会报 "foreign key mismatch"。此表现已废弃且无任何
         // 代码引用，必须在开启外键前无条件移除。
         let _ = connection.busy_timeout(Duration::from_secs(5));
-        if let Err(error) = connection.execute_batch("DROP TABLE IF EXISTS model_catalog_entries;") {
+        if let Err(error) = connection.execute_batch("DROP TABLE IF EXISTS model_catalog_entries;")
+        {
             warn!("[db] 清理遗留 model_catalog_entries 表失败：{error}");
         }
 
@@ -882,7 +883,10 @@ pub(crate) fn ensure_model_proxy_logs_table(connection: &Connection) -> Result<(
         )
         .unwrap_or(0);
     if old_exists > 0 && new_exists == 0 {
-        let _ = connection.execute("ALTER TABLE opencode_proxy_logs RENAME TO model_proxy_logs", []);
+        let _ = connection.execute(
+            "ALTER TABLE opencode_proxy_logs RENAME TO model_proxy_logs",
+            [],
+        );
     }
     let _ = connection.execute("DROP INDEX IF EXISTS idx_opencode_proxy_logs_created", []);
 
@@ -1033,7 +1037,9 @@ pub(crate) fn ensure_channel_daily_stats_table(connection: &Connection) -> Resul
 
     // 一次性回填：把既有请求日志按「日 × 渠道 × 模型 × 客户端」聚合进日统计表（仅当日表为空时执行）
     let existing: i64 = connection
-        .query_row("SELECT COUNT(*) FROM channel_daily_stats", [], |row| row.get(0))
+        .query_row("SELECT COUNT(*) FROM channel_daily_stats", [], |row| {
+            row.get(0)
+        })
         .unwrap_or(0);
     if existing == 0 {
         let _ = connection.execute(
@@ -1148,7 +1154,9 @@ pub(crate) fn ensure_channel_hourly_stats_table(connection: &Connection) -> Resu
     // 一次性回填：把既有请求日志按「日 × 时 × 渠道 × 模型 × 客户端」聚合进小时表（仅当小时表为空时执行）。
     // 明细表按保留天数留存，回填仅覆盖保留期内的数据；更早历史只有日粒度
     let existing: i64 = connection
-        .query_row("SELECT COUNT(*) FROM channel_hourly_stats", [], |row| row.get(0))
+        .query_row("SELECT COUNT(*) FROM channel_hourly_stats", [], |row| {
+            row.get(0)
+        })
         .unwrap_or(0);
     if existing == 0 {
         let _ = connection.execute(
@@ -1275,7 +1283,9 @@ pub(crate) fn read_cached_usage_sites(
                     profile_name: {
                         let raw: String = row.get(5)?;
                         let account: String = row.get(6)?;
-                        if (raw == "您的 Chrome" || raw == "Default" || raw.starts_with("个人资料")) && !account.is_empty() {
+                        if (raw == "您的 Chrome" || raw == "Default" || raw.starts_with("个人资料"))
+                            && !account.is_empty()
+                        {
                             account
                         } else {
                             raw
@@ -1340,11 +1350,9 @@ pub(crate) fn read_meta_conn(
     key: &str,
 ) -> Result<String, String> {
     connection
-        .query_row(
-            "SELECT value FROM app_meta WHERE key = ?1",
-            [key],
-            |row| row.get(0),
-        )
+        .query_row("SELECT value FROM app_meta WHERE key = ?1", [key], |row| {
+            row.get(0)
+        })
         .optional()
         .map(|value| value.unwrap_or_default())
         .map_err(|error| error.to_string())

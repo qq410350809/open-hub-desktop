@@ -13,21 +13,53 @@ pub fn collect_cline_source_files(home: &Path) -> Vec<(String, PathBuf)> {
 
     #[cfg(target_os = "macos")]
     {
-        let vscode_user = home.join("Library").join("Application Support").join("Code").join("User").join("globalStorage");
-        search_roots.push(("cline", vscode_user.join("saoudrizwan.claude-dev").join("tasks")));
-        search_roots.push(("roo-code", vscode_user.join("rooveterinaryinc.roo-cline").join("tasks")));
+        let vscode_user = home
+            .join("Library")
+            .join("Application Support")
+            .join("Code")
+            .join("User")
+            .join("globalStorage");
+        search_roots.push((
+            "cline",
+            vscode_user.join("saoudrizwan.claude-dev").join("tasks"),
+        ));
+        search_roots.push((
+            "roo-code",
+            vscode_user.join("rooveterinaryinc.roo-cline").join("tasks"),
+        ));
     }
     #[cfg(target_os = "windows")]
     {
-        let vscode_user = home.join("AppData").join("Roaming").join("Code").join("User").join("globalStorage");
-        search_roots.push(("cline", vscode_user.join("saoudrizwan.claude-dev").join("tasks")));
-        search_roots.push(("roo-code", vscode_user.join("rooveterinaryinc.roo-cline").join("tasks")));
+        let vscode_user = home
+            .join("AppData")
+            .join("Roaming")
+            .join("Code")
+            .join("User")
+            .join("globalStorage");
+        search_roots.push((
+            "cline",
+            vscode_user.join("saoudrizwan.claude-dev").join("tasks"),
+        ));
+        search_roots.push((
+            "roo-code",
+            vscode_user.join("rooveterinaryinc.roo-cline").join("tasks"),
+        ));
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
-        let vscode_user = home.join(".config").join("Code").join("User").join("globalStorage");
-        search_roots.push(("cline", vscode_user.join("saoudrizwan.claude-dev").join("tasks")));
-        search_roots.push(("roo-code", vscode_user.join("rooveterinaryinc.roo-cline").join("tasks")));
+        let vscode_user = home
+            .join(".config")
+            .join("Code")
+            .join("User")
+            .join("globalStorage");
+        search_roots.push((
+            "cline",
+            vscode_user.join("saoudrizwan.claude-dev").join("tasks"),
+        ));
+        search_roots.push((
+            "roo-code",
+            vscode_user.join("rooveterinaryinc.roo-cline").join("tasks"),
+        ));
     }
 
     for (source_name, tasks_dir) in search_roots {
@@ -83,7 +115,11 @@ pub fn parse_cline_file(source_name: &str, path: &Path) -> CachedFile {
     if let Some(arr) = messages.as_array() {
         for (idx, msg) in arr.iter().enumerate() {
             let ts_ms = msg.get("ts").and_then(JsonValue::as_i64).unwrap_or(0);
-            let iso_ts = if ts_ms > 0 { iso_from_millis(ts_ms) } else { String::new() };
+            let iso_ts = if ts_ms > 0 {
+                iso_from_millis(ts_ms)
+            } else {
+                String::new()
+            };
             update_bounds(&mut first_ts, &mut last_ts, &iso_ts);
 
             if let Some(say) = msg.get("say").and_then(JsonValue::as_str) {
@@ -92,7 +128,11 @@ pub fn parse_cline_file(source_name: &str, path: &Path) -> CachedFile {
                 }
             }
 
-            if let Some(m) = msg.get("apiConfiguration").and_then(|a| a.get("apiModelId")).and_then(JsonValue::as_str) {
+            if let Some(m) = msg
+                .get("apiConfiguration")
+                .and_then(|a| a.get("apiModelId"))
+                .and_then(JsonValue::as_str)
+            {
                 if !m.is_empty() {
                     model_name = m.to_string();
                 }
@@ -102,10 +142,18 @@ pub fn parse_cline_file(source_name: &str, path: &Path) -> CachedFile {
             if let Some(usage) = msg.get("tokens").or_else(|| msg.get("tokenUsage")) {
                 let in_tok = number(usage, &["tokensIn", "inputTokens", "promptTokens"]);
                 let out_tok = number(usage, &["tokensOut", "outputTokens", "completionTokens"]);
-                let cache_read = number(usage, &["cacheReads", "cachedTokens", "cache_read_input_tokens"]);
+                let cache_read = number(
+                    usage,
+                    &["cacheReads", "cachedTokens", "cache_read_input_tokens"],
+                );
                 let cache_write = number(usage, &["cacheWrites", "cache_creation_input_tokens"]);
-                let cost = float_number(usage, &["totalCost", "cost"]).max(float_number(msg, &["cost"]));
-                let total = if in_tok + out_tok > 0 { in_tok + out_tok } else { number(usage, &["totalTokens", "tokens"]) };
+                let cost =
+                    float_number(usage, &["totalCost", "cost"]).max(float_number(msg, &["cost"]));
+                let total = if in_tok + out_tok > 0 {
+                    in_tok + out_tok
+                } else {
+                    number(usage, &["totalTokens", "tokens"])
+                };
 
                 if total > 0 || cost > 0.0 {
                     total_in += in_tok;

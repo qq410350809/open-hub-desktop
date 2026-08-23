@@ -1,9 +1,7 @@
 use crate::models::TokenSessionTokens;
 use crate::token::collector::normalizer::normalize_workspace_project_key;
 use crate::token::collector::time_utils::update_bounds;
-use crate::token::collector::types::{
-    fingerprint, number, token_session, CachedFile, UsageEvent,
-};
+use crate::token::collector::types::{fingerprint, number, token_session, CachedFile, UsageEvent};
 use serde_json::Value as JsonValue;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -67,10 +65,20 @@ pub fn parse_continue_file(path: &Path) -> CachedFile {
 
     if let Some(history) = data.get("history").and_then(JsonValue::as_array) {
         for (idx, item) in history.iter().enumerate() {
-            let role = item.get("role").or_else(|| item.get("message").and_then(|m| m.get("role"))).and_then(JsonValue::as_str).unwrap_or("");
-            let content = item.get("content").or_else(|| item.get("message").and_then(|m| m.get("content")));
+            let role = item
+                .get("role")
+                .or_else(|| item.get("message").and_then(|m| m.get("role")))
+                .and_then(JsonValue::as_str)
+                .unwrap_or("");
+            let content = item
+                .get("content")
+                .or_else(|| item.get("message").and_then(|m| m.get("content")));
 
-            if let Some(m) = item.get("model").or_else(|| item.get("modelTitle")).and_then(JsonValue::as_str) {
+            if let Some(m) = item
+                .get("model")
+                .or_else(|| item.get("modelTitle"))
+                .and_then(JsonValue::as_str)
+            {
                 if !m.is_empty() {
                     model_name = m.to_string();
                 }
@@ -82,7 +90,10 @@ pub fn parse_continue_file(path: &Path) -> CachedFile {
 
             // Continue 会在 promptLogs / contextItems 里带 token 或者直接带 promptTokens
             let prompt_tok = number(item, &["promptTokens", "inputTokens", "prompt_tokens"]);
-            let comp_tok = number(item, &["completionTokens", "outputTokens", "completion_tokens"]);
+            let comp_tok = number(
+                item,
+                &["completionTokens", "outputTokens", "completion_tokens"],
+            );
             let total = if prompt_tok + comp_tok > 0 {
                 prompt_tok + comp_tok
             } else {
@@ -99,8 +110,15 @@ pub fn parse_continue_file(path: &Path) -> CachedFile {
             };
 
             if total > 0 {
-                let ts_str = item.get("timestamp").and_then(JsonValue::as_str).unwrap_or("");
-                let iso_ts = if !ts_str.is_empty() { ts_str.to_string() } else { String::new() };
+                let ts_str = item
+                    .get("timestamp")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or("");
+                let iso_ts = if !ts_str.is_empty() {
+                    ts_str.to_string()
+                } else {
+                    String::new()
+                };
                 update_bounds(&mut first_ts, &mut last_ts, &iso_ts);
 
                 total_in += prompt_tok;

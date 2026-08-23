@@ -1,16 +1,19 @@
 use crate::charity::db::*;
 use crate::charity::feed::items_from_topic_list;
 use crate::charity::types::*;
-use crate::site::sync;
+use crate::context::{home_dir, spawn, spawn_blocking, AppContext, EventBus};
 use crate::models::Database;
 use crate::proxypool::{self, is_http_forbidden_error, is_transport_error, ProxyRuntime};
+use crate::site::sync;
 use std::sync::{atomic::Ordering, Arc, Mutex};
 use std::time::{Duration, Instant};
-use crate::context::{home_dir, spawn, spawn_blocking, AppContext, EventBus};
 use tokio_util::sync::CancellationToken;
 
 #[allow(dead_code)]
-pub fn rotate_fast_nodes(nodes: &[(String, String, i64)], offset: usize) -> Vec<(String, String, i64)> {
+pub fn rotate_fast_nodes(
+    nodes: &[(String, String, i64)],
+    offset: usize,
+) -> Vec<(String, String, i64)> {
     if nodes.is_empty() {
         return Vec::new();
     }
@@ -116,10 +119,7 @@ pub async fn request_topic_list(
         .get(request_url)
         .header(reqwest::header::ACCEPT, "application/json")
         .header(reqwest::header::ACCEPT_LANGUAGE, "zh-CN,zh;q=0.9,en;q=0.8")
-        .header(
-            reqwest::header::USER_AGENT,
-            sync::chrome_user_agent(),
-        )
+        .header(reqwest::header::USER_AGENT, sync::chrome_user_agent())
         .header("Sec-Fetch-Dest", "empty")
         .header("Sec-Fetch-Mode", "cors")
         .header("Sec-Fetch-Site", "same-origin")
@@ -593,8 +593,8 @@ pub async fn sync_feed_with_fast_nodes(
                         };
                         let dur = attempt_started.elapsed().as_millis() as i64;
                         if !parallel_mode {
-                            let _ = proxypool::restore_proxy_node_transient(database, runtime)
-                                .await;
+                            let _ =
+                                proxypool::restore_proxy_node_transient(database, runtime).await;
                         }
                         finish_charity_sync_log(
                             &bus, database, log_id, source, stage, "failed", &message, &node.name,

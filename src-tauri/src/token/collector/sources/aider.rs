@@ -1,7 +1,5 @@
 use crate::models::TokenSessionTokens;
-use crate::token::collector::types::{
-    fingerprint, token_session, CachedFile, UsageEvent,
-};
+use crate::token::collector::types::{fingerprint, token_session, CachedFile, UsageEvent};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -52,7 +50,9 @@ pub fn parse_aider_file(path: &Path) -> CachedFile {
         let trimmed = line.trim();
         if trimmed.starts_with("# ") || trimmed.starts_with("#### ") {
             let possible_model = trimmed.trim_start_matches('#').trim();
-            if !possible_model.is_empty() && (possible_model.contains('-') || possible_model.contains('/')) {
+            if !possible_model.is_empty()
+                && (possible_model.contains('-') || possible_model.contains('/'))
+            {
                 model_name = possible_model.to_string();
             }
         }

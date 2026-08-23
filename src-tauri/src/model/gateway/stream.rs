@@ -28,7 +28,10 @@ struct StreamResponseAccumulator {
 
 impl StreamResponseAccumulator {
     fn observe_chunk(&mut self, jv: &JsonValue) {
-        if let Some(fr) = jv.pointer("/choices/0/finish_reason").and_then(JsonValue::as_str) {
+        if let Some(fr) = jv
+            .pointer("/choices/0/finish_reason")
+            .and_then(JsonValue::as_str)
+        {
             self.finish_reason = Some(fr.to_string());
         }
         let Some(delta) = jv.pointer("/choices/0/delta") else {
@@ -54,7 +57,10 @@ impl StreamResponseAccumulator {
                 if let Some(name) = tc.pointer("/function/name").and_then(JsonValue::as_str) {
                     entry.name.push_str(name);
                 }
-                if let Some(args) = tc.pointer("/function/arguments").and_then(JsonValue::as_str) {
+                if let Some(args) = tc
+                    .pointer("/function/arguments")
+                    .and_then(JsonValue::as_str)
+                {
                     entry.arguments.push_str(args);
                 }
             }
@@ -96,7 +102,6 @@ impl StreamResponseAccumulator {
     }
 }
 
-
 /// SSE 流解析过程中的 token 统计
 struct SseTokenStats {
     prompt_tokens: u64,
@@ -133,15 +138,24 @@ impl SseTokenStats {
             if let Some(t) = usage.get("total_tokens").and_then(JsonValue::as_u64) {
                 self.total_tokens = t;
             }
-            if let Some(details) = usage.get("prompt_tokens_details").and_then(JsonValue::as_object) {
+            if let Some(details) = usage
+                .get("prompt_tokens_details")
+                .and_then(JsonValue::as_object)
+            {
                 if let Some(h) = details.get("cached_tokens").and_then(JsonValue::as_u64) {
                     self.cache_hit_tokens = h;
                 }
-                if let Some(w) = details.get("cache_creation_tokens").and_then(JsonValue::as_u64) {
+                if let Some(w) = details
+                    .get("cache_creation_tokens")
+                    .and_then(JsonValue::as_u64)
+                {
                     self.cache_creation_tokens = w;
                 }
             }
-            if let Some(details) = usage.get("completion_tokens_details").and_then(JsonValue::as_object) {
+            if let Some(details) = usage
+                .get("completion_tokens_details")
+                .and_then(JsonValue::as_object)
+            {
                 if let Some(r) = details.get("reasoning_tokens").and_then(JsonValue::as_u64) {
                     self.reasoning_tokens = r;
                     self.has_reasoning = true;
@@ -156,7 +170,8 @@ impl SseTokenStats {
         log.completion_tokens = (self.completion_tokens > 0).then_some(self.completion_tokens);
         log.reasoning_tokens = (self.reasoning_tokens > 0).then_some(self.reasoning_tokens);
         log.prompt_cache_hit_tokens = (self.cache_hit_tokens > 0).then_some(self.cache_hit_tokens);
-        log.cache_creation_tokens = (self.cache_creation_tokens > 0).then_some(self.cache_creation_tokens);
+        log.cache_creation_tokens =
+            (self.cache_creation_tokens > 0).then_some(self.cache_creation_tokens);
         log.total_tokens = if self.total_tokens > 0 {
             Some(self.total_tokens)
         } else if self.prompt_tokens + self.completion_tokens > 0 {
@@ -171,19 +186,29 @@ impl SseTokenStats {
         self.apply_to_log(log);
 
         if self.has_reasoning {
-            ctx.metrics.total_reasoning_requests.fetch_add(1, Ordering::Relaxed);
+            ctx.metrics
+                .total_reasoning_requests
+                .fetch_add(1, Ordering::Relaxed);
         }
         if self.prompt_tokens > 0 {
-            ctx.metrics.total_prompt_tokens.fetch_add(self.prompt_tokens, Ordering::Relaxed);
+            ctx.metrics
+                .total_prompt_tokens
+                .fetch_add(self.prompt_tokens, Ordering::Relaxed);
         }
         if self.completion_tokens > 0 {
-            ctx.metrics.total_completion_tokens.fetch_add(self.completion_tokens, Ordering::Relaxed);
+            ctx.metrics
+                .total_completion_tokens
+                .fetch_add(self.completion_tokens, Ordering::Relaxed);
         }
         if self.reasoning_tokens > 0 {
-            ctx.metrics.total_reasoning_tokens.fetch_add(self.reasoning_tokens, Ordering::Relaxed);
+            ctx.metrics
+                .total_reasoning_tokens
+                .fetch_add(self.reasoning_tokens, Ordering::Relaxed);
         }
         if self.cache_hit_tokens > 0 {
-            ctx.metrics.total_cache_hit_tokens.fetch_add(self.cache_hit_tokens, Ordering::Relaxed);
+            ctx.metrics
+                .total_cache_hit_tokens
+                .fetch_add(self.cache_hit_tokens, Ordering::Relaxed);
         }
         if let Some(t) = log.total_tokens {
             ctx.metrics.total_tokens.fetch_add(t, Ordering::Relaxed);
@@ -622,19 +647,41 @@ mod stream_accumulator_tests {
     #[test]
     fn accumulates_content_reasoning_and_tool_calls() {
         let mut acc = StreamResponseAccumulator::default();
-        feed(&mut acc, r#"{"choices":[{"delta":{"reasoning_content":"思考A"}}]}"#);
+        feed(
+            &mut acc,
+            r#"{"choices":[{"delta":{"reasoning_content":"思考A"}}]}"#,
+        );
         feed(&mut acc, r#"{"choices":[{"delta":{"content":"你"}}]}"#);
         feed(&mut acc, r#"{"choices":[{"delta":{"content":"好"}}]}"#);
-        feed(&mut acc, r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"get_weather","arguments":"{\"city\":"}}]}}]}"#);
-        feed(&mut acc, r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"北京\"}"}}]}}]}"#);
-        feed(&mut acc, r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10}}"#);
+        feed(
+            &mut acc,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"get_weather","arguments":"{\"city\":"}}]}}]}"#,
+        );
+        feed(
+            &mut acc,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"北京\"}"}}]}}]}"#,
+        );
+        feed(
+            &mut acc,
+            r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10}}"#,
+        );
 
         let body = acc.build_response_body().unwrap();
         let jv: JsonValue = serde_json::from_str(&body).unwrap();
         assert_eq!(jv.pointer("/choices/0/message/content").unwrap(), "你好");
-        assert_eq!(jv.pointer("/choices/0/message/reasoning_content").unwrap(), "思考A");
-        assert_eq!(jv.pointer("/choices/0/finish_reason").unwrap(), "tool_calls");
-        let tcs = jv.pointer("/choices/0/message/tool_calls").unwrap().as_array().unwrap();
+        assert_eq!(
+            jv.pointer("/choices/0/message/reasoning_content").unwrap(),
+            "思考A"
+        );
+        assert_eq!(
+            jv.pointer("/choices/0/finish_reason").unwrap(),
+            "tool_calls"
+        );
+        let tcs = jv
+            .pointer("/choices/0/message/tool_calls")
+            .unwrap()
+            .as_array()
+            .unwrap();
         assert_eq!(tcs.len(), 1);
         assert_eq!(tcs[0]["function"]["name"], "get_weather");
         assert_eq!(tcs[0]["function"]["arguments"], r#"{"city":"北京"}"#);

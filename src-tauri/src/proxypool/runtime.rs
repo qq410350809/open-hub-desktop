@@ -1,5 +1,4 @@
 pub(crate) use crate::db::{read_meta, write_meta};
-use tracing::warn;
 use crate::models::*;
 use crate::proxypool::geoip::{classify_node_location, open_geoip_reader};
 use crate::proxypool::parser::{
@@ -16,6 +15,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
+use tracing::warn;
 use url::Url;
 
 pub fn row_subscription(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProxySubscription> {
@@ -31,14 +31,13 @@ pub fn row_subscription(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProxySubscr
 }
 
 pub fn runtime_info(runtime: &ProxyRuntime) -> (bool, String, String) {
-    let detected = find_mihomo_binary();
+    let detected = find_mihomo_binary(runtime);
     let mut path = detected
         .as_ref()
         .map(|item| item.display().to_string())
         .unwrap_or_default();
     let mut error = if detected.is_none() {
-        "未检测到 OpenHub 内置 Mihomo 内核，请在【设置】中一键下载安装"
-            .to_string()
+        "未检测到 Mihomo 组件，请在代理池设置中下载并初始化".to_string()
     } else {
         String::new()
     };
@@ -283,24 +282,54 @@ pub fn is_slow_or_blocked_speed_test_url(value: &str) -> bool {
     )
 }
 
-pub fn find_mihomo_binary() -> Option<PathBuf> {
+pub fn find_mihomo_binary(runtime: &ProxyRuntime) -> Option<PathBuf> {
     if let Ok(value) = std::env::var("OPENHUB_MIHOMO_PATH") {
         let path = PathBuf::from(value);
         if path.is_file() {
             return Some(path);
         }
     }
+
+    let binary_names: &[&str] = if cfg!(target_os = "windows") {
+        &["mihomo.exe", "mihomo"]
+    } else {
+        &["mihomo"]
+    };
+    let candidate_dirs = [
+        runtime.directory.clone(),
+        runtime
+            .directory
+            .parent()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| runtime.directory.clone()),
+    ];
+    for directory in candidate_dirs {
+        for name in binary_names {
+            let candidate = directory.join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+            let candidate = directory.join("bin").join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+
     if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
         let home_path = PathBuf::from(home);
-        #[cfg(target_os = "macos")]
-        let candidate = home_path.join("Library/Application Support/com.dfeer.openhub.desktop/bin/mihomo");
-        #[cfg(target_os = "windows")]
-        let candidate = home_path.join("AppData/Roaming/com.dfeer.openhub.desktop/bin/mihomo.exe");
-        #[cfg(target_os = "linux")]
-        let candidate = home_path.join(".config/com.dfeer.openhub.desktop/bin/mihomo");
-
-        if candidate.is_file() {
-            return Some(candidate);
+        let base_dirs = [
+            home_path.join("Library/Application Support/com.dfeer.openhub.desktop/bin"),
+            home_path.join("AppData/Roaming/com.dfeer.openhub.desktop/bin"),
+            home_path.join(".config/com.dfeer.openhub.desktop/bin"),
+        ];
+        for base in base_dirs {
+            for name in binary_names {
+                let candidate = base.join(name);
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
         }
     }
     None
@@ -363,7 +392,11 @@ pub fn runtime_config(
         .collect::<Vec<_>>();
     let all_node_names = configs
         .iter()
-        .filter_map(|node| node.get("name").and_then(JsonValue::as_str).map(String::from))
+        .filter_map(|node| {
+            node.get("name")
+                .and_then(JsonValue::as_str)
+                .map(String::from)
+        })
         .collect::<Vec<_>>();
 
     let mut listeners = Vec::new();
@@ -501,17 +534,29 @@ pub fn runtime_nodes(
     Ok((nodes, hash))
 }
 
-pub fn simple_http_get(port: u16, path: &str, secret: &str, timeout: Duration) -> Result<(u16, String), String> {
+pub fn simple_http_get(
+    port: u16,
+    path: &str,
+    secret: &str,
+    timeout: Duration,
+) -> Result<(u16, String), String> {
     use std::io::{Read, Write};
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    let mut stream = std::net::TcpStream::connect_timeout(&addr, timeout).map_err(|e| e.to_string())?;
-    stream.set_read_timeout(Some(timeout)).map_err(|e| e.to_string())?;
-    stream.set_write_timeout(Some(timeout)).map_err(|e| e.to_string())?;
+    let mut stream =
+        std::net::TcpStream::connect_timeout(&addr, timeout).map_err(|e| e.to_string())?;
+    stream
+        .set_read_timeout(Some(timeout))
+        .map_err(|e| e.to_string())?;
+    stream
+        .set_write_timeout(Some(timeout))
+        .map_err(|e| e.to_string())?;
     let request = format!(
         "GET {} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
         path, port, secret
     );
-    stream.write_all(request.as_bytes()).map_err(|e| e.to_string())?;
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|e| e.to_string())?;
 
     let mut buf = Vec::with_capacity(8192);
     let mut chunk = [0u8; 4096];
@@ -694,7 +739,12 @@ pub fn spawn_dedicated_single_node_instance(
     let started = Instant::now();
     let mut last_err = String::new();
     while started.elapsed() < Duration::from_secs(4) {
-        match simple_http_get(controller_port, "/version", RUNTIME_SECRET, Duration::from_millis(200)) {
+        match simple_http_get(
+            controller_port,
+            "/version",
+            RUNTIME_SECRET,
+            Duration::from_millis(200),
+        ) {
             Ok((200..=299, _)) => {
                 return Ok(InstanceState {
                     child: Some(child),
@@ -797,7 +847,8 @@ pub fn ensure_channel_instance(
     };
     drop(connection);
 
-    let engine = find_mihomo_binary().ok_or("未检测到 OpenHub 内置 Mihomo 内核，请在【设置】中一键下载安装")?;
+    let engine =
+        find_mihomo_binary(runtime).ok_or("未检测到 Mihomo 组件，请在代理池设置中下载并初始化")?;
     let channel_dir = runtime.directory.join("channels").join(channel_id);
 
     let mut instances = runtime
@@ -817,7 +868,8 @@ pub fn ensure_channel_instance(
         stop_single_instance(inst);
     }
 
-    let inst = spawn_dedicated_single_node_instance(&engine, &channel_dir, &assigned_id, &raw_json)?;
+    let inst =
+        spawn_dedicated_single_node_instance(&engine, &channel_dir, &assigned_id, &raw_json)?;
     let port = inst.proxy_port;
     instances.insert(channel_id.to_string(), inst);
     Ok(port)
@@ -834,7 +886,8 @@ pub fn ensure_account_instance(
         }
     }
 
-    let engine = find_mihomo_binary().ok_or("未检测到 OpenHub 内置 Mihomo 内核，请在【设置】中一键下载安装")?;
+    let engine =
+        find_mihomo_binary(runtime).ok_or("未检测到 Mihomo 组件，请在代理池设置中下载并初始化")?;
     let account_dir = runtime.directory.join("accounts").join(profile_id);
 
     let mut instances = runtime
@@ -870,17 +923,15 @@ pub fn ensure_account_instance(
         .map_err(|e| format!("读取节点数据失败：{e}"))?;
     drop(connection);
 
-    let inst = spawn_dedicated_single_node_instance(&engine, &account_dir, &best_node_id, &raw_json)?;
+    let inst =
+        spawn_dedicated_single_node_instance(&engine, &account_dir, &best_node_id, &raw_json)?;
     let port = inst.proxy_port;
     instances.insert(profile_id.to_string(), inst);
     Ok(port)
 }
 
 #[allow(dead_code)]
-pub fn ensure_shared_instance(
-    database: &Database,
-    runtime: &ProxyRuntime,
-) -> Result<u16, String> {
+pub fn ensure_shared_instance(database: &Database, runtime: &ProxyRuntime) -> Result<u16, String> {
     ensure_shared_instance_with_nodes(database, runtime, None)
 }
 
@@ -893,7 +944,8 @@ pub fn ensure_shared_instance_with_nodes(
     if nodes.is_empty() {
         return Err("代理池中没有配置有效的节点".into());
     }
-    let engine = find_mihomo_binary().ok_or("未检测到 OpenHub 内置 Mihomo 内核，请在【设置】中一键下载安装")?;
+    let engine =
+        find_mihomo_binary(runtime).ok_or("未检测到 Mihomo 组件，请在代理池设置中下载并初始化")?;
 
     let mut state = runtime
         .shared_instance
@@ -971,7 +1023,12 @@ pub fn ensure_shared_instance_with_nodes(
     let started = Instant::now();
     let mut last_err = String::new();
     while started.elapsed() < Duration::from_secs(6) {
-        match simple_http_get(controller_port, "/version", RUNTIME_SECRET, Duration::from_millis(200)) {
+        match simple_http_get(
+            controller_port,
+            "/version",
+            RUNTIME_SECRET,
+            Duration::from_millis(200),
+        ) {
             Ok((200..=299, _)) => return Ok(proxy_port),
             Ok((code, _)) => last_err = format!("HTTP {code}"),
             Err(e) => last_err = e,
@@ -1005,7 +1062,12 @@ pub fn wait_runtime_ready(
                 return Err("测速已取消".into());
             }
         }
-        match simple_http_get(controller_port, "/version", RUNTIME_SECRET, Duration::from_millis(400)) {
+        match simple_http_get(
+            controller_port,
+            "/version",
+            RUNTIME_SECRET,
+            Duration::from_millis(400),
+        ) {
             Ok((200..=299, _)) => {
                 std::thread::sleep(Duration::from_millis(50));
                 return Ok(());
@@ -1022,7 +1084,11 @@ pub fn wait_runtime_ready(
     Err(format!("Mihomo 测速就绪超时：{last_error}"))
 }
 
-pub async fn select_group_node(runtime: &ProxyRuntime, group: &str, name: &str) -> Result<(), String> {
+pub async fn select_group_node(
+    runtime: &ProxyRuntime,
+    group: &str,
+    name: &str,
+) -> Result<(), String> {
     let port = runtime_controller_port(runtime)?;
     let mut url =
         Url::parse(&controller_url(port, "/proxies/")).map_err(|error| error.to_string())?;

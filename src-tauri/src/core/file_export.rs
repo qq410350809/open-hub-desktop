@@ -29,9 +29,7 @@ pub async fn save_export_file(args: SaveFileArgs) -> Result<SaveFileResult, Stri
         .decode(&args.content)
         .map_err(|e| format!("解码文件内容失败: {e}"))?;
 
-    let file_path = FileDialog::new()
-        .set_file_name(&args.filename)
-        .save_file();
+    let file_path = FileDialog::new().set_file_name(&args.filename).save_file();
 
     let Some(path) = file_path else {
         return Ok(SaveFileResult {

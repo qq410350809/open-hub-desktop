@@ -185,7 +185,7 @@ pub async fn fetch_charity_feed(
 #[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn get_charity_proxy_pool_summary(
     ctx: Managed<'_, Arc<AppContext>>,
-    ) -> Result<CharityProxyPoolSummary, String> {
+) -> Result<CharityProxyPoolSummary, String> {
     let database = &*ctx.database;
     tokio::task::block_in_place(|| {
         let connection = database.lock_conn()?;

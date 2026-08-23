@@ -79,7 +79,9 @@ pub fn collect_copilot_source_files(home: &Path) -> Vec<(String, PathBuf)> {
             continue;
         }
 
-        let empty_window_sessions = user_dir.join("globalStorage").join("emptyWindowChatSessions");
+        let empty_window_sessions = user_dir
+            .join("globalStorage")
+            .join("emptyWindowChatSessions");
         if empty_window_sessions.is_dir() {
             collect_jsonl_files(
                 &empty_window_sessions,
@@ -120,7 +122,11 @@ pub fn collect_copilot_source_files(home: &Path) -> Vec<(String, PathBuf)> {
         .collect()
 }
 
-pub fn parse_vscode_chat_session(path: &Path, text: &str, file_fingerprint: FileFingerprint) -> CachedFile {
+pub fn parse_vscode_chat_session(
+    path: &Path,
+    text: &str,
+    file_fingerprint: FileFingerprint,
+) -> CachedFile {
     let mut session_id = path
         .file_stem()
         .and_then(|s| s.to_str())
@@ -256,13 +262,20 @@ pub fn parse_vscode_chat_session(path: &Path, text: &str, file_fingerprint: File
                 })
                 .unwrap_or(0);
 
-            let cached_tokens = req.get("cachedTokens").and_then(JsonValue::as_i64).unwrap_or(0);
+            let cached_tokens = req
+                .get("cachedTokens")
+                .and_then(JsonValue::as_i64)
+                .unwrap_or(0);
 
             let mut reasoning_tokens = 0i64;
             if let Some(resp_arr) = req.get("response").and_then(JsonValue::as_array) {
                 for item in resp_arr {
                     if item.get("kind").and_then(JsonValue::as_str) == Some("thinking") {
-                        let text_len = item.get("value").and_then(JsonValue::as_str).unwrap_or("").len();
+                        let text_len = item
+                            .get("value")
+                            .and_then(JsonValue::as_str)
+                            .unwrap_or("")
+                            .len();
                         reasoning_tokens += (text_len as i64 / 4).max(1);
                     }
                 }
@@ -284,7 +297,9 @@ pub fn parse_vscode_chat_session(path: &Path, text: &str, file_fingerprint: File
                 estimated_tokens = prompt_tokens + output_tokens + reasoning_tokens;
             }
 
-            let total_tokens = prompt_tokens.saturating_add(output_tokens).saturating_add(reasoning_tokens);
+            let total_tokens = prompt_tokens
+                .saturating_add(output_tokens)
+                .saturating_add(reasoning_tokens);
 
             if total_tokens > 0 || !user_text.is_empty() {
                 events.push(UsageEvent {
@@ -339,7 +354,11 @@ pub fn parse_vscode_chat_session(path: &Path, text: &str, file_fingerprint: File
     }
 }
 
-pub fn parse_copilot_cli_events(path: &Path, text: &str, file_fingerprint: FileFingerprint) -> CachedFile {
+pub fn parse_copilot_cli_events(
+    path: &Path,
+    text: &str,
+    file_fingerprint: FileFingerprint,
+) -> CachedFile {
     let session_id = path
         .parent()
         .and_then(|p| p.file_name())
@@ -360,7 +379,11 @@ pub fn parse_copilot_cli_events(path: &Path, text: &str, file_fingerprint: FileF
             continue;
         };
         let event_type = value.get("type").and_then(JsonValue::as_str).unwrap_or("");
-        let ts = value.get("timestamp").and_then(JsonValue::as_str).unwrap_or("").to_string();
+        let ts = value
+            .get("timestamp")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("")
+            .to_string();
         update_bounds(&mut first_ts, &mut last_ts, &ts);
 
         let data = value.get("data").unwrap_or(&JsonValue::Null);
@@ -375,12 +398,22 @@ pub fn parse_copilot_cli_events(path: &Path, text: &str, file_fingerprint: FileF
                 }
             }
             "user.message" => {
-                let content = data.get("content").and_then(JsonValue::as_str).unwrap_or("");
+                let content = data
+                    .get("content")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or("");
                 if !content.trim().is_empty() {
                     turns += 1;
                     let event_id = value.get("id").and_then(JsonValue::as_str).unwrap_or("");
                     events.push(UsageEvent {
-                        id: format!("u:{session_id}:{}", if event_id.is_empty() { index.to_string() } else { event_id.to_string() }),
+                        id: format!(
+                            "u:{session_id}:{}",
+                            if event_id.is_empty() {
+                                index.to_string()
+                            } else {
+                                event_id.to_string()
+                            }
+                        ),
                         source: "copilot".to_string(),
                         model: model.clone(),
                         project_key: project_key.clone(),
@@ -392,21 +425,38 @@ pub fn parse_copilot_cli_events(path: &Path, text: &str, file_fingerprint: FileF
                 }
             }
             "assistant.message" => {
-                let req_id = data.get("requestId").and_then(JsonValue::as_str).unwrap_or("");
+                let req_id = data
+                    .get("requestId")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or("");
                 let event_id = if !req_id.is_empty() {
                     format!("{session_id}:{req_id}")
                 } else {
                     format!("{session_id}:{index}")
                 };
 
-                let output_tokens = data.get("outputTokens").and_then(JsonValue::as_i64).unwrap_or_else(|| {
-                    let content = data.get("content").and_then(JsonValue::as_str).unwrap_or("");
-                    (content.len() as i64 / 4).max(1)
-                });
+                let output_tokens = data
+                    .get("outputTokens")
+                    .and_then(JsonValue::as_i64)
+                    .unwrap_or_else(|| {
+                        let content = data
+                            .get("content")
+                            .and_then(JsonValue::as_str)
+                            .unwrap_or("");
+                        (content.len() as i64 / 4).max(1)
+                    });
 
-                let reasoning_tokens = data.get("reasoningText").and_then(JsonValue::as_str).map(|r| (r.len() as i64 / 4).max(1)).unwrap_or(0);
-                let input_tokens = visible_context_tokens.saturating_add(64).min(LOCAL_ESTIMATED_CONTEXT_LIMIT);
-                let total_tokens = input_tokens.saturating_add(output_tokens).saturating_add(reasoning_tokens);
+                let reasoning_tokens = data
+                    .get("reasoningText")
+                    .and_then(JsonValue::as_str)
+                    .map(|r| (r.len() as i64 / 4).max(1))
+                    .unwrap_or(0);
+                let input_tokens = visible_context_tokens
+                    .saturating_add(64)
+                    .min(LOCAL_ESTIMATED_CONTEXT_LIMIT);
+                let total_tokens = input_tokens
+                    .saturating_add(output_tokens)
+                    .saturating_add(reasoning_tokens);
 
                 events.push(UsageEvent {
                     id: event_id,

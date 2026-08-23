@@ -1,14 +1,14 @@
-use tracing::warn;
 use crate::models::{Database, ACTIVE_PROXY_NODE_KEY};
 use crate::proxypool::runtime::{
-    ensure_channel_instance, ensure_default_proxy_channel, ensure_runtime, read_account_proxy_channel_id,
-    read_meta, runtime_proxy_url, select_runtime_node,
+    ensure_channel_instance, ensure_default_proxy_channel, ensure_runtime,
+    read_account_proxy_channel_id, read_meta, runtime_proxy_url, select_runtime_node,
 };
 use crate::proxypool::types::*;
 use rusqlite::{params, OptionalExtension};
 use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
+use tracing::warn;
 
 pub fn list_prioritized_fast_proxy_nodes(
     database: &Database,
@@ -193,10 +193,7 @@ pub fn account_proxy_failure_ttl(error: &str) -> Duration {
     }
 }
 
-pub fn read_site_uses_proxy_pool(
-    database: &Database,
-    site_id: &str,
-) -> Result<bool, String> {
+pub fn read_site_uses_proxy_pool(database: &Database, site_id: &str) -> Result<bool, String> {
     let connection = database.lock_conn()?;
     connection
         .query_row(
@@ -209,7 +206,11 @@ pub fn read_site_uses_proxy_pool(
         .map_err(|error| error.to_string())
 }
 
-pub fn write_channel_node(database: &Database, channel_id: &str, node_id: &str) -> Result<(), String> {
+pub fn write_channel_node(
+    database: &Database,
+    channel_id: &str,
+    node_id: &str,
+) -> Result<(), String> {
     let connection = database.lock_conn()?;
     ensure_default_proxy_channel(&connection)?;
     connection
@@ -345,7 +346,14 @@ pub async fn rotate_account_instance_node(
 ) -> Result<String, String> {
     if let Ok(Some(channel_id)) = read_account_proxy_channel_id(database, profile_id) {
         if !channel_id.trim().is_empty() {
-            return rotate_channel_instance_node(database, runtime, &channel_id, failed_node_id, error).await;
+            return rotate_channel_instance_node(
+                database,
+                runtime,
+                &channel_id,
+                failed_node_id,
+                error,
+            )
+            .await;
         }
     }
     if !failed_node_id.is_empty() {
@@ -399,19 +407,15 @@ where
         return request(client).await;
     }
 
-    let account_port = crate::proxypool::runtime::ensure_account_instance(database, runtime, profile_id)?;
+    let account_port =
+        crate::proxypool::runtime::ensure_account_instance(database, runtime, profile_id)?;
     let account_proxy_url = format!("http://127.0.0.1:{account_port}");
     let mut last_error = String::new();
     let mut current_failed_node: Option<String> = None;
 
     for attempt in 0..ACCOUNT_PROXY_MAX_ATTEMPTS {
-        let client = build_proxy_client_with_url(
-            database,
-            &account_proxy_url,
-            timeout,
-            redirects,
-            purpose,
-        )?;
+        let client =
+            build_proxy_client_with_url(database, &account_proxy_url, timeout, redirects, purpose)?;
         match request(client).await {
             Ok(result) => return Ok(result),
             Err(error) => {

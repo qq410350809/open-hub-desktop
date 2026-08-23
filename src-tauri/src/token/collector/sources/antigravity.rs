@@ -83,7 +83,14 @@ pub fn normalize_model_slug(raw: &str) -> String {
     }
     let mut s = s.to_ascii_lowercase();
     for suffix in [
-        "-high", "-medium", "-low", "-thinking", "_high", "_medium", "_low", "_thinking",
+        "-high",
+        "-medium",
+        "-low",
+        "-thinking",
+        "_high",
+        "_medium",
+        "_low",
+        "_thinking",
     ] {
         if s.ends_with(suffix) {
             s.truncate(s.len() - suffix.len());
@@ -138,8 +145,11 @@ fn find_display_model_name(bytes: &[u8]) -> Option<String> {
                 break;
             }
         }
-        let candidate = String::from_utf8_lossy(&bytes[index..end]).trim().to_string();
-        if candidate.len() >= 4 && !candidate.starts_with("Gemini 0") && !is_model_noise(&candidate) {
+        let candidate = String::from_utf8_lossy(&bytes[index..end])
+            .trim()
+            .to_string();
+        if candidate.len() >= 4 && !candidate.starts_with("Gemini 0") && !is_model_noise(&candidate)
+        {
             let lower = candidate.to_ascii_lowercase();
             if lower.contains("flash")
                 || lower.contains("pro")

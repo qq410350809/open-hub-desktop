@@ -177,7 +177,10 @@ pub fn chat_to_anthropic_body(openai_body: &JsonValue, model: &str, stream: bool
                     }
                     if let Some(tcs) = m.get("tool_calls").and_then(JsonValue::as_array) {
                         for tc in tcs {
-                            let args = tc.pointer("/function/arguments").cloned().unwrap_or(json!("{}"));
+                            let args = tc
+                                .pointer("/function/arguments")
+                                .cloned()
+                                .unwrap_or(json!("{}"));
                             let input = if let Some(s) = args.as_str() {
                                 serde_json::from_str::<JsonValue>(s).unwrap_or(json!({}))
                             } else {
@@ -270,7 +273,10 @@ pub fn chat_to_gemini_body(openai_body: &JsonValue) -> JsonValue {
                     }
                     if let Some(tcs) = m.get("tool_calls").and_then(JsonValue::as_array) {
                         for tc in tcs {
-                            let args = tc.pointer("/function/arguments").cloned().unwrap_or(json!("{}"));
+                            let args = tc
+                                .pointer("/function/arguments")
+                                .cloned()
+                                .unwrap_or(json!("{}"));
                             let args_val = if let Some(s) = args.as_str() {
                                 serde_json::from_str::<JsonValue>(s).unwrap_or(json!({}))
                             } else {
@@ -309,7 +315,11 @@ pub fn chat_to_gemini_body(openai_body: &JsonValue) -> JsonValue {
     }
 
     let mut generation_config = json!({});
-    if let Some(v) = openai_body.get("max_tokens").and_then(JsonValue::as_u64).filter(|v| *v > 0) {
+    if let Some(v) = openai_body
+        .get("max_tokens")
+        .and_then(JsonValue::as_u64)
+        .filter(|v| *v > 0)
+    {
         generation_config["maxOutputTokens"] = json!(v);
     }
     for (from, to) in [("temperature", "temperature"), ("top_p", "topP")] {
@@ -322,7 +332,9 @@ pub fn chat_to_gemini_body(openai_body: &JsonValue) -> JsonValue {
     if let Some(stop) = openai_body.get("stop") {
         match stop {
             JsonValue::String(s) => generation_config["stopSequences"] = json!([s]),
-            JsonValue::Array(arr) if !arr.is_empty() => generation_config["stopSequences"] = stop.clone(),
+            JsonValue::Array(arr) if !arr.is_empty() => {
+                generation_config["stopSequences"] = stop.clone()
+            }
             _ => {}
         }
     }
@@ -378,7 +390,10 @@ pub fn chat_to_responses_body(openai_body: &JsonValue, model: &str, stream: bool
                     }
                     if let Some(tcs) = m.get("tool_calls").and_then(JsonValue::as_array) {
                         for tc in tcs {
-                            let args = tc.pointer("/function/arguments").cloned().unwrap_or(json!("{}"));
+                            let args = tc
+                                .pointer("/function/arguments")
+                                .cloned()
+                                .unwrap_or(json!("{}"));
                             input.push(json!({
                                 "type": "function_call",
                                 "call_id": tc.get("id").cloned().unwrap_or(json!("call_unknown")),
@@ -412,7 +427,11 @@ pub fn chat_to_responses_body(openai_body: &JsonValue, model: &str, stream: bool
     if !instructions.is_empty() {
         body["instructions"] = json!(instructions);
     }
-    if let Some(v) = openai_body.get("max_tokens").and_then(JsonValue::as_u64).filter(|v| *v > 0) {
+    if let Some(v) = openai_body
+        .get("max_tokens")
+        .and_then(JsonValue::as_u64)
+        .filter(|v| *v > 0)
+    {
         body["max_output_tokens"] = json!(v);
     }
     if let Some(v) = openai_body.get("temperature") {
@@ -496,14 +515,28 @@ pub fn anthropic_response_to_openai(resp: &JsonValue) -> JsonValue {
     // prompt_tokens = input + cache_read + cache_creation，缓存明细放 details。
     // cache_creation_tokens 为本网关的扩展键（OpenAI 协议无此概念），供统计层提取。
     let usage = resp.get("usage");
-    let input_tokens = usage.and_then(|u| u.get("input_tokens")).and_then(JsonValue::as_u64).unwrap_or(0);
-    let cache_read = usage.and_then(|u| u.get("cache_read_input_tokens")).and_then(JsonValue::as_u64).unwrap_or(0);
-    let cache_creation = usage.and_then(|u| u.get("cache_creation_input_tokens")).and_then(JsonValue::as_u64).unwrap_or(0);
-    let completion_tokens = usage.and_then(|u| u.get("output_tokens")).and_then(JsonValue::as_u64).unwrap_or(0);
+    let input_tokens = usage
+        .and_then(|u| u.get("input_tokens"))
+        .and_then(JsonValue::as_u64)
+        .unwrap_or(0);
+    let cache_read = usage
+        .and_then(|u| u.get("cache_read_input_tokens"))
+        .and_then(JsonValue::as_u64)
+        .unwrap_or(0);
+    let cache_creation = usage
+        .and_then(|u| u.get("cache_creation_input_tokens"))
+        .and_then(JsonValue::as_u64)
+        .unwrap_or(0);
+    let completion_tokens = usage
+        .and_then(|u| u.get("output_tokens"))
+        .and_then(JsonValue::as_u64)
+        .unwrap_or(0);
     let prompt_tokens = input_tokens + cache_read + cache_creation;
 
     let mut out = empty_chat_response(model);
-    let msg = out.pointer_mut("/choices/0/message").expect("message exists");
+    let msg = out
+        .pointer_mut("/choices/0/message")
+        .expect("message exists");
     msg["content"] = json!(content);
     if !reasoning.is_empty() {
         msg["reasoning_content"] = json!(reasoning);
@@ -535,7 +568,10 @@ pub fn gemini_response_to_openai(resp: &JsonValue, model: &str) -> JsonValue {
         if let Some(c0) = candidates.first() {
             if let Some(parts) = c0.pointer("/content/parts").and_then(JsonValue::as_array) {
                 for p in parts {
-                    let is_thought = p.get("thought").and_then(JsonValue::as_bool).unwrap_or(false);
+                    let is_thought = p
+                        .get("thought")
+                        .and_then(JsonValue::as_bool)
+                        .unwrap_or(false);
                     if let Some(t) = p.get("text").and_then(JsonValue::as_str) {
                         if is_thought {
                             reasoning.push_str(t);
@@ -564,9 +600,18 @@ pub fn gemini_response_to_openai(resp: &JsonValue, model: &str) -> JsonValue {
     }
 
     let usage = resp.get("usageMetadata");
-    let prompt_tokens = usage.and_then(|u| u.get("promptTokenCount")).and_then(JsonValue::as_u64).unwrap_or(0);
-    let thoughts_tokens = usage.and_then(|u| u.get("thoughtsTokenCount")).and_then(JsonValue::as_u64).unwrap_or(0);
-    let cached_tokens = usage.and_then(|u| u.get("cachedContentTokenCount")).and_then(JsonValue::as_u64).unwrap_or(0);
+    let prompt_tokens = usage
+        .and_then(|u| u.get("promptTokenCount"))
+        .and_then(JsonValue::as_u64)
+        .unwrap_or(0);
+    let thoughts_tokens = usage
+        .and_then(|u| u.get("thoughtsTokenCount"))
+        .and_then(JsonValue::as_u64)
+        .unwrap_or(0);
+    let cached_tokens = usage
+        .and_then(|u| u.get("cachedContentTokenCount"))
+        .and_then(JsonValue::as_u64)
+        .unwrap_or(0);
     let completion_tokens = usage
         .and_then(|u| u.get("candidatesTokenCount"))
         .and_then(JsonValue::as_u64)
@@ -574,7 +619,9 @@ pub fn gemini_response_to_openai(resp: &JsonValue, model: &str) -> JsonValue {
         + thoughts_tokens;
 
     let mut out = empty_chat_response(model);
-    let msg = out.pointer_mut("/choices/0/message").expect("message exists");
+    let msg = out
+        .pointer_mut("/choices/0/message")
+        .expect("message exists");
     msg["content"] = json!(content);
     if !reasoning.is_empty() {
         msg["reasoning_content"] = json!(reasoning);
@@ -637,8 +684,14 @@ pub fn responses_response_to_openai(resp: &JsonValue) -> JsonValue {
     }
 
     let usage = resp.get("usage");
-    let prompt_tokens = usage.and_then(|u| u.get("input_tokens")).and_then(JsonValue::as_u64).unwrap_or(0);
-    let completion_tokens = usage.and_then(|u| u.get("output_tokens")).and_then(JsonValue::as_u64).unwrap_or(0);
+    let prompt_tokens = usage
+        .and_then(|u| u.get("input_tokens"))
+        .and_then(JsonValue::as_u64)
+        .unwrap_or(0);
+    let completion_tokens = usage
+        .and_then(|u| u.get("output_tokens"))
+        .and_then(JsonValue::as_u64)
+        .unwrap_or(0);
     let cached_tokens = usage
         .and_then(|u| u.pointer("/input_tokens_details/cached_tokens"))
         .and_then(JsonValue::as_u64)
@@ -649,7 +702,9 @@ pub fn responses_response_to_openai(resp: &JsonValue) -> JsonValue {
         .unwrap_or(0);
 
     let mut out = empty_chat_response(model);
-    let msg = out.pointer_mut("/choices/0/message").expect("message exists");
+    let msg = out
+        .pointer_mut("/choices/0/message")
+        .expect("message exists");
     msg["content"] = json!(content);
     if !reasoning.is_empty() {
         msg["reasoning_content"] = json!(reasoning);
@@ -728,9 +783,16 @@ impl AnthropicSseState {
                     .unwrap_or("text")
                     .to_string();
                 if kind == "tool_use" {
-                    let id = jv.pointer("/content_block/id").and_then(JsonValue::as_str).unwrap_or("toolu_unknown");
-                    let name = jv.pointer("/content_block/name").and_then(JsonValue::as_str).unwrap_or("tool");
-                    self.tool_meta.insert(idx, (id.to_string(), name.to_string()));
+                    let id = jv
+                        .pointer("/content_block/id")
+                        .and_then(JsonValue::as_str)
+                        .unwrap_or("toolu_unknown");
+                    let name = jv
+                        .pointer("/content_block/name")
+                        .and_then(JsonValue::as_str)
+                        .unwrap_or("tool");
+                    self.tool_meta
+                        .insert(idx, (id.to_string(), name.to_string()));
                 }
                 self.block_kinds.insert(idx, kind);
             }
@@ -743,7 +805,10 @@ impl AnthropicSseState {
                         }
                     }
                     Some("tool_use") => {
-                        if let Some(frag) = jv.pointer("/delta/partial_json").and_then(JsonValue::as_str) {
+                        if let Some(frag) = jv
+                            .pointer("/delta/partial_json")
+                            .and_then(JsonValue::as_str)
+                        {
                             out.push(delta_chunk(
                                 json!({ "tool_calls": [{ "index": idx, "function": { "arguments": frag } }] }),
                                 None,
@@ -762,14 +827,23 @@ impl AnthropicSseState {
                 if let Some(r) = jv.pointer("/delta/stop_reason").and_then(JsonValue::as_str) {
                     self.stop_reason = Some(r.to_string());
                 }
-                if let Some(o) = jv.pointer("/usage/output_tokens").and_then(JsonValue::as_u64) {
+                if let Some(o) = jv
+                    .pointer("/usage/output_tokens")
+                    .and_then(JsonValue::as_u64)
+                {
                     self.output_tokens = o;
                 }
                 // 部分上游在 message_delta 里才给出（或更新）缓存计数
-                if let Some(v) = jv.pointer("/usage/cache_read_input_tokens").and_then(JsonValue::as_u64) {
+                if let Some(v) = jv
+                    .pointer("/usage/cache_read_input_tokens")
+                    .and_then(JsonValue::as_u64)
+                {
                     self.cache_read_tokens = self.cache_read_tokens.max(v);
                 }
-                if let Some(v) = jv.pointer("/usage/cache_creation_input_tokens").and_then(JsonValue::as_u64) {
+                if let Some(v) = jv
+                    .pointer("/usage/cache_creation_input_tokens")
+                    .and_then(JsonValue::as_u64)
+                {
                     self.cache_creation_tokens = self.cache_creation_tokens.max(v);
                 }
             }
@@ -822,9 +896,16 @@ impl GeminiSseState {
             if let Some(c0) = candidates.first() {
                 if let Some(parts) = c0.pointer("/content/parts").and_then(JsonValue::as_array) {
                     for p in parts {
-                        let is_thought = p.get("thought").and_then(JsonValue::as_bool).unwrap_or(false);
+                        let is_thought = p
+                            .get("thought")
+                            .and_then(JsonValue::as_bool)
+                            .unwrap_or(false);
                         if let Some(t) = p.get("text").and_then(JsonValue::as_str) {
-                            let key = if is_thought { "reasoning_content" } else { "content" };
+                            let key = if is_thought {
+                                "reasoning_content"
+                            } else {
+                                "content"
+                            };
                             out.push(delta_chunk(json!({ key: t }), None, None));
                         }
                         if let Some(fc) = p.get("functionCall") {
@@ -848,13 +929,28 @@ impl GeminiSseState {
             }
         }
         if let Some(u) = jv.get("usageMetadata") {
-            self.prompt_tokens = u.get("promptTokenCount").and_then(JsonValue::as_u64).unwrap_or(self.prompt_tokens);
-            let thoughts = u.get("thoughtsTokenCount").and_then(JsonValue::as_u64).unwrap_or(0);
+            self.prompt_tokens = u
+                .get("promptTokenCount")
+                .and_then(JsonValue::as_u64)
+                .unwrap_or(self.prompt_tokens);
+            let thoughts = u
+                .get("thoughtsTokenCount")
+                .and_then(JsonValue::as_u64)
+                .unwrap_or(0);
             self.reasoning_tokens = self.reasoning_tokens.max(thoughts);
-            self.completion_tokens = u.get("candidatesTokenCount").and_then(JsonValue::as_u64).unwrap_or(self.completion_tokens)
+            self.completion_tokens = u
+                .get("candidatesTokenCount")
+                .and_then(JsonValue::as_u64)
+                .unwrap_or(self.completion_tokens)
                 + thoughts;
-            self.cached_tokens = u.get("cachedContentTokenCount").and_then(JsonValue::as_u64).unwrap_or(self.cached_tokens);
-            self.total_tokens = u.get("totalTokenCount").and_then(JsonValue::as_u64).unwrap_or(self.total_tokens);
+            self.cached_tokens = u
+                .get("cachedContentTokenCount")
+                .and_then(JsonValue::as_u64)
+                .unwrap_or(self.cached_tokens);
+            self.total_tokens = u
+                .get("totalTokenCount")
+                .and_then(JsonValue::as_u64)
+                .unwrap_or(self.total_tokens);
         }
         out
     }
@@ -924,10 +1020,22 @@ impl ResponsesSseState {
                 }
             }
             Some("response.completed") | Some("response.incomplete") => {
-                self.prompt_tokens = jv.pointer("/response/usage/input_tokens").and_then(JsonValue::as_u64).unwrap_or(self.prompt_tokens);
-                self.completion_tokens = jv.pointer("/response/usage/output_tokens").and_then(JsonValue::as_u64).unwrap_or(self.completion_tokens);
-                self.cached_tokens = jv.pointer("/response/usage/input_tokens_details/cached_tokens").and_then(JsonValue::as_u64).unwrap_or(self.cached_tokens);
-                self.reasoning_tokens = jv.pointer("/response/usage/output_tokens_details/reasoning_tokens").and_then(JsonValue::as_u64).unwrap_or(self.reasoning_tokens);
+                self.prompt_tokens = jv
+                    .pointer("/response/usage/input_tokens")
+                    .and_then(JsonValue::as_u64)
+                    .unwrap_or(self.prompt_tokens);
+                self.completion_tokens = jv
+                    .pointer("/response/usage/output_tokens")
+                    .and_then(JsonValue::as_u64)
+                    .unwrap_or(self.completion_tokens);
+                self.cached_tokens = jv
+                    .pointer("/response/usage/input_tokens_details/cached_tokens")
+                    .and_then(JsonValue::as_u64)
+                    .unwrap_or(self.cached_tokens);
+                self.reasoning_tokens = jv
+                    .pointer("/response/usage/output_tokens_details/reasoning_tokens")
+                    .and_then(JsonValue::as_u64)
+                    .unwrap_or(self.reasoning_tokens);
             }
             _ => {}
         }
@@ -989,7 +1097,10 @@ impl SseNormalizer {
 
 /// 把上游目标协议的 SSE 字节流归一化为 OpenAI Chat SSE 字节流。
 /// OpenAI 协议无需调用本函数（直接透传原始流）。
-pub fn normalized_sse_stream<E, S>(stream: S, target: TargetProtocol) -> impl futures_util::Stream<Item = Result<Bytes, E>> + Send
+pub fn normalized_sse_stream<E, S>(
+    stream: S,
+    target: TargetProtocol,
+) -> impl futures_util::Stream<Item = Result<Bytes, E>> + Send
 where
     S: futures_util::Stream<Item = Result<Bytes, E>> + Send + 'static,
     E: Send + 'static,
@@ -1060,12 +1171,30 @@ mod egress_tests {
 
     #[test]
     fn target_protocol_from_channel_maps_legacy_values() {
-        assert_eq!(TargetProtocol::from_channel(&channel_with_protocol("openai")), TargetProtocol::OpenAiChat);
-        assert_eq!(TargetProtocol::from_channel(&channel_with_protocol("opencode")), TargetProtocol::OpenAiChat);
-        assert_eq!(TargetProtocol::from_channel(&channel_with_protocol("responses")), TargetProtocol::OpenAiResponses);
-        assert_eq!(TargetProtocol::from_channel(&channel_with_protocol("claude")), TargetProtocol::AnthropicMessages);
-        assert_eq!(TargetProtocol::from_channel(&channel_with_protocol("gemini")), TargetProtocol::Gemini);
-        assert_eq!(TargetProtocol::from_channel(&channel_with_protocol("unknown")), TargetProtocol::OpenAiChat);
+        assert_eq!(
+            TargetProtocol::from_channel(&channel_with_protocol("openai")),
+            TargetProtocol::OpenAiChat
+        );
+        assert_eq!(
+            TargetProtocol::from_channel(&channel_with_protocol("opencode")),
+            TargetProtocol::OpenAiChat
+        );
+        assert_eq!(
+            TargetProtocol::from_channel(&channel_with_protocol("responses")),
+            TargetProtocol::OpenAiResponses
+        );
+        assert_eq!(
+            TargetProtocol::from_channel(&channel_with_protocol("claude")),
+            TargetProtocol::AnthropicMessages
+        );
+        assert_eq!(
+            TargetProtocol::from_channel(&channel_with_protocol("gemini")),
+            TargetProtocol::Gemini
+        );
+        assert_eq!(
+            TargetProtocol::from_channel(&channel_with_protocol("unknown")),
+            TargetProtocol::OpenAiChat
+        );
     }
 
     #[test]
@@ -1075,17 +1204,41 @@ mod egress_tests {
         let (url, _) = prepare_egress(&channel_with_protocol("openai"), "sk-x", "m", &body, false);
         assert_eq!(url, "https://upstream.example/v1/chat/completions");
 
-        let (url, _) = prepare_egress(&channel_with_protocol("openai-responses"), "sk-x", "m", &body, false);
+        let (url, _) = prepare_egress(
+            &channel_with_protocol("openai-responses"),
+            "sk-x",
+            "m",
+            &body,
+            false,
+        );
         assert_eq!(url, "https://upstream.example/v1/responses");
 
-        let (url, _) = prepare_egress(&channel_with_protocol("anthropic"), "sk-x", "m", &body, true);
+        let (url, _) = prepare_egress(
+            &channel_with_protocol("anthropic"),
+            "sk-x",
+            "m",
+            &body,
+            true,
+        );
         assert_eq!(url, "https://upstream.example/v1/v1/messages");
 
-        let (url, _) = prepare_egress(&channel_with_protocol("gemini"), "sk-123", "gemini-2.5-pro", &body, false);
-        assert_eq!(url, "https://upstream.example/v1/v1beta/models/gemini-2.5-pro:generateContent?key=sk-123");
+        let (url, _) = prepare_egress(
+            &channel_with_protocol("gemini"),
+            "sk-123",
+            "gemini-2.5-pro",
+            &body,
+            false,
+        );
+        assert_eq!(
+            url,
+            "https://upstream.example/v1/v1beta/models/gemini-2.5-pro:generateContent?key=sk-123"
+        );
 
         let (url, _) = prepare_egress(&channel_with_protocol("gemini"), "", "g", &body, true);
-        assert_eq!(url, "https://upstream.example/v1/v1beta/models/g:streamGenerateContent?alt=sse");
+        assert_eq!(
+            url,
+            "https://upstream.example/v1/v1beta/models/g:streamGenerateContent?alt=sse"
+        );
     }
 
     #[test]
@@ -1123,9 +1276,18 @@ mod egress_tests {
             "usage": {"input_tokens": 100, "output_tokens": 50},
         });
         let out = anthropic_response_to_openai(&resp);
-        assert_eq!(out.pointer("/choices/0/message/content").unwrap(), "答案是 42");
-        assert_eq!(out.pointer("/choices/0/message/reasoning_content").unwrap(), "让我想想");
-        assert_eq!(out.pointer("/choices/0/finish_reason").unwrap(), "tool_calls");
+        assert_eq!(
+            out.pointer("/choices/0/message/content").unwrap(),
+            "答案是 42"
+        );
+        assert_eq!(
+            out.pointer("/choices/0/message/reasoning_content").unwrap(),
+            "让我想想"
+        );
+        assert_eq!(
+            out.pointer("/choices/0/finish_reason").unwrap(),
+            "tool_calls"
+        );
         assert_eq!(out.pointer("/usage/prompt_tokens").unwrap(), 100);
         assert_eq!(out.pointer("/usage/completion_tokens").unwrap(), 50);
         let tc = out.pointer("/choices/0/message/tool_calls/0").unwrap();
@@ -1144,9 +1306,19 @@ mod egress_tests {
             "max_tokens": 128,
         });
         let gemini_req = chat_to_gemini_body(&chat);
-        assert_eq!(gemini_req.pointer("/systemInstruction/parts/0/text").unwrap(), "sys");
+        assert_eq!(
+            gemini_req
+                .pointer("/systemInstruction/parts/0/text")
+                .unwrap(),
+            "sys"
+        );
         assert_eq!(gemini_req.pointer("/contents/0/role").unwrap(), "user");
-        assert_eq!(gemini_req.pointer("/generationConfig/maxOutputTokens").unwrap(), 128);
+        assert_eq!(
+            gemini_req
+                .pointer("/generationConfig/maxOutputTokens")
+                .unwrap(),
+            128
+        );
 
         let gemini_resp = json!({
             "candidates": [{
@@ -1161,7 +1333,10 @@ mod egress_tests {
         });
         let out = gemini_response_to_openai(&gemini_resp, "gemini-2.5");
         assert_eq!(out.pointer("/choices/0/message/content").unwrap(), "你好！");
-        assert_eq!(out.pointer("/choices/0/message/reasoning_content").unwrap(), "思考中");
+        assert_eq!(
+            out.pointer("/choices/0/message/reasoning_content").unwrap(),
+            "思考中"
+        );
         assert_eq!(out.pointer("/choices/0/finish_reason").unwrap(), "stop");
         assert_eq!(out.pointer("/usage/total_tokens").unwrap(), 15);
     }
@@ -1178,9 +1353,19 @@ mod egress_tests {
             "usage": {"input_tokens": 8, "output_tokens": 6},
         });
         let out = responses_response_to_openai(&resp);
-        assert_eq!(out.pointer("/choices/0/message/content").unwrap(), "最终回答");
-        assert_eq!(out.pointer("/choices/0/message/reasoning_content").unwrap(), "推理过程");
-        assert_eq!(out.pointer("/choices/0/message/tool_calls/0/function/name").unwrap(), "calc");
+        assert_eq!(
+            out.pointer("/choices/0/message/content").unwrap(),
+            "最终回答"
+        );
+        assert_eq!(
+            out.pointer("/choices/0/message/reasoning_content").unwrap(),
+            "推理过程"
+        );
+        assert_eq!(
+            out.pointer("/choices/0/message/tool_calls/0/function/name")
+                .unwrap(),
+            "calc"
+        );
         assert_eq!(out.pointer("/usage/prompt_tokens").unwrap(), 8);
     }
 
@@ -1203,7 +1388,9 @@ mod egress_tests {
             collected.push_str(&chunk);
         }
 
-        assert!(collected.contains("你好") || (collected.contains("你") && collected.contains("好")));
+        assert!(
+            collected.contains("你好") || (collected.contains("你") && collected.contains("好"))
+        );
         assert!(collected.contains("\"prompt_tokens\":20"));
         assert!(collected.contains("\"completion_tokens\":9"));
         assert!(collected.contains("\"finish_reason\":\"stop\""));

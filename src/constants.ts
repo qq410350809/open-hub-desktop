@@ -5,15 +5,12 @@
  * 便于后续修改端口、URL 或默认配置时一处生效、处处生效。
  */
 
-// ── 模型反代（Model Proxy）──
+// ── 模型反代（同源 Web 服务端点）──
 
-/** 模型反代默认监听端口 */
-export const DEFAULT_PROXY_PORT = 8088;
+/** 主 Web 服务默认端口；模型 API 与 Web UI 共用该端口。 */
+export const DEFAULT_SERVICE_PORT = 17896;
 
-/** 本地回环地址前缀（统一拼接 URL 使用） */
-export const LOCALHOST = "127.0.0.1";
 
-/** OpenAI 兼容 API 路径前缀 */
 export const API_PATH_V1 = "/v1";
 
 /** OpenAI Responses API 路径 */
@@ -25,24 +22,29 @@ export const API_PATH_GEMINI = "/v1/gemini";
 /** Claude Messages 兼容 API 路径 */
 export const API_PATH_MESSAGES = "/v1/messages";
 
-/** 构建本地反代 Base URL */
-export function buildProxyBaseUrl(port: number): string {
-  return `http://${LOCALHOST}:${port}${API_PATH_V1}`;
+/** 当前 Web 服务的模型 API Origin。桌面内嵌 Web 与浏览器访问均使用当前页面源。 */
+export function modelApiOrigin(): string {
+  return window.location.origin;
 }
 
-/** 构建本地反代 Responses API URL */
-export function buildProxyResponsesUrl(port: number): string {
-  return `http://${LOCALHOST}:${port}${API_PATH_RESPONSES}`;
+/** 构建同源 OpenAI 兼容 API URL */
+export function buildProxyBaseUrl(): string {
+  return `${modelApiOrigin()}${API_PATH_V1}`;
 }
 
-/** 构建本地反代 Gemini URL */
-export function buildProxyGeminiUrl(port: number): string {
-  return `http://${LOCALHOST}:${port}${API_PATH_GEMINI}`;
+/** 构建同源 Responses API URL */
+export function buildProxyResponsesUrl(): string {
+  return `${modelApiOrigin()}${API_PATH_RESPONSES}`;
 }
 
-/** 构建本地反代 Claude Messages URL */
-export function buildProxyMessagesUrl(port: number): string {
-  return `http://${LOCALHOST}:${port}${API_PATH_MESSAGES}`;
+/** 构建同源 Gemini API URL */
+export function buildProxyGeminiUrl(): string {
+  return `${modelApiOrigin()}${API_PATH_GEMINI}`;
+}
+
+/** 构建同源 Claude Messages API URL */
+export function buildProxyMessagesUrl(): string {
+  return `${modelApiOrigin()}${API_PATH_MESSAGES}`;
 }
 
 /** OpenCode 官方上游 URL */
@@ -62,7 +64,4 @@ export const PROXY_SPEED_TEST_URL = "http://www.gstatic.com/generate_204";
 /** 远程登录地址 */
 export const REMOTE_LOGIN_URL = "https://ldoh.105117.xyz/";
 
-// ── 轻量模式内核 ──
-
-/** 轻量模式内核默认端口 */
-export const KERNEL_DEFAULT_PORT = 17896;
+// ── 远程访问 ──

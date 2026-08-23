@@ -672,7 +672,9 @@ pub fn collect_local_agent_paths(home: &Path) -> LocalAgentPathsReport {
         for p in crate::token::collector::collect_cursor_db_paths(home) {
             push_agent_path(&mut entries, "database", "SQLite state.vscdb", Some(&p));
         }
-        let root = entries.first().and_then(|e| PathBuf::from(&e.path).parent().map(|p| p.to_path_buf()));
+        let root = entries
+            .first()
+            .and_then(|e| PathBuf::from(&e.path).parent().map(|p| p.to_path_buf()));
         agents.push(finish_agent("cursor", "Cursor", root.as_deref(), entries));
     }
 
@@ -682,8 +684,15 @@ pub fn collect_local_agent_paths(home: &Path) -> LocalAgentPathsReport {
         for p in crate::token::collector::collect_windsurf_db_paths(home) {
             push_agent_path(&mut entries, "database", "SQLite state.vscdb", Some(&p));
         }
-        let root = entries.first().and_then(|e| PathBuf::from(&e.path).parent().map(|p| p.to_path_buf()));
-        agents.push(finish_agent("windsurf", "Windsurf", root.as_deref(), entries));
+        let root = entries
+            .first()
+            .and_then(|e| PathBuf::from(&e.path).parent().map(|p| p.to_path_buf()));
+        agents.push(finish_agent(
+            "windsurf",
+            "Windsurf",
+            root.as_deref(),
+            entries,
+        ));
     }
 
     // Zed
@@ -692,7 +701,9 @@ pub fn collect_local_agent_paths(home: &Path) -> LocalAgentPathsReport {
         for p in crate::token::collector::collect_zed_source_files(home) {
             push_agent_path(&mut entries, "data", "会话 .zed.json", Some(&p));
         }
-        let root = entries.first().and_then(|e| PathBuf::from(&e.path).parent().map(|p| p.to_path_buf()));
+        let root = entries
+            .first()
+            .and_then(|e| PathBuf::from(&e.path).parent().map(|p| p.to_path_buf()));
         agents.push(finish_agent("zed", "Zed Editor", root.as_deref(), entries));
     }
 
@@ -705,7 +716,9 @@ pub fn collect_local_agent_paths(home: &Path) -> LocalAgentPathsReport {
                 push_agent_path(&mut entries, "data", "任务 ui_messages.json", Some(p));
             }
         }
-        let root = entries.first().and_then(|e| PathBuf::from(&e.path).parent().map(|p| p.to_path_buf()));
+        let root = entries
+            .first()
+            .and_then(|e| PathBuf::from(&e.path).parent().map(|p| p.to_path_buf()));
         agents.push(finish_agent("cline", "Cline", root.as_deref(), entries));
     }
 
@@ -717,17 +730,39 @@ pub fn collect_local_agent_paths(home: &Path) -> LocalAgentPathsReport {
                 push_agent_path(&mut entries, "data", "任务 ui_messages.json", Some(p));
             }
         }
-        let root = entries.first().and_then(|e| PathBuf::from(&e.path).parent().map(|p| p.to_path_buf()));
-        agents.push(finish_agent("roo-code", "Roo Code", root.as_deref(), entries));
+        let root = entries
+            .first()
+            .and_then(|e| PathBuf::from(&e.path).parent().map(|p| p.to_path_buf()));
+        agents.push(finish_agent(
+            "roo-code",
+            "Roo Code",
+            root.as_deref(),
+            entries,
+        ));
     }
 
     // Continue.dev
     {
         let root = home.join(".continue");
         let mut entries = Vec::new();
-        push_agent_path(&mut entries, "config", "配置 config.json", Some(&root.join("config.json")));
-        push_agent_path(&mut entries, "data", "会话 sessions", Some(&root.join("sessions")));
-        agents.push(finish_agent("continue", "Continue.dev", Some(&root), entries));
+        push_agent_path(
+            &mut entries,
+            "config",
+            "配置 config.json",
+            Some(&root.join("config.json")),
+        );
+        push_agent_path(
+            &mut entries,
+            "data",
+            "会话 sessions",
+            Some(&root.join("sessions")),
+        );
+        agents.push(finish_agent(
+            "continue",
+            "Continue.dev",
+            Some(&root),
+            entries,
+        ));
     }
 
     // Aider
@@ -736,14 +771,24 @@ pub fn collect_local_agent_paths(home: &Path) -> LocalAgentPathsReport {
         for p in crate::token::collector::collect_aider_source_files(home) {
             push_agent_path(&mut entries, "data", "聊天历史 / 分析", Some(&p));
         }
-        agents.push(finish_agent("aider", "Aider", Some(&home.join(".aider")), entries));
+        agents.push(finish_agent(
+            "aider",
+            "Aider",
+            Some(&home.join(".aider")),
+            entries,
+        ));
     }
 
     // Goose AI
     {
         let root = home.join(".local").join("share").join("goose");
         let mut entries = Vec::new();
-        push_agent_path(&mut entries, "data", "会话 sessions", Some(&root.join("sessions")));
+        push_agent_path(
+            &mut entries,
+            "data",
+            "会话 sessions",
+            Some(&root.join("sessions")),
+        );
         agents.push(finish_agent("goose", "Goose AI", Some(&root), entries));
     }
 
@@ -751,7 +796,12 @@ pub fn collect_local_agent_paths(home: &Path) -> LocalAgentPathsReport {
     {
         let root = home.join(".openclaw");
         let mut entries = Vec::new();
-        push_agent_path(&mut entries, "data", "会话 sessions", Some(&root.join("sessions")));
+        push_agent_path(
+            &mut entries,
+            "data",
+            "会话 sessions",
+            Some(&root.join("sessions")),
+        );
         agents.push(finish_agent("openclaw", "OpenClaw", Some(&root), entries));
     }
 

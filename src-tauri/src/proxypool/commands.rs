@@ -1,8 +1,10 @@
-use tracing::warn;
+use crate::context::{AppContext, EventBus, Managed};
 use crate::db::build_http_client;
 use crate::models::*;
 use crate::proxypool::geoip::{classify_node_location, find_geoip_database, open_geoip_reader};
-use crate::proxypool::parser::{basic_node_config_error, parse_subscription, stable_id, validate_source};
+use crate::proxypool::parser::{
+    basic_node_config_error, parse_subscription, stable_id, validate_source,
+};
 use crate::proxypool::rotator::{
     list_channel_candidate_nodes, list_prioritized_fast_proxy_nodes, write_channel_node,
 };
@@ -16,12 +18,12 @@ use crate::proxypool::tester::{
     test_controller_proxy_delay,
 };
 use crate::proxypool::types::*;
-use crate::context::{AppContext, EventBus, Managed};
 use rusqlite::{params, OptionalExtension};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tracing::warn;
 use url::Url;
 
 #[cfg_attr(feature = "desktop", tauri::command)]
@@ -38,7 +40,8 @@ pub fn save_proxy_subscription(
     name: String,
     url: String,
 ) -> Result<ProxySubscription, String> {
-    let database = &*ctx.database;    let name = name.trim();
+    let database = &*ctx.database;
+    let name = name.trim();
     if name.is_empty() {
         return Err("请输入名称".into());
     }
@@ -554,7 +557,9 @@ pub async fn test_proxy_channel_nodes(
     let bus = ctx.event_bus.clone();
     let _ = channel_id;
     let requested = if let Some(ids) = node_ids.filter(|list| !list.is_empty()) {
-        ids.into_iter().filter(|id| !id.trim().is_empty()).collect::<HashSet<_>>()
+        ids.into_iter()
+            .filter(|id| !id.trim().is_empty())
+            .collect::<HashSet<_>>()
     } else {
         let candidates = list_channel_candidate_nodes(&database, ACCOUNT_PROXY_MAX_LATENCY_MS)?;
         let candidates = if candidates.is_empty() {
@@ -566,7 +571,10 @@ pub async fn test_proxy_channel_nodes(
             let (all_nodes, _) = runtime_nodes(&database, None)?;
             all_nodes.into_iter().map(|n| n.id).collect::<HashSet<_>>()
         } else {
-            candidates.into_iter().map(|(id, _, _)| id).collect::<HashSet<_>>()
+            candidates
+                .into_iter()
+                .map(|(id, _, _)| id)
+                .collect::<HashSet<_>>()
         }
     };
 
@@ -770,13 +778,19 @@ pub async fn test_proxy_nodes(
         return Err("请选择需要测速的节点".into());
     }
     let bus = ctx.event_bus.clone();
-    run_proxy_node_pool(&bus, &ctx.database, &ctx.proxy_runtime, Some(requested), None, false).await
+    run_proxy_node_pool(
+        &bus,
+        &ctx.database,
+        &ctx.proxy_runtime,
+        Some(requested),
+        None,
+        false,
+    )
+    .await
 }
 
 #[cfg_attr(feature = "desktop", tauri::command)]
-pub fn analyze_proxy_nodes(
-    ctx: Managed<'_, Arc<AppContext>>,
-) -> Result<ProxyIpAnalysis, String> {
+pub fn analyze_proxy_nodes(ctx: Managed<'_, Arc<AppContext>>) -> Result<ProxyIpAnalysis, String> {
     let database = &*ctx.database;
     let runtime = &*ctx.proxy_runtime;
     let state = load_state(&database, &runtime)?;

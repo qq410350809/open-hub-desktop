@@ -176,7 +176,8 @@ pub fn repair_node_locations_with_geoip(
     let mut updated = 0;
     for c in rows {
         let is_unknown = c.country_code.trim().is_empty() || c.country_code == "ZZ";
-        let (code, name, class, ip) = classify_node_location(&c.name, &c.server, c.port, Some(&geoip_reader));
+        let (code, name, class, ip) =
+            classify_node_location(&c.name, &c.server, c.port, Some(&geoip_reader));
         if code != "ZZ" && (is_unknown || c.country_code != code) {
             let _ = connection.execute(
                 "UPDATE proxy_pool_nodes

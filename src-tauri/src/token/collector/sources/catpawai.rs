@@ -241,12 +241,14 @@ pub fn parse_catpawai_database(path: &Path) -> CachedDatabase {
                     created_at
                 };
 
-                sessions.entry(conversation_id).or_insert_with(|| LocalDatabaseSession {
-                    directory: raw_project,
-                    started_at: iso_from_millis(started_ms),
-                    ended_at: iso_from_millis(started_ms),
-                    ..Default::default()
-                });
+                sessions
+                    .entry(conversation_id)
+                    .or_insert_with(|| LocalDatabaseSession {
+                        directory: raw_project,
+                        started_at: iso_from_millis(started_ms),
+                        ended_at: iso_from_millis(started_ms),
+                        ..Default::default()
+                    });
             }
         }
     }
@@ -269,7 +271,9 @@ pub fn parse_catpawai_database(path: &Path) -> CachedDatabase {
                 row.get::<_, String>(5).unwrap_or_default(),
             ))
         }) {
-            for (id, conversation_id, message_id, message_type, create_time, content) in rows.flatten() {
+            for (id, conversation_id, message_id, message_type, create_time, content) in
+                rows.flatten()
+            {
                 let Ok(value) = serde_json::from_str::<JsonValue>(&content) else {
                     continue;
                 };
@@ -314,7 +318,11 @@ pub fn parse_catpawai_database(path: &Path) -> CachedDatabase {
                     }
                 }
 
-                update_bounds(&mut session_entry.started_at, &mut session_entry.ended_at, &iso_ts);
+                update_bounds(
+                    &mut session_entry.started_at,
+                    &mut session_entry.ended_at,
+                    &iso_ts,
+                );
 
                 if message_type == "user_prompt" {
                     session_entry.turns += 1;
@@ -351,10 +359,7 @@ pub fn parse_catpawai_database(path: &Path) -> CachedDatabase {
                         "outputTokens",
                     ],
                 );
-                let raw_total = number(usage, &[
-                    "total_tokens",
-                    "totalTokens",
-                ]);
+                let raw_total = number(usage, &["total_tokens", "totalTokens"]);
                 let cached_from_details = usage
                     .get("promptTokensDetails")
                     .or_else(|| usage.get("prompt_tokens_details"))

@@ -396,9 +396,17 @@ pub fn collect_uncached(force: bool) -> Result<CollectedData, String> {
     }
 
     let mut database_sources = vec![
-        ("opencode".to_string(), "opencode".to_string(), opencode_db_path(&home)),
+        (
+            "opencode".to_string(),
+            "opencode".to_string(),
+            opencode_db_path(&home),
+        ),
         ("mimo".to_string(), "mimo".to_string(), mimo_db_path(&home)),
-        ("zcode".to_string(), "zcode".to_string(), zcode_db_path(&home)),
+        (
+            "zcode".to_string(),
+            "zcode".to_string(),
+            zcode_db_path(&home),
+        ),
     ];
     for (idx, db_path) in catpawai_db_paths(&home).into_iter().enumerate() {
         database_sources.push((format!("catpawai_{idx}"), "catpawai".to_string(), db_path));
@@ -447,9 +455,7 @@ pub fn collect_uncached(force: bool) -> Result<CollectedData, String> {
                 "catpawai" => parse_catpawai_database(&path),
                 _ => parse_opencode_database(&path),
             };
-            envelope
-                .databases
-                .insert(cache_key, parsed);
+            envelope.databases.insert(cache_key, parsed);
             changed = true;
         }
     }

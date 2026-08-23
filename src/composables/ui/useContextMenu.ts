@@ -1,4 +1,5 @@
 import { onMounted, onUnmounted, ref } from "vue";
+import { capabilities } from "../core/capabilities";
 
 export type ContextMenuItem = {
   id: string;
@@ -180,7 +181,11 @@ export function useContextMenu() {
       { id: "nav-modelproxy", label: "模型反代", enabled: true },
       { id: "nav-charity", label: "公益监听", enabled: true },
       { id: "nav-proxy", label: "代理池", enabled: true },
-      { id: "nav-tokenstats", label: "Token 统计", enabled: true },
+      // 本地统计依赖客户端本地日志采集能力，浏览器瘦客户端不提供
+      ...(capabilities.value.localTokenStats
+        ? [{ id: "nav-tokenstats", label: "本地统计", enabled: true }]
+        : []),
+      { id: "nav-gatewaystats", label: "网关统计", enabled: true },
       { id: "nav-settings", label: "设置", enabled: true },
       { id: "sep-2", label: "", enabled: false, separator: true },
       { id: "select-all", label: "全选", enabled: true, accelerator: "⌘A" },
@@ -292,6 +297,7 @@ export function useContextMenu() {
       case "nav-charity":
       case "nav-proxy":
       case "nav-tokenstats":
+      case "nav-gatewaystats":
       case "nav-settings": {
         window.dispatchEvent(
           new CustomEvent("oh-menu-navigate", { detail: { page: id.replace("nav-", "") } }),

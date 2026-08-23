@@ -1,7 +1,5 @@
 use crate::models::TokenSessionTokens;
-use crate::token::collector::types::{
-    fingerprint, token_session, CachedFile, UsageEvent,
-};
+use crate::token::collector::types::{fingerprint, token_session, CachedFile, UsageEvent};
 use serde_json::Value as JsonValue;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -10,9 +8,17 @@ pub fn collect_zed_source_files(home: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
 
     #[cfg(target_os = "macos")]
-    let base = home.join("Library").join("Application Support").join("Zed").join("conversations");
+    let base = home
+        .join("Library")
+        .join("Application Support")
+        .join("Zed")
+        .join("conversations");
     #[cfg(not(target_os = "macos"))]
-    let base = home.join(".local").join("share").join("zed").join("conversations");
+    let base = home
+        .join(".local")
+        .join("share")
+        .join("zed")
+        .join("conversations");
 
     if let Ok(entries) = fs::read_dir(base) {
         for entry in entries.flatten() {
@@ -67,7 +73,11 @@ pub fn parse_zed_file(path: &Path) -> CachedFile {
     if let Some(messages) = data.get("messages").and_then(JsonValue::as_array) {
         for (idx, msg) in messages.iter().enumerate() {
             let role = msg.get("role").and_then(JsonValue::as_str).unwrap_or("");
-            let text = msg.get("text").or_else(|| msg.get("body")).and_then(JsonValue::as_str).unwrap_or("");
+            let text = msg
+                .get("text")
+                .or_else(|| msg.get("body"))
+                .and_then(JsonValue::as_str)
+                .unwrap_or("");
             let text_tokens = (text.len() / 4).max(1) as i64;
 
             if role == "user" {

@@ -1,10 +1,15 @@
 <script setup lang="ts">
 import { onMounted, onUnmounted, ref, computed } from "vue";
-import { icons } from "./icons";
 import LoginView from "./components/auth/LoginView.vue";
-import { getSessionToken } from "./composables/core/ipc";
+import {
+  AuthExpiredError,
+  getSessionToken,
+  onAuthExpired,
+  resetAuthExpired,
+  runCommand,
+} from "./composables/core/ipc";
+import { loadCapabilities, capabilities } from "./composables/core/capabilities";
 import { useStore } from "./composables/useStore";
-import { isTauri, runCommand } from "./composables/useLibrary";
 import { usePreferences } from "./composables/usePreferences";
 import { useTheme } from "./composables/useTheme";
 import { useToast } from "./composables/useToast";
@@ -20,6 +25,7 @@ import SyncSitesDialog from "./components/site/SyncSitesDialog.vue";
 import ChromeSessionDialog from "./components/site/ChromeSessionDialog.vue";
 import SiteModelsDialog from "./components/site/SiteModelsDialog.vue";
 import ConfirmDialog from "./components/common/ConfirmDialog.vue";
+import ComponentBootstrapDialog from "./components/common/ComponentBootstrapDialog.vue";
 import CharityMonitorPage from "./components/pages/CharityMonitorPage.vue";
 import ProxyPoolPage from "./components/pages/ProxyPoolPage.vue";
 import TokenStatsPage from "./components/pages/TokenStatsPage.vue";
@@ -53,12 +59,80 @@ const {
 } = useContextMenu();
 
 const sidebarCollapsed = computed(() => preferences.sidebarCollapsed);
-
-// —— 登录门禁：checking → locked（展示登录页） / ready（进入主应用） ——
 const authState = ref<"checking" | "locked" | "ready">("checking");
 const loginHintUsername = ref("");
+let businessStarted = false;
+let removeAuthExpiredListener: (() => void) | null = null;
+let authProbeTimer: number | null = null;
 
-onMounted(async () => {
+function stopBusiness() {
+  if (!businessStarted) return;
+  businessStarted = false;
+  store.stopCharityMonitor();
+  store.stopDailyRefresh();
+  store.stopTokenDatabaseRefresh();
+  store.stopComponentEvents();
+  store.stopModelCatalogEvents();
+}
+
+async function startBusiness() {
+  if (businessStarted || authState.value !== "ready") return;
+  businessStarted = true;
+  store.startComponentEvents();
+  store.startTokenDatabaseRefresh();
+  const results = await Promise.allSettled([
+    store.loadLibrary(),
+    store.loadProxyPool(),
+    store.initializeModelCatalog(),
+  ]);
+  if (authState.value !== "ready") return;
+  const authFailure = results.find((result) => result.status === "rejected" && result.reason instanceof AuthExpiredError);
+  if (authFailure) return;
+  results
+    .filter((result): result is PromiseRejectedResult => result.status === "rejected")
+    .forEach((result) => console.warn("[OpenHub] 主界面初始化失败：", result.reason));
+  if (authState.value === "ready") {
+    await loadCapabilities();
+    // 浏览器瘦客户端没有本地 AI 工具日志可扫描：默认落在网关统计页
+    if (store.page.value === "tokenstats" && !capabilities.value.localTokenStats) {
+      store.openGatewayStats();
+    }
+    store.startDailyRefresh();
+    store.startCharityMonitor();
+  }
+}
+
+function startAuthProbe() {
+  if (authProbeTimer !== null) return;
+  authProbeTimer = window.setInterval(async () => {
+    if (authState.value !== "ready") return;
+    try {
+      const state = await runCommand<{ required: boolean; authenticated: boolean }>(
+        "get_login_state",
+        { token: getSessionToken() },
+      );
+      if (state.required && !state.authenticated) lockApplication();
+    } catch (error) {
+      if (error instanceof AuthExpiredError) lockApplication();
+    }
+  }, 60_000);
+}
+
+function stopAuthProbe() {
+  if (authProbeTimer !== null) {
+    window.clearInterval(authProbeTimer);
+    authProbeTimer = null;
+  }
+}
+
+function lockApplication() {
+  if (authState.value === "locked") return;
+  stopAuthProbe();
+  stopBusiness();
+  authState.value = "locked";
+}
+
+async function checkAuthentication() {
   try {
     const state = await runCommand<{ required: boolean; authenticated: boolean; username: string }>(
       "get_login_state",
@@ -67,20 +141,23 @@ onMounted(async () => {
     loginHintUsername.value = state.username || "";
     authState.value = !state.required || state.authenticated ? "ready" : "locked";
   } catch (error) {
-    // 静态预览 / 内核不可达：不设门禁，由各命令自身错误提示兜底。
-    console.warn("[OpenHub] 登录状态检查失败，直接放行：", error);
+    if (error instanceof AuthExpiredError) return;
+    // 纯静态预览 / 服务不可达时保留原有模拟数据预览能力。
+    console.warn("[OpenHub] 登录状态检查失败，进入预览模式：", error);
     authState.value = "ready";
   }
-});
-
-function onAuthenticated() {
-  // 登录成功后整树重挂载，保证所有页面按已登录状态初始化。
-  window.location.reload();
+  if (authState.value === "ready") await startBusiness();
+  if (authState.value === "ready") startAuthProbe();
 }
 
+function onAuthenticated() {
+  resetAuthExpired();
+  authState.value = "ready";
+  startAuthProbe();
+  void startBusiness();
+}
 
 function onKeydown(event: KeyboardEvent) {
-  // ⌘K 聚焦搜索
   if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
     if (
       store.page.value === "library" &&
@@ -96,7 +173,6 @@ function onKeydown(event: KeyboardEvent) {
       search?.select();
     }
   }
-  // Escape 关闭弹窗
   if (event.key === "Escape") {
     if (store.charitySyncLogOpen.value) store.closeCharitySyncLog();
     else if (store.syncDialogOpen.value) store.closeSyncDialog();
@@ -104,13 +180,12 @@ function onKeydown(event: KeyboardEvent) {
     else if (store.previewDialogOpen.value) store.closePreview();
     else if (store.linkDialogOpen.value) store.closeLinkDialog();
     else if (store.modalOpen.value) store.closeModal();
-    else if (store.page.value === "settings") store.closeSettings();
-    else if (["library", "modelparams", "charity", "proxy", "tokenstats"].includes(store.page.value)) store.openTokenStats();
+      else if (store.page.value === "settings") store.closeSettings();
+    else if (["library", "modelparams", "charity", "proxy", "tokenstats", "gatewaystats"].includes(store.page.value)) store.openTokenStats();
   }
 }
 
 function onMenuReload() {
-  // 右键“强制刷新”：类似 F5，重新加载整个页面。
   window.location.reload();
 }
 
@@ -123,20 +198,12 @@ function onMenuNavigate(event: Event) {
   else if (page === "charity") store.openCharityMonitor();
   else if (page === "proxy") store.openProxyPool();
   else if (page === "tokenstats") store.openTokenStats();
+  else if (page === "gatewaystats") store.openGatewayStats();
   else if (page === "settings") store.openSettings();
 }
 
-async function showDesktopWindow() {
-  try {
-    await runCommand("show_main_window");
-  } catch (error) {
-    store.showToast(String(error), true);
-  }
-}
-
-onMounted(async () => {
+onMounted(() => {
   applyTheme();
-
   document.addEventListener("pointerover", onPointerOver);
   document.addEventListener("pointerout", onPointerOut);
   document.addEventListener("focusin", onFocusIn);
@@ -147,18 +214,15 @@ onMounted(async () => {
   document.addEventListener("keydown", onKeydown);
   window.addEventListener("oh-menu-reload", onMenuReload);
   window.addEventListener("oh-menu-navigate", onMenuNavigate);
-  // 查询定时器立即启动，只读 SQLite，不等待其他页面数据初始化。
-  store.startTokenDatabaseRefresh();
-  await Promise.all([
-    store.loadLibrary(),
-    store.loadProxyPool(),
-    store.initializeModelCatalog(),
-  ]);
-  store.startDailyRefresh();
-  store.startCharityMonitor();
+  removeAuthExpiredListener = onAuthExpired(lockApplication);
+  void checkAuthentication();
 });
 
 onUnmounted(() => {
+  removeAuthExpiredListener?.();
+  removeAuthExpiredListener = null;
+  stopAuthProbe();
+  stopBusiness();
   document.removeEventListener("pointerover", onPointerOver);
   document.removeEventListener("pointerout", onPointerOut);
   document.removeEventListener("focusin", onFocusIn);
@@ -169,12 +233,7 @@ onUnmounted(() => {
   document.removeEventListener("keydown", onKeydown);
   window.removeEventListener("oh-menu-reload", onMenuReload);
   window.removeEventListener("oh-menu-navigate", onMenuNavigate);
-  store.stopCharityMonitor();
-  store.stopDailyRefresh();
-  store.stopTokenDatabaseRefresh();
-  store.stopModelCatalogEvents();
 });
-
 </script>
 
 <template>
@@ -184,13 +243,6 @@ onUnmounted(() => {
     @authenticated="onAuthenticated"
   />
   <div v-else-if="authState !== 'checking'" class="app-layout" :class="{ 'sidebar-collapsed': sidebarCollapsed }">
-    <div v-if="!isTauri" class="lightweight-banner" role="status">
-      <span class="lightweight-banner-icon" v-html="icons.globe" />
-      <span class="lightweight-banner-text">轻量模式：正在通过浏览器访问本地内核</span>
-      <button type="button" class="secondary-button lightweight-banner-button" @click="showDesktopWindow">
-        打开桌面窗口
-      </button>
-    </div>
     <AppSidebar />
 
     <div class="app-workspace">
@@ -241,13 +293,20 @@ onUnmounted(() => {
           class="token-stats-panel"
           aria-labelledby="tokenstats-nav"
         >
-          <TokenStatsPage />
+          <TokenStatsPage mode="local" />
+        </div>
+        <div
+          v-else-if="store.page.value === 'gatewaystats'"
+          id="gateway-stats-panel"
+          class="token-stats-panel"
+          aria-labelledby="gatewaystats-nav"
+        >
+          <TokenStatsPage mode="proxy" />
         </div>
       </div>
     </div>
   </div>
 
-  <!-- Tooltip -->
   <div
     class="ui-tooltip"
     id="ui-tooltip"
@@ -261,7 +320,6 @@ onUnmounted(() => {
     :class="{ 'is-below': tooltipBelow }"
   >{{ tooltipText }}</div>
 
-  <!-- Toast -->
   <div
     class="toast"
     id="toast"
@@ -269,7 +327,6 @@ onUnmounted(() => {
     :class="{ visible: visible, error: isError }"
   >{{ message }}</div>
 
-  <!-- 弹窗们 -->
   <SiteFormModal />
   <LinkDialog />
   <PreviewDialog />
@@ -277,9 +334,9 @@ onUnmounted(() => {
   <ChromeSessionDialog />
   <SiteModelsDialog />
   <ConfirmDialog />
+  <ComponentBootstrapDialog v-if="authState === 'ready'" />
   <SettingsPage />
 
-  <!-- 中文右键菜单：覆盖 WKWebView 默认英文菜单 -->
   <div
     v-if="contextMenuVisible"
     class="oh-context-menu"
