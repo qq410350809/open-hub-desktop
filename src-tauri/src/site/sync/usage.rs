@@ -8,15 +8,17 @@ use rusqlite::{params, OptionalExtension};
 use serde_json;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
-use tauri::{Manager, State};
+use crate::context::{spawn, spawn_blocking, AppContext, EventBus, Managed};
+use std::sync::Arc;
 use url::Url;
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn delete_site_account(
-    database: State<'_, Database>,
+    ctx: Managed<'_, Arc<AppContext>>,
     site_id: String,
     profile_id: String,
 ) -> Result<(), String> {
+    let database = &*ctx.database;
     let connection = database.lock_conn()?;
     let deleted = connection
         .execute(
@@ -37,16 +39,17 @@ pub fn delete_site_account(
     Ok(())
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn mark_sites_with_chrome_sessions(
-    app: tauri::AppHandle,
-    database: State<'_, Database>,
+    ctx: Managed<'_, Arc<AppContext>>,
     site_id: Option<String>,
     site_ids: Option<Vec<String>>,
     run_id: Option<u64>,
     extract_only: Option<bool>,
     refresh_pending: Option<bool>,
 ) -> Result<ChromeUsageScanResult, String> {
+    let database = &*ctx.database;
+    let bus: EventBus = ctx.event_bus.clone();
     // extract_only=true：只提取浏览器是否有会话数据并标注待定，不探测站点类型、不刷新账号接口。
     let extract_only = extract_only.unwrap_or(false);
     // refresh_pending=true：额度同步时允许刷新待定站点，但不改变其使用状态。
@@ -200,7 +203,7 @@ pub async fn mark_sites_with_chrome_sessions(
         }
     }
     emit_optional_sync_progress(
-        &app,
+        &bus,
         run_id,
         "chrome-scan",
         "running",
@@ -267,15 +270,12 @@ pub async fn mark_sites_with_chrome_sessions(
         .iter()
         .map(|(id, _, urls, _, _)| (id.clone(), urls.clone()))
         .collect::<Vec<_>>();
-    let home_dir = app
-        .path()
-        .home_dir()
-        .map_err(|error| format!("无法定位用户目录：{error}"))?;
+    let home_dir = crate::context::home_dir().ok_or("无法定位用户目录")?;
     let mut matched_sites = if scanned == 0 {
         Vec::new()
     } else {
         let scan_home_dir = home_dir.clone();
-        tauri::async_runtime::spawn_blocking(move || {
+        spawn_blocking(move || {
             sync::site_sessions_from_home(&scan_home_dir, &scan_targets)
         })
         .await
@@ -289,14 +289,14 @@ pub async fn mark_sites_with_chrome_sessions(
         .filter(|site| !site.sessions.is_empty())
         .map(|site| site.site_id.clone())
         .collect::<HashSet<_>>();
-    let profiles = tauri::async_runtime::spawn_blocking({
+    let profiles = spawn_blocking({
         let home_dir = home_dir.clone();
         move || sync::profile_identities_from_home(&home_dir)
     })
     .await
     .map_err(|error| format!("读取 Chrome Profile 任务失败：{error}"))??;
     emit_optional_sync_progress(
-        &app,
+        &bus,
         run_id,
         "chrome-profiles",
         "success",
@@ -323,7 +323,7 @@ pub async fn mark_sites_with_chrome_sessions(
             })
         })
         .collect::<Vec<_>>();
-    let local_storage = tauri::async_runtime::spawn_blocking({
+    let local_storage = spawn_blocking({
         let home_dir = home_dir.clone();
         move || sync::read_local_storage_from_home(&home_dir, &local_targets)
     })
@@ -333,7 +333,7 @@ pub async fn mark_sites_with_chrome_sessions(
     .map(|item| ((item.site_id, item.profile_id), (item.values, item.error)))
     .collect::<HashMap<_, _>>();
     emit_optional_sync_progress(
-        &app,
+        &bus,
         run_id,
         "chrome-local-storage",
         "success",
@@ -528,7 +528,7 @@ pub async fn mark_sites_with_chrome_sessions(
         .sum::<usize>();
     let browser_session_count = browser_session_site_ids.len();
     emit_optional_sync_progress(
-        &app,
+        &bus,
         run_id,
         "chrome-scan",
         "success",
@@ -573,7 +573,7 @@ pub async fn mark_sites_with_chrome_sessions(
                 let site_name = site_name.clone();
                 let progress_stage = format!("chrome-account-{site_index}-{session_index}");
                 emit_optional_sync_progress(
-                    &app,
+                    &bus,
                     run_id,
                     &progress_stage,
                     "running",
@@ -620,15 +620,16 @@ pub async fn mark_sites_with_chrome_sessions(
                     .get(&(site_id.clone(), profile_id.clone()))
                     .cloned()
                     .unwrap_or_default();
-                let app = app.clone();
-                let job = tauri::async_runtime::spawn(async move {
+                let job_database = ctx.database.clone();
+                let job_runtime = ctx.proxy_runtime.clone();
+                let job = spawn(async move {
                     let needs_cookie = is_newapi(&system_type)
                         || (system_type.trim().is_empty()
                             && (parse_newapi_local_account(&local_values).is_ok()
                                 || has_refresh_cookie));
                     let cookie_header = if needs_cookie {
                         let profile_id_for_cookie = profile_id.clone();
-                        tauri::async_runtime::spawn_blocking(move || {
+                        spawn_blocking(move || {
                             sync::read_chrome_cookie_header_from_home(
                                 &cookie_home_dir,
                                 &cookie_base_url,
@@ -641,7 +642,8 @@ pub async fn mark_sites_with_chrome_sessions(
                         Ok(String::new())
                     };
                     proxypool::with_account_proxy(
-                        &app,
+                        &job_database,
+                        &job_runtime,
                         &site_id,
                         &profile_id,
                         Duration::from_secs(12),
@@ -746,7 +748,7 @@ pub async fn mark_sites_with_chrome_sessions(
             let has_warning = (!session.sync_error.is_empty() && !is_refresh_handoff)
                 || !session.checkin_error.is_empty();
             emit_optional_sync_progress(
-                &app,
+                &bus,
                 run_id,
                 &progress_stage,
                 if has_warning { "error" } else { "success" },
@@ -1014,7 +1016,7 @@ pub async fn mark_sites_with_chrome_sessions(
 
     transaction.commit().map_err(|error| error.to_string())?;
     emit_optional_sync_progress(
-        &app,
+        &bus,
         run_id,
         "chrome-cache",
         "success",

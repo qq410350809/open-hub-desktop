@@ -25,12 +25,33 @@ export async function runCommand<T>(
   }
 }
 
+/** 当前登录会话令牌的存取（localStorage 持久化，进程重启后仍有效至过期）。 */
+const SESSION_KEY = "openhub_session";
+
+export function getSessionToken(): string {
+  try {
+    return localStorage.getItem(SESSION_KEY) ?? "";
+  } catch {
+    return "";
+  }
+}
+
+export function setSessionToken(token: string): void {
+  try {
+    if (token) localStorage.setItem(SESSION_KEY, token);
+    else localStorage.removeItem(SESSION_KEY);
+  } catch {
+    /* 隐私模式等场景忽略存储失败 */
+  }
+}
+
 /** 轻量模式 / 浏览器环境下的 RPC 请求：与桌面端 invoke 共用同一套命令名。 */
 export async function rpc<T>(
   command: string,
   args: Record<string, unknown> = {},
 ): Promise<T> {
-  const token = new URLSearchParams(window.location.search).get("token") ?? "";
+  const urlToken = new URLSearchParams(window.location.search).get("token") ?? "";
+  const token = getSessionToken() || urlToken;
   let response: Response;
   try {
     response = await fetch("/api/rpc", {

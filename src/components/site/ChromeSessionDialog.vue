@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
-import { listen } from "@tauri-apps/api/event";
+import { listen } from "../../composables/core/events";
 import { icons } from "../../icons";
 import { useStore } from "../../composables/useStore";
 import type { ChromeSessionInfo, SyncSitesProgress } from "../../types";

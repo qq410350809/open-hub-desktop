@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { listen, type UnlistenFn } from "../../composables/core/events";
+import { capabilities } from "../../composables/core/capabilities";
 import type { EChartsOption } from "../../echarts";
 import EChart from "../common/EChart.vue";
 import DateRangeDropdown from "../common/DateRangeDropdown.vue";
@@ -1327,6 +1328,10 @@ let proxyRefreshTimer: number | null = null;
 
 onMounted(() => {
   tokenStatsPageMounted = true;
+  // 远程服务部署且本机无 AI 工具日志：本地模式不可用，自动落到反代模式。
+  if (!capabilities.value.tokenLocalLogs && statsMode.value === "local") {
+    statsMode.value = "proxy";
+  }
   proxyRefreshTimer = window.setInterval(() => {
     if (statsMode.value === "proxy") {
       void proxyStore.loadProxyTokenUsage(store.tokenStatsFrom.value, store.tokenStatsTo.value);
@@ -1380,6 +1385,7 @@ onBeforeUnmount(() => {
             <!-- 数据模式标签：本地日志采集 / 反代网关聚合 -->
             <div class="tt-mode-tabs" role="tablist" aria-label="统计数据来源">
               <button
+                v-if="capabilities.tokenLocalLogs"
                 type="button"
                 role="tab"
                 class="tt-mode-tab"

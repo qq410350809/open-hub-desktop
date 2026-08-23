@@ -10,11 +10,20 @@ use std::net::SocketAddr;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tauri::{AppHandle, Manager};
+use crate::context::AppContext;
 use tokio::sync::{oneshot, RwLock};
 
 impl ModelProxyState {
-    pub fn new_with_app(app: Option<AppHandle>) -> Self {
+    #[allow(dead_code)]
+    pub fn new_with_app(app: Option<std::sync::Arc<crate::context::AppContext>>) -> Self {
+        let state = Self::new();
+        if let Some(ctx) = app {
+            crate::context::block_on(state.attach_ctx(ctx));
+        }
+        state
+    }
+
+    pub fn new() -> Self {
         let http_client = Client::builder()
             .timeout(Duration::from_secs(300))
             .build()
@@ -27,7 +36,7 @@ impl ModelProxyState {
             cached_channel_models: Arc::new(RwLock::new(Vec::new())),
             cached_fetch_errors: Arc::new(RwLock::new(Vec::new())),
             default_http_client: http_client,
-            app_handle: Arc::new(RwLock::new(app)),
+            app_ctx: Arc::new(RwLock::new(None)),
             key_round_robin: Arc::new(AtomicUsize::new(0)),
             node_round_robin: Arc::new(AtomicUsize::new(0)),
             log_retention_last_run: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -40,6 +49,11 @@ impl ModelProxyState {
             current_port: Arc::new(RwLock::new(DEFAULT_MODEL_PROXY_PORT)),
         }
     }
+
+    /// 注入应用上下文（幂等）。
+    pub async fn attach_ctx(&self, ctx: Arc<AppContext>) {
+        *self.context.app_ctx.write().await = Some(ctx);
+    }
 }
 
 pub async fn start_model_proxy_server(state: &ModelProxyState) -> Result<(), String> {
@@ -48,13 +62,9 @@ pub async fn start_model_proxy_server(state: &ModelProxyState) -> Result<(), Str
         return Ok(());
     }
 
-    if let Some(app) = state.context.app_handle.read().await.as_ref() {
-        let loaded = {
-            let database = app.state::<crate::models::Database>();
-            let conn = database.0.lock().ok();
-            conn.map(|c| load_model_proxy_config(&c))
-        };
-        if let Some(cfg) = loaded {
+    if let Some(ctx) = state.context.app_ctx.read().await.as_ref() {
+        let conn = ctx.database.0.lock().ok();
+        if let Some(cfg) = conn.map(|c| load_model_proxy_config(&c)) {
             *state.context.config.write().await = cfg;
         }
     }
@@ -72,7 +82,7 @@ pub async fn start_model_proxy_server(state: &ModelProxyState) -> Result<(), Str
     *state.context.started_at.write().await = Some(Instant::now());
 
     let ctx_clone = state.context.clone();
-    let handle = tauri::async_runtime::spawn(async move {
+    let handle = crate::context::spawn(async move {
         let server = axum::serve(listener, router).with_graceful_shutdown(async move {
             let _ = rx.await;
         });
@@ -85,7 +95,7 @@ pub async fn start_model_proxy_server(state: &ModelProxyState) -> Result<(), Str
     *state.server_task.write().await = Some(handle);
 
     let ctx_for_models = state.context.clone();
-    tauri::async_runtime::spawn(async move {
+    crate::context::spawn(async move {
         fetch_upstream_models_inner(&ctx_for_models).await;
     });
 

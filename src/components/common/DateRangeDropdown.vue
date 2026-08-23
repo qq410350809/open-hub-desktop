@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onUnmounted, ref, watch } from "vue";
+import { computed, nextTick, onUnmounted, ref, watch } from "vue";
 import { icons } from "../../icons";
 
 // —— 快捷分组 ——
@@ -47,6 +47,37 @@ const emit = defineEmits<{ apply: [] }>();
 const open = ref(false);
 const rootRef = ref<HTMLElement>();
 const customMode = ref(false);
+
+// —— 弹层定位（Teleport 到 body 后以 fixed 定位，避免被 overflow:hidden 的
+//    页面容器或窗口边缘裁剪）——
+const triggerRef = ref<HTMLElement>();
+const popRef = ref<HTMLElement>();
+const popStyle = ref<{ top: string; left: string }>({ top: "-9999px", left: "-9999px" });
+
+function updatePopPosition() {
+  const trigger = triggerRef.value;
+  const pop = popRef.value;
+  if (!trigger || !pop) return;
+  const rect = trigger.getBoundingClientRect();
+  const margin = 8;
+  const width = pop.offsetWidth;
+  const height = pop.offsetHeight;
+  // 水平：优先与触发器右缘对齐（沿用原 right:0 视觉），越出视口时向内夹取
+  let left = rect.right - width;
+  if (left < margin) left = margin;
+  if (left + width > window.innerWidth - margin) left = window.innerWidth - margin - width;
+  // 垂直：优先向下展开；下方放不下且上方空间更大时向上翻
+  let top = rect.bottom + 6;
+  if (top + height > window.innerHeight - margin) {
+    const above = rect.top - 6 - height;
+    top = above >= margin ? above : Math.max(margin, window.innerHeight - margin - height);
+  }
+  popStyle.value = { top: `${top}px`, left: `${left}px` };
+}
+
+function onWindowReposition() {
+  if (open.value) updatePopPosition();
+}
 
 function toLocalDate(value: Date): string {
   const year = value.getFullYear();
@@ -204,11 +235,20 @@ function toLocalToday(): string {
 function onDocClick(e: Event) {
   if (!open.value) return;
   const target = e.target as Node | null;
-  if (rootRef.value && target && !rootRef.value.contains(target)) close();
+  const inRoot = !!(rootRef.value && target && rootRef.value.contains(target));
+  // 弹层 Teleport 到 body 后不在 rootRef 内，需一并排除
+  const inPop = !!(popRef.value && target && popRef.value.contains(target));
+  if (!inRoot && !inPop) close();
 }
 watch(open, (o) => {
   if (o) {
     window.addEventListener("pointerdown", onDocClick, { capture: true });
+    window.addEventListener("scroll", onWindowReposition, { capture: true, passive: true });
+    window.addEventListener("resize", onWindowReposition);
+    nextTick(() => {
+      updatePopPosition();
+      requestAnimationFrame(updatePopPosition);
+    });
     if (from.value) viewStart.value = toYM(from.value);
     else viewStart.value = toYM(new Date());
     pickedFrom.value = from.value;
@@ -216,9 +256,23 @@ watch(open, (o) => {
     rangeAnchor = null;
   } else {
     window.removeEventListener("pointerdown", onDocClick, { capture: true });
+    window.removeEventListener("scroll", onWindowReposition, { capture: true });
+    window.removeEventListener("resize", onWindowReposition);
   }
 });
-onUnmounted(() => window.removeEventListener("pointerdown", onDocClick, { capture: true }));
+onUnmounted(() => {
+  window.removeEventListener("pointerdown", onDocClick, { capture: true });
+  window.removeEventListener("scroll", onWindowReposition, { capture: true });
+  window.removeEventListener("resize", onWindowReposition);
+});
+// 快捷面板 ↔ 自定义双日历切换会改变弹层尺寸，需重新计算定位
+watch(customMode, () => {
+  if (!open.value) return;
+  nextTick(() => {
+    updatePopPosition();
+    requestAnimationFrame(updatePopPosition);
+  });
+});
 
 // —— 双日历区间选择 ——
 function pad(n: number) { return String(n).padStart(2, "0"); }
@@ -328,7 +382,7 @@ function applyCustomRange() {
     >
       <span v-html="icons.chevron" class="drd-arrow-icon is-prev" />
     </button>
-    <button type="button" class="drd-range-trigger" :class="{ active: customMode }" @click="toggle">
+    <button ref="triggerRef" type="button" class="drd-range-trigger" :class="{ active: customMode }" @click="toggle">
       <span class="drd-range-label">{{ activeLabel }}</span>
       <span v-if="activeRangeText" class="drd-range-sub">{{ activeRangeText }}</span>
       <span class="drd-range-caret" v-html="icons.chevron" />
@@ -343,7 +397,8 @@ function applyCustomRange() {
       <span v-html="icons.chevron" class="drd-arrow-icon is-next" />
     </button>
 
-    <div v-if="open" class="drd-range-pop" @click.stop>
+    <Teleport to="body">
+      <div v-if="open" ref="popRef" class="drd-range-pop" :style="popStyle" @click.stop>
       <template v-if="!customMode">
         <div class="drd-rp-groups">
           <div v-for="g in groups" :key="g.title" class="drd-rp-group">
@@ -414,7 +469,8 @@ function applyCustomRange() {
           </div>
         </div>
       </template>
-    </div>
+      </div>
+    </Teleport>
   </div>
 </template>
 
@@ -508,11 +564,10 @@ function applyCustomRange() {
   transform: rotate(180deg);
 }
 
-/* 弹出层 */
+/* 弹出层：Teleport 到 body 后以 fixed 定位，坐标由脚本按触发器位置计算并夹取到视口内，
+   避免被页面 overflow:hidden 容器或窗口边缘裁剪 */
 .drd-range-pop {
-  position: absolute;
-  top: calc(100% + 6px);
-  right: 0;
+  position: fixed;
   z-index: 1200;
   background: var(--surface);
   border: 1px solid var(--line);

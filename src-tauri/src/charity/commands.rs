@@ -2,20 +2,19 @@ use crate::charity::db::*;
 use crate::charity::feed::charity_tag_json_url;
 use crate::charity::fetcher::{is_charity_sync_cancelled, sync_feed_with_fast_nodes};
 use crate::charity::types::*;
-use crate::models::Database;
-use crate::proxypool::ProxyRuntime;
+use crate::context::{AppContext, EventBus, Managed};
 use rusqlite::params;
-use tauri::{AppHandle, State};
+use std::sync::Arc;
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn get_charity_feed(
-    database: State<'_, Database>,
-    runtime: State<'_, CharityMonitorRuntime>,
+    ctx: Managed<'_, Arc<AppContext>>,
     feed_id: Option<String>,
     offset: Option<usize>,
     limit: Option<usize>,
     keyword: Option<String>,
 ) -> Result<CharityFeedResult, String> {
+    let database = &*ctx.database;
     let requested = feed_id.as_deref().unwrap_or(DEFAULT_CHARITY_FEED_ID);
     let offset = offset.unwrap_or(0);
     let limit = limit.unwrap_or(CHARITY_PAGE_SIZE);
@@ -29,7 +28,7 @@ pub async fn get_charity_feed(
     let mut result = tokio::task::block_in_place(|| {
         load_feed_items_from_db(&database, &source, offset, limit, &keyword)
     })?;
-    if let Ok(errors) = runtime.last_errors.lock() {
+    if let Ok(errors) = ctx.charity_runtime.last_errors.lock() {
         if let Some(message) = errors.get(&source.id) {
             if result.message.is_empty() {
                 result.message = message.clone();
@@ -42,11 +41,12 @@ pub async fn get_charity_feed(
     Ok(result)
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn mark_charity_feed_read(
-    database: State<'_, Database>,
+    ctx: Managed<'_, Arc<AppContext>>,
     feed_id: Option<String>,
 ) -> Result<usize, String> {
+    let database = &*ctx.database;
     let requested = feed_id.as_deref().unwrap_or(DEFAULT_CHARITY_FEED_ID);
     tokio::task::block_in_place(|| {
         let now = {
@@ -72,8 +72,9 @@ pub async fn mark_charity_feed_read(
     })
 }
 
-#[tauri::command]
-pub async fn get_charity_today_count(database: State<'_, Database>) -> Result<usize, String> {
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub async fn get_charity_today_count(ctx: Managed<'_, Arc<AppContext>>) -> Result<usize, String> {
+    let database = &*ctx.database;
     tokio::task::block_in_place(|| {
         let (utc_start, utc_end) = local_day_utc_range_secs();
         let connection = database.lock_conn()?;
@@ -91,8 +92,9 @@ pub async fn get_charity_today_count(database: State<'_, Database>) -> Result<us
     })
 }
 
-#[tauri::command]
-pub async fn get_charity_unread_total(database: State<'_, Database>) -> Result<usize, String> {
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub async fn get_charity_unread_total(ctx: Managed<'_, Arc<AppContext>>) -> Result<usize, String> {
+    let database = &*ctx.database;
     tokio::task::block_in_place(|| {
         let mut total = 0usize;
         let sources = load_charity_sources(&database)?;
@@ -103,14 +105,14 @@ pub async fn get_charity_unread_total(database: State<'_, Database>) -> Result<u
     })
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn fetch_charity_feed(
-    app: AppHandle,
-    database: State<'_, Database>,
-    runtime: State<'_, ProxyRuntime>,
-    monitor: State<'_, CharityMonitorRuntime>,
+    ctx: Managed<'_, Arc<AppContext>>,
     feed_id: Option<String>,
 ) -> Result<CharityFeedResult, String> {
+    let database = &*ctx.database;
+    let bus: EventBus = ctx.event_bus.clone();
+    let monitor = &ctx.charity_runtime;
     let source = charity_feed_source(
         &database,
         feed_id.as_deref().unwrap_or(DEFAULT_CHARITY_FEED_ID),
@@ -126,7 +128,7 @@ pub async fn fetch_charity_feed(
             local.status
         };
         emit_charity_progress(
-            &app,
+            &bus,
             CharitySyncProgress {
                 feed_id: source.id.clone(),
                 feed_name: source.name.clone(),
@@ -143,9 +145,9 @@ pub async fn fetch_charity_feed(
         return Ok(local);
     };
     let sync_result = sync_feed_with_fast_nodes(
-        &app,
-        &database,
-        &runtime,
+        &ctx,
+        database,
+        &ctx.proxy_runtime,
         &source,
         "manual",
         &cancellation,
@@ -180,11 +182,11 @@ pub async fn fetch_charity_feed(
     Ok(local)
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn get_charity_proxy_pool_summary(
-    database: State<'_, Database>,
-    monitor: State<'_, CharityMonitorRuntime>,
-) -> Result<CharityProxyPoolSummary, String> {
+    ctx: Managed<'_, Arc<AppContext>>,
+    ) -> Result<CharityProxyPoolSummary, String> {
+    let database = &*ctx.database;
     tokio::task::block_in_place(|| {
         let connection = database.lock_conn()?;
         let valid_count = connection
@@ -207,7 +209,7 @@ pub async fn get_charity_proxy_pool_summary(
             .map_err(|error| error.to_string())?
             .max(0) as usize;
 
-        let banned = monitor.active_banned_ids();
+        let banned = ctx.charity_runtime.active_banned_ids();
         if banned.is_empty() {
             return Ok(CharityProxyPoolSummary {
                 valid_count,
@@ -256,39 +258,42 @@ pub async fn get_charity_proxy_pool_summary(
     })
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn get_charity_sync_logs(
-    database: State<'_, Database>,
+    ctx: Managed<'_, Arc<AppContext>>,
     limit: Option<usize>,
 ) -> Result<Vec<CharitySyncLogEntry>, String> {
+    let database = &*ctx.database;
     tokio::task::block_in_place(|| list_charity_sync_logs(&database, limit.unwrap_or(120)))
 }
 
-#[tauri::command]
-pub async fn clear_charity_sync_logs(database: State<'_, Database>) -> Result<(), String> {
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub async fn clear_charity_sync_logs(ctx: Managed<'_, Arc<AppContext>>) -> Result<(), String> {
+    let database = &*ctx.database;
     tokio::task::block_in_place(|| clear_charity_sync_logs_db(&database))
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn set_charity_monitor_visible(
-    monitor: State<'_, CharityMonitorRuntime>,
+    ctx: Managed<'_, Arc<AppContext>>,
     visible: bool,
 ) -> Result<(), String> {
-    monitor.set_visible(visible);
+    ctx.charity_runtime.set_visible(visible);
     Ok(())
 }
 
-#[tauri::command]
-pub fn request_charity_round(monitor: State<'_, CharityMonitorRuntime>) -> Result<(), String> {
-    monitor.request_round();
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub fn request_charity_round(ctx: Managed<'_, Arc<AppContext>>) -> Result<(), String> {
+    ctx.charity_runtime.request_round();
     Ok(())
 }
 
-#[tauri::command]
-pub async fn refresh_all_charity_feeds(
-    database: State<'_, Database>,
-    monitor: State<'_, CharityMonitorRuntime>,
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub(crate) async fn refresh_all_charity_feeds_impl(
+    ctx: &Arc<AppContext>,
 ) -> Result<CharityRefreshAllResult, String> {
+    let database = &*ctx.database;
+    let monitor = &ctx.charity_runtime;
     let cancelled_active_round = monitor.cancel_active_sync();
     let cancelled_log_count = tokio::task::block_in_place(|| {
         cancel_running_charity_sync_logs(&database, "已被新的“立即刷新全部标签”任务取消")
@@ -303,20 +308,22 @@ pub async fn refresh_all_charity_feeds(
     })
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn list_charity_sources(
-    database: State<'_, Database>,
+    ctx: Managed<'_, Arc<AppContext>>,
 ) -> Result<Vec<CharityFeedSource>, String> {
+    let database = &*ctx.database;
     tokio::task::block_in_place(|| load_all_charity_sources(&database))
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn add_charity_source(
-    database: State<'_, Database>,
+    ctx: Managed<'_, Arc<AppContext>>,
     id: String,
     name: String,
     json_url: Option<String>,
 ) -> Result<CharityFeedSource, String> {
+    let database = &*ctx.database;
     let id = id.trim().to_string();
     let name = name.trim().to_string();
     if id.is_empty() || name.is_empty() {
@@ -351,14 +358,15 @@ pub async fn add_charity_source(
     })
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn update_charity_source(
-    database: State<'_, Database>,
+    ctx: Managed<'_, Arc<AppContext>>,
     id: String,
     name: Option<String>,
     json_url: Option<String>,
     enabled: Option<bool>,
 ) -> Result<(), String> {
+    let database = &*ctx.database;
     tokio::task::block_in_place(|| {
         let connection = database.lock_db();
         if let Some(name) = name {
@@ -395,11 +403,12 @@ pub async fn update_charity_source(
     })
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn remove_charity_source(
-    database: State<'_, Database>,
+    ctx: Managed<'_, Arc<AppContext>>,
     id: String,
 ) -> Result<(), String> {
+    let database = &*ctx.database;
     tokio::task::block_in_place(|| {
         let connection = database.lock_db();
         connection
@@ -410,4 +419,11 @@ pub async fn remove_charity_source(
             .map_err(|error| format!("删除标签源失败：{error}"))?;
         Ok(())
     })
+}
+
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub async fn refresh_all_charity_feeds(
+    ctx: Managed<'_, Arc<AppContext>>,
+) -> Result<CharityRefreshAllResult, String> {
+    refresh_all_charity_feeds_impl(&ctx).await
 }

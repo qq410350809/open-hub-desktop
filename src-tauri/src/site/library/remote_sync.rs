@@ -3,7 +3,8 @@ use crate::db::*;
 use crate::models::*;
 use crate::site::library::*;
 use std::{collections::HashSet, time::Duration};
-use tauri::{Manager, State};
+use crate::context::{home_dir, spawn_blocking, AppContext, EventBus, Managed};
+use std::sync::Arc;
 
 pub(crate) fn remote_user_string(value: &serde_json::Value, paths: &[&str]) -> String {
     paths
@@ -97,14 +98,10 @@ pub(crate) fn remote_sites_from_json(value: serde_json::Value) -> Result<Vec<Sit
 }
 
 pub(crate) async fn authenticated_remote_session(
-    app: &tauri::AppHandle,
     database: &Database,
 ) -> Result<(sync::ChromeCookieSession, serde_json::Value), String> {
-    let home_dir = app
-        .path()
-        .home_dir()
-        .map_err(|error| format!("无法定位用户目录：{error}"))?;
-    let sessions = tauri::async_runtime::spawn_blocking(move || {
+    let home_dir = home_dir().ok_or("无法定位用户目录")?;
+    let sessions = spawn_blocking(move || {
         sync::read_chrome_cookie_sessions_from_home(
             &home_dir,
             REMOTE_ROOT_URL,
@@ -150,12 +147,11 @@ pub(crate) async fn authenticated_remote_session(
     Err("Chrome 中找到的 ldoh 登录会话均已失效，请先在 Chrome 登录后重试".into())
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn get_remote_user(
-    app: tauri::AppHandle,
-    database: State<'_, Database>,
+    ctx: Managed<'_, Arc<AppContext>>,
 ) -> Result<RemoteUserInfo, String> {
-    let (session, user) = authenticated_remote_session(&app, &database).await?;
+    let (session, user) = authenticated_remote_session(&ctx.database).await?;
     let username = remote_user_username(&user);
     let name = {
         let value = remote_user_name(&user);
@@ -220,23 +216,24 @@ struct ExistingLocalSite {
     system_type: String,
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn sync_remote_sites(
-    app: tauri::AppHandle,
-    database: State<'_, Database>,
+    ctx: Managed<'_, Arc<AppContext>>,
     _runaway: Option<bool>,
     run_id: u64,
 ) -> Result<SyncSitesResult, String> {
+    let database = &*ctx.database;
+    let bus: EventBus = ctx.event_bus.clone();
     emit_sync_progress(
-        &app,
+        &bus,
         run_id,
         "session",
         "running",
         "正在读取并验证 Chrome 登录会话".into(),
     );
-    let (session, user) = authenticated_remote_session(&app, &database).await?;
+    let (session, user) = authenticated_remote_session(database).await?;
     emit_sync_progress(
-        &app,
+        &bus,
         run_id,
         "session",
         "success",
@@ -247,7 +244,7 @@ pub async fn sync_remote_sites(
         .map_err(|_| "Chrome 登录 Cookie 格式无效".to_string())?;
 
     emit_sync_progress(
-        &app,
+        &bus,
         run_id,
         "download",
         "running",
@@ -296,14 +293,14 @@ pub async fn sync_remote_sites(
     }
 
     emit_sync_progress(
-        &app,
+        &bus,
         run_id,
         "download",
         "success",
         "存活与跑路站点接口响应正常".into(),
     );
     emit_sync_progress(
-        &app,
+        &bus,
         run_id,
         "parse",
         "running",
@@ -342,7 +339,7 @@ pub async fn sync_remote_sites(
     all_remote_sites.extend(runaway_sites);
 
     emit_sync_progress(
-        &app,
+        &bus,
         run_id,
         "parse",
         "success",
@@ -354,7 +351,7 @@ pub async fn sync_remote_sites(
         ),
     );
     emit_sync_progress(
-        &app,
+        &bus,
         run_id,
         "save",
         "running",
@@ -487,7 +484,7 @@ pub async fn sync_remote_sites(
 
     transaction.commit().map_err(|error| error.to_string())?;
     emit_sync_progress(
-        &app,
+        &bus,
         run_id,
         "save",
         "success",

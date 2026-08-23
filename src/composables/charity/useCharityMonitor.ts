@@ -1,4 +1,4 @@
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { listen, type UnlistenFn } from "../core/events";
 import { computed, ref, shallowRef } from "vue";
 import { runCommand, isTauri } from "../core/ipc";
 import type {

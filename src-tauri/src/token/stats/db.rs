@@ -6,7 +6,7 @@ use crate::token::stats::catpawai::merge_catpawai_usage;
 use crate::token::stats::health::collect_request_health_snapshot;
 use crate::token::stats::types::*;
 use std::time::Instant;
-use tauri::AppHandle;
+use crate::context::EventBus;
 
 pub fn query_token_usage(database: &Database) -> Result<TokenUsageReport, String> {
     Ok(db::read_token_usage_snapshot(database)?.unwrap_or_default())
@@ -28,15 +28,19 @@ pub fn query_token_health(database: &Database) -> Result<RequestHealthReport, St
 pub fn collect_token_data(
     database: &Database,
     force: bool,
-    progress_app: Option<&AppHandle>,
+    progress_bus: Option<&EventBus>,
 ) -> Result<TokenCollectorSyncReport, String> {
+    // 统一解包为占位总线：无订阅方时 emit 为 no-op，调用点无需逐个判空。
+    static NOOP: std::sync::OnceLock<EventBus> = std::sync::OnceLock::new();
+    let noop = NOOP.get_or_init(EventBus::new);
+    let progress_bus: &EventBus = progress_bus.unwrap_or(noop);
     let _guard = token_collection_lock()
         .lock()
         .map_err(|_| "Token 数据采集锁异常".to_string())?;
     let started = Instant::now();
     if force {
         emit_token_collector_progress(
-            progress_app,
+            progress_bus,
             "cache",
             "running",
             "正在清除 OpenHub 本地 Token 缓存与数据库快照",
@@ -45,21 +49,21 @@ pub fn collect_token_data(
         clear_request_health_cache()?;
         db::clear_token_snapshots(database)?;
         emit_token_collector_progress(
-            progress_app,
+            progress_bus,
             "cache",
             "success",
             "本地缓存已清除，来源工具的原始日志保持不变",
         );
     }
     emit_token_collector_progress(
-        progress_app,
+        progress_bus,
         "scan",
         "running",
         "正在扫描 Codex、Claude 等工具的本地日志",
     );
     let snapshot = crate::token::collector::collect_snapshot(force)?;
     emit_token_collector_progress(
-        progress_app,
+        progress_bus,
         "scan",
         "success",
         format!(
@@ -68,7 +72,7 @@ pub fn collect_token_data(
         ),
     );
     emit_token_collector_progress(
-        progress_app,
+        progress_bus,
         "aggregate",
         "running",
         "正在合并 Token 用量、会话与请求健康数据",
@@ -76,19 +80,19 @@ pub fn collect_token_data(
     let usage = merge_catpawai_usage(snapshot.usage.clone())?;
     let health = collect_request_health_snapshot(force)?;
     emit_token_collector_progress(
-        progress_app,
+        progress_bus,
         "aggregate",
         "success",
         format!("数据汇总完成：{} 个会话", snapshot.sessions.len()),
     );
     emit_token_collector_progress(
-        progress_app,
+        progress_bus,
         "database",
         "running",
         "正在写入 OpenHub 本地数据库",
     );
     db::write_token_snapshots(database, &usage, &snapshot.sessions, &health)?;
-    emit_token_collector_progress(progress_app, "database", "success", "数据库快照写入完成");
+    emit_token_collector_progress(progress_bus, "database", "success", "数据库快照写入完成");
     let mut report =
         crate::token::collector::sync_report(&snapshot, started.elapsed().as_millis() as i64);
     if force {

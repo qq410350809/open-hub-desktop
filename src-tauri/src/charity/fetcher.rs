@@ -6,7 +6,7 @@ use crate::models::Database;
 use crate::proxypool::{self, is_http_forbidden_error, is_transport_error, ProxyRuntime};
 use std::sync::{atomic::Ordering, Arc, Mutex};
 use std::time::{Duration, Instant};
-use tauri::{AppHandle, Manager};
+use crate::context::{home_dir, spawn, spawn_blocking, AppContext, EventBus};
 use tokio_util::sync::CancellationToken;
 
 #[allow(dead_code)]
@@ -156,7 +156,7 @@ pub async fn request_topic_list(
 }
 
 pub async fn fetch_topic_body(
-    app: &AppHandle,
+    _ctx: &Arc<AppContext>,
     client: reqwest::Client,
     source: &CharityFeedSource,
 ) -> Result<(String, String, String, String), String> {
@@ -164,12 +164,9 @@ pub async fn fetch_topic_body(
         return Ok((body, String::new(), String::new(), protocol));
     }
 
-    let home_dir = app
-        .path()
-        .home_dir()
-        .map_err(|error| format!("无法定位用户目录：{error}"))?;
+    let home_dir = home_dir().ok_or("无法定位用户目录")?;
 
-    let profiles = tauri::async_runtime::spawn_blocking({
+    let profiles = spawn_blocking({
         let home_dir = home_dir.clone();
         move || sync::profile_identities_from_home(&home_dir)
     })
@@ -182,10 +179,10 @@ pub async fn fetch_topic_body(
             let client = client.clone();
             let home_dir = home_dir.clone();
             let source_clone = source.clone();
-            tauri::async_runtime::spawn(async move {
+            spawn(async move {
                 let profile_id = profile.id.clone();
                 let json_url_for_cookie = source_clone.json_url.clone();
-                let cookie_header = tauri::async_runtime::spawn_blocking(move || {
+                let cookie_header = spawn_blocking(move || {
                     sync::read_chrome_cookie_header_from_home(
                         &home_dir,
                         &json_url_for_cookie,
@@ -215,7 +212,7 @@ pub async fn fetch_topic_body(
 }
 
 pub async fn sync_feed_with_fast_nodes(
-    app: &AppHandle,
+    ctx: &Arc<AppContext>,
     database: &Database,
     runtime: &ProxyRuntime,
     source: &CharityFeedSource,
@@ -236,7 +233,8 @@ pub async fn sync_feed_with_fast_nodes(
         return Err(format!("{CHARITY_SYNC_CANCELLED_PREFIX}：{}", source.name));
     }
 
-    let monitor_state = app.state::<CharityMonitorRuntime>();
+    let monitor_state = &ctx.charity_runtime;
+    let bus = EventBus::clone(&ctx.event_bus);
 
     if cancellation.is_cancelled() {
         return Err(format!("{CHARITY_SYNC_CANCELLED_PREFIX}：{}", source.name));
@@ -256,7 +254,7 @@ pub async fn sync_feed_with_fast_nodes(
                 "",
             );
             finish_charity_sync_log(
-                app,
+                &bus,
                 database,
                 log_id,
                 source,
@@ -291,7 +289,7 @@ pub async fn sync_feed_with_fast_nodes(
                     "",
                 );
                 finish_charity_sync_log(
-                    app,
+                    &bus,
                     database,
                     log_id,
                     source,
@@ -324,7 +322,7 @@ pub async fn sync_feed_with_fast_nodes(
             })?;
             let _ = write_feed_sync_meta(database, &source.id, "skipped", &message, "", 0);
             finish_charity_sync_log(
-                app,
+                &bus,
                 database,
                 log_id,
                 source,
@@ -359,7 +357,7 @@ pub async fn sync_feed_with_fast_nodes(
                     "",
                 );
                 finish_charity_sync_log(
-                    app,
+                    &bus,
                     database,
                     log_id,
                     source,
@@ -427,7 +425,7 @@ pub async fn sync_feed_with_fast_nodes(
             &running_msg,
             &node.name,
         );
-        emit_running_progress(app, source, stage, &running_msg, &node.name);
+        emit_running_progress(&bus, source, stage, &running_msg, &node.name);
 
         if cancellation.is_cancelled() {
             if !parallel_mode {
@@ -436,7 +434,7 @@ pub async fn sync_feed_with_fast_nodes(
             let dur = attempt_started.elapsed().as_millis() as i64;
             let message = format!("{CHARITY_SYNC_CANCELLED_PREFIX}：{}", source.name);
             finish_charity_sync_log(
-                app,
+                &bus,
                 database,
                 log_id,
                 source,
@@ -462,7 +460,7 @@ pub async fn sync_feed_with_fast_nodes(
                 let _ = proxypool::restore_proxy_node_transient(database, runtime).await;
             }
             finish_charity_sync_log(
-                app, database, log_id, source, stage, "failed", &message, &node.name, dur, 0, 0, 0,
+                &bus, database, log_id, source, stage, "failed", &message, &node.name, dur, 0, 0, 0,
             );
             last_error = message;
             continue;
@@ -479,7 +477,7 @@ pub async fn sync_feed_with_fast_nodes(
         }
 
         let request_deadline = Instant::now() + CHARITY_REQUEST_TIMEOUT;
-        let fetch_future = fetch_topic_body(app, client.clone(), source);
+        let fetch_future = fetch_topic_body(ctx, client.clone(), source);
         tokio::pin!(fetch_future);
         let fetch_result = loop {
             if cancellation.is_cancelled() {
@@ -512,7 +510,7 @@ pub async fn sync_feed_with_fast_nodes(
                     if let Some(id) = log_id {
                         touch_running_charity_sync_log(database, id, &msg, &node.name, dur);
                     }
-                    emit_running_progress(app, source, stage, &msg, &node.name);
+                    emit_running_progress(&bus, source, stage, &msg, &node.name);
                 }
             }
         };
@@ -549,7 +547,7 @@ pub async fn sync_feed_with_fast_nodes(
                                     .await;
                                 let dur = attempt_started.elapsed().as_millis() as i64;
                                 finish_charity_sync_log(
-                                    app,
+                                    &bus,
                                     database,
                                     log_id,
                                     source,
@@ -576,7 +574,7 @@ pub async fn sync_feed_with_fast_nodes(
                                             .await;
                                 }
                                 finish_charity_sync_log(
-                                    app, database, log_id, source, stage, "failed", &message,
+                                    &bus, database, log_id, source, stage, "failed", &message,
                                     &node.name, dur, 0, 0, 0,
                                 );
                                 last_error = message;
@@ -599,7 +597,7 @@ pub async fn sync_feed_with_fast_nodes(
                                 .await;
                         }
                         finish_charity_sync_log(
-                            app, database, log_id, source, stage, "failed", &message, &node.name,
+                            &bus, database, log_id, source, stage, "failed", &message, &node.name,
                             dur, 0, 0, 0,
                         );
                         last_error = message;
@@ -629,7 +627,7 @@ pub async fn sync_feed_with_fast_nodes(
                     let _ = proxypool::restore_proxy_node_transient(database, runtime).await;
                 }
                 finish_charity_sync_log(
-                    app, database, log_id, source, stage, status, &message, &node.name, dur, 0, 0,
+                    &bus, database, log_id, source, stage, status, &message, &node.name, dur, 0, 0,
                     0,
                 );
                 if cancelled {

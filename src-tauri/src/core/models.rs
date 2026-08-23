@@ -3,27 +3,26 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::collections::{HashMap, HashSet};
-use tauri::Emitter;
 
-pub(crate) const SEED_JSON: &str = include_str!("../../resources/sites.json");
-pub(crate) const NOW_SQL: &str = "strftime('%Y-%m-%dT%H:%M:%fZ','now')";
-pub(crate) const REMOTE_ROOT_URL: &str = "https://ldoh.105117.xyz/";
-pub(crate) const REMOTE_USER_URL: &str = "https://ldoh.105117.xyz/api/ld/user";
-pub(crate) const REMOTE_SITES_URL: &str = "https://ldoh.105117.xyz/api/sites";
-pub(crate) const REMOTE_SESSION_COOKIE: &str = "ld_auth_session";
-pub(crate) const NETWORK_PROXY_KEY: &str = "network_proxy";
-pub(crate) const ACTIVE_PROXY_NODE_KEY: &str = "active_proxy_node";
-pub(crate) const PROXY_IGNORE_KEY: &str = "proxy_ignore_addresses";
-pub(crate) const PROXY_SPEED_TEST_URL_KEY: &str = "proxy_speed_test_url";
-pub(crate) const DEFAULT_PROXY_IGNORE: &str =
+pub const SEED_JSON: &str = include_str!("../../resources/sites.json");
+pub const NOW_SQL: &str = "strftime('%Y-%m-%dT%H:%M:%fZ','now')";
+pub const REMOTE_ROOT_URL: &str = "https://ldoh.105117.xyz/";
+pub const REMOTE_USER_URL: &str = "https://ldoh.105117.xyz/api/ld/user";
+pub const REMOTE_SITES_URL: &str = "https://ldoh.105117.xyz/api/sites";
+pub const REMOTE_SESSION_COOKIE: &str = "ld_auth_session";
+pub const NETWORK_PROXY_KEY: &str = "network_proxy";
+pub const ACTIVE_PROXY_NODE_KEY: &str = "active_proxy_node";
+pub const PROXY_IGNORE_KEY: &str = "proxy_ignore_addresses";
+pub const PROXY_SPEED_TEST_URL_KEY: &str = "proxy_speed_test_url";
+pub const DEFAULT_PROXY_IGNORE: &str =
     "localhost,127.0.0.1,::1,.local,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16";
-pub(crate) const DEFAULT_PROXY_SPEED_TEST_URL: &str = "http://www.gstatic.com/generate_204";
+pub const DEFAULT_PROXY_SPEED_TEST_URL: &str = "http://www.gstatic.com/generate_204";
 
-pub(crate) struct Database(pub(crate) std::sync::Mutex<Connection>);
+pub struct Database(pub(crate) std::sync::Mutex<Connection>);
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
-pub(crate) struct Maintainer {
+pub struct Maintainer {
     pub(crate) name: String,
     pub(crate) id: String,
     pub(crate) username: String,
@@ -32,14 +31,14 @@ pub(crate) struct Maintainer {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
-pub(crate) struct ExtensionLink {
+pub struct ExtensionLink {
     pub(crate) label: String,
     pub(crate) url: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
-pub(crate) struct SiteRecord {
+pub struct SiteRecord {
     pub(crate) id: String,
     pub(crate) name: String,
     pub(crate) description: String,
@@ -122,14 +121,14 @@ impl Default for SiteRecord {
 }
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct SeedPayload {
+pub struct SeedPayload {
     pub(crate) sites: Vec<SiteRecord>,
     pub(crate) tags: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct LibraryData {
+pub struct LibraryData {
     pub(crate) sites: Vec<SiteRecord>,
     pub(crate) suggested_tags: Vec<String>,
     pub(crate) usage_sites: Vec<sync::ChromeSiteSessionMatch>,
@@ -137,7 +136,7 @@ pub(crate) struct LibraryData {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct SyncSitesResult {
+pub struct SyncSitesResult {
     pub(crate) added: usize,
     pub(crate) updated: usize,
     pub(crate) total: usize,
@@ -150,7 +149,7 @@ pub(crate) struct SyncSitesResult {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct SyncSitesProgress {
+pub struct SyncSitesProgress {
     pub(crate) run_id: u64,
     pub(crate) stage: String,
     pub(crate) status: String,
@@ -158,13 +157,13 @@ pub(crate) struct SyncSitesProgress {
 }
 
 pub(crate) fn emit_sync_progress(
-    app: &tauri::AppHandle,
+    bus: &crate::context::EventBus,
     run_id: u64,
     stage: &str,
     status: &str,
     message: String,
 ) {
-    let _ = app.emit(
+    bus.emit(
         "sync-sites-progress",
         SyncSitesProgress {
             run_id,
@@ -176,13 +175,13 @@ pub(crate) fn emit_sync_progress(
 }
 
 pub(crate) fn emit_chrome_account_progress(
-    app: &tauri::AppHandle,
+    bus: &crate::context::EventBus,
     run_id: u64,
     stage: &str,
     status: &str,
     message: impl Into<String>,
 ) {
-    let _ = app.emit(
+    bus.emit(
         "chrome-account-sync-progress",
         SyncSitesProgress {
             run_id,
@@ -194,20 +193,20 @@ pub(crate) fn emit_chrome_account_progress(
 }
 
 pub(crate) fn emit_optional_sync_progress(
-    app: &tauri::AppHandle,
+    bus: &crate::context::EventBus,
     run_id: Option<u64>,
     stage: &str,
     status: &str,
     message: String,
 ) {
     if let Some(run_id) = run_id {
-        emit_sync_progress(app, run_id, stage, status, message);
+        emit_sync_progress(bus, run_id, stage, status, message);
     }
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct RemoteUserInfo {
+pub struct RemoteUserInfo {
     pub(crate) name: String,
     pub(crate) username: String,
     pub(crate) avatar_url: String,
@@ -217,7 +216,7 @@ pub(crate) struct RemoteUserInfo {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct ChromeUsageScanResult {
+pub struct ChromeUsageScanResult {
     pub(crate) scanned: usize,
     pub(crate) detected: usize,
     pub(crate) accounts: usize,
@@ -228,7 +227,7 @@ pub(crate) struct ChromeUsageScanResult {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct SiteModelCacheAccount {
+pub struct SiteModelCacheAccount {
     pub(crate) profile_id: String,
     pub(crate) profile_name: String,
     pub(crate) account_name: String,
@@ -244,7 +243,7 @@ pub(crate) struct SiteModelCacheAccount {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct SiteModelCache {
+pub struct SiteModelCache {
     pub(crate) models: Vec<SiteModelItem>,
     pub(crate) api_source: String,
     pub(crate) accounts: Vec<SiteModelCacheAccount>,
@@ -253,21 +252,21 @@ pub(crate) struct SiteModelCache {
 /// 跨站点聚合用：站点 ID + 该站点的模型缓存。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct SiteModelCacheEntry {
+pub struct SiteModelCacheEntry {
     pub(crate) site_id: String,
     pub(crate) cache: SiteModelCache,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct SiteModelItem {
+pub struct SiteModelItem {
     pub(crate) id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) owned_by: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
-pub(crate) struct SiteAccountSnapshot {
+pub struct SiteAccountSnapshot {
     pub(crate) username: String,
     pub(crate) remaining: Option<f64>,
     pub(crate) used: Option<f64>,
@@ -276,14 +275,14 @@ pub(crate) struct SiteAccountSnapshot {
 }
 
 #[derive(Debug, Clone, Default)]
-pub(crate) struct CheckinSnapshot {
+pub struct CheckinSnapshot {
     pub(crate) enabled: bool,
     pub(crate) checked_in_today: bool,
     pub(crate) error: String,
 }
 
 #[derive(Debug)]
-pub(crate) struct SiteAccountRefresh {
+pub struct SiteAccountRefresh {
     pub(crate) account: SiteAccountSnapshot,
     pub(crate) is_valid: bool,
     pub(crate) sync_error: String,
@@ -324,7 +323,7 @@ pub(crate) fn site_matches_requested_scope(
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct ChromeBridgeAccountResult {
+pub struct ChromeBridgeAccountResult {
     pub(crate) ok: bool,
     #[serde(default)]
     pub(crate) error: String,
@@ -343,7 +342,7 @@ pub(crate) struct ChromeBridgeAccountResult {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
-pub(crate) struct ProxySubscription {
+pub struct ProxySubscription {
     pub(crate) id: String,
     pub(crate) name: String,
     pub(crate) url: String,
@@ -355,7 +354,7 @@ pub(crate) struct ProxySubscription {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
-pub(crate) struct ProxyNode {
+pub struct ProxyNode {
     pub(crate) id: String,
     pub(crate) subscription_names: Vec<String>,
     pub(crate) name: String,
@@ -378,13 +377,13 @@ pub(crate) struct ProxyNode {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
-pub(crate) struct ProxyChannelAccount {
+pub struct ProxyChannelAccount {
     pub(crate) profile_id: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
-pub(crate) struct ProxyChannel {
+pub struct ProxyChannel {
     pub(crate) id: String,
     pub(crate) name: String,
     pub(crate) node_id: String,
@@ -399,7 +398,7 @@ pub(crate) struct ProxyChannel {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
-pub(crate) struct ProxyPoolState {
+pub struct ProxyPoolState {
     pub(crate) subscriptions: Vec<ProxySubscription>,
     pub(crate) nodes: Vec<ProxyNode>,
     pub(crate) channels: Vec<ProxyChannel>,
@@ -419,7 +418,7 @@ pub(crate) struct ProxyPoolState {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
-pub(crate) struct ProxyPoolRefreshResult {
+pub struct ProxyPoolRefreshResult {
     pub(crate) subscription: ProxySubscription,
     pub(crate) added: usize,
     pub(crate) total: usize,
@@ -428,7 +427,7 @@ pub(crate) struct ProxyPoolRefreshResult {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
-pub(crate) struct ProxySourceProgress {
+pub struct ProxySourceProgress {
     pub(crate) source_id: String,
     pub(crate) stage: String,
     pub(crate) status: String,
@@ -441,7 +440,7 @@ pub(crate) struct ProxySourceProgress {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
-pub(crate) struct ProxyNodeTestProgress {
+pub struct ProxyNodeTestProgress {
     pub(crate) node_id: String,
     pub(crate) phase: String,
     pub(crate) latency_ms: Option<i64>,
@@ -452,7 +451,7 @@ pub(crate) struct ProxyNodeTestProgress {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
-pub(crate) struct ProxyIpNodeAnalysis {
+pub struct ProxyIpNodeAnalysis {
     pub(crate) node_id: String,
     pub(crate) node_name: String,
     pub(crate) server: String,
@@ -466,7 +465,7 @@ pub(crate) struct ProxyIpNodeAnalysis {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
-pub(crate) struct ProxyIpGroup {
+pub struct ProxyIpGroup {
     pub(crate) key: String,
     pub(crate) label: String,
     pub(crate) classification: String,
@@ -478,7 +477,7 @@ pub(crate) struct ProxyIpGroup {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
-pub(crate) struct ProxyIpAnalysis {
+pub struct ProxyIpAnalysis {
     pub(crate) analyzed_at: String,
     pub(crate) geoip_available: bool,
     pub(crate) geoip_database_path: String,
@@ -495,7 +494,7 @@ pub(crate) struct ProxyIpAnalysis {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
-pub(crate) struct TokenStatsReport {
+pub struct TokenStatsReport {
     pub(crate) available: bool,
     pub(crate) sessions: Vec<TokenSession>,
     #[serde(alias = "session_count")]
@@ -509,7 +508,7 @@ pub(crate) struct TokenStatsReport {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
-pub(crate) struct TokenSessionTokens {
+pub struct TokenSessionTokens {
     #[serde(alias = "input_tokens")]
     pub(crate) input_tokens: i64,
     #[serde(alias = "cached_input_tokens")]
@@ -526,7 +525,7 @@ pub(crate) struct TokenSessionTokens {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
-pub(crate) struct TokenSession {
+pub struct TokenSession {
     pub(crate) version: i64,
     #[serde(alias = "session_hash")]
     pub(crate) session_hash: String,
@@ -570,7 +569,7 @@ pub(crate) struct TokenSession {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
-pub(crate) struct TokenSummary {
+pub struct TokenSummary {
     pub(crate) sessions: i64,
     #[serde(alias = "productive_sessions")]
     pub(crate) productive_sessions: i64,
@@ -607,7 +606,7 @@ pub(crate) struct TokenSummary {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
-pub(crate) struct TokenModelStat {
+pub struct TokenModelStat {
     pub(crate) model: String,
     pub(crate) sessions: i64,
     #[serde(alias = "productive_sessions")]
@@ -645,7 +644,7 @@ pub(crate) struct TokenModelStat {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
-pub(crate) struct TokenSubagentStat {
+pub struct TokenSubagentStat {
     pub(crate) name: String,
     pub(crate) calls: i64,
     pub(crate) sessions: i64,
@@ -659,7 +658,7 @@ pub(crate) struct TokenSubagentStat {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
-pub(crate) struct TokenUsageBucket {
+pub struct TokenUsageBucket {
     pub(crate) source: String,
     pub(crate) model: String,
     /// 可选项目维度；支持该维度的数据源会由 OpenHub 直接填充。
@@ -702,7 +701,7 @@ pub(crate) struct TokenUsageBucket {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
-pub(crate) struct TokenUsageReport {
+pub struct TokenUsageReport {
     pub(crate) available: bool,
     pub(crate) buckets: Vec<TokenUsageBucket>,
     #[serde(alias = "start_date")]
@@ -717,7 +716,7 @@ pub(crate) struct TokenUsageReport {
 // —— OpenHub 本地 Token 采集状态 ——
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
-pub(crate) struct TokenCollectorSyncReport {
+pub struct TokenCollectorSyncReport {
     pub(crate) available: bool,
     pub(crate) changed: bool,
     pub(crate) skipped: bool,
@@ -735,7 +734,7 @@ pub(crate) struct TokenCollectorSyncReport {
     default,
     rename_all(serialize = "camelCase", deserialize = "snake_case")
 )]
-pub(crate) struct RequestHealthBucket {
+pub struct RequestHealthBucket {
     pub(crate) hour: String,
     /// 用户发起的对话 turns（排除 tool_result / 自动触发）
     pub(crate) dialogues: i64,
@@ -752,7 +751,7 @@ pub(crate) struct RequestHealthBucket {
     default,
     rename_all(serialize = "camelCase", deserialize = "snake_case")
 )]
-pub(crate) struct RequestHealthSourceSummary {
+pub struct RequestHealthSourceSummary {
     pub(crate) source: String,
     pub(crate) dialogues: i64,
     pub(crate) requests: i64,
@@ -765,7 +764,7 @@ pub(crate) struct RequestHealthSourceSummary {
     default,
     rename_all(serialize = "camelCase", deserialize = "snake_case")
 )]
-pub(crate) struct RequestHealthReport {
+pub struct RequestHealthReport {
     pub(crate) available: bool,
     pub(crate) buckets: Vec<RequestHealthBucket>,
     /// 所选区间之前的健康桶（反代模式补偿：健康矩阵在区间起点前补位时取数；本地模式为空）
@@ -784,7 +783,7 @@ pub(crate) struct RequestHealthReport {
     default,
     rename_all(serialize = "camelCase", deserialize = "snake_case")
 )]
-pub(crate) struct RawSession {
+pub struct RawSession {
     pub(crate) id: String,
     pub(crate) source: String,
     pub(crate) project: String,
@@ -801,7 +800,7 @@ pub(crate) struct RawSession {
     default,
     rename_all(serialize = "camelCase", deserialize = "snake_case")
 )]
-pub(crate) struct RawConversation {
+pub struct RawConversation {
     pub(crate) id: String,
     pub(crate) session_id: String,
     pub(crate) source: String,
@@ -819,7 +818,7 @@ pub(crate) struct RawConversation {
     default,
     rename_all(serialize = "camelCase", deserialize = "snake_case")
 )]
-pub(crate) struct RawRequest {
+pub struct RawRequest {
     pub(crate) id: String,
     pub(crate) session_id: String,
     pub(crate) conversation_id: String,
@@ -839,7 +838,7 @@ pub(crate) struct RawRequest {
     default,
     rename_all(serialize = "camelCase", deserialize = "snake_case")
 )]
-pub(crate) struct RawLogReport {
+pub struct RawLogReport {
     pub(crate) available: bool,
     pub(crate) sessions: Vec<RawSession>,
     pub(crate) conversations: Vec<RawConversation>,
@@ -849,7 +848,7 @@ pub(crate) struct RawLogReport {
 // —— 本地 AI Agent 路径诊断：展示各工具配置 / 数据 / 数据库的根目录 ——
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
-pub(crate) struct LocalAgentPathEntry {
+pub struct LocalAgentPathEntry {
     /// 配置 / 数据 / 日志 / 数据库
     pub(crate) kind: String,
     /// 展示用简短说明（如「配置 config.toml」）
@@ -862,7 +861,7 @@ pub(crate) struct LocalAgentPathEntry {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
-pub(crate) struct LocalAgentPaths {
+pub struct LocalAgentPaths {
     pub(crate) source: String,
     pub(crate) name: String,
     /// 该 Agent 的首选根目录
@@ -877,7 +876,7 @@ pub(crate) struct LocalAgentPaths {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
-pub(crate) struct LocalAgentEnvOverride {
+pub struct LocalAgentEnvOverride {
     /// 生效中的重定向环境变量名（如 CLAUDE_CONFIG_DIR）
     pub(crate) key: String,
     pub(crate) value: String,
@@ -885,7 +884,7 @@ pub(crate) struct LocalAgentEnvOverride {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
-pub(crate) struct LocalAgentPathsReport {
+pub struct LocalAgentPathsReport {
     pub(crate) available: bool,
     pub(crate) home: String,
     pub(crate) agents: Vec<LocalAgentPaths>,

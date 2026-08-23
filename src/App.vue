@@ -1,6 +1,8 @@
 <script setup lang="ts">
-import { onMounted, onUnmounted, computed } from "vue";
+import { onMounted, onUnmounted, ref, computed } from "vue";
 import { icons } from "./icons";
+import LoginView from "./components/auth/LoginView.vue";
+import { getSessionToken } from "./composables/core/ipc";
 import { useStore } from "./composables/useStore";
 import { isTauri, runCommand } from "./composables/useLibrary";
 import { usePreferences } from "./composables/usePreferences";
@@ -51,6 +53,30 @@ const {
 } = useContextMenu();
 
 const sidebarCollapsed = computed(() => preferences.sidebarCollapsed);
+
+// —— 登录门禁：checking → locked（展示登录页） / ready（进入主应用） ——
+const authState = ref<"checking" | "locked" | "ready">("checking");
+const loginHintUsername = ref("");
+
+onMounted(async () => {
+  try {
+    const state = await runCommand<{ required: boolean; authenticated: boolean; username: string }>(
+      "get_login_state",
+      { token: getSessionToken() },
+    );
+    loginHintUsername.value = state.username || "";
+    authState.value = !state.required || state.authenticated ? "ready" : "locked";
+  } catch (error) {
+    // 静态预览 / 内核不可达：不设门禁，由各命令自身错误提示兜底。
+    console.warn("[OpenHub] 登录状态检查失败，直接放行：", error);
+    authState.value = "ready";
+  }
+});
+
+function onAuthenticated() {
+  // 登录成功后整树重挂载，保证所有页面按已登录状态初始化。
+  window.location.reload();
+}
 
 
 function onKeydown(event: KeyboardEvent) {
@@ -152,7 +178,12 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div class="app-layout" :class="{ 'sidebar-collapsed': sidebarCollapsed }">
+  <LoginView
+    v-if="authState === 'locked'"
+    :hint-username="loginHintUsername"
+    @authenticated="onAuthenticated"
+  />
+  <div v-else-if="authState !== 'checking'" class="app-layout" :class="{ 'sidebar-collapsed': sidebarCollapsed }">
     <div v-if="!isTauri" class="lightweight-banner" role="status">
       <span class="lightweight-banner-icon" v-html="icons.globe" />
       <span class="lightweight-banner-text">轻量模式：正在通过浏览器访问本地内核</span>

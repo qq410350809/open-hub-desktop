@@ -8,7 +8,8 @@ use rusqlite::{params, OptionalExtension};
 use serde_json;
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tauri::{Manager, State};
+use crate::context::{spawn_blocking, AppContext, EventBus, Managed};
+use std::sync::Arc;
 use url::Url;
 
 /// 浏览器兜底（Chrome 桥接）失败后的冷却总时长：10 分钟起步，每多失败一次翻倍，
@@ -1750,17 +1751,15 @@ pub(crate) fn parse_chrome_account_bridge_result(
 /// 单个站点 / 账号同步的硬性总超时：超过即强制失败，避免某个站点拖垮整轮同步。
 const SITE_SYNC_TIMEOUT: Duration = Duration::from_secs(60);
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn sync_site_account_via_chrome(
-    app: tauri::AppHandle,
-    database: State<'_, Database>,
+    ctx: Managed<'_, Arc<AppContext>>,
     site_id: String,
     profile_id: String,
     run_id: u64,
 ) -> Result<sync::ChromeSessionInfo, String> {
     sync_site_account_via_chrome_command(
-        app,
-        &database,
+        &ctx,
         site_id,
         profile_id,
         run_id,
@@ -1771,17 +1770,16 @@ pub async fn sync_site_account_via_chrome(
 /// 手动 Chrome 账号同步入口：统一 60 秒总超时、
 /// 失败原因与浏览器兜底冷却计数落库。
 pub(crate) async fn sync_site_account_via_chrome_command(
-    app: tauri::AppHandle,
-    database: &Database,
+    ctx: &Arc<AppContext>,
     site_id: String,
     profile_id: String,
     run_id: u64,
 ) -> Result<sync::ChromeSessionInfo, String> {
+    let database = &*ctx.database;
     let outcome = match tokio::time::timeout(
         SITE_SYNC_TIMEOUT,
         sync_site_account_via_chrome_inner(
-            &app,
-            database,
+            ctx,
             site_id.clone(),
             profile_id.clone(),
             run_id,
@@ -1816,12 +1814,14 @@ pub(crate) async fn sync_site_account_via_chrome_command(
 }
 
 async fn sync_site_account_via_chrome_inner(
-    app: &tauri::AppHandle,
-    database: &Database,
+    ctx: &Arc<AppContext>,
     site_id: String,
     profile_id: String,
     run_id: u64,
 ) -> Result<sync::ChromeSessionInfo, String> {
+    let database = &*ctx.database;
+    let runtime = &*ctx.proxy_runtime;
+    let bus: EventBus = ctx.event_bus.clone();
     let site_id = site_id.trim().to_string();
     let profile_id = profile_id.trim().to_string();
     if site_id.is_empty() || profile_id.is_empty() {
@@ -1927,7 +1927,7 @@ async fn sync_site_account_via_chrome_inner(
     }
 
     emit_chrome_account_progress(
-        &app,
+        &bus,
         run_id,
         "local-account",
         "running",
@@ -1946,7 +1946,7 @@ async fn sync_site_account_via_chrome_inner(
     // HTTP 4xx/5xx（含 Cloudflare 403）视为"站点在线但需要认证"，放行。
     {
         emit_chrome_account_progress(
-            &app,
+            &bus,
             run_id,
             "reachability",
             "running",
@@ -1955,12 +1955,12 @@ async fn sync_site_account_via_chrome_inner(
         let uses_proxy = proxypool::read_site_uses_proxy_pool(database, &site_id).unwrap_or(false);
         let probe_url = base_url.to_string();
         let probe_result: Result<(), String> = if uses_proxy {
-            let app_for_probe = app.clone();
             let site_id_for_probe = site_id.clone();
             let profile_id_for_probe = profile_id.clone();
             let probe_url_clone = probe_url.clone();
             proxypool::with_account_proxy(
-                &app_for_probe,
+                database,
+                runtime,
                 &site_id_for_probe,
                 &profile_id_for_probe,
                 Duration::from_secs(8),
@@ -1995,7 +1995,7 @@ async fn sync_site_account_via_chrome_inner(
         match probe_result {
             Ok(()) => {
                 emit_chrome_account_progress(
-                    &app,
+                    &bus,
                     run_id,
                     "reachability",
                     "success",
@@ -2013,7 +2013,7 @@ async fn sync_site_account_via_chrome_inner(
                 if is_unreachable {
                     let reason = format!("站点不可达：{error}");
                     emit_chrome_account_progress(
-                        &app,
+                        &bus,
                         run_id,
                         "reachability",
                         "error",
@@ -2022,7 +2022,7 @@ async fn sync_site_account_via_chrome_inner(
                     return Err(reason);
                 }
                 emit_chrome_account_progress(
-                    &app,
+                    &bus,
                     run_id,
                     "reachability",
                     "success",
@@ -2032,16 +2032,13 @@ async fn sync_site_account_via_chrome_inner(
         }
     }
 
-    let home_dir = app
-        .path()
-        .home_dir()
-        .map_err(|error| format!("无法定位用户目录：{error}"))?;
+    let home_dir = crate::context::home_dir().ok_or("无法定位用户目录")?;
     let local_target = sync::LocalStorageTarget {
         site_id: site_id.clone(),
         profile_id: profile_id.clone(),
         origin,
     };
-    let local_match = tauri::async_runtime::spawn_blocking({
+    let local_match = spawn_blocking({
         let home_dir = home_dir.clone();
         move || sync::read_local_storage_from_home(&home_dir, &[local_target])
     })
@@ -2083,7 +2080,7 @@ async fn sync_site_account_via_chrome_inner(
             .unwrap_or_else(|| "没有找到可用的 NewAPI 本地账号或刷新会话".into()));
     }
     emit_chrome_account_progress(
-        &app,
+        &bus,
         run_id,
         "local-account",
         "success",
@@ -2106,7 +2103,7 @@ async fn sync_site_account_via_chrome_inner(
         if let Some(cached_token) = &cached_token {
             if !cached_token.is_empty() {
                 emit_chrome_account_progress(
-                    &app,
+                    &bus,
                     run_id,
                     "token-cache",
                     "running",
@@ -2117,9 +2114,9 @@ async fn sync_site_account_via_chrome_inner(
                 let base_url_for_proxy = base_url.clone();
                 let current_month_for_proxy = current_month.clone();
                 let account_label_for_proxy = account_label.clone();
-                let app_for_proxy = app.clone();
                 let proxy_result = proxypool::with_account_proxy(
-                    &app_for_proxy,
+                    database,
+                    runtime,
                     &site_id,
                     &profile_id,
                     Duration::from_secs(8),
@@ -2196,7 +2193,7 @@ async fn sync_site_account_via_chrome_inner(
                 match proxy_result {
                     Ok(Some((account, bridge_result))) => {
                         emit_chrome_account_progress(
-                            &app,
+                            &bus,
                             run_id,
                             "token-cache",
                             "success",
@@ -2206,7 +2203,7 @@ async fn sync_site_account_via_chrome_inner(
                     }
                     Ok(None) => {
                         emit_chrome_account_progress(
-                            &app,
+                            &bus,
                             run_id,
                             "token-cache",
                             "info",
@@ -2217,7 +2214,7 @@ async fn sync_site_account_via_chrome_inner(
                     }
                     Err(error) => {
                         emit_chrome_account_progress(
-                        &app,
+                        &bus,
                         run_id,
                         "token-cache",
                         "info",
@@ -2264,13 +2261,13 @@ async fn sync_site_account_via_chrome_inner(
             false,
         );
         emit_chrome_account_progress(
-            &app,
+            &bus,
             run_id,
             "browser-bypass",
             "running",
             format!("正在尝试复用已打开的同账号 Chrome 页面（{account_label}），不切换窗口"),
         );
-        let silent_attempt = tauri::async_runtime::spawn_blocking({
+        let silent_attempt = spawn_blocking({
             let base_url = base_url.to_string();
             move || {
                 sync::run_javascript_in_existing_chrome_tab(
@@ -2285,7 +2282,7 @@ async fn sync_site_account_via_chrome_inner(
             Ok(Ok(Some(value))) => match parse_chrome_account_bridge_result(&value) {
                 Ok(parsed) => {
                     emit_chrome_account_progress(
-                        &app,
+                        &bus,
                         run_id,
                         "browser-bypass",
                         "success",
@@ -2294,7 +2291,7 @@ async fn sync_site_account_via_chrome_inner(
                     resolved_account = Some(parsed);
                 }
                 Err(error) => emit_chrome_account_progress(
-                    &app,
+                    &bus,
                     run_id,
                     "browser-bypass",
                     "success",
@@ -2302,7 +2299,7 @@ async fn sync_site_account_via_chrome_inner(
                 ),
             },
             Ok(Ok(None)) => emit_chrome_account_progress(
-                &app,
+                &bus,
                 run_id,
                 "browser-bypass",
                 "success",
@@ -2313,7 +2310,7 @@ async fn sync_site_account_via_chrome_inner(
                     return Err(error);
                 }
                 emit_chrome_account_progress(
-                    &app,
+                    &bus,
                     run_id,
                     "browser-bypass",
                     "success",
@@ -2321,7 +2318,7 @@ async fn sync_site_account_via_chrome_inner(
                 )
             }
             Err(error) => emit_chrome_account_progress(
-                &app,
+                &bus,
                 run_id,
                 "browser-bypass",
                 "success",
@@ -2330,7 +2327,7 @@ async fn sync_site_account_via_chrome_inner(
         }
     } else {
         emit_chrome_account_progress(
-            &app,
+            &bus,
             run_id,
             "browser-bypass",
             "info",
@@ -2368,14 +2365,14 @@ async fn sync_site_account_via_chrome_inner(
             true,
         );
         emit_chrome_account_progress(
-            &app,
+            &bus,
             run_id,
             "browser-background",
             "running",
             format!("正在后台打开 {account_label} 的 Chrome 并尝试自动通过验证"),
         );
-        let account_proxy_url = proxypool::proxy_url_for_account(&app, &site_id, &profile_id).ok().flatten();
-        let background_attempt = tauri::async_runtime::spawn_blocking({
+        let account_proxy_url = proxypool::proxy_url_for_account(database, runtime, &site_id, &profile_id).ok().flatten();
+        let background_attempt = spawn_blocking({
             let browser_url = browser_url.to_string();
             let profile_id = profile_id.clone();
             let marker = marker.clone();
@@ -2396,7 +2393,7 @@ async fn sync_site_account_via_chrome_inner(
             Ok(Ok(value)) => match parse_chrome_account_bridge_result(&value) {
                 Ok(parsed) => {
                     emit_chrome_account_progress(
-                        &app,
+                        &bus,
                         run_id,
                         "browser-background",
                         "success",
@@ -2405,7 +2402,7 @@ async fn sync_site_account_via_chrome_inner(
                     resolved_account = Some(parsed);
                 }
                 Err(error) => emit_chrome_account_progress(
-                    &app,
+                    &bus,
                     run_id,
                     "browser-background",
                     "success",
@@ -2417,7 +2414,7 @@ async fn sync_site_account_via_chrome_inner(
                     return Err(error);
                 }
                 emit_chrome_account_progress(
-                    &app,
+                    &bus,
                     run_id,
                     "browser-background",
                     "success",
@@ -2425,7 +2422,7 @@ async fn sync_site_account_via_chrome_inner(
                 )
             }
             Err(error) => emit_chrome_account_progress(
-                &app,
+                &bus,
                 run_id,
                 "browser-background",
                 "success",
@@ -2466,14 +2463,14 @@ async fn sync_site_account_via_chrome_inner(
                 true,
             );
             emit_chrome_account_progress(
-                &app,
+                &bus,
                 run_id,
                 "chrome-request",
                 "running",
                 format!("{account_label} 静默请求未能完成，正在打开 Chrome；如出现验证，请在浏览器中完成"),
             );
-            let account_proxy_url = proxypool::proxy_url_for_account(&app, &site_id, &profile_id).ok().flatten();
-            let bridge_result = tauri::async_runtime::spawn_blocking({
+            let account_proxy_url = proxypool::proxy_url_for_account(database, runtime, &site_id, &profile_id).ok().flatten();
+            let bridge_result = spawn_blocking({
                 let browser_url = browser_url.to_string();
                 let profile_id = profile_id.clone();
                 let marker = marker.clone();
@@ -2493,7 +2490,7 @@ async fn sync_site_account_via_chrome_inner(
             .map_err(|error| format!("Chrome 同步任务失败：{error}"))??;
             let parsed = parse_chrome_account_bridge_result(&bridge_result)?;
             emit_chrome_account_progress(
-                &app,
+                &bus,
                 run_id,
                 "chrome-request",
                 "success",
@@ -2504,7 +2501,7 @@ async fn sync_site_account_via_chrome_inner(
     };
 
     emit_chrome_account_progress(
-        &app,
+        &bus,
         run_id,
         "account-cache",
         "running",
@@ -2554,7 +2551,7 @@ async fn sync_site_account_via_chrome_inner(
         })
         .ok_or_else(|| "读取 Chrome 同步后的账号缓存失败".to_string())?;
     emit_chrome_account_progress(
-        &app,
+        &bus,
         run_id,
         "account-cache",
         "success",

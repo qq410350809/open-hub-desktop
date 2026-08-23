@@ -9,14 +9,15 @@ use super::types::{
     ModelProxyConfig, ModelProxyState, ModelProxyStatus, OpencodeProxyConfig, OpencodeProxyState,
     OpencodeProxyStatus, ProxyRequestLog,
 };
-use crate::models::Database;
 use serde_json::Value as JsonValue;
-use tauri::State;
+use crate::context::{AppContext, Managed};
+use std::sync::Arc;
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn get_model_proxy_config(
-    database: State<'_, Database>,
+    ctx: Managed<'_, Arc<AppContext>>,
 ) -> Result<ModelProxyConfig, String> {
+    let database = &*ctx.database;
     let conn = database
         .0
         .lock()
@@ -24,19 +25,21 @@ pub async fn get_model_proxy_config(
     Ok(load_model_proxy_config(&conn))
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn get_opencode_proxy_config(
-    database: State<'_, Database>,
+    ctx: Managed<'_, Arc<AppContext>>,
 ) -> Result<OpencodeProxyConfig, String> {
-    get_model_proxy_config(database).await
+    let _database = &*ctx.database;
+    get_model_proxy_config(ctx).await
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn save_model_proxy_config_cmd(
-    database: State<'_, Database>,
-    state: State<'_, ModelProxyState>,
+    ctx: Managed<'_, Arc<AppContext>>,
+    state: Managed<'_, ModelProxyState>,
     config: ModelProxyConfig,
 ) -> Result<ModelProxyStatus, String> {
+    let database = &*ctx.database;
     {
         let conn = database
             .0
@@ -62,62 +65,63 @@ pub async fn save_model_proxy_config_cmd(
     Ok(get_model_proxy_status_summary(&state).await)
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn save_opencode_proxy_config_cmd(
-    database: State<'_, Database>,
-    state: State<'_, OpencodeProxyState>,
+    ctx: Managed<'_, Arc<AppContext>>,
+    state: Managed<'_, OpencodeProxyState>,
     config: OpencodeProxyConfig,
 ) -> Result<OpencodeProxyStatus, String> {
-    save_model_proxy_config_cmd(database, state, config).await
+    let _database = &*ctx.database;
+    save_model_proxy_config_cmd(ctx, state, config).await
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn get_model_proxy_status(
-    state: State<'_, ModelProxyState>,
+    state: Managed<'_, ModelProxyState>,
 ) -> Result<ModelProxyStatus, String> {
     Ok(get_model_proxy_status_summary(&state).await)
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn get_opencode_proxy_status(
-    state: State<'_, OpencodeProxyState>,
+    state: Managed<'_, OpencodeProxyState>,
 ) -> Result<OpencodeProxyStatus, String> {
     get_model_proxy_status(state).await
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn start_model_proxy(
-    state: State<'_, ModelProxyState>,
+    state: Managed<'_, ModelProxyState>,
 ) -> Result<ModelProxyStatus, String> {
     start_model_proxy_server(&state).await?;
     Ok(get_model_proxy_status_summary(&state).await)
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn start_opencode_proxy(
-    state: State<'_, OpencodeProxyState>,
+    state: Managed<'_, OpencodeProxyState>,
 ) -> Result<OpencodeProxyStatus, String> {
     start_model_proxy(state).await
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn stop_model_proxy(
-    state: State<'_, ModelProxyState>,
+    state: Managed<'_, ModelProxyState>,
 ) -> Result<ModelProxyStatus, String> {
     stop_model_proxy_server(&state).await?;
     Ok(get_model_proxy_status_summary(&state).await)
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn stop_opencode_proxy(
-    state: State<'_, OpencodeProxyState>,
+    state: Managed<'_, OpencodeProxyState>,
 ) -> Result<OpencodeProxyStatus, String> {
     stop_model_proxy(state).await
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn fetch_model_proxy_models(
-    state: State<'_, ModelProxyState>,
+    state: Managed<'_, ModelProxyState>,
 ) -> Result<(Vec<ChannelModelList>, Vec<ChannelModelFetchError>), String> {
     fetch_upstream_models_inner(&state.context).await;
     let models = state.context.cached_channel_models.read().await.clone();
@@ -127,49 +131,49 @@ pub async fn fetch_model_proxy_models(
 
 /// 只读取内存中已缓存的渠道模型列表，不发起远程请求。
 /// 用于页面加载时默认展示已有数据，而非每次打开都远程拉取。
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn get_cached_channel_models(
-    state: State<'_, ModelProxyState>,
+    state: Managed<'_, ModelProxyState>,
 ) -> Result<Vec<ChannelModelList>, String> {
     let models = state.context.cached_channel_models.read().await.clone();
     Ok(models)
 }
 
 /// 只读取内存中已缓存的渠道模型拉取错误，不发起远程请求。
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn get_cached_channel_errors(
-    state: State<'_, ModelProxyState>,
+    state: Managed<'_, ModelProxyState>,
 ) -> Result<Vec<ChannelModelFetchError>, String> {
     let errors = state.context.cached_fetch_errors.read().await.clone();
     Ok(errors)
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn fetch_opencode_models(
-    state: State<'_, OpencodeProxyState>,
+    state: Managed<'_, OpencodeProxyState>,
 ) -> Result<(Vec<ChannelModelList>, Vec<ChannelModelFetchError>), String> {
     fetch_model_proxy_models(state).await
 }
 
 /// opencode 别名：只读取内存中已缓存的渠道模型列表，不发起远程请求。
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn get_opencode_cached_channel_models(
-    state: State<'_, OpencodeProxyState>,
+    state: Managed<'_, OpencodeProxyState>,
 ) -> Result<Vec<ChannelModelList>, String> {
     get_cached_channel_models(state).await
 }
 
 /// opencode 别名：只读取内存中已缓存的渠道模型拉取错误，不发起远程请求。
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn get_opencode_cached_channel_errors(
-    state: State<'_, OpencodeProxyState>,
+    state: Managed<'_, OpencodeProxyState>,
 ) -> Result<Vec<ChannelModelFetchError>, String> {
     get_cached_channel_errors(state).await
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn test_model_proxy_health(
-    state: State<'_, ModelProxyState>,
+    state: Managed<'_, ModelProxyState>,
 ) -> Result<serde_json::Value, String> {
     let port = *state.current_port.read().await;
     let url = format!("http://127.0.0.1:{port}/healthz");
@@ -188,16 +192,16 @@ pub async fn test_model_proxy_health(
     Ok(json_val)
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn test_opencode_proxy_health(
-    state: State<'_, OpencodeProxyState>,
+    state: Managed<'_, OpencodeProxyState>,
 ) -> Result<serde_json::Value, String> {
     test_model_proxy_health(state).await
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn get_model_proxy_logs(
-    database: State<'_, Database>,
+    ctx: Managed<'_, Arc<AppContext>>,
     page: Option<usize>,
     page_size: Option<usize>,
     filter: Option<String>,
@@ -207,6 +211,7 @@ pub async fn get_model_proxy_logs(
     from: Option<String>,
     to: Option<String>,
 ) -> Result<super::types::ProxyLogsResponse, String> {
+    let database = &*ctx.database;
     let p = page.unwrap_or(1).max(1);
     let ps = page_size.unwrap_or(50).clamp(1, 200);
     let offset = (p - 1) * ps;
@@ -412,9 +417,9 @@ pub async fn get_model_proxy_logs(
     })
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn get_opencode_proxy_logs(
-    database: State<'_, Database>,
+    ctx: Managed<'_, Arc<AppContext>>,
     page: Option<usize>,
     page_size: Option<usize>,
     filter: Option<String>,
@@ -424,38 +429,39 @@ pub async fn get_opencode_proxy_logs(
     from: Option<String>,
     to: Option<String>,
 ) -> Result<super::types::ProxyLogsResponse, String> {
-    get_model_proxy_logs(database, page, page_size, filter, q, sort_by, sort_order, from, to).await
+    let _database = &*ctx.database;
+    get_model_proxy_logs(ctx, page, page_size, filter, q, sort_by, sort_order, from, to).await
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn get_model_proxy_channel_stats(
-    state: State<'_, ModelProxyState>,
+    state: Managed<'_, ModelProxyState>,
 ) -> Result<Vec<ChannelUsageStats>, String> {
     get_channel_usage_stats_summary(&state).await
 }
 
 /// Token 统计中心「反代模式」数据源：与本地模式同构的用量桶 + 请求健康报表。
 /// from/to 均为 YYYY-MM-DD（可省略，默认全部已聚合数据）。
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn get_proxy_token_usage(
-    state: State<'_, ModelProxyState>,
+    state: Managed<'_, ModelProxyState>,
     from: Option<String>,
     to: Option<String>,
 ) -> Result<super::types::ProxyTokenUsageReport, String> {
     super::stats::get_proxy_token_usage_report(&state, from, to).await
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn get_opencode_channel_stats(
-    state: State<'_, OpencodeProxyState>,
+    state: Managed<'_, OpencodeProxyState>,
 ) -> Result<Vec<ChannelUsageStats>, String> {
     get_model_proxy_channel_stats(state).await
 }
 
 /// 控制台「全渠道数据总览」：日期区间逐日聚合 + 区间累计（未传区间时为近 N 天 + 全量，默认 14 天）
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn get_model_proxy_overview_stats(
-    state: State<'_, ModelProxyState>,
+    state: Managed<'_, ModelProxyState>,
     days: Option<u32>,
     from: Option<String>,
     to: Option<String>,
@@ -467,12 +473,13 @@ pub async fn get_model_proxy_overview_stats(
 /// - mode="all"（默认）：删除明细行；mode="payload_only"：仅置空请求/响应正文，保留元数据
 /// - before（YYYY-MM-DD）：只清理该日期之前（不含当日）的明细；未提供时清理全部
 /// 返回受影响的行数。
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn clear_model_proxy_logs(
-    database: State<'_, Database>,
+    ctx: Managed<'_, Arc<AppContext>>,
     mode: Option<String>,
     before: Option<String>,
 ) -> Result<u64, String> {
+    let database = &*ctx.database;
     let conn = database
         .0
         .lock()
@@ -509,22 +516,24 @@ pub async fn clear_model_proxy_logs(
     Ok(affected as u64)
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn clear_opencode_proxy_logs(
-    database: State<'_, Database>,
+    ctx: Managed<'_, Arc<AppContext>>,
     mode: Option<String>,
     before: Option<String>,
 ) -> Result<u64, String> {
-    clear_model_proxy_logs(database, mode, before).await
+    let _database = &*ctx.database;
+    clear_model_proxy_logs(ctx, mode, before).await
 }
 
 /// 从站点库 (Site Library) 深度同步渠道配置：自动读取已存活站点的 Base URL、API Keys 与可用模型
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn sync_model_proxy_site_channels(
-    database: State<'_, Database>,
-    state: State<'_, ModelProxyState>,
+    ctx: Managed<'_, Arc<AppContext>>,
+    state: Managed<'_, ModelProxyState>,
     site_ids: Option<Vec<String>>,
 ) -> Result<ModelProxyConfig, String> {
+    let database = &*ctx.database;
     let updated_config = tokio::task::block_in_place(|| -> Result<ModelProxyConfig, String> {
         let conn = database
             .0
@@ -645,12 +654,13 @@ pub async fn sync_model_proxy_site_channels(
     Ok(updated_config)
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn sync_opencode_site_channels(
-    database: State<'_, Database>,
-    state: State<'_, OpencodeProxyState>,
+    ctx: Managed<'_, Arc<AppContext>>,
+    state: Managed<'_, OpencodeProxyState>,
     site_ids: Option<Vec<String>>,
 ) -> Result<OpencodeProxyConfig, String> {
-    sync_model_proxy_site_channels(database, state, site_ids).await
+    let _database = &*ctx.database;
+    sync_model_proxy_site_channels(ctx, state, site_ids).await
 }
 

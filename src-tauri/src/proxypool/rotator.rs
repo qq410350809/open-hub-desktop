@@ -9,7 +9,6 @@ use rusqlite::{params, OptionalExtension};
 use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
-use tauri::Manager;
 
 pub fn list_prioritized_fast_proxy_nodes(
     database: &Database,
@@ -368,21 +367,21 @@ pub async fn rotate_account_instance_node(
 }
 
 pub fn proxy_url_for_account(
-    app: &tauri::AppHandle,
+    database: &Database,
+    runtime: &ProxyRuntime,
     site_id: &str,
     profile_id: &str,
 ) -> Result<Option<String>, String> {
-    let database = app.state::<Database>();
-    let runtime = app.state::<ProxyRuntime>();
-    if !read_site_uses_proxy_pool(&database, site_id)? {
+    if !read_site_uses_proxy_pool(database, site_id)? {
         return Ok(None);
     }
-    let port = crate::proxypool::runtime::ensure_account_instance(&database, &runtime, profile_id)?;
+    let port = crate::proxypool::runtime::ensure_account_instance(database, runtime, profile_id)?;
     Ok(Some(format!("http://127.0.0.1:{port}")))
 }
 
 pub async fn with_account_proxy<T, F, Fut>(
-    app: &tauri::AppHandle,
+    database: &Database,
+    runtime: &ProxyRuntime,
     site_id: &str,
     profile_id: &str,
     timeout: Duration,
@@ -394,22 +393,20 @@ where
     F: FnMut(reqwest::Client) -> Fut,
     Fut: std::future::Future<Output = Result<T, String>>,
 {
-    let database = app.state::<Database>();
-    let runtime = app.state::<ProxyRuntime>();
-    if !read_site_uses_proxy_pool(&database, site_id)? {
+    if !read_site_uses_proxy_pool(database, site_id)? {
         let client =
-            crate::db::build_http_client_for_site(&database, site_id, timeout, redirects, purpose)?;
+            crate::db::build_http_client_for_site(database, site_id, timeout, redirects, purpose)?;
         return request(client).await;
     }
 
-    let account_port = crate::proxypool::runtime::ensure_account_instance(&database, &runtime, profile_id)?;
+    let account_port = crate::proxypool::runtime::ensure_account_instance(database, runtime, profile_id)?;
     let account_proxy_url = format!("http://127.0.0.1:{account_port}");
     let mut last_error = String::new();
     let mut current_failed_node: Option<String> = None;
 
     for attempt in 0..ACCOUNT_PROXY_MAX_ATTEMPTS {
         let client = build_proxy_client_with_url(
-            &database,
+            database,
             &account_proxy_url,
             timeout,
             redirects,
@@ -424,8 +421,8 @@ where
                 if should_retry {
                     let failed_node = current_failed_node.as_deref().unwrap_or("");
                     match rotate_account_instance_node(
-                        &database,
-                        &runtime,
+                        database,
+                        runtime,
                         profile_id,
                         failed_node,
                         &error,

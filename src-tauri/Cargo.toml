@@ -5,21 +5,50 @@ description = "Local website library built with Tauri"
 authors = ["OpenHub"]
 edition = "2021"
 
+# 两个二进制共存时，cargo run 需要明确默认目标（tauri dev 走桌面形态）。
+default-run = "open-hub-desktop"
+
+# 仅保留 rlib：staticlib/cdylib 只服务于 Tauri 移动端打包（本项目无移动端），
+# 却会让每次 dev 构建多生成 265MB 的 .a 和 .dylib，拖慢收尾的链接/归档步骤。
 [lib]
 name = "open_hub_desktop_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
+crate-type = ["rlib"]
+
+# 双形态构建：
+# - desktop（默认）：Tauri 桌面壳 + 内嵌服务，产物为常规桌面应用
+# - server：无 Tauri 依赖的独立单文件 HTTP 服务（openhub-server）
+[features]
+default = ["desktop"]
+desktop = [
+    "dep:tauri",
+    "dep:tauri-plugin-opener",
+    "dep:font-kit",
+    "dep:rfd",
+    "dep:tauri-build",
+]
+server = []
+
+[[bin]]
+name = "open-hub-desktop"
+path = "src/main.rs"
+required-features = ["desktop"]
+
+[[bin]]
+name = "openhub-server"
+path = "src/bin/server.rs"
+required-features = ["server"]
 
 [build-dependencies]
-tauri-build = { version = "2", features = [] }
+tauri-build = { version = "2", features = [], optional = true }
 
 [dependencies]
-tauri = { version = "2", features = ["protocol-asset"] }
-tauri-plugin-opener = "2"
+tauri = { version = "2", features = ["protocol-asset"], optional = true }
+tauri-plugin-opener = { version = "2", optional = true }
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 url = "2"
-font-kit = "0.14.3"
+font-kit = { version = "0.14.3", optional = true }
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "native-tls", "http2", "stream", "gzip", "deflate", "brotli"] }
 quick-xml = { version = "0.39.4", features = ["serialize"] }
 serde_yaml = "0.9"
@@ -31,15 +60,15 @@ bytes = "1"
 flate2 = "1.0"
 
 percent-encoding = "2"
-libc = "0.2"
+libc = { version = "0.2" }
 maxminddb = "0.30"
-rfd = "0.17"
+rfd = { version = "0.17", optional = true }
 futures-util = "0.3"
 tokio-util = "0.7"
 tokio = { version = "1", features = ["time", "rt", "rt-multi-thread", "macros", "sync", "net", "io-util"] }
 axum = "0.8"
 async-stream = "0.3"
-tower-http = { version = "0.6", features = ["cors"] }
+tower-http = { version = "0.6", features = ["cors", "fs"] }
 zstd = "0.13"
 genai = "0.1"
 tracing = "0.1"

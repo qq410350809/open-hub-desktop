@@ -1,19 +1,18 @@
+use std::sync::Arc;
 use tracing::{error, info};
-use crate::models::Database;
+use crate::context::{spawn, spawn_blocking, AppContext};
 use crate::token::stats::db::collect_token_data;
 use crate::token::stats::types::{local_timestamp, TOKEN_COLLECT_INTERVAL};
-use tauri::{AppHandle, Manager};
 
-pub fn start_token_collector(app: AppHandle) {
-    tauri::async_runtime::spawn(async move {
+pub fn start_token_collector(ctx: Arc<AppContext>) {
+    spawn(async move {
         let mut interval = tokio::time::interval(TOKEN_COLLECT_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
-            let handle = app.clone();
-            let result = tauri::async_runtime::spawn_blocking(move || {
-                let database = handle.state::<Database>();
-                collect_token_data(&database, false, None)
+            let ctx = ctx.clone();
+            let result = spawn_blocking(move || {
+                collect_token_data(&ctx.database, false, Some(&ctx.event_bus))
             })
             .await;
             match result {

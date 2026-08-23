@@ -5,6 +5,7 @@ import { useStore } from "../../composables/useStore";
 import { usePreferences } from "../../composables/usePreferences";
 import { useTheme } from "../../composables/useTheme";
 import { runCommand } from "../../composables/useLibrary";
+import { getSessionToken, setSessionToken } from "../../composables/core/ipc";
 import type { LightweightState, ThemePreference, ProxyNodeViewModePreference } from "../../types";
 
 const store = useStore();
@@ -33,6 +34,23 @@ function onBackdropClick(event: MouseEvent) {
 
 function setProxyNodeViewMode(mode: ProxyNodeViewModePreference) {
   updatePreferences({ proxyNodeViewMode: mode });
+}
+
+const loggingOut = ref(false);
+
+/** 退出登录：注销后端会话并清除本地令牌，回到登录页。 */
+async function logout() {
+  if (loggingOut.value) return;
+  loggingOut.value = true;
+  try {
+    const token = getSessionToken();
+    if (token) {
+      await runCommand("logout", { token }).catch(() => undefined);
+    }
+  } finally {
+    setSessionToken("");
+    window.location.reload();
+  }
 }
 
 const lightweight = ref<LightweightState | null>(null);
@@ -226,6 +244,33 @@ async function enterLightweightMode() {
                     @click="enterLightweightMode"
                   >
                     <span v-html="icons.globe" /><span>启用并进入轻量模式</span>
+                  </button>
+                </div>
+              </div>
+            </section>
+
+            <!-- 账号与登录 -->
+            <section class="settings-section">
+              <div class="settings-section-title">
+                <span v-html="icons.user" />
+                <div>
+                  <h2>账号与登录</h2>
+                  <p>退出当前登录会话，下次访问需要重新输入用户名和密码</p>
+                </div>
+              </div>
+              <div class="settings-rows">
+                <div class="settings-row">
+                  <div>
+                    <strong>退出登录</strong>
+                    <small>清除本机保存的登录令牌，不会影响服务运行与其他已登录设备</small>
+                  </div>
+                  <button
+                    type="button"
+                    class="secondary-button settings-logout-button"
+                    :disabled="loggingOut"
+                    @click="logout"
+                  >
+                    <span v-html="icons.close" /><span>{{ loggingOut ? "正在退出…" : "退出登录" }}</span>
                   </button>
                 </div>
               </div>

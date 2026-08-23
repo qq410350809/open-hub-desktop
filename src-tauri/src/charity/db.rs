@@ -2,7 +2,7 @@ use crate::charity::types::*;
 use crate::models::Database;
 use rusqlite::{params, OptionalExtension};
 use std::collections::HashMap;
-use tauri::{AppHandle, Emitter};
+use crate::context::EventBus;
 
 pub fn load_charity_sources(database: &Database) -> Result<Vec<CharityFeedSource>, String> {
     let connection = database.lock_db();
@@ -138,14 +138,14 @@ pub fn touch_running_charity_sync_log(
 }
 
 pub fn emit_running_progress(
-    app: &AppHandle,
+    bus: &EventBus,
     source: &CharityFeedSource,
     stage: &str,
     message: &str,
     node_name: &str,
 ) {
     emit_charity_progress(
-        app,
+        bus,
         CharitySyncProgress {
             feed_id: source.id.clone(),
             feed_name: source.name.clone(),
@@ -161,12 +161,12 @@ pub fn emit_running_progress(
     );
 }
 
-pub fn emit_charity_progress(app: &AppHandle, progress: CharitySyncProgress) {
-    let _ = app.emit("charity-sync-progress", progress);
+pub fn emit_charity_progress(bus: &EventBus, progress: CharitySyncProgress) {
+    bus.emit("charity-sync-progress", progress);
 }
 
 pub fn finish_charity_sync_log(
-    app: &AppHandle,
+    bus: &EventBus,
     database: &Database,
     log_id: Option<i64>,
     source: &CharityFeedSource,
@@ -183,7 +183,7 @@ pub fn finish_charity_sync_log(
         update_charity_sync_log(database, id, status, message, node_name, duration_ms);
     }
     emit_charity_progress(
-        app,
+        bus,
         CharitySyncProgress {
             feed_id: source.id.clone(),
             feed_name: source.name.clone(),

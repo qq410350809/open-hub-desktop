@@ -3,8 +3,9 @@ use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::PathBuf;
-use tauri::{AppHandle, Emitter, Manager};
+use std::sync::Arc;
 
+use crate::context::{AppContext, Managed};
 use crate::kernel::{download_bytes_with_dynamic_racing, get_app_bin_dir};
 
 const GEOIP_PRIMARY_URL: &str = "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/country.mmdb";
@@ -27,10 +28,9 @@ pub struct GeoipDownloadProgress {
     pub message: String,
 }
 
-pub fn get_app_geoip_path(app: &AppHandle) -> Result<PathBuf, String> {
-    let app_data = app.path().app_data_dir().map_err(|e| e.to_string())?;
-    let _ = fs::create_dir_all(&app_data);
-    Ok(app_data.join("Country.mmdb"))
+pub fn get_app_geoip_path(ctx: &AppContext) -> PathBuf {
+    let _ = fs::create_dir_all(&ctx.data_dir);
+    ctx.geoip_path()
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -43,43 +43,52 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
-#[tauri::command]
-pub async fn get_geoip_status(app: AppHandle) -> Result<GeoipStatus, String> {
-    let target_path = get_app_geoip_path(&app)?;
+fn geoip_status_from_path(target_path: &PathBuf) -> GeoipStatus {
     if target_path.is_file() {
-        if let Ok(meta) = fs::metadata(&target_path) {
+        if let Ok(meta) = fs::metadata(target_path) {
             let size = meta.len();
             let updated_at = meta.modified().ok().map(|st| {
                 let dt: DateTime<Local> = st.into();
                 dt.format("%Y-%m-%d %H:%M").to_string()
             });
 
-            return Ok(GeoipStatus {
+            return GeoipStatus {
                 installed: true,
                 path: target_path.display().to_string(),
                 file_size: size,
                 file_size_formatted: format_bytes(size),
                 updated_at,
-            });
+            };
         }
     }
 
-    Ok(GeoipStatus {
+    GeoipStatus {
         installed: false,
         path: target_path.display().to_string(),
         file_size: 0,
         file_size_formatted: "0 B".to_string(),
         updated_at: None,
-    })
+    }
 }
 
-#[tauri::command]
-pub async fn download_or_update_geoip(
-    app: AppHandle,
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub async fn get_geoip_status(
+    ctx: Managed<'_, Arc<AppContext>>,
+) -> Result<GeoipStatus, String> {
+    Ok(geoip_status_from_path(&get_app_geoip_path(&ctx)))
+}
+
+/// 下载并更新 GeoIP 数据库；完成后基于新库修复已有节点的国家/地区映射。
+/// 桌面端由命令注入托管状态；server 端由 RPC 分发器直接传入。
+pub async fn download_or_update_geoip_inner(
+    ctx: &Arc<AppContext>,
+    database: Option<&crate::models::Database>,
+    proxy_runtime: Option<&crate::proxypool::ProxyRuntime>,
     mirror: Option<String>,
 ) -> Result<GeoipStatus, String> {
+    let bus = ctx.event_bus.clone();
     let emit_progress = |stage: &str, progress: f64, message: &str| {
-        let _ = app.emit(
+        bus.emit(
             "geoip-download-progress",
             GeoipDownloadProgress {
                 stage: stage.to_string(),
@@ -92,13 +101,13 @@ pub async fn download_or_update_geoip(
     emit_progress("checking", 0.05, "正在检测最新 GeoIP 数据库…");
 
     let raw_download_url = GEOIP_PRIMARY_URL;
-    let target_path = get_app_geoip_path(&app)?;
+    let target_path = get_app_geoip_path(ctx);
     let temp_download_path = target_path.with_extension("tmp");
 
     let mmdb_bytes = download_bytes_with_dynamic_racing(
         raw_download_url,
         mirror.as_deref(),
-        &app,
+        &bus,
         "geoip-download-progress",
         "GeoIP 数据库",
     ).await?;
@@ -118,20 +127,24 @@ pub async fn download_or_update_geoip(
     fs::rename(&temp_download_path, &target_path).map_err(|e| format!("保存 GeoIP 数据库失败：{e}"))?;
 
     // 如果 bin 目录存在，也同步备份一份到 bin/ 目录
-    if let Ok(bin_dir) = get_app_bin_dir(&app) {
-        let _ = fs::copy(&target_path, bin_dir.join("Country.mmdb"));
-    }
+    let bin_dir = get_app_bin_dir(ctx);
+    let _ = fs::copy(&target_path, bin_dir.join("Country.mmdb"));
 
     // 自动使用新下载的 GeoIP 数据库重新解析并修复已有节点的国家与地域映射
-    if let (Some(db), Some(runtime)) = (
-        app.try_state::<crate::models::Database>(),
-        app.try_state::<crate::proxypool::ProxyRuntime>(),
-    ) {
-        let _ = crate::proxypool::repair_node_locations_with_geoip(&db, &runtime);
-        let _ = app.emit("proxy-nodes-updated", ());
+    if let (Some(db), Some(runtime)) = (database, proxy_runtime) {
+        let _ = crate::proxypool::repair_node_locations_with_geoip(db, runtime);
+        bus.emit("proxy-nodes-updated", ());
     }
 
     emit_progress("completed", 1.0, "GeoIP 国家地理数据库更新成功！");
 
-    get_geoip_status(app).await
+    Ok(geoip_status_from_path(&target_path))
+}
+
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub async fn download_or_update_geoip(
+    ctx: Managed<'_, Arc<AppContext>>,
+    mirror: Option<String>,
+) -> Result<GeoipStatus, String> {
+    download_or_update_geoip_inner(&ctx, Some(&ctx.database), Some(&ctx.proxy_runtime), mirror).await
 }

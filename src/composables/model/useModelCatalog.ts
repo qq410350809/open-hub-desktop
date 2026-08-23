@@ -1,5 +1,5 @@
 import { ref } from "vue";
-import { listen } from "@tauri-apps/api/event";
+import { listen } from "../core/events";
 import { runCommand, isTauri } from "../core/ipc";
 import { useToast } from "../core/useToast";
 import type {

@@ -4,7 +4,8 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::sync::Arc;
 use std::time::Instant;
-use tauri::AppHandle;
+use crate::context::AppContext;
+use std::sync::Arc as StdArc;
 use tokio::sync::RwLock;
 
 pub const DEFAULT_MODEL_PROXY_PORT: u16 = 8088;
@@ -374,7 +375,8 @@ pub struct ModelProxyContext {
     pub cached_channel_models: Arc<RwLock<Vec<ChannelModelList>>>,
     pub cached_fetch_errors: Arc<RwLock<Vec<ChannelModelFetchError>>>,
     pub default_http_client: Client,
-    pub app_handle: Arc<RwLock<Option<AppHandle>>>,
+    /// 平台无关的应用上下文（桌面与 server 共用）；启动后注入。
+    pub app_ctx: StdArc<RwLock<Option<StdArc<AppContext>>>>,
     pub key_round_robin: Arc<AtomicUsize>,
     pub node_round_robin: Arc<AtomicUsize>,
     /// 上次执行明细保留期清理的时刻（epoch 毫秒），用于节流避免每次写入全表扫描
@@ -388,7 +390,7 @@ pub struct ModelProxyState {
     pub context: ModelProxyContext,
     pub shutdown_sender: Arc<RwLock<Option<tokio::sync::oneshot::Sender<()>>>>,
     /// 正在运行的服务任务句柄，stop 时等待其退出以确保端口真正释放
-    pub server_task: Arc<RwLock<Option<tauri::async_runtime::JoinHandle<()>>>>,
+    pub server_task: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
     pub current_port: Arc<RwLock<u16>>,
 }
 

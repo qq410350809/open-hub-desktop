@@ -5,7 +5,6 @@ use super::types::{
 use serde_json::Value as JsonValue;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
-use tauri::Manager;
 
 pub fn strip_opencode_prefix(model: &str) -> &str {
     model.strip_prefix("opencode/").unwrap_or(model)
@@ -199,8 +198,8 @@ pub async fn get_sorted_egress_candidates(
         candidates.push("__direct__".to_string());
     }
 
-    if let Some(app) = ctx.app_handle.read().await.as_ref() {
-        let database = app.state::<crate::models::Database>();
+    if let Some(ctx) = ctx.app_ctx.read().await.as_ref() {
+        let database = &ctx.database;
         let nodes: Vec<String> = {
             match database.0.lock() {
                 Ok(conn) => {
@@ -243,9 +242,9 @@ pub async fn build_client_for_candidate(
         return ctx.default_http_client.clone();
     }
 
-    if let Some(app) = ctx.app_handle.read().await.as_ref() {
-        let database = app.state::<crate::models::Database>();
-        let runtime = app.state::<crate::proxypool::ProxyRuntime>();
+    if let Some(ctx) = ctx.app_ctx.read().await.as_ref() {
+        let database = &ctx.database;
+        let runtime = &ctx.proxy_runtime;
 
         if let Err(e) =
             crate::proxypool::select_proxy_node_transient(&database, &runtime, candidate).await
@@ -275,8 +274,8 @@ pub async fn get_node_display_name(ctx: &ModelProxyContext, candidate: &str) -> 
         return "直连通道".to_string();
     }
 
-    if let Some(app) = ctx.app_handle.read().await.as_ref() {
-        let database = app.state::<crate::models::Database>();
+    if let Some(ctx) = ctx.app_ctx.read().await.as_ref() {
+        let database = &ctx.database;
         let name_opt: Option<String> = {
             match database.0.lock() {
                 Ok(conn) => {

@@ -1,10 +1,43 @@
 # OpenHub
 
-使用 Tauri 2 + Vue 3 + SQLite 构建的本地站点资料库桌面应用。
+使用 Tauri 2 + Vue 3 + SQLite 构建的本地站点资料库，支持「桌面壳」与「单文件 Web 服务」双形态。
 
 ## 产品定位
 
-这不是线上网站套壳，也不是远程服务状态导航。应用启动后直接进入本地资料库，站点记录只保存在当前设备。
+这不是线上网站套壳，也不是远程服务状态导航。应用启动后直接进入本地资料库，站点记录只保存在当前设备（或你自托管的服务上）。
+
+## 双形态架构
+
+```
+┌────────────────────────────────────────────┐
+│ 壳（Tauri 桌面）                            │
+│ 窗口/托盘/菜单 → 加载内嵌 HTTP 服务           │
+└──────────────┬─────────────────────────────┘
+               │ RPC + SSE（与浏览器完全同构）
+┌──────────────▼─────────────────────────────┐
+│ openhub-server 单文件跨平台服务              │
+│  /            静态 dist + SPA fallback      │
+│  /api/rpc     全量命令（与桌面 IPC 同名）     │
+│  /api/events  SSE 事件总线                   │
+│  /api/caps    能力协商（本机功能自动降级）     │
+│  /v1/*        模型网关反代                   │
+└────────────────────────────────────────────┘
+```
+
+- **桌面形态**（默认）：`npm run desktop:build`，体验与常规桌面应用一致；
+- **服务形态**：`cargo build --no-default-features --features server`，
+  产物 `target/release/openhub-server` 为无窗口依赖的单二进制，
+  可部署到本机、NAS 或 VPS：
+
+```bash
+openhub-server --listen 17896                       # 本机回环，无鉴权
+openhub-server --host-all --listen 17896 --token <t> # 对外服务（务必配令牌）
+openhub-server --data-dir ~/openhub-data --help      # 查看全部参数
+```
+
+浏览器访问 `http://<host>:<port>/?token=<t>` 即可使用完整界面。
+Chrome 会话同步、Token 本地日志解析等「依赖用户本机文件」的能力，
+会按 `/api/caps` 探测结果自动降级隐藏。
 
 ## 核心功能
 

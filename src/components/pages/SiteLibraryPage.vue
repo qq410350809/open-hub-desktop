@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { capabilities } from "../../composables/core/capabilities";
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { icons } from "../../icons";
 import { formatDate, formatRateLimit, logoText } from "../../utils";
@@ -740,6 +741,7 @@ onUnmounted(() => {
           </div>
 
           <button
+            v-if="capabilities.chromeSync"
             type="button"
             class="sl-btn-secondary"
             :disabled="store.syncingSites.value || store.syncingModelKeys.value"

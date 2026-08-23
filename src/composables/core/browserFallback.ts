@@ -705,5 +705,11 @@ export async function browserFallback<T>(
       todayTotalTokens: sum((l) => l.totalTokens),
     } as T;
   }
+  // 登录相关：纯静态预览（无内核）不设门禁。
+  if (command === "get_login_state") {
+    return { required: false, authenticated: true, username: "" } as T;
+  }
+  if (command === "login") return "static-preview-session" as T;
+  if (command === "logout") return null as T;
   throw new Error(`Unsupported command: ${command}`);
 }

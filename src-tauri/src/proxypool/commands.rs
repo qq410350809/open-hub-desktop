@@ -16,29 +16,29 @@ use crate::proxypool::tester::{
     test_controller_proxy_delay,
 };
 use crate::proxypool::types::*;
+use crate::context::{AppContext, EventBus, Managed};
 use rusqlite::{params, OptionalExtension};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tauri::{AppHandle, Emitter, State};
 use url::Url;
 
-#[tauri::command]
-pub fn get_proxy_pool_state(
-    database: State<'_, Database>,
-    runtime: State<'_, ProxyRuntime>,
-) -> Result<ProxyPoolState, String> {
-    load_state(&database, &runtime)
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub fn get_proxy_pool_state(ctx: Managed<'_, Arc<AppContext>>) -> Result<ProxyPoolState, String> {
+    let database = &*ctx.database;
+    let runtime = &*ctx.proxy_runtime;
+    load_state(database, runtime)
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn save_proxy_subscription(
-    database: State<'_, Database>,
+    ctx: Managed<'_, Arc<AppContext>>,
     id: Option<String>,
     name: String,
     url: String,
 ) -> Result<ProxySubscription, String> {
-    let name = name.trim();
+    let database = &*ctx.database;    let name = name.trim();
     if name.is_empty() {
         return Err("请输入名称".into());
     }
@@ -55,12 +55,13 @@ pub fn save_proxy_subscription(
     connection.query_row("SELECT id, name, url, node_count, last_error, created_at, updated_at FROM proxy_subscriptions WHERE id = ?1", [&id], row_subscription).map_err(|error| error.to_string())
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn delete_proxy_subscription(
-    database: State<'_, Database>,
-    runtime: State<'_, ProxyRuntime>,
+    ctx: Managed<'_, Arc<AppContext>>,
     id: String,
 ) -> Result<ProxyPoolState, String> {
+    let database = &*ctx.database;
+    let runtime = &*ctx.proxy_runtime;
     let mut connection = database.lock_conn()?;
     let transaction = connection
         .transaction()
@@ -101,13 +102,14 @@ pub fn delete_proxy_subscription(
     load_state(&database, &runtime)
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn refresh_proxy_subscription(
-    app: AppHandle,
-    database: State<'_, Database>,
-    runtime: State<'_, ProxyRuntime>,
+    ctx: Managed<'_, Arc<AppContext>>,
     id: String,
 ) -> Result<ProxyPoolRefreshResult, String> {
+    let database = &*ctx.database;
+    let runtime = &*ctx.proxy_runtime;
+    let bus: EventBus = ctx.event_bus.clone();
     let emit_progress = |stage: &str,
                          status: &str,
                          message: String,
@@ -115,7 +117,7 @@ pub async fn refresh_proxy_subscription(
                          total: usize,
                          added: usize,
                          discarded: usize| {
-        let _ = app.emit(
+        bus.emit(
             "proxy-source-progress",
             ProxySourceProgress {
                 source_id: id.clone(),
@@ -374,12 +376,13 @@ pub async fn refresh_proxy_subscription(
     })
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn set_proxy_pool_settings(
-    database: State<'_, Database>,
-    runtime: State<'_, ProxyRuntime>,
+    ctx: Managed<'_, Arc<AppContext>>,
     ignore_addresses: String,
 ) -> Result<ProxyPoolState, String> {
+    let database = &*ctx.database;
+    let runtime = &*ctx.proxy_runtime;
     let ignore = normalize_ignore_addresses(&ignore_addresses);
     let connection = database.lock_conn()?;
     write_meta(&connection, PROXY_IGNORE_KEY, &ignore)?;
@@ -387,13 +390,14 @@ pub fn set_proxy_pool_settings(
     load_state(&database, &runtime)
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn save_proxy_channel(
-    database: State<'_, Database>,
-    runtime: State<'_, ProxyRuntime>,
+    ctx: Managed<'_, Arc<AppContext>>,
     id: Option<String>,
     name: String,
 ) -> Result<ProxyPoolState, String> {
+    let database = &*ctx.database;
+    let runtime = &*ctx.proxy_runtime;
     let name = name.trim();
     if name.is_empty() {
         return Err("请输入通道名称".into());
@@ -418,12 +422,13 @@ pub fn save_proxy_channel(
     load_state(&database, &runtime)
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn delete_proxy_channel(
-    database: State<'_, Database>,
-    runtime: State<'_, ProxyRuntime>,
+    ctx: Managed<'_, Arc<AppContext>>,
     id: String,
 ) -> Result<ProxyPoolState, String> {
+    let database = &*ctx.database;
+    let runtime = &*ctx.proxy_runtime;
     let id = id.trim();
     if id == DEFAULT_PROXY_CHANNEL_ID {
         return Err("默认通道不能删除".into());
@@ -454,13 +459,14 @@ pub fn delete_proxy_channel(
     load_state(&database, &runtime)
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn set_proxy_channel_node(
-    database: State<'_, Database>,
-    runtime: State<'_, ProxyRuntime>,
+    ctx: Managed<'_, Arc<AppContext>>,
     channel_id: String,
     node_id: String,
 ) -> Result<ProxyPoolState, String> {
+    let database = &*ctx.database;
+    let runtime = &*ctx.proxy_runtime;
     let channel_id = channel_id.trim();
     let node_id = node_id.trim();
     if channel_id.is_empty() || node_id.is_empty() {
@@ -471,13 +477,14 @@ pub async fn set_proxy_channel_node(
     load_state(&database, &runtime)
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn assign_account_proxy_channel(
-    database: State<'_, Database>,
-    runtime: State<'_, ProxyRuntime>,
+    ctx: Managed<'_, Arc<AppContext>>,
     profile_id: String,
     channel_id: String,
 ) -> Result<ProxyPoolState, String> {
+    let database = &*ctx.database;
+    let runtime = &*ctx.proxy_runtime;
     let profile_id = profile_id.trim();
     let channel_id = channel_id.trim();
     if profile_id.is_empty() || channel_id.is_empty() {
@@ -514,12 +521,13 @@ pub fn assign_account_proxy_channel(
     load_state(&database, &runtime)
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn unassign_account_proxy_channel(
-    database: State<'_, Database>,
-    runtime: State<'_, ProxyRuntime>,
+    ctx: Managed<'_, Arc<AppContext>>,
     profile_id: String,
 ) -> Result<ProxyPoolState, String> {
+    let database = &*ctx.database;
+    let runtime = &*ctx.proxy_runtime;
     let profile_id = profile_id.trim();
     if profile_id.is_empty() {
         return Err("账号标识为空".into());
@@ -535,14 +543,15 @@ pub fn unassign_account_proxy_channel(
     load_state(&database, &runtime)
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn test_proxy_channel_nodes(
-    app: AppHandle,
-    database: State<'_, Database>,
-    runtime: State<'_, ProxyRuntime>,
+    ctx: Managed<'_, Arc<AppContext>>,
     channel_id: Option<String>,
     node_ids: Option<Vec<String>>,
 ) -> Result<ProxyPoolState, String> {
+    let database = &*ctx.database;
+    let runtime = &*ctx.proxy_runtime;
+    let bus = ctx.event_bus.clone();
     let _ = channel_id;
     let requested = if let Some(ids) = node_ids.filter(|list| !list.is_empty()) {
         ids.into_iter().filter(|id| !id.trim().is_empty()).collect::<HashSet<_>>()
@@ -566,23 +575,24 @@ pub async fn test_proxy_channel_nodes(
     }
 
     run_proxy_node_pool(
-        &app,
-        &database,
-        &runtime,
+        &bus,
+        database,
+        runtime,
         Some(requested),
         Some(CHANNEL_SPEED_TEST_URL.to_string()),
         true,
     )
     .await?;
-    load_state(&database, &runtime)
+    load_state(database, runtime)
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn set_active_proxy_node(
-    database: State<'_, Database>,
-    runtime: State<'_, ProxyRuntime>,
+    ctx: Managed<'_, Arc<AppContext>>,
     node_id: String,
 ) -> Result<ProxyPoolState, String> {
+    let database = &*ctx.database;
+    let runtime = &*ctx.proxy_runtime;
     let runtime_name = {
         let connection = database.lock_conn()?;
         connection
@@ -607,11 +617,12 @@ pub async fn set_active_proxy_node(
     load_state(&database, &runtime)
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn clear_active_proxy_node(
-    database: State<'_, Database>,
-    runtime: State<'_, ProxyRuntime>,
+    ctx: Managed<'_, Arc<AppContext>>,
 ) -> Result<ProxyPoolState, String> {
+    let database = &*ctx.database;
+    let runtime = &*ctx.proxy_runtime;
     let connection = database.lock_conn()?;
     write_meta(&connection, ACTIVE_PROXY_NODE_KEY, "")?;
     write_meta(&connection, NETWORK_PROXY_KEY, "")?;
@@ -619,11 +630,12 @@ pub fn clear_active_proxy_node(
     load_state(&database, &runtime)
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn delete_invalid_proxy_nodes(
-    database: State<'_, Database>,
-    runtime: State<'_, ProxyRuntime>,
+    ctx: Managed<'_, Arc<AppContext>>,
 ) -> Result<ProxyPoolState, String> {
+    let database = &*ctx.database;
+    let runtime = &*ctx.proxy_runtime;
     let connection = database.lock_conn()?;
     connection
         .execute(
@@ -638,12 +650,13 @@ pub fn delete_invalid_proxy_nodes(
     load_state(&database, &runtime)
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn test_proxy_node(
-    database: State<'_, Database>,
-    runtime: State<'_, ProxyRuntime>,
+    ctx: Managed<'_, Arc<AppContext>>,
     node_id: String,
 ) -> Result<ProxyNode, String> {
+    let database = &*ctx.database;
+    let runtime = &*ctx.proxy_runtime;
     let test_id = runtime.next_test_id.fetch_add(1, Ordering::Relaxed);
     let test_directory = runtime.directory.join(format!("single-test-{test_id}"));
     let _test_directory_cleanup = TemporaryRuntimeDirectory(test_directory.clone());
@@ -724,8 +737,9 @@ pub async fn test_proxy_node(
     }
 }
 
-#[tauri::command]
-pub fn cancel_proxy_node_tests(runtime: State<'_, ProxyRuntime>) -> Result<bool, String> {
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub fn cancel_proxy_node_tests(ctx: Managed<'_, Arc<AppContext>>) -> Result<bool, String> {
+    let runtime = &*ctx.proxy_runtime;
     match runtime.cancel_proxy_test() {
         Ok(v) => Ok(v),
         Err(error) => {
@@ -735,20 +749,17 @@ pub fn cancel_proxy_node_tests(runtime: State<'_, ProxyRuntime>) -> Result<bool,
     }
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn test_all_proxy_nodes(
-    app: AppHandle,
-    database: State<'_, Database>,
-    runtime: State<'_, ProxyRuntime>,
+    ctx: Managed<'_, Arc<AppContext>>,
 ) -> Result<ProxyPoolState, String> {
-    run_proxy_node_pool(&app, &database, &runtime, None, None, false).await
+    let bus = ctx.event_bus.clone();
+    run_proxy_node_pool(&bus, &ctx.database, &ctx.proxy_runtime, None, None, false).await
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn test_proxy_nodes(
-    app: AppHandle,
-    database: State<'_, Database>,
-    runtime: State<'_, ProxyRuntime>,
+    ctx: Managed<'_, Arc<AppContext>>,
     node_ids: Vec<String>,
 ) -> Result<ProxyPoolState, String> {
     let requested = node_ids
@@ -758,14 +769,16 @@ pub async fn test_proxy_nodes(
     if requested.is_empty() {
         return Err("请选择需要测速的节点".into());
     }
-    run_proxy_node_pool(&app, &database, &runtime, Some(requested), None, false).await
+    let bus = ctx.event_bus.clone();
+    run_proxy_node_pool(&bus, &ctx.database, &ctx.proxy_runtime, Some(requested), None, false).await
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn analyze_proxy_nodes(
-    database: State<'_, Database>,
-    runtime: State<'_, ProxyRuntime>,
+    ctx: Managed<'_, Arc<AppContext>>,
 ) -> Result<ProxyIpAnalysis, String> {
+    let database = &*ctx.database;
+    let runtime = &*ctx.proxy_runtime;
     let state = load_state(&database, &runtime)?;
     let geoip_path = find_geoip_database(&runtime);
     let geoip_reader = open_geoip_reader(&runtime);

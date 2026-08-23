@@ -9,21 +9,29 @@ use serde::{Deserialize, Serialize};
 use serde_json;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tauri::{Manager, State};
+use crate::context::{home_dir, spawn_blocking, AppContext, Managed};
+use std::sync::Arc;
 use url::Url;
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn get_system_fonts() -> Vec<String> {
-    let mut fonts = Vec::new();
-    let source = font_kit::source::SystemSource::new();
-    if let Ok(families) = source.all_families() {
-        for family in families {
-            fonts.push(family);
+    #[cfg(feature = "desktop")]
+    {
+        let mut fonts = Vec::new();
+        let source = font_kit::source::SystemSource::new();
+        if let Ok(families) = source.all_families() {
+            for family in families {
+                fonts.push(family);
+            }
         }
+        fonts.sort();
+        fonts.dedup();
+        fonts
     }
-    fonts.sort();
-    fonts.dedup();
-    fonts
+    #[cfg(not(feature = "desktop"))]
+    {
+        Vec::new()
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -660,22 +668,24 @@ pub(crate) fn save_site_model_cache(
     Ok(())
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn clear_site_model_cache_for_site(
-    database: State<'_, Database>,
+    ctx: Managed<'_, Arc<AppContext>>,
     site_id: String,
 ) -> Result<(), String> {
+    let database = &*ctx.database;
     clear_site_model_cache(&database, &site_id)
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn save_site_model_cache_for_account(
-    database: State<'_, Database>,
+    ctx: Managed<'_, Arc<AppContext>>,
     site_id: String,
     account: SiteModelCacheAccount,
     result: Option<SiteModelsResult>,
     preserve_keys: Option<bool>,
 ) -> Result<(), String> {
+    let database = &*ctx.database;
     save_site_model_cache(
         &database,
         &site_id,
@@ -685,11 +695,12 @@ pub fn save_site_model_cache_for_account(
     )
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn get_site_model_cache(
-    database: State<'_, Database>,
+    ctx: Managed<'_, Arc<AppContext>>,
     site_id: String,
 ) -> Result<SiteModelCache, String> {
+    let database = &*ctx.database;
     let connection = database.lock_conn()?;
     let mut statement = connection
         .prepare(
@@ -742,10 +753,11 @@ pub fn get_site_model_cache(
 
 /// 一次读出全部站点的模型缓存（模型聚合页数据源）。
 /// 与 get_site_model_cache 相同的行解析逻辑，但按 site_id 分组返回所有站点。
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn get_all_site_model_caches(
-    database: State<'_, Database>,
+    ctx: Managed<'_, Arc<AppContext>>,
 ) -> Result<Vec<SiteModelCacheEntry>, String> {
+    let database = &*ctx.database;
     let connection = database.lock_conn()?;
     let mut statement = connection
         .prepare(
@@ -820,39 +832,38 @@ pub fn get_all_site_model_caches(
 /// 单个站点 / 账号同步的硬性总超时：超过即强制失败。
 const SITE_SYNC_TIMEOUT: Duration = Duration::from_secs(60);
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn fetch_site_models_json(
-    app: tauri::AppHandle,
-    database: State<'_, Database>,
+    ctx: Managed<'_, Arc<AppContext>>,
     url: String,
     site_id: Option<String>,
     profile_id: Option<String>,
 ) -> Result<SiteModelsResult, String> {
+    let database = &*ctx.database;
     tokio::time::timeout(
         SITE_SYNC_TIMEOUT,
-        fetch_site_models_json_impl(&app, &*database, url, site_id, profile_id),
+        fetch_site_models_json_impl(&ctx, database, url, site_id, profile_id),
     )
     .await
     .map_err(|_| "站点模型同步超过 60 秒，已强制终止".to_string())?
 }
 
-async fn fetch_site_models_json_impl(
-    app: &tauri::AppHandle,
-    database: &Database,
+async fn fetch_site_models_json_impl<'a>(
+    ctx: &'a Arc<AppContext>,
+    database: &'a Database,
     url: String,
     site_id: Option<String>,
     profile_id: Option<String>,
 ) -> Result<SiteModelsResult, String> {
     let Some(site_id) = site_id.clone() else {
         let client = build_http_client(database, Duration::from_secs(6), 3, "站点模型请求")?;
-        return fetch_site_models_json_inner(app, database, url, None, profile_id, client).await;
+        return fetch_site_models_json_inner(ctx, database, url, None, profile_id, client).await;
     };
     let profile_key = profile_id.clone().unwrap_or_default();
-    let app_ref = app;
-    let database_ref = database;
     let site_id_for_closure = site_id.clone();
     proxypool::with_account_proxy(
-        app_ref,
+        database,
+        &ctx.proxy_runtime,
         &site_id,
         &profile_key,
         Duration::from_secs(6),
@@ -862,12 +873,10 @@ async fn fetch_site_models_json_impl(
             let url = url.clone();
             let site_id = site_id_for_closure.clone();
             let profile_id = profile_id.clone();
-            let app_ref = app_ref;
-            let database_ref = database_ref;
             async move {
                 fetch_site_models_json_inner(
-                    app_ref,
-                    database_ref,
+                    ctx,
+                    database,
                     url,
                     Some(site_id),
                     profile_id,
@@ -881,7 +890,7 @@ async fn fetch_site_models_json_impl(
 }
 
 async fn fetch_site_models_json_inner(
-    app: &tauri::AppHandle,
+    _ctx: &Arc<AppContext>,
     database: &Database,
     url: String,
     site_id: Option<String>,
@@ -947,10 +956,7 @@ async fn fetch_site_models_json_inner(
     if let Some(requested_profile_id) = requested_profile_id.as_deref() {
         profile_ids.retain(|candidate| candidate == requested_profile_id);
     }
-    let home_dir = app
-        .path()
-        .home_dir()
-        .map_err(|error| format!("无法定位用户目录：{error}"))?;
+    let home_dir = home_dir().ok_or("无法定位用户目录")?;
     let origin = base_url.origin().ascii_serialization();
     let local_targets = site_id
         .as_ref()
@@ -969,7 +975,7 @@ async fn fetch_site_models_json_inner(
         Vec::new()
     } else {
         let local_home = home_dir.clone();
-        tauri::async_runtime::spawn_blocking(move || {
+        spawn_blocking(move || {
             sync::read_local_storage_from_home(&local_home, &local_targets)
         })
         .await
@@ -1034,7 +1040,7 @@ async fn fetch_site_models_json_inner(
                     let cookie_home = home_dir.clone();
                     let cookie_target = token_url.to_string();
                     let cookie_profile = profile_id.clone();
-                    let cookie_header_result = tauri::async_runtime::spawn_blocking(move || {
+                    let cookie_header_result = spawn_blocking(move || {
                         sync::read_chrome_cookie_header_from_home(
                             &cookie_home,
                             &cookie_target,

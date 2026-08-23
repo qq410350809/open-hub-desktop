@@ -1,18 +1,20 @@
+use crate::context::{AppContext, EventBus, Managed};
 use crate::db::*;
 use crate::models::*;
 use crate::site::library::*;
 use rusqlite::params;
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::Duration;
-use tauri::State;
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn detect_site_system_types(
-    app: tauri::AppHandle,
-    database: State<'_, Database>,
+    ctx: Managed<'_, Arc<AppContext>>,
     site_ids: Vec<String>,
     run_id: u64,
 ) -> Result<usize, String> {
+    let database = &*ctx.database;
+    let bus: EventBus = ctx.event_bus.clone();
     let site_ids = site_ids.into_iter().collect::<HashSet<_>>();
     if site_ids.is_empty() {
         return Ok(0);
@@ -46,18 +48,18 @@ pub async fn detect_site_system_types(
         targets
     };
     emit_sync_progress(
-        &app,
+        &bus,
         run_id,
         "detect",
         "running",
         format!("已转入后台，并发检测 {} 个站点类型", targets.len()),
     );
-    let client = build_http_client(&database, Duration::from_secs(8), 3, "站点类型探测")?;
+    let client = build_http_client(database, Duration::from_secs(8), 3, "站点类型探测")?;
     let target_site_ids = targets
         .iter()
         .map(|(site_id, _)| site_id.clone())
         .collect::<HashSet<_>>();
-    let profile_ids = cached_profile_ids_for_sites(&database, &target_site_ids)?;
+    let profile_ids = cached_profile_ids_for_sites(database, &target_site_ids)?;
     let detected = probe_site_system_types(&client, targets, profile_ids).await;
     let detected_count = detected.len();
     let mut connection = database.lock_conn()?;
@@ -74,7 +76,7 @@ pub async fn detect_site_system_types(
     }
     transaction.commit().map_err(|error| error.to_string())?;
     emit_sync_progress(
-        &app,
+        &bus,
         run_id,
         "detect",
         "success",

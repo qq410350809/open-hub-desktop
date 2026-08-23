@@ -1,11 +1,16 @@
 pub(crate) mod charity;
 pub(crate) mod core;
-pub(crate) mod kernel;
+pub mod kernel;
 pub(crate) mod model;
-pub(crate) mod proxypool;
+pub mod proxypool;
 pub(crate) mod site;
-pub(crate) mod token;
+pub mod token;
 
+// context 经由 core 全局再导出；此处显式提升为公开，供 server 二进制使用。
+#[cfg(not(feature = "desktop"))]
+pub use core::context;
+#[cfg(feature = "desktop")]
+pub(crate) use core::context;
 pub(crate) use core::*;
 #[allow(unused_imports)]
 pub(crate) use kernel::*;
@@ -20,16 +25,47 @@ pub(crate) use crate::site::library::*;
 #[allow(unused_imports)]
 pub(crate) use crate::site::sync::*;
 
+#[cfg(feature = "desktop")]
 pub use core::app_menu;
 
 #[cfg(test)]
 mod tests;
 
-use tracing::{error, info, warn};
 use std::fs;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+#[cfg(feature = "desktop")]
 use tauri::Manager;
 
+#[cfg(feature = "desktop")]
+use tracing::{error, info, warn};
 
+#[cfg(feature = "desktop")]
+use crate::context::{AppContext, EventBus};
+
+/// 解析前端静态资源目录：开发调试优先仓库 dist；打包后读安装包资源目录。
+#[cfg(feature = "desktop")]
+fn resolve_dist_dir(app: &tauri::AppHandle) -> PathBuf {
+    let repo_dist = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../dist");
+    if cfg!(debug_assertions) && repo_dist.join("index.html").is_file() {
+        return repo_dist;
+    }
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(resource_dir) = app.path().resource_dir() {
+        candidates.push(resource_dir.join("dist"));
+        candidates.push(resource_dir);
+    }
+    candidates.push(repo_dist.clone());
+    for candidate in candidates {
+        if candidate.is_dir() && candidate.join("index.html").is_file() {
+            return candidate;
+        }
+    }
+    repo_dist
+}
+
+#[cfg(feature = "desktop")]
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // 统一日志：本地时间 + 级别 + 模块定位，支持 RUST_LOG 环境变量过滤（默认 info）
@@ -70,18 +106,10 @@ pub fn run() {
                     info!("[OpenHub] 菜单 file-refresh 触发");
                     let handle = app_handle.clone();
                     tauri::async_runtime::spawn(async move {
-                        let database = handle.state::<crate::models::Database>();
-                        let monitor =
-                            handle.state::<crate::charity::CharityMonitorRuntime>();
-                        match crate::charity::refresh_all_charity_feeds(database, monitor)
-                            .await
-                        {
-                            Ok(_) => {
-                                info!("[OpenHub] 全量刷新已提交");
-                            }
-                            Err(err) => {
-                                error!("[OpenHub] 全量刷新失败：{err}");
-                            }
+                        let ctx = handle.state::<Arc<AppContext>>();
+                        match crate::charity::commands::refresh_all_charity_feeds_impl(&ctx).await {
+                            Ok(_) => info!("[OpenHub] 全量刷新已提交"),
+                            Err(err) => error!("[OpenHub] 全量刷新失败：{err}"),
                         }
                         let _ = tauri::Emitter::emit(&handle, "menu-refresh-requested", ());
                     });
@@ -95,45 +123,73 @@ pub fn run() {
             fs::create_dir_all(&app_data_dir)?;
             // 先关掉旧实例，再开数据库/绑端口，避免端口顺延导致浏览器指向旧实例。
             single_instance::claim(&app_data_dir);
-            let database = Database::open(&app_data_dir.join("sites.sqlite3"))
-                .map_err(std::io::Error::other)?;
+
+            // —— 构建统一运行时上下文 ——
+            let database =
+                Arc::new(crate::models::Database::open(&app_data_dir.join("sites.sqlite3"))
+                    .map_err(std::io::Error::other)?);
             // 升级阶段先把现有采集缓存迁入 SQLite，页面首次查询即可得到完整快照。
             if let Err(error) = token::stats::seed_token_database_from_caches(&database) {
                 error!("[OpenHub] Token 缓存迁移到数据库失败：{error}");
             }
-            // 首次启动时若 AppData 尚无文件，先秒级释放安装包自带的内置基础版内核与 GeoIP 数据库
-            if let Err(e) = crate::kernel::ensure_bundled_assets_installed(app.handle()) {
-                warn!("[OpenHub] 释放内置资源提示：{e}");
-            }
-            let proxy_runtime = proxypool::ProxyRuntime::new(app_data_dir.join("proxy-runtime"));
-            let charity_runtime = charity::CharityMonitorRuntime::new();
-            let model_catalog_runtime = crate::model::catalog::ModelCatalogRuntime::new();
-            let model_proxy_state =
-                crate::model::gateway::ModelProxyState::new_with_app(Some(app.handle().clone()));
-            app.manage(database);
-            app.manage(proxy_runtime);
-            app.manage(charity_runtime);
-            app.manage(model_catalog_runtime);
-            app.manage(model_proxy_state);
+            let proxy_runtime =
+                Arc::new(proxypool::ProxyRuntime::new(app_data_dir.join("proxy-runtime")));
+            let charity_runtime = Arc::new(charity::CharityMonitorRuntime::new());
+            let model_catalog_runtime =
+                Arc::new(crate::model::catalog::ModelCatalogRuntime::new());
+            let event_bus = EventBus::new();
+            event_bus.attach_app(app.handle().clone());
+            let resource_dir = app.path().resource_dir().ok();
+            let ctx = Arc::new(AppContext {
+                database,
+                proxy_runtime,
+                charity_runtime,
+                model_catalog_runtime,
+                event_bus,
+                data_dir: app_data_dir.clone(),
+                resource_dir,
+                capabilities: crate::context::Capabilities::detect(),
+                login: crate::context::LoginManager::from_env(),
+            });
+
+            // —— 模型网关状态：独立管理（命令注入），启动时挂接上下文 ——
+            let gateway_state = crate::model::gateway::ModelProxyState::new();
+            crate::context::block_on(gateway_state.attach_ctx(ctx.clone()));
+
+            app.manage(ctx.clone());
+            app.manage(gateway_state);
+
             // 启动时清理历史订阅里遗留的测速结果后缀，避免旧库节点名继续显示脏数据。
-            if let Err(error) =
-                proxypool::repair_stored_node_names(&app.state::<crate::models::Database>())
-            {
+            if let Err(error) = proxypool::repair_stored_node_names(&ctx.database) {
                 warn!("[OpenHub] 修复代理节点名称失败：{error}");
             }
+            // 首次启动时若 AppData 尚无文件，先秒级释放安装包自带的内置基础版内核与 GeoIP 数据库
+            if let Err(e) = crate::kernel::ensure_bundled_assets_installed(&ctx) {
+                warn!("[OpenHub] 释放内置资源提示：{e}");
+            }
             // Token 采集与页面查询完全解耦：后台每 20 秒增量入库。
-            token::stats::start_token_collector(app.handle().clone());
+            token::stats::start_token_collector(ctx.clone());
 
-            // 轻量模式：常驻本地 HTTP 服务（浏览器访问内核）。
-            let web_server = match web_server::start(app.handle().clone()) {
-                Ok(handle) => handle,
-                Err(error) => {
-                    error!("OpenHub 轻量模式服务启动失败：{error}");
-                    web_server::WebServerHandle::disabled()
+            // —— 内嵌 HTTP 服务：浏览器访问同一内核（轻量模式 / 套壳数据源）——
+            let shared = web_server::ServerShared::new(
+                ctx.clone(),
+                resolve_dist_dir(app.handle()),
+                web_server::generate_token(),
+                app.handle().clone(),
+            );
+            app.manage(shared.clone());
+            match web_server::bind_listener(web_server::DEFAULT_PORT, false) {
+                Ok(listener) => {
+                    let shared_for_serve = shared.clone();
+                    tauri::async_runtime::spawn(async move {
+                        if let Err(error) = web_server::serve(shared_for_serve, listener).await {
+                            error!("[OpenHub] 内嵌 HTTP 服务退出：{error}");
+                        }
+                    });
                 }
-            };
-            app.manage(web_server);
-            web_server::apply_startup_lightweight_mode(app.handle());
+                Err(error) => error!("[OpenHub] 内嵌 HTTP 服务启动失败：{error}"),
+            }
+            web_server::apply_startup_lightweight_mode(&shared);
 
             // 启动阶段禁止阻塞 UI 线程：
             // 1) 恢复代理在后台
@@ -142,15 +198,14 @@ pub fn run() {
             // 前端启动后调用 sync_model_catalog(false)：后端以本地日期判断当天是否已同步；
             // 页面保持打开跨过午夜时，前端计时器会再次调用同一命令。
 
+            let restore_ctx = ctx.clone();
             let restore_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 let result = tauri::async_runtime::spawn_blocking({
-                    let restore_handle = restore_handle.clone();
+                    let restore_ctx = restore_ctx.clone();
                     move || {
-                        let database = restore_handle.state::<crate::models::Database>();
-                        let runtime = restore_handle.state::<crate::proxypool::ProxyRuntime>();
-                        proxypool::restore_saved_proxy(&database, &runtime);
+                        proxypool::restore_saved_proxy(&restore_ctx.database, &restore_ctx.proxy_runtime);
                     }
                 })
                 .await;
@@ -160,18 +215,20 @@ pub fn run() {
                 // 代理恢复后再启动公益监听，避免启动瞬间抢锁/抢内核。
                 // 前端 onMounted 会 request_charity_round，循环启动后立刻消费 force。
                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                charity::start_charity_monitor(restore_handle.clone());
+                charity::start_charity_monitor(restore_ctx.clone());
 
                 // 启动模型网关 (Model Proxy) 独立反代服务
-                let database = restore_handle.state::<crate::models::Database>();
-                let proxy_state = restore_handle.state::<crate::model::gateway::ModelProxyState>();
+                let gw = restore_handle.state::<crate::model::gateway::ModelProxyState>();
                 let proxy_cfg = {
-                    let conn = database.0.lock().ok();
-                    conn.map(|c| crate::model::gateway::load_model_proxy_config(&c)).unwrap_or_default()
+                    let conn = restore_ctx.database.0.lock().ok();
+                    conn.map(|c| crate::model::gateway::load_model_proxy_config(&c))
+                        .unwrap_or_default()
                 };
-                *proxy_state.context.config.write().await = proxy_cfg.clone();
+                *gw.context.config.write().await = proxy_cfg.clone();
                 if proxy_cfg.enabled {
-                    if let Err(e) = crate::model::gateway::start_model_proxy_server(&proxy_state).await {
+                    if let Err(e) =
+                        crate::model::gateway::start_model_proxy_server(&gw).await
+                    {
                         error!("[OpenHub] 模型网关服务启动失败: {e}");
                     }
                 }
@@ -183,24 +240,32 @@ pub fn run() {
                 tokio::time::sleep(std::time::Duration::from_millis(600)).await;
 
                 // 1. 检测 Mihomo 内核
-                let has_mihomo = crate::kernel::resolve_mihomo_binary(Some(&auto_download_handle)).is_some();
-                if !has_mihomo {
-                    info!("[OpenHub] 启动组件检测：未检测到 Mihomo 内核，启动后台自动拉取…");
-                    match crate::kernel::download_or_update_mihomo_kernel(auto_download_handle.clone(), None).await {
-                        Ok(status) => info!("[OpenHub] Mihomo 内核自动安装成功 ({})", status.version),
-                        Err(e) => error!("[OpenHub] Mihomo 内核自动安装失败：{e}"),
+                {
+                    let ctx = auto_download_handle.state::<Arc<AppContext>>();
+                    let has_mihomo = crate::kernel::resolve_mihomo_binary(Some(&ctx)).is_some();
+                    if !has_mihomo {
+                        info!("[OpenHub] 启动组件检测：未检测到 Mihomo 内核，启动后台自动拉取…");
+                        match crate::kernel::download_or_update_mihomo_kernel_impl(&ctx, None).await {
+                            Ok(status) => info!("[OpenHub] Mihomo 内核自动安装成功 ({})", status.version),
+                            Err(e) => error!("[OpenHub] Mihomo 内核自动安装失败：{e}"),
+                        }
                     }
-                }
 
-                // 2. 检测 GeoIP 数据库
-                let has_geoip = crate::kernel::get_app_geoip_path(&auto_download_handle)
-                    .map(|p| p.is_file())
-                    .unwrap_or(false);
-                if !has_geoip {
-                    info!("[OpenHub] 启动组件检测：未检测到 GeoIP 数据库，启动后台自动拉取…");
-                    match crate::kernel::download_or_update_geoip(auto_download_handle.clone(), None).await {
-                        Ok(_) => info!("[OpenHub] GeoIP 数据库自动下载成功并已就绪"),
-                        Err(e) => error!("[OpenHub] GeoIP 数据库自动下载失败：{e}"),
+                    // 2. 检测 GeoIP 数据库
+                    let has_geoip = ctx.geoip_path().is_file();
+                    if !has_geoip {
+                        info!("[OpenHub] 启动组件检测：未检测到 GeoIP 数据库，启动后台自动拉取…");
+                        match crate::kernel::download_or_update_geoip_inner(
+                            &ctx,
+                            Some(&ctx.database),
+                            Some(&ctx.proxy_runtime),
+                            None,
+                        )
+                        .await
+                        {
+                            Ok(_) => info!("[OpenHub] GeoIP 数据库自动下载成功并已就绪"),
+                            Err(e) => error!("[OpenHub] GeoIP 数据库自动下载失败：{e}"),
+                        }
                     }
                 }
             });
@@ -288,6 +353,9 @@ pub fn run() {
             token::stats::get_token_request_health,
             token::stats::get_local_agent_paths,
             web_server::get_lightweight_mode_state,
+            web_server::get_login_state,
+            web_server::login,
+            web_server::logout,
             web_server::enter_lightweight_mode,
             web_server::show_main_window,
             crate::model::gateway::get_model_proxy_config,
@@ -308,10 +376,10 @@ pub fn run() {
             crate::model::gateway::get_opencode_proxy_status,
             crate::model::gateway::start_opencode_proxy,
             crate::model::gateway::stop_opencode_proxy,
-crate::model::gateway::fetch_opencode_models,
-crate::model::gateway::get_opencode_cached_channel_models,
-crate::model::gateway::get_opencode_cached_channel_errors,
-crate::model::gateway::test_opencode_proxy_health,
+            crate::model::gateway::fetch_opencode_models,
+            crate::model::gateway::get_opencode_cached_channel_models,
+            crate::model::gateway::get_opencode_cached_channel_errors,
+            crate::model::gateway::test_opencode_proxy_health,
             crate::model::gateway::get_opencode_proxy_logs,
             crate::model::gateway::get_opencode_channel_stats,
             crate::model::gateway::clear_opencode_proxy_logs,
@@ -326,15 +394,32 @@ crate::model::gateway::test_opencode_proxy_health,
         .build(tauri::generate_context!())
         .expect("error while building Tauri application")
         .run(|app_handle, event| {
-            // 退出应用时同步停止轻量模式服务，避免端口被常驻进程占用。
-            if let tauri::RunEvent::ExitRequested { .. } = event {
-                let server = app_handle.state::<std::sync::Arc<web_server::WebServerHandle>>();
-                web_server::stop(&server);
-            }
             // macOS：点击 Dock 图标时重新显示轻量模式下隐藏的窗口。
             #[cfg(target_os = "macos")]
             if let tauri::RunEvent::Reopen { .. } = event {
-                let _ = web_server::show_main_window(app_handle.clone());
+                let _ = web_server::show_main_window(
+                    app_handle.state::<std::sync::Arc<web_server::ServerShared>>(),
+                );
             }
+            #[cfg(not(target_os = "macos"))]
+            let _ = (app_handle, event);
         });
+}
+
+/// 供 openhub-server 二进制调用的公共装配接口。
+/// 业务内核与桌面壳完全同源，仅暴露双形态所需的装配面。
+#[cfg(not(feature = "desktop"))]
+pub mod server_api {
+    pub use crate::charity::{start_charity_monitor, CharityMonitorRuntime};
+    pub use crate::context;
+    pub use crate::core::single_instance;
+    pub use crate::core::models::Database;
+    pub use crate::core::web_server::{self, ServerShared};
+    pub use crate::kernel;
+    pub use crate::model::catalog::ModelCatalogRuntime;
+    pub use crate::model::gateway::{
+        load_model_proxy_config, start_model_proxy_server, ModelProxyState,
+    };
+    pub use crate::proxypool;
+    pub use crate::token;
 }

@@ -2,11 +2,10 @@ use tracing::error;
 use crate::charity::db::*;
 use crate::charity::fetcher::*;
 use crate::charity::types::*;
-use crate::models::Database;
-use crate::proxypool::{self, ProxyRuntime};
+use crate::context::{spawn, AppContext};
+use crate::proxypool;
 use std::sync::{atomic::Ordering, Arc, Mutex};
 use std::time::Duration;
-use tauri::{AppHandle, Manager};
 
 pub fn local_hms() -> (u32, u32, u32) {
     if let Ok(output) = std::process::Command::new("/bin/date")
@@ -60,25 +59,23 @@ pub fn seconds_until_next_scheduled_run() -> u64 {
     seconds_until_next_aligned_run(h, m, s, CHARITY_SCHEDULE_EVERY_MINUTES).max(1)
 }
 
-pub fn start_charity_monitor(app: AppHandle) {
-    let monitor = app.state::<CharityMonitorRuntime>();
-    if monitor.running.swap(true, Ordering::SeqCst) {
+pub fn start_charity_monitor(ctx: Arc<AppContext>) {
+    if ctx.charity_runtime.running.swap(true, Ordering::SeqCst) {
         return;
     }
     {
-        let database = app.state::<Database>();
-        tokio::task::block_in_place(|| abandon_running_charity_sync_logs(&database));
+        tokio::task::block_in_place(|| abandon_running_charity_sync_logs(&ctx.database));
     }
-    tauri::async_runtime::spawn(async move {
+    spawn(async move {
         tokio::time::sleep(Duration::from_secs(1)).await;
         loop {
-            let monitor = app.state::<CharityMonitorRuntime>();
+            let monitor = &ctx.charity_runtime;
             let force = monitor.force_round.load(Ordering::Relaxed);
             if !force {
                 let mut wait_secs = seconds_until_next_scheduled_run();
                 while wait_secs > 0 {
-                    if app
-                        .state::<CharityMonitorRuntime>()
+                    if ctx
+                        .charity_runtime
                         .force_round
                         .load(Ordering::Relaxed)
                     {
@@ -99,7 +96,7 @@ pub fn start_charity_monitor(app: AppHandle) {
             }
 
             let Some(cancellation) = (loop {
-                let monitor = app.state::<CharityMonitorRuntime>();
+                let monitor = &ctx.charity_runtime;
                 if let Some(token) = monitor.try_begin_sync() {
                     break Some(token);
                 }
@@ -112,13 +109,13 @@ pub fn start_charity_monitor(app: AppHandle) {
                 continue;
             };
 
-            let forced = app
-                .state::<CharityMonitorRuntime>()
+            let forced = ctx
+                .charity_runtime
                 .force_round
                 .swap(false, Ordering::Relaxed);
             let stage = if forced { "manual" } else { "poll" };
-            let database = app.state::<Database>();
-            let runtime = app.state::<ProxyRuntime>();
+            let database = &*ctx.database;
+            let runtime = &*ctx.proxy_runtime;
             let round_nodes =
                 tokio::task::block_in_place(|| build_charity_node_queue(&database, &monitor))
                     .unwrap_or_default();
@@ -161,16 +158,14 @@ pub fn start_charity_monitor(app: AppHandle) {
             let mut handles = Vec::with_capacity(sources_for_round.len());
             let shared_queue = Arc::new(Mutex::new(CharityNodeQueue::from_nodes(round_nodes)));
             for source in sources_for_round {
-                let app = app.clone();
+                let task_ctx = ctx.clone();
                 let cancellation = cancellation.clone();
                 let shared_queue = shared_queue.clone();
-                handles.push(tauri::async_runtime::spawn(async move {
-                    let database = app.state::<Database>();
-                    let runtime = app.state::<ProxyRuntime>();
+                handles.push(spawn(async move {
                     let result = sync_feed_with_fast_nodes(
-                        &app,
-                        &database,
-                        &runtime,
+                        &task_ctx,
+                        &task_ctx.database,
+                        &task_ctx.proxy_runtime,
                         &source,
                         stage,
                         &cancellation,
@@ -185,7 +180,7 @@ pub fn start_charity_monitor(app: AppHandle) {
                 match handle.await {
                     Ok((feed_id, Ok(_))) => {
                         if let Ok(mut errors) =
-                            app.state::<CharityMonitorRuntime>().last_errors.lock()
+                            ctx.charity_runtime.last_errors.lock()
                         {
                             errors.remove(&feed_id);
                         }
@@ -193,7 +188,7 @@ pub fn start_charity_monitor(app: AppHandle) {
                     Ok((feed_id, Err(error))) => {
                         if !is_charity_sync_cancelled(&error) {
                             if let Ok(mut errors) =
-                                app.state::<CharityMonitorRuntime>().last_errors.lock()
+                                ctx.charity_runtime.last_errors.lock()
                             {
                                 errors.insert(feed_id, error);
                             }
@@ -203,7 +198,7 @@ pub fn start_charity_monitor(app: AppHandle) {
                 }
             }
             let _ = proxypool::restore_proxy_node_transient(&database, &runtime).await;
-            app.state::<CharityMonitorRuntime>().end_sync();
+            ctx.charity_runtime.end_sync();
         }
     });
 }

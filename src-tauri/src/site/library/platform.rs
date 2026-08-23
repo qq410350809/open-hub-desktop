@@ -372,27 +372,27 @@ pub(crate) async fn detect_platform(client: &reqwest::Client, base_url: &str) ->
         };
     }
 
-    let status_job = tauri::async_runtime::spawn({
+    let status_job = crate::context::spawn({
         let client = client.clone();
         let base_url = base_url.to_string();
         async move { probe_json(&client, &base_url, "/api/status").await }
     });
-    let auth_me_job = tauri::async_runtime::spawn({
+    let auth_me_job = crate::context::spawn({
         let client = client.clone();
         let base_url = base_url.to_string();
         async move { probe_json(&client, &base_url, "/api/v1/auth/me").await }
     });
-    let models_job = tauri::async_runtime::spawn({
+    let models_job = crate::context::spawn({
         let client = client.clone();
         let base_url = base_url.to_string();
         async move { probe_json(&client, &base_url, "/v1/models").await }
     });
-    let cpa_job = tauri::async_runtime::spawn({
+    let cpa_job = crate::context::spawn({
         let client = client.clone();
         let base_url = base_url.to_string();
         async move { probe_cliproxyapi(&client, &base_url).await }
     });
-    let title_job = tauri::async_runtime::spawn({
+    let title_job = crate::context::spawn({
         let client = client.clone();
         let base_url = base_url.to_string();
         async move { probe_title(&client, &base_url).await }

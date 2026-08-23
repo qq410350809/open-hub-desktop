@@ -9,7 +9,9 @@ use std::{
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tauri::Manager;
+use crate::context::home_dir;
+#[allow(unused_imports)]
+use crate::context::spawn_blocking;
 use url::Url;
 
 const CHROME_EPOCH_OFFSET_SECONDS: i64 = 11_644_473_600;
@@ -110,33 +112,23 @@ struct ChromeContext {
     profiles: Vec<ChromeProfile>,
 }
 
-#[tauri::command]
-pub async fn list_chrome_sessions(
-    app: tauri::AppHandle,
-    url: String,
-) -> Result<Vec<ChromeSessionInfo>, String> {
-    let home_dir = app
-        .path()
-        .home_dir()
-        .map_err(|error| format!("无法定位用户目录：{error}"))?;
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub async fn list_chrome_sessions(url: String) -> Result<Vec<ChromeSessionInfo>, String> {
+    let home_dir = home_dir().ok_or("无法定位用户目录")?;
 
-    tauri::async_runtime::spawn_blocking(move || list_chrome_sessions_from_home(&home_dir, &url))
+    spawn_blocking(move || list_chrome_sessions_from_home(&home_dir, &url))
         .await
         .map_err(|error| format!("读取 Chrome 会话任务失败：{error}"))?
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn read_chrome_session(
-    app: tauri::AppHandle,
     url: String,
     profile_id: String,
 ) -> Result<ChromeSessionValue, String> {
-    let home_dir = app
-        .path()
-        .home_dir()
-        .map_err(|error| format!("无法定位用户目录：{error}"))?;
+    let home_dir = home_dir().ok_or("无法定位用户目录")?;
 
-    tauri::async_runtime::spawn_blocking(move || {
+    spawn_blocking(move || {
         read_chrome_session_from_home(&home_dir, &url, &profile_id)
     })
     .await
@@ -186,9 +178,9 @@ pub(crate) fn chrome_user_agent() -> String {
     chrome_user_agent_for_version("")
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn open_url_in_chrome_profile(url: String, profile_id: String) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
+    spawn_blocking(move || {
         open_url_in_chrome_profile_blocking(&url, &profile_id)
     })
     .await
@@ -667,9 +659,9 @@ fn close_openhub_sync_tabs() -> Result<(), String> {
     Ok(())
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn close_chrome_sync_tabs() -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(close_openhub_sync_tabs)
+    spawn_blocking(close_openhub_sync_tabs)
         .await
         .map_err(|error| format!("清理 Chrome 同步标签任务失败：{error}"))?
 }

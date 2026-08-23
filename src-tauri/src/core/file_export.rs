@@ -1,3 +1,4 @@
+#[cfg(feature = "desktop")]
 use rfd::FileDialog;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -17,7 +18,10 @@ pub struct SaveFileResult {
 
 /// 弹出原生保存对话框，让用户选择保存位置后写入文件。
 /// content 为 Base64 编码的字节流，避免二进制数据在 JSON 序列化中损坏。
-#[tauri::command]
+///
+/// 桌面专属：server 形态无原生文件对话框，导出由浏览器下载完成。
+#[cfg_attr(feature = "desktop", tauri::command)]
+#[cfg(feature = "desktop")]
 pub async fn save_export_file(args: SaveFileArgs) -> Result<SaveFileResult, String> {
     use base64::Engine;
 

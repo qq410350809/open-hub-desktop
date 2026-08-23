@@ -7,15 +7,14 @@ use chrono::Datelike;
 use rusqlite::params;
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
-use tauri::Manager;
 
 impl ModelProxyContext {
     /// 异步记录请求日志至本地数据库，并同步累加「渠道 × 模型 × 客户端 × 日/时」聚合统计。
     /// 明细日志按保留天数节流清理（默认永久保留）；统计聚合表独立持久化，不受清理影响。
     pub async fn record_log(&self, log: ProxyRequestLog) {
-        let app_handle_opt = self.app_handle.read().await.clone();
-        if let Some(app) = app_handle_opt {
-            let database = app.state::<crate::models::Database>();
+        let app_handle_opt = self.app_ctx.read().await.clone();
+        if let Some(ctx) = app_handle_opt {
+            let database = &ctx.database;
             let now_millis = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as i64)
@@ -252,9 +251,9 @@ pub async fn get_model_proxy_status_summary(state: &ModelProxyState) -> ModelPro
     let total_toks = state.context.metrics.total_tokens.load(Ordering::Relaxed);
 
     let (db_total_prompt, db_total_comp, db_total_reas, db_total_cache, db_total_all, db_today_tokens) = {
-        let app_handle_opt = state.context.app_handle.read().await.clone();
-        if let Some(app) = app_handle_opt {
-            let database = app.state::<crate::models::Database>();
+        let app_handle_opt = state.context.app_ctx.read().await.clone();
+        if let Some(ctx) = app_handle_opt {
+            let database = &ctx.database;
             let res: Result<(i64, i64, i64, i64, i64, i64), rusqlite::Error> = (|| {
                 let conn = database.0.lock().map_err(|_| rusqlite::Error::ExecuteReturnedResults)?;
                 // 累计与今日 Token 均取自持久化日统计表。
@@ -325,8 +324,8 @@ pub async fn get_opencode_proxy_status_summary(state: &OpencodeProxyState) -> Op
 pub async fn get_channel_usage_stats_summary(
     state: &ModelProxyState,
 ) -> Result<Vec<ChannelUsageStats>, String> {
-    let app_handle_opt = state.context.app_handle.read().await.clone();
-    let Some(app) = app_handle_opt else {
+    let app_handle_opt = state.context.app_ctx.read().await.clone();
+    let Some(ctx) = app_handle_opt else {
         return Ok(Vec::new());
     };
 
@@ -336,7 +335,7 @@ pub async fn get_channel_usage_stats_summary(
     };
 
     tokio::task::block_in_place(move || {
-        let database = app.state::<crate::models::Database>();
+        let database = &ctx.database;
         let conn = database.lock_db();
 
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
@@ -485,8 +484,8 @@ pub async fn get_gateway_overview_stats(
     from: Option<String>,
     to: Option<String>,
 ) -> Result<GatewayOverviewStats, String> {
-    let app_handle_opt = state.context.app_handle.read().await.clone();
-    let Some(app) = app_handle_opt else {
+    let app_handle_opt = state.context.app_ctx.read().await.clone();
+    let Some(ctx) = app_handle_opt else {
         return Ok(GatewayOverviewStats {
             days: 14,
             daily: Vec::new(),
@@ -498,7 +497,7 @@ pub async fn get_gateway_overview_stats(
     };
 
     tokio::task::block_in_place(move || {
-        let database = app.state::<crate::models::Database>();
+        let database = &ctx.database;
         let conn = database.lock_db();
 
         let today = chrono::Local::now().date_naive();
@@ -848,8 +847,8 @@ pub async fn get_proxy_token_usage_report(
         },
     };
 
-    let app_handle_opt = state.context.app_handle.read().await.clone();
-    let Some(app) = app_handle_opt else {
+    let app_handle_opt = state.context.app_ctx.read().await.clone();
+    let Some(ctx) = app_handle_opt else {
         return Ok(empty_report());
     };
 
@@ -863,7 +862,7 @@ pub async fn get_proxy_token_usage_report(
     };
 
     tokio::task::block_in_place(move || {
-        let database = app.state::<crate::models::Database>();
+        let database = &ctx.database;
         let conn = database.lock_db();
 
         let today = chrono::Local::now().date_naive();

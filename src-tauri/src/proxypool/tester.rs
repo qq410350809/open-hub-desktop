@@ -1,3 +1,4 @@
+use crate::context::EventBus;
 use crate::models::*;
 use crate::proxypool::runtime::{
     append_controller_path, controller_client, controller_url, ensure_runtime,
@@ -9,7 +10,6 @@ use rusqlite::params;
 use serde_json::Value as JsonValue;
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
-use tauri::{AppHandle, Emitter};
 use url::Url;
 
 pub fn speed_test_candidates(configured: &str) -> Vec<String> {
@@ -77,7 +77,7 @@ pub async fn test_controller_proxy_delay(
 }
 
 pub async fn run_proxy_node_pool(
-    app: &AppHandle,
+    bus: &EventBus,
     database: &Database,
     runtime: &ProxyRuntime,
     requested_node_ids: Option<HashSet<String>>,
@@ -208,13 +208,13 @@ pub async fn run_proxy_node_pool(
         .map(|(id, _status)| {
             let client = client.clone();
             let targets = targets.clone();
-            let app = app.clone();
+            let bus = bus.clone();
             let cancellation = cancellation.clone();
             async move {
                 if cancellation.is_cancelled() {
                     return (id, None, true);
                 }
-                let _ = app.emit(
+                bus.emit(
                     progress_event,
                     ProxyNodeTestProgress {
                         node_id: id.clone(),
@@ -246,7 +246,7 @@ pub async fn run_proxy_node_pool(
     while let Some((id, delay, node_cancelled)) = results.next().await {
         if node_cancelled || cancellation.is_cancelled() {
             cancelled = true;
-            let _ = app.emit(
+            bus.emit(
                 progress_event,
                 ProxyNodeTestProgress {
                     node_id: id,
@@ -270,7 +270,7 @@ pub async fn run_proxy_node_pool(
             flush_writes(&mut pending_writes)?;
             last_flush = Instant::now();
         }
-        let _ = app.emit(
+        bus.emit(
             progress_event,
             ProxyNodeTestProgress {
                 node_id: id,

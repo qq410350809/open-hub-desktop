@@ -4,7 +4,8 @@ use crate::site::library::{detect_platform, is_newapi, is_sub2api};
 use crate::site::library::*;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::time::Duration;
-use tauri::State;
+use crate::context::{AppContext, Managed};
+use std::sync::Arc;
 
 pub(crate) fn read_site(connection: &Connection, id: &str) -> Result<Option<SiteRecord>, String> {
     let mut stmt = connection
@@ -101,9 +102,10 @@ pub(crate) fn read_site(connection: &Connection, id: &str) -> Result<Option<Site
     Ok(Some(site))
 }
 
-#[tauri::command]
-pub fn list_library(database: State<'_, Database>) -> Result<LibraryData, String> {
-    let connection = database.lock_conn()?;
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub fn list_library(ctx: Managed<'_, Arc<AppContext>>) -> Result<LibraryData, String> {
+    let database = &*ctx.database;
+let connection = database.lock_conn()?;
     let mut statement = connection
         .prepare(
             "SELECT id, name, description, registration_limit, icon, api_base_url, system_type,
@@ -226,12 +228,13 @@ pub fn list_library(database: State<'_, Database>) -> Result<LibraryData, String
     })
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn create_site(
-    database: State<'_, Database>,
+    ctx: Managed<'_, Arc<AppContext>>,
     mut input: SiteRecord,
 ) -> Result<SiteRecord, String> {
-    input.id = generated_id();
+    let database = &*ctx.database;
+input.id = generated_id();
     input.favorite = false;
     input.hidden = false;
     let input = normalize_site(input)?;
@@ -244,13 +247,14 @@ pub fn create_site(
     read_site(&connection, &input.id)?.ok_or_else(|| "创建站点失败".into())
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn import_site(
-    database: State<'_, Database>,
+    ctx: Managed<'_, Arc<AppContext>>,
     site_url: String,
     usage_state: Option<String>,
 ) -> Result<SiteRecord, String> {
-    let base_url = normalize_import_base_url(&site_url)?;
+    let database = &*ctx.database;
+let base_url = normalize_import_base_url(&site_url)?;
     let canonical_url = base_url.to_string();
     {
         let connection = database.lock_conn()?;
@@ -269,26 +273,26 @@ pub async fn import_site(
     }
 
     let client = build_http_client(&database, Duration::from_secs(12), 5, "站点资料采集")?;
-    let root_job = tauri::async_runtime::spawn(fetch_discovery_resource(
+    let root_job = crate::context::spawn(fetch_discovery_resource(
         client.clone(),
         base_url.clone(),
         "text/html,application/xhtml+xml,application/json;q=0.8,*/*;q=0.5",
     ));
-    let newapi_job = tauri::async_runtime::spawn(fetch_discovery_resource(
+    let newapi_job = crate::context::spawn(fetch_discovery_resource(
         client.clone(),
         base_url
             .join("/api/status")
             .map_err(|error| error.to_string())?,
         "application/json",
     ));
-    let sub2api_job = tauri::async_runtime::spawn(fetch_discovery_resource(
+    let sub2api_job = crate::context::spawn(fetch_discovery_resource(
         client.clone(),
         base_url
             .join("/setup/status")
             .map_err(|error| error.to_string())?,
         "application/json",
     ));
-    let detect_job = tauri::async_runtime::spawn({
+    let detect_job = crate::context::spawn({
         let client = client.clone();
         let canonical_url = canonical_url.clone();
         async move { detect_platform(&client, &canonical_url).await }
@@ -442,13 +446,14 @@ pub async fn import_site(
     read_site(&connection, &site.id)?.ok_or_else(|| "导入站点失败".into())
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn update_site(
-    database: State<'_, Database>,
+    ctx: Managed<'_, Arc<AppContext>>,
     id: String,
     mut input: SiteRecord,
 ) -> Result<SiteRecord, String> {
-    input.id = id.clone();
+    let database = &*ctx.database;
+input.id = id.clone();
     let mut input = normalize_site(input)?;
     let mut connection = database.lock_conn()?;
 
@@ -521,9 +526,10 @@ pub fn update_site(
     read_site(&connection, &input.id)?.ok_or_else(|| "读取更新后的站点失败".into())
 }
 
-#[tauri::command]
-pub fn delete_site(database: State<'_, Database>, id: String) -> Result<(), String> {
-    let connection = database.lock_conn()?;
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub fn delete_site(ctx: Managed<'_, Arc<AppContext>>, id: String) -> Result<(), String> {
+    let database = &*ctx.database;
+let connection = database.lock_conn()?;
     let changed = connection
         .execute("DELETE FROM directory_sites WHERE id = ?1", [id])
         .map_err(|error| error.to_string())?;
@@ -533,9 +539,10 @@ pub fn delete_site(database: State<'_, Database>, id: String) -> Result<(), Stri
     Ok(())
 }
 
-#[tauri::command]
-pub fn toggle_personal(database: State<'_, Database>, id: String) -> Result<SiteRecord, String> {
-    let connection = database.lock_conn()?;
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub fn toggle_personal(ctx: Managed<'_, Arc<AppContext>>, id: String) -> Result<SiteRecord, String> {
+    let database = &*ctx.database;
+let connection = database.lock_conn()?;
     let changed = connection
         .execute(
             &format!(
@@ -570,9 +577,10 @@ fn next_usage_state(is_personal: bool, is_pending: bool) -> (bool, bool) {
     }
 }
 
-#[tauri::command]
-pub fn cycle_usage_state(database: State<'_, Database>, id: String) -> Result<SiteRecord, String> {
-    let connection = database.lock_conn()?;
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub fn cycle_usage_state(ctx: Managed<'_, Arc<AppContext>>, id: String) -> Result<SiteRecord, String> {
+    let database = &*ctx.database;
+let connection = database.lock_conn()?;
     let site = read_site(&connection, &id)?.ok_or_else(|| "找不到该站点".to_string())?;
     let (is_personal, is_pending) = next_usage_state(site.is_personal, site.is_pending);
 
@@ -590,9 +598,10 @@ pub fn cycle_usage_state(database: State<'_, Database>, id: String) -> Result<Si
     read_site(&connection, &site.id)?.ok_or_else(|| "读取站点失败".into())
 }
 
-#[tauri::command]
-pub fn toggle_pending(database: State<'_, Database>, id: String) -> Result<SiteRecord, String> {
-    let connection = database.lock_conn()?;
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub fn toggle_pending(ctx: Managed<'_, Arc<AppContext>>, id: String) -> Result<SiteRecord, String> {
+    let database = &*ctx.database;
+let connection = database.lock_conn()?;
     // 待定与在用互斥：标为待定时清除在用；取消待定仅清待定。
     let changed = connection
         .execute(
@@ -615,13 +624,14 @@ pub fn toggle_pending(database: State<'_, Database>, id: String) -> Result<SiteR
     read_site(&connection, &id)?.ok_or_else(|| "读取站点失败".into())
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn set_usage_state(
-    database: State<'_, Database>,
+    ctx: Managed<'_, Arc<AppContext>>,
     id: String,
     state: String,
 ) -> Result<SiteRecord, String> {
-    let (is_personal, is_pending) = match state.as_str() {
+    let database = &*ctx.database;
+let (is_personal, is_pending) = match state.as_str() {
         "personal" => (true, false),
         "pending" => (false, true),
         "unused" => (false, false),
@@ -644,9 +654,10 @@ pub fn set_usage_state(
     read_site(&connection, &id)?.ok_or_else(|| "读取站点失败".into())
 }
 
-#[tauri::command]
-pub fn toggle_hidden(database: State<'_, Database>, id: String) -> Result<SiteRecord, String> {
-    let connection = database.lock_conn()?;
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub fn toggle_hidden(ctx: Managed<'_, Arc<AppContext>>, id: String) -> Result<SiteRecord, String> {
+    let database = &*ctx.database;
+let connection = database.lock_conn()?;
     let changed = connection
         .execute(
             "UPDATE directory_sites SET hidden = CASE hidden WHEN 0 THEN 1 ELSE 0 END WHERE id = ?1",
@@ -659,9 +670,10 @@ pub fn toggle_hidden(database: State<'_, Database>, id: String) -> Result<SiteRe
     read_site(&connection, &id)?.ok_or_else(|| "读取站点失败".into())
 }
 
-#[tauri::command]
-pub fn toggle_runaway(database: State<'_, Database>, id: String) -> Result<SiteRecord, String> {
-    let connection = database.lock_conn()?;
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub fn toggle_runaway(ctx: Managed<'_, Arc<AppContext>>, id: String) -> Result<SiteRecord, String> {
+    let database = &*ctx.database;
+let connection = database.lock_conn()?;
     let changed = connection
         .execute(
             &format!("UPDATE directory_sites SET is_runaway = CASE is_runaway WHEN 0 THEN 1 ELSE 0 END, updated_at = {NOW_SQL} WHERE id = ?1"),

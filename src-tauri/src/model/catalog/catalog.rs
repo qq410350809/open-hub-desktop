@@ -7,19 +7,20 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use tauri::{AppHandle, Emitter, State};
+use crate::context::{AppContext, Managed};
+use std::sync::Arc;
 
 pub const LLMPRICING_MANIFEST_URL: &str = "https://llmpricing.dev/rows/manifest.json";
 pub const LLMPRICING_BASE_URL: &str = "https://llmpricing.dev/rows";
 const CATALOG_SCHEMA_VERSION: &str = "9";
 const CATALOG_SCHEMA_META_KEY: &str = "model_catalog_schema_version";
 
-pub(crate) struct ModelCatalogRuntime {
+pub struct ModelCatalogRuntime {
     syncing: AtomicBool,
 }
 
 impl ModelCatalogRuntime {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             syncing: AtomicBool::new(false),
         }
@@ -367,16 +368,19 @@ fn clear_legacy_catalog_if_needed(connection: &mut rusqlite::Connection) -> Resu
     let schema_version = crate::db::read_meta_conn(&connection, CATALOG_SCHEMA_META_KEY)?;
 
     if schema_version != CATALOG_SCHEMA_VERSION {
-        let transaction = connection
-            .transaction()
-            .map_err(|error| error.to_string())?;
-        let _ = transaction.execute("DROP TABLE IF EXISTS model_catalog_entries", []);
-        let _ = transaction.execute("DROP TABLE IF EXISTS model_catalog_models", []);
-        let _ = transaction.execute("DROP TABLE IF EXISTS model_catalog_providers", []);
-        let _ = transaction.execute("DROP TABLE IF EXISTS model_catalog_sources", []);
+        // foreign_keys 开启时 DROP 父表会先隐式清空引用它的子表，若残留子表
+        // 带有无法解析的旧外键（如 canonical_key），清理本身就会失败；而
+        // PRAGMA 在事务内是空操作，因此必须在事务外临时关闭外键完成清理。
+        let _ = connection.execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             DROP TABLE IF EXISTS model_catalog_entries;
+             DROP TABLE IF EXISTS model_catalog_models;
+             DROP TABLE IF EXISTS model_catalog_providers;
+             DROP TABLE IF EXISTS model_catalog_sources;
+             PRAGMA foreign_keys = ON;",
+        );
 
-        crate::db::write_meta(&transaction, CATALOG_SCHEMA_META_KEY, CATALOG_SCHEMA_VERSION)?;
-        transaction.commit().map_err(|error| error.to_string())?;
+        crate::db::write_meta(connection, CATALOG_SCHEMA_META_KEY, CATALOG_SCHEMA_VERSION)?;
     }
 
     ensure_catalog_schema(connection)
@@ -804,9 +808,9 @@ fn persist_catalog_llmpricing(
     })
 }
 
-#[tauri::command]
-pub fn get_model_catalog(database: State<'_, Database>) -> Result<ModelCatalogSnapshot, String> {
-    get_model_catalog_inner(&database)
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub fn get_model_catalog(ctx: Managed<'_, Arc<AppContext>>) -> Result<ModelCatalogSnapshot, String> {
+    get_model_catalog_inner(&ctx.database)
 }
 
 pub(crate) fn get_model_catalog_inner(database: &Database) -> Result<ModelCatalogSnapshot, String> {
@@ -975,14 +979,14 @@ async fn fetch_hosts_for_model(client: &reqwest::Client, model_id: &str) -> Vec<
     Vec::new()
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn get_model_catalog_detail(
-    database: State<'_, Database>,
+    ctx: Managed<'_, Arc<AppContext>>,
     canonical_key: Option<String>,
     id: Option<String>,
 ) -> Result<ModelCatalogDetail, String> {
     let key = id.or(canonical_key).unwrap_or_default();
-    get_model_catalog_detail_inner(&database, &key).await
+    get_model_catalog_detail_inner(&ctx.database, &key).await
 }
 
 pub(crate) async fn get_model_catalog_detail_inner(
@@ -1223,22 +1227,21 @@ pub(crate) async fn get_model_catalog_detail_inner(
     })
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn sync_model_catalog(
-    app: AppHandle,
-    database: State<'_, Database>,
-    runtime: State<'_, ModelCatalogRuntime>,
+    ctx: Managed<'_, Arc<AppContext>>,
     force: Option<bool>,
 ) -> Result<ModelCatalogSyncResult, String> {
-    sync_model_catalog_inner(&app, &database, &runtime, force.unwrap_or(false)).await
+    sync_model_catalog_inner(&ctx, force.unwrap_or(false)).await
 }
 
 pub(crate) async fn sync_model_catalog_inner(
-    app: &AppHandle,
-    database: &Database,
-    runtime: &ModelCatalogRuntime,
+    ctx: &Arc<AppContext>,
     force: bool,
 ) -> Result<ModelCatalogSyncResult, String> {
+    let database = &*ctx.database;
+    let runtime = &*ctx.model_catalog_runtime;
+    let bus = ctx.event_bus.clone();
     if !force && is_synced_today(database)? {
         return Ok(ModelCatalogSyncResult {
             synced: false,
@@ -1257,7 +1260,7 @@ pub(crate) async fn sync_model_catalog_inner(
     }
 
     let _guard = SyncGuard(&runtime.syncing);
-    let _ = app.emit("model-catalog-sync-status", json!({ "status": "syncing" }));
+    bus.emit("model-catalog-sync-status", json!({ "status": "syncing" }));
 
     let client = build_http_client(database, Duration::from_secs(60), 5, "模型参数同步")?;
     
@@ -1276,7 +1279,7 @@ pub(crate) async fn sync_model_catalog_inner(
         let shard_name = shard_val.as_str().ok_or_else(|| "Shard 名称格式无效".to_string())?;
         let shard_url = format!("{LLMPRICING_BASE_URL}/{shard_name}");
         let progress_msg = format!("正在下载模型分片 {}/{} ({})", idx + 1, shards_array.len(), shard_name);
-        let _ = app.emit("model-catalog-sync-status", json!({ "status": "syncing", "message": progress_msg }));
+        bus.emit("model-catalog-sync-status", json!({ "status": "syncing", "message": progress_msg }));
 
         let (shard_raw, shard_json) = fetch_json(&client, shard_name, &shard_url).await?;
         shards_data.push((shard_name.to_string(), shard_raw, shard_json));
@@ -1293,7 +1296,7 @@ pub(crate) async fn sync_model_catalog_inner(
         report.shard_count,
     );
 
-    let _ = app.emit(
+    bus.emit(
         "model-catalog-sync-status",
         json!({ "status": "complete", "message": message }),
     );
@@ -1451,13 +1454,18 @@ mod tests {
                 "CREATE TABLE app_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
                  CREATE TABLE model_catalog_sources (source TEXT PRIMARY KEY);
                  CREATE TABLE model_catalog_models (canonical_key TEXT PRIMARY KEY);
-                 CREATE TABLE model_catalog_entries (id INTEGER PRIMARY KEY);
+                 CREATE TABLE model_catalog_entries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    canonical_key TEXT NOT NULL,
+                    FOREIGN KEY(canonical_key) REFERENCES model_catalog_models(canonical_key)
+                 );
                  INSERT INTO app_meta (key, value) VALUES ('model_catalog_schema_version', '7');
                  INSERT INTO model_catalog_sources (source) VALUES ('openrouter');
                  INSERT INTO model_catalog_models (canonical_key) VALUES ('openai/gpt-primary');
-                 INSERT INTO model_catalog_entries (id) VALUES (1);",
+                 INSERT INTO model_catalog_entries (canonical_key) VALUES ('openai/gpt-primary');",
             )
             .unwrap();
+        connection.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
 
         clear_legacy_catalog_if_needed(&mut connection).unwrap();
 
@@ -1476,5 +1484,69 @@ mod tests {
             )
             .unwrap();
         assert_eq!(version, CATALOG_SCHEMA_VERSION);
+    }
+
+    /// 回归：旧版 model_catalog_entries 残留了指向 canonical_key 的外键，而新目录
+    /// 主键已改为 id。外键无法解析时，开启 foreign_keys 的连接对目录表做任何写
+    /// 操作都会报 "foreign key mismatch"，版本迁移清理必须能穿透这种状态。
+    #[test]
+    fn dangling_fk_entries_table_is_cleared_on_version_upgrade() {
+        let mut connection = rusqlite::Connection::open_in_memory().unwrap();
+        // 先按旧结构建表并写入数据，再单独把 models 重建为新结构（模拟半迁移）；
+        // 显式关闭外键，避免父表 DROP 被隐式删除检查拦截（模拟历史版本升级路径）
+        connection
+            .execute_batch(
+                "PRAGMA foreign_keys = OFF;
+                 CREATE TABLE app_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 CREATE TABLE model_catalog_models (canonical_key TEXT PRIMARY KEY);
+                 CREATE TABLE model_catalog_entries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    canonical_key TEXT NOT NULL,
+                    FOREIGN KEY(canonical_key) REFERENCES model_catalog_models(canonical_key)
+                 );
+                 INSERT INTO app_meta (key, value) VALUES ('model_catalog_schema_version', '7');
+                 INSERT INTO model_catalog_models (canonical_key) VALUES ('openai/gpt-primary');
+                 INSERT INTO model_catalog_entries (canonical_key) VALUES ('openai/gpt-primary');
+                 DROP TABLE model_catalog_models;
+                 CREATE TABLE model_catalog_models (id TEXT PRIMARY KEY);
+                 PRAGMA foreign_keys = ON;",
+            )
+            .unwrap();
+
+        // 复现故障前提：外键无法解析时父表不可写
+        let mismatched = connection
+            .execute("DELETE FROM model_catalog_models", [])
+            .is_err();
+        assert!(mismatched, "stale FK should block writes before cleanup");
+
+        clear_legacy_catalog_if_needed(&mut connection).unwrap();
+
+        let count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM model_catalog_models", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0, "model_catalog_models should be recreated empty");
+
+        let version: String = connection
+            .query_row(
+                "SELECT value FROM app_meta WHERE key = ?1",
+                [CATALOG_SCHEMA_META_KEY],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, CATALOG_SCHEMA_VERSION);
+
+        // 清理后外键应恢复开启且目录表可正常写入
+        let fk_on: i64 = connection
+            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(fk_on, 1, "foreign_keys should be restored");
+        connection
+            .execute(
+                "INSERT INTO model_catalog_models (id) VALUES ('openai/gpt-primary')",
+                [],
+            )
+            .unwrap();
     }
 }

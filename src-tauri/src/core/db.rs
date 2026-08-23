@@ -6,8 +6,18 @@ use serde::{de::DeserializeOwned, Serialize};
 use std::{path::Path, time::Duration};
 
 impl Database {
-    pub(crate) fn open(path: &Path) -> Result<Self, String> {
+    pub fn open(path: &Path) -> Result<Self, String> {
         let mut connection = Connection::open(path).map_err(|error| error.to_string())?;
+
+        // 历史版本的模型目录明细表 model_catalog_entries 带有 REFERENCES
+        // model_catalog_models(canonical_key) 外键，而新目录主键已改为 id，
+        // 该外键无法解析：foreign_keys 开启后对目录表的任何写操作（包括同步
+        // 入库的 DELETE）都会报 "foreign key mismatch"。此表现已废弃且无任何
+        // 代码引用，必须在开启外键前无条件移除。
+        let _ = connection.busy_timeout(Duration::from_secs(5));
+        if let Err(error) = connection.execute_batch("DROP TABLE IF EXISTS model_catalog_entries;") {
+            warn!("[db] 清理遗留 model_catalog_entries 表失败：{error}");
+        }
 
         let has_data_col: i64 = connection
             .query_row(
@@ -487,7 +497,7 @@ impl Database {
     }
 
     /// 获取数据库连接的互斥锁，封装统一的错误处理。
-    pub(crate) fn lock_conn(&self) -> Result<std::sync::MutexGuard<'_, Connection>, String> {
+    pub fn lock_conn(&self) -> Result<std::sync::MutexGuard<'_, Connection>, String> {
         Ok(self.lock_db())
     }
 

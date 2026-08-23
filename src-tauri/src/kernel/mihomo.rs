@@ -11,8 +11,9 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::Mutex;
+
+use crate::context::{spawn, AppContext, EventBus, Managed};
 
 const MIHOMO_REPO_API: &str = "https://api.github.com/repos/MetaCubeX/mihomo/releases/latest";
 const GITHUB_PROXY_PREFIXES: &[&str] = &[
@@ -43,14 +44,11 @@ pub struct MihomoDownloadProgress {
     pub message: String,
 }
 
-pub fn get_app_bin_dir(app: &AppHandle) -> Result<PathBuf, String> {
-    let app_data = app.path().app_data_dir().map_err(|e| e.to_string())?;
-    let bin_dir = app_data.join("bin");
-    let _ = fs::create_dir_all(&bin_dir);
-    Ok(bin_dir)
+pub fn get_app_bin_dir(ctx: &AppContext) -> PathBuf {
+    ctx.bin_dir()
 }
 
-pub fn resolve_mihomo_binary(app: Option<&AppHandle>) -> Option<PathBuf> {
+pub fn resolve_mihomo_binary(ctx: Option<&AppContext>) -> Option<PathBuf> {
     if let Ok(value) = std::env::var("OPENHUB_MIHOMO_PATH") {
         let path = PathBuf::from(value);
         if path.is_file() {
@@ -58,17 +56,15 @@ pub fn resolve_mihomo_binary(app: Option<&AppHandle>) -> Option<PathBuf> {
         }
     }
 
-    if let Some(app) = app {
-        if let Ok(bin_dir) = get_app_bin_dir(app) {
-            let binary_name = if cfg!(target_os = "windows") { "mihomo.exe" } else { "mihomo" };
-            let candidate = bin_dir.join(binary_name);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
+    if let Some(ctx) = ctx {
+        let bin_dir = ctx.bin_dir();
+        let binary_name = if cfg!(target_os = "windows") { "mihomo.exe" } else { "mihomo" };
+        let candidate = bin_dir.join(binary_name);
+        if candidate.is_file() {
+            return Some(candidate);
         }
 
-        if let Ok(resource_dir) = app.path().resource_dir() {
-            let binary_name = if cfg!(target_os = "windows") { "mihomo.exe" } else { "mihomo" };
+        if let Some(resource_dir) = ctx.resource_dir.as_ref() {
             let candidate = resource_dir.join("bin").join(binary_name);
             if candidate.is_file() {
                 return Some(candidate);
@@ -80,10 +76,10 @@ pub fn resolve_mihomo_binary(app: Option<&AppHandle>) -> Option<PathBuf> {
 }
 
 /// 启动时若 AppData 目录尚无文件，先自动释放安装包自带的内置基础版内核与 GeoIP 数据库
-pub fn ensure_bundled_assets_installed(app: &AppHandle) -> Result<(), String> {
-    let app_data = app.path().app_data_dir().map_err(|e| e.to_string())?;
-    let bin_dir = app_data.join("bin");
-    let _ = fs::create_dir_all(&bin_dir);
+pub fn ensure_bundled_assets_installed(ctx: &AppContext) -> Result<(), String> {
+    let app_data = &ctx.data_dir;
+    let _ = std::fs::create_dir_all(app_data);
+    let bin_dir = ctx.bin_dir();
 
     let binary_name = if cfg!(target_os = "windows") { "mihomo.exe" } else { "mihomo" };
     let target_binary = bin_dir.join(binary_name);
@@ -92,7 +88,7 @@ pub fn ensure_bundled_assets_installed(app: &AppHandle) -> Result<(), String> {
     // 1. 如果私有 bin/ 目录下没有 mihomo，尝试从安装包内置 resources 释放
     if !target_binary.is_file() {
         let mut candidates = Vec::new();
-        if let Ok(res_dir) = app.path().resource_dir() {
+        if let Some(res_dir) = ctx.resource_dir.as_ref() {
             candidates.push(res_dir.join("bin").join(binary_name));
             candidates.push(res_dir.join("resources").join("bin").join(binary_name));
             candidates.push(res_dir.join(binary_name));
@@ -122,7 +118,7 @@ pub fn ensure_bundled_assets_installed(app: &AppHandle) -> Result<(), String> {
     // 2. 如果私有 AppData 目录下没有 Country.mmdb，尝试从安装包内置 resources 释放
     if !target_geoip.is_file() {
         let mut candidates = Vec::new();
-        if let Ok(res_dir) = app.path().resource_dir() {
+        if let Some(res_dir) = ctx.resource_dir.as_ref() {
             candidates.push(res_dir.join("Country.mmdb"));
             candidates.push(res_dir.join("resources").join("Country.mmdb"));
         }
@@ -247,9 +243,10 @@ pub async fn query_latest_release(mirror_prefix: Option<&str>) -> Result<(String
     Err(format!("获取最新 Mihomo 内核发布版本失败：{last_error}"))
 }
 
-#[tauri::command]
-pub async fn get_mihomo_kernel_status(app: AppHandle) -> Result<MihomoKernelStatus, String> {
-    let resolved = resolve_mihomo_binary(Some(&app));
+pub async fn get_mihomo_kernel_status_impl(
+    ctx: &Arc<AppContext>,
+) -> Result<MihomoKernelStatus, String> {
+    let resolved = resolve_mihomo_binary(Some(ctx));
     let (installed, path, version, is_custom) = if let Some(p) = resolved {
         let ver = read_mihomo_version(&p).unwrap_or_else(|| "未知版本".to_string());
         let custom = std::env::var("OPENHUB_MIHOMO_PATH").is_ok();
@@ -267,12 +264,18 @@ pub async fn get_mihomo_kernel_status(app: AppHandle) -> Result<MihomoKernelStat
     })
 }
 
-#[tauri::command]
-pub async fn check_mihomo_kernel_update(
-    app: AppHandle,
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub async fn get_mihomo_kernel_status(
+    ctx: Managed<'_, Arc<AppContext>>,
+) -> Result<MihomoKernelStatus, String> {
+    get_mihomo_kernel_status_impl(&ctx).await
+}
+
+pub async fn check_mihomo_kernel_update_impl(
+    ctx: &Arc<AppContext>,
     mirror: Option<String>,
 ) -> Result<MihomoKernelStatus, String> {
-    let mut status = get_mihomo_kernel_status(app).await?;
+    let mut status = get_mihomo_kernel_status_impl(ctx).await?;
     match query_latest_release(mirror.as_deref()).await {
         Ok((tag, _)) => {
             status.latest_version = Some(tag);
@@ -280,6 +283,14 @@ pub async fn check_mihomo_kernel_update(
         }
         Err(e) => Err(format!("检查更新失败：{e}")),
     }
+}
+
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub async fn check_mihomo_kernel_update(
+    ctx: Managed<'_, Arc<AppContext>>,
+    mirror: Option<String>,
+) -> Result<MihomoKernelStatus, String> {
+    check_mihomo_kernel_update_impl(&ctx, mirror).await
 }
 
 /// 并发测速并获取最快镜像源列表
@@ -325,12 +336,12 @@ async fn rank_fastest_mirrors(raw_url: &str) -> Vec<String> {
 pub async fn download_bytes_with_dynamic_racing(
     raw_download_url: &str,
     chosen_mirror: Option<&str>,
-    app: &AppHandle,
+    bus: &EventBus,
     progress_event: &str,
     item_display_name: &str,
 ) -> Result<Vec<u8>, String> {
     let emit_progress = |stage: &str, progress: f64, message: &str| {
-        let _ = app.emit(
+        bus.emit(
             progress_event,
             MihomoDownloadProgress {
                 stage: stage.to_string(),
@@ -380,14 +391,14 @@ pub async fn download_bytes_with_dynamic_racing(
     let total_mb = total_size as f64 / 1_048_576.0;
 
     // 进度广播定时器
-    let app_handle_clone = app.clone();
+    let bus_for_task = bus.clone();
     let downloaded_counter = downloaded_bytes.clone();
     let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let cancel_flag_task = cancel_flag.clone();
     let progress_event_name = progress_event.to_string();
     let display_name_clone = item_display_name.to_string();
 
-    let progress_reporter = tokio::spawn(async move {
+    let progress_reporter = spawn(async move {
         let mut last_bytes = 0u64;
         let mut last_time = Instant::now();
 
@@ -420,7 +431,7 @@ pub async fn download_bytes_with_dynamic_racing(
                 format!("正在极速拉取 {}: {:.1}MB / {:.1}MB", display_name_clone, cur_mb, total_mb)
             };
 
-            let _ = app_handle_clone.emit(
+            bus_for_task.emit(
                 &progress_event_name,
                 MihomoDownloadProgress {
                     stage: "downloading".to_string(),
@@ -541,13 +552,13 @@ pub async fn download_bytes_with_dynamic_racing(
     Ok(final_archive_bytes)
 }
 
-#[tauri::command]
-pub async fn download_or_update_mihomo_kernel(
-    app: AppHandle,
+pub async fn download_or_update_mihomo_kernel_impl(
+    ctx: &Arc<AppContext>,
     mirror: Option<String>,
 ) -> Result<MihomoKernelStatus, String> {
+    let bus = ctx.event_bus.clone();
     let emit_progress = |stage: &str, progress: f64, message: &str| {
-        let _ = app.emit(
+        bus.emit(
             "mihomo-kernel-progress",
             MihomoDownloadProgress {
                 stage: stage.to_string(),
@@ -560,7 +571,7 @@ pub async fn download_or_update_mihomo_kernel(
     emit_progress("checking", 0.05, "正在检测最新内核版本…");
     let (tag, raw_download_url) = query_latest_release(mirror.as_deref()).await?;
 
-    let bin_dir = get_app_bin_dir(&app)?;
+    let bin_dir = get_app_bin_dir(&ctx);
     let (_, binary_filename) = target_asset_keywords()?;
     let target_binary_path = bin_dir.join(binary_filename);
     let temp_extracted_path = bin_dir.join(format!("{binary_filename}.extract.tmp"));
@@ -568,7 +579,7 @@ pub async fn download_or_update_mihomo_kernel(
     let final_archive_bytes = download_bytes_with_dynamic_racing(
         &raw_download_url,
         mirror.as_deref(),
-        &app,
+        &bus,
         "mihomo-kernel-progress",
         &format!("Mihomo {tag}"),
     ).await?;
@@ -612,4 +623,12 @@ pub async fn download_or_update_mihomo_kernel(
         is_custom: false,
         latest_version: Some(tag),
     })
+}
+
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub async fn download_or_update_mihomo_kernel(
+    ctx: Managed<'_, Arc<AppContext>>,
+    mirror: Option<String>,
+) -> Result<MihomoKernelStatus, String> {
+    download_or_update_mihomo_kernel_impl(&ctx, mirror).await
 }

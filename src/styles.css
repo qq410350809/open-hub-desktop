@@ -6936,3 +6936,14 @@ kbd { padding: 3px 7px; border: 1px solid var(--line); border-radius: var(--r-xs
 
 
 
+
+/* —— 设置 · 账号与登录：退出按钮（危险色提示） —— */
+.settings-logout-button {
+  color: #b42318;
+  border-color: color-mix(in srgb, #b42318 32%, var(--line));
+}
+.settings-logout-button:hover:not(:disabled) {
+  background: color-mix(in srgb, #b42318 10%, transparent);
+  border-color: #b42318;
+}
+.settings-logout-button svg { width: 13px; }

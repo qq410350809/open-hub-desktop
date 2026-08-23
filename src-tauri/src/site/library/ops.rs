@@ -4,7 +4,6 @@ use crate::site::library;
 use serde_json;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tauri;
 use url::Url;
 
 pub(crate) fn validate_url(value: &str, label: &str, required: bool) -> Result<String, String> {
@@ -518,7 +517,7 @@ pub(crate) async fn probe_site_system_type_via_chrome(
             .as_nanos()
     );
     let script = chrome_system_probe_script(&marker);
-    let existing_attempt = tauri::async_runtime::spawn_blocking({
+    let existing_attempt = crate::context::spawn_blocking({
         let base_url = base_url.to_string();
         let script = script.clone();
         move || {
@@ -540,7 +539,7 @@ pub(crate) async fn probe_site_system_type_via_chrome(
     let profile_id = profile_ids.first()?.clone();
     let mut target_url = Url::parse(base_url).ok()?.join("/api/status").ok()?;
     target_url.set_fragment(Some(&marker));
-    let background_attempt = tauri::async_runtime::spawn_blocking({
+    let background_attempt = crate::context::spawn_blocking({
         let target_url = target_url.to_string();
         let marker = marker.clone();
         move || {
@@ -605,7 +604,7 @@ pub(crate) async fn probe_site_system_types(
         .filter(|(_, base_url)| !base_url.trim().is_empty())
         .map(|(site_id, base_url)| {
             let client = client.clone();
-            tauri::async_runtime::spawn(async move {
+            crate::context::spawn(async move {
                 let (system_type, challenge) =
                     probe_site_system_type_details(&client, &base_url).await;
                 (site_id, base_url, system_type, challenge)
