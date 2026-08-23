@@ -65,6 +65,21 @@ pub fn prepare_egress(
     prepare_egress_with(channel, api_key, model, openai_body, is_stream, true)
 }
 
+/// 为 OpenAI Chat 流式出网注入 `stream_options.include_usage`。
+///
+/// 历史缺陷警示：OpenAI 兼容上游仅在收到该参数时才会在流尾回传 usage chunk，
+/// 缺失它意味着网关与客户端永远拿不到 token 统计（表现为「0 0」）。
+/// 用 entry/or_insert 尊重调用方显式传入的设置。
+fn ensure_include_usage(body: &mut JsonValue, is_stream: bool) {
+    if !is_stream {
+        return;
+    }
+    if let Some(obj) = body.as_object_mut() {
+        obj.entry("stream_options".to_string())
+            .or_insert_with(|| json!({ "include_usage": true }));
+    }
+}
+
 /// `prepare_egress` 的完整版本：`convert = false` 表示 body 已是目标协议原生格式
 /// （同协议快速通道），只构建 URL、跳过请求体转换。
 pub fn prepare_egress_with(
@@ -97,10 +112,18 @@ pub fn prepare_egress_with(
                 url
             }
         };
-        return (url, body.clone());
+        let mut out = body.clone();
+        if matches!(target, TargetProtocol::OpenAiChat) {
+            ensure_include_usage(&mut out, is_stream);
+        }
+        return (url, out);
     }
     match target {
-        TargetProtocol::OpenAiChat => (format!("{base}/chat/completions"), body.clone()),
+        TargetProtocol::OpenAiChat => {
+            let mut out = body.clone();
+            ensure_include_usage(&mut out, is_stream);
+            (format!("{base}/chat/completions"), out)
+        },
         TargetProtocol::OpenAiResponses => (
             format!("{base}/responses"),
             chat_to_responses_body(body, model, is_stream),
@@ -1096,7 +1119,7 @@ impl SseNormalizer {
 }
 
 /// 把上游目标协议的 SSE 字节流归一化为 OpenAI Chat SSE 字节流。
-/// OpenAI 协议无需调用本函数（直接透传原始流）。
+/// OpenAI Chat 上游本就是中枢格式：零转换透传原始字节，避免误吞 delta 与 usage。
 pub fn normalized_sse_stream<E, S>(
     stream: S,
     target: TargetProtocol,
@@ -1105,19 +1128,31 @@ where
     S: futures_util::Stream<Item = Result<Bytes, E>> + Send + 'static,
     E: Send + 'static,
 {
+    type BoxedStream<E> = std::pin::Pin<
+        Box<dyn futures_util::Stream<Item = Result<Bytes, E>> + Send>,
+    >;
+
+    // 历史缺陷警示：此前 OpenAI Chat 上游也会走 SseNormalizer（回退成 Responses 解析器），
+    // 导致所有 delta 因缺少 "type" 字段而被静默丢弃 —— 客户端只见 200 空响应 + 全 0 usage。
+    if matches!(target, TargetProtocol::OpenAiChat) {
+        let passthrough: BoxedStream<E> = Box::pin(async_stream::stream! {
+            tokio::pin!(stream);
+            while let Some(item) = stream.next().await {
+                yield item;
+            }
+        });
+        return passthrough;
+    }
+
     let mut normalizer = SseNormalizer::new(target);
-    async_stream::stream! {
-        let mut buffer = String::new();
+    let converted: BoxedStream<E> = Box::pin(async_stream::stream! {
+        let mut reader = super::stream::SseLineReader::new();
         tokio::pin!(stream);
 
         while let Some(chunk_res) = stream.next().await {
             match chunk_res {
                 Ok(bytes) => {
-                    let Ok(text) = std::str::from_utf8(&bytes) else { continue };
-                    buffer.push_str(text);
-                    while let Some(pos) = buffer.find('\n') {
-                        let line = buffer[..pos].trim_end_matches('\r').to_string();
-                        buffer = buffer[pos + 1..].to_string();
+                    for line in reader.push(&bytes) {
                         let Some(data) = line.strip_prefix("data:") else { continue };
                         let data = data.trim();
                         if data.is_empty() || data == "[DONE]" {
@@ -1135,10 +1170,22 @@ where
             }
         }
 
+        if let Some(line) = reader.flush() {
+            if let Some(data) = line.strip_prefix("data:") {
+                let data = data.trim();
+                if !data.is_empty() && data != "[DONE]" {
+                    for payload in normalizer.feed(data) {
+                        yield Ok::<Bytes, E>(Bytes::from(payload));
+                    }
+                }
+            }
+        }
+
         for payload in normalizer.finish() {
             yield Ok::<Bytes, E>(Bytes::from(payload));
         }
-    }
+    });
+    converted
 }
 
 #[cfg(test)]
@@ -1402,5 +1449,68 @@ mod egress_tests {
         let raw = b"<html>Bad Gateway</html>".to_vec();
         let out = normalize_response_bytes(TargetProtocol::AnthropicMessages, "m", &raw);
         assert_eq!(out, raw);
+    }
+
+    #[tokio::test]
+    async fn openai_chat_sse_target_passes_through_without_swallowing_deltas() {
+        // 回归：OpenAI Chat 上游曾被错误送入 Responses 归一化器，
+        // 所有 delta 被吞，客户端只见 200 空响应 + 全 0 usage
+        let upstream = futures_util::stream::iter(vec![
+            Ok::<Bytes, std::io::Error>(Bytes::from(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"你\"}}]}\n\n",
+            )),
+            Ok(Bytes::from("data: {\"choices\":[{\"delta\":{\"content\":\"好\"}}]}\n\n")),
+            Ok(Bytes::from(
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            )),
+            Ok(Bytes::from(
+                "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":7,\"total_tokens\":18}}\n\n",
+            )),
+            Ok(Bytes::from("data: [DONE]\n\n")),
+        ]);
+
+        let collected: Vec<Result<Bytes, std::io::Error>> = {
+            use futures_util::StreamExt;
+            normalized_sse_stream(upstream, TargetProtocol::OpenAiChat)
+                .collect::<Vec<_>>()
+                .await
+        };
+        let text: String = collected
+            .into_iter()
+            .map(|r| String::from_utf8_lossy(&r.unwrap()).to_string())
+            .collect();
+
+        assert!(text.contains("\"你好\"") || (text.contains('你') && text.contains('好')));
+        assert!(text.contains("\"prompt_tokens\":11"));
+        assert!(text.contains("[DONE]"), "[DONE] 必须原样保留");
+    }
+
+    #[test]
+    fn prepare_egress_injects_include_usage_only_for_openai_chat_stream() {
+        let body = json!({"model": "m", "stream": true, "messages": []});
+
+        let (_, out) = prepare_egress(&channel_with_protocol("openai"), "", "m", &body, true);
+        assert_eq!(
+            out.pointer("/stream_options/include_usage").and_then(JsonValue::as_bool),
+            Some(true),
+            "流式出网必须请求 usage，否则 token 统计恒为 0"
+        );
+
+        // 非流式不注入
+        let (_, out) = prepare_egress(&channel_with_protocol("openai"), "", "m", &body, false);
+        assert!(out.get("stream_options").is_none());
+
+        // 客户端显式设置时不覆盖
+        let custom = json!({"model": "m", "stream": true, "stream_options": {"include_usage": false}});
+        let (_, out) = prepare_egress(&channel_with_protocol("openai"), "", "m", &custom, true);
+        assert_eq!(
+            out.pointer("/stream_options/include_usage").and_then(JsonValue::as_bool),
+            Some(false)
+        );
+
+        // 其他目标协议不注入
+        let (_, out) =
+            prepare_egress(&channel_with_protocol("anthropic"), "", "m", &body, true);
+        assert!(out.get("stream_options").is_none());
     }
 }
