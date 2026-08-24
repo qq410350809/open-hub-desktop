@@ -1042,27 +1042,23 @@ async fn non_opencode_channel_does_not_inplace_retry_on_503() {
     use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
 
-    // 非 OpenCode 渠道：503 直接走常规分支切节点，不做同节点原地重试
-    let (addr, counter) = spawn_scripted_upstream(vec![(
-        axum::http::StatusCode::SERVICE_UNAVAILABLE,
-        r#"{"error":{"message":"upstream unavailable"}}"#,
-    )])
+    // 5xx 原地重试已通用化：转发渠道/普通渠道同样享受每节点一次的免费原地重试。
+    // max_retries=0 时仅一次机会，503 后原地重试成功即返回 200。
+    let (addr, counter) = spawn_scripted_upstream(vec![
+        (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            r#"{"error":{"message":"upstream unavailable"}}"#,
+        ),
+        (axum::http::StatusCode::OK, valid_chat_payload()),
+    ])
     .await;
     let channel = egress_test_channel("plain-upstream", format!("http://{addr}/v1"));
 
-    let started = Instant::now();
-    let result = run_egress(&channel, 1).await;
-
-    assert!(result.is_err());
-    assert_eq!(
-        counter.load(Ordering::SeqCst),
-        2,
-        "无原地重试：仅按 max_retries 预算发送（1+1 次）"
-    );
-    assert!(
-        started.elapsed() < Duration::from_millis(2500),
-        "不应出现 1 秒原地重试等待"
-    );
+    let success = run_egress(&channel, 0)
+        .await
+        .expect("普通渠道首次 503 后原地重试应成功");
+    assert_eq!(success.status, 200);
+    assert_eq!(counter.load(Ordering::SeqCst), 2, "同节点应恰好 2 次");
 }
 
 #[tokio::test]

@@ -121,28 +121,8 @@ pub async fn handle_messages(
     if is_stream {
         let stream_body = if fast_path {
             // 提取请求 tools 的参数键作为工具名恢复线索（部分上游省略 content_block_start）
-            let preferred_tool: Option<String> = body
-                .pointer("/tool_choice/name")
-                .and_then(JsonValue::as_str)
-                .map(str::to_string);
-            let tool_hints: Vec<crate::model::gateway::stream::ToolHint> = body
-                .get("tools")
-                .and_then(JsonValue::as_array)
-                .map(|tools| {
-                    tools
-                        .iter()
-                        .filter_map(|t| {
-                            let name = t.get("name").and_then(JsonValue::as_str)?.to_string();
-                            let keys: Vec<String> = t
-                                .pointer("/input_schema/properties")
-                                .and_then(JsonValue::as_object)
-                                .map(|props| props.keys().cloned().collect())
-                                .unwrap_or_default();
-                            Some((name, keys))
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
+            let (tool_hints, preferred_tool) =
+                crate::model::gateway::stream::extract_tool_hints(&body);
             super::super::stream::passthrough_anthropic_sse_with_stats(
                 outcome.success.response.bytes_stream(),
                 ctx.clone(),
@@ -153,7 +133,16 @@ pub async fn handle_messages(
             )
         } else {
             openai_to_anthropic_sse_stream(
-                egress::normalized_sse_stream(outcome.success.response.bytes_stream(), outcome.target),
+                {
+                let (tool_hints, preferred_tool) =
+                    crate::model::gateway::stream::extract_tool_hints(&body);
+                egress::normalized_sse_stream(
+                    outcome.success.response.bytes_stream(),
+                    outcome.target,
+                    tool_hints,
+                    preferred_tool,
+                )
+            },
                 ctx.clone(),
                 log,
                 start_time,

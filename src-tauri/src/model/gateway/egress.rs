@@ -783,12 +783,97 @@ struct AnthropicSseState {
     block_kinds: std::collections::HashMap<u64, String>,
     /// 工具块索引 → (id, name)
     tool_meta: std::collections::HashMap<u64, (String, String)>,
+    /// 请求 tools 的参数键线索：上游缺失 content_block_start 时按 args 匹配恢复工具名
+    tool_hints: Vec<super::stream::ToolHint>,
+    /// 已下发过首片的工具块索引：保证 id/name 只注入一次
+    emitted_tools: std::collections::HashSet<u64>,
+    preferred_tool: Option<String>,
+    synth_seq: u64,
     stop_reason: Option<String>,
+    /// 孤儿 tool_use 块缓冲：上游缺失 content_block_start 时暂存参数增量，
+    /// 直到工具名可被可靠恢复（参数键命中/tool_choice/终态帧）才一次性下发，
+    /// 避免首片 args 过短时误判为占位名导致客户端「Tool not found」
+    pending_orphan: Option<PendingOrphanTool>,
+}
+
+/// 孤儿 tool_use 块的缓冲态
+struct PendingOrphanTool {
+    idx: u64,
+    args: String,
+    buffered: Vec<JsonValue>,
 }
 
 impl AnthropicSseState {
+    /// 孤儿块的最终工具名决策：tool_choice 指定 > 参数键命中；None 表示仍无法识别
+    fn resolve_orphan_name(&self, args: &str) -> Option<String> {
+        if let Some(p) = &self.preferred_tool {
+            return Some(p.clone());
+        }
+        for (name, keys) in &self.tool_hints {
+            if keys.iter().any(|k| args.contains(k.as_str())) {
+                return Some(name.clone());
+            }
+        }
+        None
+    }
+
     fn feed(&mut self, jv: &JsonValue) -> Vec<String> {
         let mut out = Vec::new();
+
+        // 兼容性：部分上游（如 new-api 系）tool_use 场景缺失 content_block_start 帧。
+        // 孤儿参数增量先缓冲，工具名可被可靠恢复（参数键命中 / tool_choice 指定 /
+        // 终态帧强制收口）后才合成元数据并一次性下发全部增量 —— 首片往往只有
+        // `{"` 这样的短碎片，立即匹配必然失败并以占位名下发导致「Tool not found」。
+        if jv.get("type").and_then(JsonValue::as_str) == Some("content_block_delta")
+            && jv.pointer("/delta/type").and_then(JsonValue::as_str) == Some("input_json_delta")
+        {
+            let idx = jv.get("index").and_then(JsonValue::as_u64).unwrap_or(0);
+            let orphan = !self.block_kinds.contains_key(&idx) && !self.tool_meta.contains_key(&idx);
+            if orphan || self.pending_orphan.as_ref().map(|p| p.idx) == Some(idx) {
+                let pt = self.pending_orphan.get_or_insert(PendingOrphanTool {
+                    idx,
+                    args: String::new(),
+                    buffered: Vec::new(),
+                });
+                pt.args.push_str(jv.pointer("/delta/partial_json").and_then(JsonValue::as_str).unwrap_or(""));
+                pt.buffered.push(jv.clone());
+
+                let hit = self.preferred_tool.is_some()
+                    || self.tool_hints.iter().any(|(_, keys)| {
+                        keys.iter().any(|k| pt.args.contains(k.as_str()))
+                    });
+                if !hit {
+                    return Vec::new(); // 继续缓冲，等待更多参数或终态帧
+                }
+                // 命中：冲刷缓冲，按标准增量协议输出（首片带 id/name）
+                let args = pt.args.clone();
+                let idx = pt.idx;
+                drop(pt);
+                let name = self
+                    .resolve_orphan_name(&args)
+                    .unwrap_or_else(|| format!("unknown_tool_{}", idx + 1));
+                let id = format!("toolu_synth_{}", idx + 1);
+                self.tool_meta.insert(idx, (id.clone(), name.clone()));
+                self.block_kinds.insert(idx, "tool_use".to_string());
+                let Some(pt) = self.pending_orphan.as_mut() else {
+                    unreachable!("pending 已确认存在");
+                };
+                for (i, bjv) in pt.buffered.drain(..).enumerate() {
+                    let mut tc = json!({ "index": idx });
+                    if i == 0 {
+                        tc["id"] = json!(id);
+                        tc["type"] = json!("function");
+                        tc["function"]["name"] = json!(name);
+                    }
+                    tc["function"]["arguments"] =
+                        json!(bjv.pointer("/delta/partial_json").and_then(JsonValue::as_str).unwrap_or(""));
+                    out.push(delta_chunk(json!({ "tool_calls": [tc] }), None, None));
+                }
+                self.pending_orphan = None;
+                return out;
+            }
+        }
+
         match jv.get("type").and_then(JsonValue::as_str) {
             Some("message_start") => {
                 self.input_tokens = jv
@@ -838,8 +923,24 @@ impl AnthropicSseState {
                             .pointer("/delta/partial_json")
                             .and_then(JsonValue::as_str)
                         {
+                            // 首个可见分片必须携带 id 与 function.name，
+                            // 否则标准客户端（opencode/zcode 等）校验直接失败
+                            let first_visible = !self.emitted_tools.contains(&idx);
+                            let mut tc = json!({ "index": idx });
+                            if first_visible {
+                                let (id, name) = self
+                                    .tool_meta
+                                    .get(&idx)
+                                    .cloned()
+                                    .unwrap_or(("toolu_unknown".into(), "unknown_tool".into()));
+                                tc["id"] = json!(id);
+                                tc["type"] = json!("function");
+                                tc["function"]["name"] = json!(name);
+                                self.emitted_tools.insert(idx);
+                            }
+                            tc["function"]["arguments"] = json!(frag);
                             out.push(delta_chunk(
-                                json!({ "tool_calls": [{ "index": idx, "function": { "arguments": frag } }] }),
+                                json!({ "tool_calls": [tc] }),
                                 None,
                                 None,
                             ));
@@ -851,6 +952,37 @@ impl AnthropicSseState {
                         }
                     }
                 }
+            }
+            // 终态帧强制收口：孤儿缓冲中仍无法识别名字时以占位下发（客户端会自愈重试）
+            _ if self.pending_orphan.is_some()
+                && matches!(
+                    jv.get("type").and_then(JsonValue::as_str),
+                    Some("content_block_stop") | Some("message_delta") | Some("message_stop")
+                ) =>
+            {
+                let (idx, args, buffered) = {
+                    let pt = self.pending_orphan.as_ref().unwrap();
+                    (pt.idx, pt.args.clone(), pt.buffered.clone())
+                };
+                let name = self.resolve_orphan_name(&args).unwrap_or_else(|| {
+                    self.synth_seq += 1;
+                    format!("unknown_tool_{}", self.synth_seq)
+                });
+                let id = format!("toolu_synth_{}", idx + 1);
+                self.tool_meta.insert(idx, (id.clone(), name.clone()));
+                self.block_kinds.insert(idx, "tool_use".to_string());
+                for (i, bjv) in buffered.iter().enumerate() {
+                    let mut tc = json!({ "index": idx });
+                    if i == 0 {
+                        tc["id"] = json!(id);
+                        tc["type"] = json!("function");
+                        tc["function"]["name"] = json!(name);
+                    }
+                    tc["function"]["arguments"] =
+                        json!(bjv.pointer("/delta/partial_json").and_then(JsonValue::as_str).unwrap_or(""));
+                    out.push(delta_chunk(json!({ "tool_calls": [tc] }), None, None));
+                }
+                self.pending_orphan = None;
             }
             Some("message_delta") => {
                 if let Some(r) = jv.pointer("/delta/stop_reason").and_then(JsonValue::as_str) {
@@ -1096,9 +1228,17 @@ enum SseNormalizer {
 }
 
 impl SseNormalizer {
-    fn new(target: TargetProtocol) -> Self {
+    fn new(
+        target: TargetProtocol,
+        tool_hints: Vec<super::stream::ToolHint>,
+        preferred_tool: Option<String>,
+    ) -> Self {
         match target {
-            TargetProtocol::AnthropicMessages => Self::Anthropic(AnthropicSseState::default()),
+            TargetProtocol::AnthropicMessages => Self::Anthropic(AnthropicSseState {
+                tool_hints,
+                preferred_tool,
+                ..AnthropicSseState::default()
+            }),
             TargetProtocol::Gemini => Self::Gemini(GeminiSseState::default()),
             _ => Self::Responses(ResponsesSseState::default()),
         }
@@ -1129,6 +1269,8 @@ impl SseNormalizer {
 pub fn normalized_sse_stream<E, S>(
     stream: S,
     target: TargetProtocol,
+    tool_hints: Vec<super::stream::ToolHint>,
+    preferred_tool: Option<String>,
 ) -> impl futures_util::Stream<Item = Result<Bytes, E>> + Send
 where
     S: futures_util::Stream<Item = Result<Bytes, E>> + Send + 'static,
@@ -1150,7 +1292,7 @@ where
         return passthrough;
     }
 
-    let mut normalizer = SseNormalizer::new(target);
+    let mut normalizer = SseNormalizer::new(target, tool_hints, preferred_tool);
     let converted: BoxedStream<E> = Box::pin(async_stream::stream! {
         let mut reader = super::stream::SseLineReader::new();
         tokio::pin!(stream);
@@ -1461,6 +1603,93 @@ mod egress_tests {
         assert_eq!(out, raw);
     }
 
+    /// 兼容性回归（分片缓冲）：首片 args 只有 `{"` 时不得立即以占位名下发，
+    /// 必须延迟到参数键可识别后，一次性输出带真实名字的完整增量序列
+    #[tokio::test]
+    async fn anthropic_orphan_short_first_fragment_defers_until_name_recoverable() {
+        let mk = |partial: &str| {
+            let pj = serde_json::to_string(partial).unwrap();
+            format!(
+                "data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":{pj}}}}}\n\n"
+            )
+        };
+        // 首片只有 `{` —— 旧实现会立即定名 unknown_tool_1
+        let upstream = futures_util::stream::iter(vec![
+            Ok::<Bytes, std::io::Error>(Bytes::from(
+                "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n\n"
+                    .to_string(),
+            )),
+            Ok(Bytes::from(mk("{"))),
+            Ok(Bytes::from(mk("\"command\": \"ls -la\","))),
+            Ok(Bytes::from(mk("\"description\": \"list files\"}"))),
+            Ok(Bytes::from("data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":20}}\n\n")),
+        ]);
+        let hints = vec![
+            (
+                "bash".to_string(),
+                vec!["command".to_string(), "description".to_string()],
+            ),
+            ("read_file".to_string(), vec!["path".to_string()]),
+        ];
+        let collected: Vec<Result<Bytes, std::io::Error>> = {
+            use futures_util::StreamExt;
+            normalized_sse_stream(upstream, TargetProtocol::AnthropicMessages, hints, None)
+                .collect::<Vec<_>>()
+                .await
+        };
+        let text: String = collected
+            .into_iter()
+            .map(|r| String::from_utf8_lossy(&r.unwrap()).to_string())
+            .collect();
+
+        assert!(
+            !text.contains("unknown_tool"),
+            "短碎片不得触发占位名下发: {text}"
+        );
+        assert!(
+            text.contains("\"name\":\"bash\""),
+            "应延迟至键名可识别后恢复为 bash: {text}"
+        );
+        assert!(text.contains("ls -la") && text.contains("list files"));
+        assert!(text.matches("tool_calls").count() >= 3, "缓冲的增量应全部补发");
+    }
+
+    /// 兼容性回归：Anthropic 上游缺失 content_block_start 时（x666 实测行为），
+    /// 归一化层必须合成工具块元数据，首个可见分片携带 id 与 function.name
+    #[tokio::test]
+    async fn anthropic_sse_without_start_frame_recovers_tool_name() {
+        let upstream = futures_util::stream::iter(vec![
+            Ok::<Bytes, std::io::Error>(Bytes::from(
+                "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n\n",
+            )),
+            Ok(Bytes::from(
+                "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"command\\\": \\\"ls\\\"}\"}}\n\n",
+            )),
+            Ok(Bytes::from("data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":20}}\n\n")),
+        ]);
+        let hints = vec![
+            ("bash".to_string(), vec!["command".to_string()]),
+            ("read_file".to_string(), vec!["path".to_string()]),
+        ];
+        let collected: Vec<Result<Bytes, std::io::Error>> = {
+            use futures_util::StreamExt;
+            normalized_sse_stream(upstream, TargetProtocol::AnthropicMessages, hints, None)
+                .collect::<Vec<_>>()
+                .await
+        };
+        let text: String = collected
+            .into_iter()
+            .map(|r| String::from_utf8_lossy(&r.unwrap()).to_string())
+            .collect();
+
+        assert!(
+            text.contains("\"name\":\"bash\""),
+            "工具名应按参数键匹配恢复为 bash: {text}"
+        );
+        assert!(text.contains("\"id\""), "首片必须携带 id: {text}");
+        assert!(text.contains("\\\"command"), "参数增量必须透传");
+    }
+
     #[tokio::test]
     async fn openai_chat_sse_target_passes_through_without_swallowing_deltas() {
         // 回归：OpenAI Chat 上游曾被错误送入 Responses 归一化器，
@@ -1481,7 +1710,7 @@ mod egress_tests {
 
         let collected: Vec<Result<Bytes, std::io::Error>> = {
             use futures_util::StreamExt;
-            normalized_sse_stream(upstream, TargetProtocol::OpenAiChat)
+            normalized_sse_stream(upstream, TargetProtocol::OpenAiChat, Vec::new(), None)
                 .collect::<Vec<_>>()
                 .await
         };

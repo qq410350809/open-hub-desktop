@@ -453,69 +453,88 @@ pub async fn fetch_upstream_models_inner(ctx: &ModelProxyContext) {
             continue;
         }
 
-        let models_url = format!("{}/models", ch.base_url.trim_end_matches('/'));
         let api_key = select_channel_api_key(ctx, ch);
         let client = &ctx.default_http_client;
+        let base = ch.base_url.trim_end_matches('/');
 
-        let mut req = client.get(&models_url);
-        if is_opencode_channel(ch) || ch.base_url.contains("opencode.ai") {
-            req = req
-                .header("User-Agent", "opencode/1.18.18/cli")
-                .header("x-opencode-client", "cli");
-        } else {
-            req = req.header("User-Agent", "OpenHub-Gateway/0.3.0");
-        }
-        if !api_key.is_empty() {
-            req = req.header("Authorization", format!("Bearer {api_key}"));
+        // 依次尝试的候选端点：base_url 缺少 /v1 时（如 https://x666.me/），
+        // 部分站点会把 /models 做 SPA fallback 返回 HTML(200)，此时回退到 /v1/models 再试一次
+        let mut candidates = vec![format!("{base}/models")];
+        if !base.ends_with("/v1") && !base.ends_with("/vbeta") {
+            candidates.push(format!("{base}/v1/models"));
         }
 
-        match req.send().await {
-            Ok(resp) => {
-                if resp.status().is_success() {
-                    let mut list = Vec::new();
-                    if let Ok(jv) = resp.json::<JsonValue>().await {
-                        if let Some(data) = jv.get("data").and_then(JsonValue::as_array) {
-                            for item in data {
-                                if let Some(id) = item.get("id").and_then(JsonValue::as_str) {
-                                    list.push(id.to_string());
-                                }
-                            }
-                        } else if let Some(models) = jv.get("models").and_then(JsonValue::as_array)
-                        {
-                            for item in models {
-                                if let Some(name) = item.get("name").and_then(JsonValue::as_str) {
-                                    list.push(name.trim_start_matches("models/").to_string());
-                                }
-                            }
+        let mut outcome: Result<Vec<String>, String> = Err("未发起请求".to_string());
+        for models_url in candidates {
+            let mut req = client.get(models_url);
+            if is_opencode_channel(ch) || ch.base_url.contains("opencode.ai") {
+                req = req
+                    .header("User-Agent", "opencode/1.18.18/cli")
+                    .header("x-opencode-client", "cli");
+            } else {
+                req = req.header("User-Agent", "OpenHub-Gateway/0.3.0");
+            }
+            if !api_key.is_empty() {
+                req = req.header("Authorization", format!("Bearer {api_key}"));
+            }
+
+            match req.send().await {
+                Ok(resp) => {
+                    if !resp.status().is_success() {
+                        outcome = Err(format!("上游返回 HTTP 状态码: {}", resp.status()));
+                        continue;
+                    }
+                    let bytes = resp.bytes().await.unwrap_or_default();
+                    let parsed = parse_models_payload(&bytes);
+                    match parsed {
+                        Some(list) if !list.is_empty() => {
+                            outcome = Ok(list);
+                            break;
+                        }
+                        _ => {
+                            // 200 但 body 不是标准 JSON 模型列表（典型：站点把未知路径
+                            // fallback 成 HTML 页面），换下一个候选端点
+                            let snippet = String::from_utf8_lossy(&bytes[..bytes.len().min(80)])
+                                .trim()
+                                .to_string();
+                            let looks_html = snippet.to_lowercase().starts_with("<!doctype")
+                                || snippet.to_lowercase().starts_with("<html");
+                            outcome = Err(if looks_html {
+                                "上游返回 HTML 页面而非模型列表（upstreamUrl 可能缺少 /v1 路径）".to_string()
+                            } else {
+                                "上游响应中未解析到任何模型".to_string()
+                            });
+                            continue;
                         }
                     }
-                    if list.is_empty() {
-                        if let Some(explicit) = &ch.enabled_models {
-                            list.extend(explicit.clone());
-                        }
-                    }
-                    // OpenCode 官方渠道模型列表过长（60+，绝大多数为非免费模型），仅保留免费模型
-                    if is_opencode_channel(ch) {
-                        list.retain(|m| is_free_opencode_model(&m));
-                    }
-                    channel_models.push(ChannelModelList {
-                        channel_id: ch.id.clone(),
-                        channel_name: ch.name.clone(),
-                        alias: ch.effective_alias(),
-                        models: list,
-                    });
-                } else {
-                    let err_msg = format!("上游返回 HTTP 状态码: {}", resp.status());
-                    fetch_errors.push(ChannelModelFetchError {
-                        channel_id: ch.id.clone(),
-                        channel_name: ch.name.clone(),
-                        alias: ch.effective_alias(),
-                        error: err_msg,
-                    });
+                }
+                Err(e) => {
+                    outcome = Err(format!("连接上游失败: {e}"));
+                    continue;
                 }
             }
-            Err(e) => {
-                let err_msg = format!("连接上游失败: {e}");
+        }
+
+        match outcome {
+            Ok(mut list) => {
+                // 上游返回空列表时以白名单兜底（兼容不支持列出模型的渠道）
+                if list.is_empty() {
+                    if let Some(explicit) = &ch.enabled_models {
+                        list.extend(explicit.clone());
+                    }
+                }
+                // OpenCode 官方渠道模型列表过长（60+，绝大多数为非免费模型），仅保留免费模型
+                if is_opencode_channel(ch) {
+                    list.retain(|m| is_free_opencode_model(m));
+                }
+                channel_models.push(ChannelModelList {
+                    channel_id: ch.id.clone(),
+                    channel_name: ch.name.clone(),
+                    alias: ch.effective_alias(),
+                    models: list,
+                });
+            }
+            Err(err_msg) => {
                 fetch_errors.push(ChannelModelFetchError {
                     channel_id: ch.id.clone(),
                     channel_name: ch.name.clone(),
@@ -528,4 +547,26 @@ pub async fn fetch_upstream_models_inner(ctx: &ModelProxyContext) {
 
     *ctx.cached_channel_models.write().await = channel_models;
     *ctx.cached_fetch_errors.write().await = fetch_errors;
+}
+
+/// 解析模型列表响应体：兼容 OpenAI（data[].id）与 Gemini（models[].name）两种格式。
+/// 返回 None 表示 body 不是合法 JSON 或结构完全不匹配（如 HTML 页面）。
+fn parse_models_payload(bytes: &[u8]) -> Option<Vec<String>> {
+    let jv = serde_json::from_slice::<JsonValue>(bytes).ok()?;
+    let items = jv
+        .get("data")
+        .and_then(JsonValue::as_array)
+        .or_else(|| jv.get("models").and_then(JsonValue::as_array))?;
+    let mut list = Vec::new();
+    for item in items {
+        // OpenAI 条目用 id，Gemini 条目用 name（可带 models/ 前缀）
+        let key = item
+            .get("id")
+            .and_then(JsonValue::as_str)
+            .or_else(|| item.get("name").and_then(JsonValue::as_str));
+        if let Some(id) = key {
+            list.push(id.trim_start_matches("models/").to_string());
+        }
+    }
+    Some(list)
 }

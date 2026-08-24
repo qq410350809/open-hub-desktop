@@ -183,8 +183,9 @@ pub async fn execute_resilient_egress(
                         || resp.status() == StatusCode::SERVICE_UNAVAILABLE
             );
 
-            // ① 502/503：网关类临时故障，读取错误体记录日志后原地重试
-            if is_opencode && !inplace_retried && retryable_status {
+            // ① 502/503：网关类临时故障，读取错误体记录日志后原地重试。
+            // 对所有渠道通用 —— 站点转换渠道/转发渠道同样受益。
+            if !inplace_retried && retryable_status {
                 inplace_retried = true;
                 let resp = match result {
                     Ok(r) => r,
@@ -207,7 +208,7 @@ pub async fn execute_resilient_egress(
                         status.as_u16(),
                         cand_start.elapsed().as_millis() as u64,
                         Some(format!(
-                            "OpenCode 上游 {status}，1 秒后在当前节点原地重试（不占重试名额）: {formatted}"
+                            "上游 {status}，1 秒后在当前节点原地重试（不占重试名额）: {formatted}"
                         )),
                         meta.req_body_str.clone(),
                         Some(node_display.clone()),
@@ -217,7 +218,7 @@ pub async fn execute_resilient_egress(
                 )
                 .await;
 
-                warn!("[ModelGateway] OpenCode 上游 {status}，节点 {node_display} 1 秒后原地重试");
+                warn!("[ModelGateway] 上游 {status}，节点 {node_display} 1 秒后原地重试");
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 continue;
             }

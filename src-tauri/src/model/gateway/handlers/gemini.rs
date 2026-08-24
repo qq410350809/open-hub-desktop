@@ -120,7 +120,16 @@ pub async fn handle_gemini_generate(
 
     if is_stream {
         let stream_body = openai_to_gemini_sse_stream(
-            egress::normalized_sse_stream(outcome.success.response.bytes_stream(), outcome.target),
+            {
+                let (tool_hints, preferred_tool) =
+                    crate::model::gateway::stream::extract_tool_hints(&body);
+                egress::normalized_sse_stream(
+                    outcome.success.response.bytes_stream(),
+                    outcome.target,
+                    tool_hints,
+                    preferred_tool,
+                )
+            },
             ctx.clone(),
             log,
             start_time,

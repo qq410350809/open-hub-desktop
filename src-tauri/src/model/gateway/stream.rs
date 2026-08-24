@@ -1165,6 +1165,35 @@ mod stream_accumulator_tests {
     }
 }
 
+/// 从请求体提取工具名恢复线索：兼容 OpenAI（function.*）与 Anthropic（input_schema）两种格式，
+/// 同时解析 tool_choice 显式指定（最高优先级）。
+pub fn extract_tool_hints(body: &JsonValue) -> (Vec<ToolHint>, Option<String>) {
+    let mut hints = Vec::new();
+    if let Some(tools) = body.get("tools").and_then(JsonValue::as_array) {
+        for t in tools {
+            let name = t
+                .pointer("/function/name")
+                .and_then(JsonValue::as_str)
+                .or_else(|| t.get("name").and_then(JsonValue::as_str));
+            let Some(name) = name else { continue };
+            let props = t
+                .pointer("/function/parameters/properties")
+                .or_else(|| t.pointer("/input_schema/properties"));
+            let keys: Vec<String> = props
+                .and_then(JsonValue::as_object)
+                .map(|o| o.keys().cloned().collect())
+                .unwrap_or_default();
+            hints.push((name.to_string(), keys));
+        }
+    }
+    let preferred = body
+        .pointer("/tool_choice/function/name")
+        .and_then(JsonValue::as_str)
+        .or_else(|| body.pointer("/tool_choice/name").and_then(JsonValue::as_str))
+        .map(str::to_string);
+    (hints, preferred)
+}
+
 /// 工具名候选：(工具名, 参数键列表)。提取自客户端请求体的 tools 数组，
 /// 用于在上游省略 content_block_start 帧时启发式恢复工具名。
 pub type ToolHint = (String, Vec<String>);
