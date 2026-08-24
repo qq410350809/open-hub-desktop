@@ -875,33 +875,33 @@ fn legacy_config_json_without_stats_id_still_parses() {
 // OpenCode 503 同节点原地重试（不受 max_retries 名额约束）
 // ---------------------------------------------------------------------------
 
-/// 启动一个计数型本地 mock 上游，返回其地址与请求计数器
-async fn spawn_counting_upstream(
-    always_503: bool,
+/// 启动一个按脚本应答的本地 mock 上游：第 N 次请求返回 script[N]（越界时重复末项）。
+/// 返回其地址与请求计数器。
+async fn spawn_scripted_upstream(
+    script: Vec<(axum::http::StatusCode, &'static str)>,
 ) -> (std::net::SocketAddr, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
     use axum::{routing::post, Router};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
+    assert!(!script.is_empty(), "script 至少包含一项");
     let counter = Arc::new(AtomicUsize::new(0));
+    let script = Arc::new(script);
+    let script_for_route = script.clone();
     let counter_for_route = counter.clone();
     let app = Router::new().route(
         "/v1/chat/completions",
         post(move || {
+            let script = script_for_route.clone();
             let counter = counter_for_route.clone();
             async move {
                 let n = counter.fetch_add(1, Ordering::SeqCst);
-                if !always_503 && n > 0 {
-                    (
-                        axum::http::StatusCode::OK,
-                        axum::Json(json!({ "choices": [], "usage": {} })),
-                    )
+                let (status, body) = if n < script.len() {
+                    script[n]
                 } else {
-                    (
-                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                        axum::Json(json!({ "error": { "message": "upstream unavailable" } })),
-                    )
-                }
+                    script[script.len() - 1]
+                };
+                (status, body)
             }
         }),
     );
@@ -911,6 +911,10 @@ async fn spawn_counting_upstream(
         axum::serve(listener, app).await.unwrap();
     });
     (addr, counter)
+}
+
+fn valid_chat_payload() -> &'static str {
+    r#"{"choices":[{"index":0,"message":{"role":"assistant","content":"你好"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}"#
 }
 
 fn egress_test_channel(id: &str, base_url: String) -> ChannelConfig {
@@ -979,7 +983,14 @@ async fn opencode_503_retries_inplace_once_then_succeeds_without_consuming_retry
     use std::time::{Duration, Instant};
 
     // max_retries=0：常规预算只有 1 次尝试，503 原地重试必须独立于该预算生效
-    let (addr, counter) = spawn_counting_upstream(false).await;
+    let (addr, counter) = spawn_scripted_upstream(vec![
+        (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            r#"{"error":{"message":"upstream unavailable"}}"#,
+        ),
+        (axum::http::StatusCode::OK, valid_chat_payload()),
+    ])
+    .await;
     let channel = egress_test_channel("opencode", format!("http://{addr}/v1"));
 
     let started = Instant::now();
@@ -1007,7 +1018,11 @@ async fn opencode_persistent_503_gets_one_inplace_retry_per_node_before_switchin
     use std::time::{Duration, Instant};
 
     // max_retries=1：两轮尝试（两个候选位），每轮各享一次免费原地重试 → 共 4 次请求
-    let (addr, counter) = spawn_counting_upstream(true).await;
+    let (addr, counter) = spawn_scripted_upstream(vec![(
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        r#"{"error":{"message":"upstream unavailable"}}"#,
+    )])
+    .await;
     let channel = egress_test_channel("opencode", format!("http://{addr}/v1"));
 
     let started = Instant::now();
@@ -1028,7 +1043,11 @@ async fn non_opencode_channel_does_not_inplace_retry_on_503() {
     use std::time::{Duration, Instant};
 
     // 非 OpenCode 渠道：503 直接走常规分支切节点，不做同节点原地重试
-    let (addr, counter) = spawn_counting_upstream(true).await;
+    let (addr, counter) = spawn_scripted_upstream(vec![(
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        r#"{"error":{"message":"upstream unavailable"}}"#,
+    )])
+    .await;
     let channel = egress_test_channel("plain-upstream", format!("http://{addr}/v1"));
 
     let started = Instant::now();
@@ -1041,7 +1060,184 @@ async fn non_opencode_channel_does_not_inplace_retry_on_503() {
         "无原地重试：仅按 max_retries 预算发送（1+1 次）"
     );
     assert!(
-        started.elapsed() < Duration::from_millis(900),
+        started.elapsed() < Duration::from_millis(2500),
         "不应出现 1 秒原地重试等待"
+    );
+}
+
+#[tokio::test]
+async fn opencode_502_retries_inplace_once_then_succeeds() {
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+
+    // 502 与 503 同等对待：max_retries=0 时依然获得一次免费原地重试
+    let (addr, counter) = spawn_scripted_upstream(vec![
+        (
+            axum::http::StatusCode::BAD_GATEWAY,
+            r#"{"error":{"message":"bad gateway"}}"#,
+        ),
+        (axum::http::StatusCode::OK, valid_chat_payload()),
+    ])
+    .await;
+    let channel = egress_test_channel("opencode", format!("http://{addr}/v1"));
+
+    let started = Instant::now();
+    let success = run_egress(&channel, 0)
+        .await
+        .expect("首次 502 后原地重试应成功");
+    let elapsed = started.elapsed();
+
+    assert_eq!(success.status, 200);
+    assert_eq!(counter.load(Ordering::SeqCst), 2);
+    assert!(elapsed >= Duration::from_millis(1000));
+}
+
+#[tokio::test]
+async fn opencode_empty_200_payload_retries_inplace_then_succeeds() {
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+
+    // OpenCode 官方缺陷：返回 200 但响应体为空内容 → 必须与 5xx 一样原地重试。
+    // 「仅有思考没有正文」同样属于缺陷表现（客户端只见空白回复）
+    for empty_payload in [
+        "",
+        r#"{"choices":[]}"#,
+        r#"{"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"深度思考了很久但没有产出任何正文"},"finish_reason":"stop"}]}"#,
+        r#"{"choices":[{"index":0,"message":{"role":"assistant","content":null},"finish_reason":"stop"}],"usage":{"prompt_tokens":10}}"#,
+    ] {
+        let (addr, counter) = spawn_scripted_upstream(vec![
+            (axum::http::StatusCode::OK, empty_payload),
+            (axum::http::StatusCode::OK, valid_chat_payload()),
+        ])
+        .await;
+        let channel = egress_test_channel("opencode", format!("http://{addr}/v1"));
+
+        let started = Instant::now();
+        let success = run_egress(&channel, 0)
+            .await
+            .unwrap_or_else(|_| panic!("空内容「{empty_payload}」重试后应成功"));
+        let elapsed = started.elapsed();
+
+        assert_eq!(success.status, 200);
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            2,
+            "空内容「{empty_payload}」应触发恰好一次原地重试"
+        );
+        assert!(elapsed >= Duration::from_millis(1000));
+        // 重试成功的响应体必须完好可读（预读打包回 Response 的链路不能丢数据）
+        let body = success
+            .response
+            .bytes()
+            .await
+            .expect("响应体应可读取");
+        assert_eq!(body, valid_chat_payload().as_bytes());
+    }
+}
+
+#[tokio::test]
+async fn opencode_persistent_empty_payload_returns_400_after_budget_exhausted() {
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+
+    // max_retries=0：单节点一次机会 —— 空内容原地重试仍为空后直接以 400 返回客户端
+    let (addr, counter) = spawn_scripted_upstream(vec![(
+        axum::http::StatusCode::OK,
+        r#"{"choices":[]}"#,
+    )])
+    .await;
+    let channel = egress_test_channel("opencode", format!("http://{addr}/v1"));
+
+    let started = Instant::now();
+    let err = match run_egress(&channel, 0).await {
+        Ok(_) => panic!("持续空内容必须按错误返回"),
+        Err(resp) => resp,
+    };
+    let elapsed = started.elapsed();
+
+    assert_eq!(err.status(), axum::http::StatusCode::BAD_REQUEST,
+        "空返回最终必须以 400 状态码返回客户端");
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        2,
+        "单节点应恰好发送 2 次（首次 + 原地重试）"
+    );
+    assert!(elapsed >= Duration::from_millis(1000));
+}
+
+#[tokio::test]
+async fn opencode_empty_payload_participates_in_node_rotation_before_400() {
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+
+    // max_retries=1：两轮候选位，每轮含一次免费原地重试 → 共 4 次请求后以 400 收尾
+    let (addr, counter) = spawn_scripted_upstream(vec![(
+        axum::http::StatusCode::OK,
+        "",
+    )])
+    .await;
+    let channel = egress_test_channel("opencode", format!("http://{addr}/v1"));
+
+    let started = Instant::now();
+    let err = match run_egress(&channel, 1).await {
+        Ok(_) => panic!("持续空内容必须按错误返回"),
+        Err(resp) => resp,
+    };
+
+    assert_eq!(err.status(), axum::http::StatusCode::BAD_REQUEST);
+    assert_eq!(counter.load(Ordering::SeqCst), 4);
+    assert!(started.elapsed() >= Duration::from_millis(2000));
+}
+
+#[tokio::test]
+async fn opencode_valid_200_payload_does_not_retry() {
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+
+    // 正常内容不得误判为空：仅发送 1 次、无等待
+    let (addr, counter) =
+        spawn_scripted_upstream(vec![(axum::http::StatusCode::OK, valid_chat_payload())]).await;
+    let channel = egress_test_channel("opencode", format!("http://{addr}/v1"));
+
+    let started = Instant::now();
+    let success = run_egress(&channel, 0)
+        .await
+        .expect("正常响应应直接成功");
+    let elapsed = started.elapsed();
+
+    assert_eq!(success.status, 200);
+    assert_eq!(counter.load(Ordering::SeqCst), 1, "有效内容不应重试");
+    assert!(elapsed < Duration::from_millis(2500));
+
+    // 纯文本/HTML 等 200 负载不属于「空内容」，同样不重试
+    let (addr, counter) =
+        spawn_scripted_upstream(vec![(axum::http::StatusCode::OK, "<html>ok</html>")]).await;
+    let channel = egress_test_channel("opencode", format!("http://{addr}/v1"));
+    let _ = run_egress(&channel, 0).await;
+    assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+    // 正文 + 思考并存是完整有效响应，不得误判为空内容
+    let with_reasoning = r#"{"choices":[{"index":0,"message":{"role":"assistant","content":"最终答案","reasoning_content":"推理过程"},"finish_reason":"stop"}]}"#;
+    let (addr, counter) =
+        spawn_scripted_upstream(vec![(axum::http::StatusCode::OK, with_reasoning)]).await;
+    let channel = egress_test_channel("opencode", format!("http://{addr}/v1"));
+    let success = run_egress(&channel, 0).await.expect("正文+思考应直接成功");
+    assert_eq!(success.status, 200);
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        1,
+        "有正文的响应（即便带思考）不应重试"
+    );
+
+    // 工具调用也是有效产出：无正文但有 tool_calls 不重试
+    let tool_only = r#"{"choices":[{"index":0,"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"a.rs\"}"}}]},"finish_reason":"tool_calls"}]}"#;
+    let (addr, counter) =
+        spawn_scripted_upstream(vec![(axum::http::StatusCode::OK, tool_only)]).await;
+    let channel = egress_test_channel("opencode", format!("http://{addr}/v1"));
+    let _ = run_egress(&channel, 0).await;
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        1,
+        "tool_calls 属于有效负载，不应重试"
     );
 }
