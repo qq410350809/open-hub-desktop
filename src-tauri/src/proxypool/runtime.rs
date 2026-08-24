@@ -762,6 +762,11 @@ pub fn spawn_dedicated_single_node_instance(
         std::thread::sleep(Duration::from_millis(50));
     }
 
+    // 就绪超时：必须回收刚拉起的子进程。std::process::Child 被 drop 时不会终止
+    // 子进程（Unix 无 kill-on-drop），直接返回 Err 会把 mihomo 遗留为孤儿进程。
+    let mut child = child;
+    let _ = child.kill();
+    let _ = child.wait();
     Err(format!("代理实例就绪超时：{last_err}"))
 }
 
@@ -1036,6 +1041,10 @@ pub fn ensure_shared_instance_with_nodes(
         std::thread::sleep(Duration::from_millis(50));
     }
 
+    // 就绪超时：回收本次拉起的实例，避免半死实例被后续复用或遗留为孤儿进程
+    if let Ok(mut state) = runtime.shared_instance.lock() {
+        stop_single_instance(&mut state);
+    }
     Err(format!("共享代理实例就绪超时：{last_err}"))
 }
 
@@ -1144,4 +1153,103 @@ pub fn proxy_error_index(output: &str) -> Option<usize> {
         .take_while(char::is_ascii_digit)
         .collect::<String>();
     (!digits.is_empty()).then(|| digits.parse().ok()).flatten()
+}
+
+// ---------------------------------------------------------------------------
+// 孤儿 Mihomo 进程自动淘汰
+// ---------------------------------------------------------------------------
+
+/// 判定一条进程命令行是否属于「挂在 OpenHub 运行时下的 Mihomo 内核」。
+///
+/// 双重归属标识（缺一不可）：命令行同时携带本应用数据目录标识（openhub）
+/// 与代理运行时目录（proxy-runtime）。
+///
+/// 内核名放宽为「以 mihomo 结尾」：除自研的 mihomo/mihomo.exe 外，
+/// 还覆盖历史上以 verge-mihomo 等二进制拉起 OpenHub 运行时的异常孤儿
+/// （实测存在 PPID=1、加载 OpenHub 配置的 verge-mihomo 残留）。
+/// 正常运行的 Clash Verge 实例路径为 io.github.clash-verge-rev.*，
+/// 不含归属标识，绝不会被误杀。
+pub(crate) fn is_orphan_mihomo_command(command: &str) -> bool {
+    let lower = command.to_lowercase();
+    if !lower.contains("openhub") || !lower.contains("proxy-runtime") {
+        return false;
+    }
+    // 内核特征：任一空白分隔 token 以 mihomo(.exe) 结尾（mihomo / verge-mihomo 等）。
+    // macOS 路径普遍含空格（如 "Application Support"），无法按首个空格切出 exe，
+    // 但 exe 名与其后参数之间必有空白，按 token 尾段判定即可完整覆盖。
+    lower.split_whitespace().any(|token| {
+        let path_end = token.trim_end_matches(['\\', '/']);
+        let file_name = path_end.rsplit(['/', '\\']).next().unwrap_or(path_end);
+        let stem = file_name.strip_suffix(".exe").unwrap_or(file_name);
+        stem.ends_with("mihomo")
+    })
+}
+
+fn list_process_commands() -> Vec<(u32, String)> {
+    #[cfg(target_os = "windows")]
+    {
+        // PowerShell 输出 "pid|commandline"，逐行解析
+        let output = Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                "Get-CimInstance Win32_Process | Where-Object { $_.Name -like 'mihomo*' } \
+                 | ForEach-Object { \"\" + $_.ProcessId + \"|\" + $_.CommandLine }",
+            ])
+            .output();
+        let Ok(output) = output else {
+            return Vec::new();
+        };
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| {
+                let (pid, cmd) = line.split_once('|')?;
+                Some((pid.trim().parse().ok()?, cmd.to_string()))
+            })
+            .collect()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        // macOS/Linux: ps -axo pid=,command= → "  1234 /path/to/exe args..."
+        let Ok(output) = Command::new("ps").args(["-axo", "pid=,command="]).output() else {
+            return Vec::new();
+        };
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| {
+                let trimmed = line.trim_start();
+                let (pid, rest) = trimmed.split_once(char::is_whitespace)?;
+                Some((pid.parse().ok()?, rest.to_string()))
+            })
+            .collect()
+    }
+}
+
+fn kill_pid(pid: u32) {
+    #[cfg(target_os = "windows")]
+    let _ = Command::new("taskkill").args(["/PID", &pid.to_string(), "/F"]).status();
+    #[cfg(not(target_os = "windows"))]
+    let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+}
+
+/// 清扫历史会话遗留的 OpenHub Mihomo 孤儿进程（自动淘汰）。
+///
+/// 泄漏来源：应用崩溃/强杀时 `ProxyRuntime::Drop` 未执行；旧版本就绪超时路径未回收子进程。
+/// 这些进程的父应用早已不在，却持续占用端口与内存。
+///
+/// **仅允许在应用启动早期、任何实例 spawn 之前调用**：
+/// 此刻本会话尚无活跃实例，清扫天然不会误伤当前正在使用的内核。
+/// 返回本次淘汰的进程数量。
+pub fn reap_orphan_mihomo_processes() -> usize {
+    let mut killed = 0usize;
+    for (pid, command) in list_process_commands() {
+        if is_orphan_mihomo_command(&command) {
+            kill_pid(pid);
+            killed += 1;
+        }
+    }
+    if killed > 0 {
+        warn!("[ProxyPool] 启动清扫：已自动淘汰 {killed} 个遗留的 Mihomo 孤儿进程");
+    }
+    killed
 }

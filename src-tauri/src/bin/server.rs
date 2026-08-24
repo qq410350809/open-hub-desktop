@@ -70,6 +70,8 @@ async fn main() {
     if let Err(error) = proxypool::repair_stored_node_names(&database) {
         tracing::warn!("[OpenHub] 修复代理节点名称失败：{error}");
     }
+    // 启动清扫历史会话遗留的 Mihomo 孤儿进程（必须在拉起任何本会话实例之前）
+    proxypool::reap_orphan_mihomo_processes();
     let proxy_runtime = Arc::new(proxypool::ProxyRuntime::new(
         args.data_dir.join("proxy-runtime"),
     ));

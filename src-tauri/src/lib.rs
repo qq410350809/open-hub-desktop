@@ -136,6 +136,9 @@ pub fn run() {
             if let Err(error) = token::stats::seed_token_database_from_caches(&database) {
                 error!("[OpenHub] Token 缓存迁移到数据库失败：{error}");
             }
+            // 启动清扫历史会话遗留的 Mihomo 孤儿进程：
+            // 必须在拉起任何本会话实例之前执行，此刻清扫天然不会误伤活跃内核。
+            proxypool::reap_orphan_mihomo_processes();
             let proxy_runtime = Arc::new(proxypool::ProxyRuntime::new(
                 app_data_dir.join("proxy-runtime"),
             ));

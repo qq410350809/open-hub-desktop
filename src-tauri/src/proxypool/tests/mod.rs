@@ -276,3 +276,42 @@ fn account_node_bans_expire() {
     std::thread::sleep(Duration::from_millis(5));
     assert!(!runtime.account_node_is_banned("node-a"));
 }
+
+#[test]
+fn orphan_mihomo_detection_matches_only_openhub_owned_kernels() {
+    let mac_bin = "/Users/u/Library/Application Support/com.dfeer.openhub.desktop/bin/mihomo";
+    let runtime_dir = "/Users/u/Library/Application Support/com.dfeer.openhub.desktop/proxy-runtime";
+
+    // 正例：OpenHub 自管的各类实例（shared / channel / speed-test / 自定义二进制路径）
+    for cmd in [
+        format!("{mac_bin} -d {runtime_dir}/shared -f {runtime_dir}/shared/config.yaml"),
+        format!("{mac_bin} -d {runtime_dir}/channels/default -f {runtime_dir}/channels/default/config.yaml"),
+        format!("{mac_bin} -d {runtime_dir}/speed-test-1/shared -f {runtime_dir}/speed-test-1/shared/config.yaml"),
+        format!("/opt/custom-tools/mihomo -d {runtime_dir}/shared"),
+        "C:\\Users\\u\\AppData\\Roaming\\com.dfeer.openhub.desktop\\bin\\mihomo.exe -d C:\\...\\proxy-runtime\\shared".to_string(),
+        // 实测存在的异常孤儿：verge-mihomo 二进制 + OpenHub 运行时配置（PPID=1）
+        "/Applications/Clash Verge.app/Contents/MacOS/verge-mihomo -d /Users/u/Library/Application Support/com.dfeer.openhub.desktop/proxy-runtime/shared -f /Users/u/Library/Application Support/com.dfeer.openhub.desktop/proxy-runtime/shared/config.yaml".to_string(),
+    ] {
+        assert!(
+            is_orphan_mihomo_command(&cmd),
+            "应识别为 OpenHub 孤儿内核: {cmd}"
+        );
+    }
+
+    // 负例：绝不能误杀的进程
+    for cmd in [
+        // Clash Verge 正常实例：指向自家数据目录，不含 OpenHub 归属标识
+        "/Applications/Clash Verge.app/Contents/MacOS/verge-mihomo -d /Users/u/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev -f .../clash-verge.yaml -ext-ctl-unix /tmp/verge/verge-mihomo.sock".to_string(),
+        // 其他软件的 mihomo（无 openhub 标识）
+        "/usr/local/bin/mihomo -d /etc/mihomo".to_string(),
+        // OpenHub 主程序自身（exe 名不是 mihomo）
+        "/Applications/OpenHub.app/Contents/MacOS/open-hub-desktop com.dfeer.openhub.desktop proxy-runtime".to_string(),
+        "openhub-server --data-dir /tmp/openhub/proxy-runtime".to_string(),
+        "".to_string(),
+    ] {
+        assert!(
+            !is_orphan_mihomo_command(&cmd),
+            "不得误杀: {cmd}"
+        );
+    }
+}
