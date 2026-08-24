@@ -78,6 +78,8 @@ pub struct ProxyRuntime {
     #[allow(dead_code)]
     pub shared_pool_lock: tokio::sync::Mutex<()>,
     pub shared_pool_index: AtomicU64,
+    /// 账号代理实例的节点分配游标：多账号按顺序轮询候选节点，避免全部集中到延迟最低的第一个
+    pub account_alloc_seq: AtomicU64,
     pub account_ban_until: Mutex<HashMap<String, Instant>>,
 }
 
@@ -120,6 +122,7 @@ impl ProxyRuntime {
             runtime_op_lock: tokio::sync::Mutex::new(()),
             shared_pool_lock: tokio::sync::Mutex::new(()),
             shared_pool_index: AtomicU64::new(0),
+            account_alloc_seq: AtomicU64::new(0),
             account_ban_until: Mutex::new(HashMap::new()),
         }
     }

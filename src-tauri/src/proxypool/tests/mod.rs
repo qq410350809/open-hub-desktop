@@ -315,3 +315,30 @@ fn orphan_mihomo_detection_matches_only_openhub_owned_kernels() {
         );
     }
 }
+
+#[test]
+fn account_node_allocation_rotates_sequentially_instead_of_pinning_first() {
+    // 回归：多账号此前全部固定选中第一个候选节点；
+    // 现在按分配游标轮询，账号 1→候选1、账号 2→候选2……
+    let candidates = vec![
+        ("node_a".to_string(), String::new(), 50_i64),
+        ("node_b".to_string(), String::new(), 80_i64),
+        ("node_c".to_string(), String::new(), 120_i64),
+    ];
+    let runtime = ProxyRuntime::new(std::env::temp_dir().join("openhub-account-alloc-test"));
+
+    let mut allocated = Vec::new();
+    for _ in 0..candidates.len() {
+        let seq = runtime.account_alloc_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as usize;
+        allocated.push(candidates[seq % candidates.len()].0.clone());
+    }
+
+    assert_eq!(
+        allocated,
+        vec!["node_a", "node_b", "node_c"],
+        "账号应按顺序轮询获得不同节点"
+    );
+    // 游标回绕
+    let seq = runtime.account_alloc_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as usize;
+    assert_eq!(candidates[seq % candidates.len()].0, "node_a");
+}

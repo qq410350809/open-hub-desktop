@@ -13,6 +13,7 @@ use std::fs;
 use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
@@ -913,8 +914,12 @@ pub fn ensure_account_instance(
     }
 
     let candidates = channel_candidate_nodes(database, runtime, "")?;
+    // 账号维度按顺序轮询分配：账号 1 → 候选 1，账号 2 → 候选 2……
+    // 修复此前固定取第一个候选导致所有账号集中在同一节点的问题。
+    // 已有实例的账号命中上方缓存分支不会推进游标，保证同一账号节点稳定。
+    let seq = runtime.account_alloc_seq.fetch_add(1, Ordering::Relaxed) as usize;
     let (best_node_id, _, _) = candidates
-        .first()
+        .get(seq % candidates.len())
         .cloned()
         .ok_or_else(|| "代理池中没有可用的候选节点".to_string())?;
 
