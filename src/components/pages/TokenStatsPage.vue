@@ -250,6 +250,7 @@ const agentKindLabels: Record<string, string> = {
   logs: "日志",
 };
 const localAgents = computed(() => store.localAgentPaths.value?.agents ?? []);
+const visibleAgents = computed(() => localAgents.value.filter((a) => a.detected));
 const localAgentsHome = computed(() => store.localAgentPaths.value?.home ?? "");
 const localAgentEnvOverrides = computed(() => store.localAgentPaths.value?.envOverrides ?? []);
 const detectedAgentsCount = computed(() => localAgents.value.filter((a) => a.detected).length);
@@ -456,6 +457,7 @@ const healthColumns = computed<AppTableColumn[]>(() => {
 
 const healthTableRows = computed(() =>
   healthDisplayCells.value
+    .filter((c) => c.requests > 0)
     .map((c) => ({
       ...c,
       successRate: c.successRate != null ? (c.successRate * 100).toFixed(1) + "%" : "—",
@@ -1840,7 +1842,7 @@ onBeforeUnmount(() => {
 
     <!-- 1. 工具与来源全景分析弹窗 (Tools Modal) -->
     <Transition name="tt-modal-fade">
-      <div v-if="toolsModalOpen" class="tt-modal-backdrop" @click.self="toolsModalOpen = false">
+      <div v-if="toolsModalOpen" class="tt-modal-backdrop">
         <section class="tt-modal-card is-wide" role="dialog" aria-modal="true">
           <header class="tt-modal-header">
             <div>
@@ -1893,7 +1895,7 @@ onBeforeUnmount(() => {
 
     <!-- 2. 模型排行榜与家族透视弹窗 (Models Modal) -->
     <Transition name="tt-modal-fade">
-      <div v-if="modelsModalOpen" class="tt-modal-backdrop" @click.self="modelsModalOpen = false">
+      <div v-if="modelsModalOpen" class="tt-modal-backdrop">
         <section class="tt-modal-card is-wide" role="dialog" aria-modal="true">
           <header class="tt-modal-header">
             <div>
@@ -1944,7 +1946,7 @@ onBeforeUnmount(() => {
 
     <!-- 3. 项目与工作区透视弹窗 (Projects Modal) -->
     <Transition name="tt-modal-fade">
-      <div v-if="projectsModalOpen" class="tt-modal-backdrop" @click.self="projectsModalOpen = false">
+      <div v-if="projectsModalOpen" class="tt-modal-backdrop">
         <section class="tt-modal-card is-wide" role="dialog" aria-modal="true">
           <header class="tt-modal-header">
             <div>
@@ -1996,7 +1998,7 @@ onBeforeUnmount(() => {
 
     <!-- 4. 逐日/逐时明细总账弹窗 (Audit Modal) -->
     <Transition name="tt-modal-fade">
-      <div v-if="auditModalOpen" class="tt-modal-backdrop" @click.self="auditModalOpen = false">
+      <div v-if="auditModalOpen" class="tt-modal-backdrop">
         <section class="tt-modal-card is-wide" role="dialog" aria-modal="true">
           <header class="tt-modal-header">
             <div>
@@ -2043,7 +2045,7 @@ onBeforeUnmount(() => {
 
     <!-- 5. 请求健康矩阵明细弹窗 (Health Modal) -->
     <Transition name="tt-modal-fade">
-      <div v-if="healthModalOpen" class="tt-modal-backdrop" @click.self="healthModalOpen = false">
+      <div v-if="healthModalOpen" class="tt-modal-backdrop">
         <section class="tt-modal-card is-wide" role="dialog" aria-modal="true">
           <header class="tt-modal-header">
             <div>
@@ -2094,7 +2096,7 @@ onBeforeUnmount(() => {
 
     <!-- 统计重建控制台弹窗 (Reconstruction Console Modal) -->
     <Transition name="tt-modal-fade">
-      <div v-if="refreshDialogOpen" class="tt-modal-backdrop" @click.self="closeRefreshDialog">
+      <div v-if="refreshDialogOpen" class="tt-modal-backdrop">
         <section class="tt-modal-card" role="dialog" aria-modal="true">
           <header class="tt-modal-header">
             <div>
@@ -2185,7 +2187,7 @@ onBeforeUnmount(() => {
 
     <!-- 本地 AI Agent 路径诊断弹窗 (Local Agent Inspector Modal) -->
     <Transition name="tt-modal-fade">
-      <div v-if="agentDialogOpen" class="tt-modal-backdrop" @click.self="closeAgentDialog">
+      <div v-if="agentDialogOpen" class="tt-modal-backdrop">
         <section class="tt-modal-card is-wide" role="dialog" aria-modal="true">
           <header class="tt-modal-header">
             <div>
@@ -2203,8 +2205,7 @@ onBeforeUnmount(() => {
             <template v-else-if="store.localAgentPaths.value">
               <div class="tt-agent-overview-bar">
                 <span class="tt-agent-meta-chip">系统根路径: <code>{{ localAgentsHome }}</code></span>
-                <span class="tt-agent-meta-chip">共 <strong>{{ localAgents.length }}</strong> 款 Agent</span>
-                <span class="tt-agent-meta-chip is-success">已检测 <strong>{{ detectedAgentsCount }}</strong> 款活跃</span>
+                <span class="tt-agent-meta-chip is-success">已检测 <strong>{{ detectedAgentsCount }}</strong> 款 Agent</span>
                 <span v-if="localAgentsCollectedAt" class="tt-agent-meta-chip">采集时间: {{ localAgentsCollectedAt }}</span>
               </div>
 
@@ -2219,7 +2220,7 @@ onBeforeUnmount(() => {
 
               <div class="tt-agent-cards-grid">
                 <div
-                  v-for="agent in localAgents"
+                  v-for="agent in visibleAgents"
                   :key="agent.source"
                   class="tt-agent-diag-card"
                   :class="{ 'is-detected': agent.detected }"
@@ -2274,7 +2275,7 @@ onBeforeUnmount(() => {
 
     <!-- 导出数据弹窗 (Export Modal) -->
     <Transition name="tt-modal-fade">
-      <div v-if="exportDialogOpen" class="tt-modal-backdrop" @click.self="closeExportDialog">
+      <div v-if="exportDialogOpen" class="tt-modal-backdrop">
         <section class="tt-modal-card is-wide" role="dialog" aria-modal="true">
           <header class="tt-modal-header">
             <div>

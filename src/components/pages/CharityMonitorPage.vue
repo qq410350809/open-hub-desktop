@@ -702,7 +702,7 @@ onUnmounted(() => {
     <!-- 1. 帖子详情与快速解析弹窗 (Post Detail Modal) -->
     <Teleport to="body">
       <Transition name="cm-modal-fade">
-        <div v-if="selectedPost" class="cm-modal-backdrop" @click.self="closePostDetail">
+        <div v-if="selectedPost" class="cm-modal-backdrop">
           <section class="cm-modal-card is-detail" role="dialog" aria-modal="true">
             <header class="cm-modal-header">
               <div class="cm-modal-title-group">
@@ -800,7 +800,7 @@ onUnmounted(() => {
     <!-- 2. 标签源管理中心弹窗 (Tag Manager Modal) -->
     <Teleport to="body">
       <Transition name="cm-modal-fade">
-        <div v-if="tagManagerOpen" class="cm-modal-backdrop" @click.self="closeTagManager">
+        <div v-if="tagManagerOpen" class="cm-modal-backdrop">
           <section class="cm-modal-card is-tag-mgr" role="dialog" aria-modal="true">
             <header class="cm-modal-header">
               <div>
@@ -906,7 +906,7 @@ onUnmounted(() => {
     <!-- 3. 同步与节点诊断日志终端弹窗 (Sync Log Terminal Modal) -->
     <Teleport to="body">
       <Transition name="cm-modal-fade">
-        <div v-if="store.charitySyncLogOpen.value" class="cm-modal-backdrop" @click.self="store.closeCharitySyncLog()">
+        <div v-if="store.charitySyncLogOpen.value" class="cm-modal-backdrop">
           <section class="cm-modal-card is-terminal" role="dialog" aria-modal="true">
             <header class="cm-modal-header">
               <div>

@@ -21,7 +21,7 @@ onUnmounted(() => document.removeEventListener("keydown", onKeydown, true));
 
 <template>
   <Teleport to="body">
-    <div v-if="visible" class="confirm-dialog-backdrop" @click.self="cancel">
+    <div v-if="visible" class="confirm-dialog-backdrop">
       <section
         class="confirm-dialog"
         role="alertdialog"

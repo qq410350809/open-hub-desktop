@@ -763,9 +763,9 @@ kbd { padding: 3px 7px; border: 1px solid var(--line); border-radius: var(--r-xs
 @keyframes sync-sites-spin { to { transform: rotate(360deg); } }
 
 /* —— Tooltip —— */
-/* z-index 必须高于所有弹层背景（site-models/mc-detail 均为 1000，toast 为 2000），
-   否则在“模型”等弹窗内悬停顶部按钮时气泡会渲染在遮罩之下，显示变暗模糊。 */
-.ui-tooltip { --tooltip-arrow-left: 50%; position: fixed; z-index: 3000; width: max-content; max-width: min(420px,calc(100vw - 20px)); padding: 9px 12px; border: 1px solid rgba(255,255,255,.08); border-radius: var(--r-sm); background: #1c1e24; box-shadow: 0 10px 32px rgba(0,0,0,.32); color: #f4f5f6; white-space: pre-line; overflow-wrap: anywhere; text-align: left; font-size: 11px; font-weight: 500; line-height: 1.55; pointer-events: none; animation: tooltip-in .12s var(--ease-out); }
+/* z-index 必须高于所有弹层背景与弹窗蒙版（各页面 modal-backdrop 最高 9100，
+   toast 为 100000），否则在弹窗内悬停提示元素时气泡会渲染在遮罩之下被遮挡。 */
+.ui-tooltip { --tooltip-arrow-left: 50%; position: fixed; z-index: 40000; width: max-content; max-width: min(420px,calc(100vw - 20px)); padding: 9px 12px; border: 1px solid rgba(255,255,255,.08); border-radius: var(--r-sm); background: #1c1e24; box-shadow: 0 10px 32px rgba(0,0,0,.32); color: #f4f5f6; white-space: pre-line; overflow-wrap: anywhere; text-align: left; font-size: 11px; font-weight: 500; line-height: 1.55; pointer-events: none; animation: tooltip-in .12s var(--ease-out); }
 .ui-tooltip::after { position: absolute; left: var(--tooltip-arrow-left); top: 100%; width: 8px; height: 8px; border-right: 1px solid rgba(255,255,255,.08); border-bottom: 1px solid rgba(255,255,255,.08); background: #1c1e24; content: ""; transform: translate(-50%,-4px) rotate(45deg); }
 .ui-tooltip.is-below::after { top: 0; border: 0; border-top: 1px solid rgba(255,255,255,.08); border-left: 1px solid rgba(255,255,255,.08); transform: translate(-50%,-4px) rotate(45deg); }
 @keyframes tooltip-in { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }

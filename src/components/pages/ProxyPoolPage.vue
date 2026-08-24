@@ -1419,7 +1419,7 @@ watch(nodeViewMode, () => {
     <!-- 1. 导入来源管理弹窗 (Import Sources Modal) -->
     <Teleport to="body">
       <Transition name="pp-modal-fade">
-        <div v-if="importDialogOpen" class="pp-modal-backdrop" @click.self="closeImportDialog">
+        <div v-if="importDialogOpen" class="pp-modal-backdrop">
           <section class="pp-modal-card is-import" role="dialog" aria-modal="true">
             <header class="pp-modal-header">
               <div class="pp-modal-title-group">
@@ -1585,7 +1585,7 @@ watch(nodeViewMode, () => {
     <!-- 2. 代理通道配置弹窗 (Channel Config Modal) -->
     <Teleport to="body">
       <Transition name="pp-modal-fade">
-        <div v-if="channelDialogOpen" class="pp-modal-backdrop" @click.self="closeChannelDialog">
+        <div v-if="channelDialogOpen" class="pp-modal-backdrop">
           <section class="pp-modal-card is-channel-dialog" role="dialog" aria-modal="true">
             <header class="pp-modal-header">
               <div class="pp-modal-title-group">
@@ -1729,7 +1729,7 @@ watch(nodeViewMode, () => {
     <!-- 3. 代理规则与直连名单抽屉/弹窗 (Settings Modal) -->
     <Teleport to="body">
       <Transition name="pp-modal-fade">
-        <div v-if="settingsOpen" class="pp-modal-backdrop" @click.self="closeSettings">
+        <div v-if="settingsOpen" class="pp-modal-backdrop">
           <section class="pp-modal-card is-settings" role="dialog" aria-modal="true">
             <header class="pp-modal-header">
               <div class="pp-modal-title-group">
@@ -1924,7 +1924,7 @@ watch(nodeViewMode, () => {
     <!-- 4. 测速取消确认弹窗 (Cancel Confirm Modal) -->
     <Teleport to="body">
       <Transition name="pp-modal-fade">
-        <div v-if="cancelConfirmOpen" class="pp-modal-backdrop" @click.self="closeCancelTest">
+        <div v-if="cancelConfirmOpen" class="pp-modal-backdrop">
           <section class="pp-modal-card is-confirm" role="alertdialog" aria-modal="true">
             <div class="pp-confirm-body">
               <span class="pp-confirm-icon" v-html="icons.alert" />
