@@ -51,13 +51,10 @@ const {
   proxyStatus,
   savingConfig,
   togglingServer,
-  testingHealth,
   fetchingModels,
   channelModels,
   modelsForChannel,
   channelStats,
-  healthResult,
-  healthResultTime,
   proxyLogs,
   loadingLogs,
   loadProxyData,
@@ -68,7 +65,6 @@ const {
   copyResponsesUrl,
   saveConfig,
   toggleServer,
-  testHealth,
 fetchUpstreamModels,
 refreshModels,
 loadCachedModels,
@@ -104,7 +100,6 @@ const channelSearchQuery = ref("");
 const logSearchQuery = ref("");
 const logStatusFilter = ref<"all" | "success" | "error">("all");
 const configModalOpen = ref(false);
-const healthModalOpen = ref(false);
 const gatewayModelsModalOpen = ref(false);
 const currentMainTab = ref<"console" | "channels" | "logs">("console");
 const channelModelsModalOpen = ref(false);
@@ -219,15 +214,6 @@ async function handleChannelSave(channel: ChannelConfig) {
   }
 }
 
-async function handleOpenHealthModal() {
-  healthModalOpen.value = true;
-  await testHealth();
-}
-
-function closeHealthModal() {
-  healthModalOpen.value = false;
-}
-
 function handleOpenGatewayModelsModal() {
   gatewayModelsModalOpen.value = true;
   if (Object.keys(channelModels.value).length === 0) {
@@ -285,6 +271,29 @@ async function handleOpenChannelModelsModal(channel: ChannelConfig) {
       fetchingDraftModels.value = false;
     }
   }
+
+  // 4. 后台静默拉取该渠道最新模型：保证草稿不停留在旧快照。
+  // 上游新增的模型自动进入勾选态（否则白名单会永久遮蔽新模型，造成“刷新也不变”的假象），
+  // 如不需要可在列表中手动取消勾选。
+  const knownBefore = new Set(channelDraftModels.value);
+  void (async () => {
+    try {
+      fetchingDraftModels.value = true;
+      const map = await fetchUpstreamModels({ setGlobalFetching: false });
+      const fresh = map[channel.id];
+      if (!fresh?.length) return;
+      channelDraftModels.value = [...fresh];
+      channelModels.value = { ...channelModels.value, [channel.id]: [...fresh] };
+      if (channelModelAllChecked.value) return;
+      const added = fresh.filter((m) => !knownBefore.has(m));
+      for (const m of added) channelModelSelection.value[m] = true;
+      if (added.length > 0) {
+        showToast(`「${channel.name}」发现 ${added.length} 个新增模型，已自动加入白名单`);
+      }
+    } finally {
+      fetchingDraftModels.value = false;
+    }
+  })();
 }
 
 function closeChannelModelsModal() {
@@ -410,6 +419,9 @@ const channelSettingsDraft = ref<ChannelSettingsDraft>({
   useFixedProxy: false,
 });
 const channelSettingsError = ref("");
+const channelSettingsTargetIsBuiltin = computed(
+  () => channelSettingsTarget.value != null && isBuiltinChannel(channelSettingsTarget.value),
+);
 
 function handleOpenChannelSettingsDialog(channel: ChannelConfig) {
   channelSettingsTarget.value = channel;
@@ -424,6 +436,25 @@ function handleOpenChannelSettingsDialog(channel: ChannelConfig) {
 
 function closeChannelSettingsDialog() {
   channelSettingsDialogOpen.value = false;
+}
+
+/** 内置固化渠道（后端保留 statsId 1-100，opencode=1；动态渠道从 101 起分配） */
+function isBuiltinChannel(channel: ChannelConfig): boolean {
+  return channel.statsId != null && channel.statsId > 0 && channel.statsId < 101;
+}
+
+/**
+ * 渠道有效 Key 数量：与后端 get_effective_keys 同口径——
+ * apiKeys 非空时以其为准（多 Key 自动轮换），否则回退单 apiKey；空串不计。
+ * opencode 匿名模式无 Key 时为 0。
+ */
+function channelKeyCount(channel: ChannelConfig): number {
+  const list = channel.apiKeys?.length
+    ? channel.apiKeys
+    : channel.apiKey?.trim()
+      ? [channel.apiKey]
+      : [];
+  return new Set(list.map((k) => k.trim()).filter(Boolean)).size;
 }
 
 /** 校验别名：合法字符 + 全渠道唯一（含 opencode）。返回错误信息，空串表示通过。 */
@@ -441,12 +472,16 @@ function validateAlias(alias: string, excludeId?: string): string {
 async function saveChannelSettings() {
   const channel = channelSettingsTarget.value;
   if (!channel) return;
-  const err = validateAlias(channelSettingsDraft.value.alias, channel.id);
+  // 固化渠道别名固定（网关模型前缀依赖它），无论草稿值如何都保持原样
+  const nextAlias = isBuiltinChannel(channel)
+    ? channelAlias(channel)
+    : channelSettingsDraft.value.alias.trim().toLowerCase();
+  const err = validateAlias(nextAlias, channel.id);
   if (err) {
     channelSettingsError.value = err;
     return;
   }
-  channel.alias = channelSettingsDraft.value.alias.trim().toLowerCase();
+  channel.alias = nextAlias;
   // 两种渠道的设置界面不同：站点转换渠道只有「代理池固定通道」，官方通道只有「内部代理池轮询」
   if (channel.siteId) {
     channel.useProxyPool = false;
@@ -926,49 +961,6 @@ function formatSec(ms?: number | null): string {
   return `${sec.toFixed(2)}s`;
 }
 
-interface HealthCheckItem {
-  name: string;
-  endpoint: string;
-  status: string;
-  message: string;
-  auth?: string;
-}
-
-const healthCheckList = computed<HealthCheckItem[]>(() => {
-  if (!healthResult.value) return [];
-  if (Array.isArray(healthResult.value)) {
-    return healthResult.value as HealthCheckItem[];
-  }
-  if (healthResult.value.checks && Array.isArray(healthResult.value.checks)) {
-    return healthResult.value.checks as HealthCheckItem[];
-  }
-  if (healthResult.value.error) {
-    return [
-      {
-        name: "健康检查连接",
-        endpoint: "/v1/health",
-        status: "error",
-        message: String(healthResult.value.error),
-        auth: "API Key",
-      },
-    ];
-  }
-  return [
-    {
-      name: "本地服务",
-      endpoint: "/v1/health",
-      status: "ok",
-      message: JSON.stringify(healthResult.value),
-      auth: "API Key",
-    },
-  ];
-});
-
-const healthAllPassed = computed(() => {
-  if (healthCheckList.value.length === 0) return false;
-  return healthCheckList.value.every((item: HealthCheckItem) => item.status === "ok");
-});
-
 // —— 控制台端点快速复制与指标聚合 ——
 const openAiBaseUrl = computed(
   () => (isTauri && proxyStatus.value.url) || `${serviceOrigin.value}${API_PATH_V1}`
@@ -1310,13 +1302,16 @@ const overviewActiveTokensChart = computed(() =>
 export interface ChannelModelGroup {
   channel: ChannelConfig;
   models: string[];
+  /** 该渠道已知模型总数（未经白名单过滤），供「白名单 N/M」角标展示 */
+  totalKnown: number;
 }
 
 const gatewayGroupedModels = computed<ChannelModelGroup[]>(() => {
   const q = gatewaySearchQuery.value.trim().toLowerCase();
   return proxyConfig.value.channels.map((channel) => {
     // 该渠道对外可见的模型：按渠道拉取的模型再经白名单勾选结果过滤
-    let models = filterChannelModels(channel, modelsForChannel(channel.id));
+    const known = modelsForChannel(channel.id);
+    let models = filterChannelModels(channel, known);
     const alias = channelAlias(channel);
     if (q) {
       models = models.filter(
@@ -1326,6 +1321,7 @@ const gatewayGroupedModels = computed<ChannelModelGroup[]>(() => {
     return {
       channel,
       models,
+      totalKnown: known.length,
     };
   });
 });
@@ -1486,18 +1482,6 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
           <span v-if="availableModelsCount > 0" class="mp-btn-badge">
             {{ availableModelsCount }}
           </span>
-        </button>
-
-        <!-- 健康检查弹窗触发按钮 -->
-        <button
-          type="button"
-          class="mp-btn mp-btn-ghost"
-          :disabled="testingHealth"
-          title="打开健康检查报告弹窗"
-          @click="handleOpenHealthModal"
-        >
-          <span v-html="icons.pulse" />
-          <span>{{ testingHealth ? "测试中…" : "健康检查" }}</span>
         </button>
 
         <!-- 启动/停止服务按钮 -->
@@ -1925,20 +1909,32 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
                 <span v-html="icons.cpu" />
               </div>
               <div>
-                <h3>{{ channel.name }}</h3>
+                <h3>{{ channel.name }}<span class="mp-title-alias">（{{ channelAlias(channel) }}）</span></h3>
                 <span class="mp-card-tags">
-                  <span class="mp-proto-tag">{{ channel.protocol.toUpperCase() }} 协议</span>
-                  <span class="mp-alias-tag" :title="`英文别名：${channelAlias(channel)}（作为网关模型前缀）`">{{ channelAlias(channel) }}</span>
+                  <span
+                    v-if="isBuiltinChannel(channel)"
+                    class="mp-alias-tag is-builtin"
+                    title="内置固化渠道：官方维护，别名固定不可修改"
+                  >固化渠道</span>
                   <span
                     v-if="channel.siteId"
                     class="mp-alias-tag is-site"
                     title="与站点库原纪录关联，使用该站点同步的原 Key"
                   >站点关联</span>
                   <span
-                    v-if="(channel.apiKeys?.length ?? 0) > 1"
+                    v-if="channelKeyCount(channel) > 0"
                     class="mp-alias-tag"
-                    :title="`继承该站点 ${channel.apiKeys!.length} 个原 Key，请求时自动轮换`"
-                  >Key ×{{ channel.apiKeys!.length }}</span>
+                    :title="
+                      channelKeyCount(channel) > 1
+                        ? `配置了 ${channelKeyCount(channel)} 个 Key，请求时自动轮换`
+                        : '已配置 1 个 Key'
+                    "
+                  >Key ×{{ channelKeyCount(channel) }}</span>
+                  <span
+                    v-else-if="isBuiltinChannel(channel)"
+                    class="mp-alias-tag"
+                    title="未配置 Key：以匿名模式访问 OpenCode 免费模型"
+                  >免 Key</span>
                 </span>
               </div>
             </div>
@@ -2303,7 +2299,7 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
       role="dialog"
       aria-modal="true"
       aria-labelledby="mp-config-modal-title"
-      @click.self="configModalOpen = false"
+     
     >
       <div class="mp-modal-box mp-modal-box-sm">
         <div class="mp-modal-header">
@@ -2420,7 +2416,7 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
       role="dialog"
       aria-modal="true"
       aria-labelledby="mp-log-detail-title"
-      @click.self="closeLogDetail"
+     
     >
       <div class="mp-modal-box mp-modal-box-extra-wide mp-log-detail-box">
         <div class="mp-modal-header">
@@ -2859,7 +2855,7 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
       role="dialog"
       aria-modal="true"
       aria-labelledby="mp-gateway-models-title"
-      @click.self="closeGatewayModelsModal"
+     
     >
       <div class="mp-modal-box mp-modal-box-wide">
         <div class="mp-modal-header">
@@ -2932,13 +2928,17 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
                   </div>
                   <div class="mp-group-name-wrap">
                     <h4 class="mp-group-name">{{ group.channel.name }} 渠道</h4>
-                    <span class="mp-proto-tag">{{ group.channel.protocol.toUpperCase() }} 协议</span>
-                    <span class="mp-group-count-badge">{{ group.models.length }} 个模型</span>
                     <span
                       v-if="group.channel.enabledModels != null"
                       class="mp-group-count-badge is-filtered"
-                      title="该渠道已在「管理模型」中勾选白名单，未勾选的模型不在此展示"
-                    >已管理</span>
+                      :title="`已启用白名单：仅对外暴露 ${group.models.length}/${group.totalKnown} 个已知模型；上游新增的模型需在「管理模型」中勾选后才会出现在此处`"
+                    >白名单 {{ group.models.length }}/{{ group.totalKnown }}</span>
+                    <span class="mp-group-count-badge">{{ group.models.length }} 个模型</span>
+                    <span
+                      v-if="group.channel.enabledModels != null && group.totalKnown > group.models.length"
+                      class="mp-group-count-badge is-filtered"
+                      :title="`上游有 ${group.totalKnown - group.models.length} 个模型不在白名单内，总览不展示；可在「管理模型」中调整`"
+                    >+{{ group.totalKnown - group.models.length }} 未纳入</span>
                   </div>
                 </div>
                 <div class="mp-group-meta">
@@ -3025,7 +3025,7 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
       role="dialog"
       aria-modal="true"
       aria-labelledby="mp-channel-models-title"
-      @click.self="closeChannelModelsModal"
+     
     >
       <div class="mp-modal-box mp-modal-box-wide">
         <div class="mp-modal-header">
@@ -3178,7 +3178,7 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
       role="dialog"
       aria-modal="true"
       aria-labelledby="mp-channel-settings-title"
-      @click.self="closeChannelSettingsDialog"
+     
     >
       <div class="mp-modal-box">
         <div class="mp-modal-header">
@@ -3220,9 +3220,12 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
               class="mp-settings-input"
               :class="{ 'has-error': channelSettingsError }"
               placeholder="仅限英文、数字、- 与 _"
+              :disabled="channelSettingsTargetIsBuiltin"
+              title="固化渠道的英文别名固定为 opencode，不可修改"
               @input="channelSettingsError = validateAlias(channelSettingsDraft.alias, channelSettingsTarget?.id)"
             />
             <p v-if="channelSettingsError" class="mp-settings-error">{{ channelSettingsError }}</p>
+            <p v-else-if="channelSettingsTargetIsBuiltin" class="mp-settings-hint">固化渠道的别名固定为 opencode（网关模型前缀依赖它），不可修改</p>
             <p v-else class="mp-settings-hint">所有渠道别名不能重复（含 opencode）</p>
           </div>
 
@@ -3311,7 +3314,7 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
       role="dialog"
       aria-modal="true"
       aria-labelledby="mp-delete-channel-title"
-      @click.self="closeDeleteChannelModal"
+     
     >
       <div class="mp-modal-box mp-modal-box-sm">
         <div class="mp-modal-header">
@@ -3373,7 +3376,7 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
       role="dialog"
       aria-modal="true"
       aria-labelledby="mp-site-convert-title"
-      @click.self="closeSiteConvertDialog"
+     
     >
       <div class="mp-modal-box mp-modal-box-wide">
         <div class="mp-modal-header">
@@ -3506,184 +3509,6 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
       </div>
     </div>
 
-    <!-- 健康检查与服务状态弹出框 (宽屏合并弹窗) -->
-    <div
-      v-if="healthModalOpen"
-      class="mp-modal-backdrop"
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="mp-health-modal-title"
-      @click.self="closeHealthModal"
-    >
-      <div class="mp-modal-box mp-modal-box-extra-wide">
-        <div class="mp-modal-header">
-          <div class="mp-modal-title-group">
-            <span class="mp-modal-icon" v-html="icons.pulse" />
-            <div>
-              <h3 id="mp-health-modal-title">服务连接状态与健康检查报告</h3>
-              <small class="text-muted">检测时间 {{ healthResultTime || '刚刚' }} · 端点 {{ serviceOrigin }}/v1/health</small>
-            </div>
-          </div>
-          <button
-            type="button"
-            class="mp-modal-close"
-            title="关闭弹窗 (Esc)"
-            @click="closeHealthModal"
-          >
-            <span v-html="icons.close" />
-          </button>
-        </div>
-
-        <div class="mp-modal-body">
-          <!-- 运行概览指标块 -->
-          <div class="mp-metrics-row">
-            <div class="mp-metric-box">
-              <label>服务端口</label>
-              <strong class="font-mono text-brand">{{ proxyStatus.port || "启动后确定" }}</strong>
-            </div>
-            <div class="mp-metric-box">
-              <label>累计请求</label>
-              <strong class="font-mono">{{ proxyStatus.totalRequests }}</strong>
-            </div>
-            <div class="mp-metric-box">
-              <label>成功 / 失败</label>
-              <strong class="font-mono text-success">{{ proxyStatus.successfulRequests }} <span class="text-muted">/</span> <span class="text-danger">{{ proxyStatus.failedRequests }}</span></strong>
-            </div>
-            <div class="mp-metric-box">
-              <label>运行时长</label>
-              <strong>{{ proxyStatus.running ? formatUptime(proxyStatus.uptimeSeconds) : '--' }}</strong>
-            </div>
-          </div>
-
-          <!-- Base URL & API Key 快捷条目 -->
-          <div class="mp-endpoint-list">
-            <div class="mp-endpoint-item">
-              <span class="mp-ep-label">Base URL</span>
-              <code class="mp-ep-code">{{ openAiBaseUrl }}</code>
-              <button
-                type="button"
-                class="mp-action-btn"
-                title="复制 Base URL"
-                @click="copyProxyUrl"
-              >
-                <span v-html="icons.copy" />
-                <span>复制</span>
-              </button>
-            </div>
-
-            <div class="mp-endpoint-item">
-              <span class="mp-ep-label">API Key</span>
-              <code class="mp-ep-code">
-                {{ showKey ? (proxyConfig.apiKey || '(等待服务生成 API Key)') : (proxyConfig.apiKey ? '••••••••••••••••••••' : '(等待服务生成 API Key)') }}
-              </code>
-              <div class="mp-ep-btns">
-                <button
-                  v-if="proxyConfig.apiKey"
-                  type="button"
-                  class="mp-action-btn mp-btn-icon-only"
-                  :title="showKey ? '隐藏密钥' : '显示密钥'"
-                  @click="showKey = !showKey"
-                >
-                  <span v-html="showKey ? icons.eyeOff : icons.eye" />
-                </button>
-                <button
-                  type="button"
-                  class="mp-action-btn"
-                  title="复制 API Key"
-                  @click="copyProxyKey"
-                >
-                  <span v-html="icons.copy" />
-                  <span>复制</span>
-                </button>
-              </div>
-            </div>
-          </div>
-
-          <!-- 诊断状态横幅 -->
-          <div
-            class="mp-health-summary-banner"
-            :class="healthAllPassed ? 'is-success' : 'is-warning'"
-          >
-            <span
-              class="mp-summary-icon"
-              v-html="healthAllPassed ? icons.check : icons.alert"
-            />
-            <div class="mp-summary-text">
-              <strong>{{ healthAllPassed ? '所有端点与通道运行正常' : '部分端点存在提示或异常' }}</strong>
-              <p v-if="healthCheckList.length > 0">共完成 {{ healthCheckList.length }} 项端点与通道连通性检测</p>
-              <p v-else>正在连接服务并获取健康检查数据…</p>
-            </div>
-          </div>
-
-          <!-- 详细检测数组表格 -->
-          <div class="mp-health-table-wrap">
-            <table class="mp-health-table">
-              <thead>
-                <tr>
-                  <th style="width: 220px;">检测项</th>
-                  <th style="width: 200px;">端点 / 路径</th>
-                  <th style="width: 90px;">状态</th>
-                  <th style="width: 100px;">鉴权</th>
-                  <th>检测详情与协议说明</th>
-                </tr>
-              </thead>
-              <tbody>
-                <tr
-                  v-for="(item, idx) in healthCheckList"
-                  :key="idx"
-                  class="mp-health-row"
-                >
-                  <td class="font-medium text-text">{{ item.name }}</td>
-                  <td><code class="mp-ep-code-sm">{{ item.endpoint }}</code></td>
-                  <td>
-                    <span
-                      class="mp-status-tag"
-                      :class="{
-                        'tag-ok': item.status === 'ok',
-                        'tag-warn': item.status === 'warning' || item.status === 'disabled',
-                        'tag-err': item.status === 'error',
-                      }"
-                    >
-                      <span class="mp-status-dot-sm" />
-                      <span>{{ item.status === 'ok' ? '正常' : (item.status === 'warning' ? '提示' : '异常') }}</span>
-                    </span>
-                  </td>
-                  <td>
-                    <span class="mp-auth-tag">{{ item.auth || '--' }}</span>
-                  </td>
-                  <td class="text-muted text-sm">{{ item.message }}</td>
-                </tr>
-                <tr v-if="healthCheckList.length === 0">
-                  <td colspan="5" class="text-center py-6 text-muted">
-                    {{ testingHealth ? '正在执行健康检查…' : '暂无检查数据' }}
-                  </td>
-                </tr>
-              </tbody>
-            </table>
-          </div>
-        </div>
-
-        <div class="mp-modal-footer">
-          <button
-            type="button"
-            class="mp-btn mp-btn-ghost"
-            :disabled="testingHealth"
-            @click="testHealth"
-          >
-            <span v-html="icons.restore" />
-            <span>{{ testingHealth ? "正在重新测试…" : "重新检测" }}</span>
-          </button>
-          <button
-            type="button"
-            class="mp-btn mp-btn-primary"
-            @click="closeHealthModal"
-          >
-            确定
-          </button>
-        </div>
-      </div>
-    </div>
-
     <!-- 数据库日志清理选项弹窗 (Clear Logs Options Modal) -->
     <div
       v-if="clearLogsModalOpen"
@@ -3691,7 +3516,7 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
       role="dialog"
       aria-modal="true"
       aria-labelledby="mp-clear-modal-title"
-      @click.self="clearLogsModalOpen = false"
+     
     >
       <div class="mp-modal-box mp-modal-box-sm mp-clear-logs-box">
         <div class="mp-modal-header">
@@ -4866,6 +4691,13 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
   margin: 0;
 }
 
+/* 标题后括号内的英文别名：弱化展示，不喧宾夺主 */
+.mp-title-alias {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-muted);
+}
+
 .mp-proto-tag {
   font-size: 10.5px;
   font-weight: 600;
@@ -4901,6 +4733,19 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
   color: var(--brand-deep);
   background: var(--brand-soft);
   border-color: var(--brand);
+}
+
+/* 内置固化渠道标记：官方维护、别名固定 */
+.mp-alias-tag.is-builtin {
+  color: #8a6d1a;
+  background: rgba(212, 167, 44, 0.12);
+  border-color: rgba(212, 167, 44, 0.45);
+}
+
+:global(:root[data-theme="dark"]) .mp-alias-tag.is-builtin {
+  color: #e2c258;
+  background: rgba(212, 167, 44, 0.16);
+  border-color: rgba(212, 167, 44, 0.4);
 }
 
 /* 分区头部操作区 */
@@ -5851,54 +5696,7 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
   font-size: 13px;
 }
 
-/* 健康检查弹窗样式 */
-.mp-health-summary-banner {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 12px 16px;
-  border-radius: var(--r-md);
-  border: 1px solid transparent;
-}
 
-.mp-health-summary-banner.is-success {
-  background: var(--brand-soft);
-  border-color: color-mix(in srgb, var(--brand) 40%, transparent);
-}
-
-.mp-health-summary-banner.is-warning {
-  background: color-mix(in srgb, var(--danger) 10%, transparent);
-  border-color: color-mix(in srgb, var(--danger) 40%, transparent);
-}
-
-.mp-summary-icon {
-  width: 24px;
-  height: 24px;
-  display: inline-flex;
-  flex-shrink: 0;
-}
-
-.mp-health-summary-banner.is-success .mp-summary-icon {
-  color: var(--brand);
-}
-
-.mp-health-summary-banner.is-warning .mp-summary-icon {
-  color: var(--danger);
-}
-
-.mp-summary-text strong {
-  font-size: 13.5px;
-  color: var(--text);
-  display: block;
-}
-
-.mp-summary-text p {
-  margin: 2px 0 0;
-  font-size: 12px;
-  color: var(--muted);
-}
-
-.mp-health-table-wrap,
 .mp-logs-table-wrap {
   position: relative;
   border: 1px solid var(--line);
@@ -5930,7 +5728,6 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
   font-weight: 500;
 }
 
-.mp-health-table,
 .mp-logs-table {
   width: 100%;
   border-collapse: collapse;
@@ -5940,7 +5737,6 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
   text-align: left;
 }
 
-.mp-health-table th,
 .mp-logs-table th {
   background: var(--surface-soft);
   color: var(--muted);
@@ -5974,16 +5770,12 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
   opacity: 0.75;
 }
 
-.mp-health-table td,
 .mp-logs-table td {
   padding: 10px 12px;
   border-bottom: 1px solid var(--line);
   vertical-align: middle;
 }
 
-.mp-health-row:last-child td {
-  border-bottom: none;
-}
 
 .mp-ep-code-sm {
   font-family: var(--font-mono, monospace);
