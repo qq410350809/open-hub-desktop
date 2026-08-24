@@ -3272,7 +3272,7 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
 
             <div v-if="channelSettingsDraft.useFixedProxy" class="mp-proxy-pool-status is-active">
               <span class="mp-status-dot-sm" />
-              <span>始终经代理池出口节点转发（不直连），适合直连被限制的站点渠道</span>
+              <span>始终经同一代理池出口节点转发（不直连、不轮换），适合直连被限制的站点渠道</span>
             </div>
             <div v-else class="mp-proxy-pool-status is-inactive">
               <span>默认出口：直连上游通道</span>
@@ -3282,7 +3282,7 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
 
         <div class="mp-modal-footer">
           <div class="mp-modal-footer-hint text-muted text-xs">
-            <span>💡 遇到上游频次限制或连接错误时，网关会自动切换代理池出口节点重试</span>
+            <span>💡 遇到上游频次限制或连接错误时，代理池轮询渠道会自动切换出口节点重试；固定通道始终锁定同一节点</span>
           </div>
           <div class="mp-modal-footer-buttons">
             <button

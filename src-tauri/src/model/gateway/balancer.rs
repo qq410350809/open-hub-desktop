@@ -234,7 +234,16 @@ pub async fn get_sorted_egress_candidates(
                 Err(_) => Vec::new(),
             }
         };
-        candidates.extend(nodes);
+        if channel.use_fixed_proxy {
+            // 固定通道语义：恒定使用单一出口节点。未手动指定节点时按 rowid 锁定
+            // 首个启用节点（绝对稳定，不随延迟测量值漂移），绝不进入多节点轮换，
+            // 否则重试/轮询游标会让流量在池内漂移，「固定」名存实亡。
+            if let Some(first) = nodes.into_iter().next() {
+                return vec![first];
+            }
+        } else {
+            candidates.extend(nodes);
+        }
     }
 
     if candidates.is_empty() {
