@@ -116,15 +116,50 @@ pub async fn handle_messages(
     let mut log = outcome.base_log(PATH, &raw_model, is_stream, req_body_str);
     log.client_name = Some(client_name_from_headers(&headers, PATH));
 
-    // 流式：即使同协议也经「归一化 → 回转」链路，保住 Token 统计/思考捕获/日志重建
+    // 流式：快速通道走「原生字节直通 + 兼容修复 + 旁路统计」，杜绝往返转换丢失内容；
+    // 跨协议转换路径仍经归一化链路
     if is_stream {
-        let stream_body = openai_to_anthropic_sse_stream(
-            egress::normalized_sse_stream(outcome.success.response.bytes_stream(), outcome.target),
-            ctx.clone(),
-            log,
-            start_time,
-            raw_model,
-        );
+        let stream_body = if fast_path {
+            // 提取请求 tools 的参数键作为工具名恢复线索（部分上游省略 content_block_start）
+            let preferred_tool: Option<String> = body
+                .pointer("/tool_choice/name")
+                .and_then(JsonValue::as_str)
+                .map(str::to_string);
+            let tool_hints: Vec<crate::model::gateway::stream::ToolHint> = body
+                .get("tools")
+                .and_then(JsonValue::as_array)
+                .map(|tools| {
+                    tools
+                        .iter()
+                        .filter_map(|t| {
+                            let name = t.get("name").and_then(JsonValue::as_str)?.to_string();
+                            let keys: Vec<String> = t
+                                .pointer("/input_schema/properties")
+                                .and_then(JsonValue::as_object)
+                                .map(|props| props.keys().cloned().collect())
+                                .unwrap_or_default();
+                            Some((name, keys))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            super::super::stream::passthrough_anthropic_sse_with_stats(
+                outcome.success.response.bytes_stream(),
+                ctx.clone(),
+                log,
+                start_time,
+                tool_hints,
+                preferred_tool,
+            )
+        } else {
+            openai_to_anthropic_sse_stream(
+                egress::normalized_sse_stream(outcome.success.response.bytes_stream(), outcome.target),
+                ctx.clone(),
+                log,
+                start_time,
+                raw_model,
+            )
+        };
         return Response::builder()
             .status(StatusCode::OK)
             .header("Content-Type", "text/event-stream")

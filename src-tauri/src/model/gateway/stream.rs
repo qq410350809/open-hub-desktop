@@ -8,6 +8,7 @@ use serde_json::{json, Value as JsonValue};
 use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
+use tracing::warn;
 
 /// 单个工具调用参数的流式累积
 #[derive(Default)]
@@ -330,8 +331,18 @@ pub fn clean_sse_stream<E: std::fmt::Display + Send + 'static>(
 
                                 let cleaned_data = serde_json::to_string(&jv).unwrap_or_else(|_| data.to_string());
                                 yield Ok::<Bytes, std::io::Error>(Bytes::from(format!("data: {cleaned_data}\n\n")));
+                            } else if data.starts_with('{') || data.starts_with('[') {
+                                // 残缺 JSON（上游 write 截断缺陷，实测 x666 会发出
+                                // `{"id":"msg_...","choices":[{"index":0,` 这类半截 chunk）：
+                                // 原样透传会让客户端 JSON.parse 直接报错，必须拦截丢弃。
+                                // 截断片段不含任何可用增量语义，丢弃无损。
+                                warn!(
+                                    "[ModelGateway] 丢弃上游残缺 SSE 分片（{} 字节）: {:?}",
+                                    line.len(),
+                                    cap_log_body(line.clone())
+                                );
                             } else {
-                                // 无法解析的负载原样透传；补齐事件终止空行，避免客户端粘包
+                                // 非 JSON 结构的负载（纯文本等）原样透传；补齐事件终止空行，避免客户端粘包
                                 yield Ok::<Bytes, std::io::Error>(Bytes::from(format!("{line}\n\n")));
                             }
                         } else if line.is_empty() {
@@ -1151,5 +1162,445 @@ mod stream_accumulator_tests {
         );
         // 文本连续追加不应重复开块
         assert_eq!(block_types.iter().filter(|t| **t == "text").count(), 1);
+    }
+}
+
+/// 工具名候选：(工具名, 参数键列表)。提取自客户端请求体的 tools 数组，
+/// 用于在上游省略 content_block_start 帧时启发式恢复工具名。
+pub type ToolHint = (String, Vec<String>);
+
+/// Anthropic 快速通道专用：上游原生 Anthropic SSE 字节流**零转换直通**客户端，
+/// 同时旁路扫描事件以提取 token 统计与响应全文（供日志与仪表盘使用）。
+///
+/// 兼容性能力：部分上游（如 new-api 系站点）在 tool_use 场景不发送
+/// content_block_start 帧，input_json_delta 直接裸奔。标准客户端必须先收到
+/// start 才能建立块并获得工具名。本函数维护块开启状态，检测到孤儿 delta 时
+/// 动态注入合成的 content_block_start —— 工具名按请求 tools 的参数键匹配
+/// 启发式恢复，保证客户端始终收到规范完整的事件序列。
+#[allow(clippy::too_many_arguments)]
+pub fn passthrough_anthropic_sse_with_stats<E: std::fmt::Display + Send + 'static>(
+    stream: impl futures_util::Stream<Item = Result<Bytes, E>> + Send + 'static,
+    ctx: ModelProxyContext,
+    mut log: ProxyRequestLog,
+    start_time: Instant,
+    tool_hints: Vec<ToolHint>,
+    preferred_tool: Option<String>,
+) -> Body {
+    let s = async_stream::stream! {
+        let mut reader = SseLineReader::new();
+        let mut stats = SseTokenStats::new();
+        // 响应全文：逐行忠实记录上游 data 载荷原文，仅以换行分隔，不做任何格式化加工
+        let mut raw_body = String::new();
+        let mut has_thinking = false;
+        // 兼容层状态
+        let mut open_blocks: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        let mut synth_seq: u64 = 0;
+        // 孤儿 tool_use 块缓冲：上游缺失 content_block_start 时暂存参数增量，
+        // 直到工具名可被可靠恢复（参数键命中 / tool_choice 指定）或终态帧到达才冲刷下发，
+        // 避免以占位名即时下发导致客户端「Tool not found」
+        struct PendingTool {
+            idx: u64,
+            args: String,
+            buffered: Vec<String>,
+        }
+        let mut pending: Option<PendingTool> = None;
+        let mut ttft_recorded = false;
+
+        tokio::pin!(stream);
+
+        while let Some(chunk_res) = stream.next().await {
+            match chunk_res {
+                Ok(bytes) => {
+                    // 首字节到达即 TTFT（直通模式首个上游分片就是首字时间）
+                    if !ttft_recorded {
+                        log.ttft_ms = Some(start_time.elapsed().as_millis() as u64);
+                        ttft_recorded = true;
+                    }
+                    let lines = reader.push(&bytes);
+                    // 本 chunk 的重组输出：普通行直通，孤儿块相关行按冲刷时机插入
+                    let mut out_bytes: Vec<u8> = Vec::new();
+                    let stats_lines = lines.clone();
+
+                    for line in lines {
+                        let data_payload = line.strip_prefix("data:").map(|d| d.trim().to_string());
+                        let jv = data_payload
+                            .as_deref()
+                            .and_then(|d| serde_json::from_str::<JsonValue>(d).ok());
+
+                        // ---- 工具名恢复与孤儿块冲刷辅助闭包（以宏内联形式展开）----
+                        macro_rules! resolve_name {
+                            ($args:expr) => {{
+                                let mut best_name: Option<String> = None;
+                                let mut best_score: usize = 0;
+                                for (name, keys) in &tool_hints {
+                                    let score =
+                                        keys.iter().filter(|k| $args.contains(k.as_str())).count();
+                                    if score > best_score {
+                                        best_score = score;
+                                        best_name = Some(name.clone());
+                                    }
+                                }
+                                best_name.unwrap_or_else(|| {
+                                    synth_seq += 1;
+                                    format!("unknown_tool_{synth_seq}")
+                                })
+                            }};
+                        }
+                        macro_rules! flush_pending {
+                            ($out:expr, $name:expr, $before:expr) => {{
+                                if let Some(p) = pending.take() {
+                                    let resolved = match &$name {
+                                        Some(n) => n.clone(),
+                                        None => resolve_name!(p.args),
+                                    };
+                                    let start_event = json!({
+                                        "type": "content_block_start",
+                                        "index": p.idx,
+                                        "content_block": {
+                                            "type": "tool_use",
+                                            "id": format!("toolu_synth_{}", p.idx + 1),
+                                            "name": resolved,
+                                            "input": {},
+                                        },
+                                    });
+                                    $out.extend_from_slice(
+                                        format!("event: content_block_start\ndata: {start_event}\n\n")
+                                            .as_bytes(),
+                                    );
+                                    for l in &p.buffered {
+                                        $out.extend_from_slice(format!("{l}\n").as_bytes());
+                                    }
+                                    open_blocks.insert(p.idx);
+                                    let note = if $name.is_some() || resolved.starts_with("unknown") {
+                                        String::new()
+                                    } else {
+                                        format!("（工具名按参数键匹配推断为 {resolved}）")
+                                    };
+                                    warn!(
+                                        "[ModelGateway] 兼容修复：上游缺失 content_block_start(index={})，已合成 tool_use 帧并恢复工具名为 \"{}\"{}",
+                                        p.idx, resolved, note
+                                    );
+                                }
+                            }};
+                        }
+
+                        match (&jv, jv.as_ref().and_then(|j| j.get("type")).and_then(JsonValue::as_str)) {
+                            // ---------- 正常 start 帧 ----------
+                            (Some(jv), Some("content_block_start")) => {
+                                let idx = jv.get("index").and_then(JsonValue::as_u64).unwrap_or(0);
+                                if let Some(pt) = &pending {
+                                    if pt.idx == idx {
+                                        // 缓冲中的孤儿块迎来了迟到但真实的 start：丢弃缓冲直接直通真实帧
+                                        pending = None;
+                                    }
+                                }
+                                open_blocks.insert(idx);
+                                out_bytes.extend_from_slice(format!("{line}\n").as_bytes());
+                            }
+                            // ---------- stop 帧 ----------
+                            (Some(jv), Some("content_block_stop")) => {
+                                let idx = jv.get("index").and_then(JsonValue::as_u64).unwrap_or(0);
+                                if let Some(pt) = &pending {
+                                    if pt.idx == idx {
+                                        // 终态到达仍无名：以全量 args 做最后一次匹配，失败才用占位
+                                        let name = preferred_tool.clone().or_else(|| {
+                                            tool_hints.iter()
+                                                .map(|(n, keys)| {
+                                                    (n.clone(), keys.iter().filter(|k| pt.args.contains(k.as_str())).count())
+                                                })
+                                                .max_by_key(|(_, sc)| *sc)
+                                                .filter(|(_, sc)| *sc > 0)
+                                                .map(|(n, _)| n)
+                                        });
+                                        flush_pending!(out_bytes, name, true);
+                                    }
+                                }
+                                open_blocks.remove(&idx);
+                                out_bytes.extend_from_slice(format!("{line}\n").as_bytes());
+                            }
+                            // ---------- delta ----------
+                            (Some(jv), Some("content_block_delta")) => {
+                                let idx = jv.get("index").and_then(JsonValue::as_u64).unwrap_or(0);
+                                let dtype = jv.pointer("/delta/type").and_then(JsonValue::as_str).unwrap_or("text");
+                                if dtype == "thinking_delta" {
+                                    has_thinking = true;
+                                }
+
+                                // 孤儿 input_json_delta：进入缓冲/继续累积
+                                if !open_blocks.contains(&idx)
+                                    && dtype == "input_json_delta"
+                                    && (pending.is_none()
+                                        || pending.as_ref().map(|p| p.idx) == Some(idx))
+                                {
+                                    if let Some(frag) = jv.pointer("/delta/partial_json").and_then(JsonValue::as_str) {
+                                        let pt = pending.get_or_insert(PendingTool {
+                                            idx,
+                                            args: String::new(),
+                                            buffered: Vec::new(),
+                                        });
+                                        pt.args.push_str(frag);
+                                    }
+                                    pending
+                                        .as_mut()
+                                        .unwrap()
+                                        .buffered
+                                        .push(line.to_string());
+                                    // 每片都尝试提前恢复名字：命中立即冲刷，恢复流式实时性
+                                    let hit = preferred_tool.is_some()
+                                        || tool_hints.iter().any(|(_, keys)| {
+                                            keys.iter().any(|k| pending.as_ref().unwrap().args.contains(k.as_str()))
+                                        });
+                                    if hit && pending.is_some() {
+                                        let name = preferred_tool.clone().or_else(|| {
+                                            let args = &pending.as_ref().unwrap().args;
+                                            tool_hints
+                                                .iter()
+                                                .map(|(n, keys)| {
+                                                    (n.clone(), keys.iter().filter(|k| args.contains(k.as_str())).count())
+                                                })
+                                                .max_by_key(|(_, sc)| *sc)
+                                                .filter(|(_, sc)| *sc > 0)
+                                                .map(|(n, _)| n)
+                                        });
+                                        flush_pending!(out_bytes, name, false);
+                                    }
+                                    continue;
+                                }
+
+                                // 其他类型孤儿 delta（text/thinking）：无需工具名，即时合成开块
+                                if !open_blocks.contains(&idx) {
+                                    let block = if dtype == "thinking_delta" {
+                                        json!({ "type": "thinking", "thinking": "" })
+                                    } else {
+                                        json!({ "type": "text", "text": "" })
+                                    };
+                                    let start_event = json!({
+                                        "type": "content_block_start",
+                                        "index": idx,
+                                        "content_block": block,
+                                    });
+                                    out_bytes.extend_from_slice(
+                                        format!("event: content_block_start\ndata: {start_event}\n\n").as_bytes(),
+                                    );
+                                    open_blocks.insert(idx);
+                                }
+                                out_bytes.extend_from_slice(format!("{line}\n").as_bytes());
+                            }
+                            // ---------- 终态帧：强制冲刷残余孤儿块 ----------
+                            (_, Some("message_delta")) | (_, Some("message_stop")) => {
+                                if let Some(pt) = &pending {
+                                    let name = preferred_tool.clone().or_else(|| {
+                                        tool_hints.iter()
+                                            .map(|(n, keys)| {
+                                                (n.clone(), keys.iter().filter(|k| pt.args.contains(k.as_str())).count())
+                                            })
+                                            .max_by_key(|(_, sc)| *sc)
+                                            .filter(|(_, sc)| *sc > 0)
+                                            .map(|(n, _)| n)
+                                    });
+                                    flush_pending!(out_bytes, name, true);
+                                }
+                                out_bytes.extend_from_slice(format!("{line}\n").as_bytes());
+                            }
+                            // ---------- 其余事件 ----------
+                            _ => {
+                                // 孤儿块缓冲期间的所有行一并延迟，保持事件原子性
+                                if let Some(pt) = pending.as_mut() {
+                                    pt.buffered.push(line.to_string());
+                                } else {
+                                    out_bytes.extend_from_slice(format!("{line}\n").as_bytes());
+                                }
+                            }
+                        }
+                    }
+
+                    if !out_bytes.is_empty() {
+                        yield Ok::<Bytes, std::io::Error>(Bytes::from(out_bytes));
+                    }
+
+                    // ③ 旁路统计扫描（与输出逻辑解耦）
+                    for line in stats_lines {
+                        let Some(data) = line.strip_prefix("data:") else { continue };
+                        raw_body.push_str(data.trim_start());
+                        raw_body.push('\n');
+                        let Ok(jv) = serde_json::from_str::<JsonValue>(data.trim()) else { continue };
+                        match jv.get("type").and_then(JsonValue::as_str) {
+                            Some("message_start") => {
+                                if let Some(u) = jv.pointer("/message/usage") {
+                                    let i = u.get("input_tokens").and_then(JsonValue::as_u64).unwrap_or(0);
+                                    let r = u.get("cache_read_input_tokens").and_then(JsonValue::as_u64).unwrap_or(0);
+                                    let w = u.get("cache_creation_input_tokens").and_then(JsonValue::as_u64).unwrap_or(0);
+                                    stats.cache_hit_tokens = r;
+                                    stats.cache_creation_tokens = w;
+                                    stats.prompt_tokens = i + r + w;
+                                }
+                            }
+                            Some("content_block_delta") => {
+                                if jv.pointer("/delta/type").and_then(JsonValue::as_str) == Some("thinking_delta") {
+                                    has_thinking = true;
+                                }
+                            }
+                            Some("message_delta") => {
+                                if let Some(o) = jv.pointer("/usage/output_tokens").and_then(JsonValue::as_u64) {
+                                    stats.completion_tokens = o;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                Err(err) => {
+                    log.error_message = Some(format!("Anthropic 直通流中断: {err}"));
+                    break;
+                }
+            }
+        }
+
+        // 响应全文 = 上游 data 载荷原文（逐行换行），不做任何格式化加工
+        log.response_body = cap_log_body(raw_body);
+
+        if has_thinking {
+            stats.has_reasoning = true;
+        }
+
+        let dur = start_time.elapsed().as_millis() as u64;
+        log.duration_ms = dur;
+        if log.error_message.is_some() {
+            log.status_code = 502;
+            ctx.metrics.successful_requests.fetch_sub(1, Ordering::Relaxed);
+            ctx.metrics.failed_requests.fetch_add(1, Ordering::Relaxed);
+        } else {
+            log.status_code = 200;
+        }
+        stats.apply_to_log(&mut log);
+
+        ctx.record_log(log).await;
+    };
+
+    Body::from_stream(s)
+}
+
+#[cfg(test)]
+mod clean_stream_tests {
+    use super::*;
+
+    /// 喂入原始 SSE 字节流，收集 clean_sse_stream 的全部输出
+    async fn run_clean_stream(raw: Vec<u8>) -> String {
+        let state = crate::model::gateway::ModelProxyState::new_with_app(None);
+        let ctx = state.context.clone();
+        let log: ProxyRequestLog = serde_json::from_value(json!({
+            "id": "t1", "timestamp": "", "method": "POST",
+            "path": "/v1/chat/completions", "channelId": "opencode",
+            "model": "m", "stream": true, "statusCode": 200, "durationMs": 0
+        }))
+        .unwrap();
+        let upstream = futures_util::stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from(raw))]);
+        let mut out = clean_sse_stream(upstream, ctx, log, Instant::now(), "m".into())
+            .into_data_stream();
+        let mut collected = Vec::new();
+        while let Some(chunk) = out.next().await {
+            collected.extend_from_slice(&chunk.unwrap());
+        }
+        String::from_utf8_lossy(&collected).to_string()
+    }
+
+    // ProxyRequestLog 需要 Default —— 若无则手工构造
+    #[tokio::test]
+    async fn malformed_json_chunks_are_dropped_not_forwarded() {
+        let raw = b"\
+data: {\"id\":\"msg_abc\",\"choices\":[{\"index\":0,\n\
+\n\
+data: {\"id\":\"msg_abc\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\\u6570\"}}]}\n\
+\n\
+data: [DONE]\n\
+\n"
+        .to_vec();
+        let out = run_clean_stream(raw).await;
+        assert!(
+            !out.contains("\"index\":0,\n"),
+            "残缺 JSON 分片必须被拦截，不得透传给客户端"
+        );
+        assert!(!out.contains("msg_abc\",\"choices\":[{\"index\":0,\n\n"));
+        assert!(out.contains("数") || out.contains("\\u6570"), "完整 chunk 必须正常透传");
+        assert!(out.contains("[DONE]"));
+    }
+}
+
+#[cfg(test)]
+mod passthrough_tests {
+    use super::*;
+
+    async fn run_passthrough(raw: Vec<u8>, hints: Vec<ToolHint>) -> String {
+        let state = crate::model::gateway::ModelProxyState::new_with_app(None);
+        let ctx = state.context.clone();
+        let log: ProxyRequestLog = serde_json::from_value(json!({
+            "id": "t2", "timestamp": "", "method": "POST",
+            "path": "/v1/messages", "channelId": "x666",
+            "model": "m", "stream": true, "statusCode": 200, "durationMs": 0
+        }))
+        .unwrap();
+        let upstream = futures_util::stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from(raw))]);
+        let mut out = passthrough_anthropic_sse_with_stats(upstream, ctx, log, Instant::now(), hints, None)
+            .into_data_stream();
+        let mut collected = Vec::new();
+        while let Some(chunk) = out.next().await {
+            collected.extend_from_slice(&chunk.unwrap());
+        }
+        String::from_utf8_lossy(&collected).to_string()
+    }
+
+    /// 兼容性回归：上游缺失 content_block_start 时必须自动合成，
+    /// 且工具名按请求 tools 参数键启发式恢复
+    #[tokio::test]
+    async fn orphan_input_json_delta_gets_synthesized_start_with_recovered_name() {
+        let raw = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":12,\"output_tokens\":0}}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"command\\\": \\\"cd /tmp\\\", \"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\\\"description\\\": \\\"go\\\"}\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":30}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        )
+        .as_bytes()
+        .to_vec();
+
+        let hints: Vec<ToolHint> = vec![
+            ("bash".into(), vec!["command".into(), "description".into()]),
+            ("read_file".into(), vec!["path".into()]),
+        ];
+        let out = run_passthrough(raw, hints).await;
+
+        // 合成的 content_block_start 必须出现在首个孤儿 delta 之前
+        let synth_pos = out.find("toolu_synth_1").expect("应注入合成 start 帧");
+        let delta_pos = out.find("input_json_delta").expect("原始 delta 必须保留");
+        assert!(synth_pos < delta_pos, "合成 start 必须先于孤儿 delta");
+
+        // 工具名按参数键匹配恢复为 bash（command+description 双命中）
+        let start_line = out.lines().find(|l| l.contains("toolu_synth_1")).unwrap();
+        assert!(start_line.contains("\"name\":\"bash\""), "工具名应按参数键匹配恢复: {start_line}");
+
+        // 原始事件保真：孤儿 delta 与终止序列原样到达客户端
+        assert!(out.contains("stop_reason\":\"tool_use"));
+        assert!(out.contains("message_stop"));
+    }
+
+    /// 正常流（含完整 start 帧）不得重复注入
+    #[tokio::test]
+    async fn normal_flow_with_start_frame_is_not_duplicated() {
+        let raw = concat!(
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
+        )
+        .as_bytes()
+        .to_vec();
+        let out = run_passthrough(raw, vec![("t".into(), vec![])]).await;
+        assert_eq!(out.matches("content_block_start").count(), 1, "正常帧不应被二次合成");
+        assert!(out.contains("\"hi\""));
     }
 }

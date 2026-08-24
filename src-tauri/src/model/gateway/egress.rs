@@ -91,12 +91,18 @@ pub fn prepare_egress_with(
     convert: bool,
 ) -> (String, JsonValue) {
     let base = channel.base_url.trim_end_matches('/');
+    // Anthropic 原生路径固定为 /v1/messages；base_url 已带 /v1 时避免拼出 /v1/v1/messages
+    let anthropic_base = if base.ends_with("/v1") {
+        base.to_string()
+    } else {
+        format!("{base}/v1")
+    };
     let target = TargetProtocol::from_channel(channel);
     if !convert {
         let url = match target {
             TargetProtocol::OpenAiChat => format!("{base}/chat/completions"),
             TargetProtocol::OpenAiResponses => format!("{base}/responses"),
-            TargetProtocol::AnthropicMessages => format!("{base}/v1/messages"),
+            TargetProtocol::AnthropicMessages => format!("{anthropic_base}/messages"),
             TargetProtocol::Gemini => {
                 let action = if is_stream {
                     "streamGenerateContent?alt=sse"
@@ -129,7 +135,7 @@ pub fn prepare_egress_with(
             chat_to_responses_body(body, model, is_stream),
         ),
         TargetProtocol::AnthropicMessages => (
-            format!("{base}/v1/messages"),
+            format!("{anthropic_base}/messages"),
             chat_to_anthropic_body(body, model, is_stream),
         ),
         TargetProtocol::Gemini => {
@@ -1267,7 +1273,11 @@ mod egress_tests {
             &body,
             true,
         );
-        assert_eq!(url, "https://upstream.example/v1/v1/messages");
+        assert_eq!(
+            url,
+            "https://upstream.example/v1/messages",
+            "base_url 已含 /v1 时不得重复拼接（历史 bug 固化过错误断言）"
+        );
 
         let (url, _) = prepare_egress(
             &channel_with_protocol("gemini"),
