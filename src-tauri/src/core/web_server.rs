@@ -607,9 +607,6 @@ macro_rules! rpc_arms {
             "get_cached_channel_errors" => Ok(json!(
                 crate::model::gateway::get_cached_channel_errors($gw).await
             )),
-            "test_model_proxy_health" => Ok(json!(
-                crate::model::gateway::test_model_proxy_health($gw).await
-            )),
             "get_model_proxy_logs" => {
                 let page: Option<usize> = take_opt($args, &["page"]).ok().flatten();
                 let page_size: Option<usize> =
@@ -691,9 +688,6 @@ macro_rules! rpc_arms {
             )),
             "get_opencode_cached_channel_errors" => Ok(json!(
                 crate::model::gateway::get_opencode_cached_channel_errors($gw).await
-            )),
-            "test_opencode_proxy_health" => Ok(json!(
-                crate::model::gateway::test_opencode_proxy_health($gw).await
             )),
             "get_opencode_proxy_logs" => {
                 let page: Option<usize> = take_opt($args, &["page"]).ok().flatten();

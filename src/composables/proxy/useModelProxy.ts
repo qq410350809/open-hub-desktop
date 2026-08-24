@@ -124,13 +124,10 @@ export const proxyStatus = ref<OpencodeProxyStatus>({
 export const proxyLoading = ref(false);
 export const savingConfig = ref(false);
 export const togglingServer = ref(false);
-export const testingHealth = ref(false);
 export const fetchingModels = ref(false);
 export const channelModels = ref<Record<string, string[]>>({});
 export const channelStats = ref<Record<string, ChannelUsageStats>>({});
 export const gatewayOverview = ref<GatewayOverviewStats | null>(null);
-export const healthResult = ref<any>(null);
-export const healthResultTime = ref<string>("");
 export const proxyLogs = ref<ProxyRequestLog[]>([]);
 export const loadingLogs = ref(false);
 export const logPage = ref(1);
@@ -287,25 +284,6 @@ export function useModelProxy() {
     }
   }
 
-  async function testHealth() {
-    testingHealth.value = true;
-    healthResult.value = null;
-    try {
-      const res = await runCommand<any>("test_opencode_proxy_health");
-      healthResult.value = res;
-      healthResultTime.value = new Date().toLocaleTimeString();
-      showToast("健康检查通过 (200 OK)");
-      return res;
-    } catch (e) {
-      healthResult.value = { error: String(e) };
-      healthResultTime.value = new Date().toLocaleTimeString();
-      showToast(`健康检查未通过: ${String(e)}`, true);
-      return null;
-    } finally {
-      testingHealth.value = false;
-    }
-  }
-
   async function fetchUpstreamModels(options: { setGlobalFetching?: boolean } = {}): Promise<Record<string, string[]>> {
     if (options.setGlobalFetching) {
       fetchingModels.value = true;
@@ -332,9 +310,19 @@ export function useModelProxy() {
           }
         }
       }
+      // 拉取失败的渠道必须可见，否则用户只会看到"列表不变"而无从排查
+      const errors: unknown[] =
+        Array.isArray(res) && Array.isArray(res[1]) ? res[1] : [];
+      if (errors.length > 0) {
+        const names = errors
+          .map((e: any) => e?.channelName || e?.channel_name || e?.channelId || e?.channel_id || "未知渠道")
+          .join("、");
+        showToast(`以下渠道模型拉取失败：${names}`, true);
+      }
       return map;
     } catch (e) {
       console.warn("拉取模型失败:", e);
+      showToast(`模型列表拉取失败：${String(e)}`, true);
       return {};
     } finally {
       if (options.setGlobalFetching) {
@@ -345,9 +333,17 @@ export function useModelProxy() {
 
   async function refreshModels() {
     const map = await fetchUpstreamModels({ setGlobalFetching: true });
-    if (Object.keys(map).length > 0) {
-      channelModels.value = map;
+    // 以现存渠道为准重建缓存：成功渠道用新数据；
+    // 本次拉取失败（不在 map 中）的渠道保留旧值，避免条目丢失导致列表闪空/回退到启动快照
+    const next: Record<string, string[]> = {};
+    for (const channel of proxyConfig.value.channels) {
+      const fresh = map[channel.id];
+      if (fresh) next[channel.id] = fresh;
+      else if (channelModels.value[channel.id]?.length) {
+        next[channel.id] = channelModels.value[channel.id];
+      }
     }
+    channelModels.value = next;
   }
 
   async function loadCachedModels() {
@@ -599,14 +595,11 @@ export function useModelProxy() {
     proxyLoading,
     savingConfig,
     togglingServer,
-    testingHealth,
     fetchingModels,
     channelModels,
     channelStats,
     gatewayOverview,
     modelsForChannel,
-    healthResult,
-    healthResultTime,
     proxyLogs,
     loadingLogs,
     logPage,
@@ -632,7 +625,6 @@ export function useModelProxy() {
     refreshGatewayOverview,
     saveConfig,
     toggleServer,
-    testHealth,
     fetchUpstreamModels,
     refreshModels,
     loadCachedModels,

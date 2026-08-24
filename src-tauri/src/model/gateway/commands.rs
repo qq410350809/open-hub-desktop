@@ -172,36 +172,6 @@ pub async fn get_opencode_cached_channel_errors(
 }
 
 #[cfg_attr(feature = "desktop", tauri::command)]
-pub async fn test_model_proxy_health(
-    state: Managed<'_, ModelProxyState>,
-) -> Result<serde_json::Value, String> {
-    let port = *state.context.current_port.read().await;
-    let url = format!("http://127.0.0.1:{port}/v1/health");
-    let config = state.context.config.read().await.clone();
-    let resp = state
-        .context
-        .default_http_client
-        .get(&url)
-        .header("Authorization", format!("Bearer {}", config.api_key))
-        .send()
-        .await
-        .map_err(|e| format!("健康检测请求失败: {e}"))?;
-
-    let json_val = resp
-        .json::<serde_json::Value>()
-        .await
-        .map_err(|e| format!("解析健康检测响应失败: {e}"))?;
-    Ok(json_val)
-}
-
-#[cfg_attr(feature = "desktop", tauri::command)]
-pub async fn test_opencode_proxy_health(
-    state: Managed<'_, OpencodeProxyState>,
-) -> Result<serde_json::Value, String> {
-    test_model_proxy_health(state).await
-}
-
-#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn get_model_proxy_logs(
     ctx: Managed<'_, Arc<AppContext>>,
     page: Option<usize>,
