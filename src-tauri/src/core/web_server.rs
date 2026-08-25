@@ -11,7 +11,7 @@ use crate::context::LocalRef;
 use crate::context::{AppContext, Managed};
 use crate::model::gateway::ModelProxyState;
 use axum::body::{Body, Bytes};
-use axum::extract::{DefaultBodyLimit, State};
+use axum::extract::{DefaultBodyLimit, RawQuery, State};
 use axum::http::{header, HeaderMap, Request, StatusCode};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -64,10 +64,12 @@ impl ServerShared {
         })
     }
 
+    #[allow(dead_code)]
     pub fn is_running(&self) -> bool {
         self.running.load(Ordering::Relaxed)
     }
 
+    #[allow(dead_code)]
     pub fn current_port(&self) -> u16 {
         self.port.load(Ordering::Relaxed)
     }
@@ -766,6 +768,25 @@ async fn dispatch(shared: &ServerShared, command: &str, args: &Value) -> Result<
         return Err("此命令仅在桌面形态下可用".to_string());
     }
 
+    // —— Clash 订阅（依赖 ServerShared 的服务端口，先于共享命令表处理） ——
+    match command {
+        "get_clash_subscription_info" => {
+            return crate::proxypool::clash_subscription_info(
+                &shared.ctx.database,
+                shared.current_port(),
+            )
+            .map(|info| json!(info));
+        }
+        "regenerate_clash_subscription_token" => {
+            return crate::proxypool::regenerate_clash_subscription_info(
+                &shared.ctx.database,
+                shared.current_port(),
+            )
+            .map(|info| json!(info));
+        }
+        _ => {}
+    }
+
     // —— 共享命令表 ——
     let ctx = ctx_managed(shared);
     // 网关状态在阶段 3d 接入后启用。
@@ -813,6 +834,103 @@ async fn rpc_handler(
         Err(error) => json!({ "error": error }),
     };
     ([(header::CACHE_CONTROL, "no-store")], axum::Json(body)).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Clash 订阅导出
+// ---------------------------------------------------------------------------
+
+/// 解析查询串为键值对（token / maxLatency 均为简单 ASCII 值，无需完整 URL 解析）。
+fn parse_query_pairs(query: &str) -> Vec<(String, String)> {
+    query
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .map(|pair| match pair.split_once('=') {
+            Some((key, value)) => (key.to_string(), value.to_string()),
+            None => (pair.to_string(), String::new()),
+        })
+        .collect()
+}
+
+fn query_param(pairs: &[(String, String)], key: &str) -> Option<String> {
+    pairs
+        .iter()
+        .find(|(name, _)| name == key)
+        .map(|(_, value)| value.clone())
+}
+
+/// Clash 客户端订阅端点：支持登录会话头或 `?token=` 订阅令牌两种鉴权。
+///
+/// Clash 客户端只会发普通 GET（无法携带自定义 Header），因此订阅令牌走查询串；
+/// 令牌持久化在 app_meta，可在代理池页面随时重置使旧链接失效。
+async fn clash_subscription_handler(
+    State(shared): State<Arc<ServerShared>>,
+    headers: HeaderMap,
+    RawQuery(query): RawQuery,
+) -> Response {
+    let pairs = parse_query_pairs(query.as_deref().unwrap_or(""));
+    let token = query_param(&pairs, "token").unwrap_or_default();
+    let authorized = token_ok(&shared, &headers)
+        || crate::proxypool::verify_subscription_token(&shared.ctx.database, &token);
+    if !authorized {
+        return (
+            StatusCode::UNAUTHORIZED,
+            [(header::CACHE_CONTROL, "no-store")],
+            "订阅令牌无效或已被重置，请在 OpenHub 代理池页面重新复制订阅链接",
+        )
+            .into_response();
+    }
+    // 阈值允许订阅方按需微调（maxLatency 查询参数），限制在 100~10000ms。
+    let max_latency = query_param(&pairs, "maxLatency")
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(crate::proxypool::DEFAULT_CLASH_SUB_MAX_LATENCY_MS)
+        .clamp(100, 10_000);
+    match crate::proxypool::build_clash_subscription_yaml(&shared.ctx.database, max_latency) {
+        Ok((yaml, count)) => {
+            let mut response = (
+                [
+                    (header::CONTENT_TYPE, "text/yaml; charset=utf-8"),
+                    (header::CACHE_CONTROL, "no-store"),
+                ],
+                yaml,
+            )
+                .into_response();
+            // Clash 客户端识别的订阅元信息：24h 自动更新 + 节点数提示。
+            if let Ok(value) = "24".parse() {
+                response.headers_mut().insert("profile-update-interval", value);
+            }
+            if let Ok(value) = count.to_string().parse() {
+                response.headers_mut().insert("x-openhub-node-count", value);
+            }
+            response
+        }
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("生成 Clash 订阅失败：{error}"),
+        )
+            .into_response(),
+    }
+}
+
+/// 读取 Clash 订阅信息（含基于当前内嵌服务端口的完整订阅 URL）。
+#[cfg(feature = "desktop")]
+#[tauri::command]
+pub fn get_clash_subscription_info(
+    shared: tauri::State<'_, Arc<ServerShared>>,
+) -> Result<crate::proxypool::ClashSubscriptionInfo, String> {
+    crate::proxypool::clash_subscription_info(&shared.ctx.database, shared.current_port())
+}
+
+/// 重置订阅令牌并返回新订阅信息：旧订阅链接立即失效。
+#[cfg(feature = "desktop")]
+#[tauri::command]
+pub fn regenerate_clash_subscription_token(
+    shared: tauri::State<'_, Arc<ServerShared>>,
+) -> Result<crate::proxypool::ClashSubscriptionInfo, String> {
+    crate::proxypool::regenerate_clash_subscription_info(
+        &shared.ctx.database,
+        shared.current_port(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1262,6 +1380,10 @@ pub fn build_router(shared: Arc<ServerShared>) -> Router {
         )
         .route("/api/events", get(events_handler))
         .route("/api/caps", get(caps_handler))
+        .route(
+            crate::proxypool::CLASH_SUB_PATH,
+            get(clash_subscription_handler),
+        )
         .merge(gateway)
         .fallback(static_fallback)
         .with_state(shared)

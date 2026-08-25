@@ -328,6 +328,8 @@ pub fn run() {
             web_server::get_login_state,
             web_server::login,
             web_server::logout,
+            web_server::get_clash_subscription_info,
+            web_server::regenerate_clash_subscription_token,
             crate::model::gateway::get_model_proxy_config,
             crate::model::gateway::save_model_proxy_config_cmd,
             crate::model::gateway::get_model_proxy_status,

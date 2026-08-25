@@ -310,11 +310,89 @@ function scheduleInitialChunks() {
   });
 }
 
+// —— Clash 订阅分享 ——
+const clashSubDialogOpen = ref(false);
+const clashMaxLatency = ref<"500" | "1000" | "2000">("1000");
+const clashLatencyOptions = [
+  { value: "500", text: "≤ 500ms 极速节点" },
+  { value: "1000", text: "≤ 1000ms 流畅节点" },
+  { value: "2000", text: "≤ 2000ms 可用节点" },
+];
+const copiedClashSub = ref(false);
+let copiedClashSubTimer = 0;
+const clashTokenConfirm = ref(false);
+let clashTokenConfirmTimer = 0;
+
+const clashEligibleCount = computed(() =>
+  store.proxyPool.value.nodes.filter(
+    (node) =>
+      node.testStatus === "success" &&
+      node.latencyMs != null &&
+      node.latencyMs <= Number(clashMaxLatency.value),
+  ).length,
+);
+
+const clashSubscriptionUrl = computed(() => {
+  const info = store.clashSubInfo.value;
+  if (!info?.token) return "";
+  const base = info.url.split("?")[0];
+  return `${base}?token=${info.token}&maxLatency=${clashMaxLatency.value}`;
+});
+
+function openClashSubDialog() {
+  clashTokenConfirm.value = false;
+  window.clearTimeout(clashTokenConfirmTimer);
+  clashSubDialogOpen.value = true;
+  document.body.classList.add("modal-open");
+  // 打开时刷新一次订阅信息与节点统计。
+  void store.loadClashSubscriptionInfo();
+}
+function closeClashSubDialog() {
+  clashSubDialogOpen.value = false;
+  clashTokenConfirm.value = false;
+  window.clearTimeout(clashTokenConfirmTimer);
+  document.body.classList.remove("modal-open");
+}
+
+async function copyClashSubscription() {
+  if (!clashSubscriptionUrl.value) return;
+  try {
+    await navigator.clipboard.writeText(clashSubscriptionUrl.value);
+    copiedClashSub.value = true;
+    window.clearTimeout(copiedClashSubTimer);
+    copiedClashSubTimer = window.setTimeout(() => {
+      copiedClashSub.value = false;
+    }, 1600);
+    message.value = "订阅链接已复制，粘贴到 Clash 客户端的订阅管理即可导入";
+  } catch {
+    message.value = "复制失败，请手动选择并复制订阅链接";
+  }
+}
+
+async function resetClashToken() {
+  // 二次确认：重置后所有已分发的旧链接立即失效。
+  if (!clashTokenConfirm.value) {
+    clashTokenConfirm.value = true;
+    window.clearTimeout(clashTokenConfirmTimer);
+    clashTokenConfirmTimer = window.setTimeout(() => {
+      clashTokenConfirm.value = false;
+    }, 3000);
+    return;
+  }
+  clashTokenConfirm.value = false;
+  window.clearTimeout(clashTokenConfirmTimer);
+  try {
+    await store.regenerateClashSubscriptionToken();
+    message.value = "订阅令牌已重置，旧订阅链接已全部失效，请重新复制分发";
+  } catch {
+    /* store error */
+  }
+}
+
 // —— 规则设置 ——
 function syncSettings() {
   ignoreAddresses.value = store.proxyPool.value.ignoreAddresses;
-}
-function openSettings() {
+}function openSettings() {
   settingsOpen.value = true;
   document.body.classList.add("modal-open");
   void store.loadMihomoKernelStatus();
@@ -871,9 +949,12 @@ onMounted(() => {
   syncSettings();
   rebuildDisplayNodes();
   void store.loadProxyPool();
+  void store.loadClashSubscriptionInfo();
 });
 onBeforeUnmount(() => {
   if (renderMoreRaf) cancelAnimationFrame(renderMoreRaf);
+  window.clearTimeout(copiedClashSubTimer);
+  window.clearTimeout(clashTokenConfirmTimer);
 });
 watch(() => store.proxyPool.value, syncSettings, { deep: false });
 watch(
@@ -910,6 +991,17 @@ watch(nodeViewMode, () => {
       </div>
 
       <div class="pp-cockpit-right">
+        <button
+          type="button"
+          class="pp-btn-secondary"
+          :class="{ active: clashSubDialogOpen }"
+          title="把测速达标节点打包成 Clash 订阅链接，供 Clash 客户端订阅"
+          @click="openClashSubDialog"
+        >
+          <span v-html="icons.link" />
+          <span>Clash 订阅</span>
+        </button>
+
         <button
           type="button"
           class="pp-btn-secondary"
@@ -1921,6 +2013,111 @@ watch(nodeViewMode, () => {
       </Transition>
     </Teleport>
 
+    <!-- Clash 订阅分享弹窗 (Clash Subscription Modal) -->
+    <Teleport to="body">
+      <Transition name="pp-modal-fade">
+        <div v-if="clashSubDialogOpen" class="pp-modal-backdrop">
+          <section class="pp-modal-card is-clash-sub" role="dialog" aria-modal="true">
+            <header class="pp-modal-header">
+              <div class="pp-modal-title-group">
+                <div class="pp-modal-eyebrow">CLASH SUBSCRIPTION</div>
+                <h2>Clash 订阅链接</h2>
+                <p>达标节点按国家/地区自动分组（国旗 · 地区 · 数量），每组内置最快节点自动选择，随每次更新同步最新测速结果</p>
+              </div>
+              <button type="button" class="pp-modal-close-btn" aria-label="关闭" @click="closeClashSubDialog">×</button>
+            </header>
+
+            <div class="pp-modal-body">
+              <!-- 达标统计与阈值选择 -->
+              <div class="pp-clash-sub-stats-row">
+                <div class="pp-clash-sub-stat">
+                  <span class="pp-clash-sub-stat-value">{{ clashEligibleCount }}</span>
+                  <span class="pp-clash-sub-stat-label">当前达标节点</span>
+                </div>
+                <div class="pp-clash-sub-stat">
+                  <span class="pp-clash-sub-stat-value">{{ store.clashSubInfo.value?.totalCount ?? "—" }}</span>
+                  <span class="pp-clash-sub-stat-label">池内有效节点</span>
+                </div>
+                <CustomSelect
+                  class="pp-clash-sub-threshold"
+                  :options="clashLatencyOptions"
+                  :model-value="clashMaxLatency"
+                  aria-label="订阅延迟阈值"
+                  @update:model-value="clashMaxLatency = String($event) as any"
+                />
+              </div>
+
+              <!-- 订阅链接 -->
+              <div class="pp-clash-sub-field">
+                <label class="pp-label">订阅链接（延迟阈值 ≤ {{ clashMaxLatency }}ms）</label>
+                <template v-if="clashSubscriptionUrl">
+                  <div class="pp-clash-sub-url-row">
+                    <input
+                      class="pp-clash-sub-url"
+                      type="text"
+                      readonly
+                      :value="clashSubscriptionUrl"
+                      aria-label="Clash 订阅链接"
+                      @focus="($event.target as HTMLInputElement).select()"
+                    />
+                    <button
+                      type="button"
+                      class="pp-btn-primary pp-btn-sm"
+                      title="复制完整订阅链接"
+                      @click="copyClashSubscription"
+                    >
+                      <span v-html="copiedClashSub ? icons.check : icons.copy" />
+                      <span>{{ copiedClashSub ? "已复制" : "复制链接" }}</span>
+                    </button>
+                  </div>
+                </template>
+                <div v-else class="pp-clash-sub-loading">正在生成订阅链接…</div>
+                <small class="pp-hint-text">
+                  链接仅本机可访问（127.0.0.1），Clash 客户端需与本应用在同一台电脑；每次拉取都会按最近一次测速结果重新生成节点列表。
+                </small>
+              </div>
+
+              <!-- 使用步骤 -->
+              <div class="pp-clash-sub-steps">
+                <div class="pp-clash-sub-step">
+                  <span class="pp-clash-sub-step-index">1</span>
+                  <p>先在代理池中<strong>批量测速</strong>，只有测速达标且不超过阈值的节点才会进入订阅。</p>
+                </div>
+                <div class="pp-clash-sub-step">
+                  <span class="pp-clash-sub-step-index">2</span>
+                  <p>复制上方链接，在 Clash 客户端的「订阅管理 / Profiles」中<strong>新建订阅</strong>并粘贴。</p>
+                </div>
+                <div class="pp-clash-sub-step">
+                  <span class="pp-clash-sub-step-index">3</span>
+                  <p>客户端更新订阅即可拿到最新节点；「🚀 节点选择」里可按<strong>地区组</strong>切换出口，或交给「⚡ 自动选择」全局择优。</p>
+                </div>
+              </div>
+
+              <!-- 令牌安全 -->
+              <div class="pp-clash-sub-token-row">
+                <small class="pp-hint-text">
+                  订阅链接自带访问令牌，请勿泄露给不信任的人。
+                </small>
+                <button
+                  type="button"
+                  class="pp-btn-secondary is-danger pp-btn-sm"
+                  title="重置订阅令牌，旧订阅链接立即失效"
+                  @click="resetClashToken"
+                >
+                  <span v-html="icons.repeat" />
+                  <span>{{ clashTokenConfirm ? "确认重置？" : "重置令牌" }}</span>
+                </button>
+              </div>
+            </div>
+
+            <footer class="pp-modal-footer">
+              <button type="button" class="pp-btn-primary" @click="closeClashSubDialog">完成</button>
+            </footer>
+          </section>
+        </div>
+      </Transition>
+    </Teleport>
+
     <!-- 4. 测速取消确认弹窗 (Cancel Confirm Modal) -->
     <Teleport to="body">
       <Transition name="pp-modal-fade">
@@ -2297,6 +2494,158 @@ watch(nodeViewMode, () => {
 
 .pp-stat-footer strong {
   color: var(--text);
+}
+
+/* Clash 订阅分享弹窗 */
+.pp-modal-card.is-clash-sub {
+  max-width: 560px;
+}
+
+.pp-clash-sub-stats-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.pp-clash-sub-stat {
+  flex: 1;
+  min-width: 120px;
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 10px 14px;
+  background: var(--page-bg);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md, 7px);
+}
+
+.pp-clash-sub-stat-value {
+  font-size: 20px;
+  font-weight: 800;
+  line-height: 1;
+  color: #06b6d4;
+  font-variant-numeric: tabular-nums;
+}
+
+.pp-clash-sub-stat-label {
+  font-size: 10.5px;
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.pp-clash-sub-threshold {
+  min-width: 168px;
+  flex-shrink: 0;
+}
+
+.pp-clash-sub-threshold.select-box {
+  height: 34px;
+}
+
+.pp-clash-sub-threshold .select-trigger {
+  padding: 0 9px;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.pp-clash-sub-threshold .select-menu {
+  z-index: 2100;
+}
+
+.pp-clash-sub-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.pp-clash-sub-url-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.pp-clash-sub-url {
+  flex: 1;
+  min-width: 0;
+  height: 32px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md, 7px);
+  background: var(--page-bg);
+  color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  outline: none;
+  transition: border-color 0.12s ease;
+}
+
+.pp-clash-sub-url:focus {
+  border-color: var(--brand);
+}
+
+.pp-clash-sub-loading {
+  padding: 8px 10px;
+  border: 1px dashed var(--line);
+  border-radius: var(--r-md, 7px);
+  font-size: 11px;
+  color: var(--muted);
+  text-align: center;
+}
+
+.pp-clash-sub-steps {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 14px;
+  background: var(--page-bg);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md, 7px);
+}
+
+.pp-clash-sub-step {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.pp-clash-sub-step p {
+  margin: 0;
+  font-size: 11.5px;
+  line-height: 1.55;
+  color: var(--text);
+}
+
+.pp-clash-sub-step p strong {
+  color: #06b6d4;
+}
+
+.pp-clash-sub-step-index {
+  flex-shrink: 0;
+  width: 18px;
+  height: 18px;
+  border-radius: var(--r-full, 999px);
+  background: rgba(6, 182, 212, 0.12);
+  color: #06b6d4;
+  font-size: 10px;
+  font-weight: 750;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin-top: 1px;
+}
+
+.pp-clash-sub-token-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.pp-clash-sub-token-row .pp-hint-text {
+  flex: 1;
+  min-width: 200px;
 }
 
 /* ============================================================

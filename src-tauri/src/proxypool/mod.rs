@@ -1,3 +1,4 @@
+pub mod clash_sub;
 pub mod commands;
 pub mod geoip;
 pub mod parser;
@@ -6,6 +7,7 @@ pub mod runtime;
 pub mod tester;
 pub mod types;
 
+pub use clash_sub::*;
 pub use commands::*;
 pub use geoip::*;
 pub use parser::*;

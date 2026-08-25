@@ -1,6 +1,6 @@
 import { listen, type UnlistenFn } from "../core/events";
 import { computed, ref } from "vue";
-import type { GeoipDownloadProgress, GeoipStatus, MihomoDownloadProgress, MihomoKernelStatus, ProxyIpAnalysis, ProxyNode, ProxyNodeTestProgress, ProxyPoolRefreshResult, ProxyPoolState, ProxySourceProgress } from "../../types";
+import type { ClashSubscriptionInfo, GeoipDownloadProgress, GeoipStatus, MihomoDownloadProgress, MihomoKernelStatus, ProxyIpAnalysis, ProxyNode, ProxyNodeTestProgress, ProxyPoolRefreshResult, ProxyPoolState, ProxySourceProgress } from "../../types";
 import { runCommand } from "../core/ipc";
 
 const isTauri = "__TAURI_INTERNALS__" in window;
@@ -620,6 +620,34 @@ async function cancelProxyNodeTests() {
 
 const proxyPoolActive = computed(() => proxyPool.value.enabled);
 
+// —— Clash 订阅分享 ——
+const clashSubInfo = ref<ClashSubscriptionInfo | null>(null);
+const clashSubLoading = ref(false);
+
+async function loadClashSubscriptionInfo() {
+  clashSubLoading.value = true;
+  try {
+    clashSubInfo.value = await runCommand<ClashSubscriptionInfo>("get_clash_subscription_info");
+  } catch (error) {
+    console.error("读取 Clash 订阅信息失败", error);
+  } finally {
+    clashSubLoading.value = false;
+  }
+}
+
+async function regenerateClashSubscriptionToken() {
+  proxyPoolError.value = "";
+  try {
+    clashSubInfo.value = await runCommand<ClashSubscriptionInfo>(
+      "regenerate_clash_subscription_token",
+    );
+    return clashSubInfo.value;
+  } catch (error) {
+    proxyPoolError.value = String(error);
+    throw error;
+  }
+}
+
 async function deleteInvalidProxyNodes() {
   proxyPoolBusyId.value = "delete-invalid";
   proxyPoolError.value = "";
@@ -732,5 +760,6 @@ export function useProxyPool() {
     assignAccountProxyChannel, unassignAccountProxyChannel, testProxyChannelNodes,
     loadMihomoKernelStatus, checkMihomoKernelUpdate, downloadOrUpdateMihomoKernel,
     loadGeoipStatus, downloadOrUpdateGeoip,
+    clashSubInfo, clashSubLoading, loadClashSubscriptionInfo, regenerateClashSubscriptionToken,
   };
 }

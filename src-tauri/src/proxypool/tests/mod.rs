@@ -1,4 +1,5 @@
 use crate::models::*;
+use crate::proxypool::clash_sub::*;
 use crate::proxypool::commands::*;
 use crate::proxypool::geoip::*;
 use crate::proxypool::parser::*;
@@ -20,6 +21,73 @@ fn proxy_test_task_can_be_cancelled_and_released() {
     drop(lease);
     assert!(!runtime.cancel_proxy_test().unwrap());
     assert!(runtime.start_proxy_test().is_ok());
+}
+
+#[test]
+fn clash_subscription_filters_nodes_by_latency_and_verifies_token() {
+    let dir = std::env::temp_dir().join(format!("openhub-clash-sub-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let database = Database::open(&dir.join("sites.sqlite3")).unwrap();
+    {
+        let connection = database.lock_conn().unwrap();
+        let raw = r#"{"name":"x","type":"ss","server":"hk.example.com","port":443,"cipher":"aes-128-gcm","password":"secret"}"#;
+        for (name, latency, status, code, cname) in [
+            ("fast", Some(300), "success", "HK", "香港"),
+            ("fast2", Some(420), "success", "HK", "香港"),
+            ("slow", Some(1500), "success", "US", "美国"),
+            ("broken", Some(200), "error", "JP", "日本"),
+            ("unknown", Some(600), "success", "", ""),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO proxy_pool_nodes (id, name, raw_json, latency_ms, test_status, country_code, country_name) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    rusqlite::params![format!("node-{name}"), name, raw, latency, status, code, cname],
+                )
+                .unwrap();
+        }
+    }
+    let (yaml, count) = build_clash_subscription_yaml(&database, 1000).unwrap();
+    // 达标：fast(300) + fast2(420) + unknown(600)；slow 超阈值、broken 测速失败。
+    assert_eq!(count, 3);
+    assert!(yaml.contains("fast · 300ms"));
+    assert!(!yaml.contains("slow"));
+    assert!(!yaml.contains("broken"));
+
+    // 地区分组：香港两节点一组，未知地区单独归组，未达标地区不出现。
+    assert!(yaml.contains("🇭🇰 香港 · 2"));
+    assert!(yaml.contains("🌐 其他地区 · 1"));
+    assert!(!yaml.contains("美国"));
+    // 手动选择组引用自动组与各地区组。
+    assert!(yaml.contains("MATCH,🚀 节点选择"));
+
+    // 空结果时仍输出可解析的 YAML（仅注释 + 基础配置）。
+    let (empty_yaml, empty_count) = build_clash_subscription_yaml(&database, 100).unwrap();
+    assert_eq!(empty_count, 0);
+    assert!(empty_yaml.contains("暂无延迟"));
+    assert!(!empty_yaml.contains("proxy-groups"));
+
+    // 令牌首次生成后保持稳定，且能正确校验/拒绝。
+    let token = subscription_token(&database).unwrap();
+    assert_eq!(token, subscription_token(&database).unwrap());
+    assert!(verify_subscription_token(&database, &token));
+    assert!(!verify_subscription_token(&database, "wrong-token"));
+
+    let info = clash_subscription_info(&database, 17896).unwrap();
+    assert_eq!(
+        info.url,
+        format!("http://127.0.0.1:17896{CLASH_SUB_PATH}?token={token}")
+    );
+    assert_eq!(info.eligible_count, 3);
+    // 总数包含测速失败但仍在池内、可重测的节点（仅排除 invalid）。
+    assert_eq!(info.total_count, 5);
+
+    // 重置令牌后旧令牌立即失效。
+    let new_info = regenerate_clash_subscription_info(&database, 17896).unwrap();
+    assert_ne!(new_info.token, token);
+    assert!(!verify_subscription_token(&database, &token));
+    assert!(verify_subscription_token(&database, &new_info.token));
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

@@ -442,6 +442,16 @@ export interface ProxyPoolRefreshResult {
   discarded: number;
 }
 
+/** Clash 订阅分享信息：本机订阅链接 + 达标节点统计 */
+export interface ClashSubscriptionInfo {
+  token: string;
+  port: number;
+  url: string;
+  eligibleCount: number;
+  totalCount: number;
+  maxLatencyMs: number;
+}
+
 export interface ProxySourceProgress {
   sourceId: string;
   stage: "queued" | "fetching" | "parsing" | "saving" | "done" | "error";
