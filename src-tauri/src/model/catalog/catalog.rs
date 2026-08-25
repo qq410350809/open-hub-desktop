@@ -610,6 +610,31 @@ fn persist_catalog_llmpricing(
     let mut connection = database.lock_conn()?;
     ensure_catalog_schema(&mut connection)?;
 
+    // Snapshot existing hosts_json + last_updated for change detection.
+    // This allows restoring cached detail data for models whose source data hasn't changed.
+    let mut hosts_cache: BTreeMap<String, (String, String)> = BTreeMap::new();
+    {
+        let mut cache_stmt = connection
+            .prepare(
+                "SELECT id, COALESCE(hosts_json, ''), COALESCE(last_updated, '')
+                 FROM model_catalog_models
+                 WHERE hosts_json IS NOT NULL AND hosts_json != ''",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = cache_stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?;
+        for row in rows.flatten() {
+            hosts_cache.insert(row.0, (row.1, row.2));
+        }
+    }
+
     let transaction = connection
         .transaction()
         .map_err(|error| error.to_string())?;
@@ -809,6 +834,15 @@ fn persist_catalog_llmpricing(
                 ],
             )
             .map_err(|error| error.to_string())?;
+        // Restore cached hosts_json if the model's source data hasn't changed
+        if let Some((cached_hosts, cached_last_updated)) = hosts_cache.get(&item.id) {
+            if Some(cached_last_updated.clone()) == item.last_updated {
+                let _ = transaction.execute(
+                    "UPDATE model_catalog_models SET hosts_json = ?1 WHERE id = ?2",
+                    params![cached_hosts, item.id],
+                );
+            }
+        }
         model_count += 1;
     }
 
@@ -998,6 +1032,76 @@ async fn fetch_hosts_for_model(client: &reqwest::Client, model_id: &str) -> Vec<
         }
     }
     Vec::new()
+}
+
+/// Concurrently prefetch hosts detail for models missing cached `hosts_json`.
+///
+/// Called after catalog sync to warm the cache so that clicking a model
+/// doesn't trigger individual HTTP requests. Fetches are throttled via a
+/// semaphore; results are batch-written in a single transaction.
+async fn prefetch_model_hosts(database: &Database, concurrency: usize) -> Result<usize, String> {
+    let ids: Vec<String> = {
+        let conn = database.lock_conn()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id FROM model_catalog_models
+                 WHERE (hosts_json IS NULL OR hosts_json = '')
+                   AND status != 'deprecated'",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
+        rows.flatten().collect()
+    };
+
+    if ids.is_empty() {
+        return Ok(0);
+    }
+
+    let client =
+        build_http_client(database, Duration::from_secs(10), 5, "预拉取模型渠道明细")?;
+
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
+    let mut handles = Vec::with_capacity(ids.len());
+
+    for model_id in ids {
+        let sem = semaphore.clone();
+        let client = client.clone();
+        handles.push(tokio::spawn(async move {
+            let _permit = sem.acquire().await;
+            let hosts = fetch_hosts_for_model(&client, &model_id).await;
+            if hosts.is_empty() {
+                None
+            } else {
+                serde_json::to_string(&hosts).ok().map(|s| (model_id, s))
+            }
+        }));
+    }
+
+    let mut results = Vec::new();
+    for handle in handles {
+        if let Ok(Some(pair)) = handle.await {
+            results.push(pair);
+        }
+    }
+
+    if results.is_empty() {
+        return Ok(0);
+    }
+
+    let count = results.len();
+    let mut connection = database.lock_conn()?;
+    let tx = connection.transaction().map_err(|e| e.to_string())?;
+    for (model_id, hosts_str) in &results {
+        let _ = tx.execute(
+            "UPDATE model_catalog_models SET hosts_json = ?1 WHERE id = ?2",
+            params![hosts_str, model_id],
+        );
+    }
+    tx.commit().map_err(|e| e.to_string())?;
+
+    Ok(count)
 }
 
 #[cfg_attr(feature = "desktop", tauri::command)]
@@ -1339,11 +1443,18 @@ pub(crate) async fn sync_model_catalog_inner(
 
     // 3. Persist
     let report = persist_catalog_llmpricing(database, &manifest_raw, &manifest, &shards_data)?;
+
+    bus.emit(
+        "model-catalog-sync-status",
+        json!({ "status": "syncing", "message": format!("正在预拉取模型渠道明细…") }),
+    );
+    let prefetched = prefetch_model_hosts(database, 8).await.unwrap_or(0);
+
     let snapshot = get_model_catalog_inner(database)?;
 
     let message = format!(
-        "模型参数同步完成：LLMPricing 收录 {} 个供应商、{} 个模型（共 {} 个分片）",
-        report.provider_count, report.model_count, report.shard_count,
+        "模型参数同步完成：LLMPricing 收录 {} 个供应商、{} 个模型（共 {} 个分片）· 预拉取 {} 条渠道明细",
+        report.provider_count, report.model_count, report.shard_count, prefetched,
     );
 
     bus.emit(

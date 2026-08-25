@@ -456,7 +456,7 @@ const healthColumns = computed<AppTableColumn[]>(() => {
 });
 
 const healthTableRows = computed(() =>
-  healthDisplayCells.value
+  healthTimeline.value.cells
     .filter((c) => c.requests > 0)
     .map((c) => ({
       ...c,
@@ -1512,7 +1512,7 @@ onBeforeUnmount(() => {
         <p>{{ statsMode === 'local' ? '正在读取本地 SQLite 数据库用量快照…' : '正在读取反代网关聚合统计数据…' }}</p>
       </div>
 
-      <template v-else-if="activeUsage">
+      <template v-else>
         <!-- ROW 1: 4 大核心 KPI 指标卡 (Compact Bento Deck) -->
         <section class="tt-kpi-deck" aria-label="核心指标大盘">
           <!-- KPI 1: Token 消耗大盘 -->
