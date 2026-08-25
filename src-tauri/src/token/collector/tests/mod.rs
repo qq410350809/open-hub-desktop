@@ -618,6 +618,23 @@ fn copilot_model_normalization_cleans_vendor_and_provider_prefixes() {
         normalize_copilot_model_name("opencodezen/deepseek-v4-flash-free"),
         "deepseek-v4-flash-free"
     );
+    // opencode-copilot-chat 扩展的动态模型 ID：三段式标识符 + vendor 前缀 + 会话戳
+    assert_eq!(
+        normalize_copilot_model_name(
+            "opencodezen/OpenCode Zen/opencodezen:x-preview-f-free::session-2026-05-21-b"
+        ),
+        "x-preview-f-free"
+    );
+    assert_eq!(
+        normalize_copilot_model_name("opencodezen:x-preview-f-free::session-2026-05-21-b"),
+        "x-preview-f-free"
+    );
+    assert_eq!(
+        normalize_copilot_model_name("opencodezen:big-pickle::session-2026-06-01-a"),
+        "big-pickle"
+    );
+    // 纯净模型名不受清洗影响
+    assert_eq!(normalize_copilot_model_name("ox-alpha-free"), "ox-alpha-free");
     assert_eq!(
         normalize_copilot_model_name("agent-host-claude:@provider=anthropic:sonnet"),
         "claude-3-7-sonnet"
@@ -681,6 +698,71 @@ fn copilot_vscode_chat_session_parses_tokens_and_dialogues() {
     assert_eq!(s.tokens.output_tokens, 200);
     assert_eq!(s.tokens.cached_input_tokens, 500);
     assert!(s.tokens.reasoning_output_tokens > 0);
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn copilot_delta_operation_log_replays_requests() {
+    // VS Code 新版格式：首行全量快照（requests 为空），请求以 kind:2 追加、
+    // token 数以 kind:1 按路径补写。旧解析器只能读到空 requests，统计全部丢失。
+    let dir = temp_command_code_dir("copilot-delta");
+    let path = dir.join("chat.jsonl");
+    let lines = [
+        json!({
+            "kind": 0,
+            "v": {
+                "version": 3,
+                "sessionId": "delta-session-1",
+                "creationDate": 1787619825144i64,
+                "requests": [],
+                "inputState": {
+                    "selectedModel": { "identifier": "claude-sonnet-4.5" }
+                }
+            }
+        })
+        .to_string(),
+        json!({
+            "kind": 2,
+            "k": ["requests"],
+            "v": [{
+                "requestId": "req-delta-1",
+                "message": { "text": "用 Rust 写一个快速排序" },
+                "modelId": "claude-sonnet-4.5",
+                "response": [{ "value": "快速排序代码如下……" }]
+            }]
+        })
+        .to_string(),
+        json!({ "kind": 1, "k": ["requests", 0, "promptTokens"], "v": 3200 })
+            .to_string(),
+        json!({ "kind": 1, "k": ["requests", 0, "completionTokens"], "v": 480 })
+            .to_string(),
+        json!({ "kind": 1, "k": ["requests", 0, "cachedTokens"], "v": 800 })
+            .to_string(),
+        // 第二条请求：无显式 token，应按文本长度估算。
+        json!({
+            "kind": 2,
+            "k": ["requests"],
+            "v": [{
+                "requestId": "req-delta-2",
+                "message": { "text": "再优化一下边界条件" },
+                "response": [{ "value": "已补充边界条件处理。" }]
+            }]
+        })
+        .to_string(),
+    ];
+    fs::write(&path, lines.join("\n")).unwrap();
+
+    let parsed = parse_copilot_file(&path);
+    assert_eq!(parsed.sessions.len(), 1);
+    let s = &parsed.sessions[0];
+    assert_eq!(s.session_hash, "openhub:copilot:delta-session-1");
+    assert_eq!(s.turns, 2);
+    // 第一条请求的补写 token 必须被回放出来；第二条请求无显式 token，按文本字节数估算。
+    let req2_prompt_estimate = ("再优化一下边界条件".len() as i64 / 4).max(1) + 128;
+    let req2_output_estimate = ("已补充边界条件处理。".len() as i64 / 4).max(1);
+    assert_eq!(s.tokens.input_tokens, 3200 + req2_prompt_estimate);
+    assert_eq!(s.tokens.output_tokens, 480 + req2_output_estimate);
+    assert_eq!(s.tokens.cached_input_tokens, 800);
     let _ = fs::remove_dir_all(dir);
 }
 
@@ -1014,4 +1096,96 @@ fn catpawai_real_db_parses_if_exists() {
         );
         assert_eq!(total_fresh + total_cache + total_out, total_all);
     }
+}
+
+
+#[test]
+fn copilot_transcript_counts_every_agent_turn_as_request() {
+    let dir = std::env::temp_dir().join(format!(
+        "openhub-test-transcript-{}",
+        std::process::id()
+    ));
+    let transcripts = dir
+        .join("ws-hash")
+        .join("GitHub.copilot-chat")
+        .join("transcripts");
+    fs::create_dir_all(&transcripts).unwrap();
+    let path = transcripts.join("abc.jsonl");
+    let lines = [
+        json!({"type":"session.start","data":{"sessionId":"ses-1","startTime":"2026-08-25T01:38:44.725Z"},"timestamp":"2026-08-25T01:38:44.725Z"}),
+        json!({"type":"user.message","data":{"content":"修复这个bug"},"id":"u1","timestamp":"2026-08-25T01:39:00.000Z"}),
+        // agent 第一轮：思考 + 工具调用
+        json!({"type":"assistant.message","data":{"messageId":"m1","content":"","toolRequests":[{"toolCallId":"c1","name":"read_file","arguments":"{\"filePath\":\"main.rs\"}"}],"reasoningText":"need to read the file first"},"timestamp":"2026-08-25T01:39:05.000Z"}),
+        json!({"type":"assistant.turn_end","data":{"turnId":"0"},"id":"t1","timestamp":"2026-08-25T01:39:06.000Z"}),
+        // agent 第二轮：最终回答
+        json!({"type":"assistant.message","data":{"messageId":"m2","content":"已修复该问题。"},"timestamp":"2026-08-25T01:39:20.000Z"}),
+        json!({"type":"assistant.turn_end","data":{"turnId":"1"},"id":"t2","timestamp":"2026-08-25T01:39:21.000Z"}),
+    ];
+    let text = lines
+        .iter()
+        .map(serde_json::to_string)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+        .join("\n");
+    fs::write(&path, &text).unwrap();
+
+    let cached = parse_copilot_file(&path);
+    // transcript 只统计对话轮次；token/请求数由 vscode-opencode 精确日志负责（防双计）
+    assert_eq!(
+        cached
+            .events
+            .iter()
+            .filter(|e| e.conversation_count == 1)
+            .count(),
+        1,
+        "user.message 记一次对话"
+    );
+    assert!(
+        !cached.events.iter().any(|e| e.total_tokens > 0),
+        "transcript 不再产生估算 token 事件"
+    );
+    assert_eq!(cached.sessions.len(), 1);
+    assert_eq!(cached.sessions[0].turns, 1);
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn vscode_opencode_log_parses_precise_usage_with_cache_hits() {
+    let dir = std::env::temp_dir().join(format!(
+        "openhub-test-oclog-{}",
+        std::process::id()
+    ));
+    let output_dir = dir.join("output_logging_20260825T093509");
+    fs::create_dir_all(&output_dir).unwrap();
+    let path = output_dir.join("6-OpenCode.log");
+    let text = [
+        "[activate] extension host ready",
+        "[request] url=https://opencode.ai/zen/v1/chat/completions payloadBytes=94005",
+        "[stream-summary model=x-preview-f-free] textChars=69 toolCalls=0 reasoningChars=173",
+        "[response-summary] status=200 durationMs=11845 ttfbMs=7238 promptTokens=45646 completionTokens=278 totalTokens=45924 cachedTokens=45376 finishReason=stop totalBytes=18169 totalEvents=87",
+        "[retry] transient 503 (attempt 1/2); retrying in 1119ms…",
+        "[stream-summary model=big-pickle] textChars=0 toolCalls=1 reasoningChars=113",
+        "[response-summary] status=200 durationMs=9000 ttfbMs=1000 promptTokens=23055 completionTokens=603 totalTokens=23658 cachedTokens=0 finishReason=tool_calls totalBytes=38330 totalEvents=170",
+        "[response-summary] status=503 durationMs=10 promptTokens=999 completionTokens=9 totalTokens=1008 cachedTokens=0",
+    ]
+    .join("\n");
+    fs::write(&path, &text).unwrap();
+
+    let cached = parse_vscode_opencode_log_file(&path);
+    assert_eq!(cached.events.len(), 2, "仅成功的 response-summary 计入");
+    let first = &cached.events[0];
+    assert_eq!(first.source, "vscode-opencode");
+    assert_eq!(first.model, "x-preview-f-free");
+    assert_eq!(first.cached_input_tokens, 45376, "缓存命中必须保留");
+    assert_eq!(first.input_tokens, 45646 - 45376, "input 扣除缓存命中部分");
+    assert_eq!(first.output_tokens, 278);
+    assert_eq!(first.total_tokens, 45924);
+    assert_eq!(first.estimated_tokens, 0, "精确数据不应标记为估算");
+    assert_eq!(cached.events[1].model, "big-pickle");
+    assert_eq!(cached.events[1].cached_input_tokens, 0);
+    // 时间取自 output_logging_ 目录名（本地时区）
+    assert!(!cached.events[0].timestamp.is_empty());
+    assert!(cached.events[0].timestamp.starts_with("2026-08-25T"));
+    assert_eq!(cached.sessions.len(), 1);
+    let _ = fs::remove_dir_all(dir);
 }

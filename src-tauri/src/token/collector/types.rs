@@ -8,7 +8,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
-pub const CACHE_VERSION: i64 = 15;
+/// v16：修复 VS Code Copilot 会话增量操作日志（kind 0/1/2）解析，强制全量重扫。
+pub const CACHE_VERSION: i64 = 19;
 pub const CACHE_TTL: Duration = Duration::from_secs(5);
 pub const UNKNOWN_CODEX_MODEL: &str = "codex-unknown-model";
 pub const UNKNOWN_CLAUDE_MODEL: &str = "claude-unknown-model";

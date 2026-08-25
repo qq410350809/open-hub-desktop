@@ -346,6 +346,9 @@ pub fn collect_uncached(force: bool) -> Result<CollectedData, String> {
         files.push(("goose".to_string(), path));
     }
     files.extend(collect_catpawai_source_files(&home));
+    for path in collect_vscode_opencode_log_files(&home) {
+        files.push(path);
+    }
     files.sort_by(|left, right| left.1.cmp(&right.1));
 
     let live_paths = files
@@ -388,6 +391,7 @@ pub fn collect_uncached(force: bool) -> Result<CollectedData, String> {
             "zed" => parse_zed_file(&path),
             "goose" => parse_goose_file(&path),
             "catpawai" | "openclaw" => parse_catpawai_file(&source, &path),
+            "vscode-opencode" => parse_vscode_opencode_log_file(&path),
             _ => parse_claude_file(&path),
         };
         envelope.files.insert(key, parsed);
