@@ -223,6 +223,7 @@ impl EgressOutcome {
             request_body: req_body_str,
             response_body: None,
             node_name: Some(self.success.node_display.clone()),
+            upstream_url: Some(self.success.upstream_url.clone()),
             client_name: None,
         }
     }

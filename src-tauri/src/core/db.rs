@@ -915,6 +915,7 @@ pub(crate) fn ensure_model_proxy_logs_table(connection: &Connection) -> Result<(
                 response_body TEXT,
                 node_name TEXT,
                 client_name TEXT,
+                upstream_url TEXT,
                 created_at INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_model_proxy_logs_created ON model_proxy_logs(created_at DESC);",
@@ -930,7 +931,7 @@ pub(crate) fn ensure_model_proxy_logs_table(connection: &Connection) -> Result<(
     );
 
     // 兼容旧结构：逐列探测补齐（升级安装路径）
-    for column in ["node_name", "client_name", "cache_creation_tokens"] {
+    for column in ["node_name", "client_name", "cache_creation_tokens", "upstream_url"] {
         let has: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM pragma_table_info('model_proxy_logs') WHERE name=?1",
@@ -1375,6 +1376,7 @@ pub(crate) fn write_meta(
 }
 
 /// 通用 app_meta 写入（Database 级别）：先获取锁再调用 write_meta。
+#[allow(dead_code)]
 pub(crate) fn write_meta_database(
     database: &Database,
     key: &str,

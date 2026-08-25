@@ -179,6 +179,7 @@ pub async fn record_failover_event(
         node_name: Some(get_node_display_name(ctx, cand_id).await),
         cache_creation_tokens: None,
         client_name: None,
+        upstream_url: None,
     })
     .await;
 }

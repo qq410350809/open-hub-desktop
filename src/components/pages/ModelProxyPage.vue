@@ -439,6 +439,33 @@ function closeChannelSettingsDialog() {
 }
 
 /** 内置固化渠道（后端保留 statsId 1-100，opencode=1；动态渠道从 101 起分配） */
+/** 出口路径是否与入口不同（相同则无需展示"出"行，默认都是 chat 路径） */
+const STANDARD_EGRESS_PATHS = ["/v1/chat/completions", "/v1/messages", "/v1/responses"];
+function upstreamPathDiffers(path: string, upstreamUrl: string | null | undefined): boolean {
+  if (!upstreamUrl) return false;
+  try {
+    const u = new URL(upstreamUrl);
+    const p = u.pathname;
+    // 标准协议路径（chat/messages/responses/gemini）一律视为"默认"，不展示"出"行
+    if (STANDARD_EGRESS_PATHS.includes(p) || p.startsWith("/v1/gemini")) return false;
+    return p !== path;
+  } catch {
+    return upstreamUrl !== path;
+  }
+}
+
+/** 格式化出网上游地址：去掉 scheme 前缀只保留 host+path，超长截断 */
+function formatUpstreamUrl(url: string | null | undefined): string {
+  if (!url) return "";
+  try {
+    const u = new URL(url);
+    const display = (u.host + u.pathname + u.search).replace(/\/+$/, "");
+    return display.length > 42 ? display.slice(0, 41) + "…" : display;
+  } catch {
+    return url.length > 42 ? url.slice(0, 41) + "…" : url;
+  }
+}
+
 function isBuiltinChannel(channel: ChannelConfig): boolean {
   return channel.statsId != null && channel.statsId > 0 && channel.statsId < 101;
 }
@@ -2126,7 +2153,7 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
             <thead>
               <tr>
                 <th style="width: 105px;" class="mp-th-sortable" title="点击切换：升序 / 降序 / 默认排序" :class="{ 'is-sorted': logSortBy === 'timestamp' }" @click="sortLogsBy('timestamp')">请求时间<span class="mp-sort-arrow">{{ logSortIndicator('timestamp') }}</span></th>
-                <th style="width: 170px;">方法与路径</th>
+                <th style="width: 230px;">入网 -> 出网</th>
                 <th>渠道 / 模型</th>
                 <th style="width: 125px;">出网节点</th>
                 <th style="width: 82px;">模式 / 速率</th>
@@ -2152,8 +2179,14 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
                 </td>
                 <td>
                   <div class="mp-log-method-path">
-                    <span class="mp-method-tag" :class="`method-${log.method.toLowerCase()}`">{{ log.method }}</span>
-                    <code class="mp-path-code" :title="log.path">{{ log.path }}</code>
+                    <div class="mp-path-row">
+                      <span class="mp-path-label">入</span>
+                      <code class="mp-path-code" :title="`入口路径：${log.path}`">{{ log.path }}</code>
+                    </div>
+                    <div v-if="upstreamPathDiffers(log.path, log.upstreamUrl)" class="mp-path-row">
+                      <span class="mp-path-label">出</span>
+                      <code class="mp-upstream-code" :title="`出网地址：${log.upstreamUrl}`">{{ formatUpstreamUrl(log.upstreamUrl) }}</code>
+                    </div>
                   </div>
                 </td>
                 <td>
@@ -2774,10 +2807,16 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
           <div v-if="detailActiveTab === 'meta'" class="mp-detail-tab-content">
             <div class="mp-log-detail-grid">
               <div class="mp-ld-item">
-                <label>请求方法与路径</label>
-                <div class="mp-ld-val">
-                  <span class="mp-method-tag" :class="`method-${selectedLogForDetail.method.toLowerCase()}`">{{ selectedLogForDetail.method }}</span>
-                  <code class="font-mono">{{ selectedLogForDetail.path }}</code>
+                <label>入网 -> 出网</label>
+                <div class="mp-ld-val" style="flex-direction: column; align-items: flex-start; gap: 4px;">
+                  <div style="display: flex; align-items: center; gap: 6px;">
+                    <span class="mp-path-label">入</span>
+                    <code class="font-mono">{{ selectedLogForDetail.path }}</code>
+                  </div>
+                  <div v-if="upstreamPathDiffers(selectedLogForDetail.path, selectedLogForDetail.upstreamUrl)" style="display: flex; align-items: center; gap: 6px;">
+                    <span class="mp-path-label">出</span>
+                    <code class="font-mono" style="font-size: 11px; color: var(--text-muted, #888);">{{ selectedLogForDetail.upstreamUrl }}</code>
+                  </div>
                 </div>
               </div>
 
@@ -5906,10 +5945,26 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
 .mp-log-method-path {
   display: flex;
   flex-direction: column;
-  align-items: flex-start;
   gap: 3px;
   line-height: 1.25;
   min-width: 0;
+}
+
+.mp-path-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+
+.mp-path-label {
+  font-size: 9px;
+  font-weight: 800;
+  color: var(--text-muted, #999);
+  background: color-mix(in srgb, var(--text-muted, #999) 12%, transparent);
+  padding: 0 3px;
+  border-radius: 2px;
+  flex-shrink: 0;
 }
 
 .mp-method-tag {
@@ -5933,6 +5988,16 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
   font-family: var(--font-mono, monospace);
   font-size: 11px;
   color: var(--text);
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mp-upstream-code {
+  font-family: var(--font-mono, monospace);
+  font-size: 11px;
+  color: var(--text-muted, #888);
   max-width: 100%;
   overflow: hidden;
   text-overflow: ellipsis;

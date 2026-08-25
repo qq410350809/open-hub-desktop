@@ -224,6 +224,8 @@ pub struct ProxyRequestLog {
     pub node_name: Option<String>,
     /// 发起请求的客户端标识（由 User-Agent / 端点推断，如 claude / codex / cursor）
     pub client_name: Option<String>,
+    /// 出网上游地址（完整 URL，含 path），用于日志展示「入->出」双地址
+    pub upstream_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

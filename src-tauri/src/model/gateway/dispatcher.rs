@@ -36,6 +36,7 @@ pub struct EgressSuccess {
     pub cand_start: Instant,
     pub attempt_req_id: String,
     pub attempt_idx: usize,
+    pub upstream_url: String,
 }
 
 /// 构建出网请求（含 OpenCode CLI 身份头模拟与鉴权头），供常规发送与 503 原地重试复用，
@@ -214,6 +215,7 @@ pub async fn execute_resilient_egress(
                         Some(node_display.clone()),
                     )
                     .with_channel_stats_id(meta.channel_stats_id.clone())
+                    .with_upstream_url(Some(upstream_url.to_string()))
                     .with_response_body(cap_log_body(err_text)),
                 )
                 .await;
@@ -266,6 +268,7 @@ pub async fn execute_resilient_egress(
                         Some(node_display.clone()),
                     )
                     .with_channel_stats_id(meta.channel_stats_id.clone())
+                    .with_upstream_url(Some(upstream_url.to_string()))
                     .with_response_body(cap_log_body(
                         String::from_utf8_lossy(&body_bytes).to_string(),
                     )),
@@ -323,6 +326,7 @@ pub async fn execute_resilient_egress(
                         cand_start,
                         attempt_req_id,
                         attempt_idx,
+                        upstream_url: upstream_url.to_string(),
                     });
                 } else if status == StatusCode::UNAUTHORIZED {
                     let err_bytes = resp.bytes().await.unwrap_or_default();
@@ -344,6 +348,7 @@ pub async fn execute_resilient_egress(
                             Some(node_display),
                         )
                         .with_channel_stats_id(meta.channel_stats_id.clone())
+                    .with_upstream_url(Some(upstream_url.to_string()))
                         .with_response_body(cap_log_body(err_text)),
                     )
                     .await;
@@ -378,6 +383,7 @@ pub async fn execute_resilient_egress(
                             Some(node_display),
                         )
                         .with_channel_stats_id(meta.channel_stats_id.clone())
+                    .with_upstream_url(Some(upstream_url.to_string()))
                         .with_response_body(cap_log_body(err_text.clone())),
                     )
                     .await;
@@ -414,6 +420,7 @@ pub async fn execute_resilient_egress(
                             Some(node_display),
                         )
                         .with_channel_stats_id(meta.channel_stats_id.clone())
+                    .with_upstream_url(Some(upstream_url.to_string()))
                         .with_response_body(cap_log_body(err_text)),
                     )
                     .await;

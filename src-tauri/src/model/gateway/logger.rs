@@ -45,6 +45,7 @@ pub struct ProxyLogParams {
     pub channel_stats_id: Option<String>,
     /// 发起请求的客户端标识（User-Agent / 端点推断）
     pub client_name: Option<String>,
+    pub upstream_url: Option<String>,
 }
 
 impl ProxyLogParams {
@@ -82,6 +83,7 @@ impl ProxyLogParams {
             node_name,
             channel_stats_id: None,
             client_name: None,
+            upstream_url: None,
         }
     }
 
@@ -97,6 +99,11 @@ impl ProxyLogParams {
 
     pub fn with_client_name(mut self, client_name: Option<String>) -> Self {
         self.client_name = client_name;
+        self
+    }
+
+    pub fn with_upstream_url(mut self, upstream_url: Option<String>) -> Self {
+        self.upstream_url = upstream_url;
         self
     }
 
@@ -125,6 +132,7 @@ impl ProxyLogParams {
             node_name: self.node_name,
             channel_stats_id: self.channel_stats_id,
             client_name: self.client_name,
+            upstream_url: self.upstream_url,
         }
     }
 }
