@@ -146,28 +146,96 @@ pub async fn handle_responses(
     let resp_body = cap_log_body(String::from_utf8_lossy(&resp_bytes).to_string());
 
     if let Ok(jv) = serde_json::from_slice::<JsonValue>(&resp_bytes) {
-        let text = jv
-            .pointer("/choices/0/message/content")
+        // 完整转换 OpenAI message → Responses output 数组：
+        // 此前仅取 content 文本，纯 tool_calls / reasoning 响应会变成空输出
+        let message = jv.pointer("/choices/0/message").cloned().unwrap_or(json!({}));
+        let text = message
+            .get("content")
             .and_then(JsonValue::as_str)
             .unwrap_or("");
+        let reasoning = message
+            .get("reasoning_content")
+            .or_else(|| message.get("reasoning"))
+            .and_then(JsonValue::as_str)
+            .unwrap_or("");
+        let mut output: Vec<JsonValue> = Vec::new();
+        if !reasoning.trim().is_empty() {
+            output.push(json!({
+                "id": format!("rs_{req_id}"),
+                "type": "reasoning",
+                "summary": [{ "type": "summary_text", "text": reasoning }],
+            }));
+        }
+        if !text.is_empty() {
+            output.push(json!({
+                "id": format!("msg_{req_id}"),
+                "type": "message",
+                "status": "completed",
+                "role": "assistant",
+                "content": [{
+                    "type": "output_text",
+                    "text": text,
+                    "annotations": [],
+                }],
+            }));
+        }
+        if let Some(tool_calls) = message.get("tool_calls").and_then(JsonValue::as_array) {
+            for (idx, tc) in tool_calls.iter().enumerate() {
+                let call_id = tc
+                    .get("id")
+                    .and_then(JsonValue::as_str)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("call_{idx}"));
+                let name = tc
+                    .pointer("/function/name")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or("tool");
+                let arguments = tc
+                    .pointer("/function/arguments")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or("{}");
+                output.push(json!({
+                    "id": format!("fc_{req_id}_{idx}"),
+                    "type": "function_call",
+                    "status": "completed",
+                    "call_id": call_id,
+                    "name": name,
+                    "arguments": arguments,
+                }));
+            }
+        }
+
+        let usage = jv.get("usage").cloned().unwrap_or(json!({}));
+        let responses_usage = json!({
+            "input_tokens": usage.get("prompt_tokens").and_then(JsonValue::as_u64).unwrap_or(0),
+            "input_tokens_details": {
+                "cached_tokens": usage
+                    .pointer("/prompt_tokens_details/cached_tokens")
+                    .and_then(JsonValue::as_u64)
+                    .unwrap_or(0),
+            },
+            "output_tokens": usage.get("completion_tokens").and_then(JsonValue::as_u64).unwrap_or(0),
+            "output_tokens_details": {
+                "reasoning_tokens": usage
+                    .pointer("/completion_tokens_details/reasoning_tokens")
+                    .and_then(JsonValue::as_u64)
+                    .unwrap_or(0),
+            },
+            "total_tokens": usage.get("total_tokens").and_then(JsonValue::as_u64).unwrap_or(0),
+        });
+
         let responses_output = json!({
             "id": format!("resp_{req_id}"),
             "object": "response",
-            "created": 1700000000,
-            "model": raw_model,
+            "created_at": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
             "status": "completed",
-            "output": [
-                {
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": text
-                        }
-                    ]
-                }
-            ]
+            "model": raw_model,
+            "output": output,
+            "usage": responses_usage,
         });
 
         let mut final_log = log;

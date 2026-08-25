@@ -665,6 +665,448 @@ impl AnthropicSseEmitter {
     }
 }
 
+// ---------------------------------------------------------------- Responses SSE 发射器
+
+/// 文本输出项的流式状态
+struct ResponsesTextItem {
+    item_id: String,
+    output_index: u64,
+    text: String,
+}
+
+/// 推理输出项的流式状态
+struct ResponsesReasoningItem {
+    item_id: String,
+    output_index: u64,
+    text: String,
+}
+
+/// 函数调用输出项的流式状态
+struct ResponsesToolItem {
+    item_id: String,
+    output_index: u64,
+    call_id: String,
+    name: String,
+    arguments: String,
+}
+
+/// OpenAI Chat SSE → Responses SSE 的事件机。
+///
+/// 完整产出 Responses 协议事件序列（此前仅透传 output_text.delta，
+/// 上游返回纯 tool_calls / reasoning 响应时客户端只会收到空结果）：
+///   response.created
+///   ├─ reasoning: output_item.added → reasoning_summary_text.delta* → done + item.done
+///   ├─ message:   output_item.added → content_part.added → output_text.delta*
+///   │             → text.done + part.done + item.done
+///   └─ function_call: output_item.added → function_call_arguments.delta*
+///             → arguments.done + item.done
+///   response.completed（携带完整 output 数组与 usage）
+struct ResponsesSseEmitter {
+    response_id: String,
+    model: String,
+    next_output_index: u64,
+    reasoning_item: Option<ResponsesReasoningItem>,
+    text_item: Option<ResponsesTextItem>,
+    tool_items: BTreeMap<u64, ResponsesToolItem>,
+    started: bool,
+    finished: bool,
+}
+
+impl ResponsesSseEmitter {
+    fn new(req_id: &str, model: &str) -> Self {
+        Self {
+            response_id: format!("resp_{req_id}"),
+            model: model.to_string(),
+            next_output_index: 0,
+            reasoning_item: None,
+            text_item: None,
+            tool_items: BTreeMap::new(),
+            started: false,
+            finished: false,
+        }
+    }
+
+    fn alloc_index(&mut self) -> u64 {
+        let index = self.next_output_index;
+        self.next_output_index += 1;
+        index
+    }
+
+    /// 确保 response.created 已发出（幂等）
+    fn ensure_started(&mut self) -> Vec<String> {
+        if self.started {
+            return Vec::new();
+        }
+        self.started = true;
+        vec![sse_event(
+            "response.created",
+            &json!({
+                "type": "response.created",
+                "response": {
+                    "id": self.response_id,
+                    "object": "response",
+                    "created_at": std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0),
+                    "status": "in_progress",
+                    "model": self.model,
+                    "output": [],
+                }
+            }),
+        )]
+    }
+
+    /// 消费一个 OpenAI delta，返回待发事件序列
+    fn observe_delta(&mut self, delta: &JsonValue) -> Vec<String> {
+        let Some(obj) = delta.as_object() else {
+            return Vec::new();
+        };
+        if obj.is_empty() {
+            return Vec::new();
+        }
+        let mut events = self.ensure_started();
+
+        // 思考内容优先于正文（与上游产出顺序一致）
+        if let Some(s) = delta
+            .get("reasoning_content")
+            .or_else(|| delta.get("reasoning"))
+            .and_then(JsonValue::as_str)
+        {
+            if !s.is_empty() {
+                events.extend(self.feed_reasoning(s));
+            }
+        }
+        if let Some(s) = delta.get("content").and_then(JsonValue::as_str) {
+            if !s.is_empty() {
+                events.extend(self.feed_text(s));
+            }
+        }
+        if let Some(tcs) = delta.get("tool_calls").and_then(JsonValue::as_array) {
+            for tc in tcs {
+                let idx = tc.get("index").and_then(JsonValue::as_u64).unwrap_or(0);
+                let id = tc.get("id").and_then(JsonValue::as_str);
+                let name = tc.pointer("/function/name").and_then(JsonValue::as_str);
+                let args = tc
+                    .pointer("/function/arguments")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or("");
+                events.extend(self.feed_tool_call(idx, id, name, args));
+            }
+        }
+        events
+    }
+
+    fn feed_reasoning(&mut self, text: &str) -> Vec<String> {
+        let (is_first, item_id, output_index) = {
+            if self.reasoning_item.is_none() {
+                let output_index = self.alloc_index();
+                self.reasoning_item = Some(ResponsesReasoningItem {
+                    item_id: format!("rs_{}", self.response_id),
+                    output_index,
+                    text: String::new(),
+                });
+            }
+            let item = self.reasoning_item.as_mut().expect("reasoning item");
+            let is_first = item.text.is_empty();
+            item.text.push_str(text);
+            (is_first, item.item_id.clone(), item.output_index)
+        };
+        let mut events = if is_first {
+            vec![sse_event(
+                "response.output_item.added",
+                &json!({
+                    "type": "response.output_item.added",
+                    "output_index": output_index,
+                    "item": {
+                        "id": item_id,
+                        "type": "reasoning",
+                        "summary": [],
+                    },
+                }),
+            )]
+        } else {
+            Vec::new()
+        };
+        events.push(sse_event(
+            "response.reasoning_summary_text.delta",
+            &json!({
+                "type": "response.reasoning_summary_text.delta",
+                "item_id": item_id,
+                "output_index": output_index,
+                "summary_index": 0,
+                "delta": text,
+            }),
+        ));
+        events
+    }
+
+    fn feed_text(&mut self, text: &str) -> Vec<String> {
+        let (is_first, item_id, output_index) = {
+            if self.text_item.is_none() {
+                let output_index = self.alloc_index();
+                self.text_item = Some(ResponsesTextItem {
+                    item_id: format!("msg_{}", self.response_id),
+                    output_index,
+                    text: String::new(),
+                });
+            }
+            let item = self.text_item.as_mut().expect("text item");
+            let is_first = item.text.is_empty();
+            item.text.push_str(text);
+            (is_first, item.item_id.clone(), item.output_index)
+        };
+        let mut events = if is_first {
+            vec![
+                sse_event(
+                    "response.output_item.added",
+                    &json!({
+                        "type": "response.output_item.added",
+                        "output_index": output_index,
+                        "item": {
+                            "id": item_id,
+                            "type": "message",
+                            "status": "in_progress",
+                            "role": "assistant",
+                            "content": [],
+                        },
+                    }),
+                ),
+                sse_event(
+                    "response.content_part.added",
+                    &json!({
+                        "type": "response.content_part.added",
+                        "item_id": item_id,
+                        "output_index": output_index,
+                        "content_index": 0,
+                        "part": { "type": "output_text", "text": "", "annotations": [] },
+                    }),
+                ),
+            ]
+        } else {
+            Vec::new()
+        };
+        events.push(sse_event(
+            "response.output_text.delta",
+            &json!({
+                "type": "response.output_text.delta",
+                "item_id": item_id,
+                "output_index": output_index,
+                "content_index": 0,
+                "delta": text,
+            }),
+        ));
+        events
+    }
+
+    fn feed_tool_call(
+        &mut self,
+        tc_index: u64,
+        id: Option<&str>,
+        name: Option<&str>,
+        args_fragment: &str,
+    ) -> Vec<String> {
+        let is_first;
+        {
+            if !self.tool_items.contains_key(&tc_index) {
+                let output_index = self.alloc_index();
+                self.tool_items.insert(
+                    tc_index,
+                    ResponsesToolItem {
+                        item_id: format!("fc_{}_{}", self.response_id, tc_index),
+                        output_index,
+                        call_id: String::new(),
+                        name: String::new(),
+                        arguments: String::new(),
+                    },
+                );
+            }
+            let item = self.tool_items.get_mut(&tc_index).expect("tool item");
+            is_first =
+                item.call_id.is_empty() && item.name.is_empty() && item.arguments.is_empty();
+            if let Some(id) = id.filter(|s| !s.is_empty()) {
+                if item.call_id.is_empty() {
+                    item.call_id = id.to_string();
+                }
+            }
+            if let Some(name) = name.filter(|s| !s.is_empty()) {
+                if item.name.is_empty() {
+                    item.name = name.to_string();
+                }
+            }
+            item.arguments.push_str(args_fragment);
+        }
+        let item = self
+            .tool_items
+            .get(&tc_index)
+            .expect("tool item just inserted");
+        let call_id = if item.call_id.is_empty() {
+            format!("call_{tc_index}")
+        } else {
+            item.call_id.clone()
+        };
+        let mut events = if is_first {
+            vec![sse_event(
+                "response.output_item.added",
+                &json!({
+                    "type": "response.output_item.added",
+                    "output_index": item.output_index,
+                    "item": {
+                        "id": item.item_id,
+                        "type": "function_call",
+                        "status": "in_progress",
+                        "call_id": call_id,
+                        "name": item.name,
+                        "arguments": "",
+                    },
+                }),
+            )]
+        } else {
+            Vec::new()
+        };
+        if !args_fragment.is_empty() {
+            events.push(sse_event(
+                "response.function_call_arguments.delta",
+                &json!({
+                    "type": "response.function_call_arguments.delta",
+                    "item_id": item.item_id,
+                    "output_index": item.output_index,
+                    "delta": args_fragment,
+                }),
+            ));
+        }
+        events
+    }
+
+    /// 收尾：关闭所有打开项 + response.completed（携带完整 output 与 usage）。幂等。
+    fn finish(&mut self, stop_reason: Option<&str>, stats: &SseTokenStats) -> Vec<String> {
+        if self.finished {
+            return Vec::new();
+        }
+        self.finished = true;
+        let mut events = self.ensure_started();
+
+        // 最终 output 数组按分配顺序收集；BTreeMap 遍历天然有序且与
+        // index 分配顺序一致，无需再排序。
+        let mut finalized: Vec<(u64, JsonValue)> = Vec::new();
+
+        if let Some(item) = self.reasoning_item.take() {
+            events.push(sse_event(
+                "response.reasoning_summary_text.done",
+                &json!({
+                    "type": "response.reasoning_summary_text.done",
+                    "item_id": item.item_id,
+                    "output_index": item.output_index,
+                    "summary_index": 0,
+                    "text": item.text,
+                }),
+            ));
+            finalized.push((
+                item.output_index,
+                json!({
+                    "id": item.item_id,
+                    "type": "reasoning",
+                    "summary": [{ "type": "summary_text", "text": item.text }],
+                }),
+            ));
+        }
+
+        if let Some(item) = self.text_item.take() {
+            events.push(sse_event(
+                "response.output_text.done",
+                &json!({
+                    "type": "response.output_text.done",
+                    "item_id": item.item_id,
+                    "output_index": item.output_index,
+                    "content_index": 0,
+                    "text": item.text,
+                }),
+            ));
+            events.push(sse_event(
+                "response.content_part.done",
+                &json!({
+                    "type": "response.content_part.done",
+                    "item_id": item.item_id,
+                    "output_index": item.output_index,
+                    "content_index": 0,
+                    "part": { "type": "output_text", "text": item.text, "annotations": [] },
+                }),
+            ));
+            finalized.push((
+                item.output_index,
+                json!({
+                    "id": item.item_id,
+                    "type": "message",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [{
+                        "type": "output_text",
+                        "text": item.text,
+                        "annotations": [],
+                    }],
+                }),
+            ));
+        }
+
+        for (_, item) in self.tool_items.iter() {
+            let call_id = if item.call_id.is_empty() {
+                format!("call_{}", item.output_index)
+            } else {
+                item.call_id.clone()
+            };
+            events.push(sse_event(
+                "response.function_call_arguments.done",
+                &json!({
+                    "type": "response.function_call_arguments.done",
+                    "item_id": item.item_id,
+                    "output_index": item.output_index,
+                    "arguments": item.arguments,
+                }),
+            ));
+            finalized.push((
+                item.output_index,
+                json!({
+                    "id": item.item_id,
+                    "type": "function_call",
+                    "status": "completed",
+                    "call_id": call_id,
+                    "name": item.name,
+                    "arguments": item.arguments,
+                }),
+            ));
+        }
+
+        finalized.sort_by_key(|(index, _)| *index);
+        let usage = json!({
+            "input_tokens": stats.prompt_tokens,
+            "input_tokens_details": { "cached_tokens": stats.cache_hit_tokens },
+            "output_tokens": stats.completion_tokens,
+            "output_tokens_details": { "reasoning_tokens": stats.reasoning_tokens },
+            "total_tokens": stats.total_tokens,
+        });
+        events.push(sse_event(
+            "response.completed",
+            &json!({
+                "type": "response.completed",
+                "response": {
+                    "id": self.response_id,
+                    "object": "response",
+                    "created_at": std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0),
+                    "status": "completed",
+                    "model": self.model,
+                    "output": finalized.into_iter().map(|(_, item)| item).collect::<Vec<_>>(),
+                    "stop_reason": stop_reason,
+                    "usage": usage,
+                }
+            }),
+        ));
+        events
+    }
+}
+
 /// OpenAI finish_reason → Anthropic stop_reason
 fn map_stop_reason(finish_reason: &str) -> &'static str {
     match finish_reason {
@@ -895,6 +1337,9 @@ pub fn openai_to_gemini_sse_stream<E: std::fmt::Display + Send + 'static>(
 }
 
 /// OpenAI SSE -> Responses SSE
+///
+/// 完整实现 OpenAI Responses 协议事件机：此前仅透传 output_text.delta，
+/// 上游返回纯 tool_calls / reasoning 响应时客户端只会收到空结果。
 pub fn openai_to_responses_sse_stream<E: std::fmt::Display + Send + 'static>(
     stream: impl futures_util::Stream<Item = Result<Bytes, E>> + Send + 'static,
     ctx: ModelProxyContext,
@@ -904,10 +1349,11 @@ pub fn openai_to_responses_sse_stream<E: std::fmt::Display + Send + 'static>(
 ) -> Body {
     let s = async_stream::stream! {
         let mut reader = SseLineReader::new();
-        let mut response_started = false;
         let mut ttft_recorded = false;
         let mut stats = SseTokenStats::new();
         let mut accum = StreamResponseAccumulator::default();
+        let mut emitter = ResponsesSseEmitter::new(&log.id, &model_name);
+        let mut finish_reason: Option<String> = None;
 
         tokio::pin!(stream);
 
@@ -917,7 +1363,10 @@ pub fn openai_to_responses_sse_stream<E: std::fmt::Display + Send + 'static>(
                     for line in reader.push(&bytes) {
                         if let Some((data, is_done)) = parse_sse_data_line(&line) {
                             if is_done {
-                                yield Ok::<Bytes, std::io::Error>(Bytes::from(format!("event: response.done\ndata: {}\n\n", json!({"type": "response.done"}))));
+                                // usage 已全部就绪，此刻统一收尾并回传真实统计
+                                for event in emitter.finish(finish_reason.as_deref(), &stats) {
+                                    yield Ok::<Bytes, std::io::Error>(Bytes::from(event));
+                                }
                                 continue;
                             }
 
@@ -930,29 +1379,16 @@ pub fn openai_to_responses_sse_stream<E: std::fmt::Display + Send + 'static>(
                                 accum.observe_chunk(&jv);
                                 stats.extract_from_usage(&jv);
 
-                                if !response_started {
-                                    let created = json!({
-                                        "type": "response.created",
-                                        "response": {
-                                            "id": format!("resp_{}", log.id),
-                                            "model": model_name,
-                                            "status": "in_progress"
-                                        }
-                                    });
-                                    yield Ok::<Bytes, std::io::Error>(Bytes::from(format!("event: response.created\ndata: {created}\n\n")));
-                                    response_started = true;
+                                if let Some(fr) = jv
+                                    .pointer("/choices/0/finish_reason")
+                                    .and_then(JsonValue::as_str)
+                                {
+                                    finish_reason = Some(fr.to_string());
                                 }
 
-                                if let Some(delta) = jv.pointer("/choices/0/delta") {
-                                    if let Some(content) = delta.get("content").and_then(JsonValue::as_str) {
-                                        if !content.is_empty() {
-                                            let delta_event = json!({
-                                                "type": "response.output_text.delta",
-                                                "delta": content
-                                            });
-                                            yield Ok::<Bytes, std::io::Error>(Bytes::from(format!("event: response.output_text.delta\ndata: {delta_event}\n\n")));
-                                        }
-                                    }
+                                let delta = jv.pointer("/choices/0/delta").cloned().unwrap_or(json!({}));
+                                for event in emitter.observe_delta(&delta) {
+                                    yield Ok::<Bytes, std::io::Error>(Bytes::from(event));
                                 }
                             }
                         }
@@ -971,8 +1407,17 @@ pub fn openai_to_responses_sse_stream<E: std::fmt::Display + Send + 'static>(
                 if let Ok(jv) = serde_json::from_str::<JsonValue>(data) {
                     accum.observe_chunk(&jv);
                     stats.extract_from_usage(&jv);
+                    let delta = jv.pointer("/choices/0/delta").cloned().unwrap_or(json!({}));
+                    for event in emitter.observe_delta(&delta) {
+                        yield Ok::<Bytes, std::io::Error>(Bytes::from(event));
+                    }
                 }
             }
+        }
+
+        // 无论 [DONE] 是否到达都强制收尾，客户端不至于挂死
+        for event in emitter.finish(finish_reason.as_deref(), &stats) {
+            yield Ok::<Bytes, std::io::Error>(Bytes::from(event));
         }
 
         let dur = start_time.elapsed().as_millis() as u64;
@@ -1000,6 +1445,57 @@ mod stream_accumulator_tests {
     fn feed(acc: &mut StreamResponseAccumulator, data: &str) {
         let jv: JsonValue = serde_json::from_str(data).unwrap();
         acc.observe_chunk(&jv);
+    }
+
+    #[test]
+    fn responses_emitter_emits_full_tool_call_sequence() {
+        let mut emitter = ResponsesSseEmitter::new("req1", "big-pickle");
+        let mut events: Vec<String> = Vec::new();
+        // 模拟 zcode 实际场景：reasoning + 纯 tool_calls（content 为空）
+        events.extend(
+            emitter.observe_delta(&json!({"reasoning_content": "Let me check status."})),
+        );
+        events.extend(emitter.observe_delta(&json!({
+            "tool_calls": [{"index": 0, "id": "call_a", "type": "function",
+                "function": {"name": "Bash", "arguments": "{\"command\":"}}]
+        })));
+        events.extend(emitter.observe_delta(&json!({
+            "tool_calls": [{"index": 0,
+                "function": {"arguments": "\"git status\"}"}}]
+        })));
+        events.extend(emitter.observe_delta(&json!({
+            "tool_calls": [{"index": 1, "id": "call_b", "type": "function",
+                "function": {"name": "Bash", "arguments": "{}"}}]
+        })));
+
+        let mut stats = SseTokenStats::new();
+        stats.prompt_tokens = 100;
+        stats.completion_tokens = 50;
+        stats.total_tokens = 150;
+        events.extend(emitter.finish(Some("tool_calls"), &stats));
+
+        let all = events.join("\n");
+        assert!(all.contains("event: response.created"));
+        assert!(all.contains("\"type\":\"reasoning\""));
+        assert!(all.contains("event: response.reasoning_summary_text.delta"));
+        // 两个 function_call 都必须出现（旧实现直接丢失）
+        assert!(all.matches("\"type\":\"function_call\"").count() >= 4);
+        assert!(all.contains("event: response.function_call_arguments.delta"));
+        assert!(all.contains("\"call_id\":\"call_a\""));
+        assert!(all.contains("\"call_id\":\"call_b\""));
+        assert!(all.contains("event: response.function_call_arguments.done"));
+        assert!(all.contains("git status"));
+        // completed 必须携带完整 output 与 usage
+        assert!(all.contains("event: response.completed"));
+        let completed_start = all.find("event: response.completed").unwrap();
+        let completed_payload = &all[completed_start..];
+        assert!(completed_payload.contains("\"input_tokens\":100"));
+        assert!(completed_payload.contains("\"output_tokens\":50"));
+        assert!(completed_payload.contains("\"total_tokens\":150"));
+        // output 数组顺序：reasoning(0) → fc(1) → fc(2)
+        let out0 = completed_payload.find("\"output_index\": 0").is_some()
+            || completed_payload.contains("rs_resp_req1");
+        assert!(out0);
     }
 
     #[test]
