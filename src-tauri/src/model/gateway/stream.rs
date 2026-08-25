@@ -421,10 +421,12 @@ struct AnthropicSseEmitter {
     /// OpenAI tool_calls index → anthropic 块索引
     tool_blocks: BTreeMap<u64, u64>,
     finished: bool,
+    tool_hints: Vec<ToolHint>,
+    preferred_tool: Option<String>,
 }
 
 impl AnthropicSseEmitter {
-    fn new(msg_id: &str, model: &str) -> Self {
+    fn new(msg_id: &str, model: &str, tool_hints: Vec<ToolHint>, preferred_tool: Option<String>) -> Self {
         Self {
             msg_id: format!("msg_{msg_id}"),
             model: model.to_string(),
@@ -433,6 +435,8 @@ impl AnthropicSseEmitter {
             open_block: None,
             tool_blocks: BTreeMap::new(),
             finished: false,
+            tool_hints,
+            preferred_tool,
         }
     }
 
@@ -599,7 +603,20 @@ impl AnthropicSseEmitter {
                 let tool_name = name
                     .filter(|s| !s.is_empty())
                     .map(str::to_string)
-                    .unwrap_or_else(|| "tool".to_string());
+                    .or_else(|| self.preferred_tool.clone())
+                    .unwrap_or_else(|| {
+                        // 上游 tool_calls 缺 name 时按参数键匹配恢复
+                        let frag = args_fragment;
+                        self.tool_hints
+                            .iter()
+                            .map(|(n, keys)| {
+                                (n.clone(), keys.iter().filter(|k| frag.contains(k.as_str())).count())
+                            })
+                            .max_by_key(|(_, sc)| *sc)
+                            .filter(|(_, sc)| *sc > 0)
+                            .map(|(n, _)| n)
+                            .unwrap_or_else(|| "tool".to_string())
+                    });
                 let (open_events, idx) = self.open_block(
                     AnthropicBlockKind::Tool,
                     json!({
@@ -664,13 +681,15 @@ pub fn openai_to_anthropic_sse_stream<E: std::fmt::Display + Send + 'static>(
     mut log: ProxyRequestLog,
     start_time: Instant,
     model_name: String,
+    tool_hints: Vec<ToolHint>,
+    preferred_tool: Option<String>,
 ) -> Body {
     let s = async_stream::stream! {
         let mut reader = SseLineReader::new();
         let mut ttft_recorded = false;
         let mut stats = SseTokenStats::new();
         let mut accum = StreamResponseAccumulator::default();
-        let mut emitter = AnthropicSseEmitter::new(&log.id, &model_name);
+        let mut emitter = AnthropicSseEmitter::new(&log.id, &model_name, tool_hints, preferred_tool);
         let mut stop_reason: Option<&'static str> = None;
 
         tokio::pin!(stream);
@@ -1094,7 +1113,7 @@ mod stream_accumulator_tests {
 
     #[test]
     fn anthropic_emitter_emits_complete_tool_use_sequence() {
-        let mut em = AnthropicSseEmitter::new("req1", "m");
+        let mut em = AnthropicSseEmitter::new("req1", "m", Vec::new(), None);
 
         // OpenAI 流式 tool_calls：首片带 id/name + 参数前缀，续片只带参数增量
         let mut events = Vec::new();
@@ -1142,7 +1161,7 @@ mod stream_accumulator_tests {
 
     #[test]
     fn anthropic_emitter_alternates_text_thinking_and_defers_usage() {
-        let mut em = AnthropicSseEmitter::new("req2", "m");
+        let mut em = AnthropicSseEmitter::new("req2", "m", Vec::new(), None);
 
         let mut events = Vec::new();
         events.extend(em.feed_thinking("思考"));
@@ -1207,6 +1226,7 @@ pub type ToolHint = (String, Vec<String>);
 /// 动态注入合成的 content_block_start —— 工具名按请求 tools 的参数键匹配
 /// 启发式恢复，保证客户端始终收到规范完整的事件序列。
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 pub fn passthrough_anthropic_sse_with_stats<E: std::fmt::Display + Send + 'static>(
     stream: impl futures_util::Stream<Item = Result<Bytes, E>> + Send + 'static,
     ctx: ModelProxyContext,

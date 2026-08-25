@@ -125,7 +125,7 @@ pub async fn handle_gemini_generate(
                     crate::model::gateway::stream::extract_tool_hints(&body);
                 egress::normalized_sse_stream(
                     outcome.success.response.bytes_stream(),
-                    outcome.target,
+                    if fast_path { outcome.target } else { egress::TargetProtocol::OpenAiChat },
                     tool_hints,
                     preferred_tool,
                 )
@@ -188,7 +188,7 @@ pub async fn handle_gemini_generate(
     }
 
     let resp_bytes =
-        egress::normalize_response_bytes(outcome.target, &outcome.model_to_send, &raw_bytes);
+        egress::normalize_response_bytes(if fast_path { outcome.target } else { egress::TargetProtocol::OpenAiChat }, &outcome.model_to_send, &raw_bytes);
     let openai_resp = serde_json::from_slice::<JsonValue>(&resp_bytes).unwrap_or_default();
     let gemini_resp = GeminiProtocolAdapter::openai_response_to_gemini(&openai_resp, raw_model);
 

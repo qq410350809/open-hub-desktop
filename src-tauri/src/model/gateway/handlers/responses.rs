@@ -5,7 +5,7 @@
 //! 非流式响应原样下发，仅旁路提取 usage 供日志统计。
 
 use super::super::adapters::{OpenAiProtocolAdapter, ResponsesProtocolAdapter};
-use super::super::egress::{self, TargetProtocol};
+use super::super::egress;
 use super::super::logger::{cap_log_body, client_name_from_headers};
 use super::super::pipeline::{
     auth_and_count, dispatch_protocol_egress, resolve_channel_or_404, ClientProtocol,
@@ -79,13 +79,8 @@ pub async fn handle_responses(
         Err(res) => return res,
     };
 
-    // 同协议快速通道：Responses 客户端 → Responses 上游，请求体原生透传
-    let fast_path = TargetProtocol::from_channel(chan) == TargetProtocol::OpenAiResponses;
-    let (egress_body, convert) = if fast_path {
-        let mut native = body.clone();
-        native["model"] = JsonValue::String(model_to_send.clone());
-        (native, false)
-    } else {
+    // 上游统一走 /v1/chat/completions（OpenAI Chat 格式），取消同协议快速通道
+    let (egress_body, convert) = {
         let mut openai_body = body.clone();
         openai_body["model"] = JsonValue::String(model_to_send.clone());
         ResponsesProtocolAdapter::convert_input_to_messages(&mut openai_body);
@@ -124,7 +119,7 @@ pub async fn handle_responses(
                     crate::model::gateway::stream::extract_tool_hints(&body);
                 egress::normalized_sse_stream(
                     outcome.success.response.bytes_stream(),
-                    outcome.target,
+                    egress::TargetProtocol::OpenAiChat,
                     tool_hints,
                     preferred_tool,
                 )
@@ -145,45 +140,9 @@ pub async fn handle_responses(
 
     let raw_bytes = outcome.success.response.bytes().await.unwrap_or_default();
     let dur = outcome.success.cand_start.elapsed().as_millis() as u64;
-    let resp_body = cap_log_body(String::from_utf8_lossy(&raw_bytes).to_string());
-
-    // 快速通道非流式：上游原生 Responses 响应直接下发，usage 旁路提取用于日志
-    if fast_path {
-        let mut final_log = log;
-        final_log.duration_ms = dur;
-        final_log.response_body = resp_body;
-        if let Ok(jv) = serde_json::from_slice::<JsonValue>(&raw_bytes) {
-            let p = jv
-                .pointer("/usage/input_tokens")
-                .and_then(JsonValue::as_u64)
-                .unwrap_or(0);
-            let c = jv
-                .pointer("/usage/output_tokens")
-                .and_then(JsonValue::as_u64)
-                .unwrap_or(0);
-            let cached = jv
-                .pointer("/usage/input_tokens_details/cached_tokens")
-                .and_then(JsonValue::as_u64);
-            let reasoning = jv
-                .pointer("/usage/output_tokens_details/reasoning_tokens")
-                .and_then(JsonValue::as_u64);
-            final_log.prompt_tokens = Some(p);
-            final_log.completion_tokens = Some(c);
-            final_log.prompt_cache_hit_tokens = cached.filter(|v| *v > 0);
-            final_log.reasoning_tokens = reasoning.filter(|v| *v > 0);
-            final_log.total_tokens = Some(p + c);
-        }
-        ctx.record_log(final_log).await;
-        return (
-            StatusCode::OK,
-            [("content-type", "application/json")],
-            raw_bytes,
-        )
-            .into_response();
-    }
 
     let resp_bytes =
-        egress::normalize_response_bytes(outcome.target, &outcome.model_to_send, &raw_bytes);
+        egress::normalize_response_bytes(egress::TargetProtocol::OpenAiChat, &outcome.model_to_send, &raw_bytes);
     let resp_body = cap_log_body(String::from_utf8_lossy(&resp_bytes).to_string());
 
     if let Ok(jv) = serde_json::from_slice::<JsonValue>(&resp_bytes) {

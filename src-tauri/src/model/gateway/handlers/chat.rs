@@ -116,7 +116,7 @@ pub async fn handle_chat_completions(
                     crate::model::gateway::stream::extract_tool_hints(&body);
                 egress::normalized_sse_stream(
                     outcome.success.response.bytes_stream(),
-                    outcome.target,
+                    egress::TargetProtocol::OpenAiChat,
                     tool_hints,
                     preferred_tool,
                 )
@@ -136,7 +136,7 @@ pub async fn handle_chat_completions(
     } else {
         let raw_bytes = outcome.success.response.bytes().await.unwrap_or_default();
         let resp_bytes =
-            egress::normalize_response_bytes(outcome.target, &outcome.model_to_send, &raw_bytes);
+            egress::normalize_response_bytes(egress::TargetProtocol::OpenAiChat, &outcome.model_to_send, &raw_bytes);
         let dur = outcome.success.cand_start.elapsed().as_millis() as u64;
         let resp_body = cap_log_body(String::from_utf8_lossy(&resp_bytes).to_string());
 

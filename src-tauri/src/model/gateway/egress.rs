@@ -91,75 +91,38 @@ pub fn prepare_egress_with(
     convert: bool,
 ) -> (String, JsonValue) {
     let base = channel.base_url.trim_end_matches('/');
-    // Anthropic 原生路径固定为 /v1/messages；base_url 已带 /v1 时避免拼出 /v1/v1/messages
-    let anthropic_base = if base.ends_with("/v1") {
-        base.to_string()
-    } else {
-        format!("{base}/v1")
-    };
     let target = TargetProtocol::from_channel(channel);
-    if !convert {
-        let url = match target {
-            TargetProtocol::OpenAiChat => format!("{base}/chat/completions"),
-            TargetProtocol::OpenAiResponses => format!("{base}/responses"),
-            TargetProtocol::AnthropicMessages => format!("{anthropic_base}/messages"),
-            TargetProtocol::Gemini => {
-                let action = if is_stream {
-                    "streamGenerateContent?alt=sse"
-                } else {
-                    "generateContent"
-                };
-                let mut url = format!("{base}/v1beta/models/{model}:{action}");
-                if !api_key.trim().is_empty() {
-                    url.push(if url.contains('?') { '&' } else { '?' });
-                    url.push_str("key=");
-                    url.push_str(api_key.trim());
-                }
-                url
-            }
+
+    // Gemini 原生快速通道（同协议透传）保留特殊 URL 格式
+    if matches!(target, TargetProtocol::Gemini) && !convert {
+        let action = if is_stream {
+            "streamGenerateContent?alt=sse"
+        } else {
+            "generateContent"
         };
-        let mut out = body.clone();
-        if matches!(target, TargetProtocol::OpenAiChat) {
-            ensure_include_usage(&mut out, is_stream);
+        let mut url = format!("{base}/v1beta/models/{model}:{action}");
+        if !api_key.trim().is_empty() {
+            url.push(if url.contains('?') { '&' } else { '?' });
+            url.push_str("key=");
+            url.push_str(api_key.trim());
         }
-        return (url, out);
+        return (url, body.clone());
     }
-    match target {
-        TargetProtocol::OpenAiChat => {
-            let mut out = body.clone();
-            ensure_include_usage(&mut out, is_stream);
-            (format!("{base}/chat/completions"), out)
-        },
-        TargetProtocol::OpenAiResponses => (
-            format!("{base}/responses"),
-            chat_to_responses_body(body, model, is_stream),
-        ),
-        TargetProtocol::AnthropicMessages => (
-            format!("{anthropic_base}/messages"),
-            chat_to_anthropic_body(body, model, is_stream),
-        ),
-        TargetProtocol::Gemini => {
-            let action = if is_stream {
-                "streamGenerateContent?alt=sse"
-            } else {
-                "generateContent"
-            };
-            let mut url = format!("{base}/v1beta/models/{model}:{action}");
-            // Google 原生 API 只认 query key / x-goog-api-key，聚合网关则走 Bearer，两者兼容
-            if !api_key.trim().is_empty() {
-                url.push(if url.contains('?') { '&' } else { '?' });
-                url.push_str("key=");
-                url.push_str(api_key.trim());
-            }
-            (url, chat_to_gemini_body(body))
-        }
-    }
+
+    // 所有渠道统一出口：OpenAI Chat 格式 + /v1/chat/completions 路径
+    // 不管入口协议（chat/messages/responses/gemini），发往上游的请求统一为 Chat 格式。
+    // 仅 Gemini 原生透传（上方分支）保留特殊路径。
+    let url = format!("{base}/chat/completions");
+    let mut out = body.clone();
+    ensure_include_usage(&mut out, is_stream);
+    (url, out)
 }
 
 // ---------------------------------------------------------------------------
 // 请求体转换：OpenAI Chat → 目标协议
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
 fn message_text(content: &JsonValue) -> String {
     match content {
         JsonValue::String(s) => s.clone(),
@@ -173,6 +136,7 @@ fn message_text(content: &JsonValue) -> String {
 }
 
 /// OpenAI Chat 请求体 → Anthropic Messages 请求体
+#[allow(dead_code)]
 pub fn chat_to_anthropic_body(openai_body: &JsonValue, model: &str, stream: bool) -> JsonValue {
     let mut system_parts: Vec<String> = Vec::new();
     let mut messages: Vec<JsonValue> = Vec::new();
@@ -281,6 +245,7 @@ pub fn chat_to_anthropic_body(openai_body: &JsonValue, model: &str, stream: bool
 }
 
 /// OpenAI Chat 请求体 → Gemini generateContent 请求体
+#[allow(dead_code)]
 pub fn chat_to_gemini_body(openai_body: &JsonValue) -> JsonValue {
     let mut contents: Vec<JsonValue> = Vec::new();
     let mut system_instruction: Option<JsonValue> = None;
@@ -392,6 +357,7 @@ pub fn chat_to_gemini_body(openai_body: &JsonValue) -> JsonValue {
 }
 
 /// OpenAI Chat 请求体 → OpenAI Responses API 请求体
+#[allow(dead_code)]
 pub fn chat_to_responses_body(openai_body: &JsonValue, model: &str, stream: bool) -> JsonValue {
     let mut instructions = String::new();
     let mut input: Vec<JsonValue> = Vec::new();
@@ -848,7 +814,6 @@ impl AnthropicSseState {
                 // 命中：冲刷缓冲，按标准增量协议输出（首片带 id/name）
                 let args = pt.args.clone();
                 let idx = pt.idx;
-                drop(pt);
                 let name = self
                     .resolve_orphan_name(&args)
                     .unwrap_or_else(|| format!("unknown_tool_{}", idx + 1));
@@ -1396,6 +1361,7 @@ mod egress_tests {
     fn prepare_egress_builds_url_per_protocol() {
         let body = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]});
 
+        // 统一出网规则：openai / openai-responses / anthropic 默认均转换成 /chat/completions 路径
         let (url, _) = prepare_egress(&channel_with_protocol("openai"), "sk-x", "m", &body, false);
         assert_eq!(url, "https://upstream.example/v1/chat/completions");
 
@@ -1406,7 +1372,7 @@ mod egress_tests {
             &body,
             false,
         );
-        assert_eq!(url, "https://upstream.example/v1/responses");
+        assert_eq!(url, "https://upstream.example/v1/chat/completions");
 
         let (url, _) = prepare_egress(
             &channel_with_protocol("anthropic"),
@@ -1417,15 +1383,17 @@ mod egress_tests {
         );
         assert_eq!(
             url,
-            "https://upstream.example/v1/messages",
-            "base_url 已含 /v1 时不得重复拼接（历史 bug 固化过错误断言）"
+            "https://upstream.example/v1/chat/completions",
+            "上游统一默认转成 /chat/completions 出口"
         );
 
-        let (url, _) = prepare_egress(
+        // Gemini 原生快速通道（convert=false）保留原生 URL
+        let (url, _) = prepare_egress_with(
             &channel_with_protocol("gemini"),
             "sk-123",
             "gemini-2.5-pro",
             &body,
+            false,
             false,
         );
         assert_eq!(
@@ -1433,7 +1401,14 @@ mod egress_tests {
             "https://upstream.example/v1/v1beta/models/gemini-2.5-pro:generateContent?key=sk-123"
         );
 
-        let (url, _) = prepare_egress(&channel_with_protocol("gemini"), "", "g", &body, true);
+        let (url, _) = prepare_egress_with(
+            &channel_with_protocol("gemini"),
+            "",
+            "g",
+            &body,
+            true,
+            false,
+        );
         assert_eq!(
             url,
             "https://upstream.example/v1/v1beta/models/g:streamGenerateContent?alt=sse"
@@ -1747,9 +1722,12 @@ mod egress_tests {
             Some(false)
         );
 
-        // 其他目标协议不注入
+        // 统一出网：所有走 /chat/completions 的流式请求均注入 include_usage（Anthropic/Responses 渠道亦受益）
         let (_, out) =
             prepare_egress(&channel_with_protocol("anthropic"), "", "m", &body, true);
-        assert!(out.get("stream_options").is_none());
+        assert_eq!(
+            out.pointer("/stream_options/include_usage").and_then(JsonValue::as_bool),
+            Some(true)
+        );
     }
 }
