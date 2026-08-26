@@ -14,7 +14,7 @@ use super::types::{
 };
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use serde_json::{json, Value as JsonValue};
+use serde_json::{json};
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
@@ -22,6 +22,8 @@ use std::time::Instant;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ClientProtocol {
     OpenAi,
+    /// Responses API 客户端：错误体与 OpenAI 不同（type 在顶层、error 内嵌 code/param）
+    Responses,
     Anthropic,
     Gemini,
 }
@@ -47,6 +49,20 @@ pub fn model_not_found_response(raw_model: &str, style: ClientProtocol) -> Respo
                 "error": {
                     "type": "not_found_error",
                     "message": format!("No available channel for model '{raw_model}'")
+                }
+            })),
+        )
+            .into_response(),
+        ClientProtocol::Responses => (
+            StatusCode::NOT_FOUND,
+            axum::Json(json!({
+                "type": "error",
+                "error": {
+                    "type": "invalid_request_error",
+                    "code": "model_not_found",
+                    "message": format!("No available channel for model '{raw_model}'"),
+                    "param": null,
+                    "request_id": null
                 }
             })),
         )
@@ -83,6 +99,20 @@ fn incompatible_model_response(err_msg: String, style: ClientProtocol) -> Respon
             })),
         )
             .into_response(),
+        ClientProtocol::Responses => (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({
+                "type": "error",
+                "error": {
+                    "type": "invalid_request_error",
+                    "code": "unsupported_free_model",
+                    "message": err_msg,
+                    "param": null,
+                    "request_id": null
+                }
+            })),
+        )
+            .into_response(),
         ClientProtocol::OpenAi => (
             StatusCode::BAD_REQUEST,
             axum::Json(json!({
@@ -95,6 +125,44 @@ fn incompatible_model_response(err_msg: String, style: ClientProtocol) -> Respon
         )
             .into_response(),
     }
+}
+
+/// 重试耗尽/网络错误的合成错误体（按客户端协议成形）。
+/// 与 `model_not_found_response`/`incompatible_model_response` 共用一套形状。
+pub fn gateway_error_response(
+    style: ClientProtocol,
+    status: StatusCode,
+    code: &str,
+    message: String,
+) -> Response {
+    let body = match style {
+        ClientProtocol::Gemini => json!({
+            "error": { "code": status.as_u16(), "message": message, "status": "UNAVAILABLE" }
+        }),
+        ClientProtocol::Anthropic => json!({
+            "type": "error",
+            "error": { "type": "api_error", "message": message }
+        }),
+        ClientProtocol::Responses => json!({
+            "type": "error",
+            "error": {
+                "type": "api_error",
+                "code": code,
+                "message": message,
+                "param": null,
+                "request_id": null
+            }
+        }),
+        ClientProtocol::OpenAi => json!({
+            "error": {
+                "message": message,
+                "type": "upstream_error",
+                "code": code,
+                "status": "UNAVAILABLE"
+            }
+        }),
+    };
+    (status, axum::Json(body)).into_response()
 }
 
 /// 渠道解析：失败时记录 404 日志并返回对应协议错误体
@@ -245,8 +313,7 @@ pub async fn dispatch_protocol_egress(
     is_stream: bool,
     start_time: Instant,
     req_body_str: &Option<String>,
-    egress_body: &JsonValue,
-    convert: bool,
+    egress_payload: egress::EgressBody,
     style: ClientProtocol,
 ) -> Result<EgressOutcome, Response> {
     let channel_api_key = select_channel_api_key(ctx, channel);
@@ -276,9 +343,8 @@ pub async fn dispatch_protocol_egress(
         channel,
         &channel_api_key,
         model_to_send,
-        egress_body,
+        egress_payload,
         is_stream,
-        convert,
     );
 
     let meta = EgressRequestMeta {
@@ -299,6 +365,7 @@ pub async fn dispatch_protocol_egress(
         &upstream_url,
         &channel_api_key,
         &egress_body,
+        style,
     )
     .await
     {

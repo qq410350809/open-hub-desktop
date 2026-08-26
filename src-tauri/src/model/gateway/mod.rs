@@ -5,7 +5,9 @@ pub mod config;
 pub mod dispatcher;
 pub mod egress;
 pub mod handlers;
+pub mod ir;
 pub mod logger;
+pub mod parsers;
 pub mod pipeline;
 pub mod router;
 pub mod server;
@@ -24,8 +26,11 @@ pub use config::*;
 #[allow(unused_imports)]
 pub use dispatcher::*;
 #[allow(unused_imports)]
+pub use ir::*;
+#[allow(unused_imports)]
 pub use logger::*;
 #[allow(unused_imports)]
+pub use parsers::*;
 pub use router::*;
 #[allow(unused_imports)]
 pub use server::*;

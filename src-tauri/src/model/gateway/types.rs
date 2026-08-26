@@ -388,7 +388,7 @@ pub struct ModelProxyContext {
     pub current_port: Arc<RwLock<u16>>,
     pub cached_channel_models: Arc<RwLock<Vec<ChannelModelList>>>,
     pub cached_fetch_errors: Arc<RwLock<Vec<ChannelModelFetchError>>>,
-    pub default_http_client: Client,
+    pub default_http_client: Arc<tokio::sync::RwLock<Client>>,
     /// 平台无关的应用上下文（桌面与 server 共用）；启动后注入。
     pub app_ctx: StdArc<RwLock<Option<StdArc<AppContext>>>>,
     pub key_round_robin: Arc<AtomicUsize>,

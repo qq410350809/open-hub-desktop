@@ -35,7 +35,7 @@ impl ModelProxyState {
             current_port: Arc::new(RwLock::new(0)),
             cached_channel_models: Arc::new(RwLock::new(Vec::new())),
             cached_fetch_errors: Arc::new(RwLock::new(Vec::new())),
-            default_http_client: http_client,
+            default_http_client: Arc::new(tokio::sync::RwLock::new(http_client)),
             app_ctx: Arc::new(RwLock::new(None)),
             key_round_robin: Arc::new(AtomicUsize::new(0)),
             node_round_robin: Arc::new(AtomicUsize::new(0)),
@@ -59,6 +59,9 @@ pub async fn start_model_proxy_server(state: &ModelProxyState) -> Result<(), Str
         }
     }
 
+    // 配置可能带自定义 timeout_seconds：重建默认出网客户端使其生效
+    refresh_default_http_client(&state.context).await;
+
     state.context.route_enabled.store(true, Ordering::Release);
     *state.context.started_at.write().await = Some(Instant::now());
 
@@ -68,6 +71,18 @@ pub async fn start_model_proxy_server(state: &ModelProxyState) -> Result<(), Str
     });
 
     Ok(())
+}
+
+/// 按当前配置重建默认出网客户端（timeout_seconds 生效）。
+/// 配置保存/站点同步后调用，保证直连通道运行期超时配置即时生效。
+pub async fn refresh_default_http_client(ctx: &ModelProxyContext) {
+    let timeout = {
+        let cfg = ctx.config.read().await;
+        crate::model::gateway::balancer::egress_timeout(&cfg)
+    };
+    if let Ok(client) = Client::builder().timeout(timeout).build() {
+        *ctx.default_http_client.write().await = client;
+    }
 }
 
 #[allow(dead_code)]

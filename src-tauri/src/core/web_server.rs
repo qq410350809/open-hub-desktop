@@ -107,12 +107,12 @@ fn gw_managed(shared: &ServerShared) -> Managed<'_, ModelProxyState> {
     LocalRef(&shared.gateway)
 }
 
+/// 统一托管状态引用，桌面端由 Tauri TypeMap 提供。
 #[cfg(not(feature = "desktop"))]
 fn gateway_context(shared: &ServerShared) -> crate::model::gateway::ModelProxyContext {
     shared.gateway.context.clone()
 }
 
-/// 统一托管状态引用，桌面端由 Tauri TypeMap 提供。// ---------------------------------------------------------------------------
 // 鉴权
 // ---------------------------------------------------------------------------
 

@@ -254,12 +254,24 @@ pub async fn get_sorted_egress_candidates(
     candidates
 }
 
+/// 出网请求超时：取配置 `timeout_seconds`（clamp 10..=600，缺省 300）。
+/// 该配置此前从未被读取、出网恒为 300s 硬超时，长流任务（agent 多轮工具循环）
+/// 会被无差别掐断；统一经此函数换算。
+pub fn egress_timeout(config: &ModelProxyConfig) -> Duration {
+    let secs = config.timeout_seconds.clamp(10, 600);
+    Duration::from_secs(secs)
+}
+
 pub async fn build_client_for_candidate(
     ctx: &ModelProxyContext,
     candidate: &str,
 ) -> reqwest::Client {
+    let timeout = {
+        let cfg = ctx.config.read().await;
+        egress_timeout(&cfg)
+    };
     if candidate == "__direct__" {
-        return ctx.default_http_client.clone();
+        return ctx.default_http_client.read().await.clone();
     }
 
     if let Some(ctx) = ctx.app_ctx.read().await.as_ref() {
@@ -277,7 +289,7 @@ pub async fn build_client_for_candidate(
                 if let Ok(client) = reqwest::Client::builder()
                     .proxy(proxy)
                     .pool_max_idle_per_host(0)
-                    .timeout(Duration::from_secs(300))
+                    .timeout(timeout)
                     .build()
                 {
                     return client;
@@ -286,7 +298,7 @@ pub async fn build_client_for_candidate(
         }
     }
 
-    ctx.default_http_client.clone()
+    ctx.default_http_client.read().await.clone()
 }
 
 pub async fn get_node_display_name(ctx: &ModelProxyContext, candidate: &str) -> String {

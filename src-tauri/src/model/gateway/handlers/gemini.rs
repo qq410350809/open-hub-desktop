@@ -4,13 +4,12 @@
 //! 同协议快速通道（渠道目标 = Gemini）：请求体原生透传（模型名在 URL 中重写），
 //! 非流式响应原样下发，仅旁路提取 usageMetadata 供日志统计。
 
-use super::super::adapters::{GeminiProtocolAdapter, OpenAiProtocolAdapter};
 use super::super::egress::{self, TargetProtocol};
+use crate::model::gateway::adapters::GeminiProtocolAdapter;
 use super::super::logger::{cap_log_body, client_name_from_headers};
 use super::super::pipeline::{
     auth_and_count, dispatch_protocol_egress, resolve_channel_or_404, ClientProtocol,
 };
-use super::super::stream::openai_to_gemini_sse_stream;
 use super::super::types::{generate_req_id, ModelProxyContext};
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode, Uri};
@@ -85,13 +84,14 @@ pub async fn handle_gemini_generate(
 
     // 同协议快速通道：Gemini 客户端 → Gemini 上游，请求体原生透传（模型名走 URL）
     let fast_path = TargetProtocol::from_channel(chan) == TargetProtocol::Gemini;
-    let (egress_body, convert) = if fast_path {
-        (body.clone(), false)
+    let egress_payload = if fast_path {
+        crate::model::gateway::egress::EgressBody::Native(body.clone())
     } else {
-        let mut openai_body =
-            GeminiProtocolAdapter::gemini_request_to_openai(&body, &model_to_send, is_stream);
-        OpenAiProtocolAdapter::sanitize_and_normalize(&mut openai_body);
-        (openai_body, true)
+        // Gemini 协议 body 无 stream 字段（由 URL action 表达），
+        // 跨协议时必须显式回填，否则序列化到目标上游会退化为非流式
+        let mut ur = crate::model::gateway::parsers::gemini_to_universal(&body, &model_to_send);
+        ur.stream = is_stream;
+        crate::model::gateway::egress::EgressBody::Universal(ur)
     };
 
     let outcome = match dispatch_protocol_egress(
@@ -105,8 +105,7 @@ pub async fn handle_gemini_generate(
         is_stream,
         start_time,
         &req_body_str,
-        &egress_body,
-        convert,
+        egress_payload,
         ClientProtocol::Gemini,
     )
     .await
@@ -119,31 +118,50 @@ pub async fn handle_gemini_generate(
     log.client_name = Some(client_name_from_headers(&headers, &log_path));
 
     if is_stream {
-        let stream_body = openai_to_gemini_sse_stream(
-            {
-                let (tool_hints, preferred_tool) =
-                    crate::model::gateway::stream::extract_tool_hints(&body);
-                egress::normalized_sse_stream(
-                    outcome.success.response.bytes_stream(),
-                    if fast_path { outcome.target } else { egress::TargetProtocol::OpenAiChat },
-                    tool_hints,
-                    preferred_tool,
-                )
-            },
+        if fast_path {
+            // 同协议：字节直通 + 旁路统计，保留 thoughtSignature 等原生元素
+            let upstream_headers = outcome.success.response.headers().clone();
+            let stream_body = crate::model::gateway::stream::passthrough_sse_body(
+                outcome.success.response.bytes_stream(),
+                outcome.target,
+                ctx.clone(),
+                log,
+                start_time,
+                raw_model.to_string(),
+            );
+            let resp = Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", "text/event-stream")
+                .header("Cache-Control", "no-cache")
+                .header("Connection", "keep-alive")
+                .body(stream_body)
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+            return egress::copy_upstream_headers(&upstream_headers, resp);
+        }
+        let upstream_headers = outcome.success.response.headers().clone();
+        let (tool_hints, preferred_tool) = crate::model::gateway::stream::extract_tool_hints(&body);
+        let stream_body = crate::model::gateway::stream::proxy_sse_body_with_hints(
+            outcome.success.response.bytes_stream(),
+            outcome.target,
+            crate::model::gateway::stream::SseClientProtocol::Gemini,
             ctx.clone(),
             log,
             start_time,
             raw_model.to_string(),
+            tool_hints,
+            preferred_tool,
         );
-        return Response::builder()
+        let resp = Response::builder()
             .status(StatusCode::OK)
             .header("Content-Type", "text/event-stream")
             .header("Cache-Control", "no-cache")
             .header("Connection", "keep-alive")
             .body(stream_body)
             .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+        return egress::copy_upstream_headers(&upstream_headers, resp);
     }
 
+    let upstream_headers = outcome.success.response.headers().clone();
     let raw_bytes = outcome.success.response.bytes().await.unwrap_or_default();
     let dur = outcome.success.cand_start.elapsed().as_millis() as u64;
     let resp_body = cap_log_body(String::from_utf8_lossy(&raw_bytes).to_string());
@@ -179,16 +197,19 @@ pub async fn handle_gemini_generate(
                 .or(Some(p + c + thoughts));
         }
         ctx.record_log(final_log).await;
-        return (
-            StatusCode::OK,
-            [("content-type", "application/json")],
-            raw_bytes,
-        )
-            .into_response();
+        return egress::copy_upstream_headers(
+            &upstream_headers,
+            (
+                StatusCode::OK,
+                [("content-type", "application/json")],
+                raw_bytes,
+            )
+                .into_response(),
+        );
     }
 
     let resp_bytes =
-        egress::normalize_response_bytes(if fast_path { outcome.target } else { egress::TargetProtocol::OpenAiChat }, &outcome.model_to_send, &raw_bytes);
+        egress::normalize_response_bytes(outcome.target, &outcome.model_to_send, &raw_bytes);
     let openai_resp = serde_json::from_slice::<JsonValue>(&resp_bytes).unwrap_or_default();
     let gemini_resp = GeminiProtocolAdapter::openai_response_to_gemini(&openai_resp, raw_model);
 
@@ -218,5 +239,5 @@ pub async fn handle_gemini_generate(
         .filter(|v| *v > 0);
     ctx.record_log(final_log).await;
 
-    Json(gemini_resp).into_response()
+    egress::copy_upstream_headers(&upstream_headers, Json(gemini_resp).into_response())
 }

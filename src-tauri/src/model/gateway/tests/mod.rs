@@ -229,30 +229,26 @@ fn gemini_request_and_response_bidirectional_translation() {
         ]
     });
 
-    // 1. Gemini -> OpenAI
-    let openai_req =
-        GeminiProtocolAdapter::gemini_request_to_openai(&gemini_req, "gemini-1.5-pro", false);
-    assert_eq!(openai_req["model"], "gemini-1.5-pro");
-    assert_eq!(openai_req["temperature"], 0.5);
-    assert_eq!(openai_req["max_tokens"], 1024);
+    // 1. Gemini -> UniversalRequest
+    let ur = crate::model::gateway::parsers::gemini_to_universal(&gemini_req, "gemini-1.5-pro");
+    assert_eq!(ur.model, "gemini-1.5-pro");
+    assert_eq!(ur.temperature, Some(0.5));
+    assert_eq!(ur.max_tokens, Some(1024));
 
-    let msgs = openai_req["messages"].as_array().expect("messages array");
-    assert_eq!(msgs.len(), 4);
-    assert_eq!(msgs[0]["role"], "system");
-    assert_eq!(msgs[0]["content"], "You are an expert compiler engineer.");
-    assert_eq!(msgs[1]["role"], "user");
-    assert_eq!(msgs[1]["content"], "What is Rust?");
-    assert_eq!(msgs[2]["role"], "assistant");
-    assert_eq!(
-        msgs[2]["content"],
-        "Rust is a systems programming language."
+    assert_eq!(ur.system.len(), 1);
+    assert!(
+        matches!(&ur.system[0].kind,
+            crate::model::gateway::ir::PartKind::Text { text } if text == "You are an expert compiler engineer."),
+        "systemInstruction 必须归入 system: {:?}",
+        ur.system
     );
-    assert_eq!(msgs[3]["role"], "user");
-    assert_eq!(msgs[3]["content"], "Tell me more about its memory safety.");
+    assert_eq!(ur.messages.len(), 3);
+    assert_eq!(ur.messages[0].role, crate::model::gateway::ir::Role::User);
+    assert_eq!(ur.messages[1].role, crate::model::gateway::ir::Role::Assistant);
+    assert_eq!(ur.messages[2].role, crate::model::gateway::ir::Role::User);
 
-    let tools = openai_req["tools"].as_array().expect("tools array");
-    assert_eq!(tools.len(), 1);
-    assert_eq!(tools[0]["function"]["name"], "lookup_docs");
+    assert_eq!(ur.tools.len(), 1);
+    assert_eq!(ur.tools[0].name, "lookup_docs");
 
     // 2. OpenAI -> Gemini
     let openai_resp = json!({
@@ -292,48 +288,36 @@ fn gemini_request_and_response_bidirectional_translation() {
 }
 
 #[test]
-fn gemini_stream_chunk_conversion() {
-    let openai_chunk = json!({
-        "id": "chatcmpl-123",
-        "object": "chat.completion.chunk",
-        "created": 1700000000,
-        "model": "gemini-1.5-flash",
-        "choices": [
-            {
-                "index": 0,
-                "delta": {
-                    "content": "Hello world!"
-                },
-                "finish_reason": null
-            }
-        ]
-    });
-
-    let gemini_chunk =
-        GeminiProtocolAdapter::openai_chunk_to_gemini_chunk(&openai_chunk, "gemini-1.5-flash")
-            .expect("should produce gemini chunk");
+fn gemini_stream_ir_emitter_produces_text_part() {
+    use crate::model::gateway::stream::GeminiEmitter;
+    use crate::model::gateway::ir::UniversalStreamEvent;
+    let mut emitter = GeminiEmitter::default();
+    let out = emitter.on_event(&UniversalStreamEvent::TextDelta("Hello world!".into()));
+    assert_eq!(out.len(), 1);
+    let payload: serde_json::Value =
+        serde_json::from_str(out[0].trim_start_matches("data: ").trim()).unwrap();
     assert_eq!(
-        gemini_chunk["candidates"][0]["content"]["parts"][0]["text"],
+        payload["candidates"][0]["content"]["parts"][0]["text"],
         "Hello world!"
     );
 }
 
 #[test]
-fn responses_api_adapter_converts_input_and_instructions() {
-    let mut body = json!({
+fn responses_entry_parses_into_universal_request() {
+    use crate::model::gateway::ir::{PartKind, Role};
+    let body = json!({
         "model": "gpt-4o",
         "instructions": "Be concise.",
         "input": [
             { "role": "user", "content": "Hello" }
         ]
     });
-    ResponsesProtocolAdapter::convert_input_to_messages(&mut body);
-    let msgs = body["messages"].as_array().expect("messages array");
-    assert_eq!(msgs.len(), 2);
-    assert_eq!(msgs[0]["role"], "system");
-    assert_eq!(msgs[0]["content"], "Be concise.");
-    assert_eq!(msgs[1]["role"], "user");
-    assert_eq!(msgs[1]["content"], "Hello");
+    let ur = crate::model::gateway::parsers::responses_to_universal(&body, "gpt-4o");
+    assert_eq!(ur.system.len(), 1);
+    assert!(matches!(&ur.system[0].kind, PartKind::Text { text } if text == "Be concise."));
+    assert_eq!(ur.messages.len(), 1);
+    assert_eq!(ur.messages[0].role, Role::User);
+    assert!(matches!(&ur.messages[0].parts[0].kind, PartKind::Text { text } if text == "Hello"));
 }
 
 #[test]
@@ -345,12 +329,25 @@ fn sanitizes_and_normalizes_developer_and_model_roles() {
             { "role": "model", "content": "<think>thinking here</think>final answer" }
         ]
     });
-    OpenAiProtocolAdapter::sanitize_and_normalize(&mut body);
-    let msgs = body["messages"].as_array().expect("messages array");
-    assert_eq!(msgs[0]["role"], "system");
-    assert_eq!(msgs[1]["role"], "assistant");
-    assert_eq!(msgs[1]["reasoning_content"], "thinking here");
-    assert_eq!(msgs[1]["content"], "final answer");
+    let ur = crate::model::gateway::parsers::chat_to_universal(&body, "gpt-4o");
+    use crate::model::gateway::ir::{PartKind, Role};
+    assert_eq!(
+        ur.messages.len(),
+        1,
+        "developer 归一入 system，不占 messages"
+    );
+    assert_eq!(ur.system.len(), 1);
+    assert!(matches!(&ur.system[0].kind, PartKind::Text { text } if text == "system prompt"));
+    assert_eq!(ur.messages[0].role, Role::Assistant);
+    // 内联 <think> 必须拆分为思考块 + 正文块
+    assert!(matches!(
+        &ur.messages[0].parts[0].kind,
+        PartKind::Thinking { text, .. } if text == "thinking here"
+    ));
+    assert!(matches!(
+        &ur.messages[0].parts[1].kind,
+        PartKind::Text { text } if text == "final answer"
+    ));
 }
 
 #[test]
@@ -1236,4 +1233,42 @@ async fn opencode_valid_200_payload_does_not_retry() {
         1,
         "tool_calls 属于有效负载，不应重试"
     );
+}
+
+#[test]
+fn anthropic_nonstream_response_preserves_cache_and_reasoning() {
+    // 非流式保真回归：归一化口径 prompt_tokens 为总量（含缓存），
+    // Anthropic 出口必须拆分 input/cache_read/cache_creation，且保留 thinking 块
+    let openai_resp = json!({
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": "答案正文",
+                "reasoning_content": "推理过程"
+            },
+            "finish_reason": "stop"
+        }],
+        "usage": {
+            "prompt_tokens": 1000,
+            "completion_tokens": 50,
+            "total_tokens": 1050,
+            "prompt_tokens_details": {
+                "cached_tokens": 800,
+                "cache_creation_tokens": 100
+            },
+            "completion_tokens_details": { "reasoning_tokens": 30 }
+        }
+    });
+
+    let resp = AnthropicProtocolAdapter::openai_response_to_anthropic(&openai_resp, "req9", "m");
+    assert_eq!(resp["usage"]["input_tokens"], 100, "input 必须扣除缓存命中与写入");
+    assert_eq!(resp["usage"]["cache_read_input_tokens"], 800);
+    assert_eq!(resp["usage"]["cache_creation_input_tokens"], 100);
+    assert_eq!(resp["usage"]["output_tokens"], 80, "output 需含 reasoning 部分");
+    let blocks = resp["content"].as_array().unwrap();
+    assert_eq!(blocks[0]["type"], "thinking");
+    assert_eq!(blocks[0]["thinking"], "推理过程");
+    assert_eq!(blocks[1]["type"], "text");
+    assert_eq!(blocks[1]["text"], "答案正文");
 }

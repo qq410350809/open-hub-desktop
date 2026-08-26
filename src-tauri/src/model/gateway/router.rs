@@ -454,7 +454,7 @@ pub async fn fetch_upstream_models_inner(ctx: &ModelProxyContext) {
         }
 
         let api_key = select_channel_api_key(ctx, ch);
-        let client = &ctx.default_http_client;
+        let client = ctx.default_http_client.read().await.clone();
         let base = ch.base_url.trim_end_matches('/');
 
         // 依次尝试的候选端点：base_url 缺少 /v1 时（如 https://x666.me/），

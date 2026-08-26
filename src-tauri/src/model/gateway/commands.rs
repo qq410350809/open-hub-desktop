@@ -1,6 +1,8 @@
 use super::config::{load_model_proxy_config, save_model_proxy_config};
 use super::router::fetch_upstream_models_inner;
-use super::server::{start_model_proxy_server, stop_model_proxy_server};
+use super::server::{
+    refresh_default_http_client, start_model_proxy_server, stop_model_proxy_server,
+};
 use super::stats::{
     get_channel_usage_stats_summary, get_gateway_overview_stats, get_model_proxy_status_summary,
 };
@@ -50,6 +52,7 @@ pub async fn save_model_proxy_config_cmd(
         save_model_proxy_config(&conn, &config)?;
     }
     *state.context.config.write().await = config.clone();
+    refresh_default_http_client(&state.context).await;
 
     let is_running = state
         .context
@@ -648,6 +651,7 @@ pub async fn sync_model_proxy_site_channels(
     })?;
 
     *state.context.config.write().await = updated_config.clone();
+    refresh_default_http_client(&state.context).await;
 
     Ok(updated_config)
 }

@@ -2,15 +2,16 @@ use super::balancer::{
     build_client_for_candidate, format_upstream_error_message, get_node_display_name,
     get_sorted_egress_candidates, is_opencode_channel,
 };
+use super::egress::TargetProtocol;
 use super::logger::{cap_log_body, record_attempt_failure, ProxyLogParams};
+use super::pipeline::{gateway_error_response, ClientProtocol};
 use super::types::{ChannelConfig, ModelProxyConfig, ModelProxyContext};
 use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
-    Json,
 };
 use bytes::Bytes;
-use serde_json::{json, Value as JsonValue};
+use serde_json::Value as JsonValue;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 use tracing::warn;
@@ -49,6 +50,7 @@ fn build_egress_request(
     is_opencode: bool,
     attempt_req_id: &str,
     session_seed: &str,
+    target: TargetProtocol,
 ) -> reqwest::RequestBuilder {
     let mut req_builder = client
         .post(upstream_url)
@@ -71,6 +73,14 @@ fn build_egress_request(
     if !channel_api_key.is_empty() {
         req_builder = req_builder.header("Authorization", format!("Bearer {channel_api_key}"));
     }
+    if matches!(target, TargetProtocol::AnthropicMessages) && !is_opencode {
+        // Anthropic 原生 /v1/messages 快车道：官方 API 仅认 x-api-key，
+        // 兼容站两者皆收；版本头为官方必需
+        if !channel_api_key.is_empty() {
+            req_builder = req_builder.header("x-api-key", channel_api_key);
+        }
+        req_builder = req_builder.header("anthropic-version", "2023-06-01");
+    }
     req_builder
 }
 
@@ -80,9 +90,9 @@ fn build_egress_request(
 /// - 响应体为空字节
 /// - JSON 无 `choices` 键（如伪装成 200 的错误对象）
 /// - `choices` 为空数组
-/// - 首个 choice 的 message 既无正文、也无工具调用。
-///   注意：「仅有思考（reasoning_content）没有正文」同样属于缺陷表现，
-///   客户端只会看到空白回复，因此不将思考内容视为有效负载。
+/// - 首个 choice 的 message 既无正文、也无工具调用、也无思考内容。
+///   注意：纯思考（reasoning_content 非空、无正文）视为有效负载——纯推理
+///   模型可能整段只输出思考，若判空会触发重试并最终 400。
 ///
 /// 不视为空内容：非 JSON 负载（HTML 错误页/纯文本等，交由上层按原样透传排查）。
 fn is_empty_success_payload(body: &[u8]) -> bool {
@@ -107,7 +117,12 @@ fn is_empty_success_payload(body: &[u8]) -> bool {
         .and_then(JsonValue::as_array)
         .map(|a| a.is_empty())
         .unwrap_or(true);
-    no_text && no_tools
+    let no_reasoning = first
+        .pointer("/message/reasoning_content")
+        .or_else(|| first.pointer("/message/reasoning"))
+        .map(|v| v.as_str().map(str::is_empty).unwrap_or(v.is_null()))
+        .unwrap_or(true);
+    no_text && no_tools && no_reasoning
 }
 
 /// 通用弹性出网请求调度引擎
@@ -120,6 +135,7 @@ pub async fn execute_resilient_egress(
     upstream_url: &str,
     channel_api_key: &str,
     body: &JsonValue,
+    client_protocol: ClientProtocol,
 ) -> Result<EgressSuccess, Response> {
     let candidates = get_sorted_egress_candidates(ctx, channel).await;
     let max_retries = config.max_retries as usize;
@@ -173,6 +189,7 @@ pub async fn execute_resilient_egress(
                 is_opencode,
                 &attempt_req_id,
                 &meta.req_id,
+                TargetProtocol::from_channel(channel),
             )
             .send()
             .await;
@@ -478,6 +495,7 @@ pub async fn execute_resilient_egress(
     }
 
     if !last_err_bytes.is_empty() {
+        // 上游错误体原样透传（保持上游自身协议形状）
         Err((
             last_status,
             [("content-type", "application/json")],
@@ -485,17 +503,11 @@ pub async fn execute_resilient_egress(
         )
             .into_response())
     } else {
-        Err((
+        Err(gateway_error_response(
+            client_protocol,
             last_status,
-            Json(json!({
-                "error": {
-                    "message": last_error,
-                    "type": "upstream_error",
-                    "code": last_status.as_u16(),
-                    "status": "UNAVAILABLE"
-                }
-            })),
-        )
-            .into_response())
+            &last_status.as_u16().to_string(),
+            last_error,
+        ))
     }
 }

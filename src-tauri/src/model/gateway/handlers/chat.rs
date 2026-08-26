@@ -1,15 +1,13 @@
 //! POST /v1/chat/completions — OpenAI Chat Completions 入口。
 //!
-//! 客户端协议即 OpenAI 中枢格式：请求侧无需转换（仅清洗规范化），
-//! 响应侧按渠道目标协议归一化回 OpenAI 后直接下发。
+//! 请求侧 IR：入参解析为 UniversalRequest，出网由目标序列化器展开；
+//! 响应侧嗅探上游实际协议后经 IR 回传 Chat。
 
-use super::super::adapters::{normalize_chat_messages, OpenAiProtocolAdapter};
 use super::super::egress;
 use super::super::logger::{cap_log_body, client_name_from_headers};
 use super::super::pipeline::{
     auth_and_count, dispatch_protocol_egress, resolve_channel_or_404, ClientProtocol,
 };
-use super::super::stream::clean_sse_stream;
 use super::super::types::{generate_req_id, ModelProxyContext};
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, Uri};
@@ -23,7 +21,7 @@ pub async fn handle_chat_completions(
     headers: HeaderMap,
     uri: Uri,
     State(ctx): State<ModelProxyContext>,
-    Json(mut body): Json<JsonValue>,
+    Json(body): Json<JsonValue>,
 ) -> Response {
     const PATH: &str = "/v1/chat/completions";
     let start_time = Instant::now();
@@ -79,11 +77,10 @@ pub async fn handle_chat_completions(
         Err(res) => return res,
     };
 
-    body["model"] = JsonValue::String(model_to_send.clone());
-    OpenAiProtocolAdapter::sanitize_and_normalize(&mut body);
-    if let Some(msgs) = body.get_mut("messages") {
-        normalize_chat_messages(msgs);
-    }
+    // 请求侧 IR：Chat 入口同样解析为通用对象，出网由目标序列化器展开
+    let egress_payload = crate::model::gateway::egress::EgressBody::Universal(
+        crate::model::gateway::parsers::chat_to_universal(&body, &model_to_send),
+    );
 
     let outcome = match dispatch_protocol_egress(
         &ctx,
@@ -96,8 +93,7 @@ pub async fn handle_chat_completions(
         is_stream,
         start_time,
         &req_body_str,
-        &body,
-        true,
+        egress_payload,
         ClientProtocol::OpenAi,
     )
     .await
@@ -110,33 +106,33 @@ pub async fn handle_chat_completions(
     log.client_name = Some(client_name_from_headers(&headers, PATH));
 
     if is_stream {
-        let stream_body = clean_sse_stream(
-            {
-                let (tool_hints, preferred_tool) =
-                    crate::model::gateway::stream::extract_tool_hints(&body);
-                egress::normalized_sse_stream(
-                    outcome.success.response.bytes_stream(),
-                    egress::TargetProtocol::OpenAiChat,
-                    tool_hints,
-                    preferred_tool,
-                )
-            },
+        // 出网已按渠道目标原生化，响应协议即 outcome.target（嗅探失败时的正确回退）
+        let (tool_hints, preferred_tool) = crate::model::gateway::stream::extract_tool_hints(&body);
+        let upstream_headers = outcome.success.response.headers().clone();
+        let stream_body = crate::model::gateway::stream::proxy_sse_body_with_hints(
+            outcome.success.response.bytes_stream(),
+            outcome.target,
+            crate::model::gateway::stream::SseClientProtocol::Chat,
             ctx.clone(),
             log,
             start_time,
             raw_model,
+            tool_hints,
+            preferred_tool,
         );
-        Response::builder()
+        let resp = Response::builder()
             .status(StatusCode::OK)
             .header("Content-Type", "text/event-stream")
             .header("Cache-Control", "no-cache")
             .header("Connection", "keep-alive")
             .body(stream_body)
-            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+        egress::copy_upstream_headers(&upstream_headers, resp)
     } else {
+        let upstream_headers = outcome.success.response.headers().clone();
         let raw_bytes = outcome.success.response.bytes().await.unwrap_or_default();
         let resp_bytes =
-            egress::normalize_response_bytes(egress::TargetProtocol::OpenAiChat, &outcome.model_to_send, &raw_bytes);
+            egress::normalize_response_bytes(outcome.target, &outcome.model_to_send, &raw_bytes);
         let dur = outcome.success.cand_start.elapsed().as_millis() as u64;
         let resp_body = cap_log_body(String::from_utf8_lossy(&resp_bytes).to_string());
 
@@ -234,13 +230,19 @@ pub async fn handle_chat_completions(
                 ctx.metrics.total_tokens.fetch_add(t, Ordering::Relaxed);
             }
 
-            return Json(jv).into_response();
+            return egress::copy_upstream_headers(
+                &upstream_headers,
+                Json(jv).into_response(),
+            );
         }
 
         let mut final_log = log;
         final_log.duration_ms = dur;
         final_log.response_body = resp_body;
         ctx.record_log(final_log).await;
-        (StatusCode::OK, resp_bytes).into_response()
+        egress::copy_upstream_headers(
+            &upstream_headers,
+            (StatusCode::OK, resp_bytes).into_response(),
+        )
     }
 }
