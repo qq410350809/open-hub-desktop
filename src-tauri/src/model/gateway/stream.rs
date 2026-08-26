@@ -224,6 +224,7 @@ impl AnthropicSseEmitter {
 
     /// 冲刷工具块打开期间缓冲的文本/思考增量（按到达顺序）。
     /// 调用前提：当前已无 Tool 块打开（否则会陷入递归）。
+    /// 冲刷结束后关闭最后打开的块，保证 message_delta 前无未关闭块。
     fn drain_pending_text(&mut self) -> Vec<String> {
         let pending = std::mem::take(&mut self.pending_text);
         let mut events = Vec::new();
@@ -247,6 +248,7 @@ impl AnthropicSseEmitter {
                 ));
             }
         }
+        events.extend(self.close_open_block());
         events
     }
 
@@ -1161,6 +1163,124 @@ mod stream_accumulator_tests {
         );
         // 文本连续追加不应重复开块
         assert_eq!(block_types.iter().filter(|t| **t == "text").count(), 1);
+    }
+
+    #[test]
+    fn gemini_emitter_aggregates_fragmented_tool_args() {
+        // P0-1：跨协议流式工具参数是碎分片，旧实现逐片解析失败 → args:{} 且 name:""
+        let mut em = GeminiEmitter::default();
+        let mut events = Vec::new();
+        events.extend(em.on_event(&UniversalStreamEvent::ToolCallStart {
+            index: 0,
+            call_id: "call_1".into(),
+            name: "search".into(),
+        }));
+        events.extend(em.on_event(&UniversalStreamEvent::ToolCallDelta {
+            index: 0,
+            fragment: "{\"q\":".into(),
+        }));
+        events.extend(em.on_event(&UniversalStreamEvent::ToolCallDelta {
+            index: 0,
+            fragment: "\"git\"}".into(),
+        }));
+        events.extend(em.on_event(&UniversalStreamEvent::Finish {
+            reason: StopReason::ToolUse,
+            usage: UniversalUsage {
+                input_tokens: 5,
+                output_tokens: 3,
+                ..Default::default()
+            },
+        }));
+
+        let all = events.join("\n");
+        assert!(all.contains("\"name\":\"search\""), "必须携带真实函数名: {all}");
+        assert!(all.contains("\"q\":\"git\""), "碎分片必须聚合为完整 args: {all}");
+        assert!(!all.contains("\"name\":\"\""), "不得出现空名 functionCall: {all}");
+        assert!(all.contains("finishReason"), "终帧必须携带 finishReason: {all}");
+
+        // 终帧 chunk 内必须是完整 functionCall（含解析后的完整 args）
+        let last_raw = events.last().expect("最后应为 Finish chunk");
+        let last_json: JsonValue = serde_json::from_str(
+            last_raw
+                .trim()
+                .strip_prefix("data: ")
+                .expect("Gemini 事件以 data: 开头"),
+        )
+        .expect("终帧应为合法 JSON");
+        let parts = last_json
+            .pointer("/candidates/0/content/parts")
+            .and_then(JsonValue::as_array)
+            .expect("应有 parts");
+        assert!(
+            parts.iter().any(|p| {
+                p.pointer("/functionCall/name").and_then(JsonValue::as_str) == Some("search")
+                    && p.pointer("/functionCall/args/q").and_then(JsonValue::as_str)
+                        == Some("git")
+            }),
+            "Finish chunk 内应有完整 functionCall: {all}"
+        );
+    }
+
+    #[test]
+    fn anthropic_emitter_reopens_tool_with_real_meta_and_buffers_text() {
+        // P1-2：文本插队工具参数时不得伪造 toolu_reopen_*/name:"tool"，
+        // 工具块复用真实 id/name，插队文本缓冲到工具块关闭后完整出现
+        let mut em = AnthropicSseEmitter::new("req3", "m", Vec::new(), None);
+        let mut events = Vec::new();
+        events.extend(em.on_ir_event(&UniversalStreamEvent::ToolCallStart {
+            index: 0,
+            call_id: "call_x".into(),
+            name: "search".into(),
+        }));
+        events.extend(em.on_ir_event(&UniversalStreamEvent::ToolCallDelta {
+            index: 0,
+            fragment: "{\"q\":".into(),
+        }));
+        events.extend(em.on_ir_event(&UniversalStreamEvent::TextDelta("等等".into())));
+        events.extend(em.on_ir_event(&UniversalStreamEvent::ToolCallDelta {
+            index: 0,
+            fragment: "\"git\"}".into(),
+        }));
+        events.extend(em.on_ir_event(&UniversalStreamEvent::Finish {
+            reason: StopReason::ToolUse,
+            usage: UniversalUsage {
+                input_tokens: 5,
+                output_tokens: 3,
+                ..Default::default()
+            },
+        }));
+
+        let all = events.join("\n");
+        let parsed = parse_emitter_events(&events);
+        assert!(all.contains("\"id\":\"call_x\""), "工具块必须复用真实 id: {all}");
+        assert!(!all.contains("toolu_reopen"), "不得出现伪造 id: {all}");
+        assert!(!all.contains("\"name\":\"tool\""), "不得出现占位名: {all}");
+        assert!(all.contains("等等"), "插队文本不得丢失: {all}");
+
+        // 两段参数分片都必须下发（input_json_delta 逐片透传）
+        let partial_jsons: Vec<&str> = parsed
+            .iter()
+            .filter(|(n, d)| {
+                n == "content_block_delta"
+                    && d.pointer("/delta/type").and_then(JsonValue::as_str)
+                        == Some("input_json_delta")
+            })
+            .filter_map(|(_, d)| d.pointer("/delta/partial_json").and_then(JsonValue::as_str))
+            .collect();
+        assert_eq!(partial_jsons, vec!["{\"q\":", "\"git\"}"], "参数分片应完整下发");
+
+        // 文本必须出现在工具块之后（独立文本块），message_delta 前无未关闭块
+        let types: Vec<&str> = parsed
+            .iter()
+            .filter(|(n, _)| n == "content_block_start")
+            .filter_map(|(_, d)| d.pointer("/content_block/type").and_then(JsonValue::as_str))
+            .collect();
+        assert_eq!(types, vec!["tool_use", "text"], "工具块与文本块按序独立: {all}");
+        let delta_times = parsed
+            .iter()
+            .filter(|(n, d)| n == "content_block_delta" && d.pointer("/delta/type").and_then(JsonValue::as_str) == Some("text_delta"))
+            .count();
+        assert_eq!(delta_times, 1, "插队文本应完整出现在单个 text_delta 中");
     }
 }
 

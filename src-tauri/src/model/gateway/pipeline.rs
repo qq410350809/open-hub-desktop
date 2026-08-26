@@ -415,3 +415,64 @@ pub async fn auth_and_count(
     ctx.metrics.total_requests.fetch_add(1, Ordering::Relaxed);
     Ok(())
 }
+
+#[cfg(test)]
+mod pipeline_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn responses_error_body_uses_responses_shape() {
+        // P1-5：Responses 客户端收到的不再是 OpenAI Chat 形状错误体
+        let resp = model_not_found_response("no-such-model", ClientProtocol::Responses);
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let jv: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(jv["type"], "error");
+        assert_eq!(
+            jv.pointer("/error/code").and_then(serde_json::Value::as_str),
+            Some("model_not_found")
+        );
+        assert!(jv.pointer("/error/param").is_some(), "Responses 形状带 param 字段");
+        assert!(jv.pointer("/error/request_id").is_some());
+    }
+
+    #[tokio::test]
+    async fn gateway_error_respects_client_protocol_shape() {
+        // P1-5：重试耗尽/网络错误的合成错误体按客户端协议成形
+        let resp = gateway_error_response(
+            ClientProtocol::Anthropic,
+            StatusCode::BAD_GATEWAY,
+            "502",
+            "boom".into(),
+        );
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let jv: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(jv["type"], "error");
+        assert_eq!(
+            jv.pointer("/error/type").and_then(serde_json::Value::as_str),
+            Some("api_error")
+        );
+
+        let resp = gateway_error_response(
+            ClientProtocol::Responses,
+            StatusCode::BAD_GATEWAY,
+            "502",
+            "boom".into(),
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let jv: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(jv["type"], "error");
+        assert!(jv.pointer("/error/param").is_some());
+
+        let resp = gateway_error_response(
+            ClientProtocol::Gemini,
+            StatusCode::BAD_GATEWAY,
+            "502",
+            "boom".into(),
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let jv: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(jv.pointer("/error/code").is_some(), "Gemini 形状带 code 字段");
+    }
+}

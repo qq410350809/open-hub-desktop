@@ -511,3 +511,22 @@ pub async fn execute_resilient_egress(
         ))
     }
 }
+
+#[cfg(test)]
+mod dispatcher_tests {
+    use super::*;
+
+    #[test]
+    fn reasoning_only_payload_is_not_empty() {
+        // P1-9：纯推理响应（无正文无工具）应视为有效负载，
+        // 否则触发重试并最终 400，纯思考模型被误杀
+        let body = r#"{"choices":[{"message":{"role":"assistant","content":"","reasoning_content":"思考中"}}],"usage":{"prompt_tokens":1,"completion_tokens":10}}"#.as_bytes();
+        assert!(!is_empty_success_payload(body), "仅含思考的响应不是空内容");
+
+        let body = br#"{"choices":[{"message":{"role":"assistant","content":null},"finish_reason":"stop"}]}"#;
+        assert!(is_empty_success_payload(body), "真空白响应仍是空内容");
+
+        let body = r#"{"choices":[{"message":{"role":"assistant","content":"有正文"}}]}"#.as_bytes();
+        assert!(!is_empty_success_payload(body));
+    }
+}

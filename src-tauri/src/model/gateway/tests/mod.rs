@@ -970,6 +970,7 @@ async fn run_egress(
         &upstream_url,
         "",
         &json!({ "model": "deepseek-v4-flash-free" }),
+        crate::model::gateway::pipeline::ClientProtocol::OpenAi,
     )
     .await
 }
@@ -1091,11 +1092,11 @@ async fn opencode_empty_200_payload_retries_inplace_then_succeeds() {
     use std::time::{Duration, Instant};
 
     // OpenCode 官方缺陷：返回 200 但响应体为空内容 → 必须与 5xx 一样原地重试。
-    // 「仅有思考没有正文」同样属于缺陷表现（客户端只见空白回复）
+    // 注意：仅有思考（reasoning_content）没有正文属于有效负载（P1-9），
+    // 纯推理模型可能整段只输出思考，不再按空内容处理。
     for empty_payload in [
         "",
         r#"{"choices":[]}"#,
-        r#"{"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"深度思考了很久但没有产出任何正文"},"finish_reason":"stop"}]}"#,
         r#"{"choices":[{"index":0,"message":{"role":"assistant","content":null},"finish_reason":"stop"}],"usage":{"prompt_tokens":10}}"#,
     ] {
         let (addr, counter) = spawn_scripted_upstream(vec![
@@ -1265,7 +1266,9 @@ fn anthropic_nonstream_response_preserves_cache_and_reasoning() {
     assert_eq!(resp["usage"]["input_tokens"], 100, "input 必须扣除缓存命中与写入");
     assert_eq!(resp["usage"]["cache_read_input_tokens"], 800);
     assert_eq!(resp["usage"]["cache_creation_input_tokens"], 100);
-    assert_eq!(resp["usage"]["output_tokens"], 80, "output 需含 reasoning 部分");
+    // P0-3：归一化 completion_tokens 已含推理（50 含 reasoning 30），
+    // Anthropic output_tokens 直接透传，不得再叠加 reasoning 造成双重计数
+    assert_eq!(resp["usage"]["output_tokens"], 50, "output 直接透传含推理的 completion");
     let blocks = resp["content"].as_array().unwrap();
     assert_eq!(blocks[0]["type"], "thinking");
     assert_eq!(blocks[0]["thinking"], "推理过程");

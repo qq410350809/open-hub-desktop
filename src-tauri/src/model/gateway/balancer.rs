@@ -330,3 +330,20 @@ pub async fn get_node_display_name(ctx: &ModelProxyContext, candidate: &str) -> 
 
     candidate.to_string()
 }
+
+#[cfg(test)]
+mod balancer_tests {
+    use super::*;
+
+    #[test]
+    fn egress_timeout_clamps_and_defaults() {
+        // P1-7：timeout_seconds 缺省 300s，越界 clamp 到 [10, 600]
+        let cfg = ModelProxyConfig::default();
+        assert_eq!(egress_timeout(&cfg).as_secs(), 300, "缺省 300s");
+        let mut cfg = ModelProxyConfig::default();
+        cfg.timeout_seconds = 5;
+        assert_eq!(egress_timeout(&cfg).as_secs(), 10, "下限 clamp 10s");
+        cfg.timeout_seconds = 9999;
+        assert_eq!(egress_timeout(&cfg).as_secs(), 600, "上限 clamp 600s");
+    }
+}

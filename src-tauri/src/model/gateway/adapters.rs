@@ -237,3 +237,30 @@ impl AnthropicProtocolAdapter {
     }
 }
 
+#[cfg(test)]
+mod adapter_tests {
+    use super::*;
+
+    #[test]
+    fn openai_response_to_anthropic_does_not_double_count_reasoning() {
+        // P0-3：归一化 completion_tokens 已含推理（Gemini 为 candidates+thoughts、
+        // Responses 为含 reasoning 的 output_tokens），Anthropic 语义的 output_tokens
+        // 同样含思考部分，直接透传即可，叠加 reasoning 会重复计数
+        let openai_resp = json!({
+            "choices": [{ "message": { "role": "assistant", "content": "ok" }, "finish_reason": "stop" }],
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 300,
+                "total_tokens": 400,
+                "completion_tokens_details": { "reasoning_tokens": 200 }
+            }
+        });
+        let out = AnthropicProtocolAdapter::openai_response_to_anthropic(&openai_resp, "req1", "m");
+        assert_eq!(
+            out.pointer("/usage/output_tokens").and_then(JsonValue::as_u64),
+            Some(300),
+            "推理 token 不得被计两次"
+        );
+    }
+}
+

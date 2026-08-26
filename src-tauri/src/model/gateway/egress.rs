@@ -1380,4 +1380,91 @@ mod egress_tests {
             "Anthropic 原生出口不得注入 Chat 专属的 stream_options"
         );
     }
+
+    #[test]
+    fn copy_upstream_headers_skips_framing_and_keeps_useful() {
+        // P1-6：透传 x-request-id / retry-after / ratelimit 头，跳过内容与分帧头
+        let mut src = reqwest::header::HeaderMap::new();
+        src.insert("x-request-id", "req-1".parse().unwrap());
+        src.insert("retry-after", "30".parse().unwrap());
+        src.insert(
+            "anthropic-ratelimit-input-tokens",
+            "1000".parse().unwrap(),
+        );
+        src.insert("content-type", "application/json".parse().unwrap());
+        src.insert("transfer-encoding", "chunked".parse().unwrap());
+        src.insert("set-cookie", "a=b".parse().unwrap());
+
+        let resp = axum::http::Response::builder()
+            .status(200)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let out = copy_upstream_headers(&src, resp);
+        assert_eq!(
+            out.headers().get("x-request-id").map(|v| v.to_str().unwrap()),
+            Some("req-1")
+        );
+        assert_eq!(
+            out.headers().get("retry-after").map(|v| v.to_str().unwrap()),
+            Some("30")
+        );
+        assert_eq!(
+            out.headers()
+                .get("anthropic-ratelimit-input-tokens")
+                .map(|v| v.to_str().unwrap()),
+            Some("1000")
+        );
+        assert!(out.headers().get("content-type").is_none());
+        assert!(out.headers().get("transfer-encoding").is_none());
+        assert!(out.headers().get("set-cookie").is_none());
+    }
+
+    #[test]
+    fn normalized_usage_keeps_reasoning_inside_completion() {
+        // P0-3 口径回归：归一化 completion_tokens 含推理，推理明细单列，
+        // adapters 端据此直接透传不再叠加（防双重计数）
+        let gemini = json!({
+            "candidates": [{ "content": { "parts": [{ "text": "hi" }], "role": "model" },
+                             "finishReason": "STOP", "index": 0 }],
+            "usageMetadata": {
+                "promptTokenCount": 10,
+                "candidatesTokenCount": 20,
+                "thoughtsTokenCount": 30,
+                "totalTokenCount": 60
+            }
+        });
+        let openai = gemini_response_to_openai(&gemini, "m");
+        assert_eq!(
+            openai.pointer("/usage/completion_tokens").and_then(JsonValue::as_u64),
+            Some(50),
+            "completion 含推理（candidates + thoughts）"
+        );
+        assert_eq!(
+            openai
+                .pointer("/usage/completion_tokens_details/reasoning_tokens")
+                .and_then(JsonValue::as_u64),
+            Some(30)
+        );
+
+        let responses = json!({
+            "id": "resp_1", "object": "response", "status": "completed", "output": [],
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 300,
+                "output_tokens_details": { "reasoning_tokens": 200 }
+            }
+        });
+        let openai = responses_response_to_openai(&responses);
+        assert_eq!(
+            openai.pointer("/usage/completion_tokens").and_then(JsonValue::as_u64),
+            Some(300),
+            "Responses output_tokens 已含推理，直接透传"
+        );
+        assert_eq!(
+            openai
+                .pointer("/usage/completion_tokens_details/reasoning_tokens")
+                .and_then(JsonValue::as_u64),
+            Some(200)
+        );
+    }
 }
