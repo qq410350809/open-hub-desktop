@@ -139,7 +139,7 @@ fn prepare_egress_inner(
     mut native: Option<JsonValue>,
     is_stream: bool,
 ) -> (String, JsonValue) {
-    let base = channel.base_url.trim_end_matches('/');
+    let base = channel.base_url.trim().trim_end_matches('/');
     let target = TargetProtocol::from_channel(channel);
 
     match target {
@@ -166,11 +166,7 @@ fn prepare_egress_inner(
         // Anthropic 原生：/v1/messages；跨协议时由 Chat 中枢体转换。
         // 此前一律发 Chat 体到 /chat/completions，原生上游无法消费。
         TargetProtocol::AnthropicMessages => {
-            let url = if base.ends_with("/v1") {
-                format!("{base}/messages")
-            } else {
-                format!("{base}/v1/messages")
-            };
+            let url = normalize_versioned_base(base, "messages");
             let egress_body = if let Some(ur) = universal {
                 super::parsers::universal_to_anthropic(&ur)
             } else {
@@ -178,9 +174,9 @@ fn prepare_egress_inner(
             };
             (url, egress_body)
         }
-        // OpenAI Responses 原生：/responses
+        // OpenAI Responses 原生：/v1/responses
         TargetProtocol::OpenAiResponses => {
-            let url = format!("{base}/responses");
+            let url = normalize_versioned_base(base, "responses");
             let egress_body = if let Some(ur) = universal {
                 super::parsers::universal_to_responses(&ur)
             } else {
@@ -190,7 +186,7 @@ fn prepare_egress_inner(
         }
         // OpenAI Chat 统一出口（中枢格式原样）
         TargetProtocol::OpenAiChat => {
-            let url = format!("{base}/chat/completions");
+            let url = normalize_versioned_base(base, "chat/completions");
             let mut out = if let Some(ur) = universal {
                 super::parsers::universal_to_chat(&ur)
             } else {
@@ -199,6 +195,21 @@ fn prepare_egress_inner(
             ensure_include_usage(&mut out, is_stream);
             (url, out)
         }
+    }
+}
+
+/// 规范化拼接带版本前缀的上游端点：
+/// 1. 基址已带版本路径（/v1 等）则原样衔接；裸域名（站点库普遍形态，
+///    如 https://x666.me）自动补 /v1 —— 否则请求打到 /chat/completions
+///    根本进不了上游网关，表现为「上游无请求记录、客户端空返回」；
+/// 2. 折叠基址尾部斜杠，杜绝「域名//v1」双斜杠。
+/// 与 router 模型探测的 /v1 回退候选规则保持同一口径。
+fn normalize_versioned_base(base: &str, endpoint: &str) -> String {
+    let trimmed = base.trim().trim_end_matches('/');
+    if trimmed.ends_with("/v1") || trimmed.ends_with("/vbeta") || trimmed.ends_with("/v2") {
+        format!("{trimmed}/{endpoint}")
+    } else {
+        format!("{trimmed}/v1/{endpoint}")
     }
 }
 
@@ -1014,6 +1025,42 @@ mod egress_tests {
             TargetProtocol::from_channel(&channel_with_protocol("unknown")),
             TargetProtocol::OpenAiChat
         );
+    }
+
+    #[test]
+    fn prepare_egress_bare_domain_base_gets_v1_and_no_double_slash() {
+        // 站点转换渠道的 upstreamUrl 普遍是裸域名：出网必须自动补 /v1，
+        // 否则请求打到根路径端点、上游无任何请求记录（静默空返回）
+        let body = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]});
+        let mut chan = channel_with_protocol("openai");
+        chan.base_url = "https://x666.me".to_string();
+        let (url, _) = prepare_egress(&chan, "", "claude-sonnet-5", &body, true);
+        assert_eq!(url, "https://x666.me/v1/chat/completions");
+
+        // 尾部斜杠不得产生双斜杠（scheme 的 // 除外）
+        chan.base_url = "https://x666.me/".to_string();
+        let (url, _) = prepare_egress(&chan, "", "m", &body, false);
+        assert_eq!(url, "https://x666.me/v1/chat/completions");
+        assert!(
+            !url.split("://", ).nth(1).unwrap_or("").contains("//"),
+            "禁止路径双斜杠: {url}"
+        );
+
+        // 已带版本路径的基址原样衔接
+        chan.base_url = "https://api.example.com/v1".to_string();
+        let (url, _) = prepare_egress(&chan, "", "m", &body, false);
+        assert_eq!(url, "https://api.example.com/v1/chat/completions");
+
+        // Anthropic / Responses 同规则
+        let mut anthro = channel_with_protocol("anthropic");
+        anthro.base_url = "https://relay.example".to_string();
+        let (url, _) = prepare_egress(&anthro, "", "m", &body, false);
+        assert_eq!(url, "https://relay.example/v1/messages");
+
+        let mut resp = channel_with_protocol("responses");
+        resp.base_url = "https://relay.example".to_string();
+        let (url, _) = prepare_egress(&resp, "", "m", &body, false);
+        assert_eq!(url, "https://relay.example/v1/responses");
     }
 
     #[test]
