@@ -107,27 +107,30 @@ impl ChatParser {
             }
         }
         if let Some(s) = delta.get("content").and_then(JsonValue::as_str) {
-            if s.is_empty() {
-                return out;
-            }
-            // DeepSeek 方言：<think>...</think> 内嵌于 content，
-            // 拆分为推理/正文两个事件（原 clean_sse_stream 能力的 IR 化）
-            if let Some(start) = s.find("<think>") {
-                if let Some(end) = s.find("</think>") {
-                    if start < end {
-                        let reasoning = s[start + 7..end].trim();
-                        let after = s[end + 8..].trim_start();
-                        if !reasoning.is_empty() {
-                            out.push(UniversalStreamEvent::ReasoningDelta(reasoning.to_string()));
+            if !s.is_empty() {
+                // DeepSeek 方言：<think>...</think> 内嵌于 content，
+                // 拆分为推理/正文两个事件（原 clean_sse_stream 能力的 IR 化）。
+                // 注意：不得提前 return——同帧可能还携带 tool_calls 增量
+                let mut handled_think = false;
+                if let Some(start) = s.find("<think>") {
+                    if let Some(end) = s.find("</think>") {
+                        if start < end {
+                            handled_think = true;
+                            let reasoning = s[start + 7..end].trim();
+                            let after = s[end + 8..].trim_start();
+                            if !reasoning.is_empty() {
+                                out.push(UniversalStreamEvent::ReasoningDelta(reasoning.to_string()));
+                            }
+                            if !after.is_empty() {
+                                out.push(UniversalStreamEvent::TextDelta(after.to_string()));
+                            }
                         }
-                        if !after.is_empty() {
-                            out.push(UniversalStreamEvent::TextDelta(after.to_string()));
-                        }
-                        return out;
                     }
                 }
+                if !handled_think {
+                    out.push(UniversalStreamEvent::TextDelta(s.to_string()));
+                }
             }
-            out.push(UniversalStreamEvent::TextDelta(s.to_string()));
         }
         if let Some(tool_calls) = delta.get("tool_calls").and_then(JsonValue::as_array) {
             for tc in tool_calls {
@@ -257,6 +260,8 @@ impl ChatParser {
 /// 保留孤儿工具恢复逻辑（tool_hints / preferred_tool / 缓冲收口）。
 pub struct AnthropicParser {
     usage: UniversalUsage,
+    /// Anthropic 上游原始 input_tokens（不含缓存）；IR 口径的总量由此换算
+    raw_input_tokens: Option<u64>,
     stop_reason: Option<StopReason>,
     block_kinds: BTreeMap<u64, String>,
     tool_meta: BTreeMap<u64, (String, String)>,
@@ -272,6 +277,7 @@ impl AnthropicParser {
     pub fn new(tool_hints: Vec<super::stream::ToolHint>, preferred_tool: Option<String>) -> Self {
         Self {
             usage: UniversalUsage::default(),
+            raw_input_tokens: None,
             stop_reason: None,
             block_kinds: BTreeMap::new(),
             tool_meta: BTreeMap::new(),
@@ -299,6 +305,17 @@ impl AnthropicParser {
         None
     }
 
+    /// IR 口径归一：`input_tokens` = 原始输入 + 缓存命中 + 缓存写入。
+    /// Anthropic 上游的 input_tokens 语义不含缓存部分，若原样存入，
+    /// 出口侧（Anthropic 扣减缓存）与落库统计会双重扣减/少记。
+    fn recompute_input_tokens(&mut self) {
+        if let Some(raw) = self.raw_input_tokens {
+            self.usage.input_tokens = raw
+                .saturating_add(self.usage.cache_read_tokens)
+                .saturating_add(self.usage.cache_creation_tokens);
+        }
+    }
+
     /// 下发孤儿缓冲：合成 Start + 全部 Delta
     fn flush_orphan(&mut self, events: &mut Vec<UniversalStreamEvent>) {
         let Some(pt) = self.pending_orphan.take() else {
@@ -311,6 +328,8 @@ impl AnthropicParser {
         self.tool_meta
             .insert(pt.index, (call_id.clone(), name.clone()));
         self.block_kinds.insert(pt.index, "tool_use".to_string());
+        // 标记已启动：否则后续 partial_json 走主匹配 tool_use 臂会重复发 Start
+        self.started_tools.insert(pt.index);
         events.push(UniversalStreamEvent::ToolCallStart {
             index: pt.index,
             call_id,
@@ -333,10 +352,12 @@ impl AnthropicParser {
 
         match jv.get("type").and_then(JsonValue::as_str) {
             Some("message_start") => {
-                self.usage.input_tokens = jv
+                if let Some(v) = jv
                     .pointer("/message/usage/input_tokens")
                     .and_then(JsonValue::as_u64)
-                    .unwrap_or(self.usage.input_tokens);
+                {
+                    self.raw_input_tokens = Some(v);
+                }
                 self.usage.cache_read_tokens = jv
                     .pointer("/message/usage/cache_read_input_tokens")
                     .and_then(JsonValue::as_u64)
@@ -345,6 +366,7 @@ impl AnthropicParser {
                     .pointer("/message/usage/cache_creation_input_tokens")
                     .and_then(JsonValue::as_u64)
                     .unwrap_or(self.usage.cache_creation_tokens);
+                self.recompute_input_tokens();
             }
             Some("content_block_start") => {
                 let index = jv.get("index").and_then(JsonValue::as_u64).unwrap_or(0);
@@ -414,15 +436,6 @@ impl AnthropicParser {
                     }
                 }
             }
-            // 终态帧强制收口：孤儿缓冲仍无法识别名字时以占位下发（客户端会自愈重试）
-            _ if self.pending_orphan.is_some()
-                && matches!(
-                    jv.get("type").and_then(JsonValue::as_str),
-                    Some("content_block_stop") | Some("message_delta") | Some("message_stop")
-                ) =>
-            {
-                self.flush_orphan(&mut out);
-            }
             Some("message_delta") => {
                 if let Some(r) = jv.pointer("/delta/stop_reason").and_then(JsonValue::as_str) {
                     self.stop_reason = Some(StopReason::from_anthropic(r));
@@ -446,11 +459,23 @@ impl AnthropicParser {
                 {
                     self.usage.cache_creation_tokens = self.usage.cache_creation_tokens.max(v);
                 }
+                // 缓存计数可能在 message_delta 才给出或更新，按 IR 口径重算总量
+                self.recompute_input_tokens();
             }
             _ => {}
         }
 
-        // 兼容性处理必须在主匹配之后：孤儿 input_json_delta 先于其他帧消费
+        // 兼容性处理必须在主匹配之后：孤儿 input_json_delta 先于其他帧消费。
+        // 终态帧强制收口同样放在主匹配之后——若作为守卫臂会吞掉 message_delta
+        // 的 stop_reason / output_tokens / 缓存计数解析（P0：usage 全丢）。
+        if self.pending_orphan.is_some()
+            && matches!(
+                jv.get("type").and_then(JsonValue::as_str),
+                Some("content_block_stop") | Some("message_delta") | Some("message_stop")
+            )
+        {
+            self.flush_orphan(&mut out);
+        }
         if jv.get("type").and_then(JsonValue::as_str) == Some("content_block_delta")
             && jv.pointer("/delta/type").and_then(JsonValue::as_str) == Some("input_json_delta")
         {
@@ -597,10 +622,15 @@ impl GeminiParser {
 
     pub fn finish(&mut self) -> Vec<UniversalStreamEvent> {
         let _ = self.emitted_any;
-        vec![UniversalStreamEvent::Finish {
-            reason: self.stop_reason.unwrap_or(StopReason::EndTurn),
-            usage: self.usage.clone(),
-        }]
+        // Gemini 函数调用的 finishReason 恒为 "STOP"（映射为 EndTurn）；
+        // 已产出工具调用时必须推断为 ToolUse，否则依赖
+        // finish_reason:"tool_calls" 的客户端框架不会执行工具。
+        let reason = match self.stop_reason {
+            Some(r) if r != StopReason::EndTurn => r,
+            _ if self.tool_seq > 0 => StopReason::ToolUse,
+            _ => StopReason::EndTurn,
+        };
+        vec![UniversalStreamEvent::Finish { reason, usage: self.usage.clone() }]
     }
 }
 

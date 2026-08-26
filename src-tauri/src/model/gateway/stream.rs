@@ -782,7 +782,10 @@ impl ResponsesSseEmitter {
 
     /// IR 事件驱动入口（统一代理链路）
     pub(super) fn on_ir_event(&mut self, event: &UniversalStreamEvent) -> Vec<String> {
-        match event {
+        // response.created 必须是流首事件：首帧即发出（幂等），
+        // 否则元数据晚于 output_item.added，破坏协议顺序
+        let mut out = self.ensure_started();
+        out.extend(match event {
             UniversalStreamEvent::ReasoningDelta(s) => {
                 if s.is_empty() {
                     Vec::new()
@@ -806,7 +809,8 @@ impl ResponsesSseEmitter {
             UniversalStreamEvent::Finish { reason, usage } => {
                 self.finish_with_usage(*reason, usage)
             }
-        }
+        });
+        out
     }
 
     /// 收尾：关闭所有打开项 + response.completed（携带完整 output 与 usage）。幂等。
@@ -832,14 +836,25 @@ impl ResponsesSseEmitter {
                     "text": item.text,
                 }),
             ));
-            finalized.push((
-                item.output_index,
-                json!({
-                    "id": item.item_id,
-                    "type": "reasoning",
-                    "summary": [{ "type": "summary_text", "text": item.text }],
+            let out_item = json!({
+                "id": item.item_id,
+                "type": "reasoning",
+                "summary": [{ "type": "summary_text", "text": item.text }],
+            });
+            // Responses 协议要求每个 output item 以 output_item.done 收尾；
+            // 缺终事件时严格客户端（Codex 系）会报「Tool call ended without a
+            // terminal event」并中断任务。三类 item 均须补发。
+            // 注意字段名必须是 `item`（zcode/Codex 客户端按 ae.item.type 分支），
+            // 官方文档示例的 `output` 会让客户端在校验后取 ae.item 抛错。
+            events.push(sse_event(
+                "response.output_item.done",
+                &json!({
+                    "type": "response.output_item.done",
+                    "output_index": item.output_index,
+                    "item": out_item.clone(),
                 }),
             ));
+            finalized.push((item.output_index, out_item));
         }
 
         if let Some(item) = self.text_item.take() {
@@ -863,20 +878,26 @@ impl ResponsesSseEmitter {
                     "part": { "type": "output_text", "text": item.text, "annotations": [] },
                 }),
             ));
-            finalized.push((
-                item.output_index,
-                json!({
-                    "id": item.item_id,
-                    "type": "message",
-                    "status": "completed",
-                    "role": "assistant",
-                    "content": [{
-                        "type": "output_text",
-                        "text": item.text,
-                        "annotations": [],
-                    }],
+            let out_item = json!({
+                "id": item.item_id,
+                "type": "message",
+                "status": "completed",
+                "role": "assistant",
+                "content": [{
+                    "type": "output_text",
+                    "text": item.text,
+                    "annotations": [],
+                }],
+            });
+            events.push(sse_event(
+                "response.output_item.done",
+                &json!({
+                    "type": "response.output_item.done",
+                    "output_index": item.output_index,
+                    "item": out_item.clone(),
                 }),
             ));
+            finalized.push((item.output_index, out_item));
         }
 
         for (_, item) in self.tool_items.iter() {
@@ -894,17 +915,23 @@ impl ResponsesSseEmitter {
                     "arguments": item.arguments,
                 }),
             ));
-            finalized.push((
-                item.output_index,
-                json!({
-                    "id": item.item_id,
-                    "type": "function_call",
-                    "status": "completed",
-                    "call_id": call_id,
-                    "name": item.name,
-                    "arguments": item.arguments,
+            let out_item = json!({
+                "id": item.item_id,
+                "type": "function_call",
+                "status": "completed",
+                "call_id": call_id,
+                "name": item.name,
+                "arguments": item.arguments,
+            });
+            events.push(sse_event(
+                "response.output_item.done",
+                &json!({
+                    "type": "response.output_item.done",
+                    "output_index": item.output_index,
+                    "item": out_item.clone(),
                 }),
             ));
+            finalized.push((item.output_index, out_item));
         }
 
         finalized.sort_by_key(|(index, _)| *index);
@@ -1008,6 +1035,63 @@ mod stream_accumulator_tests {
         assert!(completed_payload.contains("\"total_tokens\":150"));
         // output 数组顺序：reasoning(0) → fc(1) → fc(2)
         assert!(completed_payload.contains("rs_resp_req1"));
+        // 每个 output item 都必须以 output_item.done 收尾，且早于 response.completed
+        //（缺终事件时 zcode/Codex 客户端报 Tool call ended without a terminal event）
+        assert_eq!(
+            all.matches("event: response.output_item.done").count(),
+            3,
+            "reasoning + 2 个 function_call 各应有一条 output_item.done"
+        );
+        let last_done = all.rfind("event: response.output_item.done").unwrap();
+        let completed_pos = all.find("event: response.completed").unwrap();
+        assert!(last_done < completed_pos, "output_item.done 必须早于 response.completed");
+    }
+
+    #[test]
+    fn responses_emitter_tool_only_stream_terminates_each_function_call() {
+        // zcode 实测场景：上游返回纯 reasoning + 工具调用（无正文），
+        // 若 function_call 项缺 output_item.done，客户端会中断整个任务。
+        let mut emitter = ResponsesSseEmitter::new("req9", "big-pickle");
+        let mut events: Vec<String> = Vec::new();
+        events.extend(emitter.on_ir_event(&UniversalStreamEvent::ReasoningDelta("分析中".into())));
+        events.extend(emitter.on_ir_event(&UniversalStreamEvent::ToolCallStart {
+            index: 0,
+            call_id: "call_0".into(),
+            name: "shell".into(),
+        }));
+        events.extend(emitter.on_ir_event(&UniversalStreamEvent::ToolCallDelta {
+            index: 0,
+            fragment: "{\"command\":".into(),
+        }));
+        events.extend(emitter.on_ir_event(&UniversalStreamEvent::ToolCallDelta {
+            index: 0,
+            fragment: "\"ls\"}".into(),
+        }));
+        events.extend(emitter.finish_with_usage(
+            StopReason::ToolUse,
+            &UniversalUsage {
+                input_tokens: 10,
+                output_tokens: 5,
+                ..Default::default()
+            },
+        ));
+
+        let all = events.join("\n");
+        // reasoning 与 function_call 各 1 条 output_item.done
+        assert_eq!(all.matches("event: response.output_item.done").count(), 2);
+        // 客户端按 `item` 字段分支（而非官方示例的 `output`）；
+        // serde_json 默认按键名字典序输出，断言需与键序无关
+        assert!(all.contains("\"item\":{\"arguments\":\"{\\\"command\\\":\\\"ls\\\"}\""));
+        assert!(all.contains("\"id\":\"fc_resp_req9_0\""));
+        assert!(all.contains("\"status\":\"completed\",\"type\":\"function_call\""));
+        // function_call 的 done 携带完成的 call_id/name/arguments
+        assert!(all.contains("\"call_id\":\"call_0\""));
+        assert!(all.contains("\"arguments\":\"{\\\"command\\\":\\\"ls\\\"}\""));
+        // 事件顺序：arguments.done → output_item.done → response.completed
+        let args_done = all.find("response.function_call_arguments.done").unwrap();
+        let item_done = all.rfind("response.output_item.done").unwrap();
+        let completed = all.find("response.completed").unwrap();
+        assert!(args_done < item_done && item_done < completed);
     }
 
     #[test]
