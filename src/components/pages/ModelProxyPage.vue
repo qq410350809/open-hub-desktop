@@ -1,5 +1,7 @@
 <script setup lang="ts">
 import { ref, computed, watch, onMounted, onUnmounted } from "vue";
+import { marked } from "marked";
+import DOMPurify from "dompurify";
 import { icons } from "../../icons";
 import {
   useModelProxy,
@@ -733,16 +735,14 @@ function channelSuccessRateBad(channel: ChannelConfig): boolean {
   return s.totalRequests > 0 && s.successfulRequests / s.totalRequests < 0.9;
 }
 
-const detailActiveTab = ref<"tokens" | "request" | "response" | "reasoning" | "meta" | "error">("tokens");
-
-const parsedResponseBody = computed(() => parseResponseBody(selectedLogForDetail.value?.responseBody));
+const detailActiveTab = ref<"overview" | "request" | "response" | "reasoning" | "error">("overview");
 
 function openLogDetail(log: ProxyRequestLog) {
   selectedLogForDetail.value = log;
   if (log.statusCode >= 400) {
     detailActiveTab.value = "error";
   } else {
-    detailActiveTab.value = "tokens";
+    detailActiveTab.value = "overview";
   }
 }
 
@@ -767,6 +767,18 @@ function getOutputTextTokens(log: ProxyRequestLog): number {
   return Math.max(0, (log.completionTokens || 0) - (log.reasoningTokens || 0));
 }
 
+/** 总消耗：优先上游回传 total，缺省时按 输入+输出 合成 */
+function getTokenTotal(log: ProxyRequestLog): number {
+  return log.totalTokens ?? ((log.promptTokens || 0) + (log.completionTokens || 0));
+}
+
+/** 分项占总消耗百分比（与四卡片加法口径一致：新增输入 + 缓存命中 + 思考 + 输出 = 总量） */
+function getTokenSharePct(log: ProxyRequestLog, part: number): string {
+  const total = getTokenTotal(log);
+  if (!total || total <= 0) return "--";
+  return `${Math.round((Math.max(0, part) / total) * 100)}%`;
+}
+
 function getEstimatedTps(log: ProxyRequestLog): string {
   const tokens = getOutputTextTokens(log);
   if (tokens <= 0) return "0.0";
@@ -775,170 +787,232 @@ function getEstimatedTps(log: ProxyRequestLog): string {
   return ((tokens / genDur) * 1000).toFixed(1);
 }
 
-/** 从任意文本中提取 <think> / <thought> / <thinking> / 流式前缀标签，分离出思考过程与干净正文 */
-function extractThinkFromText(rawText: string): { thinking: string; content: string } {
-  if (!rawText) return { thinking: "", content: "" };
-
-  let text = rawText;
-  const thinkingParts: string[] = [];
-
-  // 1. 匹配后端流式旧标记：^\s*thinking\n([\s\S]*?)\n\s*response\s*\n\n([\s\S]*)$
-  const markMatch = text.match(/^\s*thinking\n([\s\S]*?)\n\s*response\s*\n\n([\s\S]*)$/);
-  if (markMatch) {
-    if (markMatch[1].trim()) thinkingParts.push(markMatch[1].trim());
-    text = markMatch[2].trim();
-  }
-
-  // 2. 匹配并提取所有 <think>...</think>, <thought>...</thought>, <thinking>...</thinking> 标签块（支持未闭合到结尾）
-  const thinkTagRegex = /<(?:think|thought|thinking)>([\s\S]*?)(?:<\/(?:think|thought|thinking)>|$)/gi;
-  let match: RegExpExecArray | null;
-  while ((match = thinkTagRegex.exec(text)) !== null) {
-    if (match[1] && match[1].trim()) {
-      thinkingParts.push(match[1].trim());
-    }
-  }
-
-  // 3. 移除文本中所有的思考标签及内容
-  const cleanContent = text
-    .replace(/<(?:think|thought|thinking)>[\s\S]*?(?:<\/(?:think|thought|thinking)>|$)/gi, "")
-    .trim();
-
-  return {
-    thinking: thinkingParts.join("\n\n").trim(),
-    content: cleanContent,
-  };
-}
-
-/** 解析后端保存的响应正文，彻底剥离思考过程（reasoning / <think>）与最终正文（含工具调用） */
-function parseResponseBody(body: string | undefined | null): { thinking: string; content: string } {
-  if (!body) return { thinking: "", content: "" };
-
-  // 先尝试 JSON 解析（针对非流式 JSON 响应）
-  try {
-    const parsed = JSON.parse(body);
-
-    // 1. OpenAI 格式 (choices[0].message)
-    const message = parsed?.choices?.[0]?.message;
-    if (message && typeof message === "object") {
-      const thinking = typeof message.reasoning_content === "string"
-        ? message.reasoning_content
-        : typeof message.reasoning === "string"
-          ? message.reasoning
-          : "";
-      let rawContent = typeof message.content === "string" ? message.content : "";
-      if (!rawContent && Array.isArray(message.content)) {
-        rawContent = message.content
-          .map((part: any) => (typeof part === "string" ? part : part?.text ?? ""))
-          .join("");
-      }
-
-      // 提取工具调用
-      const toolCalls = Array.isArray(message.tool_calls)
-        ? message.tool_calls
-            .map((tc: any) => {
-              const name = tc?.function?.name || tc?.name || "未知工具";
-              const args = tc?.function?.arguments || tc?.arguments || "{}";
-              return `[工具调用] ${name}(${typeof args === "string" ? args : JSON.stringify(args)})`;
-            })
-            .join("\n\n")
-        : "";
-
-      const extracted = extractThinkFromText(rawContent);
-      const combinedThinking = [thinking.trim(), extracted.thinking.trim()]
-        .filter(Boolean)
-        .join("\n\n");
-      const combinedContent = [extracted.content.trim(), toolCalls.trim()]
-        .filter(Boolean)
-        .join("\n\n");
-
-      return {
-        thinking: combinedThinking,
-        content: combinedContent,
-      };
-    }
-
-    // 2. Anthropic messages 格式 (content: [{type: "thinking", ...}, {type: "text", ...}, {type: "tool_use", ...}])
-    if (Array.isArray(parsed?.content)) {
-      const parts = parsed.content.map((part: any) =>
-        typeof part === "string" ? { type: "text", text: part } : part
-      );
-      const thinkingFromBlocks = parts
-        .filter((p: any) => p?.type === "thinking" || p?.type === "redacted_thinking")
-        .map((p: any) => p?.thinking ?? "")
-        .join("\n\n");
-      const rawText = parts
-        .filter((p: any) => p?.type === "text")
-        .map((p: any) => p?.text ?? "")
-        .join("");
-      const toolUses = parts
-        .filter((p: any) => p?.type === "tool_use")
-        .map((p: any) => `[工具调用] ${p?.name || "工具"}(${JSON.stringify(p?.input || {})})`)
-        .join("\n\n");
-      const topThinking = typeof parsed.thinking === "string" ? parsed.thinking : "";
-
-      const extracted = extractThinkFromText(rawText);
-      const combinedThinking = [topThinking.trim(), thinkingFromBlocks.trim(), extracted.thinking.trim()]
-        .filter(Boolean)
-        .join("\n\n");
-      const combinedContent = [extracted.content.trim(), toolUses.trim()]
-        .filter(Boolean)
-        .join("\n\n");
-
-      return {
-        thinking: combinedThinking,
-        content: combinedContent,
-      };
-    }
-
-    // 3. Responses API 格式 (output: [{type: "reasoning", ...}, {type: "message", ...}, {type: "function_call", ...}])
-    if (Array.isArray(parsed?.output)) {
-      const thinkingFromOutput = parsed.output
-        .filter((o: any) => o?.type === "reasoning")
-        .map((o: any) =>
-          Array.isArray(o?.summary)
-            ? o.summary.map((s: any) => s?.text ?? "").join("")
-            : typeof o?.summary === "string"
-              ? o.summary
-              : ""
-        )
-        .join("\n\n");
-      const rawContent = parsed.output
-        .filter((o: any) => o?.type === "message")
-        .flatMap((o: any) => (Array.isArray(o?.content) ? o.content : []))
-        .map((p: any) => (typeof p === "string" ? p : p?.text ?? ""))
-        .join("");
-      const functionCalls = parsed.output
-        .filter((o: any) => o?.type === "function_call")
-        .map((o: any) => `[工具调用] ${o?.name || "工具"}(${typeof o?.arguments === "string" ? o.arguments : JSON.stringify(o?.arguments || {})})`)
-        .join("\n\n");
-
-      const extracted = extractThinkFromText(rawContent);
-      const combinedThinking = [thinkingFromOutput.trim(), extracted.thinking.trim()]
-        .filter(Boolean)
-        .join("\n\n");
-      const combinedContent = [extracted.content.trim(), functionCalls.trim()]
-        .filter(Boolean)
-        .join("\n\n");
-
-      return {
-        thinking: combinedThinking,
-        content: combinedContent,
-      };
-    }
-  } catch {
-    // 非 JSON 文本（例如流式拼接文本），进入通用文本提取
-  }
-
-  // 流式拼接文本或普通文本，统一运行提取函数剥离 <think> 等标签
-  return extractThinkFromText(body);
-}
-
 async function copyText(text: string, label = "内容") {
   try {
     await navigator.clipboard.writeText(text);
     showToast(`已复制 ${label}`);
   } catch {
     showToast("复制失败", true);
+  }
+}
+
+// —— 响应报文结构化解析：按出现顺序拆出 正文 / 思考 / 工具调用 片段 ——
+const responseViewMode = ref<"structured" | "raw">("structured");
+const responseSegments = computed(() => parseResponseSegments(selectedLogForDetail.value?.responseBody));
+
+type ResponseSegment =
+  | { kind: "text"; text: string }
+  | { kind: "reasoning"; text: string }
+  | { kind: "tool"; name: string; args: string; callId?: string; segIndex?: number };;
+
+function appendSegment(list: ResponseSegment[], seg: ResponseSegment) {
+  const last = list[list.length - 1];
+  // 相邻同类文本/思考段合并；工具段各自独立
+  if (
+    last &&
+    ((last.kind === "text" && seg.kind === "text") ||
+      (last.kind === "reasoning" && seg.kind === "reasoning"))
+  ) {
+    last.text += seg.text;
+    return;
+  }
+  list.push(seg);
+}
+
+/** 把上游响应（SSE 原文或非流式 JSON）解析为顺序片段：正文 / 思考 / 工具调用 */
+function parseResponseSegments(body: string | undefined | null): ResponseSegment[] {
+  const segments: ResponseSegment[] = [];
+  if (!body) return segments;
+  const text = body.trim();
+
+  const feedChatDelta = (delta: any) => {
+    if (!delta || typeof delta !== "object") return;
+    const reasoning =
+      typeof delta.reasoning_content === "string"
+        ? delta.reasoning_content
+        : typeof delta.reasoning === "string"
+          ? delta.reasoning
+          : "";
+    if (reasoning) appendSegment(segments, { kind: "reasoning", text: reasoning });
+    if (typeof delta.content === "string" && delta.content) {
+      appendSegment(segments, { kind: "text", text: delta.content });
+    }
+    for (const tc of Array.isArray(delta.tool_calls) ? delta.tool_calls : []) {
+      const name = tc?.function?.name || "";
+      const frag = typeof tc?.function?.arguments === "string" ? tc.function.arguments : "";
+      const idx = typeof tc?.index === "number" ? tc.index : -1;
+      // 同一 index 的分片追加到既有工具段（流式参数是切片下发）
+      const existing = [...segments].reverse().find(
+        (s) => s.kind === "tool" && (idx >= 0 ? (s as any).segIndex === idx : !s.name),
+      ) as Extract<ResponseSegment, { kind: "tool" }> | undefined;
+      if (existing) {
+        if (name) existing.name = name;
+        existing.args += frag;
+      } else {
+        segments.push({ kind: "tool", name, args: frag, callId: tc?.id, segIndex: idx });
+      }
+    }
+  };
+
+  const feedAnthropicEvent = (frame: any) => {
+    if (!frame || typeof frame !== "object") return;
+    if (frame.type === "content_block_start") {
+      const block = frame.content_block ?? {};
+      if (block.type === "tool_use") {
+        segments.push({ kind: "tool", name: block.name ?? "", args: "", callId: block.id, segIndex: frame.index });
+      }
+      return;
+    }
+    if (frame.type === "content_block_delta") {
+      const d = frame.delta ?? {};
+      if (d.type === "text_delta" && typeof d.text === "string") {
+        appendSegment(segments, { kind: "text", text: d.text });
+      } else if (d.type === "thinking_delta" && typeof d.thinking === "string") {
+        appendSegment(segments, { kind: "reasoning", text: d.thinking });
+      } else if (d.type === "input_json_delta" && typeof d.partial_json === "string") {
+        const existing = [...segments].reverse().find(
+          (s) => s.kind === "tool" && (s as any).segIndex === frame.index,
+        ) as Extract<ResponseSegment, { kind: "tool" }> | undefined;
+        if (existing) existing.args += d.partial_json;
+      }
+    }
+  };
+
+  const ingestFrame = (frame: any) => {
+    if (!frame || typeof frame !== "object") return;
+    if (frame.choices?.[0]?.delta) return feedChatDelta(frame.choices[0].delta);
+    if (frame.type?.startsWith("content_block")) return feedAnthropicEvent(frame);
+  };
+
+  // 形态 A：SSE 原文（流式日志保存形态）
+  if (text.includes("data:") || text.includes("event:")) {
+    for (const line of text.split("\n")) {
+      const m = line.match(/^\s*data:\s*(.+)$/);
+      if (!m || m[1] === "[DONE]") continue;
+      try {
+        ingestFrame(JSON.parse(m[1]));
+      } catch {
+        // 跳过心跳/坏帧
+      }
+    }
+    if (segments.length) return segments;
+  }
+
+  // 形态 B：非流式 JSON —— OpenAI Chat / Anthropic Messages / Gemini
+  try {
+    const jv = JSON.parse(text);
+    const msg = jv?.choices?.[0]?.message;
+    if (msg) {
+      if (typeof msg.reasoning_content === "string" && msg.reasoning_content)
+        appendSegment(segments, { kind: "reasoning", text: msg.reasoning_content });
+      else if (typeof msg.reasoning === "string" && msg.reasoning)
+        appendSegment(segments, { kind: "reasoning", text: msg.reasoning });
+      if (typeof msg.content === "string" && msg.content)
+        appendSegment(segments, { kind: "text", text: msg.content });
+      for (const tc of Array.isArray(msg.tool_calls) ? msg.tool_calls : []) {
+        segments.push({
+          kind: "tool",
+          name: tc?.function?.name ?? "",
+          args: typeof tc?.function?.arguments === "string" ? tc.function.arguments : JSON.stringify(tc?.function?.arguments ?? {}),
+          callId: tc?.id,
+        });
+      }
+      if (segments.length) return segments;
+    }
+    if (Array.isArray(jv?.content)) {
+      for (const block of jv.content) {
+        if (block?.type === "text" && block.text) appendSegment(segments, { kind: "text", text: block.text });
+        else if ((block?.type === "thinking" || block?.type === "redacted_thinking") && block.thinking)
+          appendSegment(segments, { kind: "reasoning", text: block.thinking });
+        else if (block?.type === "tool_use")
+          segments.push({ kind: "tool", name: block.name ?? "", args: JSON.stringify(block.input ?? {}), callId: block.id });
+      }
+      if (segments.length) return segments;
+    }
+    const parts = jv?.candidates?.[0]?.content?.parts;
+    if (Array.isArray(parts)) {
+      for (const p of parts) {
+        if (typeof p?.text === "string") {
+          appendSegment(segments, p.thought ? { kind: "reasoning", text: p.text } : { kind: "text", text: p.text });
+        } else if (p?.functionCall) {
+          segments.push({ kind: "tool", name: p.functionCall.name ?? "", args: JSON.stringify(p.functionCall.args ?? {}) });
+        }
+      }
+      if (segments.length) return segments;
+    }
+  } catch {
+    // 非 JSON，落到 raw
+  }
+
+  // 无法识别形态：以纯文本段兜底展示
+  return [{ kind: "text", text }];
+}
+
+/** 工具参数美化：合法 JSON 缩进，否则原样 */
+function prettyToolArgs(args: string): string {
+  try {
+    return JSON.stringify(JSON.parse(args || "{}"), null, 2);
+  } catch {
+    return args || "{}";
+  }
+}
+
+/** 正文片段 Markdown 渲染（marked + DOMPurify 消毒，防上游注入） */
+function renderSegmentMarkdown(text: string): string {
+  try {
+    return DOMPurify.sanitize(marked.parse(text, { async: false }) as string);
+  } catch {
+    return `<pre>${text.replace(/</g, "&lt;")}</pre>`;
+  }
+}
+
+// —— 报文一键格式化：日志展示上游原文，格式化仅作为查看辅助（可还原） ——
+const bodyFormatOverride = ref<{ request?: string; response?: string }>({});
+
+watch(selectedLogForDetail, () => {
+  bodyFormatOverride.value = {};
+});
+
+/** 详情报文展示文本：未格式化时即后端保存的原文 */
+function displayBody(kind: "request" | "response"): string {
+  const raw =
+    kind === "request"
+      ? selectedLogForDetail.value?.requestBody
+      : selectedLogForDetail.value?.responseBody;
+  return bodyFormatOverride.value[kind] ?? raw ?? "";
+}
+
+/** 一键格式化：单一 JSON 直接美化；SSE 流逐帧美化每个 data 行（失败保持原行） */
+function formatLogBody(kind: "request" | "response") {
+  const src = displayBody(kind).trim();
+  if (!src) {
+    showToast("没有可格式化的内容", true);
+    return;
+  }
+  try {
+    bodyFormatOverride.value[kind] = JSON.stringify(JSON.parse(src), null, 2);
+    showToast("已格式化为缩进 JSON");
+    return;
+  } catch {
+    // 非单一 JSON，继续尝试 SSE 逐帧
+  }
+  const pretty = src
+    .split("\n")
+    .map((line) => {
+      const m = line.match(/^data:\s*(.+)$/);
+      if (!m || m[1] === "[DONE]") return line;
+      try {
+        return `data: ${JSON.stringify(JSON.parse(m[1]), null, 2).replace(/\n/g, "\n  ")}`;
+      } catch {
+        return line;
+      }
+    })
+    .join("\n");
+  if (pretty !== src) {
+    bodyFormatOverride.value[kind] = pretty;
+    showToast("已按 SSE 帧逐条格式化");
+  } else {
+    showToast("内容不是可解析的 JSON / SSE 报文", true);
   }
 }
 
@@ -2372,11 +2446,11 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
             <small>所有 /v1 模型接口必须携带 API Key；API Key 不放入 URL</small>
           </div>
 
-          <!-- 记录请求全文开关 (默认关闭) -->
+          <!-- 记录请求/响应全文开关 (默认关闭) -->
           <div class="mp-field">
             <div class="mp-proxy-pool-row" style="padding: 0;">
-              <label for="mp-record-body" style="font-size: 13px; font-weight: 600; color: var(--text); cursor: pointer;">记录请求全文</label>
-              <label class="mp-switch-wrap" :title="proxyConfig.recordRequestBody ? '点击关闭请求全文记录' : '点击开启请求全文记录'">
+              <label for="mp-record-body" style="font-size: 13px; font-weight: 600; color: var(--text); cursor: pointer;">记录请求 / 响应全文</label>
+              <label class="mp-switch-wrap" :title="proxyConfig.recordRequestBody ? '点击关闭全文记录' : '点击开启全文记录'">
                 <input
                   id="mp-record-body"
                   v-model="proxyConfig.recordRequestBody"
@@ -2385,7 +2459,7 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
                 <span class="mp-switch-round" />
               </label>
             </div>
-            <small>开启后在请求日志中保存客户端传入的完整 JSON 报文（默认关闭以节省内存）</small>
+            <small>开启后同时保存客户端请求原文与上游响应原文（两者同开同关，默认关闭以节省存储）</small>
           </div>
 
           <!-- 明细日志保留天数（0 = 永久保留） -->
@@ -2486,12 +2560,12 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
         </div>
 
         <div class="mp-modal-body">
-          <!-- 4 宫格 Token 消耗与缓存命中仪表盘 -->
+          <!-- 4 宫格 Token 仪表盘：承载本次请求全部 Token 信息（总量以「/ 总 N · 占比」融入各卡） -->
           <div class="mp-token-dashboard-grid">
-            <!-- 卡片 1: 输入 Tokens（新增 = 总输入 − 缓存命中） -->
-            <div class="mp-token-card is-in" title="新增输入 = 总输入 − 缓存命中">
+            <!-- 卡片 1: 输入侧（新增 = 总输入 − 缓存命中；含缓存写入） -->
+            <div class="mp-token-card is-in" title="新增输入 = 总输入 − 缓存命中；缓存写入已计入新增输入">
               <div class="mp-tc-head">
-                <span class="mp-tc-label">📥 新增输入</span>
+                <span class="mp-tc-label">📥 输入 Tokens</span>
                 <span class="mp-tc-badge" :class="(selectedLogForDetail.promptCacheHitTokens || 0) > 0 ? 'badge-hit' : ''">
                   {{ (selectedLogForDetail.promptCacheHitTokens || 0) > 0 ? `⚡ 命中率 ${getCacheHitRate(selectedLogForDetail)}%` : '未命中前缀' }}
                 </span>
@@ -2500,9 +2574,13 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
                 {{ getNewInputTokens(selectedLogForDetail) }}
               </div>
               <div class="mp-tc-foot font-mono">
-                <span>⚡ 命中 <strong>{{ selectedLogForDetail.promptCacheHitTokens ?? 0 }}</strong></span>
-                <span class="mp-tc-divider">·</span>
                 <span>总输入 <strong>{{ selectedLogForDetail.promptTokens ?? 0 }}</strong></span>
+                <span class="mp-tc-divider">·</span>
+                <span v-if="(selectedLogForDetail.cacheCreationTokens ?? 0) > 0">缓存写入 <strong>{{ selectedLogForDetail.cacheCreationTokens }}</strong></span>
+                <span v-if="(selectedLogForDetail.cacheCreationTokens ?? 0) > 0" class="mp-tc-divider">·</span>
+                <span>占总 {{ getTokenSharePct(selectedLogForDetail, getNewInputTokens(selectedLogForDetail)) }}</span>
+                <span class="mp-tc-divider">·</span>
+                <span>合计 <strong>{{ getTokenTotal(selectedLogForDetail) }}</strong></span>
               </div>
             </div>
 
@@ -2515,11 +2593,15 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
               <div class="mp-tc-value font-mono text-brand">
                 {{ selectedLogForDetail.promptCacheHitTokens ?? 0 }}
               </div>
-              <div class="mp-tc-foot">
+              <div class="mp-tc-foot font-mono">
                 <span v-if="(selectedLogForDetail.promptCacheHitTokens || 0) > 0" class="text-success font-semibold">
-                  ✓ 已复用前缀缓存，节省计算
+                  ✓ 已复用，节省计算
                 </span>
-                <span v-else class="text-muted">首轮请求或上下文前缀未命中</span>
+                <span v-else class="text-muted">首轮请求或前缀未命中</span>
+                <span class="mp-tc-divider">·</span>
+                <span>占总 {{ getTokenSharePct(selectedLogForDetail, selectedLogForDetail.promptCacheHitTokens ?? 0) }}</span>
+                <span class="mp-tc-divider">·</span>
+                <span>合计 <strong>{{ getTokenTotal(selectedLogForDetail) }}</strong></span>
               </div>
             </div>
 
@@ -2527,23 +2609,22 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
             <div class="mp-token-card is-think">
               <div class="mp-tc-head">
                 <span class="mp-tc-label">🧠 思考推理</span>
-                <span class="mp-tc-badge">深度思考</span>
+                <span class="mp-tc-badge">{{ (selectedLogForDetail.reasoningTokens || 0) > 0 ? '深度思考' : '未触发' }}</span>
               </div>
               <div class="mp-tc-value font-mono" style="color: #8b5cf6;">
                 {{ selectedLogForDetail.reasoningTokens ?? 0 }}
               </div>
-              <div class="mp-tc-foot">
-                <span v-if="(selectedLogForDetail.reasoningTokens || 0) > 0" class="text-success font-semibold">
-                  ✓ 已触发深度思考
-                </span>
-                <span v-else class="text-muted">本轮未触发思考</span>
+              <div class="mp-tc-foot font-mono">
+                <span>占总 {{ getTokenSharePct(selectedLogForDetail, selectedLogForDetail.reasoningTokens ?? 0) }}</span>
+                <span class="mp-tc-divider">·</span>
+                <span>合计 <strong>{{ getTokenTotal(selectedLogForDetail) }}</strong></span>
               </div>
             </div>
 
-            <!-- 卡片 4: 输出 Tokens（纯文本 = 总输出 − 思考推理） -->
+            <!-- 卡片 4: 输出侧（纯文本 = 总输出 − 思考推理） -->
             <div class="mp-token-card is-out" title="生成输出（纯文本）= 总输出 − 思考推理，避免重复计数">
               <div class="mp-tc-head">
-                <span class="mp-tc-label">📤 生成输出</span>
+                <span class="mp-tc-label">📤 输出 Tokens</span>
                 <span class="mp-tc-badge" v-if="(selectedLogForDetail.reasoningTokens || 0) > 0">已剥离思考 {{ selectedLogForDetail.reasoningTokens }} Token</span>
                 <span class="mp-tc-badge" v-else>纯文本输出</span>
               </div>
@@ -2551,35 +2632,31 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
                 {{ getOutputTextTokens(selectedLogForDetail) }}
               </div>
               <div class="mp-tc-foot font-mono">
-                <span>生成速率 <strong>~{{ getEstimatedTps(selectedLogForDetail) }}</strong> Token/秒</span>
-                <span v-if="selectedLogForDetail.ttftMs" class="mp-tc-divider">·</span>
-                <span v-if="selectedLogForDetail.ttftMs">首字 <strong>{{ selectedLogForDetail.ttftMs }}ms</strong></span>
+                <span>总输出 <strong>{{ selectedLogForDetail.completionTokens ?? 0 }}</strong></span>
+                <span class="mp-tc-divider">·</span>
+                <span>~{{ getEstimatedTps(selectedLogForDetail) }} tok/s</span>
+                <span class="mp-tc-divider">·</span>
+                <span>占总 {{ getTokenSharePct(selectedLogForDetail, getOutputTextTokens(selectedLogForDetail)) }}</span>
+                <span class="mp-tc-divider">·</span>
+                <span>合计 <strong>{{ getTokenTotal(selectedLogForDetail) }}</strong></span>
               </div>
             </div>
 
-            <!-- 卡片 5: 总 Token（全宽汇总） -->
-            <div class="mp-token-card is-total" title="本次请求全部 Token 消耗 = 新增输入 + 缓存命中 + 思考推理 + 生成输出（各分项去重后相加）">
-              <div class="mp-tc-head">
-                <span class="mp-tc-label">🧮 总 Token 消耗</span>
-                <span class="mp-tc-badge badge-total">全部用量汇总</span>
-              </div>
-              <div class="mp-tc-value font-mono text-brand">
-                {{ selectedLogForDetail.totalTokens ?? ((selectedLogForDetail.promptTokens || 0) + (selectedLogForDetail.completionTokens || 0)) }}
-              </div>
-              <div class="mp-tc-foot font-mono">
-                <span>= 新增输入 <strong>{{ getNewInputTokens(selectedLogForDetail) }}</strong></span>
-                <span class="mp-tc-divider">+</span>
-                <span>缓存命中 <strong>{{ selectedLogForDetail.promptCacheHitTokens ?? 0 }}</strong></span>
-                <span class="mp-tc-divider">+</span>
-                <span>思考推理 <strong>{{ selectedLogForDetail.reasoningTokens ?? 0 }}</strong></span>
-                <span class="mp-tc-divider">+</span>
-                <span>输出生成 <strong>{{ getOutputTextTokens(selectedLogForDetail) }}</strong></span>
-              </div>
-            </div>
+            <!-- 卡片 5 已移除：总量以「/ 总 N · 占比」融入上方四张分项卡 -->
           </div>
 
           <!-- 选项卡导航栏 (Tabs) -->
           <div class="mp-detail-tabs-bar">
+            <button
+              type="button"
+              class="mp-detail-tab-btn"
+              :class="{ active: detailActiveTab === 'overview' }"
+              @click="detailActiveTab = 'overview'"
+            >
+              <span v-html="icons.chart" />
+              <span>📋 请求概览</span>
+            </button>
+
             <button
               v-if="selectedLogForDetail.statusCode >= 400 || selectedLogForDetail.errorMessage"
               type="button"
@@ -2592,16 +2669,7 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
             </button>
 
             <button
-              type="button"
-              class="mp-detail-tab-btn"
-              :class="{ active: detailActiveTab === 'tokens' }"
-              @click="detailActiveTab = 'tokens'"
-            >
-              <span v-html="icons.chart" />
-              <span>📊 Token 与网络概览</span>
-            </button>
-
-            <button
+              v-if="selectedLogForDetail.requestBody"
               type="button"
               class="mp-detail-tab-btn"
               :class="{ active: detailActiveTab === 'request' }"
@@ -2612,6 +2680,7 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
             </button>
 
             <button
+              v-if="selectedLogForDetail.responseBody"
               type="button"
               class="mp-detail-tab-btn"
               :class="{ active: detailActiveTab === 'response' }"
@@ -2620,29 +2689,9 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
               <span v-html="icons.message" />
               <span>💬 响应全文</span>
             </button>
-
-            <button
-              type="button"
-              class="mp-detail-tab-btn"
-              :class="{ active: detailActiveTab === 'reasoning' }"
-              @click="detailActiveTab = 'reasoning'"
-            >
-              <span v-html="icons.message" />
-              <span>🧠 思考过程</span>
-            </button>
-
-            <button
-              type="button"
-              class="mp-detail-tab-btn"
-              :class="{ active: detailActiveTab === 'meta' }"
-              @click="detailActiveTab = 'meta'"
-            >
-              <span v-html="icons.settings" />
-              <span>🔍 路由与调用元数据</span>
-            </button>
           </div>
 
-          <!-- 选项卡内容 1: 错误诊断 -->
+          <!-- 选项卡内容: 错误诊断 -->
           <div v-if="detailActiveTab === 'error'" class="mp-detail-tab-content">
             <div class="mp-log-error-banner">
               <div class="mp-leb-icon" v-html="icons.alert" />
@@ -2661,80 +2710,28 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
             <div v-if="selectedLogForDetail.responseBody" class="mp-log-raw-box">
               <div class="mp-lrb-header">
                 <label>上游原始错误响应报文</label>
-                <button
-                  type="button"
-                  class="mp-action-btn"
-                  title="复制原始错误报文"
-                  @click="copyText(selectedLogForDetail.responseBody, '错误响应报文')"
-                >
-                  <span v-html="icons.copy" />
-                  <span>复制</span>
-                </button>
-              </div>
-              <pre class="mp-lrb-pre font-mono">{{ selectedLogForDetail.responseBody }}</pre>
-            </div>
-          </div>
-
-          <!-- 选项卡内容 2: Token 与网络概览 -->
-          <div v-if="detailActiveTab === 'tokens'" class="mp-detail-tab-content">
-            <div class="mp-log-detail-grid">
-              <div class="mp-ld-item">
-                <label>📥 新增输入 Token</label>
-                <div class="mp-ld-val font-mono">
-                  <span>{{ getNewInputTokens(selectedLogForDetail) }} Tokens</span>
-                  <small class="text-muted font-mono" style="display: block;">总输入 {{ selectedLogForDetail.promptTokens ?? 0 }} − 缓存命中 {{ selectedLogForDetail.promptCacheHitTokens ?? 0 }}</small>
+                <div class="flex-center-start gap-2">
+                  <button
+                    type="button"
+                    class="mp-action-btn"
+                    title="一键缩进格式化 JSON"
+                    @click="formatLogBody('response')"
+                  >
+                    <span class="font-mono">{ }</span>
+                    <span>格式化</span>
+                  </button>
+                  <button
+                    type="button"
+                    class="mp-action-btn"
+                    title="复制原始错误报文"
+                    @click="copyText(displayBody('response'), '错误响应报文')"
+                  >
+                    <span v-html="icons.copy" />
+                    <span>复制</span>
+                  </button>
                 </div>
               </div>
-
-              <div class="mp-ld-item">
-                <label>⚡ 缓存命中 Token</label>
-                <div class="mp-ld-val font-mono text-brand">
-                  <span>{{ selectedLogForDetail.promptCacheHitTokens ?? 0 }} Tokens ({{ getCacheHitRate(selectedLogForDetail) }}%)</span>
-                </div>
-              </div>
-
-              <div class="mp-ld-item">
-                <label>🧠 思考推理 Token</label>
-                <div class="mp-ld-val font-mono" style="color: #8b5cf6;">
-                  <span>{{ selectedLogForDetail.reasoningTokens ?? 0 }} Tokens{{ (selectedLogForDetail.reasoningTokens || 0) > 0 ? '（已触发深度思考）' : '（未触发）' }}</span>
-                </div>
-              </div>
-
-              <div class="mp-ld-item">
-                <label>📤 输出生成 Token</label>
-                <div class="mp-ld-val font-mono text-success">
-                  <span>{{ getOutputTextTokens(selectedLogForDetail) }} Tokens</span>
-                  <small class="text-muted font-mono" style="display: block;">总输出 {{ selectedLogForDetail.completionTokens ?? 0 }} − 思考推理 {{ selectedLogForDetail.reasoningTokens ?? 0 }}（纯文本，已剥离重复计数）</small>
-                </div>
-              </div>
-
-              <div class="mp-ld-item">
-                <label>首字响应耗时</label>
-                <div class="mp-ld-val font-mono text-brand">
-                  <span>{{ selectedLogForDetail.ttftMs ? `${selectedLogForDetail.ttftMs} ms` : '同步即达' }}</span>
-                </div>
-              </div>
-
-              <div class="mp-ld-item">
-                <label>响应总耗时</label>
-                <div class="mp-ld-val font-mono">
-                  <span>{{ selectedLogForDetail.durationMs }} ms</span>
-                </div>
-              </div>
-
-              <div class="mp-ld-item">
-                <label>总 Token 消耗</label>
-                <div class="mp-ld-val font-mono">
-                  <strong>{{ selectedLogForDetail.totalTokens ?? ((selectedLogForDetail.promptTokens || 0) + (selectedLogForDetail.completionTokens || 0)) }} Tokens</strong>
-                </div>
-              </div>
-
-              <div class="mp-ld-item">
-                <label>平均生成速率</label>
-                <div class="mp-ld-val font-mono">
-                  <span>~{{ getEstimatedTps(selectedLogForDetail) }} Token/秒</span>
-                </div>
-              </div>
+              <pre class="mp-lrb-pre font-mono">{{ displayBody('response') }}</pre>
             </div>
           </div>
 
@@ -2748,64 +2745,139 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
                     {{ selectedLogForDetail.stream ? "流式传输" : "同步响应" }}
                   </span>
                 </div>
-                <button
-                  v-if="selectedLogForDetail.requestBody"
-                  type="button"
-                  class="mp-action-btn"
-                  title="一键复制客户端完整请求报文"
-                  @click="copyText(selectedLogForDetail.requestBody, '请求全文')"
-                >
-                  <span v-html="icons.copy" />
-                  <span>复制全文</span>
-                </button>
+                <div class="flex-center-start gap-2">
+                  <button
+                    v-if="selectedLogForDetail.requestBody"
+                    type="button"
+                    class="mp-action-btn"
+                    title="一键缩进格式化 JSON"
+                    @click="formatLogBody('request')"
+                  >
+                    <span class="font-mono">{ }</span>
+                    <span>格式化</span>
+                  </button>
+                  <button
+                    v-if="selectedLogForDetail.requestBody"
+                    type="button"
+                    class="mp-action-btn"
+                    title="一键复制客户端完整请求报文"
+                    @click="copyText(displayBody('request'), '请求全文')"
+                  >
+                    <span v-html="icons.copy" />
+                    <span>复制全文</span>
+                  </button>
+                </div>
               </div>
-              <pre class="mp-lrb-pre font-mono">{{ selectedLogForDetail.requestBody || '// 未开启「记录请求全文」开关\n// 默认不保存请求全文以节省内存与存储空间。如需在日志中查看客户端发送的完整请求 JSON，请在右上角「服务配置」中开启「记录请求全文」开关。' }}</pre>
+              <pre class="mp-lrb-pre font-mono">{{ displayBody('request') || '// 未开启「记录请求 / 响应全文」开关\n// 请求与响应全文同开同关。如需查看完整报文，请在右上角「服务配置」中开启该开关。' }}</pre>
             </div>
           </div>
 
-          <!-- 选项卡内容 4: 响应全文 -->
+          <!-- 选项卡内容 4: 响应全文（结构化渲染 + 原文切换） -->
           <div v-if="detailActiveTab === 'response'" class="mp-detail-tab-content">
             <div class="mp-log-raw-box">
               <div class="mp-lrb-header">
-                <label>服务端最终响应正文</label>
-                <button
-                  v-if="parsedResponseBody.content"
-                  type="button"
-                  class="mp-action-btn"
-                  title="一键复制服务端响应全文"
-                  @click="copyText(parsedResponseBody.content, '响应全文')"
-                >
-                  <span v-html="icons.copy" />
-                  <span>复制全文</span>
-                </button>
+                <div class="flex-center-start gap-2">
+                  <label>上游响应</label>
+                  <div class="mp-view-toggle">
+                    <button
+                      type="button"
+                      :class="{ active: responseViewMode === 'structured' }"
+                      @click="responseViewMode = 'structured'"
+                    >语义视图</button>
+                    <button
+                      type="button"
+                      :class="{ active: responseViewMode === 'raw' }"
+                      @click="responseViewMode = 'raw'"
+                    >原文</button>
+                  </div>
+                </div>
+                <div class="flex-center-start gap-2">
+                  <button
+                    v-if="selectedLogForDetail.responseBody && responseViewMode === 'raw'"
+                    type="button"
+                    class="mp-action-btn"
+                    title="一键缩进格式化（JSON 美化 / SSE 逐帧展开）"
+                    @click="formatLogBody('response')"
+                  >
+                    <span class="font-mono">{ }</span>
+                    <span>格式化</span>
+                  </button>
+                  <button
+                    v-if="selectedLogForDetail.responseBody"
+                    type="button"
+                    class="mp-action-btn"
+                    title="一键复制上游响应原文"
+                    @click="copyText(displayBody('response'), '响应原文')"
+                  >
+                    <span v-html="icons.copy" />
+                    <span>复制全文</span>
+                  </button>
+                </div>
               </div>
-              <pre class="mp-lrb-pre font-mono">{{ parsedResponseBody.content || '未捕获或流式尚未产生正文内容' }}</pre>
+
+              <!-- 语义视图：按出现顺序渲染 工具调用 / 正文(Markdown) / 思考 片段 -->
+              <div v-if="responseViewMode === 'structured'" class="mp-seg-list">
+                <div v-if="!responseSegments.length" class="text-muted text-xs" style="padding: 12px;">
+                  未捕获到上游响应报文
+                </div>
+                <template v-for="(seg, i) in responseSegments" :key="i">
+                  <div v-if="seg.kind === 'tool'" class="mp-seg-card mp-seg-tool">
+                    <div class="mp-seg-tool-head">
+                      <span class="mp-seg-kind-tag is-tool">🛠️ 工具调用</span>
+                      <strong class="font-mono">{{ seg.name || '未知工具' }}</strong>
+                      <span v-if="seg.callId" class="mp-seg-callid font-mono">{{ seg.callId }}</span>
+                    </div>
+                    <pre class="mp-seg-args font-mono">{{ prettyToolArgs(seg.args) }}</pre>
+                  </div>
+
+                  <div v-else-if="seg.kind === 'text' && seg.text.trim()" class="mp-seg-card mp-seg-text">
+                    <div class="mp-seg-tool-head">
+                      <span class="mp-seg-kind-tag is-text">📄 内容输出</span>
+                    </div>
+                    <!-- 上游模型输出，marked 解析后经 DOMPurify 消毒 -->
+                    <div class="mp-seg-markdown" v-html="renderSegmentMarkdown(seg.text)" />
+                  </div>
+
+                  <div v-else-if="seg.kind === 'reasoning' && seg.text.trim()" class="mp-seg-card mp-seg-reason">
+                    <div class="mp-seg-tool-head">
+                      <span class="mp-seg-kind-tag is-reason">💭 思考</span>
+                    </div>
+                    <pre class="mp-seg-reason-body font-mono">{{ seg.text }}</pre>
+                  </div>
+                </template>
+              </div>
+
+              <!-- 原文视图 -->
+              <pre
+                v-else
+                class="mp-lrb-pre font-mono"
+              >{{ displayBody('response') || '未捕获到上游响应报文' }}</pre>
             </div>
           </div>
 
-          <!-- 选项卡内容 5: 思考过程 -->
-          <div v-if="detailActiveTab === 'reasoning'" class="mp-detail-tab-content">
-            <div class="mp-log-raw-box">
-              <div class="mp-lrb-header">
-                <label>模型思考推理过程（reasoning）</label>
-                <button
-                  v-if="parsedResponseBody.thinking"
-                  type="button"
-                  class="mp-action-btn"
-                  title="一键复制思考过程"
-                  @click="copyText(parsedResponseBody.thinking, '思考过程')"
-                >
-                  <span v-html="icons.copy" />
-                  <span>复制全文</span>
-                </button>
-              </div>
-              <pre class="mp-lrb-pre font-mono">{{ parsedResponseBody.thinking || '该请求未产生思考过程（非推理模型或无 reasoning 输出）' }}</pre>
-            </div>
-          </div>
-
-          <!-- 选项卡内容 6: 元数据与参数 -->
-          <div v-if="detailActiveTab === 'meta'" class="mp-detail-tab-content">
+          <!-- 选项卡内容: 请求概览（路由 / 状态 / 耗时等调用元数据） -->
+          <div v-if="detailActiveTab === 'overview'" class="mp-detail-tab-content">
             <div class="mp-log-detail-grid">
+              <div class="mp-ld-item">
+                <label>HTTP 状态码</label>
+                <div class="mp-ld-val">
+                  <span
+                    class="mp-status-tag"
+                    :class="selectedLogForDetail.statusCode >= 200 && selectedLogForDetail.statusCode < 300 ? 'tag-ok' : 'tag-err'"
+                  >
+                    <span class="mp-status-dot-sm" />
+                    <span>{{ selectedLogForDetail.statusCode }} {{ selectedLogForDetail.statusCode >= 200 && selectedLogForDetail.statusCode < 300 ? '成功' : '异常' }}</span>
+                  </span>
+                </div>
+              </div>
+
+              <div class="mp-ld-item">
+                <label>调用客户端</label>
+                <div class="mp-ld-val font-mono">
+                  <span>{{ selectedLogForDetail.clientName || '--' }}</span>
+                </div>
+              </div>
+
               <div class="mp-ld-item">
                 <label>入网 -> 出网</label>
                 <div class="mp-ld-val" style="flex-direction: column; align-items: flex-start; gap: 4px;">
@@ -2842,9 +2914,19 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
               </div>
 
               <div class="mp-ld-item">
-                <label>响应耗时</label>
+                <label>响应耗时（首字 / 总）</label>
                 <div class="mp-ld-val font-mono">
-                  <span>{{ selectedLogForDetail.durationMs }} ms</span>
+                  <span>
+                    首 {{ selectedLogForDetail.ttftMs ? formatSec(selectedLogForDetail.ttftMs) : (selectedLogForDetail.stream ? '--' : '同步即达') }}
+                    · 总 {{ formatSec(selectedLogForDetail.durationMs) }}
+                  </span>
+                </div>
+              </div>
+
+              <div class="mp-ld-item">
+                <label>平均生成速率</label>
+                <div class="mp-ld-val font-mono">
+                  <span>~{{ getEstimatedTps(selectedLogForDetail) }} Token/秒</span>
                 </div>
               </div>
 
@@ -2852,6 +2934,13 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
                 <label>传输协议模式</label>
                 <div class="mp-ld-val">
                   <span>{{ selectedLogForDetail.stream ? "流式实时传输" : "同步响应" }}</span>
+                </div>
+              </div>
+
+              <div v-if="selectedLogForDetail.errorMessage" class="mp-ld-item" style="grid-column: 1 / -1;">
+                <label>错误信息</label>
+                <div class="mp-ld-val" style="color: var(--danger, #e5484d); word-break: break-all; white-space: pre-wrap;">
+                  <span>{{ selectedLogForDetail.errorMessage }}</span>
                 </div>
               </div>
 
@@ -6539,6 +6628,110 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
   font-size: 11.5px;
   font-weight: 700;
   color: var(--muted);
+}
+
+/* 响应语义视图：视图切换 + 片段卡片 */
+.mp-view-toggle {
+  display: inline-flex;
+  border: 1px solid var(--border, #ddd);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.mp-view-toggle button {
+  border: none;
+  background: transparent;
+  padding: 3px 12px;
+  font-size: 12px;
+  cursor: pointer;
+  color: var(--text-muted, #888);
+}
+.mp-view-toggle button.active {
+  background: var(--brand, #4a6cf7);
+  color: #fff;
+}
+.mp-seg-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 10px;
+}
+.mp-seg-card {
+  border: 1px solid var(--border, #e3e6ee);
+  border-radius: 10px;
+  overflow: hidden;
+  background: var(--bg-primary, #fff);
+}
+.mp-seg-tool-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 12px;
+  background: rgba(0, 0, 0, 0.03);
+  border-bottom: 1px solid var(--border, #e3e6ee);
+  flex-wrap: wrap;
+}
+.mp-seg-kind-tag {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  white-space: nowrap;
+}
+.mp-seg-kind-tag.is-tool { background: rgba(255, 159, 10, 0.14); color: #b06000; }
+.mp-seg-kind-tag.is-text { background: rgba(16, 185, 129, 0.13); color: #0b8a5c; }
+.mp-seg-kind-tag.is-reason { background: rgba(139, 92, 246, 0.13); color: #6d3fd4; }
+.mp-seg-callid { font-size: 11px; color: var(--text-muted, #999); }
+.mp-seg-args {
+  margin: 0;
+  padding: 10px 12px;
+  font-size: 12px;
+  line-height: 1.55;
+  max-height: 260px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+  background: rgba(0, 0, 0, 0.02);
+}
+.mp-seg-markdown {
+  padding: 10px 14px;
+  font-size: 13px;
+  line-height: 1.7;
+  word-break: break-word;
+}
+.mp-seg-markdown :deep(pre) {
+  background: #1f2430;
+  color: #e6e9f2;
+  padding: 10px 12px;
+  border-radius: 8px;
+  overflow: auto;
+  font-size: 12px;
+}
+.mp-seg-markdown :deep(code) {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+}
+.mp-seg-markdown :deep(p) { margin: 6px 0; }
+.mp-seg-markdown :deep(h1),
+.mp-seg-markdown :deep(h2),
+.mp-seg-markdown :deep(h3),
+.mp-seg-markdown :deep(h4) { margin: 10px 0 6px; }
+.mp-seg-markdown :deep(table) { border-collapse: collapse; margin: 8px 0; }
+.mp-seg-markdown :deep(th),
+.mp-seg-markdown :deep(td) {
+  border: 1px solid var(--border, #ddd);
+  padding: 4px 8px;
+  font-size: 12px;
+}
+.mp-seg-reason-body {
+  margin: 0;
+  padding: 10px 12px;
+  font-size: 12px;
+  line-height: 1.65;
+  color: #6d3fd4;
+  background: rgba(139, 92, 246, 0.05);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 240px;
+  overflow: auto;
 }
 
 .mp-lrb-pre {
