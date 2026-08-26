@@ -453,6 +453,26 @@ pub async fn fetch_upstream_models_inner(ctx: &ModelProxyContext) {
             continue;
         }
 
+        // 网页直连渠道无 /models 端点：直接返回站点固化模型，避免无效探测报错
+        if super::egress::TargetProtocol::from_channel(ch) == super::egress::TargetProtocol::WebChat
+        {
+            let mut models = vec![super::webchat::WEBCHAT_MODEL.to_string()];
+            if let Some(explicit) = &ch.enabled_models {
+                for m in explicit {
+                    if !models.iter().any(|x| x.eq_ignore_ascii_case(m)) {
+                        models.push(m.clone());
+                    }
+                }
+            }
+            channel_models.push(ChannelModelList {
+                channel_id: ch.id.clone(),
+                channel_name: ch.name.clone(),
+                alias: ch.effective_alias(),
+                models,
+            });
+            continue;
+        }
+
         let api_key = select_channel_api_key(ctx, ch);
         let client = ctx.default_http_client.read().await.clone();
         let base = ch.base_url.trim_end_matches('/');

@@ -40,8 +40,16 @@ pub struct EgressSuccess {
     pub upstream_url: String,
 }
 
-/// 构建出网请求（含 OpenCode CLI 身份头模拟与鉴权头），供常规发送与 503 原地重试复用，
-/// 保证两次发出的请求完全一致。
+/// 从网页直连出网 URL 提取站点 base（scheme://host），供会话模块定位 /chat 页
+fn webchat_base_of(upstream_url: &str) -> &str {
+    upstream_url
+        .split_once("/api/")
+        .map(|(head, _)| head)
+        .unwrap_or(upstream_url)
+}
+
+/// 构建出网请求（含 OpenCode CLI 身份头模拟、网页直连会话凭证与鉴权头），
+/// 供常规发送与 503 原地重试复用，保证两次发出的请求完全一致。
 fn build_egress_request(
     client: &reqwest::Client,
     upstream_url: &str,
@@ -51,11 +59,29 @@ fn build_egress_request(
     attempt_req_id: &str,
     session_seed: &str,
     target: TargetProtocol,
+    webchat_session: Option<&super::webchat::WebChatSession>,
 ) -> reqwest::RequestBuilder {
     let mut req_builder = client
         .post(upstream_url)
         .header("Content-Type", "application/json")
         .json(body);
+
+    if matches!(target, TargetProtocol::WebChat) {
+        // 网页直连：模拟浏览器会话身份，凭证由 webchat 模块统一管理
+        let base = webchat_base_of(upstream_url);
+        for (k, v) in super::webchat::browser_header_pairs(base) {
+            req_builder = req_builder.header(k, v);
+        }
+        if let Some(sess) = webchat_session {
+            if !sess.cookie.is_empty() {
+                req_builder = req_builder.header("Cookie", &sess.cookie);
+            }
+            if !sess.csrf.is_empty() {
+                req_builder = req_builder.header("X-CSRF-TOKEN", &sess.csrf);
+            }
+        }
+        return req_builder;
+    }
 
     if is_opencode {
         // OpenCode 官方 CLI 身份与会话请求头模拟：抹平 CLI 与反代差异，享受官方正常会话配额
@@ -142,6 +168,26 @@ pub async fn execute_resilient_egress(
     let total_attempts_allowed = max_retries + 1;
     let base_node_idx = ctx.node_round_robin.load(Ordering::Relaxed);
 
+    let target = TargetProtocol::from_channel(channel);
+    let is_webchat = matches!(target, TargetProtocol::WebChat);
+    // 网页直连：出网前先确保会话凭证可用（缓存优先）；失败直接以 502 返回客户端
+    let mut webchat_session: Option<super::webchat::WebChatSession> = if is_webchat {
+        let direct_client = build_client_for_candidate(ctx, "__direct__").await;
+        match super::webchat::ensure_session(&direct_client, webchat_base_of(upstream_url)).await {
+            Ok(s) => Some(s),
+            Err(e) => {
+                return Err(gateway_error_response(
+                    client_protocol,
+                    StatusCode::BAD_GATEWAY,
+                    "502",
+                    format!("网页直连渠道获取上游会话失败: {e}"),
+                ));
+            }
+        }
+    } else {
+        None
+    };
+
     let mut last_error = String::new();
     let mut last_status = StatusCode::BAD_GATEWAY;
     let mut last_err_bytes = Bytes::new();
@@ -189,7 +235,8 @@ pub async fn execute_resilient_egress(
                 is_opencode,
                 &attempt_req_id,
                 &meta.req_id,
-                TargetProtocol::from_channel(channel),
+                target,
+                webchat_session.as_ref(),
             )
             .send()
             .await;
@@ -201,7 +248,54 @@ pub async fn execute_resilient_egress(
                         || resp.status() == StatusCode::SERVICE_UNAVAILABLE
             );
 
-            // ① 502/503：网关类临时故障，读取错误体记录日志后原地重试。
+            // ① 网页直连 419（CSRF Token 过期）：强制刷新会话后原地重试一次，
+            //    不占重试名额、不切换节点。
+            if is_webchat
+                && !inplace_retried
+                && matches!(&result, Ok(resp) if resp.status().as_u16() == 419)
+            {
+                inplace_retried = true;
+                let resp = match result {
+                    Ok(r) => r,
+                    Err(_) => unreachable!("matches! 已确保 result 为 Ok"),
+                };
+                let status = resp.status();
+                let err_bytes = resp.bytes().await.unwrap_or_default();
+                let err_text = String::from_utf8_lossy(&err_bytes).to_string();
+
+                record_attempt_failure(
+                    ctx,
+                    ProxyLogParams::new_failure(
+                        attempt_req_id.clone(),
+                        meta.path.clone(),
+                        meta.channel_id.clone(),
+                        meta.model.clone(),
+                        meta.stream,
+                        status.as_u16(),
+                        cand_start.elapsed().as_millis() as u64,
+                        Some("网页直连会话过期(419)，刷新会话后原地重试".to_string()),
+                        meta.req_body_str.clone(),
+                        Some(node_display.clone()),
+                    )
+                    .with_channel_stats_id(meta.channel_stats_id.clone())
+                    .with_upstream_url(Some(upstream_url.to_string()))
+                    .with_response_body(cap_log_body(err_text)),
+                )
+                .await;
+
+                let direct_client = build_client_for_candidate(ctx, "__direct__").await;
+                webchat_session = super::webchat::force_refresh_session(
+                    &direct_client,
+                    webchat_base_of(upstream_url),
+                )
+                .await
+                .ok();
+                warn!("[ModelGateway] web-chat 会话已刷新，1 秒后原地重试");
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                continue;
+            }
+
+            // ② 502/503：网关类临时故障，读取错误体记录日志后原地重试。
             // 对所有渠道通用 —— 站点转换渠道/转发渠道同样受益。
             if !inplace_retried && retryable_status {
                 inplace_retried = true;

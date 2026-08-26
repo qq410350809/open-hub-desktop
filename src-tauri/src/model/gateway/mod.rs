@@ -14,6 +14,7 @@ pub mod server;
 pub mod stats;
 pub mod stream;
 pub mod types;
+pub mod webchat;
 
 #[allow(unused_imports)]
 pub use adapters::*;
