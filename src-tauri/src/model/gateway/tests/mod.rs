@@ -6,14 +6,9 @@ fn parses_opencode_proxy_default_config() {
     let cfg = ModelProxyConfig::default();
     assert!(cfg.enabled);
     assert_eq!(cfg.port, DEFAULT_MODEL_PROXY_PORT);
-    // 内置固化渠道：opencode(1) + alpha 网页直连(2)
-    assert_eq!(cfg.channels.len(), 2);
+    assert_eq!(cfg.channels.len(), 1);
     assert_eq!(cfg.channels[0].id, "opencode");
     assert_eq!(cfg.channels[0].effective_alias(), "opencode");
-    assert_eq!(cfg.channels[1].id, "alpha");
-    assert_eq!(cfg.channels[1].effective_alias(), "alpha");
-    assert_eq!(cfg.channels[1].protocol, "web-chat");
-    assert_eq!(cfg.channels[1].stats_id, Some(2));
 }
 
 #[test]
@@ -834,61 +829,22 @@ fn assigns_stable_stats_ids_with_reserved_builtin_band() {
     // 统计维度键与别名解耦
     assert_eq!(by_id("site_a").stats_key(), "101");
 
-    // 改别名后 ID 不变；重复 sanitize 幂等，计数器不回退。
-    // 注意 sanitize 会按 stats_id 稳定排序（内置在前），定位一律走 id 而非索引
+    // 改别名后 ID 不变；重复 sanitize 幂等，计数器不回退
     let mut renamed = cfg.clone();
-    renamed.channels = renamed
-        .channels
-        .into_iter()
-        .map(|mut ch| {
-            if ch.id == "site_a" {
-                ch.alias = Some("renamed".to_string());
-                ch.stats_id = None;
-            }
-            ch
-        })
-        .filter(|ch| ch.id != "site_b")
-        .collect();
+    renamed.channels[0].alias = Some("renamed".to_string());
+    renamed.channels[0].stats_id = None;
+    renamed.channels.pop();
     sanitize_model_proxy_config(&mut renamed);
-    let renamed_site_a = renamed
-        .channels
-        .iter()
-        .find(|c| c.id == "site_a")
-        .expect("site_a 应保留");
-    assert_eq!(renamed_site_a.stats_id, Some(103));
-    assert_eq!(renamed_site_a.stats_key(), "103");
-    assert_eq!(
-        renamed
-            .channels
-            .iter()
-            .find(|c| c.id == "opencode")
-            .unwrap()
-            .stats_id,
-        Some(1)
-    );
+    assert_eq!(renamed.channels[0].stats_id, Some(103));
+    assert_eq!(renamed.channels[0].stats_key(), "103");
+    assert_eq!(renamed.channels[1].stats_id, Some(1));
     assert!(renamed.next_channel_stats_id >= 103);
-
-    // 内置固化渠道必须排在动态渠道之前（opencode=1 < alpha=2 < 动态 101+）
-    let builtin_first = |cfg: &ModelProxyConfig| {
-        let ids: Vec<u32> = cfg.channels.iter().map(|c| c.stats_id.unwrap_or(u32::MAX)).collect();
-        let first_dynamic = ids.iter().position(|id| *id >= 101).unwrap_or(ids.len());
-        ids[..first_dynamic].iter().all(|id| *id < 101)
-    };
-    assert!(builtin_first(&cfg), "内置渠道应位于动态渠道之前");
-    assert!(builtin_first(&renamed));
 
     // 已分配 ID 的渠道保持不变
     let mut again = renamed.clone();
     sanitize_model_proxy_config(&mut again);
-    assert_eq!(
-        again
-            .channels
-            .iter()
-            .find(|c| c.id == "site_a")
-            .unwrap()
-            .stats_id,
-        Some(103)
-    );
+    assert_eq!(again.channels[0].stats_id, Some(103));
+    assert_eq!(again.channels[1].stats_id, Some(1));
 }
 
 #[test]
@@ -1278,75 +1234,6 @@ async fn opencode_valid_200_payload_does_not_retry() {
         1,
         "tool_calls 属于有效负载，不应重试"
     );
-}
-
-// ---------------------------------------------------------------------------
-// 网页直连（alpha 渠道）真实联调：默认忽略，显式触发
-// cargo test --lib webchat_channel_real_egress_roundtrip -- --ignored --nocapture
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-#[ignore = "真实联调：需访问 oxalpha.com"]
-async fn webchat_channel_real_egress_roundtrip() {
-    use std::sync::atomic::Ordering;
-
-    let state = ModelProxyState::new_with_app(None);
-    let ctx = &state.context;
-    ctx.route_enabled.store(true, Ordering::Release);
-
-    let mut channel = egress_test_channel("alpha", "https://oxalpha.com".to_string());
-    channel.protocol = "web-chat".to_string();
-
-    let config = ModelProxyConfig {
-        enabled: true,
-        max_retries: 0,
-        ..ModelProxyConfig::default()
-    };
-    let upstream_url = format!(
-        "{}/api/chat",
-        channel.base_url.trim_end_matches('/')
-    );
-    let meta = EgressRequestMeta {
-        req_id: "req_webchat_probe".to_string(),
-        path: "/v1/chat/completions".to_string(),
-        channel_id: channel.id.clone(),
-        channel_stats_id: Some("2".to_string()),
-        model: super::webchat::WEBCHAT_MODEL.to_string(),
-        stream: false,
-        req_body_str: None,
-    };
-    let success = execute_resilient_egress(
-        ctx,
-        &channel,
-        &config,
-        meta,
-        &upstream_url,
-        "",
-        &json!({
-            "model": super::webchat::WEBCHAT_MODEL,
-            "messages": [{ "role": "user", "content": "请只回复两个汉字：成功" }],
-        }),
-        crate::model::gateway::pipeline::ClientProtocol::OpenAi,
-    )
-    .await
-    .expect("网页直连出网应成功");
-
-    assert!(success.status.is_success(), "上游状态: {}", success.status);
-    let raw = success.response.bytes().await.expect("响应体可读");
-    let text = String::from_utf8_lossy(&raw).to_string();
-    println!("--- 上游原始返回(截断) ---\n{}\n--------------------------", &text[..text.len().min(1200)]);
-    assert!(text.contains("data:"), "上游必须返回 SSE 流: {text}");
-
-    // 聚合为 Chat 响应并校验内容可达（非流式归一化路径）
-    let aggregated =
-        crate::model::gateway::egress::webchat_sse_to_chat_response(&raw, "alpha");
-    let content = aggregated
-        .pointer("/choices/0/message/content")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    println!("聚合正文: {content}");
-    assert!(!content.trim().is_empty(), "聚合后的正文不得为空");
 }
 
 #[test]

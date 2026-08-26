@@ -21,8 +21,6 @@ pub enum TargetProtocol {
     AnthropicMessages,
     /// Google · Gemini generateContent
     Gemini,
-    /// 网页直连（oxalpha.com /api/chat）：会话保护端点，响应为 Chat 形状 SSE
-    WebChat,
 }
 
 impl TargetProtocol {
@@ -36,7 +34,6 @@ impl TargetProtocol {
             "openai-responses" | "responses" => Self::OpenAiResponses,
             "anthropic" | "claude" => Self::AnthropicMessages,
             "gemini" => Self::Gemini,
-            "web-chat" | "webchat" | "oxalpha" => Self::WebChat,
             _ => Self::OpenAiChat,
         }
     }
@@ -48,7 +45,6 @@ impl TargetProtocol {
             Self::OpenAiResponses => "OpenAI Responses",
             Self::AnthropicMessages => "Anthropic Messages",
             Self::Gemini => "Gemini",
-            Self::WebChat => "Web Chat SSE",
         }
     }
 }
@@ -203,22 +199,6 @@ fn prepare_egress_inner(
             ensure_include_usage(&mut out, is_stream);
             (url, out)
         }
-        // 网页直连（oxalpha.com）：固定端点 /api/chat，模型名固化为站点唯一模型，
-        // 仅透传 messages（网页后端只消费 role/content）
-        TargetProtocol::WebChat => {
-            let url = format!("{base}/api/chat");
-            let chat_body = if let Some(ur) = universal {
-                super::parsers::universal_to_chat(&ur)
-            } else {
-                native.take().unwrap_or_else(|| json!({}))
-            };
-            let messages = chat_body.get("messages").cloned().unwrap_or_else(|| json!([]));
-            let out = json!({
-                "model": super::webchat::WEBCHAT_MODEL,
-                "messages": messages,
-            });
-            (url, out)
-        }
     }
 }
 
@@ -303,19 +283,6 @@ pub fn detect_response_protocol_from_sse_data(data: &str) -> Option<TargetProtoc
 /// 先嗅探实际协议再分发解析器：配置与实际不一致时以实际为准；
 /// 嗅探失败回退配置值。判定为 Chat（已是中枢格式）或非 JSON 时原样透传。
 pub fn normalize_response_bytes(target: TargetProtocol, model: &str, raw: &[u8]) -> Vec<u8> {
-    // 网页直连端点恒定返回 SSE 流；非流式客户端需要先聚合成完整 Chat 响应
-    if target == TargetProtocol::WebChat {
-        // 极少数情况下上游直接回 JSON（错误对象等）：交由下方常规嗅探处理
-        let trimmed = String::from_utf8_lossy(raw);
-        if !trimmed.trim_start().starts_with("data:") {
-            if let Ok(jv) = serde_json::from_slice::<JsonValue>(raw) {
-                return serde_json::to_vec(&jv).unwrap_or_else(|_| raw.to_vec());
-            }
-            return raw.to_vec();
-        }
-        return serde_json::to_vec(&webchat_sse_to_chat_response(raw, model))
-            .unwrap_or_else(|_| raw.to_vec());
-    }
     let Ok(jv) = serde_json::from_slice::<JsonValue>(raw) else {
         return raw.to_vec();
     };
@@ -331,87 +298,7 @@ pub fn normalize_response_bytes(target: TargetProtocol, model: &str, raw: &[u8])
         TargetProtocol::OpenAiResponses => {
             serde_json::to_vec(&responses_response_to_openai(&jv)).unwrap_or_else(|_| raw.to_vec())
         }
-        TargetProtocol::WebChat => unreachable!("WebChat 已在函数入口短路"),
     }
-}
-
-/// 网页直连 SSE 字节流 → 完整 OpenAI Chat 响应。
-///
-/// 聚合全部 chunk 的 content / reasoning / finish_reason 与 usage 尾包；
-/// 上游 error 帧（data: {"error": ...}）转为带错误信息的空内容响应，
-/// 由上层按普通响应记录日志。
-pub(crate) fn webchat_sse_to_chat_response(raw: &[u8], model: &str) -> JsonValue {
-    let text = String::from_utf8_lossy(raw);
-    let mut content = String::new();
-    let mut reasoning = String::new();
-    let mut finish_reason: Option<String> = None;
-    let mut upstream_model = String::new();
-    let mut usage: Option<JsonValue> = None;
-    let mut upstream_error: Option<String> = None;
-
-    for line in text.lines() {
-        let Some(data) = line.strip_prefix("data:") else {
-            continue;
-        };
-        let data = data.trim();
-        if data.is_empty() || data == "[DONE]" {
-            continue;
-        }
-        let Ok(jv) = serde_json::from_str::<JsonValue>(data) else {
-            continue;
-        };
-        if let Some(err) = jv.get("error") {
-            upstream_error = Some(
-                err.get("message")
-                    .and_then(JsonValue::as_str)
-                    .or_else(|| err.get("error").and_then(JsonValue::as_str))
-                    .unwrap_or("上游返回错误")
-                    .to_string(),
-            );
-            break;
-        }
-        if let Some(m) = jv.get("model").and_then(JsonValue::as_str) {
-            upstream_model = m.to_string();
-        }
-        if let Some(u) = jv.get("usage") {
-            usage = Some(u.clone());
-        }
-        let Some(choice) = jv.pointer("/choices/0") else {
-            continue;
-        };
-        if let Some(delta) = choice.get("delta") {
-            if let Some(t) = delta.get("content").and_then(JsonValue::as_str) {
-                content.push_str(t);
-            }
-            if let Some(t) = delta
-                .get("reasoning_content")
-                .or_else(|| delta.get("reasoning"))
-                .and_then(JsonValue::as_str)
-            {
-                reasoning.push_str(t);
-            }
-        }
-        if let Some(fr) = choice.get("finish_reason").and_then(JsonValue::as_str) {
-            finish_reason = Some(fr.to_string());
-        }
-    }
-
-    let mut out = empty_chat_response(if upstream_model.is_empty() { model } else { &upstream_model });
-    out["choices"][0]["finish_reason"] =
-        json!(finish_reason.as_deref().unwrap_or("stop"));
-    if upstream_error.is_some() && content.is_empty() {
-        out["choices"][0]["message"]["content"] = json!(upstream_error.unwrap_or_default());
-    } else {
-        let msg = out.pointer_mut("/choices/0/message").expect("message exists");
-        msg["content"] = json!(content);
-        if !reasoning.is_empty() {
-            msg["reasoning_content"] = json!(reasoning);
-        }
-    }
-    if let Some(u) = usage {
-        out["usage"] = u;
-    }
-    out
 }
 
 fn empty_chat_response(model: &str) -> JsonValue {
@@ -1124,81 +1011,8 @@ mod egress_tests {
             TargetProtocol::Gemini
         );
         assert_eq!(
-            TargetProtocol::from_channel(&channel_with_protocol("web-chat")),
-            TargetProtocol::WebChat
-        );
-        assert_eq!(
-            TargetProtocol::from_channel(&channel_with_protocol("oxalpha")),
-            TargetProtocol::WebChat
-        );
-        assert_eq!(
             TargetProtocol::from_channel(&channel_with_protocol("unknown")),
             TargetProtocol::OpenAiChat
-        );
-    }
-
-    #[test]
-    fn prepare_egress_webchat_targets_fixed_endpoint_and_model() {
-        // 网页直连渠道 base 为站点根地址（不带 API 路径）
-        let mut chan = channel_with_protocol("web-chat");
-        chan.base_url = "https://webchat.example".to_string();
-        let ur = crate::model::gateway::parsers::chat_to_universal(
-            &json!({
-                "model": "alpha/gpt-9",
-                "messages": [
-                    {"role": "system", "content": "sys"},
-                    {"role": "user", "content": "hi"},
-                ],
-                "max_tokens": 512,
-                "tools": [],
-            }),
-            "gpt-9",
-        );
-        let (url, body) =
-            prepare_egress_with(&chan, "", "gpt-9", EgressBody::Universal(ur), true);
-        // 端点与模型均固化为站点约定值；messages 保留、其余字段剥离
-        assert_eq!(url, "https://webchat.example/api/chat");
-        assert_eq!(body["model"], json!(super::super::webchat::WEBCHAT_MODEL));
-        assert_eq!(body.pointer("/messages/0/content").and_then(JsonValue::as_str), Some("sys"));
-        assert_eq!(body.pointer("/messages/1/content").and_then(JsonValue::as_str), Some("hi"));
-        assert!(body.get("max_tokens").is_none(), "网页端点不消费采样参数: {body}");
-        assert!(body.get("stream").is_none(), "流式开关由上游端点自身决定: {body}");
-    }
-
-    #[test]
-    fn webchat_sse_aggregation_merges_deltas_and_usage() {
-        let sse = concat!(
-            ": OPENROUTER PROCESSING\n\n",
-            r#"data: {"id":"gen-1","object":"chat.completion.chunk","model":"stealth/ox-alpha","choices":[{"index":0,"delta":{"role":"assistant","reasoning":"想"},"finish_reason":null}]}"#,
-            "\n\n",
-            r#"data: {"id":"gen-1","choices":[{"index":0,"delta":{"content":"你"}}]}"#,
-            "\n\n",
-            r#"data: {"id":"gen-1","choices":[{"index":0,"delta":{"content":"好"},"finish_reason":"stop"}]}"#,
-            "\n\n",
-            r#"data: {"id":"gen-1","choices":[],"usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10}}"#,
-            "\n\n",
-            "data: [DONE]\n\n",
-        );
-        let out = webchat_sse_to_chat_response(sse.as_bytes(), "alpha");
-        let msg = out.pointer("/choices/0/message").unwrap();
-        assert_eq!(msg["content"], json!("你好"));
-        assert_eq!(msg["reasoning_content"], json!("想"));
-        assert_eq!(out.pointer("/model").unwrap(), &json!("stealth/ox-alpha"));
-        assert_eq!(out.pointer("/usage/total_tokens").unwrap(), &json!(10));
-        assert_eq!(out.pointer("/choices/0/finish_reason").unwrap(), &json!("stop"));
-    }
-
-    #[test]
-    fn webchat_sse_error_frame_surfaces_message() {
-        let sse = concat!(
-            r#"data: {"error":{"error":"Limit reached","limit_exhausted":true}}"#,
-            "\n\n",
-            "data: [DONE]\n\n",
-        );
-        let out = webchat_sse_to_chat_response(sse.as_bytes(), "alpha");
-        assert_eq!(
-            out.pointer("/choices/0/message/content").unwrap(),
-            &json!("Limit reached")
         );
     }
 

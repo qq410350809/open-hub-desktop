@@ -11,7 +11,13 @@ use std::sync::atomic::Ordering;
 impl ModelProxyContext {
     /// 异步记录请求日志至本地数据库，并同步累加「渠道 × 模型 × 客户端 × 日/时」聚合统计。
     /// 明细日志按保留天数节流清理（默认永久保留）；统计聚合表独立持久化，不受清理影响。
-    pub async fn record_log(&self, log: ProxyRequestLog) {
+    pub async fn record_log(&self, mut log: ProxyRequestLog) {
+        // 全文记录开关：请求与响应要么都记、要么都不记（在唯一落库出口统一拦截，
+        // 覆盖 handlers / dispatcher 错误路径 / 流式管线等全部来源）
+        if !self.config.read().await.record_request_body {
+            log.request_body = None;
+            log.response_body = None;
+        }
         let app_handle_opt = self.app_ctx.read().await.clone();
         if let Some(ctx) = app_handle_opt {
             let database = &ctx.database;

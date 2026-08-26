@@ -207,7 +207,8 @@ pub async fn handle_messages(
 
     let resp_bytes =
         egress::normalize_response_bytes(outcome.target, &outcome.model_to_send, &raw_bytes);
-    let resp_body = cap_log_body(String::from_utf8_lossy(&resp_bytes).to_string());
+    // 日志记录上游响应原文（未归一化），便于排查协议/内容问题
+    let resp_body = cap_log_body(String::from_utf8_lossy(&raw_bytes).to_string());
 
     if let Ok(jv) = serde_json::from_slice::<JsonValue>(&resp_bytes) {
         let (p_tok, c_tok) = AnthropicProtocolAdapter::extract_token_usage(&jv);

@@ -107,52 +107,28 @@ impl ChannelConfig {
 }
 
 pub fn default_channels() -> Vec<ChannelConfig> {
-    vec![
-        ChannelConfig {
-            id: "opencode".to_string(),
-            name: "OpenCode 官方免费通道".to_string(),
-            description: "由 OpenCode 提供的公益推理加速通道，免 Key 访问多种 Coding/Chat 顶尖模型"
-                .to_string(),
-            enabled: true,
-            protocol: "openai".to_string(),
-            base_url: "https://opencode.ai/zen/v1".to_string(),
-            api_key: String::new(),
-            api_keys: None,
-            use_proxy_pool: false,
-            alias: Some("opencode".to_string()),
-            site_id: None,
-            use_fixed_proxy: false,
-            fixed_proxy_node: None,
-            priority: Some(1),
-            weight: Some(100),
-            enabled_models: None,
-            model_redirects: None,
-            rate_limit_rpm: None,
-            stats_id: Some(1),
-        },
-        ChannelConfig {
-            id: "alpha".to_string(),
-            name: "Ox Alpha 网页直连".to_string(),
-            description: "反代 oxalpha.com 网页版 SSE 接口，免 Key 使用 stealth/ox-alpha 思考模型"
-                .to_string(),
-            enabled: true,
-            protocol: "web-chat".to_string(),
-            base_url: "https://oxalpha.com".to_string(),
-            api_key: String::new(),
-            api_keys: None,
-            use_proxy_pool: false,
-            alias: Some("alpha".to_string()),
-            site_id: None,
-            use_fixed_proxy: false,
-            fixed_proxy_node: None,
-            priority: Some(2),
-            weight: Some(100),
-            enabled_models: Some(vec![super::webchat::WEBCHAT_MODEL.to_string()]),
-            model_redirects: None,
-            rate_limit_rpm: None,
-            stats_id: Some(2),
-        },
-    ]
+    vec![ChannelConfig {
+        id: "opencode".to_string(),
+        name: "OpenCode 官方免费通道".to_string(),
+        description: "由 OpenCode 提供的公益推理加速通道，免 Key 访问多种 Coding/Chat 顶尖模型"
+            .to_string(),
+        enabled: true,
+        protocol: "openai".to_string(),
+        base_url: "https://opencode.ai/zen/v1".to_string(),
+        api_key: String::new(),
+        api_keys: None,
+        use_proxy_pool: false,
+        alias: Some("opencode".to_string()),
+        site_id: None,
+        use_fixed_proxy: false,
+        fixed_proxy_node: None,
+        priority: Some(1),
+        weight: Some(100),
+        enabled_models: None,
+        model_redirects: None,
+        rate_limit_rpm: None,
+        stats_id: Some(1),
+    }]
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -165,7 +141,11 @@ pub struct ModelProxyConfig {
     pub port: u16,
     pub api_key: String,
     pub channels: Vec<ChannelConfig>,
+    /// 出网超时秒数；serde default 兜底，防止存量 JSON 缺字段时整体解析失败
+    #[serde(default = "default_timeout_seconds")]
     pub timeout_seconds: u64,
+    /// 全文记录总开关：开启时同时记录客户端请求原文与上游响应原文，
+    /// 关闭则两者都不记（在 record_log 落库出口统一拦截）
     #[serde(default)]
     pub record_request_body: bool,
     #[serde(default)]

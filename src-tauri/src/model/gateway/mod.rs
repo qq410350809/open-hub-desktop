@@ -9,12 +9,12 @@ pub mod ir;
 pub mod logger;
 pub mod parsers;
 pub mod pipeline;
+pub mod policies;
 pub mod router;
 pub mod server;
 pub mod stats;
 pub mod stream;
 pub mod types;
-pub mod webchat;
 
 #[allow(unused_imports)]
 pub use adapters::*;
@@ -32,6 +32,8 @@ pub use ir::*;
 pub use logger::*;
 #[allow(unused_imports)]
 pub use parsers::*;
+#[allow(unused_imports)]
+pub use policies::*;
 pub use router::*;
 #[allow(unused_imports)]
 pub use server::*;

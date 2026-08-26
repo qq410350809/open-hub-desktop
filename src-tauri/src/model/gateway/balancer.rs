@@ -1,3 +1,4 @@
+use super::policies::opencode::strip_opencode_prefix;
 use super::types::{
     current_timestamp, ChannelConfig, ModelProxyConfig, ModelProxyContext, ProxyRequestLog,
 };
@@ -5,10 +6,6 @@ use serde_json::Value as JsonValue;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tracing::warn;
-
-pub fn strip_opencode_prefix(model: &str) -> &str {
-    model.strip_prefix("opencode/").unwrap_or(model)
-}
 
 /// 根据请求模型名解析目标渠道与发送给上游的裸模型名。
 /// 规则：
@@ -60,42 +57,6 @@ pub fn resolve_channel<'a>(
     }
 
     None
-}
-
-/// 判断渠道是否为 OpenCode 渠道
-pub fn is_opencode_channel(channel: &ChannelConfig) -> bool {
-    channel.id == "opencode"
-        || channel.protocol.eq_ignore_ascii_case("opencode")
-        || channel
-            .alias
-            .as_deref()
-            .map_or(false, |a| a.eq_ignore_ascii_case("opencode"))
-        || channel.base_url.contains("opencode.ai")
-        || channel.name.to_lowercase().contains("opencode")
-}
-
-/// 判断是否为 OpenCode 官方免费模型（除 big-pickle 外均包含 free）
-pub fn is_free_opencode_model(model: &str) -> bool {
-    let lower = model.to_lowercase();
-    let name = strip_opencode_prefix(&lower);
-    name == "big-pickle" || name.contains("free")
-}
-
-/// 校验请求的模型在目标渠道上是否合法可用（例如在未配置 Key 的 OpenCode 免费渠道上拦截付费模型）
-pub fn check_model_channel_compatibility(
-    channel: &ChannelConfig,
-    model_to_send: &str,
-    channel_api_key: &str,
-) -> Result<(), String> {
-    if is_opencode_channel(channel)
-        && channel_api_key.is_empty()
-        && !is_free_opencode_model(model_to_send)
-    {
-        return Err(format!(
-            "模型 '{model_to_send}' 为 OpenCode 付费模型，当前未配置 API Key。请使用官方免费模型（如 deepseek-v4-flash-free, mimo-v2.5-free, big-pickle 等）或在渠道设置中配置 API Key。"
-        ));
-    }
-    Ok(())
 }
 
 /// 渠道多 Key 轮询选择器：原子递增索引并在有效 API Keys 中轮流选取

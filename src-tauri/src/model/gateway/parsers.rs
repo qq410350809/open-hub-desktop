@@ -830,8 +830,7 @@ impl UniversalParser {
             T::AnthropicMessages => Self::Anthropic(AnthropicParser::new(tool_hints, preferred_tool)),
             T::Gemini => Self::Gemini(GeminiParser::new()),
             T::OpenAiResponses => Self::Responses(ResponsesParser::new()),
-            // 网页直连上游的流即 OpenAI Chat 形状（嗅探失败回退时同样按此解析）
-            T::WebChat | T::OpenAiChat => Self::Chat(ChatParser::new(tool_hints, preferred_tool)),
+            T::OpenAiChat => Self::Chat(ChatParser::new(tool_hints, preferred_tool)),
         }
     }
 

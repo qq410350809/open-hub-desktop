@@ -24,8 +24,11 @@ pub fn sanitize_channel_config(channel: &mut ChannelConfig) {
 }
 
 /// 渠道上游目标协议白名单
-const VALID_CHANNEL_PROTOCOLS: [&str; 5] =
-    ["openai", "openai-responses", "anthropic", "gemini", "web-chat"];
+const VALID_CHANNEL_PROTOCOLS: [&str; 4] = ["openai", "openai-responses", "anthropic", "gemini"];
+
+/// 已下线的内置固化渠道：其 stats_id 落在 1-100 保留段，前端视为不可删除的
+/// 内置渠道，存量安装的配置中必须由后端在加载时自动清除。
+const RETIRED_BUILTIN_CHANNEL_IDS: [&str; 1] = ["alpha"];
 
 pub fn sanitize_model_proxy_config(config: &mut ModelProxyConfig) {
     ensure_gateway_api_key(config);
@@ -33,30 +36,13 @@ pub fn sanitize_model_proxy_config(config: &mut ModelProxyConfig) {
     if config.channels.is_empty() {
         config.channels = default_channels();
     }
-    // 内置固化渠道升级补齐：存量配置缺少后加的内置渠道时自动注入，
-    // 保证老用户升级后新通道开箱可用
-    for default_ch in default_channels() {
-        if !config.channels.iter().any(|c| c.id == default_ch.id) {
-            config.channels.push(default_ch);
-        }
-    }
+    config
+        .channels
+        .retain(|ch| !RETIRED_BUILTIN_CHANNEL_IDS.contains(&ch.id.as_str()));
     let mut seen_aliases = std::collections::HashSet::new();
     for ch in &mut config.channels {
-        // OpenCode 官方渠道别名固定为 opencode（网关模型前缀依赖它），禁止自定义
-        if ch.id == "opencode" {
-            ch.alias = None;
-            ch.protocol = "openai".to_string();
-            ch.stats_id = Some(1);
-        }
-        // Alpha 网页直连渠道：协议与统计 ID 固化，别名固定为 alpha（同 opencode 语义）
-        if ch.id == "alpha" {
-            ch.alias = None;
-            ch.protocol = "web-chat".to_string();
-            ch.stats_id = Some(2);
-            if ch.base_url.trim().is_empty() {
-                ch.base_url = "https://oxalpha.com".to_string();
-            }
-        }
+        // OpenCode 官方渠道个性化固化策略见 policies/opencode.rs
+        super::policies::opencode::pin_channel_config(ch);
         // 目标协议白名单校验：非法/历史遗留值回退为 OpenAI 兼容
         let p = ch.protocol.trim().to_lowercase();
         ch.protocol = if VALID_CHANNEL_PROTOCOLS.contains(&p.as_str()) {
@@ -90,13 +76,6 @@ pub fn sanitize_model_proxy_config(config: &mut ModelProxyConfig) {
         }
     }
     config.next_channel_stats_id = next;
-
-    // 展示与存储顺序：内置固化渠道（stats_id 1-100）在前，动态渠道（101+）在后。
-    // 升级补齐会把后置内置渠道追加到存量列表末尾，这里按稳定数字 ID 归位；
-    // 稳定排序保证同段内（尤其动态渠道之间）原有相对顺序不变。
-    config
-        .channels
-        .sort_by_key(|ch| ch.stats_id.unwrap_or(u32::MAX));
 }
 
 pub fn load_model_proxy_config(conn: &Connection) -> ModelProxyConfig {
@@ -105,7 +84,18 @@ pub fn load_model_proxy_config(conn: &Connection) -> ModelProxyConfig {
     let had_api_key = serde_json::from_str::<ModelProxyConfig>(&raw)
         .ok()
         .is_some_and(|config| !config.api_key.trim().is_empty());
-    let mut cfg = serde_json::from_str::<ModelProxyConfig>(&raw).unwrap_or_default();
+    // 解析失败绝不能静默回退默认值 —— 那会把用户全部渠道/开关"重置"，
+    // 表现为「保存了重启又恢复」。失败时保留原文并高声报错，便于定位。
+    let parse_result = serde_json::from_str::<ModelProxyConfig>(&raw);
+    if let Err(error) = &parse_result {
+        if !raw.trim().is_empty() {
+            tracing::error!(
+                "[ModelGateway] 反代配置解析失败（回退默认值，原配置前 400 字符: {}）: {error}",
+                raw.chars().take(400).collect::<String>()
+            );
+        }
+    }
+    let mut cfg = parse_result.unwrap_or_default();
 
     sanitize_model_proxy_config(&mut cfg);
     if !had_api_key {
@@ -141,13 +131,14 @@ mod config_tests {
     use super::*;
 
     #[test]
-    fn sanitize_backfills_missing_builtin_alpha_channel() {
-        // 存量用户升级场景：已保存配置含 opencode + 站点动态渠道，缺少 alpha
+    fn sanitize_purges_retired_builtin_alpha_channel() {
+        // 存量安装迁移：alpha 曾以 stats_id=2 内置身份下发并持久化，
+        // 前端视其为不可删除的内置渠道 —— 加载时必须由后端自动清除
         let mut cfg = ModelProxyConfig {
             channels: vec![
                 ChannelConfig {
                     id: "opencode".to_string(),
-                    name: "legacy".to_string(),
+                    name: "OpenCode".to_string(),
                     description: String::new(),
                     enabled: true,
                     protocol: "openai".to_string(),
@@ -165,6 +156,27 @@ mod config_tests {
                     model_redirects: None,
                     rate_limit_rpm: None,
                     stats_id: Some(1),
+                },
+                ChannelConfig {
+                    id: "alpha".to_string(),
+                    name: "Ox Alpha 网页直连".to_string(),
+                    description: String::new(),
+                    enabled: true,
+                    protocol: "web-chat".to_string(),
+                    base_url: "https://oxalpha.com".to_string(),
+                    api_key: String::new(),
+                    api_keys: None,
+                    use_proxy_pool: false,
+                    alias: None,
+                    site_id: None,
+                    use_fixed_proxy: false,
+                    fixed_proxy_node: None,
+                    priority: None,
+                    weight: None,
+                    enabled_models: None,
+                    model_redirects: None,
+                    rate_limit_rpm: None,
+                    stats_id: Some(2),
                 },
                 ChannelConfig {
                     id: "site_a".to_string(),
@@ -185,51 +197,18 @@ mod config_tests {
                     enabled_models: None,
                     model_redirects: None,
                     rate_limit_rpm: None,
-                    stats_id: None,
+                    stats_id: Some(101),
                 },
             ],
             ..Default::default()
         };
         sanitize_model_proxy_config(&mut cfg);
-        let alpha = cfg
-            .channels
-            .iter()
-            .find(|c| c.id == "alpha")
-            .expect("内置 alpha 渠道必须被自动补齐");
-        assert_eq!(alpha.protocol, "web-chat");
-        assert_eq!(alpha.stats_id, Some(2));
-        assert_eq!(alpha.effective_alias(), "alpha");
-        assert_eq!(alpha.base_url, "https://oxalpha.com");
-        // 补齐后必须归位到内置段（opencode 之后、站点动态渠道之前），
-        // 而非追加在列表末尾
-        let ids: Vec<u32> = cfg
-            .channels
-            .iter()
-            .map(|c| c.stats_id.unwrap_or(u32::MAX))
-            .collect();
-        assert_eq!(
-            ids,
-            vec![1, 2, 101],
-            "渠道顺序应为 opencode(1) → alpha(2) → 动态(101+)"
+        assert!(
+            !cfg.channels.iter().any(|c| c.id == "alpha"),
+            "已下线内置渠道必须被自动清除"
         );
-    }
-
-    #[test]
-    fn sanitize_pins_alpha_protocol_and_stats_id() {
-        // 用户误改协议/base_url 时固化回正确值（同 opencode 语义）
-        let mut cfg = ModelProxyConfig::default();
-        cfg.channels[0].protocol = "gemini".to_string();
-        let mut alpha = crate::model::gateway::types::default_channels()
-            .into_iter()
-            .find(|c| c.id == "alpha")
-            .unwrap();
-        alpha.protocol = "anthropic".to_string();
-        alpha.base_url = String::new();
-        cfg.channels.push(alpha);
-        sanitize_model_proxy_config(&mut cfg);
-        let alpha = cfg.channels.iter().find(|c| c.id == "alpha").unwrap();
-        assert_eq!(alpha.protocol, "web-chat", "协议必须固化");
-        assert_eq!(alpha.base_url, "https://oxalpha.com", "空 base 必须回填");
-        assert_eq!(alpha.stats_id, Some(2));
+        // 用户自建渠道不受清理影响
+        assert!(cfg.channels.iter().any(|c| c.id == "site_a"));
+        assert_eq!(cfg.channels.len(), 2);
     }
 }

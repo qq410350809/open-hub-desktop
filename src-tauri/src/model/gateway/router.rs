@@ -1,4 +1,7 @@
-use super::balancer::{is_free_opencode_model, is_opencode_channel, select_channel_api_key};
+use super::balancer::select_channel_api_key;
+use super::policies::opencode::{
+    apply_models_probe_identity, is_free_opencode_model, is_opencode_channel,
+};
 use super::handlers::{
     handle_chat_completions, handle_gemini_generate, handle_messages, handle_responses,
 };
@@ -453,26 +456,6 @@ pub async fn fetch_upstream_models_inner(ctx: &ModelProxyContext) {
             continue;
         }
 
-        // 网页直连渠道无 /models 端点：直接返回站点固化模型，避免无效探测报错
-        if super::egress::TargetProtocol::from_channel(ch) == super::egress::TargetProtocol::WebChat
-        {
-            let mut models = vec![super::webchat::WEBCHAT_MODEL.to_string()];
-            if let Some(explicit) = &ch.enabled_models {
-                for m in explicit {
-                    if !models.iter().any(|x| x.eq_ignore_ascii_case(m)) {
-                        models.push(m.clone());
-                    }
-                }
-            }
-            channel_models.push(ChannelModelList {
-                channel_id: ch.id.clone(),
-                channel_name: ch.name.clone(),
-                alias: ch.effective_alias(),
-                models,
-            });
-            continue;
-        }
-
         let api_key = select_channel_api_key(ctx, ch);
         let client = ctx.default_http_client.read().await.clone();
         let base = ch.base_url.trim_end_matches('/');
@@ -486,14 +469,7 @@ pub async fn fetch_upstream_models_inner(ctx: &ModelProxyContext) {
 
         let mut outcome: Result<Vec<String>, String> = Err("未发起请求".to_string());
         for models_url in candidates {
-            let mut req = client.get(models_url);
-            if is_opencode_channel(ch) || ch.base_url.contains("opencode.ai") {
-                req = req
-                    .header("User-Agent", "opencode/1.18.18/cli")
-                    .header("x-opencode-client", "cli");
-            } else {
-                req = req.header("User-Agent", "OpenHub-Gateway/0.3.0");
-            }
+            let mut req = apply_models_probe_identity(client.get(models_url), ch, base);
             if !api_key.is_empty() {
                 req = req.header("Authorization", format!("Bearer {api_key}"));
             }

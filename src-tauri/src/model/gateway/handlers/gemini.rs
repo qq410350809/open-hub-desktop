@@ -215,7 +215,8 @@ pub async fn handle_gemini_generate(
 
     let mut final_log = log;
     final_log.duration_ms = dur;
-    final_log.response_body = cap_log_body(String::from_utf8_lossy(&resp_bytes).to_string());
+    // 日志记录上游响应原文（未归一化），便于排查协议/内容问题
+    final_log.response_body = cap_log_body(String::from_utf8_lossy(&raw_bytes).to_string());
     // 归一化后的 OpenAI usage 已带缓存/推理明细
     final_log.prompt_tokens = openai_resp
         .pointer("/usage/prompt_tokens")

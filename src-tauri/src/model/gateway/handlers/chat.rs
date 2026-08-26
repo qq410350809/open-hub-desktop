@@ -131,10 +131,9 @@ pub async fn handle_chat_completions(
     } else {
         let upstream_headers = outcome.success.response.headers().clone();
         let raw_bytes = outcome.success.response.bytes().await.unwrap_or_default();
-        let resp_bytes =
-            egress::normalize_response_bytes(outcome.target, &outcome.model_to_send, &raw_bytes);
+        // 日志记录上游响应原文（未归一化），便于排查协议/内容问题
+        let resp_body = cap_log_body(String::from_utf8_lossy(&raw_bytes).to_string());
         let dur = outcome.success.cand_start.elapsed().as_millis() as u64;
-        let resp_body = cap_log_body(String::from_utf8_lossy(&resp_bytes).to_string());
 
         let mut prompt_toks = None;
         let mut comp_toks = None;
@@ -144,6 +143,8 @@ pub async fn handle_chat_completions(
         let mut total_toks = None;
         let mut has_reasoning = false;
 
+        let resp_bytes =
+            egress::normalize_response_bytes(outcome.target, &outcome.model_to_send, &raw_bytes);
         if let Ok(mut jv) = serde_json::from_slice::<JsonValue>(&resp_bytes) {
             if let Some(usage) = jv.get("usage").and_then(JsonValue::as_object) {
                 prompt_toks = usage.get("prompt_tokens").and_then(JsonValue::as_u64);

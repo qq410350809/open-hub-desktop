@@ -1,9 +1,13 @@
 use super::balancer::{
     build_client_for_candidate, format_upstream_error_message, get_node_display_name,
-    get_sorted_egress_candidates, is_opencode_channel,
+    get_sorted_egress_candidates,
 };
 use super::egress::TargetProtocol;
 use super::logger::{cap_log_body, record_attempt_failure, ProxyLogParams};
+use super::policies::opencode::{
+    apply_cli_identity_headers, is_empty_success_payload, matches_channel_or_url,
+    GATEWAY_USER_AGENT,
+};
 use super::pipeline::{gateway_error_response, ClientProtocol};
 use super::types::{ChannelConfig, ModelProxyConfig, ModelProxyContext};
 use axum::{
@@ -40,16 +44,8 @@ pub struct EgressSuccess {
     pub upstream_url: String,
 }
 
-/// 从网页直连出网 URL 提取站点 base（scheme://host），供会话模块定位 /chat 页
-fn webchat_base_of(upstream_url: &str) -> &str {
-    upstream_url
-        .split_once("/api/")
-        .map(|(head, _)| head)
-        .unwrap_or(upstream_url)
-}
-
-/// 构建出网请求（含 OpenCode CLI 身份头模拟、网页直连会话凭证与鉴权头），
-/// 供常规发送与 503 原地重试复用，保证两次发出的请求完全一致。
+/// 构建出网请求（含 OpenCode CLI 身份头模拟与鉴权头），供常规发送与 503 原地重试复用，
+/// 保证两次发出的请求完全一致。
 fn build_egress_request(
     client: &reqwest::Client,
     upstream_url: &str,
@@ -59,41 +55,17 @@ fn build_egress_request(
     attempt_req_id: &str,
     session_seed: &str,
     target: TargetProtocol,
-    webchat_session: Option<&super::webchat::WebChatSession>,
 ) -> reqwest::RequestBuilder {
     let mut req_builder = client
         .post(upstream_url)
         .header("Content-Type", "application/json")
         .json(body);
 
-    if matches!(target, TargetProtocol::WebChat) {
-        // 网页直连：模拟浏览器会话身份，凭证由 webchat 模块统一管理
-        let base = webchat_base_of(upstream_url);
-        for (k, v) in super::webchat::browser_header_pairs(base) {
-            req_builder = req_builder.header(k, v);
-        }
-        if let Some(sess) = webchat_session {
-            if !sess.cookie.is_empty() {
-                req_builder = req_builder.header("Cookie", &sess.cookie);
-            }
-            if !sess.csrf.is_empty() {
-                req_builder = req_builder.header("X-CSRF-TOKEN", &sess.csrf);
-            }
-        }
-        return req_builder;
-    }
-
     if is_opencode {
-        // OpenCode 官方 CLI 身份与会话请求头模拟：抹平 CLI 与反代差异，享受官方正常会话配额
-        let session_id = format!("sess_{}", session_seed.replace('-', ""));
-        req_builder = req_builder
-            .header("User-Agent", "opencode/1.18.18/cli")
-            .header("x-opencode-client", "cli")
-            .header("x-opencode-session", session_id)
-            .header("x-opencode-project", "proj_openhub_gateway")
-            .header("x-opencode-request", attempt_req_id.to_string());
+        // OpenCode 渠道个性化身份策略见 policies/opencode.rs
+        req_builder = apply_cli_identity_headers(req_builder, session_seed, attempt_req_id);
     } else {
-        req_builder = req_builder.header("User-Agent", "OpenHub-Gateway/0.3.0");
+        req_builder = req_builder.header("User-Agent", GATEWAY_USER_AGENT);
     }
 
     if !channel_api_key.is_empty() {
@@ -108,47 +80,6 @@ fn build_egress_request(
         req_builder = req_builder.header("anthropic-version", "2023-06-01");
     }
     req_builder
-}
-
-/// 判定 OpenCode 成功响应（2xx）是否为「空内容」——官方已知缺陷：返回 200 但无任何有效负载。
-///
-/// 视为空内容：
-/// - 响应体为空字节
-/// - JSON 无 `choices` 键（如伪装成 200 的错误对象）
-/// - `choices` 为空数组
-/// - 首个 choice 的 message 既无正文、也无工具调用、也无思考内容。
-///   注意：纯思考（reasoning_content 非空、无正文）视为有效负载——纯推理
-///   模型可能整段只输出思考，若判空会触发重试并最终 400。
-///
-/// 不视为空内容：非 JSON 负载（HTML 错误页/纯文本等，交由上层按原样透传排查）。
-fn is_empty_success_payload(body: &[u8]) -> bool {
-    if body.is_empty() {
-        return true;
-    }
-    let Ok(jv) = serde_json::from_slice::<JsonValue>(body) else {
-        return false;
-    };
-    let Some(choices) = jv.get("choices").and_then(JsonValue::as_array) else {
-        return true;
-    };
-    let Some(first) = choices.first() else {
-        return true;
-    };
-    let no_text = first
-        .pointer("/message/content")
-        .map(|v| v.as_str().map(str::is_empty).unwrap_or(v.is_null()))
-        .unwrap_or(true);
-    let no_tools = first
-        .pointer("/message/tool_calls")
-        .and_then(JsonValue::as_array)
-        .map(|a| a.is_empty())
-        .unwrap_or(true);
-    let no_reasoning = first
-        .pointer("/message/reasoning_content")
-        .or_else(|| first.pointer("/message/reasoning"))
-        .map(|v| v.as_str().map(str::is_empty).unwrap_or(v.is_null()))
-        .unwrap_or(true);
-    no_text && no_tools && no_reasoning
 }
 
 /// 通用弹性出网请求调度引擎
@@ -167,26 +98,6 @@ pub async fn execute_resilient_egress(
     let max_retries = config.max_retries as usize;
     let total_attempts_allowed = max_retries + 1;
     let base_node_idx = ctx.node_round_robin.load(Ordering::Relaxed);
-
-    let target = TargetProtocol::from_channel(channel);
-    let is_webchat = matches!(target, TargetProtocol::WebChat);
-    // 网页直连：出网前先确保会话凭证可用（缓存优先）；失败直接以 502 返回客户端
-    let mut webchat_session: Option<super::webchat::WebChatSession> = if is_webchat {
-        let direct_client = build_client_for_candidate(ctx, "__direct__").await;
-        match super::webchat::ensure_session(&direct_client, webchat_base_of(upstream_url)).await {
-            Ok(s) => Some(s),
-            Err(e) => {
-                return Err(gateway_error_response(
-                    client_protocol,
-                    StatusCode::BAD_GATEWAY,
-                    "502",
-                    format!("网页直连渠道获取上游会话失败: {e}"),
-                ));
-            }
-        }
-    } else {
-        None
-    };
 
     let mut last_error = String::new();
     let mut last_status = StatusCode::BAD_GATEWAY;
@@ -209,7 +120,7 @@ pub async fn execute_resilient_egress(
             format!("{}#{}", meta.req_id, attempt_idx + 1)
         };
 
-        let is_opencode = is_opencode_channel(channel) || upstream_url.contains("opencode.ai");
+        let is_opencode = matches_channel_or_url(channel, upstream_url);
 
         // OpenCode 渠道专属容错：遇到 502/503，或 200 但响应体为空内容（官方已知缺陷）时，
         // 在当前节点等待 1 秒后原地重试一次。
@@ -235,8 +146,7 @@ pub async fn execute_resilient_egress(
                 is_opencode,
                 &attempt_req_id,
                 &meta.req_id,
-                target,
-                webchat_session.as_ref(),
+                TargetProtocol::from_channel(channel),
             )
             .send()
             .await;
@@ -248,54 +158,7 @@ pub async fn execute_resilient_egress(
                         || resp.status() == StatusCode::SERVICE_UNAVAILABLE
             );
 
-            // ① 网页直连 419（CSRF Token 过期）：强制刷新会话后原地重试一次，
-            //    不占重试名额、不切换节点。
-            if is_webchat
-                && !inplace_retried
-                && matches!(&result, Ok(resp) if resp.status().as_u16() == 419)
-            {
-                inplace_retried = true;
-                let resp = match result {
-                    Ok(r) => r,
-                    Err(_) => unreachable!("matches! 已确保 result 为 Ok"),
-                };
-                let status = resp.status();
-                let err_bytes = resp.bytes().await.unwrap_or_default();
-                let err_text = String::from_utf8_lossy(&err_bytes).to_string();
-
-                record_attempt_failure(
-                    ctx,
-                    ProxyLogParams::new_failure(
-                        attempt_req_id.clone(),
-                        meta.path.clone(),
-                        meta.channel_id.clone(),
-                        meta.model.clone(),
-                        meta.stream,
-                        status.as_u16(),
-                        cand_start.elapsed().as_millis() as u64,
-                        Some("网页直连会话过期(419)，刷新会话后原地重试".to_string()),
-                        meta.req_body_str.clone(),
-                        Some(node_display.clone()),
-                    )
-                    .with_channel_stats_id(meta.channel_stats_id.clone())
-                    .with_upstream_url(Some(upstream_url.to_string()))
-                    .with_response_body(cap_log_body(err_text)),
-                )
-                .await;
-
-                let direct_client = build_client_for_candidate(ctx, "__direct__").await;
-                webchat_session = super::webchat::force_refresh_session(
-                    &direct_client,
-                    webchat_base_of(upstream_url),
-                )
-                .await
-                .ok();
-                warn!("[ModelGateway] web-chat 会话已刷新，1 秒后原地重试");
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                continue;
-            }
-
-            // ② 502/503：网关类临时故障，读取错误体记录日志后原地重试。
+            // ① 502/503：网关类临时故障，读取错误体记录日志后原地重试。
             // 对所有渠道通用 —— 站点转换渠道/转发渠道同样受益。
             if !inplace_retried && retryable_status {
                 inplace_retried = true;
@@ -606,21 +469,3 @@ pub async fn execute_resilient_egress(
     }
 }
 
-#[cfg(test)]
-mod dispatcher_tests {
-    use super::*;
-
-    #[test]
-    fn reasoning_only_payload_is_not_empty() {
-        // P1-9：纯推理响应（无正文无工具）应视为有效负载，
-        // 否则触发重试并最终 400，纯思考模型被误杀
-        let body = r#"{"choices":[{"message":{"role":"assistant","content":"","reasoning_content":"思考中"}}],"usage":{"prompt_tokens":1,"completion_tokens":10}}"#.as_bytes();
-        assert!(!is_empty_success_payload(body), "仅含思考的响应不是空内容");
-
-        let body = br#"{"choices":[{"message":{"role":"assistant","content":null},"finish_reason":"stop"}]}"#;
-        assert!(is_empty_success_payload(body), "真空白响应仍是空内容");
-
-        let body = r#"{"choices":[{"message":{"role":"assistant","content":"有正文"}}]}"#.as_bytes();
-        assert!(!is_empty_success_payload(body));
-    }
-}

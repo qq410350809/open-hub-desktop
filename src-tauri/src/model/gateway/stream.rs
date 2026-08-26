@@ -1610,75 +1610,6 @@ impl ClientSseEmitter {
     }
 }
 
-/// IR 事件 → 日志响应体累积
-#[derive(Default)]
-struct IrResponseAccumulator {
-    content: String,
-    reasoning: String,
-    tool_calls: BTreeMap<u64, ToolCallAccum>,
-    stop_reason: Option<String>,
-}
-
-impl IrResponseAccumulator {
-    fn observe(&mut self, event: &UniversalStreamEvent) {
-        match event {
-            UniversalStreamEvent::TextDelta(s) => self.content.push_str(s),
-            UniversalStreamEvent::ReasoningDelta(s) => self.reasoning.push_str(s),
-            UniversalStreamEvent::ToolCallStart { index, call_id, name } => {
-                let entry = self.tool_calls.entry(*index).or_default();
-                entry.id = call_id.clone();
-                entry.name = name.clone();
-            }
-            UniversalStreamEvent::ToolCallDelta { index, fragment } => {
-                self.tool_calls.entry(*index).or_default().arguments.push_str(fragment);
-            }
-            UniversalStreamEvent::Finish { reason, .. } => {
-                self.stop_reason = Some(match reason {
-                    StopReason::EndTurn => "stop".to_string(),
-                    StopReason::MaxTokens => "length".to_string(),
-                    StopReason::ToolUse => "tool_calls".to_string(),
-                    StopReason::ContentFilter => "content_filter".to_string(),
-                });
-            }
-        }
-    }
-
-    fn build_response_body(&self) -> Option<String> {
-        if self.content.is_empty() && self.reasoning.is_empty() && self.tool_calls.is_empty() {
-            return None;
-        }
-        let mut message = json!({ "role": "assistant", "content": self.content });
-        if !self.reasoning.is_empty() {
-            message["reasoning_content"] = JsonValue::String(self.reasoning.clone());
-        }
-        if !self.tool_calls.is_empty() {
-            let calls: Vec<JsonValue> = self
-                .tool_calls
-                .iter()
-                .map(|(idx, tc)| {
-                    json!({
-                        "id": tc.id,
-                        "type": "function",
-                        "index": idx,
-                        "function": { "name": tc.name, "arguments": tc.arguments }
-                    })
-                })
-                .collect();
-            message["tool_calls"] = JsonValue::Array(calls);
-        }
-        Some(
-            json!({
-                "choices": [{
-                    "index": 0,
-                    "message": message,
-                    "finish_reason": self.stop_reason,
-                }]
-            })
-            .to_string(),
-        )
-    }
-}
-
 /// 统一用量口径落库 + 网关指标累加（input 为总量，缓存明细单列）
 fn apply_usage_to_log(log: &mut ProxyRequestLog, usage: &UniversalUsage, ctx: &ModelProxyContext) {
     if usage.input_tokens == 0 && usage.output_tokens == 0 {
@@ -1769,9 +1700,10 @@ where
         let mut ttft_recorded = false;
         let mut parser: Option<UniversalParser> = None;
         let mut buffered: Vec<String> = Vec::new();
-        let mut accum = IrResponseAccumulator::default();
         let mut final_usage = UniversalUsage::default();
         let mut aborted = false;
+        // 上游 SSE 数据行原文（未解析），供日志全文记录与问题排查
+        let mut upstream_raw = String::new();
         let mut emitter = ClientSseEmitter::new(client, &log.id, &model_name, tool_hints.clone(), preferred_tool.clone());
 
         // 单行喂给 parser 并转发产出事件（非 data 行与 [DONE] 静默跳过）
@@ -1779,12 +1711,18 @@ where
             ($line:expr, $parser:expr) => {{
                 let line: &str = ($line).as_ref();
                 if let Some((data, false)) = parse_sse_data_line(line) {
+                    if data != "[DONE]" {
+                        if !upstream_raw.is_empty() {
+                            upstream_raw.push('\n');
+                        }
+                        upstream_raw.push_str("data: ");
+                        upstream_raw.push_str(data);
+                    }
                     for event in $parser.feed(data) {
                         if !ttft_recorded {
                             log.ttft_ms = Some(start_time.elapsed().as_millis() as u64);
                             ttft_recorded = true;
                         }
-                        accum.observe(&event);
                         if let UniversalStreamEvent::Finish { usage, .. } = &event {
                             final_usage = usage.clone();
                         }
@@ -1885,7 +1823,6 @@ where
             }
         };
         for event in events {
-            accum.observe(&event);
             if let UniversalStreamEvent::Finish { usage, .. } = &event {
                 final_usage = usage.clone();
             }
@@ -1919,7 +1856,8 @@ where
         }
         // 统一用量口径落库（input 为总量，缓存明细单列，与既有表结构一致）
         apply_usage_to_log(&mut log, &final_usage, &ctx);
-        log.response_body = accum.build_response_body();
+        // 日志记录上游 SSE 原文（未解析），便于排查协议/内容问题
+        log.response_body = super::logger::cap_log_body(upstream_raw);
 
         ctx.record_log(log).await;
     };

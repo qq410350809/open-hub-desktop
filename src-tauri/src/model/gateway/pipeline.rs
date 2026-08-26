@@ -4,7 +4,8 @@
 //! 渠道解析(404) → 模型兼容性校验(400) → 出网准备(目标协议) → 弹性调度 → 公共日志骨架。
 //! 各入口文件只负责：入参解析、客户端协议 ↔ OpenAI 中枢转换、响应回转。
 
-use super::balancer::{check_model_channel_compatibility, resolve_channel, select_channel_api_key};
+use super::balancer::{resolve_channel, select_channel_api_key};
+use super::policies::opencode::check_model_channel_compatibility;
 use super::dispatcher::{execute_resilient_egress, EgressRequestMeta, EgressSuccess};
 use super::egress::{self, TargetProtocol};
 use super::logger::{client_name_from_headers, record_attempt_failure, ProxyLogParams};
