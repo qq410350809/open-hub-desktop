@@ -704,6 +704,38 @@ export async function browserFallback<T>(
       todayTotalTokens: sum((l) => l.totalTokens),
     } as T;
   }
+  if (command === "get_channel_model_stats") {
+    const channelId = String(args.channelId ?? "");
+    const mockLogs = makeMockProxyLogs().filter((l) => l.channelId === channelId || !l.channelId);
+    const byModel = new Map<string, { totalRequests: number; failedRequests: number; durationTotal: number; promptTokens: number; completionTokens: number; totalTokens: number; lastUsedAt: string | null }>();
+    for (const l of mockLogs) {
+      const entry = byModel.get(l.model) ?? {
+        totalRequests: 0, failedRequests: 0, durationTotal: 0,
+        promptTokens: 0, completionTokens: 0, totalTokens: 0, lastUsedAt: null,
+      };
+      entry.totalRequests += 1;
+      if (l.statusCode >= 400) entry.failedRequests += 1;
+      entry.durationTotal += l.durationMs;
+      entry.promptTokens += l.promptTokens;
+      entry.completionTokens += l.completionTokens;
+      entry.totalTokens += l.totalTokens;
+      if (!entry.lastUsedAt || l.timestamp > entry.lastUsedAt) entry.lastUsedAt = l.timestamp;
+      byModel.set(l.model, entry);
+    }
+    return [...byModel.entries()].map(([model, s]) => ({
+      model,
+      totalRequests: s.totalRequests,
+      failedRequests: s.failedRequests,
+      avgDurationMs: s.durationTotal / Math.max(1, s.totalRequests),
+      avgTtftMs: null,
+      promptTokens: s.promptTokens,
+      completionTokens: s.completionTokens,
+      totalTokens: s.totalTokens,
+      lastUsedAt: s.lastUsedAt,
+      todayRequests: 0,
+      todayTokens: 0,
+    })) as T;
+  }
   // 登录相关：纯静态预览（无内核）不设门禁。
   if (command === "get_login_state") {
     return { required: false, authenticated: true, username: "" } as T;

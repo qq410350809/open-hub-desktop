@@ -14,6 +14,7 @@ import type {
   OpencodeProxyStatus,
   ProxyRequestLog,
   ChannelUsageStats,
+  ChannelModelUsageStats,
   ChannelModelList,
   GatewayOverviewStats,
 } from "./types";
@@ -224,6 +225,17 @@ export function useModelProxy() {
       }
     } catch (e) {
       console.warn("获取渠道使用统计失败:", e);
+    }
+  }
+
+  /** 「渠道 × 模型」粒度累计用量：管理可用模型弹窗行内统计展示用 */
+  async function fetchChannelModelStats(channelId: string): Promise<ChannelModelUsageStats[]> {
+    try {
+      const list = await runCommand<ChannelModelUsageStats[]>("get_channel_model_stats", { channelId });
+      return Array.isArray(list) ? list : [];
+    } catch (e) {
+      console.warn("获取模型用量统计失败:", e);
+      return [];
     }
   }
 
@@ -625,6 +637,7 @@ export function useModelProxy() {
     loadProxyData,
     refreshStatus,
     refreshChannelStats,
+    fetchChannelModelStats,
     refreshGatewayOverview,
     saveConfig,
     toggleServer,

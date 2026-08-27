@@ -1,3 +1,24 @@
+export interface KeyGroupItem {
+  id: string;
+  name: string;
+  enabled: boolean;
+}
+
+export interface ChannelKeyRule {
+  key: string;
+  groupId: string;
+  enabled: boolean;
+  supportedModels?: string[] | null;
+}
+
+/** 模型级代理出口覆盖：direct = 强制直连；pool = 代理池轮询；fixed = 固定出口节点 */
+export interface ModelProxyRule {
+  model: string;
+  mode: "direct" | "pool" | "fixed" | string;
+  /** fixed 模式下锁定的节点 ID */
+  nodeId?: string | null;
+}
+
 export interface ChannelConfig {
   id: string;
   name: string;
@@ -14,6 +35,12 @@ export interface ChannelConfig {
   enabledModels?: string[] | null;
   /** 统计维度稳定数字 ID：内置渠道占 1-100（opencode=1），动态渠道从 101 起；与别名解耦 */
   statsId?: number;
+  /** 渠道内 Key 分组优先级定义（按数组顺序由高到低进行故障转移） */
+  keyGroups?: KeyGroupItem[] | null;
+  /** 渠道中各个 Key 的详细配置与分组归属 */
+  keyRules?: ChannelKeyRule[] | null;
+  /** 模型级代理出口覆盖规则（管理可用模型弹窗内逐模型配置） */
+  modelProxyRules?: ModelProxyRule[] | null;
 }
 
 export interface OpencodeProxyConfig {
@@ -109,6 +136,22 @@ export interface ChannelUsageStats {
 export interface ChannelModelList {
   channelId: string;
   models: string[];
+}
+
+/** 「渠道 × 模型」粒度累计用量（管理可用模型弹窗行内统计） */
+export interface ChannelModelUsageStats {
+  model: string;
+  totalRequests: number;
+  failedRequests: number;
+  avgDurationMs: number;
+  avgTtftMs?: number | null;
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  /** 最近一次调用时间（YYYY-MM-DD HH:MM:SS，无调用为 null） */
+  lastUsedAt?: string | null;
+  todayRequests: number;
+  todayTokens: number;
 }
 
 /** 「日 × 全渠道」聚合数据点（后端 channel_daily_stats 跨渠道求和） */

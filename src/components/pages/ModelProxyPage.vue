@@ -10,7 +10,9 @@ import {
   filterChannelModels,
   isValidChannelAlias,
   type ChannelConfig,
+  type KeyGroupItem,
   type ChannelUsageStats,
+  type ChannelModelUsageStats,
   type GatewayDailyPoint,
   type GatewayHourlyPoint,
   type GatewayOverviewTotals,
@@ -63,6 +65,7 @@ const {
   loadProxyData,
   refreshStatus,
   refreshChannelStats,
+  fetchChannelModelStats,
   refreshGatewayOverview,
   gatewayOverview,
   copyResponsesUrl,
@@ -232,11 +235,31 @@ function closeGatewayModelsModal() {
 
 async function handleOpenChannelModelsModal(channel: ChannelConfig) {
   selectedChannel.value = channel;
+  channelModalTab.value = "models";
+  channelRawKeys.value = [];
+  channelDraftKeyGroups.value = [];
+  newKeyGroupName.value = "";
   channelModelsModalOpen.value = true;
-  // 0. 初始化重叠模型路由顺序草稿（深拷贝，避免直接改配置对象）
-  draftModelChannelOrder.value = JSON.parse(
-    JSON.stringify(proxyConfig.value.modelChannelOrder ?? {}),
-  );
+  void loadChannelKeysAndGroupsDraft(channel);
+  // 模型级代理出口覆盖草稿：从渠道既有规则初始化
+  {
+    const draft = new Map<string, { mode: ModelProxyMode; nodeId: string }>();
+    for (const r of channel.modelProxyRules ?? []) {
+      draft.set(r.model.toLowerCase(), { mode: (r.mode as ModelProxyMode) || "", nodeId: r.nodeId ?? "" });
+    }
+    modelProxyModeDraft.value = draft;
+  }
+  // 模型行内统计：异步拉取，加载完成后由 Map 响应式刷新各行
+  if (channel.id) {
+    loadingModelStats.value = true;
+    channelModelStatsMap.value = new Map();
+    void fetchChannelModelStats(channel.id).then((list) => {
+      const map = new Map<string, ChannelModelUsageStats>();
+      for (const s of list) map.set(s.model.toLowerCase(), s);
+      channelModelStatsMap.value = map;
+      loadingModelStats.value = false;
+    });
+  }
   // 1. 初始化白名单勾选草稿：白名单为 null（全部启用）时默认全选；否则仅勾选白名单中的模型
   const allow = channel.enabledModels;
   if (allow == null) {
@@ -288,8 +311,195 @@ function closeChannelModelsModal() {
   channelModelsModalOpen.value = false;
   channelDraftModels.value = [];
   channelModelSelection.value = {};
-  draftModelChannelOrder.value = {};
+  channelModelStatsMap.value = new Map();
+  modelProxyModeDraft.value = new Map();
   fetchingDraftModels.value = false;
+}
+
+// —— 渠道「管理模型」弹窗：双视图 Tab 与 Key 分组管理 ——
+const channelModalTab = ref<"models" | "keys">("models");
+
+interface ChannelKeyDetailItem {
+  key: string;
+  accountLabel: string;
+  profileName: string;
+  groupId: string;
+  enabled: boolean;
+  supportedModels?: string[] | null;
+}
+
+const channelRawKeys = ref<ChannelKeyDetailItem[]>([]);
+const channelDraftKeyGroups = ref<KeyGroupItem[]>([]);
+const newKeyGroupName = ref("");
+
+/** 获取某 Key 的脱敏显示 */
+function maskKeyStr(key: string): string {
+  const value = key.trim();
+  if (!value) return "—";
+  if (value.length <= 8) return "••••••••";
+  const prefix = value.startsWith("sk-") ? 7 : 4;
+  const suffix = Math.min(4, Math.max(2, Math.floor(value.length / 8)));
+  return `${value.slice(0, prefix)}••••••••${value.slice(-suffix)}`;
+}
+
+/** 为渠道初始化分组与 Key 列表 */
+async function loadChannelKeysAndGroupsDraft(channel: ChannelConfig) {
+  channelDraftKeyGroups.value = (channel.keyGroups ?? []).map((g: KeyGroupItem) => ({ ...g }));
+  if (channelDraftKeyGroups.value.length === 0) {
+    channelDraftKeyGroups.value = [
+      { id: "primary", name: "主力组", enabled: true },
+      { id: "backup", name: "备用组", enabled: true },
+    ];
+  }
+
+  const keysList: ChannelKeyDetailItem[] = [];
+  const seenKeys = new Set<string>();
+
+  if (channel.siteId) {
+    try {
+      const cache = await runCommand<{
+        accounts?: Array<{
+          profileName?: string;
+          accountName?: string;
+          username?: string;
+          keys?: string[];
+          keyGroups?: Record<string, string>;
+          keyModels?: Record<string, Array<{ id: string }>>;
+        }>;
+      }>("get_site_model_cache", { siteId: channel.siteId });
+
+      for (const acc of cache?.accounts ?? []) {
+        const accLabel = acc.username || acc.accountName || acc.profileName || "站点账号";
+        const profName = acc.profileName || "";
+        for (const k of acc.keys ?? []) {
+          const trimmed = k.trim();
+          if (trimmed && !seenKeys.has(trimmed)) {
+            seenKeys.add(trimmed);
+            const rawGroup = acc.keyGroups?.[trimmed]?.trim();
+            const models = acc.keyModels?.[trimmed]?.map((m) => m.id);
+            keysList.push({
+              key: trimmed,
+              accountLabel: accLabel,
+              profileName: profName,
+              groupId: rawGroup || "primary",
+              enabled: true,
+              supportedModels: models && models.length > 0 ? models : null,
+            });
+          }
+        }
+      }
+    } catch {
+      /* 忽略缓存读取错误 */
+    }
+  }
+
+  // 融合自定义渠道的静态 Keys
+  const staticKeys = channel.apiKeys?.length
+    ? channel.apiKeys
+    : channel.apiKey?.trim()
+      ? [channel.apiKey]
+      : [];
+  for (const k of staticKeys) {
+    const trimmed = k.trim();
+    if (trimmed && !seenKeys.has(trimmed)) {
+      seenKeys.add(trimmed);
+      keysList.push({
+        key: trimmed,
+        accountLabel: "手动配置",
+        profileName: "",
+        groupId: "primary",
+        enabled: true,
+        supportedModels: null,
+      });
+    }
+  }
+
+  // 融合已有渠道配置中的 Key 规则
+  if (channel.keyRules) {
+    for (const rule of channel.keyRules) {
+      const existing = keysList.find((k) => k.key === rule.key);
+      if (existing) {
+        if (rule.groupId) existing.groupId = rule.groupId;
+        existing.enabled = rule.enabled;
+        if (rule.supportedModels) existing.supportedModels = rule.supportedModels;
+      }
+    }
+  }
+
+  // 确保所有 Key 的 groupId 都存在于 channelDraftKeyGroups
+  for (const k of keysList) {
+    if (!channelDraftKeyGroups.value.some((g: KeyGroupItem) => g.id === k.groupId)) {
+      channelDraftKeyGroups.value.push({
+        id: k.groupId,
+        name: k.groupId === "primary" ? "主力组" : k.groupId === "backup" ? "备用组" : k.groupId,
+        enabled: true,
+      });
+    }
+  }
+
+  channelRawKeys.value = keysList;
+
+  // 渠道未配置任何 Key 时不保留分组（分组调度仅对有 Key 的渠道有意义）
+  if (keysList.length === 0) {
+    channelDraftKeyGroups.value = [];
+  }
+}
+
+/** 分组操作：添加新分组 */
+function addKeyGroup() {
+  const name = newKeyGroupName.value.trim();
+  if (!name) return;
+  const id = `grp_${Date.now().toString(36)}`;
+  channelDraftKeyGroups.value.push({ id, name, enabled: true });
+  newKeyGroupName.value = "";
+}
+
+/** 分组操作：上移/下移优先级 */
+function moveKeyGroup(groupId: string, dir: -1 | 1) {
+  const idx = channelDraftKeyGroups.value.findIndex((g) => g.id === groupId);
+  const target = idx + dir;
+  if (idx < 0 || target < 0 || target >= channelDraftKeyGroups.value.length) return;
+  const list = [...channelDraftKeyGroups.value];
+  [list[idx], list[target]] = [list[target], list[idx]];
+  channelDraftKeyGroups.value = list;
+}
+
+/** 分组操作：删除分组（将组内 Key 迁移到首个可用分组） */
+function deleteKeyGroup(groupId: string) {
+  if (channelDraftKeyGroups.value.length <= 1) {
+    showToast("至少保留一个分组", true);
+    return;
+  }
+  channelDraftKeyGroups.value = channelDraftKeyGroups.value.filter((g: KeyGroupItem) => g.id !== groupId);
+  const fallbackGroupId = channelDraftKeyGroups.value[0]?.id || "primary";
+  for (const k of channelRawKeys.value) {
+    if (k.groupId === groupId) {
+      k.groupId = fallbackGroupId;
+    }
+  }
+}
+
+/** 获取某个分组内的所有 Keys */
+function keysInGroup(groupId: string): ChannelKeyDetailItem[] {
+  return channelRawKeys.value.filter((k) => k.groupId === groupId);
+}
+
+/** Key 操作：组内上移/下移 */
+function moveKeyInGroup(keyStr: string, dir: -1 | 1) {
+  const item = channelRawKeys.value.find((k) => k.key === keyStr);
+  if (!item) return;
+  const groupKeys = keysInGroup(item.groupId);
+  const idx = groupKeys.findIndex((k) => k.key === keyStr);
+  const target = idx + dir;
+  if (idx < 0 || target < 0 || target >= groupKeys.length) return;
+  const otherKey = groupKeys[target].key;
+  const idxA = channelRawKeys.value.findIndex((k) => k.key === keyStr);
+  const idxB = channelRawKeys.value.findIndex((k) => k.key === otherKey);
+  if (idxA >= 0 && idxB >= 0) {
+    const list = [...channelRawKeys.value];
+    [list[idxA], list[idxB]] = [list[idxB], list[idxA]];
+    channelRawKeys.value = list;
+  }
 }
 
 // —— 渠道「管理模型」弹窗：草稿模型列表与勾选启用白名单 ——
@@ -298,6 +508,107 @@ const fetchingDraftModels = ref(false);
 const channelModelSelection = ref<Record<string, boolean>>({});
 /** true = 全选模式（等价未配置白名单，对外全部启用） */
 const channelModelAllChecked = ref(true);
+
+// 模型行内统计：channel_daily_stats + 明细日志聚合（打开弹窗时拉取一次）
+const channelModelStatsMap = ref<Map<string, ChannelModelUsageStats>>(new Map());
+const loadingModelStats = ref(false);
+
+// 模型级代理出口覆盖草稿：model(小写) → 规则；无条目 = 跟随渠道级配置
+type ModelProxyMode = "" | "direct" | "pool" | "fixed";
+const modelProxyModeDraft = ref<Map<string, { mode: ModelProxyMode; nodeId: string }>>(new Map());
+
+/** 某模型当前生效的代理模式（草稿优先，无草稿回退渠道级配置推导） */
+function effectiveProxyMode(model: string): ModelProxyMode | "inherit" {
+  const key = model.toLowerCase();
+  const draft = modelProxyModeDraft.value.get(key);
+  if (draft && draft.mode) return draft.mode;
+  const ch = selectedChannel.value;
+  if (!ch) return "inherit";
+  const rule = ch.modelProxyRules?.find((r) => r.model.toLowerCase() === key);
+  if (rule) return (rule.mode as ModelProxyMode) || "inherit";
+  // 渠道级配置推导
+  if (ch.useFixedProxy) return "fixed";
+  if (ch.useProxyPool) return "pool";
+  return "direct";
+}
+
+/** 渠道级配置的推导描述（用于下拉「跟随渠道」的提示文案） */
+const channelLevelProxyLabel = computed(() => {
+  const ch = selectedChannel.value;
+  if (!ch) return "";
+  if (ch.useFixedProxy) return "渠道级：固定通道";
+  if (ch.useProxyPool) return "渠道级：代理池轮询";
+  return "渠道级：直连";
+});
+
+/** 渠道级配置推导出的代理模式（用于「与渠道不同」角标判断） */
+function effectiveChannelProxyMode(): Exclude<ModelProxyMode, ""> {
+  const ch = selectedChannel.value;
+  if (!ch) return "direct";
+  if (ch.useFixedProxy) return "fixed";
+  if (ch.useProxyPool) return "pool";
+  return "direct";
+}
+
+function setModelProxyMode(model: string, mode: ModelProxyMode) {
+  const key = model.toLowerCase();
+  if (!mode) {
+    // 切回「跟随渠道」：清掉该模型的草稿与既有规则（保存时落库为无覆盖）
+    modelProxyModeDraft.value.delete(key);
+    modelProxyModeDraft.value = new Map(modelProxyModeDraft.value);
+    return;
+  }
+  const existing = modelProxyModeDraft.value.get(key);
+  modelProxyModeDraft.value.set(key, { mode, nodeId: existing?.nodeId ?? "" });
+  modelProxyModeDraft.value = new Map(modelProxyModeDraft.value);
+}
+
+/** 模型行的 Key 专属限制：仅统计显式配置了 supportedModels 的 Key，返回该模型命中的 Key 数；-1 表示不适用 */
+function keySupportCountFor(model: string): number {
+  const keys = channelRawKeys.value;
+  if (keys.length === 0) return -1;
+  let hits = 0;
+  for (const k of keys) {
+    if (!k.supportedModels?.length) continue;
+    if (k.supportedModels.some((m) => m.toLowerCase() === model.toLowerCase())) hits += 1;
+  }
+  return hits;
+}
+
+/** 是否所有含专属限制的 Key 都支持该模型（无限制 Key 存在时视为自由） */
+function isModelFreeForAllKeys(model: string): boolean {
+  const restricted = channelRawKeys.value.filter((k) => k.supportedModels?.length);
+  if (restricted.length === 0) return true;
+  return restricted.every(
+    (k) => k.supportedModels!.some((m) => m.toLowerCase() === model.toLowerCase()),
+  );
+}
+
+/** Token 数格式化：12.3k / 4.5M / 860 */
+function fmtCompactTokens(n?: number | null): string {
+  if (!n || n <= 0) return "0";
+  if (n >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(1)}B`;
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
+  return String(n);
+}
+
+/** 最近使用时间的人性化展示：刚刚/N 分钟前/N 小时前/昨天/N 天前/具体日期 */
+function fmtLastUsed(ts?: string | null): string {
+  if (!ts) return "从未调用";
+  const t = new Date(ts.replace(" ", "T"));
+  if (Number.isNaN(t.getTime())) return ts;
+  const diffMs = Date.now() - t.getTime();
+  const min = Math.floor(diffMs / 60_000);
+  if (min < 1) return "刚刚";
+  if (min < 60) return `${min} 分钟前`;
+  const hour = Math.floor(min / 60);
+  if (hour < 24) return `${hour} 小时前`;
+  const day = Math.floor(hour / 24);
+  if (day === 1) return "昨天";
+  if (day < 30) return `${day} 天前`;
+  return ts.slice(0, 10);
+}
 
 function isModelChecked(model: string): boolean {
   if (channelModelAllChecked.value) return true;
@@ -362,56 +673,6 @@ const channelOverlapByModel = computed<Map<string, ChannelConfig[]>>(() => {
   return overlaps;
 });
 
-/** 弹窗内排序草稿：model(小写) → 渠道 ID 有序列表 */
-const draftModelChannelOrder = ref<Record<string, string[]>>({});
-
-/**
- * 指定模型的候选渠道有序视图：已保存顺序在前，当前发现的其它提供渠道按发现序追加，
- * 已失效（禁用/不再提供）的渠道剔除。不足 2 个渠道时返回空。
- */
-function orderedOverlapChannelsFor(model: string): ChannelConfig[] {
-  const discovered = channelOverlapByModel.value.get(model.toLowerCase()) ?? [];
-  if (discovered.length < 2) return [];
-  const savedIds = draftModelChannelOrder.value[model.toLowerCase()] ?? [];
-  const saved = savedIds
-    .map((id) => discovered.find((c) => c.id === id))
-    .filter((c): c is ChannelConfig => !!c);
-  const rest = discovered.filter((c) => !savedIds.includes(c.id));
-  return [...saved, ...rest];
-}
-
-/** 上移/下移：基于「全量候选」重写该模型的草稿顺序 */
-function moveOverlapChannel(model: string, channelId: string, dir: -1 | 1) {
-  const key = model.toLowerCase();
-  const full = orderedOverlapChannelsFor(model);
-  const idx = full.findIndex((c) => c.id === channelId);
-  const target = idx + dir;
-  if (idx < 0 || target < 0 || target >= full.length) return;
-  const next = [...full];
-  [next[idx], next[target]] = [next[target], next[idx]];
-  draftModelChannelOrder.value = { ...draftModelChannelOrder.value, [key]: next.map((c) => c.id) };
-}
-
-/** 仅当用户对该模型调整过顺序（与发现顺序不同）才视为有效配置 */
-function isOverlapOrderCustomized(model: string): boolean {
-  const key = model.toLowerCase();
-  const saved = draftModelChannelOrder.value[key];
-  if (!saved?.length) return false;
-  const ids = orderedOverlapChannelsFor(model).map((c) => c.id);
-  if (saved.length !== ids.length) return false;
-  return ids.some((id, i) => id !== saved[i]);
-}
-
-/** 当前弹窗渠道参与共同提供的模型列表（排序区块数据源，保留渠道侧原始大小写写法） */
-const modalOverlapModels = computed(() => {
-  if (!selectedChannel.value) return [];
-  const visible = filterChannelModels(
-    selectedChannel.value,
-    modelsForChannel(selectedChannel.value.id),
-  );
-  return visible.filter((m) => channelOverlapByModel.value.has(m.toLowerCase()));
-});
-
 async function refreshChannelDraftModels() {
   const channel = selectedChannel.value;
   if (!channel) return;
@@ -455,21 +716,40 @@ async function saveChannelModelSelection() {
     channel.enabledModels = selectedChannelModels().filter((m) => isModelChecked(m));
   }
 
-  // 3. 合并重叠模型路由顺序草稿：保留其它模型的既有配置，当前弹窗内调过序的模型以草稿为准
-  const mergedOrder: Record<string, string[]> = {
-    ...(proxyConfig.value.modelChannelOrder ?? {}),
-  };
-  for (const [model, order] of Object.entries(draftModelChannelOrder.value)) {
-    const channels = orderedOverlapChannelsFor(model);
-    // 候选不足 2 个或从未调整顺序的条目不落库
-    if (channels.length >= 2 && isOverlapOrderCustomized(model)) {
-      mergedOrder[model] = order.filter((id) => channels.some((c) => c.id === id));
-    } else {
-      delete mergedOrder[model];
-    }
+  // 3. 保存该渠道的 Key 分组与规则设置（无 Key 的渠道不落库任何分组配置）
+  if (channelRawKeys.value.length > 0) {
+    channel.keyGroups = channelDraftKeyGroups.value.map((g: KeyGroupItem) => ({
+      id: g.id.trim(),
+      name: g.name.trim() || g.id.trim(),
+      enabled: g.enabled,
+    }));
+    channel.keyRules = channelRawKeys.value.map((k) => ({
+      key: k.key,
+      groupId: k.groupId,
+      enabled: k.enabled,
+      supportedModels: k.supportedModels,
+    }));
   }
-  proxyConfig.value.modelChannelOrder =
-    Object.keys(mergedOrder).length > 0 ? mergedOrder : null;
+
+  // 3.5 模型级代理出口覆盖：本弹窗内出现过的模型以草稿为准（无草稿 = 移除覆盖），
+  // 其余模型的既有规则原样保留；空列表归一为 null
+  {
+    const draft = modelProxyModeDraft.value;
+    const kept = (channel.modelProxyRules ?? []).filter(
+      (r) => !draft.has(r.model.toLowerCase()),
+    );
+    const added = selectedChannelModels().flatMap((m) => {
+      const d = draft.get(m.toLowerCase());
+      if (!d?.mode) return [];
+      return [{
+        model: m,
+        mode: d.mode,
+        nodeId: d.mode === "fixed" && d.nodeId.trim() ? d.nodeId.trim() : null,
+      }];
+    });
+    const merged = [...kept, ...added];
+    channel.modelProxyRules = merged.length > 0 ? merged : null;
+  }
 
   // 4. 只有内部保存时才触发全局「可用模型」加载状态
   fetchingModels.value = true;
@@ -1595,12 +1875,26 @@ const availableModelsCount = computed(() => {
   return proxyConfig.value.channels.reduce((acc, c) => acc + channelEnabledModelsCount(c), 0);
 });
 
+/** 模型列表排序：discovery = 上游顺序；usage = 按累计调用量降序 */
+const channelModelSortMode = ref<"discovery" | "usage">("discovery");
+/** 仅看已启用的模型 */
+const channelModelEnabledOnly = ref(false);
+
 const filteredChannelModels = computed(() => {
   const q = channelSearchQuery.value.trim().toLowerCase();
-  const list = selectedChannelModels();
   const alias = channelAlias(selectedChannel.value);
-  if (!q) return list;
-  return list.filter((m) => m.toLowerCase().includes(q) || `${alias}/${m}`.toLowerCase().includes(q));
+  let list = selectedChannelModels();
+  if (q) list = list.filter((m) => m.toLowerCase().includes(q) || `${alias}/${m}`.toLowerCase().includes(q));
+  if (channelModelEnabledOnly.value) {
+    list = list.filter((m) => isModelChecked(m));
+  }
+  if (channelModelSortMode.value === "usage") {
+    const stats = channelModelStatsMap.value;
+    return [...list].sort(
+      (a, b) => (stats.get(b.toLowerCase())?.totalRequests ?? 0) - (stats.get(a.toLowerCase())?.totalRequests ?? 0),
+    );
+  }
+  return list;
 });
 
 /** 当前页数据：筛选/搜索/排序已由后端 SQL 处理，前端仅透传展示 */
@@ -3352,145 +3646,368 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
         </div>
 
         <div class="mp-modal-body">
-          <div class="mp-models-modal-toolbar">
-            <div class="mp-search-box flex-1">
-              <span class="mp-search-icon" v-html="icons.search" />
-              <input
-                v-model="channelSearchQuery"
-                type="search"
-                placeholder="搜索此渠道下的模型 (如 deepseek, nemotron, mimo, laguna)…"
-                class="mp-search-input-lg"
-              />
-              <button
-                v-if="channelSearchQuery"
-                type="button"
-                class="mp-search-clear-btn"
-                title="清空搜索"
-                @click="channelSearchQuery = ''"
-              >
-                <span v-html="icons.close" />
-              </button>
-            </div>
+          <!-- 弹窗内部 Tab 切换（渠道未配置任何 Key 时不提供分组调度操作） -->
+          <div v-if="channelRawKeys.length > 0" class="mp-inner-tab-nav">
             <button
               type="button"
-              class="mp-btn mp-btn-ghost"
-              :class="{ 'is-active': channelModelAllChecked }"
-              title="勾选全部模型（对外暴露全部）"
-              @click="selectAllChannelModels"
+              class="mp-inner-tab-btn"
+              :class="{ active: channelModalTab === 'models' }"
+              @click="channelModalTab = 'models'"
             >
-              <span v-html="icons.check" />
-              <span>全选</span>
+              <span v-html="icons.cpu" />
+              <span>可用模型管理</span>
+              <span class="mp-inner-tab-badge font-mono">{{ channelCheckedCount }}/{{ selectedChannelModels().length }}</span>
             </button>
             <button
               type="button"
-              class="mp-btn mp-btn-ghost"
-              :class="{ 'is-active': !channelModelAllChecked && channelCheckedCount === 0 }"
-              title="取消全部勾选（不对外暴露任何模型）"
-              @click="clearChannelModels"
+              class="mp-inner-tab-btn"
+              :class="{ active: channelModalTab === 'keys' }"
+              @click="channelModalTab = 'keys'"
             >
-              <span v-html="icons.close" />
-              <span>清空</span>
-            </button>
-            <button
-              type="button"
-              class="mp-btn mp-btn-ghost"
-              :disabled="fetchingDraftModels"
-              title="从该上游渠道重新获取模型列表"
-              @click="refreshChannelDraftModels"
-            >
-              <span :class="{ 'mp-spin': fetchingDraftModels }" v-html="icons.restore" />
-              <span>{{ fetchingDraftModels ? "正在拉取…" : "刷新上游模型" }}</span>
+              <span v-html="icons.key" />
+              <span>Key 分组与轮询调度</span>
+              <span class="mp-inner-tab-badge font-mono">{{ channelRawKeys.length }} Key · {{ channelDraftKeyGroups.length }} 组</span>
             </button>
           </div>
 
-          <!-- 多渠道共同提供的模型：路由顺序调整 -->
-          <div
-            v-if="modalOverlapModels.length > 0"
-            class="mp-overlap-block"
-          >
-            <div class="mp-overlap-head">
-              <span class="mp-overlap-title">多渠道共同提供的模型</span>
-              <small class="text-muted">同名模型由多个渠道提供时，排前的渠道优先承接无前缀调用 · 改动随本次保存生效</small>
+          <!-- 视图 1: 模型管理与重叠模型优先级 -->
+          <template v-if="channelModalTab === 'models'">
+            <div class="mp-models-modal-toolbar">
+              <div class="mp-search-box flex-1">
+                <span class="mp-search-icon" v-html="icons.search" />
+                <input
+                  v-model="channelSearchQuery"
+                  type="search"
+                  placeholder="搜索此渠道下的模型 (如 deepseek, nemotron, mimo, laguna)…"
+                  class="mp-search-input-lg"
+                />
+                <button
+                  v-if="channelSearchQuery"
+                  type="button"
+                  class="mp-search-clear-btn"
+                  title="清空搜索"
+                  @click="channelSearchQuery = ''"
+                >
+                  <span v-html="icons.close" />
+                </button>
+              </div>
+              <button
+                type="button"
+                class="mp-btn mp-btn-ghost"
+                :class="{ 'is-active': channelModelAllChecked }"
+                title="勾选全部模型（对外暴露全部）"
+                @click="selectAllChannelModels"
+              >
+                <span v-html="icons.check" />
+                <span>全选</span>
+              </button>
+              <button
+                type="button"
+                class="mp-btn mp-btn-ghost"
+                :class="{ 'is-active': !channelModelAllChecked && channelCheckedCount === 0 }"
+                title="取消全部勾选（不对外暴露任何模型）"
+                @click="clearChannelModels"
+              >
+                <span v-html="icons.close" />
+                <span>清空</span>
+              </button>
+              <button
+                type="button"
+                class="mp-btn mp-btn-ghost"
+                :disabled="fetchingDraftModels"
+                title="从该上游渠道重新获取模型列表"
+                @click="refreshChannelDraftModels"
+              >
+                <span :class="{ 'mp-spin': fetchingDraftModels }" v-html="icons.restore" />
+                <span>{{ fetchingDraftModels ? "正在拉取…" : "刷新上游模型" }}</span>
+              </button>
+              <label class="mp-toolbar-switch" title="只显示已勾选启用的模型">
+                <input v-model="channelModelEnabledOnly" type="checkbox" />
+                <span>仅看已启用</span>
+              </label>
+              <div class="mp-toolbar-sort">
+                <select v-model="channelModelSortMode" class="mp-sort-select" title="列表排序方式">
+                  <option value="discovery">上游顺序</option>
+                  <option value="usage">按调用量</option>
+                </select>
+              </div>
             </div>
+
+            <!-- 可勾选的模型列表：卡片行 = 勾选框 + 名称/状态 + 用量统计 + 调用 ID 复制 -->
             <div class="mp-model-check-list">
               <div
-                v-for="model in modalOverlapModels"
+                v-for="model in filteredChannelModels"
                 :key="model"
-                class="mp-overlap-item"
+                class="mp-mcm-card"
+                :class="{ 'is-selected': isModelChecked(model) }"
+                role="checkbox"
+                :aria-checked="isModelChecked(model)"
+                :tabindex="0"
+                @click="toggleModel(model)"
+                @keydown.enter.space.prevent="toggleModel(model)"
               >
-                <code class="mp-overlap-model font-mono">{{ model }}</code>
-                <div class="mp-overlap-channels">
-                  <span
-                    v-for="(ch, idx) in orderedOverlapChannelsFor(model)"
-                    :key="ch.id"
-                    class="mp-overlap-channel-chip"
-                    :class="{ 'is-top': idx === 0 }"
-                  >
-                    <span v-if="idx === 0" class="mp-chip-priority-tag">优先</span>
+                <span class="mp-mec-check" aria-hidden="true">
+                  <span v-html="isModelChecked(model) ? icons.check : ''" />
+                </span>
+
+                <!-- 主体：模型名 + 启用状态 + Key 专属提示 -->
+                <div class="mp-mcm-main">
+                  <div class="mp-mcm-title-row">
+                    <span class="mp-model-name-title">{{ model }}</span>
+                    <span class="mp-status-pill mp-status-pill-xs" :class="{ active: isModelChecked(model) }">
+                      <span class="mp-status-dot" />
+                      <span>{{ isModelChecked(model) ? '已启用' : '未启用' }}</span>
+                    </span>
                     <span
-                      class="mp-chip-name"
-                      :title="idx === 0 ? `当前优先渠道：${ch.name}` : `第 ${idx + 1} 顺位：${ch.name}`"
-                    >{{ channelAlias(ch) }}</span>
+                      v-if="channelModelStatsMap.get(model.toLowerCase())?.todayRequests"
+                      class="mp-mcm-today-chip font-mono"
+                      :title="`今日已调用 ${channelModelStatsMap.get(model.toLowerCase())!.todayRequests} 次 / ${fmtCompactTokens(channelModelStatsMap.get(model.toLowerCase())!.todayTokens)} tokens`"
+                    >今日 {{ channelModelStatsMap.get(model.toLowerCase())!.todayRequests }} 次</span>
+                  </div>
+                  <code class="mp-mcm-id-code font-mono" :title="'点击复制调用 ID'" @click.stop="selectedChannel && copyModel(model, selectedChannel)">
+                    {{ channelAlias(selectedChannel) }}/{{ model }}
+                    <span class="mp-mcm-copy-icon" v-html="copiedModelId === model ? icons.check : icons.copy" />
+                    <span v-if="copiedModelId === model" class="mp-mcm-copy-ok">已复制</span>
+                  </code>
+                </div>
+
+                <!-- 右侧用量统计区 -->
+                <div class="mp-mcm-stats">
+                  <template v-if="channelModelStatsMap.get(model.toLowerCase())">
+                    <div class="mp-mcm-stat" title="累计调用次数（含失败）">
+                      <span class="mp-mcm-stat-val font-mono">{{ channelModelStatsMap.get(model.toLowerCase())!.totalRequests }}</span>
+                      <span class="mp-mcm-stat-label">次调用</span>
+                    </div>
+                    <div
+                      class="mp-mcm-stat"
+                      :class="{ 'is-bad': channelModelStatsMap.get(model.toLowerCase())!.failedRequests > 0 }"
+                      :title="`失败 ${channelModelStatsMap.get(model.toLowerCase())!.failedRequests} 次，成功率 ${
+                        channelModelStatsMap.get(model.toLowerCase())!.totalRequests
+                          ? Math.round((1 - channelModelStatsMap.get(model.toLowerCase())!.failedRequests / channelModelStatsMap.get(model.toLowerCase())!.totalRequests) * 100)
+                          : 100
+                      }%`"
+                    >
+                      <span class="mp-mcm-stat-val font-mono">{{ fmtCompactTokens(channelModelStatsMap.get(model.toLowerCase())!.totalTokens) }}</span>
+                      <span class="mp-mcm-stat-label">tokens</span>
+                    </div>
+                    <div class="mp-mcm-stat" title="平均响应耗时（含首字）">
+                      <span class="mp-mcm-stat-val font-mono">{{ formatSec(channelModelStatsMap.get(model.toLowerCase())!.avgDurationMs) }}</span>
+                      <span class="mp-mcm-stat-label">均耗</span>
+                    </div>
+                    <div class="mp-mcm-stat mp-mcm-stat-wide" title="最近一次调用时间">
+                      <span class="mp-mcm-stat-val">{{ fmtLastUsed(channelModelStatsMap.get(model.toLowerCase())!.lastUsedAt) }}</span>
+                      <span class="mp-mcm-stat-label">最近使用</span>
+                    </div>
+                  </template>
+                  <template v-else>
+                    <div class="mp-mcm-stat mp-mcm-stat-empty">
+                      <span
+                        class="mp-mcm-stat-label"
+                        :class="{ 'mp-spin-icon': loadingModelStats }"
+                      >{{ loadingModelStats ? '统计加载中…' : '暂无调用记录' }}</span>
+                    </div>
+                  </template>
+                </div>
+
+                <!-- 底部第四行：Key 专属限制提示 -->
+                <span
+                  v-if="keySupportCountFor(model) >= 0 && !isModelFreeForAllKeys(model)"
+                  class="mp-kg-model-tag mp-mcm-key-tag"
+                  :title="`该渠道有专属 Key 限制：仅 ${keySupportCountFor(model)} 个 Key 支持此模型，调度时可能受 Key 分组配置影响`"
+                >Key 专属 · {{ keySupportCountFor(model) }}</span>
+
+                <!-- 行尾：该模型的代理出口策略（默认跟随渠道级配置） -->
+                <div class="mp-mcm-proxy" @click.stop>
+                  <span
+                    class="mp-mcm-proxy-label"
+                    :title="`出网代理策略：默认${channelLevelProxyLabel}；可为本模型单独指定`"
+                  >代理</span>
+                  <select
+                    class="mp-mcm-proxy-select"
+                    :value="effectiveProxyMode(model)"
+                    title="为本模型单独选择出网代理策略"
+                    @change="setModelProxyMode(model, ($event.target as HTMLSelectElement).value as ModelProxyMode)"
+                  >
+                    <option value="inherit">跟随渠道</option>
+                    <option value="direct">强制直连</option>
+                    <option value="pool">代理池</option>
+                    <option value="fixed">固定节点</option>
+                  </select>
+                  <span
+                    v-if="effectiveProxyMode(model) !== 'inherit' && effectiveProxyMode(model) !== effectiveChannelProxyMode()"
+                    class="mp-mcm-proxy-dot"
+                    title="本模型代理策略与渠道级配置不同"
+                  />
+                </div>
+              </div>
+            </div>
+
+            <div v-if="filteredChannelModels.length === 0" class="mp-empty-box">
+              <div class="mp-empty-icon" v-html="icons.shield" />
+              <p v-if="fetchingDraftModels">正在从上游渠道拉取最新模型…</p>
+              <p v-else-if="channelSearchQuery">未检索到匹配的模型</p>
+              <p v-else>暂无模型数据，请先点击「刷新上游模型」</p>
+            </div>
+          </template>
+
+          <!-- 视图 2: Key 分组调度与故障转移 -->
+          <template v-else>
+            <div class="mp-key-groups-toolbar">
+              <div class="mp-kg-intro text-xs text-muted">
+                <span>💡 <strong>调度策略</strong>：同组内 Key 循环轮询；前一组 Key 全部请求失败时，自动平滑切换到下一优先级分组重试。</span>
+              </div>
+              <div class="mp-add-group-form">
+                <input
+                  v-model="newKeyGroupName"
+                  type="text"
+                  placeholder="新分组名称（如 备用通道2）"
+                  class="mp-add-group-input"
+                  @keydown.enter.prevent="addKeyGroup"
+                />
+                <button
+                  type="button"
+                  class="mp-btn mp-btn-primary mp-btn-sm"
+                  :disabled="!newKeyGroupName.trim()"
+                  @click="addKeyGroup"
+                >
+                  <span v-html="icons.plus" />
+                  <span>添加分组</span>
+                </button>
+              </div>
+            </div>
+
+            <div class="mp-key-groups-container">
+              <div
+                v-for="(grp, gIdx) in channelDraftKeyGroups"
+                :key="grp.id"
+                class="mp-key-group-card"
+                :class="{ 'is-disabled': !grp.enabled }"
+              >
+                <!-- 分组头部 -->
+                <div class="mp-key-group-head">
+                  <div class="mp-kg-head-left">
+                    <span class="mp-kg-priority-badge font-mono" :class="{ 'is-top': gIdx === 0 }">
+                      #{{ gIdx + 1 }} {{ gIdx === 0 ? "主力优先" : "故障后备" }}
+                    </span>
+                    <input
+                      v-model="grp.name"
+                      type="text"
+                      class="mp-kg-name-input"
+                      title="点击直接修改分组名称"
+                    />
+                    <span class="mp-group-count-badge font-mono">{{ keysInGroup(grp.id).length }} 个 Key</span>
+                  </div>
+
+                  <div class="mp-kg-head-actions">
                     <button
                       type="button"
                       class="mp-reorder-btn"
-                      :disabled="idx === 0"
-                      title="上移（提高优先级）"
-                      @click="moveOverlapChannel(model, ch.id, -1)"
+                      :disabled="gIdx === 0"
+                      title="提升该分组优先级"
+                      @click="moveKeyGroup(grp.id, -1)"
                     >
                       <span v-html="icons.arrowUp" />
                     </button>
                     <button
                       type="button"
-                      class="mp-reorder-btn mp-reorder-down"
-                      :disabled="idx === orderedOverlapChannelsFor(model).length - 1"
-                      title="下移（降低优先级）"
-                      @click="moveOverlapChannel(model, ch.id, 1)"
+                      class="mp-reorder-btn"
+                      :disabled="gIdx === channelDraftKeyGroups.length - 1"
+                      title="降低该分组优先级"
+                      @click="moveKeyGroup(grp.id, 1)"
                     >
                       <span style="transform: rotate(180deg); display: inline-flex;" v-html="icons.arrowUp" />
                     </button>
-                  </span>
+                    <button
+                      type="button"
+                      class="mp-reorder-btn text-danger"
+                      title="删除该分组（组内 Key 将归入首个可用组）"
+                      @click="deleteKeyGroup(grp.id)"
+                    >
+                      <span v-html="icons.trash" />
+                    </button>
+                    <label class="mp-switch-wrap" :title="grp.enabled ? '点击禁用该分组' : '点击启用该分组'">
+                      <input
+                        v-model="grp.enabled"
+                        type="checkbox"
+                      />
+                      <span class="mp-switch-round" />
+                    </label>
+                  </div>
+                </div>
+
+                <!-- 分组内部 Key 列表 -->
+                <div class="mp-kg-keys-list">
+                  <div
+                    v-for="(kItem, kIdx) in keysInGroup(grp.id)"
+                    :key="kItem.key"
+                    class="mp-kg-key-row"
+                    :class="{ 'is-disabled': !kItem.enabled }"
+                  >
+                    <div class="mp-kg-key-main">
+                      <span class="mp-kg-key-acc">{{ kItem.accountLabel }}</span>
+                      <code class="mp-kg-key-code font-mono">{{ maskKeyStr(kItem.key) }}</code>
+                      <span
+                        v-if="kItem.supportedModels?.length"
+                        class="mp-kg-model-tag"
+                        :title="`该 Key 仅支持：${kItem.supportedModels.join(', ')}`"
+                      >专属 {{ kItem.supportedModels.length }} 模型</span>
+                      <span v-else class="mp-kg-model-tag is-all">全量模型</span>
+                    </div>
+
+                    <div class="mp-kg-key-controls">
+                      <!-- 移动所属分组下拉框 -->
+                      <select
+                        v-model="kItem.groupId"
+                        class="mp-kg-group-select"
+                        title="变更该 Key 所属分组"
+                      >
+                        <option
+                          v-for="targetGrp in channelDraftKeyGroups"
+                          :key="targetGrp.id"
+                          :value="targetGrp.id"
+                        >
+                          移动至 {{ targetGrp.name }}
+                        </option>
+                      </select>
+
+                      <!-- 组内排序按钮 -->
+                      <button
+                        type="button"
+                        class="mp-reorder-btn"
+                        :disabled="kIdx === 0"
+                        title="组内上移（优先轮询）"
+                        @click="moveKeyInGroup(kItem.key, -1)"
+                      >
+                        <span v-html="icons.arrowUp" />
+                      </button>
+                      <button
+                        type="button"
+                        class="mp-reorder-btn"
+                        :disabled="kIdx === keysInGroup(grp.id).length - 1"
+                        title="组内下移"
+                        @click="moveKeyInGroup(kItem.key, 1)"
+                      >
+                        <span style="transform: rotate(180deg); display: inline-flex;" v-html="icons.arrowUp" />
+                      </button>
+
+                      <!-- 单 Key 启用/禁用开关 -->
+                      <label class="mp-switch-wrap" :title="kItem.enabled ? '点击禁用此 Key' : '点击启用此 Key'">
+                        <input
+                          v-model="kItem.enabled"
+                          type="checkbox"
+                        />
+                        <span class="mp-switch-round" />
+                      </label>
+                    </div>
+                  </div>
+
+                  <div v-if="keysInGroup(grp.id).length === 0" class="mp-kg-empty-note text-muted text-xs">
+                    该分组内暂无 Key，可从其他分组将 Key 移入此处
+                  </div>
                 </div>
               </div>
             </div>
-          </div>
-
-          <!-- 可勾选的模型列表：单行一条，勾选框 + 别名 + 模型名 + 调用 ID -->
-          <div class="mp-model-check-list">
-            <div
-              v-for="model in filteredChannelModels"
-              :key="model"
-              class="mp-model-check-item"
-              :class="{ 'is-selected': isModelChecked(model) }"
-              role="checkbox"
-              :aria-checked="isModelChecked(model)"
-              :tabindex="0"
-              :title="isModelChecked(model) ? `已启用：${model}` : `未启用：${model}`"
-              @click="toggleModel(model)"
-              @keydown.enter.space.prevent="toggleModel(model)"
-            >
-              <span class="mp-mec-check" aria-hidden="true">
-                <span v-html="isModelChecked(model) ? icons.check : ''" />
-              </span>
-              <span class="mp-model-free-badge">{{ channelAlias(selectedChannel) }}</span>
-              <span class="mp-model-name-title">{{ model }}</span>
-              <span
-                v-if="channelOverlapByModel.get(model.toLowerCase())"
-                class="mp-overlap-badge"
-                :title="
-                  `该模型另由 ${channelOverlapByModel.get(model.toLowerCase())!.filter((c) => c.id !== selectedChannel?.id).map((c) => c.name).join('、')} 提供，可在上方「多渠道共同提供的模型」中调整优先顺序`
-                "
-              >{{ channelOverlapByModel.get(model.toLowerCase())!.length }} 渠道共供</span>
-              <code class="mp-mec-id-code">{{ channelAlias(selectedChannel) }}/{{ model }}</code>
-            </div>
-          </div>
-
-          <div v-if="filteredChannelModels.length === 0" class="mp-empty-box">
-            <div class="mp-empty-icon" v-html="icons.shield" />
-            <p v-if="fetchingDraftModels">正在从上游渠道拉取最新模型…</p>
-            <p v-else-if="channelSearchQuery">未检索到匹配的模型</p>
-            <p v-else>暂无模型数据，请先点击「刷新上游模型」</p>
-          </div>
+          </template>
         </div>
 
         <div class="mp-modal-footer">
@@ -5555,6 +6072,268 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
   box-shadow: 0 0 0 2px var(--brand-glow);
 }
 
+/* —— 弹窗内部 Tab 导航 —— */
+.mp-inner-tab-nav {
+  display: flex;
+  gap: 8px;
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 10px;
+}
+
+.mp-inner-tab-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border-radius: var(--r-md, 8px);
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.mp-inner-tab-btn :deep(svg) {
+  width: 14px;
+  height: 14px;
+}
+
+.mp-inner-tab-btn:hover {
+  background: var(--surface);
+  color: var(--text);
+}
+
+.mp-inner-tab-btn.active {
+  background: var(--brand-soft);
+  border-color: var(--brand);
+  color: var(--brand-deep);
+  font-weight: 700;
+}
+
+.mp-inner-tab-badge {
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  color: var(--muted);
+}
+
+.mp-inner-tab-btn.active .mp-inner-tab-badge {
+  background: var(--brand);
+  border-color: var(--brand);
+  color: #fff;
+}
+
+/* —— Key 分组调度与轮询面板样式 —— */
+.mp-key-groups-toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding-bottom: 4px;
+}
+
+.mp-kg-intro {
+  flex: 1;
+  min-width: 240px;
+}
+
+.mp-add-group-form {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.mp-add-group-input {
+  height: 28px;
+  padding: 0 10px;
+  border-radius: var(--r-xs, 6px);
+  border: 1px solid var(--line);
+  background: var(--surface-soft);
+  font-size: 12px;
+  color: var(--text);
+}
+
+.mp-key-groups-container {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  max-height: 480px;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.mp-key-group-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md, 10px);
+  padding: 12px;
+  transition: all 0.2s ease;
+}
+
+.mp-key-group-card.is-disabled {
+  opacity: 0.55;
+  background: var(--surface);
+}
+
+.mp-key-group-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--line);
+}
+
+.mp-kg-head-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+  min-width: 0;
+}
+
+.mp-kg-priority-badge {
+  font-size: 10.5px;
+  font-weight: 800;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--surface);
+  border: 1px solid var(--line-strong);
+  color: var(--muted);
+  flex-shrink: 0;
+}
+
+.mp-kg-priority-badge.is-top {
+  background: var(--brand);
+  border-color: var(--brand);
+  color: #fff;
+}
+
+.mp-kg-name-input {
+  font-size: 13.5px;
+  font-weight: 750;
+  color: var(--text);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  padding: 2px 6px;
+  max-width: 180px;
+  transition: all 0.15s ease;
+}
+
+.mp-kg-name-input:hover {
+  border-color: var(--line);
+  background: var(--surface);
+}
+
+.mp-kg-name-input:focus {
+  outline: none;
+  border-color: var(--brand);
+  background: var(--surface);
+}
+
+.mp-kg-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.mp-kg-keys-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.mp-kg-key-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 10px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  transition: all 0.15s ease;
+}
+
+.mp-kg-key-row.is-disabled {
+  opacity: 0.45;
+}
+
+.mp-kg-key-main {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+  min-width: 0;
+}
+
+.mp-kg-key-acc {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  max-width: 140px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex-shrink: 0;
+}
+
+.mp-kg-key-code {
+  font-size: 11.5px;
+  color: var(--brand-deep);
+  background: color-mix(in srgb, var(--brand) 10%, transparent);
+  padding: 1px 6px;
+  border-radius: 4px;
+  flex-shrink: 0;
+}
+
+.mp-kg-model-tag {
+  font-size: 10.5px;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  color: var(--muted);
+}
+
+.mp-kg-model-tag.is-all {
+  color: var(--text-soft);
+}
+
+.mp-kg-key-controls {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.mp-kg-group-select {
+  height: 24px;
+  padding: 0 6px;
+  font-size: 11px;
+  border-radius: 4px;
+  border: 1px solid var(--line);
+  background: var(--surface-soft);
+  color: var(--text);
+  cursor: pointer;
+}
+
+.mp-kg-empty-note {
+  padding: 12px 0;
+  text-align: center;
+}
+
 /* 弹窗模态框通用 */
 .mp-modal-backdrop {
   position: fixed;
@@ -6114,18 +6893,19 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
   color: #fff;
 }
 
-/* 管理模型弹窗：单行列表形式 */
+/* 管理模型弹窗：富信息卡片行 */
 .mp-model-check-list {
   display: flex;
   flex-direction: column;
   gap: 8px;
 }
 
-.mp-model-check-item {
+.mp-mcm-card {
+  position: relative;
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 9px 12px;
+  gap: 12px;
+  padding: 10px 14px;
   background: var(--surface-soft);
   border: 1px solid var(--line);
   border-radius: var(--r-md, 10px);
@@ -6133,134 +6913,245 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
   transition: all 0.18s cubic-bezier(0.4, 0, 0.2, 1);
 }
 
-.mp-model-check-item:hover {
+.mp-mcm-card:hover {
   border-color: color-mix(in srgb, var(--brand) 50%, transparent);
+  box-shadow: 0 2px 8px color-mix(in srgb, var(--brand) 10%, transparent);
 }
 
 /* 勾选态高亮，未勾选态降低透明度 */
-.mp-model-check-item.is-selected {
+.mp-mcm-card.is-selected {
   border-color: var(--brand);
   background: var(--brand-soft);
 }
 
-.mp-model-check-item:not(.is-selected) {
-  opacity: 0.68;
+.mp-mcm-card:not(.is-selected) {
+  opacity: 0.72;
 }
 
-.mp-model-check-item:not(.is-selected):hover {
-  opacity: 0.9;
+.mp-mcm-card:not(.is-selected):hover {
+  opacity: 1;
 }
 
-.mp-model-check-item .mp-mec-check {
-  flex-shrink: 0;
+.mp-mcm-card.is-selected .mp-mec-check {
+  background: var(--brand);
+  border-color: var(--brand);
 }
 
-.mp-model-check-item .mp-model-free-badge {
-  flex-shrink: 0;
-}
-
-.mp-model-check-item .mp-model-name-title {
-  font-size: 13px;
-  flex-shrink: 0;
-  max-width: 40%;
-  min-width: 0;
-}
-
-.mp-model-check-item .mp-mec-id-code {
-  font-size: 11.5px;
-  margin-left: auto;
-  min-width: 0;
-}
-
-/* —— 管理模型弹窗：多渠道共同提供的模型区块 —— */
-.mp-overlap-block {
+/* —— 主体区（名称 + 状态 + 今日 + 调用 ID） —— */
+.mp-mcm-main {
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  background: var(--surface-soft);
-  border: 1px solid color-mix(in srgb, var(--brand) 30%, var(--line));
-  border-radius: var(--r-md, 10px);
-  padding: 10px 12px;
-}
-
-.mp-overlap-head {
-  display: flex;
-  align-items: baseline;
-  gap: 8px;
-  flex-wrap: wrap;
-}
-
-.mp-overlap-title {
-  font-size: 12.5px;
-  font-weight: 700;
-  color: var(--brand-deep);
-}
-
-.mp-overlap-item {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 6px 8px;
-  background: var(--surface);
-  border: 1px solid var(--line);
-  border-radius: 8px;
-}
-
-.mp-overlap-model {
-  font-size: 12px;
-  font-weight: 700;
-  color: var(--text);
+  gap: 4px;
+  min-width: 220px;
   flex-shrink: 0;
-  max-width: 200px;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
 }
 
-.mp-overlap-channels {
+.mp-mcm-title-row {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 8px;
   flex-wrap: wrap;
-  min-width: 0;
 }
 
-.mp-overlap-channel-chip {
+.mp-mcm-today-chip {
+  font-size: 10.5px;
+  font-weight: 700;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--warning) 16%, transparent);
+  color: var(--warning);
+}
+
+.mp-mcm-id-code {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
-  padding: 2px 6px;
-  border-radius: 999px;
-  background: var(--surface-soft);
-  border: 1px solid var(--line-strong);
+  gap: 5px;
+  align-self: flex-start;
   font-size: 11.5px;
-  color: var(--text);
-}
-
-.mp-overlap-channel-chip.is-top {
-  border-color: var(--brand);
-  background: var(--brand-soft);
   color: var(--brand-deep);
-  font-weight: 650;
-}
-
-.mp-chip-priority-tag {
-  font-size: 9.5px;
-  font-weight: 800;
-  letter-spacing: 0.04em;
-  padding: 0 4px;
-  border-radius: 4px;
-  background: var(--brand);
-  color: #fff;
-  line-height: 15px;
-}
-
-.mp-chip-name {
-  font-family: var(--font-mono, monospace);
-  max-width: 130px;
-  white-space: nowrap;
+  background: color-mix(in srgb, var(--surface) 80%, transparent);
+  border: 1px dashed color-mix(in srgb, var(--brand) 35%, transparent);
+  padding: 2px 8px;
+  border-radius: 6px;
+  cursor: copy;
+  transition: all 0.15s ease;
+  max-width: 100%;
   overflow: hidden;
-  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mp-mcm-id-code:hover {
+  border-color: var(--brand);
+  background: color-mix(in srgb, var(--brand) 12%, transparent);
+}
+
+.mp-mcm-copy-icon :deep(svg) {
+  width: 11px;
+  height: 11px;
+  vertical-align: -1px;
+}
+
+.mp-mcm-copy-ok {
+  font-size: 10.5px;
+  color: var(--brand);
+  font-weight: 700;
+}
+
+/* —— 右侧统计区 —— */
+.mp-mcm-stats {
+  margin-left: auto;
+  display: flex;
+  align-items: stretch;
+  gap: 0;
+  flex-shrink: 0;
+}
+
+.mp-mcm-stat {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  justify-content: center;
+  gap: 1px;
+  padding: 0 14px;
+  border-left: 1px solid var(--line);
+  min-width: 64px;
+}
+
+.mp-mcm-stat-val {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text);
+  line-height: 1.25;
+  white-space: nowrap;
+}
+
+.mp-mcm-stat-label {
+  font-size: 10px;
+  color: var(--muted);
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+}
+
+.mp-mcm-stat.is-bad .mp-mcm-stat-val {
+  color: var(--danger, #e5484d);
+}
+
+.mp-mcm-stat-wide {
+  min-width: 88px;
+}
+
+.mp-mcm-stat-wide .mp-mcm-stat-val {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.mp-mcm-stat-empty {
+  align-items: flex-end;
+}
+
+.mp-mcm-stat-empty .mp-mcm-stat-label {
+  font-style: normal;
+}
+
+/* Key 专属提示：绝对定位贴右下角，不占布局 */
+.mp-mcm-key-tag {
+  position: absolute;
+  right: 10px;
+  bottom: -6px;
+  font-size: 9.5px;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: var(--surface);
+  border: 1px solid color-mix(in srgb, var(--warning) 45%, transparent);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+}
+
+/* 行尾模型级代理策略选择 */
+.mp-mcm-proxy {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex-shrink: 0;
+  margin-left: 8px;
+  position: relative;
+}
+
+.mp-mcm-proxy-label {
+  font-size: 11px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.mp-mcm-proxy-select {
+  height: 26px;
+  padding: 0 6px;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  color: var(--text);
+  font-size: 11.5px;
+  cursor: pointer;
+  max-width: 92px;
+}
+
+.mp-mcm-proxy-select:hover {
+  border-color: color-mix(in srgb, var(--brand) 55%, transparent);
+}
+
+/* 覆盖与渠道级配置不同时的提示圆点 */
+.mp-mcm-proxy-dot {
+  position: absolute;
+  top: -3px;
+  right: -3px;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--warning);
+  border: 1.5px solid var(--surface-soft);
+}
+
+/* 工具栏扩展控件 */
+.mp-toolbar-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12.5px;
+  color: var(--muted);
+  cursor: pointer;
+  white-space: nowrap;
+  user-select: none;
+}
+
+.mp-toolbar-switch input {
+  accent-color: var(--brand);
+  cursor: pointer;
+}
+
+.mp-toolbar-sort {
+  display: inline-flex;
+  align-items: center;
+}
+
+.mp-sort-select {
+  height: 32px;
+  padding: 0 8px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  color: var(--text);
+  font-size: 12.5px;
+  cursor: pointer;
+}
+
+@keyframes mp-spin-rotate {
+  from { transform: rotate(360deg); }
+  to { transform: rotate(0deg); }
+}
+
+.mp-spin-icon {
+  animation: mp-spin-rotate 1.2s linear infinite;
+  display: inline-block;
 }
 
 .mp-reorder-btn {
