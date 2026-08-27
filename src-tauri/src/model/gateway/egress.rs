@@ -103,6 +103,7 @@ pub fn copy_upstream_headers(
 
 /// 出网载荷双轨：跨协议走 IR（序列化器按目标展开），
 /// 同协议快车道走原生体直通。
+#[derive(Debug, Clone)]
 pub enum EgressBody {
     /// 通用对象：由目标协议序列化器展开为原生请求体
     Universal(crate::model::gateway::ir::UniversalRequest),
@@ -996,6 +997,9 @@ mod egress_tests {
             model_redirects: None,
             rate_limit_rpm: None,
             stats_id: None,
+            key_groups: None,
+            key_rules: None,
+            model_proxy_rules: None,
         }
     }
 

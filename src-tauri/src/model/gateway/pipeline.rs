@@ -4,7 +4,9 @@
 //! 渠道解析(404) → 模型兼容性校验(400) → 出网准备(目标协议) → 弹性调度 → 公共日志骨架。
 //! 各入口文件只负责：入参解析、客户端协议 ↔ OpenAI 中枢转换、响应回转。
 
-use super::balancer::{resolve_channel, select_channel_api_key};
+use super::balancer::{
+    resolve_channel, resolve_channel_key_groups_for_model, select_channel_api_key,
+};
 use super::dispatcher::{execute_resilient_egress, EgressRequestMeta, EgressSuccess};
 use super::egress::{self, TargetProtocol};
 use super::logger::{client_name_from_headers, record_attempt_failure, ProxyLogParams};
@@ -317,70 +319,119 @@ pub async fn dispatch_protocol_egress(
     egress_payload: egress::EgressBody,
     style: ClientProtocol,
 ) -> Result<EgressOutcome, Response> {
-    let channel_api_key = select_channel_api_key(ctx, channel).await;
     let chan_alias = channel.effective_alias();
     let chan_stats_id = channel.stats_id;
 
-    if let Err(err_resp) = validate_model_channel_request(
-        ctx,
-        channel,
-        model_to_send,
-        raw_model,
-        &channel_api_key,
-        path,
-        style,
-        req_id,
-        is_stream,
-        start_time,
-        req_body_str,
-    )
-    .await
-    {
-        return Err(err_resp);
-    }
+    // 解析出按分组优先级排列的候选 Key 队列：Vec<Vec<String>>
+    // 外层为分组（优先级顺序），内层为该组内支持该模型的可用 Key
+    let key_groups = resolve_channel_key_groups_for_model(ctx, channel, model_to_send).await;
+
+    // 若无配置任何可用 Key，构建一个单次尝试队列（包含一个空 Key，用于免 Key 渠道）
+    let candidate_groups: Vec<Vec<String>> = if key_groups.is_empty() {
+        vec![vec![select_channel_api_key(ctx, channel).await]]
+    } else {
+        key_groups
+    };
 
     let target = TargetProtocol::from_channel(channel);
-    let (upstream_url, egress_body) = egress::prepare_egress_with(
-        channel,
-        &channel_api_key,
-        model_to_send,
-        egress_payload,
-        is_stream,
-    );
+    let mut last_error_response: Option<Response> = None;
 
-    let meta = EgressRequestMeta {
-        req_id: req_id.to_string(),
-        path: path.to_string(),
-        channel_id: chan_alias.clone(),
-        channel_stats_id: chan_stats_id.map(|v| v.to_string()),
-        model: raw_model.to_string(),
-        stream: is_stream,
-        req_body_str: req_body_str.clone(),
-    };
+    // 外层循环：分组优先级队列遍历（组间故障转移 Failover）
+    for (group_idx, group_keys) in candidate_groups.iter().enumerate() {
+        if group_keys.is_empty() {
+            continue;
+        }
 
-    let success = match execute_resilient_egress(
-        ctx,
-        channel,
-        config,
-        meta,
-        &upstream_url,
-        &channel_api_key,
-        &egress_body,
-        style,
-    )
-    .await
-    {
-        Ok(s) => s,
-        Err(err_resp) => return Err(err_resp),
-    };
+        // 组内轮询：根据原子计数器在组内可用 Key 间均匀 Round-Robin 选取起始 Key
+        let start_key_idx = ctx.key_round_robin.fetch_add(1, Ordering::Relaxed) % group_keys.len();
+        let selected_key = &group_keys[start_key_idx];
 
-    Ok(EgressOutcome {
-        success,
-        chan_alias,
-        chan_stats_id,
-        target,
-        model_to_send: model_to_send.to_string(),
-    })
+        if let Err(err_resp) = validate_model_channel_request(
+            ctx,
+            channel,
+            model_to_send,
+            raw_model,
+            selected_key,
+            path,
+            style,
+            req_id,
+            is_stream,
+            start_time,
+            req_body_str,
+        )
+        .await
+        {
+            last_error_response = Some(err_resp);
+            continue;
+        }
+
+        let (upstream_url, egress_body) = egress::prepare_egress_with(
+            channel,
+            selected_key,
+            model_to_send,
+            egress_payload.clone(),
+            is_stream,
+        );
+
+        let group_req_id = if group_idx == 0 {
+            req_id.to_string()
+        } else {
+            format!("{req_id}-g{}", group_idx + 1)
+        };
+
+        let meta = EgressRequestMeta {
+            req_id: group_req_id,
+            path: path.to_string(),
+            channel_id: chan_alias.clone(),
+            channel_stats_id: chan_stats_id.map(|v| v.to_string()),
+            model: raw_model.to_string(),
+            stream: is_stream,
+            req_body_str: req_body_str.clone(),
+        };
+
+        match execute_resilient_egress(
+            ctx,
+            channel,
+            config,
+            meta,
+            &upstream_url,
+            selected_key,
+            &egress_body,
+            style,
+        )
+        .await
+        {
+            Ok(success) => {
+                return Ok(EgressOutcome {
+                    success,
+                    chan_alias,
+                    chan_stats_id,
+                    target,
+                    model_to_send: model_to_send.to_string(),
+                });
+            }
+            Err(err_resp) => {
+                // 当前分组请求失败（例如 401 鉴权失败、429 频次限制或上游故障），记录错误并尝试切换到下一个优先级分组
+                tracing::warn!(
+                    "[ModelGateway] 渠道「{}」第 {} 分组请求模型「{}」失败，自动尝试下一优先级分组...",
+                    chan_alias,
+                    group_idx + 1,
+                    model_to_send
+                );
+                last_error_response = Some(err_resp);
+            }
+        }
+    }
+
+    // 所有分组均尝试失败，返回最后一个分组的错误响应（或兜底 502）
+    Err(last_error_response.unwrap_or_else(|| {
+        gateway_error_response(
+            style,
+            StatusCode::BAD_GATEWAY,
+            "UPSTREAM_UNAVAILABLE",
+            format!("渠道「{chan_alias}」的所有可用 Key 与分组均请求失败"),
+        )
+    }))
 }
 
 /// 鉴权失败 + 总请求数计数的公共入口封装；失败时已记录日志并返回错误响应
