@@ -22,6 +22,71 @@ pub fn sanitize_channel_config(channel: &mut ChannelConfig) {
             channel.alias = Some(trimmed);
         }
     }
+
+    // 清洗渠道自定义 Key 分组
+    if let Some(groups) = channel.key_groups.take() {
+        let mut seen = std::collections::HashSet::new();
+        let cleaned: Vec<_> = groups
+            .into_iter()
+            .filter_map(|mut g| {
+                g.id = g.id.trim().to_string();
+                g.name = g.name.trim().to_string();
+                if g.id.is_empty() || !seen.insert(g.id.clone()) {
+                    None
+                } else {
+                    if g.name.is_empty() {
+                        g.name = g.id.clone();
+                    }
+                    Some(g)
+                }
+            })
+            .collect();
+        channel.key_groups = if cleaned.is_empty() { None } else { Some(cleaned) };
+    }
+
+    // 清洗渠道单 Key 规则
+    if let Some(rules) = channel.key_rules.take() {
+        let mut seen = std::collections::HashSet::new();
+        let cleaned: Vec<_> = rules
+            .into_iter()
+            .filter_map(|mut r| {
+                r.key = r.key.trim().to_string();
+                r.group_id = r.group_id.trim().to_string();
+                if r.key.is_empty() || !seen.insert(r.key.clone()) {
+                    None
+                } else {
+                    Some(r)
+                }
+            })
+            .collect();
+        channel.key_rules = if cleaned.is_empty() { None } else { Some(cleaned) };
+    }
+
+    // 清洗模型级代理出口规则：模型名去空格去重，mode 白名单校验，
+    // direct/pool 语义下 node_id 无意义直接剥离；mode=direct 且与渠道级默认一致时仍保留（显式覆盖）
+    if let Some(rules) = channel.model_proxy_rules.take() {
+        let mut seen = std::collections::HashSet::new();
+        let cleaned: Vec<_> = rules
+            .into_iter()
+            .filter_map(|mut r| {
+                r.model = r.model.trim().to_string();
+                r.mode = r.mode.trim().to_lowercase();
+                if !matches!(r.mode.as_str(), "direct" | "pool" | "fixed") {
+                    return None;
+                }
+                if let Some(ref node) = r.node_id {
+                    let node = node.trim().to_string();
+                    r.node_id = if node.is_empty() || r.mode != "fixed" { None } else { Some(node) };
+                }
+                if r.model.is_empty() || !seen.insert(r.model.to_lowercase()) {
+                    None
+                } else {
+                    Some(r)
+                }
+            })
+            .collect();
+        channel.model_proxy_rules = if cleaned.is_empty() { None } else { Some(cleaned) };
+    }
 }
 
 /// 渠道上游目标协议白名单
@@ -208,6 +273,9 @@ mod config_tests {
                     model_redirects: None,
                     rate_limit_rpm: None,
                     stats_id: Some(1),
+                    key_groups: None,
+                    key_rules: None,
+                    model_proxy_rules: None,
                 },
                 ChannelConfig {
                     id: "alpha".to_string(),
@@ -229,6 +297,9 @@ mod config_tests {
                     model_redirects: None,
                     rate_limit_rpm: None,
                     stats_id: Some(2),
+                    key_groups: None,
+                    key_rules: None,
+                    model_proxy_rules: None,
                 },
                 ChannelConfig {
                     id: "site_a".to_string(),
@@ -240,8 +311,8 @@ mod config_tests {
                     api_key: String::new(),
                     api_keys: None,
                     use_proxy_pool: false,
-                    alias: Some("sitea".to_string()),
-                    site_id: None,
+                    alias: None,
+                    site_id: Some("site_a".to_string()),
                     use_fixed_proxy: false,
                     fixed_proxy_node: None,
                     priority: None,
@@ -250,6 +321,9 @@ mod config_tests {
                     model_redirects: None,
                     rate_limit_rpm: None,
                     stats_id: Some(101),
+                    key_groups: None,
+                    key_rules: None,
+                    model_proxy_rules: None,
                 },
             ],
             ..Default::default()
@@ -262,5 +336,86 @@ mod config_tests {
         // 用户自建渠道不受清理影响
         assert!(cfg.channels.iter().any(|c| c.id == "site_a"));
         assert_eq!(cfg.channels.len(), 2);
+    }
+
+    #[test]
+    fn sanitize_model_proxy_rules_dedupes_and_validates_mode() {
+        use super::super::types::ModelProxyRule;
+        let mut ch = ChannelConfig {
+            id: "ch".to_string(),
+            name: "ch".to_string(),
+            description: String::new(),
+            enabled: true,
+            protocol: "openai".to_string(),
+            base_url: "https://x.example/v1".to_string(),
+            api_key: String::new(),
+            api_keys: None,
+            use_proxy_pool: false,
+            alias: None,
+            site_id: None,
+            use_fixed_proxy: false,
+            fixed_proxy_node: None,
+            priority: None,
+            weight: None,
+            enabled_models: None,
+            model_redirects: None,
+            rate_limit_rpm: None,
+            stats_id: None,
+            key_groups: None,
+            key_rules: None,
+            model_proxy_rules: Some(vec![
+                ModelProxyRule { model: " glm-a ".into(), mode: "direct".into(), node_id: Some("n1".into()) },
+                ModelProxyRule { model: "GLM-A".into(), mode: "fixed".into(), node_id: Some(" n2 ".into()) },
+                ModelProxyRule { model: "glm-b".into(), mode: "bogus".into(), node_id: None },
+                ModelProxyRule { model: "glm-c".into(), mode: "fixed".into(), node_id: Some("  ".into()) },
+                ModelProxyRule { model: "   ".into(), mode: "direct".into(), node_id: None },
+            ]),
+        };
+        sanitize_channel_config(&mut ch);
+        let rules = ch.model_proxy_rules.unwrap();
+        // 同模型（忽略大小写）只保留首条；非法 mode 与空模型被剔除
+        assert_eq!(rules.len(), 2, "rules: {rules:?}");
+        assert_eq!(rules[0].model, "glm-a");
+        // direct 模式下 node_id 被剥离
+        assert_eq!(rules[0].node_id, None);
+        // fixed 模式下空 node_id 归一为 None
+        assert_eq!(rules[1].model, "glm-c");
+        assert_eq!(rules[1].mode, "fixed");
+        assert_eq!(rules[1].node_id, None);
+    }
+
+    #[test]
+    fn empty_model_proxy_rules_normalized_to_none() {
+        use super::super::types::ModelProxyRule;
+        let mut ch = ChannelConfig {
+            id: "ch".to_string(),
+            name: "ch".to_string(),
+            description: String::new(),
+            enabled: true,
+            protocol: "openai".to_string(),
+            base_url: "https://x.example/v1".to_string(),
+            api_key: String::new(),
+            api_keys: None,
+            use_proxy_pool: false,
+            alias: None,
+            site_id: None,
+            use_fixed_proxy: false,
+            fixed_proxy_node: None,
+            priority: None,
+            weight: None,
+            enabled_models: None,
+            model_redirects: None,
+            rate_limit_rpm: None,
+            stats_id: None,
+            key_groups: None,
+            key_rules: None,
+            model_proxy_rules: Some(vec![ModelProxyRule {
+                model: "m".into(),
+                mode: "invalid".into(),
+                node_id: None,
+            }]),
+        };
+        sanitize_channel_config(&mut ch);
+        assert!(ch.model_proxy_rules.is_none());
     }
 }

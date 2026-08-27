@@ -14,6 +14,45 @@ pub const DEFAULT_OPENCODE_PROXY_PORT: u16 = DEFAULT_MODEL_PROXY_PORT;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct KeyGroupItem {
+    pub id: String,
+    pub name: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelKeyRule {
+    pub key: String,
+    #[serde(default)]
+    pub group_id: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub supported_models: Option<Vec<String>>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// 模型级代理出口覆盖规则：「管理可用模型」中为单个模型独立选择代理策略。
+/// 语义与渠道级 use_proxy_pool / use_fixed_proxy 一致，仅作用域缩小到单模型。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelProxyRule {
+    /// 渠道内模型名（原始大小写保留，匹配时忽略大小写）
+    pub model: String,
+    /// direct = 强制直连；pool = 走代理池轮询；fixed = 固定单一出口节点
+    pub mode: String,
+    /// fixed 模式下锁定的节点 ID；缺省时锁定池内首个启用节点
+    #[serde(default)]
+    pub node_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ChannelConfig {
     pub id: String,
     pub name: String,
@@ -62,6 +101,15 @@ pub struct ChannelConfig {
     /// 与可修改的英文别名解耦，改名/改编码后历史统计不错位。
     #[serde(default)]
     pub stats_id: Option<u32>,
+    /// 渠道内 Key 分组定义与优先级序列（索引越靠前优先级越高）
+    #[serde(default)]
+    pub key_groups: Option<Vec<KeyGroupItem>>,
+    /// 渠道中各个 Key 的详细配置（所属分组、启用/禁用、支持模型白名单）
+    #[serde(default)]
+    pub key_rules: Option<Vec<ChannelKeyRule>>,
+    /// 模型级代理出口覆盖：为单个模型独立指定直连/代理池/固定节点
+    #[serde(default)]
+    pub model_proxy_rules: Option<Vec<ModelProxyRule>>,
 }
 
 fn default_protocol() -> String {
@@ -83,6 +131,15 @@ impl ChannelConfig {
             .map(|s| s.trim().to_lowercase())
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| self.id.to_lowercase())
+    }
+
+    /// 查找指定模型的代理出口覆盖规则（忽略大小写匹配）
+    pub fn model_proxy_rule(&self, model: &str) -> Option<&ModelProxyRule> {
+        let needle = model.trim().to_lowercase();
+        self.model_proxy_rules
+            .as_ref()?
+            .iter()
+            .find(|r| r.model.trim().to_lowercase() == needle)
     }
 
     /// 获取有效的 API Keys 列表（若配置了 api_keys 列表则取其非空项，否则取单个 api_key）
@@ -128,6 +185,9 @@ pub fn default_channels() -> Vec<ChannelConfig> {
         model_redirects: None,
         rate_limit_rpm: None,
         stats_id: Some(1),
+        key_groups: None,
+        key_rules: None,
+        model_proxy_rules: None,
     }]
 }
 
@@ -448,3 +508,22 @@ pub struct ProxyTokenUsageReport {
     pub usage: crate::core::models::TokenUsageReport,
     pub health: crate::core::models::RequestHealthReport,
 }
+
+/// 「渠道 × 模型」粒度的累计用量（全量 + 今日），channel_daily_stats 聚合结果。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelModelUsageStats {
+    pub model: String,
+    pub total_requests: u64,
+    pub failed_requests: u64,
+    pub avg_duration_ms: u64,
+    pub avg_ttft_ms: Option<u64>,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+    /// 最近一次调用时间（YYYY-MM-DD HH:MM:SS，无调用时为 None）
+    pub last_used_at: Option<String>,
+    pub today_requests: u64,
+    pub today_tokens: u64,
+}
+
