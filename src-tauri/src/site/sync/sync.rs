@@ -345,6 +345,8 @@ pub(crate) fn has_newapi_refresh_cookie_name<'a>(names: impl IntoIterator<Item =
         .any(|name| name.trim() == "new_api_refresh")
 }
 
+/// 按名判断 Cookie 头中是否含指定项（保留给测试与通用判定使用）
+#[allow(dead_code)]
 pub(crate) fn cookie_header_has_name(cookie_header: &str, expected_name: &str) -> bool {
     cookie_header.split(';').any(|pair| {
         pair.trim()
@@ -447,62 +449,6 @@ pub(crate) async fn acquire_newapi_session_token(
         Ok(None) => Ok(None),
         Err(shield_error) => Err(shield_error),
     }
-}
-
-pub(crate) async fn try_refresh_newapi_session(
-    client: &reqwest::Client,
-    base_url: &Url,
-    cookie_header: &str,
-    user_agent: &str,
-) -> Result<Option<(String, Option<String>)>, String> {
-    let endpoint = match base_url.join("/api/user/auth/refresh") {
-        Ok(url) => url,
-        Err(_) => return Ok(None),
-    };
-    let request = chrome_request_headers(client.post(endpoint), base_url.as_str(), user_agent)
-        .header(reqwest::header::COOKIE, cookie_header);
-    let response = match request.send().await {
-        Ok(res) => res,
-        Err(err) => return Err(err.to_string()),
-    };
-    if !response.status().is_success() {
-        return Ok(None);
-    }
-    let mut new_cookies = HashMap::new();
-    for part in cookie_header.split(';') {
-        let trimmed = part.trim();
-        if let Some((k, v)) = trimmed.split_once('=') {
-            new_cookies.insert(k.trim().to_string(), v.trim().to_string());
-        }
-    }
-    for cookie_header_val in response.headers().get_all(reqwest::header::SET_COOKIE) {
-        if let Ok(val_str) = cookie_header_val.to_str() {
-            if let Some(first_part) = val_str.split(';').next() {
-                if let Some((k, v)) = first_part.split_once('=') {
-                    new_cookies.insert(k.trim().to_string(), v.trim().to_string());
-                }
-            }
-        }
-    }
-    let combined_cookies = new_cookies
-        .into_iter()
-        .map(|(k, v)| format!("{k}={v}"))
-        .collect::<Vec<_>>()
-        .join("; ");
-
-    let body = response.bytes().await.unwrap_or_default();
-    let value: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
-    let token = value
-        .pointer("/data/token")
-        .or_else(|| value.pointer("/data/access_token"))
-        .or_else(|| value.pointer("/data/accessToken"))
-        .or_else(|| value.pointer("/token"))
-        .or_else(|| value.pointer("/access_token"))
-        .and_then(serde_json::Value::as_str)
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-
-    Ok(Some((combined_cookies, token)))
 }
 
 /// 识别签到"未启用"类提示。部分站点签到功能关闭时状态接口直接返回
@@ -1133,7 +1079,6 @@ pub(crate) async fn fetch_site_account(
                 }
             }
         };
-        let has_refresh_cookie = cookie_header_has_name(&cookie_header, "new_api_refresh");
         // user id 优先取 Local Storage 实时数据，取不到时回退数据库缓存
         let user_id = newapi_user_id(local_values).or_else(|| {
             cached_newapi_user_id
@@ -1161,7 +1106,7 @@ pub(crate) async fn fetch_site_account(
         }
         let user_id = user_id.unwrap_or_default();
 
-        let mut temp_auth = NewApiAuth::Legacy {
+        let temp_auth = NewApiAuth::Legacy {
             cookie_header: cookie_header.clone(),
             user_id: user_id.clone(),
         };
@@ -1197,14 +1142,18 @@ pub(crate) async fn fetch_site_account(
         .await;
 
         // 2. 如果请求失败（令牌过期、401、权限不足等），且不是盾拦截，进行自愈刷新
+        let mut self_heal_failed = false;
         if self_response.is_err()
             && !self_response
                 .as_ref()
                 .err()
                 .is_some_and(|e| is_cloudflare_shield_error(e))
         {
-            let mut acquired = false;
-            // 2.1 尝试通过现有 Cookie 获取新 Token
+            // 自愈只走不轮换路径：缓存访问令牌 / 现有 Cookie 换取访问令牌。
+            // 刻意不在浏览器外调用 /api/user/auth/refresh —— refresh 会轮换
+            // HttpOnly new_api_refresh，而本应用没有把新 Cookie 写回浏览器的
+            // 通道，轮换后浏览器里的旧令牌随即作废、用户被登出。会话彻底失效
+            // 时交由错误提示引导用户在浏览器打开一次站点完成自动续期。
             if uses_refresh_auth {
                 if let Ok(Some(new_token)) =
                     try_acquire_newapi_token(client, &base_url_parsed, &temp_auth, user_agent).await
@@ -1214,40 +1163,11 @@ pub(crate) async fn fetch_site_account(
                         access_token: api_token.clone(),
                         user_id: user_id.clone(),
                     };
-                    acquired = true;
+                } else {
+                    self_heal_failed = true;
                 }
             }
-            // 2.2 如果没拿到新 Token，且存在 refresh cookie，尝试通过 /api/user/auth/refresh 刷新会话
-            if !acquired && has_refresh_cookie {
-                if let Ok(Some((new_cookies, maybe_token))) =
-                    try_refresh_newapi_session(client, &base_url_parsed, &cookie_header, user_agent)
-                        .await
-                {
-                    temp_auth = NewApiAuth::Legacy {
-                        cookie_header: new_cookies,
-                        user_id: user_id.clone(),
-                    };
-                    if let Some(t) = maybe_token {
-                        api_token = t;
-                        auth = NewApiAuth::Token {
-                            access_token: api_token.clone(),
-                            user_id: user_id.clone(),
-                        };
-                    } else if let Ok(Some(new_token)) =
-                        try_acquire_newapi_token(client, &base_url_parsed, &temp_auth, user_agent)
-                            .await
-                    {
-                        api_token = new_token;
-                        auth = NewApiAuth::Token {
-                            access_token: api_token.clone(),
-                            user_id: user_id.clone(),
-                        };
-                    } else {
-                        auth = temp_auth.clone();
-                    }
-                }
-            }
-            // 2.3 使用刷新后的凭证重试 /api/user/self
+            // 使用现有凭证重试 /api/user/self
             self_response = request_json(
                 apply_newapi_auth(
                     chrome_request_headers(client.get(endpoint), base_url, user_agent),
@@ -1287,7 +1207,14 @@ pub(crate) async fn fetch_site_account(
             Ok((account, response_user_id))
         }) {
             Ok(result) => result,
-            Err(error) => {
+            Err(mut error) => {
+                // 非盾失败且自愈未取得新令牌：本地会话与访问令牌均已失效。
+                // 引导浏览器内自动续期，绝不代调轮换接口（会导致浏览器登出）。
+                if self_heal_failed && !requires_chrome_fallback(&error) {
+                    error = format!(
+                        "{error}；本地会话与访问令牌均已失效。请在浏览器中打开一次该站点（会自动静默续期、不会登出），完成后重新同步"
+                    );
+                }
                 return match local_account {
                     Some(account) => Ok(SiteAccountRefresh {
                         account,
