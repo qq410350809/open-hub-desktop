@@ -512,6 +512,92 @@ pub async fn get_channel_usage_stats_summary(
     })
 }
 
+/// 「渠道 × 模型」粒度的累计用量统计（channel_daily_stats 聚合），
+/// 供渠道「管理可用模型」弹窗为每个模型行展示调用量/Token/最近使用。
+pub async fn get_channel_model_usage_stats(
+    state: &ModelProxyState,
+    channel_id: String,
+) -> Result<Vec<super::types::ChannelModelUsageStats>, String> {
+    use super::types::ChannelModelUsageStats as ModelStats;
+
+    let app_handle_opt = state.context.app_ctx.read().await.clone();
+    let Some(ctx) = app_handle_opt else {
+        return Ok(Vec::new());
+    };
+
+    tokio::task::block_in_place(move || {
+        let database = &ctx.database;
+        let conn = database.lock_db();
+
+        // 最近使用时间从明细日志补齐（聚合表只有日期粒度）；无日志则回落到最近有数据的日期
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let mut stmt = conn
+            .prepare(
+                "SELECT
+                    m.model,
+                    COALESCE(a.total_requests, 0),
+                    COALESCE(a.failed_requests, 0),
+                    COALESCE(a.duration_ms_total, 0),
+                    COALESCE(a.ttft_ms_total, 0),
+                    COALESCE(a.ttft_count, 0),
+                    COALESCE(a.prompt_tokens, 0),
+                    COALESCE(a.completion_tokens, 0),
+                    COALESCE(a.total_tokens, 0),
+                    (SELECT MAX(timestamp) FROM model_proxy_logs l
+                        WHERE l.channel_id = ?1 AND LOWER(l.model) = LOWER(m.model)),
+                    COALESCE(d.total_requests, 0),
+                    COALESCE(d.total_tokens, 0)
+                 FROM (SELECT DISTINCT model FROM channel_daily_stats WHERE channel_id = ?1) AS m
+                 LEFT JOIN (
+                    SELECT model,
+                        SUM(total_requests) as total_requests,
+                        SUM(failed_requests) as failed_requests,
+                        SUM(duration_ms_total) as duration_ms_total,
+                        SUM(ttft_ms_total) as ttft_ms_total,
+                        SUM(ttft_count) as ttft_count,
+                        SUM(prompt_tokens) as prompt_tokens,
+                        SUM(completion_tokens) as completion_tokens,
+                        SUM(total_tokens) as total_tokens
+                    FROM channel_daily_stats WHERE channel_id = ?1 GROUP BY model
+                 ) AS a ON a.model = m.model
+                 LEFT JOIN (
+                    SELECT model, total_requests, total_tokens
+                    FROM channel_daily_stats WHERE channel_id = ?1 AND date = ?2
+                 ) AS d ON d.model = m.model
+                 ORDER BY a.total_requests DESC, m.model ASC",
+            )
+            .map_err(|e| format!("查询模型用量统计失败: {e}"))?;
+
+        let rows = stmt
+            .query_map(params![channel_id, today], |row| {
+                let total_requests: i64 = row.get(1)?;
+                let duration_total: i64 = row.get(3)?;
+                let ttft_total: i64 = row.get(4)?;
+                let ttft_count: i64 = row.get(5)?;
+                Ok(ModelStats {
+                    model: row.get(0)?,
+                    total_requests: total_requests.max(0) as u64,
+                    failed_requests: row.get::<_, i64>(2)?.max(0) as u64,
+                    avg_duration_ms: (duration_total / total_requests.max(1)).max(0) as u64,
+                    avg_ttft_ms: avg_or_none(ttft_total, ttft_count).map(|v| v as u64),
+                    prompt_tokens: row.get::<_, i64>(6)?.max(0) as u64,
+                    completion_tokens: row.get::<_, i64>(7)?.max(0) as u64,
+                    total_tokens: row.get::<_, i64>(8)?.max(0) as u64,
+                    last_used_at: row.get(9)?,
+                    today_requests: row.get::<_, i64>(10)?.max(0) as u64,
+                    today_tokens: row.get::<_, i64>(11)?.max(0) as u64,
+                })
+            })
+            .map_err(|e| format!("解析模型用量统计失败: {e}"))?;
+
+        let mut list = Vec::new();
+        for r in rows.flatten() {
+            list.push(r);
+        }
+        Ok(list)
+    })
+}
+
 /// 控制台「全渠道数据总览」。
 /// 提供 from/to 时按日期区间逐日聚合（缺日补零）+ 区间内汇总；
 /// 未提供时回退旧行为：近 N 天窗口（默认 14，1-90 钳制）+ 全量累计。

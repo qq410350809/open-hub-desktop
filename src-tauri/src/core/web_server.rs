@@ -631,6 +631,15 @@ macro_rules! rpc_arms {
             "get_model_proxy_channel_stats" => Ok(json!(
                 crate::model::gateway::get_model_proxy_channel_stats($gw).await
             )),
+            "get_channel_model_stats" => {
+                let channel_id: String = take_opt($args, &["channelId", "channel_id"])
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+                Ok(json!(
+                    crate::model::gateway::get_channel_model_stats($gw, channel_id).await
+                ))
+            }
             "get_proxy_token_usage" => {
                 let from: Option<String> = take_opt($args, &["from"]).ok().flatten();
                 let to: Option<String> = take_opt($args, &["to"]).ok().flatten();

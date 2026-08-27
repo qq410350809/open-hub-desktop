@@ -427,6 +427,15 @@ pub async fn get_model_proxy_channel_stats(
     get_channel_usage_stats_summary(&state).await
 }
 
+/// 「渠道 × 模型」粒度累计用量（渠道管理模型弹窗行内统计展示用）
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub async fn get_channel_model_stats(
+    state: Managed<'_, ModelProxyState>,
+    channel_id: String,
+) -> Result<Vec<super::types::ChannelModelUsageStats>, String> {
+    super::stats::get_channel_model_usage_stats(&state, channel_id).await
+}
+
 /// Token 统计中心「反代模式」数据源：与本地模式同构的用量桶 + 请求健康报表。
 /// from/to 均为 YYYY-MM-DD（可省略，默认全部已聚合数据）。
 #[cfg_attr(feature = "desktop", tauri::command)]
@@ -617,6 +626,9 @@ pub async fn sync_model_proxy_site_channels(
                     model_redirects: None,
                     rate_limit_rpm: None,
                     stats_id: None,
+                    key_groups: None,
+                    key_rules: None,
+                    model_proxy_rules: None,
                 });
             }
         }

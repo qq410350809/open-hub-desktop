@@ -339,6 +339,7 @@ pub fn run() {
             crate::model::gateway::get_model_proxy_logs,
             crate::model::gateway::get_proxy_token_usage,
             crate::model::gateway::get_model_proxy_channel_stats,
+            crate::model::gateway::get_channel_model_stats,
             crate::model::gateway::get_model_proxy_overview_stats,
             crate::model::gateway::clear_model_proxy_logs,
             crate::model::gateway::sync_model_proxy_site_channels,
