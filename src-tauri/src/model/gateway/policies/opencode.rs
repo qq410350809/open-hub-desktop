@@ -110,6 +110,7 @@ pub(crate) fn apply_models_probe_identity(
 /// 由 config sanitize 在每次加载/保存时强制执行。
 pub fn pin_channel_config(ch: &mut ChannelConfig) {
     if ch.id == CHANNEL_ID {
+        ch.name = "OpenCode 免费".to_string();
         ch.alias = None;
         ch.protocol = "openai".to_string();
         ch.stats_id = Some(STATS_ID);
@@ -172,7 +173,8 @@ mod opencode_policy_tests {
         let body = br#"{"choices":[{"message":{"role":"assistant","content":null},"finish_reason":"stop"}]}"#;
         assert!(is_empty_success_payload(body), "真空白响应仍是空内容");
 
-        let body = r#"{"choices":[{"message":{"role":"assistant","content":"有正文"}}]}"#.as_bytes();
+        let body =
+            r#"{"choices":[{"message":{"role":"assistant","content":"有正文"}}]}"#.as_bytes();
         assert!(!is_empty_success_payload(body));
     }
 

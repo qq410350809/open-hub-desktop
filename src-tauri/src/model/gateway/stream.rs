@@ -9,14 +9,6 @@ use std::sync::atomic::Ordering;
 use std::time::Instant;
 use tracing::warn;
 
-/// 单个工具调用参数的流式累积
-#[derive(Default)]
-struct ToolCallAccum {
-    id: String,
-    name: String,
-    arguments: String,
-}
-
 /// 跨 chunk 安全的 SSE 行读取器。
 ///
 /// 历史缺陷警示：此前按「整块 from_utf8 失败即丢弃整个 chunk」处理，
