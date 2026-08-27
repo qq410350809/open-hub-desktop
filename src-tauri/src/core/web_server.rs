@@ -682,9 +682,13 @@ macro_rules! rpc_arms {
             "stop_opencode_proxy" => {
                 Ok(json!(crate::model::gateway::stop_opencode_proxy($gw).await))
             }
-            "fetch_opencode_models" => Ok(json!(
-                crate::model::gateway::fetch_opencode_models($gw).await
-            )),
+            "fetch_opencode_models" => {
+                let channel_id: Option<String> =
+                    take_opt($args, &["channelId", "channel_id"])?;
+                Ok(json!(
+                    crate::model::gateway::fetch_opencode_models($gw, channel_id).await
+                ))
+            }
             "get_opencode_cached_channel_models" => Ok(json!(
                 crate::model::gateway::get_opencode_cached_channel_models($gw).await
             )),

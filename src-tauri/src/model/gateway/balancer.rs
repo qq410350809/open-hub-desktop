@@ -3,16 +3,28 @@ use super::types::{
     current_timestamp, ChannelConfig, ModelProxyConfig, ModelProxyContext, ProxyRequestLog,
 };
 use serde_json::Value as JsonValue;
+use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tracing::warn;
 
+/// 渠道是否对外暴露指定模型：白名单为空(None) = 全部暴露，否则须包含该模型（大小写不敏感）
+fn channel_exposes_model(channel: &ChannelConfig, model: &str) -> bool {
+    channel
+        .enabled_models
+        .as_ref()
+        .map_or(true, |models| {
+            models.iter().any(|m| m.eq_ignore_ascii_case(model))
+        })
+}
+
 /// 根据请求模型名解析目标渠道与发送给上游的裸模型名。
 /// 规则：
 /// 1. `alias/裸模型` 优先按别名前缀精确匹配启用渠道；
-/// 2. 无前缀时，若某个启用渠道的白名单（enabled_models）中包含该模型，则优先分发给该渠道；
-/// 3. 若无匹配，回退至启用的默认 opencode 渠道；
-/// 4. 若默认 opencode 未启用，回退至首个已启用的自定义渠道。
+/// 2. 「多渠道共同提供的模型」按用户配置的路由顺序（model_channel_order）选取首个可用渠道；
+/// 3. 未配置顺序时，若某个启用渠道的白名单（enabled_models）中包含该模型，则优先分发给该渠道；
+/// 4. 若无匹配，回退至启用的默认 opencode 渠道；
+/// 5. 若默认 opencode 未启用，回退至首个已启用的自定义渠道。
 pub fn resolve_channel<'a>(
     config: &'a ModelProxyConfig,
     raw_model: &str,
@@ -30,7 +42,25 @@ pub fn resolve_channel<'a>(
 
     let stripped = strip_opencode_prefix(raw_model);
 
-    // 2. 检查是否有启用渠道显式在 enabled_models 中勾选/包含了该模型
+    // 2. 用户配置的重叠模型路由顺序：按列表序找首个启用且暴露该模型的渠道。
+    //    raw 与 stripped 双查，兼容白名单里同时存在带/不带前缀写法的情况。
+    if let Some(order) = &config.model_channel_order {
+        let lookup = |key: &str| -> Option<&'a ChannelConfig> {
+            order
+                .get(&key.to_lowercase())?
+                .iter()
+                .find_map(|channel_id| {
+                    config.channels.iter().find(|c| {
+                        c.enabled && &c.id == channel_id && channel_exposes_model(c, stripped)
+                    })
+                })
+        };
+        if let Some(ch) = lookup(raw_model).or_else(|| lookup(stripped)) {
+            return Some((ch, stripped.to_string()));
+        }
+    }
+
+    // 3. 检查是否有启用渠道显式在 enabled_models 中勾选/包含了该模型
     if let Some(ch) = config.channels.iter().find(|c| {
         c.enabled
             && c.enabled_models.as_ref().map_or(false, |models| {
@@ -59,14 +89,65 @@ pub fn resolve_channel<'a>(
     None
 }
 
-/// 渠道多 Key 轮询选择器：原子递增索引并在有效 API Keys 中轮流选取
-pub fn select_channel_api_key(ctx: &ModelProxyContext, channel: &ChannelConfig) -> String {
-    let keys = channel.get_effective_keys();
+/// 解析渠道当前可用的 API Keys。
+/// 站点关联渠道以 site_model_cache 为唯一来源，不回退到配置中可能残留的旧 Key。
+pub async fn resolve_channel_api_keys(
+    ctx: &ModelProxyContext,
+    channel: &ChannelConfig,
+) -> Vec<String> {
+    if let Some(site_id) = channel
+        .site_id
+        .as_deref()
+        .filter(|id| !id.trim().is_empty())
+    {
+        let Some(app_ctx) = ctx.app_ctx.read().await.as_ref().cloned() else {
+            return Vec::new();
+        };
+        let Ok(connection) = app_ctx.database.0.lock() else {
+            return Vec::new();
+        };
+        let Ok(mut statement) = connection.prepare(
+            "SELECT keys_json FROM site_model_cache WHERE site_id = ?1 ORDER BY profile_id",
+        ) else {
+            return Vec::new();
+        };
+        let rows = statement.query_map([site_id], |row| row.get::<_, String>(0));
+        let Ok(rows) = rows else {
+            return Vec::new();
+        };
+        let mut keys = Vec::new();
+        let mut seen = HashSet::new();
+        for raw in rows.flatten() {
+            let Ok(value) = serde_json::from_str::<JsonValue>(&raw) else {
+                continue;
+            };
+            let Some(items) = value.as_array() else {
+                continue;
+            };
+            for item in items {
+                let key = item
+                    .as_str()
+                    .or_else(|| item.get("key").and_then(JsonValue::as_str))
+                    .map(str::trim)
+                    .filter(|key| !key.is_empty());
+                if let Some(key) = key {
+                    if seen.insert(key.to_string()) {
+                        keys.push(key.to_string());
+                    }
+                }
+            }
+        }
+        return keys;
+    }
+
+    channel.get_effective_keys()
+}
+
+/// 选择渠道当前可用的 API Key。站点渠道的 Key 在运行时从站点缓存读取。
+pub async fn select_channel_api_key(ctx: &ModelProxyContext, channel: &ChannelConfig) -> String {
+    let keys = resolve_channel_api_keys(ctx, channel).await;
     if keys.is_empty() {
         return String::new();
-    }
-    if keys.len() == 1 {
-        return keys[0].clone();
     }
     let idx = ctx.key_round_robin.fetch_add(1, Ordering::Relaxed) % keys.len();
     keys[idx].clone()

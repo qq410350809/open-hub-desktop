@@ -126,9 +126,7 @@ pub async fn stop_opencode_proxy(
 pub async fn fetch_model_proxy_models(
     state: Managed<'_, ModelProxyState>,
 ) -> Result<(Vec<ChannelModelList>, Vec<ChannelModelFetchError>), String> {
-    fetch_upstream_models_inner(&state.context).await;
-    let models = state.context.cached_channel_models.read().await.clone();
-    let errors = state.context.cached_fetch_errors.read().await.clone();
+    let (models, errors) = fetch_upstream_models_inner(&state.context, None).await;
     Ok((models, errors))
 }
 
@@ -154,8 +152,9 @@ pub async fn get_cached_channel_errors(
 #[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn fetch_opencode_models(
     state: Managed<'_, OpencodeProxyState>,
+    channel_id: Option<String>,
 ) -> Result<(Vec<ChannelModelList>, Vec<ChannelModelFetchError>), String> {
-    fetch_model_proxy_models(state).await
+    Ok(fetch_upstream_models_inner(&state.context, channel_id.as_deref()).await)
 }
 
 /// opencode 别名：只读取内存中已缓存的渠道模型列表，不发起远程请求。
@@ -533,7 +532,7 @@ pub async fn sync_model_proxy_site_channels(
         // 查询站点库数据
         let mut stmt = conn
             .prepare(
-                "SELECT ds.id, ds.name, ds.api_base_url, smc.keys_json, smc.models_json
+                "SELECT ds.id, ds.name, ds.api_base_url, smc.models_json
                  FROM directory_sites ds
                  LEFT JOIN site_model_cache smc ON smc.site_id = ds.id",
             )
@@ -544,9 +543,8 @@ pub async fn sync_model_proxy_site_channels(
                 let id: String = row.get(0)?;
                 let name: String = row.get(1)?;
                 let api_base_url: String = row.get(2)?;
-                let keys_json: String = row.get::<_, Option<String>>(3)?.unwrap_or_default();
-                let models_json: String = row.get::<_, Option<String>>(4)?.unwrap_or_default();
-                Ok((id, name, api_base_url, keys_json, models_json))
+                let models_json: String = row.get::<_, Option<String>>(3)?.unwrap_or_default();
+                Ok((id, name, api_base_url, models_json))
             })
             .map_err(|e| format!("读取站点记录失败: {e}"))?;
 
@@ -554,7 +552,7 @@ pub async fn sync_model_proxy_site_channels(
             site_ids.map(|s| s.into_iter().collect());
 
         for item in rows.flatten() {
-            let (site_id, site_name, base_url, keys_raw, models_raw) = item;
+            let (site_id, site_name, base_url, models_raw) = item;
             if base_url.trim().is_empty() {
                 continue;
             }
@@ -564,23 +562,7 @@ pub async fn sync_model_proxy_site_channels(
                 }
             }
 
-            // 解析 API Keys
-            let mut parsed_keys = Vec::new();
-            if let Ok(jv) = serde_json::from_str::<JsonValue>(&keys_raw) {
-                if let Some(arr) = jv.as_array() {
-                    for k in arr {
-                        if let Some(s) = k.as_str() {
-                            if !s.trim().is_empty() {
-                                parsed_keys.push(s.trim().to_string());
-                            }
-                        } else if let Some(key_val) = k.get("key").and_then(JsonValue::as_str) {
-                            if !key_val.trim().is_empty() {
-                                parsed_keys.push(key_val.trim().to_string());
-                            }
-                        }
-                    }
-                }
-            }
+            // API Key 不写入反代配置；站点关联渠道运行时从 site_model_cache 读取。
 
             // 解析 Models
             let mut parsed_models = Vec::new();
@@ -603,17 +585,14 @@ pub async fn sync_model_proxy_site_channels(
                 .find(|c| c.site_id.as_deref() == Some(&site_id) || c.id == site_id)
             {
                 existing.base_url = base_url;
-                if !parsed_keys.is_empty() {
-                    existing.api_key = parsed_keys[0].clone();
-                    existing.api_keys = Some(parsed_keys);
-                }
+                existing.api_key.clear();
+                existing.api_keys = None;
                 if !parsed_models.is_empty() && existing.enabled_models.is_none() {
                     existing.enabled_models = Some(parsed_models);
                 }
             } else if filter_set.is_some() {
                 // 用户主动要求同步该站点，自动新增 channel
                 let channel_id = format!("site_{site_id}");
-                let api_key = parsed_keys.first().cloned().unwrap_or_default();
                 current_config.channels.push(ChannelConfig {
                     id: channel_id.clone(),
                     name: site_name,
@@ -621,12 +600,8 @@ pub async fn sync_model_proxy_site_channels(
                     enabled: true,
                     protocol: "openai".to_string(),
                     base_url,
-                    api_key,
-                    api_keys: if parsed_keys.is_empty() {
-                        None
-                    } else {
-                        Some(parsed_keys)
-                    },
+                    api_key: String::new(),
+                    api_keys: None,
                     use_proxy_pool: false,
                     alias: Some(site_id.clone()),
                     site_id: Some(site_id),

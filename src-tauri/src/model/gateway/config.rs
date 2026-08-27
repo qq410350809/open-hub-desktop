@@ -1,6 +1,7 @@
 use super::types::{default_channels, ChannelConfig, ModelProxyConfig, OpencodeProxyConfig};
 use getrandom::fill as fill_random;
 use rusqlite::Connection;
+use std::collections::HashMap;
 
 fn ensure_gateway_api_key(config: &mut ModelProxyConfig) {
     if !config.api_key.trim().is_empty() {
@@ -51,6 +52,15 @@ pub fn sanitize_model_proxy_config(config: &mut ModelProxyConfig) {
             "openai".to_string()
         };
         sanitize_channel_config(ch);
+        if ch
+            .site_id
+            .as_deref()
+            .is_some_and(|site_id| !site_id.trim().is_empty())
+        {
+            // 站点关联渠道的 Key 只从 site_model_cache 运行时读取，避免在网关配置中留存副本。
+            ch.api_key.clear();
+            ch.api_keys = None;
+        }
         let eff = ch.effective_alias();
         if seen_aliases.contains(&eff) {
             let disambiguated = format!("{}_{}", eff, &ch.id[..ch.id.len().min(4)]);
@@ -76,6 +86,48 @@ pub fn sanitize_model_proxy_config(config: &mut ModelProxyConfig) {
         }
     }
     config.next_channel_stats_id = next;
+
+    sanitize_model_channel_order(config);
+}
+
+/// 清洗「多渠道共同提供的模型」路由顺序：key 统一小写，value 去重并剔除
+/// 已不存在的渠道 ID；空表清为 None。顺序（先后关系）保持用户配置不变。
+fn sanitize_model_channel_order(config: &mut ModelProxyConfig) {
+    let Some(order) = config.model_channel_order.take() else {
+        return;
+    };
+    let channel_ids: std::collections::HashSet<&str> = config
+        .channels
+        .iter()
+        .map(|ch| ch.id.as_str())
+        .collect();
+    let cleaned: HashMap<String, Vec<String>> = order
+        .into_iter()
+        .filter_map(|(model, ids)| {
+            let key = model.trim().to_lowercase();
+            if key.is_empty() {
+                return None;
+            }
+            let mut seen = std::collections::HashSet::new();
+            let ids: Vec<String> = ids
+                .into_iter()
+                .filter(|id| {
+                    channel_ids.contains(id.as_str()) && seen.insert(id.clone())
+                })
+                .collect();
+            if ids.len() < 2 {
+                // 单渠道顺序无排序意义，视为未配置
+                None
+            } else {
+                Some((key, ids))
+            }
+        })
+        .collect();
+    if cleaned.is_empty() {
+        config.model_channel_order = None;
+    } else {
+        config.model_channel_order = Some(cleaned);
+    }
 }
 
 pub fn load_model_proxy_config(conn: &Connection) -> ModelProxyConfig {

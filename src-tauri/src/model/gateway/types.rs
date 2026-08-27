@@ -109,7 +109,7 @@ impl ChannelConfig {
 pub fn default_channels() -> Vec<ChannelConfig> {
     vec![ChannelConfig {
         id: "opencode".to_string(),
-        name: "OpenCode 官方免费通道".to_string(),
+        name: "OpenCode 免费".to_string(),
         description: "由 OpenCode 提供的公益推理加速通道，免 Key 访问多种 Coding/Chat 顶尖模型"
             .to_string(),
         enabled: true,
@@ -157,6 +157,10 @@ pub struct ModelProxyConfig {
     /// None 或 0 表示永久保留，由用户手动通过范围清理管理。
     #[serde(default)]
     pub log_retention_days: Option<u32>,
+    /// 多渠道共同提供的模型路由顺序：key=模型名（小写），value=候选渠道 ID 有序列表，
+    /// 排前的优先承接该模型的无前缀调用；未配置的模型沿用渠道数组顺序。
+    #[serde(default)]
+    pub model_channel_order: Option<HashMap<String, Vec<String>>>,
 }
 
 impl ModelProxyConfig {
@@ -193,6 +197,7 @@ impl Default for ModelProxyConfig {
             max_retries: 0,
             next_channel_stats_id: default_next_channel_stats_id(),
             log_retention_days: None,
+            model_channel_order: None,
         }
     }
 }

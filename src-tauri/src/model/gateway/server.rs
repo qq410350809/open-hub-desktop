@@ -67,7 +67,7 @@ pub async fn start_model_proxy_server(state: &ModelProxyState) -> Result<(), Str
 
     let ctx_for_models = state.context.clone();
     crate::context::spawn(async move {
-        fetch_upstream_models_inner(&ctx_for_models).await;
+        fetch_upstream_models_inner(&ctx_for_models, None).await;
     });
 
     Ok(())

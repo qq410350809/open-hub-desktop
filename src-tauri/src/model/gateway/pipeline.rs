@@ -5,17 +5,17 @@
 //! 各入口文件只负责：入参解析、客户端协议 ↔ OpenAI 中枢转换、响应回转。
 
 use super::balancer::{resolve_channel, select_channel_api_key};
-use super::policies::opencode::check_model_channel_compatibility;
 use super::dispatcher::{execute_resilient_egress, EgressRequestMeta, EgressSuccess};
 use super::egress::{self, TargetProtocol};
 use super::logger::{client_name_from_headers, record_attempt_failure, ProxyLogParams};
+use super::policies::opencode::check_model_channel_compatibility;
 use super::router::check_auth;
 use super::types::{
     current_timestamp, ChannelConfig, ModelProxyConfig, ModelProxyContext, ProxyRequestLog,
 };
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use serde_json::{json};
+use serde_json::json;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
@@ -317,7 +317,7 @@ pub async fn dispatch_protocol_egress(
     egress_payload: egress::EgressBody,
     style: ClientProtocol,
 ) -> Result<EgressOutcome, Response> {
-    let channel_api_key = select_channel_api_key(ctx, channel);
+    let channel_api_key = select_channel_api_key(ctx, channel).await;
     let chan_alias = channel.effective_alias();
     let chan_stats_id = channel.stats_id;
 
@@ -430,10 +430,14 @@ mod pipeline_tests {
         let jv: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(jv["type"], "error");
         assert_eq!(
-            jv.pointer("/error/code").and_then(serde_json::Value::as_str),
+            jv.pointer("/error/code")
+                .and_then(serde_json::Value::as_str),
             Some("model_not_found")
         );
-        assert!(jv.pointer("/error/param").is_some(), "Responses 形状带 param 字段");
+        assert!(
+            jv.pointer("/error/param").is_some(),
+            "Responses 形状带 param 字段"
+        );
         assert!(jv.pointer("/error/request_id").is_some());
     }
 
@@ -451,7 +455,8 @@ mod pipeline_tests {
         let jv: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(jv["type"], "error");
         assert_eq!(
-            jv.pointer("/error/type").and_then(serde_json::Value::as_str),
+            jv.pointer("/error/type")
+                .and_then(serde_json::Value::as_str),
             Some("api_error")
         );
 
@@ -474,6 +479,9 @@ mod pipeline_tests {
         );
         let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
         let jv: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert!(jv.pointer("/error/code").is_some(), "Gemini 形状带 code 字段");
+        assert!(
+            jv.pointer("/error/code").is_some(),
+            "Gemini 形状带 code 字段"
+        );
     }
 }
