@@ -284,12 +284,15 @@ export function useModelProxy() {
     }
   }
 
-  async function fetchUpstreamModels(options: { setGlobalFetching?: boolean } = {}): Promise<Record<string, string[]>> {
+  async function fetchUpstreamModels(options: { setGlobalFetching?: boolean; channelId?: string } = {}): Promise<Record<string, string[]>> {
     if (options.setGlobalFetching) {
       fetchingModels.value = true;
     }
     try {
-      const res = await runCommand<any>("fetch_opencode_models");
+      const res = await runCommand<any>(
+        "fetch_opencode_models",
+        options.channelId ? { channelId: options.channelId } : {},
+      );
       const list: ChannelModelList[] =
         Array.isArray(res) && Array.isArray(res[0])
           ? res[0]

@@ -6,8 +6,9 @@ import { icons } from "../../icons";
 import {
   useModelProxy,
   channelAlias,
-  isValidChannelAlias,
+  channelStatsKey,
   filterChannelModels,
+  isValidChannelAlias,
   type ChannelConfig,
   type ChannelUsageStats,
   type GatewayDailyPoint,
@@ -136,6 +137,7 @@ watch(
   (tab) => {
     if (tab === "channels") {
       void refreshChannelStats();
+      void refreshSiteInheritedKeyCounts();
     } else if (tab === "console") {
       void refreshGatewayOverview();
     }
@@ -157,6 +159,7 @@ onMounted(async () => {
 void refreshGatewayOverview();
 await loadProxyData();
 await loadCachedModels();
+void refreshSiteInheritedKeyCounts();
 await fetchLogs({ filter: logStatusFilter.value, q: logSearchQuery.value.trim() });
 
   uptimeTicker = window.setInterval(() => {
@@ -230,6 +233,10 @@ function closeGatewayModelsModal() {
 async function handleOpenChannelModelsModal(channel: ChannelConfig) {
   selectedChannel.value = channel;
   channelModelsModalOpen.value = true;
+  // 0. 初始化重叠模型路由顺序草稿（深拷贝，避免直接改配置对象）
+  draftModelChannelOrder.value = JSON.parse(
+    JSON.stringify(proxyConfig.value.modelChannelOrder ?? {}),
+  );
   // 1. 初始化白名单勾选草稿：白名单为 null（全部启用）时默认全选；否则仅勾选白名单中的模型
   const allow = channel.enabledModels;
   if (allow == null) {
@@ -274,34 +281,14 @@ async function handleOpenChannelModelsModal(channel: ChannelConfig) {
     }
   }
 
-  // 4. 后台静默拉取该渠道最新模型：保证草稿不停留在旧快照。
-  // 上游新增的模型自动进入勾选态（否则白名单会永久遮蔽新模型，造成“刷新也不变”的假象），
-  // 如不需要可在列表中手动取消勾选。
-  const knownBefore = new Set(channelDraftModels.value);
-  void (async () => {
-    try {
-      fetchingDraftModels.value = true;
-      const map = await fetchUpstreamModels({ setGlobalFetching: false });
-      const fresh = map[channel.id];
-      if (!fresh?.length) return;
-      channelDraftModels.value = [...fresh];
-      channelModels.value = { ...channelModels.value, [channel.id]: [...fresh] };
-      if (channelModelAllChecked.value) return;
-      const added = fresh.filter((m) => !knownBefore.has(m));
-      for (const m of added) channelModelSelection.value[m] = true;
-      if (added.length > 0) {
-        showToast(`「${channel.name}」发现 ${added.length} 个新增模型，已自动加入白名单`);
-      }
-    } finally {
-      fetchingDraftModels.value = false;
-    }
-  })();
+  // 打开弹窗只展示本地缓存；远程模型仅由“刷新上游模型”按钮主动拉取。
 }
 
 function closeChannelModelsModal() {
   channelModelsModalOpen.value = false;
   channelDraftModels.value = [];
   channelModelSelection.value = {};
+  draftModelChannelOrder.value = {};
   fetchingDraftModels.value = false;
 }
 
@@ -354,13 +341,87 @@ function clearChannelModels() {
   channelModelSelection.value = {};
 }
 
+// —— 多渠道共同提供的模型：倒排索引 + 路由顺序草稿 ——
+
+/** model(小写) → 提供该模型的启用渠道列表（对外可见口径，白名单过滤后）；仅保留 ≥2 个渠道的条目 */
+const channelOverlapByModel = computed<Map<string, ChannelConfig[]>>(() => {
+  const byModel = new Map<string, ChannelConfig[]>();
+  for (const channel of proxyConfig.value.channels) {
+    if (!channel.enabled) continue;
+    const models = [...new Set(filterChannelModels(channel, modelsForChannel(channel.id)))];
+    for (const model of models) {
+      const list = byModel.get(model.toLowerCase()) ?? [];
+      list.push(channel);
+      byModel.set(model.toLowerCase(), list);
+    }
+  }
+  const overlaps = new Map<string, ChannelConfig[]>();
+  for (const [model, channels] of byModel) {
+    if (channels.length >= 2) overlaps.set(model, channels);
+  }
+  return overlaps;
+});
+
+/** 弹窗内排序草稿：model(小写) → 渠道 ID 有序列表 */
+const draftModelChannelOrder = ref<Record<string, string[]>>({});
+
+/**
+ * 指定模型的候选渠道有序视图：已保存顺序在前，当前发现的其它提供渠道按发现序追加，
+ * 已失效（禁用/不再提供）的渠道剔除。不足 2 个渠道时返回空。
+ */
+function orderedOverlapChannelsFor(model: string): ChannelConfig[] {
+  const discovered = channelOverlapByModel.value.get(model.toLowerCase()) ?? [];
+  if (discovered.length < 2) return [];
+  const savedIds = draftModelChannelOrder.value[model.toLowerCase()] ?? [];
+  const saved = savedIds
+    .map((id) => discovered.find((c) => c.id === id))
+    .filter((c): c is ChannelConfig => !!c);
+  const rest = discovered.filter((c) => !savedIds.includes(c.id));
+  return [...saved, ...rest];
+}
+
+/** 上移/下移：基于「全量候选」重写该模型的草稿顺序 */
+function moveOverlapChannel(model: string, channelId: string, dir: -1 | 1) {
+  const key = model.toLowerCase();
+  const full = orderedOverlapChannelsFor(model);
+  const idx = full.findIndex((c) => c.id === channelId);
+  const target = idx + dir;
+  if (idx < 0 || target < 0 || target >= full.length) return;
+  const next = [...full];
+  [next[idx], next[target]] = [next[target], next[idx]];
+  draftModelChannelOrder.value = { ...draftModelChannelOrder.value, [key]: next.map((c) => c.id) };
+}
+
+/** 仅当用户对该模型调整过顺序（与发现顺序不同）才视为有效配置 */
+function isOverlapOrderCustomized(model: string): boolean {
+  const key = model.toLowerCase();
+  const saved = draftModelChannelOrder.value[key];
+  if (!saved?.length) return false;
+  const ids = orderedOverlapChannelsFor(model).map((c) => c.id);
+  if (saved.length !== ids.length) return false;
+  return ids.some((id, i) => id !== saved[i]);
+}
+
+/** 当前弹窗渠道参与共同提供的模型列表（排序区块数据源，保留渠道侧原始大小写写法） */
+const modalOverlapModels = computed(() => {
+  if (!selectedChannel.value) return [];
+  const visible = filterChannelModels(
+    selectedChannel.value,
+    modelsForChannel(selectedChannel.value.id),
+  );
+  return visible.filter((m) => channelOverlapByModel.value.has(m.toLowerCase()));
+});
+
 async function refreshChannelDraftModels() {
   const channel = selectedChannel.value;
   if (!channel) return;
   fetchingDraftModels.value = true;
   try {
     // 刷新 = 始终远程获取，替换原有模型列表
-    const fetchedMap = await fetchUpstreamModels({ setGlobalFetching: false });
+    const fetchedMap = await fetchUpstreamModels({
+      setGlobalFetching: false,
+      channelId: channel.id,
+    });
     if (fetchedMap[channel.id]?.length) {
       // 更新弹窗草稿列表为远程获取的最新模型
       channelDraftModels.value = [...fetchedMap[channel.id]];
@@ -394,7 +455,23 @@ async function saveChannelModelSelection() {
     channel.enabledModels = selectedChannelModels().filter((m) => isModelChecked(m));
   }
 
-  // 3. 只有内部保存时才触发全局「可用模型」加载状态
+  // 3. 合并重叠模型路由顺序草稿：保留其它模型的既有配置，当前弹窗内调过序的模型以草稿为准
+  const mergedOrder: Record<string, string[]> = {
+    ...(proxyConfig.value.modelChannelOrder ?? {}),
+  };
+  for (const [model, order] of Object.entries(draftModelChannelOrder.value)) {
+    const channels = orderedOverlapChannelsFor(model);
+    // 候选不足 2 个或从未调整顺序的条目不落库
+    if (channels.length >= 2 && isOverlapOrderCustomized(model)) {
+      mergedOrder[model] = order.filter((id) => channels.some((c) => c.id === id));
+    } else {
+      delete mergedOrder[model];
+    }
+  }
+  proxyConfig.value.modelChannelOrder =
+    Object.keys(mergedOrder).length > 0 ? mergedOrder : null;
+
+  // 4. 只有内部保存时才触发全局「可用模型」加载状态
   fetchingModels.value = true;
   try {
     const ok = await saveConfig(proxyConfig.value);
@@ -486,6 +563,49 @@ function channelKeyCount(channel: ChannelConfig): number {
   return new Set(list.map((k) => k.trim()).filter(Boolean)).size;
 }
 
+// —— 站点关联渠道继承的 Key 数量（运行时从站点模型缓存读取，跨账号去重）——
+const siteInheritedKeyCounts = ref<Record<string, number>>({});
+
+/** 按后端 resolve_channel_api_keys 同口径统计：汇总 site_model_cache 各账号 keys 并全局去重 */
+async function refreshSiteInheritedKeyCounts() {
+  const siteIds = [
+    ...new Set(
+      proxyConfig.value.channels
+        .map((c) => c.siteId)
+        .filter((v): v is string => !!v && v.trim() !== ""),
+    ),
+  ];
+  const counts: Record<string, number> = {};
+  await Promise.all(
+    siteIds.map(async (siteId) => {
+      try {
+        const cache = await runCommand<{ accounts?: { keys?: string[] }[] }>(
+          "get_site_model_cache",
+          { siteId },
+        );
+        const seen = new Set<string>();
+        for (const account of cache?.accounts ?? []) {
+          for (const key of account.keys ?? []) {
+            const trimmed = key.trim();
+            if (trimmed) seen.add(trimmed);
+          }
+        }
+        counts[siteId] = seen.size;
+      } catch {
+        /* 缓存读取失败时保持上次结果 */
+      }
+    }),
+  );
+  if (Object.keys(counts).length > 0) {
+    siteInheritedKeyCounts.value = { ...siteInheritedKeyCounts.value, ...counts };
+  }
+}
+
+function channelInheritedKeyCount(channel: ChannelConfig): number {
+  if (!channel.siteId) return 0;
+  return siteInheritedKeyCounts.value[channel.siteId] ?? 0;
+}
+
 /** 校验别名：合法字符 + 全渠道唯一（含 opencode）。返回错误信息，空串表示通过。 */
 function validateAlias(alias: string, excludeId?: string): string {
   const a = alias.trim().toLowerCase();
@@ -567,11 +687,48 @@ const convertSelectedSite = ref<SiteRecord | null>(null);
 const convertAlias = ref("");
 const convertApiBaseUrl = ref("");
 const convertAliasError = ref("");
-const convertKeyLoading = ref(false);
-/** 站点同步数据中读取到的原 Key 列表（与站点纪录关联，全部继承） */
-const convertSiteKeys = ref<{ account: string; key: string }[]>([]);
-/** 未读取到站点 Key 时的手动兜底输入 */
-const convertManualKey = ref("");
+const convertModelLoading = ref(false);
+const convertSiteModelCount = ref(0);
+const convertSiteSearch = ref("");
+
+/** 各站点模型缓存摘要：Key/模型/账号数，供转换列表展示 */
+interface SiteCacheSummary {
+  keyCount: number;
+  modelCount: number;
+  accountCount: number;
+}
+const siteCacheSummaries = ref<Record<string, SiteCacheSummary>>({});
+
+function siteCacheSummary(siteId: string): SiteCacheSummary | undefined {
+  return siteCacheSummaries.value[siteId];
+}
+
+/** 一次拉取全部站点缓存，统计各站点的 Key（去重）、模型、账号数 */
+async function refreshSiteCacheSummaries() {
+  try {
+    const entries = await runCommand<
+      { siteId: string; cache: { models?: unknown[]; accounts?: { keys?: string[] }[] } }[]
+    >("get_all_site_model_caches");
+    const next: Record<string, SiteCacheSummary> = {};
+    for (const entry of entries ?? []) {
+      const keySet = new Set<string>();
+      for (const account of entry.cache?.accounts ?? []) {
+        for (const key of account.keys ?? []) {
+          const trimmed = key.trim();
+          if (trimmed) keySet.add(trimmed);
+        }
+      }
+      next[entry.siteId] = {
+        keyCount: keySet.size,
+        modelCount: entry.cache?.models?.length ?? 0,
+        accountCount: entry.cache?.accounts?.length ?? 0,
+      };
+    }
+    siteCacheSummaries.value = next;
+  } catch {
+    /* 忽略：摘要缺失时按 0 展示 */
+  }
+}
 
 /** 在用且存活（未标记跑路）的站点；已转换为渠道的排除在外 */
 const convertibleSites = computed(() => {
@@ -583,6 +740,16 @@ const convertibleSites = computed(() => {
     .filter((s) => !convertedIds.has(s.id))
     .slice()
     .sort((a, b) => a.name.localeCompare(b.name, "zh-CN"));
+});
+
+/** 转换弹窗内搜索：匹配站点名称或 API 地址 */
+const filteredConvertibleSites = computed(() => {
+  const q = convertSiteSearch.value.trim().toLowerCase();
+  if (!q) return convertibleSites.value;
+  return convertibleSites.value.filter(
+    (s) =>
+      s.name.toLowerCase().includes(q) || s.apiBaseUrl.toLowerCase().includes(q),
+  );
 });
 
 /** 从站点名生成英文别名（中文名回退为 site），并保证与现有渠道别名不冲突 */
@@ -599,29 +766,18 @@ function uniqueChannelAlias(base: string): string {
   return `${base}-${i}`;
 }
 
-function maskApiKey(key: string): string {
-  const value = key.trim();
-  if (!value) return "—";
-  if (value.length <= 6) return `${"•".repeat(6)}`;
-  const prefixLength = value.startsWith("sk-") ? 7 : 4;
-  const suffixLength = Math.min(4, Math.max(2, Math.floor(value.length / 8)));
-  if (value.length <= prefixLength + suffixLength) {
-    return `${value.slice(0, 4)}${"•".repeat(6)}`;
-  }
-  return `${value.slice(0, prefixLength)}${"•".repeat(8)}${value.slice(-suffixLength)}`;
-}
-
 function openSiteConvertDialog() {
   convertSelectedSite.value = null;
   convertAlias.value = "";
   convertApiBaseUrl.value = "";
   convertAliasError.value = "";
-  convertSiteKeys.value = [];
-  convertManualKey.value = "";
+  convertSiteModelCount.value = 0;
+  convertSiteSearch.value = "";
   siteConvertDialogOpen.value = true;
   if (librarySites.value.length === 0) {
     void loadLibrary();
   }
+  void refreshSiteCacheSummaries();
 }
 
 function closeSiteConvertDialog() {
@@ -634,31 +790,21 @@ async function selectConvertSite(site: SiteRecord) {
   convertApiBaseUrl.value = site.apiBaseUrl.trim();
   convertAlias.value = uniqueChannelAlias(slugifySiteName(site.name));
   convertAliasError.value = "";
-  convertSiteKeys.value = [];
-  convertManualKey.value = "";
-  convertKeyLoading.value = true;
+  convertSiteModelCount.value = 0;
+  convertModelLoading.value = true;
   try {
-    const cache = await runCommand<{
-      models?: { id: string }[];
-      accounts?: { username?: string; accountName?: string; profileName?: string; keys?: string[] }[];
-    }>("get_site_model_cache", { siteId: site.id });
-    const accounts = Array.isArray(cache?.accounts) ? cache.accounts : [];
-    const keys: { account: string; key: string }[] = [];
-    for (const acc of accounts) {
-      const accName = acc.username || acc.accountName || acc.profileName || "账号";
-      for (const k of Array.isArray(acc.keys) ? acc.keys : []) {
-        if (k.trim()) keys.push({ account: accName, key: k });
-      }
-    }
-    convertSiteKeys.value = keys;
-    if (Array.isArray(cache?.models) && cache.models.length > 0) {
-      const modelIds = cache.models.map((m) => m.id).filter(Boolean);
+    const cache = await runCommand<{ models?: { id: string }[] }>("get_site_model_cache", {
+      siteId: site.id,
+    });
+    const modelIds = Array.isArray(cache?.models) ? cache.models.map((m) => m.id).filter(Boolean) : [];
+    convertSiteModelCount.value = modelIds.length;
+    if (modelIds.length > 0) {
       channelModels.value[`site_${site.id}`] = modelIds;
     }
   } catch {
-    /* 忽略：无本地缓存时由用户手动填写 */
+    /* 忽略：模型缓存由网关运行时按 siteId 读取 */
   } finally {
-    convertKeyLoading.value = false;
+    convertModelLoading.value = false;
   }
 }
 
@@ -678,19 +824,15 @@ async function confirmConvertSite() {
     convertAliasError.value = "请填写 API 地址";
     return;
   }
-  // 继承站点同步的全部原 Key（请求时自动轮换尝试）；未读取到用手动兜底输入
-  const keys = convertSiteKeys.value.map((item) => item.key.trim()).filter(Boolean);
-  const manualKey = convertManualKey.value.trim();
-  const apiKeys = keys.length > 0 ? keys : manualKey ? [manualKey] : [];
   const channel: ChannelConfig = {
     id: `site_${site.id}`,
     name: site.name,
-    description: `由站点「${site.name}」转换而来的反代渠道（继承站点原 Key ×${apiKeys.length || 1}）`,
+    description: `由站点「${site.name}」转换而来的反代渠道（运行时使用关联站点 Key）`,
     enabled: true,
     protocol: "openai",
     upstreamUrl: convertApiBaseUrl.value.trim(),
-    apiKey: apiKeys[0] ?? "",
-    apiKeys,
+    apiKey: "",
+    apiKeys: [],
     // 站点转换渠道不支持「内部代理池轮询」，仅可在渠道设置中开启「代理池固定通道」
     useProxyPool: false,
     alias: convertAlias.value.trim().toLowerCase(),
@@ -720,13 +862,24 @@ const emptyChannelStats: ChannelUsageStats = {
 };
 
 function channelStatsFor(channel: ChannelConfig): ChannelUsageStats {
-  return channelStats.value[channel.id] ?? emptyChannelStats;
+  const key = channelStatsKey(channel);
+  return channelStats.value[key]
+    ?? channelStats.value[channelAlias(channel)]
+    ?? channelStats.value[channel.id]
+    ?? emptyChannelStats;
 }
 
 function channelSuccessRate(channel: ChannelConfig): string {
   const s = channelStatsFor(channel);
   if (s.totalRequests <= 0) return "—";
   return `${((s.successfulRequests / s.totalRequests) * 100).toFixed(1)}%`;
+}
+
+function channelTodaySuccessRate(channel: ChannelConfig): string {
+  const s = channelStatsFor(channel);
+  const today = s.todayRequests ?? 0;
+  if (today <= 0) return "-";
+  return `${(((s.todaySuccessfulRequests ?? 0) / today) * 100).toFixed(1)}%`;
 }
 
 /** 有请求但成功率低于 90% 时标红提示 */
@@ -2023,7 +2176,18 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
                     title="与站点库原纪录关联，使用该站点同步的原 Key"
                   >站点关联</span>
                   <span
-                    v-if="channelKeyCount(channel) > 0"
+                    v-if="channel.siteId"
+                    class="mp-alias-tag"
+                    :title="
+                      channelInheritedKeyCount(channel) > 1
+                        ? `从站点缓存继承 ${channelInheritedKeyCount(channel)} 个 Key，请求时自动轮换`
+                        : channelInheritedKeyCount(channel) === 1
+                          ? '从站点缓存继承 1 个 Key'
+                          : '站点缓存中暂无可用 Key，请先在站点库同步该站点的 Key'
+                    "
+                  >Key ×{{ channelInheritedKeyCount(channel) }}</span>
+                  <span
+                    v-else-if="channelKeyCount(channel) > 0"
                     class="mp-alias-tag"
                     :title="
                       channelKeyCount(channel) > 1
@@ -2050,51 +2214,53 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
             </label>
           </div>
 
-          <p class="mp-channel-desc">
-            {{ channel.description }}
-          </p>
-
-          <!-- 渠道快捷状态：网络模式 / 在线模型数（点击进入对应弹窗） -->
-          <div class="mp-channel-meta-row">
-            <button
-              type="button"
-              class="mp-channel-meta-chip"
-              :class="{ 'is-active': channel.useProxyPool || channel.useFixedProxy }"
-              title="点击打开渠道设置：网络模式与英文别名"
-              @click="handleOpenChannelSettingsDialog(channel)"
-            >
-              <span v-html="icons.repeat" />
-              <span>{{ channel.useFixedProxy ? "固定通道" : (channel.useProxyPool ? "代理池轮询" : "直连上游") }}</span>
-            </button>
-            <button
-              type="button"
-              class="mp-channel-meta-chip"
-              :class="{ 'is-active': channel.enabledModels != null }"
-              title="管理此渠道对外暴露的可用模型"
-              @click="handleOpenChannelModelsModal(channel)"
-            >
-              <span v-html="icons.cpu" />
-              <span>模型 {{ channelEnabledModelsCount(channel) }}</span>
-            </button>
+          <!-- 渠道统计摘要：累计与今日双层对照 -->
+          <div class="mp-channel-summary" aria-label="渠道使用统计">
+            <div class="mp-channel-summary-row is-total">
+              <span class="mp-channel-summary-label">累计</span>
+              <div class="mp-channel-summary-metrics">
+                <span class="mp-channel-summary-metric" :title="`累计请求 ${channelStatsFor(channel).totalRequests} 次`">
+                  <small>请求</small>
+                  <strong class="font-mono">{{ formatNumber(channelStatsFor(channel).totalRequests) }}</strong>
+                </span>
+                <span
+                  class="mp-channel-summary-metric"
+                  :class="{ 'is-bad': channelSuccessRateBad(channel) }"
+                  :title="`累计成功率 ${channelSuccessRate(channel)}`"
+                >
+                  <small>成功率</small>
+                  <strong>{{ channelSuccessRate(channel) }}</strong>
+                </span>
+                <span class="mp-channel-summary-metric" :title="`累计 Token ${formatNumber(channelStatsFor(channel).totalTokens)}`">
+                  <small>Token</small>
+                  <strong class="font-mono text-brand">{{ formatCompactToken(channelStatsFor(channel).totalTokens) }}</strong>
+                </span>
+              </div>
+            </div>
+            <div class="mp-channel-summary-row is-today">
+              <span class="mp-channel-summary-label">今日</span>
+              <div class="mp-channel-summary-metrics">
+                <span class="mp-channel-summary-metric" :title="`今日请求 ${channelStatsFor(channel).todayRequests ?? 0} 次`">
+                  <small>请求</small>
+                  <strong class="font-mono">{{ formatNumber(channelStatsFor(channel).todayRequests ?? 0) }}</strong>
+                </span>
+                <span
+                  class="mp-channel-summary-metric"
+                  :class="{ 'is-bad': (channelStatsFor(channel).todayRequests ?? 0) > 0 && (channelStatsFor(channel).todaySuccessfulRequests ?? 0) / (channelStatsFor(channel).todayRequests ?? 1) < 0.9 }"
+                  :title="`今日成功率 ${channelTodaySuccessRate(channel)}`"
+                >
+                  <small>成功率</small>
+                  <strong>{{ channelTodaySuccessRate(channel) }}</strong>
+                </span>
+                <span class="mp-channel-summary-metric" :title="`今日 Token ${formatNumber(channelStatsFor(channel).todayTotalTokens ?? 0)}`">
+                  <small>Token</small>
+                  <strong class="font-mono text-brand">{{ formatCompactToken(channelStatsFor(channel).todayTotalTokens ?? 0) }}</strong>
+                </span>
+              </div>
+            </div>
           </div>
 
           <div class="mp-channel-card-footer">
-            <!-- 该渠道使用统计 -->
-            <div class="mp-channel-stats">
-              <div class="mp-channel-stat" title="该渠道累计请求次数">
-                <span>累计请求</span>
-                <strong class="font-mono">{{ channelStatsFor(channel).totalRequests }}</strong>
-              </div>
-              <div class="mp-channel-stat" title="该渠道累计成功请求占比">
-                <span>成功率</span>
-                <strong :class="{ 'is-bad': channelSuccessRateBad(channel) }">{{ channelSuccessRate(channel) }}</strong>
-              </div>
-              <div class="mp-channel-stat" title="该渠道累计消耗 Token（含缓存命中）">
-                <span>累计 Token</span>
-                <strong class="font-mono text-brand">{{ formatCompactToken(channelStatsFor(channel).totalTokens) }}</strong>
-              </div>
-            </div>
-
             <div class="mp-channel-actions">
               <button
                 type="button"
@@ -3094,6 +3260,11 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
                     <div class="mp-mec-title-row">
                       <span class="mp-model-free-badge">{{ channelAlias(group.channel) }}</span>
                       <span class="mp-model-name-title">{{ model }}</span>
+                      <span
+                        v-if="(channelOverlapByModel.get(model.toLowerCase())?.length ?? 0) >= 2"
+                        class="mp-overlap-badge"
+                        :title="`该模型由 ${channelOverlapByModel.get(model.toLowerCase())!.length} 个渠道共同提供；不带别名前缀调用时按「管理模型」中配置的顺序路由`"
+                      >{{ channelOverlapByModel.get(model.toLowerCase())!.length }} 渠道共供</span>
                     </div>
                     <div class="mp-mec-id-row">
                       <span class="mp-mec-id-label">调用 ID</span>
@@ -3232,12 +3403,64 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
             </button>
           </div>
 
-          <!-- 可勾选的模型卡片矩阵 -->
-          <div class="mp-model-cards-grid">
+          <!-- 多渠道共同提供的模型：路由顺序调整 -->
+          <div
+            v-if="modalOverlapModels.length > 0"
+            class="mp-overlap-block"
+          >
+            <div class="mp-overlap-head">
+              <span class="mp-overlap-title">多渠道共同提供的模型</span>
+              <small class="text-muted">同名模型由多个渠道提供时，排前的渠道优先承接无前缀调用 · 改动随本次保存生效</small>
+            </div>
+            <div class="mp-model-check-list">
+              <div
+                v-for="model in modalOverlapModels"
+                :key="model"
+                class="mp-overlap-item"
+              >
+                <code class="mp-overlap-model font-mono">{{ model }}</code>
+                <div class="mp-overlap-channels">
+                  <span
+                    v-for="(ch, idx) in orderedOverlapChannelsFor(model)"
+                    :key="ch.id"
+                    class="mp-overlap-channel-chip"
+                    :class="{ 'is-top': idx === 0 }"
+                  >
+                    <span v-if="idx === 0" class="mp-chip-priority-tag">优先</span>
+                    <span
+                      class="mp-chip-name"
+                      :title="idx === 0 ? `当前优先渠道：${ch.name}` : `第 ${idx + 1} 顺位：${ch.name}`"
+                    >{{ channelAlias(ch) }}</span>
+                    <button
+                      type="button"
+                      class="mp-reorder-btn"
+                      :disabled="idx === 0"
+                      title="上移（提高优先级）"
+                      @click="moveOverlapChannel(model, ch.id, -1)"
+                    >
+                      <span v-html="icons.arrowUp" />
+                    </button>
+                    <button
+                      type="button"
+                      class="mp-reorder-btn mp-reorder-down"
+                      :disabled="idx === orderedOverlapChannelsFor(model).length - 1"
+                      title="下移（降低优先级）"
+                      @click="moveOverlapChannel(model, ch.id, 1)"
+                    >
+                      <span style="transform: rotate(180deg); display: inline-flex;" v-html="icons.arrowUp" />
+                    </button>
+                  </span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- 可勾选的模型列表：单行一条，勾选框 + 别名 + 模型名 + 调用 ID -->
+          <div class="mp-model-check-list">
             <div
               v-for="model in filteredChannelModels"
               :key="model"
-              class="mp-model-elegant-card"
+              class="mp-model-check-item"
               :class="{ 'is-selected': isModelChecked(model) }"
               role="checkbox"
               :aria-checked="isModelChecked(model)"
@@ -3246,19 +3469,19 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
               @click="toggleModel(model)"
               @keydown.enter.space.prevent="toggleModel(model)"
             >
-              <div class="mp-mec-check" aria-hidden="true">
+              <span class="mp-mec-check" aria-hidden="true">
                 <span v-html="isModelChecked(model) ? icons.check : ''" />
-              </div>
-              <div class="mp-mec-left">
-                <div class="mp-mec-title-row">
-                  <span class="mp-model-free-badge">{{ channelAlias(selectedChannel) }}</span>
-                  <span class="mp-model-name-title">{{ model }}</span>
-                </div>
-                <div class="mp-mec-id-row">
-                  <span class="mp-mec-id-label">网关 ID</span>
-                  <code class="mp-mec-id-code">{{ channelAlias(selectedChannel) }}/{{ model }}</code>
-                </div>
-              </div>
+              </span>
+              <span class="mp-model-free-badge">{{ channelAlias(selectedChannel) }}</span>
+              <span class="mp-model-name-title">{{ model }}</span>
+              <span
+                v-if="channelOverlapByModel.get(model.toLowerCase())"
+                class="mp-overlap-badge"
+                :title="
+                  `该模型另由 ${channelOverlapByModel.get(model.toLowerCase())!.filter((c) => c.id !== selectedChannel?.id).map((c) => c.name).join('、')} 提供，可在上方「多渠道共同提供的模型」中调整优先顺序`
+                "
+              >{{ channelOverlapByModel.get(model.toLowerCase())!.length }} 渠道共供</span>
+              <code class="mp-mec-id-code">{{ channelAlias(selectedChannel) }}/{{ model }}</code>
             </div>
           </div>
 
@@ -3531,22 +3754,56 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
         </div>
 
         <div class="mp-modal-body">
-          <!-- 站点列表 -->
+          <!-- 站点搜索框 -->
+          <div class="mp-search-box">
+            <span class="mp-search-icon" v-html="icons.search" />
+            <input
+              v-model="convertSiteSearch"
+              type="search"
+              placeholder="搜索站点名称或 API 地址…"
+            />
+          </div>
+
+          <!-- 站点列表：图标 + 名称/主机 + Key·模型·账号 统计徽标 -->
           <div class="mp-site-list">
             <button
-              v-for="site in convertibleSites"
+              v-for="site in filteredConvertibleSites"
               :key="site.id"
               type="button"
               class="mp-site-item"
               :class="{ 'is-selected': convertSelectedSite?.id === site.id }"
               @click="selectConvertSite(site)"
             >
-              <span class="mp-site-item-name">{{ site.name }}</span>
-              <span class="mp-site-item-url font-mono">{{ site.apiBaseUrl }}</span>
+              <img v-if="site.icon" class="mp-site-item-icon" :src="site.icon" alt="" />
+              <span v-else class="mp-site-item-icon mp-site-item-icon-fallback">{{
+                site.name.slice(0, 1)
+              }}</span>
+              <span class="mp-site-item-main">
+                <span class="mp-site-item-name">{{ site.name }}</span>
+                <span class="mp-site-item-url font-mono">{{ formatUpstreamUrl(site.apiBaseUrl) }}</span>
+              </span>
+              <span class="mp-site-item-stats font-mono">
+                <span
+                  class="mp-sis-badge"
+                  :class="{ 'is-empty': (siteCacheSummary(site.id)?.keyCount ?? 0) === 0 }"
+                  :title="`从站点缓存继承 ${siteCacheSummary(site.id)?.keyCount ?? 0} 个 Key`"
+                >Key {{ siteCacheSummary(site.id)?.keyCount ?? 0 }}</span>
+                <span
+                  class="mp-sis-badge"
+                  :class="{ 'is-empty': (siteCacheSummary(site.id)?.modelCount ?? 0) === 0 }"
+                  :title="`已同步 ${siteCacheSummary(site.id)?.modelCount ?? 0} 个模型`"
+                >模型 {{ siteCacheSummary(site.id)?.modelCount ?? 0 }}</span>
+                <span
+                  v-if="(siteCacheSummary(site.id)?.accountCount ?? 0) > 1"
+                  class="mp-sis-badge"
+                  :title="`覆盖 ${siteCacheSummary(site.id)?.accountCount} 个浏览器账号`"
+                >{{ siteCacheSummary(site.id)?.accountCount }} 账号</span>
+              </span>
             </button>
-            <div v-if="convertibleSites.length === 0" class="mp-empty-box">
+            <div v-if="filteredConvertibleSites.length === 0" class="mp-empty-box">
               <div class="mp-empty-icon" v-html="icons.globe" />
-              <p>暂无「在用且存活」的站点可转换</p>
+              <p v-if="convertSiteSearch">未检索到匹配的站点</p>
+              <p v-else>暂无「在用且存活」的站点可转换</p>
             </div>
           </div>
 
@@ -3581,30 +3838,23 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
               />
             </div>
 
-            <!-- 站点原 Key：全部继承，无需选择 -->
+            <!-- 站点凭证由网关运行时按 siteId 读取，不复制到渠道配置 -->
             <div class="mp-settings-field">
               <div class="mp-settings-field-head">
-                <span>站点 API Key（继承全部）</span>
-                <small v-if="convertKeyLoading" class="text-muted">正在读取站点 Key…</small>
+                <span>站点凭证</span>
+                <small v-if="convertModelLoading" class="text-muted">正在读取站点模型…</small>
               </div>
-              <div v-if="convertSiteKeys.length > 0" class="mp-convert-keys">
-                <span
-                  v-for="(item, i) in convertSiteKeys"
-                  :key="i"
-                  class="mp-convert-key-chip"
-                  :title="`${item.account} 的原 Key`"
-                >{{ maskApiKey(item.key) }}</span>
-              </div>
-              <input
-                v-else
-                v-model="convertManualKey"
-                type="password"
-                class="mp-settings-input"
-                placeholder="未读取到站点 Key，可手动填写（留空则发送 Bearer public）"
-              />
-              <p v-if="convertSiteKeys.length > 0" class="mp-settings-hint">已继承该站点 {{ convertSiteKeys.length }} 个原 Key，请求时自动轮换尝试</p>
-              <p v-else-if="convertKeyLoading" class="mp-settings-hint">正在从本地同步数据读取站点原 Key…</p>
-              <p v-else class="mp-settings-hint">未在本地同步数据中找到该站点的 Key</p>
+              <p class="mp-settings-hint">
+                该渠道只保存站点关联关系；请求和模型拉取时会直接使用站点当前同步的 Key，不在反代配置中保存副本。
+                <span v-if="convertModelLoading">正在读取站点缓存…</span>
+                <template v-else>
+                  <span v-if="convertSiteModelCount > 0">当前已同步 {{ convertSiteModelCount }} 个模型。</span>
+                  <span
+                    v-if="(siteCacheSummary(convertSelectedSite.id)?.keyCount ?? 0) > 0"
+                  >将继承 {{ siteCacheSummary(convertSelectedSite.id)?.keyCount }} 个 Key（多 Key 自动轮换）。</span>
+                  <span v-else class="mp-convert-key-missing">⚠️ 该站点暂无已同步的 Key，转换后需先在站点库同步 Key 才能调用。</span>
+                </template>
+              </p>
             </div>
           </div>
         </div>
@@ -4946,14 +5196,14 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
 .mp-site-item {
   display: flex;
   align-items: center;
-  justify-content: space-between;
   gap: 10px;
-  padding: 10px 12px;
+  padding: 9px 12px;
   border-radius: var(--r-md, 8px);
   background: var(--surface-soft);
   border: 1px solid var(--line);
   cursor: pointer;
   transition: all 0.15s ease;
+  text-align: left;
 }
 
 .mp-site-item:hover {
@@ -4966,19 +5216,79 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
   background: var(--brand-soft);
 }
 
+.mp-site-item-icon {
+  width: 26px;
+  height: 26px;
+  border-radius: 6px;
+  object-fit: cover;
+  flex-shrink: 0;
+  background: var(--surface);
+  border: 1px solid var(--line);
+}
+
+.mp-site-item-icon-fallback {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--brand-deep);
+}
+
+.mp-site-item-main {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1;
+}
+
 .mp-site-item-name {
   font-size: 13px;
   font-weight: 650;
   color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .mp-site-item-url {
-  font-size: 11.5px;
+  font-size: 11px;
   color: var(--muted);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  max-width: 55%;
+}
+
+.mp-site-item-stats {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex-shrink: 0;
+}
+
+.mp-sis-badge {
+  font-family: var(--font-mono, monospace);
+  font-size: 10.5px;
+  font-weight: 600;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: var(--brand-soft);
+  border: 1px solid color-mix(in srgb, var(--brand) 45%, transparent);
+  color: var(--brand-deep);
+  white-space: nowrap;
+}
+
+.mp-sis-badge.is-empty {
+  background: var(--surface);
+  border-color: var(--line);
+  color: var(--muted);
+}
+
+/* 转换弹窗：站点无 Key 的警示文案 */
+.mp-convert-key-missing {
+  color: var(--warning, #d97706);
+  font-weight: 600;
 }
 
 .mp-convert-config {
@@ -5003,14 +5313,6 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
   background: var(--brand-soft);
   border: 1px solid var(--brand);
   color: var(--brand-deep);
-}
-
-.mp-channel-desc {
-  font-size: 12.5px;
-  color: var(--muted);
-  margin: 0;
-  line-height: 1.45;
-  min-height: 36px;
 }
 
 /* 代理池配置块 */
@@ -5074,42 +5376,84 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
   color: var(--muted);
 }
 
-/* 渠道快捷状态行 */
-.mp-channel-meta-row {
+/* 渠道统计摘要：累计与今日双层对照 */
+.mp-channel-summary {
   display: flex;
-  gap: 8px;
-  flex-wrap: wrap;
-}
-
-.mp-channel-meta-chip {
-  display: inline-flex;
-  align-items: center;
+  flex-direction: column;
   gap: 6px;
-  padding: 4px 10px;
-  border-radius: 999px;
+  padding: 8px 10px;
+  border-radius: var(--r-md, 10px);
   background: var(--surface-soft);
   border: 1px solid var(--line);
+}
+
+.mp-channel-summary-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.mp-channel-summary-row.is-today {
+  border-top: 1px dashed var(--line);
+  padding-top: 6px;
+}
+
+.mp-channel-summary-label {
+  font-size: 11px;
+  font-weight: 700;
   color: var(--muted);
-  font-size: 11.5px;
-  font-weight: 600;
-  cursor: pointer;
-  transition: all 0.15s ease;
+  width: 28px;
+  flex-shrink: 0;
+  text-align: center;
+  letter-spacing: 0.04em;
 }
 
-.mp-channel-meta-chip :deep(svg) {
-  width: 12px;
-  height: 12px;
-}
-
-.mp-channel-meta-chip:hover {
-  color: var(--text);
-  border-color: var(--line-strong);
-}
-
-.mp-channel-meta-chip.is-active {
+.mp-channel-summary-row.is-today .mp-channel-summary-label {
   color: var(--brand-deep);
-  border-color: var(--brand);
-  background: var(--brand-soft);
+}
+
+.mp-channel-summary-metrics {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 6px;
+  flex: 1;
+  min-width: 0;
+}
+
+.mp-channel-summary-metric {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
+.mp-channel-summary-metric small {
+  font-size: 10.5px;
+  color: var(--muted);
+  line-height: 1;
+}
+
+.mp-channel-summary-metric strong {
+  font-size: 13.5px;
+  font-weight: 700;
+  color: var(--text);
+  line-height: 1.2;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.mp-channel-summary-metric.is-bad strong {
+  color: var(--danger, #e5484d);
+}
+
+@media (max-width: 480px) {
+  .mp-channel-summary-metrics {
+    gap: 4px;
+  }
+  .mp-channel-summary-metric strong {
+    font-size: 12.5px;
+  }
 }
 
 .mp-channel-card-footer {
@@ -5118,33 +5462,6 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
   gap: 10px;
   padding-top: 12px;
   border-top: 1px solid var(--line);
-}
-
-/* 渠道使用统计：三格均分 */
-.mp-channel-stats {
-  display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: 8px;
-}
-
-.mp-channel-stat {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-}
-
-.mp-channel-stat span {
-  font-size: 11px;
-  color: var(--muted);
-}
-
-.mp-channel-stat strong {
-  font-size: 13px;
-  color: var(--text);
-}
-
-.mp-channel-stat strong.is-bad {
-  color: var(--danger, #e5484d);
 }
 
 .mp-channel-actions {
@@ -5795,6 +6112,197 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
 
 .mp-copy-action-btn.copied :deep(svg) {
   color: #fff;
+}
+
+/* 管理模型弹窗：单行列表形式 */
+.mp-model-check-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.mp-model-check-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 12px;
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md, 10px);
+  cursor: pointer;
+  transition: all 0.18s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.mp-model-check-item:hover {
+  border-color: color-mix(in srgb, var(--brand) 50%, transparent);
+}
+
+/* 勾选态高亮，未勾选态降低透明度 */
+.mp-model-check-item.is-selected {
+  border-color: var(--brand);
+  background: var(--brand-soft);
+}
+
+.mp-model-check-item:not(.is-selected) {
+  opacity: 0.68;
+}
+
+.mp-model-check-item:not(.is-selected):hover {
+  opacity: 0.9;
+}
+
+.mp-model-check-item .mp-mec-check {
+  flex-shrink: 0;
+}
+
+.mp-model-check-item .mp-model-free-badge {
+  flex-shrink: 0;
+}
+
+.mp-model-check-item .mp-model-name-title {
+  font-size: 13px;
+  flex-shrink: 0;
+  max-width: 40%;
+  min-width: 0;
+}
+
+.mp-model-check-item .mp-mec-id-code {
+  font-size: 11.5px;
+  margin-left: auto;
+  min-width: 0;
+}
+
+/* —— 管理模型弹窗：多渠道共同提供的模型区块 —— */
+.mp-overlap-block {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  background: var(--surface-soft);
+  border: 1px solid color-mix(in srgb, var(--brand) 30%, var(--line));
+  border-radius: var(--r-md, 10px);
+  padding: 10px 12px;
+}
+
+.mp-overlap-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.mp-overlap-title {
+  font-size: 12.5px;
+  font-weight: 700;
+  color: var(--brand-deep);
+}
+
+.mp-overlap-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 8px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.mp-overlap-model {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text);
+  flex-shrink: 0;
+  max-width: 200px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.mp-overlap-channels {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.mp-overlap-channel-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 6px;
+  border-radius: 999px;
+  background: var(--surface-soft);
+  border: 1px solid var(--line-strong);
+  font-size: 11.5px;
+  color: var(--text);
+}
+
+.mp-overlap-channel-chip.is-top {
+  border-color: var(--brand);
+  background: var(--brand-soft);
+  color: var(--brand-deep);
+  font-weight: 650;
+}
+
+.mp-chip-priority-tag {
+  font-size: 9.5px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  padding: 0 4px;
+  border-radius: 4px;
+  background: var(--brand);
+  color: #fff;
+  line-height: 15px;
+}
+
+.mp-chip-name {
+  font-family: var(--font-mono, monospace);
+  max-width: 130px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.mp-reorder-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 4px;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  transition: all 0.15s ease;
+  padding: 0;
+}
+
+.mp-reorder-btn :deep(svg) {
+  width: 11px;
+  height: 11px;
+}
+
+.mp-reorder-btn:hover:not(:disabled) {
+  background: var(--brand-soft);
+  color: var(--brand-deep);
+}
+
+.mp-reorder-btn:disabled {
+  opacity: 0.3;
+  cursor: default;
+}
+
+/* 模型行内的「N 渠道共供」角标 */
+.mp-overlap-badge {
+  flex-shrink: 0;
+  font-size: 10px;
+  font-weight: 700;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: color-mix(in srgb, #f59e0b 16%, transparent);
+  border: 1px solid color-mix(in srgb, #f59e0b 55%, transparent);
+  color: #b45309;
 }
 
 .mp-empty-box {

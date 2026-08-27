@@ -29,6 +29,8 @@ export interface OpencodeProxyConfig {
   nextChannelStatsId?: number;
   /** 请求明细保留天数：超期自动清理明细（统计聚合不受影响）；0 或缺省 = 永久保留 */
   logRetentionDays?: number;
+  /** 多渠道共同提供的模型路由顺序：key=模型名（小写），value=候选渠道 ID 有序列表，排前的优先承接无前缀调用 */
+  modelChannelOrder?: Record<string, string[]> | null;
 }
 
 export interface OpencodeProxyStatus {
