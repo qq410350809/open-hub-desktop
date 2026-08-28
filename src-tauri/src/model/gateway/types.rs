@@ -8,9 +8,10 @@ use std::sync::Arc as StdArc;
 use std::time::Instant;
 use tokio::sync::RwLock;
 
-pub const DEFAULT_MODEL_PROXY_PORT: u16 = 17896;
-#[allow(dead_code)]
-pub const DEFAULT_OPENCODE_PROXY_PORT: u16 = DEFAULT_MODEL_PROXY_PORT;
+/// 模型网关默认端口：与内嵌 Web 服务同端口，dev 隔离形态走 17996。
+pub fn default_model_proxy_port() -> u16 {
+    crate::core::profile::preferred_service_port()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -249,7 +250,7 @@ impl Default for ModelProxyConfig {
         Self {
             enabled: true,
             listen_host: default_listen_host(),
-            port: DEFAULT_MODEL_PROXY_PORT,
+            port: default_model_proxy_port(),
             api_key: String::new(),
             channels: default_channels(),
             timeout_seconds: default_timeout_seconds(),

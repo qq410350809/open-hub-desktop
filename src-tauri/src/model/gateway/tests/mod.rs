@@ -5,7 +5,7 @@ use serde_json::json;
 fn parses_opencode_proxy_default_config() {
     let cfg = ModelProxyConfig::default();
     assert!(cfg.enabled);
-    assert_eq!(cfg.port, DEFAULT_MODEL_PROXY_PORT);
+    assert_eq!(cfg.port, default_model_proxy_port());
     assert_eq!(cfg.channels.len(), 1);
     assert_eq!(cfg.channels[0].id, "opencode");
     assert_eq!(cfg.channels[0].effective_alias(), "opencode");
@@ -54,6 +54,9 @@ fn channel_alias_fallback_and_normalization() {
         model_redirects: None,
         rate_limit_rpm: None,
         stats_id: None,
+        key_groups: None,
+        key_rules: None,
+        model_proxy_rules: None,
     };
     assert_eq!(ch.effective_alias(), "vip_channel");
     ch.alias = None;
@@ -88,6 +91,9 @@ fn resolves_channels_with_alias_prefix_or_model_whitelist() {
                 model_redirects: None,
                 rate_limit_rpm: None,
                 stats_id: None,
+                key_groups: None,
+                key_rules: None,
+                model_proxy_rules: None,
             },
             ChannelConfig {
                 id: "vip".to_string(),
@@ -109,6 +115,9 @@ fn resolves_channels_with_alias_prefix_or_model_whitelist() {
                 model_redirects: None,
                 rate_limit_rpm: None,
                 stats_id: None,
+                key_groups: None,
+                key_rules: None,
+                model_proxy_rules: None,
             },
         ],
         timeout_seconds: 300,
@@ -157,6 +166,9 @@ fn order_test_channel(id: &str, alias: &str, enabled: bool) -> ChannelConfig {
         model_redirects: None,
         rate_limit_rpm: None,
         stats_id: None,
+        key_groups: None,
+        key_rules: None,
+        model_proxy_rules: None,
     }
 }
 
@@ -281,6 +293,9 @@ async fn multi_key_round_robin_selection() {
         model_redirects: None,
         rate_limit_rpm: None,
         stats_id: None,
+        key_groups: None,
+        key_rules: None,
+        model_proxy_rules: None,
     };
 
     let keys = ch.get_effective_keys();
@@ -296,6 +311,116 @@ async fn multi_key_round_robin_selection() {
     assert_eq!(k2, "key-2");
     assert_eq!(k3, "key-3");
     assert_eq!(k4, "key-1");
+}
+
+#[tokio::test]
+async fn channel_key_groups_failover_and_filtering() {
+    use crate::model::gateway::types::{ChannelKeyRule, KeyGroupItem};
+
+    let ch = ChannelConfig {
+        id: "grouped_channel".to_string(),
+        name: "Grouped Channel".to_string(),
+        description: "".to_string(),
+        enabled: true,
+        protocol: "openai".to_string(),
+        base_url: "https://api.example.com/v1".to_string(),
+        api_key: "".to_string(),
+        api_keys: Some(vec![
+            "key-primary-1".to_string(),
+            "key-primary-2".to_string(),
+            "key-backup-1".to_string(),
+            "key-disabled".to_string(),
+            "key-gpt4-only".to_string(),
+        ]),
+        use_proxy_pool: false,
+        alias: None,
+        site_id: None,
+        use_fixed_proxy: false,
+        fixed_proxy_node: None,
+        priority: None,
+        weight: None,
+        enabled_models: None,
+        model_redirects: None,
+        rate_limit_rpm: None,
+        stats_id: None,
+        // 定义分组优先级：primary 优先级最高，backup 其次，disabled_group 禁用
+        key_groups: Some(vec![
+            KeyGroupItem {
+                id: "primary".to_string(),
+                name: "主力组".to_string(),
+                enabled: true,
+            },
+            KeyGroupItem {
+                id: "backup".to_string(),
+                name: "备用组".to_string(),
+                enabled: true,
+            },
+            KeyGroupItem {
+                id: "disabled_group".to_string(),
+                name: "停用组".to_string(),
+                enabled: false,
+            },
+        ]),
+        key_rules: Some(vec![
+            ChannelKeyRule {
+                key: "key-primary-1".to_string(),
+                group_id: "primary".to_string(),
+                enabled: true,
+                supported_models: None, // 支持全部
+            },
+            ChannelKeyRule {
+                key: "key-primary-2".to_string(),
+                group_id: "primary".to_string(),
+                enabled: true,
+                supported_models: None, // 支持全部
+            },
+            ChannelKeyRule {
+                key: "key-backup-1".to_string(),
+                group_id: "backup".to_string(),
+                enabled: true,
+                supported_models: None,
+            },
+            ChannelKeyRule {
+                key: "key-disabled".to_string(),
+                group_id: "primary".to_string(),
+                enabled: false, // 单 Key 禁用
+                supported_models: None,
+            },
+            ChannelKeyRule {
+                key: "key-gpt4-only".to_string(),
+                group_id: "primary".to_string(),
+                enabled: true,
+                supported_models: Some(vec!["gpt-4".to_string()]), // 仅支持 gpt-4
+            },
+        ]),
+        model_proxy_rules: None,
+    };
+
+    let state = ModelProxyState::new_with_app(None);
+
+    // 1. 请求 gpt-3.5-turbo：key-gpt4-only 不支持，key-disabled 被禁用
+    // 应当返回 2 个分组：[ [key-primary-1, key-primary-2], [key-backup-1] ]
+    let groups = resolve_channel_key_groups_for_model(&state.context, &ch, "gpt-3.5-turbo").await;
+    assert_eq!(groups.len(), 2);
+    assert_eq!(groups[0], vec!["key-primary-1", "key-primary-2"]);
+    assert_eq!(groups[1], vec!["key-backup-1"]);
+
+    // 2. 请求 gpt-4：key-gpt4-only 支持，进入主力组
+    let groups_gpt4 = resolve_channel_key_groups_for_model(&state.context, &ch, "gpt-4").await;
+    assert_eq!(groups_gpt4.len(), 2);
+    assert_eq!(
+        groups_gpt4[0],
+        vec!["key-primary-1", "key-primary-2", "key-gpt4-only"]
+    );
+    assert_eq!(groups_gpt4[1], vec!["key-backup-1"]);
+
+    // 3. 禁用主力组：自动只剩下备用组
+    let mut ch_disabled_primary = ch.clone();
+    ch_disabled_primary.key_groups.as_mut().unwrap()[0].enabled = false;
+    let groups_backup_only =
+        resolve_channel_key_groups_for_model(&state.context, &ch_disabled_primary, "gpt-4").await;
+    assert_eq!(groups_backup_only.len(), 1);
+    assert_eq!(groups_backup_only[0], vec!["key-backup-1"]);
 }
 
 #[test]
@@ -513,6 +638,9 @@ fn opencode_channel_detection_covers_id_protocol_alias_url_and_name() {
             model_redirects: None,
             rate_limit_rpm: None,
             stats_id: None,
+            key_groups: None,
+            key_rules: None,
+            model_proxy_rules: None,
         };
 
     assert!(is_opencode_channel(&make(
@@ -869,6 +997,9 @@ async fn opencode_model_compatibility_and_anonymous_mode() {
         model_redirects: None,
         rate_limit_rpm: None,
         stats_id: None,
+        key_groups: None,
+        key_rules: None,
+        model_proxy_rules: None,
     };
 
     let state = ModelProxyState::new_with_app(None);
@@ -923,6 +1054,9 @@ fn stats_channel(id: &str, alias: Option<&str>, stats_id: Option<u32>) -> Channe
         model_redirects: None,
         rate_limit_rpm: None,
         stats_id,
+        key_groups: None,
+        key_rules: None,
+        model_proxy_rules: None,
     }
 }
 
@@ -1063,6 +1197,9 @@ fn egress_test_channel(id: &str, base_url: String) -> ChannelConfig {
         model_redirects: None,
         rate_limit_rpm: None,
         stats_id: None,
+        key_groups: None,
+        key_rules: None,
+        model_proxy_rules: None,
     }
 }
 
@@ -1428,6 +1565,9 @@ fn sanitize_clears_keys_for_site_linked_channels_only() {
         model_redirects: None,
         rate_limit_rpm: None,
         stats_id: None,
+        key_groups: None,
+        key_rules: None,
+        model_proxy_rules: None,
     });
     // 手工渠道：Key 必须原样保留
     cfg.channels.push(ChannelConfig {
@@ -1450,6 +1590,9 @@ fn sanitize_clears_keys_for_site_linked_channels_only() {
         model_redirects: None,
         rate_limit_rpm: None,
         stats_id: None,
+        key_groups: None,
+        key_rules: None,
+        model_proxy_rules: None,
     });
 
     sanitize_model_proxy_config(&mut cfg);
@@ -1547,6 +1690,9 @@ async fn resolve_channel_api_keys_reads_site_cache_and_dedupes() {
         model_redirects: None,
         rate_limit_rpm: None,
         stats_id: None,
+        key_groups: None,
+        key_rules: None,
+        model_proxy_rules: None,
     };
     let keys = super::balancer::resolve_channel_api_keys(&state.context, &site_channel).await;
     // 合并两个 profile：sk-99130cfe8 跨账号重复，应去重；最终 3 个唯一 Key
@@ -1576,6 +1722,9 @@ async fn resolve_channel_api_keys_reads_site_cache_and_dedupes() {
         model_redirects: None,
         rate_limit_rpm: None,
         stats_id: None,
+        key_groups: None,
+        key_rules: None,
+        model_proxy_rules: None,
     };
     let manual_keys =
         super::balancer::resolve_channel_api_keys(&state.context, &manual_channel).await;
