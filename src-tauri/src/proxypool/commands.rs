@@ -9,18 +9,17 @@ use crate::proxypool::rotator::{
     list_channel_candidate_nodes, list_prioritized_fast_proxy_nodes, write_channel_node,
 };
 use crate::proxypool::runtime::{
-    controller_client, ensure_channel_instance, ensure_default_proxy_channel, ensure_runtime,
-    is_slow_or_blocked_speed_test_url, load_state, row_subscription, runtime_controller_port,
-    runtime_nodes, runtime_proxy_url, select_runtime_node, wait_runtime_ready, write_meta,
+    controller_client, ensure_channel_instance, ensure_default_proxy_channel,
+    ensure_global_runtime, ensure_runtime, is_slow_or_blocked_speed_test_url, load_state,
+    row_subscription, runtime_controller_port, runtime_nodes, runtime_proxy_url,
+    select_group_node, select_runtime_node, write_meta,
 };
 use crate::proxypool::tester::{
-    normalize_ignore_addresses, run_proxy_node_pool, speed_test_candidates,
-    test_controller_proxy_delay,
+    controller_proxy_delay, measure_get_probe, normalize_ignore_addresses, run_proxy_node_pool,
 };
 use crate::proxypool::types::*;
 use rusqlite::{params, OptionalExtension};
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::warn;
@@ -456,11 +455,7 @@ pub fn delete_proxy_channel(
         .execute("DELETE FROM proxy_channels WHERE id = ?1", [id])
         .map_err(|error| error.to_string())?;
     drop(connection);
-    if let Ok(mut instances) = runtime.channel_instances.lock() {
-        if let Some(mut inst) = instances.remove(id) {
-            stop_single_instance(&mut inst);
-        }
-    }
+    runtime.release_channel_lane(id);
     load_state(&database, &runtime)
 }
 
@@ -523,6 +518,8 @@ pub fn assign_account_proxy_channel(
         )
         .map_err(|error| error.to_string())?;
     drop(connection);
+    // 账号改走通道出口，其独立 lane 映射已无意义，释放回池
+    runtime.release_account_lane(profile_id);
     load_state(&database, &runtime)
 }
 
@@ -545,6 +542,8 @@ pub fn unassign_account_proxy_channel(
         )
         .map_err(|error| error.to_string())?;
     drop(connection);
+    // 解绑后账号下次出口请求会重新轮询分配独立 lane，这里先释放旧映射
+    runtime.release_account_lane(profile_id);
     load_state(&database, &runtime)
 }
 
@@ -584,15 +583,8 @@ pub async fn test_proxy_channel_nodes(
         return Err("代理池中没有可测试的节点，请先添加或启用节点".to_string());
     }
 
-    run_proxy_node_pool(
-        &bus,
-        database,
-        runtime,
-        Some(requested),
-        Some(CHANNEL_SPEED_TEST_URL.to_string()),
-        true,
-    )
-    .await?;
+    run_proxy_node_pool(&bus, database, runtime, Some(requested), true)
+        .await?;
     load_state(database, runtime)
 }
 
@@ -615,9 +607,9 @@ pub async fn set_active_proxy_node(
             .map_err(|error| error.to_string())?
             .ok_or("代理节点不存在")?
     };
-    let only = HashSet::from([runtime_name.clone()]);
+    // 全局单实例装载全量节点，激活节点只是切 OpenHub 组，无需按子集重建配置
     let _guard = runtime.runtime_op_lock.lock().await;
-    tokio::task::block_in_place(|| ensure_runtime(&database, &runtime, Some(&only), None))?;
+    tokio::task::block_in_place(|| ensure_global_runtime(&database, &runtime))?;
     select_runtime_node(&runtime, &runtime_name).await?;
     let proxy_url = runtime_proxy_url(&runtime);
     let connection = database.lock_conn()?;
@@ -667,20 +659,7 @@ pub async fn test_proxy_node(
 ) -> Result<ProxyNode, String> {
     let database = &*ctx.database;
     let runtime = &*ctx.proxy_runtime;
-    let test_id = runtime.next_test_id.fetch_add(1, Ordering::Relaxed);
-    let test_directory = runtime.directory.join(format!("single-test-{test_id}"));
-    let _test_directory_cleanup = TemporaryRuntimeDirectory(test_directory.clone());
-    let port_offset = ((test_id % 100) as u16).saturating_mul(2);
-    let test_runtime = ProxyRuntime::new_with_ports(
-        test_directory,
-        37890u16.saturating_add(port_offset),
-        39090u16.saturating_add(port_offset),
-    );
-    let only = HashSet::from([node_id.clone()]);
-    tokio::task::block_in_place(|| ensure_runtime(&database, &test_runtime, Some(&only), None))?;
-    let controller_port = runtime_controller_port(&test_runtime)?;
-    tokio::task::block_in_place(|| wait_runtime_ready(controller_port, 1, None))?;
-    let configured = {
+    {
         let connection = database.lock_conn()?;
         let exists = connection
             .query_row(
@@ -694,46 +673,62 @@ pub async fn test_proxy_node(
         if !exists {
             return Err("代理节点不存在".into());
         }
-        let value = crate::db::read_meta_conn(&connection, PROXY_SPEED_TEST_URL_KEY)?;
-        let trimmed = value.trim();
-        if !trimmed.is_empty() && !is_slow_or_blocked_speed_test_url(trimmed) {
-            trimmed.to_string()
-        } else {
-            DEFAULT_PROXY_SPEED_TEST_URL.to_string()
-        }
-    };
-    let client = controller_client()?;
-    let mut latency = None;
-    let mut attempted = Vec::new();
-    for target in speed_test_candidates(&configured) {
-        attempted.push(target.clone());
-        latency =
-            test_controller_proxy_delay(client.clone(), controller_port, node_id.clone(), target)
-                .await;
-        if latency.is_some() {
-            break;
-        }
     }
-    let status = if latency.is_some() {
-        "success"
-    } else {
-        "error"
+    // 与批量测速互斥（共用固定 SPEED lane），不再拉起临时单节点实例。
+    // 全局单实例装载全量节点且代理名即节点 id，切组直接寻址。
+    let test_lease = runtime.start_proxy_test()?;
+    let _op_guard = runtime.runtime_op_lock.lock().await;
+    tokio::task::block_in_place(|| ensure_global_runtime(database, runtime))?;
+    let client = controller_client()?;
+    let controller_port = runtime_controller_port(runtime)?;
+    let lane = runtime.speed_lane_slot(0)?;
+    select_group_node(runtime, &lane.group_name, &node_id).await?;
+    // 延迟：控制器 delay 接口（unified-delay 双测取小，传统面板口径）；
+    // 连不通直接判死，不再白等下载超时。网速：经 lane 真实 GET 下载 500KB。
+    let delay_url = {
+        let stored = crate::db::read_meta(database, PROXY_SPEED_TEST_URL_KEY).unwrap_or_default();
+        if stored.trim().is_empty() || is_slow_or_blocked_speed_test_url(&stored) {
+            DEFAULT_PROXY_SPEED_TEST_URL.to_string()
+        } else {
+            stored
+        }
     };
-    let error_message = if latency.is_some() {
-        None
+    // 测速前先清空该节点的旧网速数据，重测期间不残留过期结果
+    {
+        let connection = database.lock_conn()?;
+        connection
+            .execute(
+                "UPDATE proxy_pool_nodes SET channel_latency_ms=NULL, channel_test_status='', channel_tested_at='' WHERE id=?1",
+                params![node_id],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    let latency = controller_proxy_delay(&client, controller_port, &node_id, &delay_url).await;
+    let (speed_ms, status, error_message) = if latency.is_some() {
+        let proxy_url = format!("http://127.0.0.1:{}", lane.listen_port);
+        let (_, speed_ms) =
+            measure_get_probe(proxy_url, CHANNEL_SPEED_TEST_URL.to_string()).await;
+        (speed_ms, "success", None)
     } else {
-        Some(format!("测速失败，已尝试 {} 个测速地址", attempted.len()))
+        (None, "error", Some("连通测试失败：节点无响应".to_string()))
     };
     {
         let connection = database.lock_conn()?;
         connection
             .execute(
-                "UPDATE proxy_pool_nodes SET latency_ms=?2, test_status=?3, tested_at=CURRENT_TIMESTAMP WHERE id=?1",
-                params![node_id, latency, status],
+                "UPDATE proxy_pool_nodes SET latency_ms=?2, test_status=?3, channel_latency_ms=?4, channel_test_status=?5, channel_tested_at=CURRENT_TIMESTAMP, tested_at=CURRENT_TIMESTAMP WHERE id=?1",
+                params![
+                    node_id,
+                    latency,
+                    status,
+                    speed_ms,
+                    if speed_ms.is_some() { "success" } else { "error" }
+                ],
             )
             .map_err(|error| error.to_string())?;
     }
-    drop(test_runtime);
+    drop(_op_guard);
+    drop(test_lease);
     let state = load_state(&database, &runtime)?;
     let node = state
         .nodes
@@ -764,7 +759,7 @@ pub async fn test_all_proxy_nodes(
     ctx: Managed<'_, Arc<AppContext>>,
 ) -> Result<ProxyPoolState, String> {
     let bus = ctx.event_bus.clone();
-    run_proxy_node_pool(&bus, &ctx.database, &ctx.proxy_runtime, None, None, false).await
+    run_proxy_node_pool(&bus, &ctx.database, &ctx.proxy_runtime, None, false).await
 }
 
 #[cfg_attr(feature = "desktop", tauri::command)]
@@ -785,7 +780,6 @@ pub async fn test_proxy_nodes(
         &ctx.database,
         &ctx.proxy_runtime,
         Some(requested),
-        None,
         false,
     )
     .await

@@ -1,12 +1,11 @@
 use crate::models::{Database, ACTIVE_PROXY_NODE_KEY};
 use crate::proxypool::runtime::{
-    ensure_channel_instance, ensure_default_proxy_channel, ensure_runtime,
-    read_account_proxy_channel_id, read_meta, runtime_proxy_url, select_runtime_node,
+    ensure_account_instance, ensure_channel_instance, ensure_default_proxy_channel,
+    ensure_global_runtime, read_account_proxy_channel_id, read_meta, runtime_proxy_url,
+    select_runtime_node,
 };
 use crate::proxypool::types::*;
 use rusqlite::{params, OptionalExtension};
-use std::collections::HashSet;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tracing::warn;
 
@@ -96,14 +95,15 @@ pub fn channel_candidate_nodes(
         .collect())
 }
 
+/// 全局单实例配置装载全量节点，无需按候选子集重建配置（重建会瞬断所有出口）。
+/// 仅确保实例在跑；node_ids 保留参数签名兼容既有调用方（公益抢号每轮候选）。
 pub async fn prepare_proxy_nodes_transient(
     database: &Database,
     runtime: &ProxyRuntime,
-    node_ids: &[String],
+    _node_ids: &[String],
 ) -> Result<(), String> {
     let _guard = runtime.runtime_op_lock.lock().await;
-    let only = node_ids.iter().cloned().collect::<HashSet<_>>();
-    tokio::task::block_in_place(|| ensure_runtime(database, runtime, Some(&only), None))?;
+    tokio::task::block_in_place(|| ensure_global_runtime(database, runtime))?;
     Ok(())
 }
 
@@ -114,7 +114,7 @@ pub async fn select_proxy_node_transient(
 ) -> Result<(), String> {
     let _guard = runtime.runtime_op_lock.lock().await;
     if select_runtime_node(runtime, node_id).await.is_err() {
-        tokio::task::block_in_place(|| ensure_runtime(database, runtime, None, None))?;
+        tokio::task::block_in_place(|| ensure_global_runtime(database, runtime))?;
         select_runtime_node(runtime, node_id).await?;
     }
     Ok(())
@@ -142,8 +142,7 @@ pub async fn restore_proxy_node_transient(
     };
     let _guard = runtime.runtime_op_lock.lock().await;
     if select_runtime_node(runtime, &runtime_name).await.is_err() {
-        let only = HashSet::from([runtime_name.clone()]);
-        tokio::task::block_in_place(|| ensure_runtime(database, runtime, Some(&only), None))?;
+        tokio::task::block_in_place(|| ensure_global_runtime(database, runtime))?;
         select_runtime_node(runtime, &runtime_name).await?;
     }
     Ok(())
@@ -238,55 +237,9 @@ pub async fn rotate_channel_instance_node(
         .cloned()
         .ok_or_else(|| "代理池中没有可用的候选节点".to_string())?;
     write_channel_node(database, channel_id, &next_id)?;
-    let _ = ensure_channel_instance(database, runtime, channel_id);
+    // lane 化后切组立即生效（此前活实例上轮换要等进程重启才真正换节点）
+    tokio::task::block_in_place(|| ensure_channel_instance(database, runtime, channel_id))?;
     Ok(next_id)
-}
-
-#[allow(dead_code)]
-pub async fn rotate_channel_group_node(
-    database: &Database,
-    runtime: &ProxyRuntime,
-    channel_id: &str,
-    _group_name: &str,
-    failed_node_id: &str,
-    error: &str,
-) -> Result<String, String> {
-    rotate_channel_instance_node(database, runtime, channel_id, failed_node_id, error).await
-}
-
-#[allow(dead_code)]
-pub async fn select_next_shared_pool_node(
-    database: &Database,
-    runtime: &ProxyRuntime,
-) -> Result<String, String> {
-    let candidates = channel_candidate_nodes(database, runtime, "")?;
-    if candidates.is_empty() {
-        return Err("代理池中没有可用的候选节点".to_string());
-    }
-    let idx = runtime.shared_pool_index.fetch_add(1, Ordering::Relaxed) as usize;
-    let (node_id, node_name, _) = &candidates[idx % candidates.len()];
-    select_runtime_node(runtime, node_name).await?;
-    Ok(node_id.clone())
-}
-
-#[allow(dead_code)]
-pub async fn rotate_shared_pool_node(
-    database: &Database,
-    runtime: &ProxyRuntime,
-    failed_node_id: &str,
-    error: &str,
-) -> Result<String, String> {
-    if !failed_node_id.is_empty() {
-        runtime.account_ban_node(failed_node_id, account_proxy_failure_ttl(error));
-    }
-    let candidates = channel_candidate_nodes(database, runtime, failed_node_id)?;
-    if candidates.is_empty() {
-        return Err("代理池中没有可用的候选节点进行轮换".to_string());
-    }
-    let idx = runtime.shared_pool_index.fetch_add(1, Ordering::Relaxed) as usize;
-    let (next_id, next_name, _) = &candidates[idx % candidates.len()];
-    select_runtime_node(runtime, next_name).await?;
-    Ok(next_id.clone())
 }
 
 pub fn build_proxy_client_with_url(
@@ -308,35 +261,6 @@ pub fn build_proxy_client_with_url(
         .map_err(|error| format!("无法初始化{purpose}：{error}"))
 }
 
-#[allow(dead_code)]
-pub fn build_channel_proxy_client_by_id(
-    database: &Database,
-    runtime: &ProxyRuntime,
-    channel_id: &str,
-    timeout: Duration,
-    redirects: usize,
-    purpose: &str,
-) -> Result<reqwest::Client, String> {
-    let proxy_url = runtime
-        .channel_proxy_url(channel_id)
-        .unwrap_or_else(|| runtime_proxy_url(runtime));
-    build_proxy_client_with_url(database, &proxy_url, timeout, redirects, purpose)
-}
-
-#[allow(dead_code)]
-pub fn build_shared_proxy_client(
-    database: &Database,
-    runtime: &ProxyRuntime,
-    timeout: Duration,
-    redirects: usize,
-    purpose: &str,
-) -> Result<reqwest::Client, String> {
-    let proxy_url = runtime
-        .shared_proxy_url()
-        .unwrap_or_else(|| runtime_proxy_url(runtime));
-    build_proxy_client_with_url(database, &proxy_url, timeout, redirects, purpose)
-}
-
 pub async fn rotate_account_instance_node(
     database: &Database,
     runtime: &ProxyRuntime,
@@ -356,21 +280,28 @@ pub async fn rotate_account_instance_node(
             .await;
         }
     }
-    if !failed_node_id.is_empty() {
-        runtime.account_ban_node(failed_node_id, account_proxy_failure_ttl(error));
+    // 调用方未告知失败节点时，取 lane 当前选中节点参与排除与封禁，
+    // 避免轮换后又选中同一个节点。
+    let current_node = if !failed_node_id.is_empty() {
+        failed_node_id.to_string()
+    } else {
+        runtime
+            .account_lane_current_node(profile_id)
+            .unwrap_or_default()
+    };
+    if !current_node.is_empty() {
+        runtime.account_ban_node(&current_node, account_proxy_failure_ttl(error));
     }
-    let candidates = channel_candidate_nodes(database, runtime, failed_node_id)?;
+    let candidates = channel_candidate_nodes(database, runtime, &current_node)?;
     let (next_id, _, _) = candidates
         .first()
         .cloned()
         .ok_or_else(|| "代理池中没有可用的候选节点".to_string())?;
-
-    if let Ok(mut instances) = runtime.account_instances.lock() {
-        if let Some(mut inst) = instances.remove(profile_id) {
-            stop_single_instance(&mut inst);
-        }
-    }
-    let _ = crate::proxypool::runtime::ensure_account_instance(database, runtime, profile_id);
+    // lane 化后轮换只切组，不再杀账号实例；出口端口保持不变，
+    // 既有 client/URL 继续有效。
+    tokio::task::block_in_place(|| {
+        ensure_account_instance(database, runtime, profile_id, Some(&next_id))
+    })?;
     Ok(next_id)
 }
 
@@ -383,7 +314,7 @@ pub fn proxy_url_for_account(
     if !read_site_uses_proxy_pool(database, site_id)? {
         return Ok(None);
     }
-    let port = crate::proxypool::runtime::ensure_account_instance(database, runtime, profile_id)?;
+    let port = crate::proxypool::runtime::ensure_account_instance(database, runtime, profile_id, None)?;
     Ok(Some(format!("http://127.0.0.1:{port}")))
 }
 
@@ -407,8 +338,13 @@ where
         return request(client).await;
     }
 
-    let account_port =
-        crate::proxypool::runtime::ensure_account_instance(database, runtime, profile_id)?;
+    let account_port = crate::proxypool::runtime::ensure_account_instance(
+        database,
+        runtime,
+        profile_id,
+        None,
+    )?;
+    // lane 端口在轮换时保持不变（切组而非杀进程），重试可继续复用同一 URL
     let account_proxy_url = format!("http://127.0.0.1:{account_port}");
     let mut last_error = String::new();
     let mut current_failed_node: Option<String> = None;

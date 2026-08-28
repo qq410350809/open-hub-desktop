@@ -2,7 +2,7 @@ pub(crate) use crate::db::{read_meta, write_meta};
 use crate::models::*;
 use crate::proxypool::geoip::{classify_node_location, open_geoip_reader};
 use crate::proxypool::parser::{
-    basic_node_config_error, canonical_json, sanitize_proxy_node_json, stable_id,
+    basic_node_config_error, sanitize_proxy_node_json, stable_id,
 };
 use crate::proxypool::rotator::channel_candidate_nodes;
 use crate::proxypool::types::*;
@@ -11,7 +11,7 @@ use serde_json::{json, Value as JsonValue};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::net::{SocketAddr, TcpListener};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -370,18 +370,16 @@ pub fn runtime_controller_port(runtime: &ProxyRuntime) -> Result<u16, String> {
         })
 }
 
-#[derive(Debug, Clone)]
-pub struct ChannelRuntimeConfig {
-    pub channel_id: String,
-    pub port: u16,
-    pub node_names: Vec<String>,
-}
-
+/// 全局单实例配置：mixed-port + OpenHub 共享组 + 三个 lane 池
+/// （SPEED 测速 / ACCT 账号 / CH 通道），每个 lane 一个 select 组
+/// （组内全量节点）+ 一个绑定该组的本地监听端口。
 pub fn runtime_config(
     nodes: &[RuntimeNode],
     proxy_port: u16,
     controller_port: u16,
-    channel_configs: &[ChannelRuntimeConfig],
+    speed_lanes: &[LaneSlot],
+    account_lanes: &[LaneSlot],
+    channel_lanes: &[LaneSlot],
 ) -> JsonValue {
     let configs = nodes
         .iter()
@@ -409,24 +407,22 @@ pub fn runtime_config(
         "proxies": all_node_names.clone()
     }));
 
-    for ch in channel_configs {
-        let group_name = format!("CHANNEL-{}", ch.channel_id);
-        let group_proxies = if ch.node_names.is_empty() {
-            &all_node_names
-        } else {
-            &ch.node_names
-        };
+    for lane in speed_lanes
+        .iter()
+        .chain(account_lanes.iter())
+        .chain(channel_lanes.iter())
+    {
         proxy_groups.push(json!({
-            "name": group_name,
+            "name": lane.group_name,
             "type": "select",
-            "proxies": group_proxies
+            "proxies": all_node_names.clone()
         }));
         listeners.push(json!({
-            "name": format!("listener-{}", ch.channel_id),
+            "name": format!("ln-{}", lane.group_name),
             "type": "mixed",
-            "port": ch.port,
+            "port": lane.listen_port,
             "listen": "127.0.0.1",
-            "proxy": group_name
+            "proxy": lane.group_name
         }));
     }
 
@@ -535,10 +531,14 @@ pub fn runtime_nodes(
     Ok((nodes, hash))
 }
 
-pub fn simple_http_get(
+/// 极简 HTTP/1.1 客户端：手写请求头，读完整响应（按 Content-Length / 连接关闭判定）。
+/// 供控制器就绪探测与同步切组（PUT /proxies/{group}）使用，避免同步路径引入异步客户端。
+pub fn simple_http_request(
     port: u16,
+    method: &str,
     path: &str,
     secret: &str,
+    body: Option<&str>,
     timeout: Duration,
 ) -> Result<(u16, String), String> {
     use std::io::{Read, Write};
@@ -551,12 +551,22 @@ pub fn simple_http_get(
     stream
         .set_write_timeout(Some(timeout))
         .map_err(|e| e.to_string())?;
-    let request = format!(
-        "GET {} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
-        path, port, secret
+    let mut request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {secret}\r\n"
     );
+    if let Some(body) = body {
+        request.push_str(&format!(
+            "Content-Type: application/json\r\nContent-Length: {}\r\n",
+            body.len()
+        ));
+    }
+    request.push_str("Connection: close\r\n\r\n");
+    let mut request_bytes = request.into_bytes();
+    if let Some(body) = body {
+        request_bytes.extend_from_slice(body.as_bytes());
+    }
     stream
-        .write_all(request.as_bytes())
+        .write_all(&request_bytes)
         .map_err(|e| e.to_string())?;
 
     let mut buf = Vec::with_capacity(8192);
@@ -617,6 +627,15 @@ pub fn simple_http_get(
     Ok((status_code, body))
 }
 
+pub fn simple_http_get(
+    port: u16,
+    path: &str,
+    secret: &str,
+    timeout: Duration,
+) -> Result<(u16, String), String> {
+    simple_http_request(port, "GET", path, secret, None, timeout)
+}
+
 pub fn controller_url(port: u16, path: &str) -> String {
     format!("http://127.0.0.1:{port}{path}")
 }
@@ -639,77 +658,383 @@ pub fn controller_client() -> Result<reqwest::Client, String> {
         .map_err(|error| error.to_string())
 }
 
-pub fn spawn_dedicated_single_node_instance(
-    engine: &PathBuf,
-    instance_dir: &PathBuf,
-    node_id: &str,
-    raw_json: &str,
-) -> Result<InstanceState, String> {
-    let mut config: JsonValue = serde_json::from_str(raw_json).map_err(|e| e.to_string())?;
-    sanitize_proxy_node_json(&mut config);
-    if let Some(obj) = config.as_object_mut() {
-        obj.insert("name".into(), JsonValue::String(node_id.to_string()));
-        for key in ["dialer-proxy", "proxy", "interface-name", "routing-mark"] {
-            obj.remove(key);
-        }
-        let tls_on = obj.get("tls").and_then(|v| v.as_bool()).unwrap_or(false)
-            || obj
-                .get("type")
-                .and_then(|v| v.as_str())
-                .map(|t| matches!(t, "trojan" | "hysteria2" | "tuic"))
-                .unwrap_or(false);
-        if tls_on && !obj.contains_key("skip-cert-verify") {
-            obj.insert("skip-cert-verify".into(), JsonValue::Bool(true));
+/// 分配一个不与本批已用端口重复的本地端口。
+/// lane 池端口在 mihomo 启动前都是空闲的，连续 allocate_free_port 可能
+/// 撞出重复端口，必须批内去重。
+pub fn allocate_free_port_excluding(used: &mut HashSet<u16>) -> Result<u16, String> {
+    loop {
+        let port = allocate_free_port()?;
+        if used.insert(port) {
+            return Ok(port);
         }
     }
+}
 
-    let node_hash = stable_id(&[node_id, &canonical_json(&config, true).to_string()]);
-    let proxy_port = allocate_free_port()?;
-    let controller_port = allocate_free_port()?;
-    let _ = fs::create_dir_all(instance_dir);
+fn global_instance_running(runtime: &ProxyRuntime) -> bool {
+    let Ok(mut state) = runtime.shared_instance.lock() else {
+        return false;
+    };
+    state.proxy_port > 0
+        && state
+            .child
+            .as_mut()
+            .and_then(|child| child.try_wait().ok())
+            .map(|status| status.is_none())
+            .unwrap_or(false)
+}
 
-    let single_node_config = json!({
-        "mixed-port": proxy_port,
-        "external-controller": format!("127.0.0.1:{controller_port}"),
-        "secret": RUNTIME_SECRET,
-        "allow-lan": false,
-        "bind-address": "127.0.0.1",
-        "mode": "rule",
-        "log-level": "warning",
-        "ipv6": false,
-        "profile": {
-            "store-selected": false,
-            "store-fake-ip": false
-        },
-        "dns": {
-            "enable": true,
-            "ipv6": false,
-            "use-system-hosts": true,
-            "enhanced-mode": "redir-host",
-            "default-nameserver": ["223.5.5.5", "119.29.29.29", "8.8.8.8", "1.1.1.1"],
-            "nameserver": ["223.5.5.5", "119.29.29.29", "180.76.76.76", "8.8.8.8", "1.1.1.1", "system"]
-        },
-        "proxies": [config],
-        "proxy-groups": [
-            {
-                "name": "GLOBAL",
-                "type": "select",
-                "proxies": [node_id]
+/// 确保全局单实例在跑：存活则直接返回（全量节点已在配置内，无需重建），
+/// 否则按全量节点拉起。lane 化后账号/通道/测速出口都依赖该实例。
+pub fn ensure_global_runtime(database: &Database, runtime: &ProxyRuntime) -> Result<(), String> {
+    if global_instance_running(runtime) {
+        return Ok(());
+    }
+    ensure_runtime(database, runtime, None, None)
+}
+
+/// 确保三个 lane 池完成一次性预配。首次使用时整池分配端口；
+/// 之后全局实例重启也复用同一批端口（调用前旧进程已停止）。
+fn ensure_lane_pools(runtime: &ProxyRuntime, used_ports: &mut HashSet<u16>) -> Result<(), String> {
+    let pools: [(&std::sync::Mutex<Vec<LaneSlot>>, usize, &str); 3] = [
+        (&runtime.speed_lane_slots, SPEED_TEST_LANES, "SPEED-lane"),
+        (&runtime.account_lane_slots, ACCOUNT_LANE_POOL, "ACCT-lane"),
+        (&runtime.channel_lane_slots, CHANNEL_LANE_POOL, "CH-lane"),
+    ];
+    for (pool, expected, prefix) in pools {
+        let mut slots = pool
+            .lock()
+            .map_err(|_| "lane 池状态锁定失败".to_string())?;
+        if slots.len() == expected {
+            for slot in slots.iter() {
+                used_ports.insert(slot.listen_port);
             }
-        ],
-        "rules": [
-            "IP-CIDR,127.0.0.0/8,DIRECT,no-resolve",
-            "IP-CIDR,10.0.0.0/8,DIRECT,no-resolve",
-            "IP-CIDR,172.16.0.0/12,DIRECT,no-resolve",
-            "IP-CIDR,192.168.0.0/16,DIRECT,no-resolve",
-            "MATCH,GLOBAL"
-        ]
-    });
+            continue;
+        }
+        slots.clear();
+        for i in 0..expected {
+            slots.push(LaneSlot {
+                group_name: format!("{prefix}-{i}"),
+                listen_port: allocate_free_port_excluding(used_ports)?,
+            });
+        }
+    }
+    Ok(())
+}
 
+/// 解析通道当前绑定的节点 id；节点缺失时回退到延迟最低的启用节点并回写 DB。
+fn resolve_channel_node_id(database: &Database, channel_id: &str) -> Result<String, String> {
+    let connection = database.lock_conn()?;
+    ensure_default_proxy_channel(&connection)?;
+    let node_id: Option<String> = connection
+        .query_row(
+            "SELECT node_id FROM proxy_channels WHERE id = ?1",
+            [channel_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+        .flatten()
+        .filter(|s: &String| !s.trim().is_empty());
+
+    if let Some(id) = node_id {
+        let exists = connection
+            .query_row(
+                "SELECT 1 FROM proxy_pool_nodes WHERE id = ?1",
+                [&id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .is_some();
+        if exists {
+            return Ok(id);
+        }
+    }
+    let fallback: String = connection
+        .query_row(
+            "SELECT id FROM proxy_pool_nodes WHERE is_enabled = 1 ORDER BY latency_ms ASC, name ASC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "代理池中没有可用的代理节点".to_string())?;
+    connection
+        .execute(
+            "UPDATE proxy_channels SET node_id = ?2 WHERE id = ?1",
+            params![channel_id, fallback],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(fallback)
+}
+
+/// 阻塞版切组：PUT /proxies/{group}。同步 ensure 路径使用（异步路径用 select_group_node）。
+pub fn select_group_node_sync(runtime: &ProxyRuntime, group: &str, name: &str) -> Result<(), String> {
+    let port = runtime_controller_port(runtime)?;
+    let (status, _) = simple_http_request(
+        port,
+        "PUT",
+        &format!("/proxies/{group}"),
+        RUNTIME_SECRET,
+        Some(&json!({ "name": name }).to_string()),
+        Duration::from_secs(3),
+    )?;
+    if (200..=299).contains(&status) {
+        Ok(())
+    } else {
+        Err(format!("Mihomo 切换节点返回 HTTP {status}"))
+    }
+}
+
+/// 将 lane 组切到指定节点（带内存去重：重复 ensure 不重复 PUT）。
+/// 全局实例重启后 lane_selected 被清空，下一次 ensure 会重新落一次选中。
+fn select_lane_node_if_needed(
+    runtime: &ProxyRuntime,
+    group_name: &str,
+    node_id: &str,
+) -> Result<(), String> {
+    {
+        let selected = runtime
+            .lane_selected
+            .lock()
+            .map_err(|_| "lane 选中状态锁定失败".to_string())?;
+        if selected.get(group_name).map(String::as_str) == Some(node_id) {
+            return Ok(());
+        }
+    }
+    select_group_node_sync(runtime, group_name, node_id)?;
+    if let Ok(mut selected) = runtime.lane_selected.lock() {
+        selected.insert(group_name.to_string(), node_id.to_string());
+    }
+    Ok(())
+}
+
+/// 确保通道出口就绪并指向其绑定节点：分配通道 lane + 同步切组。
+/// 返回该 lane 的监听端口（http://127.0.0.1:{port}）。
+pub fn ensure_channel_instance(
+    database: &Database,
+    runtime: &ProxyRuntime,
+    channel_id: &str,
+) -> Result<u16, String> {
+    let node_id = resolve_channel_node_id(database, channel_id)?;
+    ensure_global_runtime(database, runtime)?;
+    let mut used_ports = HashSet::new();
+    ensure_lane_pools(runtime, &mut used_ports)?;
+
+    let (group_name, port) = {
+        let mut map = runtime
+            .channel_lane_map
+            .lock()
+            .map_err(|_| "通道 lane 状态锁定失败".to_string())?;
+        let slots = runtime
+            .channel_lane_slots
+            .lock()
+            .map_err(|_| "通道 lane 状态锁定失败".to_string())?;
+        let idx = match map.get(channel_id) {
+            Some(&idx) if idx < slots.len() => idx,
+            _ => {
+                let used: HashSet<usize> = map.values().copied().collect();
+                let idx = (0..slots.len())
+                    .find(|i| !used.contains(i))
+                    .ok_or_else(|| format!("通道数量已达到 lane 池上限（{CHANNEL_LANE_POOL}）"))?;
+                map.insert(channel_id.to_string(), idx);
+                idx
+            }
+        };
+        let lane = &slots[idx];
+        (lane.group_name.clone(), lane.listen_port)
+    };
+    select_lane_node_if_needed(runtime, &group_name, &node_id)?;
+    Ok(port)
+}
+
+/// 确保账号出口就绪：绑定通道走通道 lane；否则分配账号 lane 并选中节点。
+/// `force_node_id` 供故障轮换强制切换；None 时沿用 lane 当前选中节点
+/// （新分配或全局实例重启后按游标轮询挑候选）。
+/// 返回该出口的监听端口。
+pub fn ensure_account_instance(
+    database: &Database,
+    runtime: &ProxyRuntime,
+    profile_id: &str,
+    force_node_id: Option<&str>,
+) -> Result<u16, String> {
+    if let Ok(Some(channel_id)) = read_account_proxy_channel_id(database, profile_id) {
+        if !channel_id.trim().is_empty() {
+            return ensure_channel_instance(database, runtime, &channel_id);
+        }
+    }
+    ensure_global_runtime(database, runtime)?;
+    let mut used_ports = HashSet::new();
+    ensure_lane_pools(runtime, &mut used_ports)?;
+
+    let (group_name, port, has_selection) = {
+        let mut map = runtime
+            .account_lane_map
+            .lock()
+            .map_err(|_| "账号 lane 状态锁定失败".to_string())?;
+        let slots = runtime
+            .account_lane_slots
+            .lock()
+            .map_err(|_| "账号 lane 状态锁定失败".to_string())?;
+        let idx = match map.get(profile_id) {
+            Some(&idx) if idx < slots.len() => idx,
+            _ => {
+                let used: HashSet<usize> = map.values().copied().collect();
+                let idx = (0..slots.len()).find(|i| !used.contains(i)).ok_or_else(|| {
+                    format!("账号出口 lane 池已满（{ACCOUNT_LANE_POOL}），请减少未绑定通道的账号数量")
+                })?;
+                map.insert(profile_id.to_string(), idx);
+                idx
+            }
+        };
+        let lane = &slots[idx];
+        let has_selection = runtime
+            .lane_selected
+            .lock()
+            .map(|selected| selected.contains_key(&lane.group_name))
+            .unwrap_or(false);
+        (lane.group_name.clone(), lane.listen_port, has_selection)
+    };
+
+    if let Some(node_id) = force_node_id {
+        select_lane_node_if_needed(runtime, &group_name, node_id)?;
+    } else if !has_selection {
+        // 新分配 lane 或全局实例刚重启：按游标轮询挑候选节点，
+        // 修复既往固定取第一个候选导致所有账号集中在同一节点的问题。
+        let candidates = channel_candidate_nodes(database, runtime, "")?;
+        let seq = runtime.account_alloc_seq.fetch_add(1, Ordering::Relaxed) as usize;
+        let (node_id, _, _) = candidates
+            .get(seq % candidates.len())
+            .cloned()
+            .ok_or_else(|| "代理池中没有可用的候选节点".to_string())?;
+        select_lane_node_if_needed(runtime, &group_name, &node_id)?;
+    }
+    Ok(port)
+}
+
+pub fn read_account_proxy_channel_id(
+    database: &Database,
+    profile_id: &str,
+) -> Result<Option<String>, String> {
+    let connection = database.lock_conn()?;
+    connection
+        .query_row(
+            "SELECT channel_id FROM account_proxy_channels WHERE profile_id = ?1",
+            [profile_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())
+}
+
+pub fn ensure_shared_instance_with_nodes(
+    database: &Database,
+    runtime: &ProxyRuntime,
+    only_ids: Option<&HashSet<String>>,
+) -> Result<u16, String> {
+    let (nodes, initial_hash) = runtime_nodes(database, only_ids)?;
+    if nodes.is_empty() {
+        return Err("代理池中没有配置有效的节点".into());
+    }
+    let engine =
+        find_mihomo_binary(runtime).ok_or("未检测到 Mihomo 组件，请在代理池设置中下载并初始化")?;
+
+    let proxy_port;
+    let controller_port;
+    {
+        let mut state = runtime
+            .shared_instance
+            .lock()
+            .map_err(|_| "共享代理实例锁定失败")?;
+
+        let running = if let Some(child) = state.child.as_mut() {
+            child.try_wait().map_err(|e| e.to_string())?.is_none()
+        } else {
+            false
+        };
+
+        if running && state.config_hash == initial_hash && state.proxy_port > 0 {
+            return Ok(state.proxy_port);
+        }
+
+        // 需要（重）拉起：先停旧进程再复用端口。既往实现直接覆盖 child 句柄，
+        // 旧 mihomo 会泄漏为孤儿进程，只能等下次启动清扫回收。
+        stop_single_instance(&mut state);
+        proxy_port = if state.proxy_port > 0 && port_is_available(state.proxy_port) {
+            state.proxy_port
+        } else {
+            allocate_free_port()?
+        };
+        controller_port = if state.controller_port > 0 && port_is_available(state.controller_port) {
+            state.controller_port
+        } else {
+            allocate_free_port()?
+        };
+    }
+
+    // lane 池端口在旧进程停止后分配/校验；批内统一去重，避免互相撞端口
+    let mut used_ports = HashSet::new();
+    used_ports.insert(proxy_port);
+    used_ports.insert(controller_port);
+    ensure_lane_pools(runtime, &mut used_ports)?;
+    let speed_lanes = runtime
+        .speed_lane_slots
+        .lock()
+        .map_err(|_| "lane 池状态锁定失败".to_string())?
+        .clone();
+    let account_lanes = runtime
+        .account_lane_slots
+        .lock()
+        .map_err(|_| "lane 池状态锁定失败".to_string())?
+        .clone();
+    let channel_lanes = runtime
+        .channel_lane_slots
+        .lock()
+        .map_err(|_| "lane 池状态锁定失败".to_string())?
+        .clone();
+
+    let shared_dir = runtime.directory.join("shared");
+    let config_json = runtime_config(
+        &nodes,
+        proxy_port,
+        controller_port,
+        &speed_lanes,
+        &account_lanes,
+        &channel_lanes,
+    );
+    // 配置含 ~89 个组，内核解析耗时更长，就绪等待放宽到 10s
+    spawn_engine_instance(
+        runtime,
+        &engine,
+        &shared_dir,
+        config_json,
+        proxy_port,
+        controller_port,
+        initial_hash,
+        Duration::from_secs(10),
+        "共享代理实例",
+    )?;
+    Ok(proxy_port)
+}
+
+/// 写入配置、拉起 mihomo 引擎并等待控制器就绪，随后更新实例状态。
+/// 失败时回收本次拉起的实例，避免半死实例被后续复用或遗留为孤儿进程。
+fn spawn_engine_instance(
+    runtime: &ProxyRuntime,
+    engine: &Path,
+    instance_dir: &Path,
+    config_json: JsonValue,
+    proxy_port: u16,
+    controller_port: u16,
+    config_hash: String,
+    ready_timeout: Duration,
+    label: &str,
+) -> Result<(), String> {
+    let _ = fs::create_dir_all(instance_dir);
     let config_path = instance_dir.join("config.yaml");
     fs::write(
         &config_path,
-        serde_yaml::to_string(&single_node_config).map_err(|e| e.to_string())?,
+        serde_yaml::to_string(&config_json).map_err(|e| e.to_string())?,
     )
     .map_err(|e| format!("无法写入代理配置: {e}"))?;
 
@@ -737,9 +1062,23 @@ pub fn spawn_dedicated_single_node_instance(
         .spawn()
         .map_err(|e| format!("无法启动代理进程: {e}"))?;
 
+    {
+        let mut state = runtime
+            .shared_instance
+            .lock()
+            .map_err(|_| "共享代理实例锁定失败")?;
+        state.child = Some(child);
+        state.directory = instance_dir.to_path_buf();
+        state.config_hash = config_hash;
+        state.engine_path = engine.display().to_string();
+        state.proxy_port = proxy_port;
+        state.controller_port = controller_port;
+        state.last_error.clear();
+    }
+
     let started = Instant::now();
     let mut last_err = String::new();
-    while started.elapsed() < Duration::from_secs(4) {
+    while started.elapsed() < ready_timeout {
         match simple_http_get(
             controller_port,
             "/version",
@@ -747,299 +1086,12 @@ pub fn spawn_dedicated_single_node_instance(
             Duration::from_millis(200),
         ) {
             Ok((200..=299, _)) => {
-                return Ok(InstanceState {
-                    child: Some(child),
-                    directory: instance_dir.clone(),
-                    config_hash: node_hash,
-                    engine_path: engine.display().to_string(),
-                    last_error: String::new(),
-                    proxy_port,
-                    controller_port,
-                });
+                // 新进程的组选择全部复位，lane 选中记录随之失效
+                if let Ok(mut selected) = runtime.lane_selected.lock() {
+                    selected.clear();
+                }
+                return Ok(());
             }
-            Ok((code, _)) => last_err = format!("HTTP {code}"),
-            Err(e) => last_err = e,
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-
-    // 就绪超时：必须回收刚拉起的子进程。std::process::Child 被 drop 时不会终止
-    // 子进程（Unix 无 kill-on-drop），直接返回 Err 会把 mihomo 遗留为孤儿进程。
-    let mut child = child;
-    let _ = child.kill();
-    let _ = child.wait();
-    Err(format!("代理实例就绪超时：{last_err}"))
-}
-
-pub fn read_account_proxy_channel_id(
-    database: &Database,
-    profile_id: &str,
-) -> Result<Option<String>, String> {
-    let connection = database.lock_conn()?;
-    connection
-        .query_row(
-            "SELECT channel_id FROM account_proxy_channels WHERE profile_id = ?1",
-            [profile_id],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()
-        .map_err(|error| error.to_string())
-}
-
-pub fn ensure_channel_instance(
-    database: &Database,
-    runtime: &ProxyRuntime,
-    channel_id: &str,
-) -> Result<u16, String> {
-    let connection = database.lock_conn()?;
-    ensure_default_proxy_channel(&connection)?;
-    let node_id: Option<String> = connection
-        .query_row(
-            "SELECT node_id FROM proxy_channels WHERE id = ?1",
-            [channel_id],
-            |row| row.get::<_, Option<String>>(0),
-        )
-        .optional()
-        .map_err(|error| error.to_string())?
-        .flatten()
-        .filter(|s: &String| !s.trim().is_empty());
-
-    let (assigned_id, raw_json) = if let Some(id) = node_id {
-        let row = connection
-            .query_row(
-                "SELECT id, raw_json FROM proxy_pool_nodes WHERE id = ?1",
-                [&id],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-            )
-            .optional()
-            .map_err(|error| error.to_string())?;
-        if let Some(r) = row {
-            r
-        } else {
-            let fallback = connection
-                .query_row(
-                    "SELECT id, raw_json FROM proxy_pool_nodes WHERE is_enabled = 1 ORDER BY latency_ms ASC, name ASC LIMIT 1",
-                    [],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-                )
-                .optional()
-                .map_err(|error| error.to_string())?
-                .ok_or_else(|| "代理池中没有可用的代理节点".to_string())?;
-            connection
-                .execute(
-                    "UPDATE proxy_channels SET node_id = ?2 WHERE id = ?1",
-                    params![channel_id, fallback.0],
-                )
-                .map_err(|error| error.to_string())?;
-            fallback
-        }
-    } else {
-        let fallback = connection
-            .query_row(
-                "SELECT id, raw_json FROM proxy_pool_nodes WHERE is_enabled = 1 ORDER BY latency_ms ASC, name ASC LIMIT 1",
-                [],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-            )
-            .optional()
-            .map_err(|error| error.to_string())?
-            .ok_or_else(|| "代理池中没有可用的代理节点".to_string())?;
-        connection
-            .execute(
-                "UPDATE proxy_channels SET node_id = ?2 WHERE id = ?1",
-                params![channel_id, fallback.0],
-            )
-            .map_err(|error| error.to_string())?;
-        fallback
-    };
-    drop(connection);
-
-    let engine =
-        find_mihomo_binary(runtime).ok_or("未检测到 Mihomo 组件，请在代理池设置中下载并初始化")?;
-    let channel_dir = runtime.directory.join("channels").join(channel_id);
-
-    let mut instances = runtime
-        .channel_instances
-        .lock()
-        .map_err(|_| "通道代理实例状态锁定失败")?;
-
-    if let Some(inst) = instances.get_mut(channel_id) {
-        let running = if let Some(child) = inst.child.as_mut() {
-            child.try_wait().map_err(|e| e.to_string())?.is_none()
-        } else {
-            false
-        };
-        if running && inst.proxy_port > 0 {
-            return Ok(inst.proxy_port);
-        }
-        stop_single_instance(inst);
-    }
-
-    let inst =
-        spawn_dedicated_single_node_instance(&engine, &channel_dir, &assigned_id, &raw_json)?;
-    let port = inst.proxy_port;
-    instances.insert(channel_id.to_string(), inst);
-    Ok(port)
-}
-
-pub fn ensure_account_instance(
-    database: &Database,
-    runtime: &ProxyRuntime,
-    profile_id: &str,
-) -> Result<u16, String> {
-    if let Ok(Some(channel_id)) = read_account_proxy_channel_id(database, profile_id) {
-        if !channel_id.trim().is_empty() {
-            return ensure_channel_instance(database, runtime, &channel_id);
-        }
-    }
-
-    let engine =
-        find_mihomo_binary(runtime).ok_or("未检测到 Mihomo 组件，请在代理池设置中下载并初始化")?;
-    let account_dir = runtime.directory.join("accounts").join(profile_id);
-
-    let mut instances = runtime
-        .account_instances
-        .lock()
-        .map_err(|_| "账号代理实例状态锁定失败")?;
-
-    if let Some(inst) = instances.get_mut(profile_id) {
-        let running = if let Some(child) = inst.child.as_mut() {
-            child.try_wait().map_err(|e| e.to_string())?.is_none()
-        } else {
-            false
-        };
-        if running && inst.proxy_port > 0 {
-            return Ok(inst.proxy_port);
-        }
-        stop_single_instance(inst);
-    }
-
-    let candidates = channel_candidate_nodes(database, runtime, "")?;
-    // 账号维度按顺序轮询分配：账号 1 → 候选 1，账号 2 → 候选 2……
-    // 修复此前固定取第一个候选导致所有账号集中在同一节点的问题。
-    // 已有实例的账号命中上方缓存分支不会推进游标，保证同一账号节点稳定。
-    let seq = runtime.account_alloc_seq.fetch_add(1, Ordering::Relaxed) as usize;
-    let (best_node_id, _, _) = candidates
-        .get(seq % candidates.len())
-        .cloned()
-        .ok_or_else(|| "代理池中没有可用的候选节点".to_string())?;
-
-    let connection = database.lock_conn()?;
-    let raw_json: String = connection
-        .query_row(
-            "SELECT raw_json FROM proxy_pool_nodes WHERE id = ?1",
-            [&best_node_id],
-            |row| row.get(0),
-        )
-        .map_err(|e| format!("读取节点数据失败：{e}"))?;
-    drop(connection);
-
-    let inst =
-        spawn_dedicated_single_node_instance(&engine, &account_dir, &best_node_id, &raw_json)?;
-    let port = inst.proxy_port;
-    instances.insert(profile_id.to_string(), inst);
-    Ok(port)
-}
-
-#[allow(dead_code)]
-pub fn ensure_shared_instance(database: &Database, runtime: &ProxyRuntime) -> Result<u16, String> {
-    ensure_shared_instance_with_nodes(database, runtime, None)
-}
-
-pub fn ensure_shared_instance_with_nodes(
-    database: &Database,
-    runtime: &ProxyRuntime,
-    only_ids: Option<&HashSet<String>>,
-) -> Result<u16, String> {
-    let (nodes, initial_hash) = runtime_nodes(database, only_ids)?;
-    if nodes.is_empty() {
-        return Err("代理池中没有配置有效的节点".into());
-    }
-    let engine =
-        find_mihomo_binary(runtime).ok_or("未检测到 Mihomo 组件，请在代理池设置中下载并初始化")?;
-
-    let mut state = runtime
-        .shared_instance
-        .lock()
-        .map_err(|_| "共享代理实例锁定失败")?;
-
-    let running = if let Some(child) = state.child.as_mut() {
-        child.try_wait().map_err(|e| e.to_string())?.is_none()
-    } else {
-        false
-    };
-
-    if running && state.config_hash == initial_hash && state.proxy_port > 0 {
-        return Ok(state.proxy_port);
-    }
-
-    stop_single_instance(&mut state);
-
-    let proxy_port = if state.proxy_port > 0 && port_is_available(state.proxy_port) {
-        state.proxy_port
-    } else {
-        allocate_free_port()?
-    };
-
-    let controller_port = if state.controller_port > 0 && port_is_available(state.controller_port) {
-        state.controller_port
-    } else {
-        allocate_free_port()?
-    };
-
-    let shared_dir = runtime.directory.join("shared");
-    let _ = fs::create_dir_all(&shared_dir);
-
-    let config_json = runtime_config(&nodes, proxy_port, controller_port, &[]);
-    let config_path = shared_dir.join("config.yaml");
-    fs::write(
-        &config_path,
-        serde_yaml::to_string(&config_json).map_err(|e| e.to_string())?,
-    )
-    .map_err(|e| format!("无法写入共享代理配置: {e}"))?;
-
-    let log_file = fs::File::create(shared_dir.join("runtime.log"))
-        .map_err(|e| format!("无法创建共享代理日志: {e}"))?;
-    let err_file = log_file.try_clone().map_err(|e| e.to_string())?;
-
-    let child = Command::new(&engine)
-        .arg("-d")
-        .arg(&shared_dir)
-        .arg("-f")
-        .arg(&config_path)
-        .stdout(Stdio::from(log_file))
-        .stderr(Stdio::from(err_file))
-        .env_remove("http_proxy")
-        .env_remove("https_proxy")
-        .env_remove("HTTP_PROXY")
-        .env_remove("HTTPS_PROXY")
-        .env_remove("ALL_PROXY")
-        .env_remove("all_proxy")
-        .env_remove("SOCKS_PROXY")
-        .env_remove("socks_proxy")
-        .env("NO_PROXY", "*")
-        .env("no_proxy", "*")
-        .spawn()
-        .map_err(|e| format!("无法启动共享代理进程: {e}"))?;
-
-    state.child = Some(child);
-    state.directory = shared_dir;
-    state.config_hash = initial_hash;
-    state.engine_path = engine.display().to_string();
-    state.proxy_port = proxy_port;
-    state.controller_port = controller_port;
-    state.last_error.clear();
-    drop(state);
-
-    let started = Instant::now();
-    let mut last_err = String::new();
-    while started.elapsed() < Duration::from_secs(6) {
-        match simple_http_get(
-            controller_port,
-            "/version",
-            RUNTIME_SECRET,
-            Duration::from_millis(200),
-        ) {
-            Ok((200..=299, _)) => return Ok(proxy_port),
             Ok((code, _)) => last_err = format!("HTTP {code}"),
             Err(e) => last_err = e,
         }
@@ -1050,7 +1102,41 @@ pub fn ensure_shared_instance_with_nodes(
     if let Ok(mut state) = runtime.shared_instance.lock() {
         stop_single_instance(&mut state);
     }
-    Err(format!("共享代理实例就绪超时：{last_err}"))
+    Err(format!("{label}就绪超时：{last_err}"))
+}
+
+#[derive(Debug, Clone)]
+pub struct SpeedLanePlan {
+    /// lane 对应的 mihomo select 组名（SPEED-lane-{i}）
+    pub group_name: String,
+    /// 该 lane 专属的本地监听端口（127.0.0.1），流量固定走组内当前选中节点
+    pub listen_port: u16,
+}
+
+#[derive(Debug, Clone)]
+pub struct SpeedTestPlan {
+    pub lanes: Vec<SpeedLanePlan>,
+}
+
+/// 全局单实例内的固定测速 lane 计划。
+/// 配置生成时节点名已被 runtime_nodes 改写为节点 id，因此 mihomo 代理名 == 节点 id。
+pub fn speed_test_plan(runtime: &ProxyRuntime) -> Result<SpeedTestPlan, String> {
+    let slots = runtime
+        .speed_lane_slots
+        .lock()
+        .map_err(|_| "测速 lane 状态锁定失败".to_string())?;
+    if slots.len() < SPEED_TEST_LANES {
+        return Err("测速 lane 尚未初始化".to_string());
+    }
+    Ok(SpeedTestPlan {
+        lanes: slots[..SPEED_TEST_LANES]
+            .iter()
+            .map(|lane| SpeedLanePlan {
+                group_name: lane.group_name.clone(),
+                listen_port: lane.listen_port,
+            })
+            .collect(),
+    })
 }
 
 pub fn ensure_runtime(
@@ -1060,42 +1146,6 @@ pub fn ensure_runtime(
     _cancelled: Option<&CancellationToken>,
 ) -> Result<(), String> {
     ensure_shared_instance_with_nodes(database, runtime, only_ids).map(|_| ())
-}
-
-pub fn wait_runtime_ready(
-    controller_port: u16,
-    _expected_nodes: usize,
-    cancelled: Option<&CancellationToken>,
-) -> Result<(), String> {
-    let started = Instant::now();
-    let deadline = Duration::from_secs(8);
-    let mut last_error = "控制器尚未就绪".to_string();
-    while started.elapsed() < deadline {
-        if let Some(token) = cancelled {
-            if token.is_cancelled() {
-                return Err("测速已取消".into());
-            }
-        }
-        match simple_http_get(
-            controller_port,
-            "/version",
-            RUNTIME_SECRET,
-            Duration::from_millis(400),
-        ) {
-            Ok((200..=299, _)) => {
-                std::thread::sleep(Duration::from_millis(50));
-                return Ok(());
-            }
-            Ok((code, _)) => {
-                last_error = format!("Mihomo /version 返回 HTTP {code}");
-            }
-            Err(e) => {
-                last_error = format!("Mihomo /version 未就绪: {e}");
-            }
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    Err(format!("Mihomo 测速就绪超时：{last_error}"))
 }
 
 pub async fn select_group_node(

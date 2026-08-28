@@ -47,12 +47,18 @@ fn clash_subscription_filters_nodes_by_latency_and_verifies_token() {
                 .unwrap();
         }
     }
-    let (yaml, count) = build_clash_subscription_yaml(&database, 1000).unwrap();
+    let (yaml, count) = build_clash_subscription_yaml(&database, 1000, None).unwrap();
     // 达标：fast(300) + fast2(420) + unknown(600)；slow 超阈值、broken 测速失败。
     assert_eq!(count, 3);
     assert!(yaml.contains("fast · 300ms"));
     assert!(!yaml.contains("slow"));
     assert!(!yaml.contains("broken"));
+
+    // 网速门槛：测试节点均无网速数据，开启 minSpeed 后全部被过滤。
+    let (speed_yaml, speed_count) =
+        build_clash_subscription_yaml(&database, 1000, Some(5.0)).unwrap();
+    assert_eq!(speed_count, 0);
+    assert!(speed_yaml.contains("网速 ≥ 5MB/s"));
 
     // 地区分组：香港两节点一组，未知地区单独归组，未达标地区不出现。
     assert!(yaml.contains("🇭🇰 香港 · 2"));
@@ -62,7 +68,7 @@ fn clash_subscription_filters_nodes_by_latency_and_verifies_token() {
     assert!(yaml.contains("MATCH,🚀 节点选择"));
 
     // 空结果时仍输出可解析的 YAML（仅注释 + 基础配置）。
-    let (empty_yaml, empty_count) = build_clash_subscription_yaml(&database, 100).unwrap();
+    let (empty_yaml, empty_count) = build_clash_subscription_yaml(&database, 100, None).unwrap();
     assert_eq!(empty_count, 0);
     assert!(empty_yaml.contains("暂无延迟"));
     assert!(!empty_yaml.contains("proxy-groups"));
@@ -175,17 +181,6 @@ fn local_addresses_are_always_ignored() {
     let value = normalize_ignore_addresses("example.com");
     assert!(value.contains("127.0.0.1"));
     assert!(value.contains("192.168.0.0/16"));
-}
-
-#[test]
-fn speed_test_uses_selected_or_default_url() {
-    let list = speed_test_candidates("https://cp.cloudflare.com/generate_204");
-    assert_eq!(list, vec![DEFAULT_PROXY_SPEED_TEST_URL.to_string()]);
-    let list = speed_test_candidates("http://www.gstatic.com/generate_204");
-    assert_eq!(
-        list,
-        vec!["http://www.gstatic.com/generate_204".to_string()]
-    );
 }
 
 #[test]
@@ -409,4 +404,84 @@ fn account_node_allocation_rotates_sequentially_instead_of_pinning_first() {
     // 游标回绕
     let seq = runtime.account_alloc_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as usize;
     assert_eq!(candidates[seq % candidates.len()].0, "node_a");
+}
+
+#[test]
+fn lane_pools_map_release_and_current_node() {
+    use crate::proxypool::types::LaneSlot;
+
+    let runtime = ProxyRuntime::new(std::env::temp_dir().join("openhub-lane-pool-test"));
+
+    // 池未预配时：通道无端口、测速 lane 不可用
+    assert_eq!(runtime.channel_port("ch1"), None);
+    assert!(runtime.speed_lane_slot(0).is_err());
+
+    // 手工预配池（真实预配发生在全局实例拉起时）
+    *runtime.speed_lane_slots.lock().unwrap() = vec![
+        LaneSlot { group_name: "SPEED-lane-0".into(), listen_port: 41001 },
+        LaneSlot { group_name: "SPEED-lane-1".into(), listen_port: 41002 },
+    ];
+    *runtime.channel_lane_slots.lock().unwrap() = vec![
+        LaneSlot { group_name: "CH-lane-0".into(), listen_port: 42001 },
+        LaneSlot { group_name: "CH-lane-1".into(), listen_port: 42002 },
+    ];
+    *runtime.account_lane_slots.lock().unwrap() = vec![
+        LaneSlot { group_name: "ACCT-lane-0".into(), listen_port: 43001 },
+        LaneSlot { group_name: "ACCT-lane-1".into(), listen_port: 43002 },
+    ];
+    runtime.channel_lane_map.lock().unwrap().insert("ch1".into(), 0);
+    runtime.account_lane_map.lock().unwrap().insert("p1".into(), 1);
+    runtime.lane_selected.lock().unwrap().insert("CH-lane-0".into(), "node_a".into());
+    runtime.lane_selected.lock().unwrap().insert("ACCT-lane-1".into(), "node_b".into());
+
+    assert_eq!(runtime.channel_port("ch1"), Some(42001));
+    assert_eq!(runtime.speed_lane_slot(0).unwrap().listen_port, 41001);
+    assert_eq!(runtime.account_lane_current_node("p1"), Some("node_b".into()));
+
+    // 释放通道 lane：端口消失、选中记录被清、lane 槽位可复用
+    runtime.release_channel_lane("ch1");
+    assert_eq!(runtime.channel_port("ch1"), None);
+    assert!(!runtime.lane_selected.lock().unwrap().contains_key("CH-lane-0"));
+
+    // 释放账号 lane：当前节点查询为空
+    runtime.release_account_lane("p1");
+    assert_eq!(runtime.account_lane_current_node("p1"), None);
+    assert!(!runtime.lane_selected.lock().unwrap().contains_key("ACCT-lane-1"));
+}
+
+#[test]
+fn runtime_config_contains_all_lane_groups_with_full_nodes() {
+    use crate::proxypool::types::LaneSlot;
+
+    let nodes = vec![
+        RuntimeNode { id: "node_a".into(), config: serde_json::json!({"name": "node_a", "type": "socks5", "server": "1.1.1.1", "port": 1080}) },
+        RuntimeNode { id: "node_b".into(), config: serde_json::json!({"name": "node_b", "type": "socks5", "server": "2.2.2.2", "port": 1080}) },
+    ];
+    let speed = vec![LaneSlot { group_name: "SPEED-lane-0".into(), listen_port: 41001 }];
+    let accounts = vec![LaneSlot { group_name: "ACCT-lane-0".into(), listen_port: 43001 }];
+    let channels = vec![LaneSlot { group_name: "CH-lane-0".into(), listen_port: 42001 }];
+
+    let config = runtime_config(&nodes, 40001, 40002, &speed, &accounts, &channels);
+
+    let groups = config["proxy-groups"].as_array().unwrap();
+    let group_names: Vec<&str> = groups.iter().filter_map(|g| g["name"].as_str()).collect();
+    assert_eq!(group_names, vec!["OpenHub", "SPEED-lane-0", "ACCT-lane-0", "CH-lane-0"]);
+    for group in groups {
+        let proxies = group["proxies"].as_array().unwrap();
+        assert_eq!(proxies.len(), 2, "每个 lane 组必须包含全量节点");
+    assert_eq!(proxies[0], "node_a");
+        assert_eq!(proxies[1], "node_b");
+    }
+
+    let listeners = config["listeners"].as_array().unwrap();
+    assert_eq!(listeners.len(), 3);
+    for listener in listeners {
+        assert_eq!(listener["type"], "mixed");
+        assert_eq!(listener["listen"], "127.0.0.1");
+        let proxy_group = listener["proxy"].as_str().unwrap();
+        assert!(group_names.contains(&proxy_group), "listener 必须绑定存在的 lane 组");
+    }
+
+    assert_eq!(config["mixed-port"], 40001);
+    assert_eq!(config["proxy-groups"][0]["name"], "OpenHub");
 }

@@ -3,11 +3,13 @@
 //! 数据流：
 //! - 节点来源：SQLite `proxy_pool_nodes`（订阅解析后的 `raw_json` 本身就是 Clash 代理配置）；
 //! - 达标条件：`test_status = 'success'` 且 `latency_ms <= max_latency_ms`（默认 1000ms）；
+//!   可选网速门槛（min_speed_mbps，MB/s）按 `channel_latency_ms` 等效耗时换算过滤；
 //! - 输出：完整 Clash YAML（proxies + 策略组 + 基础分流规则），由内嵌 HTTP 服务以
 //!   `/api/proxy-pool/clash-sub?token=...` 形式暴露，Clash 客户端可直接订阅并随测速自动更新。
 
 use crate::core::db::{read_meta, write_meta};
 use crate::models::Database;
+use rusqlite::params;
 use serde::Serialize;
 use serde_json::{json, Value as JsonValue};
 use std::collections::{HashMap, HashSet};
@@ -93,6 +95,12 @@ pub fn verify_subscription_token(database: &Database, token: &str) -> bool {
 /// 订阅访问路径（不含 host/port，供 HTTP 层挂载时对齐）。
 pub const CLASH_SUB_PATH: &str = "/api/proxy-pool/clash-sub";
 
+/// 网速门槛（MB/s）换算为 `channel_latency_ms` 上限：channel_latency_ms 存等效
+/// 下载 500KB 的耗时（ms），耗时 = 500KB ÷ 速度，如 5MB/s → 100ms、0.5MB/s → 1000ms。
+fn speed_to_max_channel_ms(speed_mbps: f64) -> i64 {
+    (500.0 / speed_mbps).round() as i64
+}
+
 /// 拼接完整订阅 URL。
 pub fn subscription_url(port: u16, token: &str) -> String {
     format!("http://127.0.0.1:{port}{CLASH_SUB_PATH}?token={token}")
@@ -106,7 +114,7 @@ pub fn clash_subscription_info(
     let token = subscription_token(database)?;
     Ok(ClashSubscriptionInfo {
         url: subscription_url(port, &token),
-        eligible_count: count_eligible_nodes(database, DEFAULT_CLASH_SUB_MAX_LATENCY_MS)?,
+        eligible_count: count_eligible_nodes(database, DEFAULT_CLASH_SUB_MAX_LATENCY_MS, None)?,
         total_count: count_active_nodes(database)?,
         token,
         port,
@@ -123,14 +131,23 @@ pub fn regenerate_clash_subscription_info(
     clash_subscription_info(database, port)
 }
 
-fn count_eligible_nodes(database: &Database, max_latency_ms: i64) -> Result<usize, String> {
+fn count_eligible_nodes(
+    database: &Database,
+    max_latency_ms: i64,
+    min_speed_mbps: Option<f64>,
+) -> Result<usize, String> {
+    let max_channel_ms = min_speed_mbps.map(speed_to_max_channel_ms);
     let connection = database.lock_conn()?;
     connection
         .query_row(
             "SELECT COUNT(*) FROM proxy_pool_nodes
              WHERE is_enabled = 1 AND test_status = 'success'
-               AND latency_ms IS NOT NULL AND latency_ms <= ?1",
-            [max_latency_ms],
+               AND latency_ms IS NOT NULL AND latency_ms <= ?1
+               AND (?2 IS NULL OR (
+                   channel_test_status = 'success'
+                   AND channel_latency_ms IS NOT NULL AND channel_latency_ms <= ?2
+               ))",
+            params![max_latency_ms, max_channel_ms],
             |row| row.get::<_, i64>(0),
         )
         .map(|count| count as usize)
@@ -150,10 +167,13 @@ fn count_active_nodes(database: &Database) -> Result<usize, String> {
 }
 
 /// 收集测速达标的启用节点，按延迟升序；导出名追加实时延迟便于客户端直读快慢。
+/// `min_speed_mbps` 为可选网速门槛（MB/s），只保留本轮测速写出网速且达标的节点。
 fn collect_export_nodes(
     database: &Database,
     max_latency_ms: i64,
+    min_speed_mbps: Option<f64>,
 ) -> Result<Vec<ExportNode>, String> {
+    let max_channel_ms = min_speed_mbps.map(speed_to_max_channel_ms);
     let connection = database.lock_conn()?;
     let mut statement = connection
         .prepare(
@@ -161,11 +181,15 @@ fn collect_export_nodes(
              FROM proxy_pool_nodes
              WHERE is_enabled = 1 AND test_status = 'success'
                AND latency_ms IS NOT NULL AND latency_ms <= ?1
+               AND (?2 IS NULL OR (
+                   channel_test_status = 'success'
+                   AND channel_latency_ms IS NOT NULL AND channel_latency_ms <= ?2
+               ))
              ORDER BY latency_ms ASC, name COLLATE NOCASE",
         )
         .map_err(|error| error.to_string())?;
     let rows = statement
-        .query_map([max_latency_ms], |row| {
+        .query_map(params![max_latency_ms, max_channel_ms], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, i64>(1)?,
@@ -311,8 +335,9 @@ fn base_config() -> JsonValue {
 pub fn build_clash_subscription_yaml(
     database: &Database,
     max_latency_ms: i64,
+    min_speed_mbps: Option<f64>,
 ) -> Result<(String, usize), String> {
-    let nodes = collect_export_nodes(database, max_latency_ms)?;
+    let nodes = collect_export_nodes(database, max_latency_ms, min_speed_mbps)?;
     let count = nodes.len();
     let mut root = base_config();
 
@@ -369,9 +394,13 @@ pub fn build_clash_subscription_yaml(
 
     let yaml = serde_yaml::to_string(&root).map_err(|error| error.to_string())?;
     if count == 0 {
+        let threshold_note = match min_speed_mbps {
+            Some(speed) => format!("延迟 ≤ {max_latency_ms}ms 且网速 ≥ {speed}MB/s"),
+            None => format!("延迟 ≤ {max_latency_ms}ms"),
+        };
         return Ok((
             format!(
-                "# OpenHub Clash 订阅\n# 暂无延迟 ≤ {max_latency_ms}ms 的达标节点，请先在代理池批量测速\n{yaml}"
+                "# OpenHub Clash 订阅\n# 暂无{threshold_note}的达标节点，请先在代理池批量测速\n{yaml}"
             ),
             0,
         ));
