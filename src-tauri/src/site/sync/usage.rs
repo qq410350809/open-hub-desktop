@@ -36,6 +36,18 @@ pub fn delete_site_account(
             params![site_id, profile_id],
         )
         .map_err(|error| error.to_string())?;
+    // 该 profile 已无任何站点账号时，回收其代理出口 lane（修复既往实例泄漏）。
+    // 注意 profile_id 可能被多个站点的账号共用，仅在最后一个引用消失时释放。
+    let remaining: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM site_accounts WHERE profile_id = ?1",
+            [profile_id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    if remaining == 0 {
+        ctx.proxy_runtime.release_account_lane(&profile_id);
+    }
     Ok(())
 }
 

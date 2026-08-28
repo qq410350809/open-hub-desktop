@@ -10,6 +10,7 @@ use std::{
 use tokio_util::sync::CancellationToken;
 
 pub const DEFAULT_CHARITY_FEED_ID: &str = "1515";
+/// 公益抢号候选节点的连通门槛（latency_ms 为 delay 接口口径，传统面板语义）
 pub const CHARITY_FAST_NODE_MAX_LATENCY_MS: i64 = 500;
 pub const CHARITY_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 pub const CHARITY_MAX_NODE_ATTEMPTS: usize = 5;

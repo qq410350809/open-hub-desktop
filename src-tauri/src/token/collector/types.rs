@@ -114,28 +114,29 @@ pub fn collector_cache_path() -> Option<PathBuf> {
         return Some(PathBuf::from(path));
     }
     let home = PathBuf::from(std::env::var_os("HOME")?);
+    // 目录名随运行形态隔离：dev 写 -dev 后缀目录，避免污染正式版采集缓存。
+    let dir_name = crate::core::profile::app_support_dir_name();
     #[cfg(target_os = "macos")]
     {
         return Some(
             home.join("Library")
                 .join("Application Support")
-                .join("com.dfeer.openhub.desktop")
+                .join(dir_name)
                 .join("token-collector-cache.json"),
         );
     }
     #[cfg(target_os = "windows")]
     {
-        return std::env::var_os("APPDATA").map(PathBuf::from).map(|path| {
-            path.join("com.dfeer.openhub.desktop")
-                .join("token-collector-cache.json")
-        });
+        return std::env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .map(|path| path.join(dir_name).join("token-collector-cache.json"));
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         Some(
             home.join(".local")
                 .join("share")
-                .join("com.dfeer.openhub.desktop")
+                .join(dir_name)
                 .join("token-collector-cache.json"),
         )
     }
