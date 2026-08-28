@@ -341,6 +341,19 @@ npm run integrated:dev     # 即 tauri dev；desktop 是兼容别名
 
 启动内容：Vite dev server（:1420）+ 默认二进制 `open-hub-desktop`，包含本地 SQLite、Tauri IPC、本地 Token 日志采集、模型网关和内嵌 HTTP 服务。首次启动 Mihomo/GeoIP 由组件初始化引导按需下载。
 
+#### dev 与正式版自动隔离
+
+`tauri dev` 是 debug 构建，与 `tauri build` 出的正式版（release 构建）自动隔离，可同时运行互不干扰：
+
+| 资源 | 正式版 | dev |
+|---|---|---|
+| Web UI / 模型网关端口 | `17896` | `17996` |
+| 数据目录 | `…/com.dfeer.openhub.desktop` | `…/com.dfeer.openhub.desktop-dev` |
+| 数据库 / 配置 / 缓存 / 代理运行时 | 共用正式数据 | 全新独立 |
+| 单实例锁 | 只管理正式版进程 | 只管理 dev 进程 |
+
+因此开发调试不会污染正式版数据，也不会把正在使用的正式版进程挤掉线。判据是构建 profile，需要临时反转时可用环境变量覆盖：`OPENHUB_PROFILE=dev|release`；dev 形态的窗口标题会显示为「OpenHub (dev)」以便区分。
+
 ### 仅前端开发（静态预览模式）
 
 ```bash
@@ -441,7 +454,9 @@ Windows: %APPDATA%\com.dfeer.openhub.desktop\
 Linux:   ~/.local/share/com.dfeer.openhub.desktop\
 ```
 
-应用自带内嵌 HTTP 服务（默认 `127.0.0.1:17896`），可在浏览器打开同源 Web 界面；关闭主窗口即退出整个应用。
+应用自带内嵌 HTTP 服务（默认 `127.0.0.1:17896`），可在浏览器打开同源 Web 界面。
+
+关闭主窗口不会退出应用：窗口隐藏，macOS 底部 Dock 图标同步收起，仅保留菜单栏托盘图标，后台继续提供 Web UI 与模型网关服务。点菜单栏托盘图标（左键单击或右键菜单「显示主窗口」）可再次打开窗口；彻底退出请用托盘菜单「退出 OpenHub」或 `Cmd+Q`。
 
 ### 形态二：独立服务端（NAS / VPS / 家庭服务器）
 
