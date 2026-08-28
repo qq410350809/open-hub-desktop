@@ -19,6 +19,8 @@ const proxyPoolLoading = ref(false);
 const proxyPoolError = ref("");
 const proxyPoolBusyId = ref("");
 const channelTestBusyId = ref("");
+// 通道测速实时进度（单阶段 GET：TTFB 作延迟、下载完总耗时作网速）
+const channelTestProgress = ref({ completed: 0, total: 0 });
 // 节点切换是独立状态，不再占用全局 busy，避免整片节点卡片变灰。
 const proxyPoolSwitchingNodeId = ref("");
 let desiredProxyNodeId = "";
@@ -329,6 +331,8 @@ async function testProxyNode(nodeId: string) {
     const node = await runCommand<ProxyNode>("test_proxy_node", { nodeId });
     const index = proxyPool.value.nodes.findIndex((item) => item.id === node.id);
     if (index >= 0) proxyPool.value.nodes[index] = node;
+    // 单节点测速结束也触发重过滤，网速档位列表立即反映新结果
+    bumpProxyNodesRevision();
     return node;
   } catch (error) {
     await loadProxyPool();
@@ -349,6 +353,15 @@ async function runProxyNodeBatch(nodeIds: string[] | null, busyId: string) {
 
   // 节点索引表：避免每个进度事件都全表 findIndex。
   const nodeIndex = new Map(proxyPool.value.nodes.map((node, index) => [node.id, index]));
+  // 与后端开测清理保持一致：启动即清空本批节点的旧网速并触发一次重过滤，
+  // 未重测到的节点不会带着过期网速留在网速档位列表里。
+  for (const node of candidates) {
+    node.channelLatencyMs = null;
+    node.channelTestStatus = "";
+  }
+  bumpProxyNodesRevision();
+  // 结果流式写入时节流触发重建，让列表过滤实时跟上最新测速结果。
+  let lastResultRebuildAt = 0;
   proxyPoolBusyId.value = busyId;
   proxyPoolError.value = "";
   proxyTestCancelling.value = false;
@@ -364,7 +377,7 @@ async function runProxyNodeBatch(nodeIds: string[] | null, busyId: string) {
   const pendingStarts = new Set<string>();
   const pendingStops = new Set<string>();
   let pendingProgress: { completed: number; total: number } | null = null;
-  const pendingResults = new Map<string, { latencyMs: number | null; status: string }>();
+  const pendingResults = new Map<string, { latencyMs: number | null; speedMs: number | null; status: string }>();
 
   const flushProgress = () => {
     rafId = 0;
@@ -383,12 +396,19 @@ async function runProxyNodeBatch(nodeIds: string[] | null, busyId: string) {
         if (index == null) return;
         const node = proxyPool.value.nodes[index];
         if (!node) return;
-        // 原地更新，避免替换整个数组元素触发大列表 diff。
+        // 单次 GET 双指标：TTFB 写延迟列，下载完总耗时写网速列。原地更新避免大列表 diff。
         node.latencyMs = result.latencyMs;
         node.testStatus = result.status;
+        node.channelLatencyMs = result.speedMs;
+        node.channelTestStatus = result.speedMs != null ? "success" : "error";
         node.testedAt = testedAt;
       });
       pendingResults.clear();
+      const now = Date.now();
+      if (now - lastResultRebuildAt >= 1000) {
+        lastResultRebuildAt = now;
+        bumpProxyNodesRevision();
+      }
     }
     if (pendingProgress) {
       proxyTestProgress.value = pendingProgress;
@@ -416,6 +436,7 @@ async function runProxyNodeBatch(nodeIds: string[] | null, busyId: string) {
             else batchFailed += 1;
             pendingResults.set(payload.nodeId, {
               latencyMs: payload.latencyMs,
+              speedMs: payload.speedMs ?? null,
               status: payload.status,
             });
           }
@@ -580,6 +601,19 @@ async function testProxyChannelNodes(channelId?: string, nodeIds?: string[]) {
   const busyId = `test-channel-${channelId || "all"}`;
   channelTestBusyId.value = busyId;
   proxyPoolError.value = "";
+  // 通道测速实时进度：单阶段 GET，一次探测同时产出延迟与网速。
+  channelTestProgress.value = { completed: 0, total: 0 };
+  let unlisten: UnlistenFn | undefined;
+  if (isTauri) {
+    try {
+      unlisten = await listen<ProxyNodeTestProgress>("proxy-channel-test-progress", ({ payload }) => {
+        if (payload.phase !== "completed") return;
+        channelTestProgress.value = { completed: payload.completed, total: payload.total };
+      });
+    } catch {
+      /* 进度监听失败不影响最终结果刷新 */
+    }
+  }
   try {
     proxyPool.value = await runCommand<ProxyPoolState>("test_proxy_channel_nodes", {
       channelId: channelId || undefined,
@@ -591,6 +625,8 @@ async function testProxyChannelNodes(channelId?: string, nodeIds?: string[]) {
     proxyPoolError.value = String(error);
     throw error;
   } finally {
+    unlisten?.();
+    channelTestProgress.value = { completed: 0, total: 0 };
     if (channelTestBusyId.value === busyId) channelTestBusyId.value = "";
   }
 }
@@ -747,7 +783,7 @@ async function downloadOrUpdateGeoip(mirror?: string) {
 
 export function useProxyPool() {
   return {
-    proxyPool, proxyPoolLoading, proxyPoolError, proxyPoolBusyId, channelTestBusyId, proxyPoolSwitchingNodeId, testingNodeIds, proxyTestProgress, proxyTestCancelling, proxyNodesRevision, proxySourceProgress, proxyPoolActive,
+    proxyPool, proxyPoolLoading, proxyPoolError, proxyPoolBusyId, channelTestBusyId, channelTestProgress, proxyPoolSwitchingNodeId, testingNodeIds, proxyTestProgress, proxyTestCancelling, proxyNodesRevision, proxySourceProgress, proxyPoolActive,
     kernelStatus, kernelLoading, kernelChecking, kernelDownloading, kernelDownloadProgress,
     geoipStatus, geoipLoading, geoipDownloading, geoipDownloadProgress,
     kernelSelectedMirror, kernelCustomMirror,

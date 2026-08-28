@@ -300,6 +300,11 @@ const exportDialogOpen = ref(false);
 function openExportDialog() {
   exportDialogOpen.value = true;
 }
+
+// 原生菜单「文件 → 导出数据」联动：切到本地统计页后打开导出弹窗。
+window.addEventListener("oh-menu-export", () => {
+  if (!exportDialogOpen.value) openExportDialog();
+});
 function closeExportDialog() {
   exportDialogOpen.value = false;
 }

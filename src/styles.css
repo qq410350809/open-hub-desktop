@@ -605,8 +605,6 @@ kbd { padding: 3px 7px; border: 1px solid var(--line); border-radius: var(--r-xs
 .settings-toggle-row > i::after { position: absolute; top: 3px; left: 3px; width: 16px; height: 16px; border-radius: 50%; background: var(--faint); content: ""; transition: .2s var(--ease); box-shadow: var(--shadow-xs); }
 .settings-toggle-row input:checked + i { border-color: var(--brand); background: var(--brand); box-shadow: 0 2px 8px var(--brand-glow); }
 .settings-toggle-row input:checked + i::after { left: 22px; background: #fff; }
-.about-line { grid-column: 2; min-height: 30px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--line-soft); color: var(--muted); font-size: 11px; }
-.about-line strong { color: var(--text); font-weight: 600; }
 
 /* ============================================================
    链接弹窗
@@ -1002,7 +1000,6 @@ kbd { padding: 3px 7px; border: 1px solid var(--line); border-radius: var(--r-xs
   .proxy-control { grid-template-columns: 1fr; }
   .proxy-control .secondary-button { width: 100%; }
   .settings-toggle-row { align-items: center; flex-direction: row; }
-  .about-line { grid-column: 1; }
   .link-dialog-backdrop { padding: 10px; }
   .link-dialog { width: calc(100vw - 20px); max-height: calc(100vh - 20px); }
   .link-dialog-header { min-height: 68px; padding: 13px 12px 13px 16px; }

@@ -33,13 +33,13 @@ import {
 import CustomSelect from "../common/CustomSelect.vue";
 import DateRangeDropdown from "../common/DateRangeDropdown.vue";
 import type { SiteRecord } from "../../types";
-import { API_PATH_V1, API_PATH_GEMINI, API_PATH_MESSAGES } from "../../constants";
+import { API_PATH_V1, API_PATH_GEMINI, API_PATH_MESSAGES, DEFAULT_SERVICE_PORT } from "../../constants";
 import { isTauri } from "../../composables/core/ipc";
 
 /** 模型 API Origin：桌面端访问本机内嵌服务（端口随实际监听顺延），浏览器端与 Web 服务同源。 */
 const serviceOrigin = computed(() =>
   isTauri
-    ? `http://127.0.0.1:${proxyStatus.value.port || 17896}`
+    ? `http://127.0.0.1:${proxyStatus.value.port || DEFAULT_SERVICE_PORT}`
     : window.location.origin,
 );
 

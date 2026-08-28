@@ -4,11 +4,13 @@ import LoginView from "./components/auth/LoginView.vue";
 import {
   AuthExpiredError,
   getSessionToken,
+  isIntegratedClient,
   onAuthExpired,
   resetAuthExpired,
   runCommand,
 } from "./composables/core/ipc";
 import { loadCapabilities, capabilities } from "./composables/core/capabilities";
+import { listen, type UnlistenFn } from "./composables/core/events";
 import { useStore } from "./composables/useStore";
 import { usePreferences } from "./composables/usePreferences";
 import { useTheme } from "./composables/useTheme";
@@ -64,10 +66,74 @@ const loginHintUsername = ref("");
 let businessStarted = false;
 let removeAuthExpiredListener: (() => void) | null = null;
 let authProbeTimer: number | null = null;
+// 原生菜单 → 前端联动（后端 on_menu_event 发出）。
+let menuUnlisteners: UnlistenFn[] = [];
+
+/** 处理原生菜单的页面导航（与右键菜单 oh-menu-navigate 同一通路）。 */
+function onNativeMenuNavigate(page: string) {
+  switch (page) {
+    case "library":
+      store.openLibrary();
+      break;
+    case "modelparams":
+      store.openModelParams();
+      break;
+    case "modelproxy":
+      store.openModelProxy();
+      break;
+    case "charity":
+      store.openCharityMonitor();
+      break;
+    case "proxy":
+      store.openProxyPool();
+      break;
+    case "tokenstats":
+      store.openTokenStats();
+      break;
+    case "gatewaystats":
+      store.openGatewayStats();
+      break;
+    case "settings":
+      store.openSettings();
+      break;
+    default:
+      break;
+  }
+}
+
+async function startNativeMenuListeners() {
+  if (menuUnlisteners.length || !isIntegratedClient) return;
+  try {
+    menuUnlisteners = (
+      await Promise.all([
+        listen<string>("menu-navigate", (event) => onNativeMenuNavigate(event.payload)),
+        listen("menu-new-site", () => {
+          // 与站点库页内「导入站点」一致：切到站点库并打开新建弹窗。
+          store.openLibrary();
+          store.openModal();
+        }),
+        listen("menu-export-data", () => {
+          // 复用本地统计页的导出入口。
+          store.openTokenStats();
+          window.dispatchEvent(new CustomEvent("oh-menu-export"));
+        }),
+        listen("menu-reload", () => window.location.reload()),
+      ])
+    ).map((result) => result);
+  } catch (error) {
+    console.warn("[OpenHub] 原生菜单事件监听失败：", error);
+  }
+}
+
+function stopNativeMenuListeners() {
+  menuUnlisteners.forEach((unlisten) => unlisten());
+  menuUnlisteners = [];
+}
 
 function stopBusiness() {
   if (!businessStarted) return;
   businessStarted = false;
+  stopNativeMenuListeners();
   store.stopCharityMonitor();
   store.stopDailyRefresh();
   store.stopTokenDatabaseRefresh();
@@ -78,6 +144,7 @@ function stopBusiness() {
 async function startBusiness() {
   if (businessStarted || authState.value !== "ready") return;
   businessStarted = true;
+  void startNativeMenuListeners();
   store.startComponentEvents();
   store.startTokenDatabaseRefresh();
   const results = await Promise.allSettled([

@@ -232,12 +232,14 @@ export interface ModelItem {
 
 export type ThemePreference = "system" | "light" | "dark";
 export type ProxyNodeViewModePreference = "list" | "country";
+export type ProxySortMode = "latency" | "speed" | "name";
 
 export interface Preferences {
   theme: ThemePreference;
   defaultRunawayFilter: string;
   defaultUsageFilter: string;
   proxyNodeViewMode: ProxyNodeViewModePreference;
+  proxyNodeSortMode: ProxySortMode;
   sidebarCollapsed: boolean;
 }
 
@@ -466,8 +468,13 @@ export interface ProxySourceProgress {
 export interface ProxyNodeTestProgress {
   nodeId: string;
   phase: "started" | "completed";
+  /** 连通指标：GET 响应头到达耗时（TTFB） */
   latencyMs: number | null;
+  /** 网速指标：body 下载完成的总耗时；未下载完（超时/失败）为 null */
+  speedMs?: number | null;
   status: string;
+  /** latency=普通延迟测速；connectivity=通道测速连通阶段；speed=通道测速网速阶段 */
+  stage?: "latency" | "connectivity" | "speed" | string;
   completed: number;
   total: number;
 }

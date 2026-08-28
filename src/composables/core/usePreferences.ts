@@ -3,6 +3,7 @@ import type {
   Preferences,
   ThemePreference,
   ProxyNodeViewModePreference,
+  ProxySortMode,
 } from "../../types";
 
 const PREFERENCES_KEY = "ldoh:preferences";
@@ -12,6 +13,7 @@ const defaultPreferences: Preferences = {
   defaultRunawayFilter: "active",
   defaultUsageFilter: "all",
   proxyNodeViewMode: "list",
+  proxyNodeSortMode: "latency",
   sidebarCollapsed: false,
 };
 
@@ -22,6 +24,11 @@ function loadPreferences(): Preferences {
     ) as Partial<Preferences>;
     const legacyTheme = localStorage.getItem("ldoh:theme");
     const proxyNodeViewMode = saved.proxyNodeViewMode === "country" ? "country" : "list";
+    const proxyNodeSortMode = (["latency", "speed", "name"] as const).includes(
+      saved.proxyNodeSortMode as ProxySortMode,
+    )
+      ? (saved.proxyNodeSortMode as ProxySortMode)
+      : defaultPreferences.proxyNodeSortMode;
     return {
       theme: ["system", "light", "dark"].includes(String(saved.theme))
         ? (saved.theme as ThemePreference)
@@ -33,6 +40,7 @@ function loadPreferences(): Preferences {
       defaultRunawayFilter: saved.defaultRunawayFilter ?? "active",
       defaultUsageFilter: saved.defaultUsageFilter ?? "all",
       proxyNodeViewMode: proxyNodeViewMode as ProxyNodeViewModePreference,
+      proxyNodeSortMode,
       sidebarCollapsed: Boolean(saved.sidebarCollapsed),
     };
   } catch {

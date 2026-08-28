@@ -5,7 +5,12 @@ import { useStore } from "../../composables/useStore";
 import { usePreferences } from "../../composables/usePreferences";
 import { KERNEL_DOWNLOAD_MIRRORS } from "../../composables/useProxyPool";
 import CustomSelect from "../common/CustomSelect.vue";
-import type { ProxyChannel, ProxyNode, ProxySubscription } from "../../types";
+import type {
+  ProxyChannel,
+  ProxyNode,
+  ProxySortMode,
+  ProxySubscription,
+} from "../../types";
 
 const store = useStore();
 const { preferences, updatePreferences } = usePreferences();
@@ -34,14 +39,34 @@ const selectedSource = ref("all");
 const nodeSearchQuery = ref("");
 
 // 延迟级别过滤
-const latencyFilter = ref<"500" | "1000" | "2000" | "error" | "all">("1000");
+const latencyFilter = ref<"200" | "500" | "1000" | "2000" | "error" | "all">("1000");
 const latencyFilterOptions = [
+  { value: "200", text: "≤ 200ms" },
   { value: "500", text: "≤ 500ms" },
   { value: "1000", text: "≤ 1000ms" },
   { value: "2000", text: "≤ 2000ms" },
   { value: "error", text: "失败/超时" },
   { value: "all", text: "全部节点" },
 ];
+
+// 网速级别过滤（依据 channel_latency_ms：等效 500KB 下载耗时，网速 = 500/耗时ms MB/s；
+// 测速为 10MB 流式采样，快节点跑满速、慢节点按实收字节计算）
+const speedFilter = ref<"all" | "10mbps" | "5mbps" | "1mbps" | "05mbps" | "untested">("5mbps");
+const speedFilterOptions = [
+  { value: "10mbps", text: "≥ 10MB/s" },
+  { value: "5mbps", text: "≥ 5MB/s" },
+  { value: "1mbps", text: "≥ 1MB/s" },
+  { value: "05mbps", text: "≥ 500KB/s" },
+  { value: "untested", text: "未测出网速" },
+  { value: "all", text: "全部网速" },
+];
+// 网速档位换算：500KB → 500/耗时ms MB/s（500KB/s ≈ ≤1000ms，1MB/s ≈ ≤500ms）
+const SPEED_THRESHOLD_MS: Record<string, number> = {
+  "10mbps": 50,
+  "5mbps": 100,
+  "1mbps": 500,
+  "05mbps": 1000,
+};
 
 const sourceOptions = computed(() => [
   { value: "all", text: `全部来源 (${store.proxyPool.value.nodeCount})` },
@@ -62,6 +87,8 @@ const channelEditingId = ref("");
 const channelName = ref("");
 const channelSelectedNodeId = ref("");
 const channelNodeQuery = ref("");
+// 通道弹窗候选列表的排序模式（会话内记忆，不持久化）
+const channelNodeSortMode = ref<ProxySortMode>("latency");
 const channelAssignedProfileIds = ref<Set<string>>(new Set());
 const deleteChannelConfirmId = ref("");
 const nodeViewMode = ref<"list" | "ip">(preferences.proxyNodeViewMode === "country" ? "ip" : "list");
@@ -100,20 +127,57 @@ const goodNodesCount = computed(() =>
 );
 
 // —— 排序与节点列表构建 ——
+// 排序模式：latency=延迟优先，speed=网速优先，name=名称。持久化到 preferences。
+const nodeSortMode = ref<ProxySortMode>(
+  ["latency", "speed", "name"].includes(preferences.proxyNodeSortMode)
+    ? preferences.proxyNodeSortMode
+    : "latency",
+);
+const nodeSortOptions = [
+  { value: "latency", text: "按延迟排序" },
+  { value: "speed", text: "按网速排序" },
+  { value: "name", text: "按名称排序" },
+];
+watch(nodeSortMode, (mode) => updatePreferences({ proxyNodeSortMode: mode }));
+
+// 排序取值：数值越小越靠前。网速按 channel_latency_ms（等效耗时越小=越快），
+// 未测出网速的排到已测出之后。
+function sortMetric(node: ProxyNode, mode: ProxySortMode): number {
+  if (mode === "speed") {
+    return node.channelTestStatus === "success" && node.channelLatencyMs != null
+      ? node.channelLatencyMs
+      : Number.POSITIVE_INFINITY;
+  }
+  if (mode === "name") return 0;
+  return node.latencyMs ?? Number.POSITIVE_INFINITY;
+}
+
 function nodeSortRank(node: ProxyNode) {
   if (node.testStatus === "error" || node.testStatus === "invalid") return 2;
   if (node.latencyMs == null) return 1;
   return 0;
 }
 
-function compareNodes(left: ProxyNode, right: ProxyNode) {
+function compareByMode(left: ProxyNode, right: ProxyNode, mode: ProxySortMode) {
+  if (mode === "name") {
+    return left.name.localeCompare(right.name, "zh-CN");
+  }
   const leftRank = nodeSortRank(left);
   const rightRank = nodeSortRank(right);
   if (leftRank !== rightRank) return leftRank - rightRank;
-  if (left.latencyMs != null && right.latencyMs != null && left.latencyMs !== right.latencyMs) {
-    return left.latencyMs - right.latencyMs;
-  }
+  const leftMetric = sortMetric(left, mode);
+  const rightMetric = sortMetric(right, mode);
+  if (leftMetric !== rightMetric) return leftMetric - rightMetric;
+  // 主指标相同按另一指标补充排序：延迟模式次按网速，网速模式次按延迟
+  const fallback = mode === "speed" ? "latency" : "speed";
+  const leftAlt = sortMetric(left, fallback);
+  const rightAlt = sortMetric(right, fallback);
+  if (leftAlt !== rightAlt) return leftAlt - rightAlt;
   return left.name.localeCompare(right.name, "zh-CN");
+}
+
+function compareNodes(left: ProxyNode, right: ProxyNode) {
+  return compareByMode(left, right, nodeSortMode.value);
 }
 
 const displayNodes = shallowRef<ProxyNode[]>([]);
@@ -131,6 +195,7 @@ function resetProgressiveRender() {
 
 function rebuildDisplayNodes() {
   const filter = latencyFilter.value;
+  const speed = speedFilter.value;
   const sName = selectedSource.value === "all"
     ? ""
     : (store.proxyPool.value.subscriptions.find((item) => item.id === selectedSource.value)?.name ?? "");
@@ -163,6 +228,18 @@ function rebuildDisplayNodes() {
       if (node.latencyMs == null || node.testStatus !== "success") return false;
       if (node.latencyMs > maxLatency) return false;
       return true;
+    })
+    .filter((node) => {
+      if (speed === "all") return true;
+      if (speed === "untested") {
+        return node.channelTestStatus !== "success";
+      }
+      const threshold = SPEED_THRESHOLD_MS[speed];
+      return (
+        node.channelTestStatus === "success" &&
+        node.channelLatencyMs != null &&
+        node.channelLatencyMs <= threshold
+      );
     })
     .sort(compareNodes);
 
@@ -312,31 +389,58 @@ function scheduleInitialChunks() {
 
 // —— Clash 订阅分享 ——
 const clashSubDialogOpen = ref(false);
-const clashMaxLatency = ref<"500" | "1000" | "2000">("1000");
+const clashMaxLatency = ref<"200" | "500" | "1000" | "2000">("1000");
 const clashLatencyOptions = [
+  { value: "200", text: "≤ 200ms 低延迟节点" },
   { value: "500", text: "≤ 500ms 极速节点" },
   { value: "1000", text: "≤ 1000ms 流畅节点" },
   { value: "2000", text: "≤ 2000ms 可用节点" },
 ];
+// Clash 订阅网速门槛（与节点列表网速档位同口径：channel_latency_ms ≤ 500/速度 换算 ms）
+const clashMinSpeed = ref<"all" | "10" | "5" | "1" | "0.5">("all");
+const clashSpeedOptions = [
+  { value: "10", text: "≥ 10MB/s 高速节点" },
+  { value: "5", text: "≥ 5MB/s 快速节点" },
+  { value: "1", text: "≥ 1MB/s 可用节点" },
+  { value: "0.5", text: "≥ 500KB/s 基础节点" },
+  { value: "all", text: "不限网速" },
+];
+const CLASH_SPEED_THRESHOLD_MS: Record<string, number> = {
+  "10": 50,
+  "5": 100,
+  "1": 500,
+  "0.5": 1000,
+};
 const copiedClashSub = ref(false);
 let copiedClashSubTimer = 0;
 const clashTokenConfirm = ref(false);
 let clashTokenConfirmTimer = 0;
 
-const clashEligibleCount = computed(() =>
-  store.proxyPool.value.nodes.filter(
-    (node) =>
-      node.testStatus === "success" &&
-      node.latencyMs != null &&
-      node.latencyMs <= Number(clashMaxLatency.value),
-  ).length,
-);
+const clashEligibleCount = computed(() => {
+  const speedMaxMs = CLASH_SPEED_THRESHOLD_MS[clashMinSpeed.value];
+  return store.proxyPool.value.nodes.filter((node) => {
+    if (
+      node.testStatus !== "success" ||
+      node.latencyMs == null ||
+      node.latencyMs > Number(clashMaxLatency.value)
+    ) {
+      return false;
+    }
+    if (speedMaxMs == null) return true;
+    return (
+      node.channelTestStatus === "success" &&
+      node.channelLatencyMs != null &&
+      node.channelLatencyMs <= speedMaxMs
+    );
+  }).length;
+});
 
 const clashSubscriptionUrl = computed(() => {
   const info = store.clashSubInfo.value;
   if (!info?.token) return "";
   const base = info.url.split("?")[0];
-  return `${base}?token=${info.token}&maxLatency=${clashMaxLatency.value}`;
+  const speed = clashMinSpeed.value === "all" ? "" : `&minSpeed=${clashMinSpeed.value}`;
+  return `${base}?token=${info.token}&maxLatency=${clashMaxLatency.value}${speed}`;
 });
 
 function openClashSubDialog() {
@@ -517,6 +621,20 @@ function downloadRateText(latencyMs: number | null | undefined) {
   return `${Math.round(mbps * 1000)}KB/s`;
 }
 
+// —— 通道测速双指标（延迟 ms + 网速 MB/s）显示 ——
+function channelLatencyText(node: ProxyNode) {
+  if (store.testingNodeIds.value.has(node.id)) return "…";
+  if (node.testStatus === "error") return "不通";
+  if (node.latencyMs == null) return "待测";
+  return `${node.latencyMs}ms`;
+}
+function channelSpeedText(node: ProxyNode) {
+  // 网速指标只在通道测速成功后有效，连通失败不显示换算值。
+  if (node.channelTestStatus === "error") return "—";
+  if (node.channelLatencyMs == null) return "待测";
+  return downloadRateText(node.channelLatencyMs);
+}
+
 type ProxyPoolAccountOption = {
   profileId: string;
   profileName: string;
@@ -569,8 +687,9 @@ const channelCandidateNodes = computed(() => {
 
   const result = baseNodes
     .filter((node) => {
-      const latency = node.channelLatencyMs ?? node.latencyMs;
-      const isTestedSuccess = (node.channelTestStatus === "success" || node.testStatus === "success") && latency != null;
+      // 连通指标（latencyMs）决定候选资格；网速指标仅作展示参考。
+      const latency = node.latencyMs;
+      const isTestedSuccess = node.testStatus === "success" && latency != null;
       const isEligible = (isTestedSuccess && latency <= 500) || (channelSelectedNodeId.value && node.id === channelSelectedNodeId.value);
       return isEligible;
     })
@@ -585,11 +704,7 @@ const channelCandidateNodes = computed(() => {
         node.proxyType,
       ].some((value) => value && String(value).toLowerCase().includes(query));
     })
-    .sort((left, right) => {
-      const leftLatency = left.channelLatencyMs ?? left.latencyMs ?? Number.POSITIVE_INFINITY;
-      const rightLatency = right.channelLatencyMs ?? right.latencyMs ?? Number.POSITIVE_INFINITY;
-      return leftLatency - rightLatency;
-    });
+    .sort((left, right) => compareByMode(left, right, channelNodeSortMode.value));
 
   if (channelSelectedNodeId.value && !result.some((node) => node.id === channelSelectedNodeId.value)) {
     const selectedNode = store.proxyPool.value.nodes.find((node) => node.id === channelSelectedNodeId.value);
@@ -646,7 +761,7 @@ async function testChannelNodes() {
         : [];
 
     await store.testProxyChannelNodes(channelEditingId.value || "", targetNodeIds);
-    message.value = "通道节点网速测试完成，请选择节点后保存";
+    message.value = "通道节点测速完成（先连通、后网速），请选择节点后保存";
   } catch (error) {
     message.value = `通道测速失败: ${error}`;
   }
@@ -789,7 +904,7 @@ async function testAll() {
   message.value = "";
   const sName = selectedSourceName();
   if (!sName) {
-    message.value = "正在装载节点并并行测速…";
+    message.value = "正在装载节点并测速（先连通、后网速）…";
     const result = await store.testAllProxyNodes();
     message.value = testResultMessage("全部来源测速", result);
     return;
@@ -799,7 +914,7 @@ async function testAll() {
     message.value = `${selectedSourceLabel()}当前没有可测速节点`;
     return;
   }
-  message.value = `正在装载 ${nodes.length} 个节点并并行测速…`;
+  message.value = `正在装载 ${nodes.length} 个节点并测速（先连通、后网速）…`;
   const result = await store.testProxyNodes(
     nodes.map((node) => node.id),
     `test-source-${selectedSource.value}`,
@@ -808,7 +923,7 @@ async function testAll() {
     !result.cancelled &&
     result.succeeded === 0 &&
     result.failed > 0 &&
-    ["500", "1000", "2000"].includes(latencyFilter.value)
+    ["200", "500", "1000", "2000"].includes(latencyFilter.value)
   ) {
     latencyFilter.value = "error";
   }
@@ -869,6 +984,7 @@ function channelLatencyClass(node: ProxyNode) {
 function latencyClassForMs(latencyMs: number | null | undefined, testStatus: string) {
   if (testStatus === "error" || testStatus === "invalid") return "bad";
   if (latencyMs == null) return "untested";
+  // latencyMs 来自控制器 delay 接口（unified-delay 双测取小），传统面板口径
   if (latencyMs < 250) return "fast";
   if (latencyMs < 500) return "good";
   if (latencyMs < 1000) return "medium";
@@ -958,7 +1074,7 @@ onBeforeUnmount(() => {
 });
 watch(() => store.proxyPool.value, syncSettings, { deep: false });
 watch(
-  () => [selectedSource.value, latencyFilter.value, nodeSearchQuery.value, store.proxyNodesRevision.value] as const,
+  () => [selectedSource.value, latencyFilter.value, speedFilter.value, nodeSortMode.value, nodeSearchQuery.value, store.proxyNodesRevision.value] as const,
   () => {
     rebuildDisplayNodes();
     void nextTick(scheduleInitialChunks);
@@ -1040,14 +1156,15 @@ watch(nodeViewMode, () => {
             :class="{ 'is-spinning': isBatchTesting() && !store.proxyTestCancelling.value }"
             v-html="isBatchTesting() ? icons.close : icons.pulse"
           />
-          <span>{{
-            isBatchTesting()
-              ? store.proxyTestCancelling.value
+          <span v-if="isBatchTesting()">
+            {{
+              store.proxyTestCancelling.value
                 ? "正在取消…"
-                : `取消测速 ${store.proxyTestProgress.value.completed}/${store.proxyTestProgress.value.total}`
-              : selectedSource === "all"
-                ? "批量测速"
-                : "测速此来源"
+                : `测速 ${store.proxyTestProgress.value.completed}/${store.proxyTestProgress.value.total}`
+            }}
+          </span>
+          <span v-else>{{
+            selectedSource === "all" ? "批量测速" : "测速此来源"
           }}</span>
         </button>
       </div>
@@ -1122,7 +1239,7 @@ watch(nodeViewMode, () => {
             <span class="pp-stat-unit">可用节点</span>
           </div>
           <div class="pp-stat-footer">
-            <span>≤1000ms: <strong>{{ goodNodesCount }}</strong> 个 · Cloudflare 500KB 实测</span>
+            <span>≤1000ms: <strong>{{ goodNodesCount }}</strong> 个 · 连通 + 10MB 流式下载实测</span>
           </div>
         </div>
 
@@ -1190,8 +1307,9 @@ watch(nodeViewMode, () => {
                 v-if="channel.node"
                 class="pp-channel-rate-badge"
                 :class="channelLatencyClass(channel.node)"
+                :title="`连通 ${channelLatencyText(channel.node)} · 网速 ${channelSpeedText(channel.node)}`"
               >
-                {{ downloadRateText(channel.node.channelLatencyMs ?? channel.node.latencyMs) }}
+                {{ channelLatencyText(channel.node) }} · {{ channelSpeedText(channel.node) }}
               </span>
             </div>
 
@@ -1243,6 +1361,17 @@ watch(nodeViewMode, () => {
 
           <div class="pp-strip-divider" />
 
+          <!-- 排序模式下拉框 -->
+          <CustomSelect
+            class="pp-strip-dropdown"
+            :options="nodeSortOptions"
+            :model-value="nodeSortMode"
+            aria-label="节点排序方式"
+            @update:model-value="nodeSortMode = $event as any"
+          />
+
+          <div class="pp-strip-divider" />
+
           <!-- 来源快速切换下拉框 -->
           <CustomSelect
             class="pp-strip-dropdown"
@@ -1261,6 +1390,17 @@ watch(nodeViewMode, () => {
             :model-value="latencyFilter"
             aria-label="延迟范围筛选"
             @update:model-value="latencyFilter = $event as any"
+          />
+
+          <div class="pp-strip-divider" />
+
+          <!-- 网速范围下拉框 -->
+          <CustomSelect
+            class="pp-strip-dropdown"
+            :options="speedFilterOptions"
+            :model-value="speedFilter"
+            aria-label="网速范围筛选"
+            @update:model-value="speedFilter = $event as any"
           />
         </div>
 
@@ -1313,16 +1453,26 @@ watch(nodeViewMode, () => {
                 <span class="pp-node-flag">{{ countryFlag(node.countryCode) }}</span>
                 <strong class="pp-node-name">{{ node.name }}</strong>
               </div>
-              <button
-                type="button"
-                class="pp-node-latency-btn"
-                :class="latencyClass(node)"
-                :disabled="Boolean(store.proxyPoolBusyId.value) || store.testingNodeIds.value.has(node.id)"
-                @click.stop="testNode(node)"
-              >
-                <span v-if="store.testingNodeIds.value.has(node.id)" class="pp-mini-spinner" />
-                <template v-else>{{ latencyText(node) }}</template>
-              </button>
+              <div class="pp-node-metrics">
+                <button
+                  type="button"
+                  class="pp-node-latency-btn"
+                  :class="latencyClass(node)"
+                  :disabled="Boolean(store.proxyPoolBusyId.value) || store.testingNodeIds.value.has(node.id)"
+                  title="连通延迟（节点真实建链测得）"
+                  @click.stop="testNode(node)"
+                >
+                  <span v-if="store.testingNodeIds.value.has(node.id)" class="pp-mini-spinner" />
+                  <template v-else>{{ latencyText(node) }}</template>
+                </button>
+                <span
+                  class="pp-node-speed-chip"
+                  :class="channelLatencyClass(node)"
+                  :title="`下载网速：${channelSpeedText(node)}（10MB 流式下载实测）`"
+                >
+                  {{ channelSpeedText(node) }}
+                </span>
+              </div>
             </div>
 
             <div class="pp-node-endpoint">
@@ -1410,13 +1560,14 @@ watch(nodeViewMode, () => {
                     @click.stop="isGroupTesting(group.key) ? requestCancelTest() : testGroup(group)"
                   >
                     <span v-html="isGroupTesting(group.key) ? icons.close : icons.pulse" />
-                    <span>{{
-                      isGroupTesting(group.key)
-                        ? store.proxyTestCancelling.value
+                    <span v-if="isGroupTesting(group.key)">
+                      {{
+                        store.proxyTestCancelling.value
                           ? "取消中…"
-                          : `取消 ${store.proxyTestProgress.value.completed}/${store.proxyTestProgress.value.total}`
-                        : "本组测速"
-                    }}</span>
+                          : `测速 ${store.proxyTestProgress.value.completed}/${store.proxyTestProgress.value.total}`
+                      }}
+                    </span>
+                    <span v-else>本组测速</span>
                   </button>
                 </div>
               </header>
@@ -1434,16 +1585,26 @@ watch(nodeViewMode, () => {
                       <div class="pp-node-title-group">
                         <strong class="pp-node-name">{{ node.name }}</strong>
                       </div>
-                      <button
-                        type="button"
-                        class="pp-node-latency-btn"
-                        :class="latencyClass(node)"
-                        :disabled="Boolean(store.proxyPoolBusyId.value) || store.testingNodeIds.value.has(node.id)"
-                        @click.stop="testNode(node)"
-                      >
-                        <span v-if="store.testingNodeIds.value.has(node.id)" class="pp-mini-spinner" />
-                        <template v-else>{{ latencyText(node) }}</template>
-                      </button>
+                      <div class="pp-node-metrics">
+                        <button
+                          type="button"
+                          class="pp-node-latency-btn"
+                          :class="latencyClass(node)"
+                          :disabled="Boolean(store.proxyPoolBusyId.value) || store.testingNodeIds.value.has(node.id)"
+                          title="连通延迟（节点真实建链测得）"
+                          @click.stop="testNode(node)"
+                        >
+                          <span v-if="store.testingNodeIds.value.has(node.id)" class="pp-mini-spinner" />
+                          <template v-else>{{ latencyText(node) }}</template>
+                        </button>
+                        <span
+                          class="pp-node-speed-chip"
+                          :class="channelLatencyClass(node)"
+                          :title="`下载网速：${channelSpeedText(node)}（10MB 流式下载实测）`"
+                        >
+                          {{ channelSpeedText(node) }}
+                        </span>
+                      </div>
                     </div>
 
                     <div class="pp-node-endpoint">
@@ -1498,7 +1659,9 @@ watch(nodeViewMode, () => {
                 ? "当前来源下没有失败/超时节点"
                 : latencyFilter === "all"
                   ? "当前来源下暂无节点记录"
-                  : `当前 ≤${latencyFilter}ms 范围内没有节点，可切换“全部节点”或点击“批量测速”`
+                  : speedFilter !== "all"
+                    ? `当前网速档位（${speedFilterOptions.find((o) => o.value === speedFilter)?.text}）下没有节点，可切换“全部网速”`
+                    : `当前 ≤${latencyFilter}ms 范围内没有节点，可切换“全部节点”或点击“批量测速”`
           }}</strong>
         </div>
       </section>
@@ -1705,7 +1868,7 @@ watch(nodeViewMode, () => {
                 <!-- 固定节点选择器 -->
                 <div class="pp-form-group">
                   <div class="pp-label-row">
-                    <label class="pp-label">固定出口节点 (≤500ms 极速候选)</label>
+                    <label class="pp-label" title="先测连通延迟（节点建链），连通正常的节点再自动做 10MB 流式下载测网速">固定出口节点 (连通 ≤500ms 候选)</label>
                     <button
                       type="button"
                       class="pp-btn-secondary pp-btn-sm"
@@ -1713,12 +1876,22 @@ watch(nodeViewMode, () => {
                       @click="testChannelNodes"
                     >
                       <span v-html="icons.pulse" />
-                      <span>{{ store.channelTestBusyId.value ? "测速中…" : "刷新列表节点网速测速" }}</span>
+                      <span v-if="store.channelTestBusyId.value">
+                        测速 {{ store.channelTestProgress.value.completed }}/{{ store.channelTestProgress.value.total }}…
+                      </span>
+                      <span v-else>刷新列表节点测速</span>
                     </button>
                   </div>
 
                   <div class="pp-channel-candidate-box">
                     <div class="pp-candidate-search-bar">
+                      <CustomSelect
+                        class="pp-strip-dropdown pp-candidate-sort"
+                        :options="nodeSortOptions"
+                        :model-value="channelNodeSortMode"
+                        aria-label="候选节点排序方式"
+                        @update:model-value="channelNodeSortMode = $event as any"
+                      />
                       <span class="pp-search-icon" v-html="icons.search" />
                       <input
                         v-model="channelNodeQuery"
@@ -1748,15 +1921,22 @@ watch(nodeViewMode, () => {
                           <strong>{{ node.name }}</strong>
                           <small>{{ [nodeCountryLabel(node), endpoint(node)].filter(Boolean).join(" · ") }}</small>
                         </div>
-                        <span class="pp-candidate-rate-badge" :class="channelLatencyClass(node)">
-                          {{ downloadRateText(node.channelLatencyMs ?? node.latencyMs) }}
+                        <span class="pp-candidate-rate-badge" :class="channelLatencyClass(node)" title="连通延迟（ms）">
+                          {{ channelLatencyText(node) }}
+                        </span>
+                        <span
+                          class="pp-candidate-rate-badge pp-speed-badge"
+                          :class="channelLatencyClass(node)"
+                          title="下载网速（10MB 流式下载实测）"
+                        >
+                          {{ channelSpeedText(node) }}
                         </span>
                       </label>
 
                       <div v-if="!channelCandidateNodes.length" class="pp-candidate-empty">
                         <span v-html="icons.globe" />
-                        <strong>{{ channelNodeQuery ? "没有匹配的候选节点" : "暂无 ≤500ms 的候选节点" }}</strong>
-                        <small>可点击上方「刷新通道候选测速」或在主界面完成测速</small>
+                        <strong>{{ channelNodeQuery ? "没有匹配的候选节点" : "暂无连通 ≤500ms 的候选节点" }}</strong>
+                        <small>可点击上方「刷新列表节点测速」（先连通后网速）或在主界面完成测速</small>
                       </div>
                     </div>
                   </div>
@@ -2045,11 +2225,18 @@ watch(nodeViewMode, () => {
                   aria-label="订阅延迟阈值"
                   @update:model-value="clashMaxLatency = String($event) as any"
                 />
+                <CustomSelect
+                  class="pp-clash-sub-threshold"
+                  :options="clashSpeedOptions"
+                  :model-value="clashMinSpeed"
+                  aria-label="订阅网速门槛"
+                  @update:model-value="clashMinSpeed = String($event) as any"
+                />
               </div>
 
               <!-- 订阅链接 -->
               <div class="pp-clash-sub-field">
-                <label class="pp-label">订阅链接（延迟阈值 ≤ {{ clashMaxLatency }}ms）</label>
+                <label class="pp-label">订阅链接（延迟阈值 ≤ {{ clashMaxLatency }}ms{{ clashMinSpeed === "all" ? "" : " · 网速 ≥ " + clashMinSpeed + "MB/s" }}）</label>
                 <template v-if="clashSubscriptionUrl">
                   <div class="pp-clash-sub-url-row">
                     <input
@@ -2885,7 +3072,8 @@ watch(nodeViewMode, () => {
 }
 
 .pp-strip-dropdown {
-  min-width: 130px;
+  /* 宽度随选中内容自适应，不强制最小宽度 */
+  width: fit-content;
   flex-shrink: 0;
 }
 
@@ -2897,6 +3085,7 @@ watch(nodeViewMode, () => {
   padding: 0 8px;
   font-size: 11px;
   font-weight: 600;
+  gap: 6px;
 }
 
 .pp-strip-dropdown .select-trigger svg {
@@ -3025,6 +3214,31 @@ watch(nodeViewMode, () => {
   justify-content: space-between;
   gap: 6px;
 }
+
+/* 双指标容器：延迟按钮 + 网速徽章并排，保持卡片右上角紧凑 */
+.pp-node-metrics {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.pp-node-speed-chip {
+  font-size: 10px;
+  font-weight: 650;
+  padding: 2px 5px;
+  border-radius: 4px;
+  white-space: nowrap;
+  background: var(--surface-hover);
+  color: var(--muted);
+}
+
+.pp-node-speed-chip.fast { background: rgba(16, 185, 129, 0.15); color: #10b981; }
+.pp-node-speed-chip.good { background: rgba(59, 130, 246, 0.15); color: #3b82f6; }
+.pp-node-speed-chip.medium { background: rgba(245, 158, 11, 0.15); color: #f59e0b; }
+.pp-node-speed-chip.slow { background: rgba(239, 68, 68, 0.15); color: #ef4444; }
+.pp-node-speed-chip.bad { background: var(--surface-hover); color: var(--muted); opacity: 0.7; }
+.pp-node-speed-chip.untested { background: var(--surface-hover); color: var(--muted); opacity: 0.7; }
 
 .pp-node-title-group {
   display: flex;
@@ -3636,6 +3850,12 @@ watch(nodeViewMode, () => {
   gap: 6px;
 }
 
+/* 候选列表排序下拉：与搜索框同高、宽度随内容自适应 */
+.pp-candidate-sort.select-box {
+  height: 30px;
+  flex-shrink: 0;
+}
+
 .pp-candidate-count-pill {
   font-size: 10px;
   color: var(--muted);
@@ -3702,6 +3922,13 @@ watch(nodeViewMode, () => {
   font-weight: 750;
   padding: 1px 5px;
   border-radius: 3px;
+  white-space: nowrap;
+}
+
+/* 网速徽章：与连通延迟徽章并排，稍微弱化以区分主次 */
+.pp-speed-badge {
+  opacity: 0.85;
+  margin-left: -2px;
 }
 
 .pp-candidate-empty {

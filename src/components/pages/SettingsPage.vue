@@ -193,33 +193,6 @@ async function logout() {
               </div>
             </section>
 
-            <!-- 账号与登录 -->
-            <section class="settings-section">
-              <div class="settings-section-title">
-                <span v-html="icons.user" />
-                <div>
-                  <h2>账号与登录</h2>
-                  <p>退出当前登录会话，下次访问需要重新输入用户名和密码</p>
-                </div>
-              </div>
-              <div class="settings-rows">
-                <div class="settings-row">
-                  <div>
-                    <strong>退出登录</strong>
-                    <small>清除本机保存的登录令牌，不会影响服务运行与其他已登录设备</small>
-                  </div>
-                  <button
-                    type="button"
-                    class="secondary-button settings-logout-button"
-                    :disabled="loggingOut"
-                    @click="logout"
-                  >
-                    <span v-html="icons.close" /><span>{{ loggingOut ? "正在退出…" : "退出登录" }}</span>
-                  </button>
-                </div>
-              </div>
-            </section>
-
             <!-- 代理池与内核 -->
             <section class="settings-section">
               <div class="settings-section-title">
@@ -257,18 +230,30 @@ async function logout() {
               </div>
             </section>
 
-            <!-- 关于 -->
-            <section class="settings-section settings-about">
+            <!-- 账号与登录：放在页面底部，登出属于收尾操作 -->
+            <section class="settings-section">
               <div class="settings-section-title">
-                <span v-html="icons.info" />
+                <span v-html="icons.user" />
                 <div>
-                  <h2>关于</h2>
-                  <p>OpenHub</p>
+                  <h2>账号与登录</h2>
+                  <p>退出当前登录会话，下次访问需要重新输入用户名和密码</p>
                 </div>
               </div>
-              <div class="about-line">
-                <span>版本</span>
-                <strong>0.3.0</strong>
+              <div class="settings-rows">
+                <div class="settings-row">
+                  <div>
+                    <strong>退出登录</strong>
+                    <small>清除本机保存的登录令牌，不会影响服务运行与其他已登录设备</small>
+                  </div>
+                  <button
+                    type="button"
+                    class="secondary-button settings-logout-button"
+                    :disabled="loggingOut"
+                    @click="logout"
+                  >
+                    <span v-html="icons.close" /><span>{{ loggingOut ? "正在退出…" : "退出登录" }}</span>
+                  </button>
+                </div>
               </div>
             </section>
           </div>

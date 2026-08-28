@@ -7,8 +7,15 @@
 
 // ── 模型反代（同源 Web 服务端点）──
 
-/** 主 Web 服务默认端口；模型 API 与 Web UI 共用该端口。 */
-export const DEFAULT_SERVICE_PORT = 17896;
+/** dev 隔离形态端口（后端 debug 构建 / OPENHUB_PROFILE=dev 时使用）。 */
+export const DEV_SERVICE_PORT = 17996;
+
+/**
+ * 主 Web 服务默认端口；模型 API 与 Web UI 共用该端口。
+ * vite dev server（tauri dev）下前端走 dev 隔离端口，与正式版（17896）互不抢占；
+ * 实际监听端口以后端 status 返回为准，此处仅作初始回退值。
+ */
+export const DEFAULT_SERVICE_PORT = import.meta.env.DEV ? DEV_SERVICE_PORT : 17896;
 
 
 export const API_PATH_V1 = "/v1";

@@ -6,6 +6,7 @@ import {
   API_PATH_RESPONSES,
   API_PATH_GEMINI,
   API_PATH_MESSAGES,
+  DEFAULT_SERVICE_PORT,
   OPENCODE_UPSTREAM_URL,
 } from "../../constants";
 import type {
@@ -27,7 +28,7 @@ export * from "./types";
  */
 function modelApiOrigin(): string {
   return isTauri
-    ? `http://127.0.0.1:${proxyStatus.value.port || 17896}`
+    ? `http://127.0.0.1:${proxyStatus.value.port || DEFAULT_SERVICE_PORT}`
     : window.location.origin;
 }
 
@@ -81,7 +82,7 @@ export function isValidChannelAlias(alias: string): boolean {
 export const proxyConfig = ref<OpencodeProxyConfig>({
   enabled: true,
   listenHost: "127.0.0.1",
-  port: 17896,
+  port: DEFAULT_SERVICE_PORT,
   apiKey: "",
   channels: [
     {
@@ -105,8 +106,8 @@ export const proxyConfig = ref<OpencodeProxyConfig>({
 
 export const proxyStatus = ref<OpencodeProxyStatus>({
   running: false,
-  port: 17896,
-  url: "http://127.0.0.1:17896/v1",
+  port: DEFAULT_SERVICE_PORT,
+  url: `http://127.0.0.1:${DEFAULT_SERVICE_PORT}/v1`,
   totalRequests: 0,
   successfulRequests: 0,
   failedRequests: 0,
