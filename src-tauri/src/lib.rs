@@ -102,27 +102,74 @@ pub fn run() {
                     .status();
             }
             app_menu::install_chinese_menu(app)?;
+            crate::core::tray::install_tray(app)?;
 
-            // 菜单刷新：文件 → 刷新 → 后端直接全量刷新 + 通知前端刷新 UI。
+            // dev 隔离形态在窗口标题打标，避免与正式版窗口混淆。
+            if crate::core::profile::is_dev_profile() {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.set_title("OpenHub (dev)");
+                }
+            }
+
+            // 菜单事件：功能类在后端直接执行并通知前端；导航类统一转发给前端路由。
             app.on_menu_event(move |app_handle, event| {
-                if event.id() == "file-refresh" {
-                    info!("[OpenHub] 菜单 file-refresh 触发");
-                    let handle = app_handle.clone();
-                    tauri::async_runtime::spawn(async move {
-                        let ctx = handle.state::<Arc<AppContext>>();
-                        match crate::charity::commands::refresh_all_charity_feeds_impl(&ctx).await {
-                            Ok(_) => info!("[OpenHub] 全量刷新已提交"),
-                            Err(err) => error!("[OpenHub] 全量刷新失败：{err}"),
-                        }
-                        let _ = tauri::Emitter::emit(&handle, "menu-refresh-requested", ());
-                    });
+                let id = event.id().as_ref().to_string();
+                let handle = app_handle.clone();
+                match id.as_str() {
+                    "file-refresh" => {
+                        info!("[OpenHub] 菜单 file-refresh 触发");
+                        tauri::async_runtime::spawn(async move {
+                            let ctx = handle.state::<Arc<AppContext>>();
+                            match crate::charity::commands::refresh_all_charity_feeds_impl(&ctx)
+                                .await
+                            {
+                                Ok(_) => info!("[OpenHub] 全量刷新已提交"),
+                                Err(err) => error!("[OpenHub] 全量刷新失败：{err}"),
+                            }
+                            let _ = tauri::Emitter::emit(&handle, "menu-refresh-requested", ());
+                        });
+                    }
+                    // 导航类：视图菜单页面项 → 前端 onMenuNavigate 消费（nav-xxx → 页面名）。
+                    id if id.starts_with("nav-") => {
+                        let page = id.trim_start_matches("nav-").to_string();
+                        let _ = tauri::Emitter::emit(&handle, "menu-navigate", page);
+                    }
+                    // 功能类：新建站点 / 导出数据 → 前端打开对应弹窗。
+                    "file-new-site" => {
+                        let _ = tauri::Emitter::emit(&handle, "menu-new-site", ());
+                    }
+                    "file-export" => {
+                        let _ = tauri::Emitter::emit(&handle, "menu-export-data", ());
+                    }
+                    "view-reload" => {
+                        let _ = tauri::Emitter::emit(&handle, "menu-reload", ());
+                    }
+                    _ => {}
                 }
             });
 
+            let dev_profile = crate::core::profile::is_dev_profile();
+            if dev_profile {
+                info!("[OpenHub] dev 隔离形态：端口 {} / 数据目录 {}",
+                    crate::core::profile::DEV_SERVICE_PORT,
+                    crate::core::profile::app_support_dir_name());
+            }
             let app_data_dir = app
                 .path()
                 .app_data_dir()
                 .map_err(|error| error.to_string())?;
+            // dev 形态把数据目录切到 -dev 后缀目录：数据库、pid 锁、代理运行时、
+            // token 缓存全部随之隔离，且单实例锁只作用于本形态，不会误杀正式版。
+            let app_data_dir = if dev_profile {
+                app_data_dir.with_file_name(format!(
+                    "{}-dev",
+                    app_data_dir.file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or_default()
+                ))
+            } else {
+                app_data_dir
+            };
             fs::create_dir_all(&app_data_dir)?;
             // 先关掉旧实例，再开数据库/绑端口，避免端口顺延导致浏览器指向旧实例。
             single_instance::claim(&app_data_dir);
@@ -182,7 +229,7 @@ pub fn run() {
             );
             app.manage(shared.clone());
             match web_server::bind_listener(
-                web_server::DEFAULT_PORT,
+                crate::core::profile::preferred_service_port(),
                 std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             ) {
                 Ok(listener) => {
@@ -247,10 +294,18 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
-            // 关闭主窗口视为退出整个应用，避免内嵌 HTTP 服务继续驻留。
+            // 关闭主窗口 = 隐藏到菜单栏图标：窗口隐藏 + Dock 图标收起（macOS），
+            // 应用驻留后台继续提供内嵌 HTTP 服务与模型网关；
+            // 唤起走托盘图标（左键/菜单），彻底退出走托盘菜单或 Cmd+Q。
             if window.label() == "main" {
-                if let tauri::WindowEvent::CloseRequested { .. } = event {
-                    window.app_handle().exit(0);
+                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                    api.prevent_close();
+                    let _ = window.hide();
+                    #[cfg(target_os = "macos")]
+                    {
+                        use tauri::Manager;
+                        let _ = window.app_handle().set_dock_visibility(false);
+                    }
                 }
             }
         })
@@ -368,6 +423,8 @@ pub fn run() {
         .run(|app_handle, event| {
             #[cfg(target_os = "macos")]
             if let tauri::RunEvent::Reopen { .. } = event {
+                // Dock 图标隐藏期间仍可能经 Finder/Spotlight 触发 Reopen，恢复可见性。
+                let _ = app_handle.set_dock_visibility(true);
                 if let Some(window) = app_handle.get_webview_window("main") {
                     let _ = window.show();
                     let _ = window.unminimize();

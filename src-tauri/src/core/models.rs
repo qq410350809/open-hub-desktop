@@ -443,8 +443,13 @@ pub struct ProxySourceProgress {
 pub struct ProxyNodeTestProgress {
     pub(crate) node_id: String,
     pub(crate) phase: String,
+    /// 连通指标：GET 响应头到达耗时（TTFB）
     pub(crate) latency_ms: Option<i64>,
+    /// 网速指标：body 下载完成的总耗时；未下载完（超时/失败）为 None
+    pub(crate) speed_ms: Option<i64>,
     pub(crate) status: String,
+    /// 测速阶段标记：latency=普通延迟，connectivity=通道测速连通阶段，speed=通道测速网速阶段
+    pub(crate) stage: String,
     pub(crate) completed: usize,
     pub(crate) total: usize,
 }

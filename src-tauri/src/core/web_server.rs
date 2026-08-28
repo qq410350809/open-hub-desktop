@@ -898,7 +898,14 @@ async fn clash_subscription_handler(
         .and_then(|value| value.parse::<i64>().ok())
         .unwrap_or(crate::proxypool::DEFAULT_CLASH_SUB_MAX_LATENCY_MS)
         .clamp(100, 10_000);
-    match crate::proxypool::build_clash_subscription_yaml(&shared.ctx.database, max_latency) {
+    // 网速门槛（minSpeed 查询参数，单位 MB/s）：换算为等效 500KB 下载耗时上限，
+    // 合法范围 0.05~100 MB/s，缺省为不限网速。
+    let min_speed = query_param(&pairs, "minSpeed")
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|speed| speed.is_finite() && *speed > 0.0)
+        .map(|speed| speed.clamp(0.05, 100.0));
+    match crate::proxypool::build_clash_subscription_yaml(&shared.ctx.database, max_latency, min_speed)
+    {
         Ok((yaml, count)) => {
             let mut response = (
                 [

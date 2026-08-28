@@ -11,8 +11,20 @@ type DynItem<'a, R> = &'a dyn IsMenuItem<R>;
 /// 安装中文菜单到应用与主窗口。
 pub fn install_chinese_menu<R: tauri::Runtime>(app: &tauri::App<R>) -> tauri::Result<()> {
     // macOS 会把菜单栏第一个子菜单固定显示为应用名，标题写什么都会被系统替换。
-    let about =
-        PredefinedMenuItem::about(app, Some("关于 OpenHub"), Some(AboutMetadata::default())).ok();
+    // 关于面板：填充 macOS 支持的字段（name/version/copyright/credits），
+    // 版本号编译期取自 Cargo.toml，与 tauri.conf.json 由 check:version 保证一致。
+    let about = PredefinedMenuItem::about(
+        app,
+        Some("关于 OpenHub"),
+        Some(AboutMetadata {
+            name: Some("OpenHub".into()),
+            version: Some(env!("CARGO_PKG_VERSION").into()),
+            copyright: Some("© 2026 OpenHub".into()),
+            credits: Some("本地站点资料库".into()),
+            ..AboutMetadata::default()
+        }),
+    )
+    .ok();
     let sep = PredefinedMenuItem::separator(app).ok();
     let services = PredefinedMenuItem::services(app, Some("服务")).ok();
     let hide = PredefinedMenuItem::hide(app, Some("隐藏 OpenHub")).ok();
@@ -35,14 +47,21 @@ pub fn install_chinese_menu<R: tauri::Runtime>(app: &tauri::App<R>) -> tauri::Re
     .collect();
     let app_menu = Submenu::with_items(app, "OpenHub", true, &app_items)?;
 
-    let close_window = PredefinedMenuItem::close_window(app, Some("关闭窗口")).ok();
-    let refresh_item = MenuItem::with_id(app, "file-refresh", "刷新", true, Some("CmdOrCtrl+R"))
+    // —— 文件菜单：新建 / 刷新 / 导出（参照常见 macOS 应用布局）——
+    let new_site = MenuItem::with_id(app, "file-new-site", "新建站点…", true, Some("CmdOrCtrl+N"))
+        .expect("创建文件菜单新建项失败");
+    let refresh_item = MenuItem::with_id(app, "file-refresh", "全部刷新", true, Some("CmdOrCtrl+R"))
         .expect("创建文件菜单刷新项失败");
+    let export_data =
+        MenuItem::with_id(app, "file-export", "导出数据…", true, Some("CmdOrCtrl+E"))
+            .expect("创建文件菜单导出项失败");
     let sep_file = PredefinedMenuItem::separator(app).ok();
     let file_items: Vec<DynItem<'_, R>> = vec![
-        close_window.as_ref().map(|i| i as DynItem<'_, R>),
+        Some(&new_site as DynItem<'_, R>),
         sep_file.as_ref().map(|i| i as DynItem<'_, R>),
         Some(&refresh_item as DynItem<'_, R>),
+        sep_file.as_ref().map(|i| i as DynItem<'_, R>),
+        Some(&export_data as DynItem<'_, R>),
     ]
     .into_iter()
     .flatten()
@@ -70,18 +89,51 @@ pub fn install_chinese_menu<R: tauri::Runtime>(app: &tauri::App<R>) -> tauri::Re
     .collect();
     let edit_menu = Submenu::with_items(app, "编辑", true, &edit_items)?;
 
+    // —— 视图菜单：页面导航 + 刷新页面 + 全屏 ——
+    let nav_defs: [(&str, &str, &str); 8] = [
+        ("nav-tokenstats", "本地统计", "CmdOrCtrl+1"),
+        ("nav-gatewaystats", "网关统计", "CmdOrCtrl+2"),
+        ("nav-library", "站点库", "CmdOrCtrl+3"),
+        ("nav-modelparams", "模型参数", "CmdOrCtrl+4"),
+        ("nav-modelproxy", "模型网关", "CmdOrCtrl+5"),
+        ("nav-charity", "公益监听", "CmdOrCtrl+6"),
+        ("nav-proxy", "代理池", "CmdOrCtrl+7"),
+        ("nav-settings", "设置…", "CmdOrCtrl+,"),
+    ];
+    let mut nav_items: Vec<Box<dyn IsMenuItem<R>>> = Vec::new();
+    for (id, text, accelerator) in nav_defs {
+        nav_items.push(Box::new(
+            MenuItem::with_id(app, id, text, true, Some(accelerator))
+                .expect("创建视图菜单导航项失败"),
+        ));
+    }
+    let reload_page =
+        MenuItem::with_id(app, "view-reload", "刷新页面", true, Some("CmdOrCtrl+Shift+R"))
+            .expect("创建视图菜单刷新页面项失败");
     let fullscreen = PredefinedMenuItem::fullscreen(app, Some("进入全屏")).ok();
-    let view_items: Vec<DynItem<'_, R>> = vec![fullscreen.as_ref().map(|i| i as DynItem<'_, R>)]
-        .into_iter()
-        .flatten()
-        .collect();
-    let view_menu = Submenu::with_items(app, "视图", true, &view_items)?;
+    let sep_view = PredefinedMenuItem::separator(app).ok();
+    let mut view_refs: Vec<DynItem<'_, R>> =
+        nav_items.iter().map(|item| item.as_ref() as DynItem<'_, R>).collect();
+    for optional in [
+        Some(&reload_page as DynItem<'_, R>),
+        sep_view.as_ref().map(|i| i as DynItem<'_, R>),
+        fullscreen.as_ref().map(|i| i as DynItem<'_, R>),
+    ] {
+        if let Some(item) = optional {
+            view_refs.push(item);
+        }
+    }
+    let view_menu = Submenu::with_items(app, "视图", true, &view_refs)?;
 
     let minimize = PredefinedMenuItem::minimize(app, Some("最小化")).ok();
     let maximize = PredefinedMenuItem::maximize(app, Some("缩放")).ok();
+    let close_window = PredefinedMenuItem::close_window(app, Some("关闭窗口")).ok();
+    let sep_window = PredefinedMenuItem::separator(app).ok();
     let window_items: Vec<DynItem<'_, R>> = vec![
         minimize.as_ref().map(|i| i as DynItem<'_, R>),
         maximize.as_ref().map(|i| i as DynItem<'_, R>),
+        sep_window.as_ref().map(|i| i as DynItem<'_, R>),
+        close_window.as_ref().map(|i| i as DynItem<'_, R>),
     ]
     .into_iter()
     .flatten()

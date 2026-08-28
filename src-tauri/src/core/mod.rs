@@ -5,7 +5,10 @@ pub mod db;
 #[cfg(feature = "desktop")]
 pub mod file_export;
 pub mod models;
+pub mod profile;
 pub mod single_instance;
+#[cfg(feature = "desktop")]
+pub mod tray;
 pub mod web_server;
 
 #[cfg(feature = "desktop")]
