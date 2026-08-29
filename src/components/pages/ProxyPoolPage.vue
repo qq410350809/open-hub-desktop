@@ -977,7 +977,7 @@ async function testAll() {
   message.value = "";
   const sName = selectedSourceName();
   if (!sName) {
-    message.value = "正在装载节点并测速（先连通、后网速）…";
+    message.value = "正在装载节点并测速（延时+网速一体探测）…";
     const result = await store.testAllProxyNodes();
     message.value = testResultMessage("全部来源测速", result);
     return;
@@ -987,7 +987,7 @@ async function testAll() {
     message.value = `${selectedSourceLabel()}当前没有可测速节点`;
     return;
   }
-  message.value = `正在装载 ${nodes.length} 个节点并测速（先连通、后网速）…`;
+  message.value = `正在装载 ${nodes.length} 个节点并测速（延时+网速一体探测）…`;
   const result = await store.testProxyNodes(
     nodes.map((node) => node.id),
     `test-source-${selectedSource.value}`,

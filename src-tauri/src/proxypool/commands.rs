@@ -9,13 +9,12 @@ use crate::proxypool::rotator::{
     list_channel_candidate_nodes, list_prioritized_fast_proxy_nodes, write_channel_node,
 };
 use crate::proxypool::runtime::{
-    controller_client, ensure_channel_instance, ensure_default_proxy_channel,
-    ensure_global_runtime, ensure_runtime, is_slow_or_blocked_speed_test_url, load_state,
-    row_subscription, runtime_controller_port, runtime_nodes, runtime_proxy_url,
-    select_group_node, select_runtime_node, write_meta,
+    ensure_channel_instance, ensure_default_proxy_channel, ensure_global_runtime, ensure_runtime,
+    load_state, row_subscription, runtime_nodes, runtime_proxy_url, select_group_node,
+    select_runtime_node, write_meta,
 };
 use crate::proxypool::tester::{
-    controller_proxy_delay, measure_get_probe, normalize_ignore_addresses, run_proxy_node_pool,
+    measure_get_probe, normalize_ignore_addresses, run_proxy_node_pool,
 };
 use crate::proxypool::types::*;
 use rusqlite::{params, OptionalExtension};
@@ -679,38 +678,18 @@ pub async fn test_proxy_node(
     let test_lease = runtime.start_proxy_test()?;
     let _op_guard = runtime.runtime_op_lock.lock().await;
     tokio::task::block_in_place(|| ensure_global_runtime(database, runtime))?;
-    let client = controller_client()?;
-    let controller_port = runtime_controller_port(runtime)?;
     let lane = runtime.speed_lane_slot(0)?;
     select_group_node(runtime, &lane.group_name, &node_id).await?;
-    // 延迟：控制器 delay 接口（unified-delay 双测取小，传统面板口径）；
-    // 连不通直接判死，不再白等下载超时。网速：经 lane 真实 GET 下载 500KB。
-    let delay_url = {
-        let stored = crate::db::read_meta(database, PROXY_SPEED_TEST_URL_KEY).unwrap_or_default();
-        if stored.trim().is_empty() || is_slow_or_blocked_speed_test_url(&stored) {
-            DEFAULT_PROXY_SPEED_TEST_URL.to_string()
-        } else {
-            stored
-        }
-    };
-    // 测速前先清空该节点的旧网速数据，重测期间不残留过期结果
-    {
-        let connection = database.lock_conn()?;
-        connection
-            .execute(
-                "UPDATE proxy_pool_nodes SET channel_latency_ms=NULL, channel_test_status='', channel_tested_at='' WHERE id=?1",
-                params![node_id],
-            )
-            .map_err(|error| error.to_string())?;
-    }
-    let latency = controller_proxy_delay(&client, controller_port, &node_id, &delay_url).await;
-    let (speed_ms, status, error_message) = if latency.is_some() {
-        let proxy_url = format!("http://127.0.0.1:{}", lane.listen_port);
-        let (_, speed_ms) =
-            measure_get_probe(proxy_url, CHANNEL_SPEED_TEST_URL.to_string()).await;
-        (speed_ms, "success", None)
+    // 延时与网速一体测（与批量同源）：同一条经 lane 的下载连接，
+    // 响应头到达耗时 = 连通延迟，滑窗峰值吞吐 = 网速。
+    let proxy_url = format!("http://127.0.0.1:{}", lane.listen_port);
+    let (latency, speed_ms) =
+        measure_get_probe(proxy_url, CHANNEL_SPEED_TEST_URL.to_string()).await;
+    let status = if latency.is_some() { "success" } else { "error" };
+    let error_message = if latency.is_some() {
+        None
     } else {
-        (None, "error", Some("连通测试失败：节点无响应".to_string()))
+        Some("测速失败：节点无法连通（探测请求未在预算内收到响应头）".to_string())
     };
     {
         let connection = database.lock_conn()?;

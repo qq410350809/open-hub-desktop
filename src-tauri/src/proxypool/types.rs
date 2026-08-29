@@ -17,8 +17,11 @@ pub const SPEED_TEST_LANES: usize = 8;
 pub const ACCOUNT_LANE_POOL: usize = 64;
 /// 全局单实例预配的通道 lane 池上限：每个通道占一个 lane
 pub const CHANNEL_LANE_POOL: usize = 16;
-/// 单个 GET 的硬超时（含建链）：超时前没收到响应头 → 全失败
-pub const SPEED_TEST_TIMEOUT_MS: u64 = 5000;
+/// 一体探测的单次硬超时（延时+网速同一条连接）：响应头到达 = 延迟值，
+/// 超时前没收到响应头 → 两指标一起判死。预算须覆盖"经节点建链 + TLS 握手 +
+/// 请求头"全链路，实测 400ms 级 RTT 节点的 TTFB 可达 5.3s，5s 预算会把大量
+/// 可用节点误杀，放宽到 8s。
+pub const SPEED_TEST_TIMEOUT_MS: u64 = 8000;
 /// 下载测速的流式采样目标：收满即停（也作为测速 URL 的 bytes 参数）。
 /// 500KB 样本太小——TCP 慢启动未爬到满速就结束，实测会把 6.5MB/s 的节点
 /// 测成 0.8MB/s（差 8 倍）；大样本才能测出真实吞吐。

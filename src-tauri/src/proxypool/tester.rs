@@ -7,7 +7,6 @@ use crate::proxypool::runtime::{
 use crate::proxypool::types::*;
 use futures_util::future;
 use rusqlite::params;
-use rusqlite::params_from_iter;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -44,9 +43,9 @@ pub fn normalize_ignore_addresses(value: &str) -> String {
 /// 目标到达即停，网速取最大连续 3 桶（300ms 滑窗）的平均速率——既跳过
 /// 慢启动，又摊平 chunk 级调度突发。并行 lane 共享总带宽，短窗口峰值法
 /// 不被长下载的带宽争抢拖垮。
-/// 返回 (响应头到达耗时 ms, 等效 500KB 下载耗时 ms)：
-/// - 超时前没收到响应头 → (None, None)
-/// - 总采样 < 最小采样量或无峰值 → (Some, None)（有连通但无有效吞吐）
+/// 延时与网速一体产出：(响应头到达耗时, 等效 500KB 下载耗时)。
+/// - 超时前没收到响应头 → (None, None)（节点不通，两指标一起判死）
+/// - 总采样 < 最小采样量或无峰值 → (Some, None)（连通但无有效吞吐）
 /// - 采样完成 → (Some, Some)，等效耗时 = 500KB ÷ 峰值速率
 pub(crate) async fn measure_get_probe(
     proxy_url: String,
@@ -170,37 +169,6 @@ async fn select_lane_node(
     Ok(())
 }
 
-/// 经控制器 delay 接口测节点连通延迟。mihomo 内部做两次测量取小
-/// （unified-delay），扣除建链一次性成本，数值即传统面板口径的"延迟"
-/// （几十~几百 ms）。拨号真实经节点（DialContext 走代理），无假测速问题——
-/// 网速由独立的 GET 下载负责。
-pub(crate) async fn controller_proxy_delay(
-    client: &reqwest::Client,
-    controller_port: u16,
-    proxy_name: &str,
-    url: &str,
-) -> Option<i64> {
-    let mut endpoint =
-        Url::parse(&controller_url(controller_port, "/proxies/")).ok()?;
-    append_controller_path(&mut endpoint, &[proxy_name, "delay"]).ok()?;
-    endpoint
-        .query_pairs_mut()
-        .append_pair("timeout", &SPEED_TEST_TIMEOUT_MS.to_string())
-        .append_pair("url", url);
-    let response = client
-        .get(endpoint)
-        .bearer_auth(RUNTIME_SECRET)
-        .timeout(Duration::from_millis(SPEED_TEST_TIMEOUT_MS + 2_000))
-        .send()
-        .await
-        .ok()?;
-    if !response.status().is_success() {
-        return None;
-    }
-    let value: serde_json::Value = response.json().await.ok()?;
-    value.get("delay").and_then(|delay| delay.as_i64())
-}
-
 pub async fn run_proxy_node_pool(
     bus: &EventBus,
     database: &Database,
@@ -256,24 +224,10 @@ pub async fn run_proxy_node_pool(
     let ordered_ids: Vec<String> = testable_nodes.iter().map(|(id, _)| id.clone()).collect();
     let controller_port = runtime_controller_port(runtime)?;
 
-    // 测速前清空本次目标节点的旧网速数据：取消/漏测的节点不残留过期网速，
-    // 前端网速档位过滤只认本轮测速写回的新结果。
-    {
-        let connection = database.lock_conn()?;
-        for chunk in testable_nodes.chunks(500) {
-            let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-            let sql = format!(
-                "UPDATE proxy_pool_nodes SET channel_latency_ms=NULL, channel_test_status='', channel_tested_at='' WHERE id IN ({placeholders})"
-            );
-            let ids = chunk.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>();
-            connection
-                .execute(&sql, params_from_iter(ids))
-                .map_err(|error| error.to_string())?;
-        }
-    }
-
     // 两指标一次落库：delay 连通成功保留延迟；下载完成写网速耗时；
     // delay 失败两列都置 error（连不通的节点不再白等下载超时）。
+    // 不预清空旧网速：本轮被取消/漏测的节点保留历史指标，避免一次
+    // 异常测速（如实例端口冲突全挂）把既有 ms/网速数据全部清掉。
     let full_success_sql = "UPDATE proxy_pool_nodes SET latency_ms=?2, test_status='success', channel_latency_ms=?3, channel_test_status='success', channel_tested_at=CURRENT_TIMESTAMP, tested_at=CURRENT_TIMESTAMP WHERE id=?1";
     let header_only_sql = "UPDATE proxy_pool_nodes SET latency_ms=?2, test_status='success', channel_latency_ms=NULL, channel_test_status='error', channel_tested_at=CURRENT_TIMESTAMP, tested_at=CURRENT_TIMESTAMP WHERE id=?1";
     let fail_sql = "UPDATE proxy_pool_nodes SET latency_ms=NULL, test_status='error', channel_latency_ms=NULL, channel_test_status='error', channel_tested_at=CURRENT_TIMESTAMP, tested_at=CURRENT_TIMESTAMP WHERE id=?1";
@@ -301,18 +255,6 @@ pub async fn run_proxy_node_pool(
     let completed = Arc::new(AtomicUsize::new(0));
     let client = controller_client()?;
 
-    // 延迟口径：控制器 delay 接口的测试 URL（设置页"测速地址"，默认 gstatic 204）
-    let delay_url = {
-        let stored = crate::db::read_meta(database, PROXY_SPEED_TEST_URL_KEY).unwrap_or_default();
-        if stored.trim().is_empty()
-            || crate::proxypool::runtime::is_slow_or_blocked_speed_test_url(&stored)
-        {
-            DEFAULT_PROXY_SPEED_TEST_URL.to_string()
-        } else {
-            stored
-        }
-    };
-
     let lane_futures = lanes
         .iter()
         .enumerate()
@@ -328,7 +270,6 @@ pub async fn run_proxy_node_pool(
             let cancellation = cancellation.clone();
             let group_name = lane.group_name.clone();
             let listen_port = lane.listen_port;
-            let delay_url = delay_url.clone();
             let completed = Arc::clone(&completed);
             async move {
                 for node_id in my_nodes {
@@ -367,27 +308,22 @@ pub async fn run_proxy_node_pool(
                         );
                         continue;
                     }
-                    // 连通延迟：控制器 delay 接口（unified-delay 双测取小）。
-                    // 连不通直接判死，不再白等 5s 下载超时。
-                    let latency =
-                        controller_proxy_delay(&client, controller_port, &node_id, &delay_url)
-                            .await;
-                    let (download_ms, status) = if latency.is_some() {
-                        let proxy_url = format!("http://127.0.0.1:{listen_port}");
-                        let (_, download_ms) =
-                            measure_get_probe(proxy_url, CHANNEL_SPEED_TEST_URL.to_string()).await;
-                        (download_ms, "success")
-                    } else {
-                        (None, "error")
-                    };
-                    let _ = write_probe_result(&node_id, latency, download_ms);
+                    // 延时与网速一体测：同一条经 lane 的真实下载连接——
+                    // 响应头到达耗时即连通延迟，滑窗峰值吞吐换算网速。
+                    // 同源同预算，节点要么两个指标一起出，要么一起判死，
+                    // 不会再出现“有延迟没网速”的分裂结果。
+                    let proxy_url = format!("http://127.0.0.1:{listen_port}");
+                    let (ttfb, download_ms) =
+                        measure_get_probe(proxy_url, CHANNEL_SPEED_TEST_URL.to_string()).await;
+                    let status = if ttfb.is_some() { "success" } else { "error" };
+                    let _ = write_probe_result(&node_id, ttfb, download_ms);
                     let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
                     bus.emit(
                         progress_event,
                         ProxyNodeTestProgress {
                             node_id,
                             phase: "completed".to_string(),
-                            latency_ms: latency,
+                            latency_ms: ttfb,
                             speed_ms: download_ms,
                             status: status.to_string(),
                             stage: "speed".to_string(),
