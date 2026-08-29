@@ -188,6 +188,13 @@ const CHROME_BRIDGE_PENDING: &str = "__OPENHUB_PENDING__";
 const CHROME_BRIDGE_TAB_PENDING_PREFIX: &str = "__OPENHUB_TAB_PENDING__:";
 const CHROME_BRIDGE_PROFILE_MISMATCH: &str = "__OPENHUB_PROFILE_MISMATCH__";
 
+/// 可见 / 后台同步标签的 URL fragment 前缀，与 sync.rs 生成的 marker 保持一致。
+/// 用于识别“本应用此前同步遗留的标签”，复用而不是再开一个新标签。
+#[cfg(target_os = "macos")]
+const VISIBLE_BRIDGE_MARKER_PREFIX: &str = "openhub-sync-";
+#[cfg(target_os = "macos")]
+const BACKGROUND_BRIDGE_MARKER_PREFIX: &str = "openhub-background-";
+
 fn chrome_tab_id_from_pending(value: &str) -> Option<&str> {
     value
         .strip_prefix(CHROME_BRIDGE_TAB_PENDING_PREFIX)
@@ -201,6 +208,11 @@ fn is_transient_chrome_automation_error(error: &str) -> bool {
         || error.contains("-600")
         || error.contains("-1719")
         || error.contains("-1728")
+        // -1712：AppleEvent 超时。页面尚在加载、被内存省电休眠或 Chrome 忙时
+        // execute javascript 会超时，属于可重试的瞬态错误；直接判定失败会让
+        // 一个慢标签页中断整轮同步，并连锁触发反复打开新标签页兜底。
+        || error.contains("-1712")
+        || error.contains("AppleEvent已超时")
         || error.contains("连接无效")
         || error.contains("无效的索引")
         || error.contains("Connection is invalid")
@@ -263,13 +275,13 @@ on run argv
                             end if
                         end if
                     on error errorMessage number errorNumber
-                        if errorNumber is not -1719 and errorNumber is not -1728 then
+                        if errorNumber is not -1719 and errorNumber is not -1728 and errorNumber is not -1712 then
                             error errorMessage number errorNumber
                         end if
                     end try
                 end repeat
             on error errorMessage number errorNumber
-                if errorNumber is not -1719 and errorNumber is not -1728 then
+                if errorNumber is not -1719 and errorNumber is not -1728 and errorNumber is not -1712 then
                     error errorMessage number errorNumber
                 end if
             end try
@@ -312,9 +324,7 @@ end run
                         .into(),
                 );
             }
-            if error.contains("-1712") || error.contains("AppleEvent已超时") {
-                return Err("Chrome 标签页响应 AppleEvent 超时".into());
-            }
+            // -1712 已归入瞬态错误：不在此处致命返回，由外层轮询重试到整体超时。
             if is_transient_chrome_automation_error(&error) {
                 thread::sleep(Duration::from_millis(300));
                 continue;
@@ -361,8 +371,25 @@ pub(crate) fn run_javascript_in_chrome_profile(
     javascript: &str,
     timeout: Duration,
     proxy_url: Option<&str>,
+    allow_tab_reuse: bool,
 ) -> Result<String, String> {
     validate_chrome_bridge_marker(marker)?;
+    // 上一次同步可能已经为该站点开过验证标签（被总超时掐断、或手动同步遗留）。
+    // 优先复用，不再新开一个同样的标签，避免 Chrome 里反复堆积站点标签。
+    // 仅在 bridge 脚本能用 Local Storage 用户 ID 核对账号时才允许复用，
+    // 否则可能把账号请求注入其他 Chrome 账号的标签页。
+    if allow_tab_reuse {
+        if let Some(tab_id) = find_openhub_bridge_tab(target_url, VISIBLE_BRIDGE_MARKER_PREFIX) {
+            // 不新开标签，但仍把 Chrome 带到前台，保留“可见验证”的语义。
+            let _ = Command::new("/usr/bin/open")
+                .args(["-a", "Google Chrome"])
+                .output();
+            match run_javascript_in_marked_chrome_tab(marker, javascript, Some(&tab_id), timeout) {
+                Ok(value) if value == CHROME_BRIDGE_PROFILE_MISMATCH => {}
+                outcome => return outcome,
+            }
+        }
+    }
     let existing_tab_ids = chrome_tab_ids();
     open_url_in_chrome_profile_blocking_with_mode(target_url, profile_id, false, proxy_url)?;
     let target_tab_id =
@@ -378,8 +405,21 @@ pub(crate) fn run_javascript_in_background_chrome_profile(
     javascript: &str,
     timeout: Duration,
     proxy_url: Option<&str>,
+    allow_tab_reuse: bool,
 ) -> Result<String, String> {
     validate_chrome_bridge_marker(marker)?;
+    if allow_tab_reuse {
+        if let Some(tab_id) = find_openhub_bridge_tab(target_url, BACKGROUND_BRIDGE_MARKER_PREFIX)
+        {
+            match run_javascript_in_marked_chrome_tab(marker, javascript, Some(&tab_id), timeout) {
+                Ok(value) if value == CHROME_BRIDGE_PROFILE_MISMATCH => {}
+                outcome => {
+                    close_chrome_bridge_tabs(Some(&tab_id), marker);
+                    return outcome;
+                }
+            }
+        }
+    }
     let existing_tab_ids = chrome_tab_ids();
     open_url_in_chrome_profile_blocking_with_mode(target_url, profile_id, true, proxy_url)?;
     let target_tab_id =
@@ -432,13 +472,13 @@ on run argv
                             return scriptResult as text
                         end if
                     on error errorMessage number errorNumber
-                        if errorNumber is not -1719 and errorNumber is not -1728 then
+                        if errorNumber is not -1719 and errorNumber is not -1728 and errorNumber is not -1712 then
                             error errorMessage number errorNumber
                         end if
                     end try
                 end repeat
             on error errorMessage number errorNumber
-                if errorNumber is not -1719 and errorNumber is not -1728 then
+                if errorNumber is not -1719 and errorNumber is not -1728 and errorNumber is not -1712 then
                     error errorMessage number errorNumber
                 end if
             end try
@@ -474,9 +514,7 @@ end run
                         .into(),
                 );
             }
-            if error.contains("-1712") || error.contains("AppleEvent已超时") {
-                return Err("Chrome 标签页响应 AppleEvent 超时".into());
-            }
+            // -1712 已归入瞬态错误：不在此处致命返回，由外层轮询重试到整体超时。
             if is_transient_chrome_automation_error(&error) {
                 thread::sleep(Duration::from_millis(500));
                 continue;
@@ -547,6 +585,33 @@ return tabLines
 #[cfg(target_os = "macos")]
 fn chrome_tab_ids() -> HashSet<String> {
     chrome_tabs().into_iter().map(|(id, _)| id).collect()
+}
+
+/// 判断某个 Chrome 标签页是否是本应用此前同步遗留的桥接标签：
+/// 站点 origin 相同，且 URL fragment 以对应流程的 marker 前缀开头。
+#[cfg(target_os = "macos")]
+fn is_openhub_bridge_tab(tab_url: &str, target_origin: &str, fragment_prefix: &str) -> bool {
+    let Ok(parsed) = Url::parse(tab_url) else {
+        return false;
+    };
+    if parsed.origin().ascii_serialization() != target_origin {
+        return false;
+    }
+    parsed
+        .fragment()
+        .is_some_and(|fragment| fragment.starts_with(fragment_prefix))
+}
+
+/// 在已打开的 Chrome 标签页里寻找此前同步遗留的 OpenHub 桥接标签。
+#[cfg(target_os = "macos")]
+fn find_openhub_bridge_tab(target_url: &str, fragment_prefix: &str) -> Option<String> {
+    let target_origin = validated_external_url(target_url)
+        .ok()?
+        .origin()
+        .ascii_serialization();
+    chrome_tabs().into_iter().find_map(|(id, url)| {
+        is_openhub_bridge_tab(&url, &target_origin, fragment_prefix).then_some(id)
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -670,6 +735,7 @@ pub(crate) fn run_javascript_in_chrome_profile(
     _javascript: &str,
     _timeout: Duration,
     _proxy_url: Option<&str>,
+    _allow_tab_reuse: bool,
 ) -> Result<String, String> {
     Err("当前仅支持在 macOS 上通过 Chrome 同步账号".into())
 }
@@ -682,6 +748,7 @@ pub(crate) fn run_javascript_in_background_chrome_profile(
     _javascript: &str,
     _timeout: Duration,
     _proxy_url: Option<&str>,
+    _allow_tab_reuse: bool,
 ) -> Result<String, String> {
     Err("当前仅支持在 macOS 上通过 Chrome 同步账号".into())
 }
@@ -1544,8 +1611,44 @@ mod tests {
         assert!(is_transient_chrome_automation_error(
             "不能获得 tab id of window id。 (-1728)"
         ));
+        assert!(is_transient_chrome_automation_error(
+            "execution error: AppleEvent已超时。 (-1712)"
+        ));
+        assert!(is_transient_chrome_automation_error(
+            "Google Chrome got an error: AppleEvent timed out. (-1712)"
+        ));
         assert!(!is_transient_chrome_automation_error(
             "Not authorized to send Apple events. (-1743)"
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn matches_only_same_origin_openhub_bridge_tabs() {
+        assert!(is_openhub_bridge_tab(
+            "https://example.com/console#openhub-sync-123",
+            "https://example.com",
+            "openhub-sync-"
+        ));
+        assert!(!is_openhub_bridge_tab(
+            "https://example.com/console#openhub-models-123",
+            "https://example.com",
+            "openhub-sync-"
+        ));
+        assert!(!is_openhub_bridge_tab(
+            "https://other.com/#openhub-sync-123",
+            "https://example.com",
+            "openhub-sync-"
+        ));
+        assert!(!is_openhub_bridge_tab(
+            "https://example.com/console",
+            "https://example.com",
+            "openhub-sync-"
+        ));
+        assert!(!is_openhub_bridge_tab(
+            "not a url",
+            "https://example.com",
+            "openhub-sync-"
         ));
     }
 

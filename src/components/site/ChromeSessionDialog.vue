@@ -123,7 +123,6 @@ async function openSiteInBrowser(session: ChromeSessionInfo) {
             class="close-button"
             type="button"
             aria-label="关闭 Chrome 账号会话"
-            :disabled="store.chromeSessionSyncActive.value || store.chromeModelsSyncing.value"
             @click="close"
             v-html="icons.close"
           />

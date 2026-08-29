@@ -42,6 +42,11 @@ let chromeBrowserSyncRunId = 0;
 let chromeBrowserSyncLogId = 0;
 let chromeBrowserSyncStartedAt = 0;
 let chromeBrowserSyncLastLogAt = 0;
+// 强制停止标记：用户在关闭确认里选择“强制停止并关闭”后置位。
+// 账号同步循环与单账号同步在拿到结果后据此放弃后续账号与提示；
+// 下一次发起同步时复位。后端通过 cancel_site_account_sync 按 runId
+// 在阶段边界停止打开新的 Chrome 标签页。
+let chromeSyncForceStopped = false;
 // 浏览器兜底冷却已改为后端持久化（site_accounts.browser_fallback_*，指数退避），
 // 前端从会话信息的 browserFallbackCooldownMs 读取：重启不丢失，自动调度与
 // 手动弹窗共用同一份状态；手动点击账号行的 Chrome 同步按钮不受冷却限制。
@@ -136,6 +141,7 @@ async function runChromeAccountSync(
   session: ChromeSessionInfo,
   options: { reloadLibrary?: boolean } = {},
 ): Promise<boolean> {
+  if (chromeSyncForceStopped) return false;
   const reloadLibrary = options.reloadLibrary ?? true;
   const site = chromeSessionSite.value;
   if (!site) return false;
@@ -154,6 +160,8 @@ async function runChromeAccountSync(
       profileId: session.profileId,
       runId,
     });
+    // 强制停止后放弃本次结果（后端已在阶段边界中断，结果不可信）
+    if (chromeSyncForceStopped) return false;
     const index = chromeSessions.value.findIndex((item) => item.profileId === session.profileId);
     if (index >= 0) chromeSessions.value[index] = refreshed;
     // 失败冷却与失败原因由后端写入 site_accounts（sync_error / browser_fallback_*），
@@ -203,6 +211,7 @@ async function closeChromeSyncTabs(accountLabel = "当前账号", profileId = "c
 
 async function syncAccountViaChrome(session: ChromeSessionInfo) {
   if (chromeBrowserSyncingProfileId.value) return;
+  chromeSyncForceStopped = false;
   startChromeBrowserSyncLog();
   chromeSessionSyncActive.value = true;
   const accountLabel = session.username || session.accountName || session.profileName;
@@ -230,7 +239,7 @@ async function syncAccountViaChrome(session: ChromeSessionInfo) {
   });
   if (accountSucceeded) {
     showToast(`已更新 ${accountLabel} 额度与账号资料`);
-  } else {
+  } else if (!chromeSyncForceStopped) {
     showToast(`Chrome 同步失败：${chromeBrowserSyncError.value}`, true);
   }
 }
@@ -300,8 +309,34 @@ async function copyChromeSession(session: ChromeSessionInfo) {
   }
 }
 
-function closeChromeSessionDialog() {
-  if (chromeBrowserSyncingProfileId.value || chromeModelsSyncing.value) return;
+async function closeChromeSessionDialog() {
+  if (chromeBrowserSyncingProfileId.value || chromeModelsSyncing.value) {
+    const accepted = await confirm({
+      title: "强制停止同步",
+      message: "正在同步账号额度与会话资料。强制停止后本次同步立即中断，当前账号数据可能不完整，临时打开的 Chrome 标签页会被清理。确定停止并关闭吗？",
+      confirmText: "强制停止并关闭",
+      cancelText: "继续同步",
+      danger: true,
+    });
+    if (!accepted) return;
+    const activeRunId = chromeBrowserSyncRunId;
+    chromeSyncForceStopped = true;
+    chromeSessionRequestId += 1;
+    chromeBrowserSyncRunId += 1;
+    try {
+      await runCommand("cancel_site_account_sync", { runId: activeRunId });
+    } catch {
+      // 取消失败不阻塞关闭：同步会在 60 秒硬上限处自行结束
+    }
+    try {
+      await runCommand("close_chrome_sync_tabs");
+    } catch {
+      // 标签清理失败同样不阻塞关闭
+    }
+    chromeBrowserSyncingProfileId.value = "";
+    chromeSessionSyncActive.value = false;
+    stopChromeBrowserSyncTimer();
+  }
   chromeSessionRequestId += 1;
   chromeBrowserSyncRunId += 1;
   resetChromeBrowserSyncLog();
@@ -374,6 +409,7 @@ async function analyzeChromeUsage(
 
 async function syncChromeSession(site: any, trigger: HTMLElement) {
   const requestId = ++chromeSessionRequestId;
+  chromeSyncForceStopped = false;
   chromeSessionSyncActive.value = true;
   chromeSessionSite.value = site;
   chromeSessionTrigger.value = trigger;
@@ -430,6 +466,8 @@ async function syncChromeSession(site: any, trigger: HTMLElement) {
     });
 
     for (const [index, initialSession] of sessionsToProcess.entries()) {
+      // 强制停止后终止剩余账号；当前账号的结果由 runChromeAccountSync 放弃
+      if (chromeSyncForceStopped) break;
       let session = initialSession;
       const accountLabel = session.username || session.accountName || session.profileName;
       const progressLabel = `账户 ${index + 1}/${sessionsToProcess.length}`;

@@ -1,8 +1,7 @@
 use crate::models::{Database, ACTIVE_PROXY_NODE_KEY};
 use crate::proxypool::runtime::{
-    ensure_account_instance, ensure_channel_instance, ensure_default_proxy_channel,
-    ensure_global_runtime, read_account_proxy_channel_id, read_meta, runtime_proxy_url,
-    select_runtime_node,
+    ensure_account_instance, ensure_default_proxy_channel, ensure_global_runtime,
+    read_account_proxy_channel_id, read_meta, runtime_proxy_url, select_runtime_node,
 };
 use crate::proxypool::types::*;
 use rusqlite::{params, OptionalExtension};
@@ -223,42 +222,15 @@ pub fn write_channel_node(
     Ok(())
 }
 
-pub async fn rotate_channel_instance_node(
-    database: &Database,
-    runtime: &ProxyRuntime,
-    channel_id: &str,
-    failed_node_id: &str,
-    error: &str,
-) -> Result<String, String> {
-    runtime.account_ban_node(failed_node_id, account_proxy_failure_ttl(error));
-    let candidates = channel_candidate_nodes(database, runtime, failed_node_id)?;
-    let (next_id, _, _) = candidates
-        .first()
-        .cloned()
-        .ok_or_else(|| "代理池中没有可用的候选节点".to_string())?;
-    write_channel_node(database, channel_id, &next_id)?;
-    // lane 化后切组立即生效（此前活实例上轮换要等进程重启才真正换节点）
-    tokio::task::block_in_place(|| ensure_channel_instance(database, runtime, channel_id))?;
-    Ok(next_id)
-}
-
 pub fn build_proxy_client_with_url(
     database: &Database,
     proxy_url: &str,
     timeout: Duration,
     redirects: usize,
     purpose: &str,
-) -> Result<reqwest::Client, String> {
+) -> Result<wreq::Client, String> {
     let ignore = crate::db::read_proxy_ignore_addresses(database)?;
-    let proxy = reqwest::Proxy::all(proxy_url)
-        .map_err(|_| "代理池当前出口地址无效")?
-        .no_proxy(reqwest::NoProxy::from_string(&ignore));
-    reqwest::Client::builder()
-        .timeout(timeout)
-        .redirect(reqwest::redirect::Policy::limited(redirects))
-        .proxy(proxy)
-        .build()
-        .map_err(|error| format!("无法初始化{purpose}：{error}"))
+    crate::db::build_site_http_client_with_proxy(proxy_url, &ignore, timeout, redirects, purpose)
 }
 
 pub async fn rotate_account_instance_node(
@@ -268,16 +240,10 @@ pub async fn rotate_account_instance_node(
     failed_node_id: &str,
     error: &str,
 ) -> Result<String, String> {
+    // 固定通道不参与任何自动轮换：出口节点由用户固定，失败就失败。
     if let Ok(Some(channel_id)) = read_account_proxy_channel_id(database, profile_id) {
         if !channel_id.trim().is_empty() {
-            return rotate_channel_instance_node(
-                database,
-                runtime,
-                &channel_id,
-                failed_node_id,
-                error,
-            )
-            .await;
+            return Err("账号已绑定固定通道，出口节点不自动轮换".to_string());
         }
     }
     // 调用方未告知失败节点时，取 lane 当前选中节点参与排除与封禁，
@@ -329,12 +295,12 @@ pub async fn with_account_proxy<T, F, Fut>(
     mut request: F,
 ) -> Result<T, String>
 where
-    F: FnMut(reqwest::Client) -> Fut,
+    F: FnMut(wreq::Client) -> Fut,
     Fut: std::future::Future<Output = Result<T, String>>,
 {
     if !read_site_uses_proxy_pool(database, site_id)? {
         let client =
-            crate::db::build_http_client_for_site(database, site_id, timeout, redirects, purpose)?;
+            crate::db::build_site_http_client(database, timeout, redirects, purpose)?;
         return request(client).await;
     }
 
@@ -346,6 +312,19 @@ where
     )?;
     // lane 端口在轮换时保持不变（切组而非杀进程），重试可继续复用同一 URL
     let account_proxy_url = format!("http://127.0.0.1:{account_port}");
+    // 固定通道语义：账号绑定通道后，出口节点由用户手动固定。请求失败就失败，
+    // 不重试、不拉黑节点、不改写通道节点——否则“固定出口”就失去意义
+    // （且 cf_clearance 绑定出口 IP，自动换节点只会让浏览器里的验证作废）。
+    if read_account_proxy_channel_id(database, profile_id)
+        .ok()
+        .flatten()
+        .is_some_and(|channel_id| !channel_id.trim().is_empty())
+    {
+        let client =
+            build_proxy_client_with_url(database, &account_proxy_url, timeout, redirects, purpose)?;
+        return request(client).await;
+    }
+
     let mut last_error = String::new();
     let mut current_failed_node: Option<String> = None;
 

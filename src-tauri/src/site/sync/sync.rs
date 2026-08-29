@@ -7,8 +7,8 @@ use crate::site::library::{is_newapi, is_newapi_refresh, is_sub2api};
 use crate::site::sync;
 use rusqlite::{params, OptionalExtension};
 use serde_json;
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use url::Url;
 
@@ -260,7 +260,7 @@ pub(crate) fn parse_sub2api_local_account(
 }
 
 async fn fetch_sub2api_usage(
-    client: &reqwest::Client,
+    client: &wreq::Client,
     base_url: &str,
     api_key: &str,
     user_agent: &str,
@@ -356,15 +356,15 @@ pub(crate) fn cookie_header_has_name(cookie_header: &str, expected_name: &str) -
 }
 
 pub(crate) fn apply_newapi_auth(
-    request: reqwest::RequestBuilder,
+    request: wreq::RequestBuilder,
     auth: &NewApiAuth,
-) -> reqwest::RequestBuilder {
+) -> wreq::RequestBuilder {
     match auth {
         NewApiAuth::Legacy {
             cookie_header,
             user_id,
         } => request
-            .header(reqwest::header::COOKIE, cookie_header)
+            .header(wreq::header::COOKIE, cookie_header)
             .header("new-api-user", user_id),
         NewApiAuth::Token {
             access_token,
@@ -384,7 +384,7 @@ pub(crate) fn apply_newapi_auth(
 /// 传统 Cookie 模式没有访问令牌机制，调用方不得走到这里。
 /// 成功返回 `Some(token_string)`，遇盾返回 `Err(shield_error)`，其他失败返回 `None`。
 pub(crate) async fn try_acquire_newapi_token(
-    client: &reqwest::Client,
+    client: &wreq::Client,
     base_url: &Url,
     auth: &NewApiAuth,
     user_agent: &str,
@@ -433,7 +433,7 @@ pub(crate) async fn try_acquire_newapi_token(
 /// 返回 Some(NewApiAuth::Token) 表示拿到了可用的访问令牌；
 /// Ok(None) 表示本地无可用令牌；Err 表示遇盾需要浏览器验证。
 pub(crate) async fn acquire_newapi_session_token(
-    client: &reqwest::Client,
+    client: &wreq::Client,
     base_url: &Url,
     legacy: &NewApiAuth,
     user_agent: &str,
@@ -545,7 +545,7 @@ pub(crate) fn parse_newapi_checkin_logs(value: &serde_json::Value) -> Result<boo
 /// 手动签到过。分别查询 type=4（签到日志）和 type=1（充值/系统日志），任一存在
 /// 记录即视为今日已签到；返回 Ok(true) 表示今日已签到，Ok(false) 表示无签到记录。
 pub(crate) async fn query_newapi_checkin_log(
-    client: &reqwest::Client,
+    client: &wreq::Client,
     base_url: &str,
     auth: &NewApiAuth,
     user_agent: &str,
@@ -651,7 +651,7 @@ pub(crate) const NEWAPI_REFRESH_HANDOFF_MESSAGE: &str =
     "检测到 NewAPI refresh cookie 且本地会话已失效，将通过 Chrome 同源请求刷新并写回浏览器";
 
 pub(crate) async fn request_json(
-    request: reqwest::RequestBuilder,
+    request: wreq::RequestBuilder,
     label: &str,
 ) -> Result<serde_json::Value, String> {
     request_json_with_hint(
@@ -663,7 +663,7 @@ pub(crate) async fn request_json(
 }
 
 pub(crate) async fn request_json_with_hint(
-    request: reqwest::RequestBuilder,
+    request: wreq::RequestBuilder,
     label: &str,
     auth_failure_hint: &str,
 ) -> Result<serde_json::Value, String> {
@@ -674,7 +674,7 @@ pub(crate) async fn request_json_with_hint(
     let status = response.status();
     let content_type = response
         .headers()
-        .get(reqwest::header::CONTENT_TYPE)
+        .get(wreq::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default()
         .to_ascii_lowercase();
@@ -693,7 +693,7 @@ pub(crate) async fn request_json_with_hint(
                 .copied()
                 .find(|byte| !byte.is_ascii_whitespace());
             if content_type.contains("text/html") || first == Some(b'<') {
-                let reason = if status == reqwest::StatusCode::FORBIDDEN {
+                let reason = if status == wreq::StatusCode::FORBIDDEN {
                     "Cloudflare 安全验证拦截了直接请求，请先用对应 Chrome 账号打开站点并通过验证"
                 } else {
                     "站点返回了网页而不是 API 数据"
@@ -715,7 +715,7 @@ pub(crate) async fn request_json_with_hint(
             status.as_u16(),
             api_error_message(&value, "请求失败")
         );
-        if status == reqwest::StatusCode::UNAUTHORIZED {
+        if status == wreq::StatusCode::UNAUTHORIZED {
             message.push_str(auth_failure_hint);
         }
         return Err(message);
@@ -796,20 +796,20 @@ pub(crate) fn is_cloudflare_shield_error(error: &str) -> bool {
 }
 
 pub(crate) fn chrome_request_headers(
-    request: reqwest::RequestBuilder,
+    request: wreq::RequestBuilder,
     base_url: &str,
     user_agent: &str,
-) -> reqwest::RequestBuilder {
+) -> wreq::RequestBuilder {
     let major = user_agent
         .split("Chrome/")
         .nth(1)
         .and_then(|value| value.split('.').next())
         .unwrap_or("120");
     request
-        .header(reqwest::header::ACCEPT, "application/json, text/plain, */*")
-        .header(reqwest::header::ACCEPT_LANGUAGE, "zh-CN,zh;q=0.9,en;q=0.8")
-        .header(reqwest::header::REFERER, base_url)
-        .header(reqwest::header::USER_AGENT, user_agent)
+        .header(wreq::header::ACCEPT, "application/json, text/plain, */*")
+        .header(wreq::header::ACCEPT_LANGUAGE, "zh-CN,zh;q=0.9,en;q=0.8")
+        .header(wreq::header::REFERER, base_url)
+        .header(wreq::header::USER_AGENT, user_agent)
         .header(
             "sec-ch-ua",
             format!(
@@ -824,7 +824,7 @@ pub(crate) fn chrome_request_headers(
 }
 
 pub(crate) async fn refresh_newapi_checkin(
-    client: &reqwest::Client,
+    client: &wreq::Client,
     base_url: &str,
     auth: &NewApiAuth,
     user_agent: &str,
@@ -845,7 +845,7 @@ pub(crate) async fn refresh_newapi_checkin(
     query_url
         .query_pairs_mut()
         .append_pair("month", current_month);
-    let headers = |request: reqwest::RequestBuilder| {
+    let headers = |request: wreq::RequestBuilder| {
         apply_newapi_auth(chrome_request_headers(request, base_url, user_agent), auth)
     };
     let value = match request_json(headers(client.get(query_url.clone())), "签到状态接口").await
@@ -919,7 +919,7 @@ pub(crate) async fn refresh_newapi_checkin(
 }
 
 pub(crate) async fn refresh_sub2api_checkin(
-    client: &reqwest::Client,
+    client: &wreq::Client,
     base_url: &str,
     auth_token: &str,
     user_agent: &str,
@@ -955,7 +955,7 @@ pub(crate) async fn refresh_sub2api_checkin(
             };
         }
     };
-    let headers = |request: reqwest::RequestBuilder| {
+    let headers = |request: wreq::RequestBuilder| {
         chrome_request_headers(request, base_url.as_str(), user_agent).bearer_auth(auth_token)
     };
     let value = match request_json_with_hint(
@@ -1023,7 +1023,7 @@ pub(crate) async fn refresh_sub2api_checkin(
 }
 
 pub(crate) async fn fetch_site_account(
-    client: &reqwest::Client,
+    client: &wreq::Client,
     base_url: &str,
     system_type: &str,
     local_values: &HashMap<String, String>,
@@ -1676,8 +1676,41 @@ pub(crate) fn parse_chrome_account_bridge_result(
     Ok((account, result))
 }
 
-/// 单个站点 / 账号同步的硬性总超时：超过即强制失败，避免某个站点拖垮整轮同步。
+/// 单个站点 / 账号同步的硬性总超时：全过程（可达性探测 + 直连 + 静默/后台/
+/// 可见三层兜底）合计超过 60 秒即强制失败并释放界面，避免整个弹窗卡住
+/// 什么都干不了。下方三个阶段预算已压缩到该上限之内，宁可早失败
+/// （失败会计入浏览器兜底冷却），也不长时间占住同步流程。
 const SITE_SYNC_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// 被手动强制停止的账号同步 run_id 集合。取消后在下一个阶段边界
+/// （静默/后台/可见）立即失败返回，不再打开新的 Chrome 标签页；
+/// 已打开的桥接标签由前端调用 close_chrome_sync_tabs 清理。
+fn cancelled_sync_runs() -> &'static Mutex<HashSet<u64>> {
+    static CANCELLED: OnceLock<Mutex<HashSet<u64>>> = OnceLock::new();
+    CANCELLED.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn is_site_account_sync_cancelled(run_id: u64) -> bool {
+    cancelled_sync_runs()
+        .lock()
+        .map(|runs| runs.contains(&run_id))
+        .unwrap_or(false)
+}
+
+fn clear_site_account_sync_cancelled(run_id: u64) {
+    if let Ok(mut runs) = cancelled_sync_runs().lock() {
+        runs.remove(&run_id);
+    }
+}
+
+/// 强制停止指定 run_id 的账号同步。同步结束时（成功/失败/超时）登记自动清除。
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub fn cancel_site_account_sync(run_id: u64) -> bool {
+    cancelled_sync_runs()
+        .lock()
+        .map(|mut runs| runs.insert(run_id))
+        .unwrap_or(false)
+}
 
 #[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn sync_site_account_via_chrome(
@@ -1727,6 +1760,7 @@ pub(crate) async fn sync_site_account_via_chrome_command(
             );
         }
     }
+    clear_site_account_sync_cancelled(run_id);
     outcome
 }
 
@@ -1898,9 +1932,9 @@ async fn sync_site_account_via_chrome_inner(
             .await
         } else {
             let probe_client =
-                build_http_client(database, Duration::from_secs(6), 3, "站点可达性探测")
+                build_site_http_client(database, Duration::from_secs(6), 3, "站点可达性探测")
                     .unwrap_or_else(|_| {
-                        reqwest::Client::builder()
+                        wreq::Client::builder()
                             .timeout(Duration::from_secs(6))
                             .no_proxy()
                             .build()
@@ -2148,21 +2182,25 @@ async fn sync_site_account_via_chrome_inner(
         }
     }
 
+    // 三阶段预算合计 60 秒（15+15+30 / 20+15+25），与 SITE_SYNC_TIMEOUT 对齐：
+    // 静默/后台失败要尽早让位给可见验证，可见验证也只保留有限窗口，
+    // 超时就整体失败并进入浏览器兜底冷却，不长时间卡住同步弹窗。
     let silent_timeout = if use_refresh_auth {
-        Duration::from_secs(35)
-    } else {
         Duration::from_secs(20)
-    };
-    let background_timeout = if use_refresh_auth {
-        Duration::from_secs(35)
     } else {
-        Duration::from_secs(25)
+        Duration::from_secs(15)
     };
+    let background_timeout = Duration::from_secs(15);
     let visible_timeout = if use_refresh_auth {
-        Duration::from_secs(120)
+        Duration::from_secs(25)
     } else {
-        Duration::from_secs(60)
+        Duration::from_secs(30)
     };
+
+    // 每个阶段开始前检查强制停止：取消后立即失败，不再打开新的 Chrome 标签页。
+    if is_site_account_sync_cancelled(run_id) {
+        return Err("同步已被手动强制停止".into());
+    }
 
     // refresh 模式下即使没有 user_id 也允许静默请求（bridge 脚本不依赖 user_id）
     let can_silent = (user_id.is_some() || use_refresh_auth) && resolved_account.is_none();
@@ -2258,6 +2296,9 @@ async fn sync_site_account_via_chrome_inner(
     }
 
     if resolved_account.is_none() {
+        if is_site_account_sync_cancelled(run_id) {
+            return Err("同步已被手动强制停止".into());
+        }
         let marker = format!(
             "openhub-background-{}",
             SystemTime::now()
@@ -2302,6 +2343,9 @@ async fn sync_site_account_via_chrome_inner(
             let profile_id = profile_id.clone();
             let marker = marker.clone();
             let account_proxy_url = account_proxy_url.clone();
+            // 仅在 bridge 脚本能核对 Local Storage 用户 ID 时才允许复用遗留标签，
+            // 防止把账号请求注入其他 Chrome 账号的页面。
+            let allow_tab_reuse = user_id.is_some();
             move || {
                 sync::run_javascript_in_background_chrome_profile(
                     &browser_url,
@@ -2310,6 +2354,7 @@ async fn sync_site_account_via_chrome_inner(
                     &javascript,
                     background_timeout,
                     account_proxy_url.as_deref(),
+                    allow_tab_reuse,
                 )
             }
         })
@@ -2359,6 +2404,9 @@ async fn sync_site_account_via_chrome_inner(
     let (account, result) = match resolved_account {
         Some(parsed) => parsed,
         None => {
+            if is_site_account_sync_cancelled(run_id) {
+                return Err("同步已被手动强制停止".into());
+            }
             let marker = format!(
                 "openhub-sync-{}",
                 SystemTime::now()
@@ -2403,6 +2451,7 @@ async fn sync_site_account_via_chrome_inner(
                 let profile_id = profile_id.clone();
                 let marker = marker.clone();
                 let account_proxy_url = account_proxy_url.clone();
+                let allow_tab_reuse = user_id.is_some();
                 move || {
                     sync::run_javascript_in_chrome_profile(
                         &browser_url,
@@ -2411,6 +2460,7 @@ async fn sync_site_account_via_chrome_inner(
                         &javascript,
                         visible_timeout,
                         account_proxy_url.as_deref(),
+                        allow_tab_reuse,
                     )
                 }
             })

@@ -268,6 +268,10 @@ macro_rules! rpc_arms {
                     .await
                 ))
             }
+            "cancel_site_account_sync" => {
+                let run_id: u64 = take($args, &["runId", "run_id"])?;
+                Ok(json!(crate::site::sync::cancel_site_account_sync(run_id)))
+            }
             "get_remote_user" => Ok(json!(crate::site::library::get_remote_user($ctx).await)),
             "sync_remote_sites" => {
                 let runaway: Option<bool> = take_opt($args, &["runaway"])?;
