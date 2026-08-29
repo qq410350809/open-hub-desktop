@@ -54,7 +54,7 @@ pub async fn detect_site_system_types(
         "running",
         format!("已转入后台，并发检测 {} 个站点类型", targets.len()),
     );
-    let client = build_http_client(database, Duration::from_secs(8), 3, "站点类型探测")?;
+    let client = build_site_http_client(database, Duration::from_secs(8), 3, "站点类型探测")?;
     let target_site_ids = targets
         .iter()
         .map(|(site_id, _)| site_id.clone())

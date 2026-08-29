@@ -11,7 +11,7 @@
 //!   5. URL 低置信兜底（保留旧 OpenHub 行为：域名含 newapi/one-api）
 
 use crate::site::library::{html_title, shield_page_response};
-use reqwest::header;
+use wreq::header;
 use serde_json::Value;
 use std::time::Duration;
 use url::Url;
@@ -195,7 +195,7 @@ pub(crate) struct JsonProbe {
     pub(crate) challenge: bool,
 }
 
-async fn probe_json(client: &reqwest::Client, base_url: &str, path: &str) -> Option<JsonProbe> {
+async fn probe_json(client: &wreq::Client, base_url: &str, path: &str) -> Option<JsonProbe> {
     let url = Url::parse(base_url).ok()?.join(path).ok()?;
     let response = client
         .get(url)
@@ -233,7 +233,7 @@ async fn probe_json(client: &reqwest::Client, base_url: &str, path: &str) -> Opt
     Some(JsonProbe { json, challenge })
 }
 
-async fn probe_title(client: &reqwest::Client, base_url: &str) -> Option<String> {
+async fn probe_title(client: &wreq::Client, base_url: &str) -> Option<String> {
     let url = Url::parse(base_url).ok()?.join("/").ok()?;
     let response = client
         .get(url)
@@ -262,7 +262,7 @@ async fn probe_title(client: &reqwest::Client, base_url: &str) -> Option<String>
 }
 
 /// 探测 cliproxyapi 专属管理端点（响应头 x-cpa-* 或 JSON 含 openai-compatibility）。
-async fn probe_cliproxyapi(client: &reqwest::Client, base_url: &str) -> bool {
+async fn probe_cliproxyapi(client: &wreq::Client, base_url: &str) -> bool {
     let Ok(base) = Url::parse(base_url) else {
         return false;
     };
@@ -283,11 +283,11 @@ async fn probe_cliproxyapi(client: &reqwest::Client, base_url: &str) -> bool {
         || response.headers().contains_key("x-cpa-commit")
         || response.headers().contains_key("x-cpa-build-date");
     if has_cpa_headers {
-        return status == reqwest::StatusCode::OK
-            || status == reqwest::StatusCode::UNAUTHORIZED
-            || status == reqwest::StatusCode::FORBIDDEN;
+        return status == wreq::StatusCode::OK
+            || status == wreq::StatusCode::UNAUTHORIZED
+            || status == wreq::StatusCode::FORBIDDEN;
     }
-    if status == reqwest::StatusCode::OK {
+    if status == wreq::StatusCode::OK {
         if let Ok(json) = response.json::<Value>().await {
             return json.is_object() && json.get("openai-compatibility").is_some();
         }
@@ -364,7 +364,7 @@ pub(crate) struct PlatformDetection {
 }
 
 /// 完整检测流水线，返回规范平台名与是否命中盾页（供 Chrome 兜底）。
-pub(crate) async fn detect_platform(client: &reqwest::Client, base_url: &str) -> PlatformDetection {
+pub(crate) async fn detect_platform(client: &wreq::Client, base_url: &str) -> PlatformDetection {
     if let Some(platform) = detect_platform_by_url_hint(base_url) {
         return PlatformDetection {
             platform: Some(platform.into()),

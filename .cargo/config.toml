@@ -1,0 +1,8 @@
+# wreq（Chrome TLS 指纹模拟）依赖 boring2/BoringSSL，需要编译 C++。
+# 本机若只装了 CommandLine Tools，其 clang 21 缺少 libc++ 头文件组件
+# （/Library/Developer/CommandLineTools/usr/include/c++/v1 不存在），
+# BoringSSL 编译会报 "'memory' file not found"。
+# 这里默认改用 Homebrew LLVM 的 clang++；已在环境中显式设置 CXX
+# （例如装有完整 Xcode 的机器）不受影响（force = false 不覆盖已有环境变量）。
+[env]
+CXX = { value = "/opt/homebrew/opt/llvm/bin/clang++", force = false }

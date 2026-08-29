@@ -272,7 +272,7 @@ pub async fn import_site(
         }
     }
 
-    let client = build_http_client(&database, Duration::from_secs(12), 5, "站点资料采集")?;
+    let client = build_site_http_client(&database, Duration::from_secs(12), 5, "站点资料采集")?;
     let root_job = crate::context::spawn(fetch_discovery_resource(
         client.clone(),
         base_url.clone(),

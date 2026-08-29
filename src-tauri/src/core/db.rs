@@ -1416,16 +1416,6 @@ pub(crate) fn build_http_client(
     build_http_client_with_proxy(database, timeout, redirects, purpose)
 }
 
-pub(crate) fn build_http_client_for_site(
-    database: &Database,
-    _site_id: &str,
-    timeout: Duration,
-    redirects: usize,
-    purpose: &str,
-) -> Result<reqwest::Client, String> {
-    build_http_client_with_proxy(database, timeout, redirects, purpose)
-}
-
 pub(crate) fn build_http_client_with_proxy(
     database: &Database,
     timeout: Duration,
@@ -1443,6 +1433,49 @@ pub(crate) fn build_http_client_with_proxy(
         let proxy = reqwest::Proxy::all(&proxy_url)
             .map_err(|_| "代理池当前出口地址无效")?
             .no_proxy(reqwest::NoProxy::from_string(&ignore));
+        builder = builder.proxy(proxy);
+    }
+    builder
+        .build()
+        .map_err(|error| format!("无法初始化{purpose}：{error}"))
+}
+
+/// 站点同步直连客户端：用 wreq 模拟 Chrome 的 TLS/JA3/HTTP2 指纹。
+/// 站点 API 大多挂在 Cloudflare 后面，reqwest 默认指纹会被识别为脚本拦截；
+/// 模拟 Chrome 指纹后，配合从浏览器解密出的同源 Cookie（含 cf_clearance），
+/// 多数安全盾场景可直接通过，无需再拉起浏览器走 AppleEvent 桥接。
+pub(crate) fn build_site_http_client(
+    database: &Database,
+    timeout: Duration,
+    redirects: usize,
+    purpose: &str,
+) -> Result<wreq::Client, String> {
+    let proxy_url = read_network_proxy(database)?;
+    let ignore = if proxy_url.is_empty() {
+        String::new()
+    } else {
+        read_proxy_ignore_addresses(database)?
+    };
+    build_site_http_client_with_proxy(&proxy_url, &ignore, timeout, redirects, purpose)
+}
+
+pub(crate) fn build_site_http_client_with_proxy(
+    proxy_url: &str,
+    ignore_addresses: &str,
+    timeout: Duration,
+    redirects: usize,
+    purpose: &str,
+) -> Result<wreq::Client, String> {
+    let mut builder = wreq::Client::builder()
+        .emulation(wreq_util::Emulation::Chrome133)
+        .timeout(timeout)
+        .redirect(wreq::redirect::Policy::limited(redirects));
+    if proxy_url.trim().is_empty() {
+        builder = builder.no_proxy();
+    } else {
+        let proxy = wreq::Proxy::all(proxy_url)
+            .map_err(|_| "代理池当前出口地址无效")?
+            .no_proxy(wreq::NoProxy::from_string(ignore_addresses));
         builder = builder.proxy(proxy);
     }
     builder

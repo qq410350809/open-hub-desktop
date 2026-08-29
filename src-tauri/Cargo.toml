@@ -50,6 +50,10 @@ serde_json = "1"
 url = "2"
 font-kit = { version = "0.14.3", optional = true }
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "native-tls", "http2", "stream", "gzip", "deflate", "brotli"] }
+# 站点同步直连客户端：模拟 Chrome TLS/JA3/HTTP2 指纹，配合浏览器 Cookie（含 cf_clearance）
+# 通过 Cloudflare 安全盾，替代 AppleEvent 浏览器桥接的大部分场景。
+wreq = { version = "0.15.3", features = ["json", "stream", "gzip", "deflate", "brotli", "socks"] }
+wreq-util = "0.1.0"
 quick-xml = { version = "0.39.4", features = ["serialize"] }
 serde_yaml = "0.9"
 base64 = "0.22"

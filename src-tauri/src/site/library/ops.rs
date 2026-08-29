@@ -183,7 +183,7 @@ pub(crate) fn infer_remote_system_type(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct EndpointProbe {
-    pub(crate) status: reqwest::StatusCode,
+    pub(crate) status: wreq::StatusCode,
     pub(crate) is_json: bool,
     pub(crate) is_challenge: bool,
 }
@@ -217,21 +217,21 @@ pub(crate) fn normalize_import_base_url(value: &str) -> Result<Url, String> {
 }
 
 pub(crate) async fn fetch_discovery_resource(
-    client: reqwest::Client,
+    client: wreq::Client,
     url: Url,
     accept: &'static str,
 ) -> Option<DiscoveryResponse> {
     let response = client
         .get(url)
-        .header(reqwest::header::ACCEPT, accept)
-        .header(reqwest::header::USER_AGENT, "OpenHub-Desktop/0.3")
+        .header(wreq::header::ACCEPT, accept)
+        .header(wreq::header::USER_AGENT, "OpenHub-Desktop/0.3")
         .timeout(Duration::from_secs(10))
         .send()
         .await
         .ok()?;
     let content_type = response
         .headers()
-        .get(reqwest::header::CONTENT_TYPE)
+        .get(wreq::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default()
         .to_ascii_lowercase();
@@ -375,13 +375,13 @@ pub(crate) fn resolve_discovered_url(base_url: &Url, value: &str) -> String {
 }
 
 pub(crate) fn endpoint_probe_exists(probe: EndpointProbe) -> bool {
-    probe.status == reqwest::StatusCode::UNAUTHORIZED
+    probe.status == wreq::StatusCode::UNAUTHORIZED
         || (probe.is_json
-            && (probe.status.is_success() || probe.status == reqwest::StatusCode::FORBIDDEN))
+            && (probe.status.is_success() || probe.status == wreq::StatusCode::FORBIDDEN))
 }
 
 pub(crate) fn shield_page_response(
-    status: reqwest::StatusCode,
+    status: wreq::StatusCode,
     content_type: &str,
     security_gateway_header: bool,
     body: &[u8],
@@ -422,8 +422,8 @@ pub(crate) fn system_type_from_probes(
         Some("new-api")
     } else if sub2api_probe.is_some_and(endpoint_probe_exists) {
         Some("sub2api")
-    } else if newapi_probe.is_some_and(|probe| probe.status == reqwest::StatusCode::NOT_FOUND)
-        && sub2api_probe.is_some_and(|probe| probe.status == reqwest::StatusCode::NOT_FOUND)
+    } else if newapi_probe.is_some_and(|probe| probe.status == wreq::StatusCode::NOT_FOUND)
+        && sub2api_probe.is_some_and(|probe| probe.status == wreq::StatusCode::NOT_FOUND)
     {
         Some("")
     } else {
@@ -432,7 +432,7 @@ pub(crate) fn system_type_from_probes(
 }
 
 pub(crate) async fn probe_site_system_type_details(
-    client: &reqwest::Client,
+    client: &wreq::Client,
     base_url: &str,
 ) -> (Option<String>, bool) {
     // 移植自 metapi 的 detectPlatform 流水线：URL 提示 → title 提示 → 端点探测。
@@ -441,7 +441,7 @@ pub(crate) async fn probe_site_system_type_details(
 }
 
 pub(crate) async fn probe_site_system_type(
-    client: &reqwest::Client,
+    client: &wreq::Client,
     base_url: &str,
 ) -> Option<String> {
     probe_site_system_type_details(client, base_url).await.0
@@ -492,7 +492,7 @@ pub(crate) fn parse_chrome_system_probe(value: &str) -> Option<String> {
     let parse = |name: &str| {
         let value = value.get(name)?;
         Some(EndpointProbe {
-            status: reqwest::StatusCode::from_u16(value.get("status")?.as_u64()?.try_into().ok()?)
+            status: wreq::StatusCode::from_u16(value.get("status")?.as_u64()?.try_into().ok()?)
                 .ok()?,
             is_json: value.get("isJson")?.as_bool()?,
             is_challenge: false,
@@ -545,6 +545,7 @@ pub(crate) async fn probe_site_system_type_via_chrome(
                 &script,
                 Duration::from_secs(20),
                 None,
+                false,
             )
         }
     })
@@ -590,7 +591,7 @@ pub(crate) fn cached_profile_ids_for_sites(
 }
 
 pub(crate) async fn probe_site_system_types(
-    client: &reqwest::Client,
+    client: &wreq::Client,
     targets: Vec<(String, String)>,
     profile_ids: HashMap<String, Vec<String>>,
 ) -> HashMap<String, String> {

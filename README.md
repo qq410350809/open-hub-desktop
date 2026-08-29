@@ -238,6 +238,7 @@ UI 为完全自研的组件库（表格、下拉、对话框、Toast、右键菜
 | 数据库 | rusqlite（bundled SQLite，WAL） | 0.37 |
 | 异步运行时 | Tokio（rt-multi-thread） | 1.x |
 | HTTP 客户端 | reqwest（native-tls/http2/gzip/brotli/stream） | 0.13 |
+| 站点同步直连 | wreq + wreq-util（Chrome TLS/JA3/HTTP2 指纹模拟，BoringSSL） | 0.15 / 0.1 |
 | 序列化 | Serde / serde_json / serde_yaml / quick-xml | — |
 | GeoIP | maxminddb | 0.30 |
 | 压缩 | zstd / flate2 / zip | — |
@@ -247,7 +248,8 @@ UI 为完全自研的组件库（表格、下拉、对话框、Toast、右键菜
 
 - `[lib] crate-type = ["rlib"]`：去掉 staticlib/cdylib，dev 构建少生成约 265MB 的 `.a/.dylib`；
 - `profile.dev`：`debug = "line-tables-only"`，第三方依赖 `debug = false`；
-- `profile.release`：`lto = "thin"` + `codegen-units = 1` + `strip = "symbols"`。
+- `profile.release`：`lto = "thin"` + `codegen-units = 1` + `strip = "symbols"`；
+- wreq 需要 CMake + C++ 工具链编译 BoringSSL。macOS 只装 Command Line Tools 时其 clang 可能缺 libc++ 头文件（BoringSSL 报 `'memory' file not found`），仓库根的 `.cargo/config.toml` 已默认改用 Homebrew LLVM（`brew install llvm`）作为 CXX；装有完整 Xcode 或自行设置了 `CXX` 的环境不受影响。
 
 ---
 
