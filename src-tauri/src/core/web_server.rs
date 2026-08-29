@@ -461,6 +461,12 @@ macro_rules! rpc_arms {
                         .await
                 ))
             }
+            "test_site_models_per_channel" => {
+                let url: String = take($args, &["url"])?;
+                Ok(json!(
+                    crate::model::catalog::test_site_models_per_channel($ctx, url).await
+                ))
+            }
 
             // —— 公益监听 ——
             "get_charity_feed" => {

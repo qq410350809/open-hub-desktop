@@ -5,7 +5,7 @@ use crate::proxypool;
 use crate::site::library::{is_newapi, is_newapi_refresh, is_sub2api};
 use crate::site::sync;
 use crate::site::sync::*;
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json;
 use std::collections::{HashMap, HashSet};
@@ -332,7 +332,7 @@ pub(crate) fn parse_revealed_api_key(value: &serde_json::Value) -> Option<String
 }
 
 pub(crate) async fn reveal_newapi_keys(
-    client: &reqwest::Client,
+    client: &wreq::Client,
     base_url: &Url,
     auth: &NewApiAuth,
     user_agent: &str,
@@ -387,7 +387,7 @@ pub(crate) async fn reveal_newapi_keys(
 }
 
 pub(crate) async fn fetch_models_with_keys(
-    client: &reqwest::Client,
+    client: &wreq::Client,
     base_url: &Url,
     keys: Vec<String>,
     visible_keys: Vec<String>,
@@ -846,6 +846,229 @@ pub async fn fetch_site_models_json(
     .map_err(|_| "站点模型同步超过 60 秒，已强制终止".to_string())?
 }
 
+/// 站点接口探测超时：探测只关心端点可达性，无需站点同步那样的长超时。
+const SITE_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+/// 响应体展示片段的最大字符数。
+const SITE_PROBE_EXCERPT_CHARS: usize = 400;
+
+/// 站点 /v1/models 无 Key 探测结果。
+/// 只要收到 HTTP 响应就代表端点可达：401/403 的 JSON 错误（key 无效/未授权）视为正常返回。
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SiteProbeResult {
+    /// 端点是否正常（key 无效也算正常；连接失败/安全盾拦截/5xx 为异常）。
+    pub(crate) ok: bool,
+    /// HTTP 状态码，0 表示未收到响应。
+    pub(crate) status: u16,
+    pub(crate) latency_ms: u64,
+    pub(crate) content_type: String,
+    pub(crate) is_json: bool,
+    /// 能从响应中解析出的模型数量（无法解析时为 0）。
+    pub(crate) model_count: usize,
+    /// 一句话结论，用于标签旁的说明。
+    pub(crate) message: String,
+    /// 响应体截断片段，供用户自查。
+    pub(crate) body_excerpt: String,
+}
+
+/// 归一化站点 API 地址：补协议头、补尾斜杠并解析为 Url。
+fn normalize_site_base_url(raw: &str) -> Result<Url, String> {
+    let mut base = raw.trim().to_string();
+    if !base.starts_with("http://") && !base.starts_with("https://") {
+        base = format!("https://{base}");
+    }
+    if !base.ends_with('/') {
+        base.push('/');
+    }
+    Url::parse(&base).map_err(|_| "站点 API 地址无效".to_string())
+}
+
+fn excerpt_body(body: &[u8]) -> String {
+    let text = String::from_utf8_lossy(body);
+    text.chars().take(SITE_PROBE_EXCERPT_CHARS).collect()
+}
+
+/// 单通道站点探测结果 = 通道信息 + 探测结果（probe 以 flatten 展开为 camelCase 字段）。
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ChannelSiteProbe {
+    pub(crate) channel_id: String,
+    pub(crate) channel_name: String,
+    /// 探测实际经过的出口节点名（通道未固定节点时会自动回退写回）。
+    pub(crate) node_name: String,
+    #[serde(flatten)]
+    pub(crate) probe: SiteProbeResult,
+}
+
+/// 测试站点：每个通道用各自的固定出口 lane 各请求一次 /v1/models（通道间并发）。
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub async fn test_site_models_per_channel(
+    ctx: Managed<'_, Arc<AppContext>>,
+    url: String,
+) -> Result<Vec<ChannelSiteProbe>, String> {
+    let database = &*ctx.database;
+    let runtime = &*ctx.proxy_runtime;
+    let models_url = normalize_site_base_url(&url)?
+        .join("v1/models")
+        .map_err(|_| "站点 API 地址无效".to_string())?;
+
+    // 逐通道准备出口 lane 端口与节点名；ensure/查询是阻塞操作，集中放进阻塞线程池
+    let exits = tokio::task::block_in_place(|| {
+        let channels: Vec<(String, String)> = {
+            let connection = database.lock_conn()?;
+            let mut statement = connection
+                .prepare("SELECT id, name FROM proxy_channels ORDER BY rowid")
+                .map_err(|error| error.to_string())?;
+            let rows = statement
+                .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+                .map_err(|error| error.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())?;
+            rows
+        };
+        let mut exits = Vec::with_capacity(channels.len());
+        for (channel_id, channel_name) in channels {
+            let port = proxypool::ensure_channel_instance(database, runtime, &channel_id)?;
+            let node_name = {
+                let connection = database.lock_conn()?;
+                connection
+                    .query_row(
+                        "SELECT n.name FROM proxy_channels c
+                         JOIN proxy_pool_nodes n ON n.id = c.node_id
+                         WHERE c.id = ?1",
+                        [&channel_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()
+                    .map_err(|error| error.to_string())?
+                    .unwrap_or_else(|| "未绑定节点".into())
+            };
+            exits.push((channel_id, channel_name, port, node_name));
+        }
+        Ok::<_, String>(exits)
+    })?;
+
+    // 每个通道一条请求：各自独立 lane 出口，互不影响，并发执行
+    let probes = exits
+        .into_iter()
+        .map(|(channel_id, channel_name, port, node_name)| {
+            let models_url = models_url.clone();
+            async move {
+                let proxy_url = format!("http://127.0.0.1:{port}");
+                let probe = match proxypool::build_proxy_client_with_url(
+                    database,
+                    &proxy_url,
+                    SITE_PROBE_TIMEOUT,
+                    3,
+                    "站点接口测试",
+                ) {
+                    Ok(client) => probe_models_endpoint(client, models_url).await,
+                    Err(error) => SiteProbeResult {
+                        ok: false,
+                        status: 0,
+                        latency_ms: 0,
+                        content_type: String::new(),
+                        is_json: false,
+                        model_count: 0,
+                        message: format!("通道出口不可用：{error}"),
+                        body_excerpt: String::new(),
+                    },
+                };
+                ChannelSiteProbe {
+                    channel_id,
+                    channel_name,
+                    node_name,
+                    probe,
+                }
+            }
+        });
+    Ok(futures_util::future::join_all(probes).await)
+}
+
+async fn probe_models_endpoint(client: wreq::Client, models_url: Url) -> SiteProbeResult {
+    let started = std::time::Instant::now();
+    let response = match client.get(models_url).send().await {
+        Ok(response) => response,
+        Err(error) => {
+            let latency_ms = started.elapsed().as_millis() as u64;
+            return SiteProbeResult {
+                ok: false,
+                status: 0,
+                latency_ms,
+                content_type: String::new(),
+                is_json: false,
+                model_count: 0,
+                message: format!("请求失败：{error:#}"),
+                body_excerpt: String::new(),
+            };
+        }
+    };
+    let latency_ms = started.elapsed().as_millis() as u64;
+
+    let status = response.status().as_u16();
+    let content_type = response
+        .headers()
+        .get(wreq::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let body = response.bytes().await.unwrap_or_default();
+    let body = body
+        .strip_prefix(&[0xef, 0xbb, 0xbf])
+        .unwrap_or(body.as_ref());
+    let parsed = serde_json::from_slice::<serde_json::Value>(body).ok();
+    let is_json = parsed.is_some();
+    let model_count = parsed
+        .as_ref()
+        .map(parse_site_models)
+        .map(|models| models.len())
+        .unwrap_or(0);
+
+    let ok = if (200..300).contains(&status) {
+        // 2xx：端点公开可用；返回 HTML 也算通，但结论里点名
+        true
+    } else if status == 401 {
+        true
+    } else if status == 403 {
+        // JSON 403 = key 无效（预期）；HTML 403 = 多为安全盾拦截，不算正常
+        is_json
+    } else {
+        false
+    };
+    let message = if (200..300).contains(&status) {
+        if is_json && model_count > 0 {
+            format!("端点正常，返回 {model_count} 个模型")
+        } else if is_json {
+            "端点正常，未返回模型列表".to_string()
+        } else {
+            "端点可达，但返回的不是 JSON".to_string()
+        }
+    } else if status == 401 {
+        "端点正常（未带 key 被拒绝，属预期）".to_string()
+    } else if status == 403 && is_json {
+        "端点正常（key 无效，属预期）".to_string()
+    } else if status == 403 {
+        "403 且返回非 JSON，疑似安全盾拦截".to_string()
+    } else if status == 404 {
+        "站点未提供 /v1/models 接口".to_string()
+    } else if status >= 500 {
+        format!("服务端错误 HTTP {status}")
+    } else {
+        format!("端点返回异常状态 HTTP {status}")
+    };
+
+    SiteProbeResult {
+        ok,
+        status,
+        latency_ms,
+        content_type,
+        is_json,
+        model_count,
+        message,
+        body_excerpt: excerpt_body(body),
+    }
+}
+
 async fn fetch_site_models_json_impl<'a>(
     ctx: &'a Arc<AppContext>,
     database: &'a Database,
@@ -854,7 +1077,7 @@ async fn fetch_site_models_json_impl<'a>(
     profile_id: Option<String>,
 ) -> Result<SiteModelsResult, String> {
     let Some(site_id) = site_id.clone() else {
-        let client = build_http_client(database, Duration::from_secs(6), 3, "站点模型请求")?;
+        let client = build_site_http_client(database, Duration::from_secs(6), 3, "站点模型请求")?;
         return fetch_site_models_json_inner(ctx, database, url, None, profile_id, client).await;
     };
     let profile_key = profile_id.clone().unwrap_or_default();
@@ -886,7 +1109,7 @@ async fn fetch_site_models_json_inner(
     url: String,
     site_id: Option<String>,
     profile_id: Option<String>,
-    client: reqwest::Client,
+    client: wreq::Client,
 ) -> Result<SiteModelsResult, String> {
     let mut base = url.trim().to_string();
     if !base.starts_with("http://") && !base.starts_with("https://") {

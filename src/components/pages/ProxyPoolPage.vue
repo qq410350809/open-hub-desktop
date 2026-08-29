@@ -3,6 +3,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, watch 
 import { icons } from "../../icons";
 import { useStore } from "../../composables/useStore";
 import { usePreferences } from "../../composables/usePreferences";
+import { runCommand } from "../../composables/core/ipc";
 import { KERNEL_DOWNLOAD_MIRRORS } from "../../composables/useProxyPool";
 import CustomSelect from "../common/CustomSelect.vue";
 import type {
@@ -753,6 +754,77 @@ function closeChannelDialog() {
 function addChannel() {
   openChannelDialog();
 }
+
+// —— 测试站点：每个通道走各自固定出口各请求一次 /v1/models（无 Key），key 无效也算端点正常 ——
+interface SiteProbeResult {
+  ok: boolean;
+  status: number;
+  latencyMs: number;
+  contentType: string;
+  isJson: boolean;
+  modelCount: number;
+  message: string;
+  bodyExcerpt: string;
+}
+interface ChannelSiteProbe extends SiteProbeResult {
+  channelId: string;
+  channelName: string;
+  nodeName: string;
+}
+const siteTestOpen = ref(false);
+const siteTestQuery = ref("");
+const siteTestSelectedId = ref("");
+const siteTestBusy = ref(false);
+const siteTestResults = ref<ChannelSiteProbe[]>([]);
+const siteTestError = ref("");
+
+const siteTestOptions = computed(() =>
+  store.sites.value.filter((site) => !site.hidden && site.apiBaseUrl.trim()),
+);
+const siteTestFiltered = computed(() => {
+  const query = siteTestQuery.value.trim().toLowerCase();
+  if (!query) return siteTestOptions.value;
+  return siteTestOptions.value.filter((site) =>
+    [site.name, site.apiBaseUrl].some((value) => value.toLowerCase().includes(query)),
+  );
+});
+const siteTestSelected = computed(
+  () => siteTestOptions.value.find((site) => site.id === siteTestSelectedId.value) ?? null,
+);
+
+function openSiteTestDialog() {
+  siteTestQuery.value = "";
+  siteTestSelectedId.value = "";
+  siteTestResults.value = [];
+  siteTestError.value = "";
+  siteTestOpen.value = true;
+  document.body.classList.add("modal-open");
+}
+function closeSiteTestDialog() {
+  siteTestOpen.value = false;
+  document.body.classList.remove("modal-open");
+}
+function selectSiteTestSite(siteId: string) {
+  siteTestSelectedId.value = siteId;
+  siteTestResults.value = [];
+  siteTestError.value = "";
+}
+async function runSiteTest() {
+  const site = siteTestSelected.value;
+  if (!site || siteTestBusy.value) return;
+  siteTestBusy.value = true;
+  siteTestResults.value = [];
+  siteTestError.value = "";
+  try {
+    siteTestResults.value = await runCommand<ChannelSiteProbe[]>("test_site_models_per_channel", {
+      url: site.apiBaseUrl.trim(),
+    });
+  } catch (cause) {
+    siteTestError.value = String(cause);
+  } finally {
+    siteTestBusy.value = false;
+  }
+}
 function toggleChannelAccount(profileId: string) {
   const next = new Set(channelAssignedProfileIds.value);
   if (next.has(profileId)) next.delete(profileId);
@@ -1270,10 +1342,16 @@ watch(nodeViewMode, () => {
             <h2>固定出口通道</h2>
             <p>每个 Chrome 账号归属一个通道，账号下的所有站点共享该通道固定出口与实测节点</p>
           </div>
-          <button type="button" class="pp-btn-secondary pp-btn-sm" @click="addChannel">
-            <span v-html="icons.plus" />
-            <span>添加通道</span>
-          </button>
+          <div class="pp-channels-actions">
+            <button type="button" class="pp-btn-secondary pp-btn-sm" @click="openSiteTestDialog">
+              <span v-html="icons.activity" />
+              <span>测试站点</span>
+            </button>
+            <button type="button" class="pp-btn-secondary pp-btn-sm" @click="addChannel">
+              <span v-html="icons.plus" />
+              <span>添加通道</span>
+            </button>
+          </div>
         </div>
 
         <div class="pp-channels-grid">
@@ -1990,6 +2068,120 @@ watch(nodeViewMode, () => {
                   </button>
                 </div>
               </form>
+            </div>
+          </section>
+        </div>
+      </Transition>
+    </Teleport>
+
+    <!-- 2.5 测试站点弹窗 (Site Probe Modal)：无 Key 探测站点 /v1/models -->
+    <Teleport to="body">
+      <Transition name="pp-modal-fade">
+        <div v-if="siteTestOpen" class="pp-modal-backdrop">
+          <section class="pp-modal-card is-site-test" role="dialog" aria-modal="true">
+            <header class="pp-modal-header">
+              <div class="pp-modal-title-group">
+                <div class="pp-modal-eyebrow">站点接口探测</div>
+                <h2>测试站点</h2>
+                <p>每个通道经各自固定出口无 Key 请求一次 /v1/models；key 无效（401/403）也算端点正常</p>
+              </div>
+              <button type="button" class="pp-modal-close-btn" aria-label="关闭" @click="closeSiteTestDialog">×</button>
+            </header>
+
+            <div class="pp-modal-body">
+              <div class="pp-search-box pp-site-test-search">
+                <span class="pp-search-icon" v-html="icons.search" />
+                <input
+                  v-model="siteTestQuery"
+                  class="pp-search-input"
+                  type="search"
+                  placeholder="搜索站点名称 / API 地址…"
+                />
+                <button
+                  v-if="siteTestQuery"
+                  type="button"
+                  class="pp-search-clear"
+                  aria-label="清空搜索"
+                  @click="siteTestQuery = ''"
+                  v-html="icons.close"
+                />
+              </div>
+
+              <div class="pp-site-test-list">
+                <label
+                  v-for="site in siteTestFiltered"
+                  :key="site.id"
+                  class="pp-site-test-item"
+                  :class="{ 'is-selected': siteTestSelectedId === site.id }"
+                >
+                  <input
+                    type="radio"
+                    name="site-test-site"
+                    :value="site.id"
+                    :checked="siteTestSelectedId === site.id"
+                    @change="selectSiteTestSite(site.id)"
+                  />
+                  <div class="pp-candidate-info">
+                    <strong>{{ site.name }}</strong>
+                    <small>{{ site.apiBaseUrl }}</small>
+                  </div>
+                </label>
+
+                <div v-if="!siteTestFiltered.length" class="pp-candidate-empty">
+                  <span v-html="icons.globe" />
+                  <strong>{{ siteTestQuery ? "没有匹配的站点" : "暂无配置了 API 地址的站点" }}</strong>
+                </div>
+              </div>
+
+              <!-- 探测结果：每个通道一组标签展示返回值 -->
+              <div v-if="siteTestBusy" class="pp-site-test-result">
+                <div v-for="channel in channels" :key="channel.id" class="pp-probe-channel">
+                  <div class="pp-site-test-tags">
+                    <span class="pp-probe-tag is-channel">{{ channel.name }}</span>
+                    <span class="pp-probe-tag is-testing">测试中…</span>
+                  </div>
+                </div>
+              </div>
+              <div v-else-if="siteTestError" class="pp-site-test-status is-error">
+                测试失败：{{ siteTestError }}
+              </div>
+              <div v-else-if="siteTestResults.length" class="pp-site-test-result">
+                <div v-for="item in siteTestResults" :key="item.channelId" class="pp-probe-channel">
+                  <div class="pp-site-test-tags">
+                    <span class="pp-probe-tag is-channel">{{ item.channelName }}</span>
+                    <span class="pp-probe-tag" :class="item.ok ? 'is-ok' : 'is-bad'">
+                      {{ item.ok ? "✓ 正常" : "✗ 异常" }}
+                    </span>
+                    <span class="pp-probe-tag" :class="item.ok ? 'is-ok' : 'is-bad'">
+                      HTTP {{ item.status || "无响应" }}
+                    </span>
+                    <span class="pp-probe-tag">{{ item.latencyMs }}ms</span>
+                    <span class="pp-probe-tag" :class="{ 'is-warn': !item.isJson }">
+                      {{ item.isJson ? "JSON" : "非 JSON" }}
+                    </span>
+                    <span v-if="item.modelCount > 0" class="pp-probe-tag is-info">
+                      {{ item.modelCount }} 个模型
+                    </span>
+                  </div>
+                  <p class="pp-site-test-message">{{ item.nodeName }} · {{ item.message }}</p>
+                  <details v-if="item.bodyExcerpt" class="pp-probe-details">
+                    <summary>响应体</summary>
+                    <pre class="pp-site-test-body">{{ item.bodyExcerpt }}</pre>
+                  </details>
+                </div>
+              </div>
+            </div>
+
+            <div class="pp-modal-footer">
+              <button type="button" class="pp-btn-cancel" @click="closeSiteTestDialog">关闭</button>
+              <button
+                type="button"
+                class="pp-btn-primary"
+                :disabled="!siteTestSelected || siteTestBusy"
+                @click="runSiteTest"
+              >
+                {{ siteTestBusy ? `测试中（${channels.length} 个通道）…` : "开始测试" }}
+              </button>
             </div>
           </section>
         </div>
@@ -4430,5 +4622,169 @@ watch(nodeViewMode, () => {
 @keyframes pulse-subtle {
   0%, 100% { opacity: 1; transform: scale(1); }
   50% { opacity: 0.88; transform: scale(1.03); }
+}
+
+/* —— 测试站点弹窗（站点 /v1/models 无 Key 探测） —— */
+.pp-channels-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.pp-modal-card.is-site-test {
+  max-width: 540px;
+}
+
+.pp-site-test-search {
+  margin-bottom: 10px;
+}
+
+.pp-site-test-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 260px;
+  overflow-y: auto;
+  padding: 6px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-soft);
+}
+
+.pp-site-test-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 5px;
+  border: 1px solid transparent;
+  background: var(--surface);
+  cursor: pointer;
+  transition: all 0.1s ease;
+}
+
+.pp-site-test-item:hover {
+  background: var(--surface-hover);
+}
+
+.pp-site-test-item.is-selected {
+  border-color: var(--brand);
+  background: var(--brand-soft);
+}
+
+.pp-site-test-item input {
+  accent-color: var(--brand);
+  flex-shrink: 0;
+}
+
+.pp-site-test-status {
+  margin-top: 12px;
+  font-size: 11.5px;
+  color: var(--muted);
+  word-break: break-all;
+}
+
+.pp-site-test-status.is-error {
+  color: #ef4444;
+}
+
+.pp-site-test-result {
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px dashed var(--line);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.pp-probe-channel {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.pp-probe-details {
+  font-size: 10.5px;
+  color: var(--muted);
+}
+
+.pp-probe-details summary {
+  cursor: pointer;
+  user-select: none;
+  margin-top: 2px;
+}
+
+.pp-probe-tag.is-channel {
+  color: var(--text);
+  font-weight: 750;
+  background: var(--surface-soft);
+  border-color: var(--line);
+}
+
+.pp-probe-tag.is-testing {
+  color: var(--muted);
+  animation: pulse-subtle 1.2s ease-in-out infinite;
+}
+
+.pp-site-test-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.pp-probe-tag {
+  font-size: 10.5px;
+  font-weight: 700;
+  padding: 3px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  color: var(--muted);
+  background: var(--surface);
+  white-space: nowrap;
+}
+
+.pp-probe-tag.is-ok {
+  color: #059669;
+  border-color: rgba(5, 150, 105, 0.4);
+  background: rgba(5, 150, 105, 0.1);
+}
+
+.pp-probe-tag.is-bad {
+  color: #ef4444;
+  border-color: rgba(239, 68, 68, 0.4);
+  background: rgba(239, 68, 68, 0.1);
+}
+
+.pp-probe-tag.is-warn {
+  color: #d97706;
+  border-color: rgba(217, 119, 6, 0.4);
+  background: rgba(217, 119, 6, 0.1);
+}
+
+.pp-probe-tag.is-info {
+  color: var(--primary, #3b82f6);
+  border-color: rgba(59, 130, 246, 0.4);
+  background: rgba(59, 130, 246, 0.1);
+}
+
+.pp-site-test-message {
+  margin: 8px 0 0;
+  font-size: 11.5px;
+  color: var(--text);
+}
+
+.pp-site-test-body {
+  margin: 8px 0 0;
+  max-height: 140px;
+  overflow: auto;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  font-size: 10.5px;
+  line-height: 1.5;
+  color: var(--muted);
+  white-space: pre-wrap;
+  word-break: break-all;
 }
 </style>
