@@ -612,7 +612,9 @@ fn persist_catalog_llmpricing(
 
     // Snapshot existing hosts_json + last_updated for change detection.
     // This allows restoring cached detail data for models whose source data hasn't changed.
-    let mut hosts_cache: BTreeMap<String, (String, String)> = BTreeMap::new();
+    // 条数一并快照：页面渠道数变化后旧缓存条数会与新一揽子 host_count 对不上，
+    // 这种过期缓存不能恢复，交给 prefetch 重新抓取。
+    let mut hosts_cache: BTreeMap<String, (String, String, usize)> = BTreeMap::new();
     {
         let mut cache_stmt = connection
             .prepare(
@@ -631,7 +633,10 @@ fn persist_catalog_llmpricing(
             })
             .map_err(|error| error.to_string())?;
         for row in rows.flatten() {
-            hosts_cache.insert(row.0, (row.1, row.2));
+            let cached_count = serde_json::from_str::<Vec<Value>>(&row.1)
+                .map(|hosts| hosts.len())
+                .unwrap_or(0);
+            hosts_cache.insert(row.0, (row.1, row.2, cached_count));
         }
     }
 
@@ -835,8 +840,13 @@ fn persist_catalog_llmpricing(
             )
             .map_err(|error| error.to_string())?;
         // Restore cached hosts_json if the model's source data hasn't changed
-        if let Some((cached_hosts, cached_last_updated)) = hosts_cache.get(&item.id) {
-            if Some(cached_last_updated.clone()) == item.last_updated {
+        // and the cached entry count still matches the manifest's host_count.
+        if let Some((cached_hosts, cached_last_updated, cached_host_count)) =
+            hosts_cache.get(&item.id)
+        {
+            if Some(cached_last_updated.clone()) == item.last_updated
+                && *cached_host_count == item.host_count
+            {
                 let _ = transaction.execute(
                     "UPDATE model_catalog_models SET hosts_json = ?1 WHERE id = ?2",
                     params![cached_hosts, item.id],
@@ -973,35 +983,121 @@ pub(crate) fn get_model_catalog_inner(database: &Database) -> Result<ModelCatalo
     })
 }
 
+/// 解码从指定位置开始的 JSON 字符串字面量（含首尾引号），返回解码后的内容。
+fn decode_json_string_literal(text: &str) -> Option<String> {
+    let mut chars = text.char_indices();
+    if chars.next()?.1 != '"' {
+        return None;
+    }
+    let mut escaped = false;
+    for (i, c) in chars {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match c {
+            '\\' => escaped = true,
+            '"' => return serde_json::from_str(&text[..=i]).ok(),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// 重组 Next.js RSC flight 流：页面数据存放在一系列
+/// `self.__next_f.push([1,"…"])` 的 JSON 字符串字面量中，逐段解码后拼接。
+fn collect_rsc_flight(html: &str) -> String {
+    const MARKER: &str = "self.__next_f.push([1,";
+    let mut flight = String::new();
+    let mut rest = html;
+    while let Some(idx) = rest.find(MARKER) {
+        rest = &rest[idx + MARKER.len()..];
+        match decode_json_string_literal(rest.trim_start()) {
+            Some(chunk) => flight.push_str(&chunk),
+            None => break,
+        }
+    }
+    flight
+}
+
+/// 在解码后的 JSON 文本中定位 `key`（形如 `"hosts":[`）后的第一个完整数组并解析。
+/// 括号匹配正确跳过字符串字面量与转义（数组元素字符串里可能含 `]`）。
+fn find_array_string_aware(text: &str, key: &str) -> Option<Vec<Value>> {
+    let idx = text.find(key)?;
+    let start = idx + key.len() - 1;
+    let mut escaped = false;
+    let mut in_string = false;
+    let mut depth = 0usize;
+    for (i, c) in text[start..].char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => in_string = true,
+            '[' => depth += 1,
+            ']' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return serde_json::from_str::<Vec<Value>>(&text[start..=start + i]).ok();
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// 朴素括号计数匹配（不感知字符串），适配双重转义的旧格式原文——那种文本里
+/// 转义引号会让字符串状态机失步，必须像旧逻辑一样只数括号；解析失败时先反转义再试。
+fn find_array_naive(text: &str, key: &str) -> Option<Vec<Value>> {
+    let idx = text.find(key)?;
+    let start = idx + key.len() - 1;
+    let slice = &text[start..];
+    let mut count: i64 = 0;
+    let mut end = None;
+    for (i, c) in slice.char_indices() {
+        match c {
+            '[' => count += 1,
+            ']' => {
+                count -= 1;
+                if count == 0 {
+                    end = Some(i + 1);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let chunk = &slice[..end?];
+    if let Ok(value) = serde_json::from_str::<Vec<Value>>(chunk) {
+        return Some(value);
+    }
+    let unescaped = chunk.replace("\\\"", "\"").replace("\\\\", "\\");
+    serde_json::from_str::<Vec<Value>>(&unescaped).ok()
+}
+
 fn extract_hosts_from_html(html: &str) -> Vec<Value> {
+    // 当前线上格式：hosts 数组在 RSC flight 流中（解码后的正常 JSON 文本）
+    let flight = collect_rsc_flight(html);
+    if !flight.is_empty() {
+        if let Some(hosts) = find_array_string_aware(&flight, "\"hosts\":[") {
+            if !hosts.is_empty() {
+                return hosts;
+            }
+        }
+    }
+    // 兜底：历史格式——直接在原文上找明文/转义两种 key
     for key in ["\"hosts\":[", "\\\"hosts\\\":["] {
-        if let Some(idx) = html.find(key) {
-            let start = idx + key.len() - 1;
-            if let Some(slice_str) = html.get(start..) {
-                let mut count = 0;
-                let mut end = 0;
-                for (i, c) in slice_str.char_indices() {
-                    if c == '[' {
-                        count += 1;
-                    } else if c == ']' {
-                        count -= 1;
-                        if count == 0 {
-                            end = i + 1;
-                            break;
-                        }
-                    }
-                }
-                if end > 0 {
-                    let mut raw_chunk = slice_str[..end].to_string();
-                    if key.starts_with('\\') {
-                        raw_chunk = raw_chunk.replace("\\\"", "\"").replace("\\\\", "\\");
-                    }
-                    if let Ok(val) = serde_json::from_str::<Vec<Value>>(&raw_chunk) {
-                        if !val.is_empty() {
-                            return val;
-                        }
-                    }
-                }
+        if let Some(hosts) = find_array_naive(html, key) {
+            if !hosts.is_empty() {
+                return hosts;
             }
         }
     }
@@ -1206,7 +1302,9 @@ pub(crate) async fn get_model_catalog_detail_inner(
     let mut raw_hosts = Vec::new();
     if let Some(cached) = &cached_hosts_json {
         if let Ok(parsed) = serde_json::from_str::<Vec<Value>>(cached) {
-            if !parsed.is_empty() {
+            // 缓存条数与清单 host_count 不一致，说明是页面渠道数变化前的过期抓取，
+            // 不能继续用（否则列表显示 N 个渠道、详情却少一批），强制走下方重抓。
+            if !parsed.is_empty() && parsed.len() == model.host_count {
                 raw_hosts = parsed;
             }
         }
@@ -1528,6 +1626,46 @@ async fn fetch_and_persist_once(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 把一段 flight 明文转成页面上的 JS 字符串字面量（引号/反斜杠转义）。
+    fn escape_flight_chunk(flight_part: &str) -> String {
+        flight_part.replace('\\', "\\\\").replace('"', "\\\"")
+    }
+
+    #[test]
+    fn extracts_hosts_from_rsc_flight_payload() {
+        // 模拟线上 Next.js 页面：hosts 数组被拆进两段转义的 flight chunk，
+        // 且 provider 名里带 ']'（考验字符串感知的括号匹配）。
+        let chunk_left = r#"2a:["$","L",null,{"note":"prefix ] here"},{"hosts":[{"provider":"ke]nari","modelId":"a"#;
+        let chunk_right = r#"","input":1.0},{"provider":"acme","modelId":"b"}]}]"#;
+        let html = format!(
+            "<script>self.__next_f.push([1,\"{}\"])</script>\
+             <script>self.__next_f.push([1,\"{}\"])</script>",
+            escape_flight_chunk(chunk_left),
+            escape_flight_chunk(chunk_right),
+        );
+        let hosts = extract_hosts_from_html(&html);
+        assert_eq!(hosts.len(), 2, "应从拆分的 flight 流里还原全部 hosts");
+        assert_eq!(hosts[0]["provider"], "ke]nari");
+        assert_eq!(hosts[1]["provider"], "acme");
+    }
+
+    #[test]
+    fn extracts_hosts_from_legacy_plain_html() {
+        let html = r#"<html><script>var data = {"hosts":[{"provider":"a"},{"provider":"b"}]};</script></html>"#;
+        let hosts = extract_hosts_from_html(html);
+        assert_eq!(hosts.len(), 2);
+        assert_eq!(hosts[1]["provider"], "b");
+    }
+
+    #[test]
+    fn extracts_hosts_from_legacy_escaped_html() {
+        // 历史格式：数组整体嵌在双重转义字符串里
+        let html = r#"<script>var s = "{\"hosts\":[{\"provider\":\"a\"},{\"provider\":\"b\"}]}";</script>"#;
+        let hosts = extract_hosts_from_html(html);
+        assert_eq!(hosts.len(), 2);
+        assert_eq!(hosts[0]["provider"], "a");
+    }
 
     #[test]
     fn parses_llmpricing_sample_model() {
