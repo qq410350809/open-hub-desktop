@@ -318,7 +318,7 @@ pub async fn sync_feed_with_fast_nodes(
                 "",
             );
             let local = tokio::task::block_in_place(|| {
-                load_feed_items_from_db(database, source, 0, CHARITY_PAGE_SIZE, "")
+                load_feed_items_from_db(database, source, 0, CHARITY_PAGE_SIZE, "", "all")
             })?;
             let _ = write_feed_sync_meta(database, &source.id, "skipped", &message, "", 0);
             finish_charity_sync_log(
@@ -645,7 +645,7 @@ pub async fn sync_feed_with_fast_nodes(
         let _ = proxypool::restore_proxy_node_transient(database, runtime).await;
     }
     let mut local = tokio::task::block_in_place(|| {
-        load_feed_items_from_db(database, source, 0, CHARITY_PAGE_SIZE, "")
+        load_feed_items_from_db(database, source, 0, CHARITY_PAGE_SIZE, "", "all")
     })
     .unwrap_or(CharityFeedResult {
         feed_id: source.id.clone(),

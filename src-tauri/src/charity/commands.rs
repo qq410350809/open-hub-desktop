@@ -13,20 +13,22 @@ pub async fn get_charity_feed(
     offset: Option<usize>,
     limit: Option<usize>,
     keyword: Option<String>,
+    filter: Option<String>,
 ) -> Result<CharityFeedResult, String> {
     let database = &*ctx.database;
     let requested = feed_id.as_deref().unwrap_or(DEFAULT_CHARITY_FEED_ID);
     let offset = offset.unwrap_or(0);
     let limit = limit.unwrap_or(CHARITY_PAGE_SIZE);
     let keyword = keyword.unwrap_or_default();
+    let filter = filter.unwrap_or_default();
     if requested == "all" {
         return tokio::task::block_in_place(|| {
-            load_all_feed_items_from_db(&database, offset, limit, &keyword)
+            load_all_feed_items_from_db(&database, offset, limit, &keyword, &filter)
         });
     }
     let source = charity_feed_source(&database, requested)?;
     let mut result = tokio::task::block_in_place(|| {
-        load_feed_items_from_db(&database, &source, offset, limit, &keyword)
+        load_feed_items_from_db(&database, &source, offset, limit, &keyword, &filter)
     })?;
     if let Ok(errors) = ctx.charity_runtime.last_errors.lock() {
         if let Some(message) = errors.get(&source.id) {
@@ -119,7 +121,7 @@ pub async fn fetch_charity_feed(
     )?;
     let Some(cancellation) = monitor.try_begin_sync() else {
         let mut local = tokio::task::block_in_place(|| {
-            load_feed_items_from_db(&database, &source, 0, CHARITY_PAGE_SIZE, "")
+            load_feed_items_from_db(&database, &source, 0, CHARITY_PAGE_SIZE, "", "all")
         })?;
         local.message = "后台同步进行中，已返回本地数据".into();
         local.status = if local.status.is_empty() {
@@ -171,7 +173,7 @@ pub async fn fetch_charity_feed(
         }
     }
     let mut local = tokio::task::block_in_place(|| {
-        load_feed_items_from_db(&database, &source, 0, CHARITY_PAGE_SIZE, "")
+        load_feed_items_from_db(&database, &source, 0, CHARITY_PAGE_SIZE, "", "all")
     })?;
     if let Err(error) = sync_result {
         if local.message.is_empty() {

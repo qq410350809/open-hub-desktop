@@ -417,21 +417,42 @@ pub fn persist_feed(
     })
 }
 
+/// 属性快捷筛选下推为 SQL 条件；today 内嵌本地日界的 i64 时间戳（无注入风险）。
+pub fn charity_filter_clause(filter: &str) -> String {
+    match filter {
+        "hot" => " AND (reply_count >= 20 OR views >= 500)".into(),
+        "pinned" => " AND pinned = 1".into(),
+        "today" => {
+            let (utc_start, utc_end) = local_day_utc_range_secs();
+            format!(
+                " AND published_at IS NOT NULL
+                   AND unixepoch(published_at) >= {utc_start}
+                   AND unixepoch(published_at) < {utc_end}"
+            )
+        }
+        _ => String::new(),
+    }
+}
+
 pub fn load_all_feed_items_from_db(
     database: &Database,
     offset: usize,
     limit: usize,
     keyword: &str,
+    filter: &str,
 ) -> Result<CharityFeedResult, String> {
     let limit = limit.clamp(1, CHARITY_PAGE_LIMIT_MAX);
+    let filter_clause = charity_filter_clause(filter);
     let connection = database.lock_conn()?;
     let key_pat = format!("%{}%", keyword.trim());
     let has_key = !keyword.trim().is_empty();
     let total_count = if has_key {
         connection
             .query_row(
-                "SELECT COUNT(DISTINCT guid) FROM charity_feed_items
-                 WHERE title LIKE ?1 OR author LIKE ?1 OR categories LIKE ?1",
+                &format!(
+                    "SELECT COUNT(DISTINCT guid) FROM charity_feed_items
+                     WHERE title LIKE ?1 OR author LIKE ?1 OR categories LIKE ?1{filter_clause}"
+                ),
                 [&key_pat],
                 |row| row.get::<_, i64>(0),
             )
@@ -440,7 +461,9 @@ pub fn load_all_feed_items_from_db(
     } else {
         connection
             .query_row(
-                "SELECT COUNT(DISTINCT guid) FROM charity_feed_items",
+                &format!(
+                    "SELECT COUNT(DISTINCT guid) FROM charity_feed_items WHERE 1 = 1{filter_clause}"
+                ),
                 [],
                 |row| row.get::<_, i64>(0),
             )
@@ -450,12 +473,14 @@ pub fn load_all_feed_items_from_db(
 
     let mut statement = connection
         .prepare(
-            "SELECT guid, title, link, author, published_at, summary, categories, first_seen_at,
-                    reply_count, views, like_count, last_activity_at, pinned, posters, feed_id
-             FROM charity_feed_items
-             WHERE (?3 = '' OR title LIKE ?3 OR author LIKE ?3 OR categories LIKE ?3)
-             ORDER BY published_at DESC, rowid DESC
-             LIMIT ?1 OFFSET ?2",
+            &format!(
+                "SELECT guid, title, link, author, published_at, summary, categories, first_seen_at,
+                        reply_count, views, like_count, last_activity_at, pinned, posters, feed_id
+                 FROM charity_feed_items
+                 WHERE (?3 = '' OR title LIKE ?3 OR author LIKE ?3 OR categories LIKE ?3){filter_clause}
+                 ORDER BY published_at DESC, rowid DESC
+                 LIMIT ?1 OFFSET ?2"
+            ),
         )
         .map_err(|error| error.to_string())?;
     let all = statement
@@ -577,6 +602,7 @@ pub fn load_feed_items_from_db(
     offset: usize,
     limit: usize,
     keyword: &str,
+    filter: &str,
 ) -> Result<CharityFeedResult, String> {
     let limit = limit.clamp(1, CHARITY_PAGE_LIMIT_MAX);
     let keys = feed_meta_keys(&source.id);
@@ -592,11 +618,14 @@ pub fn load_feed_items_from_db(
     let last_updated = read_meta(&keys.last_updated)?.parse::<usize>().unwrap_or(0);
     let key_pat = format!("%{}%", keyword.trim());
     let has_key = !keyword.trim().is_empty();
+    let filter_clause = charity_filter_clause(filter);
     let total_count = if has_key {
         connection
             .query_row(
-                "SELECT COUNT(*) FROM charity_feed_items
-                 WHERE feed_id = ?1 AND (title LIKE ?2 OR author LIKE ?2 OR categories LIKE ?2)",
+                &format!(
+                    "SELECT COUNT(*) FROM charity_feed_items
+                     WHERE feed_id = ?1 AND (title LIKE ?2 OR author LIKE ?2 OR categories LIKE ?2){filter_clause}"
+                ),
                 params![source.id.as_str(), key_pat],
                 |row| row.get::<_, i64>(0),
             )
@@ -605,7 +634,9 @@ pub fn load_feed_items_from_db(
     } else {
         connection
             .query_row(
-                "SELECT COUNT(*) FROM charity_feed_items WHERE feed_id = ?1",
+                &format!(
+                    "SELECT COUNT(*) FROM charity_feed_items WHERE feed_id = ?1{filter_clause}"
+                ),
                 [source.id.as_str()],
                 |row| row.get::<_, i64>(0),
             )
@@ -626,14 +657,14 @@ pub fn load_feed_items_from_db(
             .max(0) as usize
     };
     let mut statement = connection
-        .prepare(
+        .prepare(&format!(
             "SELECT guid, title, link, author, published_at, summary, categories, first_seen_at,
                     reply_count, views, like_count, last_activity_at, pinned, posters
              FROM charity_feed_items
-             WHERE feed_id = ?1 AND (?4 = '' OR title LIKE ?4 OR author LIKE ?4 OR categories LIKE ?4)
+             WHERE feed_id = ?1 AND (?4 = '' OR title LIKE ?4 OR author LIKE ?4 OR categories LIKE ?4){filter_clause}
              ORDER BY published_at DESC, rowid DESC
-             LIMIT ?2 OFFSET ?3",
-        )
+             LIMIT ?2 OFFSET ?3"
+        ))
         .map_err(|error| error.to_string())?;
     let items = statement
         .query_map(

@@ -12,6 +12,8 @@ import type {
 const DEFAULT_PAGE_SIZE = 20;
 const MAX_SYNC_LOG = 120;
 
+export type CharityPropertyFilter = "all" | "hot" | "pinned" | "today";
+
 const charityTags = ref<CharityFeedTag[]>([
   { id: "all", name: "全部" },
 ]);
@@ -90,6 +92,7 @@ const refreshAllBusy = ref(false);
 const syncLogLoading = ref(false);
 const syncing = ref(false);
 const searchKeyword = ref("");
+const propertyFilter = ref<CharityPropertyFilter>("all");
 const proxyPoolSummary = ref<{ validCount: number; candidateCount: number } | null>(null);
 
 let eventUnlisten: UnlistenFn | undefined;
@@ -209,6 +212,7 @@ async function queryLocalFeed(feedId = selectedTagId.value, page = currentPage.v
       offset,
       limit: pageSize.value,
       keyword: searchKeyword.value.trim() || undefined,
+      filter: propertyFilter.value === "all" ? undefined : propertyFilter.value,
     });
     if (seq !== loadSeq || feedId !== selectedTagId.value) return result;
     applyLocalPage(result, "replace");
@@ -250,6 +254,13 @@ function setSearchKeyword(value: string) {
     currentPage.value = 1;
     void queryLocalFeed(selectedTagId.value, 1);
   }, 260);
+}
+
+function setCharityPropertyFilter(filter: CharityPropertyFilter) {
+  if (propertyFilter.value === filter) return;
+  propertyFilter.value = filter;
+  currentPage.value = 1;
+  void queryLocalFeed(selectedTagId.value, 1);
 }
 
 async function refreshCharityFeed() {
@@ -427,6 +438,8 @@ export function useCharityMonitor() {
     charitySourcesLoading,
     selectedTagId,
     searchKeyword,
+    charityPropertyFilter: propertyFilter,
+    setCharityPropertyFilter,
     currentFeedName,
     charityFeedItems: items,
     charityFeedLoading: loading,

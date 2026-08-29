@@ -474,8 +474,9 @@ macro_rules! rpc_arms {
                 let offset: Option<usize> = take_opt($args, &["offset"])?;
                 let limit: Option<usize> = take_opt($args, &["limit"])?;
                 let keyword: Option<String> = take_opt($args, &["keyword"])?;
+                let filter: Option<String> = take_opt($args, &["filter"])?;
                 Ok(json!(
-                    crate::charity::get_charity_feed($ctx, feed_id, offset, limit, keyword).await
+                    crate::charity::get_charity_feed($ctx, feed_id, offset, limit, keyword, filter).await
                 ))
             }
             "mark_charity_feed_read" => {

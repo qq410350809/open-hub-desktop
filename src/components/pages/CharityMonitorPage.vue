@@ -44,9 +44,9 @@ async function copyPostLink(item: CharityFeedItem) {
   }
 }
 
-// —— 属性快捷筛选 ——
-type PropertyFilter = "all" | "hot" | "pinned" | "today";
-const propertyFilter = ref<PropertyFilter>("all");
+// —— 列表过滤与排序 ——
+// 属性筛选（全部/热门/置顶/今日）已下推到后端，与分页同源，避免“只筛当前页”导致分页错乱。
+const topicSorting = ref<SortingState>([]);
 
 function isToday(dateStr?: string): boolean {
   if (!dateStr) return false;
@@ -60,20 +60,7 @@ function isToday(dateStr?: string): boolean {
   );
 }
 
-// —— 列表过滤与排序 ——
-const topicSorting = ref<SortingState>([]);
-
-const displayItems = computed(() => {
-  let list = store.charityFeedItems.value;
-  if (propertyFilter.value === "hot") {
-    list = list.filter((item) => (item.replyCount ?? 0) >= 20 || (item.views ?? 0) >= 500);
-  } else if (propertyFilter.value === "pinned") {
-    list = list.filter((item) => item.pinned);
-  } else if (propertyFilter.value === "today") {
-    list = list.filter((item) => isToday(item.publishedAt));
-  }
-  return list;
-});
+const displayItems = computed(() => store.charityFeedItems.value);
 
 // —— 标签管理弹窗 ——
 const tagManagerOpen = ref(false);
@@ -505,38 +492,38 @@ onUnmounted(() => {
 
           <div class="cm-strip-divider" />
 
-          <!-- 属性快捷过滤胶囊 -->
+          <!-- 属性快捷过滤胶囊（筛选在后端执行，分页与筛选结果一致） -->
           <div class="cm-prop-filters">
             <button
               type="button"
               class="cm-filter-btn"
-              :class="{ active: propertyFilter === 'all' }"
-              @click="propertyFilter = 'all'"
+              :class="{ active: store.charityPropertyFilter.value === 'all' }"
+              @click="store.setCharityPropertyFilter('all')"
             >全部</button>
             <button
               type="button"
               class="cm-filter-btn"
-              :class="{ active: propertyFilter === 'hot' }"
+              :class="{ active: store.charityPropertyFilter.value === 'hot' }"
               title="回复数 ≥ 20 或浏览量 ≥ 500"
-              @click="propertyFilter = 'hot'"
+              @click="store.setCharityPropertyFilter('hot')"
             >
               <span>🔥 热门</span>
             </button>
             <button
               type="button"
               class="cm-filter-btn"
-              :class="{ active: propertyFilter === 'pinned' }"
+              :class="{ active: store.charityPropertyFilter.value === 'pinned' }"
               title="仅查看置顶公告与精华帖"
-              @click="propertyFilter = 'pinned'"
+              @click="store.setCharityPropertyFilter('pinned')"
             >
               <span>📌 置顶</span>
             </button>
             <button
               type="button"
               class="cm-filter-btn"
-              :class="{ active: propertyFilter === 'today' }"
+              :class="{ active: store.charityPropertyFilter.value === 'today' }"
               title="仅查看今日发布的帖子"
-              @click="propertyFilter = 'today'"
+              @click="store.setCharityPropertyFilter('today')"
             >
               <span>⚡ 今日</span>
             </button>
