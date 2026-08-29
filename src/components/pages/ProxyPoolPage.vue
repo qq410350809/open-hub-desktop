@@ -89,6 +89,8 @@ const channelSelectedNodeId = ref("");
 const channelNodeQuery = ref("");
 // 通道弹窗候选列表的排序模式（会话内记忆，不持久化）
 const channelNodeSortMode = ref<ProxySortMode>("latency");
+// 通道弹窗候选列表的网速档位（会话内记忆，不持久化）
+const channelSpeedFilter = ref<"all" | "10mbps" | "5mbps" | "1mbps" | "05mbps" | "untested">("all");
 const channelAssignedProfileIds = ref<Set<string>>(new Set());
 const deleteChannelConfirmId = ref("");
 const nodeViewMode = ref<"list" | "ip">(preferences.proxyNodeViewMode === "country" ? "ip" : "list");
@@ -694,6 +696,19 @@ const channelCandidateNodes = computed(() => {
       return isEligible;
     })
     .filter((node) => {
+      // 网速档位筛选：与主界面网速下拉同口径
+      if (channelSpeedFilter.value === "all") return true;
+      if (channelSpeedFilter.value === "untested") {
+        return node.channelTestStatus !== "success";
+      }
+      const threshold = SPEED_THRESHOLD_MS[channelSpeedFilter.value];
+      return (
+        node.channelTestStatus === "success" &&
+        node.channelLatencyMs != null &&
+        node.channelLatencyMs <= threshold
+      );
+    })
+    .filter((node) => {
       if (!query) return true;
       return [
         node.name,
@@ -721,6 +736,7 @@ function openChannelDialog(channel?: ProxyChannel) {
   channelName.value = channel?.name ?? "";
   channelSelectedNodeId.value = channel?.nodeId ?? "";
   channelNodeQuery.value = "";
+  channelSpeedFilter.value = "all";
   channelAssignedProfileIds.value = new Set((channel?.accounts ?? []).map((account) => account.profileId));
   channelDialogOpen.value = true;
   document.body.classList.add("modal-open");
@@ -750,21 +766,6 @@ function isChannelAccountLocked(profileId: string) {
 }
 function selectChannelNode(nodeId: string) {
   channelSelectedNodeId.value = nodeId;
-}
-async function testChannelNodes() {
-  message.value = "";
-  try {
-    const targetNodeIds = (channelCandidateNodes.value && channelCandidateNodes.value.length > 0)
-      ? channelCandidateNodes.value.map((n) => n.id)
-      : (displayNodes.value && displayNodes.value.length > 0)
-        ? displayNodes.value.map((n) => n.id)
-        : [];
-
-    await store.testProxyChannelNodes(channelEditingId.value || "", targetNodeIds);
-    message.value = "通道节点测速完成（先连通、后网速），请选择节点后保存";
-  } catch (error) {
-    message.value = `通道测速失败: ${error}`;
-  }
 }
 async function saveChannel() {
   message.value = "";
@@ -1869,18 +1870,6 @@ watch(nodeViewMode, () => {
                 <div class="pp-form-group">
                   <div class="pp-label-row">
                     <label class="pp-label" title="先测连通延迟（节点建链），连通正常的节点再自动做 10MB 流式下载测网速">固定出口节点 (连通 ≤500ms 候选)</label>
-                    <button
-                      type="button"
-                      class="pp-btn-secondary pp-btn-sm"
-                      :disabled="Boolean(store.proxyPoolBusyId.value) || Boolean(store.channelTestBusyId.value)"
-                      @click="testChannelNodes"
-                    >
-                      <span v-html="icons.pulse" />
-                      <span v-if="store.channelTestBusyId.value">
-                        测速 {{ store.channelTestProgress.value.completed }}/{{ store.channelTestProgress.value.total }}…
-                      </span>
-                      <span v-else>刷新列表节点测速</span>
-                    </button>
                   </div>
 
                   <div class="pp-channel-candidate-box">
@@ -1892,13 +1881,22 @@ watch(nodeViewMode, () => {
                         aria-label="候选节点排序方式"
                         @update:model-value="channelNodeSortMode = $event as any"
                       />
-                      <span class="pp-search-icon" v-html="icons.search" />
-                      <input
-                        v-model="channelNodeQuery"
-                        class="pp-search-input"
-                        type="search"
-                        placeholder="搜索候选节点名称 / 地区…"
+                      <CustomSelect
+                        class="pp-strip-dropdown pp-candidate-sort"
+                        :options="speedFilterOptions"
+                        :model-value="channelSpeedFilter"
+                        aria-label="候选节点网速筛选"
+                        @update:model-value="channelSpeedFilter = $event as any"
                       />
+                      <div class="pp-search-box pp-candidate-search">
+                        <span class="pp-search-icon" v-html="icons.search" />
+                        <input
+                          v-model="channelNodeQuery"
+                          class="pp-search-input"
+                          type="search"
+                          placeholder="搜索候选节点名称 / 地区…"
+                        />
+                      </div>
                       <span class="pp-candidate-count-pill">{{ channelCandidateNodes.length }} 个候选节点</span>
                     </div>
 
@@ -1936,7 +1934,7 @@ watch(nodeViewMode, () => {
                       <div v-if="!channelCandidateNodes.length" class="pp-candidate-empty">
                         <span v-html="icons.globe" />
                         <strong>{{ channelNodeQuery ? "没有匹配的候选节点" : "暂无连通 ≤500ms 的候选节点" }}</strong>
-                        <small>可点击上方「刷新列表节点测速」（先连通后网速）或在主界面完成测速</small>
+                        <small>请先在主界面批量测速，连通 ≤500ms 且达标的节点会进入候选列表</small>
                       </div>
                     </div>
                   </div>
@@ -3854,6 +3852,13 @@ watch(nodeViewMode, () => {
 .pp-candidate-sort.select-box {
   height: 30px;
   flex-shrink: 0;
+}
+
+/* 候选列表搜索框：主样式复用 .pp-search-box，此处自适应占满剩余宽度 */
+.pp-candidate-search.pp-search-box {
+  flex: 1;
+  width: auto;
+  min-width: 120px;
 }
 
 .pp-candidate-count-pill {
