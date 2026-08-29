@@ -10,7 +10,7 @@ use rusqlite::{params, OptionalExtension};
 use serde_json::{json, Value as JsonValue};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::net::{SocketAddr, TcpListener};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::Ordering;
@@ -338,6 +338,14 @@ pub fn find_mihomo_binary(runtime: &ProxyRuntime) -> Option<PathBuf> {
 
 pub fn port_is_available(port: u16) -> bool {
     TcpListener::bind(("127.0.0.1", port)).is_ok()
+}
+
+/// 端口上是否真的有监听者：用 connect 探测而非试绑定——试绑定会在探测
+/// 瞬间占住端口，理论上可能撞上内核正在进行的监听绑定，导致该 listener
+/// 永久绑定失败；connect 无副作用，且对空闲端口立即返回 ECONNREFUSED。
+fn port_has_listener(port: u16) -> bool {
+    let address: SocketAddr = ([127, 0, 0, 1], port).into();
+    TcpStream::connect_timeout(&address, Duration::from_millis(200)).is_ok()
 }
 
 pub fn allocate_free_port() -> Result<u16, String> {
@@ -705,7 +713,13 @@ fn ensure_lane_pools(runtime: &ProxyRuntime, used_ports: &mut HashSet<u16>) -> R
             .lock()
             .map_err(|_| "lane 池状态锁定失败".to_string())?;
         if slots.len() == expected {
-            for slot in slots.iter() {
+            for slot in slots.iter_mut() {
+                // 复用前必须确认端口真的空闲：句柄丢失的残留内核会继续占着旧端口，
+                // 新实例绑定失败后（内核只记日志不退出）lane 流量会串到旧实例——
+                // 测速全失败、出口串节点都源于此。被占的端口就地换新。
+                if !port_is_available(slot.listen_port) {
+                    slot.listen_port = allocate_free_port_excluding(used_ports)?;
+                }
                 used_ports.insert(slot.listen_port);
             }
             continue;
@@ -957,20 +971,25 @@ pub fn ensure_shared_instance_with_nodes(
             return Ok(state.proxy_port);
         }
 
-        // 需要（重）拉起：先停旧进程再复用端口。既往实现直接覆盖 child 句柄，
-        // 旧 mihomo 会泄漏为孤儿进程，只能等下次启动清扫回收。
-        stop_single_instance(&mut state);
-        proxy_port = if state.proxy_port > 0 && port_is_available(state.proxy_port) {
-            state.proxy_port
-        } else {
-            allocate_free_port()?
-        };
-        controller_port = if state.controller_port > 0 && port_is_available(state.controller_port) {
-            state.controller_port
-        } else {
-            allocate_free_port()?
-        };
+    // 需要（重）拉起：先停旧进程再复用端口。既往实现直接覆盖 child 句柄，
+    // 旧 mihomo 会泄漏为孤儿进程，只能等下次启动清扫回收。
+    stop_single_instance(&mut state);
+    proxy_port = if state.proxy_port > 0 && port_is_available(state.proxy_port) {
+        state.proxy_port
+    } else {
+        allocate_free_port()?
+    };
+    controller_port = if state.controller_port > 0 && port_is_available(state.controller_port) {
+        state.controller_port
+    } else {
+        allocate_free_port()?
+    };
+    drop(state);
     }
+
+    // 定向清扫"该杀未杀"的残留内核：它霸占的 lane 端口会让新实例绑定失败，
+    // 流量串到旧实例（测速全失败、出口串节点）。必须在分配 lane 端口前执行。
+    reap_stale_mihomo_in_dir(&runtime.directory);
 
     // lane 池端口在旧进程停止后分配/校验；批内统一去重，避免互相撞端口
     let mut used_ports = HashSet::new();
@@ -1002,6 +1021,12 @@ pub fn ensure_shared_instance_with_nodes(
         &account_lanes,
         &channel_lanes,
     );
+    let listener_ports = speed_lanes
+        .iter()
+        .chain(&account_lanes)
+        .chain(&channel_lanes)
+        .map(|lane| lane.listen_port)
+        .collect::<Vec<_>>();
     // 配置含 ~89 个组，内核解析耗时更长，就绪等待放宽到 10s
     spawn_engine_instance(
         runtime,
@@ -1013,12 +1038,18 @@ pub fn ensure_shared_instance_with_nodes(
         initial_hash,
         Duration::from_secs(10),
         "共享代理实例",
+        &listener_ports,
     )?;
     Ok(proxy_port)
 }
 
 /// 写入配置、拉起 mihomo 引擎并等待控制器就绪，随后更新实例状态。
+/// `listener_ports` 为本实例配置的全部监听端口（mixed + 各 lane），
+/// 就绪判定除控制器 /version 外逐一确认端口真的被新实例绑定——内核对绑定
+/// 失败的 listener 只记日志不退出，跳过该校验会让半死实例把测速/出口流量
+/// 引到霸占端口的残留实例上。
 /// 失败时回收本次拉起的实例，避免半死实例被后续复用或遗留为孤儿进程。
+#[allow(clippy::too_many_arguments)]
 fn spawn_engine_instance(
     runtime: &ProxyRuntime,
     engine: &Path,
@@ -1029,6 +1060,7 @@ fn spawn_engine_instance(
     config_hash: String,
     ready_timeout: Duration,
     label: &str,
+    listener_ports: &[u16],
 ) -> Result<(), String> {
     let _ = fs::create_dir_all(instance_dir);
     let config_path = instance_dir.join("config.yaml");
@@ -1086,11 +1118,20 @@ fn spawn_engine_instance(
             Duration::from_millis(200),
         ) {
             Ok((200..=299, _)) => {
-                // 新进程的组选择全部复位，lane 选中记录随之失效
-                if let Ok(mut selected) = runtime.lane_selected.lock() {
-                    selected.clear();
+                // 控制器就绪后还需确认全部监听端口真的绑定成功：端口连不上
+                // 说明新实例没绑上，流量会落到残留实例的旧监听。
+                let unbound = std::iter::once(proxy_port)
+                    .chain(listener_ports.iter().copied())
+                    .filter(|port| !port_has_listener(*port))
+                    .collect::<Vec<_>>();
+                if unbound.is_empty() {
+                    // 新进程的组选择全部复位，lane 选中记录随之失效
+                    if let Ok(mut selected) = runtime.lane_selected.lock() {
+                        selected.clear();
+                    }
+                    return Ok(());
                 }
-                return Ok(());
+                last_err = format!("监听端口未就绪: {unbound:?}");
             }
             Ok((code, _)) => last_err = format!("HTTP {code}"),
             Err(e) => last_err = e,
@@ -1305,6 +1346,31 @@ pub fn reap_orphan_mihomo_processes() -> usize {
     }
     if killed > 0 {
         warn!("[ProxyPool] 启动清扫：已自动淘汰 {killed} 个遗留的 Mihomo 孤儿进程");
+    }
+    killed
+}
+
+/// 实例重建前的定向清扫：回收挂在本运行时目录下的残留 Mihomo。
+///
+/// `stop_single_instance` 只能杀本会话句柄内的子进程；句柄丢失（历史缺陷遗留）
+/// 或上一次 kill 未生效的旧内核会继续霸占 lane 监听端口，导致新实例绑定失败、
+/// lane 流量串到旧实例。按完整运行时目录匹配（dev 与生产目录互不影响），
+/// 在 spawn 新实例之前调用，天然不会误伤刚拉起的内核。
+/// 返回本次回收的进程数量。
+pub(crate) fn reap_stale_mihomo_in_dir(directory: &Path) -> usize {
+    let dir_token = directory.to_string_lossy().to_lowercase();
+    if dir_token.is_empty() {
+        return 0;
+    }
+    let mut killed = 0usize;
+    for (pid, command) in list_process_commands() {
+        if command.to_lowercase().contains(&dir_token) && is_orphan_mihomo_command(&command) {
+            kill_pid(pid);
+            killed += 1;
+        }
+    }
+    if killed > 0 {
+        warn!("[ProxyPool] 实例重建：已回收 {killed} 个占用运行时目录的残留 Mihomo 进程");
     }
     killed
 }
