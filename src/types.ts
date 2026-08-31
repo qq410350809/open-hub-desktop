@@ -116,6 +116,7 @@ export interface SyncSitesResult {
   accountName: string;
   userName: string;
   runaway: boolean;
+  /** 仅包含本次新增的站点 id；类型检测只针对新增站点 */
   siteIds: string[];
 }
 
@@ -192,6 +193,24 @@ export interface CharitySyncProgress {
   unreadCount: number;
 }
 
+export interface CharitySyncLogFeedDetail {
+  id: string;
+  name: string;
+  status: string;
+  new: number;
+  updated: number;
+}
+
+/** 单标签行：new/updated/unread；汇总行：totalNew/totalUpdated/feeds */
+export interface CharitySyncLogDetail {
+  new?: number;
+  updated?: number;
+  unread?: number;
+  totalNew?: number;
+  totalUpdated?: number;
+  feeds?: CharitySyncLogFeedDetail[];
+}
+
 export interface CharitySyncLogEntry {
   id: number;
   at: string;
@@ -202,12 +221,12 @@ export interface CharitySyncLogEntry {
   message: string;
   nodeName: string;
   durationMs?: number;
+  detail?: CharitySyncLogDetail | null;
 }
 
 export interface CharityFeedTag {
   id: string;
   name: string;
-  jsonUrl?: string;
   enabled?: boolean;
   sortOrder?: number;
 }

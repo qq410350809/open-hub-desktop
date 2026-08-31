@@ -144,6 +144,8 @@ pub struct SyncSitesResult {
     pub(crate) account_name: String,
     pub(crate) user_name: String,
     pub(crate) runaway: bool,
+    /// 仅包含本次新增站点的 id；站点类型检测只应针对新增站点，
+    /// 更新站点的类型保持冻结。
     pub(crate) site_ids: Vec<String>,
 }
 

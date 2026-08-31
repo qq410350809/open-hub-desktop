@@ -228,7 +228,7 @@ async function openRemoteLogin() {
 async function detectSyncedSiteTypes(siteIds: string[], runId: number) {
   if (siteIds.length === 0) {
     if (runId === syncRunId && syncDialogOpen.value) {
-      appendSyncLog({ stage: "detect", status: "info", message: "本批没有需要检测的站点" });
+      appendSyncLog({ stage: "detect", status: "info", message: "本批没有新增站点，无需类型检测" });
       syncRunState.value = "complete";
       stopSyncTimer();
     }
@@ -451,7 +451,7 @@ async function syncSites() {
     const account = result.userName ? `账号 ${result.userName}` : `Chrome ${result.profileName}`;
     showToast(`${account} 已同步 ${result.total} 个公共站点（新增 ${result.added}，更新 ${result.updated}）`);
     syncRunState.value = "detecting";
-    appendSyncLog({ stage: "available", status: "success", message: `站点数据已可用，共 ${result.total} 条（存活与跑路全量同步）；类型检测将在后台继续` });
+    appendSyncLog({ stage: "available", status: "success", message: `站点数据已可用，共 ${result.total} 条（存活与跑路全量同步）；仅新增 ${result.added} 个站点进入类型检测` });
     void detectSyncedSiteTypes(result.siteIds, runId);
   } catch (error) {
     remoteUserError.value = `同步失败：${String(error)}`;

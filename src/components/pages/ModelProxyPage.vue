@@ -240,7 +240,15 @@ async function handleOpenChannelModelsModal(channel: ChannelConfig) {
   channelDraftKeyGroups.value = [];
   newKeyGroupName.value = "";
   channelModelsModalOpen.value = true;
-  void loadChannelKeysAndGroupsDraft(channel);
+  // Key 行通道绑定下拉需要通道候选；两路加载完成后归一化各 Key 的通道引用（名称 → ID）
+  void Promise.all([
+    loadProxyPoolOptions(),
+    loadChannelKeysAndGroupsDraft(channel),
+  ]).then(() => {
+    for (const k of channelRawKeys.value) {
+      k.fixedChannelId = normalizePoolChannelRef(k.fixedChannelId);
+    }
+  });
   // 模型级代理出口覆盖草稿：从渠道既有规则初始化
   {
     const draft = new Map<string, { mode: ModelProxyMode; nodeId: string }>();
@@ -326,6 +334,8 @@ interface ChannelKeyDetailItem {
   groupId: string;
   enabled: boolean;
   supportedModels?: string[] | null;
+  /** 渠道为固定通道模式时该 Key 绑定的代理池通道 ID；空 = 渠道默认通道 */
+  fixedChannelId: string;
 }
 
 const channelRawKeys = ref<ChannelKeyDetailItem[]>([]);
@@ -384,6 +394,7 @@ async function loadChannelKeysAndGroupsDraft(channel: ChannelConfig) {
               groupId: rawGroup || "primary",
               enabled: true,
               supportedModels: models && models.length > 0 ? models : null,
+              fixedChannelId: "",
             });
           }
         }
@@ -410,6 +421,7 @@ async function loadChannelKeysAndGroupsDraft(channel: ChannelConfig) {
         groupId: "primary",
         enabled: true,
         supportedModels: null,
+        fixedChannelId: "",
       });
     }
   }
@@ -422,6 +434,7 @@ async function loadChannelKeysAndGroupsDraft(channel: ChannelConfig) {
         if (rule.groupId) existing.groupId = rule.groupId;
         existing.enabled = rule.enabled;
         if (rule.supportedModels) existing.supportedModels = rule.supportedModels;
+        existing.fixedChannelId = rule.fixedChannelId ?? "";
       }
     }
   }
@@ -526,28 +539,30 @@ function effectiveProxyMode(model: string): ModelProxyMode | "inherit" {
   if (!ch) return "inherit";
   const rule = ch.modelProxyRules?.find((r) => r.model.toLowerCase() === key);
   if (rule) return (rule.mode as ModelProxyMode) || "inherit";
-  // 渠道级配置推导
-  if (ch.useFixedProxy) return "fixed";
-  if (ch.useProxyPool) return "pool";
-  return "direct";
+  // 渠道级配置推导（fixed_channel/custom_node 在模型粒度均归入「固定」族）
+  const mode = channelProxyModeOf(ch);
+  return mode === "pool" ? "pool" : mode === "direct" ? "direct" : "fixed";
 }
 
 /** 渠道级配置的推导描述（用于下拉「跟随渠道」的提示文案） */
 const channelLevelProxyLabel = computed(() => {
   const ch = selectedChannel.value;
   if (!ch) return "";
-  if (ch.useFixedProxy) return "渠道级：固定通道";
-  if (ch.useProxyPool) return "渠道级：代理池轮询";
+  const mode = channelProxyModeOf(ch);
+  if (mode === "fixed_channel") return "渠道级：固定通道";
+  if (mode === "custom_node") return "渠道级：自定义节点";
+  if (mode === "pool") return "渠道级：代理池轮询";
   return "渠道级：直连";
 });
 
-/** 渠道级配置推导出的代理模式（用于「与渠道不同」角标判断） */
+/** 渠道级配置推导出的代理模式（用于「与渠道不同」角标判断；fixed_channel 在模型粒度按固定节点族展示） */
 function effectiveChannelProxyMode(): Exclude<ModelProxyMode, ""> {
   const ch = selectedChannel.value;
   if (!ch) return "direct";
-  if (ch.useFixedProxy) return "fixed";
-  if (ch.useProxyPool) return "pool";
-  return "direct";
+  const mode = channelProxyModeOf(ch);
+  if (mode === "pool") return "pool";
+  if (mode === "direct") return "direct";
+  return "fixed";
 }
 
 function setModelProxyMode(model: string, mode: ModelProxyMode) {
@@ -728,6 +743,7 @@ async function saveChannelModelSelection() {
       groupId: k.groupId,
       enabled: k.enabled,
       supportedModels: k.supportedModels,
+      fixedChannelId: k.fixedChannelId || null,
     }));
   }
 
@@ -764,33 +780,103 @@ async function saveChannelModelSelection() {
   }
 }
 
-// —— 渠道「设置」弹窗：别名 / 内部代理池轮询 / 代理池固定通道 ——
+// —— 渠道「设置」弹窗：别名 / 代理设置（四模式合一） ——
+type ChannelProxyMode = "direct" | "pool" | "fixed_channel" | "custom_node";
 interface ChannelSettingsDraft {
   alias: string;
-  useProxyPool: boolean;
-  useFixedProxy: boolean;
+  proxyMode: ChannelProxyMode;
+  /** custom_node 模式锁定的代理池节点 ID */
+  fixedProxyNode: string;
+  /** fixed_channel 模式的渠道默认固定通道 ID */
+  proxyFixedChannel: string;
 }
 
 const channelSettingsTarget = ref<ChannelConfig | null>(null);
 const channelSettingsDraft = ref<ChannelSettingsDraft>({
   alias: "",
-  useProxyPool: false,
-  useFixedProxy: false,
+  proxyMode: "direct",
+  fixedProxyNode: "",
+  proxyFixedChannel: "",
 });
 const channelSettingsError = ref("");
 const channelSettingsTargetIsBuiltin = computed(
   () => channelSettingsTarget.value != null && isBuiltinChannel(channelSettingsTarget.value),
 );
 
+/** 代理池节点候选（自定义节点模式选择用，测速成功者优先按延迟升序） */
+const proxyPoolNodeOptions = ref<{ id: string; name: string; latencyMs: number | null }[]>([]);
+/** 代理池固定通道候选（固定通道模式选择用） */
+const proxyPoolChannelOptions = ref<{ id: string; name: string }[]>([]);
+
+async function loadProxyPoolOptions() {
+  try {
+    const state = await runCommand<Record<string, any>>("get_proxy_pool_state");
+    proxyPoolNodeOptions.value = ((state?.nodes as any[]) ?? [])
+      .filter((n) => n.testStatus === "success")
+      .map((n) => ({ id: n.id, name: n.name, latencyMs: n.latencyMs ?? null }))
+      .sort((a, b) => (a.latencyMs ?? 99999) - (b.latencyMs ?? 99999));
+    proxyPoolChannelOptions.value = ((state?.channels as any[]) ?? []).map((c) => ({
+      id: c.id,
+      name: c.name,
+    }));
+  } catch {
+    /* 加载失败保持空列表，下拉展示空态 */
+  }
+}
+
+/** 通道引用归一化：存量数据若以通道名称存库则转换为通道 ID，绑定与名称解耦；
+ * 候选未加载或无法识别时原样返回（由「已删除」标记兜底展示） */
+function normalizePoolChannelRef(value: string): string {
+  const v = value.trim();
+  if (!v || proxyPoolChannelOptions.value.length === 0) return v;
+  if (proxyPoolChannelOptions.value.some((c) => c.id === v)) return v;
+  return proxyPoolChannelOptions.value.find((c) => c.name === v)?.id ?? v;
+}
+
+/** 通道引用已失联（绑定后被删除）：候选加载完成且无匹配时下拉展示「已删除」标记 */
+function isDeletedPoolChannelRef(value: string): boolean {
+  const v = value.trim();
+  if (!v || proxyPoolChannelOptions.value.length === 0) return false;
+  return !proxyPoolChannelOptions.value.some((c) => c.id === v);
+}
+
+/** 渠道配置 → 四模式的归一化推导（兼容旧布尔字段） */
+function channelProxyModeOf(ch: ChannelConfig | null): ChannelProxyMode {
+  if (!ch) return "direct";
+  const mode = String(ch.proxyMode ?? "").trim().toLowerCase();
+  if (mode === "pool" || mode === "fixed_channel" || mode === "custom_node" || mode === "direct") {
+    return mode as ChannelProxyMode;
+  }
+  if (ch.useFixedProxy) return "custom_node";
+  if (ch.useProxyPool) return "pool";
+  return "direct";
+}
+
+/** 管理模型弹窗当前渠道是否为固定通道模式（Key 行展示通道绑定下拉） */
+const selectedChannelIsFixedChannel = computed(
+  () => channelProxyModeOf(selectedChannel.value) === "fixed_channel",
+);
+
 function handleOpenChannelSettingsDialog(channel: ChannelConfig) {
   channelSettingsTarget.value = channel;
   channelSettingsDraft.value = {
     alias: channelAlias(channel),
-    useProxyPool: channel.useProxyPool,
-    useFixedProxy: !!channel.useFixedProxy,
+    proxyMode: channelProxyModeOf(channel),
+    fixedProxyNode: channel.fixedProxyNode ?? "",
+    proxyFixedChannel: channel.proxyFixedChannel ?? "",
   };
   channelSettingsError.value = "";
   channelSettingsDialogOpen.value = true;
+  // 通道候选加载完成后归一化已绑定通道引用（名称 → ID）；期间用户改动则跳过
+  const original = channelSettingsDraft.value.proxyFixedChannel;
+  void loadProxyPoolOptions().then(() => {
+    if (
+      channelSettingsDialogOpen.value &&
+      channelSettingsDraft.value.proxyFixedChannel === original
+    ) {
+      channelSettingsDraft.value.proxyFixedChannel = normalizePoolChannelRef(original);
+    }
+  });
 }
 
 function closeChannelSettingsDialog() {
@@ -911,19 +997,26 @@ async function saveChannelSettings() {
     return;
   }
   channel.alias = nextAlias;
-  // 两种渠道的设置界面不同：站点转换渠道只有「代理池固定通道」，官方通道只有「内部代理池轮询」
-  if (channel.siteId) {
-    channel.useProxyPool = false;
-    channel.useFixedProxy = channelSettingsDraft.value.useFixedProxy;
-  } else {
-    channel.useProxyPool = channelSettingsDraft.value.useProxyPool;
-    channel.useFixedProxy = false;
-  }
+  // 四模式合一落库；旧布尔字段同步维护，兼容旧版读取方
+  const mode = channelSettingsDraft.value.proxyMode;
+  channel.proxyMode = mode;
+  channel.proxyFixedChannel =
+    mode === "fixed_channel" ? channelSettingsDraft.value.proxyFixedChannel || null : null;
+  channel.fixedProxyNode =
+    mode === "custom_node" ? channelSettingsDraft.value.fixedProxyNode || null : null;
+  channel.useProxyPool = mode === "pool";
+  channel.useFixedProxy = mode === "custom_node" || mode === "fixed_channel";
   const ok = await saveConfig(proxyConfig.value);
   if (ok) {
-    showToast(
-      `已更新「${channel.name}」渠道设置（别名 ${channel.alias}${channel.useFixedProxy ? " · 代理池固定通道" : channel.useProxyPool ? " · 代理池轮询" : ""}）`,
-    );
+    const modeLabel =
+      mode === "pool"
+        ? "代理池轮询"
+        : mode === "fixed_channel"
+          ? "代理池固定通道"
+          : mode === "custom_node"
+            ? "自定义节点"
+            : "强制直连";
+    showToast(`已更新「${channel.name}」渠道设置（别名 ${channel.alias} · ${modeLabel}）`);
     channelSettingsDialogOpen.value = false;
   }
 }
@@ -1113,11 +1206,13 @@ async function confirmConvertSite() {
     upstreamUrl: convertApiBaseUrl.value.trim(),
     apiKey: "",
     apiKeys: [],
-    // 站点转换渠道不支持「内部代理池轮询」，仅可在渠道设置中开启「代理池固定通道」
+    // 站点转换渠道默认强制直连，代理策略可在渠道设置的四模式中选择
     useProxyPool: false,
+    proxyMode: "direct",
     alias: convertAlias.value.trim().toLowerCase(),
     siteId: site.id,
     useFixedProxy: false,
+    proxyFixedChannel: null,
     enabledModels: null,
   };
   proxyConfig.value.channels.push(channel);
@@ -3955,6 +4050,29 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
                     </div>
 
                     <div class="mp-kg-key-controls">
+                      <!-- 固定通道模式：为该 Key 绑定代理池通道（不同账号走不同通道） -->
+                      <select
+                        v-if="selectedChannelIsFixedChannel"
+                        v-model="kItem.fixedChannelId"
+                        class="mp-kg-group-select"
+                        title="该 Key 绑定的代理池固定通道；留空使用渠道默认通道"
+                      >
+                        <option value="">默认通道</option>
+                        <option
+                          v-if="isDeletedPoolChannelRef(kItem.fixedChannelId)"
+                          :value="kItem.fixedChannelId"
+                        >
+                          原通道已删除
+                        </option>
+                        <option
+                          v-for="pc in proxyPoolChannelOptions"
+                          :key="pc.id"
+                          :value="pc.id"
+                        >
+                          {{ pc.name }}
+                        </option>
+                      </select>
+
                       <!-- 移动所属分组下拉框 -->
                       <select
                         v-model="kItem.groupId"
@@ -4097,53 +4215,81 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
             <p v-else class="mp-settings-hint">所有渠道别名不能重复（含 opencode）</p>
           </div>
 
-          <!-- 内部代理池轮询（仅官方免费通道，如 OpenCode） -->
-          <div v-if="!channelSettingsTarget?.siteId" class="mp-proxy-pool-box">
-            <div class="mp-proxy-pool-row">
-              <div class="mp-proxy-pool-label">
-                <span class="mp-pp-icon" v-html="icons.repeat" />
-                <span>内部代理池轮询</span>
-              </div>
-              <label class="mp-switch-wrap" :title="channelSettingsDraft.useProxyPool ? '点击关闭代理池轮询' : '点击开启内部代理池轮询'">
-                <input
-                  v-model="channelSettingsDraft.useProxyPool"
-                  type="checkbox"
-                />
-                <span class="mp-switch-round" />
-              </label>
-            </div>
-
-            <div v-if="channelSettingsDraft.useProxyPool" class="mp-proxy-pool-status is-active">
-              <span class="mp-status-dot-sm" />
-              <span>优先直连，报错自动按速度切换至代理池 <strong>≤ 1000ms</strong> 节点（粘性保持）</span>
-            </div>
-            <div v-else class="mp-proxy-pool-status is-inactive">
-              <span>当前网络模式：直接连接 (直连上游通道)</span>
-            </div>
-          </div>
-
-          <!-- 代理池固定通道（仅站点转换渠道） -->
-          <div v-if="channelSettingsTarget?.siteId" class="mp-proxy-pool-box">
+          <!-- 代理设置（四模式合一，合并旧「内部代理池轮询 / 代理池固定通道」双开关） -->
+          <div class="mp-proxy-pool-box">
             <div class="mp-proxy-pool-row">
               <div class="mp-proxy-pool-label">
                 <span class="mp-pp-icon" v-html="icons.shield" />
-                <span>代理池固定通道</span>
+                <span>代理设置</span>
               </div>
-              <label class="mp-switch-wrap" :title="channelSettingsDraft.useFixedProxy ? '点击关闭固定通道' : '点击开启代理池固定通道'">
-                <input
-                  v-model="channelSettingsDraft.useFixedProxy"
-                  type="checkbox"
-                />
-                <span class="mp-switch-round" />
-              </label>
+              <select
+                v-model="channelSettingsDraft.proxyMode"
+                class="mp-settings-input"
+                title="渠道出网代理策略，默认强制直连"
+              >
+                <option value="direct">强制直连（默认）</option>
+                <option value="pool">代理池（轮询 + 失败切换）</option>
+                <option value="fixed_channel">固定通道（代理池）</option>
+                <option value="custom_node">自定义节点（代理池）</option>
+              </select>
             </div>
 
-            <div v-if="channelSettingsDraft.useFixedProxy" class="mp-proxy-pool-status is-active">
-              <span class="mp-status-dot-sm" />
-              <span>始终经同一代理池出口节点转发（不直连、不轮换），适合直连被限制的站点渠道</span>
+            <div v-if="channelSettingsDraft.proxyMode === 'direct'" class="mp-proxy-pool-status is-inactive">
+              <span>不走任何代理，直连上游通道（默认）</span>
             </div>
-            <div v-else class="mp-proxy-pool-status is-inactive">
-              <span>默认出口：直连上游通道</span>
+            <div v-else-if="channelSettingsDraft.proxyMode === 'pool'" class="mp-proxy-pool-status is-active">
+              <span class="mp-status-dot-sm" />
+              <span>优先直连，报错自动按速度切换至代理池 <strong>≤ 1000ms</strong> 节点（粘性保持）</span>
+            </div>
+            <div v-else-if="channelSettingsDraft.proxyMode === 'fixed_channel'" class="mp-proxy-pool-status is-active">
+              <span class="mp-status-dot-sm" />
+              <span>固定经代理池通道出口转发；可在「管理可用模型 → Key 分组」为不同 Key 绑定不同通道</span>
+            </div>
+            <div v-else class="mp-proxy-pool-status is-active">
+              <span class="mp-status-dot-sm" />
+              <span>恒定使用所选单一节点出口（不直连、不轮换）</span>
+            </div>
+
+            <!-- 固定通道：选择渠道默认通道（Key 可在 Key 分组中按 Key 覆盖） -->
+            <div v-if="channelSettingsDraft.proxyMode === 'fixed_channel'" class="mp-proxy-pool-row" style="margin-top: 10px;">
+              <div class="mp-proxy-pool-label">
+                <span class="mp-pp-icon" v-html="icons.globe" />
+                <span>默认固定通道</span>
+              </div>
+              <select
+                v-model="channelSettingsDraft.proxyFixedChannel"
+                class="mp-settings-input"
+                title="未单独绑定通道的 Key 使用该通道"
+              >
+                <option value="">请选择通道</option>
+                <option
+                  v-if="isDeletedPoolChannelRef(channelSettingsDraft.proxyFixedChannel)"
+                  :value="channelSettingsDraft.proxyFixedChannel"
+                >
+                  原通道已删除（请重新选择）
+                </option>
+                <option v-for="pc in proxyPoolChannelOptions" :key="pc.id" :value="pc.id">
+                  {{ pc.name }}
+                </option>
+              </select>
+            </div>
+
+            <!-- 自定义节点：选择代理池单一节点（参照固定通道设置的候选口径） -->
+            <div v-if="channelSettingsDraft.proxyMode === 'custom_node'" class="mp-proxy-pool-row" style="margin-top: 10px;">
+              <div class="mp-proxy-pool-label">
+                <span class="mp-pp-icon" v-html="icons.activity" />
+                <span>固定出口节点</span>
+              </div>
+              <select
+                v-model="channelSettingsDraft.fixedProxyNode"
+                class="mp-settings-input"
+                title="恒定使用该节点出网；留空锁定池内首个启用节点"
+              >
+                <option value="">请选择节点</option>
+                <option v-for="pn in proxyPoolNodeOptions" :key="pn.id" :value="pn.id">
+                  {{ pn.name }}{{ pn.latencyMs != null ? ` · ${pn.latencyMs}ms` : "" }}
+                </option>
+              </select>
             </div>
           </div>
         </div>

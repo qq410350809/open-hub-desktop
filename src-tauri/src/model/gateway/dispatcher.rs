@@ -94,7 +94,7 @@ pub async fn execute_resilient_egress(
     body: &JsonValue,
     client_protocol: ClientProtocol,
 ) -> Result<EgressSuccess, Response> {
-    let candidates = get_sorted_egress_candidates(ctx, channel, &meta.model).await;
+    let candidates = get_sorted_egress_candidates(ctx, channel, &meta.model, channel_api_key).await;
     let max_retries = config.max_retries as usize;
     let total_attempts_allowed = max_retries + 1;
     let base_node_idx = ctx.node_round_robin.load(Ordering::Relaxed);

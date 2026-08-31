@@ -320,6 +320,7 @@ fn caches_only_the_profile_api_counts() {
         keys: vec!["sk-one".into(), "sk-two".into()],
         key_groups: HashMap::new(),
         key_models: HashMap::new(),
+        errors: Vec::new(),
     };
     cache_profile_api_counts(&database, Some("site-a"), Some("Default"), result).unwrap();
     let connection = database.0.lock().unwrap();
@@ -331,6 +332,102 @@ fn caches_only_the_profile_api_counts() {
             )
             .unwrap();
     assert_eq!(counts, (2, 1));
+}
+
+#[test]
+fn sync_failure_error_is_persisted_to_model_cache() {
+    // 回归保护：同步失败收集的 errors 必须写进 site_model_cache.error，
+    // 即便调用方只带了 account.error 空串。目前 key 同步失败后界面只显示
+    // "0 个 Key"，看不到失败原因，就是这段阵地空转导致的。
+    let connection = Connection::open_in_memory().unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE site_accounts (
+                    site_id TEXT NOT NULL,
+                    profile_id TEXT NOT NULL,
+                    is_valid INTEGER NOT NULL DEFAULT 0,
+                    sync_error TEXT NOT NULL DEFAULT '',
+                    api_sync_error TEXT NOT NULL DEFAULT ''
+                 );
+                 CREATE TABLE site_model_cache (
+                    site_id TEXT NOT NULL,
+                    profile_id TEXT NOT NULL,
+                    profile_name TEXT NOT NULL DEFAULT '',
+                    account_name TEXT NOT NULL DEFAULT '',
+                    username TEXT NOT NULL DEFAULT '',
+                    api_source TEXT NOT NULL DEFAULT '',
+                    keys_json TEXT NOT NULL DEFAULT '[]',
+                    groups_json TEXT NOT NULL DEFAULT '{}',
+                    models_json TEXT NOT NULL DEFAULT '[]',
+                    key_models_json TEXT NOT NULL DEFAULT '{}',
+                    error TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY (site_id, profile_id)
+                 );",
+        )
+        .unwrap();
+    let database = Database(std::sync::Mutex::new(connection));
+
+    let empty_result = SiteModelsResult {
+        models: vec![],
+        source: "newapi-key".into(),
+        keys: vec![],
+        key_groups: HashMap::new(),
+        key_models: HashMap::new(),
+        errors: vec!["Profile 11：Sub2API Key 接口请求失败".into()],
+    };
+    let account = SiteModelCacheAccount {
+        profile_id: "Profile 11".into(),
+        profile_name: "吴锁明".into(),
+        account_name: "wusuoming@gmail.com".into(),
+        username: "wusuoming".into(),
+        keys: vec![],
+        key_groups: HashMap::new(),
+        key_models: HashMap::new(),
+        error: "".into(),
+    };
+    save_site_model_cache(&database, "site-ai", &account, Some(&empty_result), false).unwrap();
+    let saved: String = database
+        .0
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT error FROM site_model_cache WHERE site_id='site-ai' AND profile_id='Profile 11'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        saved.contains("Sub2API Key 接口请求失败"),
+        "同步失败原因未落库，实际 error: {saved}"
+    );
+
+    // 有 Key 时错误不应落库（上次失败后本次恢复 → 错误清干净）
+    let ok_result = SiteModelsResult {
+        models: vec![SiteModelItem {
+            id: "m1".into(),
+            owned_by: None,
+        }],
+        source: "newapi-key".into(),
+        keys: vec!["sk-live".into()],
+        key_groups: HashMap::new(),
+        key_models: HashMap::new(),
+        errors: vec![],
+    };
+    let mut account_ok = account.clone();
+    account_ok.keys = vec!["sk-live".into()];
+    save_site_model_cache(&database, "site-ai", &account_ok, Some(&ok_result), false).unwrap();
+    let saved2: String = database
+        .0
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT error FROM site_model_cache WHERE site_id='site-ai' AND profile_id='Profile 11'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(saved2.is_empty(), "成功时遗留错误未清：{saved2}");
 }
 
 #[test]

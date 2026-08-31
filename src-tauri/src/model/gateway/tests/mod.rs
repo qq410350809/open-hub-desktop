@@ -46,6 +46,8 @@ fn channel_alias_fallback_and_normalization() {
         use_proxy_pool: false,
         alias: Some(" VIP_Channel ".to_string()),
         site_id: None,
+        proxy_mode: None,
+        proxy_fixed_channel: None,
         use_fixed_proxy: false,
         fixed_proxy_node: None,
         priority: None,
@@ -83,6 +85,8 @@ fn resolves_channels_with_alias_prefix_or_model_whitelist() {
                 use_proxy_pool: false,
                 alias: Some("opencode".to_string()),
                 site_id: None,
+                proxy_mode: None,
+                proxy_fixed_channel: None,
                 use_fixed_proxy: false,
                 fixed_proxy_node: None,
                 priority: Some(1),
@@ -107,6 +111,8 @@ fn resolves_channels_with_alias_prefix_or_model_whitelist() {
                 use_proxy_pool: false,
                 alias: Some("vip".to_string()),
                 site_id: None,
+                proxy_mode: None,
+                proxy_fixed_channel: None,
                 use_fixed_proxy: false,
                 fixed_proxy_node: None,
                 priority: Some(2),
@@ -158,6 +164,8 @@ fn order_test_channel(id: &str, alias: &str, enabled: bool) -> ChannelConfig {
         use_proxy_pool: false,
         alias: Some(alias.to_string()),
         site_id: None,
+        proxy_mode: None,
+        proxy_fixed_channel: None,
         use_fixed_proxy: false,
         fixed_proxy_node: None,
         priority: None,
@@ -285,6 +293,8 @@ async fn multi_key_round_robin_selection() {
         use_proxy_pool: false,
         alias: None,
         site_id: None,
+        proxy_mode: None,
+        proxy_fixed_channel: None,
         use_fixed_proxy: false,
         fixed_proxy_node: None,
         priority: None,
@@ -335,6 +345,8 @@ async fn channel_key_groups_failover_and_filtering() {
         use_proxy_pool: false,
         alias: None,
         site_id: None,
+        proxy_mode: None,
+        proxy_fixed_channel: None,
         use_fixed_proxy: false,
         fixed_proxy_node: None,
         priority: None,
@@ -366,31 +378,36 @@ async fn channel_key_groups_failover_and_filtering() {
                 key: "key-primary-1".to_string(),
                 group_id: "primary".to_string(),
                 enabled: true,
-                supported_models: None, // 支持全部
+                supported_models: None,
+                fixed_channel_id: None,
             },
             ChannelKeyRule {
                 key: "key-primary-2".to_string(),
                 group_id: "primary".to_string(),
                 enabled: true,
-                supported_models: None, // 支持全部
+                supported_models: None,
+                fixed_channel_id: None,
             },
             ChannelKeyRule {
                 key: "key-backup-1".to_string(),
                 group_id: "backup".to_string(),
                 enabled: true,
                 supported_models: None,
+                fixed_channel_id: None,
             },
             ChannelKeyRule {
                 key: "key-disabled".to_string(),
                 group_id: "primary".to_string(),
                 enabled: false, // 单 Key 禁用
                 supported_models: None,
+                fixed_channel_id: None,
             },
             ChannelKeyRule {
                 key: "key-gpt4-only".to_string(),
                 group_id: "primary".to_string(),
                 enabled: true,
-                supported_models: Some(vec!["gpt-4".to_string()]), // 仅支持 gpt-4
+                supported_models: Some(vec!["gpt-4".to_string()]),
+                fixed_channel_id: None,
             },
         ]),
         model_proxy_rules: None,
@@ -630,6 +647,8 @@ fn opencode_channel_detection_covers_id_protocol_alias_url_and_name() {
             use_proxy_pool: false,
             alias: alias.map(|s| s.to_string()),
             site_id: None,
+            proxy_mode: None,
+            proxy_fixed_channel: None,
             use_fixed_proxy: false,
             fixed_proxy_node: None,
             priority: None,
@@ -989,6 +1008,8 @@ async fn opencode_model_compatibility_and_anonymous_mode() {
         use_proxy_pool: false,
         alias: Some("opencode".to_string()),
         site_id: None,
+        proxy_mode: None,
+        proxy_fixed_channel: None,
         use_fixed_proxy: false,
         fixed_proxy_node: None,
         priority: None,
@@ -1046,6 +1067,8 @@ fn stats_channel(id: &str, alias: Option<&str>, stats_id: Option<u32>) -> Channe
         use_proxy_pool: false,
         alias: alias.map(|s| s.to_string()),
         site_id: None,
+        proxy_mode: None,
+        proxy_fixed_channel: None,
         use_fixed_proxy: false,
         fixed_proxy_node: None,
         priority: None,
@@ -1138,21 +1161,51 @@ async fn spawn_scripted_upstream(
     std::net::SocketAddr,
     std::sync::Arc<std::sync::atomic::AtomicUsize>,
 ) {
+    let (addr, counter, _arrivals) = spawn_scripted_upstream_with_arrivals(script).await;
+    (addr, counter)
+}
+
+/// 同 spawn_scripted_upstream，额外返回每次请求到达服务端的时间戳：
+/// 「重试退避时长」用两次到达的间隔断言（间隔 = 退避 + 毫秒级网络耗时），
+/// 不受客户端墙钟在本机网络扩展下可达数秒的波动影响。
+async fn spawn_scripted_upstream_with_arrivals(
+    script: Vec<(axum::http::StatusCode, &'static str)>,
+) -> (
+    std::net::SocketAddr,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    std::sync::Arc<std::sync::Mutex<Vec<std::time::Instant>>>,
+) {
+    assert!(!script.is_empty(), "script 至少包含一项");
+    warmup_loopback().await;
+    spawn_mock_upstream(script).await
+}
+
+/// mock 上游构建实体（不做预热，避免与预热入口形成 async 递归）。
+async fn spawn_mock_upstream(
+    script: Vec<(axum::http::StatusCode, &'static str)>,
+) -> (
+    std::net::SocketAddr,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    std::sync::Arc<std::sync::Mutex<Vec<std::time::Instant>>>,
+) {
     use axum::{routing::post, Router};
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
-    assert!(!script.is_empty(), "script 至少包含一项");
     let counter = Arc::new(AtomicUsize::new(0));
+    let arrivals = Arc::new(Mutex::new(Vec::new()));
     let script = Arc::new(script);
     let script_for_route = script.clone();
     let counter_for_route = counter.clone();
+    let arrivals_for_route = arrivals.clone();
     let app = Router::new().route(
         "/v1/chat/completions",
         post(move || {
             let script = script_for_route.clone();
             let counter = counter_for_route.clone();
+            let arrivals = arrivals_for_route.clone();
             async move {
+                arrivals.lock().unwrap().push(std::time::Instant::now());
                 let n = counter.fetch_add(1, Ordering::SeqCst);
                 let (status, body) = if n < script.len() {
                     script[n]
@@ -1168,7 +1221,34 @@ async fn spawn_scripted_upstream(
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
-    (addr, counter)
+    (addr, counter, arrivals)
+}
+
+/// 回环冷启动预热。macOS 防火墙/网络扩展（代理类工具的透明接管）对本进程
+/// 批量并行测试时的首批 TCP 连接有 1~4 秒的放行延迟，实测裸 TcpStream::
+/// connect 到 127.0.0.1 也要 1.4 秒；首批连接偶发被重置还会污染 mock 请求
+/// 计数。这里向独立的一次性 mock 连发 3 个请求消化冷启动，避免污染
+/// egress 测试的墙钟断言（elapsed 上限）与请求次数断言。
+async fn warmup_loopback() {
+    let (addr, counter, _arrivals) =
+        spawn_mock_upstream(vec![(axum::http::StatusCode::OK, valid_chat_payload())]).await;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .no_proxy()
+        .build()
+        .unwrap_or_default();
+    for _ in 0..3 {
+        let _ = client
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .header("Content-Type", "application/json")
+            .body(valid_chat_payload())
+            .send()
+            .await;
+    }
+    // 预热失败不影响测试正确性，仅失去抗噪保护
+    if counter.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        tracing::warn!("[egress-test] 回环预热未收到任何请求，后续墙钟断言可能不稳");
+    }
 }
 
 fn valid_chat_payload() -> &'static str {
@@ -1189,6 +1269,8 @@ fn egress_test_channel(id: &str, base_url: String) -> ChannelConfig {
         use_proxy_pool: false,
         alias: None,
         site_id: None,
+        proxy_mode: None,
+        proxy_fixed_channel: None,
         use_fixed_proxy: false,
         fixed_proxy_node: None,
         priority: None,
@@ -1245,10 +1327,10 @@ async fn run_egress(
 #[tokio::test]
 async fn opencode_503_retries_inplace_once_then_succeeds_without_consuming_retry_budget() {
     use std::sync::atomic::Ordering;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     // max_retries=0：常规预算只有 1 次尝试，503 原地重试必须独立于该预算生效
-    let (addr, counter) = spawn_scripted_upstream(vec![
+    let (addr, counter, arrivals) = spawn_scripted_upstream_with_arrivals(vec![
         (
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
             r#"{"error":{"message":"upstream unavailable"}}"#,
@@ -1258,11 +1340,9 @@ async fn opencode_503_retries_inplace_once_then_succeeds_without_consuming_retry
     .await;
     let channel = egress_test_channel("opencode", format!("http://{addr}/v1"));
 
-    let started = Instant::now();
     let success = run_egress(&channel, 0)
         .await
         .expect("首次 503 后原地重试应成功");
-    let elapsed = started.elapsed();
 
     assert_eq!(success.status, 200);
     assert_eq!(
@@ -1270,11 +1350,17 @@ async fn opencode_503_retries_inplace_once_then_succeeds_without_consuming_retry
         2,
         "同一节点应恰好发送 2 次（首次 + 原地重试），且不切换节点"
     );
+    // 退避时长用服务端到达间隔测量：间隔 >= 1 秒退避。该方向噪声免疫
+    // （调度延迟只会拉大间隔，不会缩短）。「退避没有变长」无法在并行满载
+    // 下用间隔可靠断言——调度延迟与退避增长不可区分（实测满载可达 4.6s），
+    // 行为契约由次数断言（恰好 2 次、不切节点）承载
+    let arrivals = arrivals.lock().unwrap().clone();
+    assert_eq!(arrivals.len(), 2);
+    let gap = arrivals[1].duration_since(arrivals[0]);
     assert!(
-        elapsed >= Duration::from_millis(1000),
-        "原地重试前必须等待 1 秒"
+        gap >= Duration::from_millis(900),
+        "原地重试前必须等待 1 秒（服务端到达间隔 {gap:?}）"
     );
-    assert!(elapsed < Duration::from_millis(3000));
 }
 
 #[tokio::test]
@@ -1305,7 +1391,6 @@ async fn opencode_persistent_503_gets_one_inplace_retry_per_node_before_switchin
 #[tokio::test]
 async fn non_opencode_channel_does_not_inplace_retry_on_503() {
     use std::sync::atomic::Ordering;
-    use std::time::{Duration, Instant};
 
     // 5xx 原地重试已通用化：转发渠道/普通渠道同样享受每节点一次的免费原地重试。
     // max_retries=0 时仅一次机会，503 后原地重试成功即返回 200。
@@ -1445,20 +1530,18 @@ async fn opencode_empty_payload_participates_in_node_rotation_before_400() {
 #[tokio::test]
 async fn opencode_valid_200_payload_does_not_retry() {
     use std::sync::atomic::Ordering;
-    use std::time::{Duration, Instant};
 
-    // 正常内容不得误判为空：仅发送 1 次、无等待
+    // 正常内容不得误判为空：仅发送 1 次。不设墙钟上限——请求次数断言已完整
+    // 承载「无重试」契约，而本机网络扩展冷启动下墙钟波动可达数秒，任何
+    // 紧上限都必然间歇性误报
     let (addr, counter) =
         spawn_scripted_upstream(vec![(axum::http::StatusCode::OK, valid_chat_payload())]).await;
     let channel = egress_test_channel("opencode", format!("http://{addr}/v1"));
 
-    let started = Instant::now();
     let success = run_egress(&channel, 0).await.expect("正常响应应直接成功");
-    let elapsed = started.elapsed();
 
     assert_eq!(success.status, 200);
     assert_eq!(counter.load(Ordering::SeqCst), 1, "有效内容不应重试");
-    assert!(elapsed < Duration::from_millis(2500));
 
     // 纯文本/HTML 等 200 负载不属于「空内容」，同样不重试
     let (addr, counter) =
@@ -1557,6 +1640,8 @@ fn sanitize_clears_keys_for_site_linked_channels_only() {
         use_proxy_pool: false,
         alias: Some("fengwind-api".to_string()),
         site_id: Some("local-1".to_string()),
+        proxy_mode: None,
+        proxy_fixed_channel: None,
         use_fixed_proxy: false,
         fixed_proxy_node: None,
         priority: None,
@@ -1582,6 +1667,8 @@ fn sanitize_clears_keys_for_site_linked_channels_only() {
         use_proxy_pool: false,
         alias: Some("manual".to_string()),
         site_id: None,
+        proxy_mode: None,
+        proxy_fixed_channel: None,
         use_fixed_proxy: false,
         fixed_proxy_node: None,
         priority: None,
@@ -1682,6 +1769,8 @@ async fn resolve_channel_api_keys_reads_site_cache_and_dedupes() {
         use_proxy_pool: false,
         alias: Some("fengwind-api".to_string()),
         site_id: Some("local-1".to_string()),
+        proxy_mode: None,
+        proxy_fixed_channel: None,
         use_fixed_proxy: false,
         fixed_proxy_node: None,
         priority: None,
@@ -1714,6 +1803,8 @@ async fn resolve_channel_api_keys_reads_site_cache_and_dedupes() {
         use_proxy_pool: false,
         alias: Some("manual".to_string()),
         site_id: None,
+        proxy_mode: None,
+        proxy_fixed_channel: None,
         use_fixed_proxy: false,
         fixed_proxy_node: None,
         priority: None,

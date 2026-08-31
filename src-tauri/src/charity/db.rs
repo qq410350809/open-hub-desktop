@@ -1,7 +1,7 @@
 use crate::charity::types::*;
 use crate::context::EventBus;
 use crate::models::Database;
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashMap;
 
 pub fn load_charity_sources(database: &Database) -> Result<Vec<CharityFeedSource>, String> {
@@ -73,6 +73,45 @@ pub fn charity_feed_source(
         .map_err(|_| format!("不支持的 Linux.do 标签：{feed_id}"))
 }
 
+/// 删除标签源：独属于该标签的帖子一并删除，仍属于其他订阅标签的帖子保留。
+/// 返回被连带删除的帖子行数。
+pub fn remove_charity_source_db(connection: &Connection, feed_id: &str) -> Result<usize, String> {
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|error| error.to_string())?;
+    let removed_items = transaction
+        .execute(
+            "DELETE FROM charity_feed_items
+             WHERE feed_id = ?1
+               AND guid NOT IN (
+                 SELECT guid FROM charity_feed_items WHERE feed_id <> ?1
+               )",
+            params![feed_id],
+        )
+        .map_err(|error| format!("删除标签帖子失败：{error}"))?;
+    transaction
+        .execute(
+            "DELETE FROM charity_feed_sources WHERE id = ?1",
+            params![feed_id],
+        )
+        .map_err(|error| format!("删除标签源失败：{error}"))?;
+    let keys = feed_meta_keys(feed_id);
+    for key in [
+        keys.initialized,
+        keys.source_url,
+        keys.fetched_at,
+        keys.read_at,
+        keys.last_status,
+        keys.last_message,
+        keys.last_node,
+        keys.last_updated,
+    ] {
+        let _ = transaction.execute("DELETE FROM app_meta WHERE key = ?1", params![key]);
+    }
+    transaction.commit().map_err(|error| error.to_string())?;
+    Ok(removed_items)
+}
+
 pub fn append_charity_sync_log(
     database: &Database,
     feed_id: &str,
@@ -81,14 +120,15 @@ pub fn append_charity_sync_log(
     status: &str,
     message: &str,
     node_name: &str,
+    detail_json: &str,
 ) -> Option<i64> {
     let connection = database.lock_db();
     if connection
         .execute(
             "INSERT INTO charity_sync_logs
-             (feed_id, feed_name, stage, status, message, node_name, duration_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)",
-            params![feed_id, feed_name, stage, status, message, node_name],
+             (feed_id, feed_name, stage, status, message, node_name, duration_ms, detail_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7)",
+            params![feed_id, feed_name, stage, status, message, node_name, detail_json],
         )
         .is_err()
     {
@@ -114,13 +154,14 @@ pub fn update_charity_sync_log(
     message: &str,
     node_name: &str,
     duration_ms: i64,
+    detail_json: &str,
 ) {
     let connection = database.lock_db();
     let _ = connection.execute(
         "UPDATE charity_sync_logs
-         SET status = ?1, message = ?2, node_name = ?3, duration_ms = ?4
-         WHERE id = ?5 AND status = 'running'",
-        params![status, message, node_name, duration_ms, id],
+         SET status = ?1, message = ?2, node_name = ?3, duration_ms = ?4, detail_json = ?5
+         WHERE id = ?6 AND status = 'running'",
+        params![status, message, node_name, duration_ms, detail_json, id],
     );
 }
 
@@ -183,7 +224,13 @@ pub fn finish_charity_sync_log(
     unread_count: usize,
 ) {
     if let Some(id) = log_id {
-        update_charity_sync_log(database, id, status, message, node_name, duration_ms);
+        let detail_json = serde_json::json!({
+            "new": new_count,
+            "updated": updated_count,
+            "unread": unread_count,
+        })
+        .to_string();
+        update_charity_sync_log(database, id, status, message, node_name, duration_ms, &detail_json);
     }
     emit_charity_progress(
         bus,
@@ -210,7 +257,7 @@ pub fn list_charity_sync_logs(
     let connection = database.lock_conn()?;
     let mut statement = connection
         .prepare(
-            "SELECT id, created_at, feed_id, feed_name, stage, status, message, node_name, duration_ms
+            "SELECT id, created_at, feed_id, feed_name, stage, status, message, node_name, duration_ms, detail_json
              FROM charity_sync_logs
              ORDER BY created_at DESC, id DESC
              LIMIT ?1",
@@ -218,6 +265,12 @@ pub fn list_charity_sync_logs(
         .map_err(|error| error.to_string())?;
     let rows = statement
         .query_map(params![limit as i64], |row| {
+            let detail_raw: String = row.get(9)?;
+            let detail = if detail_raw.trim().is_empty() {
+                None
+            } else {
+                serde_json::from_str::<serde_json::Value>(&detail_raw).ok()
+            };
             Ok(CharitySyncLogEntry {
                 id: row.get(0)?,
                 at: row.get(1)?,
@@ -228,6 +281,7 @@ pub fn list_charity_sync_logs(
                 message: row.get(6)?,
                 node_name: row.get(7)?,
                 duration_ms: row.get(8)?,
+                detail,
             })
         })
         .map_err(|error| error.to_string())?

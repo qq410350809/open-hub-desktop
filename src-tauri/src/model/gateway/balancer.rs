@@ -401,8 +401,10 @@ pub async fn get_sorted_egress_candidates(
     ctx: &ModelProxyContext,
     channel: &ChannelConfig,
     model: &str,
+    api_key: &str,
 ) -> Vec<String> {
-    // 模型级覆盖优先于渠道级配置：「管理可用模型」中为该模型单独选择的代理策略
+    // 模型级覆盖优先于渠道级配置：「管理可用模型」中为该模型单独选择的代理策略。
+    // follow（跟随渠道）与未知值一律落回渠道级设置。
     if let Some(rule) = channel.model_proxy_rule(model) {
         let mode = rule.mode.trim().to_lowercase();
         if mode == "direct" {
@@ -415,7 +417,7 @@ pub async fn get_sorted_egress_candidates(
                     return vec![node.to_string()];
                 }
             }
-            // 未指定节点时锁定池内首个启用节点（与渠道级固定通道语义一致）
+            // 未指定节点时锁定池内首个启用节点（与渠道级固定节点语义一致）
             if let Some(first) = first_enabled_pool_node(ctx).await {
                 return vec![first];
             }
@@ -426,42 +428,46 @@ pub async fn get_sorted_egress_candidates(
             candidates.extend(enabled_pool_nodes(ctx).await);
             return candidates;
         }
-        // 未知模式回退渠道级配置
+        // follow / 未知模式 → 跟随渠道级配置
     }
 
-    if channel.use_fixed_proxy {
-        if let Some(ref node) = channel.fixed_proxy_node {
-            if !node.trim().is_empty() {
-                return vec![node.trim().to_string()];
+    match channel.effective_proxy_mode().as_str() {
+        // 代理池轮询（沿用 opencode 逻辑）：优先直连，失败按速度切换池内节点
+        "pool" => {
+            let mut candidates = vec!["__direct__".to_string()];
+            candidates.extend(enabled_pool_nodes(ctx).await);
+            if candidates.len() > 1 {
+                return candidates;
+            }
+            vec!["__direct__".to_string()]
+        }
+        // 自定义节点：恒定使用单一出口节点（不直连、不轮换）
+        "custom_node" => {
+            if let Some(ref node) = channel.fixed_proxy_node {
+                let node = node.trim();
+                if !node.is_empty() {
+                    return vec![node.to_string()];
+                }
+            }
+            if let Some(first) = first_enabled_pool_node(ctx).await {
+                return vec![first];
+            }
+            vec!["__direct__".to_string()]
+        }
+        // 代理池固定通道：走通道的专用 lane 出口，不同 Key 可绑定不同通道；
+        // 未绑定任何通道时直连兜底
+        "fixed_channel" => {
+            let channel_id = channel
+                .key_fixed_channel(api_key)
+                .or_else(|| channel.default_fixed_channel());
+            match channel_id {
+                Some(id) => vec![format!("__proxy_channel__:{id}")],
+                None => vec!["__direct__".to_string()],
             }
         }
+        // 强制直连（默认）
+        _ => vec!["__direct__".to_string()],
     }
-
-    if !channel.use_proxy_pool && !channel.use_fixed_proxy {
-        return vec!["__direct__".to_string()];
-    }
-
-    let mut candidates = Vec::new();
-    if !channel.use_fixed_proxy {
-        candidates.push("__direct__".to_string());
-    }
-
-    if channel.use_fixed_proxy {
-        // 固定通道语义：恒定使用单一出口节点。未手动指定节点时按 rowid 锁定
-        // 首个启用节点（绝对稳定，不随延迟测量值漂移），绝不进入多节点轮换，
-        // 否则重试/轮询游标会让流量在池内漂移，「固定」名存实亡。
-        if let Some(first) = first_enabled_pool_node(ctx).await {
-            return vec![first];
-        }
-    } else {
-        candidates.extend(enabled_pool_nodes(ctx).await);
-    }
-
-    if candidates.is_empty() {
-        candidates.push("__direct__".to_string());
-    }
-
-    candidates
 }
 
 /// 池内启用节点 ID 列表：测活成功者优先，其后按延迟升序，最后按入库序
@@ -520,6 +526,37 @@ pub async fn build_client_for_candidate(
         return ctx.default_http_client.read().await.clone();
     }
 
+    // 代理池固定通道候选：走该通道的专用 lane 监听端口（通道绑定节点由
+    // ensure_channel_instance 保证就绪），不占用共享实例的 select 组。
+    if let Some(channel_id) = candidate.strip_prefix("__proxy_channel__:") {
+        if let Some(app_ctx) = ctx.app_ctx.read().await.as_ref() {
+            let database = &app_ctx.database;
+            let runtime = &app_ctx.proxy_runtime;
+            let channel_id = channel_id.to_string();
+            let lane = tokio::task::block_in_place(|| {
+                crate::proxypool::ensure_channel_instance(database, runtime, &channel_id)
+            });
+            match lane {
+                Ok(port) => {
+                    if let Ok(proxy) = reqwest::Proxy::all(format!("http://127.0.0.1:{port}")) {
+                        if let Ok(client) = reqwest::Client::builder()
+                            .proxy(proxy)
+                            .pool_max_idle_per_host(0)
+                            .timeout(timeout)
+                            .build()
+                        {
+                            return client;
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("[ModelGateway] 就绪固定通道 {channel_id} 失败: {e}");
+                }
+            }
+        }
+        return ctx.default_http_client.read().await.clone();
+    }
+
     if let Some(ctx) = ctx.app_ctx.read().await.as_ref() {
         let database = &ctx.database;
         let runtime = &ctx.proxy_runtime;
@@ -550,6 +587,28 @@ pub async fn build_client_for_candidate(
 pub async fn get_node_display_name(ctx: &ModelProxyContext, candidate: &str) -> String {
     if candidate == "__direct__" {
         return "直连通道".to_string();
+    }
+
+    // 代理池固定通道候选：显示通道名
+    if let Some(channel_id) = candidate.strip_prefix("__proxy_channel__:") {
+        if let Some(app_ctx) = ctx.app_ctx.read().await.as_ref() {
+            let name_opt: Option<String> = match app_ctx.database.0.lock() {
+                Ok(conn) => conn
+                    .query_row(
+                        "SELECT name FROM proxy_channels WHERE id = ?1",
+                        [channel_id],
+                        |row| row.get(0),
+                    )
+                    .ok(),
+                Err(_) => None,
+            };
+            if let Some(name) = name_opt {
+                if !name.trim().is_empty() {
+                    return format!("固定通道 · {name}");
+                }
+            }
+        }
+        return "代理池固定通道".to_string();
     }
 
     if let Some(ctx) = ctx.app_ctx.read().await.as_ref() {

@@ -34,17 +34,17 @@ async function loadCharitySources() {
   }
 }
 
-async function addCharitySource(id: string, name: string, jsonUrl?: string) {
+async function addCharitySource(id: string, name: string) {
   charitySourcesLoading.value = true;
   try {
-    await runCommand("add_charity_source", { id, name, jsonUrl: jsonUrl || null });
+    await runCommand("add_charity_source", { id, name });
     await loadCharitySources();
   } finally {
     charitySourcesLoading.value = false;
   }
 }
 
-async function updateCharitySource(id: string, opts: { name?: string; jsonUrl?: string; enabled?: boolean }) {
+async function updateCharitySource(id: string, opts: { name?: string; enabled?: boolean }) {
   charitySourcesLoading.value = true;
   try {
     await runCommand("update_charity_source", { id, ...opts });
@@ -61,8 +61,10 @@ async function removeCharitySource(id: string) {
     if (selectedTagId.value === id) {
       selectedTagId.value = "all";
       currentFeedName.value = "全部";
+      currentPage.value = 1;
     }
     await loadCharitySources();
+    await queryLocalFeed(selectedTagId.value, 1);
   } finally {
     charitySourcesLoading.value = false;
   }

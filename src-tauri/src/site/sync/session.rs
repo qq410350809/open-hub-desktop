@@ -7,14 +7,57 @@ use std::{
     collections::HashSet,
     ffi::{c_char, c_void},
     fs,
+    io::Read,
     path::{Component, Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use url::Url;
 
 const CHROME_EPOCH_OFFSET_SECONDS: i64 = 11_644_473_600;
+
+/// 带进程级死线的 osascript 调用：AppleEvent 通道拥塞时 `output()` 会无限期
+/// 阻塞，阶段自身的轮询预算拦不住，整个同步会被 60 秒总超时连坐强杀。
+/// 超时即 kill 子进程并返回 Err（错误文本含"AppleEvent已超时"，归入瞬态
+/// 错误，由调用方继续轮询直到阶段预算耗尽）。
+#[cfg(target_os = "macos")]
+fn run_osascript_with_deadline(
+    mut command: Command,
+    deadline: Duration,
+) -> Result<std::process::Output, String> {
+    command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("无法启动 osascript：{error}"))?;
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let mut stdout = Vec::new();
+                let mut stderr = Vec::new();
+                if let Some(mut pipe) = child.stdout.take() {
+                    let _ = pipe.read_to_end(&mut stdout);
+                }
+                if let Some(mut pipe) = child.stderr.take() {
+                    let _ = pipe.read_to_end(&mut stderr);
+                }
+                return Ok(std::process::Output { status, stdout, stderr });
+            }
+            Ok(None) => {
+                if started.elapsed() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(
+                        "osascript AppleEvent已超时，已终止本次调用".to_string(),
+                    );
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => return Err(format!("osascript 状态读取失败：{error}")),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -294,16 +337,16 @@ end run
     let started = Instant::now();
     let mut target_tab_id = String::new();
     while started.elapsed() < timeout {
-        let output = Command::new("/usr/bin/osascript")
-            .args([
-                "-e",
-                SCRIPT,
-                "--",
-                &target_origin,
-                javascript,
-                &target_tab_id,
-            ])
-            .output()
+        let mut command = Command::new("/usr/bin/osascript");
+        command.args([
+            "-e",
+            SCRIPT,
+            "--",
+            &target_origin,
+            javascript,
+            &target_tab_id,
+        ]);
+        let output = run_osascript_with_deadline(command, Duration::from_secs(8))
             .map_err(|error| format!("无法调用 Chrome 静默自动化：{error}"))?;
         if !output.status.success() {
             let error = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -491,9 +534,9 @@ end run
     let started = Instant::now();
     let mut target_tab_id = initial_tab_id.unwrap_or_default().to_string();
     while started.elapsed() < timeout {
-        let output = Command::new("/usr/bin/osascript")
-            .args(["-e", SCRIPT, "--", marker, javascript, &target_tab_id])
-            .output()
+        let mut command = Command::new("/usr/bin/osascript");
+        command.args(["-e", SCRIPT, "--", marker, javascript, &target_tab_id]);
+        let output = run_osascript_with_deadline(command, Duration::from_secs(8))
             .map_err(|error| format!("无法调用 Chrome 自动化：{error}"))?;
         if !output.status.success() {
             let error = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -563,10 +606,9 @@ tell application "Google Chrome"
 end tell
 return tabLines
 "#;
-    let Ok(output) = Command::new("/usr/bin/osascript")
-        .args(["-e", SCRIPT])
-        .output()
-    else {
+    let mut command = Command::new("/usr/bin/osascript");
+    command.args(["-e", SCRIPT]);
+    let Ok(output) = run_osascript_with_deadline(command, Duration::from_secs(10)) else {
         return Vec::new();
     };
     if !output.status.success() {
@@ -664,15 +706,15 @@ on run argv
     end tell
 end run
 "#;
-    let _ = Command::new("/usr/bin/osascript")
-        .args([
-            "-e",
-            SCRIPT,
-            "--",
-            target_tab_id.unwrap_or_default(),
-            marker,
-        ])
-        .output();
+    let mut command = Command::new("/usr/bin/osascript");
+    command.args([
+        "-e",
+        SCRIPT,
+        "--",
+        target_tab_id.unwrap_or_default(),
+        marker,
+    ]);
+    let _ = run_osascript_with_deadline(command, Duration::from_secs(10));
 }
 
 #[cfg(target_os = "macos")]
@@ -699,9 +741,9 @@ tell application "Google Chrome"
     end repeat
 end tell
 "##;
-    let output = Command::new("/usr/bin/osascript")
-        .args(["-e", SCRIPT])
-        .output()
+    let mut command = Command::new("/usr/bin/osascript");
+    command.args(["-e", SCRIPT]);
+    let output = run_osascript_with_deadline(command, Duration::from_secs(10))
         .map_err(|error| format!("无法调用 Chrome 标签清理自动化：{error}"))?;
     if output.status.success() {
         Ok(())

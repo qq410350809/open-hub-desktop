@@ -455,8 +455,11 @@ pub fn runtime_config(
             "ipv6": false,
             "use-system-hosts": true,
             "enhanced-mode": "redir-host",
-            "default-nameserver": ["223.5.5.5", "119.29.29.29", "8.8.8.8", "1.1.1.1"],
-            "nameserver": ["223.5.5.5", "119.29.29.29", "180.76.76.76", "8.8.8.8", "1.1.1.1", "system"]
+            "default-nameserver": ["223.5.5.5", "119.29.29.29"],
+            // 必须用加密 DNS：明文 UDP 查询会被注入假 IP（Twitter/Dropbox 段等），
+            // 被污染域名（如 CNAME 优选链站点）会整站 Connect 失败。
+            // doh.pub 实测对污染域名能返回正确链路，阿里 DoH 出过污染结果，故 doh.pub 优先。
+            "nameserver": ["https://doh.pub/dns-query", "https://223.5.5.5/dns-query"]
         },
         "listeners": listeners,
         "proxies": configs,
@@ -800,27 +803,131 @@ pub fn select_group_node_sync(runtime: &ProxyRuntime, group: &str, name: &str) -
     }
 }
 
-/// 将 lane 组切到指定节点（带内存去重：重复 ensure 不重复 PUT）。
-/// 全局实例重启后 lane_selected 被清空，下一次 ensure 会重新落一次选中。
+/// 读取控制器上 lane 组当前实际选中的节点 id。
+/// mihomo 重启/热重载/外部改组后，内存里的 lane_selected 记录会与内核实际状态脱节，
+/// 只有控制器上的 `now` 才是流量真正经过的出口。
+fn lane_group_selected_node(runtime: &ProxyRuntime, group: &str) -> Result<String, String> {
+    let port = runtime_controller_port(runtime)?;
+    let (status, body) = simple_http_get(
+        port,
+        &format!("/proxies/{group}"),
+        RUNTIME_SECRET,
+        Duration::from_secs(3),
+    )?;
+    if !(200..=299).contains(&status) {
+        return Err(format!("Mihomo 查询组状态返回 HTTP {status}"));
+    }
+    let value: JsonValue = serde_json::from_str(&body).map_err(|e| e.to_string())?;
+    Ok(value
+        .get("now")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string())
+}
+
+/// 将 lane 组切到指定节点：以控制器实际选中为准做去重，必要时 PUT 切组。
+/// 内存 lane_selected 仅在控制器查询失败时兜底——内核热重载或外部改组会把
+/// 选择器复位到组内默认节点（可能是死节点），只信内存记录会让出口静默漂移。
 fn select_lane_node_if_needed(
     runtime: &ProxyRuntime,
     group_name: &str,
     node_id: &str,
 ) -> Result<(), String> {
-    {
-        let selected = runtime
-            .lane_selected
-            .lock()
-            .map_err(|_| "lane 选中状态锁定失败".to_string())?;
-        if selected.get(group_name).map(String::as_str) == Some(node_id) {
-            return Ok(());
+    let already_selected = match lane_group_selected_node(runtime, group_name) {
+        Ok(current) => {
+            if current == node_id {
+                // 控制器实际已指向目标节点：同步内存记录后无需切组。
+                if let Ok(mut selected) = runtime.lane_selected.lock() {
+                    selected.insert(group_name.to_string(), node_id.to_string());
+                }
+                true
+            } else {
+                false
+            }
         }
+        Err(_) => {
+            // 控制器暂不可达时退回内存记录，避免可用状态被误判成漂移。
+            runtime
+                .lane_selected
+                .lock()
+                .ok()
+                .and_then(|selected| selected.get(group_name).cloned())
+                .as_deref()
+                == Some(node_id)
+        }
+    };
+    if already_selected {
+        return Ok(());
     }
     select_group_node_sync(runtime, group_name, node_id)?;
     if let Ok(mut selected) = runtime.lane_selected.lock() {
         selected.insert(group_name.to_string(), node_id.to_string());
     }
     Ok(())
+}
+
+/// 探测节点在控制器上是否真实可达（app 内部 probe）。
+fn probe_node_alive(runtime: &ProxyRuntime, node_id: &str) -> Result<i64, String> {
+    let port = runtime_controller_port(runtime)?;
+    let encoded: String = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("", node_id)
+        .finish()
+        .trim_start_matches('=')
+        .to_string();
+    let timeout_ms = NODE_PROBE_TIMEOUT_MS;
+    let path = format!(
+        "/proxies/{encoded}/delay?timeout={timeout_ms}&url={}",
+        url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("", NODE_PROBE_URL)
+            .finish()
+            .trim_start_matches('=')
+    );
+    let (status, body) = simple_http_get(port, &path, RUNTIME_SECRET, Duration::from_millis(timeout_ms + 2_000))?;
+    if (200..=299).contains(&status) {
+        let value: JsonValue = serde_json::from_str(&body).map_err(|e| e.to_string())?;
+        return value
+            .get("delay")
+            .and_then(|v| v.as_i64())
+            .ok_or_else(|| "控制器延迟响应缺少 delay 字段".to_string());
+    }
+    Err(format!("节点探活返回 HTTP {status}: {}", body.trim()))
+}
+
+/// 公开给轮换路径使用：与内部同名，包装为 bool 便于迭代。
+pub(crate) fn probe_node_alive_pub(runtime: &ProxyRuntime, node_id: &str) -> bool {
+    probe_node_alive(runtime, node_id).is_ok()
+}
+
+/// 为代理池账号出口挑选可用节点：从游标位置轮询候选，逐个控制器验活，
+/// 死节点短暂封禁后顺延。候选全部验活失败时退回游标原位节点（宁可用
+/// 可能已恢复的旧节点，也不让出口悬空）。返回选中的节点 id。
+fn pick_alive_account_node(
+    database: &Database,
+    runtime: &ProxyRuntime,
+    group_name: &str,
+) -> Result<String, String> {
+    let candidates = channel_candidate_nodes(database, runtime, "")?;
+    if candidates.is_empty() {
+        return Err("代理池中没有可用的候选节点".to_string());
+    }
+    let seq = runtime.account_alloc_seq.fetch_add(1, Ordering::Relaxed) as usize;
+    let fallback = &candidates[seq % candidates.len()];
+    for offset in 0..candidates.len() {
+        let (node_id, _, _) = &candidates[(seq + offset) % candidates.len()];
+        if runtime.account_node_is_banned(node_id) {
+            continue;
+        }
+        match probe_node_alive(runtime, node_id) {
+            Ok(_) => return Ok(node_id.clone()),
+            Err(error) => {
+                warn!("账号出口候选节点探活失败 {node_id}: {error}");
+                runtime.account_ban_node(node_id, ACCOUNT_NODE_PROBE_FAIL_TTL);
+            }
+        }
+    }
+    warn!("账号出口候选全部探活失败，退回轮询原位节点");
+    select_lane_node_if_needed(runtime, group_name, &fallback.0)?;
+    return Ok(fallback.0.clone());
 }
 
 /// 确保通道出口就绪并指向其绑定节点：分配通道 lane + 同步切组。
@@ -881,7 +988,7 @@ pub fn ensure_account_instance(
     let mut used_ports = HashSet::new();
     ensure_lane_pools(runtime, &mut used_ports)?;
 
-    let (group_name, port, has_selection) = {
+    let (group_name, port, desired_node) = {
         let mut map = runtime
             .account_lane_map
             .lock()
@@ -902,25 +1009,25 @@ pub fn ensure_account_instance(
             }
         };
         let lane = &slots[idx];
-        let has_selection = runtime
+        // 上次为该 lane 选中的节点：交给 select_lane_node_if_needed 与内核实际状态比对，
+        // 漂移（热重载/外部改组把选择器复位）时自动切回。
+        let desired_node = runtime
             .lane_selected
             .lock()
-            .map(|selected| selected.contains_key(&lane.group_name))
-            .unwrap_or(false);
-        (lane.group_name.clone(), lane.listen_port, has_selection)
+            .ok()
+            .and_then(|selected| selected.get(&lane.group_name).cloned());
+        (lane.group_name.clone(), lane.listen_port, desired_node)
     };
 
     if let Some(node_id) = force_node_id {
         select_lane_node_if_needed(runtime, &group_name, node_id)?;
-    } else if !has_selection {
-        // 新分配 lane 或全局实例刚重启：按游标轮询挑候选节点，
-        // 修复既往固定取第一个候选导致所有账号集中在同一节点的问题。
-        let candidates = channel_candidate_nodes(database, runtime, "")?;
-        let seq = runtime.account_alloc_seq.fetch_add(1, Ordering::Relaxed) as usize;
-        let (node_id, _, _) = candidates
-            .get(seq % candidates.len())
-            .cloned()
-            .ok_or_else(|| "代理池中没有可用的候选节点".to_string())?;
+    } else if let Some(node_id) = desired_node {
+        select_lane_node_if_needed(runtime, &group_name, &node_id)?;
+    } else {
+        // 新分配 lane 或全局实例刚重启：游标轮询 + 逐个控制器验活。
+        // 既往固定按游标取模不验证，重启后选中表头死节点会让所有走
+        // 代理池的账号静默 502。
+        let node_id = pick_alive_account_node(database, runtime, &group_name)?;
         select_lane_node_if_needed(runtime, &group_name, &node_id)?;
     }
     Ok(port)

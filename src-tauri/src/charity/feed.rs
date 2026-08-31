@@ -30,7 +30,7 @@ pub fn topic_id(value: &str) -> Option<u64> {
 }
 
 pub fn charity_tag_json_url(tag_id: &str) -> String {
-    format!("https://linux.do/tag/{tag_id}-tag/{tag_id}.json?order=created&ascending=false")
+    format!("https://linux.do/tag/{tag_id}/l/latest.json?order=created")
 }
 
 pub fn items_from_topic_list(value: &str) -> Result<Vec<CharityFeedItem>, String> {
@@ -119,14 +119,22 @@ pub fn items_from_topic_list(value: &str) -> Result<Vec<CharityFeedItem>, String
                 })
                 .take(5)
                 .collect::<Vec<_>>();
+            // linux.do latest.json 的 tags 是对象数组（{"id":3,"name":"ChatGPT"}），
+            // 标准 Discourse 则是字符串数组，两种形态都要兼容。
             let mut categories = topic
                 .get("tags")
                 .and_then(serde_json::Value::as_array)
                 .into_iter()
                 .flatten()
-                .filter_map(|tag| tag.as_str().map(str::trim))
-                .filter(|tag| !tag.is_empty())
-                .map(str::to_string)
+                .filter_map(|tag| {
+                    let name = tag
+                        .as_str()
+                        .or_else(|| tag.get("name").and_then(serde_json::Value::as_str))
+                        .or_else(|| tag.get("slug").and_then(serde_json::Value::as_str))
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())?;
+                    Some(name.to_string())
+                })
                 .collect::<Vec<_>>();
             categories.sort();
             categories.dedup();

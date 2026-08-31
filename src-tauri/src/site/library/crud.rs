@@ -461,13 +461,7 @@ pub fn update_site(
     input.favorite = old_site.favorite;
     input.hidden = old_site.hidden;
 
-    // We don't need to preserve created_at from input since insert_site_transaction handles it via COALESCE and updated_at is mapped correctly?
-    // Wait, insert_site_transaction sets created_at to COALESCE(NULLIF(?24, ''), CURRENT_TIMESTAMP) which is updated_at.
-    // In fact, if we use INSERT OR REPLACE, it deletes the old row and creates a new one! This implies we lose created_at and we lose favorite/hidden unless we preserve them.
-    // Yes! That's why I fetched old_site and mapped them back.
-    // BUT we need to use a proper UPDATE or manually map all fields.
-    // Let's rewrite insert_site_transaction into a pure UPDATE if it exists, to preserve created_at if we can.
-    // Wait! Since we already do a transaction, let's just use an UPDATE statement for update_site!
+    // 用纯 UPDATE 而不是整行重插：保留原 created_at 与 rowid。
     let transaction = connection.transaction().map_err(|e| e.to_string())?;
     transaction.execute(
         "UPDATE directory_sites SET

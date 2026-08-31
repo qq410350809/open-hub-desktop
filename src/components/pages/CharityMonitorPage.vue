@@ -4,7 +4,7 @@ import { icons } from "../../icons";
 import { useStore } from "../../composables/useStore";
 import { useConfirm } from "../../composables/useConfirm";
 import AppTable, { type AppTableColumn } from "../common/AppTable.vue";
-import type { CharityFeedItem } from "../../types";
+import type { CharityFeedItem, CharitySyncLogEntry } from "../../types";
 import type { SortingState } from "@tanstack/table-core";
 import { formatCompactCount as formatCompactCountUtil, formatDuration as formatDurationUtil } from "../../utils";
 
@@ -66,7 +66,6 @@ const displayItems = computed(() => store.charityFeedItems.value);
 const tagManagerOpen = ref(false);
 const newTagId = ref("");
 const newTagName = ref("");
-const newTagUrl = ref("");
 const tagManagerError = ref("");
 
 function openTagManager() {
@@ -79,7 +78,6 @@ function closeTagManager() {
   tagManagerOpen.value = false;
   newTagId.value = "";
   newTagName.value = "";
-  newTagUrl.value = "";
   tagManagerError.value = "";
   document.body.classList.remove("modal-open");
 }
@@ -93,10 +91,9 @@ async function handleAddTag() {
   }
   try {
     tagManagerError.value = "";
-    await store.addCharitySource(id, name, newTagUrl.value.trim() || undefined);
+    await store.addCharitySource(id, name);
     newTagId.value = "";
     newTagName.value = "";
-    newTagUrl.value = "";
   } catch (cause) {
     tagManagerError.value = String(cause);
   }
@@ -113,7 +110,7 @@ async function handleToggleTag(id: string, enabled: boolean) {
 async function handleRemoveTag(id: string, name: string) {
   const accepted = await confirm({
     title: "删除标签",
-    message: `确定删除标签「${name}」吗？已抓取的帖子不会被删除。`,
+    message: `确定删除标签「${name}」吗？仅属于该标签的帖子将一并删除，同时属于其他订阅标签的帖子会保留。`,
     confirmText: "删除",
     danger: true,
   });
@@ -123,6 +120,11 @@ async function handleRemoveTag(id: string, name: string) {
   } catch (cause) {
     tagManagerError.value = String(cause);
   }
+}
+
+// 标签 ID 点击后在浏览器打开对应的 linux.do 标签页
+function openTagInBrowser(id: string) {
+  void store.openExternal(`https://linux.do/tag/${id}-tag/${id}`);
 }
 
 // —— 同步日志管理与终端 ——
@@ -145,18 +147,60 @@ function toggleLogDetail(id: number) {
   expandedLogId.value = expandedLogId.value === id ? null : id;
 }
 
-function logDetailText(entry: {
-  message?: string;
-  nodeName?: string;
-  durationMs?: number | null;
-  status: string;
-  at: string;
-}) {
-  const lines: string[] = [];
-  if (entry.message) lines.push(entry.message);
-  if (entry.nodeName) lines.push(`节点：${entry.nodeName}`);
-  lines.push(`耗时：${formatDuration(liveDurationMs(entry))}`);
-  return lines.join("\n");
+function isRoundLogEntry(entry: CharitySyncLogEntry) {
+  return entry.feedId === "round" || !!entry.detail?.feeds?.length;
+}
+
+function logSummaryText(entry: CharitySyncLogEntry) {
+  const time = formatLogTime(entry.at);
+  const node = entry.nodeName || "智能轮询调度";
+  const stage = stageText(entry.stage);
+  if (isRoundLogEntry(entry)) {
+    const feeds = entry.detail?.feeds ?? [];
+    const okCount = feeds.filter((feed) => feed.status === "success").length;
+    return `${stage}于 ${time} 结束，共 ${feeds.length} 个标签（成功 ${okCount} 个），合计新增 ${entry.detail?.totalNew ?? 0} 条 / 更新 ${entry.detail?.totalUpdated ?? 0} 条。`;
+  }
+  if (entry.status === "success") {
+    return `${stage}「${entry.feedName}」于 ${time} 通过节点「${node}」完成，耗时 ${formatDuration(liveDurationMs(entry))}。`;
+  }
+  if (entry.status === "cancelled") {
+    return `「${entry.feedName}」的${stage}于 ${time} 被取消。`;
+  }
+  return `「${entry.feedName}」的${stage}于 ${time} 失败：${entry.message}`;
+}
+
+interface LogDetailCell {
+  text: string;
+  cls?: string;
+}
+
+function logDetailRows(entry: CharitySyncLogEntry): LogDetailCell[][] {
+  const rows: LogDetailCell[][] = [];
+  if (isRoundLogEntry(entry)) {
+    for (const feed of entry.detail?.feeds ?? []) {
+      rows.push([
+        { text: feed.name || feed.id },
+        { text: statusText(feed.status), cls: `is-${feed.status}` },
+        { text: String(feed.new ?? 0), cls: "num" },
+        { text: String(feed.updated ?? 0), cls: "num" },
+      ]);
+    }
+    rows.push([
+      { text: "合计" },
+      { text: "" },
+      { text: String(entry.detail?.totalNew ?? 0), cls: "num" },
+      { text: String(entry.detail?.totalUpdated ?? 0), cls: "num" },
+    ]);
+    return rows;
+  }
+  rows.push([{ text: "新增帖子" }, { text: String(entry.detail?.new ?? 0), cls: "num" }]);
+  rows.push([{ text: "更新帖子" }, { text: String(entry.detail?.updated ?? 0), cls: "num" }]);
+  if (entry.detail?.unread != null) {
+    rows.push([{ text: "当前未读" }, { text: String(entry.detail.unread), cls: "num" }]);
+  }
+  rows.push([{ text: "使用节点" }, { text: entry.nodeName || "智能轮询调度" }]);
+  rows.push([{ text: "耗时" }, { text: formatDuration(liveDurationMs(entry)) }]);
+  return rows;
 }
 
 const nowTick = ref(Date.now());
@@ -819,12 +863,6 @@ onUnmounted(() => {
                     type="text"
                     placeholder="显示名称 (如 公益推广)"
                   />
-                  <input
-                    v-model="newTagUrl"
-                    class="cm-input is-wide"
-                    type="text"
-                    placeholder="自定义 JSON/RSS URL (可选，留空自动生成)"
-                  />
                   <button
                     type="button"
                     class="cm-btn-primary cm-add-btn"
@@ -861,12 +899,16 @@ onUnmounted(() => {
                     <div class="cm-tag-info">
                       <div class="cm-tag-name-row">
                         <strong>{{ tag.name }}</strong>
-                        <span class="cm-tag-id-badge">ID: {{ tag.id }}</span>
+                        <button
+                          type="button"
+                          class="cm-tag-id-badge"
+                          :title="`在浏览器中打开标签页（linux.do/tag/${tag.id}-tag/${tag.id}）`"
+                          @click="openTagInBrowser(tag.id)"
+                        >ID: {{ tag.id }}</button>
                         <span class="cm-tag-status-badge" :class="{ 'is-on': tag.enabled !== false }">
                           {{ tag.enabled === false ? "已停用" : "活跃监听" }}
                         </span>
                       </div>
-                      <small v-if="tag.jsonUrl" class="cm-tag-url-text" :title="tag.jsonUrl">{{ tag.jsonUrl }}</small>
                     </div>
 
                     <button
@@ -982,12 +1024,34 @@ onUnmounted(() => {
                       <i>{{ stageText(entry.stage) }}</i>
                       <em :class="`is-${entry.status}`">{{ statusText(entry.status) }}</em>
                     </span>
+                    <span class="cm-log-message" :title="entry.message">{{ entry.message }}</span>
                     <span class="cm-log-node">{{ entry.nodeName || "智能轮询调度" }}</span>
                     <span class="cm-log-duration" :class="{ 'is-live': entry.status === 'running' }">
                       {{ formatDuration(liveDurationMs(entry)) }}
                     </span>
                     <div v-if="expandedLogId === entry.id" class="cm-log-detail-box" @click.stop>
-                      <pre>{{ logDetailText(entry) }}</pre>
+                      <div class="cm-log-detail-title">
+                        <strong>{{ entry.feedName || entry.feedId }}</strong>
+                        <span class="cm-log-detail-node">节点：{{ entry.nodeName || "智能轮询调度" }}</span>
+                      </div>
+                      <p class="cm-log-detail-summary">{{ logSummaryText(entry) }}</p>
+                      <table v-if="logDetailRows(entry).length" class="cm-log-detail-table">
+                        <thead v-if="isRoundLogEntry(entry)">
+                          <tr>
+                            <th>标签</th>
+                            <th>状态</th>
+                            <th>新增</th>
+                            <th>更新</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          <tr v-for="(row, rowIndex) in logDetailRows(entry)" :key="rowIndex">
+                            <td v-for="(cell, cellIndex) in row" :key="cellIndex" :class="cell.cls">
+                              {{ cell.text }}
+                            </td>
+                          </tr>
+                        </tbody>
+                      </table>
                     </div>
                   </li>
                 </ol>
@@ -2056,7 +2120,7 @@ onUnmounted(() => {
 
 .cm-tag-add-grid {
   display: grid;
-  grid-template-columns: 140px 150px 1fr auto;
+  grid-template-columns: 140px 150px auto;
   gap: 8px;
   align-items: center;
 }
@@ -2180,8 +2244,15 @@ onUnmounted(() => {
   border-radius: 3px;
   background: var(--surface);
   border: 1px solid var(--line);
+  font-family: inherit;
   font-size: 9.5px;
   color: var(--muted);
+  cursor: pointer;
+}
+
+.cm-tag-id-badge:hover {
+  color: var(--brand);
+  border-color: var(--brand);
 }
 
 .cm-tag-status-badge {
@@ -2192,14 +2263,6 @@ onUnmounted(() => {
 .cm-tag-status-badge.is-on {
   color: #10b981;
   font-weight: 600;
-}
-
-.cm-tag-url-text {
-  font-size: 10px;
-  color: var(--muted);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 .cm-tag-delete-btn {
@@ -2367,9 +2430,19 @@ onUnmounted(() => {
 .cm-log-stage-badge em.is-error,
 .cm-log-stage-badge em.is-failed { background: rgba(239, 68, 68, 0.2); color: #f87171; }
 
+.cm-log-message {
+  color: #cbd5e1;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .cm-log-node {
   color: #94a3b8;
-  flex: 1;
+  flex: 0 1 auto;
+  max-width: 180px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -2391,6 +2464,69 @@ onUnmounted(() => {
   background: rgba(0, 0, 0, 0.4);
   border-radius: 4px;
   border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.cm-log-detail-title {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 6px;
+  font-size: 11px;
+}
+
+.cm-log-detail-title strong {
+  color: #7dd3fc;
+  flex-shrink: 0;
+}
+
+.cm-log-detail-node {
+  color: #94a3b8;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cm-log-detail-summary {
+  margin: 0 0 8px;
+  font-size: 10.5px;
+  line-height: 1.55;
+  color: #cbd5e1;
+}
+
+.cm-log-detail-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 10.5px;
+}
+
+.cm-log-detail-table th,
+.cm-log-detail-table td {
+  padding: 3px 8px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  text-align: left;
+}
+
+.cm-log-detail-table th {
+  color: #94a3b8;
+  font-weight: 600;
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.cm-log-detail-table td.num {
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.cm-log-detail-table td.is-success { color: #34d399; }
+.cm-log-detail-table td.is-failed,
+.cm-log-detail-table td.is-error { color: #f87171; }
+.cm-log-detail-table td.is-cancelled { color: #94a3b8; }
+
+.cm-log-detail-table tbody tr:last-child td {
+  color: #e2e8f0;
+  font-weight: 600;
+  background: rgba(255, 255, 255, 0.03);
 }
 
 .cm-log-detail-box pre {

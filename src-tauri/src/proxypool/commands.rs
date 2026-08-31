@@ -9,12 +9,14 @@ use crate::proxypool::rotator::{
     list_channel_candidate_nodes, list_prioritized_fast_proxy_nodes, write_channel_node,
 };
 use crate::proxypool::runtime::{
-    ensure_channel_instance, ensure_default_proxy_channel, ensure_global_runtime, ensure_runtime,
-    load_state, row_subscription, runtime_nodes, runtime_proxy_url, select_group_node,
-    select_runtime_node, write_meta,
+    controller_client, ensure_channel_instance, ensure_default_proxy_channel,
+    ensure_global_runtime, ensure_runtime, is_slow_or_blocked_speed_test_url, load_state,
+    row_subscription, runtime_controller_port, runtime_nodes, runtime_proxy_url,
+    select_group_node, select_runtime_node, write_meta,
 };
 use crate::proxypool::tester::{
-    measure_get_probe, normalize_ignore_addresses, run_proxy_node_pool,
+    apply_exit_ip_geoip, controller_proxy_delay, download_throughput_probe,
+    ip_echo_probe_with_fallback, normalize_ignore_addresses, run_proxy_node_pool,
 };
 use crate::proxypool::types::*;
 use rusqlite::{params, OptionalExtension};
@@ -678,19 +680,42 @@ pub async fn test_proxy_node(
     let test_lease = runtime.start_proxy_test()?;
     let _op_guard = runtime.runtime_op_lock.lock().await;
     tokio::task::block_in_place(|| ensure_global_runtime(database, runtime))?;
+    let client = controller_client()?;
+    let controller_port = runtime_controller_port(runtime)?;
     let lane = runtime.speed_lane_slot(0)?;
     select_group_node(runtime, &lane.group_name, &node_id).await?;
-    // 延时与网速一体测（与批量同源）：同一条经 lane 的下载连接，
-    // 响应头到达耗时 = 连通延迟，滑窗峰值吞吐 = 网速。
+    // 延迟口径：控制器 delay 接口的测试 URL（设置页"测速地址"，默认 gstatic 204）
+    let delay_url = {
+        let stored = crate::db::read_meta(database, PROXY_SPEED_TEST_URL_KEY).unwrap_or_default();
+        if stored.trim().is_empty() || is_slow_or_blocked_speed_test_url(&stored) {
+            DEFAULT_PROXY_SPEED_TEST_URL.to_string()
+        } else {
+            stored
+        }
+    };
+    // 三路并行一体测（与批量同构）：控制器 delay（面板口径延迟，整体判死
+    // 依据）、lane 下载吞吐（网速）、出口 IP 回显（落库纠错国家分组）。
     let proxy_url = format!("http://127.0.0.1:{}", lane.listen_port);
-    let (latency, speed_ms) =
-        measure_get_probe(proxy_url, CHANNEL_SPEED_TEST_URL.to_string()).await;
-    let status = if latency.is_some() { "success" } else { "error" };
+    let (latency, echo, speed_ms) = futures_util::future::join3(
+        controller_proxy_delay(&client, controller_port, &node_id, &delay_url),
+        ip_echo_probe_with_fallback(&proxy_url),
+        download_throughput_probe(proxy_url.clone(), CHANNEL_SPEED_TEST_URL.to_string()),
+    )
+    .await;
+    let (speed_ms, status) = if latency.is_some() {
+        (speed_ms, "success")
+    } else {
+        (None, "error")
+    };
     let error_message = if latency.is_some() {
         None
     } else {
-        Some("测速失败：节点无法连通（探测请求未在预算内收到响应头）".to_string())
+        Some("测速失败：节点无法连通（delay 探测无响应）".to_string())
     };
+    if let (Some(_), Some((_, exit_ip))) = (latency, echo) {
+        let geoip_reader = open_geoip_reader(runtime);
+        apply_exit_ip_geoip(database, geoip_reader.as_ref(), &node_id, &exit_ip);
+    }
     {
         let connection = database.lock_conn()?;
         connection

@@ -9,15 +9,28 @@ export interface ChannelKeyRule {
   groupId: string;
   enabled: boolean;
   supportedModels?: string[] | null;
+  /** 渠道 proxyMode = fixed_channel 时该 Key 绑定的代理池固定通道 ID；空 = 渠道默认通道 */
+  fixedChannelId?: string | null;
 }
 
-/** 模型级代理出口覆盖：direct = 强制直连；pool = 代理池轮询；fixed = 固定出口节点 */
+/**
+ * 模型级代理出口覆盖：follow = 跟随渠道（默认值，等价无覆盖）；
+ * direct = 强制直连；pool = 代理池轮询；fixed = 固定出口节点
+ */
 export interface ModelProxyRule {
   model: string;
-  mode: "direct" | "pool" | "fixed" | string;
+  mode: "follow" | "direct" | "pool" | "fixed" | string;
   /** fixed 模式下锁定的节点 ID */
   nodeId?: string | null;
 }
+
+/**
+ * 渠道级代理设置（合并旧 useProxyPool/useFixedProxy 两个布尔）：
+ * direct = 强制直连（默认）；pool = 代理池轮询+失败切换；
+ * fixed_channel = 代理池固定通道（Key 可按 KeyRule 绑定不同通道）；
+ * custom_node = 固定单一出口节点（fixedProxyNode）
+ */
+export type ChannelProxyMode = "direct" | "pool" | "fixed_channel" | "custom_node";
 
 export interface ChannelConfig {
   id: string;
@@ -32,6 +45,12 @@ export interface ChannelConfig {
   alias?: string;
   siteId?: string | null;
   useFixedProxy?: boolean;
+  /** custom_node 模式锁定的代理池节点 ID；空 = 池内首个启用节点 */
+  fixedProxyNode?: string | null;
+  /** 渠道级代理设置；缺省按 useProxyPool/useFixedProxy 旧布尔推导 */
+  proxyMode?: ChannelProxyMode | string | null;
+  /** fixed_channel 模式的渠道级默认固定通道 ID（Key 规则可按 Key 覆盖） */
+  proxyFixedChannel?: string | null;
   enabledModels?: string[] | null;
   /** 统计维度稳定数字 ID：内置渠道占 1-100（opencode=1），动态渠道从 101 起；与别名解耦 */
   statsId?: number;

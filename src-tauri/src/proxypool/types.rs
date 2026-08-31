@@ -17,31 +17,45 @@ pub const SPEED_TEST_LANES: usize = 8;
 pub const ACCOUNT_LANE_POOL: usize = 64;
 /// 全局单实例预配的通道 lane 池上限：每个通道占一个 lane
 pub const CHANNEL_LANE_POOL: usize = 16;
-/// 一体探测的单次硬超时（延时+网速同一条连接）：响应头到达 = 延迟值，
-/// 超时前没收到响应头 → 两指标一起判死。预算须覆盖"经节点建链 + TLS 握手 +
-/// 请求头"全链路，实测 400ms 级 RTT 节点的 TTFB 可达 5.3s，5s 预算会把大量
-/// 可用节点误杀，放宽到 8s。
+/// 三路并行探测的预算：
+/// - 延迟 = 控制器 delay 接口（unified-delay 面板口径），mihomo 侧 query
+///   超时同此值（客户端再放宽 2s 收响应）；
+/// - 网速 = 经 lane 的真实流式下载，硬超时（含建链）须覆盖"经节点建链 +
+///   TLS 握手 + 请求头 + 采样窗"全链路，实测 400ms 级 RTT 节点的响应头
+///   到达需 5.3s，5s 会把大量可用节点误杀，放宽到 8s；
+/// - 出口 IP 回显 = 经 lane 抓取出口公网 IP（`LANE_DELAY_TIMEOUT_MS`），
+///   仅用于落库纠错国家分组，不影响节点判定。
 pub const SPEED_TEST_TIMEOUT_MS: u64 = 8000;
-/// 下载测速的流式采样目标：收满即停（也作为测速 URL 的 bytes 参数）。
-/// 500KB 样本太小——TCP 慢启动未爬到满速就结束，实测会把 6.5MB/s 的节点
-/// 测成 0.8MB/s（差 8 倍）；大样本才能测出真实吞吐。
-pub const SPEED_TEST_TARGET_BYTES: u64 = 10_000_000;
-/// 网速的传输窗口：从响应头到达起算，超过即停止采样。
-/// 并行 lane 共享总带宽，窗口越长互相争抢越久、平均速率被压得越低；
-/// 短窗口 + 峰值统计只需捕捉稳态 burst，无需下载完整大文件。
-pub const SPEED_TEST_TRANSFER_WINDOW_MS: u64 = 900;
-/// 峰值吞吐的时间桶宽度：100ms 足以平滑 chunk 级调度突发（10ms 桶会被
-/// 单个大 chunk / 本地缓冲排空灌出虚高峰值），又能在窗口内留出多个采样桶
-pub const SPEED_TEST_PEAK_BUCKET_MS: u64 = 100;
-/// 峰值统计的连续桶数：取最大连续 3 桶（300ms 滑窗）平均速率，
-/// 单桶突发被摊薄，峰值更接近可持续的稳态吞吐
-pub const SPEED_TEST_PEAK_WINDOW_BUCKETS: u64 = 3;
-/// 网速有效的最小总采样量：窗口内实收不足视为无有效吞吐（节点近乎不可用）
+/// 出口 IP 回显抓取（国家分组纠错）的独立预算
+pub const LANE_DELAY_TIMEOUT_MS: u64 = 5000;
+/// 出口 IP 回显服务（按优先级依次尝试）：全部纯 HTTP（无 TLS 握手，延迟
+/// 数值明显低于 HTTPS 版本）且强制/仅回 IPv4，响应体为纯文本 IP。
+/// 节点侧超时不换服务（换了也不通），服务侧异常才降级；
+/// 若个别服务 301 跳转 HTTPS，reqwest 会跟随，仅该次略慢不影响结果。
+pub const PROXY_IP_ECHO_URLS: [&str; 3] = [
+    "http://api4.ipify.org",
+    "http://ipv4.icanhazip.com",
+    "http://api-ipv4.ip.sb/ip",
+];
+/// 下载测速的流式采样目标：收满 500KB 即停（也作为测速 URL 的 bytes 参数）。
+/// 批量测速对带宽友好：8 lane 并行时每个节点最多收 500KB，全量测速的
+/// 总下载量从 GB 级降到百 MB 级，不再挤占节点正常使用带宽。
+pub const SPEED_TEST_TARGET_BYTES: u64 = 500_000;
+/// 传输采样窗口：从首字节到达起算，1 秒内没收满 500KB 就主动断开——
+/// 已收到的标本对峰值桶计量已经足够，慢节点不再拖到整体超时，
+/// 批量测速的每节点下载段耗时封顶约 TTFB + 1s
+pub const SPEED_TEST_TRANSFER_WINDOW_MS: u64 = 1000;
+/// 吞吐计量的时间桶宽度：从首字节起按 50ms 分桶，取字节最多的单桶为峰值。
+/// 50ms 桶在 10MB/s 下每桶约 500KB，既平滑 chunk 级调度突发又足够细，
+/// 单桶满速即代表链路稳态能力（TCP 慢启动的低速首桶自然被峰值桶覆盖）。
+pub const SPEED_TEST_PEAK_BUCKET_MS: u64 = 50;
+/// 网速有效的最小总采样量：总量不足视为无有效吞吐（节点近乎不可用）
 pub const SPEED_TEST_MIN_SAMPLE_BYTES: u64 = 32_000;
-/// 网速等效换算基准：channel_latency_ms 语义保持"等效下载 500KB 耗时 ms"，
-/// 前端 MB/s 换算与通道候选门槛均基于该基准，无需随采样目标变化。
+/// 网速换算基准：channel_latency_ms 语义保持"等效下载 500KB 耗时 ms"，
+/// 由峰值桶速率外推（500KB ÷ 桶速率）；前端 MB/s 换算与通道候选门槛
+/// 均基于该基准，无需随采样目标变化。
 pub const SPEED_TEST_REF_BYTES: u64 = 500_000;
-pub const CHANNEL_SPEED_TEST_URL: &str = "https://speed.cloudflare.com/__down?bytes=10000000";
+pub const CHANNEL_SPEED_TEST_URL: &str = "https://speed.cloudflare.com/__down?bytes=500000";
 /// 通道候选节点的网速门槛：channel_latency_ms 现在是真实下载 500KB 的总耗时（ms）
 pub const CHANNEL_MAX_DOWNLOAD_MS: i64 = 1500;
 pub const BATCH_PROXY_TEST_CONCURRENCY: usize = 24;
@@ -51,11 +65,19 @@ pub const BATCH_PROXY_TEST_NODE_CHUNK: usize = 5000;
 /// （unified-delay 双测取小，传统面板口径），500ms 即旧有语义。
 /// 超过此门槛的候选由 channel_candidate_nodes 的 2000ms 档兜底。
 pub const ACCOUNT_PROXY_MAX_LATENCY_MS: i64 = 500;
-pub const ACCOUNT_PROXY_MAX_ATTEMPTS: usize = 2;
+/// 单次代理池请求的最大轮候次数：必须足够让走死链节点（gstatic 通但目标站不通）
+/// 也能在一次同步里触达活的节点。2 次再遇到立体感悬挂场景根本顶不住。
+pub const ACCOUNT_PROXY_MAX_ATTEMPTS: usize = 4;
 pub const ACCOUNT_PROXY_BAN_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 pub const ACCOUNT_PROXY_BAN_FORBIDDEN: Duration = Duration::from_secs(2 * 60 * 60);
 pub const ACCOUNT_PROXY_BAN_UNREACHABLE: Duration = Duration::from_secs(2 * 60 * 60);
 pub const ACCOUNT_PROXY_BAN_DEFAULT: Duration = Duration::from_secs(15 * 60);
+/// 账号出口选点时控制器验活的探测目标与超时（对应 mihomo /delay 参数）。
+pub(crate) const NODE_PROBE_URL: &str = "https://www.gstatic.com/generate_204";
+pub(crate) const NODE_PROBE_TIMEOUT_MS: u64 = 3_000;
+/// 探活失败的候选节点短封禁时长：避免同一死节点在每次 ensure 时反复实测，
+/// 也给节点自愈留窗口（到期后重新参与验活）。
+pub(crate) const ACCOUNT_NODE_PROBE_FAIL_TTL: Duration = Duration::from_secs(5 * 60);
 pub const DEFAULT_PROXY_CHANNEL_ID: &str = "default";
 pub const DEFAULT_PROXY_CHANNEL_NAME: &str = "默认通道";
 

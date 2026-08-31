@@ -421,6 +421,9 @@ pub async fn sync_remote_sites(
 
     let mut added = 0_usize;
     let mut updated = 0_usize;
+    // 类型检测只面向本次新增的站点：更新站点的类型已被冻结（本地为空时由
+    // 远端值补齐），不允许再被后台探测改写。
+    let mut added_ids: Vec<String> = Vec::new();
     let mut synced_ids = HashSet::new();
     let mut processed_url_keys = HashSet::new();
 
@@ -440,6 +443,7 @@ pub async fn sync_remote_sites(
             None
         };
 
+        let mut is_new_site = false;
         if let Some(existing) = existing_match {
             site.id = existing.id.clone();
             site.favorite = existing.favorite;
@@ -468,10 +472,14 @@ pub async fn sync_remote_sites(
             site.use_system_proxy = false;
             site.use_proxy_pool = false;
             added += 1;
+            is_new_site = true;
         }
 
         if !synced_ids.insert(site.id.clone()) {
             continue;
+        }
+        if is_new_site {
+            added_ids.push(site.id.clone());
         }
 
         let site_name = site.name.clone();
@@ -499,7 +507,7 @@ pub async fn sync_remote_sites(
             session.profile_name.clone()
         }
     };
-    let site_ids = synced_ids.into_iter().collect();
+    let site_ids = added_ids;
     Ok(SyncSitesResult {
         added,
         updated,

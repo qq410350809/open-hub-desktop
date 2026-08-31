@@ -32,6 +32,10 @@ pub struct ChannelKeyRule {
     pub enabled: bool,
     #[serde(default)]
     pub supported_models: Option<Vec<String>>,
+    /// 渠道 proxy_mode = fixed_channel 时，该 Key 绑定的代理池固定通道 ID；
+    /// 空 = 使用渠道级默认固定通道（proxy_fixed_channel）
+    #[serde(default)]
+    pub fixed_channel_id: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -39,13 +43,14 @@ fn default_true() -> bool {
 }
 
 /// 模型级代理出口覆盖规则：「管理可用模型」中为单个模型独立选择代理策略。
-/// 语义与渠道级 use_proxy_pool / use_fixed_proxy 一致，仅作用域缩小到单模型。
+/// 语义与渠道级 proxy_mode 一致，仅作用域缩小到单模型。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelProxyRule {
     /// 渠道内模型名（原始大小写保留，匹配时忽略大小写）
     pub model: String,
-    /// direct = 强制直连；pool = 走代理池轮询；fixed = 固定单一出口节点
+    /// direct = 强制直连；pool = 走代理池轮询；fixed = 固定单一出口节点；
+    /// follow = 跟随渠道（等价于无本条规则，前端显式表达默认值）
     pub mode: String,
     /// fixed 模式下锁定的节点 ID；缺省时锁定池内首个启用节点
     #[serde(default)]
@@ -77,7 +82,17 @@ pub struct ChannelConfig {
     /// 通过「站点转换」创建时关联的站点库站点 id
     #[serde(default)]
     pub site_id: Option<String>,
-    /// 代理池固定通道：始终经代理池出口节点转发，不优先直连
+    /// 渠道级代理设置（合并旧 use_proxy_pool / use_fixed_proxy 两个布尔）：
+    /// direct = 强制直连（默认）| pool = 代理池轮询+失败切换（直连优先）|
+    /// fixed_channel = 代理池固定通道（Key 可按 KeyRule 绑定不同通道）|
+    /// custom_node = 固定单一出口节点（fixed_proxy_node）。
+    /// 缺省时按旧布尔字段推导，保持存量配置兼容。
+    #[serde(default)]
+    pub proxy_mode: Option<String>,
+    /// fixed_channel 模式的渠道级默认固定通道 ID（Key 规则可按 Key 覆盖）
+    #[serde(default)]
+    pub proxy_fixed_channel: Option<String>,
+    /// 代理池固定节点：始终经代理池出口节点转发，不优先直连（custom_node 模式生效）
     #[serde(default)]
     pub use_fixed_proxy: bool,
     /// 固定出口节点 ID（仅在 use_fixed_proxy 为 true 时生效）
@@ -134,6 +149,51 @@ impl ChannelConfig {
             .unwrap_or_else(|| self.id.to_lowercase())
     }
 
+    /// 渠道级生效代理模式：proxy_mode 显式配置优先；缺省按旧布尔字段推导
+    /// （use_fixed_proxy → custom_node，use_proxy_pool → pool，否则 direct），
+    /// 保持存量配置行为不变。
+    pub fn effective_proxy_mode(&self) -> String {
+        if let Some(mode) = self.proxy_mode.as_deref() {
+            let mode = mode.trim().to_lowercase();
+            if !mode.is_empty() {
+                return mode;
+            }
+        }
+        if self.use_fixed_proxy {
+            "custom_node".to_string()
+        } else if self.use_proxy_pool {
+            "pool".to_string()
+        } else {
+            "direct".to_string()
+        }
+    }
+
+    /// fixed_channel 模式下某 API Key 绑定的代理池固定通道 ID（KeyRule 覆盖）
+    pub fn key_fixed_channel(&self, api_key: &str) -> Option<String> {
+        let needle = api_key.trim();
+        if needle.is_empty() {
+            return None;
+        }
+        self.key_rules
+            .as_ref()?
+            .iter()
+            .find(|r| r.key.trim() == needle)?
+            .fixed_channel_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    }
+
+    /// fixed_channel 模式的渠道级默认固定通道 ID
+    pub fn default_fixed_channel(&self) -> Option<String> {
+        self.proxy_fixed_channel
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    }
+
     /// 查找指定模型的代理出口覆盖规则（忽略大小写匹配）
     pub fn model_proxy_rule(&self, model: &str) -> Option<&ModelProxyRule> {
         let needle = model.trim().to_lowercase();
@@ -178,6 +238,8 @@ pub fn default_channels() -> Vec<ChannelConfig> {
         use_proxy_pool: false,
         alias: Some("opencode".to_string()),
         site_id: None,
+        proxy_mode: None,
+        proxy_fixed_channel: None,
         use_fixed_proxy: false,
         fixed_proxy_node: None,
         priority: Some(1),

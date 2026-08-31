@@ -767,6 +767,9 @@ pub(crate) fn access_token_was_rejected(error: &str) -> bool {
         "令牌已过期",
         "unauthorized",
         "token is invalid",
+        // newapi2（如 Pomelo）对失效令牌返回的文案
+        "access token 无效",
+        "invalid access token",
     ]
     .iter()
     .any(|marker| error.to_ascii_lowercase().contains(marker))
@@ -1391,12 +1394,13 @@ pub(crate) fn chrome_account_bridge_script(
         storedUser = JSON.parse(storedUser);
       }
       const storedUserId = storedUser?.id ?? storedUser?.data?.id ?? "";
-      if (String(storedUserId) !== String(legacyUserId)) {
+      // 新版前端（如 Pomelo）不写 user 键：无法核对时不得判串号（旧逻辑把
+      // 整站 newapi2 桥接错杀成 PROFILE_MISMATCH），身份交由 Profile 隔离的
+      // Cookie 罐决定；只有能明确读出不同用户 ID 时才拒绝。
+      if (storedUserId && String(storedUserId) !== String(legacyUserId)) {
         return "__OPENHUB_PROFILE_MISMATCH__";
       }
-    } catch (_) {
-      return "__OPENHUB_PROFILE_MISMATCH__";
-    }
+    } catch (_) {}
   }
   const previous = window.__openHubAccountSync;
   if (previous && previous.token === token) {
@@ -2182,19 +2186,21 @@ async fn sync_site_account_via_chrome_inner(
         }
     }
 
-    // 三阶段预算合计 60 秒（15+15+30 / 20+15+25），与 SITE_SYNC_TIMEOUT 对齐：
-    // 静默/后台失败要尽早让位给可见验证，可见验证也只保留有限窗口，
-    // 超时就整体失败并进入浏览器兜底冷却，不长时间卡住同步弹窗。
+    // 三阶段预算与 SITE_SYNC_TIMEOUT（60 秒）的关系：预算合计 45 秒
+    // （12+13+20 / 10+13+22），给前置的会话读取、可达性探测、缓存令牌校验
+    // （实测 8~15 秒）留出余量。此前合计恰好 60 秒，任何前置开销都会让最后
+    // 的可见验证被总超时连坐掐断——用户还没看到浏览器窗口流程就报失败。
+    // 静默/后台失败要尽早让位给可见验证，可见验证也只保留有限窗口。
     let silent_timeout = if use_refresh_auth {
+        Duration::from_secs(12)
+    } else {
+        Duration::from_secs(10)
+    };
+    let background_timeout = Duration::from_secs(13);
+    let visible_timeout = if use_refresh_auth {
         Duration::from_secs(20)
     } else {
-        Duration::from_secs(15)
-    };
-    let background_timeout = Duration::from_secs(15);
-    let visible_timeout = if use_refresh_auth {
-        Duration::from_secs(25)
-    } else {
-        Duration::from_secs(30)
+        Duration::from_secs(22)
     };
 
     // 每个阶段开始前检查强制停止：取消后立即失败，不再打开新的 Chrome 标签页。
@@ -2629,6 +2635,14 @@ mod tests {
         assert!(requires_chrome_fallback(
             "账号接口 HTTP 403：无效的令牌，请重新登录"
         ));
+    }
+
+    #[test]
+    fn newapi2_access_token_rejection_is_recognized() {
+        // Pomelo（newapi2）实测文案：失效令牌返回 401 + "access token 无效"。
+        let error = "账号接口 HTTP 401：无权进行此操作，access token 无效";
+        assert!(access_token_was_rejected(error));
+        assert!(requires_chrome_fallback(error));
     }
 
     #[test]

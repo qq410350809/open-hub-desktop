@@ -18,6 +18,8 @@ pub const CHARITY_PREPARE_NODE_LIMIT: usize = 40;
 pub const CHARITY_BAN_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 pub const CHARITY_BAN_FORBIDDEN: Duration = Duration::from_secs(2 * 60 * 60);
 pub const CHARITY_BAN_UNREACHABLE: Duration = Duration::from_secs(2 * 60 * 60);
+/// 429 只是请求过快（节点本身可用），短封禁后即可重新入池
+pub const CHARITY_BAN_RATE_LIMITED: Duration = Duration::from_secs(2 * 60);
 pub const CHARITY_BAN_DEFAULT: Duration = Duration::from_secs(15 * 60);
 pub const CHARITY_PAGE_SIZE: usize = 20;
 pub const CHARITY_PAGE_LIMIT_MAX: usize = 2000;
@@ -129,6 +131,10 @@ pub struct CharitySyncLogEntry {
     pub message: String,
     pub node_name: String,
     pub duration_ms: i64,
+    /// 展开详情用：单标签为 {"new","updated","unread"}，
+    /// 汇总行为 {"totalNew","totalUpdated","feeds":[{id,name,status,new,updated}]}
+    #[serde(default)]
+    pub detail: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -169,8 +175,11 @@ impl CharityNodeQueue {
         self.nodes.pop_front()
     }
 
-    pub fn push_back(&mut self, node: CharityNodeRef) {
-        self.nodes.push_back(node);
+    /// 归还节点，但队列里已有同 ID 节点（粘性节点未出队被复用）时不重复入队
+    pub fn push_back_if_absent(&mut self, node: CharityNodeRef) {
+        if !self.nodes.iter().any(|existing| existing.id == node.id) {
+            self.nodes.push_back(node);
+        }
     }
 
     #[cfg(test)]
@@ -191,6 +200,8 @@ pub struct CharityMonitorRuntime {
     pub force_round: AtomicBool,
     pub syncing: AtomicBool,
     pub node_round_robin: AtomicUsize,
+    /// 上次请求成功的节点：采集默认粘住它，仅在 HTTP 4xx/5xx 等失败剔除后才切换
+    preferred_node: Mutex<Option<String>>,
     pub active_sync_cancellation: Mutex<Option<CancellationToken>>,
     pub proxy_sync_lock: tokio::sync::Mutex<()>,
     pub last_errors: Mutex<HashMap<String, String>>,
@@ -205,6 +216,7 @@ impl CharityMonitorRuntime {
             force_round: AtomicBool::new(false),
             syncing: AtomicBool::new(false),
             node_round_robin: AtomicUsize::new(0),
+            preferred_node: Mutex::new(None),
             active_sync_cancellation: Mutex::new(None),
             proxy_sync_lock: tokio::sync::Mutex::new(()),
             last_errors: Mutex::new(HashMap::new()),
@@ -218,6 +230,28 @@ impl CharityMonitorRuntime {
         };
         let now = Instant::now();
         bans.retain(|_, until| *until > now);
+    }
+
+    pub fn preferred_node(&self) -> Option<String> {
+        self.preferred_node
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+    }
+
+    pub fn set_preferred_node(&self, node_id: &str) {
+        if let Ok(mut guard) = self.preferred_node.lock() {
+            *guard = Some(node_id.to_string());
+        }
+    }
+
+    /// 仅当被剔除的正是粘性节点时才清除，避免并行 feed 误清其他节点的粘性
+    pub fn clear_preferred_node(&self, node_id: &str) {
+        if let Ok(mut guard) = self.preferred_node.lock() {
+            if guard.as_deref() == Some(node_id) {
+                *guard = None;
+            }
+        }
     }
 
     pub fn is_banned(&self, node_id: &str) -> bool {

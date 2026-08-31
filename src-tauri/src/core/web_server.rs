@@ -523,18 +523,16 @@ macro_rules! rpc_arms {
             "add_charity_source" => {
                 let id: String = take($args, &["id"])?;
                 let name: String = take($args, &["name"])?;
-                let json_url: Option<String> = take_opt($args, &["jsonUrl", "json_url"])?;
                 Ok(json!(
-                    crate::charity::add_charity_source($ctx, id, name, json_url).await
+                    crate::charity::add_charity_source($ctx, id, name).await
                 ))
             }
             "update_charity_source" => {
                 let id: String = take($args, &["id"])?;
                 let name: Option<String> = take_opt($args, &["name"])?;
-                let json_url: Option<String> = take_opt($args, &["jsonUrl", "json_url"])?;
                 let enabled: Option<bool> = take_opt($args, &["enabled"])?;
                 Ok(json!(
-                    crate::charity::update_charity_source($ctx, id, name, json_url, enabled).await
+                    crate::charity::update_charity_source($ctx, id, name, enabled).await
                 ))
             }
             "remove_charity_source" => {

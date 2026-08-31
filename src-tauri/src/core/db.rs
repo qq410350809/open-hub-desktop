@@ -284,7 +284,8 @@ impl Database {
                     status TEXT NOT NULL DEFAULT '',
                     message TEXT NOT NULL DEFAULT '',
                     node_name TEXT NOT NULL DEFAULT '',
-                    duration_ms INTEGER NOT NULL DEFAULT 0
+                    duration_ms INTEGER NOT NULL DEFAULT 0,
+                    detail_json TEXT NOT NULL DEFAULT ''
                 );
                 CREATE INDEX IF NOT EXISTS idx_charity_sync_logs_created
                     ON charity_sync_logs(created_at DESC, id DESC);
@@ -1204,6 +1205,20 @@ fn ensure_charity_sync_log_columns(connection: &Connection) -> Result<(), String
             )
             .map_err(|error| error.to_string())?;
     }
+    let has_detail: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('charity_sync_logs') WHERE name='detail_json'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if has_detail == 0 {
+        connection
+            .execute_batch(
+                "ALTER TABLE charity_sync_logs ADD COLUMN detail_json TEXT NOT NULL DEFAULT '';",
+            )
+            .map_err(|error| error.to_string())?;
+    }
     Ok(())
 }
 
@@ -1487,8 +1502,12 @@ pub(crate) fn insert_site_transaction(
     transaction: &rusqlite::Transaction,
     site: &SiteRecord,
 ) -> Result<(), String> {
+    // 必须用 UPSERT 而不是 INSERT OR REPLACE：外键开启后 REPLACE 会先删除
+    // 旧行，级联清空 site_accounts、site_model_cache 等子表（同步更新站点
+    // 会把账号与额度缓存全部洗掉）。DO UPDATE 只改列值不触碰子表，
+    // created_at 与 rowid 也得以保留。
     transaction.execute(
-        "INSERT OR REPLACE INTO directory_sites (
+        "INSERT INTO directory_sites (
             id, name, description, registration_limit, icon, api_base_url, system_type,
             supports_immersive_translation, supports_ldc, supports_checkin, supports_nsfw,
             checkin_url, checkin_note, benefit_url, rate_limit, status_url,
@@ -1501,7 +1520,35 @@ pub(crate) fn insert_site_transaction(
             ?17, ?18, ?19, ?20,
             ?21, ?22, ?23, ?24, ?25, ?26, ?27,
             COALESCE(NULLIF(?28, ''), CURRENT_TIMESTAMP), COALESCE(NULLIF(?28, ''), CURRENT_TIMESTAMP)
-        )",
+        )
+        ON CONFLICT(id) DO UPDATE SET
+            name = excluded.name,
+            description = excluded.description,
+            registration_limit = excluded.registration_limit,
+            icon = excluded.icon,
+            api_base_url = excluded.api_base_url,
+            system_type = excluded.system_type,
+            supports_immersive_translation = excluded.supports_immersive_translation,
+            supports_ldc = excluded.supports_ldc,
+            supports_checkin = excluded.supports_checkin,
+            supports_nsfw = excluded.supports_nsfw,
+            checkin_url = excluded.checkin_url,
+            checkin_note = excluded.checkin_note,
+            benefit_url = excluded.benefit_url,
+            rate_limit = excluded.rate_limit,
+            status_url = excluded.status_url,
+            is_only_maintainer_visible = excluded.is_only_maintainer_visible,
+            requires_invite_code = excluded.requires_invite_code,
+            is_runaway = excluded.is_runaway,
+            is_fake_charity = excluded.is_fake_charity,
+            has_pending_report = excluded.has_pending_report,
+            is_personal = excluded.is_personal,
+            is_pending = excluded.is_pending,
+            use_system_proxy = excluded.use_system_proxy,
+            use_proxy_pool = excluded.use_proxy_pool,
+            favorite = excluded.favorite,
+            hidden = excluded.hidden,
+            updated_at = excluded.updated_at",
         params![
             site.id, site.name, site.description, site.registration_limit, site.icon, site.api_base_url, site.system_type,
             site.supports_immersive_translation, site.supports_ldc, site.supports_checkin, site.supports_nsfw,
@@ -1639,6 +1686,17 @@ pub(crate) fn ensure_charity_feed_sources_table(connection: &Connection) -> Resu
             );",
         )
         .map_err(|error| error.to_string())?;
+    // 存量库中旧版标签 JSON 地址（/tag/{id}-tag/{id}.json）迁移到 /tag/{id}/l/latest.json，
+    // 仅精确匹配程序生成过的旧地址，用户手工自定义的 URL 不动。
+    connection
+        .execute(
+            "UPDATE charity_feed_sources
+             SET json_url = 'https://linux.do/tag/' || id || '/l/latest.json?order=created'
+             WHERE json_url = 'https://linux.do/tag/' || id || '-tag/' || id
+                   || '.json?order=created&ascending=false'",
+            [],
+        )
+        .map_err(|error| error.to_string())?;
     // 仅在表为空时插入默认标签
     let count: i64 = connection
         .query_row("SELECT COUNT(*) FROM charity_feed_sources", [], |row| {
@@ -1649,12 +1707,12 @@ pub(crate) fn ensure_charity_feed_sources_table(connection: &Connection) -> Resu
         connection
             .execute_batch(
                 "INSERT INTO charity_feed_sources (id, name, json_url, sort_order) VALUES
-                    ('1515', '公益推广', 'https://linux.do/tag/1515-tag/1515.json?order=created&ascending=false', 1),
-                    ('1980', '公益站',   'https://linux.do/tag/1980-tag/1980.json?order=created&ascending=false', 2),
-                    ('2233', '中转站',   'https://linux.do/tag/2233-tag/2233.json?order=created&ascending=false', 3),
-                    ('2234', '开源推广', 'https://linux.do/tag/2234-tag/2234.json?order=created&ascending=false', 4),
-                    ('1514', '高级推广', 'https://linux.do/tag/1514-tag/1514.json?order=created&ascending=false', 5),
-                    ('193',  '订阅节点', 'https://linux.do/tag/193-tag/193.json?order=created&ascending=false', 6)
+                    ('1515', '公益推广', 'https://linux.do/tag/1515/l/latest.json?order=created', 1),
+                    ('1980', '公益站',   'https://linux.do/tag/1980/l/latest.json?order=created', 2),
+                    ('2233', '中转站',   'https://linux.do/tag/2233/l/latest.json?order=created', 3),
+                    ('2234', '开源推广', 'https://linux.do/tag/2234/l/latest.json?order=created', 4),
+                    ('1514', '高级推广', 'https://linux.do/tag/1514/l/latest.json?order=created', 5),
+                    ('193',  '订阅节点', 'https://linux.do/tag/193/l/latest.json?order=created', 6)
                 ;",
             )
             .map_err(|error| error.to_string())?;
@@ -1899,5 +1957,153 @@ mod account_proxy_channel_tests {
             )
             .unwrap();
         assert_eq!(has_created_at, 1);
+    }
+}
+
+#[cfg(test)]
+mod site_upsert_tests {
+    use super::*;
+
+    fn upsert_test_connection() -> Connection {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "PRAGMA foreign_keys = ON;
+                 CREATE TABLE directory_sites (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    description TEXT NOT NULL DEFAULT '',
+                    registration_limit INTEGER NOT NULL DEFAULT 0,
+                    icon TEXT NOT NULL DEFAULT '',
+                    api_base_url TEXT NOT NULL DEFAULT '',
+                    system_type TEXT NOT NULL DEFAULT '',
+                    supports_immersive_translation INTEGER NOT NULL DEFAULT 0,
+                    supports_ldc INTEGER NOT NULL DEFAULT 0,
+                    supports_checkin INTEGER NOT NULL DEFAULT 0,
+                    supports_nsfw INTEGER NOT NULL DEFAULT 0,
+                    checkin_url TEXT NOT NULL DEFAULT '',
+                    checkin_note TEXT NOT NULL DEFAULT '',
+                    benefit_url TEXT NOT NULL DEFAULT '',
+                    rate_limit TEXT NOT NULL DEFAULT '',
+                    status_url TEXT NOT NULL DEFAULT '',
+                    is_only_maintainer_visible INTEGER NOT NULL DEFAULT 0,
+                    requires_invite_code INTEGER NOT NULL DEFAULT 0,
+                    is_runaway INTEGER NOT NULL DEFAULT 0,
+                    is_fake_charity INTEGER NOT NULL DEFAULT 0,
+                    has_pending_report INTEGER NOT NULL DEFAULT 0,
+                    is_personal INTEGER NOT NULL DEFAULT 0,
+                    is_pending INTEGER NOT NULL DEFAULT 0,
+                    use_system_proxy INTEGER NOT NULL DEFAULT 0,
+                    use_proxy_pool INTEGER NOT NULL DEFAULT 0,
+                    favorite INTEGER NOT NULL DEFAULT 0,
+                    hidden INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                 );
+                 CREATE TABLE site_accounts (
+                    site_id TEXT NOT NULL,
+                    profile_id TEXT NOT NULL,
+                    domain TEXT NOT NULL,
+                    remaining REAL,
+                    used REAL,
+                    total REAL,
+                    PRIMARY KEY (site_id, profile_id, domain),
+                    FOREIGN KEY(site_id) REFERENCES directory_sites(id) ON DELETE CASCADE
+                 );
+                 CREATE TABLE site_model_cache (
+                    site_id TEXT NOT NULL,
+                    profile_id TEXT NOT NULL,
+                    PRIMARY KEY (site_id, profile_id),
+                    FOREIGN KEY(site_id) REFERENCES directory_sites(id) ON DELETE CASCADE
+                 );
+                 CREATE TABLE site_tags (
+                    site_id TEXT NOT NULL,
+                    tag TEXT NOT NULL,
+                    FOREIGN KEY(site_id) REFERENCES directory_sites(id) ON DELETE CASCADE
+                 );
+                 CREATE TABLE site_maintainers (
+                    site_id TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    maintainer_id TEXT NOT NULL,
+                    username TEXT NOT NULL,
+                    profile_url TEXT NOT NULL,
+                    FOREIGN KEY(site_id) REFERENCES directory_sites(id) ON DELETE CASCADE
+                 );
+                 CREATE TABLE site_extensions (
+                    site_id TEXT NOT NULL,
+                    label TEXT NOT NULL,
+                    url TEXT NOT NULL,
+                    FOREIGN KEY(site_id) REFERENCES directory_sites(id) ON DELETE CASCADE
+                 );",
+            )
+            .unwrap();
+        connection
+    }
+
+    #[test]
+    fn reinserting_existing_site_keeps_accounts_and_quota_cache() {
+        let mut connection = upsert_test_connection();
+        connection
+            .execute(
+                "INSERT INTO directory_sites (id, name, api_base_url, created_at, updated_at)
+                 VALUES ('site-1', '旧名字', 'https://example.com', '2020-01-01T00:00:00.000Z', '2020-01-01T00:00:00.000Z')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO site_accounts (site_id, profile_id, domain, remaining, used, total)
+                 VALUES ('site-1', 'profile-1', 'example.com', 7.5, 2.5, 10.0)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO site_model_cache (site_id, profile_id) VALUES ('site-1', 'profile-1')",
+                [],
+            )
+            .unwrap();
+
+        let transaction = connection.transaction().unwrap();
+        insert_site_transaction(
+            &transaction,
+            &SiteRecord {
+                id: "site-1".into(),
+                name: "新名字".into(),
+                api_base_url: "https://example.com".into(),
+                updated_at: "2026-08-30T00:00:00.000Z".into(),
+                ..SiteRecord::default()
+            },
+        )
+        .unwrap();
+        transaction.commit().unwrap();
+
+        let (name, created_at): (String, String) = connection
+            .query_row(
+                "SELECT name, created_at FROM directory_sites WHERE id = 'site-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(name, "新名字");
+        assert_eq!(created_at, "2020-01-01T00:00:00.000Z");
+
+        let quota: (f64, f64, f64) = connection
+            .query_row(
+                "SELECT remaining, used, total FROM site_accounts WHERE site_id = 'site-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(quota, (7.5, 2.5, 10.0));
+
+        let cache_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM site_model_cache WHERE site_id = 'site-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cache_count, 1);
     }
 }

@@ -1,5 +1,6 @@
 use crate::context::EventBus;
 use crate::models::*;
+use crate::proxypool::geoip::{classify_ip, geoip_country, open_geoip_reader};
 use crate::proxypool::runtime::{
     append_controller_path, controller_client, controller_url, ensure_global_runtime, load_state,
     runtime_controller_port, speed_test_plan,
@@ -9,6 +10,7 @@ use futures_util::future;
 use rusqlite::params;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -38,24 +40,21 @@ pub fn normalize_ignore_addresses(value: &str) -> String {
     items.join(",")
 }
 
-/// 经本地代理端口（mihomo lane listener）做一次流式下载测速。
-/// 请求 10MB 上限的流，按 100ms 时间桶统计到达字节：窗口（900ms）或采样
-/// 目标到达即停，网速取最大连续 3 桶（300ms 滑窗）的平均速率——既跳过
-/// 慢启动，又摊平 chunk 级调度突发。并行 lane 共享总带宽，短窗口峰值法
-/// 不被长下载的带宽争抢拖垮。
-/// 延时与网速一体产出：(响应头到达耗时, 等效 500KB 下载耗时)。
-/// - 超时前没收到响应头 → (None, None)（节点不通，两指标一起判死）
-/// - 总采样 < 最小采样量或无峰值 → (Some, None)（连通但无有效吞吐）
-/// - 采样完成 → (Some, Some)，等效耗时 = 500KB ÷ 峰值速率
-pub(crate) async fn measure_get_probe(
-    proxy_url: String,
-    target: String,
-) -> (Option<i64>, Option<i64>) {
+/// 经本地代理端口（mihomo lane listener）做一次流式下载测吞吐。
+/// 下载上限 500KB（收满即停，URL bytes 参数同步封顶）：从首字节起按 50ms
+/// 分桶累计到达字节，取字节最多的单桶为峰值——TCP 慢启动的低速首桶自然
+/// 被稳态峰值桶覆盖；首字节后 1s 未收满即主动断开（标本已够，慢节点不拖
+/// 整体超时），总量不足最小样本线视为无有效吞吐。返回按峰值桶速率外推的
+/// 等效 500KB 下载耗时（毫秒），与前端 MB/s 换算口径一致。
+/// 注意：mihomo 对 CONNECT 先回 200 再拨号上游，纯 CONNECT 计时测不到
+/// 节点连通性（只有本地回环耗时），因此延迟指标用真实 GET 计时，见
+/// `lane_public_fetch_latency` 相关探测；两者由调用方并行执行、一体写回。
+pub(crate) async fn download_throughput_probe(proxy_url: String, target: String) -> Option<i64> {
     let client = match reqwest::Client::builder()
         .no_proxy()
         .proxy(match reqwest::Proxy::all(&proxy_url) {
             Ok(proxy) => proxy,
-            Err(_) => return (None, None),
+            Err(_) => return None,
         })
         .connect_timeout(Duration::from_millis(SPEED_TEST_TIMEOUT_MS))
         .timeout(Duration::from_millis(SPEED_TEST_TIMEOUT_MS))
@@ -67,31 +66,25 @@ pub(crate) async fn measure_get_probe(
         Ok(client) => client,
         Err(error) => {
             warn!("构建下载测速客户端失败：{error}");
-            return (None, None);
+            return None;
         }
     };
-    let started = Instant::now();
-    let ttfb_ms = Arc::new(AtomicI64::new(-1));
-    // 峰值窗口（连续 K 桶）字节数 / 总采样字节数（probe 结束或被超时中断后可读）
-    let peak_window_bytes = Arc::new(AtomicI64::new(0));
+    // 峰值 50ms 桶字节数 / 总采样字节数（probe 结束或被超时中断后可读）
+    let peak_bucket_bytes = Arc::new(AtomicI64::new(0));
     let total_bytes = Arc::new(AtomicI64::new(0));
     let probe = {
-        let ttfb_ms = ttfb_ms.clone();
-        let peak_window_bytes = peak_window_bytes.clone();
+        let peak_bucket_bytes = peak_bucket_bytes.clone();
         let total_bytes = total_bytes.clone();
         async move {
             let mut response = match client.get(&target).send().await {
                 Ok(response) => response,
                 Err(_) => return,
             };
-            let ttfb = started.elapsed().as_millis() as i64;
-            ttfb_ms.store(ttfb, Ordering::Relaxed);
             if !response.status().is_success() {
                 return;
             }
-            // 按 100ms 时间桶累计到达字节；窗口（或采样目标）一到即停，
-            // 不必下载完整文件——并行 lane 共享带宽，短窗口+峰值统计
-            // 既能跳过慢启动，又不被长下载的带宽争抢拖垮。
+            // 从首字节起按 50ms 分桶累计；收满 500KB 或超过 1s 传输窗口即停
+            // （窗口内没收满说明节点吞吐有限，已收标本对峰值桶计量足够）。
             let header_at = Instant::now();
             let mut buckets: HashMap<u64, u64> = HashMap::new();
             let mut received: u64 = 0;
@@ -113,36 +106,25 @@ pub(crate) async fn measure_get_probe(
                     _ => break,
                 }
             }
-            // 峰值取最大连续 K 桶的字节和（从桶 1 起：桶 0 不完整且处于慢启动
-            // 起点）；缺失桶按 0 计。单桶突发被 K 桶窗口摊薄。
-            let max_index = buckets.keys().copied().max().unwrap_or(0);
-            let mut peak_window: u64 = 0;
-            for start in 1..=max_index {
-                let sum: u64 = (0..SPEED_TEST_PEAK_WINDOW_BUCKETS)
-                    .map(|offset| buckets.get(&(start + offset)).copied().unwrap_or(0))
-                    .sum();
-                peak_window = peak_window.max(sum);
-            }
-            peak_window_bytes.store(peak_window as i64, Ordering::Relaxed);
+            // 峰值 = 字节数最多的单个 50ms 桶；换算为等效 500KB 耗时
+            let peak_bucket = buckets.values().copied().max().unwrap_or(0);
+            peak_bucket_bytes.store(peak_bucket as i64, Ordering::Relaxed);
             total_bytes.store(received as i64, Ordering::Relaxed);
         }
     };
     let _ = tokio::time::timeout(Duration::from_millis(SPEED_TEST_TIMEOUT_MS), probe).await;
 
-    let ttfb = {
-        let value = ttfb_ms.load(Ordering::Relaxed);
-        (value >= 0).then_some(value)
-    };
     let total = total_bytes.load(Ordering::Relaxed);
-    let peak = peak_window_bytes.load(Ordering::Relaxed);
-    // 网速 = 峰值窗口字节数 ÷ 窗口时长；channel_latency_ms 存等效 500KB 耗时
-    let window_ms = (SPEED_TEST_PEAK_BUCKET_MS * SPEED_TEST_PEAK_WINDOW_BUCKETS) as f64;
-    let effective_ms = if total >= SPEED_TEST_MIN_SAMPLE_BYTES as i64 && peak > 0 {
-        Some((SPEED_TEST_REF_BYTES as f64 * window_ms / peak as f64).round() as i64)
+    let peak = peak_bucket_bytes.load(Ordering::Relaxed);
+    // 网速 = 峰值桶字节 ÷ 50ms；channel_latency_ms 存等效 500KB 耗时
+    if total >= SPEED_TEST_MIN_SAMPLE_BYTES as i64 && peak > 0 {
+        Some(
+            (SPEED_TEST_REF_BYTES as f64 * SPEED_TEST_PEAK_BUCKET_MS as f64 / peak as f64)
+                .round() as i64,
+        )
     } else {
         None
-    };
-    (ttfb, effective_ms)
+    }
 }
 
 /// 通过控制器 API 把 lane 的 select 组切换到指定节点
@@ -167,6 +149,134 @@ async fn select_lane_node(
         return Err(format!("切换测速节点失败：HTTP {}", response.status()));
     }
     Ok(())
+}
+
+/// 经控制器 delay 接口测节点连通延迟。mihomo 内部做两次测量取小
+/// （unified-delay），扣除建链一次性成本，数值即传统面板口径的"延迟"——
+/// 200ms 级节点显示 ~200ms，这是唯一符合用户直觉的口径
+/// （经 lane 的完整 HTTP/HTTPS 请求天然含 3~5 倍 RTT，必然偏大；
+/// mihomo 对 CONNECT 先回 200 再拨号，lane 侧 CONNECT 计时只有本地回环）。
+pub(crate) async fn controller_proxy_delay(
+    client: &reqwest::Client,
+    controller_port: u16,
+    proxy_name: &str,
+    url: &str,
+) -> Option<i64> {
+    let mut endpoint =
+        Url::parse(&controller_url(controller_port, "/proxies/")).ok()?;
+    append_controller_path(&mut endpoint, &[proxy_name, "delay"]).ok()?;
+    endpoint
+        .query_pairs_mut()
+        .append_pair("timeout", &SPEED_TEST_TIMEOUT_MS.to_string())
+        .append_pair("url", url);
+    let response = client
+        .get(endpoint)
+        .bearer_auth(RUNTIME_SECRET)
+        .timeout(Duration::from_millis(SPEED_TEST_TIMEOUT_MS + 2_000))
+        .send()
+        .await
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let value: serde_json::Value = response.json().await.ok()?;
+    value.get("delay").and_then(|delay| delay.as_i64())
+}
+
+/// 单个回显服务的探测结果：
+/// - Success：拿到合法 IP 与端到端耗时
+/// - BadResponse：服务侧异常（非 2xx / 响应体不是 IP / 被劫持）——可换服务重试
+/// - Unreachable：传输层不通（超时/连接失败）——换服务也没意义，节点判死
+enum EchoProbeOutcome {
+    Success(i64, String),
+    BadResponse,
+    Unreachable,
+}
+
+/// 出口 IP 抓取（不作为延迟指标）：经 lane 向 IP 回显服务发起 GET，取回
+/// 出口公网 IP 用于落库与国家分组纠错。响应体必须能解析为 IP（防止把
+/// 错误页当成功）。抓取失败不影响节点判定，仅放弃本次分组纠错。
+async fn ip_echo_latency(proxy_url: &str, echo_url: &str) -> EchoProbeOutcome {
+    let client = match reqwest::Client::builder()
+        .no_proxy()
+        .proxy(match reqwest::Proxy::all(proxy_url) {
+            Ok(proxy) => proxy,
+            Err(_) => return EchoProbeOutcome::Unreachable,
+        })
+        .connect_timeout(Duration::from_millis(LANE_DELAY_TIMEOUT_MS))
+        .timeout(Duration::from_millis(LANE_DELAY_TIMEOUT_MS))
+        .pool_max_idle_per_host(0)
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => {
+            warn!("构建延迟探测客户端失败：{error}");
+            return EchoProbeOutcome::Unreachable;
+        }
+    };
+    let started = Instant::now();
+    let fetch = async {
+        let response = client.get(echo_url).send().await.ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        let body = response.text().await.ok()?;
+        let ip = body.trim();
+        if ip.parse::<IpAddr>().is_err() {
+            return None;
+        }
+        Some(ip.to_string())
+    };
+    match tokio::time::timeout(Duration::from_millis(LANE_DELAY_TIMEOUT_MS), fetch).await {
+        Ok(Some(exit_ip)) => EchoProbeOutcome::Success(started.elapsed().as_millis() as i64, exit_ip),
+        Ok(None) => EchoProbeOutcome::BadResponse,
+        Err(_) => EchoProbeOutcome::Unreachable,
+    }
+}
+
+/// 按优先级依次尝试回显服务：服务侧异常（BadResponse）换下一个重试；
+/// 节点侧不通（Unreachable）直接判死，避免死节点白等全部服务的超时预算。
+pub(crate) async fn ip_echo_probe_with_fallback(proxy_url: &str) -> Option<(i64, String)> {
+    for echo_url in PROXY_IP_ECHO_URLS {
+        match ip_echo_latency(proxy_url, echo_url).await {
+            EchoProbeOutcome::Success(latency_ms, exit_ip) => {
+                return Some((latency_ms, exit_ip));
+            }
+            EchoProbeOutcome::BadResponse => continue,
+            EchoProbeOutcome::Unreachable => return None,
+        }
+    }
+    None
+}
+
+/// 出口 IP 落库并按其 geoip 归属纠错国家分组：分组按 country_code 聚合，
+/// 出口 IP 的归属才是节点的真实地区（入口服务器地址常与出口不一致）。
+/// geoip 不可用或查不到时仅落 IP，保留原国家归属。
+pub(crate) fn apply_exit_ip_geoip(
+    database: &Database,
+    geoip_reader: Option<&maxminddb::Reader<Vec<u8>>>,
+    node_id: &str,
+    exit_ip: &str,
+) {
+    let Ok(parsed) = exit_ip.parse::<IpAddr>() else {
+        return;
+    };
+    let classification = classify_ip(parsed).to_string();
+    let (country_code, country_name) = geoip_reader
+        .and_then(|reader| geoip_country(reader, parsed))
+        .unwrap_or_default();
+    let connection = match database.lock_conn() {
+        Ok(connection) => connection,
+        Err(_) => return,
+    };
+    let _ = connection.execute(
+        "UPDATE proxy_pool_nodes
+         SET primary_ip=?2, classification=?3,
+             country_code=CASE WHEN ?4 != '' THEN ?4 ELSE country_code END,
+             country_name=CASE WHEN ?5 != '' THEN ?5 ELSE country_name END
+         WHERE id=?1",
+        params![node_id, exit_ip, classification, country_code, country_name],
+    );
 }
 
 pub async fn run_proxy_node_pool(
@@ -254,6 +364,19 @@ pub async fn run_proxy_node_pool(
 
     let completed = Arc::new(AtomicUsize::new(0));
     let client = controller_client()?;
+    let geoip_reader = open_geoip_reader(runtime);
+
+    // 延迟口径：控制器 delay 接口的测试 URL（设置页"测速地址"，默认 gstatic 204）
+    let delay_url = {
+        let stored = crate::db::read_meta(database, PROXY_SPEED_TEST_URL_KEY).unwrap_or_default();
+        if stored.trim().is_empty()
+            || crate::proxypool::runtime::is_slow_or_blocked_speed_test_url(&stored)
+        {
+            DEFAULT_PROXY_SPEED_TEST_URL.to_string()
+        } else {
+            stored
+        }
+    };
 
     let lane_futures = lanes
         .iter()
@@ -270,6 +393,8 @@ pub async fn run_proxy_node_pool(
             let cancellation = cancellation.clone();
             let group_name = lane.group_name.clone();
             let listen_port = lane.listen_port;
+            let delay_url = delay_url.clone();
+            let geoip_reader = geoip_reader.as_ref();
             let completed = Arc::clone(&completed);
             async move {
                 for node_id in my_nodes {
@@ -308,22 +433,38 @@ pub async fn run_proxy_node_pool(
                         );
                         continue;
                     }
-                    // 延时与网速一体测：同一条经 lane 的真实下载连接——
-                    // 响应头到达耗时即连通延迟，滑窗峰值吞吐换算网速。
-                    // 同源同预算，节点要么两个指标一起出，要么一起判死，
-                    // 不会再出现“有延迟没网速”的分裂结果。
+                    // 三路并行一体测，单节点耗时取三路最大值：
+                    // - 延迟：控制器 delay（unified-delay 面板口径，200ms 节点
+                    //   显示 ~200ms），未通过即整体判死；
+                    // - 网速：经 lane 的真实下载吞吐；
+                    // - 出口 IP：经 lane 的回显抓取，仅用于落库 + geoip 纠错
+                    //   国家分组，失败不影响节点判定与延迟/网速。
                     let proxy_url = format!("http://127.0.0.1:{listen_port}");
-                    let (ttfb, download_ms) =
-                        measure_get_probe(proxy_url, CHANNEL_SPEED_TEST_URL.to_string()).await;
-                    let status = if ttfb.is_some() { "success" } else { "error" };
-                    let _ = write_probe_result(&node_id, ttfb, download_ms);
+                    let (latency, echo, download_ms) = future::join3(
+                        controller_proxy_delay(&client, controller_port, &node_id, &delay_url),
+                        ip_echo_probe_with_fallback(&proxy_url),
+                        download_throughput_probe(
+                            proxy_url.clone(),
+                            CHANNEL_SPEED_TEST_URL.to_string(),
+                        ),
+                    )
+                    .await;
+                    let (download_ms, status) = if latency.is_some() {
+                        (download_ms, "success")
+                    } else {
+                        (None, "error")
+                    };
+                    if let (Some(_), Some((_, exit_ip))) = (latency, echo) {
+                        apply_exit_ip_geoip(database, geoip_reader, &node_id, &exit_ip);
+                    }
+                    let _ = write_probe_result(&node_id, latency, download_ms);
                     let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
                     bus.emit(
                         progress_event,
                         ProxyNodeTestProgress {
                             node_id,
                             phase: "completed".to_string(),
-                            latency_ms: ttfb,
+                            latency_ms: latency,
                             speed_ms: download_ms,
                             status: status.to_string(),
                             stage: "speed".to_string(),

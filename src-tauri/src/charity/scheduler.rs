@@ -1,4 +1,5 @@
 use crate::charity::db::*;
+use crate::charity::feed::charity_tag_json_url;
 use crate::charity::fetcher::*;
 use crate::charity::types::*;
 use crate::context::{spawn, AppContext};
@@ -151,9 +152,15 @@ pub fn start_charity_monitor(ctx: Arc<AppContext>) {
             }
 
             let sources_for_round = load_charity_sources(&database).unwrap_or_default();
-            let mut handles = Vec::with_capacity(sources_for_round.len());
+            // 标准标签源（地址为程序生成的 tag latest.json）→ 每轮一次 filter.json 合并请求；
+            // 自定义源 → 保留各自的独立请求。
+            let (standard_sources, custom_sources): (Vec<_>, Vec<_>) = sources_for_round
+                .into_iter()
+                .partition(|source| source.json_url == charity_tag_json_url(&source.id));
             let shared_queue = Arc::new(Mutex::new(CharityNodeQueue::from_nodes(round_nodes)));
-            for source in sources_for_round {
+
+            let mut handles = Vec::with_capacity(custom_sources.len());
+            for source in custom_sources {
                 let task_ctx = ctx.clone();
                 let cancellation = cancellation.clone();
                 let shared_queue = shared_queue.clone();
@@ -171,6 +178,18 @@ pub fn start_charity_monitor(ctx: Arc<AppContext>) {
                     .await;
                     (source.id.to_string(), result)
                 }));
+            }
+            if !standard_sources.is_empty() {
+                sync_round_combined(
+                    &ctx,
+                    database,
+                    runtime,
+                    &standard_sources,
+                    stage,
+                    &cancellation,
+                    &shared_queue,
+                )
+                .await;
             }
             for handle in handles {
                 match handle.await {

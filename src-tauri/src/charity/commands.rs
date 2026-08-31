@@ -323,7 +323,6 @@ pub async fn add_charity_source(
     ctx: Managed<'_, Arc<AppContext>>,
     id: String,
     name: String,
-    json_url: Option<String>,
 ) -> Result<CharityFeedSource, String> {
     let database = &*ctx.database;
     let id = id.trim().to_string();
@@ -331,9 +330,7 @@ pub async fn add_charity_source(
     if id.is_empty() || name.is_empty() {
         return Err("标签 ID 和名称不能为空".into());
     }
-    let json_url = json_url
-        .filter(|u| !u.trim().is_empty())
-        .unwrap_or_else(|| charity_tag_json_url(&id));
+    let json_url = charity_tag_json_url(&id);
     tokio::task::block_in_place(|| {
         let connection = database.lock_db();
         let max_sort: i64 = connection
@@ -365,7 +362,6 @@ pub async fn update_charity_source(
     ctx: Managed<'_, Arc<AppContext>>,
     id: String,
     name: Option<String>,
-    json_url: Option<String>,
     enabled: Option<bool>,
 ) -> Result<(), String> {
     let database = &*ctx.database;
@@ -378,17 +374,6 @@ pub async fn update_charity_source(
                     .execute(
                         "UPDATE charity_feed_sources SET name = ?2 WHERE id = ?1",
                         params![id, name],
-                    )
-                    .map_err(|error| error.to_string())?;
-            }
-        }
-        if let Some(json_url) = json_url {
-            let json_url = json_url.trim().to_string();
-            if !json_url.is_empty() {
-                connection
-                    .execute(
-                        "UPDATE charity_feed_sources SET json_url = ?2 WHERE id = ?1",
-                        params![id, json_url],
                     )
                     .map_err(|error| error.to_string())?;
             }
@@ -409,18 +394,16 @@ pub async fn update_charity_source(
 pub async fn remove_charity_source(
     ctx: Managed<'_, Arc<AppContext>>,
     id: String,
-) -> Result<(), String> {
+) -> Result<usize, String> {
     let database = &*ctx.database;
-    tokio::task::block_in_place(|| {
+    let removed_items = tokio::task::block_in_place(|| {
         let connection = database.lock_db();
-        connection
-            .execute(
-                "DELETE FROM charity_feed_sources WHERE id = ?1",
-                params![id],
-            )
-            .map_err(|error| format!("删除标签源失败：{error}"))?;
-        Ok(())
-    })
+        remove_charity_source_db(&connection, &id)
+    })?;
+    if let Ok(mut errors) = ctx.charity_runtime.last_errors.lock() {
+        errors.remove(&id);
+    }
+    Ok(removed_items)
 }
 
 #[cfg_attr(feature = "desktop", tauri::command)]

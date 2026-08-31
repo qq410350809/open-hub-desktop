@@ -614,6 +614,8 @@ pub async fn sync_model_proxy_site_channels(
                     use_proxy_pool: false,
                     alias: Some(site_id.clone()),
                     site_id: Some(site_id),
+                    proxy_mode: None,
+                    proxy_fixed_channel: None,
                     use_fixed_proxy: false,
                     fixed_proxy_node: None,
                     priority: Some(5),

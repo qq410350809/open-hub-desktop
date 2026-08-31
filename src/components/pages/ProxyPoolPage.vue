@@ -40,7 +40,7 @@ const selectedSource = ref("all");
 const nodeSearchQuery = ref("");
 
 // 延迟级别过滤
-const latencyFilter = ref<"200" | "500" | "1000" | "2000" | "error" | "all">("1000");
+const latencyFilter = ref<"200" | "500" | "1000" | "2000" | "error" | "all">("500");
 const latencyFilterOptions = [
   { value: "200", text: "≤ 200ms" },
   { value: "500", text: "≤ 500ms" },
@@ -51,8 +51,8 @@ const latencyFilterOptions = [
 ];
 
 // 网速级别过滤（依据 channel_latency_ms：等效 500KB 下载耗时，网速 = 500/耗时ms MB/s；
-// 测速为 10MB 流式采样，快节点跑满速、慢节点按实收字节计算）
-const speedFilter = ref<"all" | "10mbps" | "5mbps" | "1mbps" | "05mbps" | "untested">("5mbps");
+// 测速为 500KB 峰值桶采样（50ms 分桶取峰值），快节点跑满速、慢节点按实收字节计算）
+const speedFilter = ref<"all" | "10mbps" | "5mbps" | "1mbps" | "05mbps" | "untested">("1mbps");
 const speedFilterOptions = [
   { value: "10mbps", text: "≥ 10MB/s" },
   { value: "5mbps", text: "≥ 5MB/s" },
@@ -977,7 +977,7 @@ async function testAll() {
   message.value = "";
   const sName = selectedSourceName();
   if (!sName) {
-    message.value = "正在装载节点并测速（延时+网速一体探测）…";
+    message.value = "正在装载节点并测速（延时+网速+出口IP 三路并行探测）…";
     const result = await store.testAllProxyNodes();
     message.value = testResultMessage("全部来源测速", result);
     return;
@@ -987,7 +987,7 @@ async function testAll() {
     message.value = `${selectedSourceLabel()}当前没有可测速节点`;
     return;
   }
-  message.value = `正在装载 ${nodes.length} 个节点并测速（延时+网速一体探测）…`;
+  message.value = `正在装载 ${nodes.length} 个节点并测速（延时+网速+出口IP 三路并行探测）…`;
   const result = await store.testProxyNodes(
     nodes.map((node) => node.id),
     `test-source-${selectedSource.value}`,
@@ -1312,7 +1312,7 @@ watch(nodeViewMode, () => {
             <span class="pp-stat-unit">可用节点</span>
           </div>
           <div class="pp-stat-footer">
-            <span>≤1000ms: <strong>{{ goodNodesCount }}</strong> 个 · 连通 + 10MB 流式下载实测</span>
+            <span>≤1000ms: <strong>{{ goodNodesCount }}</strong> 个 · 连通 + 500KB 峰值采样实测</span>
           </div>
         </div>
 
@@ -1547,7 +1547,7 @@ watch(nodeViewMode, () => {
                 <span
                   class="pp-node-speed-chip"
                   :class="channelLatencyClass(node)"
-                  :title="`下载网速：${channelSpeedText(node)}（10MB 流式下载实测）`"
+                  :title="`下载网速：${channelSpeedText(node)}（500KB 峰值采样实测）`"
                 >
                   {{ channelSpeedText(node) }}
                 </span>
@@ -1679,7 +1679,7 @@ watch(nodeViewMode, () => {
                         <span
                           class="pp-node-speed-chip"
                           :class="channelLatencyClass(node)"
-                          :title="`下载网速：${channelSpeedText(node)}（10MB 流式下载实测）`"
+                          :title="`下载网速：${channelSpeedText(node)}（500KB 峰值采样实测）`"
                         >
                           {{ channelSpeedText(node) }}
                         </span>
@@ -1947,7 +1947,7 @@ watch(nodeViewMode, () => {
                 <!-- 固定节点选择器 -->
                 <div class="pp-form-group">
                   <div class="pp-label-row">
-                    <label class="pp-label" title="先测连通延迟（节点建链），连通正常的节点再自动做 10MB 流式下载测网速">固定出口节点 (连通 ≤500ms 候选)</label>
+                    <label class="pp-label" title="先测连通延迟（节点建链），连通正常的节点再自动做 500KB 峰值采样测网速">固定出口节点 (连通 ≤500ms 候选)</label>
                   </div>
 
                   <div class="pp-channel-candidate-box">
@@ -2003,7 +2003,7 @@ watch(nodeViewMode, () => {
                         <span
                           class="pp-candidate-rate-badge pp-speed-badge"
                           :class="channelLatencyClass(node)"
-                          title="下载网速（10MB 流式下载实测）"
+                          title="下载网速（500KB 峰值采样实测）"
                         >
                           {{ channelSpeedText(node) }}
                         </span>

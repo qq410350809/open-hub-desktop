@@ -989,6 +989,8 @@ mod egress_tests {
             use_proxy_pool: false,
             alias: None,
             site_id: None,
+            proxy_mode: None,
+            proxy_fixed_channel: None,
             use_fixed_proxy: false,
             fixed_proxy_node: None,
             priority: None,

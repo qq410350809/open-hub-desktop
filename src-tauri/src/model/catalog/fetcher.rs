@@ -46,6 +46,11 @@ pub(crate) struct SiteModelsResult {
     /// Key 为去前缀的原始值，与 `keys` 字段一致。
     #[serde(default)]
     pub(crate) key_models: HashMap<String, Vec<SiteModelItem>>,
+    /// 逐账号同步过程中收集的失败原因。Key/模型为空时它就是同步失败的
+    /// 真实原因，必须随结果带回并落库——此前被丢弃导致界面只显示
+    /// “0 个 Key”而没有任何报错。
+    #[serde(default)]
+    pub(crate) errors: Vec<String>,
 }
 
 pub(crate) fn json_array_at<'a>(
@@ -403,6 +408,7 @@ pub(crate) async fn fetch_models_with_keys(
             keys: visible_keys,
             key_groups: visible_key_groups,
             key_models: HashMap::new(),
+            errors: Vec::new(),
         });
     }
     let models_url = base_url
@@ -460,6 +466,7 @@ pub(crate) async fn fetch_models_with_keys(
         keys: visible_keys,
         key_groups: visible_key_groups,
         key_models,
+        errors,
     })
 }
 
@@ -612,6 +619,15 @@ pub(crate) fn save_site_model_cache(
                 .and_then(|(_, _, _, _, source)| (!source.is_empty()).then(|| source.clone()))
         })
         .unwrap_or_default();
+    // 同步失败原因落库：调用方传入的 account.error 常为空，而后端收集的
+    // result.errors 是唯一能说明“为什么 0 个 Key”的信息，不能丢弃。
+    let persisted_error = if !keys.is_empty() || !models.is_empty() {
+        String::new()
+    } else if !account.error.is_empty() {
+        account.error.clone()
+    } else {
+        result.map(|item| item.errors.join("\n")).unwrap_or_default()
+    };
     connection
         .execute(
             "INSERT INTO site_model_cache
@@ -639,11 +655,7 @@ pub(crate) fn save_site_model_cache(
                 serde_json::to_string(&key_groups).map_err(|error| error.to_string())?,
                 serde_json::to_string(&models).map_err(|error| error.to_string())?,
                 serde_json::to_string(&key_models).map_err(|error| error.to_string())?,
-                if !keys.is_empty() || !models.is_empty() {
-                    ""
-                } else {
-                    account.error.as_str()
-                },
+                persisted_error,
             ],
         )
         .map_err(|error| error.to_string())?;
@@ -985,8 +997,7 @@ pub async fn test_site_models_per_channel(
     Ok(futures_util::future::join_all(probes).await)
 }
 
-async fn probe_models_endpoint(client: wreq::Client, models_url: Url) -> SiteProbeResult {
-    let started = std::time::Instant::now();
+async fn probe_models_endpoint(client: wreq::Client, models_url: Url) -> SiteProbeResult {    let started = std::time::Instant::now();
     let response = match client.get(models_url).send().await {
         Ok(response) => response,
         Err(error) => {
@@ -1496,6 +1507,7 @@ async fn fetch_site_models_json_inner(
                                     keys: vec![auth_token.clone()],
                                     key_groups: HashMap::new(),
                                     key_models: HashMap::new(),
+                                    errors: Vec::new(),
                                 },
                             );
                         }
@@ -1588,6 +1600,7 @@ async fn fetch_site_models_json_inner(
             keys: discovered_keys,
             key_groups: discovered_key_groups,
             key_models: HashMap::new(),
+            errors,
         },
     )
 }

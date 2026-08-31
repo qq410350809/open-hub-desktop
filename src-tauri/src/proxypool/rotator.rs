@@ -259,10 +259,20 @@ pub async fn rotate_account_instance_node(
         runtime.account_ban_node(&current_node, account_proxy_failure_ttl(error));
     }
     let candidates = channel_candidate_nodes(database, runtime, &current_node)?;
-    let (next_id, _, _) = candidates
-        .first()
-        .cloned()
-        .ok_or_else(|| "代理池中没有可用的候选节点".to_string())?;
+    // 轮换也逐个验活：下一个候选本身可能已经是死节点（出口 IP 风控、仅在刚启动时
+    // 曾被验证过、节点网络抖动），直接盲切换极易落到新死节点上。
+    let mut next_id = String::new();
+    for (candidate_id, _, _) in &candidates {
+        if crate::proxypool::runtime::probe_node_alive_pub(runtime, candidate_id) {
+            next_id = candidate_id.clone();
+            break;
+        }
+        warn!("轮换候选节点探活失败 {candidate_id}");
+        runtime.account_ban_node(candidate_id, crate::proxypool::types::ACCOUNT_NODE_PROBE_FAIL_TTL);
+    }
+    if next_id.is_empty() {
+        return Err("代理池所有候选节点均不可用".to_string());
+    }
     // lane 化后轮换只切组，不再杀账号实例；出口端口保持不变，
     // 既有 client/URL 继续有效。
     tokio::task::block_in_place(|| {
