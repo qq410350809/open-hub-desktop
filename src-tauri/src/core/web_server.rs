@@ -476,7 +476,8 @@ macro_rules! rpc_arms {
                 let keyword: Option<String> = take_opt($args, &["keyword"])?;
                 let filter: Option<String> = take_opt($args, &["filter"])?;
                 Ok(json!(
-                    crate::charity::get_charity_feed($ctx, feed_id, offset, limit, keyword, filter).await
+                    crate::charity::get_charity_feed($ctx, feed_id, offset, limit, keyword, filter)
+                        .await
                 ))
             }
             "mark_charity_feed_read" => {
@@ -701,8 +702,7 @@ macro_rules! rpc_arms {
                 Ok(json!(crate::model::gateway::stop_opencode_proxy($gw).await))
             }
             "fetch_opencode_models" => {
-                let channel_id: Option<String> =
-                    take_opt($args, &["channelId", "channel_id"])?;
+                let channel_id: Option<String> = take_opt($args, &["channelId", "channel_id"])?;
                 Ok(json!(
                     crate::model::gateway::fetch_opencode_models($gw, channel_id).await
                 ))
@@ -913,8 +913,11 @@ async fn clash_subscription_handler(
         .and_then(|value| value.parse::<f64>().ok())
         .filter(|speed| speed.is_finite() && *speed > 0.0)
         .map(|speed| speed.clamp(0.05, 100.0));
-    match crate::proxypool::build_clash_subscription_yaml(&shared.ctx.database, max_latency, min_speed)
-    {
+    match crate::proxypool::build_clash_subscription_yaml(
+        &shared.ctx.database,
+        max_latency,
+        min_speed,
+    ) {
         Ok((yaml, count)) => {
             let mut response = (
                 [
@@ -926,7 +929,9 @@ async fn clash_subscription_handler(
                 .into_response();
             // Clash 客户端识别的订阅元信息：24h 自动更新 + 节点数提示。
             if let Ok(value) = "24".parse() {
-                response.headers_mut().insert("profile-update-interval", value);
+                response
+                    .headers_mut()
+                    .insert("profile-update-interval", value);
             }
             if let Ok(value) = count.to_string().parse() {
                 response.headers_mut().insert("x-openhub-node-count", value);

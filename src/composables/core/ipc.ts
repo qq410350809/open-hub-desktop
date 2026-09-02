@@ -25,6 +25,10 @@ export const LOCAL_TOKEN_COMMANDS = new Set([
   "get_token_raw_logs",
   "get_token_request_health",
   "get_local_agent_paths",
+  "get_token_model_mappings",
+  "register_token_model_names",
+  "set_token_model_mapping",
+  "analyze_token_model_mappings",
 ]);
 
 function localUnavailable(command: string): Error {

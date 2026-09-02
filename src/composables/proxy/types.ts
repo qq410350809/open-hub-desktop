@@ -1,7 +1,16 @@
+/** Key 分组调度模式：轮询 = 组内逐请求轮转；独立 = 黏住首个 Key，失败才顺延组内下一个 */
+export type KeyGroupMode = "round_robin" | "independent";
+
+/**
+ * 渠道内的一个 Key 分组。分组身份直接取自 Key 自身的 groupName（站点同步下发），
+ * 同名 groupName 的 Key 天然落在同一组；`id` 即该 groupName。
+ */
 export interface KeyGroupItem {
   id: string;
   name: string;
   enabled: boolean;
+  /** 缺省 round_robin */
+  mode?: KeyGroupMode;
 }
 
 export interface ChannelKeyRule {
@@ -14,14 +23,17 @@ export interface ChannelKeyRule {
 }
 
 /**
- * 模型级代理出口覆盖：follow = 跟随渠道（默认值，等价无覆盖）；
- * direct = 强制直连；pool = 代理池轮询；fixed = 固定出口节点
+ * 模型级代理出口覆盖：follow = 跟随渠道（默认值，等价无覆盖）；其余四项与渠道级四模式对齐：
+ * direct = 强制直连；pool = 代理池轮询；fixed_channel = 固定通道（channelId）；
+ * custom_node = 固定单一出口节点（nodeId）；旧 fixed 值语义同 custom_node（后端加载时归一）
  */
 export interface ModelProxyRule {
   model: string;
-  mode: "follow" | "direct" | "pool" | "fixed" | string;
-  /** fixed 模式下锁定的节点 ID */
+  mode: "follow" | "direct" | "pool" | "fixed_channel" | "custom_node" | "fixed" | string;
+  /** custom_node（旧 fixed）模式下锁定的节点 ID */
   nodeId?: string | null;
+  /** fixed_channel 模式绑定的代理池通道 ID；空 = 渠道默认通道 */
+  channelId?: string | null;
 }
 
 /**
@@ -54,7 +66,7 @@ export interface ChannelConfig {
   enabledModels?: string[] | null;
   /** 统计维度稳定数字 ID：内置渠道占 1-100（opencode=1），动态渠道从 101 起；与别名解耦 */
   statsId?: number;
-  /** 渠道内 Key 分组优先级定义（按数组顺序由高到低进行故障转移） */
+  /** 渠道内 Key 分组定义（按数组顺序由高到低进行故障转移；分组身份即 Key 的 groupName） */
   keyGroups?: KeyGroupItem[] | null;
   /** 渠道中各个 Key 的详细配置与分组归属 */
   keyRules?: ChannelKeyRule[] | null;

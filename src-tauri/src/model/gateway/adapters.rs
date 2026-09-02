@@ -5,7 +5,6 @@ use serde_json::{json, Value as JsonValue};
 // 支持 OpenAI Chat Completions, Anthropic Messages, Google Gemini, OpenAI Responses API
 // ---------------------------------------------------------------------------
 
-
 // ---------------------------------------------------------------------------
 // Google Gemini 原生协议适配器 (Gemini ↔ OpenAI 双向转换)
 // ---------------------------------------------------------------------------
@@ -14,7 +13,7 @@ pub struct GeminiProtocolAdapter;
 
 impl GeminiProtocolAdapter {
     /// 将 Gemini contents 格式转换为标准 OpenAI Chat Completions 请求格式
-        /// 将 OpenAI 完整非流式响应转译为 Gemini generateContent 响应格式
+    /// 将 OpenAI 完整非流式响应转译为 Gemini generateContent 响应格式
     pub fn openai_response_to_gemini(openai_resp: &JsonValue, model: &str) -> JsonValue {
         let mut parts = Vec::new();
         let mut finish_reason = "STOP";
@@ -93,10 +92,7 @@ impl GeminiProtocolAdapter {
             "modelVersion": model
         })
     }
-
-    
 }
-
 
 // ---------------------------------------------------------------------------
 // Anthropic Claude Messages 协议适配器 (Anthropic ↔ OpenAI 双向转换)
@@ -106,10 +102,10 @@ pub struct AnthropicProtocolAdapter;
 
 impl AnthropicProtocolAdapter {
     /// 将 Anthropic tools 格式转换为 OpenAI tools 格式
-        /// 将 Anthropic system 字段提取为 OpenAI system message
-        /// 将 Anthropic messages 转换为 OpenAI messages
-        /// 将 Anthropic Messages API 请求体转换为 OpenAI Chat Completions 请求体
-        /// 将 OpenAI 非流式响应转换为 Anthropic Messages 响应格式
+    /// 将 Anthropic system 字段提取为 OpenAI system message
+    /// 将 Anthropic messages 转换为 OpenAI messages
+    /// 将 Anthropic Messages API 请求体转换为 OpenAI Chat Completions 请求体
+    /// 将 OpenAI 非流式响应转换为 Anthropic Messages 响应格式
     pub fn openai_response_to_anthropic(
         openai_resp: &JsonValue,
         req_id: &str,
@@ -257,10 +253,10 @@ mod adapter_tests {
         });
         let out = AnthropicProtocolAdapter::openai_response_to_anthropic(&openai_resp, "req1", "m");
         assert_eq!(
-            out.pointer("/usage/output_tokens").and_then(JsonValue::as_u64),
+            out.pointer("/usage/output_tokens")
+                .and_then(JsonValue::as_u64),
             Some(300),
             "推理 token 不得被计两次"
         );
     }
 }
-

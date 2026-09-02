@@ -150,9 +150,11 @@ pub fn run() {
 
             let dev_profile = crate::core::profile::is_dev_profile();
             if dev_profile {
-                info!("[OpenHub] dev 隔离形态：端口 {} / 数据目录 {}",
+                info!(
+                    "[OpenHub] dev 隔离形态：端口 {} / 数据目录 {}",
                     crate::core::profile::DEV_SERVICE_PORT,
-                    crate::core::profile::app_support_dir_name());
+                    crate::core::profile::app_support_dir_name()
+                );
             }
             let app_data_dir = app
                 .path()
@@ -163,7 +165,8 @@ pub fn run() {
             let app_data_dir = if dev_profile {
                 app_data_dir.with_file_name(format!(
                     "{}-dev",
-                    app_data_dir.file_name()
+                    app_data_dir
+                        .file_name()
                         .and_then(|name| name.to_str())
                         .unwrap_or_default()
                 ))
@@ -354,6 +357,9 @@ pub fn run() {
             crate::model::catalog::get_all_site_model_caches,
             crate::model::catalog::clear_site_model_cache_for_site,
             crate::model::catalog::save_site_model_cache_for_account,
+            crate::model::catalog::add_site_model_cache_key,
+            crate::model::catalog::remove_site_model_cache_key,
+            crate::model::catalog::sync_models_for_cached_keys,
             crate::model::catalog::get_model_catalog,
             crate::model::catalog::get_model_catalog_detail,
             crate::model::catalog::sync_model_catalog,
@@ -382,6 +388,10 @@ pub fn run() {
             token::stats::get_token_raw_logs,
             token::stats::get_token_request_health,
             token::stats::get_local_agent_paths,
+            token::mapping::get_token_model_mappings,
+            token::mapping::register_token_model_names,
+            token::mapping::set_token_model_mapping,
+            token::mapping::analyze_token_model_mappings,
             web_server::get_login_state,
             web_server::login,
             web_server::logout,

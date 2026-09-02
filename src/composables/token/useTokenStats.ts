@@ -6,6 +6,8 @@ import type {
   TokenCollectorSyncReport,
   TokenUsageReport,
   LocalAgentPathsReport,
+  TokenModelMapping,
+  TokenMappingAnalyzeReport,
 } from "../../types";
 import { localTokenStatsAvailable, runLocalCommand } from "../core/ipc";
 
@@ -34,6 +36,14 @@ const rawLogsError = ref("");
 const requestHealth = ref<RequestHealthReport | null>(null);
 const requestHealthLoading = ref(false);
 const requestHealthError = ref("");
+
+// 模型映射（本地 Token 统计原始名 → 正式模型；AI 分析 + 手工确认）
+const tokenModelMappings = ref<TokenModelMapping[]>([]);
+const tokenModelMappingsLoading = ref(false);
+const tokenModelMappingsError = ref("");
+const tokenModelAnalyzeReport = ref<TokenMappingAnalyzeReport | null>(null);
+const tokenModelAnalyzing = ref(false);
+const tokenModelAnalyzeError = ref("");
 
 // OpenHub 自有 Token 采集状态；只读取本机日志并维护本地缓存。
 const tokenCollectorSyncing = ref(false);
@@ -224,6 +234,80 @@ async function loadLocalAgentPaths() {
   }
 }
 
+async function loadTokenModelMappings() {
+  tokenModelMappingsLoading.value = true;
+  tokenModelMappingsError.value = "";
+  try {
+    tokenModelMappings.value = await localCommand<TokenModelMapping[]>("get_token_model_mappings");
+  } catch (error) {
+    tokenModelMappingsError.value = String(error);
+    tokenModelMappings.value = [];
+  } finally {
+    tokenModelMappingsLoading.value = false;
+  }
+}
+
+/** 把统计里出现的原始模型名登记进映射表（INSERT OR IGNORE，已有判定不被覆盖）。 */
+async function registerTokenModelNames(names: string[]): Promise<number> {
+  if (!names.length) return 0;
+  try {
+    return await localCommand<number>("register_token_model_names", { names });
+  } catch (error) {
+    tokenModelMappingsError.value = String(error);
+    return 0;
+  }
+}
+
+/** 打开弹窗时的引导：先登记当前统计里的模型名，再拉取映射表。 */
+async function bootstrapTokenModelMappings(names: string[]) {
+  await registerTokenModelNames(names);
+  await loadTokenModelMappings();
+}
+
+export interface TokenMappingAnalyzeOptions {
+  channelId?: string | null;
+  model?: string | null;
+  force?: boolean;
+}
+
+/** 调 AI 分析映射；force = true 时重跑全部条目（手工确认的行始终保留）。 */
+async function analyzeTokenModelMappings(
+  options: TokenMappingAnalyzeOptions = {},
+): Promise<TokenMappingAnalyzeReport | null> {
+  tokenModelAnalyzing.value = true;
+  tokenModelAnalyzeError.value = "";
+  try {
+    const report = await localCommand<TokenMappingAnalyzeReport>("analyze_token_model_mappings", {
+      channelId: options.channelId || null,
+      model: options.model || null,
+      force: options.force ?? false,
+    });
+    tokenModelAnalyzeReport.value = report;
+    await loadTokenModelMappings();
+    return report;
+  } catch (error) {
+    tokenModelAnalyzeError.value = String(error);
+    return null;
+  } finally {
+    tokenModelAnalyzing.value = false;
+  }
+}
+
+/** 手工修改单条映射；officialModel 传空串表示清除映射（回到未确认）。 */
+async function setTokenModelMapping(rawModel: string, officialModel: string): Promise<boolean> {
+  try {
+    await localCommand<TokenModelMapping>("set_token_model_mapping", {
+      rawModel,
+      officialModel,
+    });
+    await loadTokenModelMappings();
+    return true;
+  } catch (error) {
+    tokenModelMappingsError.value = String(error);
+    return false;
+  }
+}
+
 async function refreshTokenDatabaseView(showLoading = false) {
   if (tokenDatabaseRefreshPromise) {
     try {
@@ -307,7 +391,17 @@ export function useTokenStats() {
     localAgentPaths,
     localAgentPathsLoading,
     localAgentPathsError,
+    tokenModelMappings,
+    tokenModelMappingsLoading,
+    tokenModelMappingsError,
+    tokenModelAnalyzeReport,
+    tokenModelAnalyzing,
+    tokenModelAnalyzeError,
     loadLocalAgentPaths,
+    loadTokenModelMappings,
+    bootstrapTokenModelMappings,
+    analyzeTokenModelMappings,
+    setTokenModelMapping,
     syncTokenCollector,
     onRangeChange,
     refreshTokenStats,

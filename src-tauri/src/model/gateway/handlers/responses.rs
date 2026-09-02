@@ -137,8 +137,7 @@ pub async fn handle_responses(
         }
         // 跨协议 IR 链路：完整 output_item/usage 事件回传（此前仅透传文本 delta）
         let upstream_headers = outcome.success.response.headers().clone();
-        let (tool_hints, preferred_tool) =
-            crate::model::gateway::stream::extract_tool_hints(&body);
+        let (tool_hints, preferred_tool) = crate::model::gateway::stream::extract_tool_hints(&body);
         let stream_body = crate::model::gateway::stream::proxy_sse_body_with_hints(
             outcome.success.response.bytes_stream(),
             outcome.target,
@@ -170,12 +169,18 @@ pub async fn handle_responses(
         final_log.duration_ms = dur;
         final_log.response_body = cap_log_body(String::from_utf8_lossy(&raw_bytes).to_string());
         if let Ok(jv) = serde_json::from_slice::<JsonValue>(&raw_bytes) {
-            let input = jv.pointer("/response/usage/input_tokens").and_then(JsonValue::as_u64).unwrap_or(0);
+            let input = jv
+                .pointer("/response/usage/input_tokens")
+                .and_then(JsonValue::as_u64)
+                .unwrap_or(0);
             let cached = jv
                 .pointer("/response/usage/input_tokens_details/cached_tokens")
                 .and_then(JsonValue::as_u64)
                 .unwrap_or(0);
-            let output = jv.pointer("/response/usage/output_tokens").and_then(JsonValue::as_u64).unwrap_or(0);
+            let output = jv
+                .pointer("/response/usage/output_tokens")
+                .and_then(JsonValue::as_u64)
+                .unwrap_or(0);
             final_log.prompt_tokens = (input > 0).then_some(input);
             final_log.completion_tokens = (output > 0).then_some(output);
             final_log.prompt_cache_hit_tokens = (cached > 0).then_some(cached);
@@ -201,7 +206,10 @@ pub async fn handle_responses(
     if let Ok(jv) = serde_json::from_slice::<JsonValue>(&resp_bytes) {
         // 完整转换 OpenAI message → Responses output 数组：
         // 此前仅取 content 文本，纯 tool_calls / reasoning 响应会变成空输出
-        let message = jv.pointer("/choices/0/message").cloned().unwrap_or(json!({}));
+        let message = jv
+            .pointer("/choices/0/message")
+            .cloned()
+            .unwrap_or(json!({}));
         let text = message
             .get("content")
             .and_then(JsonValue::as_str)

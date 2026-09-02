@@ -73,7 +73,10 @@ impl ChatParser {
                 if let Some(v) = cached.get("cached_tokens").and_then(JsonValue::as_u64) {
                     self.usage.cache_read_tokens = v;
                 }
-                if let Some(v) = cached.get("cache_creation_tokens").and_then(JsonValue::as_u64) {
+                if let Some(v) = cached
+                    .get("cache_creation_tokens")
+                    .and_then(JsonValue::as_u64)
+                {
                     self.usage.cache_creation_tokens = v;
                 }
             }
@@ -119,7 +122,9 @@ impl ChatParser {
                             let reasoning = s[start + 7..end].trim();
                             let after = s[end + 8..].trim_start();
                             if !reasoning.is_empty() {
-                                out.push(UniversalStreamEvent::ReasoningDelta(reasoning.to_string()));
+                                out.push(UniversalStreamEvent::ReasoningDelta(
+                                    reasoning.to_string(),
+                                ));
                             }
                             if !after.is_empty() {
                                 out.push(UniversalStreamEvent::TextDelta(after.to_string()));
@@ -192,7 +197,9 @@ impl ChatParser {
                         call_id: raw_id
                             .map(str::to_string)
                             .unwrap_or_else(|| format!("call_{index}")),
-                        name: raw_name.map(str::to_string).unwrap_or_else(|| "tool".to_string()),
+                        name: raw_name
+                            .map(str::to_string)
+                            .unwrap_or_else(|| "tool".to_string()),
                     });
                     if !fragment.is_empty() {
                         out.push(UniversalStreamEvent::ToolCallDelta { index, fragment });
@@ -222,7 +229,10 @@ impl ChatParser {
                 self.tool_hints
                     .iter()
                     .map(|(n, keys)| {
-                        (n.clone(), keys.iter().filter(|k| p.args.contains(k.as_str())).count())
+                        (
+                            n.clone(),
+                            keys.iter().filter(|k| p.args.contains(k.as_str())).count(),
+                        )
                     })
                     .max_by_key(|(_, sc)| *sc)
                     .filter(|(_, sc)| *sc > 0)
@@ -393,9 +403,7 @@ impl AnthropicParser {
                 let index = jv.get("index").and_then(JsonValue::as_u64).unwrap_or(0);
                 match self.block_kinds.get(&index).map(String::as_str) {
                     Some("thinking") => {
-                        if let Some(t) =
-                            jv.pointer("/delta/thinking").and_then(JsonValue::as_str)
-                        {
+                        if let Some(t) = jv.pointer("/delta/thinking").and_then(JsonValue::as_str) {
                             if !t.is_empty() {
                                 out.push(UniversalStreamEvent::ReasoningDelta(t.to_string()));
                             }
@@ -480,7 +488,8 @@ impl AnthropicParser {
             && jv.pointer("/delta/type").and_then(JsonValue::as_str) == Some("input_json_delta")
         {
             let index = jv.get("index").and_then(JsonValue::as_u64).unwrap_or(0);
-            let orphan = !self.block_kinds.contains_key(&index) && !self.tool_meta.contains_key(&index);
+            let orphan =
+                !self.block_kinds.contains_key(&index) && !self.tool_meta.contains_key(&index);
             if orphan || self.pending_orphan.as_ref().map(|p| p.index) == Some(index) {
                 let fragment = jv
                     .pointer("/delta/partial_json")
@@ -496,9 +505,10 @@ impl AnthropicParser {
                 pt.buffered_fragments.push(fragment);
 
                 let hit = self.preferred_tool.is_some()
-                    || self.tool_hints.iter().any(|(_, keys)| {
-                        keys.iter().any(|k| pt.args.contains(k.as_str()))
-                    });
+                    || self
+                        .tool_hints
+                        .iter()
+                        .any(|(_, keys)| keys.iter().any(|k| pt.args.contains(k.as_str())));
                 if hit {
                     self.flush_orphan(&mut out);
                 }
@@ -579,14 +589,8 @@ impl GeminiParser {
                             self.emitted_any = true;
                             let index = self.tool_seq;
                             self.tool_seq += 1;
-                            let name = fc
-                                .get("name")
-                                .and_then(JsonValue::as_str)
-                                .unwrap_or("tool");
-                            let args = fc
-                                .get("args")
-                                .cloned()
-                                .unwrap_or_else(|| json!({}));
+                            let name = fc.get("name").and_then(JsonValue::as_str).unwrap_or("tool");
+                            let args = fc.get("args").cloned().unwrap_or_else(|| json!({}));
                             out.push(UniversalStreamEvent::ToolCallStart {
                                 index,
                                 call_id: format!("gem_call_{index}"),
@@ -605,9 +609,7 @@ impl GeminiParser {
             }
         }
         if let Some(u) = jv.get("usageMetadata").and_then(JsonValue::as_object) {
-            let get = |key: &str| {
-                u.get(key).and_then(JsonValue::as_u64).unwrap_or(0)
-            };
+            let get = |key: &str| u.get(key).and_then(JsonValue::as_u64).unwrap_or(0);
             self.usage.input_tokens = get("promptTokenCount");
             self.usage.cache_read_tokens = get("cachedContentTokenCount");
             let thoughts = get("thoughtsTokenCount");
@@ -630,7 +632,10 @@ impl GeminiParser {
             _ if self.tool_seq > 0 => StopReason::ToolUse,
             _ => StopReason::EndTurn,
         };
-        vec![UniversalStreamEvent::Finish { reason, usage: self.usage.clone() }]
+        vec![UniversalStreamEvent::Finish {
+            reason,
+            usage: self.usage.clone(),
+        }]
     }
 }
 
@@ -707,11 +712,14 @@ impl ResponsesParser {
             }
             Some("response.function_call_arguments.delta") => {
                 let item_id = jv.get("item_id").and_then(JsonValue::as_str).unwrap_or("");
-                let index = *self.item_index.entry(item_id.to_string()).or_insert_with(|| {
-                    let index = self.tool_seq;
-                    self.tool_seq += 1;
-                    index
-                });
+                let index = *self
+                    .item_index
+                    .entry(item_id.to_string())
+                    .or_insert_with(|| {
+                        let index = self.tool_seq;
+                        self.tool_seq += 1;
+                        index
+                    });
                 if !self.started_items.contains(item_id) {
                     self.started_items.insert(item_id.to_string());
                     out.push(UniversalStreamEvent::ToolCallStart {
@@ -763,13 +771,19 @@ impl ResponsesParser {
                             .cloned()
                             .unwrap_or_else(|| json!("{}"))
                             .to_string();
-                        out.push(UniversalStreamEvent::ToolCallDelta { index, fragment: arguments });
+                        out.push(UniversalStreamEvent::ToolCallDelta {
+                            index,
+                            fragment: arguments,
+                        });
                     }
                 }
             }
             Some("response.completed") | Some("response.incomplete") => {
                 self.usage_seen = true;
-                if let Some(v) = jv.pointer("/response/usage/input_tokens").and_then(JsonValue::as_u64) {
+                if let Some(v) = jv
+                    .pointer("/response/usage/input_tokens")
+                    .and_then(JsonValue::as_u64)
+                {
                     self.usage.input_tokens = v;
                 }
                 if let Some(v) = jv
@@ -778,7 +792,10 @@ impl ResponsesParser {
                 {
                     self.usage.cache_read_tokens = v;
                 }
-                if let Some(v) = jv.pointer("/response/usage/output_tokens").and_then(JsonValue::as_u64) {
+                if let Some(v) = jv
+                    .pointer("/response/usage/output_tokens")
+                    .and_then(JsonValue::as_u64)
+                {
                     self.usage.output_tokens = v;
                 }
                 if let Some(v) = jv
@@ -807,7 +824,10 @@ impl ResponsesParser {
             }
         });
         let _ = self.usage_seen;
-        vec![UniversalStreamEvent::Finish { reason, usage: self.usage.clone() }]
+        vec![UniversalStreamEvent::Finish {
+            reason,
+            usage: self.usage.clone(),
+        }]
     }
 }
 
@@ -827,7 +847,9 @@ impl UniversalParser {
     ) -> Self {
         use crate::model::gateway::egress::TargetProtocol as T;
         match protocol {
-            T::AnthropicMessages => Self::Anthropic(AnthropicParser::new(tool_hints, preferred_tool)),
+            T::AnthropicMessages => {
+                Self::Anthropic(AnthropicParser::new(tool_hints, preferred_tool))
+            }
             T::Gemini => Self::Gemini(GeminiParser::new()),
             T::OpenAiResponses => Self::Responses(ResponsesParser::new()),
             T::OpenAiChat => Self::Chat(ChatParser::new(tool_hints, preferred_tool)),
@@ -863,11 +885,9 @@ impl UniversalParser {
     }
 }
 
-
 // ===========================================================================
 // 请求方向：协议体 → UniversalRequest
 // ===========================================================================
-
 
 /// 从 OpenAI Chat content 复合数组提取部件（image_url 支持 data URL 与 http URL）
 fn chat_content_parts(content: &JsonValue) -> Vec<ContentPart> {
@@ -878,25 +898,45 @@ fn chat_content_parts(content: &JsonValue) -> Vec<ContentPart> {
             vec![ContentPart::text(text)]
         };
     }
-    let Some(arr) = content.as_array() else { return Vec::new() };
+    let Some(arr) = content.as_array() else {
+        return Vec::new();
+    };
     let mut parts = Vec::new();
     for item in arr {
         if let Some(t) = item.get("text").and_then(JsonValue::as_str) {
             if !t.is_empty() {
                 parts.push(ContentPart::text(t));
             }
-        } else if let Some(img) = item.get("image_url").and_then(|v| v.get("url")).or_else(|| item.get("url")) {
+        } else if let Some(img) = item
+            .get("image_url")
+            .and_then(|v| v.get("url"))
+            .or_else(|| item.get("url"))
+        {
             if let Some(url) = img.as_str() {
                 let source = if let Some(rest) = url.strip_prefix("data:") {
-                    let (mime, data) = rest.split_once(";base64,").map(|(m, d)| (m.to_string(), d.to_string())).unwrap_or(("image/png".into(), String::new()));
-                    ImageSource::Base64 { media_type: mime, data }
+                    let (mime, data) = rest
+                        .split_once(";base64,")
+                        .map(|(m, d)| (m.to_string(), d.to_string()))
+                        .unwrap_or(("image/png".into(), String::new()));
+                    ImageSource::Base64 {
+                        media_type: mime,
+                        data,
+                    }
                 } else {
                     ImageSource::Url(url.to_string())
                 };
-                parts.push(ContentPart { kind: PartKind::Image(source), cache_control: None });
+                parts.push(ContentPart {
+                    kind: PartKind::Image(source),
+                    cache_control: None,
+                });
             }
         } else if item.get("input_audio").is_some() {
-            parts.push(ContentPart { kind: PartKind::Unsupported { hint: "[语音输入]".into() }, cache_control: None });
+            parts.push(ContentPart {
+                kind: PartKind::Unsupported {
+                    hint: "[语音输入]".into(),
+                },
+                cache_control: None,
+            });
         }
     }
     parts
@@ -913,7 +953,10 @@ fn split_inline_think(parts: Vec<ContentPart>) -> Vec<ContentPart> {
                     let after = text[end + 8..].trim_start().to_string();
                     part.kind = PartKind::Text { text: after };
                     out.push(ContentPart {
-                        kind: PartKind::Thinking { text: reasoning, signature: None },
+                        kind: PartKind::Thinking {
+                            text: reasoning,
+                            signature: None,
+                        },
                         cache_control: None,
                     });
                 }
@@ -930,16 +973,25 @@ fn split_inline_think(parts: Vec<ContentPart>) -> Vec<ContentPart> {
 pub fn chat_to_universal(body: &JsonValue, model: &str) -> UniversalRequest {
     let mut ur = UniversalRequest::new(model);
     ur.source = Some("chat");
-    ur.stream = body.get("stream").and_then(JsonValue::as_bool).unwrap_or(false);
+    ur.stream = body
+        .get("stream")
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(false);
     ur.temperature = body.get("temperature").and_then(JsonValue::as_f64);
     ur.top_p = body.get("top_p").and_then(JsonValue::as_f64);
     ur.max_tokens = body
         .get("max_completion_tokens")
         .or_else(|| body.get("max_tokens"))
         .and_then(JsonValue::as_u64);
-    ur.response_format = body.get("response_format").filter(|v| v.is_object()).cloned();
+    ur.response_format = body
+        .get("response_format")
+        .filter(|v| v.is_object())
+        .cloned();
     if let Some(effort) = body.get("reasoning_effort").and_then(JsonValue::as_str) {
-        ur.reasoning = Some(ReasoningConfig { effort: Some(effort.to_string()), ..Default::default() });
+        ur.reasoning = Some(ReasoningConfig {
+            effort: Some(effort.to_string()),
+            ..Default::default()
+        });
     }
     match body.get("stop") {
         Some(JsonValue::String(s)) => ur.stop_sequences.push(s.clone()),
@@ -956,7 +1008,10 @@ pub fn chat_to_universal(body: &JsonValue, model: &str) -> UniversalRequest {
     // tools
     if let Some(tools) = body.get("tools").and_then(JsonValue::as_array) {
         for t in tools {
-            let name = t.pointer("/function/name").and_then(JsonValue::as_str).unwrap_or("");
+            let name = t
+                .pointer("/function/name")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("");
             if name.is_empty() {
                 continue;
             }
@@ -996,15 +1051,25 @@ pub fn chat_to_universal(body: &JsonValue, model: &str) -> UniversalRequest {
                     };
                     if let Some(tcs) = m.get("tool_calls").and_then(JsonValue::as_array) {
                         for tc in tcs {
-                            let call_id = tc.get("id").and_then(JsonValue::as_str).unwrap_or("call_default");
-                            let name = tc.pointer("/function/name").and_then(JsonValue::as_str).unwrap_or("");
-                            let args = tc.pointer("/function/arguments").and_then(JsonValue::as_str).unwrap_or("{}");
+                            let call_id = tc
+                                .get("id")
+                                .and_then(JsonValue::as_str)
+                                .unwrap_or("call_default");
+                            let name = tc
+                                .pointer("/function/name")
+                                .and_then(JsonValue::as_str)
+                                .unwrap_or("");
+                            let args = tc
+                                .pointer("/function/arguments")
+                                .and_then(JsonValue::as_str)
+                                .unwrap_or("{}");
                             if !name.is_empty() {
                                 um.parts.push(ContentPart {
                                     kind: PartKind::ToolUse {
                                         call_id: call_id.to_string(),
                                         name: name.to_string(),
-                                        input: serde_json::from_str(args).unwrap_or_else(|_| json!({})),
+                                        input: serde_json::from_str(args)
+                                            .unwrap_or_else(|_| json!({})),
                                     },
                                     cache_control: None,
                                 });
@@ -1032,7 +1097,10 @@ pub fn chat_to_universal(body: &JsonValue, model: &str) -> UniversalRequest {
                 }
                 // role:"tool" / function → 归入 User 消息携带 ToolResult（与 Anthropic tool_result 语义对齐）
                 _ => {
-                    let call_id = m.get("tool_call_id").and_then(JsonValue::as_str).unwrap_or("call_default");
+                    let call_id = m
+                        .get("tool_call_id")
+                        .and_then(JsonValue::as_str)
+                        .unwrap_or("call_default");
                     let mut content = String::new();
                     if let Some(cs) = m.get("content").and_then(JsonValue::as_str) {
                         content = cs.to_string();
@@ -1046,8 +1114,14 @@ pub fn chat_to_universal(body: &JsonValue, model: &str) -> UniversalRequest {
                             }
                         }
                     }
-                    let is_error = m.get("is_error").and_then(JsonValue::as_bool).unwrap_or(false);
-                    let mut um = UniversalMessage { role: Role::User, parts: Vec::new() };
+                    let is_error = m
+                        .get("is_error")
+                        .and_then(JsonValue::as_bool)
+                        .unwrap_or(false);
+                    let mut um = UniversalMessage {
+                        role: Role::User,
+                        parts: Vec::new(),
+                    };
                     um.parts.push(ContentPart {
                         kind: PartKind::ToolResult {
                             call_id: call_id.to_string(),
@@ -1062,11 +1136,24 @@ pub fn chat_to_universal(body: &JsonValue, model: &str) -> UniversalRequest {
         }
     }
 
-    collect_extra(body, &mut ur, &[
-        "model", "messages", "stream", "temperature", "top_p", "max_tokens",
-        "max_completion_tokens", "stop", "tools", "tool_choice", "response_format",
-        "reasoning_effort",
-    ]);
+    collect_extra(
+        body,
+        &mut ur,
+        &[
+            "model",
+            "messages",
+            "stream",
+            "temperature",
+            "top_p",
+            "max_tokens",
+            "max_completion_tokens",
+            "stop",
+            "tools",
+            "tool_choice",
+            "response_format",
+            "reasoning_effort",
+        ],
+    );
     ur
 }
 
@@ -1081,7 +1168,9 @@ fn parse_chat_tool_choice(body: &JsonValue) -> Option<ToolChoice> {
         },
         JsonValue::Object(_) => {
             let name = tc.pointer("/function/name").and_then(JsonValue::as_str)?;
-            Some(ToolChoice::Tool { name: name.to_string() })
+            Some(ToolChoice::Tool {
+                name: name.to_string(),
+            })
         }
         _ => None,
     }
@@ -1102,11 +1191,17 @@ fn collect_extra(body: &JsonValue, ur: &mut UniversalRequest, modeled: &[&str]) 
 pub fn anthropic_to_universal(body: &JsonValue, model: &str) -> UniversalRequest {
     let mut ur = UniversalRequest::new(model);
     ur.source = Some("anthropic");
-    ur.stream = body.get("stream").and_then(JsonValue::as_bool).unwrap_or(false);
+    ur.stream = body
+        .get("stream")
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(false);
     ur.max_tokens = body.get("max_tokens").and_then(JsonValue::as_u64);
     ur.temperature = body.get("temperature").and_then(JsonValue::as_f64);
     ur.top_p = body.get("top_p").and_then(JsonValue::as_f64);
-    ur.top_k = body.get("top_k").and_then(JsonValue::as_u64).map(|v| v as u32);
+    ur.top_k = body
+        .get("top_k")
+        .and_then(JsonValue::as_u64)
+        .map(|v| v as u32);
     if let Some(ss) = body.get("stop_sequences").and_then(JsonValue::as_array) {
         for s in ss {
             if let Some(s) = s.as_str() {
@@ -1133,7 +1228,11 @@ pub fn anthropic_to_universal(body: &JsonValue, model: &str) -> UniversalRequest
             }
             ur.tools.push(ToolDef {
                 name: name.to_string(),
-                description: t.get("description").and_then(JsonValue::as_str).unwrap_or("").to_string(),
+                description: t
+                    .get("description")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or("")
+                    .to_string(),
                 input_schema: t
                     .get("input_schema")
                     .cloned()
@@ -1141,14 +1240,20 @@ pub fn anthropic_to_universal(body: &JsonValue, model: &str) -> UniversalRequest
             });
         }
     }
-    if let Some(tc) = body.get("tool_choice").and_then(|v| v.get("type")).and_then(JsonValue::as_str) {
+    if let Some(tc) = body
+        .get("tool_choice")
+        .and_then(|v| v.get("type"))
+        .and_then(JsonValue::as_str)
+    {
         ur.tool_choice = match tc {
             "any" => Some(ToolChoice::Required),
             "auto" => Some(ToolChoice::Auto),
             "tool" => body
                 .pointer("/tool_choice/name")
                 .and_then(JsonValue::as_str)
-                .map(|n| ToolChoice::Tool { name: n.to_string() }),
+                .map(|n| ToolChoice::Tool {
+                    name: n.to_string(),
+                }),
             _ => None,
         };
     }
@@ -1164,7 +1269,10 @@ pub fn anthropic_to_universal(body: &JsonValue, model: &str) -> UniversalRequest
                 Some("assistant") => Role::Assistant,
                 _ => Role::User,
             };
-            let mut um = UniversalMessage { role, parts: Vec::new() };
+            let mut um = UniversalMessage {
+                role,
+                parts: Vec::new(),
+            };
             match msg.get("content") {
                 Some(JsonValue::String(text)) => {
                     if !text.is_empty() {
@@ -1177,21 +1285,26 @@ pub fn anthropic_to_universal(body: &JsonValue, model: &str) -> UniversalRequest
                         let cache_control = block.get("cache_control").and_then(|cc| {
                             cc.get("type")
                                 .and_then(JsonValue::as_str)
-                                .map(|k| CacheControl { kind: k.to_string() })
+                                .map(|k| CacheControl {
+                                    kind: k.to_string(),
+                                })
                         });
                         let kind = match b_type {
                             "text" => block.get("text").and_then(JsonValue::as_str).map(|t| {
-                                PartKind::Text { text: t.to_string() }
+                                PartKind::Text {
+                                    text: t.to_string(),
+                                }
                             }),
-                            "thinking" | "redacted_thinking" => {
-                                block.get("thinking").and_then(JsonValue::as_str).map(|t| PartKind::Thinking {
+                            "thinking" | "redacted_thinking" => block
+                                .get("thinking")
+                                .and_then(JsonValue::as_str)
+                                .map(|t| PartKind::Thinking {
                                     text: t.to_string(),
                                     signature: block
                                         .get("signature")
                                         .and_then(JsonValue::as_str)
                                         .map(str::to_string),
-                                })
-                            }
+                                }),
                             "tool_use" => {
                                 let part = PartKind::ToolUse {
                                     call_id: block
@@ -1199,7 +1312,11 @@ pub fn anthropic_to_universal(body: &JsonValue, model: &str) -> UniversalRequest
                                         .and_then(JsonValue::as_str)
                                         .unwrap_or("call_default")
                                         .to_string(),
-                                    name: block.get("name").and_then(JsonValue::as_str).unwrap_or("").to_string(),
+                                    name: block
+                                        .get("name")
+                                        .and_then(JsonValue::as_str)
+                                        .unwrap_or("")
+                                        .to_string(),
                                     input: block.get("input").cloned().unwrap_or_else(|| json!({})),
                                 };
                                 Some(part)
@@ -1221,31 +1338,48 @@ pub fn anthropic_to_universal(body: &JsonValue, model: &str) -> UniversalRequest
                                         .unwrap_or("call_default")
                                         .to_string(),
                                     content: content_text,
-                                    is_error: block.get("is_error").and_then(JsonValue::as_bool).unwrap_or(false),
+                                    is_error: block
+                                        .get("is_error")
+                                        .and_then(JsonValue::as_bool)
+                                        .unwrap_or(false),
                                 };
                                 Some(part)
                             }
-                            "image" => block.pointer("/source/type").and_then(JsonValue::as_str).map(|st| {
-                                let source = if st == "url" {
-                                    ImageSource::Url(
-                                        block.pointer("/source/url").and_then(JsonValue::as_str).unwrap_or("").to_string(),
-                                    )
-                                } else {
-                                    ImageSource::Base64 {
-                                        media_type: block
-                                            .pointer("/source/media_type")
-                                            .and_then(JsonValue::as_str)
-                                            .unwrap_or("image/png")
-                                            .to_string(),
-                                        data: block.pointer("/source/data").and_then(JsonValue::as_str).unwrap_or("").to_string(),
-                                    }
-                                };
-                                PartKind::Image(source)
-                            }),
+                            "image" => block
+                                .pointer("/source/type")
+                                .and_then(JsonValue::as_str)
+                                .map(|st| {
+                                    let source = if st == "url" {
+                                        ImageSource::Url(
+                                            block
+                                                .pointer("/source/url")
+                                                .and_then(JsonValue::as_str)
+                                                .unwrap_or("")
+                                                .to_string(),
+                                        )
+                                    } else {
+                                        ImageSource::Base64 {
+                                            media_type: block
+                                                .pointer("/source/media_type")
+                                                .and_then(JsonValue::as_str)
+                                                .unwrap_or("image/png")
+                                                .to_string(),
+                                            data: block
+                                                .pointer("/source/data")
+                                                .and_then(JsonValue::as_str)
+                                                .unwrap_or("")
+                                                .to_string(),
+                                        }
+                                    };
+                                    PartKind::Image(source)
+                                }),
                             _ => None,
                         };
                         if let Some(kind) = kind {
-                            um.parts.push(ContentPart { kind, cache_control });
+                            um.parts.push(ContentPart {
+                                kind,
+                                cache_control,
+                            });
                         }
                     }
                 }
@@ -1258,11 +1392,25 @@ pub fn anthropic_to_universal(body: &JsonValue, model: &str) -> UniversalRequest
         }
     }
 
-    collect_extra(body, &mut ur, &[
-        "model", "messages", "system", "stream", "temperature", "top_p", "top_k",
-        "max_tokens", "stop_sequences", "tools", "tool_choice", "thinking",
-        "metadata",
-    ]);
+    collect_extra(
+        body,
+        &mut ur,
+        &[
+            "model",
+            "messages",
+            "system",
+            "stream",
+            "temperature",
+            "top_p",
+            "top_k",
+            "max_tokens",
+            "stop_sequences",
+            "tools",
+            "tool_choice",
+            "thinking",
+            "metadata",
+        ],
+    );
     ur
 }
 
@@ -1279,10 +1427,14 @@ fn parse_anthropic_system_into(body: &JsonValue, ur: &mut UniversalRequest) {
                     let cache_control = block.get("cache_control").and_then(|cc| {
                         cc.get("type")
                             .and_then(JsonValue::as_str)
-                            .map(|k| CacheControl { kind: k.to_string() })
+                            .map(|k| CacheControl {
+                                kind: k.to_string(),
+                            })
                     });
                     ur.system.push(ContentPart {
-                        kind: PartKind::Text { text: text.to_string() },
+                        kind: PartKind::Text {
+                            text: text.to_string(),
+                        },
                         cache_control,
                     });
                 }
@@ -1292,19 +1444,24 @@ fn parse_anthropic_system_into(body: &JsonValue, ur: &mut UniversalRequest) {
     }
 }
 
-
 /// OpenAI Responses 请求体 → UniversalRequest
 pub fn responses_to_universal(body: &JsonValue, model: &str) -> UniversalRequest {
     let mut ur = UniversalRequest::new(model);
     ur.source = Some("responses");
-    ur.stream = body.get("stream").and_then(JsonValue::as_bool).unwrap_or(false);
+    ur.stream = body
+        .get("stream")
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(false);
     ur.temperature = body.get("temperature").and_then(JsonValue::as_f64);
     ur.top_p = body.get("top_p").and_then(JsonValue::as_f64);
     // Responses 的 max_output_tokens 含推理部分；Chat 口径亦近似处理
     ur.max_tokens = body.get("max_output_tokens").and_then(JsonValue::as_u64);
     if let Some(reasoning) = body.get("reasoning") {
         ur.reasoning = Some(ReasoningConfig {
-            effort: reasoning.get("effort").and_then(JsonValue::as_str).map(str::to_string),
+            effort: reasoning
+                .get("effort")
+                .and_then(JsonValue::as_str)
+                .map(str::to_string),
             budget_tokens: None,
         });
     }
@@ -1326,7 +1483,11 @@ pub fn responses_to_universal(body: &JsonValue, model: &str) -> UniversalRequest
             }
             ur.tools.push(ToolDef {
                 name: name.to_string(),
-                description: t.get("description").and_then(JsonValue::as_str).unwrap_or("").to_string(),
+                description: t
+                    .get("description")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or("")
+                    .to_string(),
                 input_schema: t
                     .get("parameters")
                     .cloned()
@@ -1342,8 +1503,13 @@ pub fn responses_to_universal(body: &JsonValue, model: &str) -> UniversalRequest
             _ => {}
         },
         Some(JsonValue::Object(_)) => {
-            if let Some(name) = body.pointer("/tool_choice/name").and_then(JsonValue::as_str) {
-                ur.tool_choice = Some(ToolChoice::Tool { name: name.to_string() });
+            if let Some(name) = body
+                .pointer("/tool_choice/name")
+                .and_then(JsonValue::as_str)
+            {
+                ur.tool_choice = Some(ToolChoice::Tool {
+                    name: name.to_string(),
+                });
             }
         }
         _ => {}
@@ -1362,14 +1528,20 @@ pub fn responses_to_universal(body: &JsonValue, model: &str) -> UniversalRequest
         Some(JsonValue::Array(items)) => {
             let mut gem_seq = 0usize;
             for item in items {
-                let item_type = item.get("type").and_then(JsonValue::as_str).unwrap_or("message");
+                let item_type = item
+                    .get("type")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or("message");
                 match item_type {
                     "message" => {
                         let role = match item.get("role").and_then(JsonValue::as_str) {
                             Some("assistant") => Role::Assistant,
                             _ => Role::User,
                         };
-                        let mut um = UniversalMessage { role, parts: Vec::new() };
+                        let mut um = UniversalMessage {
+                            role,
+                            parts: Vec::new(),
+                        };
                         match item.get("content") {
                             Some(JsonValue::String(text)) => {
                                 if !text.is_empty() {
@@ -1388,16 +1560,23 @@ pub fn responses_to_universal(body: &JsonValue, model: &str) -> UniversalRequest
                                             um.parts.push(ContentPart::text(t));
                                         }
                                     }
-                                    if part.get("type").and_then(JsonValue::as_str) == Some("input_image") {
+                                    if part.get("type").and_then(JsonValue::as_str)
+                                        == Some("input_image")
+                                    {
                                         if let Some(url) =
                                             part.pointer("/image_url").and_then(JsonValue::as_str)
                                         {
-                                            let source = if let Some(rest) = url.strip_prefix("data:") {
+                                            let source = if let Some(rest) =
+                                                url.strip_prefix("data:")
+                                            {
                                                 let (mime, data) = rest
                                                     .split_once(";base64,")
                                                     .map(|(m, d)| (m.to_string(), d.to_string()))
                                                     .unwrap_or(("image/png".into(), String::new()));
-                                                ImageSource::Base64 { media_type: mime, data }
+                                                ImageSource::Base64 {
+                                                    media_type: mime,
+                                                    data,
+                                                }
                                             } else {
                                                 ImageSource::Url(url.to_string())
                                             };
@@ -1419,7 +1598,10 @@ pub fn responses_to_universal(body: &JsonValue, model: &str) -> UniversalRequest
                         let index = gem_seq; // 保留递增语义供后续扩展
                         gem_seq += 1;
                         let _ = index;
-                        let mut um = UniversalMessage { role: Role::Assistant, parts: Vec::new() };
+                        let mut um = UniversalMessage {
+                            role: Role::Assistant,
+                            parts: Vec::new(),
+                        };
                         um.parts.push(ContentPart {
                             kind: PartKind::ToolUse {
                                 call_id: item
@@ -1428,7 +1610,11 @@ pub fn responses_to_universal(body: &JsonValue, model: &str) -> UniversalRequest
                                     .and_then(JsonValue::as_str)
                                     .unwrap_or("call_unknown")
                                     .to_string(),
-                                name: item.get("name").and_then(JsonValue::as_str).unwrap_or("").to_string(),
+                                name: item
+                                    .get("name")
+                                    .and_then(JsonValue::as_str)
+                                    .unwrap_or("")
+                                    .to_string(),
                                 input: item
                                     .get("arguments")
                                     .and_then(JsonValue::as_str)
@@ -1445,7 +1631,10 @@ pub fn responses_to_universal(body: &JsonValue, model: &str) -> UniversalRequest
                             Some(other) => other.to_string(),
                             None => String::new(),
                         };
-                        let mut um = UniversalMessage { role: Role::User, parts: Vec::new() };
+                        let mut um = UniversalMessage {
+                            role: Role::User,
+                            parts: Vec::new(),
+                        };
                         um.parts.push(ContentPart {
                             kind: PartKind::ToolResult {
                                 call_id: item
@@ -1469,10 +1658,22 @@ pub fn responses_to_universal(body: &JsonValue, model: &str) -> UniversalRequest
         _ => {}
     }
 
-    collect_extra(body, &mut ur, &[
-        "model", "input", "instructions", "stream", "temperature", "top_p",
-        "max_output_tokens", "tools", "tool_choice", "reasoning",
-    ]);
+    collect_extra(
+        body,
+        &mut ur,
+        &[
+            "model",
+            "input",
+            "instructions",
+            "stream",
+            "temperature",
+            "top_p",
+            "max_output_tokens",
+            "tools",
+            "tool_choice",
+            "reasoning",
+        ],
+    );
     ur
 }
 
@@ -1487,7 +1688,10 @@ pub fn gemini_to_universal(body: &JsonValue, model: &str) -> UniversalRequest {
     // 能关联到合成 call_id（跨协议出站时 linkage 不失真）。
     let mut name_to_call_id = std::collections::HashMap::new();
 
-    if let Some(sys) = body.get("systemInstruction").or_else(|| body.get("system_instruction")) {
+    if let Some(sys) = body
+        .get("systemInstruction")
+        .or_else(|| body.get("system_instruction"))
+    {
         if let Some(parts) = sys.pointer("/parts").and_then(JsonValue::as_array) {
             for part in parts {
                 if let Some(t) = part.get("text").and_then(JsonValue::as_str) {
@@ -1505,17 +1709,30 @@ pub fn gemini_to_universal(body: &JsonValue, model: &str) -> UniversalRequest {
                 Some("model") => Role::Assistant,
                 _ => Role::User,
             };
-            let mut um = UniversalMessage { role, parts: Vec::new() };
-            if let Some(parts) = content.pointer("/content/parts").or_else(|| content.get("parts")).and_then(JsonValue::as_array) {
+            let mut um = UniversalMessage {
+                role,
+                parts: Vec::new(),
+            };
+            if let Some(parts) = content
+                .pointer("/content/parts")
+                .or_else(|| content.get("parts"))
+                .and_then(JsonValue::as_array)
+            {
                 for part in parts {
-                    let is_thought = part.get("thought").and_then(JsonValue::as_bool).unwrap_or(false);
+                    let is_thought = part
+                        .get("thought")
+                        .and_then(JsonValue::as_bool)
+                        .unwrap_or(false);
                     if let Some(t) = part.get("text").and_then(JsonValue::as_str) {
                         if t.is_empty() {
                             continue;
                         }
                         if is_thought {
                             um.parts.push(ContentPart {
-                                kind: PartKind::Thinking { text: t.to_string(), signature: None },
+                                kind: PartKind::Thinking {
+                                    text: t.to_string(),
+                                    signature: None,
+                                },
                                 cache_control: None,
                             });
                         } else {
@@ -1526,7 +1743,11 @@ pub fn gemini_to_universal(body: &JsonValue, model: &str) -> UniversalRequest {
                         let index = tool_seq;
                         tool_seq += 1;
                         let call_id = format!("gem_call_{index}");
-                        let name = fc.get("name").and_then(JsonValue::as_str).unwrap_or("").to_string();
+                        let name = fc
+                            .get("name")
+                            .and_then(JsonValue::as_str)
+                            .unwrap_or("")
+                            .to_string();
                         name_to_call_id.insert(name.clone(), call_id.clone());
                         um.parts.push(ContentPart {
                             kind: PartKind::ToolUse {
@@ -1538,20 +1759,32 @@ pub fn gemini_to_universal(body: &JsonValue, model: &str) -> UniversalRequest {
                         });
                     }
                     if let Some(fr) = part.get("functionResponse") {
-                        let name = fr.get("name").and_then(JsonValue::as_str).unwrap_or("").to_string();
+                        let name = fr
+                            .get("name")
+                            .and_then(JsonValue::as_str)
+                            .unwrap_or("")
+                            .to_string();
                         // 优先关联到最近一次同名 functionCall 的合成 call_id；
                         // 无匹配时回退函数名（保住 gemini→gemini 的同名关联语义）
-                        let call_id = name_to_call_id.get(&name).cloned().unwrap_or_else(|| name.clone());
+                        let call_id = name_to_call_id
+                            .get(&name)
+                            .cloned()
+                            .unwrap_or_else(|| name.clone());
                         um.parts.push(ContentPart {
                             kind: PartKind::ToolResult {
                                 call_id,
-                                content: fr.get("response").cloned().map(|v| v.to_string()).unwrap_or_default(),
+                                content: fr
+                                    .get("response")
+                                    .cloned()
+                                    .map(|v| v.to_string())
+                                    .unwrap_or_default(),
                                 is_error: false,
                             },
                             cache_control: None,
                         });
                     }
-                    if let Some(inline) = part.get("inlineData").or_else(|| part.get("inline_data")) {
+                    if let Some(inline) = part.get("inlineData").or_else(|| part.get("inline_data"))
+                    {
                         um.parts.push(ContentPart {
                             kind: PartKind::Image(ImageSource::Base64 {
                                 media_type: inline
@@ -1560,7 +1793,11 @@ pub fn gemini_to_universal(body: &JsonValue, model: &str) -> UniversalRequest {
                                     .and_then(JsonValue::as_str)
                                     .unwrap_or("image/png")
                                     .to_string(),
-                                data: inline.get("data").and_then(JsonValue::as_str).unwrap_or("").to_string(),
+                                data: inline
+                                    .get("data")
+                                    .and_then(JsonValue::as_str)
+                                    .unwrap_or("")
+                                    .to_string(),
                             }),
                             cache_control: None,
                         });
@@ -1586,8 +1823,15 @@ pub fn gemini_to_universal(body: &JsonValue, model: &str) -> UniversalRequest {
             }
             ur.tools.push(ToolDef {
                 name: name.to_string(),
-                description: d.get("description").and_then(JsonValue::as_str).unwrap_or("").to_string(),
-                input_schema: d.get("parameters").cloned().unwrap_or_else(|| json!({ "type": "object", "properties": {} })),
+                description: d
+                    .get("description")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                input_schema: d
+                    .get("parameters")
+                    .cloned()
+                    .unwrap_or_else(|| json!({ "type": "object", "properties": {} })),
             });
         }
     }
@@ -1603,7 +1847,11 @@ pub fn gemini_to_universal(body: &JsonValue, model: &str) -> UniversalRequest {
         .and_then(|a| a.first())
         .and_then(JsonValue::as_str);
     ur.tool_choice = match mode {
-        Some("ANY") => allowed.map(|n| ToolChoice::Tool { name: n.to_string() }).or(Some(ToolChoice::Required)),
+        Some("ANY") => allowed
+            .map(|n| ToolChoice::Tool {
+                name: n.to_string(),
+            })
+            .or(Some(ToolChoice::Required)),
         Some("NONE") => Some(ToolChoice::None_),
         Some("AUTO") => Some(ToolChoice::Auto),
         _ => None,
@@ -1613,13 +1861,24 @@ pub fn gemini_to_universal(body: &JsonValue, model: &str) -> UniversalRequest {
     let gc = body.get("generationConfig");
     if let Some(gc) = gc {
         ur.temperature = gc.get("temperature").and_then(JsonValue::as_f64);
-        ur.top_p = gc.get("topP").or_else(|| gc.get("top_p")).and_then(JsonValue::as_f64);
-        ur.top_k = gc.get("topK").or_else(|| gc.get("top_k")).and_then(JsonValue::as_u64).map(|v| v as u32);
+        ur.top_p = gc
+            .get("topP")
+            .or_else(|| gc.get("top_p"))
+            .and_then(JsonValue::as_f64);
+        ur.top_k = gc
+            .get("topK")
+            .or_else(|| gc.get("top_k"))
+            .and_then(JsonValue::as_u64)
+            .map(|v| v as u32);
         ur.max_tokens = gc
             .get("maxOutputTokens")
             .or_else(|| gc.get("max_output_tokens"))
             .and_then(JsonValue::as_u64);
-        if let Some(ss) = gc.get("stopSequences").or_else(|| gc.get("stop_sequences")).and_then(JsonValue::as_array) {
+        if let Some(ss) = gc
+            .get("stopSequences")
+            .or_else(|| gc.get("stop_sequences"))
+            .and_then(JsonValue::as_array)
+        {
             for s in ss {
                 if let Some(s) = s.as_str() {
                     ur.stop_sequences.push(s.to_string());
@@ -1631,17 +1890,29 @@ pub fn gemini_to_universal(body: &JsonValue, model: &str) -> UniversalRequest {
             .or_else(|| gc.pointer("/thinking_config/thinking_budget"))
             .and_then(JsonValue::as_u64)
         {
-            ur.reasoning = Some(ReasoningConfig { effort: None, budget_tokens: Some(budget) });
+            ur.reasoning = Some(ReasoningConfig {
+                effort: None,
+                budget_tokens: Some(budget),
+            });
         }
     }
 
-    collect_extra(body, &mut ur, &[
-        "contents", "systemInstruction", "system_instruction", "tools",
-        "toolConfig", "tool_config", "generationConfig", "generation_config",
-    ]);
+    collect_extra(
+        body,
+        &mut ur,
+        &[
+            "contents",
+            "systemInstruction",
+            "system_instruction",
+            "tools",
+            "toolConfig",
+            "tool_config",
+            "generationConfig",
+            "generation_config",
+        ],
+    );
     ur
 }
-
 
 // ===========================================================================
 // 出网方向：UniversalRequest → 目标协议原生请求体
@@ -1689,14 +1960,22 @@ pub fn universal_to_chat(ur: &UniversalRequest) -> JsonValue {
                     };
                     text_parts.push(format!("[图片输入:{url}]"));
                 }
-                PartKind::ToolUse { call_id, name, input } => {
+                PartKind::ToolUse {
+                    call_id,
+                    name,
+                    input,
+                } => {
                     tool_calls.push(json!({
                         "id": call_id,
                         "type": "function",
                         "function": { "name": name, "arguments": input.to_string() },
                     }));
                 }
-                PartKind::ToolResult { call_id, content, is_error } => {
+                PartKind::ToolResult {
+                    call_id,
+                    content,
+                    is_error,
+                } => {
                     let mut content_val = json!(content);
                     if *is_error {
                         content_val = json!({ "error": content });
@@ -1722,7 +2001,9 @@ pub fn universal_to_chat(ur: &UniversalRequest) -> JsonValue {
                         "tool_calls": tool_calls,
                     }));
                 } else if !text_parts.is_empty() {
-                    messages.push(json!({ "role": msg.role.as_str(), "content": text_parts.join("\n") }));
+                    messages.push(
+                        json!({ "role": msg.role.as_str(), "content": text_parts.join("\n") }),
+                    );
                 }
             }
         } else if !tool_calls.is_empty() {
@@ -1830,8 +2111,13 @@ pub fn universal_to_anthropic(ur: &UniversalRequest) -> JsonValue {
             // 无 signature 的思考块（chat <think> / gemini thought 拆出）在
             // assistant 消息内会被 Anthropic 上游拒绝（thinking 块必须携带有效签名），
             // 直接跳过；带签名（anthropic 源往返）才回写。
-            PartKind::Thinking { signature: None, .. } => return None,
-            PartKind::Thinking { text, signature: Some(sig) } => {
+            PartKind::Thinking {
+                signature: None, ..
+            } => return None,
+            PartKind::Thinking {
+                text,
+                signature: Some(sig),
+            } => {
                 json!({ "type": "thinking", "thinking": text, "signature": sig })
             }
             PartKind::Image(ImageSource::Base64 { media_type, data }) => json!({
@@ -1842,11 +2128,20 @@ pub fn universal_to_anthropic(ur: &UniversalRequest) -> JsonValue {
                 "type": "image",
                 "source": { "type": "url", "url": url },
             }),
-            PartKind::ToolUse { call_id, name, input } => json!({
+            PartKind::ToolUse {
+                call_id,
+                name,
+                input,
+            } => json!({
                 "type": "tool_use", "id": call_id, "name": name, "input": input,
             }),
-            PartKind::ToolResult { call_id, content, is_error } => {
-                let mut b = json!({ "type": "tool_result", "tool_use_id": call_id, "content": content });
+            PartKind::ToolResult {
+                call_id,
+                content,
+                is_error,
+            } => {
+                let mut b =
+                    json!({ "type": "tool_result", "tool_use_id": call_id, "content": content });
                 if *is_error {
                     b["is_error"] = json!(true);
                 }
@@ -1862,8 +2157,7 @@ pub fn universal_to_anthropic(ur: &UniversalRequest) -> JsonValue {
 
     let mut messages = Vec::<JsonValue>::new();
     for msg in &ur.messages {
-        let blocks: Vec<JsonValue> =
-            msg.parts.iter().filter_map(part_to_block).collect();
+        let blocks: Vec<JsonValue> = msg.parts.iter().filter_map(part_to_block).collect();
         if blocks.is_empty() {
             continue;
         }
@@ -1972,15 +2266,26 @@ pub fn universal_to_gemini(ur: &UniversalRequest) -> JsonValue {
                 PartKind::Image(ImageSource::Url(url)) => {
                     parts.push(json!({ "fileData": { "fileUri": url } }));
                 }
-                PartKind::ToolUse { call_id, name, input } => {
+                PartKind::ToolUse {
+                    call_id,
+                    name,
+                    input,
+                } => {
                     let _ = call_id; // Gemini 以函数名关联
                     parts.push(json!({ "functionCall": { "name": name, "args": input } }));
                 }
-                PartKind::ToolResult { call_id, content, .. } => {
-                    let response =
-                        serde_json::from_str::<JsonValue>(content).unwrap_or_else(|_| json!({ "result": content }));
-                    let name = call_id_to_name.get(call_id).cloned().unwrap_or_else(|| call_id.clone());
-                    parts.push(json!({ "functionResponse": { "name": name, "response": response } }));
+                PartKind::ToolResult {
+                    call_id, content, ..
+                } => {
+                    let response = serde_json::from_str::<JsonValue>(content)
+                        .unwrap_or_else(|_| json!({ "result": content }));
+                    let name = call_id_to_name
+                        .get(call_id)
+                        .cloned()
+                        .unwrap_or_else(|| call_id.clone());
+                    parts.push(
+                        json!({ "functionResponse": { "name": name, "response": response } }),
+                    );
                 }
                 PartKind::Unsupported { hint } => parts.push(json!({ "text": hint })),
             }
@@ -2086,7 +2391,11 @@ pub fn universal_to_responses(ur: &UniversalRequest) -> JsonValue {
                         }],
                     }));
                 }
-                PartKind::ToolUse { call_id, name, input: args } => {
+                PartKind::ToolUse {
+                    call_id,
+                    name,
+                    input: args,
+                } => {
                     if !texts.is_empty() {
                         input.push(json!({
                             "type": "message",
@@ -2102,7 +2411,9 @@ pub fn universal_to_responses(ur: &UniversalRequest) -> JsonValue {
                         "arguments": args.to_string(),
                     }));
                 }
-                PartKind::ToolResult { call_id, content, .. } => {
+                PartKind::ToolResult {
+                    call_id, content, ..
+                } => {
                     if !texts.is_empty() {
                         input.push(json!({
                             "type": "message",
@@ -2180,8 +2491,6 @@ pub fn universal_to_responses(ur: &UniversalRequest) -> JsonValue {
     out
 }
 
-
-
 #[cfg(test)]
 mod parser_tests {
     use super::*;
@@ -2189,9 +2498,8 @@ mod parser_tests {
     #[test]
     fn chat_parser_splits_inline_think_tags() {
         let mut p = crate::model::gateway::parsers::ChatParser::new(Vec::new(), None);
-        let events = p.feed(
-            r#"{"choices":[{"delta":{"content":"<think>推理中</think>正式回答"}}]}"#,
-        );
+        let events =
+            p.feed(r#"{"choices":[{"delta":{"content":"<think>推理中</think>正式回答"}}]}"#);
         assert_eq!(events.len(), 2);
         assert!(matches!(
             &events[0],
@@ -2233,11 +2541,18 @@ mod parser_tests {
         });
         let ur = crate::model::gateway::parsers::anthropic_to_universal(&body, "claude-x");
         // system cache_control 保真
-        assert!(ur.system[0].cache_control.is_some(), "system 的缓存标记不可丢失");
+        assert!(
+            ur.system[0].cache_control.is_some(),
+            "system 的缓存标记不可丢失"
+        );
         // thinking signature 保真
         match &ur.messages[0].parts[0].kind {
             crate::model::gateway::ir::PartKind::Thinking { signature, .. } => {
-                assert_eq!(signature.as_deref(), Some("sig-abc"), "signature 是思考链连续性凭证");
+                assert_eq!(
+                    signature.as_deref(),
+                    Some("sig-abc"),
+                    "signature 是思考链连续性凭证"
+                );
             }
             other => panic!("expect thinking, got {other:?}"),
         }
@@ -2252,16 +2567,22 @@ mod parser_tests {
         // 往返：UR → Anthropic 原生体，独占元素必须原样回归
         let native = crate::model::gateway::parsers::universal_to_anthropic(&ur);
         assert_eq!(
-            native.pointer("/system/0/cache_control/type").and_then(JsonValue::as_str),
+            native
+                .pointer("/system/0/cache_control/type")
+                .and_then(JsonValue::as_str),
             Some("ephemeral"),
             "system 缓存标记必须回填: {native}"
         );
         assert_eq!(
-            native.pointer("/messages/0/content/0/signature").and_then(JsonValue::as_str),
+            native
+                .pointer("/messages/0/content/0/signature")
+                .and_then(JsonValue::as_str),
             Some("sig-abc")
         );
         assert_eq!(
-            native.pointer("/messages/1/content/0/is_error").and_then(JsonValue::as_bool),
+            native
+                .pointer("/messages/1/content/0/is_error")
+                .and_then(JsonValue::as_bool),
             Some(true)
         );
     }
@@ -2287,14 +2608,22 @@ mod parser_tests {
             Some("be brief")
         );
         assert_eq!(
-            native.pointer("/messages/0/content/0/text").and_then(JsonValue::as_str),
+            native
+                .pointer("/messages/0/content/0/text")
+                .and_then(JsonValue::as_str),
             Some("hi")
         );
         // Chat 口径 max_tokens 缺省时 Anthropic 必填兜底
         let mut ur2 = ur.clone();
         ur2.max_tokens = None;
         let native2 = crate::model::gateway::parsers::universal_to_anthropic(&ur2);
-        assert!(native2.get("max_tokens").and_then(JsonValue::as_u64).unwrap_or(0) > 0);
+        assert!(
+            native2
+                .get("max_tokens")
+                .and_then(JsonValue::as_u64)
+                .unwrap_or(0)
+                > 0
+        );
     }
 
     #[test]
@@ -2313,12 +2642,21 @@ mod parser_tests {
         });
         let ur = crate::model::gateway::parsers::responses_to_universal(&body, "gpt-x");
         assert_eq!(ur.messages.len(), 3);
-        assert!(matches!(&ur.messages[0].parts[0].kind, PartKind::Text { text } if text == "run it"));
+        assert!(
+            matches!(&ur.messages[0].parts[0].kind, PartKind::Text { text } if text == "run it")
+        );
         match &ur.messages[1].parts[0].kind {
-            PartKind::ToolUse { call_id, name, input } => {
+            PartKind::ToolUse {
+                call_id,
+                name,
+                input,
+            } => {
                 assert_eq!(call_id, "c1");
                 assert_eq!(name, "bash");
-                assert_eq!(input.pointer("/cmd").and_then(JsonValue::as_str), Some("ls"));
+                assert_eq!(
+                    input.pointer("/cmd").and_then(JsonValue::as_str),
+                    Some("ls")
+                );
             }
             other => panic!("{other:?}"),
         }
@@ -2327,12 +2665,19 @@ mod parser_tests {
 
         // UR → Chat 出口：instructions 成为 system 首条，工具事件转为 role:tool
         let chat = crate::model::gateway::parsers::universal_to_chat(&ur);
-        assert_eq!(chat.pointer("/messages/0/role").and_then(JsonValue::as_str), Some("system"));
         assert_eq!(
-            chat.pointer("/messages/2/tool_calls/0/id").and_then(JsonValue::as_str),
+            chat.pointer("/messages/0/role").and_then(JsonValue::as_str),
+            Some("system")
+        );
+        assert_eq!(
+            chat.pointer("/messages/2/tool_calls/0/id")
+                .and_then(JsonValue::as_str),
             Some("c1")
         );
-        assert_eq!(chat.pointer("/messages/3/role").and_then(JsonValue::as_str), Some("tool"));
+        assert_eq!(
+            chat.pointer("/messages/3/role").and_then(JsonValue::as_str),
+            Some("tool")
+        );
     }
 
     #[test]
@@ -2363,9 +2708,6 @@ mod parser_tests {
         assert_eq!(chat["temperature"], 0.3);
         assert_eq!(chat["max_tokens"], 900);
     }
-
-
-
 
     #[test]
     fn gemini_entry_stream_flag_survives_cross_protocol_serialization() {
@@ -2401,7 +2743,10 @@ mod parser_tests {
         });
         let ur = crate::model::gateway::parsers::chat_to_universal(&body, "gpt-x");
         let out = crate::model::gateway::parsers::universal_to_chat(&ur);
-        assert_eq!(out["parallel_tool_calls"], false, "parallel_tool_calls 不得被抹掉");
+        assert_eq!(
+            out["parallel_tool_calls"], false,
+            "parallel_tool_calls 不得被抹掉"
+        );
         assert_eq!(out["service_tier"], "flex");
         assert_eq!(out["modalities"][0], "text");
     }
@@ -2417,11 +2762,14 @@ mod parser_tests {
         });
         let ur = crate::model::gateway::parsers::chat_to_universal(&body, "gpt-x");
         assert!(crate::model::gateway::parsers::universal_to_anthropic(&ur)
-            .get("service_tier").is_none());
+            .get("service_tier")
+            .is_none());
         assert!(crate::model::gateway::parsers::universal_to_gemini(&ur)
-            .get("service_tier").is_none());
+            .get("service_tier")
+            .is_none());
         assert!(crate::model::gateway::parsers::universal_to_responses(&ur)
-            .get("service_tier").is_none());
+            .get("service_tier")
+            .is_none());
         // 白名单键（frequency_penalty）在 chat 出口保留
         let chat_body = crate::model::gateway::parsers::universal_to_chat(&ur);
         assert_eq!(chat_body["frequency_penalty"], 0.5);
@@ -2451,7 +2799,10 @@ mod parser_tests {
             PartKind::ToolResult { call_id, .. } => call_id.clone(),
             _ => unreachable!(),
         };
-        assert_eq!(call_id, "gem_call_0", "应关联到同名 functionCall 的合成 call_id");
+        assert_eq!(
+            call_id, "gem_call_0",
+            "应关联到同名 functionCall 的合成 call_id"
+        );
         // 出站到 chat：ToolUse 与 ToolResult 的 call_id 一致，客户端能对上工具结果
         let chat_body = crate::model::gateway::parsers::universal_to_chat(&ur);
         assert!(chat_body.to_string().contains("gem_call_0"));
@@ -2473,7 +2824,10 @@ mod parser_tests {
         let ur = crate::model::gateway::parsers::chat_to_universal(&body, "gpt-x");
         let gemini_body = crate::model::gateway::parsers::universal_to_gemini(&ur);
         let s = gemini_body.to_string();
-        assert!(s.contains("\"name\":\"search\""), "functionResponse.name 应为函数名: {s}");
+        assert!(
+            s.contains("\"name\":\"search\""),
+            "functionResponse.name 应为函数名: {s}"
+        );
         assert!(!s.contains("call_abc"), "不得把 tool_call_id 当函数名: {s}");
     }
 
@@ -2486,7 +2840,10 @@ mod parser_tests {
             role: Role::Assistant,
             parts: vec![
                 ContentPart {
-                    kind: PartKind::Thinking { text: "unsigned".into(), signature: None },
+                    kind: PartKind::Thinking {
+                        text: "unsigned".into(),
+                        signature: None,
+                    },
                     cache_control: None,
                 },
                 ContentPart {
@@ -2500,8 +2857,14 @@ mod parser_tests {
         });
         let body = crate::model::gateway::parsers::universal_to_anthropic(&ur);
         let s = body.to_string();
-        assert!(!s.contains("unsigned"), "无签名思考块应被丢弃，避免上游 400");
-        assert!(s.contains("sig-1") && s.contains("signed"), "带签名思考块应保留");
+        assert!(
+            !s.contains("unsigned"),
+            "无签名思考块应被丢弃，避免上游 400"
+        );
+        assert!(
+            s.contains("sig-1") && s.contains("signed"),
+            "带签名思考块应保留"
+        );
     }
 
     #[test]
@@ -2517,7 +2880,9 @@ mod parser_tests {
         );
         assert!(events.is_empty(), "续片仍应缓冲");
         let events = p.finish();
-        assert!(events.iter().any(|e| matches!(e, UniversalStreamEvent::ToolCallStart { name, .. } if name == "search")));
+        assert!(events.iter().any(
+            |e| matches!(e, UniversalStreamEvent::ToolCallStart { name, .. } if name == "search")
+        ));
         assert!(events.iter().any(|e| matches!(e, UniversalStreamEvent::ToolCallDelta { fragment, .. } if fragment.contains("\"q\""))));
     }
 
@@ -2526,9 +2891,14 @@ mod parser_tests {
         // P1-3：坏帧不再静默吞掉，计数可观测且 finish 仍产出终帧
         let mut p = ChatParser::new(Vec::new(), None);
         assert!(p.feed("not-json").is_empty());
-        assert_eq!(p.feed(r#"{"choices":[{"delta":{"content":"hi"}}]}"#).len(), 1);
+        assert_eq!(
+            p.feed(r#"{"choices":[{"delta":{"content":"hi"}}]}"#).len(),
+            1
+        );
         assert_eq!(p.dropped_frames(), 1);
         let events = p.finish();
-        assert!(events.iter().any(|e| matches!(e, UniversalStreamEvent::Finish { .. })));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, UniversalStreamEvent::Finish { .. })));
     }
 }

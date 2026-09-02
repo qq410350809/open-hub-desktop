@@ -50,11 +50,8 @@ fn channel_alias_fallback_and_normalization() {
         proxy_fixed_channel: None,
         use_fixed_proxy: false,
         fixed_proxy_node: None,
-        priority: None,
-        weight: None,
         enabled_models: None,
         model_redirects: None,
-        rate_limit_rpm: None,
         stats_id: None,
         key_groups: None,
         key_rules: None,
@@ -89,11 +86,8 @@ fn resolves_channels_with_alias_prefix_or_model_whitelist() {
                 proxy_fixed_channel: None,
                 use_fixed_proxy: false,
                 fixed_proxy_node: None,
-                priority: Some(1),
-                weight: Some(100),
                 enabled_models: None,
                 model_redirects: None,
-                rate_limit_rpm: None,
                 stats_id: None,
                 key_groups: None,
                 key_rules: None,
@@ -115,11 +109,8 @@ fn resolves_channels_with_alias_prefix_or_model_whitelist() {
                 proxy_fixed_channel: None,
                 use_fixed_proxy: false,
                 fixed_proxy_node: None,
-                priority: Some(2),
-                weight: Some(100),
                 enabled_models: Some(vec!["claude-3-5-sonnet-20241022".to_string()]),
                 model_redirects: None,
-                rate_limit_rpm: None,
                 stats_id: None,
                 key_groups: None,
                 key_rules: None,
@@ -168,11 +159,8 @@ fn order_test_channel(id: &str, alias: &str, enabled: bool) -> ChannelConfig {
         proxy_fixed_channel: None,
         use_fixed_proxy: false,
         fixed_proxy_node: None,
-        priority: None,
-        weight: None,
         enabled_models: None,
         model_redirects: None,
-        rate_limit_rpm: None,
         stats_id: None,
         key_groups: None,
         key_rules: None,
@@ -297,11 +285,8 @@ async fn multi_key_round_robin_selection() {
         proxy_fixed_channel: None,
         use_fixed_proxy: false,
         fixed_proxy_node: None,
-        priority: None,
-        weight: None,
         enabled_models: None,
         model_redirects: None,
-        rate_limit_rpm: None,
         stats_id: None,
         key_groups: None,
         key_rules: None,
@@ -325,7 +310,9 @@ async fn multi_key_round_robin_selection() {
 
 #[tokio::test]
 async fn channel_key_groups_failover_and_filtering() {
-    use crate::model::gateway::types::{ChannelKeyRule, KeyGroupItem};
+    use crate::model::gateway::types::{
+        ChannelKeyRule, KeyGroupItem, KEY_GROUP_MODE_INDEPENDENT, KEY_GROUP_MODE_ROUND_ROBIN,
+    };
 
     let ch = ChannelConfig {
         id: "grouped_channel".to_string(),
@@ -349,62 +336,62 @@ async fn channel_key_groups_failover_and_filtering() {
         proxy_fixed_channel: None,
         use_fixed_proxy: false,
         fixed_proxy_node: None,
-        priority: None,
-        weight: None,
         enabled_models: None,
         model_redirects: None,
-        rate_limit_rpm: None,
         stats_id: None,
-        // 定义分组优先级：primary 优先级最高，backup 其次，disabled_group 禁用
+        // 定义分组优先级：vip 优先级最高，spare 其次，disabled_group 禁用
         key_groups: Some(vec![
             KeyGroupItem {
-                id: "primary".to_string(),
-                name: "主力组".to_string(),
+                id: "vip".to_string(),
+                name: "VIP 组".to_string(),
                 enabled: true,
+                mode: KEY_GROUP_MODE_ROUND_ROBIN.to_string(),
             },
             KeyGroupItem {
-                id: "backup".to_string(),
+                id: "spare".to_string(),
                 name: "备用组".to_string(),
                 enabled: true,
+                mode: KEY_GROUP_MODE_INDEPENDENT.to_string(),
             },
             KeyGroupItem {
                 id: "disabled_group".to_string(),
                 name: "停用组".to_string(),
                 enabled: false,
+                mode: KEY_GROUP_MODE_ROUND_ROBIN.to_string(),
             },
         ]),
         key_rules: Some(vec![
             ChannelKeyRule {
                 key: "key-primary-1".to_string(),
-                group_id: "primary".to_string(),
+                group_id: "vip".to_string(),
                 enabled: true,
                 supported_models: None,
                 fixed_channel_id: None,
             },
             ChannelKeyRule {
                 key: "key-primary-2".to_string(),
-                group_id: "primary".to_string(),
+                group_id: "vip".to_string(),
                 enabled: true,
                 supported_models: None,
                 fixed_channel_id: None,
             },
             ChannelKeyRule {
                 key: "key-backup-1".to_string(),
-                group_id: "backup".to_string(),
+                group_id: "spare".to_string(),
                 enabled: true,
                 supported_models: None,
                 fixed_channel_id: None,
             },
             ChannelKeyRule {
                 key: "key-disabled".to_string(),
-                group_id: "primary".to_string(),
+                group_id: "vip".to_string(),
                 enabled: false, // 单 Key 禁用
                 supported_models: None,
                 fixed_channel_id: None,
             },
             ChannelKeyRule {
                 key: "key-gpt4-only".to_string(),
-                group_id: "primary".to_string(),
+                group_id: "vip".to_string(),
                 enabled: true,
                 supported_models: Some(vec!["gpt-4".to_string()]),
                 fixed_channel_id: None,
@@ -419,25 +406,138 @@ async fn channel_key_groups_failover_and_filtering() {
     // 应当返回 2 个分组：[ [key-primary-1, key-primary-2], [key-backup-1] ]
     let groups = resolve_channel_key_groups_for_model(&state.context, &ch, "gpt-3.5-turbo").await;
     assert_eq!(groups.len(), 2);
-    assert_eq!(groups[0], vec!["key-primary-1", "key-primary-2"]);
-    assert_eq!(groups[1], vec!["key-backup-1"]);
+    assert_eq!(groups[0].keys, vec!["key-primary-1", "key-primary-2"]);
+    assert_eq!(groups[1].keys, vec!["key-backup-1"]);
 
-    // 2. 请求 gpt-4：key-gpt4-only 支持，进入主力组
+    // 分组元数据随队列一起返回：id / 展示名 / 调度模式
+    assert_eq!(groups[0].id, "vip");
+    assert_eq!(groups[0].name, "VIP 组");
+    assert!(!groups[0].is_independent(), "vip 组为轮询模式");
+    assert!(groups[1].is_independent(), "spare 组为独立黏性模式");
+
+    // 2. 请求 gpt-4：key-gpt4-only 支持，进入 vip 组
     let groups_gpt4 = resolve_channel_key_groups_for_model(&state.context, &ch, "gpt-4").await;
     assert_eq!(groups_gpt4.len(), 2);
     assert_eq!(
-        groups_gpt4[0],
+        groups_gpt4[0].keys,
         vec!["key-primary-1", "key-primary-2", "key-gpt4-only"]
     );
-    assert_eq!(groups_gpt4[1], vec!["key-backup-1"]);
+    assert_eq!(groups_gpt4[1].keys, vec!["key-backup-1"]);
 
-    // 3. 禁用主力组：自动只剩下备用组
+    // 3. 禁用首个分组：自动只剩下备用组
     let mut ch_disabled_primary = ch.clone();
     ch_disabled_primary.key_groups.as_mut().unwrap()[0].enabled = false;
     let groups_backup_only =
         resolve_channel_key_groups_for_model(&state.context, &ch_disabled_primary, "gpt-4").await;
     assert_eq!(groups_backup_only.len(), 1);
-    assert_eq!(groups_backup_only[0], vec!["key-backup-1"]);
+    assert_eq!(groups_backup_only[0].keys, vec!["key-backup-1"]);
+
+    // 4. 未在 key_groups 中声明的分组（仅由 Key 的 groupName 发现）默认走轮询模式
+    let mut ch_undeclared = ch.clone();
+    ch_undeclared.key_groups = None;
+    let discovered =
+        resolve_channel_key_groups_for_model(&state.context, &ch_undeclared, "gpt-3.5-turbo").await;
+    assert_eq!(discovered.len(), 2);
+    assert!(
+        discovered.iter().all(|g| !g.is_independent()),
+        "未声明的分组缺省为轮询"
+    );
+    assert_eq!(
+        discovered[0].name, discovered[0].id,
+        "未声明分组的展示名回退为组 ID"
+    );
+}
+
+#[tokio::test]
+async fn legacy_preset_key_groups_are_migrated_to_group_name() {
+    use crate::model::gateway::config::sanitize_channel_config;
+    use crate::model::gateway::types::{ChannelKeyRule, KeyGroupItem, KEY_GROUP_MODE_ROUND_ROBIN};
+
+    let mut ch = ChannelConfig {
+        id: "legacy_channel".to_string(),
+        name: "Legacy Channel".to_string(),
+        description: String::new(),
+        enabled: true,
+        protocol: "openai".to_string(),
+        base_url: "https://api.example.com/v1".to_string(),
+        api_key: String::new(),
+        api_keys: Some(vec!["key-a".to_string(), "key-b".to_string()]),
+        use_proxy_pool: false,
+        alias: None,
+        site_id: None,
+        proxy_mode: None,
+        proxy_fixed_channel: None,
+        use_fixed_proxy: false,
+        fixed_proxy_node: None,
+        enabled_models: None,
+        model_redirects: None,
+        stats_id: None,
+        model_proxy_rules: None,
+        key_groups: Some(vec![
+            KeyGroupItem {
+                id: "primary".to_string(),
+                name: "主力组".to_string(),
+                enabled: true,
+                mode: KEY_GROUP_MODE_ROUND_ROBIN.to_string(),
+            },
+            KeyGroupItem {
+                id: "backup".to_string(),
+                name: "备用组".to_string(),
+                enabled: true,
+                mode: KEY_GROUP_MODE_ROUND_ROBIN.to_string(),
+            },
+            KeyGroupItem {
+                id: "vip".to_string(),
+                name: "VIP".to_string(),
+                enabled: true,
+                mode: "bogus_mode".to_string(),
+            },
+        ]),
+        key_rules: Some(vec![
+            ChannelKeyRule {
+                key: "key-a".to_string(),
+                group_id: "primary".to_string(),
+                enabled: true,
+                supported_models: None,
+                fixed_channel_id: None,
+            },
+            ChannelKeyRule {
+                key: "key-b".to_string(),
+                group_id: "vip".to_string(),
+                enabled: true,
+                supported_models: None,
+                fixed_channel_id: None,
+            },
+        ]),
+    };
+
+    sanitize_channel_config(&mut ch);
+
+    // 预设的 primary/backup 组被剔除，只保留由 groupName 决定的真实分组
+    let groups = ch.key_groups.expect("vip 组保留");
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].id, "vip");
+    // 非法 mode 归一为缺省轮询
+    assert_eq!(groups[0].mode, KEY_GROUP_MODE_ROUND_ROBIN);
+
+    // 指向预设组的 Key 规则清空 group_id，回落到自身 groupName 分组；其余保持不变
+    let rules = ch.key_rules.expect("规则保留");
+    assert_eq!(rules[0].group_id, "", "primary 归属被清空");
+    assert_eq!(rules[1].group_id, "vip", "真实分组归属保留");
+}
+
+#[test]
+fn default_group_alias_normalizes_to_single_group() {
+    use crate::model::gateway::balancer::normalize_key_group_id;
+
+    // 手动添加 Key 落库的「默认分组」与自动同步的空分组必须归一到同一个组，
+    // 否则「无分组」的 Key 会被拆成两组、各自独立调度
+    assert_eq!(normalize_key_group_id("默认分组"), "default");
+    assert_eq!(normalize_key_group_id(""), "default");
+    assert_eq!(normalize_key_group_id("   "), "default");
+    assert_eq!(normalize_key_group_id(" 默认分组 "), "default");
+    // 真实分组名原样保留（仅去空格）
+    assert_eq!(normalize_key_group_id(" vip "), "vip");
 }
 
 #[test]
@@ -651,11 +751,8 @@ fn opencode_channel_detection_covers_id_protocol_alias_url_and_name() {
             proxy_fixed_channel: None,
             use_fixed_proxy: false,
             fixed_proxy_node: None,
-            priority: None,
-            weight: None,
             enabled_models: None,
             model_redirects: None,
-            rate_limit_rpm: None,
             stats_id: None,
             key_groups: None,
             key_rules: None,
@@ -860,68 +957,56 @@ fn attempt_request_id_formatting_and_node_cycling() {
     );
 }
 
-#[test]
-fn node_switching_only_on_429_and_persists_for_next_requests() {
+#[tokio::test]
+async fn node_switching_only_on_429_and_persists_for_next_requests() {
+    use std::sync::atomic::Ordering::Relaxed;
+
     let state = ModelProxyState::new_with_app(None);
     let candidates = vec![
         "__direct__".to_string(),
         "proxy_node_1".to_string(),
         "proxy_node_2".to_string(),
     ];
+    let cursor = state.context.node_round_robin_for("channel_a").await;
 
     // 1. 正常成功请求：保持当前活跃节点（直连）不变
-    let base_idx_req1 = state
-        .context
-        .node_round_robin
-        .load(std::sync::atomic::Ordering::Relaxed);
-    assert_eq!(candidates[base_idx_req1 % candidates.len()], "__direct__");
-
-    let base_idx_req2 = state
-        .context
-        .node_round_robin
-        .load(std::sync::atomic::Ordering::Relaxed);
-    assert_eq!(candidates[base_idx_req2 % candidates.len()], "__direct__");
+    assert_eq!(candidates[cursor.load(Relaxed) % candidates.len()], "__direct__");
+    assert_eq!(candidates[cursor.load(Relaxed) % candidates.len()], "__direct__");
 
     // 2. 发生 429：推进活跃节点游标
-    state
-        .context
-        .node_round_robin
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    cursor.fetch_add(1, Relaxed);
 
     // 3. 下一次新请求到来：自动继承并使用新节点（proxy_node_1）
-    let base_idx_req3 = state
-        .context
-        .node_round_robin
-        .load(std::sync::atomic::Ordering::Relaxed);
-    assert_eq!(candidates[base_idx_req3 % candidates.len()], "proxy_node_1");
-
-    let base_idx_req4 = state
-        .context
-        .node_round_robin
-        .load(std::sync::atomic::Ordering::Relaxed);
-    assert_eq!(candidates[base_idx_req4 % candidates.len()], "proxy_node_1");
+    assert_eq!(candidates[cursor.load(Relaxed) % candidates.len()], "proxy_node_1");
+    assert_eq!(candidates[cursor.load(Relaxed) % candidates.len()], "proxy_node_1");
 
     // 4. 再次遇到 429：切换到 proxy_node_2
-    state
-        .context
-        .node_round_robin
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let base_idx_req5 = state
-        .context
-        .node_round_robin
-        .load(std::sync::atomic::Ordering::Relaxed);
-    assert_eq!(candidates[base_idx_req5 % candidates.len()], "proxy_node_2");
+    cursor.fetch_add(1, Relaxed);
+    assert_eq!(candidates[cursor.load(Relaxed) % candidates.len()], "proxy_node_2");
 
     // 5. 循环回直连
-    state
-        .context
-        .node_round_robin
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let base_idx_req6 = state
-        .context
-        .node_round_robin
-        .load(std::sync::atomic::Ordering::Relaxed);
-    assert_eq!(candidates[base_idx_req6 % candidates.len()], "__direct__");
+    cursor.fetch_add(1, Relaxed);
+    assert_eq!(candidates[cursor.load(Relaxed) % candidates.len()], "__direct__");
+}
+
+/// 游标按渠道隔离：一个渠道因 429 切节点，不应拖动其他渠道。
+#[tokio::test]
+async fn node_cursor_is_isolated_per_channel() {
+    use std::sync::atomic::Ordering::Relaxed;
+
+    let state = ModelProxyState::new_with_app(None);
+    let channel_a = state.context.node_round_robin_for("channel_a").await;
+    let channel_b = state.context.node_round_robin_for("channel_b").await;
+
+    channel_a.fetch_add(1, Relaxed);
+    channel_a.fetch_add(1, Relaxed);
+
+    assert_eq!(channel_a.load(Relaxed), 2);
+    assert_eq!(channel_b.load(Relaxed), 0, "渠道 B 的游标不应被渠道 A 推进");
+
+    // 同一渠道重复取用返回同一游标，而非每次新建
+    let channel_a_again = state.context.node_round_robin_for("channel_a").await;
+    assert_eq!(channel_a_again.load(Relaxed), 2);
 }
 
 #[tokio::test]
@@ -967,6 +1052,7 @@ fn egress_request_meta_constructs_properly() {
         channel_id: "chan_1".to_string(),
         channel_stats_id: Some("101".to_string()),
         model: "claude-3-7-sonnet".to_string(),
+        rule_model: "claude-3-7-sonnet".to_string(),
         stream: true,
         req_body_str: Some("{}".to_string()),
     };
@@ -1012,11 +1098,8 @@ async fn opencode_model_compatibility_and_anonymous_mode() {
         proxy_fixed_channel: None,
         use_fixed_proxy: false,
         fixed_proxy_node: None,
-        priority: None,
-        weight: None,
         enabled_models: None,
         model_redirects: None,
-        rate_limit_rpm: None,
         stats_id: None,
         key_groups: None,
         key_rules: None,
@@ -1071,11 +1154,8 @@ fn stats_channel(id: &str, alias: Option<&str>, stats_id: Option<u32>) -> Channe
         proxy_fixed_channel: None,
         use_fixed_proxy: false,
         fixed_proxy_node: None,
-        priority: None,
-        weight: None,
         enabled_models: None,
         model_redirects: None,
-        rate_limit_rpm: None,
         stats_id,
         key_groups: None,
         key_rules: None,
@@ -1273,11 +1353,8 @@ fn egress_test_channel(id: &str, base_url: String) -> ChannelConfig {
         proxy_fixed_channel: None,
         use_fixed_proxy: false,
         fixed_proxy_node: None,
-        priority: None,
-        weight: None,
         enabled_models: None,
         model_redirects: None,
-        rate_limit_rpm: None,
         stats_id: None,
         key_groups: None,
         key_rules: None,
@@ -1308,6 +1385,7 @@ async fn run_egress(
         channel_id: channel.id.clone(),
         channel_stats_id: None,
         model: "deepseek-v4-flash-free".to_string(),
+        rule_model: "deepseek-v4-flash-free".to_string(),
         stream: false,
         req_body_str: None,
     };
@@ -1644,11 +1722,8 @@ fn sanitize_clears_keys_for_site_linked_channels_only() {
         proxy_fixed_channel: None,
         use_fixed_proxy: false,
         fixed_proxy_node: None,
-        priority: None,
-        weight: None,
         enabled_models: None,
         model_redirects: None,
-        rate_limit_rpm: None,
         stats_id: None,
         key_groups: None,
         key_rules: None,
@@ -1671,11 +1746,8 @@ fn sanitize_clears_keys_for_site_linked_channels_only() {
         proxy_fixed_channel: None,
         use_fixed_proxy: false,
         fixed_proxy_node: None,
-        priority: None,
-        weight: None,
         enabled_models: None,
         model_redirects: None,
-        rate_limit_rpm: None,
         stats_id: None,
         key_groups: None,
         key_rules: None,
@@ -1773,11 +1845,8 @@ async fn resolve_channel_api_keys_reads_site_cache_and_dedupes() {
         proxy_fixed_channel: None,
         use_fixed_proxy: false,
         fixed_proxy_node: None,
-        priority: None,
-        weight: None,
         enabled_models: None,
         model_redirects: None,
-        rate_limit_rpm: None,
         stats_id: None,
         key_groups: None,
         key_rules: None,
@@ -1807,11 +1876,8 @@ async fn resolve_channel_api_keys_reads_site_cache_and_dedupes() {
         proxy_fixed_channel: None,
         use_fixed_proxy: false,
         fixed_proxy_node: None,
-        priority: None,
-        weight: None,
         enabled_models: None,
         model_redirects: None,
-        rate_limit_rpm: None,
         stats_id: None,
         key_groups: None,
         key_rules: None,
@@ -1834,4 +1900,433 @@ async fn resolve_channel_api_keys_reads_site_cache_and_dedupes() {
     );
 
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// 回归：模型级代理规则表的键是上游返回的裸模型 id（无渠道别名前缀）。
+/// 带前缀的客户端模型名必须先剥离前缀再查表，否则规则 miss 会静默
+/// 退回渠道级代理模式，用户设置的「强制直连」被无声忽略。
+#[test]
+fn model_proxy_rule_is_keyed_by_bare_model_not_prefixed() {
+    let mut channel = ModelProxyConfig::default().channels.remove(0);
+    channel.alias = Some("x666".to_string());
+    channel.model_proxy_rules = Some(vec![ModelProxyRule {
+        model: "gpt-4".to_string(),
+        mode: "direct".to_string(),
+        node_id: None,
+        channel_id: None,
+    }]);
+
+    // 裸模型名命中规则
+    let hit = channel.model_proxy_rule("gpt-4");
+    assert!(hit.is_some(), "裸模型名必须命中规则表");
+    assert_eq!(hit.unwrap().mode, "direct");
+
+    // 带别名前缀的原始模型名查不到 —— 这正是必须传 rule_model 而非 model 的原因
+    assert!(
+        channel.model_proxy_rule("x666/gpt-4").is_none(),
+        "带前缀模型名不应命中：证明查表前必须剥离前缀"
+    );
+
+    // 大小写不敏感
+    assert!(channel.model_proxy_rule("GPT-4").is_some());
+}
+
+/// 回归：resolve_channel 返回的裸模型名可直接用于规则查表，
+/// 二者构成 EgressRequestMeta.rule_model 的完整链路。
+#[test]
+fn resolved_bare_model_matches_proxy_rule_after_prefix_strip() {
+    let mut channel = ModelProxyConfig::default().channels.remove(0);
+    channel.alias = Some("x666".to_string());
+    channel.enabled = true;
+    channel.model_proxy_rules = Some(vec![ModelProxyRule {
+        model: "gpt-4".to_string(),
+        mode: "direct".to_string(),
+        node_id: None,
+        channel_id: None,
+    }]);
+    let cfg = ModelProxyConfig {
+        channels: vec![channel],
+        ..ModelProxyConfig::default()
+    };
+
+    let (resolved_channel, bare_model) =
+        resolve_channel(&cfg, "x666/gpt-4").expect("别名前缀应路由到该渠道");
+    assert_eq!(bare_model, "gpt-4", "resolve_channel 必须剥离别名前缀");
+
+    let rule = resolved_channel
+        .model_proxy_rule(&bare_model)
+        .expect("裸模型名必须命中模型级代理规则");
+    assert_eq!(
+        rule.mode, "direct",
+        "带前缀调用也必须拿到用户设置的强制直连"
+    );
+}
+
+/// 回归（接线级）：出口候选解析必须收到裸模型名。
+/// 若调用方误传带别名前缀的原始模型名，规则表 miss，模型级
+/// 「强制直连」被静默丢弃，退回渠道级出口设置。
+///
+/// 渠道级刻意用 fixed_channel + 显式通道 ID：该分支不查代理池数据库，
+/// 返回形态 `__proxy_channel__:<id>` 与直连明确可分，因此空池环境下
+/// 两种结果不会退化成同一个值，测试对接线错误保持判别力。
+#[tokio::test]
+async fn egress_candidates_honor_direct_rule_only_with_bare_model() {
+    let mut channel = ModelProxyConfig::default().channels.remove(0);
+    channel.alias = Some("x666".to_string());
+    channel.proxy_mode = Some("fixed_channel".to_string());
+    channel.proxy_fixed_channel = Some("lane-a".to_string());
+    channel.model_proxy_rules = Some(vec![ModelProxyRule {
+        model: "gpt-4".to_string(),
+        mode: "direct".to_string(),
+        node_id: None,
+        channel_id: None,
+    }]);
+
+    let state = ModelProxyState::new();
+    let ctx = &state.context;
+
+    // 裸模型名：模型级 direct 生效
+    let bare = super::balancer::get_sorted_egress_candidates(ctx, &channel, "gpt-4", "").await;
+    assert_eq!(
+        bare,
+        vec!["__direct__".to_string()],
+        "裸模型名必须命中模型级强制直连"
+    );
+
+    // 带前缀模型名：规则 miss → 落回渠道级 fixed_channel。
+    // 这正是修复前 dispatcher 传 meta.model 时的错误行为。
+    let prefixed =
+        super::balancer::get_sorted_egress_candidates(ctx, &channel, "x666/gpt-4", "").await;
+    assert_eq!(
+        prefixed,
+        vec!["__proxy_channel__:lane-a".to_string()],
+        "带前缀模型名会 miss 规则表并退回渠道级出口"
+    );
+}
+
+/// 存量配置里残留已下线的 priority/weight/rateLimitRpm 键时仍能正常反序列化。
+/// ChannelConfig 无 deny_unknown_fields，未知键静默忽略 —— 锁住这一兼容性，
+/// 避免日后有人加上 deny_unknown_fields 导致老用户配置加载失败。
+#[test]
+fn legacy_config_with_retired_fields_still_deserializes() {
+    let legacy = r#"{
+        "id": "legacy",
+        "name": "Legacy Channel",
+        "enabled": true,
+        "upstreamUrl": "https://api.example.com/v1",
+        "priority": 5,
+        "weight": 100,
+        "rateLimitRpm": 60
+    }"#;
+
+    let ch: ChannelConfig = serde_json::from_str(legacy).expect("已下线字段不应导致反序列化失败");
+    assert_eq!(ch.id, "legacy");
+    assert_eq!(ch.base_url, "https://api.example.com/v1");
+    assert!(ch.enabled);
+}
+
+/// 候选列表的首项必须恒等于 resolve_channel 的结果 —— 这是「不改变既有路由行为」的前提。
+#[test]
+fn candidate_list_head_matches_resolve_channel() {
+    use crate::model::gateway::balancer::resolve_channel_candidates;
+    use std::collections::HashMap;
+
+    let mut cfg = ModelProxyConfig {
+        channels: vec![
+            order_test_channel("opencode", "opencode", true),
+            {
+                let mut ch = order_test_channel("b", "b", true);
+                ch.enabled_models = Some(vec!["shared-model".to_string()]);
+                ch
+            },
+            {
+                let mut ch = order_test_channel("a", "a", true);
+                ch.enabled_models = Some(vec!["shared-model".to_string()]);
+                ch
+            },
+        ],
+        ..ModelProxyConfig::default()
+    };
+
+    for model in ["shared-model", "Shared-Model", "unknown-model", "a/foo"] {
+        let head = resolve_channel_candidates(&cfg, model);
+        let single = resolve_channel(&cfg, model);
+        match (head.first(), single) {
+            (Some((c1, m1)), Some((c2, m2))) => {
+                assert_eq!(c1.id, c2.id, "首项渠道应与 resolve_channel 一致: {model}");
+                assert_eq!(m1, &m2, "裸模型名应一致: {model}");
+            }
+            (None, None) => {}
+            _ => panic!("候选列表与 resolve_channel 的可解析性不一致: {model}"),
+        }
+    }
+
+    // 配置路由顺序后首项仍需对齐
+    let mut order = HashMap::new();
+    order.insert(
+        "shared-model".to_string(),
+        vec!["a".to_string(), "b".to_string()],
+    );
+    cfg.model_channel_order = Some(order);
+    let cands = resolve_channel_candidates(&cfg, "shared-model");
+    assert_eq!(cands[0].0.id, "a");
+    assert_eq!(resolve_channel(&cfg, "shared-model").unwrap().0.id, "a");
+    // 后备渠道紧随其后，供故障转移使用
+    assert_eq!(cands[1].0.id, "b");
+}
+
+/// 显式带别名前缀 = 用户定向指派，不得扩展后备渠道（否则请求会被悄悄换到别的渠道）。
+#[test]
+fn aliased_request_does_not_expand_to_fallback_channels() {
+    use crate::model::gateway::balancer::resolve_channel_candidates;
+
+    let cfg = ModelProxyConfig {
+        channels: vec![
+            order_test_channel("opencode", "opencode", true),
+            order_test_channel("a", "a", true),
+            order_test_channel("b", "b", true),
+        ],
+        ..ModelProxyConfig::default()
+    };
+
+    let cands = resolve_channel_candidates(&cfg, "a/gpt-4");
+    assert_eq!(cands.len(), 1, "定向指派只应返回被指派的渠道");
+    assert_eq!(cands[0].0.id, "a");
+    assert_eq!(cands[0].1, "gpt-4", "别名前缀应已剥离");
+}
+
+/// 设了白名单但不含该模型的渠道不能作为后备 —— 它处理不了这个请求。
+#[test]
+fn candidates_exclude_channels_whose_whitelist_lacks_model() {
+    use crate::model::gateway::balancer::resolve_channel_candidates;
+
+    let cfg = ModelProxyConfig {
+        channels: vec![
+            {
+                let mut ch = order_test_channel("has", "has", true);
+                ch.enabled_models = Some(vec!["target-model".to_string()]);
+                ch
+            },
+            {
+                let mut ch = order_test_channel("lacks", "lacks", true);
+                ch.enabled_models = Some(vec!["other-model".to_string()]);
+                ch
+            },
+            // 无白名单 = 全部暴露，可作后备
+            order_test_channel("open", "open", true),
+            // 禁用渠道永不入选
+            {
+                let mut ch = order_test_channel("off", "off", false);
+                ch.enabled_models = Some(vec!["target-model".to_string()]);
+                ch
+            },
+        ],
+        ..ModelProxyConfig::default()
+    };
+
+    let ids: Vec<&str> = resolve_channel_candidates(&cfg, "target-model")
+        .iter()
+        .map(|(c, _)| c.id.as_str())
+        .collect();
+    assert_eq!(ids, vec!["has", "open"], "只应包含能承接该模型的启用渠道");
+}
+
+/// 端到端跨渠道故障转移：首选渠道恒定 401（不可重试的鉴权失败，渠道内候选立即耗尽）
+/// → 请求必须转移到下一个提供该模型的渠道并成功，且日志归属为实际成功的渠道。
+#[tokio::test]
+async fn failover_switches_to_next_channel_when_primary_exhausted() {
+    use crate::model::gateway::pipeline::{dispatch_protocol_egress, ClientProtocol};
+    use std::sync::atomic::Ordering;
+    use std::time::Instant;
+
+    // 首选渠道：始终 401 —— 鉴权失败不做原地重试
+    let (bad_addr, bad_hits) = spawn_scripted_upstream(vec![(
+        axum::http::StatusCode::UNAUTHORIZED,
+        r#"{"error":{"message":"invalid api key"}}"#,
+    )])
+    .await;
+    // 后备渠道：正常返回
+    let (good_addr, good_hits) =
+        spawn_scripted_upstream(vec![(axum::http::StatusCode::OK, valid_chat_payload())]).await;
+
+    let mut primary = egress_test_channel("primary", format!("http://{bad_addr}/v1"));
+    primary.enabled_models = Some(vec!["shared-model".to_string()]);
+    let mut backup = egress_test_channel("backup", format!("http://{good_addr}/v1"));
+    backup.enabled_models = Some(vec!["shared-model".to_string()]);
+
+    let state = ModelProxyState::new_with_app(None);
+    let ctx = &state.context;
+    ctx.route_enabled.store(true, Ordering::Release);
+    let config = ModelProxyConfig {
+        enabled: true,
+        max_retries: 0,
+        channels: vec![primary.clone(), backup.clone()],
+        ..ModelProxyConfig::default()
+    };
+
+    let outcome = dispatch_protocol_egress(
+        ctx,
+        &config,
+        &primary,
+        "shared-model",
+        "shared-model",
+        "/v1/chat/completions",
+        "req_failover",
+        false,
+        Instant::now(),
+        &None,
+        crate::model::gateway::egress::EgressBody::native(json!({ "model": "shared-model" })),
+        ClientProtocol::OpenAi,
+    )
+    .await
+    .expect("首选渠道耗尽后应转移到后备渠道并成功");
+
+    assert_eq!(outcome.success.status, 200);
+    assert_eq!(
+        outcome.chan_alias, "backup",
+        "日志/统计必须归属实际成功的渠道"
+    );
+    assert!(bad_hits.load(Ordering::SeqCst) >= 1, "首选渠道应被尝试过");
+    assert_eq!(good_hits.load(Ordering::SeqCst), 1, "后备渠道应承接该请求");
+}
+
+/// 定向指派（别名前缀）在 dispatch 层同样不得转移：用户明确指定了渠道，
+/// 悄悄换到别的渠道会违背意图（计费主体、上游供应商都不同）。
+#[tokio::test]
+async fn aliased_request_stays_on_designated_channel_at_dispatch_layer() {
+    use crate::model::gateway::pipeline::{dispatch_protocol_egress, ClientProtocol};
+    use std::sync::atomic::Ordering;
+    use std::time::Instant;
+
+    let (bad_addr, bad_hits) = spawn_scripted_upstream(vec![(
+        axum::http::StatusCode::UNAUTHORIZED,
+        r#"{"error":{"message":"invalid api key"}}"#,
+    )])
+    .await;
+    let (good_addr, good_hits) =
+        spawn_scripted_upstream(vec![(axum::http::StatusCode::OK, valid_chat_payload())]).await;
+
+    let mut primary = egress_test_channel("primary", format!("http://{bad_addr}/v1"));
+    primary.alias = Some("primary".to_string());
+    let mut backup = egress_test_channel("backup", format!("http://{good_addr}/v1"));
+    backup.alias = Some("backup".to_string());
+
+    let state = ModelProxyState::new_with_app(None);
+    let ctx = &state.context;
+    ctx.route_enabled.store(true, Ordering::Release);
+    let config = ModelProxyConfig {
+        enabled: true,
+        max_retries: 0,
+        channels: vec![primary.clone(), backup.clone()],
+        ..ModelProxyConfig::default()
+    };
+
+    // raw_model 带别名前缀 = 定向指派
+    let result = dispatch_protocol_egress(
+        ctx,
+        &config,
+        &primary,
+        "some-model",
+        "primary/some-model",
+        "/v1/chat/completions",
+        "req_aliased",
+        false,
+        Instant::now(),
+        &None,
+        crate::model::gateway::egress::EgressBody::native(json!({ "model": "some-model" })),
+        ClientProtocol::OpenAi,
+    )
+    .await;
+
+    assert!(result.is_err(), "定向渠道失败后应直接返回错误，不转移");
+    assert!(bad_hits.load(Ordering::SeqCst) >= 1, "指派渠道应被尝试");
+    assert_eq!(
+        good_hits.load(Ordering::SeqCst),
+        0,
+        "未被指派的渠道绝不能收到请求"
+    );
+}
+
+#[test]
+fn backoff_grows_exponentially_and_is_capped() {
+    use super::dispatcher::{exponential_backoff_ms, MAX_429_BACKOFF_MS};
+
+    // 500ms 起指数翻倍，而非旧的 500+300*n（上界仅 1.4s，几乎必然落在上游限流窗口内）
+    assert_eq!(exponential_backoff_ms(0), 500);
+    assert_eq!(exponential_backoff_ms(1), 1_000);
+    assert_eq!(exponential_backoff_ms(2), 2_000);
+    assert_eq!(exponential_backoff_ms(3), 4_000);
+
+    // 第 4 次即达上界；更深的 attempt 不再增长，也不溢出
+    assert!(exponential_backoff_ms(4) >= MAX_429_BACKOFF_MS);
+    for idx in 4..64usize {
+        assert!(
+            exponential_backoff_ms(idx).min(MAX_429_BACKOFF_MS) == MAX_429_BACKOFF_MS,
+            "attempt {idx} 截断后应恒为上界"
+        );
+    }
+}
+
+#[test]
+fn retry_after_header_is_honoured_over_local_backoff() {
+    use super::dispatcher::parse_retry_after_ms;
+    use reqwest::header::{HeaderMap, HeaderValue};
+
+    let mut headers = HeaderMap::new();
+    headers.insert("retry-after", HeaderValue::from_static("3"));
+    assert_eq!(parse_retry_after_ms(&headers), Some(3_000));
+
+    // 小数秒（部分上游返回 0.5）
+    headers.insert("retry-after", HeaderValue::from_static("0.5"));
+    assert_eq!(parse_retry_after_ms(&headers), Some(500));
+
+    // 缺失 / 非数值 / 负值 / HTTP-date 一律回落本地退避，不能 panic
+    assert_eq!(parse_retry_after_ms(&HeaderMap::new()), None);
+    for bad in ["", "soon", "-5", "Wed, 21 Oct 2015 07:28:00 GMT", "NaN"] {
+        headers.insert("retry-after", HeaderValue::from_str(bad).unwrap());
+        assert_eq!(parse_retry_after_ms(&headers), None, "「{bad}」应回落本地退避");
+    }
+}
+
+/// 复刻 `ModelProxyContext::node_round_robin_for` 的惰性创建逻辑。
+/// 直接构造 `ModelProxyContext` 需要真实 AppContext/HTTP client 等重依赖，
+/// 而被测语义完全落在这张分片 map 上，故只对 map 建模。
+async fn cursor_for(
+    map: &std::sync::Arc<tokio::sync::RwLock<std::collections::HashMap<String, std::sync::Arc<std::sync::atomic::AtomicUsize>>>>,
+    channel_id: &str,
+) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
+    if let Some(counter) = map.read().await.get(channel_id) {
+        return counter.clone();
+    }
+    map.write()
+        .await
+        .entry(channel_id.to_string())
+        .or_insert_with(|| std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)))
+        .clone()
+}
+
+#[tokio::test]
+async fn node_cursor_is_sharded_per_channel() {
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc as StdArc;
+
+    let map: StdArc<tokio::sync::RwLock<std::collections::HashMap<String, StdArc<std::sync::atomic::AtomicUsize>>>> =
+        StdArc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+
+    // 渠道 A 的 429 重试推进自己的游标
+    let a = cursor_for(&map, "chan-a").await;
+    a.fetch_add(3, Ordering::SeqCst);
+
+    // 渠道 B 必须从 0 起：A 的重试不得污染 B 的起始节点
+    let b = cursor_for(&map, "chan-b").await;
+    assert_eq!(
+        b.load(Ordering::SeqCst),
+        0,
+        "渠道游标必须互相隔离，否则一个渠道限流会让其他渠道跳过健康节点"
+    );
+
+    // 同一渠道重复取用返回同一游标（跨请求保持，而非每次重置）
+    let a_again = cursor_for(&map, "chan-a").await;
+    assert_eq!(a_again.load(Ordering::SeqCst), 3);
+    assert!(StdArc::ptr_eq(&a, &a_again), "同渠道应共享同一游标实例");
 }

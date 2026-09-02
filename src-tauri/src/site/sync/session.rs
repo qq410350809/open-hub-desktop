@@ -26,7 +26,10 @@ fn run_osascript_with_deadline(
     mut command: Command,
     deadline: Duration,
 ) -> Result<std::process::Output, String> {
-    command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     let mut child = command
         .spawn()
         .map_err(|error| format!("无法启动 osascript：{error}"))?;
@@ -42,15 +45,17 @@ fn run_osascript_with_deadline(
                 if let Some(mut pipe) = child.stderr.take() {
                     let _ = pipe.read_to_end(&mut stderr);
                 }
-                return Ok(std::process::Output { status, stdout, stderr });
+                return Ok(std::process::Output {
+                    status,
+                    stdout,
+                    stderr,
+                });
             }
             Ok(None) => {
                 if started.elapsed() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return Err(
-                        "osascript AppleEvent已超时，已终止本次调用".to_string(),
-                    );
+                    return Err("osascript AppleEvent已超时，已终止本次调用".to_string());
                 }
                 thread::sleep(Duration::from_millis(50));
             }
@@ -452,8 +457,7 @@ pub(crate) fn run_javascript_in_background_chrome_profile(
 ) -> Result<String, String> {
     validate_chrome_bridge_marker(marker)?;
     if allow_tab_reuse {
-        if let Some(tab_id) = find_openhub_bridge_tab(target_url, BACKGROUND_BRIDGE_MARKER_PREFIX)
-        {
+        if let Some(tab_id) = find_openhub_bridge_tab(target_url, BACKGROUND_BRIDGE_MARKER_PREFIX) {
             match run_javascript_in_marked_chrome_tab(marker, javascript, Some(&tab_id), timeout) {
                 Ok(value) if value == CHROME_BRIDGE_PROFILE_MISMATCH => {}
                 outcome => {

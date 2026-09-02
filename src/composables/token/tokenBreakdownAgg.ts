@@ -24,6 +24,35 @@ export function bucketTotals(buckets: UsageBucketLike[]) {
 
 export type { BucketBreakdownTotal };
 
+/**
+ * 查表键：复刻后端 raw_key（小写、取最后一段 "/" 前缀），
+ * 保证前端展示归组与 token_model_mappings 表的主键一致。
+ */
+export function modelRawKey(name: string): string {
+  const trimmed = (name || "").trim();
+  if (!trimmed) return "";
+  const tail = trimmed.split("/").pop() ?? trimmed;
+  return tail.trim().toLowerCase();
+}
+
+/** raw_key → 正式模型名；未命中的原始名回退现有 normalize + stripSuffix 归组。 */
+export type ModelMappingLookup = Map<string, string>;
+
+/** 由映射表构建归组查表（只收已确定正式名的行）。 */
+export function buildModelMappingLookup(
+  mappings: { rawKey?: string; rawModel?: string; officialModel?: string }[] | null | undefined,
+): ModelMappingLookup | undefined {
+  if (!mappings?.length) return undefined;
+  const lookup: ModelMappingLookup = new Map();
+  for (const item of mappings) {
+    const official = (item.officialModel || "").trim();
+    if (!official) continue;
+    const key = item.rawKey?.trim() || modelRawKey(item.rawModel || "");
+    if (key) lookup.set(key, official);
+  }
+  return lookup.size ? lookup : undefined;
+}
+
 function emptyBucketBreakdown(): BucketBreakdownTotal {
   return {
     totalTokens: 0,
@@ -127,10 +156,19 @@ function stripSuffix(name: string): { base: string; changed: boolean } {
   return { base, changed };
 }
 
-export function mergeModelTotals(items: ModelTotal[]): ModelTotal[] {
+export function mergeModelTotals(items: ModelTotal[], mapping?: ModelMappingLookup): ModelTotal[] {
+  // 映射表命中的名字是目录正式名，不能再被 stripSuffix 二次削尾。
+  const mappedNames = new Set<string>();
   const byName = new Map<string, ModelTotal>();
   for (const item of items) {
-    const name = normalizeModelName(item.model) || item.model;
+    let name: string;
+    const official = mapping?.get(modelRawKey(item.model)) || "";
+    if (official) {
+      name = official;
+      mappedNames.add(name);
+    } else {
+      name = normalizeModelName(item.model) || item.model;
+    }
     const current = byName.get(name) || { model: name, ...emptyBucketBreakdown() };
     current.totalTokens += item.totalTokens;
     current.inputTokens += item.inputTokens;
@@ -151,8 +189,13 @@ export function mergeModelTotals(items: ModelTotal[]): ModelTotal[] {
   const list = [...byName.values()];
   const result = new Map<string, ModelTotal>();
   for (const item of list) {
-    const { base, changed } = stripSuffix(item.model);
-    const targetName = changed ? base : item.model;
+    let targetName: string;
+    if (mappedNames.has(item.model)) {
+      targetName = item.model;
+    } else {
+      const { base, changed } = stripSuffix(item.model);
+      targetName = changed ? base : item.model;
+    }
     const target = result.get(targetName) || { model: targetName, ...emptyBucketBreakdown() };
     target.totalTokens += item.totalTokens;
     target.inputTokens += item.inputTokens;

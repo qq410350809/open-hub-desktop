@@ -454,6 +454,7 @@ export function useCharityMonitor() {
     charityFeedTodayCount: todayCount,
     refreshTodayCount,
     charityProxyPoolSummary: proxyPoolSummary,
+    refreshCharityProxyPoolSummary: refreshProxyPoolSummary,
     charityFeedUpdatedCount: updatedCount,
     charityFeedSourceProfileName: ref(""),
     charityFeedSourceAccountName: ref(""),

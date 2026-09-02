@@ -64,7 +64,10 @@ mod tests {
             assert_eq!(app_support_dir_name(), "com.dfeer.openhub.desktop-dev");
         } else {
             assert!(!is_dev_profile());
-            assert_eq!(preferred_service_port(), crate::core::web_server::DEFAULT_PORT);
+            assert_eq!(
+                preferred_service_port(),
+                crate::core::web_server::DEFAULT_PORT
+            );
             assert_eq!(app_support_dir_name(), RELEASE_DIR_NAME);
         }
         // 目录后缀必须以正式名开头，保证 Windows 注册表卸载清理等按前缀匹配的场景。

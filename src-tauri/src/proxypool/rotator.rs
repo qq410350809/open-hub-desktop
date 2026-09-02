@@ -268,7 +268,10 @@ pub async fn rotate_account_instance_node(
             break;
         }
         warn!("轮换候选节点探活失败 {candidate_id}");
-        runtime.account_ban_node(candidate_id, crate::proxypool::types::ACCOUNT_NODE_PROBE_FAIL_TTL);
+        runtime.account_ban_node(
+            candidate_id,
+            crate::proxypool::types::ACCOUNT_NODE_PROBE_FAIL_TTL,
+        );
     }
     if next_id.is_empty() {
         return Err("代理池所有候选节点均不可用".to_string());
@@ -290,7 +293,8 @@ pub fn proxy_url_for_account(
     if !read_site_uses_proxy_pool(database, site_id)? {
         return Ok(None);
     }
-    let port = crate::proxypool::runtime::ensure_account_instance(database, runtime, profile_id, None)?;
+    let port =
+        crate::proxypool::runtime::ensure_account_instance(database, runtime, profile_id, None)?;
     Ok(Some(format!("http://127.0.0.1:{port}")))
 }
 
@@ -309,17 +313,12 @@ where
     Fut: std::future::Future<Output = Result<T, String>>,
 {
     if !read_site_uses_proxy_pool(database, site_id)? {
-        let client =
-            crate::db::build_site_http_client(database, timeout, redirects, purpose)?;
+        let client = crate::db::build_site_http_client(database, timeout, redirects, purpose)?;
         return request(client).await;
     }
 
-    let account_port = crate::proxypool::runtime::ensure_account_instance(
-        database,
-        runtime,
-        profile_id,
-        None,
-    )?;
+    let account_port =
+        crate::proxypool::runtime::ensure_account_instance(database, runtime, profile_id, None)?;
     // lane 端口在轮换时保持不变（切组而非杀进程），重试可继续复用同一 URL
     let account_proxy_url = format!("http://127.0.0.1:{account_port}");
     // 固定通道语义：账号绑定通道后，出口节点由用户手动固定。请求失败就失败，

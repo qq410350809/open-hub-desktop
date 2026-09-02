@@ -343,7 +343,8 @@ fn account_node_bans_expire() {
 #[test]
 fn orphan_mihomo_detection_matches_only_openhub_owned_kernels() {
     let mac_bin = "/Users/u/Library/Application Support/com.dfeer.openhub.desktop/bin/mihomo";
-    let runtime_dir = "/Users/u/Library/Application Support/com.dfeer.openhub.desktop/proxy-runtime";
+    let runtime_dir =
+        "/Users/u/Library/Application Support/com.dfeer.openhub.desktop/proxy-runtime";
 
     // 正例：OpenHub 自管的各类实例（shared / channel / speed-test / 自定义二进制路径）
     for cmd in [
@@ -392,7 +393,9 @@ fn account_node_allocation_rotates_sequentially_instead_of_pinning_first() {
 
     let mut allocated = Vec::new();
     for _ in 0..candidates.len() {
-        let seq = runtime.account_alloc_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as usize;
+        let seq = runtime
+            .account_alloc_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed) as usize;
         allocated.push(candidates[seq % candidates.len()].0.clone());
     }
 
@@ -402,7 +405,9 @@ fn account_node_allocation_rotates_sequentially_instead_of_pinning_first() {
         "账号应按顺序轮询获得不同节点"
     );
     // 游标回绕
-    let seq = runtime.account_alloc_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as usize;
+    let seq = runtime
+        .account_alloc_seq
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed) as usize;
     assert_eq!(candidates[seq % candidates.len()].0, "node_a");
 }
 
@@ -418,35 +423,80 @@ fn lane_pools_map_release_and_current_node() {
 
     // 手工预配池（真实预配发生在全局实例拉起时）
     *runtime.speed_lane_slots.lock().unwrap() = vec![
-        LaneSlot { group_name: "SPEED-lane-0".into(), listen_port: 41001 },
-        LaneSlot { group_name: "SPEED-lane-1".into(), listen_port: 41002 },
+        LaneSlot {
+            group_name: "SPEED-lane-0".into(),
+            listen_port: 41001,
+        },
+        LaneSlot {
+            group_name: "SPEED-lane-1".into(),
+            listen_port: 41002,
+        },
     ];
     *runtime.channel_lane_slots.lock().unwrap() = vec![
-        LaneSlot { group_name: "CH-lane-0".into(), listen_port: 42001 },
-        LaneSlot { group_name: "CH-lane-1".into(), listen_port: 42002 },
+        LaneSlot {
+            group_name: "CH-lane-0".into(),
+            listen_port: 42001,
+        },
+        LaneSlot {
+            group_name: "CH-lane-1".into(),
+            listen_port: 42002,
+        },
     ];
     *runtime.account_lane_slots.lock().unwrap() = vec![
-        LaneSlot { group_name: "ACCT-lane-0".into(), listen_port: 43001 },
-        LaneSlot { group_name: "ACCT-lane-1".into(), listen_port: 43002 },
+        LaneSlot {
+            group_name: "ACCT-lane-0".into(),
+            listen_port: 43001,
+        },
+        LaneSlot {
+            group_name: "ACCT-lane-1".into(),
+            listen_port: 43002,
+        },
     ];
-    runtime.channel_lane_map.lock().unwrap().insert("ch1".into(), 0);
-    runtime.account_lane_map.lock().unwrap().insert("p1".into(), 1);
-    runtime.lane_selected.lock().unwrap().insert("CH-lane-0".into(), "node_a".into());
-    runtime.lane_selected.lock().unwrap().insert("ACCT-lane-1".into(), "node_b".into());
+    runtime
+        .channel_lane_map
+        .lock()
+        .unwrap()
+        .insert("ch1".into(), 0);
+    runtime
+        .account_lane_map
+        .lock()
+        .unwrap()
+        .insert("p1".into(), 1);
+    runtime
+        .lane_selected
+        .lock()
+        .unwrap()
+        .insert("CH-lane-0".into(), "node_a".into());
+    runtime
+        .lane_selected
+        .lock()
+        .unwrap()
+        .insert("ACCT-lane-1".into(), "node_b".into());
 
     assert_eq!(runtime.channel_port("ch1"), Some(42001));
     assert_eq!(runtime.speed_lane_slot(0).unwrap().listen_port, 41001);
-    assert_eq!(runtime.account_lane_current_node("p1"), Some("node_b".into()));
+    assert_eq!(
+        runtime.account_lane_current_node("p1"),
+        Some("node_b".into())
+    );
 
     // 释放通道 lane：端口消失、选中记录被清、lane 槽位可复用
     runtime.release_channel_lane("ch1");
     assert_eq!(runtime.channel_port("ch1"), None);
-    assert!(!runtime.lane_selected.lock().unwrap().contains_key("CH-lane-0"));
+    assert!(!runtime
+        .lane_selected
+        .lock()
+        .unwrap()
+        .contains_key("CH-lane-0"));
 
     // 释放账号 lane：当前节点查询为空
     runtime.release_account_lane("p1");
     assert_eq!(runtime.account_lane_current_node("p1"), None);
-    assert!(!runtime.lane_selected.lock().unwrap().contains_key("ACCT-lane-1"));
+    assert!(!runtime
+        .lane_selected
+        .lock()
+        .unwrap()
+        .contains_key("ACCT-lane-1"));
 }
 
 #[test]
@@ -454,22 +504,40 @@ fn runtime_config_contains_all_lane_groups_with_full_nodes() {
     use crate::proxypool::types::LaneSlot;
 
     let nodes = vec![
-        RuntimeNode { id: "node_a".into(), config: serde_json::json!({"name": "node_a", "type": "socks5", "server": "1.1.1.1", "port": 1080}) },
-        RuntimeNode { id: "node_b".into(), config: serde_json::json!({"name": "node_b", "type": "socks5", "server": "2.2.2.2", "port": 1080}) },
+        RuntimeNode {
+            id: "node_a".into(),
+            config: serde_json::json!({"name": "node_a", "type": "socks5", "server": "1.1.1.1", "port": 1080}),
+        },
+        RuntimeNode {
+            id: "node_b".into(),
+            config: serde_json::json!({"name": "node_b", "type": "socks5", "server": "2.2.2.2", "port": 1080}),
+        },
     ];
-    let speed = vec![LaneSlot { group_name: "SPEED-lane-0".into(), listen_port: 41001 }];
-    let accounts = vec![LaneSlot { group_name: "ACCT-lane-0".into(), listen_port: 43001 }];
-    let channels = vec![LaneSlot { group_name: "CH-lane-0".into(), listen_port: 42001 }];
+    let speed = vec![LaneSlot {
+        group_name: "SPEED-lane-0".into(),
+        listen_port: 41001,
+    }];
+    let accounts = vec![LaneSlot {
+        group_name: "ACCT-lane-0".into(),
+        listen_port: 43001,
+    }];
+    let channels = vec![LaneSlot {
+        group_name: "CH-lane-0".into(),
+        listen_port: 42001,
+    }];
 
     let config = runtime_config(&nodes, 40001, 40002, &speed, &accounts, &channels);
 
     let groups = config["proxy-groups"].as_array().unwrap();
     let group_names: Vec<&str> = groups.iter().filter_map(|g| g["name"].as_str()).collect();
-    assert_eq!(group_names, vec!["OpenHub", "SPEED-lane-0", "ACCT-lane-0", "CH-lane-0"]);
+    assert_eq!(
+        group_names,
+        vec!["OpenHub", "SPEED-lane-0", "ACCT-lane-0", "CH-lane-0"]
+    );
     for group in groups {
         let proxies = group["proxies"].as_array().unwrap();
         assert_eq!(proxies.len(), 2, "每个 lane 组必须包含全量节点");
-    assert_eq!(proxies[0], "node_a");
+        assert_eq!(proxies[0], "node_a");
         assert_eq!(proxies[1], "node_b");
     }
 
@@ -479,7 +547,10 @@ fn runtime_config_contains_all_lane_groups_with_full_nodes() {
         assert_eq!(listener["type"], "mixed");
         assert_eq!(listener["listen"], "127.0.0.1");
         let proxy_group = listener["proxy"].as_str().unwrap();
-        assert!(group_names.contains(&proxy_group), "listener 必须绑定存在的 lane 组");
+        assert!(
+            group_names.contains(&proxy_group),
+            "listener 必须绑定存在的 lane 组"
+        );
     }
 
     assert_eq!(config["mixed-port"], 40001);

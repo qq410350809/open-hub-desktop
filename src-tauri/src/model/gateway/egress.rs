@@ -218,10 +218,6 @@ fn normalize_versioned_base(base: &str, endpoint: &str) -> String {
 // 请求体转换：OpenAI Chat → 目标协议
 // ---------------------------------------------------------------------------
 
-
-
-
-
 // ---------------------------------------------------------------------------
 // 非流式响应归一化：目标协议 JSON → OpenAI Chat 响应
 // ---------------------------------------------------------------------------
@@ -304,9 +300,8 @@ pub fn normalize_response_bytes(target: TargetProtocol, model: &str, raw: &[u8])
         TargetProtocol::AnthropicMessages => {
             serde_json::to_vec(&anthropic_response_to_openai(&jv)).unwrap_or_else(|_| raw.to_vec())
         }
-        TargetProtocol::Gemini => {
-            serde_json::to_vec(&gemini_response_to_openai(&jv, model)).unwrap_or_else(|_| raw.to_vec())
-        }
+        TargetProtocol::Gemini => serde_json::to_vec(&gemini_response_to_openai(&jv, model))
+            .unwrap_or_else(|_| raw.to_vec()),
         TargetProtocol::OpenAiResponses => {
             serde_json::to_vec(&responses_response_to_openai(&jv)).unwrap_or_else(|_| raw.to_vec())
         }
@@ -578,7 +573,11 @@ pub fn responses_response_to_openai(resp: &JsonValue) -> JsonValue {
 // ---------------------------------------------------------------------------
 
 /// 单个发往客户端的 OpenAI delta 分片（不含 data: 前缀）
-pub(crate) fn delta_chunk(delta: JsonValue, finish_reason: Option<&str>, usage: Option<JsonValue>) -> String {
+pub(crate) fn delta_chunk(
+    delta: JsonValue,
+    finish_reason: Option<&str>,
+    usage: Option<JsonValue>,
+) -> String {
     let mut chunk = json!({
         "id": "chatcmpl-egress",
         "object": "chat.completion.chunk",
@@ -635,7 +634,10 @@ mod egress_tests {
             Some(TargetProtocol::OpenAiChat)
         );
         // 错误对象/未知结构 → None（回退渠道配置）
-        assert_eq!(detect_response_protocol_from_json(&json!({"type":"error","error":{"message":"x"}})), None);
+        assert_eq!(
+            detect_response_protocol_from_json(&json!({"type":"error","error":{"message":"x"}})),
+            None
+        );
         assert_eq!(detect_response_protocol_from_json(&json!({})), None);
     }
 
@@ -678,7 +680,7 @@ mod egress_tests {
     async fn collect_stream<E: Send + 'static>(
         stream: impl futures_util::Stream<Item = Result<Bytes, E>>,
     ) -> Vec<String> {
-                let mut out = Vec::new();
+        let mut out = Vec::new();
         tokio::pin!(stream);
         while let Some(item) = stream.next().await {
             if let Ok(bytes) = item {
@@ -728,7 +730,8 @@ mod egress_tests {
     #[test]
     fn sse_stream_chat_passthrough_even_when_misconfigured() {
         // 配置为 Gemini，实际是 Chat SSE → 判定为中枢格式后按行透传
-        let raw_line = r#"{"choices":[{"index":0,"delta":{"content":"hey"},"finish_reason":null}]}"#;
+        let raw_line =
+            r#"{"choices":[{"index":0,"delta":{"content":"hey"},"finish_reason":null}]}"#;
         let upstream = sse_body(vec![raw_line, "[DONE]"]);
         let body = crate::model::gateway::stream::proxy_sse_body(
             upstream,
@@ -775,7 +778,13 @@ mod egress_tests {
         is_stream: bool,
     ) -> (String, JsonValue) {
         let ur = crate::model::gateway::parsers::chat_to_universal(openai_body, model);
-        prepare_egress_with(channel, api_key, model, EgressBody::Universal(ur), is_stream)
+        prepare_egress_with(
+            channel,
+            api_key,
+            model,
+            EgressBody::Universal(ur),
+            is_stream,
+        )
     }
 
     fn test_log() -> crate::model::gateway::types::ProxyRequestLog {
@@ -812,12 +821,15 @@ mod egress_tests {
     }
 
     fn test_context() -> crate::model::gateway::types::ModelProxyContext {
+        use std::collections::HashMap;
         use std::sync::atomic::AtomicUsize;
         use std::sync::Arc;
         use tokio::sync::RwLock;
         crate::model::gateway::types::ModelProxyContext {
             route_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            config: Arc::new(RwLock::new(crate::model::gateway::types::ModelProxyConfig::default())),
+            config: Arc::new(RwLock::new(
+                crate::model::gateway::types::ModelProxyConfig::default(),
+            )),
             metrics: Arc::new(crate::model::gateway::types::ProxyMetrics::default()),
             started_at: Arc::new(RwLock::new(None)),
             current_port: Arc::new(RwLock::new(0)),
@@ -826,11 +838,10 @@ mod egress_tests {
             default_http_client: Arc::new(RwLock::new(reqwest::Client::new())),
             app_ctx: Arc::new(RwLock::new(None)),
             key_round_robin: Arc::new(AtomicUsize::new(0)),
-            node_round_robin: Arc::new(AtomicUsize::new(0)),
+            node_round_robin: Arc::new(RwLock::new(HashMap::new())),
             log_retention_last_run: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
-
 
     #[tokio::test]
     async fn chat_upstream_pure_tool_calls_reach_responses_client() {
@@ -860,16 +871,24 @@ mod egress_tests {
         let all = collect_stream(body.into_data_stream()).await.join("");
 
         // 工具调用必须以标准 function_call item 到达客户端
-        assert!(all.contains("\"type\":\"function_call\""), "工具调用不可丢失: {all}");
+        assert!(
+            all.contains("\"type\":\"function_call\""),
+            "工具调用不可丢失: {all}"
+        );
         assert!(all.contains("\"name\":\"Bash\""));
         assert!(all.contains("call_e96"));
         assert!(all.contains("git status"));
         // reasoning 必须保留
-        assert!(all.contains("response.reasoning_summary_text.delta"), "{all}");
+        assert!(
+            all.contains("response.reasoning_summary_text.delta"),
+            "{all}"
+        );
         assert!(all.contains("The user wants to commit."));
         // completed 携带完整 output 数组
         assert!(all.contains("event: response.completed"));
-        assert!(all.contains("\"status\":\"completed\"") || all.contains("\"status\": \"completed\""));
+        assert!(
+            all.contains("\"status\":\"completed\"") || all.contains("\"status\": \"completed\"")
+        );
     }
 
     #[test]
@@ -888,7 +907,10 @@ mod egress_tests {
         );
         assert!(url.ends_with("/messages"), "anthropic 快车道 URL: {url}");
         assert_eq!(out, body, "原生请求体不得被改写");
-        assert!(out.get("stream_options").is_none(), "非 Chat 出口不注入 include_usage");
+        assert!(
+            out.get("stream_options").is_none(),
+            "非 Chat 出口不注入 include_usage"
+        );
 
         // Responses 渠道
         let chan = channel_with_protocol("responses");
@@ -915,9 +937,13 @@ mod egress_tests {
         let (url2, out2) =
             prepare_egress_with(&chan, "sk-x", "claude-x", EgressBody::Universal(ur), true);
         assert!(url2.ends_with("/v1/messages") || url2.ends_with("/messages"));
-        assert!(out2.get("stream_options").is_none(), "非 Chat 出口不注入 include_usage");
+        assert!(
+            out2.get("stream_options").is_none(),
+            "非 Chat 出口不注入 include_usage"
+        );
         assert_eq!(
-            out2.pointer("/messages/0/content/0/text").and_then(JsonValue::as_str),
+            out2.pointer("/messages/0/content/0/text")
+                .and_then(JsonValue::as_str),
             Some("hi"),
             "UR 展开的 Anthropic 体为 blocks 结构: {out2}"
         );
@@ -993,11 +1019,8 @@ mod egress_tests {
             proxy_fixed_channel: None,
             use_fixed_proxy: false,
             fixed_proxy_node: None,
-            priority: None,
-            weight: None,
             enabled_models: None,
             model_redirects: None,
-            rate_limit_rpm: None,
             stats_id: None,
             key_groups: None,
             key_rules: None,
@@ -1048,7 +1071,7 @@ mod egress_tests {
         let (url, _) = prepare_egress(&chan, "", "m", &body, false);
         assert_eq!(url, "https://x666.me/v1/chat/completions");
         assert!(
-            !url.split("://", ).nth(1).unwrap_or("").contains("//"),
+            !url.split("://",).nth(1).unwrap_or("").contains("//"),
             "禁止路径双斜杠: {url}"
         );
 
@@ -1099,8 +1122,7 @@ mod egress_tests {
             true,
         );
         assert_eq!(
-            url,
-            "https://upstream.example/v1/messages",
+            url, "https://upstream.example/v1/messages",
             "Anthropic 渠道出网必须使用原生 /v1/messages"
         );
         assert!(
@@ -1259,8 +1281,12 @@ mod egress_tests {
         }
         events.extend(p.finish());
 
-        assert!(events.iter().any(|e| matches!(e, UniversalStreamEvent::TextDelta(t) if t == "你")));
-        assert!(events.iter().any(|e| matches!(e, UniversalStreamEvent::TextDelta(t) if t == "好")));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, UniversalStreamEvent::TextDelta(t) if t == "你")));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, UniversalStreamEvent::TextDelta(t) if t == "好")));
         let Some(UniversalStreamEvent::Finish { usage, reason }) = events.last() else {
             panic!("must end with Finish");
         };
@@ -1328,7 +1354,10 @@ mod egress_tests {
             "应延迟至键名可识别后恢复为 bash: {text}"
         );
         assert!(text.contains("ls -la") && text.contains("list files"));
-        assert!(text.matches("tool_calls").count() >= 3, "缓冲的增量应全部补发");
+        assert!(
+            text.matches("tool_calls").count() >= 3,
+            "缓冲的增量应全部补发"
+        );
     }
 
     #[tokio::test]
@@ -1408,7 +1437,8 @@ mod egress_tests {
 
         let (_, out) = prepare_egress(&channel_with_protocol("openai"), "", "m", &body, true);
         assert_eq!(
-            out.pointer("/stream_options/include_usage").and_then(JsonValue::as_bool),
+            out.pointer("/stream_options/include_usage")
+                .and_then(JsonValue::as_bool),
             Some(true),
             "流式出网必须请求 usage，否则 token 统计恒为 0"
         );
@@ -1418,16 +1448,17 @@ mod egress_tests {
         assert!(out.get("stream_options").is_none());
 
         // 客户端显式设置时不覆盖
-        let custom = json!({"model": "m", "stream": true, "stream_options": {"include_usage": false}});
+        let custom =
+            json!({"model": "m", "stream": true, "stream_options": {"include_usage": false}});
         let (_, out) = prepare_egress(&channel_with_protocol("openai"), "", "m", &custom, true);
         assert_eq!(
-            out.pointer("/stream_options/include_usage").and_then(JsonValue::as_bool),
+            out.pointer("/stream_options/include_usage")
+                .and_then(JsonValue::as_bool),
             Some(false)
         );
 
         // include_usage 仅对 Chat 出口有意义；原生协议出口由响应协议自带 usage
-        let (_, out) =
-            prepare_egress(&channel_with_protocol("anthropic"), "", "m", &body, true);
+        let (_, out) = prepare_egress(&channel_with_protocol("anthropic"), "", "m", &body, true);
         assert!(
             out.get("stream_options").is_none(),
             "Anthropic 原生出口不得注入 Chat 专属的 stream_options"
@@ -1440,10 +1471,7 @@ mod egress_tests {
         let mut src = reqwest::header::HeaderMap::new();
         src.insert("x-request-id", "req-1".parse().unwrap());
         src.insert("retry-after", "30".parse().unwrap());
-        src.insert(
-            "anthropic-ratelimit-input-tokens",
-            "1000".parse().unwrap(),
-        );
+        src.insert("anthropic-ratelimit-input-tokens", "1000".parse().unwrap());
         src.insert("content-type", "application/json".parse().unwrap());
         src.insert("transfer-encoding", "chunked".parse().unwrap());
         src.insert("set-cookie", "a=b".parse().unwrap());
@@ -1454,11 +1482,15 @@ mod egress_tests {
             .unwrap();
         let out = copy_upstream_headers(&src, resp);
         assert_eq!(
-            out.headers().get("x-request-id").map(|v| v.to_str().unwrap()),
+            out.headers()
+                .get("x-request-id")
+                .map(|v| v.to_str().unwrap()),
             Some("req-1")
         );
         assert_eq!(
-            out.headers().get("retry-after").map(|v| v.to_str().unwrap()),
+            out.headers()
+                .get("retry-after")
+                .map(|v| v.to_str().unwrap()),
             Some("30")
         );
         assert_eq!(
@@ -1488,7 +1520,9 @@ mod egress_tests {
         });
         let openai = gemini_response_to_openai(&gemini, "m");
         assert_eq!(
-            openai.pointer("/usage/completion_tokens").and_then(JsonValue::as_u64),
+            openai
+                .pointer("/usage/completion_tokens")
+                .and_then(JsonValue::as_u64),
             Some(50),
             "completion 含推理（candidates + thoughts）"
         );
@@ -1509,7 +1543,9 @@ mod egress_tests {
         });
         let openai = responses_response_to_openai(&responses);
         assert_eq!(
-            openai.pointer("/usage/completion_tokens").and_then(JsonValue::as_u64),
+            openai
+                .pointer("/usage/completion_tokens")
+                .and_then(JsonValue::as_u64),
             Some(300),
             "Responses output_tokens 已含推理，直接透传"
         );

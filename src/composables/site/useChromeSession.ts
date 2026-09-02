@@ -11,7 +11,7 @@ import type {
   SyncLogEntry,
   SyncSitesProgress,
 } from "../../types";
-import { isNewApiCompatible, normalizeSystemType } from "../../types";
+import { isNewApiCompatible, isUnknownSystemType, normalizeSystemType } from "../../types";
 
 const { sites, usageSites, loadLibrary } = useLibrary();
 const { showToast } = useToast();
@@ -408,6 +408,11 @@ async function analyzeChromeUsage(
 }
 
 async function syncChromeSession(site: any, trigger: HTMLElement) {
+  // 未知架构站点没有可识别的签到/额度接口，会话同步（额度/签到/Key 模型）无意义
+  if (isUnknownSystemType(site.systemType)) {
+    showToast(`「${site.name}」是未知架构站点，不支持同步会话与额度`, true);
+    return;
+  }
   const requestId = ++chromeSessionRequestId;
   chromeSyncForceStopped = false;
   chromeSessionSyncActive.value = true;

@@ -218,15 +218,20 @@ function ensureTickTimer() {
   }
 }
 
+// 后端 CURRENT_TIMESTAMP 落库的是无时区 UTC 字符串,统一视为 UTC 解析
+function parseFeedTimestampMs(value: string): number {
+  const normalized = value.includes("T") ? value : value.replace(" ", "T");
+  const withZone = /Z$|[+-]\d{2}:?\d{2}$/.test(normalized) ? normalized : `${normalized}Z`;
+  return new Date(withZone).getTime();
+}
+
 function liveDurationMs(entry: { status: string; at: string; durationMs?: number | null }) {
   if (entry.status !== "running") {
     return entry.durationMs ?? 0;
   }
   void nowTick.value;
   const raw = entry.at || "";
-  const normalized = raw.includes("T") ? raw : raw.replace(" ", "T");
-  const withZone = /Z$|[+-]\d{2}:?\d{2}$/.test(normalized) ? normalized : `${normalized}Z`;
-  const started = new Date(withZone).getTime();
+  const started = raw ? parseFeedTimestampMs(raw) : Number.NaN;
   if (!Number.isFinite(started)) return entry.durationMs ?? 0;
   return Math.max(0, Date.now() - started);
 }
@@ -238,14 +243,14 @@ const selectedLabel = computed(
 // —— 格式化函数 ——
 function formatPublishedAt(value?: string) {
   if (!value) return "时间未知";
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return value || "时间未知";
+  const ts = parseFeedTimestampMs(value);
+  if (!Number.isFinite(ts)) return value || "时间未知";
   return new Intl.DateTimeFormat("zh-CN", {
     month: "2-digit",
     day: "2-digit",
     hour: "2-digit",
     minute: "2-digit",
-  }).format(date);
+  }).format(ts);
 }
 
 function formatCompactCount(value?: number | null) {
@@ -255,9 +260,9 @@ function formatCompactCount(value?: number | null) {
 function formatRelativeActivity(value?: string, fallback?: string) {
   const raw = (value || fallback || "").trim();
   if (!raw) return "—";
-  const date = new Date(raw);
-  if (Number.isNaN(date.getTime())) return formatPublishedAt(raw);
-  const diffMs = Date.now() - date.getTime();
+  const ts = parseFeedTimestampMs(raw);
+  if (!Number.isFinite(ts)) return formatPublishedAt(raw);
+  const diffMs = Date.now() - ts;
   if (diffMs < 0) return formatPublishedAt(raw);
   const minutes = Math.floor(diffMs / 60000);
   if (minutes < 1) return "刚刚";
@@ -271,17 +276,15 @@ function formatRelativeActivity(value?: string, fallback?: string) {
 
 function formatLogTime(value: string) {
   if (!value) return "--:--:--";
-  const normalized = value.includes("T") ? value : value.replace(" ", "T");
-  const withZone = /Z$|[+-]\d{2}:?\d{2}$/.test(normalized) ? normalized : `${normalized}Z`;
-  const date = new Date(withZone);
-  if (Number.isNaN(date.getTime())) return value;
+  const ts = parseFeedTimestampMs(value);
+  if (!Number.isFinite(ts)) return value;
   return new Intl.DateTimeFormat("zh-CN", {
     month: "2-digit",
     day: "2-digit",
     hour: "2-digit",
     minute: "2-digit",
     second: "2-digit",
-  }).format(date);
+  }).format(ts);
 }
 
 function formatDuration(ms?: number) {
@@ -347,6 +350,7 @@ function topicRowClass(row: { pinned?: boolean }) {
 
 onMounted(() => {
   void store.loadCharityFeedLocal();
+  void store.refreshCharityProxyPoolSummary();
   tickTimer = window.setInterval(() => {
     nowTick.value = Date.now();
     ensureTickTimer();
@@ -447,7 +451,7 @@ onUnmounted(() => {
               <span v-html="icons.flame" />
               <span>今日新帖</span>
             </span>
-            <span class="cm-stat-pill is-orange">近 24 小时</span>
+            <span class="cm-stat-pill is-orange">本日发布</span>
           </div>
           <div class="cm-stat-main">
             <strong>{{ store.charityFeedTodayCount.value }}</strong>

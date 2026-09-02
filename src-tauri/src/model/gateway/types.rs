@@ -13,6 +13,17 @@ pub fn default_model_proxy_port() -> u16 {
     crate::core::profile::preferred_service_port()
 }
 
+/// Key 分组调度模式：组内 Key 轮转做负载均衡。
+pub const KEY_GROUP_MODE_ROUND_ROBIN: &str = "round_robin";
+/// Key 分组调度模式：黏住组内首个可用 Key，仅在其失败时顺延到组内下一个 Key。
+pub const KEY_GROUP_MODE_INDEPENDENT: &str = "independent";
+
+pub fn default_key_group_mode() -> String {
+    KEY_GROUP_MODE_ROUND_ROBIN.to_string()
+}
+
+/// 渠道内的一个 Key 分组。分组身份直接取自 Key 自身的 groupName（站点同步下发），
+/// 同名 groupName 的 Key 天然落在同一组；`id` 即该 groupName。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KeyGroupItem {
@@ -20,6 +31,9 @@ pub struct KeyGroupItem {
     pub name: String,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// round_robin（缺省）= 组内 Key 逐请求轮询；independent = 黏住首个 Key，失败才顺延组内下一个
+    #[serde(default = "default_key_group_mode")]
+    pub mode: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,12 +63,17 @@ fn default_true() -> bool {
 pub struct ModelProxyRule {
     /// 渠道内模型名（原始大小写保留，匹配时忽略大小写）
     pub model: String,
-    /// direct = 强制直连；pool = 走代理池轮询；fixed = 固定单一出口节点；
+    /// direct = 强制直连；pool = 走代理池轮询；fixed = 固定单一出口节点（旧值，加载时
+    /// 归一为 custom_node）；custom_node = 固定单一出口节点；
+    /// fixed_channel = 固定通道（代理池通道出口，可按 Key 绑定覆盖）；
     /// follow = 跟随渠道（等价于无本条规则，前端显式表达默认值）
     pub mode: String,
-    /// fixed 模式下锁定的节点 ID；缺省时锁定池内首个启用节点
+    /// fixed/custom_node 模式下锁定的代理池节点 ID；缺省时锁定池内首个启用节点
     #[serde(default)]
     pub node_id: Option<String>,
+    /// fixed_channel 模式锁定的代理池通道 ID；缺省回退渠道默认固定通道
+    #[serde(default)]
+    pub channel_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,21 +117,12 @@ pub struct ChannelConfig {
     /// 固定出口节点 ID（仅在 use_fixed_proxy 为 true 时生效）
     #[serde(default)]
     pub fixed_proxy_node: Option<String>,
-    /// 优先级（数值越小越优先）
-    #[serde(default)]
-    pub priority: Option<u32>,
-    /// 权重（1-100）
-    #[serde(default)]
-    pub weight: Option<u32>,
     /// 该渠道对外暴露的模型白名单
     #[serde(default)]
     pub enabled_models: Option<Vec<String>>,
     /// 模型重定向映射表：例如 {"gpt-4": "gpt-4-turbo"}
     #[serde(default)]
     pub model_redirects: Option<HashMap<String, String>>,
-    /// 渠道 RPM 限制
-    #[serde(default)]
-    pub rate_limit_rpm: Option<u32>,
     /// 统计维度稳定数字 ID：内置固化渠道占用 1-100（opencode=1），动态渠道从 101 递增。
     /// 与可修改的英文别名解耦，改名/改编码后历史统计不错位。
     #[serde(default)]
@@ -242,11 +252,8 @@ pub fn default_channels() -> Vec<ChannelConfig> {
         proxy_fixed_channel: None,
         use_fixed_proxy: false,
         fixed_proxy_node: None,
-        priority: Some(1),
-        weight: Some(100),
         enabled_models: None,
         model_redirects: None,
-        rate_limit_rpm: None,
         stats_id: Some(1),
         key_groups: None,
         key_rules: None,
@@ -524,9 +531,33 @@ pub struct ModelProxyContext {
     /// 平台无关的应用上下文（桌面与 server 共用）；启动后注入。
     pub app_ctx: StdArc<RwLock<Option<StdArc<AppContext>>>>,
     pub key_round_robin: Arc<AtomicUsize>,
-    pub node_round_robin: Arc<AtomicUsize>,
+    /// 出口节点轮询游标，**按渠道分片**。
+    ///
+    /// 曾是单个全局计数器：渠道 A 因 429 推进游标会让毫不相关的渠道 B
+    /// 下次请求从一个偏移过的节点开始——A 的限流污染了 B 的节点选择。
+    /// 现每个渠道各持一份游标，互不干扰；`node_round_robin_for` 按需惰性创建。
+    pub node_round_robin: Arc<RwLock<HashMap<String, Arc<AtomicUsize>>>>,
     /// 上次执行明细保留期清理的时刻（epoch 毫秒），用于节流避免每次写入全表扫描
     pub log_retention_last_run: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl ModelProxyContext {
+    /// 取指定渠道的出口节点轮询游标（不存在则惰性创建）。
+    ///
+    /// 返回 `Arc` 而非借用：调用方持有它跨越 await 点（重试循环中推进游标），
+    /// 不能让 map 的读锁一直悬着。
+    pub async fn node_round_robin_for(&self, channel_id: &str) -> Arc<AtomicUsize> {
+        if let Some(counter) = self.node_round_robin.read().await.get(channel_id) {
+            return counter.clone();
+        }
+        // 双检：读锁释放到写锁获取之间可能已被其他请求创建
+        self.node_round_robin
+            .write()
+            .await
+            .entry(channel_id.to_string())
+            .or_insert_with(|| Arc::new(AtomicUsize::new(0)))
+            .clone()
+    }
 }
 
 #[allow(dead_code)]
@@ -589,4 +620,3 @@ pub struct ChannelModelUsageStats {
     pub today_requests: u64,
     pub today_tokens: u64,
 }
-

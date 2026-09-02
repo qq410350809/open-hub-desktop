@@ -618,15 +618,12 @@ pub async fn sync_model_proxy_site_channels(
                     proxy_fixed_channel: None,
                     use_fixed_proxy: false,
                     fixed_proxy_node: None,
-                    priority: Some(5),
-                    weight: Some(100),
                     enabled_models: if parsed_models.is_empty() {
                         None
                     } else {
                         Some(parsed_models)
                     },
                     model_redirects: None,
-                    rate_limit_rpm: None,
                     stats_id: None,
                     key_groups: None,
                     key_rules: None,

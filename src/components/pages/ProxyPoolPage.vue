@@ -2926,9 +2926,7 @@ watch(nodeViewMode, () => {
   font-weight: 600;
 }
 
-.pp-clash-sub-threshold .select-menu {
-  z-index: 2100;
-}
+/* 菜单已 Teleport 到 body 且 z-index 统一为 10000，无需页面级覆盖 */
 
 .pp-clash-sub-field {
   display: flex;
@@ -3280,10 +3278,6 @@ watch(nodeViewMode, () => {
 
 .pp-strip-dropdown .select-trigger svg {
   width: 12px;
-}
-
-.pp-strip-dropdown .select-menu {
-  z-index: 200;
 }
 
 .pp-strip-dropdown .select-option {

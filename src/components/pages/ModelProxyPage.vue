@@ -240,7 +240,7 @@ async function handleOpenChannelModelsModal(channel: ChannelConfig) {
   channelDraftKeyGroups.value = [];
   newKeyGroupName.value = "";
   channelModelsModalOpen.value = true;
-  // Key 行通道绑定下拉需要通道候选；两路加载完成后归一化各 Key 的通道引用（名称 → ID）
+  // Key 行通道绑定下拉需要通道候选；两路加载完成后归一化各 Key 与模型规则的通道引用（名称 → ID）
   void Promise.all([
     loadProxyPoolOptions(),
     loadChannelKeysAndGroupsDraft(channel),
@@ -248,12 +248,24 @@ async function handleOpenChannelModelsModal(channel: ChannelConfig) {
     for (const k of channelRawKeys.value) {
       k.fixedChannelId = normalizePoolChannelRef(k.fixedChannelId);
     }
+    let touched = false;
+    for (const d of modelProxyModeDraft.value.values()) {
+      if (d.channelId) {
+        d.channelId = normalizePoolChannelRef(d.channelId);
+        touched = true;
+      }
+    }
+    if (touched) modelProxyModeDraft.value = new Map(modelProxyModeDraft.value);
   });
   // 模型级代理出口覆盖草稿：从渠道既有规则初始化
   {
-    const draft = new Map<string, { mode: ModelProxyMode; nodeId: string }>();
+    const draft = new Map<string, { mode: ModelProxyMode; nodeId: string; channelId: string }>();
     for (const r of channel.modelProxyRules ?? []) {
-      draft.set(r.model.toLowerCase(), { mode: (r.mode as ModelProxyMode) || "", nodeId: r.nodeId ?? "" });
+      draft.set(r.model.toLowerCase(), {
+        mode: normalizeModelRuleMode(String(r.mode ?? "")),
+        nodeId: r.nodeId ?? "",
+        channelId: r.channelId ?? "",
+      });
     }
     modelProxyModeDraft.value = draft;
   }
@@ -342,6 +354,38 @@ const channelRawKeys = ref<ChannelKeyDetailItem[]>([]);
 const channelDraftKeyGroups = ref<KeyGroupItem[]>([]);
 const newKeyGroupName = ref("");
 
+/** 无 groupName 的 Key 归入的兜底分组 ID（与后端 balancer 一致） */
+const DEFAULT_KEY_GROUP_ID = "default";
+/**
+ * 手动添加 Key 时落库的兜底组名（后端 add_site_model_cache_key 写入），
+ * 与自动同步的「无分组」语义等价，需归一到同一组，否则两批 Key 会被拆成两组。
+ */
+const DEFAULT_KEY_GROUP_ALIAS = "默认分组";
+/** 已下线的固定预设分组：分组现一律由 Key 的 groupName 决定 */
+const LEGACY_PRESET_KEY_GROUP_IDS = ["primary", "backup"];
+
+/** 归一化分组名：空值与「默认分组」别名统一落到 DEFAULT_KEY_GROUP_ID */
+function normalizeKeyGroupId(raw: string | undefined | null): string {
+  const trimmed = (raw ?? "").trim();
+  return !trimmed || trimmed === DEFAULT_KEY_GROUP_ALIAS ? DEFAULT_KEY_GROUP_ID : trimmed;
+}
+
+/** 分组 ID 的默认展示名：兜底组给中文名，其余直接用 groupName 本身 */
+function displayNameForGroupId(groupId: string): string {
+  return groupId === DEFAULT_KEY_GROUP_ID ? DEFAULT_KEY_GROUP_ALIAS : groupId;
+}
+
+/** 分组调度模式下拉候选 */
+const keyGroupModeOptions: { value: string; text: string }[] = [
+  { value: "round_robin", text: "轮询" },
+  { value: "independent", text: "独立" },
+];
+
+/** 回写：分组调度模式 */
+function setKeyGroupMode(group: KeyGroupItem, mode: string) {
+  group.mode = mode === "independent" ? "independent" : "round_robin";
+}
+
 /** 获取某 Key 的脱敏显示 */
 function maskKeyStr(key: string): string {
   const value = key.trim();
@@ -352,15 +396,15 @@ function maskKeyStr(key: string): string {
   return `${value.slice(0, prefix)}••••••••${value.slice(-suffix)}`;
 }
 
-/** 为渠道初始化分组与 Key 列表 */
+/**
+ * 为渠道初始化分组与 Key 列表。
+ *
+ * 分组身份 = Key 自身的 groupName（站点同步下发），同 groupName 的 Key 默认落在同一组；
+ * 无 groupName 的 Key（含手动配置的静态 Key）归入 DEFAULT_KEY_GROUP_ID。
+ * 已保存的 keyGroups 只提供「顺序 / 展示名 / 启用状态 / 调度模式」，不再凭空造组。
+ */
 async function loadChannelKeysAndGroupsDraft(channel: ChannelConfig) {
-  channelDraftKeyGroups.value = (channel.keyGroups ?? []).map((g: KeyGroupItem) => ({ ...g }));
-  if (channelDraftKeyGroups.value.length === 0) {
-    channelDraftKeyGroups.value = [
-      { id: "primary", name: "主力组", enabled: true },
-      { id: "backup", name: "备用组", enabled: true },
-    ];
-  }
+  const savedGroups = channel.keyGroups ?? [];
 
   const keysList: ChannelKeyDetailItem[] = [];
   const seenKeys = new Set<string>();
@@ -385,13 +429,12 @@ async function loadChannelKeysAndGroupsDraft(channel: ChannelConfig) {
           const trimmed = k.trim();
           if (trimmed && !seenKeys.has(trimmed)) {
             seenKeys.add(trimmed);
-            const rawGroup = acc.keyGroups?.[trimmed]?.trim();
             const models = acc.keyModels?.[trimmed]?.map((m) => m.id);
             keysList.push({
               key: trimmed,
               accountLabel: accLabel,
               profileName: profName,
-              groupId: rawGroup || "primary",
+              groupId: normalizeKeyGroupId(acc.keyGroups?.[trimmed]),
               enabled: true,
               supportedModels: models && models.length > 0 ? models : null,
               fixedChannelId: "",
@@ -418,7 +461,7 @@ async function loadChannelKeysAndGroupsDraft(channel: ChannelConfig) {
         key: trimmed,
         accountLabel: "手动配置",
         profileName: "",
-        groupId: "primary",
+        groupId: DEFAULT_KEY_GROUP_ID,
         enabled: true,
         supportedModels: null,
         fixedChannelId: "",
@@ -426,12 +469,16 @@ async function loadChannelKeysAndGroupsDraft(channel: ChannelConfig) {
     }
   }
 
-  // 融合已有渠道配置中的 Key 规则
+  // 融合已有渠道配置中的 Key 规则（用户手动改过的归属 / 启用状态 / 通道绑定）。
+  // 指向已下线预设组的归属忽略，让该 Key 回落到自身 groupName 分组。
   if (channel.keyRules) {
     for (const rule of channel.keyRules) {
       const existing = keysList.find((k) => k.key === rule.key);
       if (existing) {
-        if (rule.groupId) existing.groupId = rule.groupId;
+        const rawGid = rule.groupId?.trim();
+        if (rawGid && !LEGACY_PRESET_KEY_GROUP_IDS.includes(rawGid)) {
+          existing.groupId = normalizeKeyGroupId(rawGid);
+        }
         existing.enabled = rule.enabled;
         if (rule.supportedModels) existing.supportedModels = rule.supportedModels;
         existing.fixedChannelId = rule.fixedChannelId ?? "";
@@ -439,31 +486,53 @@ async function loadChannelKeysAndGroupsDraft(channel: ChannelConfig) {
     }
   }
 
-  // 确保所有 Key 的 groupId 都存在于 channelDraftKeyGroups
+  channelRawKeys.value = keysList;
+
+  // 由 Key 的实际归属反推分组列表：已保存的分组按原顺序在前（沿用其展示名/启用/模式），
+  // 新发现的 groupName 按出现顺序追加在后。空组不再保留。
+  const presentGroupIds = new Set(keysList.map((k) => k.groupId));
+  const ordered: KeyGroupItem[] = [];
+  for (const saved of savedGroups) {
+    const gid = saved.id?.trim() ? normalizeKeyGroupId(saved.id) : "";
+    if (!gid || !presentGroupIds.has(gid) || ordered.some((g) => g.id === gid)) continue;
+    ordered.push({
+      id: gid,
+      name: saved.name?.trim() || displayNameForGroupId(gid),
+      enabled: saved.enabled,
+      mode: saved.mode === "independent" ? "independent" : "round_robin",
+    });
+  }
   for (const k of keysList) {
-    if (!channelDraftKeyGroups.value.some((g: KeyGroupItem) => g.id === k.groupId)) {
-      channelDraftKeyGroups.value.push({
+    if (!ordered.some((g) => g.id === k.groupId)) {
+      ordered.push({
         id: k.groupId,
-        name: k.groupId === "primary" ? "主力组" : k.groupId === "backup" ? "备用组" : k.groupId,
+        name: displayNameForGroupId(k.groupId),
         enabled: true,
+        mode: "round_robin",
       });
     }
   }
-
-  channelRawKeys.value = keysList;
-
-  // 渠道未配置任何 Key 时不保留分组（分组调度仅对有 Key 的渠道有意义）
-  if (keysList.length === 0) {
-    channelDraftKeyGroups.value = [];
-  }
+  channelDraftKeyGroups.value = ordered;
 }
 
-/** 分组操作：添加新分组 */
+/**
+ * 分组操作：添加新分组。分组身份即组名（对齐 Key 的 groupName），
+ * 因此新建组的 id 直接取组名，与站点下发的同名组自动合流。
+ */
 function addKeyGroup() {
   const name = newKeyGroupName.value.trim();
   if (!name) return;
-  const id = `grp_${Date.now().toString(36)}`;
-  channelDraftKeyGroups.value.push({ id, name, enabled: true });
+  const id = normalizeKeyGroupId(name);
+  if (channelDraftKeyGroups.value.some((g) => g.id === id)) {
+    showToast(`分组「${name}」已存在`, true);
+    return;
+  }
+  channelDraftKeyGroups.value.push({
+    id,
+    name: displayNameForGroupId(id),
+    enabled: true,
+    mode: "round_robin",
+  });
   newKeyGroupName.value = "";
 }
 
@@ -484,7 +553,7 @@ function deleteKeyGroup(groupId: string) {
     return;
   }
   channelDraftKeyGroups.value = channelDraftKeyGroups.value.filter((g: KeyGroupItem) => g.id !== groupId);
-  const fallbackGroupId = channelDraftKeyGroups.value[0]?.id || "primary";
+  const fallbackGroupId = channelDraftKeyGroups.value[0]?.id || DEFAULT_KEY_GROUP_ID;
   for (const k of channelRawKeys.value) {
     if (k.groupId === groupId) {
       k.groupId = fallbackGroupId;
@@ -527,8 +596,18 @@ const channelModelStatsMap = ref<Map<string, ChannelModelUsageStats>>(new Map())
 const loadingModelStats = ref(false);
 
 // 模型级代理出口覆盖草稿：model(小写) → 规则；无条目 = 跟随渠道级配置
-type ModelProxyMode = "" | "direct" | "pool" | "fixed";
-const modelProxyModeDraft = ref<Map<string, { mode: ModelProxyMode; nodeId: string }>>(new Map());
+type ModelProxyMode = "" | "direct" | "pool" | "fixed_channel" | "custom_node";
+const modelProxyModeDraft = ref<Map<string, { mode: ModelProxyMode; nodeId: string; channelId: string }>>(new Map());
+
+/** 归一化规则模式：旧 fixed 语义 = 自定义节点 */
+function normalizeModelRuleMode(mode: string): ModelProxyMode {
+  const m = (mode || "").trim().toLowerCase();
+  if (m === "fixed" || m === "custom_node") return "custom_node";
+  if (m === "fixed_channel") return "fixed_channel";
+  if (m === "pool") return "pool";
+  if (m === "direct") return "direct";
+  return "";
+}
 
 /** 某模型当前生效的代理模式（草稿优先，无草稿回退渠道级配置推导） */
 function effectiveProxyMode(model: string): ModelProxyMode | "inherit" {
@@ -538,10 +617,13 @@ function effectiveProxyMode(model: string): ModelProxyMode | "inherit" {
   const ch = selectedChannel.value;
   if (!ch) return "inherit";
   const rule = ch.modelProxyRules?.find((r) => r.model.toLowerCase() === key);
-  if (rule) return (rule.mode as ModelProxyMode) || "inherit";
-  // 渠道级配置推导（fixed_channel/custom_node 在模型粒度均归入「固定」族）
-  const mode = channelProxyModeOf(ch);
-  return mode === "pool" ? "pool" : mode === "direct" ? "direct" : "fixed";
+  if (rule) {
+    const m = normalizeModelRuleMode(String(rule.mode));
+    if (m) return m;
+    return "inherit";
+  }
+  // 渠道级配置推导
+  return channelProxyModeOf(ch);
 }
 
 /** 渠道级配置的推导描述（用于下拉「跟随渠道」的提示文案） */
@@ -555,14 +637,9 @@ const channelLevelProxyLabel = computed(() => {
   return "渠道级：直连";
 });
 
-/** 渠道级配置推导出的代理模式（用于「与渠道不同」角标判断；fixed_channel 在模型粒度按固定节点族展示） */
+/** 渠道级配置推导出的模式（模型级四模式与渠道级一一对应后，直接取渠道模式） */
 function effectiveChannelProxyMode(): Exclude<ModelProxyMode, ""> {
-  const ch = selectedChannel.value;
-  if (!ch) return "direct";
-  const mode = channelProxyModeOf(ch);
-  if (mode === "pool") return "pool";
-  if (mode === "direct") return "direct";
-  return "fixed";
+  return channelProxyModeOf(selectedChannel.value);
 }
 
 function setModelProxyMode(model: string, mode: ModelProxyMode) {
@@ -574,7 +651,37 @@ function setModelProxyMode(model: string, mode: ModelProxyMode) {
     return;
   }
   const existing = modelProxyModeDraft.value.get(key);
-  modelProxyModeDraft.value.set(key, { mode, nodeId: existing?.nodeId ?? "" });
+  modelProxyModeDraft.value.set(key, {
+    mode,
+    nodeId: existing?.nodeId ?? "",
+    channelId: existing?.channelId ?? "",
+  });
+  modelProxyModeDraft.value = new Map(modelProxyModeDraft.value);
+}
+
+/** 模型规则草稿的读取（固定节点/固定通道下拉当前值） */
+function modelDraftNodeId(model: string): string {
+  return modelProxyModeDraft.value.get(model.toLowerCase())?.nodeId ?? "";
+}
+function modelDraftChannelId(model: string): string {
+  return modelProxyModeDraft.value.get(model.toLowerCase())?.channelId ?? "";
+}
+
+/** 回写：模型行固定出口节点 */
+function setModelFixedNode(model: string, nodeId: string) {
+  const key = model.toLowerCase();
+  const existing = modelProxyModeDraft.value.get(key);
+  const mode = existing?.mode ? existing.mode : "custom_node";
+  modelProxyModeDraft.value.set(key, { mode, nodeId, channelId: existing?.channelId ?? "" });
+  modelProxyModeDraft.value = new Map(modelProxyModeDraft.value);
+}
+
+/** 回写：模型行固定通道 */
+function setModelFixedChannel(model: string, channelId: string) {
+  const key = model.toLowerCase();
+  const existing = modelProxyModeDraft.value.get(key);
+  const mode = existing?.mode ? existing.mode : "fixed_channel";
+  modelProxyModeDraft.value.set(key, { mode, nodeId: existing?.nodeId ?? "", channelId });
   modelProxyModeDraft.value = new Map(modelProxyModeDraft.value);
 }
 
@@ -737,6 +844,7 @@ async function saveChannelModelSelection() {
       id: g.id.trim(),
       name: g.name.trim() || g.id.trim(),
       enabled: g.enabled,
+      mode: g.mode === "independent" ? ("independent" as const) : ("round_robin" as const),
     }));
     channel.keyRules = channelRawKeys.value.map((k) => ({
       key: k.key,
@@ -760,7 +868,8 @@ async function saveChannelModelSelection() {
       return [{
         model: m,
         mode: d.mode,
-        nodeId: d.mode === "fixed" && d.nodeId.trim() ? d.nodeId.trim() : null,
+        nodeId: d.mode === "custom_node" && d.nodeId.trim() ? d.nodeId.trim() : null,
+        channelId: d.mode === "fixed_channel" && d.channelId.trim() ? d.channelId.trim() : null,
       }];
     });
     const merged = [...kept, ...added];
@@ -804,7 +913,227 @@ const channelSettingsTargetIsBuiltin = computed(
 );
 
 /** 代理池节点候选（自定义节点模式选择用，测速成功者优先按延迟升序） */
-const proxyPoolNodeOptions = ref<{ id: string; name: string; latencyMs: number | null }[]>([]);
+const proxyPoolNodeOptions = ref<{
+  id: string;
+  name: string;
+  latencyMs: number | null;
+  channelLatencyMs: number | null;
+  channelTestStatus: string;
+  countryName: string;
+}[]>([]);
+
+/** 「固定出口节点」下拉占位项（未选择 = 锁定首个启用节点）。 */
+const fixedNodePlaceholderOptions: { value: string; text: string }[] = [
+  { value: "", text: "请选择节点" },
+];
+
+// —— 节点筛选：延迟上限 + 网速下限（档位与代理池页一致；菜单头胶囊点击循环） ——
+const nodeLatencyFilter = ref<"all" | "200" | "500" | "1000" | "2000">("all");
+const nodeSpeedFilter = ref<"all" | "10mbps" | "5mbps" | "1mbps" | "05mbps">("all");
+
+const NODE_LATENCY_FILTER_TEXT: Record<string, string> = {
+  all: "全部",
+  "200": "≤200ms",
+  "500": "≤500ms",
+  "1000": "≤1000ms",
+  "2000": "≤2000ms",
+};
+/** 网速档位 → channel_latency_ms 上限（等效 500KB 下载耗时，网速 = 500/耗时 ms MB/s）。 */
+const NODE_SPEED_THRESHOLD_MS: Record<string, number> = {
+  "10mbps": 50,
+  "5mbps": 100,
+  "1mbps": 500,
+  "05mbps": 1000,
+};
+const NODE_SPEED_FILTER_TEXT: Record<string, string> = {
+  all: "全部",
+  "10mbps": "≥10MB/s",
+  "5mbps": "≥5MB/s",
+  "1mbps": "≥1MB/s",
+  "05mbps": "≥0.5MB/s",
+};
+
+const latencyFilterText = computed(() => NODE_LATENCY_FILTER_TEXT[nodeLatencyFilter.value]);
+const speedFilterText = computed(() => NODE_SPEED_FILTER_TEXT[nodeSpeedFilter.value]);
+
+/** 点击循环延迟档位：全部 → ≤200 → ≤500 → ≤1000 → ≤2000 → 全部 */
+function cycleNodeLatencyFilter() {
+  const order = ["all", "200", "500", "1000", "2000"] as const;
+  const idx = order.indexOf(nodeLatencyFilter.value as (typeof order)[number]);
+  nodeLatencyFilter.value = order[(idx + 1) % order.length];
+}
+
+/** 点击循环网速档位：全部 → ≥10MB/s → ≥5 → ≥1 → ≥0.5 → 全部 */
+function cycleNodeSpeedFilter() {
+  const order = ["all", "10mbps", "5mbps", "1mbps", "05mbps"] as const;
+  const idx = order.indexOf(nodeSpeedFilter.value as (typeof order)[number]);
+  nodeSpeedFilter.value = order[(idx + 1) % order.length];
+}
+
+/** 按两个指标筛选后的节点列表。 */
+const filteredProxyNodes = computed(() =>
+  proxyPoolNodeOptions.value.filter((node) => {
+    const latencyMax = nodeLatencyFilter.value;
+    if (latencyMax !== "all" && (node.latencyMs == null || node.latencyMs > Number(latencyMax))) {
+      return false;
+    }
+    const speedKey = nodeSpeedFilter.value;
+    if (speedKey !== "all") {
+      const threshold = NODE_SPEED_THRESHOLD_MS[speedKey];
+      if (
+        node.channelTestStatus !== "success" ||
+        node.channelLatencyMs == null ||
+        node.channelLatencyMs > threshold
+      ) {
+        return false;
+      }
+    }
+    return true;
+  }),
+);
+
+/** 筛选命中数（跨所有分组求和）。 */
+const fixedNodeMatchCount = computed(() =>
+  fixedNodeSelectGroups.value.reduce((total, group) => total + group.options.length, 0),
+);
+
+/** 网速文案：channel_latency_ms 语义为「等效下载 500KB 的耗时」，换算成 MB/s（与代理池页同口径）。 */
+function nodeSpeedText(node: { channelLatencyMs: number | null; channelTestStatus: string }): string {
+  if (node.channelTestStatus === "error" || node.channelLatencyMs == null) return "";
+  const seconds = Math.max(node.channelLatencyMs, 1) / 1000;
+  const mbps = 0.5 / seconds;
+  if (mbps >= 100) return `${Math.round(mbps)}MB/s`;
+  if (mbps >= 1) return `${mbps.toFixed(1)}MB/s`;
+  return `${Math.round(mbps * 1000)}KB/s`;
+}
+
+/** 「固定出口节点」分组候选：按国家分组，组内按延迟升序；组间按国家名排序。选项展示 延迟 + 网速。 */
+const fixedNodeSelectGroups = computed(() => {
+  const byCountry = new Map<string, { value: string; text: string }[]>();
+  for (const node of filteredProxyNodes.value) {
+    const parts = [node.name];
+    if (node.latencyMs != null) parts.push(`${node.latencyMs}ms`);
+    const speed = nodeSpeedText(node);
+    if (speed) parts.push(speed);
+    const list = byCountry.get(node.countryName) ?? [];
+    list.push({ value: node.id, text: parts.join(" · ") });
+    byCountry.set(node.countryName, list);
+  }
+  return [...byCountry.entries()]
+    .sort(([a], [b]) => a.localeCompare(b, "zh-CN"))
+    .map(([label, options]) => ({ label, options }));
+});
+
+/** 渠道代理策略下拉候选。 */
+const proxyModeSelectOptions: { value: string; text: string }[] = [
+  { value: "direct", text: "强制直连（默认）" },
+  { value: "pool", text: "代理池（轮询 + 失败切换）" },
+  { value: "fixed_channel", text: "固定通道（代理池）" },
+  { value: "custom_node", text: "自定义节点（代理池）" },
+];
+
+/** 「管理模型」排序下拉候选。 */
+const sortModeSelectOptions: { value: string; text: string }[] = [
+  { value: "discovery", text: "上游顺序" },
+  { value: "usage", text: "按调用量" },
+];
+
+/** CustomSelect 回写渠道代理策略（字符串收窄为联合类型）。 */
+function setChannelProxyMode(value: string) {
+  if ((["direct", "pool", "fixed_channel", "custom_node"] as const).includes(value as ChannelProxyMode)) {
+    channelSettingsDraft.value.proxyMode = value as ChannelProxyMode;
+  }
+}
+
+/** CustomSelect 回写模型列表排序方式。 */
+function setModelSortMode(value: string) {
+  if (value === "discovery" || value === "usage") {
+    channelModelSortMode.value = value;
+  }
+}
+
+// —— CustomSelect 统一约定：options 全部定义在 script（常量/computed/函数），
+//    回写一律走 setXxx 函数；模板只做绑定，不再内联选项数组 ——
+
+/** 渠道「默认固定通道」下拉候选（含已删除通道的占位项）。 */
+const fixedChannelSelectOptions = computed<{ value: string; text: string }[]>(() => [
+  { value: "", text: "请选择通道" },
+  ...(isDeletedPoolChannelRef(channelSettingsDraft.value.proxyFixedChannel)
+    ? [{ value: channelSettingsDraft.value.proxyFixedChannel, text: "原通道已删除（请重新选择）" }]
+    : []),
+  ...proxyPoolChannelOptions.value.map((pc) => ({ value: pc.id, text: pc.name })),
+]);
+
+/** Key 行「固定通道」下拉候选（含该 Key 已删除通道的占位项）。 */
+function keyChannelOptions(kItem: ChannelKeyDetailItem): { value: string; text: string }[] {
+  return [
+    { value: "", text: "默认通道" },
+    ...(isDeletedPoolChannelRef(kItem.fixedChannelId)
+      ? [{ value: kItem.fixedChannelId, text: "原通道已删除" }]
+      : []),
+    ...proxyPoolChannelOptions.value.map((pc) => ({ value: pc.id, text: pc.name })),
+  ];
+}
+
+/** 模型行「固定通道」下拉候选（空 = 跟随 Key 绑定/渠道默认通道）。 */
+function modelFixedChannelOptions(model: string): { value: string; text: string }[] {
+  const cur = modelProxyModeDraft.value.get(model.toLowerCase())?.channelId ?? "";
+  return [
+    { value: "", text: "默认通道" },
+    ...(isDeletedPoolChannelRef(cur) ? [{ value: cur, text: "原通道已删除" }] : []),
+    ...proxyPoolChannelOptions.value.map((pc) => ({ value: pc.id, text: pc.name })),
+  ];
+}
+
+/**
+ * Key 行「所属分组」下拉候选。
+ * 文案只用组名：trigger 展示的是该 Key 当前所属的组，加「移动至」前缀会读成
+ * 「当前值 = 移动至 X」；移动语义由 title 说明。
+ */
+const keyGroupMoveOptions = computed(() =>
+  channelDraftKeyGroups.value.map((grp) => ({ value: grp.id, text: grp.name })),
+);
+
+/** 模型行「代理策略」下拉候选：跟随渠道 + 渠道级四模式一一对齐 */
+const modelProxyModeOptions: { value: string; text: string }[] = [
+  { value: "inherit", text: "跟随渠道" },
+  { value: "direct", text: "强制直连" },
+  { value: "pool", text: "代理池" },
+  { value: "fixed_channel", text: "固定通道" },
+  { value: "custom_node", text: "自定义节点" },
+];
+
+/** 回写：渠道默认固定通道 */
+function setChannelFixedChannel(value: string) {
+  channelSettingsDraft.value.proxyFixedChannel = value;
+}
+
+/** 回写：渠道固定出口节点 */
+function setChannelFixedNode(value: string) {
+  channelSettingsDraft.value.fixedProxyNode = value;
+}
+
+/** 回写：Key 行固定通道 */
+function setKeyFixedChannel(kItem: ChannelKeyDetailItem, value: string) {
+  kItem.fixedChannelId = value;
+}
+
+/** 回写：Key 行移动分组 */
+function setKeyGroup(kItem: ChannelKeyDetailItem, value: string) {
+  kItem.groupId = value;
+}
+
+/** 回写：模型行代理策略（inherit = 跟随渠道 = 清草稿） */
+function setModelProxyOption(model: string, value: string) {
+  if (value === "inherit") {
+    setModelProxyMode(model, "");
+    return;
+  }
+  if (value === "direct" || value === "pool" || value === "fixed_channel" || value === "custom_node") {
+    setModelProxyMode(model, value as ModelProxyMode);
+  }
+}
+
 /** 代理池固定通道候选（固定通道模式选择用） */
 const proxyPoolChannelOptions = ref<{ id: string; name: string }[]>([]);
 
@@ -813,7 +1142,14 @@ async function loadProxyPoolOptions() {
     const state = await runCommand<Record<string, any>>("get_proxy_pool_state");
     proxyPoolNodeOptions.value = ((state?.nodes as any[]) ?? [])
       .filter((n) => n.testStatus === "success")
-      .map((n) => ({ id: n.id, name: n.name, latencyMs: n.latencyMs ?? null }))
+      .map((n) => ({
+        id: n.id,
+        name: n.name,
+        latencyMs: n.latencyMs ?? null,
+        channelLatencyMs: n.channelLatencyMs ?? null,
+        channelTestStatus: n.channelTestStatus || "",
+        countryName: n.countryName || "未知地区",
+      }))
       .sort((a, b) => (a.latencyMs ?? 99999) - (b.latencyMs ?? 99999));
     proxyPoolChannelOptions.value = ((state?.channels as any[]) ?? []).map((c) => ({
       id: c.id,
@@ -3821,10 +4157,14 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
                 <span>仅看已启用</span>
               </label>
               <div class="mp-toolbar-sort">
-                <select v-model="channelModelSortMode" class="mp-sort-select" title="列表排序方式">
-                  <option value="discovery">上游顺序</option>
-                  <option value="usage">按调用量</option>
-                </select>
+                <CustomSelect
+                  class="mp-sort-dd"
+                :options="sortModeSelectOptions"
+                :model-value="channelModelSortMode"
+                  aria-label="列表排序方式"
+                  title="列表排序方式"
+                  @update:model-value="setModelSortMode(String($event))"
+                />
               </div>
             </div>
 
@@ -3917,17 +4257,55 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
                     class="mp-mcm-proxy-label"
                     :title="`出网代理策略：默认${channelLevelProxyLabel}；可为本模型单独指定`"
                   >代理</span>
-                  <select
-                    class="mp-mcm-proxy-select"
-                    :value="effectiveProxyMode(model)"
+                  <CustomSelect
+                    class="mp-mcm-proxy-dd"
+                    auto-width
+                    :options="modelProxyModeOptions"
+                    :model-value="effectiveProxyMode(model)"
+                    aria-label="为本模型单独选择出网代理策略"
                     title="为本模型单独选择出网代理策略"
-                    @change="setModelProxyMode(model, ($event.target as HTMLSelectElement).value as ModelProxyMode)"
+                    @update:model-value="setModelProxyOption(model, String($event))"
+                  />
+                  <!-- 固定通道：级联选择该模型绑定的代理池通道 -->
+                  <CustomSelect
+                    v-if="effectiveProxyMode(model) === 'fixed_channel'"
+                    class="mp-mcm-proxy-dd mp-mcm-proxy-sub"
+                    :options="modelFixedChannelOptions(model)"
+                    :model-value="modelDraftChannelId(model)"
+                    aria-label="本模型绑定的代理池通道"
+                    title="本模型固定通道；留空跟随 Key 绑定 / 渠道默认通道"
+                    @update:model-value="setModelFixedChannel(model, String($event))"
+                  />
+                  <!-- 自定义节点：级联选择锁定的出口节点（按国家分组 + 延迟/网速筛选） -->
+                  <CustomSelect
+                    v-else-if="effectiveProxyMode(model) === 'custom_node'"
+                    class="mp-mcm-proxy-dd mp-mcm-proxy-sub"
+                    :options="fixedNodePlaceholderOptions"
+                    :groups="fixedNodeSelectGroups"
+                    :model-value="modelDraftNodeId(model)"
+                    aria-label="本模型固定出口节点"
+                    title="本模型固定使用所选节点出网；留空锁定池内首个启用节点"
+                    @update:model-value="setModelFixedNode(model, String($event))"
                   >
-                    <option value="inherit">跟随渠道</option>
-                    <option value="direct">强制直连</option>
-                    <option value="pool">代理池</option>
-                    <option value="fixed">固定节点</option>
-                  </select>
+                    <template #menu-header>
+                      <button
+                        type="button"
+                        class="mp-node-filter-chip"
+                        :class="{ active: nodeLatencyFilter !== 'all' }"
+                        :title="`延迟筛选：${latencyFilterText}（点击切换档位）`"
+                        @click.stop="cycleNodeLatencyFilter"
+                      >延迟 {{ latencyFilterText }}</button>
+                      <button
+                        type="button"
+                        class="mp-node-filter-chip"
+                        :class="{ active: nodeSpeedFilter !== 'all' }"
+                        :title="`网速筛选：${speedFilterText}（点击切换档位）`"
+                        @click.stop="cycleNodeSpeedFilter"
+                      >网速 {{ speedFilterText }}</button>
+                      <span class="mp-node-filter-count">{{ fixedNodeMatchCount }}/{{ proxyPoolNodeOptions.length }}</span>
+                      <p v-if="fixedNodeMatchCount === 0" class="mp-node-filter-empty">无匹配节点，请放宽筛选</p>
+                    </template>
+                  </CustomSelect>
                   <span
                     v-if="effectiveProxyMode(model) !== 'inherit' && effectiveProxyMode(model) !== effectiveChannelProxyMode()"
                     class="mp-mcm-proxy-dot"
@@ -3949,13 +4327,13 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
           <template v-else>
             <div class="mp-key-groups-toolbar">
               <div class="mp-kg-intro text-xs text-muted">
-                <span>💡 <strong>调度策略</strong>：同组内 Key 循环轮询；前一组 Key 全部请求失败时，自动平滑切换到下一优先级分组重试。</span>
+                <span>💡 <strong>分组</strong>：按 Key 自身的分组名归类，同名 Key 默认同组。<strong>轮询</strong> = 组内逐请求轮转分摊；<strong>独立</strong> = 黏住组内首个 Key，失败才顺延组内下一个。当前分组用尽后按顺序切换到下一分组重试。</span>
               </div>
               <div class="mp-add-group-form">
                 <input
                   v-model="newKeyGroupName"
                   type="text"
-                  placeholder="新分组名称（如 备用通道2）"
+                  placeholder="新分组名称（与 Key 分组名一致即自动合流）"
                   class="mp-add-group-input"
                   @keydown.enter.prevent="addKeyGroup"
                 />
@@ -3981,19 +4359,36 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
                 <!-- 分组头部 -->
                 <div class="mp-key-group-head">
                   <div class="mp-kg-head-left">
-                    <span class="mp-kg-priority-badge font-mono" :class="{ 'is-top': gIdx === 0 }">
-                      #{{ gIdx + 1 }} {{ gIdx === 0 ? "主力优先" : "故障后备" }}
+                    <span
+                      class="mp-kg-priority-badge font-mono"
+                      :class="{ 'is-top': gIdx === 0 }"
+                      :title="gIdx === 0 ? '最先使用的分组' : `前 ${gIdx} 个分组用尽后才轮到该组`"
+                    >
+                      #{{ gIdx + 1 }}
                     </span>
                     <input
                       v-model="grp.name"
                       type="text"
                       class="mp-kg-name-input"
-                      title="点击直接修改分组名称"
+                      title="分组展示名（分组归属由 Key 的分组名决定，改名不影响归属）"
                     />
                     <span class="mp-group-count-badge font-mono">{{ keysInGroup(grp.id).length }} 个 Key</span>
                   </div>
 
                   <div class="mp-kg-head-actions">
+                    <!-- 组内调度模式：轮询 / 独立黏性 -->
+                    <CustomSelect
+                      class="mp-kg-mode-dd"
+                      auto-width
+                      :options="keyGroupModeOptions"
+                      :model-value="grp.mode ?? 'round_robin'"
+                      aria-label="该分组的组内调度模式"
+                      :title="(grp.mode ?? 'round_robin') === 'independent'
+                        ? '独立：固定用组内第一个 Key，仅在其失败时顺延到组内下一个'
+                        : '轮询：组内 Key 逐请求轮转，分摊调用量'"
+                      @update:model-value="setKeyGroupMode(grp, String($event))"
+                    />
+
                     <button
                       type="button"
                       class="mp-reorder-btn"
@@ -4051,49 +4446,36 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
 
                     <div class="mp-kg-key-controls">
                       <!-- 固定通道模式：为该 Key 绑定代理池通道（不同账号走不同通道） -->
-                      <select
+                      <CustomSelect
                         v-if="selectedChannelIsFixedChannel"
-                        v-model="kItem.fixedChannelId"
-                        class="mp-kg-group-select"
+                        class="mp-kg-group-dd"
+                        auto-width
+                        :options="keyChannelOptions(kItem)"
+                        :model-value="kItem.fixedChannelId"
+                        aria-label="该 Key 绑定的代理池固定通道"
                         title="该 Key 绑定的代理池固定通道；留空使用渠道默认通道"
-                      >
-                        <option value="">默认通道</option>
-                        <option
-                          v-if="isDeletedPoolChannelRef(kItem.fixedChannelId)"
-                          :value="kItem.fixedChannelId"
-                        >
-                          原通道已删除
-                        </option>
-                        <option
-                          v-for="pc in proxyPoolChannelOptions"
-                          :key="pc.id"
-                          :value="pc.id"
-                        >
-                          {{ pc.name }}
-                        </option>
-                      </select>
+                        @update:model-value="setKeyFixedChannel(kItem, String($event))"
+                      />
 
-                      <!-- 移动所属分组下拉框 -->
-                      <select
-                        v-model="kItem.groupId"
-                        class="mp-kg-group-select"
-                        title="变更该 Key 所属分组"
-                      >
-                        <option
-                          v-for="targetGrp in channelDraftKeyGroups"
-                          :key="targetGrp.id"
-                          :value="targetGrp.id"
-                        >
-                          移动至 {{ targetGrp.name }}
-                        </option>
-                      </select>
+                      <!-- 所属分组下拉框：选中即把该 Key 移入目标分组 -->
+                      <CustomSelect
+                        class="mp-kg-group-dd"
+                        auto-width
+                        :options="keyGroupMoveOptions"
+                        :model-value="kItem.groupId"
+                        aria-label="变更该 Key 所属分组"
+                        :title="`当前分组：${displayNameForGroupId(kItem.groupId)}；选择其他分组即移入`"
+                        @update:model-value="setKeyGroup(kItem, String($event))"
+                      />
 
                       <!-- 组内排序按钮 -->
                       <button
                         type="button"
                         class="mp-reorder-btn"
                         :disabled="kIdx === 0"
-                        title="组内上移（优先轮询）"
+                        :title="(grp.mode ?? 'round_robin') === 'independent'
+                          ? '组内上移（独立模式下越靠前越先被使用）'
+                          : '组内上移（调整轮询顺序）'"
                         @click="moveKeyInGroup(kItem.key, -1)"
                       >
                         <span v-html="icons.arrowUp" />
@@ -4222,16 +4604,14 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
                 <span class="mp-pp-icon" v-html="icons.shield" />
                 <span>代理设置</span>
               </div>
-              <select
-                v-model="channelSettingsDraft.proxyMode"
-                class="mp-settings-input"
+              <CustomSelect
+                class="mp-settings-select"
+                :options="proxyModeSelectOptions"
+                :model-value="channelSettingsDraft.proxyMode"
+                aria-label="渠道出网代理策略"
                 title="渠道出网代理策略，默认强制直连"
-              >
-                <option value="direct">强制直连（默认）</option>
-                <option value="pool">代理池（轮询 + 失败切换）</option>
-                <option value="fixed_channel">固定通道（代理池）</option>
-                <option value="custom_node">自定义节点（代理池）</option>
-              </select>
+                @update:model-value="setChannelProxyMode(String($event))"
+              />
             </div>
 
             <div v-if="channelSettingsDraft.proxyMode === 'direct'" class="mp-proxy-pool-status is-inactive">
@@ -4256,22 +4636,14 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
                 <span class="mp-pp-icon" v-html="icons.globe" />
                 <span>默认固定通道</span>
               </div>
-              <select
-                v-model="channelSettingsDraft.proxyFixedChannel"
-                class="mp-settings-input"
+              <CustomSelect
+                class="mp-settings-select"
+                :options="fixedChannelSelectOptions"
+                :model-value="channelSettingsDraft.proxyFixedChannel"
+                aria-label="渠道默认固定通道"
                 title="未单独绑定通道的 Key 使用该通道"
-              >
-                <option value="">请选择通道</option>
-                <option
-                  v-if="isDeletedPoolChannelRef(channelSettingsDraft.proxyFixedChannel)"
-                  :value="channelSettingsDraft.proxyFixedChannel"
-                >
-                  原通道已删除（请重新选择）
-                </option>
-                <option v-for="pc in proxyPoolChannelOptions" :key="pc.id" :value="pc.id">
-                  {{ pc.name }}
-                </option>
-              </select>
+                @update:model-value="setChannelFixedChannel(String($event))"
+              />
             </div>
 
             <!-- 自定义节点：选择代理池单一节点（参照固定通道设置的候选口径） -->
@@ -4280,16 +4652,34 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
                 <span class="mp-pp-icon" v-html="icons.activity" />
                 <span>固定出口节点</span>
               </div>
-              <select
-                v-model="channelSettingsDraft.fixedProxyNode"
-                class="mp-settings-input"
+              <CustomSelect
+                class="mp-settings-select"
+                :options="fixedNodePlaceholderOptions"
+                :groups="fixedNodeSelectGroups"
+                :model-value="channelSettingsDraft.fixedProxyNode"
+                aria-label="渠道固定出口节点"
                 title="恒定使用该节点出网；留空锁定池内首个启用节点"
+                @update:model-value="setChannelFixedNode(String($event))"
               >
-                <option value="">请选择节点</option>
-                <option v-for="pn in proxyPoolNodeOptions" :key="pn.id" :value="pn.id">
-                  {{ pn.name }}{{ pn.latencyMs != null ? ` · ${pn.latencyMs}ms` : "" }}
-                </option>
-              </select>
+                <template #menu-header>
+                  <button
+                    type="button"
+                    class="mp-node-filter-chip"
+                    :class="{ active: nodeLatencyFilter !== 'all' }"
+                    :title="`延迟筛选：${latencyFilterText}（点击切换档位）`"
+                    @click.stop="cycleNodeLatencyFilter"
+                  >延迟 {{ latencyFilterText }}</button>
+                  <button
+                    type="button"
+                    class="mp-node-filter-chip"
+                    :class="{ active: nodeSpeedFilter !== 'all' }"
+                    :title="`网速筛选：${speedFilterText}（点击切换档位）`"
+                    @click.stop="cycleNodeSpeedFilter"
+                  >网速 {{ speedFilterText }}</button>
+                  <span class="mp-node-filter-count">{{ fixedNodeMatchCount }}/{{ proxyPoolNodeOptions.length }}</span>
+                  <p v-if="fixedNodeMatchCount === 0" class="mp-node-filter-empty">无匹配节点，请放宽筛选</p>
+                </template>
+              </CustomSelect>
             </div>
           </div>
         </div>
@@ -5826,6 +6216,55 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
   transition: border-color 0.15s ease, box-shadow 0.15s ease;
 }
 
+/* 渠道设置弹窗内的统一自定义下拉：尺寸与 mp-settings-input 对齐 */
+.mp-settings-select.select-box {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 36px;
+  border-radius: var(--r-md, 8px);
+}
+.mp-settings-select .select-trigger {
+  font-size: 13px;
+  font-family: var(--font-mono, monospace);
+}
+
+/* 节点筛选芯片（位于节点下拉菜单头部，点击循环档位） */
+.mp-node-filter-chip {
+  height: 22px;
+  padding: 0 8px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--surface-soft);
+  color: var(--muted);
+  font-size: 10.5px;
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+}
+.mp-node-filter-chip:hover {
+  border-color: color-mix(in srgb, var(--brand) 55%, transparent);
+  color: var(--text);
+}
+.mp-node-filter-chip.active {
+  background: var(--brand-soft);
+  border-color: color-mix(in srgb, var(--brand) 55%, transparent);
+  color: var(--brand-deep);
+}
+.mp-node-filter-count {
+  margin-left: auto;
+  font-size: 10.5px;
+  color: var(--faint);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.mp-node-filter-empty {
+  flex-basis: 100%;
+  margin: 2px 0 0;
+  color: var(--warning);
+  font-size: 10.5px;
+}
+
 .mp-settings-input:focus {
   border-color: var(--brand);
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--brand) 15%, transparent);
@@ -5996,6 +6435,8 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
 }
 
 .mp-proxy-pool-label {
+  /* 固定标签宽度：代理设置 / 默认固定通道 / 固定出口节点各行下拉左缘对齐 */
+  flex: 0 0 100px;
   display: flex;
   align-items: center;
   gap: 6px;
@@ -6473,6 +6914,47 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
   background: var(--surface-soft);
   color: var(--text);
   cursor: pointer;
+}
+
+/* Key 行内统一自定义下拉：宽度由 auto-width 按最长选项自撑，
+   仅约束下限（太短不好点）与上限（通道名可能很长，避免挤爆整行） */
+.mp-kg-group-dd.select-box {
+  height: 24px;
+  min-width: 92px;
+  max-width: 200px;
+  border-radius: 4px;
+  background: var(--surface-soft);
+}
+.mp-kg-group-dd .select-trigger {
+  padding: 0 6px;
+  font-size: 11px;
+  font-weight: 500;
+}
+
+/* 分组头部「轮询 / 独立」调度模式下拉 */
+.mp-kg-mode-dd.select-box {
+  height: 24px;
+  min-width: 64px;
+  border-radius: 4px;
+  background: var(--surface-soft);
+}
+.mp-kg-mode-dd .select-trigger {
+  padding: 0 6px;
+  font-size: 11px;
+  font-weight: 500;
+}
+
+/* 紧凑下拉（高度 ≤ 26px）：默认 8px 间距 + 14px 箭头会吃掉近半宽度，
+   这里收紧间距与箭头，把空间让给文字，避免「自定义节点」这类 5 字选项被截断 */
+.mp-kg-group-dd .select-trigger,
+.mp-kg-mode-dd .select-trigger,
+.mp-mcm-proxy-dd .select-trigger {
+  gap: 3px;
+}
+.mp-kg-group-dd .select-trigger svg,
+.mp-kg-mode-dd .select-trigger svg,
+.mp-mcm-proxy-dd .select-trigger svg {
+  width: 11px;
 }
 
 .mp-kg-empty-note {
@@ -7223,6 +7705,15 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
   position: relative;
 }
 
+/* 级联子选择（固定通道/自定义节点）：与模式下拉等高。
+   承载任意长度的通道名/节点名，给足宽度，超长仍由 trigger 省略号收尾 */
+.mp-mcm-proxy-sub.select-box {
+  width: 150px;
+}
+.mp-mcm-proxy-sub .select-trigger {
+  color: var(--muted);
+}
+
 .mp-mcm-proxy-label {
   font-size: 11px;
   color: var(--muted);
@@ -7239,6 +7730,18 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
   font-size: 11.5px;
   cursor: pointer;
   max-width: 92px;
+}
+
+/* 模型行内统一自定义下拉：宽度由 auto-width 按最长选项（自定义节点）自撑 */
+.mp-mcm-proxy-dd.select-box {
+  height: 26px;
+  min-width: 84px;
+  border-radius: 6px;
+}
+.mp-mcm-proxy-dd .select-trigger {
+  padding: 0 6px;
+  font-size: 11.5px;
+  font-weight: 500;
 }
 
 .mp-mcm-proxy-select:hover {
@@ -7288,6 +7791,17 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
   color: var(--text);
   font-size: 12.5px;
   cursor: pointer;
+}
+
+/* 工具栏统一自定义下拉：尺寸与原 mp-sort-select 对齐 */
+.mp-sort-dd.select-box {
+  height: 32px;
+  min-width: 104px;
+  border-radius: 8px;
+}
+.mp-sort-dd .select-trigger {
+  padding: 0 8px;
+  font-size: 12.5px;
 }
 
 @keyframes mp-spin-rotate {

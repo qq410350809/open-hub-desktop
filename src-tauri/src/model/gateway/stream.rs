@@ -64,7 +64,6 @@ fn parse_sse_data_line(line: &str) -> Option<(&str, bool)> {
     Some((data, is_done))
 }
 
-
 fn sse_event(event: &str, data: &JsonValue) -> String {
     format!("event: {event}\ndata: {data}\n\n")
 }
@@ -107,7 +106,12 @@ struct AnthropicSseEmitter {
 }
 
 impl AnthropicSseEmitter {
-    fn new(msg_id: &str, model: &str, tool_hints: Vec<ToolHint>, preferred_tool: Option<String>) -> Self {
+    fn new(
+        msg_id: &str,
+        model: &str,
+        tool_hints: Vec<ToolHint>,
+        preferred_tool: Option<String>,
+    ) -> Self {
         Self {
             msg_id: format!("msg_{msg_id}"),
             model: model.to_string(),
@@ -203,11 +207,14 @@ impl AnthropicSseEmitter {
             events.extend(self.start_message());
         }
         let (open_events, new_idx) = match kind {
-            AnthropicBlockKind::Text => {
-                self.open_block(AnthropicBlockKind::Text, json!({ "type": "text", "text": "" }))
-            }
-            AnthropicBlockKind::Thinking => self
-                .open_block(AnthropicBlockKind::Thinking, json!({ "type": "thinking", "thinking": "" })),
+            AnthropicBlockKind::Text => self.open_block(
+                AnthropicBlockKind::Text,
+                json!({ "type": "text", "text": "" }),
+            ),
+            AnthropicBlockKind::Thinking => self.open_block(
+                AnthropicBlockKind::Thinking,
+                json!({ "type": "thinking", "thinking": "" }),
+            ),
             AnthropicBlockKind::Tool => unreachable!("tool block 必须携带 id/name 元数据"),
         };
         events.extend(open_events);
@@ -350,7 +357,10 @@ impl AnthropicSseEmitter {
                         self.tool_hints
                             .iter()
                             .map(|(n, keys)| {
-                                (n.clone(), keys.iter().filter(|k| frag.contains(k.as_str())).count())
+                                (
+                                    n.clone(),
+                                    keys.iter().filter(|k| frag.contains(k.as_str())).count(),
+                                )
                             })
                             .max_by_key(|(_, sc)| *sc)
                             .filter(|(_, sc)| *sc > 0)
@@ -470,9 +480,11 @@ impl AnthropicSseEmitter {
                     self.feed_text(s)
                 }
             }
-            UniversalStreamEvent::ToolCallStart { index, call_id, name } => {
-                self.feed_tool_start(*index, call_id, name)
-            }
+            UniversalStreamEvent::ToolCallStart {
+                index,
+                call_id,
+                name,
+            } => self.feed_tool_start(*index, call_id, name),
             UniversalStreamEvent::ToolCallDelta { index, fragment } => {
                 self.feed_tool_args(*index, fragment)
             }
@@ -486,11 +498,7 @@ impl AnthropicSseEmitter {
     ///
     /// 此前 message_delta 仅回传 output_tokens、message_start 的 input_tokens 恒 0，
     /// 导致 Claude 系客户端（opencode/Claude Code）本地记账 input/cache 全为零。
-    fn finish_with_usage(
-        &mut self,
-        reason: StopReason,
-        usage: &UniversalUsage,
-    ) -> Vec<String> {
+    fn finish_with_usage(&mut self, reason: StopReason, usage: &UniversalUsage) -> Vec<String> {
         if self.finished {
             return Vec::new();
         }
@@ -517,7 +525,10 @@ impl AnthropicSseEmitter {
                 },
             }),
         ));
-        events.push(sse_event("message_stop", &json!({ "type": "message_stop" })));
+        events.push(sse_event(
+            "message_stop",
+            &json!({ "type": "message_stop" }),
+        ));
         events
     }
 }
@@ -792,9 +803,11 @@ impl ResponsesSseEmitter {
                     self.feed_text(s)
                 }
             }
-            UniversalStreamEvent::ToolCallStart { index, call_id, name } => {
-                self.feed_tool_start(*index, call_id, name)
-            }
+            UniversalStreamEvent::ToolCallStart {
+                index,
+                call_id,
+                name,
+            } => self.feed_tool_start(*index, call_id, name),
             UniversalStreamEvent::ToolCallDelta { index, fragment } => {
                 self.feed_tool_args(*index, fragment)
             }
@@ -960,10 +973,6 @@ impl ResponsesSseEmitter {
     }
 }
 
-
-
-
-
 #[cfg(test)]
 mod stream_accumulator_tests {
     use super::*;
@@ -973,9 +982,9 @@ mod stream_accumulator_tests {
         let mut emitter = ResponsesSseEmitter::new("req1", "big-pickle");
         let mut events: Vec<String> = Vec::new();
         // 模拟 zcode 实际场景：reasoning + 纯 tool_calls（content 为空）
-        events.extend(
-            emitter.on_ir_event(&UniversalStreamEvent::ReasoningDelta("Let me check status.".into())),
-        );
+        events.extend(emitter.on_ir_event(&UniversalStreamEvent::ReasoningDelta(
+            "Let me check status.".into(),
+        )));
         events.extend(emitter.on_ir_event(&UniversalStreamEvent::ToolCallStart {
             index: 0,
             call_id: "call_a".into(),
@@ -1036,7 +1045,10 @@ mod stream_accumulator_tests {
         );
         let last_done = all.rfind("event: response.output_item.done").unwrap();
         let completed_pos = all.find("event: response.completed").unwrap();
-        assert!(last_done < completed_pos, "output_item.done 必须早于 response.completed");
+        assert!(
+            last_done < completed_pos,
+            "output_item.done 必须早于 response.completed"
+        );
     }
 
     #[test]
@@ -1137,9 +1149,10 @@ mod stream_accumulator_tests {
                     .strip_prefix("event: ")
                     .unwrap_or_default()
                     .to_string();
-                let data: JsonValue =
-                    serde_json::from_str(it.next().unwrap_or_default().trim_start_matches("data: "))
-                        .expect("事件体必须是合法 JSON");
+                let data: JsonValue = serde_json::from_str(
+                    it.next().unwrap_or_default().trim_start_matches("data: "),
+                )
+                .expect("事件体必须是合法 JSON");
                 (name, data)
             })
             .collect()
@@ -1191,8 +1204,14 @@ mod stream_accumulator_tests {
         );
 
         let (_, start_block) = &parsed[1];
-        assert_eq!(start_block.pointer("/content_block/type").unwrap(), "tool_use");
-        assert_eq!(start_block.pointer("/content_block/name").unwrap(), "get_weather");
+        assert_eq!(
+            start_block.pointer("/content_block/type").unwrap(),
+            "tool_use"
+        );
+        assert_eq!(
+            start_block.pointer("/content_block/name").unwrap(),
+            "get_weather"
+        );
         assert_eq!(start_block.pointer("/content_block/id").unwrap(), "call_1");
         assert_eq!(start_block.pointer("/index").unwrap(), 0);
 
@@ -1269,10 +1288,22 @@ mod stream_accumulator_tests {
         }));
 
         let all = events.join("\n");
-        assert!(all.contains("\"name\":\"search\""), "必须携带真实函数名: {all}");
-        assert!(all.contains("\"q\":\"git\""), "碎分片必须聚合为完整 args: {all}");
-        assert!(!all.contains("\"name\":\"\""), "不得出现空名 functionCall: {all}");
-        assert!(all.contains("finishReason"), "终帧必须携带 finishReason: {all}");
+        assert!(
+            all.contains("\"name\":\"search\""),
+            "必须携带真实函数名: {all}"
+        );
+        assert!(
+            all.contains("\"q\":\"git\""),
+            "碎分片必须聚合为完整 args: {all}"
+        );
+        assert!(
+            !all.contains("\"name\":\"\""),
+            "不得出现空名 functionCall: {all}"
+        );
+        assert!(
+            all.contains("finishReason"),
+            "终帧必须携带 finishReason: {all}"
+        );
 
         // 终帧 chunk 内必须是完整 functionCall（含解析后的完整 args）
         let last_raw = events.last().expect("最后应为 Finish chunk");
@@ -1290,7 +1321,8 @@ mod stream_accumulator_tests {
         assert!(
             parts.iter().any(|p| {
                 p.pointer("/functionCall/name").and_then(JsonValue::as_str) == Some("search")
-                    && p.pointer("/functionCall/args/q").and_then(JsonValue::as_str)
+                    && p.pointer("/functionCall/args/q")
+                        .and_then(JsonValue::as_str)
                         == Some("git")
             }),
             "Finish chunk 内应有完整 functionCall: {all}"
@@ -1328,7 +1360,10 @@ mod stream_accumulator_tests {
 
         let all = events.join("\n");
         let parsed = parse_emitter_events(&events);
-        assert!(all.contains("\"id\":\"call_x\""), "工具块必须复用真实 id: {all}");
+        assert!(
+            all.contains("\"id\":\"call_x\""),
+            "工具块必须复用真实 id: {all}"
+        );
         assert!(!all.contains("toolu_reopen"), "不得出现伪造 id: {all}");
         assert!(!all.contains("\"name\":\"tool\""), "不得出现占位名: {all}");
         assert!(all.contains("等等"), "插队文本不得丢失: {all}");
@@ -1343,7 +1378,11 @@ mod stream_accumulator_tests {
             })
             .filter_map(|(_, d)| d.pointer("/delta/partial_json").and_then(JsonValue::as_str))
             .collect();
-        assert_eq!(partial_jsons, vec!["{\"q\":", "\"git\"}"], "参数分片应完整下发");
+        assert_eq!(
+            partial_jsons,
+            vec!["{\"q\":", "\"git\"}"],
+            "参数分片应完整下发"
+        );
 
         // 文本必须出现在工具块之后（独立文本块），message_delta 前无未关闭块
         let types: Vec<&str> = parsed
@@ -1351,10 +1390,17 @@ mod stream_accumulator_tests {
             .filter(|(n, _)| n == "content_block_start")
             .filter_map(|(_, d)| d.pointer("/content_block/type").and_then(JsonValue::as_str))
             .collect();
-        assert_eq!(types, vec!["tool_use", "text"], "工具块与文本块按序独立: {all}");
+        assert_eq!(
+            types,
+            vec!["tool_use", "text"],
+            "工具块与文本块按序独立: {all}"
+        );
         let delta_times = parsed
             .iter()
-            .filter(|(n, d)| n == "content_block_delta" && d.pointer("/delta/type").and_then(JsonValue::as_str) == Some("text_delta"))
+            .filter(|(n, d)| {
+                n == "content_block_delta"
+                    && d.pointer("/delta/type").and_then(JsonValue::as_str) == Some("text_delta")
+            })
             .count();
         assert_eq!(delta_times, 1, "插队文本应完整出现在单个 text_delta 中");
     }
@@ -1405,7 +1451,11 @@ impl ChatEmitter {
             UniversalStreamEvent::TextDelta(s) => {
                 vec![delta_chunk(json!({ "content": s }), None, None)]
             }
-            UniversalStreamEvent::ToolCallStart { index, call_id, name } => {
+            UniversalStreamEvent::ToolCallStart {
+                index,
+                call_id,
+                name,
+            } => {
                 self.started_tools.insert(*index);
                 vec![delta_chunk(
                     json!({ "tool_calls": [{
@@ -1436,7 +1486,11 @@ impl ChatEmitter {
                 }
                 self.finished = true;
                 vec![
-                    delta_chunk(json!({}), Some(reason.to_chat()), Some(usage_to_chat_json(usage))),
+                    delta_chunk(
+                        json!({}),
+                        Some(reason.to_chat()),
+                        Some(usage_to_chat_json(usage)),
+                    ),
                     "data: [DONE]\n\n".to_string(),
                 ]
             }
@@ -1540,13 +1594,16 @@ impl GeminiEmitter {
                 .unwrap_or_else(|_| json!({ "result": args }));
             parts.push(json!({ "functionCall": { "name": name, "args": args_val } }));
         }
-        vec![format!("data: {}\n\n", json!({
-            "candidates": [{
-                "content": { "parts": parts, "role": "model" },
-                "index": 0,
-                "finishReason": "STOP",
-            }],
-        }))]
+        vec![format!(
+            "data: {}\n\n",
+            json!({
+                "candidates": [{
+                    "content": { "parts": parts, "role": "model" },
+                    "index": 0,
+                    "finishReason": "STOP",
+                }],
+            })
+        )]
     }
 }
 
@@ -1633,7 +1690,9 @@ fn apply_usage_to_log(log: &mut ProxyRequestLog, usage: &UniversalUsage, ctx: &M
             .fetch_add(usage.cache_read_tokens, Ordering::Relaxed);
     }
     if usage.total() > 0 {
-        ctx.metrics.total_tokens.fetch_add(usage.total(), Ordering::Relaxed);
+        ctx.metrics
+            .total_tokens
+            .fetch_add(usage.total(), Ordering::Relaxed);
     }
 }
 
@@ -1857,7 +1916,6 @@ where
     Body::from_stream(s)
 }
 
-
 /// 同协议快速通道：上游与客户端协议一致时，字节级直通 + 旁路统计。
 ///
 /// IR 往返无法表达协议全部元素（如 Anthropic thinking 的 signature、
@@ -1972,7 +2030,10 @@ pub fn extract_tool_hints(body: &JsonValue) -> (Vec<ToolHint>, Option<String>) {
     let preferred = body
         .pointer("/tool_choice/function/name")
         .and_then(JsonValue::as_str)
-        .or_else(|| body.pointer("/tool_choice/name").and_then(JsonValue::as_str))
+        .or_else(|| {
+            body.pointer("/tool_choice/name")
+                .and_then(JsonValue::as_str)
+        })
         .map(str::to_string);
     (hints, preferred)
 }

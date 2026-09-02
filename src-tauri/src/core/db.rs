@@ -932,7 +932,12 @@ pub(crate) fn ensure_model_proxy_logs_table(connection: &Connection) -> Result<(
     );
 
     // 兼容旧结构：逐列探测补齐（升级安装路径）
-    for column in ["node_name", "client_name", "cache_creation_tokens", "upstream_url"] {
+    for column in [
+        "node_name",
+        "client_name",
+        "cache_creation_tokens",
+        "upstream_url",
+    ] {
         let has: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM pragma_table_info('model_proxy_logs') WHERE name=?1",
@@ -1264,6 +1269,10 @@ pub(crate) fn read_cached_usage_sites(
              LEFT JOIN site_accounts sa
                ON sa.site_id = smc.site_id AND sa.profile_id = smc.profile_id
              WHERE sa.profile_id IS NULL
+               -- profile_id 为空的行是「站点级 Key 缓存」（无账号时拉取/手动管理
+               -- 的 Key），不是 Chrome 会话：吐出去会渲染成只有时间戳的幽灵账号行，
+               -- 且删除按钮对它必然空操作。
+               AND smc.profile_id != ''
              ORDER BY 1, 2",
         )
         .map_err(|error| error.to_string())?;
@@ -1717,6 +1726,33 @@ pub(crate) fn ensure_charity_feed_sources_table(connection: &Connection) -> Resu
             )
             .map_err(|error| error.to_string())?;
     }
+
+    // 本地 Token 统计的「原始模型名 → 正式模型」映射表。
+    // raw_key 为小写去空白后的原始名，保证大小写不同的同一模型只占一行。
+    // origin: rule = 规则推导 | ai = AI 分析 | manual = 手工修改；
+    // confirmed = 1 的行不参与 AI 分析，除非强制同步。
+    connection
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS token_model_mappings (
+                raw_key TEXT PRIMARY KEY,
+                raw_model TEXT NOT NULL,
+                official_model TEXT NOT NULL DEFAULT '',
+                official_slug TEXT,
+                lab TEXT,
+                origin TEXT NOT NULL DEFAULT 'rule',
+                confidence REAL NOT NULL DEFAULT 0,
+                reason TEXT,
+                confirmed INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_token_model_mappings_confirmed
+                ON token_model_mappings(confirmed);
+            CREATE INDEX IF NOT EXISTS idx_token_model_mappings_official
+                ON token_model_mappings(official_model);",
+        )
+        .map_err(|error| error.to_string())?;
+
     Ok(())
 }
 

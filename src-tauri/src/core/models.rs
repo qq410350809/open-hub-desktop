@@ -291,6 +291,10 @@ pub struct SiteAccountRefresh {
     pub(crate) checkin: CheckinSnapshot,
     pub(crate) newapi_token: String,
     pub(crate) newapi_user_id: String,
+    /// 本次是否真的从站点接口取到了账号数据（降级到本地缓存的分支为 false）。
+    /// 为 true 时调用方应清掉上次同步遗留的 sync_error/checkin_error 与
+    /// 浏览器兜底冷却——旧异常只描述旧数据，成功刷新后继续展示会误导用户。
+    pub(crate) refreshed: bool,
 }
 
 #[derive(Clone)]

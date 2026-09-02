@@ -81,7 +81,8 @@ pub async fn handle_messages(
     // 同协议快速通道：Anthropic 客户端 → Anthropic 上游，请求体原生透传。
     // 此前强制转 Chat 导致 cache_control / thinking signature 丢失，
     // Anthropic 上游的 prompt caching 与思考链连续性完全失效，现恢复直通。
-    let fast_path = egress::TargetProtocol::from_channel(chan) == egress::TargetProtocol::AnthropicMessages;
+    let fast_path =
+        egress::TargetProtocol::from_channel(chan) == egress::TargetProtocol::AnthropicMessages;
     let egress_payload = if fast_path {
         let mut native = body.clone();
         native["model"] = serde_json::Value::String(model_to_send.clone());
@@ -141,8 +142,7 @@ pub async fn handle_messages(
         // 跨协议 IR 链路：嗅探上游实际协议 → Parser → UniversalStreamEvent →
         // Anthropic Emitter（全量 usage/缓存明细回传，孤儿工具名恢复保留）
         let upstream_headers = outcome.success.response.headers().clone();
-        let (tool_hints, preferred_tool) =
-            crate::model::gateway::stream::extract_tool_hints(&body);
+        let (tool_hints, preferred_tool) = crate::model::gateway::stream::extract_tool_hints(&body);
         let stream_body = crate::model::gateway::stream::proxy_sse_body_with_hints(
             outcome.success.response.bytes_stream(),
             outcome.target,
@@ -175,7 +175,10 @@ pub async fn handle_messages(
         final_log.response_body = cap_log_body(String::from_utf8_lossy(&raw_bytes).to_string());
         if let Ok(jv) = serde_json::from_slice::<JsonValue>(&raw_bytes) {
             // Anthropic 口径换算为网关总量口径：prompt = input + cache_read + cache_creation
-            let input = jv.pointer("/usage/input_tokens").and_then(JsonValue::as_u64).unwrap_or(0);
+            let input = jv
+                .pointer("/usage/input_tokens")
+                .and_then(JsonValue::as_u64)
+                .unwrap_or(0);
             let cache_read = jv
                 .pointer("/usage/cache_read_input_tokens")
                 .and_then(JsonValue::as_u64)
@@ -184,7 +187,10 @@ pub async fn handle_messages(
                 .pointer("/usage/cache_creation_input_tokens")
                 .and_then(JsonValue::as_u64)
                 .unwrap_or(0);
-            let output = jv.pointer("/usage/output_tokens").and_then(JsonValue::as_u64).unwrap_or(0);
+            let output = jv
+                .pointer("/usage/output_tokens")
+                .and_then(JsonValue::as_u64)
+                .unwrap_or(0);
             final_log.prompt_tokens = (input + cache_read + cache_creation > 0)
                 .then_some(input + cache_read + cache_creation);
             final_log.completion_tokens = (output > 0).then_some(output);

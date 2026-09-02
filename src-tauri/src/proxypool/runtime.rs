@@ -1,9 +1,7 @@
 pub(crate) use crate::db::{read_meta, write_meta};
 use crate::models::*;
 use crate::proxypool::geoip::{classify_node_location, open_geoip_reader};
-use crate::proxypool::parser::{
-    basic_node_config_error, sanitize_proxy_node_json, stable_id,
-};
+use crate::proxypool::parser::{basic_node_config_error, sanitize_proxy_node_json, stable_id};
 use crate::proxypool::rotator::channel_candidate_nodes;
 use crate::proxypool::types::*;
 use rusqlite::{params, OptionalExtension};
@@ -705,25 +703,34 @@ pub fn ensure_global_runtime(database: &Database, runtime: &ProxyRuntime) -> Res
 
 /// 确保三个 lane 池完成一次性预配。首次使用时整池分配端口；
 /// 之后全局实例重启也复用同一批端口（调用前旧进程已停止）。
-fn ensure_lane_pools(runtime: &ProxyRuntime, used_ports: &mut HashSet<u16>) -> Result<(), String> {
+/// `verify_free`：是否逐槽校验端口空闲并就地换新——只允许重建路径
+/// 开启（此刻旧进程已停止、残留已清扫，占端口者必为残留/异物）。
+/// 实例运行中的快路径绝不能开：运行中内核正持有全部 lane 端口，
+/// 试绑定必然失败，会误判为残留而把端口全部换新，换出来的端口
+/// 无人监听，所有经 lane 的出口立刻 Connect 失败。
+fn ensure_lane_pools(
+    runtime: &ProxyRuntime,
+    used_ports: &mut HashSet<u16>,
+    verify_free: bool,
+) -> Result<(), String> {
     let pools: [(&std::sync::Mutex<Vec<LaneSlot>>, usize, &str); 3] = [
         (&runtime.speed_lane_slots, SPEED_TEST_LANES, "SPEED-lane"),
         (&runtime.account_lane_slots, ACCOUNT_LANE_POOL, "ACCT-lane"),
         (&runtime.channel_lane_slots, CHANNEL_LANE_POOL, "CH-lane"),
     ];
     for (pool, expected, prefix) in pools {
-        let mut slots = pool
-            .lock()
-            .map_err(|_| "lane 池状态锁定失败".to_string())?;
+        let mut slots = pool.lock().map_err(|_| "lane 池状态锁定失败".to_string())?;
         if slots.len() == expected {
-            for slot in slots.iter_mut() {
-                // 复用前必须确认端口真的空闲：句柄丢失的残留内核会继续占着旧端口，
-                // 新实例绑定失败后（内核只记日志不退出）lane 流量会串到旧实例——
-                // 测速全失败、出口串节点都源于此。被占的端口就地换新。
-                if !port_is_available(slot.listen_port) {
-                    slot.listen_port = allocate_free_port_excluding(used_ports)?;
+            if verify_free {
+                for slot in slots.iter_mut() {
+                    // 复用前必须确认端口真的空闲：句柄丢失的残留内核会继续占着旧端口，
+                    // 新实例绑定失败后（内核只记日志不退出）lane 流量会串到旧实例——
+                    // 测速全失败、出口串节点都源于此。被占的端口就地换新。
+                    if !port_is_available(slot.listen_port) {
+                        slot.listen_port = allocate_free_port_excluding(used_ports)?;
+                    }
+                    used_ports.insert(slot.listen_port);
                 }
-                used_ports.insert(slot.listen_port);
             }
             continue;
         }
@@ -786,7 +793,11 @@ fn resolve_channel_node_id(database: &Database, channel_id: &str) -> Result<Stri
 }
 
 /// 阻塞版切组：PUT /proxies/{group}。同步 ensure 路径使用（异步路径用 select_group_node）。
-pub fn select_group_node_sync(runtime: &ProxyRuntime, group: &str, name: &str) -> Result<(), String> {
+pub fn select_group_node_sync(
+    runtime: &ProxyRuntime,
+    group: &str,
+    name: &str,
+) -> Result<(), String> {
     let port = runtime_controller_port(runtime)?;
     let (status, _) = simple_http_request(
         port,
@@ -882,7 +893,12 @@ fn probe_node_alive(runtime: &ProxyRuntime, node_id: &str) -> Result<i64, String
             .finish()
             .trim_start_matches('=')
     );
-    let (status, body) = simple_http_get(port, &path, RUNTIME_SECRET, Duration::from_millis(timeout_ms + 2_000))?;
+    let (status, body) = simple_http_get(
+        port,
+        &path,
+        RUNTIME_SECRET,
+        Duration::from_millis(timeout_ms + 2_000),
+    )?;
     if (200..=299).contains(&status) {
         let value: JsonValue = serde_json::from_str(&body).map_err(|e| e.to_string())?;
         return value
@@ -939,8 +955,9 @@ pub fn ensure_channel_instance(
 ) -> Result<u16, String> {
     let node_id = resolve_channel_node_id(database, channel_id)?;
     ensure_global_runtime(database, runtime)?;
+    // 实例在跑时端口被其 listener 持有是常态，不做空闲校验
     let mut used_ports = HashSet::new();
-    ensure_lane_pools(runtime, &mut used_ports)?;
+    ensure_lane_pools(runtime, &mut used_ports, false)?;
 
     let (group_name, port) = {
         let mut map = runtime
@@ -985,8 +1002,9 @@ pub fn ensure_account_instance(
         }
     }
     ensure_global_runtime(database, runtime)?;
+    // 实例在跑时端口被其 listener 持有是常态，不做空闲校验
     let mut used_ports = HashSet::new();
-    ensure_lane_pools(runtime, &mut used_ports)?;
+    ensure_lane_pools(runtime, &mut used_ports, false)?;
 
     let (group_name, port, desired_node) = {
         let mut map = runtime
@@ -1078,20 +1096,20 @@ pub fn ensure_shared_instance_with_nodes(
             return Ok(state.proxy_port);
         }
 
-    // 需要（重）拉起：先停旧进程再复用端口。既往实现直接覆盖 child 句柄，
-    // 旧 mihomo 会泄漏为孤儿进程，只能等下次启动清扫回收。
-    stop_single_instance(&mut state);
-    proxy_port = if state.proxy_port > 0 && port_is_available(state.proxy_port) {
-        state.proxy_port
-    } else {
-        allocate_free_port()?
-    };
-    controller_port = if state.controller_port > 0 && port_is_available(state.controller_port) {
-        state.controller_port
-    } else {
-        allocate_free_port()?
-    };
-    drop(state);
+        // 需要（重）拉起：先停旧进程再复用端口。既往实现直接覆盖 child 句柄，
+        // 旧 mihomo 会泄漏为孤儿进程，只能等下次启动清扫回收。
+        stop_single_instance(&mut state);
+        proxy_port = if state.proxy_port > 0 && port_is_available(state.proxy_port) {
+            state.proxy_port
+        } else {
+            allocate_free_port()?
+        };
+        controller_port = if state.controller_port > 0 && port_is_available(state.controller_port) {
+            state.controller_port
+        } else {
+            allocate_free_port()?
+        };
+        drop(state);
     }
 
     // 定向清扫"该杀未杀"的残留内核：它霸占的 lane 端口会让新实例绑定失败，
@@ -1102,7 +1120,7 @@ pub fn ensure_shared_instance_with_nodes(
     let mut used_ports = HashSet::new();
     used_ports.insert(proxy_port);
     used_ports.insert(controller_port);
-    ensure_lane_pools(runtime, &mut used_ports)?;
+    ensure_lane_pools(runtime, &mut used_ports, true)?;
     let speed_lanes = runtime
         .speed_lane_slots
         .lock()
@@ -1134,7 +1152,8 @@ pub fn ensure_shared_instance_with_nodes(
         .chain(&channel_lanes)
         .map(|lane| lane.listen_port)
         .collect::<Vec<_>>();
-    // 配置含 ~89 个组，内核解析耗时更长，就绪等待放宽到 10s
+    // 配置含 ~89 个组、数百个节点（实测 config.yaml 近 9MB），内核解析后还要串行
+    // 绑定全部 listener，控制器可响应的时刻远早于端口绑完；就绪等待放宽到 30s。
     spawn_engine_instance(
         runtime,
         &engine,
@@ -1143,7 +1162,7 @@ pub fn ensure_shared_instance_with_nodes(
         proxy_port,
         controller_port,
         initial_hash,
-        Duration::from_secs(10),
+        Duration::from_secs(30),
         "共享代理实例",
         &listener_ports,
     )?;
@@ -1222,9 +1241,12 @@ fn spawn_engine_instance(
             controller_port,
             "/version",
             RUNTIME_SECRET,
-            Duration::from_millis(200),
+            Duration::from_millis(600),
         ) {
-            Ok((200..=299, _)) => {
+            // 任何 HTTP 状态码都证明控制器已在监听：4xx 只说明鉴权或路由不匹配
+            // （如残留实例 secret 不同回 401），不代表实例未就绪。据此继续做端口校验，
+            // 由端口绑定情况决定是否放行，避免把已监听的实例误判成超时。
+            Ok((_code, _)) => {
                 // 控制器就绪后还需确认全部监听端口真的绑定成功：端口连不上
                 // 说明新实例没绑上，流量会落到残留实例的旧监听。
                 let unbound = std::iter::once(proxy_port)
@@ -1238,9 +1260,8 @@ fn spawn_engine_instance(
                     }
                     return Ok(());
                 }
-                last_err = format!("监听端口未就绪: {unbound:?}");
+                last_err = format!("监听端口未就绪: {} 个 {unbound:?}", unbound.len());
             }
-            Ok((code, _)) => last_err = format!("HTTP {code}"),
             Err(e) => last_err = e,
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -1430,7 +1451,9 @@ fn list_process_commands() -> Vec<(u32, String)> {
 
 fn kill_pid(pid: u32) {
     #[cfg(target_os = "windows")]
-    let _ = Command::new("taskkill").args(["/PID", &pid.to_string(), "/F"]).status();
+    let _ = Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/F"])
+        .status();
     #[cfg(not(target_os = "windows"))]
     let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
 }

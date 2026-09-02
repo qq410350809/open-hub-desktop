@@ -5,7 +5,7 @@ use crate::context::{home_dir, spawn, spawn_blocking, AppContext, EventBus};
 use crate::models::Database;
 use crate::proxypool::{self, is_http_forbidden_error, is_transport_error, ProxyRuntime};
 use crate::site::sync;
-use std::sync::{atomic::Ordering, atomic::AtomicUsize, Arc, Mutex};
+use std::sync::{atomic::AtomicUsize, atomic::Ordering, Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
@@ -277,10 +277,7 @@ pub fn combined_filter_json_url(feed_names: &[String]) -> String {
     let mut url = url::Url::parse("https://linux.do/filter.json?").expect("静态地址必然可解析");
     {
         let mut pairs = url.query_pairs_mut();
-        pairs.append_pair(
-            "q",
-            &format!("tag:{} order:created", feed_names.join(",")),
-        );
+        pairs.append_pair("q", &format!("tag:{} order:created", feed_names.join(",")));
     }
     url.to_string()
 }
@@ -361,7 +358,10 @@ pub async fn sync_round_combined(
             .collect()
     };
 
-    let feed_names = sources.iter().map(|source| source.name.clone()).collect::<Vec<_>>();
+    let feed_names = sources
+        .iter()
+        .map(|source| source.name.clone())
+        .collect::<Vec<_>>();
     let combined_source = CharityFeedSource {
         id: "round".into(),
         name: "本轮汇总".into(),
@@ -385,7 +385,15 @@ pub async fn sync_round_combined(
         Err(error) => {
             let message = format!("合并同步失败：无法初始化代理客户端：{error}");
             if let Some(id) = round_log_id {
-                update_charity_sync_log(database, id, "error", &message, "", round_started.elapsed().as_millis() as i64, "");
+                update_charity_sync_log(
+                    database,
+                    id,
+                    "error",
+                    &message,
+                    "",
+                    round_started.elapsed().as_millis() as i64,
+                    "",
+                );
             }
             return fail_all(&message);
         }
@@ -397,7 +405,15 @@ pub async fn sync_round_combined(
         if cancellation.is_cancelled() {
             let message = format!("{CHARITY_SYNC_CANCELLED_PREFIX}：合并同步");
             if let Some(id) = round_log_id {
-                update_charity_sync_log(database, id, "cancelled", &message, "", round_started.elapsed().as_millis() as i64, "");
+                update_charity_sync_log(
+                    database,
+                    id,
+                    "cancelled",
+                    &message,
+                    "",
+                    round_started.elapsed().as_millis() as i64,
+                    "",
+                );
             }
             return sources
                 .iter()
@@ -426,7 +442,9 @@ pub async fn sync_round_combined(
             touch_running_charity_sync_log(database, id, &running_msg, &node.name, 0);
         }
 
-        if let Err(error) = proxypool::select_proxy_node_transient(database, runtime, &node.id).await {
+        if let Err(error) =
+            proxypool::select_proxy_node_transient(database, runtime, &node.id).await
+        {
             let message = format!("{}: 切换代理失败：{error}", node.name);
             eject_node_from_charity_candidate(monitor, queue, &node, &message);
             last_error = message;
@@ -494,12 +512,7 @@ pub async fn sync_round_combined(
                                 let outcome = if owned.1.is_empty() {
                                     let message = "本轮合并结果中无该标签新帖";
                                     let _ = write_feed_sync_meta(
-                                        database,
-                                        &source.id,
-                                        "success",
-                                        message,
-                                        &node.name,
-                                        0,
+                                        database, &source.id, "success", message, &node.name, 0,
                                     );
                                     if let Ok(mut errors) = monitor.last_errors.lock() {
                                         errors.remove(&source.id);
@@ -512,7 +525,13 @@ pub async fn sync_round_combined(
                                         updated_count: 0,
                                     }
                                 } else {
-                                    match persist_feed(database, source, owned.1.clone(), profile_name.clone(), account_name.clone()) {
+                                    match persist_feed(
+                                        database,
+                                        source,
+                                        owned.1.clone(),
+                                        profile_name.clone(),
+                                        account_name.clone(),
+                                    ) {
                                         Ok(result) => {
                                             if let Ok(mut errors) = monitor.last_errors.lock() {
                                                 errors.remove(&source.id);
@@ -528,12 +547,8 @@ pub async fn sync_round_combined(
                                         Err(error) => {
                                             let message = format!("入库失败：{error}");
                                             let _ = write_feed_sync_meta(
-                                                database,
-                                                &source.id,
-                                                "error",
-                                                &message,
-                                                &node.name,
-                                                0,
+                                                database, &source.id, "error", &message,
+                                                &node.name, 0,
                                             );
                                             if let Ok(mut errors) = monitor.last_errors.lock() {
                                                 errors.insert(source.id.clone(), message);
@@ -619,7 +634,15 @@ pub async fn sync_round_combined(
             Err(error) => {
                 if is_charity_sync_cancelled(&error) {
                     if let Some(id) = round_log_id {
-                        update_charity_sync_log(database, id, "cancelled", &error, &node.name, round_started.elapsed().as_millis() as i64, "");
+                        update_charity_sync_log(
+                            database,
+                            id,
+                            "cancelled",
+                            &error,
+                            &node.name,
+                            round_started.elapsed().as_millis() as i64,
+                            "",
+                        );
                     }
                     return sources
                         .iter()
@@ -639,12 +662,26 @@ pub async fn sync_round_combined(
     }
 
     let message = if last_error.is_empty() {
-        format!("合并同步失败：本轮没有可尝试的 ≤{}ms 候选节点", CHARITY_FAST_NODE_MAX_LATENCY_MS)
+        format!(
+            "合并同步失败：本轮没有可尝试的 ≤{}ms 候选节点",
+            CHARITY_FAST_NODE_MAX_LATENCY_MS
+        )
     } else {
-        format!("{}（合并请求已尝试 {attempts}/{} 个节点）", last_error, CHARITY_MAX_NODE_ATTEMPTS)
+        format!(
+            "{}（合并请求已尝试 {attempts}/{} 个节点）",
+            last_error, CHARITY_MAX_NODE_ATTEMPTS
+        )
     };
     if let Some(id) = round_log_id {
-        update_charity_sync_log(database, id, "error", &message, "", round_started.elapsed().as_millis() as i64, "");
+        update_charity_sync_log(
+            database,
+            id,
+            "error",
+            &message,
+            "",
+            round_started.elapsed().as_millis() as i64,
+            "",
+        );
     }
     fail_all(&message)
 }

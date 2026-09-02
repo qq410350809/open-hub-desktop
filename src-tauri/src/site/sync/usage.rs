@@ -720,6 +720,13 @@ pub async fn mark_sites_with_chrome_sessions(
                     session.newapi_token = refresh.newapi_token;
                     session.has_access_token = !session.newapi_token.is_empty();
                     session.newapi_user_id = refresh.newapi_user_id;
+                    // 真正从站点取到数据：上次同步遗留的浏览器兜底冷却一并清零，
+                    // 否则直连已恢复、界面冷却倒计时却还在，自动同步继续被跳过。
+                    if refresh.refreshed {
+                        session.browser_fallback_failed_at = 0;
+                        session.browser_fallback_fail_count = 0;
+                        session.browser_fallback_cooldown_ms = 0;
+                    }
                 }
                 Ok(Err(error)) => session.sync_error = error,
                 Err(error) => session.sync_error = format!("账号同步任务失败：{error}"),

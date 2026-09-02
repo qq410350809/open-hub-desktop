@@ -167,7 +167,9 @@ fn ejecting_node_clears_sticky_preference_and_queue() {
 
     let runtime = CharityMonitorRuntime::new();
     runtime.set_preferred_node("n1");
-    let queue = Arc::new(Mutex::new(CharityNodeQueue::from_nodes(node_refs(&["n1", "n2"]))));
+    let queue = Arc::new(Mutex::new(CharityNodeQueue::from_nodes(node_refs(&[
+        "n1", "n2",
+    ]))));
     let node = CharityNodeRef {
         id: "n1".into(),
         name: "N1".into(),
@@ -186,7 +188,9 @@ fn sticky_node_is_reused_without_leaving_the_queue() {
 
     let runtime = CharityMonitorRuntime::new();
     runtime.set_preferred_node("n1");
-    let queue = Arc::new(Mutex::new(CharityNodeQueue::from_nodes(node_refs(&["n1", "n2"]))));
+    let queue = Arc::new(Mutex::new(CharityNodeQueue::from_nodes(node_refs(&[
+        "n1", "n2",
+    ]))));
     let first = take_attempt_node(&runtime, &queue).unwrap();
     assert_eq!(first.id, "n1");
     // 粘性节点不出队，可被下一轮/并行 feed 继续复用
@@ -325,7 +329,10 @@ fn migrates_legacy_tag_json_urls_only_for_generated_addresses() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(migrated, "https://linux.do/tag/1515/l/latest.json?order=created");
+    assert_eq!(
+        migrated,
+        "https://linux.do/tag/1515/l/latest.json?order=created"
+    );
     let migrated_b: String = connection
         .query_row(
             "SELECT json_url FROM charity_feed_sources WHERE id = '1980'",
@@ -333,7 +340,10 @@ fn migrates_legacy_tag_json_urls_only_for_generated_addresses() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(migrated_b, "https://linux.do/tag/1980/l/latest.json?order=created");
+    assert_eq!(
+        migrated_b,
+        "https://linux.do/tag/1980/l/latest.json?order=created"
+    );
     let untouched: String = connection
         .query_row(
             "SELECT json_url FROM charity_feed_sources WHERE id = '2233'",
@@ -402,11 +412,16 @@ fn split_items_attributes_topics_by_tag_name() {
     let split = split_items_by_feed(&items, &sources);
     assert_eq!(split.len(), 2);
     assert_eq!(split[0].0, "1515");
-    assert_eq!(split[0].1.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(), ["a"]);
+    assert_eq!(
+        split[0].1.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(),
+        ["a"]
+    );
     assert_eq!(split[1].0, "1980");
-    assert_eq!(split[1].1.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(), ["b"]);
+    assert_eq!(
+        split[1].1.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(),
+        ["b"]
+    );
 }
-
 
 #[test]
 fn sorts_by_topic_creation_time_instead_of_activity_time() {

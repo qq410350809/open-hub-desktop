@@ -4,11 +4,11 @@ use super::balancer::{
 };
 use super::egress::TargetProtocol;
 use super::logger::{cap_log_body, record_attempt_failure, ProxyLogParams};
+use super::pipeline::{gateway_error_response, ClientProtocol};
 use super::policies::opencode::{
     apply_cli_identity_headers, is_empty_success_payload, matches_channel_or_url,
     GATEWAY_USER_AGENT,
 };
-use super::pipeline::{gateway_error_response, ClientProtocol};
 use super::types::{ChannelConfig, ModelProxyConfig, ModelProxyContext};
 use axum::{
     http::StatusCode,
@@ -20,6 +20,27 @@ use std::sync::atomic::Ordering;
 use std::time::Instant;
 use tracing::warn;
 
+/// 429 退避的硬上界。上游限流窗口通常按秒计，1.4s 的旧上界几乎必然落在窗口内；
+/// 8s 覆盖常见窗口，同时不至于让客户端以为请求卡死。
+pub(super) const MAX_429_BACKOFF_MS: u64 = 8_000;
+
+/// 无 Retry-After 时的指数退避：500ms 起，每次翻倍（500/1000/2000/4000/8000…），
+/// 由调用方截到 `MAX_429_BACKOFF_MS`。
+pub(super) fn exponential_backoff_ms(attempt_idx: usize) -> u64 {
+    500u64 << attempt_idx.min(6)
+}
+
+/// 解析上游 `Retry-After`：支持「延迟秒数」形式（RFC 7231 的两种取值中实际唯一常见的一种）。
+/// HTTP-date 形式不解析——需要当前时间基准，且各家限流响应几乎都用秒数。
+pub(super) fn parse_retry_after_ms(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    let raw = headers.get("retry-after")?.to_str().ok()?.trim().to_string();
+    let secs: f64 = raw.parse().ok()?;
+    if !secs.is_finite() || secs < 0.0 {
+        return None;
+    }
+    Some((secs * 1000.0) as u64)
+}
+
 #[derive(Clone, Debug)]
 pub struct EgressRequestMeta {
     pub req_id: String,
@@ -27,7 +48,12 @@ pub struct EgressRequestMeta {
     pub channel_id: String,
     /// 统计维度稳定数字 ID（字符串形式），随失败日志落库
     pub channel_stats_id: Option<String>,
+    /// 客户端原始模型名（可能带渠道别名/opencode 前缀）：仅用于日志展示与统计维度
     pub model: String,
+    /// 剥离前缀后的裸模型名：用于匹配「管理可用模型」里的模型级代理出口规则。
+    /// 必须与 model 区分 —— 规则表的键来自上游返回的原始模型 id（无前缀），
+    /// 拿带前缀的 model 去查表会 miss 并静默退回渠道级代理模式。
+    pub rule_model: String,
     pub stream: bool,
     pub req_body_str: Option<String>,
 }
@@ -94,10 +120,12 @@ pub async fn execute_resilient_egress(
     body: &JsonValue,
     client_protocol: ClientProtocol,
 ) -> Result<EgressSuccess, Response> {
-    let candidates = get_sorted_egress_candidates(ctx, channel, &meta.model, channel_api_key).await;
+    let candidates =
+        get_sorted_egress_candidates(ctx, channel, &meta.rule_model, channel_api_key).await;
     let max_retries = config.max_retries as usize;
     let total_attempts_allowed = max_retries + 1;
-    let base_node_idx = ctx.node_round_robin.load(Ordering::Relaxed);
+    let node_round_robin = ctx.node_round_robin_for(&channel.id).await;
+    let base_node_idx = node_round_robin.load(Ordering::Relaxed);
 
     let mut last_error = String::new();
     let mut last_status = StatusCode::BAD_GATEWAY;
@@ -215,8 +243,10 @@ pub async fn execute_resilient_egress(
                 if !is_empty_success_payload(&body_bytes) {
                     // 内容有效：把预读的 body 重新打包为完整 Response 返回，上层无感知
                     let rebuilt = axum::http::Response::builder()
-                        .status(axum::http::StatusCode::from_u16(status.as_u16())
-                            .unwrap_or(axum::http::StatusCode::OK))
+                        .status(
+                            axum::http::StatusCode::from_u16(status.as_u16())
+                                .unwrap_or(axum::http::StatusCode::OK),
+                        )
                         .header("Content-Type", "application/json")
                         .body(body_bytes)
                         .expect("固定字段合成响应必然合法");
@@ -258,9 +288,7 @@ pub async fn execute_resilient_egress(
                     continue;
                 }
 
-                warn!(
-                    "[ModelGateway] OpenCode 上游原地重试仍为空内容，节点 {node_display} 判负"
-                );
+                warn!("[ModelGateway] OpenCode 上游原地重试仍为空内容，节点 {node_display} 判负");
                 break SendStep::NodeFailedEmpty;
             }
 
@@ -270,10 +298,11 @@ pub async fn execute_resilient_egress(
         // 空内容视为错误请求：与 5xx 同样参与节点轮换；预算耗尽后向客户端返回 400
         if matches!(send_step, SendStep::NodeFailedEmpty) {
             last_status = StatusCode::BAD_REQUEST;
-            last_error = "OpenCode 上游持续返回空内容（已原地重试并轮换节点），按错误请求处理".to_string();
+            last_error =
+                "OpenCode 上游持续返回空内容（已原地重试并轮换节点），按错误请求处理".to_string();
 
             if attempt_idx < max_retries {
-                ctx.node_round_robin.fetch_add(1, Ordering::Relaxed);
+                node_round_robin.fetch_add(1, Ordering::Relaxed);
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 continue;
             }
@@ -322,7 +351,7 @@ pub async fn execute_resilient_egress(
                             Some(node_display),
                         )
                         .with_channel_stats_id(meta.channel_stats_id.clone())
-                    .with_upstream_url(Some(upstream_url.to_string()))
+                        .with_upstream_url(Some(upstream_url.to_string()))
                         .with_response_body(cap_log_body(err_text)),
                     )
                     .await;
@@ -334,6 +363,8 @@ pub async fn execute_resilient_egress(
                     )
                         .into_response());
                 } else if status == StatusCode::TOO_MANY_REQUESTS {
+                    // Retry-After 必须在 resp.bytes() 消费掉响应前读取
+                    let retry_after = parse_retry_after_ms(resp.headers());
                     let err_bytes = resp.bytes().await.unwrap_or_default();
                     let err_text = String::from_utf8_lossy(&err_bytes).to_string();
                     let formatted = format_upstream_error_message(status.as_u16(), &err_text);
@@ -357,15 +388,19 @@ pub async fn execute_resilient_egress(
                             Some(node_display),
                         )
                         .with_channel_stats_id(meta.channel_stats_id.clone())
-                    .with_upstream_url(Some(upstream_url.to_string()))
+                        .with_upstream_url(Some(upstream_url.to_string()))
                         .with_response_body(cap_log_body(err_text.clone())),
                     )
                     .await;
 
                     if count_429 <= max_retries {
-                        ctx.node_round_robin.fetch_add(1, Ordering::Relaxed);
-                        // 遭遇 429 时增加动态指数退避延迟（500ms ~ 1500ms），避免瞬时重试风暴击穿后续所有节点
-                        let backoff_ms = 500 + 300 * (attempt_idx as u64).min(3);
+                        node_round_robin.fetch_add(1, Ordering::Relaxed);
+                        // 上游明确给出 Retry-After 时以它为准（截到上界），否则退回指数退避。
+                        // 旧实现是线性 500+300*n（上界仅 1.4s），对上游按秒计的限流窗口太短，
+                        // 重试往往落在窗口内再次撞 429，白耗一个重试名额。
+                        let backoff_ms = retry_after
+                            .unwrap_or_else(|| exponential_backoff_ms(attempt_idx))
+                            .min(MAX_429_BACKOFF_MS);
                         tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
                         continue;
                     } else {
@@ -394,7 +429,7 @@ pub async fn execute_resilient_egress(
                             Some(node_display),
                         )
                         .with_channel_stats_id(meta.channel_stats_id.clone())
-                    .with_upstream_url(Some(upstream_url.to_string()))
+                        .with_upstream_url(Some(upstream_url.to_string()))
                         .with_response_body(cap_log_body(err_text)),
                     )
                     .await;
@@ -409,7 +444,7 @@ pub async fn execute_resilient_egress(
                     }
 
                     if attempt_idx < max_retries {
-                        ctx.node_round_robin.fetch_add(1, Ordering::Relaxed);
+                        node_round_robin.fetch_add(1, Ordering::Relaxed);
                         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                         continue;
                     } else {
@@ -441,7 +476,7 @@ pub async fn execute_resilient_egress(
                 .await;
 
                 if attempt_idx < max_retries {
-                    ctx.node_round_robin.fetch_add(1, Ordering::Relaxed);
+                    node_round_robin.fetch_add(1, Ordering::Relaxed);
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                     continue;
                 } else {
@@ -468,4 +503,3 @@ pub async fn execute_resilient_egress(
         ))
     }
 }
-

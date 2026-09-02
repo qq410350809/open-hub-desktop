@@ -5,12 +5,12 @@
 //! 非流式响应原样下发，仅旁路提取 usageMetadata 供日志统计。
 
 use super::super::egress::{self, TargetProtocol};
-use crate::model::gateway::adapters::GeminiProtocolAdapter;
 use super::super::logger::{cap_log_body, client_name_from_headers};
 use super::super::pipeline::{
     auth_and_count, dispatch_protocol_egress, resolve_channel_or_404, ClientProtocol,
 };
 use super::super::types::{generate_req_id, ModelProxyContext};
+use crate::model::gateway::adapters::GeminiProtocolAdapter;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};

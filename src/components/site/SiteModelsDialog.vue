@@ -1,10 +1,12 @@
 <script setup lang="ts">
 import { computed, ref, watch, nextTick } from "vue";
-import { runCommand, useLibrary } from "../../composables/useLibrary";
+import { runCommand } from "../../composables/useLibrary";
 import { icons } from "../../icons";
 import { useStore } from "../../composables/useStore";
 import { logoText } from "../../utils";
 import { systemTypeLabel } from "../../types";
+import { useToast } from "../../composables/core/useToast";
+import { useConfirm } from "../../composables/ui/useConfirm";
 
 interface LiveModelItem {
   id: string;
@@ -18,6 +20,7 @@ interface FetchSiteModelsResult {
   keys: string[];
   keyGroups?: Record<string, string>;
   keyModels?: Record<string, LiveModelItem[]>;
+  errors?: string[];
 }
 
 type ModelApiSource = "newapi-key" | "sub2api-key" | "pricing" | "models" | "none";
@@ -36,7 +39,8 @@ interface LiveAccountKeys {
 
 const isTauri = "__TAURI_INTERNALS__" in window;
 const store = useStore();
-const { usageSites } = useLibrary();
+const { showToast } = useToast();
+const { confirm } = useConfirm();
 const closeBtnRef = ref<HTMLButtonElement>();
 const searchQuery = ref("");
 const liveFetching = ref(false);
@@ -155,6 +159,9 @@ watch(
       searchQuery.value = "";
       apiSource.value = "none";
       selectedKeyId.value = null;
+      addingKeyForProfile.value = null;
+      newKeyGroup.value = "";
+      newKeyValue.value = "";
       void refreshModels();
     } else {
       liveFetchRequestId += 1;
@@ -173,12 +180,12 @@ function onBackdropClick(event: MouseEvent) {
   if (event.target === event.currentTarget) close();
 }
 
-async function refreshModels(mode: "cache" | "keys" | "models" = "cache") {
+async function refreshModels(mode: "cache" | "models" = "cache") {
   const requestedSite = site.value;
   if (!requestedSite) return;
   const requestId = ++liveFetchRequestId;
   liveFetching.value = true;
-  liveFetchingKind.value = mode === "keys" ? "keys" : mode === "models" ? "models" : null;
+  liveFetchingKind.value = mode === "models" ? "models" : null;
   liveError.value = "";
   liveModels.value = [];
   // 同步模型只刷新右侧模型列表：保留左侧 Key 树、来源标签与选中 Key，不重置它们。
@@ -189,95 +196,21 @@ async function refreshModels(mode: "cache" | "keys" | "models" = "cache") {
   }
   try {
     if (mode !== "cache") {
-      const siteUsage = usageSites.value.find((item) => item.siteId === requestedSite.id);
-      const sessions = siteUsage?.sessions?.filter((s) => s.isValid) ?? [];
-      let baseUrl = requestedSite.apiBaseUrl.trim();
-      if (!baseUrl.endsWith("/")) baseUrl += "/";
-      if (sessions.length === 0) {
-        // 没有有效账号，尝试不带 profileId 请求。
-        try {
-          const result = await runCommand<FetchSiteModelsResult>("fetch_site_models_json", {
-            url: baseUrl,
-            siteId: requestedSite.id,
-          });
-          // 同步 Key 成功获取数据后，保存前清理掉这个站点原来的对应旧数据，避免数据冲突与旧 Key 残留
-          if (mode === "keys") {
-            await runCommand("clear_site_model_cache_for_site", { siteId: requestedSite.id });
-          }
-          await runCommand("save_site_model_cache_for_account", {
-            siteId: requestedSite.id,
-            account: {
-              profileId: "",
-              profileName: "",
-              accountName: "",
-              username: "",
-              keys: result.keys ?? [],
-              keyGroups: result.keyGroups ?? {},
-              keyModels: result.keyModels ?? {},
-              error: "",
-            },
-            result,
-            preserveKeys: mode === "models",
-          });
-        } catch {
-          /* 忽略，继续读缓存 */
-        }
-      } else {
-        let clearedOldSiteData = false;
-        for (const session of sessions) {
-          if (requestId !== liveFetchRequestId) return;
-          if (mode === "models" && (!session.apiKeyCount || session.apiKeyCount === 0)) continue;
-          try {
-            const result = await runCommand<FetchSiteModelsResult>("fetch_site_models_json", {
-              url: baseUrl,
-              siteId: requestedSite.id,
-              profileId: session.profileId,
-            });
-            // 同步 Key 成功获取数据后，首次保存前清理掉这个站点原来的对应旧数据，避免数据冲突与旧 Key 残留
-            if (mode === "keys" && !clearedOldSiteData) {
-              await runCommand("clear_site_model_cache_for_site", { siteId: requestedSite.id });
-              clearedOldSiteData = true;
-            }
-            await runCommand("save_site_model_cache_for_account", {
-              siteId: requestedSite.id,
-              account: {
-                profileId: session.profileId,
-                profileName: session.profileName,
-                accountName: session.accountName,
-                username: session.username,
-                keys: result.keys ?? [],
-                keyGroups: result.keyGroups ?? {},
-                keyModels: result.keyModels ?? {},
-                error: "",
-              },
-              result,
-              preserveKeys: mode === "models",
-            });
-          } catch (error) {
-            await runCommand("save_site_model_cache_for_account", {
-              siteId: requestedSite.id,
-              account: {
-                profileId: session.profileId,
-                profileName: session.profileName,
-                accountName: session.accountName,
-                username: session.username,
-                keys: [],
-                keyGroups: {},
-                keyModels: {},
-                error: String(error),
-              },
-              result: null,
-              preserveKeys: mode === "models",
-            });
-          }
-        }
+      // 以缓存中的 Key 集合为准逐 Key 拉取 /v1/models（含手动添加的 Key，
+      // 与其它入口的「同步 Key」语义一致：不重建 Key 列表，只刷新模型映射）。
+      const result = await runCommand<FetchSiteModelsResult>("sync_models_for_cached_keys", {
+        siteId: requestedSite.id,
+      });
+      if (requestId !== liveFetchRequestId) return;
+      if (result.errors?.length && liveKeyCount.value === 0) {
+        liveError.value = result.errors.join("\n");
       }
     }
     await store.loadLibrary();
     const cached = await readCachedModels(requestedSite.id);
     if (requestId !== liveFetchRequestId) return;
     if (!cached) {
-      liveError.value = "暂无本地模型数据，请先执行同步会话。";
+      liveError.value = "暂无本地模型数据，请先同步或手动添加 Key。";
     } else if (liveModels.value.length === 0 && liveKeyCount.value === 0) {
       liveError.value = "本地同步数据中没有可用 Key 或模型。";
     }
@@ -342,6 +275,110 @@ function keyModelCount(key: string): number | null {
   }
   return null;
 }
+
+// —— 手动管理 Key ——
+/** 正在添加 Key 的账号（profileId），控制行内输入框显示。 */
+const addingKeyForProfile = ref<string | null>(null);
+const newKeyGroup = ref("");
+const newKeyValue = ref("");
+const newKeySaving = ref(false);
+/** 正在删除的 Key（账号-键），控制删除按钮禁用态。 */
+const removingKeyId = ref<string | null>(null);
+
+function startAddKey(account: LiveAccountKeys) {
+  addingKeyForProfile.value = account.profileId || account.accountName || "";
+  newKeyGroup.value = "";
+  newKeyValue.value = "";
+}
+
+function cancelAddKey() {
+  addingKeyForProfile.value = null;
+  newKeyGroup.value = "";
+  newKeyValue.value = "";
+}
+
+/** 某账号是否处于「正在添加 Key」状态。 */
+function isAddingKey(account: LiveAccountKeys): boolean {
+  return addingKeyForProfile.value === (account.profileId || account.accountName || "");
+}
+
+function accountProfileId(account: LiveAccountKeys): string {
+  return account.profileId || account.accountName || "";
+}
+
+async function submitAddKey(account: LiveAccountKeys) {
+  const siteId = site.value?.id;
+  const profileId = account.profileId || "";
+  const group = newKeyGroup.value.trim();
+  // 支持一次粘贴多个 Key：按换行/逗号/分号切分
+  const keys = newKeyValue.value
+    .split(/[\n,;，；]/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+  if (!siteId) return;
+  if (keys.length === 0) {
+    showToast("请输入要添加的 Key", true);
+    return;
+  }
+  newKeySaving.value = true;
+  try {
+    let addedCount = 0;
+    for (const key of keys) {
+      const added = await runCommand<boolean>("add_site_model_cache_key", {
+        siteId,
+        profileId,
+        key,
+        groupName: group,
+        profileName: account.profileName || "",
+        username: account.username || account.accountName || "",
+      });
+      if (added) addedCount += 1;
+    }
+    addingKeyForProfile.value = null;
+    newKeyGroup.value = "";
+    newKeyValue.value = "";
+    await store.loadLibrary();
+    await readCachedModels(siteId);
+    showToast(
+      keys.length > addedCount
+        ? `已添加 ${addedCount} 个 Key，${keys.length - addedCount} 个已存在被跳过`
+        : `已添加 ${addedCount} 个 Key`,
+    );
+  } catch (error) {
+    showToast(`添加 Key 失败：${String(error)}`, true);
+  } finally {
+    newKeySaving.value = false;
+  }
+}
+
+async function removeKey(account: LiveAccountKeys, key: string) {
+  const siteId = site.value?.id;
+  const profileId = account.profileId || "";
+  if (!siteId) return;
+  const ok = await confirm({
+    title: "删除 API Key",
+    message: `确定删除 Key「${maskApiKey(key)}」吗？该 Key 的分组与模型数据将一并移除。`,
+    confirmText: "删除",
+    danger: true,
+  });
+  if (!ok) return;
+  removingKeyId.value = `${profileId}:${key}`;
+  try {
+    await runCommand<boolean>("remove_site_model_cache_key", {
+      siteId,
+      profileId,
+      key,
+    });
+    if (selectedKeyId.value === key) selectedKeyId.value = null;
+    await store.loadLibrary();
+    await readCachedModels(siteId);
+    showToast("Key 已删除");
+  } catch (error) {
+    showToast(`删除 Key 失败：${String(error)}`, true);
+  } finally {
+    removingKeyId.value = null;
+  }
+}
 </script>
 
 <template>
@@ -371,16 +408,6 @@ function keyModelCount(key: string): number | null {
           </div>
 
           <div class="site-models-actions">
-            <button
-              type="button"
-              class="site-models-icon-btn"
-              :disabled="liveFetching"
-              :aria-label="liveFetchingKind === 'keys' ? '正在同步 Key' : '同步 Key：拉取站点 API Key 列表'"
-              title="同步 Key：拉取站点 API Key 列表"
-              @click="refreshModels('keys')"
-            >
-              <span v-html="icons.key" :class="{ 'site-models-spin': liveFetchingKind === 'keys' }" />
-            </button>
             <button
               type="button"
               class="site-models-icon-btn"
@@ -437,6 +464,52 @@ function keyModelCount(key: string): number | null {
                           >
                         </strong>
                         <small>{{ account.keys.length }}</small>
+                        <button
+                          type="button"
+                          class="site-models-key-manage"
+                          :aria-label="`为 ${accountLabel(account)} 添加 API Key`"
+                          title="添加 Key"
+                          @click.stop="startAddKey(account)"
+                        >
+                          <span v-html="icons.plus" />
+                        </button>
+                      </div>
+                      <div v-if="isAddingKey(account)" class="site-models-key-add">
+                        <input
+                          v-model="newKeyGroup"
+                          type="text"
+                          class="site-models-key-add-group"
+                          placeholder="分组名"
+                          :disabled="newKeySaving"
+                          @keydown.enter.prevent="submitAddKey(account)"
+                          @keydown.esc.prevent="cancelAddKey"
+                        />
+                        <textarea
+                          v-model="newKeyValue"
+                          class="site-models-key-add-value"
+                          rows="2"
+                          placeholder="粘贴 API Key，可一次粘贴多个（换行/逗号分隔）"
+                          :disabled="newKeySaving"
+                          @keydown.enter.exact.prevent="submitAddKey(account)"
+                          @keydown.esc.prevent="cancelAddKey"
+                        />
+                        <button
+                          type="button"
+                          class="site-models-key-add-confirm"
+                          :disabled="newKeySaving || !newKeyValue.trim()"
+                          title="确认添加"
+                          @click="submitAddKey(account)"
+                        >
+                          <span v-html="icons.check" />
+                        </button>
+                        <button
+                          type="button"
+                          class="site-models-key-add-cancel"
+                          :disabled="newKeySaving"
+                          title="取消"
+                          @click="cancelAddKey"
+                          v-html="icons.close"
+                        />
                       </div>
                       <div class="site-models-tree-children">
                         <template v-if="account.keys.length > 0">
@@ -468,6 +541,16 @@ function keyModelCount(key: string): number | null {
                               @click.stop="copyApiKey(key, keyIndex, accountLabel(account))"
                             >
                               <span v-html="icons.copy" />
+                            </button>
+                            <button
+                              type="button"
+                              class="site-models-copy site-models-key-remove"
+                              :disabled="removingKeyId === `${accountProfileId(account)}:${key}`"
+                              :aria-label="`删除 ${accountLabel(account)} 的 API Key ${keyIndex + 1}`"
+                              title="删除 Key"
+                              @click.stop="removeKey(account, key)"
+                            >
+                              <span v-html="icons.trash" />
                             </button>
                           </div>
                         </template>

@@ -15,6 +15,7 @@ import type {
   SyncSitesProgress,
   SyncSitesResult,
 } from "../../types";
+import { isUnknownSystemType } from "../../types";
 
 const { sites, usageSites, loadLibrary } = useLibrary();
 const { showToast } = useToast();
@@ -192,15 +193,24 @@ function openSyncDialog(
   syncDialogMode.value = explicitMode ?? (quotaMode ? "quota" : "remote");
   syncDialogUsage.value = explicitUsage ?? (usageFilter.value === "pending" ? "pending" : "personal");
   if (explicitSiteIds && explicitSiteIds.length > 0) {
-    syncDialogSiteIds.value = [...explicitSiteIds];
+    // 额度同步只针对可识别架构的站点；未知站点无签到/额度能力，直接排除
+    syncDialogSiteIds.value = syncDialogMode.value === "quota"
+      ? explicitSiteIds.filter((id) => {
+          const site = sites.value.find((s) => s.id === id);
+          return site ? !isUnknownSystemType(site.systemType) : false;
+        })
+      : [...explicitSiteIds];
   } else if (syncDialogMode.value === "quota") {
     const targetUsage = syncDialogUsage.value;
     const targetSites = sites.value.filter((site) =>
-      targetUsage === "pending" ? site.isPending : site.isPersonal,
+      (targetUsage === "pending" ? site.isPending : site.isPersonal) &&
+      !isUnknownSystemType(site.systemType),
     );
     syncDialogSiteIds.value = targetSites.length > 0
       ? targetSites.map((s) => s.id)
-      : filteredSites.value.map((s) => s.id);
+      : filteredSites.value
+          .filter((s) => !isUnknownSystemType(s.systemType))
+          .map((s) => s.id);
   } else {
     syncDialogSiteIds.value = filteredSites.value.map((site) => site.id);
   }

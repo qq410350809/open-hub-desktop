@@ -1,6 +1,7 @@
 use super::policies::opencode::strip_opencode_prefix;
 use super::types::{
-    current_timestamp, ChannelConfig, ModelProxyConfig, ModelProxyContext, ProxyRequestLog,
+    current_timestamp, default_key_group_mode, ChannelConfig, ModelProxyConfig, ModelProxyContext,
+    ProxyRequestLog, KEY_GROUP_MODE_INDEPENDENT,
 };
 use serde_json::Value as JsonValue;
 use std::collections::HashSet;
@@ -10,12 +11,9 @@ use tracing::warn;
 
 /// 渠道是否对外暴露指定模型：白名单为空(None) = 全部暴露，否则须包含该模型（大小写不敏感）
 fn channel_exposes_model(channel: &ChannelConfig, model: &str) -> bool {
-    channel
-        .enabled_models
-        .as_ref()
-        .map_or(true, |models| {
-            models.iter().any(|m| m.eq_ignore_ascii_case(model))
-        })
+    channel.enabled_models.as_ref().map_or(true, |models| {
+        models.iter().any(|m| m.eq_ignore_ascii_case(model))
+    })
 }
 
 /// 根据请求模型名解析目标渠道与发送给上游的裸模型名。
@@ -89,6 +87,107 @@ pub fn resolve_channel<'a>(
     None
 }
 
+/// 解析该模型的**全部**可用渠道，按与 `resolve_channel` 一致的优先级排序。
+///
+/// 返回列表的首项恒等于 `resolve_channel` 的结果，其后是可用于跨渠道故障转移的
+/// 后备渠道。用于「首选渠道的 Key 与出口全部耗尽后，切换到另一个同样提供该模型
+/// 的渠道」——单渠道的全部候选失败不再直接判定请求失败。
+///
+/// 显式带别名前缀（`alias/model`）的请求是用户的定向指派，不参与故障转移：
+/// 此时只返回该渠道自身。
+pub fn resolve_channel_candidates<'a>(
+    config: &'a ModelProxyConfig,
+    raw_model: &str,
+) -> Vec<(&'a ChannelConfig, String)> {
+    // 带前缀 = 定向指派，不扩展后备渠道（与 resolve_channel 规则 1 对齐）
+    if let Some((prefix, rest)) = raw_model.split_once('/') {
+        if let Some(ch) = config
+            .channels
+            .iter()
+            .find(|c| c.enabled && c.effective_alias().eq_ignore_ascii_case(prefix))
+        {
+            return vec![(ch, rest.to_string())];
+        }
+    }
+
+    let stripped = strip_opencode_prefix(raw_model);
+    let mut ordered: Vec<&'a ChannelConfig> = Vec::new();
+    let push = |ch: &'a ChannelConfig, out: &mut Vec<&'a ChannelConfig>| {
+        if !out.iter().any(|c| c.id == ch.id) {
+            out.push(ch);
+        }
+    };
+
+    // 1. 用户配置的重叠模型路由顺序：整条列表都是候选，而非只取首个
+    if let Some(order) = &config.model_channel_order {
+        let ids = order
+            .get(&raw_model.to_lowercase())
+            .or_else(|| order.get(&stripped.to_lowercase()));
+        if let Some(ids) = ids {
+            for channel_id in ids {
+                if let Some(ch) = config.channels.iter().find(|c| {
+                    c.enabled && &c.id == channel_id && channel_exposes_model(c, stripped)
+                }) {
+                    push(ch, &mut ordered);
+                }
+            }
+        }
+    }
+
+    // 2. 白名单显式勾选该模型的渠道（配置数组序）
+    for ch in config.channels.iter().filter(|c| {
+        c.enabled
+            && c.enabled_models.as_ref().is_some_and(|models| {
+                models
+                    .iter()
+                    .any(|m| m.eq_ignore_ascii_case(stripped) || m.eq_ignore_ascii_case(raw_model))
+            })
+    }) {
+        push(ch, &mut ordered);
+    }
+
+    // 3. 默认 opencode 渠道
+    if let Some(ch) = config
+        .channels
+        .iter()
+        .find(|c| c.id == "opencode" && c.enabled)
+    {
+        push(ch, &mut ordered);
+    }
+
+    // 4. 其余启用渠道中「未设白名单」的（白名单为 None = 全部暴露，故也能承接该模型）。
+    //    设了白名单但不含该模型的渠道被排除：它们无法处理这个请求。
+    for ch in config
+        .channels
+        .iter()
+        .filter(|c| c.enabled && c.enabled_models.is_none())
+    {
+        push(ch, &mut ordered);
+    }
+
+    ordered
+        .into_iter()
+        .map(|ch| (ch, stripped.to_string()))
+        .collect()
+}
+
+/// 无分组 Key 归入的兜底分组 ID。
+pub const DEFAULT_KEY_GROUP_ID: &str = "default";
+
+/// 手动添加 Key 时落库的兜底组名（见 catalog::fetcher::add_site_model_cache_key），
+/// 与自动同步下发的「无分组」语义等价，需归一到同一个组，否则两批 Key 会被拆成两组。
+const DEFAULT_KEY_GROUP_ALIAS: &str = "默认分组";
+
+/// 归一化 Key 的分组名：空值与「默认分组」别名统一落到 DEFAULT_KEY_GROUP_ID。
+pub fn normalize_key_group_id(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed == DEFAULT_KEY_GROUP_ALIAS {
+        DEFAULT_KEY_GROUP_ID.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 /// Key 的元数据描述，用于分组和模型支持度匹配
 #[derive(Debug, Clone)]
 pub struct ChannelKeyInfo {
@@ -140,12 +239,9 @@ pub async fn load_channel_all_keys_info(
                                     .filter(|k| !k.is_empty());
                                 if let Some(k) = key {
                                     if seen.insert(k.to_string()) {
-                                        let group = groups_map
-                                            .get(k)
-                                            .map(|s| s.trim())
-                                            .filter(|s| !s.is_empty())
-                                            .unwrap_or("default")
-                                            .to_string();
+                                        let group = normalize_key_group_id(
+                                            groups_map.get(k).map_or("", String::as_str),
+                                        );
                                         let supported_models = key_models_map.get(k).map(|models| {
                                             models
                                                 .iter()
@@ -175,7 +271,7 @@ pub async fn load_channel_all_keys_info(
             if seen.insert(k.clone()) {
                 raw_keys.push(ChannelKeyInfo {
                     key: k,
-                    group_id: "default".to_string(),
+                    group_id: DEFAULT_KEY_GROUP_ID.to_string(),
                     enabled: true,
                     supported_models: None,
                 });
@@ -187,8 +283,9 @@ pub async fn load_channel_all_keys_info(
     if let Some(rules) = &channel.key_rules {
         for rule in rules {
             if let Some(info) = raw_keys.iter_mut().find(|k| k.key == rule.key) {
+                // 规则里的 group_id 为空 = 不覆盖，沿用 Key 自身 groupName 决定的分组
                 if !rule.group_id.trim().is_empty() {
-                    info.group_id = rule.group_id.trim().to_string();
+                    info.group_id = normalize_key_group_id(&rule.group_id);
                 }
                 info.enabled = rule.enabled;
                 if rule.supported_models.is_some() {
@@ -198,11 +295,7 @@ pub async fn load_channel_all_keys_info(
                 // 如果是用户手动新增但不在同步缓存里的 Key，也予以纳入
                 raw_keys.push(ChannelKeyInfo {
                     key: rule.key.clone(),
-                    group_id: if rule.group_id.trim().is_empty() {
-                        "default".to_string()
-                    } else {
-                        rule.group_id.trim().to_string()
-                    },
+                    group_id: normalize_key_group_id(&rule.group_id),
                     enabled: rule.enabled,
                     supported_models: rule.supported_models.clone(),
                 });
@@ -213,14 +306,34 @@ pub async fn load_channel_all_keys_info(
     raw_keys
 }
 
+/// 一个已解析的候选 Key 分组：组身份 + 调度模式 + 组内可用 Key（有序）。
+#[derive(Debug, Clone)]
+pub struct ResolvedKeyGroup {
+    /// 分组 ID（等于 Key 的 groupName）
+    #[allow(dead_code)]
+    pub id: String,
+    /// 分组展示名；未显式配置时回退为 id
+    pub name: String,
+    /// round_robin = 组内逐请求轮询；independent = 黏住首个 Key，失败才顺延组内下一个
+    pub mode: String,
+    /// 组内支持该模型且启用的 Key，按配置顺序排列
+    pub keys: Vec<String>,
+}
+
+impl ResolvedKeyGroup {
+    pub fn is_independent(&self) -> bool {
+        self.mode == KEY_GROUP_MODE_INDEPENDENT
+    }
+}
+
 /// 根据请求的模型名称，按「分组优先级」解析出候选 Key 分组队列。
-/// 返回：`Vec<Vec<String>>`，外层为分组优先级序列（按顺序故障转移 Failover），
-/// 内层为该组内支持该模型的可用 Key 列表（组内 Round-Robin 轮询）。
+/// 外层为分组优先级序列（按顺序故障转移 Failover），内层为该组内支持该模型的可用 Key，
+/// 组内取用顺序由该组的 `mode` 决定（轮询 / 独立黏性）。
 pub async fn resolve_channel_key_groups_for_model(
     ctx: &ModelProxyContext,
     channel: &ChannelConfig,
     model: &str,
-) -> Vec<Vec<String>> {
+) -> Vec<ResolvedKeyGroup> {
     let all_keys = load_channel_all_keys_info(ctx, channel).await;
     if all_keys.is_empty() {
         return Vec::new();
@@ -248,7 +361,9 @@ pub async fn resolve_channel_key_groups_for_model(
             // 检查模型支持度：None 表示全部支持
             if let Some(supported) = &k.supported_models {
                 if !supported.is_empty()
-                    && !supported.iter().any(|m| m.trim().eq_ignore_ascii_case(&model_lower))
+                    && !supported
+                        .iter()
+                        .any(|m| m.trim().eq_ignore_ascii_case(&model_lower))
                 {
                     return false;
                 }
@@ -275,17 +390,30 @@ pub async fn resolve_channel_key_groups_for_model(
         }
     }
 
-    // 4. 构建外层为分组、内层为 Key 列表的二层结构
-    let mut result: Vec<Vec<String>> = Vec::new();
+    // 4. 构建「分组 → 组内 Key」结构，并带上该组的展示名与调度模式
+    let mut result: Vec<ResolvedKeyGroup> = Vec::new();
     for gid in ordered_groups {
         let group_keys: Vec<String> = valid_keys
             .iter()
             .filter(|k| k.group_id == gid)
             .map(|k| k.key.clone())
             .collect();
-        if !group_keys.is_empty() {
-            result.push(group_keys);
+        if group_keys.is_empty() {
+            continue;
         }
+        let defined = defined_groups.iter().find(|g| g.id == gid);
+        result.push(ResolvedKeyGroup {
+            name: defined
+                .map(|g| g.name.clone())
+                .filter(|n| !n.trim().is_empty())
+                .unwrap_or_else(|| gid.clone()),
+            mode: defined
+                .map(|g| g.mode.clone())
+                .filter(|m| m == KEY_GROUP_MODE_INDEPENDENT)
+                .unwrap_or_else(default_key_group_mode),
+            id: gid,
+            keys: group_keys,
+        });
     }
 
     result
@@ -410,18 +538,34 @@ pub async fn get_sorted_egress_candidates(
         if mode == "direct" {
             return vec!["__direct__".to_string()];
         }
-        if mode == "fixed" {
+        // custom_node（旧 fixed 值已在加载侧归一）：恒定使用单一出口节点（不直连、不轮换）
+        if mode == "custom_node" || mode == "fixed" {
             if let Some(ref node) = rule.node_id {
                 let node = node.trim();
                 if !node.is_empty() {
                     return vec![node.to_string()];
                 }
             }
-            // 未指定节点时锁定池内首个启用节点（与渠道级固定节点语义一致）
+            // 未指定节点时锁定池内首个启用节点（与渠道级自定义节点语义一致）
             if let Some(first) = first_enabled_pool_node(ctx).await {
                 return vec![first];
             }
             return vec!["__direct__".to_string()];
+        }
+        // fixed_channel：恒定走通道专用 lane 出口；未显式绑定时沿用 Key 绑定 / 渠道默认通道
+        if mode == "fixed_channel" {
+            let channel_id = rule
+                .channel_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .or_else(|| channel.key_fixed_channel(api_key))
+                .or_else(|| channel.default_fixed_channel());
+            return match channel_id {
+                Some(id) => vec![format!("__proxy_channel__:{id}")],
+                None => vec!["__direct__".to_string()],
+            };
         }
         if mode == "pool" {
             let mut candidates = vec!["__direct__".to_string()];

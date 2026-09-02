@@ -11,8 +11,8 @@ use crate::proxypool::rotator::{
 use crate::proxypool::runtime::{
     controller_client, ensure_channel_instance, ensure_default_proxy_channel,
     ensure_global_runtime, ensure_runtime, is_slow_or_blocked_speed_test_url, load_state,
-    row_subscription, runtime_controller_port, runtime_nodes, runtime_proxy_url,
-    select_group_node, select_runtime_node, write_meta,
+    row_subscription, runtime_controller_port, runtime_nodes, runtime_proxy_url, select_group_node,
+    select_runtime_node, write_meta,
 };
 use crate::proxypool::tester::{
     apply_exit_ip_geoip, controller_proxy_delay, download_throughput_probe,
@@ -584,8 +584,7 @@ pub async fn test_proxy_channel_nodes(
         return Err("代理池中没有可测试的节点，请先添加或启用节点".to_string());
     }
 
-    run_proxy_node_pool(&bus, database, runtime, Some(requested), true)
-        .await?;
+    run_proxy_node_pool(&bus, database, runtime, Some(requested), true).await?;
     load_state(database, runtime)
 }
 

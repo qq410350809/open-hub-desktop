@@ -231,10 +231,7 @@ pub async fn handle_chat_completions(
                 ctx.metrics.total_tokens.fetch_add(t, Ordering::Relaxed);
             }
 
-            return egress::copy_upstream_headers(
-                &upstream_headers,
-                Json(jv).into_response(),
-            );
+            return egress::copy_upstream_headers(&upstream_headers, Json(jv).into_response());
         }
 
         let mut final_log = log;

@@ -128,7 +128,15 @@ pub fn append_charity_sync_log(
             "INSERT INTO charity_sync_logs
              (feed_id, feed_name, stage, status, message, node_name, duration_ms, detail_json)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7)",
-            params![feed_id, feed_name, stage, status, message, node_name, detail_json],
+            params![
+                feed_id,
+                feed_name,
+                stage,
+                status,
+                message,
+                node_name,
+                detail_json
+            ],
         )
         .is_err()
     {
@@ -230,7 +238,15 @@ pub fn finish_charity_sync_log(
             "unread": unread_count,
         })
         .to_string();
-        update_charity_sync_log(database, id, status, message, node_name, duration_ms, &detail_json);
+        update_charity_sync_log(
+            database,
+            id,
+            status,
+            message,
+            node_name,
+            duration_ms,
+            &detail_json,
+        );
     }
     emit_charity_progress(
         bus,
@@ -498,6 +514,15 @@ pub fn load_all_feed_items_from_db(
     let limit = limit.clamp(1, CHARITY_PAGE_LIMIT_MAX);
     let filter_clause = charity_filter_clause(filter);
     let connection = database.lock_conn()?;
+    // 「全部」是前端聚合的虚拟标签，没有自己的 meta 键；取各真实 feed 里最新的同步时间。
+    let fetched_at = connection
+        .query_row(
+            "SELECT COALESCE(MAX(value), '') FROM app_meta
+             WHERE key LIKE 'charity_feed_last_fetched_at:%'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|error| error.to_string())?;
     let key_pat = format!("%{}%", keyword.trim());
     let has_key = !keyword.trim().is_empty();
     let total_count = if has_key {
@@ -630,7 +655,7 @@ pub fn load_all_feed_items_from_db(
         feed_id: "all".into(),
         feed_name: "全部".into(),
         items,
-        fetched_at: String::new(),
+        fetched_at,
         changed: false,
         new_count: 0,
         updated_count: 0,

@@ -27,19 +27,12 @@ pub async fn get_charity_feed(
         });
     }
     let source = charity_feed_source(&database, requested)?;
-    let mut result = tokio::task::block_in_place(|| {
+    // 不再把后台轮询的 last_errors 贴到查询结果上：切标签是纯读库操作，
+    // 附带上一轮同步的失败消息会让人误以为点击本身触发了网络请求。
+    // 同步失败已由 charity_sync_logs 记录，前端从同步日志查看。
+    let result = tokio::task::block_in_place(|| {
         load_feed_items_from_db(&database, &source, offset, limit, &keyword, &filter)
     })?;
-    if let Ok(errors) = ctx.charity_runtime.last_errors.lock() {
-        if let Some(message) = errors.get(&source.id) {
-            if result.message.is_empty() {
-                result.message = message.clone();
-                if result.status == "local" {
-                    result.status = "error".into();
-                }
-            }
-        }
-    }
     Ok(result)
 }
 
@@ -82,7 +75,7 @@ pub async fn get_charity_today_count(ctx: Managed<'_, Arc<AppContext>>) -> Resul
         let connection = database.lock_conn()?;
         let count = connection
             .query_row(
-                "SELECT COUNT(*) FROM charity_feed_items
+                "SELECT COUNT(DISTINCT guid) FROM charity_feed_items
                  WHERE published_at IS NOT NULL
                    AND unixepoch(published_at) >= ?1
                    AND unixepoch(published_at) < ?2",

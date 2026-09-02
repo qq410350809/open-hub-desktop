@@ -634,7 +634,10 @@ fn copilot_model_normalization_cleans_vendor_and_provider_prefixes() {
         "big-pickle"
     );
     // 纯净模型名不受清洗影响
-    assert_eq!(normalize_copilot_model_name("ox-alpha-free"), "ox-alpha-free");
+    assert_eq!(
+        normalize_copilot_model_name("ox-alpha-free"),
+        "ox-alpha-free"
+    );
     assert_eq!(
         normalize_copilot_model_name("agent-host-claude:@provider=anthropic:sonnet"),
         "claude-3-7-sonnet"
@@ -732,12 +735,9 @@ fn copilot_delta_operation_log_replays_requests() {
             }]
         })
         .to_string(),
-        json!({ "kind": 1, "k": ["requests", 0, "promptTokens"], "v": 3200 })
-            .to_string(),
-        json!({ "kind": 1, "k": ["requests", 0, "completionTokens"], "v": 480 })
-            .to_string(),
-        json!({ "kind": 1, "k": ["requests", 0, "cachedTokens"], "v": 800 })
-            .to_string(),
+        json!({ "kind": 1, "k": ["requests", 0, "promptTokens"], "v": 3200 }).to_string(),
+        json!({ "kind": 1, "k": ["requests", 0, "completionTokens"], "v": 480 }).to_string(),
+        json!({ "kind": 1, "k": ["requests", 0, "cachedTokens"], "v": 800 }).to_string(),
         // 第二条请求：无显式 token，应按文本长度估算。
         json!({
             "kind": 2,
@@ -1098,13 +1098,9 @@ fn catpawai_real_db_parses_if_exists() {
     }
 }
 
-
 #[test]
 fn copilot_transcript_counts_every_agent_turn_as_request() {
-    let dir = std::env::temp_dir().join(format!(
-        "openhub-test-transcript-{}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("openhub-test-transcript-{}", std::process::id()));
     let transcripts = dir
         .join("ws-hash")
         .join("GitHub.copilot-chat")
@@ -1151,10 +1147,7 @@ fn copilot_transcript_counts_every_agent_turn_as_request() {
 
 #[test]
 fn vscode_opencode_log_parses_precise_usage_with_cache_hits() {
-    let dir = std::env::temp_dir().join(format!(
-        "openhub-test-oclog-{}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("openhub-test-oclog-{}", std::process::id()));
     let output_dir = dir.join("output_logging_20260825T093509");
     fs::create_dir_all(&output_dir).unwrap();
     let path = output_dir.join("6-OpenCode.log");

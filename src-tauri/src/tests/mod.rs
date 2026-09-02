@@ -257,6 +257,77 @@ fn rebuilds_cached_site_accounts_from_sqlite() {
 }
 
 #[test]
+fn cached_usage_sites_exclude_site_level_key_cache_rows() {
+    // site_model_cache 里 profile_id='' 的行是站点级 Key 缓存（无 Chrome 账号
+    // 时拉取/手动管理的 Key），不是会话：必须从 usageSites 中剔除，否则前端
+    // 会渲染出只有时间戳的幽灵账号行。read_cached_usage_sites 依赖的表结构
+    // 与外键用最小 schema 复刻即可。
+    let connection = Connection::open_in_memory().unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE directory_sites (
+                    id TEXT PRIMARY KEY,
+                    is_runaway INTEGER NOT NULL DEFAULT 0
+                 );
+                 CREATE TABLE site_accounts (
+                    site_id TEXT NOT NULL,
+                    profile_id TEXT NOT NULL,
+                    domain TEXT NOT NULL DEFAULT '',
+                    cookie_count INTEGER NOT NULL DEFAULT 0,
+                    cookie_names TEXT NOT NULL DEFAULT '[]',
+                    profile_name TEXT NOT NULL DEFAULT '',
+                    account_name TEXT NOT NULL DEFAULT '',
+                    username TEXT NOT NULL DEFAULT '',
+                    api_key_count INTEGER NOT NULL DEFAULT 0,
+                    api_model_count INTEGER NOT NULL DEFAULT 0,
+                    remaining REAL,
+                    used REAL,
+                    total REAL,
+                    unit TEXT NOT NULL DEFAULT '',
+                    is_valid INTEGER NOT NULL DEFAULT 1,
+                    sync_error TEXT NOT NULL DEFAULT '',
+                    checkin_enabled INTEGER NOT NULL DEFAULT 0,
+                    checked_in_today INTEGER NOT NULL DEFAULT 0,
+                    checkin_date TEXT NOT NULL DEFAULT '',
+                    checkin_error TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    newapi_token TEXT NOT NULL DEFAULT '',
+                    newapi_user_id TEXT NOT NULL DEFAULT '',
+                    browser_fallback_failed_at INTEGER NOT NULL DEFAULT 0,
+                    browser_fallback_fail_count INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (site_id, profile_id)
+                 );
+                 CREATE TABLE site_model_cache (
+                    site_id TEXT NOT NULL,
+                    profile_id TEXT NOT NULL,
+                    profile_name TEXT NOT NULL DEFAULT '',
+                    account_name TEXT NOT NULL DEFAULT '',
+                    username TEXT NOT NULL DEFAULT '',
+                    api_source TEXT NOT NULL DEFAULT '',
+                    keys_json TEXT NOT NULL DEFAULT '[]',
+                    groups_json TEXT NOT NULL DEFAULT '{}',
+                    models_json TEXT NOT NULL DEFAULT '[]',
+                    key_models_json TEXT NOT NULL DEFAULT '{}',
+                    error TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (site_id, profile_id)
+                 );
+                 INSERT INTO directory_sites (id) VALUES ('site-a');
+                 INSERT INTO site_accounts (site_id, profile_id, domain, cookie_count, cookie_names, profile_name, account_name)
+                    VALUES ('site-a', 'Profile 11', 'a.example', 1, '[\"session\"]', 'Profile 11', 'a@example.com');
+                 INSERT INTO site_model_cache (site_id, profile_id, keys_json)
+                    VALUES ('site-a', '', '[\"sk-site-level\"]');",
+        )
+        .unwrap();
+
+    let cached = read_cached_usage_sites(&connection).unwrap();
+    assert_eq!(cached.len(), 1, "站点级缓存行不得成为独立会话");
+    assert_eq!(cached[0].site_id, "site-a");
+    assert_eq!(cached[0].sessions.len(), 1);
+    assert_eq!(cached[0].sessions[0].profile_id, "Profile 11");
+}
+
+#[test]
 fn resets_stale_checkin_state_when_local_date_changes() {
     let connection = Connection::open_in_memory().unwrap();
     connection

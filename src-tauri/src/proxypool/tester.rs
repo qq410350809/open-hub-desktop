@@ -11,8 +11,8 @@ use rusqlite::params;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::warn;
 use url::Url;
@@ -119,8 +119,8 @@ pub(crate) async fn download_throughput_probe(proxy_url: String, target: String)
     // 网速 = 峰值桶字节 ÷ 50ms；channel_latency_ms 存等效 500KB 耗时
     if total >= SPEED_TEST_MIN_SAMPLE_BYTES as i64 && peak > 0 {
         Some(
-            (SPEED_TEST_REF_BYTES as f64 * SPEED_TEST_PEAK_BUCKET_MS as f64 / peak as f64)
-                .round() as i64,
+            (SPEED_TEST_REF_BYTES as f64 * SPEED_TEST_PEAK_BUCKET_MS as f64 / peak as f64).round()
+                as i64,
         )
     } else {
         None
@@ -162,8 +162,7 @@ pub(crate) async fn controller_proxy_delay(
     proxy_name: &str,
     url: &str,
 ) -> Option<i64> {
-    let mut endpoint =
-        Url::parse(&controller_url(controller_port, "/proxies/")).ok()?;
+    let mut endpoint = Url::parse(&controller_url(controller_port, "/proxies/")).ok()?;
     append_controller_path(&mut endpoint, &[proxy_name, "delay"]).ok()?;
     endpoint
         .query_pairs_mut()
@@ -228,7 +227,9 @@ async fn ip_echo_latency(proxy_url: &str, echo_url: &str) -> EchoProbeOutcome {
         Some(ip.to_string())
     };
     match tokio::time::timeout(Duration::from_millis(LANE_DELAY_TIMEOUT_MS), fetch).await {
-        Ok(Some(exit_ip)) => EchoProbeOutcome::Success(started.elapsed().as_millis() as i64, exit_ip),
+        Ok(Some(exit_ip)) => {
+            EchoProbeOutcome::Success(started.elapsed().as_millis() as i64, exit_ip)
+        }
         Ok(None) => EchoProbeOutcome::BadResponse,
         Err(_) => EchoProbeOutcome::Unreachable,
     }
@@ -341,26 +342,24 @@ pub async fn run_proxy_node_pool(
     let full_success_sql = "UPDATE proxy_pool_nodes SET latency_ms=?2, test_status='success', channel_latency_ms=?3, channel_test_status='success', channel_tested_at=CURRENT_TIMESTAMP, tested_at=CURRENT_TIMESTAMP WHERE id=?1";
     let header_only_sql = "UPDATE proxy_pool_nodes SET latency_ms=?2, test_status='success', channel_latency_ms=NULL, channel_test_status='error', channel_tested_at=CURRENT_TIMESTAMP, tested_at=CURRENT_TIMESTAMP WHERE id=?1";
     let fail_sql = "UPDATE proxy_pool_nodes SET latency_ms=NULL, test_status='error', channel_latency_ms=NULL, channel_test_status='error', channel_tested_at=CURRENT_TIMESTAMP, tested_at=CURRENT_TIMESTAMP WHERE id=?1";
-    let write_probe_result = |node_id: &str,
-                              ttfb: Option<i64>,
-                              download_ms: Option<i64>|
-     -> Result<(), String> {
-        let connection = database.lock_conn()?;
-        if let (Some(ttfb), Some(download_ms)) = (ttfb, download_ms) {
-            connection
-                .execute(full_success_sql, params![node_id, ttfb, download_ms])
-                .map_err(|error| error.to_string())?;
-        } else if let Some(ttfb) = ttfb {
-            connection
-                .execute(header_only_sql, params![node_id, ttfb])
-                .map_err(|error| error.to_string())?;
-        } else {
-            connection
-                .execute(fail_sql, [node_id])
-                .map_err(|error| error.to_string())?;
-        }
-        Ok(())
-    };
+    let write_probe_result =
+        |node_id: &str, ttfb: Option<i64>, download_ms: Option<i64>| -> Result<(), String> {
+            let connection = database.lock_conn()?;
+            if let (Some(ttfb), Some(download_ms)) = (ttfb, download_ms) {
+                connection
+                    .execute(full_success_sql, params![node_id, ttfb, download_ms])
+                    .map_err(|error| error.to_string())?;
+            } else if let Some(ttfb) = ttfb {
+                connection
+                    .execute(header_only_sql, params![node_id, ttfb])
+                    .map_err(|error| error.to_string())?;
+            } else {
+                connection
+                    .execute(fail_sql, [node_id])
+                    .map_err(|error| error.to_string())?;
+            }
+            Ok(())
+        };
 
     let completed = Arc::new(AtomicUsize::new(0));
     let client = controller_client()?;

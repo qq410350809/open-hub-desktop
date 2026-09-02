@@ -15,6 +15,7 @@ import type {
 } from "../../types";
 import {
   SYSTEM_TYPES,
+  isUnknownSystemType,
   isNewApiCompatible,
   normalizeSystemType,
   systemTypeLabel,
@@ -161,14 +162,19 @@ const metrics = computed(() => {
   let accountsWithQuota = 0;
 
   const usageMap = store.chromeUsageAccounts.value;
+  // 未知架构站点不参与告警/签到/额度统计
+  const unknownSiteIds = new Set(
+    store.sites.value.filter((s) => isUnknownSite(s)).map((s) => s.id),
+  );
   for (const siteId of Object.keys(usageMap)) {
+    const isUnknown = unknownSiteIds.has(siteId);
     const sessions = usageMap[siteId] ?? [];
     for (const session of sessions) {
-      totalAccounts += 1;
+      if (!isUnknown) totalAccounts += 1;
       if (session.hasAccessToken) accountsWithTokens += 1;
       if (session.checkedInToday) checkedInAccounts += 1;
-      if (session.syncError || session.checkinError) errorAccounts += 1;
-      if (session.remaining !== null && Number.isFinite(session.remaining)) {
+      if (!isUnknown && (session.syncError || session.checkinError)) errorAccounts += 1;
+      if (!isUnknown && session.remaining !== null && Number.isFinite(session.remaining)) {
         totalQuotaNumber += session.remaining;
         accountsWithQuota += 1;
       }
@@ -319,6 +325,7 @@ const filteredSites = computed(() => {
       if (!checked) return false;
     }
     if (featureFilters.value.syncError) {
+      if (isUnknownSite(site)) return false;
       const hasErr = sessions.some((s) => s.syncError || s.checkinError || (s.apiSyncError && !s.apiKeyCount && !s.apiModelCount));
       if (!hasErr) return false;
     }
@@ -393,7 +400,15 @@ function getSiteSessions(siteId: string): ChromeSessionInfo[] {
   return store.chromeUsageAccounts.value[siteId] ?? [];
 }
 
+/** 未知架构站点：无签到/额度能力，卡片不展示相关内容，也不提供会话同步。 */
+function isUnknownSite(site: Pick<SiteRecord, "systemType">): boolean {
+  return isUnknownSystemType(site.systemType);
+}
+
 function getSiteErrorMessage(siteId: string): string {
+  const site = store.sites.value.find((s) => s.id === siteId);
+  // 未知架构站点：所有会话级告警一律不显示
+  if (site && isUnknownSite(site)) return "";
   const sessions = getSiteSessions(siteId);
   for (const s of sessions) {
     if (s.syncError) return s.syncError;
@@ -1205,7 +1220,7 @@ onUnmounted(() => {
                 <span class="sl-spec-k">关联会话</span>
                 <strong class="sl-spec-v">{{ getSiteSessions(site.id).length }} 个账号</strong>
               </div>
-              <div class="sl-spec-item">
+              <div v-if="!isUnknownSite(site)" class="sl-spec-item">
                 <span class="sl-spec-k">剩余额度</span>
                 <strong class="sl-spec-v text-brand">{{ getSiteQuotaText(site.id) }}</strong>
               </div>
@@ -1374,7 +1389,8 @@ onUnmounted(() => {
 
           <!-- 剩余额度列 -->
           <template #cell-quota="{ row }">
-            <span class="font-mono font-semibold text-brand">{{ getSiteQuotaText(row.id) }}</span>
+            <span v-if="!isUnknownSite(row)" class="font-mono font-semibold text-brand">{{ getSiteQuotaText(row.id) }}</span>
+            <span v-else class="text-faint">—</span>
           </template>
 
           <!-- 注册门槛列 -->
@@ -1537,6 +1553,7 @@ onUnmounted(() => {
 
                 <!-- 同步会话 -->
                 <button
+                  v-if="!isUnknownSite(site)"
                   type="button"
                   class="sl-topo-head-btn sl-topo-sync-btn"
                   :class="{ 'is-syncing': store.chromeSessionSyncActive.value && store.chromeSessionSite.value?.id === site.id }"
@@ -1556,7 +1573,7 @@ onUnmounted(() => {
                   v-for="session in getSiteSessions(site.id)"
                   :key="session.profileId"
                   class="sl-topo-session-row"
-                  :class="{ 'has-error': session.syncError || session.checkinError || (session.apiSyncError && !session.apiKeyCount && !session.apiModelCount) }"
+                  :class="{ 'has-error': !isUnknownSite(site) && (session.syncError || session.checkinError || (session.apiSyncError && !session.apiKeyCount && !session.apiModelCount)) }"
                 >
                   <div class="sl-topo-session-meta">
                     <span class="sl-topo-user-icon" v-html="icons.user" />
@@ -1568,22 +1585,21 @@ onUnmounted(() => {
                           <span v-if="session.hasAccessToken" class="sl-token-pill active" title="已从 Chrome 会话中获取访问令牌">已取令牌</span>
                           <span v-else class="sl-token-pill" title="未获取到访问令牌，需刷新">无令牌</span>
                         </template>
-                        <template v-if="site.supportsCheckin || session.checkinEnabled">
+                        <template v-if="!isUnknownSite(site) && (site.supportsCheckin || session.checkinEnabled)">
                           <span v-if="session.checkedInToday" class="sl-token-pill sl-token-checked" title="今日已成功签到">今日已签到</span>
                           <span v-else-if="session.checkinEnabled" class="sl-token-pill sl-token-uncheck" title="站点开启签到，今日尚未签到">今日未签到</span>
                           <span v-else class="sl-token-pill sl-token-disabled" title="站点接口返回404/403/人机验证或功能未启用，无法签到">无法签到</span>
                         </template>
-                        <span v-if="session.syncError || session.checkinError" class="sl-token-pill sl-token-err" :title="session.syncError || session.checkinError">异常</span>
+                        <span v-if="!isUnknownSite(site) && (session.syncError || session.checkinError)" class="sl-token-pill sl-token-err" :title="session.syncError || session.checkinError">异常</span>
                       </div>
-                      <small class="sl-topo-subline">
-                        <span>配置：{{ session.profileName || "默认配置" }}</span>
-                        <span v-if="session.accountUpdatedAt" class="sl-topo-subtime">· {{ formatDate(session.accountUpdatedAt) }}</span>
+                      <small v-if="session.accountUpdatedAt" class="sl-topo-subline">
+                        <span class="sl-topo-subtime">{{ formatDate(session.accountUpdatedAt) }}</span>
                       </small>
                     </div>
                   </div>
 
                   <div class="sl-topo-session-right">
-                    <div class="sl-topo-session-quota">
+                    <div v-if="!isUnknownSite(site)" class="sl-topo-session-quota">
                       <strong class="font-mono text-brand">{{ formatAccountQuota(session.remaining, session.unit) }}</strong>
                       <small v-if="session.apiKeyCount || session.apiModelCount">
                         {{ session.apiKeyCount || 0 }} Key · {{ session.apiModelCount || 0 }} 模型
@@ -1625,6 +1641,7 @@ onUnmounted(() => {
                 <span v-html="icons.user" />
                 <p>暂无关联的 Chrome 账号会话</p>
                 <button
+                  v-if="!isUnknownSite(site)"
                   type="button"
                   class="sl-link-action"
                   @click="store.syncChromeSession(site, $event.currentTarget as HTMLElement)"
@@ -2023,6 +2040,7 @@ onUnmounted(() => {
                 <div class="sl-tab-action-bar">
                   <span class="sl-tab-section-title">已关联 Chrome 授权账号</span>
                   <button
+                    v-if="!isUnknownSite(selectedSite)"
                     type="button"
                     class="sl-btn-secondary"
                     @click="store.syncChromeSession(selectedSite, $event.currentTarget as HTMLElement)"
@@ -2049,17 +2067,17 @@ onUnmounted(() => {
                               <span v-if="session.hasAccessToken" class="sl-token-pill active" title="已从 Chrome 会话中获取访问令牌">已取令牌</span>
                               <span v-else class="sl-token-pill" title="未获取到访问令牌，需刷新">无令牌</span>
                             </template>
-                            <template v-if="selectedSite.supportsCheckin || session.checkinEnabled">
+                            <template v-if="!isUnknownSite(selectedSite) && (selectedSite.supportsCheckin || session.checkinEnabled)">
                               <span v-if="session.checkedInToday" class="sl-token-pill sl-token-checked" title="今日已成功签到">今日已签到</span>
                               <span v-else-if="session.checkinEnabled" class="sl-token-pill sl-token-uncheck" title="站点开启签到，今日尚未签到">今日未签到</span>
                               <span v-else class="sl-token-pill sl-token-disabled" title="站点接口返回404/403/人机验证或功能未启用，无法签到">无法签到</span>
                             </template>
-                            <span v-if="session.syncError || session.checkinError" class="sl-token-pill sl-token-err" :title="session.syncError || session.checkinError">异常</span>
+                            <span v-if="!isUnknownSite(selectedSite) && (session.syncError || session.checkinError)" class="sl-token-pill sl-token-err" :title="session.syncError || session.checkinError">异常</span>
                           </div>
                         </div>
                       </div>
 
-                      <div class="sl-drawer-acc-quota-block">
+                      <div v-if="!isUnknownSite(selectedSite)" class="sl-drawer-acc-quota-block">
                         <div class="sl-drawer-acc-quota">
                           <span class="sl-acc-quota-k">可用额度</span>
                           <strong class="sl-acc-quota-v text-brand">{{ formatAccountQuota(session.remaining, session.unit) }}</strong>
@@ -2106,7 +2124,7 @@ onUnmounted(() => {
                       </div>
                     </div>
 
-                    <div v-if="session.syncError || session.checkinError" class="sl-drawer-acc-error">
+                    <div v-if="!isUnknownSite(selectedSite) && (session.syncError || session.checkinError)" class="sl-drawer-acc-error">
                       <span v-html="icons.info" />
                       <span>{{ session.syncError || session.checkinError }}</span>
                     </div>
@@ -2116,6 +2134,7 @@ onUnmounted(() => {
                   <span v-html="icons.user" />
                   <p>该站点尚未提取或关联 Chrome 授权账号会话</p>
                   <button
+                    v-if="!isUnknownSite(selectedSite)"
                     type="button"
                     class="sl-btn-primary"
                     @click="store.syncChromeSession(selectedSite, $event.currentTarget as HTMLElement)"

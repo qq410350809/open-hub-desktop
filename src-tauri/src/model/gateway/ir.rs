@@ -25,7 +25,6 @@ impl UniversalUsage {
     pub fn total(&self) -> u64 {
         self.input_tokens + self.output_tokens
     }
-
 }
 
 /// 统一的停止原因；各协议字符串 ↔ 枚举的双向映射集中在此。
@@ -164,14 +163,29 @@ pub struct CacheControl {
 /// 消息内容部件：跨协议统一的内容原子
 #[derive(Debug, Clone)]
 pub enum PartKind {
-    Text { text: String },
+    Text {
+        text: String,
+    },
     Image(ImageSource),
     /// 思考块；signature 为 Anthropic 思考链连续性凭证，同协议回写时必须携带
-    Thinking { text: String, signature: Option<String> },
-    ToolUse { call_id: String, name: String, input: JsonValue },
-    ToolResult { call_id: String, content: String, is_error: bool },
+    Thinking {
+        text: String,
+        signature: Option<String>,
+    },
+    ToolUse {
+        call_id: String,
+        name: String,
+        input: JsonValue,
+    },
+    ToolResult {
+        call_id: String,
+        content: String,
+        is_error: bool,
+    },
     /// 当前版本无法结构化表达的输入（如音频），以文本提示形式跨协议传递
-    Unsupported { hint: String },
+    Unsupported {
+        hint: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -182,7 +196,10 @@ pub struct ContentPart {
 
 impl ContentPart {
     pub fn text(text: impl Into<String>) -> Self {
-        Self { kind: PartKind::Text { text: text.into() }, cache_control: None }
+        Self {
+            kind: PartKind::Text { text: text.into() },
+            cache_control: None,
+        }
     }
 }
 
@@ -265,6 +282,9 @@ pub struct UniversalRequest {
 
 impl UniversalRequest {
     pub fn new(model: impl Into<String>) -> Self {
-        Self { model: model.into(), ..Default::default() }
+        Self {
+            model: model.into(),
+            ..Default::default()
+        }
     }
 }

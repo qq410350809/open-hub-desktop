@@ -626,7 +626,9 @@ pub(crate) fn save_site_model_cache(
     } else if !account.error.is_empty() {
         account.error.clone()
     } else {
-        result.map(|item| item.errors.join("\n")).unwrap_or_default()
+        result
+            .map(|item| item.errors.join("\n"))
+            .unwrap_or_default()
     };
     connection
         .execute(
@@ -703,6 +705,297 @@ pub fn save_site_model_cache_for_account(
         result.as_ref(),
         preserve_keys.unwrap_or(false),
     )
+}
+
+/// 按缓存 Key 逐个拉取模型：读取 site_model_cache 中该站点全部账号行的
+/// keys_json，逐 Key 请求 /v1/models（不额外向站点要 Key 列表），把结果
+/// 写回各自账号行的 key_models_json / models_json。与「同步 Key」（拉站点
+/// Key 列表重建）不同，本命令完全以用户手动维护的 Key 集合为准，手动添加
+/// 的 Key 也参与拉取；某 Key 拉取失败只记 errors，不清空其旧模型映射。
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub async fn sync_models_for_cached_keys(
+    ctx: Managed<'_, Arc<AppContext>>,
+    site_id: String,
+) -> Result<SiteModelsResult, String> {
+    let database = &*ctx.database;
+    // 读出全部账号行的 Key 与分组（站点级 profile_id='' 行也参与）。
+    let rows: Vec<(String, Vec<String>, HashMap<String, String>)> = {
+        let connection = database.lock_conn()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT profile_id, keys_json, groups_json
+                 FROM site_model_cache WHERE site_id = ?1",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([&site_id], |row| {
+                let keys: Vec<String> =
+                    serde_json::from_str(&row.get::<_, String>(1)?).unwrap_or_default();
+                let groups: HashMap<String, String> =
+                    serde_json::from_str(&row.get::<_, String>(2)?).unwrap_or_default();
+                Ok((row.get::<_, String>(0)?, keys, groups))
+            })
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        rows
+    };
+    // 该站点的 API 地址（从 directory_sites 读 api_base_url）。
+    let base_raw: String = {
+        let connection = database.lock_conn()?;
+        connection
+            .query_row(
+                "SELECT api_base_url FROM directory_sites WHERE id = ?1",
+                [&site_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "站点不存在".to_string())?
+    };
+
+    let mut all_keys: Vec<String> = Vec::new();
+    let mut all_groups: HashMap<String, String> = HashMap::new();
+    for (_, keys, groups) in &rows {
+        merge_api_keys(&mut all_keys, keys.iter().cloned());
+        merge_api_key_groups(
+            &mut all_groups,
+            groups.iter().map(|(k, v)| (k.clone(), v.clone())),
+        );
+    }
+    if all_keys.is_empty() {
+        return Err("该站点没有可用的 Key，请先添加 Key".to_string());
+    }
+
+    let client = build_site_http_client(database, SITE_PROBE_TIMEOUT, 3, "站点模型同步")?;
+    let base_url = normalize_site_base_url(&base_raw)?;
+    // 逐 Key 拉取：复用 fetch_models_with_keys 的候选与解析逻辑。
+    // 不带站点会话 Cookie，仅 Bearer Key，与手动管理的语义一致。
+    let result = fetch_models_with_keys(
+        &client,
+        &base_url,
+        all_keys.clone(),
+        all_keys,
+        all_groups,
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+        "models",
+        None,
+    )
+    .await;
+
+    // 写回每个账号行：本行 Key 中拉到模型的写入 key_models_json；整站模型列表
+    // = 各 Key 结果合并。拉取整体失败（如全部 401）也保留已有数据，只把错误
+    // 记到站点级行。
+    let (key_models, _models, errors, _source) = match &result {
+        Ok(result) => (
+            result.key_models.clone(),
+            result.models.clone(),
+            result.errors.clone(),
+            result.source.clone(),
+        ),
+        Err(error) => (
+            HashMap::new(),
+            Vec::new(),
+            vec![error.clone()],
+            "models".into(),
+        ),
+    };
+    {
+        let connection = database.lock_conn()?;
+        for (profile_id, keys, _) in &rows {
+            let mut row_models: HashMap<String, Vec<SiteModelItem>> = HashMap::new();
+            for key in keys {
+                if let Some(models) = key_models.get(key) {
+                    row_models.insert(key.clone(), models.clone());
+                }
+            }
+            let merged: Vec<SiteModelItem> = {
+                let mut items: Vec<SiteModelItem> = Vec::new();
+                for models in row_models.values() {
+                    for model in models {
+                        if !items.iter().any(|item| item.id == model.id) {
+                            items.push(model.clone());
+                        }
+                    }
+                }
+                items.sort_by(|left, right| left.id.cmp(&right.id));
+                items
+            };
+            connection
+                .execute(
+                    "UPDATE site_model_cache
+                     SET key_models_json = ?3,
+                         models_json = CASE WHEN ?3 != '{}' THEN ?4 ELSE models_json END,
+                         error = CASE WHEN ?3 = '{}' AND ?5 != '' THEN ?5 ELSE '' END,
+                         updated_at = CURRENT_TIMESTAMP
+                     WHERE site_id = ?1 AND profile_id = ?2",
+                    params![
+                        site_id,
+                        profile_id,
+                        serde_json::to_string(&row_models).map_err(|error| error.to_string())?,
+                        serde_json::to_string(&merged).map_err(|error| error.to_string())?,
+                        errors.join("\n"),
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    // 整体失败时向前端报告，同时库中已尽量保留旧数据。
+    result
+}
+
+/// 手动管理 Key：向指定账号行追加一个 Key（去重）。账号行不存在时按
+/// site_id + profile_id 新建一行。返回是否新增（重复添加返回 false）。
+/// `group_name` 与自动拉取的 keyGroups 对齐：写入 groups_json，空值落「默认分组」。
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub fn add_site_model_cache_key(
+    ctx: Managed<'_, Arc<AppContext>>,
+    site_id: String,
+    profile_id: String,
+    key: String,
+    group_name: Option<String>,
+    profile_name: Option<String>,
+    username: Option<String>,
+) -> Result<bool, String> {
+    let trimmed = key.trim().to_string();
+    if trimmed.is_empty() {
+        return Err("Key 不能为空".to_string());
+    }
+    let group = {
+        let raw = group_name.unwrap_or_default().trim().to_string();
+        if raw.is_empty() {
+            "默认分组".to_string()
+        } else {
+            raw
+        }
+    };
+    let database = &*ctx.database;
+    let connection = database.lock_conn()?;
+    let row: Option<(String, String)> = connection
+        .query_row(
+            "SELECT keys_json, groups_json FROM site_model_cache WHERE site_id = ?1 AND profile_id = ?2",
+            params![site_id, profile_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    // 行不存在时只允许站点级（profile_id 为空）自动建行：给任意 profile_id
+    // 凭空造行会在会话列表里渲染出不存在的账号。
+    let (row_exists, keys_json, groups_json) = match row {
+        Some((keys_json, groups_json)) => (true, keys_json, groups_json),
+        None if profile_id.is_empty() => (false, "[]".to_string(), "{}".to_string()),
+        None => return Err("目标账号不存在：请先同步会话建立账号信息，再手动添加 Key".to_string()),
+    };
+    let mut keys: Vec<String> = serde_json::from_str(&keys_json).unwrap_or_default();
+    if keys.iter().any(|item| item == &trimmed) {
+        return Ok(false);
+    }
+    keys.push(trimmed);
+    let mut key_groups: HashMap<String, String> =
+        serde_json::from_str(&groups_json).unwrap_or_default();
+    key_groups.insert(keys.last().expect("just pushed").clone(), group);
+    if row_exists {
+        connection
+            .execute(
+                "UPDATE site_model_cache
+                 SET keys_json = ?3,
+                     groups_json = ?4,
+                     profile_name = COALESCE(NULLIF(?5, ''), profile_name),
+                     username = COALESCE(NULLIF(?6, ''), username),
+                     error = '',
+                     updated_at = CURRENT_TIMESTAMP
+                 WHERE site_id = ?1 AND profile_id = ?2",
+                params![
+                    site_id,
+                    profile_id,
+                    serde_json::to_string(&keys).map_err(|error| error.to_string())?,
+                    serde_json::to_string(&key_groups).map_err(|error| error.to_string())?,
+                    profile_name.unwrap_or_default(),
+                    username.unwrap_or_default(),
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+    } else {
+        connection
+            .execute(
+                "INSERT INTO site_model_cache (site_id, profile_id, keys_json, groups_json, error)
+                 VALUES (?1, ?2, ?3, ?4, '')",
+                params![
+                    site_id,
+                    profile_id,
+                    serde_json::to_string(&keys).map_err(|error| error.to_string())?,
+                    serde_json::to_string(&key_groups).map_err(|error| error.to_string())?,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(true)
+}
+
+/// 手动管理 Key：从指定账号行移除一个 Key，并同步清理分组与逐 Key 模型映射。
+/// 返回是否发生删除（Key 不存在返回 false）。
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub fn remove_site_model_cache_key(
+    ctx: Managed<'_, Arc<AppContext>>,
+    site_id: String,
+    profile_id: String,
+    key: String,
+) -> Result<bool, String> {
+    let database = &*ctx.database;
+    let connection = database.lock_conn()?;
+    let keys_json: String = connection
+        .query_row(
+            "SELECT keys_json FROM site_model_cache WHERE site_id = ?1 AND profile_id = ?2",
+            params![site_id, profile_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "目标账号不存在".to_string())?;
+    let mut keys: Vec<String> = serde_json::from_str(&keys_json).unwrap_or_default();
+    let original_len = keys.len();
+    keys.retain(|item| item != &key);
+    if keys.len() == original_len {
+        return Ok(false);
+    }
+    let mut key_groups: HashMap<String, String> = connection
+        .query_row(
+            "SELECT groups_json FROM site_model_cache WHERE site_id = ?1 AND profile_id = ?2",
+            params![site_id, profile_id],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|error| error.to_string())
+        .and_then(|json| serde_json::from_str(&json).map_err(|error| error.to_string()))
+        .unwrap_or_default();
+    let mut key_models: HashMap<String, Vec<SiteModelItem>> = connection
+        .query_row(
+            "SELECT key_models_json FROM site_model_cache WHERE site_id = ?1 AND profile_id = ?2",
+            params![site_id, profile_id],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|error| error.to_string())
+        .and_then(|json| serde_json::from_str(&json).map_err(|error| error.to_string()))
+        .unwrap_or_default();
+    key_groups.remove(&key);
+    key_models.remove(&key);
+    connection
+        .execute(
+            "UPDATE site_model_cache
+             SET keys_json = ?3, groups_json = ?4, key_models_json = ?5,
+                 error = CASE WHEN ?6 = 0 THEN '' ELSE error END,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE site_id = ?1 AND profile_id = ?2",
+            params![
+                site_id,
+                profile_id,
+                serde_json::to_string(&keys).map_err(|error| error.to_string())?,
+                serde_json::to_string(&key_groups).map_err(|error| error.to_string())?,
+                serde_json::to_string(&key_models).map_err(|error| error.to_string())?,
+                keys.len() as i64,
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(true)
 }
 
 #[cfg_attr(feature = "desktop", tauri::command)]
@@ -932,7 +1225,9 @@ pub async fn test_site_models_per_channel(
                 .prepare("SELECT id, name FROM proxy_channels ORDER BY rowid")
                 .map_err(|error| error.to_string())?;
             let rows = statement
-                .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
                 .map_err(|error| error.to_string())?
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|error| error.to_string())?;
@@ -997,7 +1292,8 @@ pub async fn test_site_models_per_channel(
     Ok(futures_util::future::join_all(probes).await)
 }
 
-async fn probe_models_endpoint(client: wreq::Client, models_url: Url) -> SiteProbeResult {    let started = std::time::Instant::now();
+async fn probe_models_endpoint(client: wreq::Client, models_url: Url) -> SiteProbeResult {
+    let started = std::time::Instant::now();
     let response = match client.get(models_url).send().await {
         Ok(response) => response,
         Err(error) => {

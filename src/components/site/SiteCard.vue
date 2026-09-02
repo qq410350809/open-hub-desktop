@@ -5,7 +5,7 @@ import { formatDate, formatRateLimit, logoText } from "../../utils";
 import { useStore } from "../../composables/useStore";
 import TagList from "../common/TagList.vue";
 import type { ChromeSessionInfo, SiteRecord } from "../../types";
-import { normalizeSystemType, systemTypeLabel } from "../../types";
+import { isUnknownSystemType, normalizeSystemType, systemTypeLabel } from "../../types";
 
 const props = defineProps<{
   site: SiteRecord;
@@ -128,7 +128,8 @@ const menuEntries = computed<CardMenuEntry[]>(() => {
     { key: "models", label: "查看模型", icon: icons.cpu },
     { key: "preview", label: "查看详情", icon: icons.info },
     { key: "edit", label: "编辑", icon: icons.edit },
-    ...(isUsage
+    // 未知架构站点没有签到/额度能力，不提供会话同步
+    ...(isUsage && !isUnknownSystemType(props.site.systemType)
       ? [{ key: "sync-session", label: "同步会话", icon: icons.sessionImport }]
       : []),
     ...usageTargets.value,
@@ -375,32 +376,38 @@ onUnmounted(() => {
               :class="{ 'has-token': session.hasAccessToken }"
               :title="session.hasAccessToken ? '此账号已缓存 NewAPI 访问令牌' : '此账号尚未取得 NewAPI 访问令牌'"
             >{{ session.hasAccessToken ? "有访问令牌" : "无访问令牌" }}</span>
-            <span
-              v-if="session.checkinEnabled || site.supportsCheckin || session.checkinError"
-              class="usage-account-checkin"
-              :class="{ 'is-checked': session.checkedInToday, 'has-error': session.checkinError, 'is-disabled': !session.checkedInToday && !session.checkinEnabled }"
-              :title="session.checkinError || (session.checkedInToday ? '今日已签到' : (session.checkinEnabled ? '今日未签到' : '无法自动签到（404/403/未启用）'))"
-            >{{ session.checkinError ? "签到异常" : (session.checkedInToday ? "已签到" : (session.checkinEnabled ? "未签到" : "无法签到")) }}</span>
-            <span v-if="session.apiCountsSynced && !session.apiSyncError">
-              {{ session.apiKeyCount ?? 0 }} 个 Key · {{ session.apiModelCount ?? 0 }} 个模型
-            </span>
-            <button
-              v-else-if="session.apiSyncError"
-              class="usage-account-api-action is-error"
-              type="button"
-              :title="`${session.apiSyncError}\n点击重新同步`"
-              @click="store.syncChromeSession(site, $event.currentTarget as HTMLElement)"
-            >Key 与模型同步失败，点击重试</button>
-            <button
-              v-else
-              class="usage-account-api-action"
-              type="button"
-              title="点击同步 Key 与模型"
-              @click="store.syncChromeSession(site, $event.currentTarget as HTMLElement)"
-            >Key 与模型未同步，点击同步</button>
+            <template v-if="!isUnknownSystemType(site.systemType)">
+              <span
+                v-if="session.checkinEnabled || site.supportsCheckin || session.checkinError"
+                class="usage-account-checkin"
+                :class="{ 'is-checked': session.checkedInToday, 'has-error': session.checkinError, 'is-disabled': !session.checkedInToday && !session.checkinEnabled }"
+                :title="session.checkinError || (session.checkedInToday ? '今日已签到' : (session.checkinEnabled ? '今日未签到' : '无法自动签到（404/403/未启用）'))"
+              >{{ session.checkinError ? "签到异常" : (session.checkedInToday ? "已签到" : (session.checkinEnabled ? "未签到" : "无法签到")) }}</span>
+              <span v-if="session.apiCountsSynced && !session.apiSyncError">
+                {{ session.apiKeyCount ?? 0 }} 个 Key · {{ session.apiModelCount ?? 0 }} 个模型
+              </span>
+              <button
+                v-else-if="session.apiSyncError"
+                class="usage-account-api-action is-error"
+                type="button"
+                :title="`${session.apiSyncError}\n点击重新同步`"
+                @click="store.syncChromeSession(site, $event.currentTarget as HTMLElement)"
+              >Key 与模型同步失败，点击重试</button>
+              <button
+                v-else
+                class="usage-account-api-action"
+                type="button"
+                title="点击同步 Key 与模型"
+                @click="store.syncChromeSession(site, $event.currentTarget as HTMLElement)"
+              >Key 与模型未同步，点击同步</button>
+            </template>
           </small>
         </div>
-        <div class="usage-account-quota" :class="{ 'has-error': session.syncError }">
+        <div
+          v-if="!isUnknownSystemType(site.systemType)"
+          class="usage-account-quota"
+          :class="{ 'has-error': session.syncError }"
+        >
           <strong :title="session.syncError || `剩余额度：${accountQuota(session)}`">{{ accountQuota(session) }}</strong>
           <small :title="session.syncError">{{ session.syncError ? "账号信息同步失败" : "站点剩余额度" }}</small>
         </div>

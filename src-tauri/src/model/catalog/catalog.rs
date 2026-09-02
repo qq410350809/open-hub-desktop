@@ -1155,8 +1155,7 @@ async fn prefetch_model_hosts(database: &Database, concurrency: usize) -> Result
         return Ok(0);
     }
 
-    let client =
-        build_http_client(database, Duration::from_secs(10), 5, "预拉取模型渠道明细")?;
+    let client = build_http_client(database, Duration::from_secs(10), 5, "预拉取模型渠道明细")?;
 
     let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
     let mut handles = Vec::with_capacity(ids.len());

@@ -65,7 +65,7 @@ fn restore_window_chrome<R: tauri::Runtime>(window: &tauri::WebviewWindow<R>) {
 fn refresh_dock_icon<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     use objc2::AnyThread;
     use objc2_app_kit::{NSApplication, NSImage};
-    use objc2_foundation::{NSData, MainThreadMarker};
+    use objc2_foundation::{MainThreadMarker, NSData};
 
     // tauri 的 default_window_icon 拿到的是裸 RGBA 像素，NSImage 不认；
     // 直接解码打包内 PNG（与托盘图标回退同源）。
@@ -88,9 +88,10 @@ pub fn install_tray<R: tauri::Runtime>(app: &tauri::App<R>) -> tauri::Result<()>
     let menu = Menu::with_items(app, &[&show, &sep, &quit])?;
 
     // 图标：优先复用应用默认图标（tauri.conf.json icons），缺失时回退打包内 32x32 PNG。
-    let icon = app.default_window_icon().cloned().or_else(|| {
-        tauri::image::Image::from_bytes(include_bytes!("../../icons/32x32.png")).ok()
-    });
+    let icon = app
+        .default_window_icon()
+        .cloned()
+        .or_else(|| tauri::image::Image::from_bytes(include_bytes!("../../icons/32x32.png")).ok());
 
     let mut builder = TrayIconBuilder::with_id("main-tray")
         .tooltip("OpenHub — 点击图标显示主窗口")
@@ -119,4 +120,3 @@ pub fn install_tray<R: tauri::Runtime>(app: &tauri::App<R>) -> tauri::Result<()>
     builder.build(app)?;
     Ok(())
 }
-

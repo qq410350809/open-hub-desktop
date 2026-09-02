@@ -246,11 +246,7 @@ impl ProxyRuntime {
 
     /// 账号 lane 当前选中的节点 id（mihomo 代理名），用于轮换时排除当前节点。
     pub fn account_lane_current_node(&self, profile_id: &str) -> Option<String> {
-        let idx = *self
-            .account_lane_map
-            .lock()
-            .ok()?
-            .get(profile_id)?;
+        let idx = *self.account_lane_map.lock().ok()?.get(profile_id)?;
         let group = self
             .account_lane_slots
             .lock()

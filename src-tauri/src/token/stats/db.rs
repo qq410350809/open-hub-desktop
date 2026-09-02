@@ -95,6 +95,7 @@ pub fn collect_token_data(
     );
     db::write_token_snapshots(database, &usage, &snapshot.sessions, &health)?;
     emit_token_collector_progress(progress_bus, "database", "success", "数据库快照写入完成");
+    register_collected_model_names(database, &usage);
     let mut report =
         crate::token::collector::sync_report(&snapshot, started.elapsed().as_millis() as i64);
     if force {
@@ -106,6 +107,27 @@ pub fn collect_token_data(
         );
     }
     Ok(report)
+}
+
+/// 把本次采集到的原始模型名登记进映射表（INSERT OR IGNORE，不覆盖已有判定）。
+/// UNKNOWN 占位名与空名不登记——它们不是真实模型，没有映射意义。
+fn register_collected_model_names(database: &Database, usage: &TokenUsageReport) {
+    let mut names: Vec<String> = Vec::new();
+    for bucket in &usage.buckets {
+        let model = bucket.model.trim();
+        if model.is_empty() || model.contains("-unknown-") {
+            continue;
+        }
+        if !names.iter().any(|name| name == model) {
+            names.push(model.to_string());
+        }
+    }
+    if names.is_empty() {
+        return;
+    }
+    if let Err(error) = crate::token::mapping::store::register_raw_models(database, &names) {
+        tracing::warn!("[token-mapping] 登记原始模型名失败：{error}");
+    }
 }
 
 pub fn seed_token_database_from_caches(database: &Database) -> Result<bool, String> {

@@ -123,10 +123,17 @@ pub fn start_charity_monitor(ctx: Arc<AppContext>) {
                     let message = format!(
                         "无 ≤{CHARITY_FAST_NODE_MAX_LATENCY_MS}ms 可用公益候选节点，本轮跳过"
                     );
-                    let _ = write_feed_sync_meta(&database, &source.id, "skipped", &message, "", 0);
-                    if let Ok(mut errors) = monitor.last_errors.lock() {
-                        errors.insert(source.id.clone(), message);
-                    }
+                    // 同上：本轮无可用节点是调度结果而非源错误，只留日志。
+                    append_charity_sync_log(
+                        &database,
+                        &source.id,
+                        &source.name,
+                        "prepare",
+                        "skipped",
+                        &message,
+                        "",
+                        "",
+                    );
                 }
                 monitor.end_sync();
                 continue;
@@ -140,12 +147,20 @@ pub fn start_charity_monitor(ctx: Arc<AppContext>) {
                 proxypool::prepare_proxy_nodes_transient(&database, &runtime, &prepare_ids).await
             {
                 let message = format!("装载公益候选节点失败：{error}");
+                // 代理实例装载失败属于本轮基础设施问题，与单个源无关：只落同步日志，
+                // 不写 feed meta、不进 last_errors，避免每次切标签都重复弹出横幅。
                 let sources_for_err = load_charity_sources(&database).unwrap_or_default();
                 for source in &sources_for_err {
-                    let _ = write_feed_sync_meta(&database, &source.id, "error", &message, "", 0);
-                    if let Ok(mut errors) = monitor.last_errors.lock() {
-                        errors.insert(source.id.clone(), message.clone());
-                    }
+                    append_charity_sync_log(
+                        &database,
+                        &source.id,
+                        &source.name,
+                        "prepare",
+                        "error",
+                        &message,
+                        "",
+                        "",
+                    );
                 }
                 monitor.end_sync();
                 continue;

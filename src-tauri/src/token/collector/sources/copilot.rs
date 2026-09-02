@@ -129,10 +129,7 @@ pub fn collect_copilot_source_files(home: &Path) -> Vec<(String, PathBuf)> {
                     }
                     // Copilot Chat 扩展的真实请求日志：assistant.turn_end 每次
                     // 都是一次完整 LLM 请求（agent 工具循环），是请求数的权威来源
-                    let transcripts = entry
-                        .path()
-                        .join("GitHub.copilot-chat")
-                        .join("transcripts");
+                    let transcripts = entry.path().join("GitHub.copilot-chat").join("transcripts");
                     if transcripts.is_dir() {
                         collect_jsonl_files(
                             &transcripts,
@@ -175,7 +172,10 @@ fn ensure_container_at<'a>(
 ) -> Option<&'a mut JsonValue> {
     let mut current = document;
     for (index, segment) in path.iter().enumerate() {
-        let next_is_index = path.get(index + 1).map(|seg| is_index_segment(seg)).unwrap_or(false);
+        let next_is_index = path
+            .get(index + 1)
+            .map(|seg| is_index_segment(seg))
+            .unwrap_or(false);
         if is_index_segment(segment) {
             let idx = segment.as_i64()?.max(0) as usize;
             if !current.is_array() {
@@ -714,7 +714,13 @@ pub fn parse_copilot_transcript(
                     .get("content")
                     .and_then(JsonValue::as_str)
                     .unwrap_or("");
-                if content.trim().is_empty() && data.get("attachments").and_then(JsonValue::as_array).map(Vec::is_empty) != Some(false) {
+                if content.trim().is_empty()
+                    && data
+                        .get("attachments")
+                        .and_then(JsonValue::as_array)
+                        .map(Vec::is_empty)
+                        != Some(false)
+                {
                     continue;
                 }
                 turns += 1;
@@ -930,7 +936,11 @@ fn parse_key_values(segment: &str) -> Vec<(String, i64)> {
 /// 行格式（无行级时间戳，事件时间取自 output_logging_ 目录名）：
 ///   [stream-summary model=x-preview-f-free] textChars=... toolCalls=...
 ///   [response-summary] status=200 durationMs=... promptTokens=... completionTokens=... cachedTokens=...
-pub fn parse_vscode_opencode_log(path: &Path, text: &str, file_fingerprint: FileFingerprint) -> CachedFile {
+pub fn parse_vscode_opencode_log(
+    path: &Path,
+    text: &str,
+    file_fingerprint: FileFingerprint,
+) -> CachedFile {
     let default_ts = output_logging_start_millis(path)
         .map(iso_from_millis)
         .unwrap_or_default();

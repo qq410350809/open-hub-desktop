@@ -1077,6 +1077,7 @@ pub(crate) async fn fetch_site_account(
                         checkin: previous_checkin,
                         newapi_token: cached_newapi_token.unwrap_or_default(),
                         newapi_user_id: cached_newapi_user_id.unwrap_or_default(),
+                        refreshed: false,
                     }),
                     None => Err(error),
                 }
@@ -1099,6 +1100,7 @@ pub(crate) async fn fetch_site_account(
                     checkin: previous_checkin,
                     newapi_token: String::new(),
                     newapi_user_id: String::new(),
+                    refreshed: false,
                 }),
                 None => Err(if local_error.is_empty() {
                     "没有找到可用的 NewAPI 登录凭据".into()
@@ -1229,6 +1231,7 @@ pub(crate) async fn fetch_site_account(
                         checkin,
                         newapi_token: newapi_token.clone(),
                         newapi_user_id: newapi_user_id.clone(),
+                        refreshed: false,
                     }),
                     None => Err(format!("账号接口失败：{error}")),
                 };
@@ -1247,6 +1250,7 @@ pub(crate) async fn fetch_site_account(
             checkin,
             newapi_token,
             newapi_user_id,
+            refreshed: true,
         });
     }
     // —— Sub2API ——
@@ -1271,6 +1275,7 @@ pub(crate) async fn fetch_site_account(
             checkin: previous_checkin,
             newapi_token: String::new(),
             newapi_user_id: String::new(),
+            refreshed: false,
         });
     }
 
@@ -1304,6 +1309,7 @@ pub(crate) async fn fetch_site_account(
                     checkin,
                     newapi_token: String::new(),
                     newapi_user_id: String::new(),
+                    refreshed: true,
                 });
             }
             Err(_) => continue,
@@ -1329,6 +1335,7 @@ pub(crate) async fn fetch_site_account(
                 checkin,
                 newapi_token: String::new(),
                 newapi_user_id: String::new(),
+                refreshed: true,
             }),
             Err(error) => Ok(SiteAccountRefresh {
                 account: local_account.clone().unwrap_or_default(),
@@ -1337,6 +1344,7 @@ pub(crate) async fn fetch_site_account(
                 checkin,
                 newapi_token: String::new(),
                 newapi_user_id: String::new(),
+                refreshed: false,
             }),
         };
     }
@@ -1361,6 +1369,7 @@ pub(crate) async fn fetch_site_account(
         checkin,
         newapi_token: String::new(),
         newapi_user_id: String::new(),
+        refreshed: false,
     })
 }
 

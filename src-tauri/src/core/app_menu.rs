@@ -50,11 +50,11 @@ pub fn install_chinese_menu<R: tauri::Runtime>(app: &tauri::App<R>) -> tauri::Re
     // —— 文件菜单：新建 / 刷新 / 导出（参照常见 macOS 应用布局）——
     let new_site = MenuItem::with_id(app, "file-new-site", "新建站点…", true, Some("CmdOrCtrl+N"))
         .expect("创建文件菜单新建项失败");
-    let refresh_item = MenuItem::with_id(app, "file-refresh", "全部刷新", true, Some("CmdOrCtrl+R"))
-        .expect("创建文件菜单刷新项失败");
-    let export_data =
-        MenuItem::with_id(app, "file-export", "导出数据…", true, Some("CmdOrCtrl+E"))
-            .expect("创建文件菜单导出项失败");
+    let refresh_item =
+        MenuItem::with_id(app, "file-refresh", "全部刷新", true, Some("CmdOrCtrl+R"))
+            .expect("创建文件菜单刷新项失败");
+    let export_data = MenuItem::with_id(app, "file-export", "导出数据…", true, Some("CmdOrCtrl+E"))
+        .expect("创建文件菜单导出项失败");
     let sep_file = PredefinedMenuItem::separator(app).ok();
     let file_items: Vec<DynItem<'_, R>> = vec![
         Some(&new_site as DynItem<'_, R>),
@@ -107,13 +107,20 @@ pub fn install_chinese_menu<R: tauri::Runtime>(app: &tauri::App<R>) -> tauri::Re
                 .expect("创建视图菜单导航项失败"),
         ));
     }
-    let reload_page =
-        MenuItem::with_id(app, "view-reload", "刷新页面", true, Some("CmdOrCtrl+Shift+R"))
-            .expect("创建视图菜单刷新页面项失败");
+    let reload_page = MenuItem::with_id(
+        app,
+        "view-reload",
+        "刷新页面",
+        true,
+        Some("CmdOrCtrl+Shift+R"),
+    )
+    .expect("创建视图菜单刷新页面项失败");
     let fullscreen = PredefinedMenuItem::fullscreen(app, Some("进入全屏")).ok();
     let sep_view = PredefinedMenuItem::separator(app).ok();
-    let mut view_refs: Vec<DynItem<'_, R>> =
-        nav_items.iter().map(|item| item.as_ref() as DynItem<'_, R>).collect();
+    let mut view_refs: Vec<DynItem<'_, R>> = nav_items
+        .iter()
+        .map(|item| item.as_ref() as DynItem<'_, R>)
+        .collect();
     for optional in [
         Some(&reload_page as DynItem<'_, R>),
         sep_view.as_ref().map(|i| i as DynItem<'_, R>),

@@ -212,7 +212,8 @@ fn collect_export_nodes(
         let Some(object) = config.as_object_mut() else {
             continue;
         };
-        let display = super::parser::unique_name(&format!("{name} · {latency_ms}ms"), &mut used_names);
+        let display =
+            super::parser::unique_name(&format!("{name} · {latency_ms}ms"), &mut used_names);
         object.insert("name".to_string(), json!(display));
         nodes.push(ExportNode {
             name: display,

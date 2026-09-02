@@ -1,7 +1,15 @@
-use super::types::{default_channels, ChannelConfig, ModelProxyConfig, OpencodeProxyConfig};
+use super::balancer::normalize_key_group_id;
+use super::types::{
+    default_channels, default_key_group_mode, ChannelConfig, ModelProxyConfig, OpencodeProxyConfig,
+    KEY_GROUP_MODE_INDEPENDENT,
+};
 use getrandom::fill as fill_random;
 use rusqlite::Connection;
 use std::collections::HashMap;
+
+/// 已下线的固定预设分组 ID：分组现一律由 Key 自身的 groupName 决定，
+/// 存量配置中的这两个预设组在加载时清除，其成员 Key 回落到 groupName 分组。
+const LEGACY_PRESET_KEY_GROUP_IDS: [&str; 2] = ["primary", "backup"];
 
 fn ensure_gateway_api_key(config: &mut ModelProxyConfig) {
     if !config.api_key.trim().is_empty() {
@@ -23,35 +31,61 @@ pub fn sanitize_channel_config(channel: &mut ChannelConfig) {
         }
     }
 
-    // 清洗渠道自定义 Key 分组
+    // 清洗渠道自定义 Key 分组：id 即 Key 的 groupName；
+    // 历史的 primary/backup 预设组已下线（分组一律由 groupName 决定），加载时剔除。
     if let Some(groups) = channel.key_groups.take() {
         let mut seen = std::collections::HashSet::new();
         let cleaned: Vec<_> = groups
             .into_iter()
             .filter_map(|mut g| {
-                g.id = g.id.trim().to_string();
+                // 组 ID 与 Key 的 groupName 同源，需走同一套归一（「默认分组」→ default）
+                g.id = if g.id.trim().is_empty() {
+                    String::new()
+                } else {
+                    normalize_key_group_id(&g.id)
+                };
                 g.name = g.name.trim().to_string();
-                if g.id.is_empty() || !seen.insert(g.id.clone()) {
+                if g.id.is_empty()
+                    || LEGACY_PRESET_KEY_GROUP_IDS.contains(&g.id.as_str())
+                    || !seen.insert(g.id.clone())
+                {
                     None
                 } else {
                     if g.name.is_empty() {
                         g.name = g.id.clone();
                     }
+                    if g.mode != KEY_GROUP_MODE_INDEPENDENT {
+                        g.mode = default_key_group_mode();
+                    }
                     Some(g)
                 }
             })
             .collect();
-        channel.key_groups = if cleaned.is_empty() { None } else { Some(cleaned) };
+        channel.key_groups = if cleaned.is_empty() {
+            None
+        } else {
+            Some(cleaned)
+        };
     }
 
-    // 清洗渠道单 Key 规则
+    // 清洗渠道单 Key 规则：指向已下线预设组的 group_id 清空，
+    // 使该 Key 回落到自身 groupName 决定的分组
     if let Some(rules) = channel.key_rules.take() {
         let mut seen = std::collections::HashSet::new();
         let cleaned: Vec<_> = rules
             .into_iter()
             .filter_map(|mut r| {
                 r.key = r.key.trim().to_string();
-                r.group_id = r.group_id.trim().to_string();
+                // 空 group_id 保持为空（= 不覆盖，跟随 Key 自身 groupName）；
+                // 非空则与分组 ID 同源归一；指向已下线预设组的归属清空以回落 groupName
+                r.group_id = if r.group_id.trim().is_empty() {
+                    String::new()
+                } else {
+                    normalize_key_group_id(&r.group_id)
+                };
+                if LEGACY_PRESET_KEY_GROUP_IDS.contains(&r.group_id.as_str()) {
+                    r.group_id = String::new();
+                }
                 if r.key.is_empty() || !seen.insert(r.key.clone()) {
                     None
                 } else {
@@ -59,11 +93,18 @@ pub fn sanitize_channel_config(channel: &mut ChannelConfig) {
                 }
             })
             .collect();
-        channel.key_rules = if cleaned.is_empty() { None } else { Some(cleaned) };
+        channel.key_rules = if cleaned.is_empty() {
+            None
+        } else {
+            Some(cleaned)
+        };
     }
 
     // 清洗模型级代理出口规则：模型名去空格去重，mode 白名单校验，
-    // direct/pool 语义下 node_id 无意义直接剥离；mode=direct 且与渠道级默认一致时仍保留（显式覆盖）
+    // 旧 fixed 值归一为 custom_node（语义相同：固定单一出口节点）；
+    // direct/pool 语义下 node_id/channel_id 无意义直接剥离；
+    // fixed_channel 剥离 node_id 保留 channel_id；custom_node 剥离 channel_id 保留 node_id；
+    // mode=direct 且与渠道级默认一致时仍保留（显式覆盖）
     if let Some(rules) = channel.model_proxy_rules.take() {
         let mut seen = std::collections::HashSet::new();
         let cleaned: Vec<_> = rules
@@ -71,12 +112,30 @@ pub fn sanitize_channel_config(channel: &mut ChannelConfig) {
             .filter_map(|mut r| {
                 r.model = r.model.trim().to_string();
                 r.mode = r.mode.trim().to_lowercase();
-                if !matches!(r.mode.as_str(), "direct" | "pool" | "fixed") {
+                if r.mode == "fixed" {
+                    r.mode = "custom_node".to_string();
+                }
+                if !matches!(
+                    r.mode.as_str(),
+                    "direct" | "pool" | "custom_node" | "fixed_channel"
+                ) {
                     return None;
                 }
                 if let Some(ref node) = r.node_id {
                     let node = node.trim().to_string();
-                    r.node_id = if node.is_empty() || r.mode != "fixed" { None } else { Some(node) };
+                    r.node_id = if node.is_empty() || r.mode != "custom_node" {
+                        None
+                    } else {
+                        Some(node)
+                    };
+                }
+                if let Some(ref ch) = r.channel_id {
+                    let ch = ch.trim().to_string();
+                    r.channel_id = if ch.is_empty() || r.mode != "fixed_channel" {
+                        None
+                    } else {
+                        Some(ch)
+                    };
                 }
                 if r.model.is_empty() || !seen.insert(r.model.to_lowercase()) {
                     None
@@ -85,7 +144,11 @@ pub fn sanitize_channel_config(channel: &mut ChannelConfig) {
                 }
             })
             .collect();
-        channel.model_proxy_rules = if cleaned.is_empty() { None } else { Some(cleaned) };
+        channel.model_proxy_rules = if cleaned.is_empty() {
+            None
+        } else {
+            Some(cleaned)
+        };
     }
 }
 
@@ -161,11 +224,8 @@ fn sanitize_model_channel_order(config: &mut ModelProxyConfig) {
     let Some(order) = config.model_channel_order.take() else {
         return;
     };
-    let channel_ids: std::collections::HashSet<&str> = config
-        .channels
-        .iter()
-        .map(|ch| ch.id.as_str())
-        .collect();
+    let channel_ids: std::collections::HashSet<&str> =
+        config.channels.iter().map(|ch| ch.id.as_str()).collect();
     let cleaned: HashMap<String, Vec<String>> = order
         .into_iter()
         .filter_map(|(model, ids)| {
@@ -176,9 +236,7 @@ fn sanitize_model_channel_order(config: &mut ModelProxyConfig) {
             let mut seen = std::collections::HashSet::new();
             let ids: Vec<String> = ids
                 .into_iter()
-                .filter(|id| {
-                    channel_ids.contains(id.as_str()) && seen.insert(id.clone())
-                })
+                .filter(|id| channel_ids.contains(id.as_str()) && seen.insert(id.clone()))
                 .collect();
             if ids.len() < 2 {
                 // 单渠道顺序无排序意义，视为未配置
@@ -269,11 +327,8 @@ mod config_tests {
                     proxy_fixed_channel: None,
                     use_fixed_proxy: false,
                     fixed_proxy_node: None,
-                    priority: None,
-                    weight: None,
                     enabled_models: None,
                     model_redirects: None,
-                    rate_limit_rpm: None,
                     stats_id: Some(1),
                     key_groups: None,
                     key_rules: None,
@@ -295,11 +350,8 @@ mod config_tests {
                     proxy_fixed_channel: None,
                     use_fixed_proxy: false,
                     fixed_proxy_node: None,
-                    priority: None,
-                    weight: None,
                     enabled_models: None,
                     model_redirects: None,
-                    rate_limit_rpm: None,
                     stats_id: Some(2),
                     key_groups: None,
                     key_rules: None,
@@ -321,11 +373,8 @@ mod config_tests {
                     proxy_fixed_channel: None,
                     use_fixed_proxy: false,
                     fixed_proxy_node: None,
-                    priority: None,
-                    weight: None,
                     enabled_models: None,
                     model_redirects: None,
-                    rate_limit_rpm: None,
                     stats_id: Some(101),
                     key_groups: None,
                     key_rules: None,
@@ -363,33 +412,77 @@ mod config_tests {
             proxy_fixed_channel: None,
             use_fixed_proxy: false,
             fixed_proxy_node: None,
-            priority: None,
-            weight: None,
             enabled_models: None,
             model_redirects: None,
-            rate_limit_rpm: None,
             stats_id: None,
             key_groups: None,
             key_rules: None,
             model_proxy_rules: Some(vec![
-                ModelProxyRule { model: " glm-a ".into(), mode: "direct".into(), node_id: Some("n1".into()) },
-                ModelProxyRule { model: "GLM-A".into(), mode: "fixed".into(), node_id: Some(" n2 ".into()) },
-                ModelProxyRule { model: "glm-b".into(), mode: "bogus".into(), node_id: None },
-                ModelProxyRule { model: "glm-c".into(), mode: "fixed".into(), node_id: Some("  ".into()) },
-                ModelProxyRule { model: "   ".into(), mode: "direct".into(), node_id: None },
+                ModelProxyRule {
+                    model: " glm-a ".into(),
+                    mode: "direct".into(),
+                    node_id: Some("n1".into()),
+                    channel_id: None,
+                },
+                ModelProxyRule {
+                    model: "GLM-A".into(),
+                    mode: "fixed".into(),
+                    node_id: Some(" n2 ".into()),
+                    channel_id: None,
+                },
+                ModelProxyRule {
+                    model: "glm-b".into(),
+                    mode: "bogus".into(),
+                    node_id: None,
+                    channel_id: None,
+                },
+                ModelProxyRule {
+                    model: "glm-c".into(),
+                    mode: "fixed".into(),
+                    node_id: Some("  ".into()),
+                    channel_id: None,
+                },
+                ModelProxyRule {
+                    model: "   ".into(),
+                    mode: "direct".into(),
+                    node_id: None,
+                    channel_id: None,
+                },
+                ModelProxyRule {
+                    model: "glm-d".into(),
+                    mode: "fixed_channel".into(),
+                    node_id: Some("n3".into()),
+                    channel_id: Some(" pc1 ".into()),
+                },
+                ModelProxyRule {
+                    model: "glm-e".into(),
+                    mode: "custom_node".into(),
+                    node_id: Some(" n4 ".into()),
+                    channel_id: Some("pc2".into()),
+                },
             ]),
         };
         sanitize_channel_config(&mut ch);
         let rules = ch.model_proxy_rules.unwrap();
         // 同模型（忽略大小写）只保留首条；非法 mode 与空模型被剔除
-        assert_eq!(rules.len(), 2, "rules: {rules:?}");
+        assert_eq!(rules.len(), 4, "rules: {rules:?}");
         assert_eq!(rules[0].model, "glm-a");
         // direct 模式下 node_id 被剥离
         assert_eq!(rules[0].node_id, None);
-        // fixed 模式下空 node_id 归一为 None
+        // 旧 fixed 归一为 custom_node；空 node_id 归一为 None
         assert_eq!(rules[1].model, "glm-c");
-        assert_eq!(rules[1].mode, "fixed");
+        assert_eq!(rules[1].mode, "custom_node");
         assert_eq!(rules[1].node_id, None);
+        // fixed_channel：剥离 node_id、保留去空格后的 channel_id
+        assert_eq!(rules[2].model, "glm-d");
+        assert_eq!(rules[2].mode, "fixed_channel");
+        assert_eq!(rules[2].node_id, None);
+        assert_eq!(rules[2].channel_id.as_deref(), Some("pc1"));
+        // custom_node：保留去空格后的 node_id、剥离 channel_id
+        assert_eq!(rules[3].model, "glm-e");
+        assert_eq!(rules[3].mode, "custom_node");
+        assert_eq!(rules[3].node_id.as_deref(), Some("n4"));
+        assert_eq!(rules[3].channel_id, None);
     }
 
     #[test]
@@ -411,11 +504,8 @@ mod config_tests {
             proxy_fixed_channel: None,
             use_fixed_proxy: false,
             fixed_proxy_node: None,
-            priority: None,
-            weight: None,
             enabled_models: None,
             model_redirects: None,
-            rate_limit_rpm: None,
             stats_id: None,
             key_groups: None,
             key_rules: None,
@@ -423,6 +513,7 @@ mod config_tests {
                 model: "m".into(),
                 mode: "invalid".into(),
                 node_id: None,
+                channel_id: None,
             }]),
         };
         sanitize_channel_config(&mut ch);

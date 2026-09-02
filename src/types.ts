@@ -343,6 +343,15 @@ export const KNOWN_SYSTEM_TYPES: ReadonlySet<string> = new Set(
   SYSTEM_TYPES.map((item) => normalizeSystemType(item.value)),
 );
 
+/**
+ * 未知架构站点：systemType 为空或不在已知集合。
+ * 这类站点无法识别签到/额度接口，不提供会话同步（额度/签到）能力。
+ */
+export function isUnknownSystemType(raw: string): boolean {
+  const normalized = normalizeSystemType(raw);
+  return !normalized || !KNOWN_SYSTEM_TYPES.has(normalized);
+}
+
 /** 判断系统类型是否属于/兼容 NewAPI 架构（NewAPI / AnyRouter / One API / One Hub / Done Hub / Veloera）。 */
 export function isNewApiCompatible(raw: string): boolean {
   const normalized = normalizeSystemType(raw);
@@ -650,6 +659,28 @@ export interface TokenCollectorSyncReport {
   elapsedMs: number;
   updatedAt: string;
   message: string;
+}
+
+// —— 模型映射：Token 统计原始名 → 正式模型（AI 分析 / 手工确认） ——
+export interface TokenModelMapping {
+  rawKey: string;        // 小写、去厂商前缀后的原始名（与后端 raw_key 一致）
+  rawModel: string;      // 首次见到的原始模型名
+  officialModel: string; // 正式模型名；空串表示尚未确定
+  officialSlug: string | null;
+  lab: string | null;
+  origin: "rule" | "ai" | "manual";
+  confidence: number;
+  reason: string | null;
+  confirmed: boolean;
+  updatedAt: string;
+}
+
+export interface TokenMappingAnalyzeReport {
+  analyzed: number;         // 本次实际送给 AI 的条目数
+  skippedConfirmed: number; // 因已确认而跳过的条目数
+  resolved: number;         // 成功写回映射的条目数
+  unresolved: string[];     // AI 未能给出正式模型的原始名
+  warnings: string[];
 }
 
 // —— 请求/对话活动：多工具直读后的小时桶 ——
