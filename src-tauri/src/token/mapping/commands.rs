@@ -1,9 +1,9 @@
 use super::ai;
 use super::store;
 use super::types::*;
+use crate::context::{AppContext, Managed};
 use crate::model::gateway::types::ChannelConfig;
-use crate::models::Database;
-use tauri::State;
+use std::sync::Arc;
 use tracing::warn;
 
 /// 组装 AI 判定请求用的模型名。要求显式指定渠道：拼上渠道网关别名前缀
@@ -29,26 +29,26 @@ pub(crate) fn resolve_request_model(
 
 #[tauri::command]
 pub fn get_token_model_mappings(
-    database: State<'_, Database>,
+    ctx: Managed<'_, Arc<AppContext>>,
 ) -> Result<Vec<ModelMapping>, String> {
-    store::list_mappings(&database)
+    store::list_mappings(&ctx.database)
 }
 
 #[tauri::command]
 pub fn register_token_model_names(
-    database: State<'_, Database>,
+    ctx: Managed<'_, Arc<AppContext>>,
     names: Vec<String>,
 ) -> Result<usize, String> {
-    store::register_raw_models(&database, &names)
+    store::register_raw_models(&ctx.database, &names)
 }
 
 #[tauri::command]
 pub fn set_token_model_mapping(
-    database: State<'_, Database>,
+    ctx: Managed<'_, Arc<AppContext>>,
     raw_model: String,
     official_model: String,
 ) -> Result<ModelMapping, String> {
-    store::set_mapping_manually(&database, &raw_model, &official_model)
+    store::set_mapping_manually(&ctx.database, &raw_model, &official_model)
 }
 
 /// 用 AI 补全「原始模型名 → 正式模型」映射。
@@ -58,7 +58,7 @@ pub fn set_token_model_mapping(
 /// 由网关的渠道前缀路由定向到所选反代渠道。
 #[tauri::command]
 pub async fn analyze_token_model_mappings(
-    database: State<'_, Database>,
+    ctx: Managed<'_, Arc<AppContext>>,
     model: Option<String>,
     force: Option<bool>,
     channel_id: Option<String>,
@@ -66,8 +66,8 @@ pub async fn analyze_token_model_mappings(
     let force = force.unwrap_or(false);
     let mut report = AnalyzeReport::default();
 
-    let confirmed_before = store::count_confirmed(&database)?;
-    let pending = store::pending_models(&database, force)?;
+    let confirmed_before = store::count_confirmed(&ctx.database)?;
+    let pending = store::pending_models(&ctx.database, force)?;
     if !force {
         report.skipped_confirmed = confirmed_before;
     }
@@ -76,7 +76,7 @@ pub async fn analyze_token_model_mappings(
     }
 
     let catalog = {
-        let connection = database.lock_conn()?;
+        let connection = ctx.database.lock_conn()?;
         store::official_catalog(&connection)?
     };
     if catalog.is_empty() {
@@ -84,7 +84,7 @@ pub async fn analyze_token_model_mappings(
     }
 
     let config = {
-        let connection = database.lock_conn()?;
+        let connection = ctx.database.lock_conn()?;
         crate::model::gateway::config::load_model_proxy_config(&connection)
     };
     if !config.enabled {
@@ -123,7 +123,7 @@ pub async fn analyze_token_model_mappings(
             }
         };
         report.analyzed += batch.len();
-        report.resolved += store::apply_ai_results(&database, &items, force)?;
+        report.resolved += store::apply_ai_results(&ctx.database, &items, force)?;
 
         for item in batch {
             let hit = items.iter().any(|result| {
