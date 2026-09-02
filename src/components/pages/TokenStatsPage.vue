@@ -278,6 +278,18 @@ const mappingOfficialCount = computed(
   () => store.tokenModelMappings.value.filter((row) => row.officialModel.trim()).length,
 );
 
+const mappingColumns: AppTableColumn[] = [
+  { key: "rawModel", title: "原始模型名", width: "minmax(150px, 1fr)", sortable: false },
+  { key: "officialModel", title: "正式模型", width: "minmax(220px, 1.2fr)", sortable: false },
+  { key: "origin", title: "来源", width: "68px", align: "center", sortable: false },
+  { key: "confirmed", title: "状态", width: "84px", align: "center", sortable: false },
+  { key: "reason", title: "说明", width: "minmax(120px, 1fr)", sortable: false },
+];
+
+function mappingRowClass(row: TokenModelMapping): string {
+  return mappingSavingKey.value === row.rawKey ? "is-saving" : "";
+}
+
 // 渠道下拉：仅列出已启用的反代渠道；分析请求必须指定渠道
 const mappingChannelOptions = computed(() => {
   const channels = mappingProxy.proxyConfig.value.channels.filter((channel) => channel.enabled);
@@ -2473,41 +2485,41 @@ onBeforeUnmount(() => {
               <span v-if="mappingCatalogLoading" class="tt-mapping-catalog-hint">模型目录加载中…</span>
             </div>
 
-            <div class="tt-mapping-table">
-              <div class="tt-mapping-head">
-                <span>原始模型名</span>
-                <span>正式模型</span>
-                <span>来源</span>
-                <span>状态</span>
-                <span>说明</span>
-              </div>
-              <div v-if="store.tokenModelMappingsLoading.value" class="tt-mapping-empty">映射加载中…</div>
-              <div v-else-if="!mappingRows.length" class="tt-mapping-empty">暂无映射记录，点击「开始 AI 分析」生成</div>
-              <div
-                v-for="row in mappingRows"
-                :key="row.rawKey"
-                class="tt-mapping-row"
-                :class="{ 'is-saving': mappingSavingKey === row.rawKey }"
-              >
-                <span class="tt-mapping-raw" :title="row.rawModel">{{ row.rawModel }}</span>
-                <span class="tt-mapping-official">
-                  <CustomSelect
-                    :options="[{ value: '', text: '未映射' }]"
-                    :groups="mappingCatalogGroups"
-                    :model-value="row.officialModel"
-                    :aria-label="`为 ${row.rawModel} 选择正式模型`"
-                    @update:model-value="saveMappingOfficial(row, String($event))"
-                  />
-                </span>
-                <span class="tt-mapping-origin">
-                  <i class="tt-origin-badge" :class="`is-${row.origin}`">{{ mappingOriginLabels[row.origin] || row.origin }}</i>
-                </span>
+            <AppTable
+              class="tt-mapping-table"
+              :rows="mappingRows"
+              :columns="mappingColumns"
+              :row-key="(row: any) => row.rawKey"
+              :loading="store.tokenModelMappingsLoading.value"
+              :page-size="20"
+              :row-class="mappingRowClass"
+              empty-text="暂无映射记录，点击「开始 AI 分析」生成"
+            >
+              <template #cell-rawModel="{ row }">
+                <code class="tt-mapping-raw" :title="row.rawModel">{{ row.rawModel }}</code>
+              </template>
+              <template #cell-officialModel="{ row }">
+                <CustomSelect
+                  class="tt-mapping-official"
+                  :options="[{ value: '', text: '未映射' }]"
+                  :groups="mappingCatalogGroups"
+                  :model-value="row.officialModel"
+                  :aria-label="`为 ${row.rawModel} 选择正式模型`"
+                  @update:model-value="saveMappingOfficial(row, String($event))"
+                />
+              </template>
+              <template #cell-origin="{ row }">
+                <i class="tt-origin-badge" :class="`is-${row.origin}`">{{ mappingOriginLabels[row.origin] || row.origin }}</i>
+              </template>
+              <template #cell-confirmed="{ row }">
                 <span class="tt-mapping-state" :class="row.confirmed ? 'is-ok' : 'is-pending'">
                   {{ row.confirmed ? "已确认" : "待确认" }}
                 </span>
+              </template>
+              <template #cell-reason="{ row }">
                 <span class="tt-mapping-reason" :title="row.reason || ''">{{ row.reason || "—" }}</span>
-              </div>
-            </div>
+              </template>
+            </AppTable>
           </div>
 
           <footer class="tt-modal-footer">
@@ -4171,45 +4183,17 @@ onBeforeUnmount(() => {
 }
 
 .tt-mapping-table {
-  border: 1px solid var(--line);
-  border-radius: var(--r-md, 8px);
-  overflow: hidden;
-  display: flex;
-  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
 }
 
-.tt-mapping-head,
-.tt-mapping-row {
-  display: grid;
-  grid-template-columns: minmax(140px, 1.1fr) minmax(200px, 1.4fr) 56px 64px minmax(120px, 1fr);
-  align-items: center;
-  gap: 10px;
-  padding: 7px 12px;
-}
-
-.tt-mapping-head {
-  font-size: 11px;
-  color: var(--muted);
-  background: var(--page-bg);
-  border-bottom: 1px solid var(--line);
-  padding-top: 9px;
-  padding-bottom: 9px;
-}
-
-.tt-mapping-row {
-  border-bottom: 1px solid var(--line-soft, var(--line));
-  font-size: 12px;
-}
-
-.tt-mapping-row:last-child {
-  border-bottom: none;
-}
-
-.tt-mapping-row.is-saving {
+.tt-mapping-table :deep(.app-table-tr.is-saving) {
   opacity: 0.55;
 }
 
 .tt-mapping-raw {
+  display: block;
+  max-width: 100%;
   font-family: var(--font-mono, ui-monospace, monospace);
   font-size: 11px;
   overflow: hidden;
@@ -4217,9 +4201,9 @@ onBeforeUnmount(() => {
   white-space: nowrap;
 }
 
-.tt-mapping-origin,
-.tt-mapping-state {
-  text-align: center;
+.tt-mapping-official {
+  width: 100%;
+  max-width: 340px;
 }
 
 .tt-origin-badge {
@@ -4241,28 +4225,25 @@ onBeforeUnmount(() => {
   color: #10b981;
 }
 
+.tt-mapping-state {
+  font-size: 11px;
+}
+
 .tt-mapping-state.is-ok {
   color: #10b981;
-  font-size: 11px;
 }
 
 .tt-mapping-state.is-pending {
   color: var(--muted);
-  font-size: 11px;
 }
 
 .tt-mapping-reason {
+  display: block;
+  max-width: 100%;
   font-size: 11px;
   color: var(--muted);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-.tt-mapping-empty {
-  padding: 22px 12px;
-  text-align: center;
-  font-size: 12px;
-  color: var(--muted);
 }
 </style>
