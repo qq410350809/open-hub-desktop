@@ -4182,28 +4182,76 @@ onBeforeUnmount(() => {
   color: var(--muted);
 }
 
+/* —— 模型映射表格：在弹窗内收敛为一张带包边、行距紧凑的卡片表 —— */
 .tt-mapping-table {
-  flex: 1 1 auto;
-  min-height: 0;
+  height: auto;
+  max-height: 52vh;
+  flex: 0 1 auto;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md, 8px);
+  overflow: hidden;
+  background: var(--surface);
+}
+
+.tt-mapping-table :deep(.app-table) {
+  table-layout: fixed;
+}
+
+.tt-mapping-table :deep(.app-table-scroll) {
+  overflow-x: hidden;
+}
+
+.tt-mapping-table :deep(th.app-table-th) {
+  height: auto;
+  padding: 8px 12px;
+  background: var(--page-bg);
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0;
+}
+
+.tt-mapping-table :deep(td.app-table-td) {
+  padding: 8px 12px;
+  vertical-align: middle;
+}
+
+.tt-mapping-table :deep(tbody .app-table-tr:hover) {
+  background: var(--surface-hover);
 }
 
 .tt-mapping-table :deep(.app-table-tr.is-saving) {
   opacity: 0.55;
 }
 
+.tt-mapping-table :deep(.app-table-pagination) {
+  min-height: 44px;
+  padding: 6px 12px;
+  background: var(--page-bg);
+}
+
+.tt-mapping-table :deep(.app-table-page-total) {
+  font-size: 11px;
+}
+
 .tt-mapping-raw {
-  display: block;
+  display: inline-block;
   max-width: 100%;
+  padding: 3px 8px;
+  border-radius: var(--r-sm, 6px);
+  background: var(--surface-hover);
   font-family: var(--font-mono, ui-monospace, monospace);
   font-size: 11px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  vertical-align: middle;
 }
 
 .tt-mapping-official {
   width: 100%;
   max-width: 340px;
+  height: 30px;
 }
 
 .tt-origin-badge {
@@ -4226,14 +4274,20 @@ onBeforeUnmount(() => {
 }
 
 .tt-mapping-state {
-  font-size: 11px;
+  display: inline-block;
+  font-size: 10px;
+  padding: 2px 8px;
+  border-radius: var(--r-full, 999px);
+  white-space: nowrap;
 }
 
 .tt-mapping-state.is-ok {
+  background: rgba(16, 185, 129, 0.14);
   color: #10b981;
 }
 
 .tt-mapping-state.is-pending {
+  background: var(--surface-hover);
   color: var(--muted);
 }
 
