@@ -2437,7 +2437,8 @@ onBeforeUnmount(() => {
             <p class="tt-mapping-hint">
               <span v-html="icons.info" />
               <span>
-                分析请求经模型网关发往所选渠道的所选模型；已确认条目只在强制同步时重跑，手工映射始终保留。
+                分析请求经进程内网关入口直发所选渠道，无需开启网关服务，请求会照常记入网关日志；
+                已确认条目只在强制同步时重跑，手工映射始终保留。
               </span>
             </p>
             <p v-if="mappingCatalogError" class="tt-mapping-error">模型目录加载失败：{{ mappingCatalogError }}</p>

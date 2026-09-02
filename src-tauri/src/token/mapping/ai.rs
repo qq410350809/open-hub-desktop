@@ -1,6 +1,6 @@
 use super::types::*;
-use serde_json::{json, Value as JsonValue};
-use std::time::Duration;
+use crate::model::gateway::types::ModelProxyContext;
+use serde_json::Value as JsonValue;
 
 /// 单批送给 AI 的待分析条目数。批太大容易触发上游截断与漏条。
 pub const BATCH_SIZE: usize = 40;
@@ -114,36 +114,18 @@ pub fn parse_items(value: &JsonValue) -> Vec<AiMappingItem> {
         .collect()
 }
 
-/// 通过本地模型网关发一次判定请求，复用用户已配置的渠道与 key。
+/// 经进程内网关入口发一次判定请求：免 Key 免回环端口，
+/// 渠道解析、协议转换与请求日志与普通网关请求一致。
 pub async fn request_mapping(
-    base_url: &str,
-    api_key: &str,
+    ctx: &ModelProxyContext,
     model: &str,
     prompt: &str,
-    timeout_seconds: u64,
 ) -> Result<Vec<AiMappingItem>, String> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(timeout_seconds.max(30)))
-        .build()
-        .map_err(|error| error.to_string())?;
-    let endpoint = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
-    let mut request = client.post(&endpoint).json(&json!({
-        "model": model,
-        "temperature": 0,
-        "messages": [{ "role": "user", "content": prompt }],
-    }));
-    if !api_key.trim().is_empty() {
-        request = request.bearer_auth(api_key.trim());
-    }
-    let response = request.send().await.map_err(|error| error.to_string())?;
-    let status = response.status();
-    let body = response.text().await.map_err(|error| error.to_string())?;
-    if !status.is_success() {
-        return Err(format!("AI 分析请求失败（{status}）：{body}"));
-    }
-    let payload: JsonValue = serde_json::from_str(&body).map_err(|error| error.to_string())?;
-    let content = payload["choices"][0]["message"]["content"]
-        .as_str()
+    let payload =
+        crate::model::gateway::handlers::chat::internal_chat_completion(ctx, model, prompt).await?;
+    let content = payload
+        .pointer("/choices/0/message/content")
+        .and_then(JsonValue::as_str)
         .ok_or_else(|| "AI 响应缺少 message.content".to_string())?;
     let parsed = extract_json(content).ok_or_else(|| "AI 响应不是可解析的 JSON".to_string())?;
     Ok(parse_items(&parsed))

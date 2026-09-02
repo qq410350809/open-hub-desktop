@@ -8,26 +8,29 @@ use super::super::logger::{cap_log_body, client_name_from_headers};
 use super::super::pipeline::{
     auth_and_count, dispatch_protocol_egress, resolve_channel_or_404, ClientProtocol,
 };
-use super::super::types::{generate_req_id, ModelProxyContext};
+use super::super::types::{generate_req_id, ModelProxyConfig, ModelProxyContext};
 use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode, Uri};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use serde_json::Value as JsonValue;
+use serde_json::{json, Value as JsonValue};
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
-pub async fn handle_chat_completions(
-    headers: HeaderMap,
-    uri: Uri,
-    State(ctx): State<ModelProxyContext>,
-    Json(body): Json<JsonValue>,
-) -> Response {
-    const PATH: &str = "/v1/chat/completions";
-    let start_time = Instant::now();
-    let req_id = generate_req_id();
-    let config = ctx.config.read().await.clone();
+const CHAT_PATH: &str = "/v1/chat/completions";
 
+/// 鉴权与出网共用的一次性请求摘要。
+struct PreparedChat {
+    config: ModelProxyConfig,
+    raw_model: String,
+    is_stream: bool,
+    req_id: String,
+    start_time: Instant,
+    req_body_str: Option<String>,
+}
+
+async fn prepare_chat_request(ctx: &ModelProxyContext, body: &JsonValue) -> PreparedChat {
+    let config = ctx.config.read().await.clone();
     let raw_model = body
         .get("model")
         .and_then(JsonValue::as_str)
@@ -42,29 +45,96 @@ pub async fn handle_chat_completions(
     } else {
         None
     };
+    PreparedChat {
+        config,
+        raw_model,
+        is_stream,
+        req_id: generate_req_id(),
+        start_time: Instant::now(),
+        req_body_str,
+    }
+}
 
+pub async fn handle_chat_completions(
+    headers: HeaderMap,
+    uri: Uri,
+    State(ctx): State<ModelProxyContext>,
+    Json(body): Json<JsonValue>,
+) -> Response {
+    let prep = prepare_chat_request(&ctx, &body).await;
     if let Err(res) = auth_and_count(
         &ctx,
         &headers,
         &uri,
-        &config,
-        &req_id,
-        PATH,
-        &raw_model,
-        is_stream,
-        start_time,
-        &req_body_str,
+        &prep.config,
+        &prep.req_id,
+        CHAT_PATH,
+        &prep.raw_model,
+        prep.is_stream,
+        prep.start_time,
+        &prep.req_body_str,
     )
     .await
     {
         return res;
     }
+    dispatch_chat_request(&ctx, &headers, &body, prep).await
+}
+
+/// 进程内直调 Chat 入口：跳过 HTTP 鉴权与网关路由开关，
+/// 渠道解析、协议转换、出网重试、日志与用量统计与 HTTP 请求完全一致。
+/// 供 Token 模型映射等内部功能复用渠道与日志链路，免回环端口与 Key。
+pub async fn internal_chat_completion(
+    ctx: &ModelProxyContext,
+    model: &str,
+    prompt: &str,
+) -> Result<JsonValue, String> {
+    let body = json!({
+        "model": model,
+        "temperature": 0,
+        "messages": [{ "role": "user", "content": prompt }],
+    });
+    let mut headers = HeaderMap::new();
+    if let Ok(value) = HeaderValue::from_str("OpenHub-TokenMapping") {
+        headers.insert(axum::http::header::USER_AGENT, value);
+    }
+    let prep = prepare_chat_request(ctx, &body).await;
+    ctx.metrics.total_requests.fetch_add(1, Ordering::Relaxed);
+    let response = dispatch_chat_request(ctx, &headers, &body, prep).await;
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 32 * 1024 * 1024)
+        .await
+        .map_err(|error| format!("读取网关响应失败：{error}"))?;
+    if !status.is_success() {
+        return Err(format!(
+            "网关返回 {status}：{}",
+            String::from_utf8_lossy(&bytes).trim()
+        ));
+    }
+    serde_json::from_slice(&bytes).map_err(|error| format!("网关响应不是有效 JSON：{error}"))
+}
+
+/// 鉴权后的公共主体：渠道解析 → IR 转换 → 出网 → 响应回转与日志落库。
+async fn dispatch_chat_request(
+    ctx: &ModelProxyContext,
+    headers: &HeaderMap,
+    body: &JsonValue,
+    prep: PreparedChat,
+) -> Response {
+    let PreparedChat {
+        config,
+        raw_model,
+        is_stream,
+        req_id,
+        start_time,
+        req_body_str,
+    } = prep;
 
     let (chan, model_to_send) = match resolve_channel_or_404(
         &ctx,
         &config,
         &raw_model,
-        PATH,
+        CHAT_PATH,
         &req_id,
         is_stream,
         start_time,
@@ -79,7 +149,7 @@ pub async fn handle_chat_completions(
 
     // 请求侧 IR：Chat 入口同样解析为通用对象，出网由目标序列化器展开
     let egress_payload = crate::model::gateway::egress::EgressBody::Universal(
-        crate::model::gateway::parsers::chat_to_universal(&body, &model_to_send),
+        crate::model::gateway::parsers::chat_to_universal(body, &model_to_send),
     );
 
     let outcome = match dispatch_protocol_egress(
@@ -88,7 +158,7 @@ pub async fn handle_chat_completions(
         chan,
         &model_to_send,
         &raw_model,
-        PATH,
+        CHAT_PATH,
         &req_id,
         is_stream,
         start_time,
@@ -102,12 +172,12 @@ pub async fn handle_chat_completions(
         Err(res) => return res,
     };
 
-    let mut log = outcome.base_log(PATH, &raw_model, is_stream, req_body_str);
-    log.client_name = Some(client_name_from_headers(&headers, PATH));
+    let mut log = outcome.base_log(CHAT_PATH, &raw_model, is_stream, req_body_str);
+    log.client_name = Some(client_name_from_headers(headers, CHAT_PATH));
 
     if is_stream {
         // 出网已按渠道目标原生化，响应协议即 outcome.target（嗅探失败时的正确回退）
-        let (tool_hints, preferred_tool) = crate::model::gateway::stream::extract_tool_hints(&body);
+        let (tool_hints, preferred_tool) = crate::model::gateway::stream::extract_tool_hints(body);
         let upstream_headers = outcome.success.response.headers().clone();
         let stream_body = crate::model::gateway::stream::proxy_sse_body_with_hints(
             outcome.success.response.bytes_stream(),

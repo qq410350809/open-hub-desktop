@@ -2,7 +2,7 @@ use super::ai;
 use super::store;
 use super::types::*;
 use crate::context::{AppContext, Managed};
-use crate::model::gateway::types::ChannelConfig;
+use crate::model::gateway::types::{ChannelConfig, ModelProxyState};
 use std::sync::Arc;
 use tracing::warn;
 
@@ -54,11 +54,12 @@ pub fn set_token_model_mapping(
 /// 用 AI 补全「原始模型名 → 正式模型」映射。
 /// force = false（默认）时跳过已确认的条目，只分析新增或未决的；
 /// force = true 时重跑全部条目，但手工修改（origin = manual）的行始终保留。
-/// channel_id 非空时，请求模型名带上该渠道的网关别名前缀（{alias}/{model}），
-/// 由网关的渠道前缀路由定向到所选反代渠道。
+/// 请求经进程内网关入口发出（免 Key、免回环端口、免网关开关），channel_id
+/// 定向所选反代渠道：模型名带 {alias}/{model} 前缀走渠道前缀路由。
 #[tauri::command]
 pub async fn analyze_token_model_mappings(
     ctx: Managed<'_, Arc<AppContext>>,
+    gateway: Managed<'_, ModelProxyState>,
     model: Option<String>,
     force: Option<bool>,
     channel_id: Option<String>,
@@ -83,19 +84,16 @@ pub async fn analyze_token_model_mappings(
         return Err("模型目录为空，请先同步模型目录再做 AI 分析".to_string());
     }
 
-    let config = {
-        let connection = ctx.database.lock_conn()?;
-        crate::model::gateway::config::load_model_proxy_config(&connection)
-    };
-    if !config.enabled {
-        return Err("模型网关未启用，无法调用 AI 分析".to_string());
-    }
-    let base_url = format!("http://127.0.0.1:{}", config.port);
+    let gateway_ctx = gateway.context.clone();
     let model = model
         .map(|name| name.trim().to_string())
         .filter(|name| !name.is_empty())
         .ok_or_else(|| "请选择发起 AI 分析的分析模型".to_string())?;
-    let request_model = resolve_request_model(&config.channels, channel_id.as_deref(), &model)?;
+    // 渠道校验与实际出网用同一份网关运行时配置，避免两处配置漂移。
+    let request_model = {
+        let gateway_config = gateway_ctx.config.read().await;
+        resolve_request_model(&gateway_config.channels, channel_id.as_deref(), &model)?
+    };
 
     for batch in pending.chunks(ai::BATCH_SIZE) {
         let candidates = ai::shortlist_candidates(batch, &catalog);
@@ -106,15 +104,7 @@ pub async fn analyze_token_model_mappings(
             continue;
         }
         let prompt = ai::build_prompt(batch, &candidates);
-        let items = match ai::request_mapping(
-            &base_url,
-            &config.api_key,
-            &request_model,
-            &prompt,
-            config.timeout_seconds,
-        )
-        .await
-        {
+        let items = match ai::request_mapping(&gateway_ctx, &request_model, &prompt).await {
             Ok(items) => items,
             Err(error) => {
                 warn!("[token-mapping] 批次分析失败：{error}");
