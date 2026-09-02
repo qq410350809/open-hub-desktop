@@ -82,6 +82,7 @@ async fn main() {
         proxy_runtime,
         charity_runtime,
         model_catalog_runtime,
+        model_probe: Arc::new(crate::model::probe::ProbeRuntime::new()),
         event_bus: context::EventBus::new(),
         data_dir: args.data_dir.clone(),
         resource_dir: None,

@@ -141,7 +141,8 @@ fn prepare_egress_inner(
     is_stream: bool,
 ) -> (String, JsonValue) {
     let base = channel.base_url.trim().trim_end_matches('/');
-    let target = TargetProtocol::from_channel(channel);
+    // 模型级协议覆盖优先（「管理模型」中为单个模型选择的上游协议）
+    let target = channel.target_protocol_for(model);
 
     match target {
         // Gemini 原生：模型名走 URL，key 走查询参数；跨协议时由 IR 序列化

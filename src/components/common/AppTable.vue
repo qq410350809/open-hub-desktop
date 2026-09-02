@@ -33,6 +33,7 @@ const props = withDefaults(
     pageSize?: number;
     total?: number;
     manualPagination?: boolean;
+    manualSorting?: boolean;
     sorting?: SortingState;
     rowClass?: (row: T) => string;
     selectedKey?: string | number | null;
@@ -49,6 +50,7 @@ const props = withDefaults(
     pageSize: 50,
     total: 0,
     manualPagination: false,
+    manualSorting: false,
     sorting: () => [] as SortingState,
     selectedKey: null,
     clickable: false,
@@ -137,6 +139,7 @@ const table = useTable({
     }
   }) as any,
   manualPagination: props.manualPagination,
+  manualSorting: props.manualSorting,
   pageCount: props.manualPagination ? Math.max(1, Math.ceil(props.total / props.pageSize)) : undefined,
   rowCount: props.manualPagination ? props.total : undefined,
   autoResetPageIndex: false,

@@ -2047,7 +2047,8 @@ kbd { padding: 3px 7px; border: 1px solid var(--line); border-radius: var(--r-xs
 .charity-panel,
 .token-stats-panel,
 .model-params-panel,
-.modelproxy-panel {
+.modelproxy-panel,
+.modeltest-panel {
   min-width: 0;
   min-height: 0;
   height: 100%;

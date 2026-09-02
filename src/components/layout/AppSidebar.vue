@@ -79,6 +79,13 @@ const navItems = computed(() => [
     onClick: () => store.openModelProxy(),
   },
   {
+    id: "modeltest",
+    label: "模型测试",
+    icon: icons.flask,
+    active: store.page.value === "modeltest",
+    onClick: () => store.openModelTest(),
+  },
+  {
     id: "charity",
     label: "公益监听",
     icon: icons.heartPulse,

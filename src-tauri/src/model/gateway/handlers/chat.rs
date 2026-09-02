@@ -94,8 +94,18 @@ pub async fn internal_chat_completion(
         "temperature": 0,
         "messages": [{ "role": "user", "content": prompt }],
     });
+    internal_chat_completion_body(ctx, body, "OpenHub-TokenMapping").await
+}
+
+/// 进程内直调 Chat 入口的通用版本：完整请求体（含 model / max_tokens / messages），
+/// `client_name` 写入 User-Agent 供网关日志区分调用方。
+pub async fn internal_chat_completion_body(
+    ctx: &ModelProxyContext,
+    body: JsonValue,
+    client_name: &str,
+) -> Result<JsonValue, String> {
     let mut headers = HeaderMap::new();
-    if let Ok(value) = HeaderValue::from_str("OpenHub-TokenMapping") {
+    if let Ok(value) = HeaderValue::from_str(client_name) {
         headers.insert(axum::http::header::USER_AGENT, value);
     }
     let prep = prepare_chat_request(ctx, &body).await;

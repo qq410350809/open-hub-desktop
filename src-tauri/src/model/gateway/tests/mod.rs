@@ -1818,6 +1818,7 @@ async fn resolve_channel_api_keys_reads_site_cache_and_dedupes() {
         model_catalog_runtime: std::sync::Arc::new(
             crate::model::catalog::ModelCatalogRuntime::new(),
         ),
+        model_probe: std::sync::Arc::new(crate::model::probe::ProbeRuntime::new()),
         event_bus: crate::context::EventBus::new(),
         data_dir: root.clone(),
         resource_dir: None,
@@ -1910,6 +1911,7 @@ fn model_proxy_rule_is_keyed_by_bare_model_not_prefixed() {
     let mut channel = ModelProxyConfig::default().channels.remove(0);
     channel.alias = Some("x666".to_string());
     channel.model_proxy_rules = Some(vec![ModelProxyRule {
+        protocol: None,
         model: "gpt-4".to_string(),
         mode: "direct".to_string(),
         node_id: None,
@@ -1939,6 +1941,7 @@ fn resolved_bare_model_matches_proxy_rule_after_prefix_strip() {
     channel.alias = Some("x666".to_string());
     channel.enabled = true;
     channel.model_proxy_rules = Some(vec![ModelProxyRule {
+        protocol: None,
         model: "gpt-4".to_string(),
         mode: "direct".to_string(),
         node_id: None,
@@ -1976,6 +1979,7 @@ async fn egress_candidates_honor_direct_rule_only_with_bare_model() {
     channel.proxy_mode = Some("fixed_channel".to_string());
     channel.proxy_fixed_channel = Some("lane-a".to_string());
     channel.model_proxy_rules = Some(vec![ModelProxyRule {
+        protocol: None,
         model: "gpt-4".to_string(),
         mode: "direct".to_string(),
         node_id: None,

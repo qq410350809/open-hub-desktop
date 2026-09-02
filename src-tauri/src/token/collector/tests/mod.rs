@@ -35,7 +35,8 @@ fn zcode_database_extracts_nested_model_on_user_turn() {
 }
 
 #[test]
-fn codex_usage_normalization_separates_cached_input() {
+fn codex_usage_normalization_keeps_input_and_cached_independent() {
+    // 输入与缓存读是两个独立分量，不得互相扣减（旧实现 input - cached 会产生负数）
     let usage = CodexUsage {
         input_tokens: 100,
         cached_input_tokens: 80,
@@ -44,9 +45,21 @@ fn codex_usage_normalization_separates_cached_input() {
         ..Default::default()
     }
     .normalized();
-    assert_eq!(usage.input_tokens, 20);
+    assert_eq!(usage.input_tokens, 100);
     assert_eq!(usage.cached_input_tokens, 80);
-    assert_eq!(usage.total_tokens, 110);
+    assert_eq!(usage.total_tokens, 190);
+
+    // 缓存读大于输入时也不得出现负值
+    let top_heavy = CodexUsage {
+        input_tokens: 822,
+        cached_input_tokens: 23872,
+        output_tokens: 118,
+        ..Default::default()
+    }
+    .normalized();
+    assert_eq!(top_heavy.input_tokens, 822);
+    assert_eq!(top_heavy.cached_input_tokens, 23872);
+    assert_eq!(top_heavy.total_tokens, 24812);
 }
 
 #[test]

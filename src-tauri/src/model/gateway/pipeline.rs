@@ -394,7 +394,8 @@ async fn dispatch_single_channel_egress(
         build_key_attempt_queue(&key_groups, &ctx.key_round_robin, &chan_alias)
     };
 
-    let target = TargetProtocol::from_channel(channel);
+    // 出网协议：模型级覆盖优先（响应回转嗅探也按该协议归一）
+    let target = channel.target_protocol_for(model_to_send);
     let mut last_error_response: Option<Response> = None;
 
     // 顺序遍历尝试队列：组内（独立组）与组间故障转移已在建队时铺平

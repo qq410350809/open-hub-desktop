@@ -377,6 +377,7 @@ pub struct AppContext {
     pub proxy_runtime: std::sync::Arc<crate::proxypool::ProxyRuntime>,
     pub charity_runtime: std::sync::Arc<crate::charity::CharityMonitorRuntime>,
     pub model_catalog_runtime: std::sync::Arc<crate::model::catalog::ModelCatalogRuntime>,
+    pub model_probe: std::sync::Arc<crate::model::probe::ProbeRuntime>,
     pub event_bus: EventBus,
     /// 应用数据目录（桌面为 app_data_dir；server 为 --data-dir 或默认路径）。
     pub data_dir: PathBuf,

@@ -38,6 +38,9 @@ pub struct CharityFeedSource {
     pub enabled: bool,
     #[serde(default)]
     pub sort_order: i64,
+    /// 上游协议类型：chat (OpenAI 兼容) | claude | gemini | ollama，空值表示使用全局设置
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_protocol: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

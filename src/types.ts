@@ -229,6 +229,7 @@ export interface CharityFeedTag {
   name: string;
   enabled?: boolean;
   sortOrder?: number;
+  upstreamProtocol?: string;
 }
 
 export interface RemoteUserInfo {

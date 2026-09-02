@@ -74,6 +74,10 @@ pub struct ModelProxyRule {
     /// fixed_channel 模式锁定的代理池通道 ID；缺省回退渠道默认固定通道
     #[serde(default)]
     pub channel_id: Option<String>,
+    /// 模型级上游协议覆盖：openai / openai-responses / anthropic / gemini。
+    /// 缺省 = 跟随渠道级 protocol。仅覆盖出网协议，不影响出口代理策略。
+    #[serde(default)]
+    pub protocol: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -211,6 +215,18 @@ impl ChannelConfig {
             .as_ref()?
             .iter()
             .find(|r| r.model.trim().to_lowercase() == needle)
+    }
+
+    /// 出网目标协议：模型级规则覆盖优先，未覆盖或值非法时回退渠道级 protocol。
+    pub fn target_protocol_for(&self, model: &str) -> crate::model::gateway::egress::TargetProtocol {
+        if let Some(rule) = self.model_proxy_rule(model) {
+            if let Some(protocol) = rule.protocol.as_deref().map(str::trim) {
+                if !protocol.is_empty() {
+                    return crate::model::gateway::egress::TargetProtocol::from_str(protocol);
+                }
+            }
+        }
+        crate::model::gateway::egress::TargetProtocol::from_channel(self)
     }
 
     /// 获取有效的 API Keys 列表（若配置了 api_keys 列表则取其非空项，否则取单个 api_key）

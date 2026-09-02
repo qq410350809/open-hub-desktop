@@ -8,7 +8,7 @@ pub fn load_charity_sources(database: &Database) -> Result<Vec<CharityFeedSource
     let connection = database.lock_db();
     let mut statement = connection
         .prepare(
-            "SELECT id, name, json_url, enabled, sort_order FROM charity_feed_sources
+            "SELECT id, name, json_url, enabled, sort_order, upstream_protocol FROM charity_feed_sources
              WHERE enabled = 1 ORDER BY sort_order, id",
         )
         .map_err(|error| error.to_string())?;
@@ -20,6 +20,7 @@ pub fn load_charity_sources(database: &Database) -> Result<Vec<CharityFeedSource
                 json_url: row.get(2)?,
                 enabled: row.get::<_, i64>(3).unwrap_or(1) != 0,
                 sort_order: row.get(4).unwrap_or(0),
+                upstream_protocol: row.get(5).ok(),
             })
         })
         .map_err(|error| error.to_string())?;
@@ -31,7 +32,7 @@ pub fn load_all_charity_sources(database: &Database) -> Result<Vec<CharityFeedSo
     let connection = database.lock_db();
     let mut statement = connection
         .prepare(
-            "SELECT id, name, json_url, enabled, sort_order FROM charity_feed_sources
+            "SELECT id, name, json_url, enabled, sort_order, upstream_protocol FROM charity_feed_sources
              ORDER BY sort_order, id",
         )
         .map_err(|error| error.to_string())?;
@@ -43,6 +44,7 @@ pub fn load_all_charity_sources(database: &Database) -> Result<Vec<CharityFeedSo
                 json_url: row.get(2)?,
                 enabled: row.get::<_, i64>(3).unwrap_or(1) != 0,
                 sort_order: row.get(4).unwrap_or(0),
+                upstream_protocol: row.get(5).ok(),
             })
         })
         .map_err(|error| error.to_string())?;
@@ -58,7 +60,7 @@ pub fn charity_feed_source(
     let connection = database.lock_db();
     connection
         .query_row(
-            "SELECT id, name, json_url, enabled, sort_order FROM charity_feed_sources WHERE id = ?1",
+            "SELECT id, name, json_url, enabled, sort_order, upstream_protocol FROM charity_feed_sources WHERE id = ?1",
             params![feed_id],
             |row| {
                 Ok(CharityFeedSource {
@@ -67,6 +69,7 @@ pub fn charity_feed_source(
                     json_url: row.get(2)?,
                     enabled: row.get::<_, i64>(3).unwrap_or(1) != 0,
                     sort_order: row.get(4).unwrap_or(0),
+                    upstream_protocol: row.get(5).ok(),
                 })
             },
         )
@@ -504,15 +507,42 @@ pub fn charity_filter_clause(filter: &str) -> String {
     }
 }
 
+/// 前端列 key → 数据库排序列。白名单映射，杜绝把任意字符串拼进 ORDER BY。
+fn charity_sort_column(key: &str) -> &'static str {
+    match key {
+        "title" => "title COLLATE NOCASE",
+        "author" => "author COLLATE NOCASE",
+        "replyCount" => "reply_count",
+        "views" => "views",
+        "lastActivityAt" => "last_activity_at",
+        _ => "published_at",
+    }
+}
+
+fn charity_sort_direction(order: &str) -> &'static str {
+    if order.eq_ignore_ascii_case("asc") {
+        "ASC"
+    } else {
+        "DESC"
+    }
+}
+
 pub fn load_all_feed_items_from_db(
     database: &Database,
     offset: usize,
     limit: usize,
     keyword: &str,
     filter: &str,
+    sort_by: &str,
+    sort_order: &str,
 ) -> Result<CharityFeedResult, String> {
     let limit = limit.clamp(1, CHARITY_PAGE_LIMIT_MAX);
     let filter_clause = charity_filter_clause(filter);
+    let order_clause = format!(
+        "{} {}, rowid DESC",
+        charity_sort_column(sort_by),
+        charity_sort_direction(sort_order)
+    );
     let connection = database.lock_conn()?;
     // 「全部」是前端聚合的虚拟标签，没有自己的 meta 键；取各真实 feed 里最新的同步时间。
     let fetched_at = connection
@@ -557,7 +587,7 @@ pub fn load_all_feed_items_from_db(
                         reply_count, views, like_count, last_activity_at, pinned, posters, feed_id
                  FROM charity_feed_items
                  WHERE (?3 = '' OR title LIKE ?3 OR author LIKE ?3 OR categories LIKE ?3){filter_clause}
-                 ORDER BY published_at DESC, rowid DESC
+                 ORDER BY {order_clause}
                  LIMIT ?1 OFFSET ?2"
             ),
         )
@@ -682,6 +712,8 @@ pub fn load_feed_items_from_db(
     limit: usize,
     keyword: &str,
     filter: &str,
+    sort_by: &str,
+    sort_order: &str,
 ) -> Result<CharityFeedResult, String> {
     let limit = limit.clamp(1, CHARITY_PAGE_LIMIT_MAX);
     let keys = feed_meta_keys(&source.id);
@@ -698,6 +730,11 @@ pub fn load_feed_items_from_db(
     let key_pat = format!("%{}%", keyword.trim());
     let has_key = !keyword.trim().is_empty();
     let filter_clause = charity_filter_clause(filter);
+    let order_clause = format!(
+        "{} {}, rowid DESC",
+        charity_sort_column(sort_by),
+        charity_sort_direction(sort_order)
+    );
     let total_count = if has_key {
         connection
             .query_row(
@@ -741,7 +778,7 @@ pub fn load_feed_items_from_db(
                     reply_count, views, like_count, last_activity_at, pinned, posters
              FROM charity_feed_items
              WHERE feed_id = ?1 AND (?4 = '' OR title LIKE ?4 OR author LIKE ?4 OR categories LIKE ?4){filter_clause}
-             ORDER BY published_at DESC, rowid DESC
+             ORDER BY {order_clause}
              LIMIT ?2 OFFSET ?3"
         ))
         .map_err(|error| error.to_string())?;

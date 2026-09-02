@@ -34,6 +34,8 @@ export interface ModelProxyRule {
   nodeId?: string | null;
   /** fixed_channel 模式绑定的代理池通道 ID；空 = 渠道默认通道 */
   channelId?: string | null;
+  /** 模型级上游协议覆盖：openai / openai-responses / anthropic / gemini；空 = 跟随渠道级协议 */
+  protocol?: string | null;
 }
 
 /**

@@ -4,8 +4,7 @@ import { icons } from "../../icons";
 import { useStore } from "../../composables/useStore";
 import { useConfirm } from "../../composables/useConfirm";
 import AppTable, { type AppTableColumn } from "../common/AppTable.vue";
-import type { CharityFeedItem, CharitySyncLogEntry } from "../../types";
-import type { SortingState } from "@tanstack/table-core";
+import type { CharityFeedItem, CharityFeedTag, CharitySyncLogEntry } from "../../types";
 import { formatCompactCount as formatCompactCountUtil, formatDuration as formatDurationUtil } from "../../utils";
 
 const store = useStore();
@@ -45,8 +44,8 @@ async function copyPostLink(item: CharityFeedItem) {
 }
 
 // —— 列表过滤与排序 ——
-// 属性筛选（全部/热门/置顶/今日）已下推到后端，与分页同源，避免“只筛当前页”导致分页错乱。
-const topicSorting = ref<SortingState>([]);
+// 筛选与排序都下推到后端：筛选和分页同源，排序由数据库 ORDER BY 决定；
+// 表格只做手动排序（点表头触发后端按列重查），避免“只排当前页”与分页脱节。
 
 function isToday(dateStr?: string): boolean {
   if (!dateStr) return false;
@@ -67,10 +66,22 @@ const tagManagerOpen = ref(false);
 const newTagId = ref("");
 const newTagName = ref("");
 const tagManagerError = ref("");
+const editingProtocolForTag = ref<string | null>(null);
+const editingProtocolValue = ref("");
+
+const upstreamProtocolOptions = [
+  { value: "", label: "使用全局设置" },
+  { value: "chat", label: "Chat（OpenAI 兼容）" },
+  { value: "claude", label: "Claude" },
+  { value: "gemini", label: "Gemini" },
+  { value: "ollama", label: "Ollama" },
+];
 
 function openTagManager() {
   tagManagerOpen.value = true;
   tagManagerError.value = "";
+  editingProtocolForTag.value = null;
+  editingProtocolValue.value = "";
   document.body.classList.add("modal-open");
 }
 
@@ -79,6 +90,8 @@ function closeTagManager() {
   newTagId.value = "";
   newTagName.value = "";
   tagManagerError.value = "";
+  editingProtocolForTag.value = null;
+  editingProtocolValue.value = "";
   document.body.classList.remove("modal-open");
 }
 
@@ -125,6 +138,32 @@ async function handleRemoveTag(id: string, name: string) {
 // 标签 ID 点击后在浏览器打开对应的 linux.do 标签页
 function openTagInBrowser(id: string) {
   void store.openExternal(`https://linux.do/tag/${id}-tag/${id}`);
+}
+
+function startEditProtocol(tag: CharityFeedTag) {
+  editingProtocolForTag.value = tag.id;
+  editingProtocolValue.value = tag.upstreamProtocol || "";
+}
+
+function cancelEditProtocol() {
+  editingProtocolForTag.value = null;
+  editingProtocolValue.value = "";
+}
+
+async function saveProtocol(tag: CharityFeedTag) {
+  try {
+    await store.updateCharitySource(tag.id, { upstreamProtocol: editingProtocolValue.value });
+    editingProtocolForTag.value = null;
+    editingProtocolValue.value = "";
+  } catch (cause) {
+    tagManagerError.value = String(cause);
+  }
+}
+
+function protocolLabel(protocol?: string): string {
+  if (!protocol) return "使用全局设置";
+  const option = upstreamProtocolOptions.find(opt => opt.value === protocol);
+  return option?.label || protocol;
 }
 
 // —— 同步日志管理与终端 ——
@@ -614,15 +653,16 @@ onUnmounted(() => {
           :page-size="store.charityFeedPageSize.value"
           :page-size-options="[20, 50, 100]"
           :total="store.charityFeedTotalCount.value"
-          :sorting="topicSorting"
           manual-pagination
+          manual-sorting
+          :sorting="store.topicSorting.value"
           :row-class="topicRowClass"
           :selected-key="selectedPost?.id ?? null"
           clickable
           @select="(item: any) => openPostDetail(item)"
           @update:page="(page: number) => store.goCharityPage(page)"
           @update:page-size="(size: number) => store.setCharityPageSize(size)"
-          @update:sorting="(s: any) => topicSorting = s"
+          @update:sorting="(s: any) => store.setTopicSorting(s)"
         >
           <!-- 话题列 -->
           <template #cell-title="{ row }">
@@ -912,6 +952,47 @@ onUnmounted(() => {
                         <span class="cm-tag-status-badge" :class="{ 'is-on': tag.enabled !== false }">
                           {{ tag.enabled === false ? "已停用" : "活跃监听" }}
                         </span>
+                      </div>
+                      <div class="cm-tag-protocol-row">
+                        <template v-if="editingProtocolForTag === tag.id">
+                          <select
+                            v-model="editingProtocolValue"
+                            class="cm-tag-protocol-select"
+                            @click.stop
+                          >
+                            <option v-for="opt in upstreamProtocolOptions" :key="opt.value" :value="opt.value">
+                              {{ opt.label }}
+                            </option>
+                          </select>
+                          <button
+                            type="button"
+                            class="cm-tag-protocol-save"
+                            title="保存协议设置"
+                            @click.stop="saveProtocol(tag)"
+                          >
+                            <span v-html="icons.check" />
+                          </button>
+                          <button
+                            type="button"
+                            class="cm-tag-protocol-cancel"
+                            title="取消"
+                            @click.stop="cancelEditProtocol"
+                          >
+                            <span v-html="icons.close" />
+                          </button>
+                        </template>
+                        <template v-else>
+                          <span class="cm-tag-protocol-label">上游协议:</span>
+                          <span class="cm-tag-protocol-value">{{ protocolLabel(tag.upstreamProtocol) }}</span>
+                          <button
+                            type="button"
+                            class="cm-tag-protocol-edit"
+                            title="自定义该标签的上游协议类型"
+                            @click.stop="startEditProtocol(tag)"
+                          >
+                            <span v-html="icons.settings" />
+                          </button>
+                        </template>
                       </div>
                     </div>
 
@@ -2231,6 +2312,7 @@ onUnmounted(() => {
   display: flex;
   flex-direction: column;
   overflow: hidden;
+  gap: 4px;
 }
 
 .cm-tag-name-row {
@@ -2241,6 +2323,79 @@ onUnmounted(() => {
 
 .cm-tag-name-row strong {
   font-size: 12px;
+}
+
+.cm-tag-protocol-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 10.5px;
+}
+
+.cm-tag-protocol-label {
+  color: var(--muted);
+}
+
+.cm-tag-protocol-value {
+  color: var(--text);
+  font-weight: 500;
+}
+
+.cm-tag-protocol-select {
+  height: 22px;
+  padding: 0 6px;
+  border-radius: 4px;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  color: var(--text);
+  font-size: 10.5px;
+  outline: none;
+  cursor: pointer;
+}
+
+.cm-tag-protocol-select:focus {
+  border-color: var(--brand);
+}
+
+.cm-tag-protocol-edit,
+.cm-tag-protocol-save,
+.cm-tag-protocol-cancel {
+  width: 18px;
+  height: 18px;
+  border-radius: 3px;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+}
+
+.cm-tag-protocol-edit:hover {
+  color: var(--brand);
+  background: var(--surface-hover);
+}
+
+.cm-tag-protocol-save {
+  color: #10b981;
+}
+
+.cm-tag-protocol-save:hover {
+  background: rgba(16, 185, 129, 0.1);
+}
+
+.cm-tag-protocol-cancel:hover {
+  color: #ef4444;
+  background: rgba(239, 68, 68, 0.1);
+}
+
+.cm-tag-protocol-edit :deep(svg),
+.cm-tag-protocol-save :deep(svg),
+.cm-tag-protocol-cancel :deep(svg) {
+  width: 11px;
+  height: 11px;
 }
 
 .cm-tag-id-badge {

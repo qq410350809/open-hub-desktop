@@ -130,11 +130,7 @@ pub fn parse_zcode_database(path: &Path) -> CachedDatabase {
                         let cache = tokens.get("cache").unwrap_or(&JsonValue::Null);
                         let cached = number(cache, &["read"]);
                         let cache_creation = number(cache, &["write"]);
-                        let input_total = number(tokens, &["input"]);
-                        let input = input_total
-                            .saturating_sub(cached)
-                            .saturating_sub(cache_creation)
-                            .max(0);
+                        let input = number(tokens, &["input"]);
                         let output = number(tokens, &["output"]);
                         let reasoning = number(tokens, &["reasoning"]);
                         let total = input + cached + cache_creation + output + reasoning;

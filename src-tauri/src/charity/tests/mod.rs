@@ -377,6 +377,7 @@ fn split_items_attributes_topics_by_tag_name() {
             json_url: charity_tag_json_url("1515"),
             enabled: true,
             sort_order: 1,
+            upstream_protocol: None,
         },
         CharityFeedSource {
             id: "1980".into(),
@@ -384,6 +385,7 @@ fn split_items_attributes_topics_by_tag_name() {
             json_url: charity_tag_json_url("1980"),
             enabled: true,
             sort_order: 2,
+            upstream_protocol: None,
         },
     ];
     let make_item = |id: &str, tags: &[&str]| CharityFeedItem {

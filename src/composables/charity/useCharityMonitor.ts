@@ -44,10 +44,14 @@ async function addCharitySource(id: string, name: string) {
   }
 }
 
-async function updateCharitySource(id: string, opts: { name?: string; enabled?: boolean }) {
+async function updateCharitySource(id: string, opts: { name?: string; enabled?: boolean; upstreamProtocol?: string }) {
   charitySourcesLoading.value = true;
   try {
-    await runCommand("update_charity_source", { id, ...opts });
+    const params: Record<string, any> = { id };
+    if (opts.name !== undefined) params.name = opts.name;
+    if (opts.enabled !== undefined) params.enabled = opts.enabled;
+    if (opts.upstreamProtocol !== undefined) params.upstream_protocol = opts.upstreamProtocol;
+    await runCommand("update_charity_source", params);
     await loadCharitySources();
   } finally {
     charitySourcesLoading.value = false;
@@ -95,6 +99,7 @@ const syncLogLoading = ref(false);
 const syncing = ref(false);
 const searchKeyword = ref("");
 const propertyFilter = ref<CharityPropertyFilter>("all");
+const topicSorting = ref<{ id: string; desc: boolean }[]>([{ id: "publishedAt", desc: true }]);
 const proxyPoolSummary = ref<{ validCount: number; candidateCount: number } | null>(null);
 
 let eventUnlisten: UnlistenFn | undefined;
@@ -209,12 +214,15 @@ async function queryLocalFeed(feedId = selectedTagId.value, page = currentPage.v
   loading.value = true;
   try {
     const offset = Math.max(0, (page - 1) * pageSize.value);
+    const sort = topicSorting.value[0] ?? { id: "publishedAt", desc: true };
     const result = await runCommand<CharityFeedResult>("get_charity_feed", {
       feedId,
       offset,
       limit: pageSize.value,
       keyword: searchKeyword.value.trim() || undefined,
       filter: propertyFilter.value === "all" ? undefined : propertyFilter.value,
+      sortBy: sort.id,
+      sortOrder: sort.desc ? "desc" : "asc",
     });
     if (seq !== loadSeq || feedId !== selectedTagId.value) return result;
     applyLocalPage(result, "replace");
@@ -261,6 +269,12 @@ function setSearchKeyword(value: string) {
 function setCharityPropertyFilter(filter: CharityPropertyFilter) {
   if (propertyFilter.value === filter) return;
   propertyFilter.value = filter;
+  currentPage.value = 1;
+  void queryLocalFeed(selectedTagId.value, 1);
+}
+
+function setTopicSorting(sorting: { id: string; desc: boolean }[]) {
+  topicSorting.value = sorting.length ? [...sorting] : [{ id: "publishedAt", desc: true }];
   currentPage.value = 1;
   void queryLocalFeed(selectedTagId.value, 1);
 }
@@ -442,6 +456,8 @@ export function useCharityMonitor() {
     searchKeyword,
     charityPropertyFilter: propertyFilter,
     setCharityPropertyFilter,
+    topicSorting,
+    setTopicSorting,
     currentFeedName,
     charityFeedItems: items,
     charityFeedLoading: loading,

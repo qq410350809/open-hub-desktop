@@ -259,12 +259,13 @@ async function handleOpenChannelModelsModal(channel: ChannelConfig) {
   });
   // 模型级代理出口覆盖草稿：从渠道既有规则初始化
   {
-    const draft = new Map<string, { mode: ModelProxyMode; nodeId: string; channelId: string }>();
+    const draft = new Map<string, { mode: ModelProxyMode; nodeId: string; channelId: string; protocol: string }>();
     for (const r of channel.modelProxyRules ?? []) {
       draft.set(r.model.toLowerCase(), {
         mode: normalizeModelRuleMode(String(r.mode ?? "")),
         nodeId: r.nodeId ?? "",
         channelId: r.channelId ?? "",
+        protocol: r.protocol ?? "",
       });
     }
     modelProxyModeDraft.value = draft;
@@ -597,7 +598,7 @@ const loadingModelStats = ref(false);
 
 // 模型级代理出口覆盖草稿：model(小写) → 规则；无条目 = 跟随渠道级配置
 type ModelProxyMode = "" | "direct" | "pool" | "fixed_channel" | "custom_node";
-const modelProxyModeDraft = ref<Map<string, { mode: ModelProxyMode; nodeId: string; channelId: string }>>(new Map());
+const modelProxyModeDraft = ref<Map<string, { mode: ModelProxyMode; nodeId: string; channelId: string; protocol: string }>>(new Map());
 
 /** 归一化规则模式：旧 fixed 语义 = 自定义节点 */
 function normalizeModelRuleMode(mode: string): ModelProxyMode {
@@ -652,16 +653,20 @@ function setModelProxyMode(model: string, mode: ModelProxyMode) {
     mode,
     nodeId: existing?.nodeId ?? "",
     channelId: existing?.channelId ?? "",
+    protocol: existing?.protocol ?? "",
   });
   modelProxyModeDraft.value = new Map(modelProxyModeDraft.value);
 }
 
-/** 模型规则草稿的读取（固定节点/固定通道下拉当前值） */
+/** 模型规则草稿的读取（固定节点/固定通道/协议下拉当前值） */
 function modelDraftNodeId(model: string): string {
   return modelProxyModeDraft.value.get(model.toLowerCase())?.nodeId ?? "";
 }
 function modelDraftChannelId(model: string): string {
   return modelProxyModeDraft.value.get(model.toLowerCase())?.channelId ?? "";
+}
+function modelDraftProtocol(model: string): string {
+  return modelProxyModeDraft.value.get(model.toLowerCase())?.protocol ?? "";
 }
 
 /** 回写：模型行固定出口节点 */
@@ -669,7 +674,7 @@ function setModelFixedNode(model: string, nodeId: string) {
   const key = model.toLowerCase();
   const existing = modelProxyModeDraft.value.get(key);
   const mode = existing?.mode ? existing.mode : "custom_node";
-  modelProxyModeDraft.value.set(key, { mode, nodeId, channelId: existing?.channelId ?? "" });
+  modelProxyModeDraft.value.set(key, { mode, nodeId, channelId: existing?.channelId ?? "", protocol: existing?.protocol ?? "" });
   modelProxyModeDraft.value = new Map(modelProxyModeDraft.value);
 }
 
@@ -678,7 +683,19 @@ function setModelFixedChannel(model: string, channelId: string) {
   const key = model.toLowerCase();
   const existing = modelProxyModeDraft.value.get(key);
   const mode = existing?.mode ? existing.mode : "fixed_channel";
-  modelProxyModeDraft.value.set(key, { mode, nodeId: existing?.nodeId ?? "", channelId });
+  modelProxyModeDraft.value.set(key, { mode, nodeId: existing?.nodeId ?? "", channelId, protocol: existing?.protocol ?? "" });
+  modelProxyModeDraft.value = new Map(modelProxyModeDraft.value);
+}
+
+/** 回写：模型行上游协议覆盖（"" = 跟随渠道级协议；全空草稿 = 移除覆盖） */
+function setModelProtocol(model: string, protocol: string) {
+  const key = model.toLowerCase();
+  const existing = modelProxyModeDraft.value.get(key);
+  if (existing) {
+    modelProxyModeDraft.value.set(key, { ...existing, protocol });
+  } else {
+    modelProxyModeDraft.value.set(key, { mode: "", nodeId: "", channelId: "", protocol });
+  }
   modelProxyModeDraft.value = new Map(modelProxyModeDraft.value);
 }
 
@@ -853,7 +870,7 @@ async function saveChannelModelSelection() {
   }
 
   // 3.5 模型级代理出口覆盖：本弹窗内出现过的模型以草稿为准（无草稿 = 移除覆盖），
-  // 其余模型的既有规则原样保留；空列表归一为 null
+  // 其余模型的既有规则原样保留；全空草稿（无代理模式且无协议覆盖）同样移除；空列表归一为 null
   {
     const draft = modelProxyModeDraft.value;
     const kept = (channel.modelProxyRules ?? []).filter(
@@ -861,12 +878,13 @@ async function saveChannelModelSelection() {
     );
     const added = selectedChannelModels().flatMap((m) => {
       const d = draft.get(m.toLowerCase());
-      if (!d?.mode) return [];
+      if (!d || (!d.mode && !d.protocol)) return [];
       return [{
         model: m,
-        mode: d.mode,
+        mode: d.mode || "direct",
         nodeId: d.mode === "custom_node" && d.nodeId.trim() ? d.nodeId.trim() : null,
         channelId: d.mode === "fixed_channel" && d.channelId.trim() ? d.channelId.trim() : null,
+        protocol: d.protocol || null,
       }];
     });
     const merged = [...kept, ...added];
@@ -1139,6 +1157,33 @@ const modelProxyModeOptions: { value: string; text: string }[] = [
   { value: "fixed_channel", text: "固定通道" },
   { value: "custom_node", text: "自定义节点" },
 ];
+
+/** 模型行「上游协议」下拉候选：跟随渠道 + 渠道级协议四选项对齐 */
+const modelProtocolSelectOptions: { value: string; text: string }[] = [
+  { value: "inherit", text: "跟随渠道" },
+  { value: "openai", text: "Chat（OpenAI 兼容）" },
+  { value: "openai-responses", text: "Responses（OpenAI）" },
+  { value: "anthropic", text: "Messages（Claude）" },
+  { value: "gemini", text: "Gemini（Google）" },
+];
+
+/** 某模型行「上游协议」下拉显示值：显式覆盖显示协议值，否则 inherit */
+function effectiveModelProtocol(model: string): string {
+  const protocol = modelDraftProtocol(model);
+  return protocol ? protocol : "inherit";
+}
+
+/** 渠道级协议的展示文案（跟随渠道项的 title 说明用） */
+const channelLevelProtocolLabel = computed(() => {
+  const ch = selectedChannel.value;
+  if (!ch) return "";
+  return channelProtocolSelectOptions.find((opt) => opt.value === channelProtocolOf(ch))?.text || "Chat（OpenAI 兼容）";
+});
+
+/** 回写：模型行上游协议（inherit = 跟随渠道 = 清空覆盖） */
+function setModelProtocolOption(model: string, value: string) {
+  setModelProtocol(model, value === "inherit" ? "" : value);
+}
 
 /** 回写：渠道默认固定通道 */
 function setChannelFixedChannel(value: string) {
@@ -4227,63 +4272,65 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
                   <span v-html="isModelChecked(model) ? icons.check : ''" />
                 </span>
 
-                <!-- 主体：模型名 + 启用状态 + Key 专属提示 -->
-                <div class="mp-mcm-main">
-                  <div class="mp-mcm-title-row">
-                    <span class="mp-model-name-title">{{ model }}</span>
-                    <span class="mp-status-pill mp-status-pill-xs" :class="{ active: isModelChecked(model) }">
-                      <span class="mp-status-dot" />
-                      <span>{{ isModelChecked(model) ? '已启用' : '未启用' }}</span>
-                    </span>
-                    <span
-                      v-if="channelModelStatsMap.get(model.toLowerCase())?.todayRequests"
-                      class="mp-mcm-today-chip font-mono"
-                      :title="`今日已调用 ${channelModelStatsMap.get(model.toLowerCase())!.todayRequests} 次 / ${fmtCompactTokens(channelModelStatsMap.get(model.toLowerCase())!.todayTokens)} tokens`"
-                    >今日 {{ channelModelStatsMap.get(model.toLowerCase())!.todayRequests }} 次</span>
-                  </div>
-                  <code class="mp-mcm-id-code font-mono" :title="'点击复制调用 ID'" @click.stop="selectedChannel && copyModel(model, selectedChannel)">
-                    {{ channelAlias(selectedChannel) }}/{{ model }}
-                    <span class="mp-mcm-copy-icon" v-html="copiedModelId === model ? icons.check : icons.copy" />
-                    <span v-if="copiedModelId === model" class="mp-mcm-copy-ok">已复制</span>
-                  </code>
-                </div>
-
-                <!-- 右侧用量统计区 -->
-                <div class="mp-mcm-stats">
-                  <template v-if="channelModelStatsMap.get(model.toLowerCase())">
-                    <div class="mp-mcm-stat" title="累计调用次数（含失败）">
-                      <span class="mp-mcm-stat-val font-mono">{{ channelModelStatsMap.get(model.toLowerCase())!.totalRequests }}</span>
-                      <span class="mp-mcm-stat-label">次调用</span>
-                    </div>
-                    <div
-                      class="mp-mcm-stat"
-                      :class="{ 'is-bad': channelModelStatsMap.get(model.toLowerCase())!.failedRequests > 0 }"
-                      :title="`失败 ${channelModelStatsMap.get(model.toLowerCase())!.failedRequests} 次，成功率 ${
-                        channelModelStatsMap.get(model.toLowerCase())!.totalRequests
-                          ? Math.round((1 - channelModelStatsMap.get(model.toLowerCase())!.failedRequests / channelModelStatsMap.get(model.toLowerCase())!.totalRequests) * 100)
-                          : 100
-                      }%`"
-                    >
-                      <span class="mp-mcm-stat-val font-mono">{{ fmtCompactTokens(channelModelStatsMap.get(model.toLowerCase())!.totalTokens) }}</span>
-                      <span class="mp-mcm-stat-label">tokens</span>
-                    </div>
-                    <div class="mp-mcm-stat" title="平均响应耗时（含首字）">
-                      <span class="mp-mcm-stat-val font-mono">{{ formatSec(channelModelStatsMap.get(model.toLowerCase())!.avgDurationMs) }}</span>
-                      <span class="mp-mcm-stat-label">均耗</span>
-                    </div>
-                    <div class="mp-mcm-stat mp-mcm-stat-wide" title="最近一次调用时间">
-                      <span class="mp-mcm-stat-val">{{ fmtLastUsed(channelModelStatsMap.get(model.toLowerCase())!.lastUsedAt) }}</span>
-                      <span class="mp-mcm-stat-label">最近使用</span>
-                    </div>
-                  </template>
-                  <template v-else>
-                    <div class="mp-mcm-stat mp-mcm-stat-empty">
+                <!-- 主体区：上行 = 模型名 + 用量统计；下行 = 代理/协议覆盖控件 -->
+                <div class="mp-mcm-content">
+                  <div class="mp-mcm-main">
+                    <div class="mp-mcm-title-row">
+                      <span class="mp-model-name-title">{{ model }}</span>
+                      <span class="mp-status-pill mp-status-pill-xs" :class="{ active: isModelChecked(model) }">
+                        <span class="mp-status-dot" />
+                        <span>{{ isModelChecked(model) ? '已启用' : '未启用' }}</span>
+                      </span>
                       <span
-                        class="mp-mcm-stat-label"
-                        :class="{ 'mp-spin-icon': loadingModelStats }"
-                      >{{ loadingModelStats ? '统计加载中…' : '暂无调用记录' }}</span>
+                        v-if="channelModelStatsMap.get(model.toLowerCase())?.todayRequests"
+                        class="mp-mcm-today-chip font-mono"
+                        :title="`今日已调用 ${channelModelStatsMap.get(model.toLowerCase())!.todayRequests} 次 / ${fmtCompactTokens(channelModelStatsMap.get(model.toLowerCase())!.todayTokens)} tokens`"
+                      >今日 {{ channelModelStatsMap.get(model.toLowerCase())!.todayRequests }} 次</span>
                     </div>
-                  </template>
+                    <code class="mp-mcm-id-code font-mono" :title="'点击复制调用 ID'" @click.stop="selectedChannel && copyModel(model, selectedChannel)">
+                      {{ channelAlias(selectedChannel) }}/{{ model }}
+                      <span class="mp-mcm-copy-icon" v-html="copiedModelId === model ? icons.check : icons.copy" />
+                      <span v-if="copiedModelId === model" class="mp-mcm-copy-ok">已复制</span>
+                    </code>
+                  </div>
+
+                  <!-- 上行右段：用量统计区 -->
+                  <div class="mp-mcm-stats">
+                    <template v-if="channelModelStatsMap.get(model.toLowerCase())">
+                      <div class="mp-mcm-stat" title="累计调用次数（含失败）">
+                        <span class="mp-mcm-stat-val font-mono">{{ channelModelStatsMap.get(model.toLowerCase())!.totalRequests }}</span>
+                        <span class="mp-mcm-stat-label">次调用</span>
+                      </div>
+                      <div
+                        class="mp-mcm-stat"
+                        :class="{ 'is-bad': channelModelStatsMap.get(model.toLowerCase())!.failedRequests > 0 }"
+                        :title="`失败 ${channelModelStatsMap.get(model.toLowerCase())!.failedRequests} 次，成功率 ${
+                          channelModelStatsMap.get(model.toLowerCase())!.totalRequests
+                            ? Math.round((1 - channelModelStatsMap.get(model.toLowerCase())!.failedRequests / channelModelStatsMap.get(model.toLowerCase())!.totalRequests) * 100)
+                            : 100
+                        }%`"
+                      >
+                        <span class="mp-mcm-stat-val font-mono">{{ fmtCompactTokens(channelModelStatsMap.get(model.toLowerCase())!.totalTokens) }}</span>
+                        <span class="mp-mcm-stat-label">tokens</span>
+                      </div>
+                      <div class="mp-mcm-stat" title="平均响应耗时（含首字）">
+                        <span class="mp-mcm-stat-val font-mono">{{ formatSec(channelModelStatsMap.get(model.toLowerCase())!.avgDurationMs) }}</span>
+                        <span class="mp-mcm-stat-label">均耗</span>
+                      </div>
+                      <div class="mp-mcm-stat mp-mcm-stat-wide" title="最近一次调用时间">
+                        <span class="mp-mcm-stat-val">{{ fmtLastUsed(channelModelStatsMap.get(model.toLowerCase())!.lastUsedAt) }}</span>
+                        <span class="mp-mcm-stat-label">最近使用</span>
+                      </div>
+                    </template>
+                    <template v-else>
+                      <div class="mp-mcm-stat mp-mcm-stat-empty">
+                        <span
+                          class="mp-mcm-stat-label"
+                          :class="{ 'mp-spin-icon': loadingModelStats }"
+                        >{{ loadingModelStats ? '统计加载中…' : '暂无调用记录' }}</span>
+                      </div>
+                    </template>
+                  </div>
                 </div>
 
                 <!-- 底部第四行：Key 专属限制提示 -->
@@ -4293,7 +4340,7 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
                   :title="`该渠道有专属 Key 限制：仅 ${keySupportCountFor(model)} 个 Key 支持此模型，调度时可能受 Key 分组配置影响`"
                 >Key 专属 · {{ keySupportCountFor(model) }}</span>
 
-                <!-- 行尾：该模型的代理出口策略（默认跟随渠道级配置） -->
+                <!-- 下行：该模型的代理出口策略与上游协议覆盖（默认跟随渠道级配置） -->
                 <div class="mp-mcm-proxy" @click.stop>
                   <span
                     class="mp-mcm-proxy-label"
@@ -4352,6 +4399,25 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
                     v-if="effectiveProxyMode(model) !== 'inherit' && effectiveProxyMode(model) !== effectiveChannelProxyMode()"
                     class="mp-mcm-proxy-dot"
                     title="本模型代理策略与渠道级配置不同"
+                  />
+                  <!-- 上游协议覆盖：默认跟随渠道级 protocol，可为本模型单独指定 -->
+                  <span
+                    class="mp-mcm-proxy-label mp-mcm-protocol-label"
+                    :title="`出网上游协议：默认${channelLevelProtocolLabel}；可为本模型单独指定`"
+                  >协议</span>
+                  <CustomSelect
+                    class="mp-mcm-proxy-dd"
+                    auto-width
+                    :options="modelProtocolSelectOptions"
+                    :model-value="effectiveModelProtocol(model)"
+                    aria-label="为本模型单独选择上游协议"
+                    title="为本模型单独选择上游协议（覆盖渠道级设置）"
+                    @update:model-value="setModelProtocolOption(model, String($event))"
+                  />
+                  <span
+                    v-if="effectiveModelProtocol(model) !== 'inherit'"
+                    class="mp-mcm-proxy-dot mp-mcm-protocol-dot"
+                    title="本模型上游协议与渠道级配置不同"
                   />
                 </div>
               </div>
@@ -7594,14 +7660,33 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
 .mp-mcm-card {
   position: relative;
   display: flex;
-  align-items: center;
-  gap: 12px;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
   padding: 10px 14px;
   background: var(--surface-soft);
   border: 1px solid var(--line);
   border-radius: var(--r-md, 10px);
   cursor: pointer;
   transition: all 0.18s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/* 上行：模型主体（名称/状态/调用 ID）+ 右侧用量统计 */
+.mp-mcm-content {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+/* 下行：代理策略 + 上游协议覆盖控件，独立占满整行不与统计挤压 */
+.mp-mcm-proxy {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px 6px;
+  margin-left: 32px;
+  position: relative;
 }
 
 .mp-mcm-card:hover {
@@ -7633,8 +7718,8 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
   display: flex;
   flex-direction: column;
   gap: 4px;
-  min-width: 220px;
-  flex-shrink: 0;
+  flex: 1;
+  min-width: 0;
 }
 
 .mp-mcm-title-row {
@@ -7690,11 +7775,10 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
 
 /* —— 右侧统计区 —— */
 .mp-mcm-stats {
-  margin-left: auto;
+  flex-shrink: 0;
   display: flex;
   align-items: stretch;
   gap: 0;
-  flex-shrink: 0;
 }
 
 .mp-mcm-stat {
@@ -7822,6 +7906,17 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
   border-radius: 50%;
   background: var(--warning);
   border: 1.5px solid var(--surface-soft);
+}
+
+/* 协议覆盖提示点：定位在协议下拉左上角，避免与代理覆盖点重叠 */
+.mp-mcm-protocol-dot {
+  right: auto;
+  left: -3px;
+}
+
+/* 协议标签与代理标签之间的分隔：下行控件区拉开两组的视觉边界 */
+.mp-mcm-protocol-label {
+  margin-left: 14px;
 }
 
 /* 工具栏扩展控件 */

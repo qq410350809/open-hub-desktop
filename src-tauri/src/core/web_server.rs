@@ -475,9 +475,13 @@ macro_rules! rpc_arms {
                 let limit: Option<usize> = take_opt($args, &["limit"])?;
                 let keyword: Option<String> = take_opt($args, &["keyword"])?;
                 let filter: Option<String> = take_opt($args, &["filter"])?;
+                let sort_by: Option<String> = take_opt($args, &["sortBy", "sort_by"])?;
+                let sort_order: Option<String> = take_opt($args, &["sortOrder", "sort_order"])?;
                 Ok(json!(
-                    crate::charity::get_charity_feed($ctx, feed_id, offset, limit, keyword, filter)
-                        .await
+                    crate::charity::get_charity_feed(
+                        $ctx, feed_id, offset, limit, keyword, filter, sort_by, sort_order
+                    )
+                    .await
                 ))
             }
             "mark_charity_feed_read" => {
@@ -491,12 +495,6 @@ macro_rules! rpc_arms {
             }
             "get_charity_unread_total" => {
                 Ok(json!(crate::charity::get_charity_unread_total($ctx).await))
-            }
-            "fetch_charity_feed" => {
-                let feed_id: Option<String> = take_opt($args, &["feedId", "feed_id"])?;
-                Ok(json!(
-                    crate::charity::fetch_charity_feed($ctx, feed_id).await
-                ))
             }
             "get_charity_proxy_pool_summary" => Ok(json!(
                 crate::charity::get_charity_proxy_pool_summary($ctx).await
@@ -532,8 +530,9 @@ macro_rules! rpc_arms {
                 let id: String = take($args, &["id"])?;
                 let name: Option<String> = take_opt($args, &["name"])?;
                 let enabled: Option<bool> = take_opt($args, &["enabled"])?;
+                let upstream_protocol: Option<String> = take_opt($args, &["upstream_protocol"])?;
                 Ok(json!(
-                    crate::charity::update_charity_source($ctx, id, name, enabled).await
+                    crate::charity::update_charity_source($ctx, id, name, enabled, upstream_protocol).await
                 ))
             }
             "remove_charity_source" => {
@@ -747,6 +746,48 @@ macro_rules! rpc_arms {
                     take_opt($args, &["siteIds", "site_ids"]).ok().flatten();
                 Ok(json!(
                     crate::model::gateway::sync_opencode_site_channels($ctx, $gw, site_ids).await
+                ))
+            }
+
+            // —— 模型能力测试（probe） ——
+            "run_model_test" => {
+                let params: crate::model::probe::RunParams = take($args, &["params"])?;
+                Ok(json!(
+                    crate::model::probe::run_model_test($ctx, $gw, params).await
+                ))
+            }
+            "cancel_model_test" => {
+                Ok(json!(crate::model::probe::cancel_model_test($ctx).await))
+            }
+            "list_model_test_runs" => {
+                let limit: Option<u32> = take_opt($args, &["limit"]).ok().flatten();
+                Ok(json!(crate::model::probe::list_model_test_runs($ctx, limit).await))
+            }
+            "get_model_test_results" => {
+                let run_id: i64 = take($args, &["runId", "run_id"])?;
+                Ok(json!(crate::model::probe::get_model_test_results($ctx, run_id).await))
+            }
+            "delete_model_test_run" => {
+                let run_id: i64 = take($args, &["runId", "run_id"])?;
+                Ok(json!(crate::model::probe::delete_model_test_run($ctx, run_id).await))
+            }
+            "get_model_test_custom_prompts" => Ok(json!(
+                crate::model::probe::get_model_test_custom_prompts($ctx).await
+            )),
+            "save_model_test_custom_prompts" => {
+                let prompts: Vec<crate::model::probe::ProbePrompt> =
+                    take($args, &["prompts"])?;
+                Ok(json!(
+                    crate::model::probe::save_model_test_custom_prompts($ctx, prompts).await
+                ))
+            }
+            "get_model_test_last_config" => Ok(json!(
+                crate::model::probe::get_model_test_last_config($ctx).await
+            )),
+            "save_model_test_last_config" => {
+                let config: serde_json::Value = take($args, &["config"])?;
+                Ok(json!(
+                    crate::model::probe::save_model_test_last_config($ctx, config).await
                 ))
             }
 
@@ -1172,6 +1213,7 @@ mod tests {
             model_catalog_runtime: std::sync::Arc::new(
                 crate::model::catalog::ModelCatalogRuntime::new(),
             ),
+            model_probe: std::sync::Arc::new(crate::model::probe::ProbeRuntime::new()),
             event_bus: EventBus::new(),
             data_dir: root.clone(),
             resource_dir: None,

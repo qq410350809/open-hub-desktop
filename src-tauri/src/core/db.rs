@@ -385,6 +385,7 @@ impl Database {
         ensure_model_proxy_logs_table(&connection)?;
         ensure_channel_daily_stats_table(&connection)?;
         ensure_channel_hourly_stats_table(&connection)?;
+        crate::model::probe::store::ensure_model_test_tables(&connection)?;
         reset_expired_checkin_states(&connection)?;
 
         let has_system_type: i64 = connection
@@ -1691,10 +1692,29 @@ pub(crate) fn ensure_charity_feed_sources_table(connection: &Connection) -> Resu
                 json_url TEXT NOT NULL,
                 enabled INTEGER NOT NULL DEFAULT 1,
                 sort_order INTEGER NOT NULL DEFAULT 0,
+                upstream_protocol TEXT,
                 created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
             );",
         )
         .map_err(|error| error.to_string())?;
+    // 存量库补列：CREATE TABLE IF NOT EXISTS 对已存在的旧表不生效，
+    // 新增列必须在这里按 pragma_table_info 检查后显式 ALTER。
+    let has_upstream_protocol: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('charity_feed_sources')
+             WHERE name = 'upstream_protocol'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if has_upstream_protocol == 0 {
+        connection
+            .execute(
+                "ALTER TABLE charity_feed_sources ADD COLUMN upstream_protocol TEXT",
+                [],
+            )
+            .map_err(|error| error.to_string())?;
+    }
     // 存量库中旧版标签 JSON 地址（/tag/{id}-tag/{id}.json）迁移到 /tag/{id}/l/latest.json，
     // 仅精确匹配程序生成过的旧地址，用户手工自定义的 URL 不动。
     connection
@@ -1993,6 +2013,55 @@ mod account_proxy_channel_tests {
             )
             .unwrap();
         assert_eq!(has_created_at, 1);
+    }
+
+    #[test]
+    fn ensures_upstream_protocol_column_added_to_legacy_charity_sources() {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE charity_feed_sources (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    json_url TEXT NOT NULL,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    sort_order INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+                );
+                INSERT INTO charity_feed_sources (id, name, json_url)
+                VALUES ('1515', '公益推广', 'https://linux.do/tag/1515/l/latest.json?order=created');",
+            )
+            .unwrap();
+
+        ensure_charity_feed_sources_table(&connection).unwrap();
+        // 幂等：重复执行不报错、不重复插数据。
+        ensure_charity_feed_sources_table(&connection).unwrap();
+
+        let has_protocol: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('charity_feed_sources')
+                 WHERE name = 'upstream_protocol'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_protocol, 1);
+
+        let legacy_rows: i64 = connection
+            .query_row("SELECT COUNT(*) FROM charity_feed_sources", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(legacy_rows, 1);
+
+        let protocol: Option<String> = connection
+            .query_row(
+                "SELECT upstream_protocol FROM charity_feed_sources WHERE id = '1515'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(protocol, None);
     }
 }
 

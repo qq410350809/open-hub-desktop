@@ -545,10 +545,10 @@ async function exportDataAsJson() {
 
 async function exportDataAsCsv() {
   const rows: string[] = [];
-  rows.push("时间,总计Token,输入Token,输出Token,缓存Token,缓存命中率,推理Token,对话数,请求数");
+  rows.push("时间,总计Token,输入Token,输出Token,缓存读取Token,缓存写入Token,缓存命中率,推理Token,对话数,请求数");
   for (const item of trendDetailList.value) {
     const hitRate = item.cacheHitRate != null ? `${(item.cacheHitRate * 100).toFixed(2)}%` : "0%";
-    rows.push(`"${item.label}",${item.total},${item.input},${item.output},${item.cache},"${hitRate}",${item.reasoning},${item.sessions},${item.requests}`);
+    rows.push(`"${item.label}",${item.total},${item.input},${item.output},${item.cacheRead},${item.cacheWrite},"${hitRate}",${item.reasoning},${item.sessions},${item.requests}`);
   }
   await downloadFile(
     `openhub-token-trend-${toLocalDate(new Date())}.csv`,
@@ -566,7 +566,8 @@ const dailyColumns = computed<AppTableColumn[]>(() => {
     { key: "total", title: "总量 Tokens", width: "88px", align: "right", sortable: true },
     { key: "input", title: "输入", width: "72px", align: "right", sortable: true },
     { key: "output", title: "输出", width: "72px", align: "right", sortable: true },
-    { key: "cache", title: "缓存 (读+写)", width: "76px", align: "right", sortable: true },
+    { key: "cacheRead", title: "缓存读取", width: "76px", align: "right", sortable: true },
+    { key: "cacheWrite", title: "缓存写入", width: "76px", align: "right", sortable: true },
     { key: "cacheHitRate", title: "缓存命中率", width: "80px", align: "right", sortable: true },
     { key: "reasoning", title: "深度推理", width: "72px", align: "right", sortable: true },
   ];
@@ -584,7 +585,8 @@ const projectColumns = computed<AppTableColumn[]>(() => {
     { key: "share", title: "占比", width: "78px", align: "right", sortable: false },
     { key: "input", title: "输入", width: "74px", align: "right", sortable: true },
     { key: "output", title: "输出", width: "74px", align: "right", sortable: true },
-    { key: "cache", title: "缓存", width: "74px", align: "right", sortable: true },
+    { key: "cacheRead", title: "缓存读取", width: "74px", align: "right", sortable: true },
+    { key: "cacheWrite", title: "缓存写入", width: "74px", align: "right", sortable: true },
     { key: "cacheHitRate", title: "缓存命中率", width: "82px", align: "right", sortable: true },
     { key: "reasoning", title: "推理", width: "74px", align: "right", sortable: true },
   ];
@@ -602,7 +604,8 @@ const sourceColumns = computed<AppTableColumn[]>(() => {
     { key: "share", title: "占比", width: "78px", align: "right", sortable: false },
     { key: "inputTokens", title: "输入", width: "74px", align: "right", sortable: true },
     { key: "outputTokens", title: "输出", width: "74px", align: "right", sortable: true },
-    { key: "cacheTokens", title: "缓存", width: "74px", align: "right", sortable: true },
+    { key: "cacheReadTokens", title: "缓存读取", width: "74px", align: "right", sortable: true },
+    { key: "cacheWriteTokens", title: "缓存写入", width: "74px", align: "right", sortable: true },
     { key: "cacheHitRate", title: "缓存命中率", width: "82px", align: "right", sortable: true },
     { key: "reasoningTokens", title: "推理", width: "74px", align: "right", sortable: true },
   ];
@@ -646,7 +649,8 @@ const modelColumns = computed<AppTableColumn[]>(() => {
     { key: "share", title: "占比", width: "78px", align: "right", sortable: false },
     { key: "inputTokens", title: "输入", width: "74px", align: "right", sortable: true },
     { key: "outputTokens", title: "输出", width: "74px", align: "right", sortable: true },
-    { key: "cacheTokens", title: "缓存", width: "74px", align: "right", sortable: true },
+    { key: "cacheReadTokens", title: "缓存读取", width: "74px", align: "right", sortable: true },
+    { key: "cacheWriteTokens", title: "缓存写入", width: "74px", align: "right", sortable: true },
     { key: "cacheHitRate", title: "缓存命中率", width: "82px", align: "right", sortable: true },
     { key: "reasoningTokens", title: "推理", width: "74px", align: "right", sortable: true },
   ];
@@ -1323,7 +1327,7 @@ const trendChartOption = computed<EChartsOption>(() => {
         textStyle: { color: isDark ? "#f8fafc" : "#0f172a", fontSize: 12 },
       },
       legend: {
-        data: ["输入 Tokens", "输出 Tokens", "Prompt 缓存", "推理 Tokens"],
+        data: ["输入 Tokens", "输出 Tokens", "缓存读取", "缓存写入", "推理 Tokens"],
         textStyle: { color: textColor, fontSize: 11 },
         top: 0,
         right: 10,
@@ -1356,11 +1360,18 @@ const trendChartOption = computed<EChartsOption>(() => {
           itemStyle: { color: "#10b981" },
         },
         {
-          name: "Prompt 缓存",
+          name: "缓存读取",
           type: "bar",
           stack: "total",
-          data: trendDetail.value.map((i) => i.cache),
+          data: trendDetail.value.map((i) => i.cacheRead),
           itemStyle: { color: "#8b5cf6" },
+        },
+        {
+          name: "缓存写入",
+          type: "bar",
+          stack: "total",
+          data: trendDetail.value.map((i) => i.cacheWrite),
+          itemStyle: { color: "#a78bfa" },
         },
         {
           name: "推理 Tokens",
@@ -1441,7 +1452,8 @@ const trendChartOption = computed<EChartsOption>(() => {
           <div>总计: <strong>${formatCompact(detail.total)}</strong> (${formatTokens(detail.total)})</div>
           <div style="color: #0284c7;">输入: ${formatCompact(detail.input)}</div>
           <div style="color: #10b981;">输出: ${formatCompact(detail.output)}</div>
-          <div style="color: #8b5cf6;">缓存: ${formatCompact(detail.cache)} (命中率 ${hitRateStr})</div>
+          <div style="color: #8b5cf6;">缓存读取: ${formatCompact(detail.cacheRead)}</div>
+          <div style="color: #a78bfa;">缓存写入: ${formatCompact(detail.cacheWrite)} (命中率 ${hitRateStr})</div>
           ${detail.reasoning > 0 ? `<div style="color: #f59e0b;">推理: ${formatCompact(detail.reasoning)}</div>` : ""}
           <div style="color: #06b6d4;">对话: ${detail.sessions} 轮</div>
         `;
@@ -1736,13 +1748,13 @@ onBeforeUnmount(() => {
                 <div
                   class="tt-prog-seg is-cache"
                   :style="{ width: `${shareOf(rangeSplits.cache, bucketTotal.total)}%` }"
-                  :title="`缓存: ${formatCompact(rangeSplits.cache)} (${shareOf(rangeSplits.cache, bucketTotal.total).toFixed(1)}%)`"
+                  :title="`缓存: ${formatCompact(rangeSplits.cache)} (读 ${formatCompact(cacheBreakdown.read)} / 写 ${formatCompact(cacheBreakdown.write)}, ${shareOf(rangeSplits.cache, bucketTotal.total).toFixed(1)}%)`"
                 />
               </div>
               <div class="tt-kpi-sub-pills">
                 <span class="tt-sub-pill in"><i></i>输入 {{ formatCompact(rangeSplits.input) }}</span>
                 <span class="tt-sub-pill out"><i></i>输出 {{ formatCompact(rangeSplits.output) }}</span>
-                <span class="tt-sub-pill cache"><i></i>缓存 {{ formatCompact(rangeSplits.cache) }}</span>
+                <span class="tt-sub-pill cache"><i></i>缓存读 {{ formatCompact(cacheBreakdown.read) }} · 写 {{ formatCompact(cacheBreakdown.write) }}</span>
                 <span v-if="rangeSplits.reasoning > 0" class="tt-sub-pill reasoning"><i></i>推理 {{ formatCompact(rangeSplits.reasoning) }}</span>
               </div>
             </div>
@@ -2072,7 +2084,8 @@ onBeforeUnmount(() => {
                 <template #cell-share="{ row }">{{ shareOf(row.totalTokens, totalTokensAll).toFixed(2) }}%</template>
                 <template #cell-inputTokens="{ row }">{{ formatCompact(row.inputTokens) }}</template>
                 <template #cell-outputTokens="{ row }">{{ formatCompact(row.outputTokens) }}</template>
-                <template #cell-cacheTokens="{ row }">{{ formatCompact(row.cacheTokens) }}</template>
+                <template #cell-cacheReadTokens="{ row }">{{ formatCompact(row.cacheReadTokens) }}</template>
+                <template #cell-cacheWriteTokens="{ row }">{{ formatCompact(row.cacheWriteTokens) }}</template>
                 <template #cell-cacheHitRate="{ row }">{{ formatRate(row.cacheHitRate) }}</template>
                 <template #cell-reasoningTokens="{ row }">{{ formatCompact(row.reasoningTokens) }}</template>
                 <template #cell-conversations="{ row }">{{ formatTokens(row.conversations) }}</template>
@@ -2123,7 +2136,8 @@ onBeforeUnmount(() => {
                 <template #cell-share="{ row }">{{ shareOf(row.totalTokens, totalTokensAll).toFixed(2) }}%</template>
                 <template #cell-inputTokens="{ row }">{{ formatCompact(row.inputTokens) }}</template>
                 <template #cell-outputTokens="{ row }">{{ formatCompact(row.outputTokens) }}</template>
-                <template #cell-cacheTokens="{ row }">{{ formatCompact(row.cacheTokens) }}</template>
+                <template #cell-cacheReadTokens="{ row }">{{ formatCompact(row.cacheReadTokens) }}</template>
+                <template #cell-cacheWriteTokens="{ row }">{{ formatCompact(row.cacheWriteTokens) }}</template>
                 <template #cell-cacheHitRate="{ row }">{{ formatRate(row.cacheHitRate) }}</template>
                 <template #cell-reasoningTokens="{ row }">{{ formatCompact(row.reasoningTokens) }}</template>
                 <template #cell-conversations="{ row }">{{ formatTokens(row.conversations) }}</template>
@@ -2175,7 +2189,8 @@ onBeforeUnmount(() => {
                 <template #cell-share="{ row }">{{ shareOf(row.totalTokens, totalTokensAll).toFixed(2) }}%</template>
                 <template #cell-input="{ row }">{{ formatCompact(row.input) }}</template>
                 <template #cell-output="{ row }">{{ formatCompact(row.output) }}</template>
-                <template #cell-cache="{ row }">{{ formatCompact(row.cache) }}</template>
+                <template #cell-cacheRead="{ row }">{{ formatCompact(row.cacheRead) }}</template>
+                <template #cell-cacheWrite="{ row }">{{ formatCompact(row.cacheWrite) }}</template>
                 <template #cell-cacheHitRate="{ row }">{{ formatRate(row.cacheHitRate) }}</template>
                 <template #cell-reasoning="{ row }">{{ formatCompact(row.reasoning) }}</template>
                 <template #cell-sessions="{ row }">{{ formatTokens(row.sessions) }}</template>
@@ -2222,7 +2237,8 @@ onBeforeUnmount(() => {
                 <template #cell-total="{ row }"><strong>{{ formatCompact(row.total) }}</strong></template>
                 <template #cell-input="{ row }">{{ formatCompact(row.input) }}</template>
                 <template #cell-output="{ row }">{{ formatCompact(row.output) }}</template>
-                <template #cell-cache="{ row }">{{ formatCompact(row.cache) }}</template>
+                <template #cell-cacheRead="{ row }">{{ formatCompact(row.cacheRead) }}</template>
+                <template #cell-cacheWrite="{ row }">{{ formatCompact(row.cacheWrite) }}</template>
                 <template #cell-cacheHitRate="{ row }">{{ formatRate(row.cacheHitRate) }}</template>
                 <template #cell-reasoning="{ row }">{{ formatCompact(row.reasoning) }}</template>
                 <template #cell-sessions="{ row }">{{ formatTokens(row.sessions) }}</template>
@@ -2645,7 +2661,7 @@ onBeforeUnmount(() => {
               <div class="tt-export-option-card" @click="exportDataAsCsv">
                 <span class="tt-export-icon" v-html="icons.download" />
                 <strong>导出时序明细 CSV 表格</strong>
-                <p>导出逐日/逐小时 Token 消耗明细（含输入、输出、缓存、命中率与请求数），适合 Excel / Numbers 打开。</p>
+                <p>导出逐日/逐小时 Token 消耗明细（含输入、输出、缓存读写、命中率与请求数），适合 Excel / Numbers 打开。</p>
                 <button type="button" class="tt-btn-primary">下载 CSV 表格</button>
               </div>
             </div>

@@ -194,6 +194,7 @@ pub fn run() {
             ));
             let charity_runtime = Arc::new(charity::CharityMonitorRuntime::new());
             let model_catalog_runtime = Arc::new(crate::model::catalog::ModelCatalogRuntime::new());
+            let model_probe = Arc::new(crate::model::probe::ProbeRuntime::new());
             let event_bus = EventBus::new();
             event_bus.attach_app(app.handle().clone());
             let resource_dir = app.path().resource_dir().ok();
@@ -202,6 +203,7 @@ pub fn run() {
                 proxy_runtime,
                 charity_runtime,
                 model_catalog_runtime,
+                model_probe,
                 event_bus,
                 data_dir: app_data_dir.clone(),
                 resource_dir,
@@ -368,7 +370,6 @@ pub fn run() {
             crate::site::sync::open_url_in_chrome_profile,
             crate::site::sync::close_chrome_sync_tabs,
             charity::get_charity_feed,
-            charity::fetch_charity_feed,
             charity::mark_charity_feed_read,
             charity::get_charity_unread_total,
             charity::get_charity_today_count,
@@ -422,6 +423,15 @@ pub fn run() {
             crate::model::gateway::get_opencode_channel_stats,
             crate::model::gateway::clear_opencode_proxy_logs,
             crate::model::gateway::sync_opencode_site_channels,
+            crate::model::probe::run_model_test,
+            crate::model::probe::cancel_model_test,
+            crate::model::probe::list_model_test_runs,
+            crate::model::probe::get_model_test_results,
+            crate::model::probe::delete_model_test_run,
+            crate::model::probe::get_model_test_custom_prompts,
+            crate::model::probe::save_model_test_custom_prompts,
+            crate::model::probe::get_model_test_last_config,
+            crate::model::probe::save_model_test_last_config,
             file_export::save_export_file,
             kernel::get_component_bootstrap_status,
             kernel::get_mihomo_kernel_status,

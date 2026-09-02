@@ -118,7 +118,10 @@ pub fn start_charity_monitor(ctx: Arc<AppContext>) {
                     .unwrap_or_default();
 
             if round_nodes.is_empty() {
-                let sources_for_skip = load_charity_sources(&database).unwrap_or_default();
+                let sources_for_skip = load_charity_sources(&database).unwrap_or_else(|error| {
+                    error!("加载公益源列表失败，本轮跳过日志缺失：{error}");
+                    Vec::new()
+                });
                 for source in &sources_for_skip {
                     let message = format!(
                         "无 ≤{CHARITY_FAST_NODE_MAX_LATENCY_MS}ms 可用公益候选节点，本轮跳过"
@@ -149,7 +152,10 @@ pub fn start_charity_monitor(ctx: Arc<AppContext>) {
                 let message = format!("装载公益候选节点失败：{error}");
                 // 代理实例装载失败属于本轮基础设施问题，与单个源无关：只落同步日志，
                 // 不写 feed meta、不进 last_errors，避免每次切标签都重复弹出横幅。
-                let sources_for_err = load_charity_sources(&database).unwrap_or_default();
+                let sources_for_err = load_charity_sources(&database).unwrap_or_else(|error| {
+                    error!("加载公益源列表失败，本轮错误日志缺失：{error}");
+                    Vec::new()
+                });
                 for source in &sources_for_err {
                     append_charity_sync_log(
                         &database,
@@ -166,7 +172,15 @@ pub fn start_charity_monitor(ctx: Arc<AppContext>) {
                 continue;
             }
 
-            let sources_for_round = load_charity_sources(&database).unwrap_or_default();
+            let sources_for_round = match tokio::task::block_in_place(|| load_charity_sources(&database))
+            {
+                Ok(sources) => sources,
+                Err(error) => {
+                    error!("加载公益源列表失败，本轮同步跳过：{error}");
+                    monitor.end_sync();
+                    continue;
+                }
+            };
             // 标准标签源（地址为程序生成的 tag latest.json）→ 每轮一次 filter.json 合并请求；
             // 自定义源 → 保留各自的独立请求。
             let (standard_sources, custom_sources): (Vec<_>, Vec<_>) = sources_for_round

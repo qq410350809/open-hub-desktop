@@ -104,7 +104,8 @@ pub fn sanitize_channel_config(channel: &mut ChannelConfig) {
     // 旧 fixed 值归一为 custom_node（语义相同：固定单一出口节点）；
     // direct/pool 语义下 node_id/channel_id 无意义直接剥离；
     // fixed_channel 剥离 node_id 保留 channel_id；custom_node 剥离 channel_id 保留 node_id；
-    // mode=direct 且与渠道级默认一致时仍保留（显式覆盖）
+    // mode=direct 且与渠道级默认一致时仍保留（显式覆盖）；
+    // protocol（模型级上游协议覆盖）白名单校验，空/非法值清空 = 跟随渠道级
     if let Some(rules) = channel.model_proxy_rules.take() {
         let mut seen = std::collections::HashSet::new();
         let cleaned: Vec<_> = rules
@@ -135,6 +136,14 @@ pub fn sanitize_channel_config(channel: &mut ChannelConfig) {
                         None
                     } else {
                         Some(ch)
+                    };
+                }
+                if let Some(protocol) = &r.protocol {
+                    let protocol = protocol.trim().to_lowercase();
+                    r.protocol = if VALID_CHANNEL_PROTOCOLS.contains(&protocol.as_str()) {
+                        Some(protocol)
+                    } else {
+                        None
                     };
                 }
                 if r.model.is_empty() || !seen.insert(r.model.to_lowercase()) {
@@ -419,42 +428,49 @@ mod config_tests {
             key_rules: None,
             model_proxy_rules: Some(vec![
                 ModelProxyRule {
+                    protocol: None,
                     model: " glm-a ".into(),
                     mode: "direct".into(),
                     node_id: Some("n1".into()),
                     channel_id: None,
                 },
                 ModelProxyRule {
+                    protocol: None,
                     model: "GLM-A".into(),
                     mode: "fixed".into(),
                     node_id: Some(" n2 ".into()),
                     channel_id: None,
                 },
                 ModelProxyRule {
+                    protocol: None,
                     model: "glm-b".into(),
                     mode: "bogus".into(),
                     node_id: None,
                     channel_id: None,
                 },
                 ModelProxyRule {
+                    protocol: None,
                     model: "glm-c".into(),
                     mode: "fixed".into(),
                     node_id: Some("  ".into()),
                     channel_id: None,
                 },
                 ModelProxyRule {
+                    protocol: None,
                     model: "   ".into(),
                     mode: "direct".into(),
                     node_id: None,
                     channel_id: None,
                 },
                 ModelProxyRule {
+                    protocol: None,
                     model: "glm-d".into(),
                     mode: "fixed_channel".into(),
                     node_id: Some("n3".into()),
                     channel_id: Some(" pc1 ".into()),
                 },
                 ModelProxyRule {
+                    protocol: None,
                     model: "glm-e".into(),
                     mode: "custom_node".into(),
                     node_id: Some(" n4 ".into()),
@@ -510,6 +526,7 @@ mod config_tests {
             key_groups: None,
             key_rules: None,
             model_proxy_rules: Some(vec![ModelProxyRule {
+                    protocol: None,
                 model: "m".into(),
                 mode: "invalid".into(),
                 node_id: None,

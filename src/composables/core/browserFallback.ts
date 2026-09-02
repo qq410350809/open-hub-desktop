@@ -335,26 +335,6 @@ export async function browserFallback<T>(
       hasMore: false,
     } as T;
   }
-  if (command === "fetch_charity_feed") {
-    return {
-      feedId: String(args.feedId || "1515"),
-      feedName: "公益推广",
-      items: [],
-      fetchedAt: new Date().toISOString(),
-      changed: false,
-      newCount: 0,
-      updatedCount: 0,
-      initialized: true,
-      sourceProfileName: "",
-      sourceAccountName: "",
-      status: "skipped",
-      message: "浏览器模式无代理节点，已跳过",
-      usedNodeId: "",
-      usedNodeName: "",
-      unreadCount: 0,
-      skipped: true,
-    } as T;
-  }
   if (command === "mark_charity_feed_read") return 0 as T;
   if (command === "get_charity_unread_total") return 0 as T;
   if (command === "get_charity_sync_logs") return [] as T;

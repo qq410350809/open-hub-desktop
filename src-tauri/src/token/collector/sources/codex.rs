@@ -78,14 +78,16 @@ impl CodexUsage {
         }
     }
 
+    /// 三项输入（全新 / 缓存读 / 缓存写）语义独立，互不扣减；
+    /// total 取上游口径与三分量之和的较大值，保证 total ≥ 分量和。
     pub fn normalized(self) -> Self {
-        let fresh_input = self.input_tokens.saturating_sub(self.cached_input_tokens);
-        let total = fresh_input
+        let total = self
+            .input_tokens
             .saturating_add(self.cached_input_tokens)
             .saturating_add(self.cache_creation_input_tokens)
-            .saturating_add(self.output_tokens);
+            .saturating_add(self.output_tokens)
+            .max(self.total_tokens);
         Self {
-            input_tokens: fresh_input,
             total_tokens: total,
             ..self
         }

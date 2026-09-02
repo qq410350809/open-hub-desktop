@@ -1,8 +1,7 @@
 use crate::charity::db::*;
 use crate::charity::feed::charity_tag_json_url;
-use crate::charity::fetcher::{is_charity_sync_cancelled, sync_feed_with_fast_nodes};
 use crate::charity::types::*;
-use crate::context::{AppContext, EventBus, Managed};
+use crate::context::{AppContext, Managed};
 use rusqlite::params;
 use std::sync::Arc;
 
@@ -14,6 +13,8 @@ pub async fn get_charity_feed(
     limit: Option<usize>,
     keyword: Option<String>,
     filter: Option<String>,
+    sort_by: Option<String>,
+    sort_order: Option<String>,
 ) -> Result<CharityFeedResult, String> {
     let database = &*ctx.database;
     let requested = feed_id.as_deref().unwrap_or(DEFAULT_CHARITY_FEED_ID);
@@ -21,9 +22,11 @@ pub async fn get_charity_feed(
     let limit = limit.unwrap_or(CHARITY_PAGE_SIZE);
     let keyword = keyword.unwrap_or_default();
     let filter = filter.unwrap_or_default();
+    let sort_by = sort_by.unwrap_or_else(|| "publishedAt".into());
+    let sort_order = sort_order.unwrap_or_else(|| "desc".into());
     if requested == "all" {
         return tokio::task::block_in_place(|| {
-            load_all_feed_items_from_db(&database, offset, limit, &keyword, &filter)
+            load_all_feed_items_from_db(&database, offset, limit, &keyword, &filter, &sort_by, &sort_order)
         });
     }
     let source = charity_feed_source(&database, requested)?;
@@ -31,7 +34,7 @@ pub async fn get_charity_feed(
     // 附带上一轮同步的失败消息会让人误以为点击本身触发了网络请求。
     // 同步失败已由 charity_sync_logs 记录，前端从同步日志查看。
     let result = tokio::task::block_in_place(|| {
-        load_feed_items_from_db(&database, &source, offset, limit, &keyword, &filter)
+        load_feed_items_from_db(&database, &source, offset, limit, &keyword, &filter, &sort_by, &sort_order)
     })?;
     Ok(result)
 }
@@ -98,83 +101,6 @@ pub async fn get_charity_unread_total(ctx: Managed<'_, Arc<AppContext>>) -> Resu
         }
         Ok(total)
     })
-}
-
-#[cfg_attr(feature = "desktop", tauri::command)]
-pub async fn fetch_charity_feed(
-    ctx: Managed<'_, Arc<AppContext>>,
-    feed_id: Option<String>,
-) -> Result<CharityFeedResult, String> {
-    let database = &*ctx.database;
-    let bus: EventBus = ctx.event_bus.clone();
-    let monitor = &ctx.charity_runtime;
-    let source = charity_feed_source(
-        &database,
-        feed_id.as_deref().unwrap_or(DEFAULT_CHARITY_FEED_ID),
-    )?;
-    let Some(cancellation) = monitor.try_begin_sync() else {
-        let mut local = tokio::task::block_in_place(|| {
-            load_feed_items_from_db(&database, &source, 0, CHARITY_PAGE_SIZE, "", "all")
-        })?;
-        local.message = "后台同步进行中，已返回本地数据".into();
-        local.status = if local.status.is_empty() {
-            "local".into()
-        } else {
-            local.status
-        };
-        emit_charity_progress(
-            &bus,
-            CharitySyncProgress {
-                feed_id: source.id.clone(),
-                feed_name: source.name.clone(),
-                stage: "manual".into(),
-                status: "skipped".into(),
-                message: local.message.clone(),
-                used_node_id: String::new(),
-                used_node_name: String::new(),
-                new_count: 0,
-                updated_count: 0,
-                unread_count: local.unread_count,
-            },
-        );
-        return Ok(local);
-    };
-    let sync_result = sync_feed_with_fast_nodes(
-        &ctx,
-        database,
-        &ctx.proxy_runtime,
-        &source,
-        "manual",
-        &cancellation,
-        None,
-        false,
-    )
-    .await;
-    monitor.end_sync();
-    match &sync_result {
-        Ok(_) => {
-            if let Ok(mut errors) = monitor.last_errors.lock() {
-                errors.remove(&source.id);
-            }
-        }
-        Err(error) => {
-            if !is_charity_sync_cancelled(error) {
-                if let Ok(mut errors) = monitor.last_errors.lock() {
-                    errors.insert(source.id.to_string(), error.clone());
-                }
-            }
-        }
-    }
-    let mut local = tokio::task::block_in_place(|| {
-        load_feed_items_from_db(&database, &source, 0, CHARITY_PAGE_SIZE, "", "all")
-    })?;
-    if let Err(error) = sync_result {
-        if local.message.is_empty() {
-            local.message = error;
-            local.status = "error".into();
-        }
-    }
-    Ok(local)
 }
 
 #[cfg_attr(feature = "desktop", tauri::command)]
@@ -346,6 +272,7 @@ pub async fn add_charity_source(
             json_url,
             enabled: true,
             sort_order: max_sort + 1,
+            upstream_protocol: None,
         })
     })
 }
@@ -356,6 +283,7 @@ pub async fn update_charity_source(
     id: String,
     name: Option<String>,
     enabled: Option<bool>,
+    upstream_protocol: Option<String>,
 ) -> Result<(), String> {
     let database = &*ctx.database;
     tokio::task::block_in_place(|| {
@@ -376,6 +304,19 @@ pub async fn update_charity_source(
                 .execute(
                     "UPDATE charity_feed_sources SET enabled = ?2 WHERE id = ?1",
                     params![id, enabled as i64],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        if let Some(protocol) = upstream_protocol {
+            let protocol_value = if protocol.trim().is_empty() {
+                None
+            } else {
+                Some(protocol.trim().to_string())
+            };
+            connection
+                .execute(
+                    "UPDATE charity_feed_sources SET upstream_protocol = ?2 WHERE id = ?1",
+                    params![id, protocol_value],
                 )
                 .map_err(|error| error.to_string())?;
         }
