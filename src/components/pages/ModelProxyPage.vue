@@ -609,21 +609,18 @@ function normalizeModelRuleMode(mode: string): ModelProxyMode {
   return "";
 }
 
-/** 某模型当前生效的代理模式（草稿优先，无草稿回退渠道级配置推导） */
+/** 某模型在下拉中显示的代理模式：仅反映显式覆盖（草稿/既有规则），
+ * 未配置的模型一律显示「跟随渠道」——不把渠道级推导固化到模型行，
+ * 否则保存后渠道级设置再怎么改对该模型也不生效 */
 function effectiveProxyMode(model: string): ModelProxyMode | "inherit" {
   const key = model.toLowerCase();
   const draft = modelProxyModeDraft.value.get(key);
   if (draft && draft.mode) return draft.mode;
-  const ch = selectedChannel.value;
-  if (!ch) return "inherit";
-  const rule = ch.modelProxyRules?.find((r) => r.model.toLowerCase() === key);
+  const rule = selectedChannel.value?.modelProxyRules?.find((r) => r.model.toLowerCase() === key);
   if (rule) {
-    const m = normalizeModelRuleMode(String(rule.mode));
-    if (m) return m;
-    return "inherit";
+    return normalizeModelRuleMode(String(rule.mode)) || "inherit";
   }
-  // 渠道级配置推导
-  return channelProxyModeOf(ch);
+  return "inherit";
 }
 
 /** 渠道级配置的推导描述（用于下拉「跟随渠道」的提示文案） */
@@ -889,10 +886,12 @@ async function saveChannelModelSelection() {
   }
 }
 
-// —— 渠道「设置」弹窗：别名 / 代理设置（四模式合一） ——
+// —— 渠道「设置」弹窗：别名 / 上游协议 / 代理设置（四模式合一） ——
 type ChannelProxyMode = "direct" | "pool" | "fixed_channel" | "custom_node";
 interface ChannelSettingsDraft {
   alias: string;
+  /** 上游协议：openai(chat,默认) / openai-responses / anthropic / gemini */
+  protocol: string;
   proxyMode: ChannelProxyMode;
   /** custom_node 模式锁定的代理池节点 ID */
   fixedProxyNode: string;
@@ -903,6 +902,7 @@ interface ChannelSettingsDraft {
 const channelSettingsTarget = ref<ChannelConfig | null>(null);
 const channelSettingsDraft = ref<ChannelSettingsDraft>({
   alias: "",
+  protocol: "openai",
   proxyMode: "direct",
   fixedProxyNode: "",
   proxyFixedChannel: "",
@@ -911,6 +911,43 @@ const channelSettingsError = ref("");
 const channelSettingsTargetIsBuiltin = computed(
   () => channelSettingsTarget.value != null && isBuiltinChannel(channelSettingsTarget.value),
 );
+
+/** 上游协议四选项：决定网关向该渠道上游发请求时使用的协议格式 */
+const channelProtocolSelectOptions: { value: string; text: string }[] = [
+  { value: "openai", text: "Chat（OpenAI 兼容）" },
+  { value: "openai-responses", text: "Responses（OpenAI）" },
+  { value: "anthropic", text: "Messages（Claude）" },
+  { value: "gemini", text: "Gemini（Google）" },
+];
+
+/** 上游协议说明文案 */
+const CHANNEL_PROTOCOL_HINTS: Record<string, string> = {
+  openai: "OpenAI Chat Completions 兼容协议（默认），适配绝大多数反代与中转站",
+  "openai-responses": "OpenAI Responses API 协议（/v1/responses）",
+  anthropic: "Anthropic Messages 协议（/v1/messages，Claude 系模型）",
+  gemini: "Google Gemini generateContent 协议",
+};
+
+/** 渠道配置里的 protocol 归一化：空值/未知值回退 openai（与后端 sanitize 口径一致） */
+function channelProtocolOf(ch: ChannelConfig | null): string {
+  const raw = String(ch?.protocol ?? "").trim().toLowerCase();
+  if (
+    raw === "openai" ||
+    raw === "openai-responses" ||
+    raw === "anthropic" ||
+    raw === "gemini"
+  ) {
+    return raw;
+  }
+  return "openai";
+}
+
+/** CustomSelect 回写上游协议 */
+function setChannelProtocol(value: string) {
+  if (channelProtocolSelectOptions.some((opt) => opt.value === value)) {
+    channelSettingsDraft.value.protocol = value;
+  }
+}
 
 /** 代理池节点候选（自定义节点模式选择用，测速成功者优先按延迟升序） */
 const proxyPoolNodeOptions = ref<{
@@ -1197,6 +1234,7 @@ function handleOpenChannelSettingsDialog(channel: ChannelConfig) {
   channelSettingsTarget.value = channel;
   channelSettingsDraft.value = {
     alias: channelAlias(channel),
+    protocol: channelProtocolOf(channel),
     proxyMode: channelProxyModeOf(channel),
     fixedProxyNode: channel.fixedProxyNode ?? "",
     proxyFixedChannel: channel.proxyFixedChannel ?? "",
@@ -1333,6 +1371,10 @@ async function saveChannelSettings() {
     return;
   }
   channel.alias = nextAlias;
+  // 上游协议落库：内置固化渠道（如 opencode）协议由后端固化，设置弹窗不覆盖
+  if (!isBuiltinChannel(channel)) {
+    channel.protocol = channelSettingsDraft.value.protocol;
+  }
   // 四模式合一落库；旧布尔字段同步维护，兼容旧版读取方
   const mode = channelSettingsDraft.value.proxyMode;
   channel.proxyMode = mode;
@@ -4597,6 +4639,27 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
             <p v-else class="mp-settings-hint">所有渠道别名不能重复（含 opencode）</p>
           </div>
 
+          <!-- 上游协议：决定网关出网到该渠道时使用的协议格式 -->
+          <div class="mp-proxy-pool-box">
+            <div class="mp-proxy-pool-row">
+              <div class="mp-proxy-pool-label">
+                <span class="mp-pp-icon" v-html="icons.layers" />
+                <span>上游协议</span>
+              </div>
+              <CustomSelect
+                class="mp-settings-select"
+                :options="channelProtocolSelectOptions"
+                :model-value="channelSettingsDraft.protocol"
+                aria-label="渠道上游协议"
+                title="网关向该渠道上游发请求时使用的协议，默认 Chat（OpenAI 兼容）"
+                @update:model-value="setChannelProtocol(String($event))"
+              />
+            </div>
+            <div class="mp-proxy-pool-status is-inactive">
+              <span>{{ CHANNEL_PROTOCOL_HINTS[channelSettingsDraft.protocol] || CHANNEL_PROTOCOL_HINTS.openai }}</span>
+            </div>
+          </div>
+
           <!-- 代理设置（四模式合一，合并旧「内部代理池轮询 / 代理池固定通道」双开关） -->
           <div class="mp-proxy-pool-box">
             <div class="mp-proxy-pool-row">
@@ -7708,7 +7771,7 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
 /* 级联子选择（固定通道/自定义节点）：与模式下拉等高。
    承载任意长度的通道名/节点名，给足宽度，超长仍由 trigger 省略号收尾 */
 .mp-mcm-proxy-sub.select-box {
-  width: 150px;
+  width: 190px;
 }
 .mp-mcm-proxy-sub .select-trigger {
   color: var(--muted);
@@ -7732,15 +7795,16 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
   max-width: 92px;
 }
 
-/* 模型行内统一自定义下拉：宽度由 auto-width 按最长选项（自定义节点）自撑 */
+/* 模型行内统一自定义下拉：宽度由 auto-width 按最长选项（自定义节点）自撑，
+   min-width 保证视觉下限；高度/字号略放大以提升可读性 */
 .mp-mcm-proxy-dd.select-box {
-  height: 26px;
-  min-width: 84px;
+  height: 28px;
+  min-width: 104px;
   border-radius: 6px;
 }
 .mp-mcm-proxy-dd .select-trigger {
-  padding: 0 6px;
-  font-size: 11.5px;
+  padding: 0 8px;
+  font-size: 12px;
   font-weight: 500;
 }
 
