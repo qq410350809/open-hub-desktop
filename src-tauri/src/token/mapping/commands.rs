@@ -6,16 +6,17 @@ use crate::models::Database;
 use tauri::State;
 use tracing::warn;
 
-/// 组装 AI 判定请求用的模型名。channel_id 非空时拼上渠道网关别名前缀
+/// 组装 AI 判定请求用的模型名。要求显式指定渠道：拼上渠道网关别名前缀
 /// （{alias}/{model}），由网关的渠道前缀路由定向到该渠道。
 pub(crate) fn resolve_request_model(
     channels: &[ChannelConfig],
     channel_id: Option<&str>,
     model: &str,
 ) -> Result<String, String> {
-    let Some(id) = channel_id.map(str::trim).filter(|id| !id.is_empty()) else {
-        return Ok(model.to_string());
-    };
+    let id = channel_id
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| "请先选择发起 AI 分析的反代渠道".to_string())?;
     let channel = channels
         .iter()
         .find(|channel| channel.id == id)
@@ -151,11 +152,12 @@ mod tests {
     }
 
     #[test]
-    fn request_model_without_channel_keeps_bare_model() {
+    fn request_model_requires_explicit_channel() {
         let channels = vec![channel("c1", "x666", true)];
-        let resolved =
-            resolve_request_model(&channels, None, "gpt-5.6").expect("should resolve");
-        assert_eq!(resolved, "gpt-5.6");
+        let error = resolve_request_model(&channels, None, "gpt-5.6")
+            .expect_err("missing channel should fail");
+        assert!(error.contains("反代渠道"));
+        assert!(resolve_request_model(&channels, Some(""), "gpt-5.6").is_err());
     }
 
     #[test]

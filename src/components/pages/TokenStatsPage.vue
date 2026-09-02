@@ -5,10 +5,14 @@ import type { EChartsOption } from "../../echarts";
 import EChart from "../common/EChart.vue";
 import DateRangeDropdown from "../common/DateRangeDropdown.vue";
 import AppTable, { type AppTableColumn } from "../common/AppTable.vue";
+import CustomSelect from "../common/CustomSelect.vue";
 import { icons } from "../../icons";
 import { useStore } from "../../composables/useStore";
 import { usePreferences } from "../../composables/usePreferences";
 import { useProxyTokenStats } from "../../composables/proxy/useProxyTokenStats";
+import { useModelProxy } from "../../composables/proxy/useModelProxy";
+import { useConfirm } from "../../composables/ui/useConfirm";
+import type { ModelCatalogSnapshot, TokenModelMapping } from "../../types";
 import {
   bucketModelTotals,
   bucketSourceTotals,
@@ -23,6 +27,7 @@ import {
   buildTrendFromBuckets,
   estimateRequestCount,
   mergeModelTotals,
+  buildModelMappingLookup,
   formatCompact,
   formatRate,
   formatTokens,
@@ -239,6 +244,160 @@ async function startRefresh() {
     });
     refreshPhase.value = "error";
   }
+}
+
+// —— 模型映射弹窗（AI 分析：原始模型名 → 正式模型） ——
+const mappingDialogOpen = ref(false);
+type MappingFilter = "all" | "pending" | "confirmed";
+const mappingFilter = ref<MappingFilter>("all");
+const mappingChannelId = ref("");
+const mappingModel = ref("");
+const mappingCatalogGroups = ref<{ label: string; options: { value: string; text: string }[] }[]>([]);
+const mappingCatalogLoading = ref(false);
+const mappingCatalogError = ref("");
+const mappingSavingKey = ref("");
+const mappingProxy = useModelProxy();
+const { confirm: confirmMappingForce } = useConfirm();
+
+const mappingOriginLabels: Record<string, string> = {
+  rule: "规则",
+  ai: "AI",
+  manual: "手工",
+};
+
+const mappingRows = computed(() => {
+  const rows = store.tokenModelMappings.value;
+  if (mappingFilter.value === "pending") return rows.filter((row) => !row.confirmed);
+  if (mappingFilter.value === "confirmed") return rows.filter((row) => row.confirmed);
+  return rows;
+});
+const mappingPendingCount = computed(
+  () => store.tokenModelMappings.value.filter((row) => !row.confirmed).length,
+);
+const mappingOfficialCount = computed(
+  () => store.tokenModelMappings.value.filter((row) => row.officialModel.trim()).length,
+);
+
+// 渠道下拉：仅列出已启用的反代渠道；分析请求必须指定渠道
+const mappingChannelOptions = computed(() => {
+  const channels = mappingProxy.proxyConfig.value.channels.filter((channel) => channel.enabled);
+  return channels.map((channel) => ({ value: channel.id, text: channel.name || channel.id }));
+});
+
+// 无渠道可选时禁用分析；有渠道但尚未选中时默认取第一个
+const mappingHasChannels = computed(() => mappingChannelOptions.value.length > 0);
+watch(mappingChannelOptions, (options) => {
+  if (!options.some((opt) => opt.value === mappingChannelId.value)) {
+    mappingChannelId.value = options[0]?.value ?? "";
+  }
+}, { immediate: true });
+
+// 分析模型下拉：跟随所选渠道的模型列表（网关缓存优先，enabledModels 兜底）
+const mappingModelOptions = computed(() => {
+  const channel = mappingProxy.proxyConfig.value.channels.find(
+    (item) => item.id === mappingChannelId.value,
+  );
+  let models: string[] = ["gpt-5.6"];
+  if (channel) {
+    const cached = mappingProxy.modelsForChannel(channel.id);
+    models = cached.length ? cached : channel.enabledModels ?? [];
+    if (!models.length) models = ["gpt-5.6"];
+  }
+  if (mappingModel.value && !models.includes(mappingModel.value)) {
+    models = [mappingModel.value, ...models];
+  }
+  return models.map((model) => ({ value: model, text: model }));
+});
+
+// 切换渠道后模型列表变化：当前选中值不在列表里时回落到第一项
+watch(mappingModelOptions, (options) => {
+  if (!options.some((opt) => opt.value === mappingModel.value)) {
+    mappingModel.value = options[0]?.value ?? "";
+  }
+}, { immediate: true });
+
+function openMappingDialog() {
+  mappingDialogOpen.value = true;
+  void ensureMappingCatalog();
+  void mappingProxy.loadProxyData().catch(() => {});
+  // 引导登记：把当前统计里出现的原始模型名补进映射表（幂等，已有判定不覆盖）
+  const names = new Set<string>();
+  for (const bucket of allBuckets.value) {
+    const model = (bucket.model || "").trim();
+    if (model && !model.includes("-unknown-")) names.add(model);
+  }
+  void store.bootstrapTokenModelMappings([...names]);
+}
+
+function closeMappingDialog() {
+  mappingDialogOpen.value = false;
+}
+
+async function ensureMappingCatalog() {
+  if (mappingCatalogGroups.value.length || mappingCatalogLoading.value) return;
+  mappingCatalogLoading.value = true;
+  mappingCatalogError.value = "";
+  try {
+    const snapshot = await runLocalCommand<ModelCatalogSnapshot>("get_model_catalog");
+    const groups = new Map<string, { value: string; text: string }[]>();
+    for (const model of snapshot.models) {
+      const lab = model.lab || "其他";
+      let bucket = groups.get(lab);
+      if (!bucket) {
+        bucket = [];
+        groups.set(lab, bucket);
+      }
+      bucket.push({ value: model.name, text: model.name });
+    }
+    mappingCatalogGroups.value = [...groups.entries()]
+      .sort((a, b) => a[0].localeCompare(b[0]))
+      .map(([label, options]) => ({
+        label,
+        options: options.sort((a, b) => a.text.localeCompare(b.text)),
+      }));
+  } catch (error) {
+    mappingCatalogError.value = String(error);
+  } finally {
+    mappingCatalogLoading.value = false;
+  }
+}
+
+async function runMappingAnalyze(force: boolean) {
+  if (store.tokenModelAnalyzing.value) return;
+  if (force) {
+    const ok = await confirmMappingForce({
+      title: "强制同步",
+      message:
+        "强制同步会重新分析全部模型（含已确认条目），手工设置的映射不会被覆盖。确定继续？",
+      confirmText: "强制同步",
+      danger: true,
+    });
+    if (!ok) return;
+  }
+  const report = await store.analyzeTokenModelMappings({
+    channelId: mappingChannelId.value || null,
+    model: mappingModel.value || null,
+    force,
+  });
+  if (report) {
+    const summary = `AI 分析完成：成功 ${report.resolved} 条 / 送审 ${report.analyzed} 条`;
+    store.showToast(
+      report.warnings.length ? `${summary}；${report.warnings.length} 个批次告警` : summary,
+      report.resolved === 0 && report.analyzed > 0,
+    );
+    void store.refreshTokenDatabaseView(false);
+  } else {
+    store.showToast(store.tokenModelAnalyzeError.value || "AI 分析失败", true);
+  }
+}
+
+async function saveMappingOfficial(row: TokenModelMapping, officialModel: string) {
+  if (officialModel === row.officialModel) return;
+  mappingSavingKey.value = row.rawKey;
+  const ok = await store.setTokenModelMapping(row.rawModel, officialModel);
+  mappingSavingKey.value = "";
+  store.showToast(ok ? "映射已保存" : "映射保存失败", !ok);
+  if (ok) void store.refreshTokenDatabaseView(false);
 }
 
 // —— 本地 AI Agent 路径诊断弹窗 ——
@@ -664,9 +823,12 @@ const filteredSources = computed(() => {
   );
 });
 
-// 模型分布
+// 模型分布：优先按映射表的正式模型名归组，未映射的回退现有归一化规则
+const modelMappingLookup = computed(() => buildModelMappingLookup(store.tokenModelMappings.value));
 const byModel = computed(() =>
-  mergeModelTotals(bucketModelTotals(filteredBuckets.value)).filter((item) => item.totalTokens > 0),
+  mergeModelTotals(bucketModelTotals(filteredBuckets.value), modelMappingLookup.value).filter(
+    (item) => item.totalTokens > 0,
+  ),
 );
 const filteredModels = computed(() => {
   const q = modelSearch.value.trim().toLowerCase();
@@ -1341,6 +1503,7 @@ onMounted(() => {
     }, 5_000);
   }
   if (localTokenStatsAvailable && statsMode.value === "local") {
+    void store.loadTokenModelMappings();
     listen<TokenCollectorProgress>("token-collector-progress", ({ payload }) => {
       appendRefreshLog(payload);
     }, { local: true }).then((unlisten) => {
@@ -1424,6 +1587,18 @@ onBeforeUnmount(() => {
           <span v-html="icons.cpu" />
           <span>本地 Agent</span>
           <span v-if="detectedAgentsCount > 0" class="tt-agent-count-chip">{{ detectedAgentsCount }} 在线</span>
+        </button>
+
+        <button
+          v-if="statsMode === 'local'"
+          type="button"
+          class="tt-btn-secondary"
+          title="用 AI 分析原始模型名与正式模型的映射关系"
+          @click="openMappingDialog"
+        >
+          <span v-html="icons.link" />
+          <span>模型映射</span>
+          <span v-if="mappingPendingCount > 0" class="tt-agent-count-chip">{{ mappingPendingCount }} 待定</span>
         </button>
 
         <button
@@ -2185,6 +2360,159 @@ onBeforeUnmount(() => {
                 {{ refreshPhase === "running" ? "后台运行" : "完成并关闭" }}
               </button>
             </template>
+          </footer>
+        </section>
+      </div>
+    </Transition>
+
+    <!-- 模型映射弹窗（AI 分析：原始模型名 → 正式模型） -->
+    <Transition name="tt-modal-fade">
+      <div v-if="mappingDialogOpen" class="tt-modal-backdrop">
+        <section class="tt-modal-card is-wide" role="dialog" aria-modal="true">
+          <header class="tt-modal-header">
+            <div>
+              <h2>模型映射</h2>
+              <p>用 AI 把本地统计到的原始模型名对应到正式模型；手工确认的结果不会被自动覆盖。</p>
+            </div>
+            <button type="button" class="tt-modal-close-btn" aria-label="关闭" @click="closeMappingDialog">×</button>
+          </header>
+
+          <div class="tt-modal-body">
+            <!-- 分析控制条 -->
+            <div class="tt-mapping-controls">
+              <label class="tt-mapping-field">
+                <span>反代渠道</span>
+                <CustomSelect
+                  :options="mappingChannelOptions"
+                  :model-value="mappingChannelId"
+                  aria-label="选择反代渠道"
+                  @update:model-value="mappingChannelId = String($event)"
+                />
+              </label>
+              <label class="tt-mapping-field">
+                <span>分析模型</span>
+                <CustomSelect
+                  :options="mappingModelOptions"
+                  :model-value="mappingModel"
+                  aria-label="选择分析模型"
+                  @update:model-value="mappingModel = String($event)"
+                />
+              </label>
+              <button
+                type="button"
+                class="tt-btn-primary"
+                :disabled="store.tokenModelAnalyzing.value || !mappingHasChannels"
+                @click="runMappingAnalyze(false)"
+              >
+                <span :class="{ 'is-spinning': store.tokenModelAnalyzing.value }" v-html="icons.sparkles" />
+                <span>{{ store.tokenModelAnalyzing.value ? "分析中…" : "开始 AI 分析" }}</span>
+              </button>
+              <button
+                type="button"
+                class="tt-btn-cancel"
+                :disabled="store.tokenModelAnalyzing.value || !mappingHasChannels"
+                @click="runMappingAnalyze(true)"
+              >
+                <span v-html="icons.restore" />
+                <span>强制同步</span>
+              </button>
+            </div>
+            <p v-if="!mappingHasChannels" class="tt-mapping-error">
+              未检测到已启用的反代渠道，请先在「模型代理」页面启用一个渠道。
+            </p>
+            <p class="tt-mapping-hint">
+              <span v-html="icons.info" />
+              <span>
+                分析请求经模型网关发往所选渠道的所选模型；已确认条目只在强制同步时重跑，手工映射始终保留。
+              </span>
+            </p>
+            <p v-if="mappingCatalogError" class="tt-mapping-error">模型目录加载失败：{{ mappingCatalogError }}</p>
+
+            <!-- 分析报告 -->
+            <div v-if="store.tokenModelAnalyzeReport.value" class="tt-mapping-report">
+              <div class="tt-mapping-report-stats">
+                <span>送审 <strong>{{ store.tokenModelAnalyzeReport.value.analyzed }}</strong></span>
+                <span>跳过已确认 <strong>{{ store.tokenModelAnalyzeReport.value.skippedConfirmed }}</strong></span>
+                <span>成功 <strong>{{ store.tokenModelAnalyzeReport.value.resolved }}</strong></span>
+                <span>未决 <strong>{{ store.tokenModelAnalyzeReport.value.unresolved.length }}</strong></span>
+              </div>
+              <p
+                v-if="store.tokenModelAnalyzeReport.value.unresolved.length"
+                class="tt-mapping-unresolved"
+              >
+                未决：{{ store.tokenModelAnalyzeReport.value.unresolved.join("、") }}
+              </p>
+              <p
+                v-for="(warning, index) in store.tokenModelAnalyzeReport.value.warnings"
+                :key="index"
+                class="tt-mapping-error"
+              >{{ warning }}</p>
+            </div>
+
+            <!-- 映射列表 -->
+            <div class="tt-mapping-toolbar">
+              <div class="tt-mapping-filters">
+                <button
+                  type="button"
+                  :class="{ 'is-active': mappingFilter === 'all' }"
+                  @click="mappingFilter = 'all'"
+                >全部 ({{ store.tokenModelMappings.value.length }})</button>
+                <button
+                  type="button"
+                  :class="{ 'is-active': mappingFilter === 'pending' }"
+                  @click="mappingFilter = 'pending'"
+                >待确认 ({{ mappingPendingCount }})</button>
+                <button
+                  type="button"
+                  :class="{ 'is-active': mappingFilter === 'confirmed' }"
+                  @click="mappingFilter = 'confirmed'"
+                >已确认 ({{ mappingOfficialCount }})</button>
+              </div>
+              <span v-if="mappingCatalogLoading" class="tt-mapping-catalog-hint">模型目录加载中…</span>
+            </div>
+
+            <div class="tt-mapping-table">
+              <div class="tt-mapping-head">
+                <span>原始模型名</span>
+                <span>正式模型</span>
+                <span>来源</span>
+                <span>状态</span>
+                <span>说明</span>
+              </div>
+              <div v-if="store.tokenModelMappingsLoading.value" class="tt-mapping-empty">映射加载中…</div>
+              <div v-else-if="!mappingRows.length" class="tt-mapping-empty">暂无映射记录，点击「开始 AI 分析」生成</div>
+              <div
+                v-for="row in mappingRows"
+                :key="row.rawKey"
+                class="tt-mapping-row"
+                :class="{ 'is-saving': mappingSavingKey === row.rawKey }"
+              >
+                <span class="tt-mapping-raw" :title="row.rawModel">{{ row.rawModel }}</span>
+                <span class="tt-mapping-official">
+                  <CustomSelect
+                    :options="[{ value: '', text: '未映射' }]"
+                    :groups="mappingCatalogGroups"
+                    :model-value="row.officialModel"
+                    :aria-label="`为 ${row.rawModel} 选择正式模型`"
+                    @update:model-value="saveMappingOfficial(row, String($event))"
+                  />
+                </span>
+                <span class="tt-mapping-origin">
+                  <i class="tt-origin-badge" :class="`is-${row.origin}`">{{ mappingOriginLabels[row.origin] || row.origin }}</i>
+                </span>
+                <span class="tt-mapping-state" :class="row.confirmed ? 'is-ok' : 'is-pending'">
+                  {{ row.confirmed ? "已确认" : "待确认" }}
+                </span>
+                <span class="tt-mapping-reason" :title="row.reason || ''">{{ row.reason || "—" }}</span>
+              </div>
+            </div>
+          </div>
+
+          <footer class="tt-modal-footer">
+            <span class="tt-footer-hint">
+              正式模型候选来自模型目录；手工选择后立即保存并标记为已确认，统计归组随即生效。
+            </span>
+            <button type="button" class="tt-btn-cancel" @click="closeMappingDialog">关闭</button>
           </footer>
         </section>
       </div>
@@ -3721,5 +4049,218 @@ onBeforeUnmount(() => {
 .tt-modal-fade-enter-from,
 .tt-modal-fade-leave-to {
   opacity: 0;
+}
+
+/* ============================================================
+   模型映射弹窗 (Model Mapping Modal)
+   ============================================================ */
+.tt-mapping-controls {
+  display: flex;
+  align-items: flex-end;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.tt-mapping-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 180px;
+}
+
+.tt-mapping-field > span {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.tt-mapping-field .select-box {
+  height: 34px;
+}
+
+.tt-mapping-hint {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--muted);
+}
+
+.tt-mapping-hint :deep(svg) {
+  width: 13px;
+  height: 13px;
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+
+.tt-mapping-report {
+  border: 1px solid var(--line);
+  border-radius: var(--r-md, 8px);
+  background: var(--page-bg);
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.tt-mapping-report-stats {
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.tt-mapping-report-stats strong {
+  color: var(--text);
+  font-size: 13px;
+}
+
+.tt-mapping-unresolved {
+  margin: 0;
+  font-size: 11px;
+  color: var(--muted);
+  word-break: break-all;
+}
+
+.tt-mapping-error {
+  margin: 0;
+  font-size: 11px;
+  color: #ef4444;
+  word-break: break-all;
+}
+
+.tt-mapping-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.tt-mapping-filters {
+  display: inline-flex;
+  gap: 4px;
+  padding: 3px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-full, 999px);
+  background: var(--page-bg);
+}
+
+.tt-mapping-filters button {
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  font-size: 11px;
+  padding: 4px 10px;
+  border-radius: var(--r-full, 999px);
+  cursor: pointer;
+}
+
+.tt-mapping-filters button.is-active {
+  background: var(--brand-soft);
+  color: var(--brand-deep, var(--brand));
+  font-weight: 650;
+}
+
+.tt-mapping-catalog-hint {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.tt-mapping-table {
+  border: 1px solid var(--line);
+  border-radius: var(--r-md, 8px);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+.tt-mapping-head,
+.tt-mapping-row {
+  display: grid;
+  grid-template-columns: minmax(140px, 1.1fr) minmax(200px, 1.4fr) 56px 64px minmax(120px, 1fr);
+  align-items: center;
+  gap: 10px;
+  padding: 7px 12px;
+}
+
+.tt-mapping-head {
+  font-size: 11px;
+  color: var(--muted);
+  background: var(--page-bg);
+  border-bottom: 1px solid var(--line);
+  padding-top: 9px;
+  padding-bottom: 9px;
+}
+
+.tt-mapping-row {
+  border-bottom: 1px solid var(--line-soft, var(--line));
+  font-size: 12px;
+}
+
+.tt-mapping-row:last-child {
+  border-bottom: none;
+}
+
+.tt-mapping-row.is-saving {
+  opacity: 0.55;
+}
+
+.tt-mapping-raw {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tt-mapping-origin,
+.tt-mapping-state {
+  text-align: center;
+}
+
+.tt-origin-badge {
+  font-style: normal;
+  font-size: 10px;
+  padding: 2px 7px;
+  border-radius: var(--r-full, 999px);
+  background: var(--surface-hover);
+  color: var(--muted);
+}
+
+.tt-origin-badge.is-ai {
+  background: var(--brand-soft);
+  color: var(--brand-deep, var(--brand));
+}
+
+.tt-origin-badge.is-manual {
+  background: rgba(16, 185, 129, 0.16);
+  color: #10b981;
+}
+
+.tt-mapping-state.is-ok {
+  color: #10b981;
+  font-size: 11px;
+}
+
+.tt-mapping-state.is-pending {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.tt-mapping-reason {
+  font-size: 11px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tt-mapping-empty {
+  padding: 22px 12px;
+  text-align: center;
+  font-size: 12px;
+  color: var(--muted);
 }
 </style>
