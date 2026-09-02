@@ -10,7 +10,7 @@ import { icons } from "../../icons";
 import { useStore } from "../../composables/useStore";
 import { usePreferences } from "../../composables/usePreferences";
 import { useProxyTokenStats } from "../../composables/proxy/useProxyTokenStats";
-import { useModelProxy } from "../../composables/proxy/useModelProxy";
+import { useModelProxy, filterChannelModels } from "../../composables/proxy/useModelProxy";
 import { useConfirm } from "../../composables/ui/useConfirm";
 import type { ModelCatalogSnapshot, TokenModelMapping } from "../../types";
 import {
@@ -292,22 +292,21 @@ watch(mappingChannelOptions, (options) => {
   }
 }, { immediate: true });
 
-// 分析模型下拉：跟随所选渠道的模型列表（网关缓存优先，enabledModels 兜底）
+// 分析模型下拉：跟随所选渠道「管理后」的对外可见模型（白名单过滤后）
 const mappingModelOptions = computed(() => {
   const channel = mappingProxy.proxyConfig.value.channels.find(
     (item) => item.id === mappingChannelId.value,
   );
-  let models: string[] = ["gpt-5.6"];
-  if (channel) {
-    const cached = mappingProxy.modelsForChannel(channel.id);
-    models = cached.length ? cached : channel.enabledModels ?? [];
-    if (!models.length) models = ["gpt-5.6"];
-  }
-  if (mappingModel.value && !models.includes(mappingModel.value)) {
-    models = [mappingModel.value, ...models];
+  if (!channel) return [];
+  const models = [
+    ...new Set(filterChannelModels(channel, mappingProxy.modelsForChannel(channel.id))),
+  ];
+  if (mappingModel.value && models.length && !models.includes(mappingModel.value)) {
+    models.unshift(mappingModel.value);
   }
   return models.map((model) => ({ value: model, text: model }));
 });
+const mappingHasModels = computed(() => mappingModelOptions.value.length > 0);
 
 // 切换渠道后模型列表变化：当前选中值不在列表里时回落到第一项
 watch(mappingModelOptions, (options) => {
@@ -2401,7 +2400,7 @@ onBeforeUnmount(() => {
               <button
                 type="button"
                 class="tt-btn-primary"
-                :disabled="store.tokenModelAnalyzing.value || !mappingHasChannels"
+                :disabled="store.tokenModelAnalyzing.value || !mappingHasChannels || !mappingHasModels"
                 @click="runMappingAnalyze(false)"
               >
                 <span :class="{ 'is-spinning': store.tokenModelAnalyzing.value }" v-html="icons.sparkles" />
@@ -2410,7 +2409,7 @@ onBeforeUnmount(() => {
               <button
                 type="button"
                 class="tt-btn-cancel"
-                :disabled="store.tokenModelAnalyzing.value || !mappingHasChannels"
+                :disabled="store.tokenModelAnalyzing.value || !mappingHasChannels || !mappingHasModels"
                 @click="runMappingAnalyze(true)"
               >
                 <span v-html="icons.restore" />
@@ -2419,6 +2418,9 @@ onBeforeUnmount(() => {
             </div>
             <p v-if="!mappingHasChannels" class="tt-mapping-error">
               未检测到已启用的反代渠道，请先在「模型代理」页面启用一个渠道。
+            </p>
+            <p v-else-if="!mappingHasModels" class="tt-mapping-error">
+              该渠道暂无可用模型，请先在「模型代理」页面为该渠道拉取并勾选可用模型。
             </p>
             <p class="tt-mapping-hint">
               <span v-html="icons.info" />

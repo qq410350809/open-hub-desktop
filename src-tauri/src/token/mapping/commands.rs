@@ -91,7 +91,10 @@ pub async fn analyze_token_model_mappings(
         return Err("模型网关未启用，无法调用 AI 分析".to_string());
     }
     let base_url = format!("http://127.0.0.1:{}", config.port);
-    let model = model.unwrap_or_else(|| "gpt-5.6".to_string());
+    let model = model
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| "请选择发起 AI 分析的分析模型".to_string())?;
     let request_model = resolve_request_model(&config.channels, channel_id.as_deref(), &model)?;
 
     for batch in pending.chunks(ai::BATCH_SIZE) {
