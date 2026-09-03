@@ -1747,6 +1747,31 @@ pub(crate) fn ensure_charity_feed_sources_table(connection: &Connection) -> Resu
             .map_err(|error| error.to_string())?;
     }
 
+    // Token 统计专用的标准模型清单（独立于模型目录）。
+    // 用于 AI 分析的候选池、用户自定义映射、动态扩充新模型。
+    // source: catalog = 从模型目录初始化 | ai = AI 自动学习 | user = 用户手动添加 | migration = 数据迁移
+    connection
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS token_official_models (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                lab TEXT NOT NULL DEFAULT '',
+                aliases TEXT NOT NULL DEFAULT '[]',
+                source TEXT NOT NULL DEFAULT 'catalog',
+                confidence REAL NOT NULL DEFAULT 1.0,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_token_official_models_lab
+                ON token_official_models(lab);
+            CREATE INDEX IF NOT EXISTS idx_token_official_models_source
+                ON token_official_models(source);
+            CREATE INDEX IF NOT EXISTS idx_token_official_models_confidence
+                ON token_official_models(confidence DESC);",
+        )
+        .map_err(|error| error.to_string())?;
+
     // 本地 Token 统计的「原始模型名 → 正式模型」映射表。
     // raw_key 为小写去空白后的原始名，保证大小写不同的同一模型只占一行。
     // origin: rule = 规则推导 | ai = AI 分析 | manual = 手工修改；
@@ -1770,6 +1795,61 @@ pub(crate) fn ensure_charity_feed_sources_table(connection: &Connection) -> Resu
                 ON token_model_mappings(confirmed);
             CREATE INDEX IF NOT EXISTS idx_token_model_mappings_official
                 ON token_model_mappings(official_model);",
+        )
+        .map_err(|error| error.to_string())?;
+
+    // 初始化标准模型清单：从模型目录导入主流厂商的 GA 模型
+    initialize_token_official_models(&connection)?;
+
+    Ok(())
+}
+
+/// 从模型目录初始化标准模型清单（仅在表为空时执行）
+fn initialize_token_official_models(connection: &Connection) -> Result<(), String> {
+    let count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM token_official_models",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+
+    if count > 0 {
+        return Ok(()); // 已初始化过，跳过
+    }
+
+    connection
+        .execute_batch(
+            "INSERT OR IGNORE INTO token_official_models (id, name, lab, source, confidence)
+             SELECT
+                LOWER(COALESCE(slug, id)) as id,
+                name,
+                lab,
+                'catalog' as source,
+                1.0 as confidence
+             FROM model_catalog_models
+             WHERE status = 'ga'
+               AND lab IN ('openai','anthropic','google','zhipu','alibaba','deepseek',
+                          'mistral','meta','cohere','01-ai','moonshot','baichuan','minimax')
+               AND kind IN ('chat','reasoning')
+             ORDER BY last_updated DESC",
+        )
+        .map_err(|error| error.to_string())?;
+
+    // 将已确认映射中的正式模型补录到清单中（数据迁移）
+    connection
+        .execute_batch(
+            "INSERT OR IGNORE INTO token_official_models (id, name, lab, source, confidence)
+             SELECT DISTINCT
+                LOWER(official_model) as id,
+                official_model as name,
+                COALESCE(lab, '') as lab,
+                'migration' as source,
+                0.8 as confidence
+             FROM token_model_mappings
+             WHERE confirmed = 1
+               AND official_model != ''
+               AND LOWER(official_model) NOT IN (SELECT id FROM token_official_models)",
         )
         .map_err(|error| error.to_string())?;
 

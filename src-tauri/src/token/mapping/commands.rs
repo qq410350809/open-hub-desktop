@@ -3,8 +3,23 @@ use super::store;
 use super::types::*;
 use crate::context::{AppContext, Managed};
 use crate::model::gateway::types::{ChannelConfig, ModelProxyState};
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::warn;
+
+/// Token 统计专用的标准模型（独立于模型目录）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenOfficialModel {
+    pub id: String,
+    pub name: String,
+    pub lab: String,
+    pub aliases: Vec<String>,
+    pub source: String,
+    pub confidence: f64,
+    pub created_at: String,
+    pub updated_at: String,
+}
 
 /// 组装 AI 判定请求用的模型名。要求显式指定渠道：拼上渠道网关别名前缀
 /// （{alias}/{model}），由网关的渠道前缀路由定向到该渠道。
@@ -49,6 +64,122 @@ pub fn set_token_model_mapping(
     official_model: String,
 ) -> Result<ModelMapping, String> {
     store::set_mapping_manually(&ctx.database, &raw_model, &official_model)
+}
+
+/// 获取 Token 统计的标准模型清单
+#[tauri::command]
+pub fn get_token_official_models(
+    ctx: Managed<'_, Arc<AppContext>>,
+) -> Result<Vec<TokenOfficialModel>, String> {
+    let connection = ctx.database.lock_conn()?;
+    let mut statement = connection
+        .prepare(
+            "SELECT id, name, lab, aliases, source, confidence, created_at, updated_at
+             FROM token_official_models
+             ORDER BY confidence DESC, lab, name",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = statement
+        .query_map([], |row| {
+            let aliases_json: String = row.get(3)?;
+            let aliases: Vec<String> = serde_json::from_str(&aliases_json).unwrap_or_default();
+            Ok(TokenOfficialModel {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                lab: row.get(2)?,
+                aliases,
+                source: row.get(4)?,
+                confidence: row.get(5)?,
+                created_at: row.get(6)?,
+                updated_at: row.get(7)?,
+            })
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    Ok(rows)
+}
+
+/// 添加自定义标准模型（用户手动添加或 AI 自动学习）
+#[tauri::command]
+pub fn add_token_official_model(
+    ctx: Managed<'_, Arc<AppContext>>,
+    id: String,
+    name: String,
+    lab: String,
+) -> Result<TokenOfficialModel, String> {
+    let connection = ctx.database.lock_conn()?;
+    let id_trimmed = id.trim().to_lowercase().replace(" ", "-");
+    let name_trimmed = name.trim();
+    let lab_trimmed = lab.trim();
+
+    if id_trimmed.is_empty() || name_trimmed.is_empty() {
+        return Err("模型 ID 和名称不能为空".to_string());
+    }
+
+    connection
+        .execute(
+            "INSERT INTO token_official_models (id, name, lab, source, confidence)
+             VALUES (?1, ?2, ?3, 'user', 0.5)
+             ON CONFLICT(id) DO UPDATE SET
+                name = excluded.name,
+                lab = excluded.lab,
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+            rusqlite::params![id_trimmed, name_trimmed, lab_trimmed],
+        )
+        .map_err(|e| e.to_string())?;
+
+    // 返回创建/更新后的模型
+    connection
+        .query_row(
+            "SELECT id, name, lab, aliases, source, confidence, created_at, updated_at
+             FROM token_official_models WHERE id = ?1",
+            rusqlite::params![id_trimmed],
+            |row| {
+                let aliases_json: String = row.get(3)?;
+                let aliases: Vec<String> = serde_json::from_str(&aliases_json).unwrap_or_default();
+                Ok(TokenOfficialModel {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    lab: row.get(2)?,
+                    aliases,
+                    source: row.get(4)?,
+                    confidence: row.get(5)?,
+                    created_at: row.get(6)?,
+                    updated_at: row.get(7)?,
+                })
+            },
+        )
+        .map_err(|e| e.to_string())
+}
+
+/// 删除自定义标准模型（只能删除用户添加的，不能删除目录导入的）
+#[tauri::command]
+pub fn remove_token_official_model(
+    ctx: Managed<'_, Arc<AppContext>>,
+    id: String,
+) -> Result<(), String> {
+    let connection = ctx.database.lock_conn()?;
+    let deleted = connection
+        .execute(
+            "DELETE FROM token_official_models WHERE id = ?1 AND source IN ('user', 'ai')",
+            rusqlite::params![id],
+        )
+        .map_err(|e| e.to_string())?;
+
+    if deleted == 0 {
+        return Err("无法删除：模型不存在或来源于目录（只能删除用户添加的模型）".to_string());
+    }
+
+    Ok(())
+}
+
+/// 从模型目录迁移数据到 token_official_models（一次性操作）
+#[tauri::command]
+pub fn migrate_token_official_models(
+    ctx: Managed<'_, Arc<AppContext>>,
+) -> Result<usize, String> {
+    store::migrate_catalog_to_official_models(&ctx.database)
 }
 
 /// 用 AI 补全「原始模型名 → 正式模型」映射。

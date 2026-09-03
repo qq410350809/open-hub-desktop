@@ -4,8 +4,8 @@ use serde_json::Value as JsonValue;
 
 /// 单批送给 AI 的待分析条目数。批太大容易触发上游截断与漏条。
 pub const BATCH_SIZE: usize = 40;
-/// 候选池注入上限：全量 2500+ 条会把提示词撑爆，按厂商前缀预筛后再截断。
-const CANDIDATE_LIMIT: usize = 260;
+/// 候选池注入上限：新架构使用轻量标准库，候选池从 2500+ 降至 50-100 条。
+const CANDIDATE_LIMIT: usize = 100;
 
 /// 按待分析条目的词元与候选正式名做粗筛，缩小注入 AI 的候选池。
 pub fn shortlist_candidates(
@@ -74,13 +74,14 @@ pub fn build_prompt(
     format!(
         "你要把本地统计到的「原始模型名」对应到「正式模型名」。\n\n\
          规则：\n\
-         1. officialModel 必须逐字取自下面的候选清单，不得改写、不得自造；\n\
-         2. 无法确定时把 officialModel 留空字符串，不要猜测；\n\
-         3. 同一模型的大小写差异、版本分隔符差异（5-2 与 5.2）、\
+         1. officialModel 优先从下面的候选清单中逐字选取；\n\
+         2. 候选清单中没有匹配项时，可以自行判定合理的正式名称（系统会自动记录新模型）；\n\
+         3. 无法确定时把 officialModel 留空字符串，不要猜测；\n\
+         4. 同一模型的大小写差异、版本分隔符差异（5-2 与 5.2）、\
             厂商前缀差异（zai-glm 与 glm）都应归到同一个正式模型；\n\
-         4. confidence 用 0 到 1 的小数，reason 用一句中文说明依据。{standards_rule}\n\
+         5. confidence 用 0 到 1 的小数，reason 用一句中文说明依据。{standards_rule}\n\
          待判定条目：\n{listed}{standards_block}\n\n\
-         候选正式模型清单：\n{pool}\n\n\
+         候选正式模型清单（优先选择，若无匹配可自行判定）：\n{pool}\n\n\
          只输出 JSON，形如：\n\
          {{\"items\":[{{\"rawModel\":\"...\",\"officialModel\":\"...\",\
          \"lab\":\"...\",\"confidence\":0.9,\"reason\":\"...\"}}]}}"

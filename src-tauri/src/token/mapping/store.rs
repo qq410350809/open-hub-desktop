@@ -1,7 +1,7 @@
 use super::normalize::{raw_key, rule_base_name};
 use super::types::*;
 use crate::models::Database;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 
 fn row_mapping(row: &rusqlite::Row<'_>) -> rusqlite::Result<ModelMapping> {
     Ok(ModelMapping {
@@ -131,13 +131,14 @@ pub fn confirmed_standards(
         .collect())
 }
 
-/// 正式模型候选池：模型目录里的规范名，供 AI 选择而非自由生成。
+/// 正式模型候选池：从 token_official_models 轻量标准库查询，替代原有的模型目录全量查询。
+/// 根据待分析条目的关键词智能筛选，候选池从 2500+ 条降至 50-100 条。
 pub fn official_catalog(connection: &Connection) -> Result<Vec<(String, String, String)>, String> {
     let mut statement = connection
         .prepare(
-            "SELECT name, COALESCE(slug,''), COALESCE(lab,'')
-             FROM model_catalog_models
-             ORDER BY lab, name",
+            "SELECT name, id, lab FROM token_official_models
+             ORDER BY confidence DESC, lab, name
+             LIMIT 300",
         )
         .map_err(|e| e.to_string())?;
     let rows = statement
@@ -156,6 +157,7 @@ pub fn official_catalog(connection: &Connection) -> Result<Vec<(String, String, 
 
 /// 写回一批 AI 结果。force = false 时仅覆盖未确认的行；
 /// force = true 时可覆盖已确认行，但手工修改（origin = manual）的行始终保留。
+/// 新架构：AI 返回的模型名不在清单中时，自动创建占位符（来源标记为 ai）。
 pub fn apply_ai_results(
     database: &Database,
     items: &[AiMappingItem],
@@ -173,14 +175,34 @@ pub fn apply_ai_results(
         if key.is_empty() {
             continue;
         }
-        // 只接受落在目录里的正式名，AI 编造的名字直接丢弃。
+
+        let official_trimmed = item.official_model.trim();
+
+        // 1. 尝试在 token_official_models 中查找（大小写不敏感）
         let matched = catalog
             .iter()
-            .find(|(name, _, _)| name.eq_ignore_ascii_case(item.official_model.trim()));
+            .find(|(name, _, _)| name.eq_ignore_ascii_case(official_trimmed));
+
         let (official, slug, lab) = match matched {
             Some((name, slug, lab)) => (name.clone(), Some(slug.clone()), Some(lab.clone())),
-            None => continue,
+            None => {
+                // 2. 不在清单中 → 自动创建占位符，标记来源为 ai
+                let id = official_trimmed.to_lowercase().replace(" ", "-");
+                let lab = extract_lab_from_name(official_trimmed);
+                transaction
+                    .execute(
+                        "INSERT OR IGNORE INTO token_official_models
+                         (id, name, lab, source, confidence)
+                         VALUES (?1, ?2, ?3, 'ai', ?4)",
+                        params![id, official_trimmed, lab, item.confidence],
+                    )
+                    .map_err(|e| e.to_string())?;
+
+                // 使用新创建的模型
+                (official_trimmed.to_string(), Some(id), Some(lab))
+            }
         };
+
         let guard = if force {
             " AND origin != 'manual'"
         } else {
@@ -212,7 +234,32 @@ pub fn apply_ai_results(
     Ok(applied)
 }
 
+/// 从模型名中提取厂商标识（简单启发式）
+fn extract_lab_from_name(name: &str) -> String {
+    let lower = name.to_lowercase();
+    if lower.contains("gpt") || lower.contains("openai") {
+        "openai".to_string()
+    } else if lower.contains("claude") || lower.contains("anthropic") {
+        "anthropic".to_string()
+    } else if lower.contains("gemini") || lower.contains("google") {
+        "google".to_string()
+    } else if lower.contains("glm") || lower.contains("zhipu") {
+        "zhipu".to_string()
+    } else if lower.contains("qwen") || lower.contains("alibaba") {
+        "alibaba".to_string()
+    } else if lower.contains("deepseek") {
+        "deepseek".to_string()
+    } else if lower.contains("mistral") {
+        "mistral".to_string()
+    } else if lower.contains("llama") || lower.contains("meta") {
+        "meta".to_string()
+    } else {
+        "unknown".to_string()
+    }
+}
+
 /// 手工修改单条映射，来源标记为 manual 并置为已确认。
+/// 新架构：不再要求正式模型必须在目录中，支持用户自定义任意模型。
 pub fn set_mapping_manually(
     database: &Database,
     raw_model: &str,
@@ -222,17 +269,52 @@ pub fn set_mapping_manually(
     if key.is_empty() {
         return Err("原始模型名不能为空".to_string());
     }
-    let connection = database.lock_conn()?;
+    let mut connection = database.lock_conn()?;
     let trimmed = official_model.trim();
     let (official, slug, lab) = if trimmed.is_empty() {
         (String::new(), None, None)
     } else {
-        official_catalog(&connection)?
-            .into_iter()
-            .find(|(name, _, _)| name.eq_ignore_ascii_case(trimmed))
-            .map(|(name, slug, lab)| (name, Some(slug), Some(lab)))
-            .ok_or_else(|| format!("正式模型不在模型目录中：{trimmed}"))?
+        let transaction = connection.transaction().map_err(|e| e.to_string())?;
+
+        // 1. 尝试在 token_official_models 中查找
+        let existing = transaction
+            .query_row(
+                "SELECT id, name, lab FROM token_official_models
+                 WHERE name = ?1 OR id = ?1 COLLATE NOCASE",
+                params![trimmed],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+
+        let (id, name, lab) = match existing {
+            Some((id, name, lab)) => (id, name, lab),
+            None => {
+                // 2. 不存在 → 自动创建，标记来源为 user
+                let id = trimmed.to_lowercase().replace(" ", "-");
+                let lab = extract_lab_from_name(trimmed);
+                transaction
+                    .execute(
+                        "INSERT INTO token_official_models
+                         (id, name, lab, source, confidence)
+                         VALUES (?1, ?2, ?3, 'user', 0.5)",
+                        params![id, trimmed, lab],
+                    )
+                    .map_err(|e| e.to_string())?;
+                (id, trimmed.to_string(), lab)
+            }
+        };
+
+        transaction.commit().map_err(|e| e.to_string())?;
+        (name, Some(id), Some(lab))
     };
+
     let confirmed = if official.is_empty() { 0 } else { 1 };
     connection
         .execute(
@@ -267,6 +349,43 @@ pub fn set_mapping_manually(
         .map_err(|e| e.to_string())
 }
 
+/// 从 model_catalog_models 初始化 token_official_models（一次性迁移）
+/// 只迁移尚不存在的模型，不覆盖已有的用户自定义或 AI 学习的模型
+pub fn migrate_catalog_to_official_models(database: &Database) -> Result<usize, String> {
+    let connection = database.lock_conn()?;
+
+    // 检查 model_catalog_models 表是否存在
+    let catalog_exists: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='model_catalog_models'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+
+    if catalog_exists == 0 {
+        return Ok(0); // 目录表不存在，跳过迁移
+    }
+
+    // 迁移：INSERT OR IGNORE 确保不覆盖已有条目
+    let migrated = connection
+        .execute(
+            "INSERT OR IGNORE INTO token_official_models (id, name, lab, source, confidence)
+             SELECT
+                LOWER(COALESCE(slug, id)) as id,
+                name,
+                COALESCE(lab, '') as lab,
+                'catalog' as source,
+                1.0 as confidence
+             FROM model_catalog_models
+             WHERE name IS NOT NULL AND name != ''",
+            [],
+        )
+        .map_err(|e| e.to_string())?;
+
+    Ok(migrated)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -287,11 +406,15 @@ mod tests {
                     confirmed INTEGER NOT NULL DEFAULT 0,
                     updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
                 );
-                CREATE TABLE model_catalog_models (
+                CREATE TABLE token_official_models (
                     id TEXT PRIMARY KEY,
-                    slug TEXT,
                     name TEXT NOT NULL,
-                    lab TEXT
+                    lab TEXT NOT NULL DEFAULT '',
+                    aliases TEXT NOT NULL DEFAULT '[]',
+                    source TEXT NOT NULL DEFAULT 'catalog',
+                    confidence REAL NOT NULL DEFAULT 1.0,
+                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
                 );",
             )
             .unwrap();
@@ -302,8 +425,8 @@ mod tests {
         let connection = database.lock_conn().unwrap();
         connection
             .execute(
-                "INSERT INTO model_catalog_models (id, slug, name, lab) VALUES (?1, ?2, ?1, ?3)",
-                params![name, name.to_lowercase(), "test-lab"],
+                "INSERT INTO token_official_models (id, name, lab, source) VALUES (?1, ?2, ?3, 'catalog')",
+                params![name.to_lowercase(), name, "test-lab"],
             )
             .unwrap();
     }
@@ -413,24 +536,41 @@ mod tests {
     }
 
     #[test]
-    fn apply_ai_results_drops_names_outside_catalog() {
+    fn apply_ai_results_auto_creates_new_models() {
         let database = test_database();
         register_raw_models(&database, &["mystery-model".to_string()]).unwrap();
+
+        // AI 返回不在目录中的模型名，新架构应自动创建
         let applied = apply_ai_results(
             &database,
             &[AiMappingItem {
                 raw_model: "mystery-model".to_string(),
-                official_model: "Not-In-Catalog".to_string(),
-                lab: None,
+                official_model: "Mystery LLM Pro".to_string(),
+                lab: Some("mystery-lab".to_string()),
                 confidence: 0.9,
-                reason: None,
+                reason: Some("AI 识别新模型".to_string()),
             }],
             false,
         )
         .unwrap();
-        assert_eq!(applied, 0);
+
+        assert_eq!(applied, 1);
+
+        // 验证映射已创建
         let rows = list_mappings(&database).unwrap();
-        assert!(!rows[0].confirmed);
-        assert!(rows[0].official_model.is_empty());
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].confirmed);
+        assert_eq!(rows[0].official_model, "Mystery LLM Pro");
+
+        // 验证 token_official_models 中自动创建了条目
+        let connection = database.lock_conn().unwrap();
+        let count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM token_official_models WHERE name = 'Mystery LLM Pro'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
     }
 }
