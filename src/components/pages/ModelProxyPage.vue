@@ -32,7 +32,6 @@ import {
 } from "../../utils";
 import CustomSelect from "../common/CustomSelect.vue";
 import DateRangeDropdown from "../common/DateRangeDropdown.vue";
-import type { SiteRecord } from "../../types";
 import { API_PATH_V1, API_PATH_GEMINI, API_PATH_MESSAGES, DEFAULT_SERVICE_PORT } from "../../constants";
 import { isTauri } from "../../composables/core/ipc";
 
@@ -753,7 +752,39 @@ function isModelChecked(model: string): boolean {
 
 /** 当前选中渠道的模型列表（弹窗数据源：优先取草稿） */
 function selectedChannelModels(): string[] {
-  return channelDraftModels.value;
+  const models = channelDraftModels.value;
+  const channel = selectedChannel.value;
+
+  // OpenCode 渠道去重：后端同时返回 opencode/xxx 和 xxx，前端只显示带前缀版本
+  if (channel && channel.id === 'opencode') {
+    const alias = channelAlias(channel);
+    const deduplicated = new Set<string>();
+    const unprefixed = new Set<string>();
+
+    // 第一轮：收集所有不带前缀的模型名
+    for (const m of models) {
+      if (!m.includes('/')) {
+        unprefixed.add(m);
+      }
+    }
+
+    // 第二轮：只保留带前缀版本，如果存在对应的裸模型名则跳过裸模型名
+    for (const m of models) {
+      if (m.startsWith(`${alias}/`)) {
+        deduplicated.add(m);
+      } else if (!m.includes('/') && !unprefixed.has(m.replace(`${alias}/`, ''))) {
+        // 只有当不存在带前缀版本时，才保留裸模型名
+        const prefixed = `${alias}/${m}`;
+        if (!models.includes(prefixed)) {
+          deduplicated.add(m);
+        }
+      }
+    }
+
+    return Array.from(deduplicated);
+  }
+
+  return models;
 }
 
 /** 当前勾选数量（按现有模型列表计算），用于头部计数与保存结果 */
@@ -1617,7 +1648,6 @@ async function confirmConvertSites() {
   );
 
   let successCount = 0;
-  const failedSites: string[] = [];
 
   for (const site of sitesToConvert) {
     const alias = uniqueChannelAlias(extractAliasFromUrl(site.apiBaseUrl));
