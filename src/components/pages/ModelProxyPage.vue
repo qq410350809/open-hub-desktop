@@ -1479,12 +1479,7 @@ async function confirmDeleteChannel() {
 // —— 站点转换：从站点库「在用且存活」的站点创建反代渠道 ——
 const { sites: librarySites, loadLibrary } = useLibrary();
 const siteConvertDialogOpen = ref(false);
-const convertSelectedSite = ref<SiteRecord | null>(null);
-const convertAlias = ref("");
-const convertApiBaseUrl = ref("");
-const convertAliasError = ref("");
-const convertModelLoading = ref(false);
-const convertSiteModelCount = ref(0);
+const convertSelectedSites = ref<Set<string>>(new Set()); // 改为多选，存储站点 ID
 const convertSiteSearch = ref("");
 
 /** 各站点模型缓存摘要：Key/模型/账号数，供转换列表展示 */
@@ -1548,10 +1543,38 @@ const filteredConvertibleSites = computed(() => {
   );
 });
 
-/** 从站点名生成英文别名（中文名回退为 site），并保证与现有渠道别名不冲突 */
-function slugifySiteName(name: string): string {
-  const base = (name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 24)) || "site";
-  return base;
+/** 从站点 URL 中提取最具代表性的英文单词作为别名 */
+function extractAliasFromUrl(url: string): string {
+  try {
+    const urlObj = new URL(url);
+    const hostname = urlObj.hostname.toLowerCase();
+
+    // 移除常见前缀和后缀
+    let domain = hostname
+      .replace(/^(www\d*|api|gateway|proxy|app)\./i, "")
+      .replace(/\.(com|net|org|io|ai|dev|app|tech|cloud|chat|pro|plus|xyz|cc|me|co)$/i, "");
+
+    // 如果是多级子域名，取最有意义的部分
+    const parts = domain.split(".");
+    if (parts.length > 1) {
+      // 优先取倒数第二个部分（通常是品牌名）
+      domain = parts[parts.length - 2] || parts[parts.length - 1];
+    }
+
+    // 清理特殊字符，只保留字母数字
+    const cleaned = domain.replace(/[^a-z0-9]+/g, "");
+
+    // 如果提取到有效单词，返回；否则回退
+    if (cleaned.length >= 2 && cleaned.length <= 20) {
+      return cleaned;
+    }
+  } catch {
+    // URL 解析失败，尝试简单处理
+  }
+
+  // 回退：从站点名提取
+  const fromName = url.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 24);
+  return fromName || "site";
 }
 
 function uniqueChannelAlias(base: string): string {
@@ -1563,11 +1586,7 @@ function uniqueChannelAlias(base: string): string {
 }
 
 function openSiteConvertDialog() {
-  convertSelectedSite.value = null;
-  convertAlias.value = "";
-  convertApiBaseUrl.value = "";
-  convertAliasError.value = "";
-  convertSiteModelCount.value = 0;
+  convertSelectedSites.value.clear();
   convertSiteSearch.value = "";
   siteConvertDialogOpen.value = true;
   if (librarySites.value.length === 0) {
@@ -1580,72 +1599,77 @@ function closeSiteConvertDialog() {
   siteConvertDialogOpen.value = false;
 }
 
-/** 选择站点：预填 API 地址、自动生成唯一别名，并读取站点同步的全部原 Key（继承，无需选择） */
-async function selectConvertSite(site: SiteRecord) {
-  convertSelectedSite.value = site;
-  convertApiBaseUrl.value = site.apiBaseUrl.trim();
-  convertAlias.value = uniqueChannelAlias(slugifySiteName(site.name));
-  convertAliasError.value = "";
-  convertSiteModelCount.value = 0;
-  convertModelLoading.value = true;
-  try {
-    const cache = await runCommand<{ models?: { id: string }[] }>("get_site_model_cache", {
-      siteId: site.id,
-    });
-    const modelIds = Array.isArray(cache?.models) ? cache.models.map((m) => m.id).filter(Boolean) : [];
-    convertSiteModelCount.value = modelIds.length;
-    if (modelIds.length > 0) {
-      channelModels.value[`site_${site.id}`] = modelIds;
-    }
-  } catch {
-    /* 忽略：模型缓存由网关运行时按 siteId 读取 */
-  } finally {
-    convertModelLoading.value = false;
+/** 切换站点选中状态 */
+function toggleConvertSite(siteId: string) {
+  if (convertSelectedSites.value.has(siteId)) {
+    convertSelectedSites.value.delete(siteId);
+  } else {
+    convertSelectedSites.value.add(siteId);
   }
 }
 
-watch(convertAlias, (val) => {
-  convertAliasError.value = validateAlias(val);
-});
+/** 批量转换选中的站点 */
+async function confirmConvertSites() {
+  if (convertSelectedSites.value.size === 0) return;
 
-async function confirmConvertSite() {
-  const site = convertSelectedSite.value;
-  if (!site) return;
-  const err = validateAlias(convertAlias.value);
-  if (err) {
-    convertAliasError.value = err;
-    return;
+  const sitesToConvert = librarySites.value.filter((s) =>
+    convertSelectedSites.value.has(s.id)
+  );
+
+  let successCount = 0;
+  const failedSites: string[] = [];
+
+  for (const site of sitesToConvert) {
+    const alias = uniqueChannelAlias(extractAliasFromUrl(site.apiBaseUrl));
+
+    const channel: ChannelConfig = {
+      id: `site_${site.id}`,
+      name: site.name,
+      description: `由站点「${site.name}」转换而来的反代渠道（运行时使用关联站点 Key）`,
+      enabled: true,
+      protocol: "openai",
+      upstreamUrl: site.apiBaseUrl.trim(),
+      apiKey: "",
+      apiKeys: [],
+      useProxyPool: false,
+      proxyMode: "direct",
+      alias: alias,
+      siteId: site.id,
+      useFixedProxy: false,
+      proxyFixedChannel: null,
+      enabledModels: null,
+    };
+
+    proxyConfig.value.channels.push(channel);
+
+    // 尝试加载该站点的模型缓存
+    try {
+      const cache = await runCommand<{ models?: { id: string }[] }>("get_site_model_cache", {
+        siteId: site.id,
+      });
+      const modelIds = Array.isArray(cache?.models) ? cache.models.map((m) => m.id).filter(Boolean) : [];
+      if (modelIds.length > 0) {
+        channelModels.value[`site_${site.id}`] = modelIds;
+      }
+    } catch {
+      /* 忽略：模型缓存由网关运行时按 siteId 读取 */
+    }
+
+    successCount++;
   }
-  if (!convertApiBaseUrl.value.trim()) {
-    convertAliasError.value = "请填写 API 地址";
-    return;
-  }
-  const channel: ChannelConfig = {
-    id: `site_${site.id}`,
-    name: site.name,
-    description: `由站点「${site.name}」转换而来的反代渠道（运行时使用关联站点 Key）`,
-    enabled: true,
-    protocol: "openai",
-    upstreamUrl: convertApiBaseUrl.value.trim(),
-    apiKey: "",
-    apiKeys: [],
-    // 站点转换渠道默认强制直连，代理策略可在渠道设置的四模式中选择
-    useProxyPool: false,
-    proxyMode: "direct",
-    alias: convertAlias.value.trim().toLowerCase(),
-    siteId: site.id,
-    useFixedProxy: false,
-    proxyFixedChannel: null,
-    enabledModels: null,
-  };
-  proxyConfig.value.channels.push(channel);
+
   const ok = await saveConfig(proxyConfig.value);
   if (ok) {
-    showToast(`已将「${site.name}」转换为反代渠道（别名 ${channel.alias}）`);
+    showToast(`已成功转换 ${successCount} 个站点为反代渠道`);
     siteConvertDialogOpen.value = false;
     void refreshModels();
   } else {
-    proxyConfig.value.channels = proxyConfig.value.channels.filter((c) => c.id !== channel.id);
+    // 回滚失败的转换
+    for (const site of sitesToConvert) {
+      proxyConfig.value.channels = proxyConfig.value.channels.filter(
+        (c) => c.id !== `site_${site.id}`
+      );
+    }
   }
 }
 
@@ -4919,8 +4943,11 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
               <div class="mp-modal-title-wrap">
                 <h3 id="mp-site-convert-title">站点转换</h3>
                 <span class="mp-header-chip">{{ convertibleSites.length }} 个可用站点</span>
+                <span v-if="convertSelectedSites.size > 0" class="mp-header-chip mp-chip-primary">
+                  已选 {{ convertSelectedSites.size }} 个
+                </span>
               </div>
-              <small class="text-muted">从站点库「在用且存活」的站点创建反代渠道 · 所有渠道英文别名不能重复（含 opencode）</small>
+              <small class="text-muted">从站点库「在用且存活」的站点创建反代渠道 · 支持多选批量转换 · 自动从 URL 生成英文别名</small>
             </div>
           </div>
           <button
@@ -4944,16 +4971,23 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
             />
           </div>
 
-          <!-- 站点列表：图标 + 名称/主机 + Key·模型·账号 统计徽标 -->
+          <!-- 站点列表：图标 + 名称/主机 + Key·模型·账号 统计徽标 + 复选框 -->
           <div class="mp-site-list">
             <button
               v-for="site in filteredConvertibleSites"
               :key="site.id"
               type="button"
-              class="mp-site-item"
-              :class="{ 'is-selected': convertSelectedSite?.id === site.id }"
-              @click="selectConvertSite(site)"
+              class="mp-site-item mp-site-item-checkbox"
+              :class="{ 'is-selected': convertSelectedSites.has(site.id) }"
+              @click="toggleConvertSite(site.id)"
             >
+              <div class="mp-site-checkbox">
+                <input
+                  type="checkbox"
+                  :checked="convertSelectedSites.has(site.id)"
+                  @click.stop
+                />
+              </div>
               <img v-if="site.icon" class="mp-site-item-icon" :src="site.icon" alt="" />
               <span v-else class="mp-site-item-icon mp-site-item-icon-fallback">{{
                 site.name.slice(0, 1)
@@ -4961,6 +4995,9 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
               <span class="mp-site-item-main">
                 <span class="mp-site-item-name">{{ site.name }}</span>
                 <span class="mp-site-item-url font-mono">{{ formatUpstreamUrl(site.apiBaseUrl) }}</span>
+                <span class="mp-site-item-alias font-mono text-muted">
+                  别名: {{ extractAliasFromUrl(site.apiBaseUrl) }}
+                </span>
               </span>
               <span class="mp-site-item-stats font-mono">
                 <span
@@ -4987,62 +5024,26 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
             </div>
           </div>
 
-          <!-- 转换配置 -->
-          <div v-if="convertSelectedSite" class="mp-convert-config">
-            <div class="mp-settings-field">
-              <div class="mp-settings-field-head">
-                <div class="mp-proxy-pool-label">
-                  <span class="mp-pp-icon" v-html="icons.globe" />
-                  <span>英文别名（唯一）</span>
-                </div>
-                <small class="text-muted">网关模型前缀，如 {{ convertAlias || "alias" }}/model</small>
-              </div>
-              <input
-                v-model="convertAlias"
-                type="text"
-                class="mp-settings-input"
-                :class="{ 'has-error': convertAliasError }"
-                placeholder="仅限英文、数字、- 与 _"
-              />
-              <p v-if="convertAliasError" class="mp-settings-error">{{ convertAliasError }}</p>
-            </div>
-            <div class="mp-settings-field">
-              <div class="mp-settings-field-head">
-                <span>API 地址</span>
-              </div>
-              <input
-                v-model="convertApiBaseUrl"
-                type="text"
-                class="mp-settings-input"
-                placeholder="https://example.com/v1"
-              />
-            </div>
-
-            <!-- 站点凭证由网关运行时按 siteId 读取，不复制到渠道配置 -->
-            <div class="mp-settings-field">
-              <div class="mp-settings-field-head">
-                <span>站点凭证</span>
-                <small v-if="convertModelLoading" class="text-muted">正在读取站点模型…</small>
-              </div>
-              <p class="mp-settings-hint">
-                该渠道只保存站点关联关系；请求和模型拉取时会直接使用站点当前同步的 Key，不在反代配置中保存副本。
-                <span v-if="convertModelLoading">正在读取站点缓存…</span>
-                <template v-else>
-                  <span v-if="convertSiteModelCount > 0">当前已同步 {{ convertSiteModelCount }} 个模型。</span>
-                  <span
-                    v-if="(siteCacheSummary(convertSelectedSite.id)?.keyCount ?? 0) > 0"
-                  >将继承 {{ siteCacheSummary(convertSelectedSite.id)?.keyCount }} 个 Key（多 Key 自动轮换）。</span>
-                  <span v-else class="mp-convert-key-missing">⚠️ 该站点暂无已同步的 Key，转换后需先在站点库同步 Key 才能调用。</span>
-                </template>
-              </p>
-            </div>
+          <!-- 移除单站点转换配置区，改为批量转换说明 -->
+          <div v-if="convertSelectedSites.size > 0" class="mp-convert-hint">
+            <p class="text-muted">
+              💡 已选择 {{ convertSelectedSites.size }} 个站点，点击「批量转换」后将自动：
+            </p>
+            <ul class="mp-convert-hint-list text-muted">
+              <li>从各站点 URL 提取最具代表性的英文单词作为别名（自动去重）</li>
+              <li>继承站点当前同步的所有 Key（多 Key 自动轮换）</li>
+              <li>同步站点已缓存的模型列表（可在「管理模型」中调整）</li>
+              <li>默认强制直连（可在渠道设置中修改代理策略）</li>
+            </ul>
           </div>
         </div>
 
         <div class="mp-modal-footer">
           <div class="mp-modal-footer-hint text-muted text-xs">
-            <span v-if="convertSelectedSite">💡 转换后可在「管理模型」中勾选该渠道对外暴露的模型</span>
-            <span v-else>💡 选择上方一个在用且存活的站点开始转换</span>
+            <span v-if="convertSelectedSites.size > 0">
+              💡 转换后可在「管理模型」中勾选各渠道对外暴露的模型
+            </span>
+            <span v-else>💡 勾选上方一个或多个在用且存活的站点开始批量转换</span>
           </div>
           <div class="mp-modal-footer-buttons">
             <button
@@ -5055,12 +5056,12 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
             <button
               type="button"
               class="mp-btn mp-btn-primary"
-              :disabled="savingConfig || !convertSelectedSite"
-              title="将该站点转换为一个反代渠道"
-              @click="confirmConvertSite"
+              :disabled="savingConfig || convertSelectedSites.size === 0"
+              title="批量转换选中的站点为反代渠道"
+              @click="confirmConvertSites"
             >
               <span v-html="icons.plus" />
-              <span>{{ savingConfig ? "转换中…" : "转换为渠道" }}</span>
+              <span>{{ savingConfig ? "转换中…" : `批量转换 (${convertSelectedSites.size})` }}</span>
             </button>
           </div>
         </div>
@@ -6435,6 +6436,26 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
   text-align: left;
 }
 
+.mp-site-item-checkbox {
+  padding-left: 8px;
+}
+
+.mp-site-checkbox {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  flex-shrink: 0;
+}
+
+.mp-site-checkbox input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  cursor: pointer;
+  accent-color: var(--brand);
+}
+
 .mp-site-item:hover {
   border-color: var(--line-strong);
   background: var(--surface);
@@ -6489,11 +6510,53 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
   text-overflow: ellipsis;
 }
 
+.mp-site-item-alias {
+  font-size: 10.5px;
+  color: var(--brand);
+  font-weight: 600;
+  margin-top: 1px;
+}
+
 .mp-site-item-stats {
   display: inline-flex;
   align-items: center;
   gap: 5px;
   flex-shrink: 0;
+}
+
+/* 站点转换：批量转换提示区 */
+.mp-convert-hint {
+  margin-top: 12px;
+  padding: 12px;
+  border-radius: var(--r-md, 8px);
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+}
+
+.mp-convert-hint > p {
+  margin: 0 0 8px;
+  font-size: 12px;
+}
+
+.mp-convert-hint-list {
+  margin: 0;
+  padding-left: 20px;
+  font-size: 11.5px;
+  line-height: 1.6;
+}
+
+.mp-convert-hint-list li {
+  margin-bottom: 4px;
+}
+
+.mp-convert-hint-list li:last-child {
+  margin-bottom: 0;
+}
+
+.mp-chip-primary {
+  background: var(--brand-soft);
+  color: var(--brand);
+  border-color: var(--brand);
 }
 
 .mp-sis-badge {
