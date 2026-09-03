@@ -2,7 +2,8 @@ use crate::models::TokenSessionTokens;
 use crate::token::collector::normalizer::{is_common_subfolder, normalize_workspace_project_key};
 use crate::token::collector::time_utils::update_bounds;
 use crate::token::collector::types::{
-    fingerprint, number, token_session, CachedFile, UsageEvent, UNKNOWN_CODEX_MODEL,
+    fingerprint, normalize_usage, number, token_session, CachedFile, InputSemantics, RawUsage,
+    UsageEvent, UNKNOWN_CODEX_MODEL,
 };
 use serde_json::Value as JsonValue;
 use std::collections::HashSet;
@@ -78,16 +79,59 @@ impl CodexUsage {
         }
     }
 
-    /// 三项输入（全新 / 缓存读 / 缓存写）语义独立，互不扣减；
-    /// total 取上游口径与三分量之和的较大值，保证 total ≥ 分量和。
+    /// 归一到统一口径 total = 全新输入 + 缓存命中 + 输出。
+    ///
+    /// Codex 上游存在两种真实口径，须逐事件判别：
+    /// - OpenAI Responses 原生（主流）：`input_tokens` 为**总输入**，cached 是其中的子集
+    ///   （实测 99/113 个会话、67% 事件满足 total == input + output）。
+    ///   此时必须拆分 fresh = input - cached——否则 cached 被双计，
+    ///   缓存命中率从 cached/input（≈98%）腰斩成 cached/(input+cached)（≈50%），total 虚高约 44%。
+    /// - Anthropic 类中转：字段为独立分量（cached 可大于 input），total == input + cached + output。
+    /// 判别依据：
+    ///   1. cached > input → 必然是独立协议（OpenAI 协议中 cached 不可能超过 input）
+    ///   2. total 精确匹配 input + cached + output → 独立协议
+    ///   3. total 精确匹配 input + output （cached == 0 或被忽略）→ OpenAI 协议
+    ///   4. 其他情况默认 OpenAI 协议（主流占 67%）
     pub fn normalized(self) -> Self {
-        let total = self
-            .input_tokens
-            .saturating_add(self.cached_input_tokens)
-            .saturating_add(self.cache_creation_input_tokens)
-            .saturating_add(self.output_tokens)
-            .max(self.total_tokens);
+        // 强证据：cached 超出 input，必然是独立协议
+        let independent = if self.cached_input_tokens > self.input_tokens {
+            true
+        } else if self.total_tokens > 0 {
+            let sum_independent = self
+                .input_tokens
+                .saturating_add(self.cached_input_tokens)
+                .saturating_add(self.output_tokens);
+            let sum_openai = self.input_tokens.saturating_add(self.output_tokens);
+
+            if self.total_tokens == sum_independent && self.cached_input_tokens > 0 {
+                // total 匹配独立协议，且有缓存数据
+                true
+            } else if self.total_tokens == sum_openai {
+                // total 匹配 OpenAI 协议（cached 未计入或为 0）
+                false
+            } else {
+                // 无明确匹配，默认主流 OpenAI 协议
+                false
+            }
+        } else {
+            // 无 total_tokens，默认 OpenAI 协议
+            false
+        };
+
+        let (fresh_input, _read, _write, _out, _reasoning, total) = normalize_usage(RawUsage {
+            input: self.input_tokens,
+            semantics: if independent {
+                InputSemantics::Fresh
+            } else {
+                InputSemantics::InclusiveOfCacheRead
+            },
+            cache_read: self.cached_input_tokens,
+            cache_write: self.cache_creation_input_tokens,
+            output: self.output_tokens,
+            reasoning: self.reasoning_output_tokens,
+        });
         Self {
+            input_tokens: fresh_input,
             total_tokens: total,
             ..self
         }

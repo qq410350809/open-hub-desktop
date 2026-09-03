@@ -8,8 +8,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
-/// v16：修复 VS Code Copilot 会话增量操作日志（kind 0/1/2）解析，强制全量重扫。
-pub const CACHE_VERSION: i64 = 19;
+/// v22：Codex input 口径实测修正——原生 OpenAI Responses 的 input_tokens 为总输入（含缓存命中），
+/// 需拆分全新输入，否则缓存命中率被腰斩、total 虚高；中转独立口径按事件自动判别。
+/// total 口径不变：total = 全新输入 + 缓存命中 + 输出；缓存写入与思考 token 独立。
+pub const CACHE_VERSION: i64 = 22;
 pub const CACHE_TTL: Duration = Duration::from_secs(5);
 pub const UNKNOWN_CODEX_MODEL: &str = "codex-unknown-model";
 pub const UNKNOWN_CLAUDE_MODEL: &str = "claude-unknown-model";
@@ -244,12 +246,106 @@ pub fn float_number(value: &JsonValue, keys: &[&str]) -> f64 {
     0.0
 }
 
+/// 上游 input 字段的缓存语义：决定 normalize_usage 如何拆分全新输入。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InputSemantics {
+    /// input 即全新输入，不含缓存（Anthropic / codex / opencode / mimo）。
+    #[default]
+    Fresh,
+    /// input 为总输入，已包含缓存命中（OpenAI prompt_tokens / copilot / zcode 类）。
+    InclusiveOfCacheRead,
+    /// input 为总输入，已包含缓存命中与缓存写入（如某些网关把 cache write 并入 prompt）。
+    InclusiveOfAllCache,
+}
+
+/// 各源解析出的原始用量（未拆分口径）。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RawUsage {
+    pub input: i64,
+    pub semantics: InputSemantics,
+    pub cache_read: i64,
+    pub cache_write: i64,
+    pub output: i64,
+    pub reasoning: i64,
+}
+
+/// 统一归一化（全链路唯一口径）：
+/// total = 全新输入 + 缓存命中 + 输出；缓存写入与思考 token 独立上报，不计入 total。
+/// 返回 (fresh_input, cache_read, cache_write, output, reasoning, total)。
+pub fn normalize_usage(raw: RawUsage) -> (i64, i64, i64, i64, i64, i64) {
+    let read = raw.cache_read.max(0);
+    let write = raw.cache_write.max(0);
+    let fresh = match raw.semantics {
+        InputSemantics::Fresh => raw.input.max(0),
+        InputSemantics::InclusiveOfCacheRead => raw.input.saturating_sub(read).max(0),
+        InputSemantics::InclusiveOfAllCache => {
+            raw.input.saturating_sub(read).saturating_sub(write).max(0)
+        }
+    };
+    let total = fresh.saturating_add(read).saturating_add(raw.output.max(0));
+    (fresh, read, write, raw.output.max(0), raw.reasoning.max(0), total)
+}
+
+/// 读取 OpenAI 式 `prompt_tokens_details.cached_tokens`（camelCase/snake_case 兼容）。
+/// 这是 prompt 已含缓存时的权威缓存命中字段。
+pub fn openai_cached_from_details(usage: &JsonValue) -> i64 {
+    usage
+        .get("promptTokensDetails")
+        .or_else(|| usage.get("prompt_tokens_details"))
+        .map(|details| number(details, &["cachedTokens", "cached_tokens"]))
+        .unwrap_or(0)
+}
+
+/// 读取 OpenAI 式 `completion_tokens_details.reasoning_tokens`。
+pub fn openai_reasoning_from_details(usage: &JsonValue) -> i64 {
+    usage
+        .get("completionTokensDetails")
+        .or_else(|| usage.get("completion_tokens_details"))
+        .map(|details| number(details, &["reasoningTokens", "reasoning_tokens"]))
+        .unwrap_or(0)
+}
+
 pub fn open_readonly_sqlite(path: &Path) -> Option<Connection> {
-    Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .ok()
+    // 修复：添加重试逻辑处理数据库锁定
+    // 当其他进程持有写锁时，等待最多 3 次（每次 100ms）
+    // 避免静默失败导致永久数据丢失
+
+    const MAX_RETRIES: u32 = 3;
+    const RETRY_DELAY_MS: u64 = 100;
+
+    for attempt in 0..MAX_RETRIES {
+        match Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        ) {
+            Ok(conn) => {
+                // 设置 busy_timeout 以处理短暂的锁定
+                let _ = conn.busy_timeout(Duration::from_millis(500));
+                return Some(conn);
+            }
+            Err(e) => {
+                let is_locked = e.to_string().to_lowercase().contains("lock");
+                if is_locked && attempt < MAX_RETRIES - 1 {
+                    // 数据库被锁定，等待后重试
+                    std::thread::sleep(Duration::from_millis(RETRY_DELAY_MS));
+                    continue;
+                } else if is_locked {
+                    // 最后一次重试仍然失败
+                    eprintln!(
+                        "[SQLite] 警告：数据库被锁定，跳过采集: {}",
+                        path.display()
+                    );
+                    eprintln!("[SQLite] 关闭正在使用该数据库的应用后重试");
+                    return None;
+                } else {
+                    // 其他错误（文件不存在、权限等）
+                    return None;
+                }
+            }
+        }
+    }
+
+    None
 }
 
 pub fn token_session(

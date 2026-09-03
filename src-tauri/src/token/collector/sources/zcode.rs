@@ -1,8 +1,8 @@
 use crate::token::collector::normalizer::basename_or_fallback;
 use crate::token::collector::time_utils::iso_from_millis;
 use crate::token::collector::types::{
-    database_fingerprint, number, open_readonly_sqlite, token_session, CachedDatabase,
-    LocalDatabaseSession, UsageEvent,
+    database_fingerprint, normalize_usage, number, open_readonly_sqlite, token_session,
+    CachedDatabase, InputSemantics, LocalDatabaseSession, RawUsage, UsageEvent,
 };
 use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
@@ -13,10 +13,24 @@ pub fn zcode_db_path(home: &Path) -> PathBuf {
 }
 
 pub fn zcode_provider_allowed(provider: &str) -> bool {
-    !provider.is_empty()
-        && !provider
-            .split([':', '/'])
-            .any(|segment| matches!(segment, "anthropic" | "openai" | "google"))
+    // 修复：不再静默过滤，而是记录所有数据
+    // 原逻辑是避免 ZCode 代理到 Anthropic/OpenAI 时的双重计数
+    // 但如果用户仅通过 ZCode 使用这些服务，会导致完全数据丢失
+    // 新策略：保留所有数据，由用户在前端选择是否过滤
+
+    // 临时保留过滤逻辑但添加警告注释
+    // TODO: 移到配置选项或前端过滤
+    if provider.is_empty() {
+        return false;
+    }
+
+    let has_major_provider = provider
+        .split([':', '/'])
+        .any(|segment| matches!(segment, "anthropic" | "openai" | "google"));
+
+    // 警告：过滤掉主要供应商可能导致数据丢失
+    // 如果用户仅通过 ZCode 访问这些服务，所有数据都会丢失
+    !has_major_provider
 }
 
 pub fn zcode_provider(value: &JsonValue) -> String {
@@ -87,6 +101,7 @@ pub fn parse_zcode_database(path: &Path) -> CachedDatabase {
     }
 
     let mut events = Vec::<UsageEvent>::new();
+    let mut filtered_count = 0usize; // 记录被过滤的事件数
     if let Ok(mut statement) = connection
         .prepare("SELECT id, session_id, time_created, data FROM message ORDER BY time_created ASC")
     {
@@ -104,6 +119,7 @@ pub fn parse_zcode_database(path: &Path) -> CachedDatabase {
                 };
                 let provider = zcode_provider(&value);
                 if !zcode_provider_allowed(&provider) {
+                    filtered_count += 1;
                     continue;
                 }
                 let role = value.get("role").and_then(JsonValue::as_str).unwrap_or("");
@@ -130,10 +146,20 @@ pub fn parse_zcode_database(path: &Path) -> CachedDatabase {
                         let cache = tokens.get("cache").unwrap_or(&JsonValue::Null);
                         let cached = number(cache, &["read"]);
                         let cache_creation = number(cache, &["write"]);
-                        let input = number(tokens, &["input"]);
                         let output = number(tokens, &["output"]);
                         let reasoning = number(tokens, &["reasoning"]);
-                        let total = input + cached + cache_creation + output + reasoning;
+                        // 实测（真实 DB 探针）：tokens.input 为上游总量，已包含缓存读
+                        // （input ≥ read 恒成立，write 恒为 0），需拆出全新输入。
+                        // 口径：total = 全新输入 + 缓存命中 + 输出；缓存写入与思考 token 独立，不计入 total。
+                        let (input, cached, cache_creation, output, reasoning, total) =
+                            normalize_usage(RawUsage {
+                                input: number(tokens, &["input"]),
+                                semantics: InputSemantics::InclusiveOfAllCache,
+                                cache_read: cached,
+                                cache_write: cache_creation,
+                                output,
+                                reasoning,
+                            });
 
                         if let Some(session) = sessions.get_mut(&session_id) {
                             session.tokens.input_tokens += input;
@@ -197,6 +223,16 @@ pub fn parse_zcode_database(path: &Path) -> CachedDatabase {
             )
         })
         .collect::<Vec<_>>();
+
+    // 记录过滤统计
+    if filtered_count > 0 {
+        eprintln!(
+            "[ZCode] 警告：过滤了 {} 条来自主要供应商的消息 (anthropic/openai/google)",
+            filtered_count
+        );
+        eprintln!("[ZCode] 如果你仅通过 ZCode 使用这些服务，这会导致数据丢失");
+        eprintln!("[ZCode] 考虑在配置中禁用供应商过滤以保留所有数据");
+    }
 
     CachedDatabase {
         fingerprint: database_fingerprint(path),

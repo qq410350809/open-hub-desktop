@@ -2,8 +2,8 @@ use crate::models::TokenSessionTokens;
 use crate::token::collector::normalizer::vscode_workspace_project_from_path;
 use crate::token::collector::time_utils::{iso_from_millis, update_bounds};
 use crate::token::collector::types::{
-    collect_jsonl_files, fingerprint, token_session, CachedFile, FileFingerprint, UsageEvent,
-    LOCAL_ESTIMATED_CONTEXT_LIMIT, UNKNOWN_COPILOT_MODEL,
+    collect_jsonl_files, fingerprint, normalize_usage, token_session, CachedFile, FileFingerprint,
+    InputSemantics, RawUsage, UsageEvent, LOCAL_ESTIMATED_CONTEXT_LIMIT, UNKNOWN_COPILOT_MODEL,
 };
 use serde_json::{json, Value as JsonValue};
 use std::fs;
@@ -443,18 +443,31 @@ pub fn parse_vscode_chat_session(
                 let mut resp_text_len = 0usize;
                 if let Some(resp_arr) = req.get("response").and_then(JsonValue::as_array) {
                     for item in resp_arr {
+                        // 思考文本单独计入 reasoning_output_tokens，不得混入输出（避免双算）
+                        if item.get("kind").and_then(JsonValue::as_str) == Some("thinking") {
+                            continue;
+                        }
                         if let Some(v) = item.get("value").and_then(JsonValue::as_str) {
                             resp_text_len += v.len();
                         }
                     }
                 }
                 output_tokens = (resp_text_len as i64 / 4).max(1);
-                estimated_tokens = prompt_tokens + output_tokens + reasoning_tokens;
+                estimated_tokens = prompt_tokens + output_tokens;
             }
 
-            let total_tokens = prompt_tokens
-                .saturating_add(output_tokens)
-                .saturating_add(reasoning_tokens);
+            // 口径：total = 全新输入 + 缓存命中 + 输出；思考 token 独立上报，不计入 total。
+            // Copilot 的 promptTokens 为上游总量（已包含 cachedTokens），必须拆出全新输入
+            // ——input 字段一旦存入含缓存总量，下游 fresh+cached+output 即双计。
+            let (fresh_input, cached_read, _write, output_final, _reasoning, total_tokens) =
+                normalize_usage(RawUsage {
+                    input: prompt_tokens,
+                    semantics: InputSemantics::InclusiveOfCacheRead,
+                    cache_read: cached_tokens,
+                    cache_write: 0,
+                    output: output_tokens,
+                    reasoning: reasoning_tokens,
+                });
 
             if total_tokens > 0 || !user_text.is_empty() {
                 events.push(UsageEvent {
@@ -463,10 +476,10 @@ pub fn parse_vscode_chat_session(
                     model: req_model,
                     project_key: project_key.clone(),
                     timestamp,
-                    input_tokens: prompt_tokens,
-                    cached_input_tokens: cached_tokens,
+                    input_tokens: fresh_input,
+                    cached_input_tokens: cached_read,
                     cache_creation_input_tokens: 0,
-                    output_tokens,
+                    output_tokens: output_final,
                     reasoning_output_tokens: reasoning_tokens,
                     total_tokens,
                     conversation_count: 0,
@@ -609,9 +622,16 @@ pub fn parse_copilot_cli_events(
                 let input_tokens = visible_context_tokens
                     .saturating_add(64)
                     .min(LOCAL_ESTIMATED_CONTEXT_LIMIT);
-                let total_tokens = input_tokens
-                    .saturating_add(output_tokens)
-                    .saturating_add(reasoning_tokens);
+                // 口径：total = 全新输入 + 缓存命中 + 输出；思考 token 独立上报，不计入 total。
+                let (_fresh, _read, _write, _out, _reasoning, total_tokens) = normalize_usage(
+                    RawUsage {
+                        input: input_tokens,
+                        semantics: InputSemantics::Fresh,
+                        cache_write: 0,
+                        output: output_tokens,
+                        ..Default::default()
+                    },
+                );
 
                 events.push(UsageEvent {
                     id: event_id,
@@ -742,7 +762,32 @@ pub fn parse_copilot_transcript(
                     ..Default::default()
                 });
             }
-            _ => {}
+            // 修复：前向兼容性 - 尝试提取未知事件类型中的 token 数据
+            // 避免未来版本新增字段时数据丢失
+            unknown_type => {
+                // 检查是否包含 usage/tokens 字段
+                if let Some(usage) = data.get("usage").or_else(|| data.get("tokens")) {
+                    // 尝试提取 token 计量数据
+                    let input = usage
+                        .get("input_tokens")
+                        .or_else(|| usage.get("prompt_tokens"))
+                        .and_then(JsonValue::as_i64)
+                        .unwrap_or(0);
+                    let output = usage
+                        .get("output_tokens")
+                        .or_else(|| usage.get("completion_tokens"))
+                        .and_then(JsonValue::as_i64)
+                        .unwrap_or(0);
+
+                    if input > 0 || output > 0 {
+                        eprintln!(
+                            "[Copilot] 发现未知事件类型 '{}' 包含 token 数据 (in:{}, out:{})",
+                            unknown_type, input, output
+                        );
+                        eprintln!("[Copilot] 请更新采集器以支持此事件类型");
+                    }
+                }
+            }
         }
     }
 
@@ -1001,6 +1046,15 @@ pub fn parse_vscode_opencode_log(
                 }
                 let timestamp = default_ts.clone();
                 update_bounds(&mut first_ts, &mut last_ts, &timestamp);
+                // OpenAI 语义：promptTokens 已含 cachedTokens，需拆出全新输入。
+                let (fresh_input, cached_read, _write, output_final, _reasoning, total_tokens) =
+                    normalize_usage(RawUsage {
+                        input: prompt_tokens,
+                        semantics: InputSemantics::InclusiveOfCacheRead,
+                        cache_read: cached_tokens,
+                        output: completion_tokens,
+                        ..Default::default()
+                    });
                 events.push(UsageEvent {
                     id: format!("{path_key}:{index}"),
                     source: "vscode-opencode".to_string(),
@@ -1011,12 +1065,12 @@ pub fn parse_vscode_opencode_log(
                     },
                     project_key: project_key.clone(),
                     timestamp,
-                    input_tokens: prompt_tokens.saturating_sub(cached_tokens).max(0),
-                    cached_input_tokens: cached_tokens,
+                    input_tokens: fresh_input,
+                    cached_input_tokens: cached_read,
                     cache_creation_input_tokens: 0,
-                    output_tokens: completion_tokens,
+                    output_tokens: output_final,
                     reasoning_output_tokens: 0,
-                    total_tokens: prompt_tokens + completion_tokens,
+                    total_tokens,
                     conversation_count: 0,
                     cost_usd: 0.0,
                     pricing_available: false,

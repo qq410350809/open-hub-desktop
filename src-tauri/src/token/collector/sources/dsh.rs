@@ -2,7 +2,8 @@ use crate::models::TokenSessionTokens;
 use crate::token::collector::normalizer::normalize_workspace_project_key;
 use crate::token::collector::time_utils::{iso_from_millis, update_bounds};
 use crate::token::collector::types::{
-    fingerprint, number, token_session, CachedFile, UsageEvent, UNKNOWN_DSH_MODEL,
+    fingerprint, normalize_usage, number, token_session, CachedFile, InputSemantics, RawUsage,
+    UsageEvent, UNKNOWN_DSH_MODEL,
 };
 use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
@@ -158,13 +159,17 @@ pub fn parse_dsh_file(path: &Path) -> CachedFile {
                 if let Some(ev) = event {
                     let msg_id = ev.id.clone();
                     let total = ev.total_tokens;
-                    let should_replace = usage_events
-                        .get(&msg_id)
-                        .map(|ex| total > ex.total_tokens)
-                        .unwrap_or(true);
-                    if should_replace {
-                        usage_events.insert(msg_id, ev);
-                    }
+                    // 修复：使用 entry API 原子性地检查和更新，避免竞态条件
+                    // 之前的 get-then-insert 模式在重试场景下可能丢失数据
+                    usage_events
+                        .entry(msg_id)
+                        .and_modify(|existing| {
+                            // 只在新事件 token 更多时替换（取最完整的数据）
+                            if total > existing.total_tokens {
+                                *existing = ev.clone();
+                            }
+                        })
+                        .or_insert(ev);
                 }
             }
             continue;
@@ -191,13 +196,19 @@ pub fn parse_dsh_file(path: &Path) -> CachedFile {
                     dsh_usage_event(usage, &session_id, &project_key, &model, &anchor_ts, index);
                 if let Some(ev) = event {
                     let chunk_id = format!("{}:chunk:{}:{}", ev.id, turn, step);
-                    let should_replace = usage_events
-                        .get(&chunk_id)
-                        .map(|ex| ev.total_tokens > ex.total_tokens)
-                        .unwrap_or(true);
-                    if should_replace {
-                        usage_events.insert(chunk_id.clone(), UsageEvent { id: chunk_id, ..ev });
-                    }
+                    let total = ev.total_tokens;
+                    // 修复：使用 entry API 原子性地检查和更新
+                    usage_events
+                        .entry(chunk_id.clone())
+                        .and_modify(|existing| {
+                            if total > existing.total_tokens {
+                                *existing = UsageEvent {
+                                    id: chunk_id.clone(),
+                                    ..ev.clone()
+                                };
+                            }
+                        })
+                        .or_insert_with(|| UsageEvent { id: chunk_id, ..ev });
                 }
             }
             continue;
@@ -278,10 +289,15 @@ fn dsh_usage_event(
     timestamp: &str,
     index: usize,
 ) -> Option<UsageEvent> {
-    let input = number(usage, &["inputTokens", "input_tokens"]);
-    let cached = number(usage, &["cacheReadTokens", "cache_read_input_tokens"]);
-    let output = number(usage, &["outputTokens", "output_tokens"]);
-    let total = input.saturating_add(cached).saturating_add(output);
+    // 口径：total = 全新输入 + 缓存命中 + 输出；缓存写入独立上报，不计入 total。
+    // DSH usage 为 Anthropic 风格字段名（inputTokens/cacheReadTokens），input 视为全新输入。
+    let (input, cached, _write, output, _reasoning, total) = normalize_usage(RawUsage {
+        input: number(usage, &["inputTokens", "input_tokens"]),
+        semantics: InputSemantics::Fresh,
+        cache_read: number(usage, &["cacheReadTokens", "cache_read_input_tokens"]),
+        output: number(usage, &["outputTokens", "output_tokens"]),
+        ..Default::default()
+    });
     if total <= 0 || timestamp.is_empty() {
         return None;
     }
