@@ -419,9 +419,8 @@ pub fn parse_antigravity_file(path: &Path) -> CachedFile {
                 .min(LOCAL_ESTIMATED_CONTEXT_LIMIT);
             let output_tokens = content_tokens.saturating_add(tool_call_tokens);
             let reasoning_output_tokens = thinking_tokens;
-            let total_tokens = input_tokens
-                .saturating_add(output_tokens)
-                .saturating_add(reasoning_output_tokens);
+            // 思考 token 独立上报，不计入 total。
+            let total_tokens = input_tokens.saturating_add(output_tokens);
             events.push(UsageEvent {
                 id: event_id,
                 source: "antigravity".to_string(),
@@ -435,7 +434,15 @@ pub fn parse_antigravity_file(path: &Path) -> CachedFile {
                 estimated_tokens: total_tokens,
                 ..Default::default()
             });
+
+            // 修复：重置上下文累积，避免长会话中输入 token 10x-100x 虚增
+            // 每次响应后只保留本次输出作为下一轮的上下文基础
+            // 之前的无限累积会导致第 10 轮请求被计为 10 倍输入
+            visible_context_tokens = context_delta;
+            continue;
         }
+
+        // 其他事件类型（非 PLANNER_RESPONSE）才累积到上下文
         visible_context_tokens = visible_context_tokens.saturating_add(context_delta);
     }
 

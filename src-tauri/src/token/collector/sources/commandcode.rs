@@ -6,8 +6,8 @@ use crate::token::collector::normalizer::{
 use crate::token::collector::sources::claude::claude_user_is_human;
 use crate::token::collector::time_utils::update_bounds;
 use crate::token::collector::types::{
-    fingerprint, float_number, number, token_session, CachedFile, FileFingerprint, UsageEvent,
-    LOCAL_ESTIMATED_CONTEXT_LIMIT, UNKNOWN_COMMAND_CODE_MODEL,
+    fingerprint, float_number, normalize_usage, number, token_session, CachedFile, FileFingerprint,
+    InputSemantics, RawUsage, UsageEvent, LOCAL_ESTIMATED_CONTEXT_LIMIT, UNKNOWN_COMMAND_CODE_MODEL,
 };
 use serde_json::{json, Value as JsonValue};
 use std::fs;
@@ -88,10 +88,16 @@ pub fn local_content_chars(value: &JsonValue) -> (i64, i64) {
 
 pub fn estimate_local_content_tokens(content: &JsonValue) -> i64 {
     let (ascii, non_ascii) = local_content_chars(content);
-    ascii
-        .saturating_add(3)
-        .div_euclid(4)
-        .saturating_add(non_ascii)
+
+    // 修复：CJK 字符的 token 估算
+    // ASCII: ~4 字符/token (英文单词平均长度 + 空格)
+    // 非 ASCII (CJK): ~2 字符/token (中文/日文/韩文通常 1-3 token/字符，取中位数 2)
+    // 之前按 1:1 计算导致中文内容低估 ~50%
+    let ascii_tokens = ascii.saturating_add(3).div_euclid(4);
+    let non_ascii_tokens = non_ascii.saturating_add(1).div_euclid(2);
+
+    ascii_tokens
+        .saturating_add(non_ascii_tokens)
         .saturating_add(4)
 }
 
@@ -241,24 +247,27 @@ pub fn parse_command_code_file(path: &Path) -> CachedFile {
 
         assistant_message_count += 1;
         if let Some(usage) = command_code_usage(&value) {
-            let input_tokens = number(usage, &["inputTokens", "input_tokens"]);
-            let output_tokens = number(usage, &["outputTokens", "output_tokens"]);
-            let cached_input_tokens = number(
-                usage,
-                &["cacheReadTokens", "cache_read_tokens", "cachedInputTokens"],
-            );
-            let cache_creation_input_tokens = number(
-                usage,
-                &[
-                    "cacheWriteTokens",
-                    "cache_write_tokens",
-                    "cacheCreationInputTokens",
-                ],
-            );
-            let total_tokens = input_tokens
-                .saturating_add(output_tokens)
-                .saturating_add(cached_input_tokens)
-                .saturating_add(cache_creation_input_tokens);
+            // 口径：total = 全新输入 + 缓存命中 + 输出；缓存写入独立上报，不计入 total。
+            // Command Code 转录沿用 Claude Code 的 Anthropic 语义，inputTokens 不含缓存。
+            let (input_tokens, cached_input_tokens, cache_creation_input_tokens, output_tokens, _reasoning, total_tokens) =
+                normalize_usage(RawUsage {
+                    input: number(usage, &["inputTokens", "input_tokens"]),
+                    semantics: InputSemantics::Fresh,
+                    cache_read: number(
+                        usage,
+                        &["cacheReadTokens", "cache_read_tokens", "cachedInputTokens"],
+                    ),
+                    cache_write: number(
+                        usage,
+                        &[
+                            "cacheWriteTokens",
+                            "cache_write_tokens",
+                            "cacheCreationInputTokens",
+                        ],
+                    ),
+                    output: number(usage, &["outputTokens", "output_tokens"]),
+                    ..Default::default()
+                });
             let cost_usd = float_number(usage, &["costUsd", "cost_usd"]);
             exact_usage_events += 1;
             events.push(UsageEvent {

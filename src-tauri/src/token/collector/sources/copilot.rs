@@ -650,6 +650,10 @@ pub fn parse_copilot_cli_events(
                     pricing_available: false,
                     estimated_tokens: total_tokens,
                 });
+
+                // 修复：重置上下文累积，避免长会话中输入 token 无限虚增
+                // 每次响应后只保留本次输出作为下一轮的上下文基础
+                visible_context_tokens = output_tokens;
             }
             _ => {}
         }
