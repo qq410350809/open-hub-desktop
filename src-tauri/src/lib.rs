@@ -186,6 +186,18 @@ pub fn run() {
             if let Err(error) = token::stats::seed_token_database_from_caches(&database) {
                 error!("[OpenHub] Token 缓存迁移到数据库失败：{error}");
             }
+            // 从模型目录迁移标准模型到 token_official_models 表（一次性操作）
+            match token::mapping::store::migrate_catalog_to_official_models(&database) {
+                Ok(count) if count > 0 => {
+                    info!("[OpenHub] Token 模型映射：从目录迁移 {count} 个标准模型");
+                }
+                Ok(_) => {
+                    // 已迁移过或目录表不存在，静默跳过
+                }
+                Err(error) => {
+                    warn!("[OpenHub] Token 模型映射迁移失败：{error}");
+                }
+            }
             // 启动清扫历史会话遗留的 Mihomo 孤儿进程：
             // 必须在拉起任何本会话实例之前执行，此刻清扫天然不会误伤活跃内核。
             proxypool::reap_orphan_mihomo_processes();
