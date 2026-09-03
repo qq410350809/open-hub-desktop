@@ -3621,6 +3621,9 @@ onBeforeUnmount(() => {
   font-size: 12px;
   font-weight: 600;
   cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   transition: all 0.15s ease;
 }
 
