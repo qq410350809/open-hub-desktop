@@ -116,12 +116,16 @@ pub fn catpawai_usage(value: &JsonValue) -> Option<&JsonValue> {
 }
 
 /// 统一归一化 CatPawAI Token 计量
-/// - 格式 1（OpenAI 嵌入式）：prompt_tokens 已包含 cachedTokens，需扣减得到 fresh_input
+/// - 格式 1（OpenAI 嵌入式）：prompt_tokens 已包含 cachedTokens（prompt_tokens_details），需扣减得到 fresh_input
 /// - 格式 2（新网关独立式）：prompt_tokens 仅为 fresh_input，cacheReadTokens 独立上报，总计需累加缓存
+/// - 两缓存字段并存时无法从数值判定 prompt 是否含缓存，仅当 raw_total 证明缓存已被独立计入
+///   （total == prompt + cache + completion）时才维持 prompt 为全新输入，避免双计
+/// - 仅 total_tokens 可用时以其为总量兜底（扣缓存后拆分）
+/// - total = fresh_input + 缓存命中 + 输出；缓存写入独立上报，不计入 total
 pub fn normalize_catpawai_usage_numbers(
     prompt: i64,
     completion: i64,
-    _raw_total: i64,
+    raw_total: i64,
     cache_read_field: i64,
     cache_write: i64,
     cached_from_details: i64,
@@ -129,15 +133,30 @@ pub fn normalize_catpawai_usage_numbers(
 ) -> (i64, i64, i64, i64, i64, i64) {
     let cached_input = cache_read_field.max(cached_from_details);
     let fresh_input = if cached_from_details > 0 && cache_read_field == 0 {
+        // 格式 1：prompt 含缓存命中（与写入），拆出全新输入。
         prompt
+            .saturating_sub(cached_input)
+            .saturating_sub(cache_write)
+    } else if cache_read_field > 0
+        && cached_from_details > 0
+        && raw_total > 0
+        && raw_total == prompt
+            .saturating_add(cached_input)
+            .saturating_add(completion)
+    {
+        // 两字段并存：raw_total 证明缓存是独立分量（未被并入 prompt），prompt 即全新输入。
+        prompt
+    } else if prompt == 0 && completion == 0 && raw_total > 0 {
+        // 仅 total_tokens 可用：以总量扣缓存拆分。
+        raw_total
             .saturating_sub(cached_input)
             .saturating_sub(cache_write)
     } else {
         prompt
     };
+    // 口径：total = 全新输入 + 缓存命中 + 输出；缓存写入独立上报，不计入 total。
     let total = fresh_input
         .saturating_add(cached_input)
-        .saturating_add(cache_write)
         .saturating_add(completion);
     let reasoning = reasoning.min(completion);
     (
@@ -185,12 +204,15 @@ pub fn parse_catpawai_database(path: &Path) -> CachedDatabase {
                 let project = normalize_workspace_project_key(&raw_project, "CatPawAI");
                 projects.insert(conversation_id.clone(), project);
 
-                let started_ms = if create_time > 0 && create_time < 100_000_000_000 {
+                // 时间戳判定阈值：< 10^10 视为秒（需乘 1000），>= 10^10 视为毫秒
+                // 10^10 毫秒 = 2001-09-09，10^10 秒 = 2286 年
+                // 修复：之前阈值 10^11 导致 2001-2073 年数据被错误乘以 1000
+                let started_ms = if create_time > 0 && create_time < 10_000_000_000 {
                     create_time.saturating_mul(1000)
                 } else {
                     create_time
                 };
-                let ended_ms = if update_time > 0 && update_time < 100_000_000_000 {
+                let ended_ms = if update_time > 0 && update_time < 10_000_000_000 {
                     update_time.saturating_mul(1000)
                 } else {
                     update_time
@@ -233,9 +255,9 @@ pub fn parse_catpawai_database(path: &Path) -> CachedDatabase {
                 let project = normalize_workspace_project_key(&raw_project, "CatPawAI");
                 projects.entry(conversation_id.clone()).or_insert(project);
 
-                let started_ms = if created_at > 0 && created_at < 100_000_000_000 {
+                let started_ms = if created_at > 0 && created_at < 10_000_000_000 {
                     created_at.saturating_mul(1000)
-                } else if ts > 0 && ts < 100_000_000_000 {
+                } else if ts > 0 && ts < 10_000_000_000 {
                     ts.saturating_mul(1000)
                 } else {
                     created_at
@@ -292,7 +314,7 @@ pub fn parse_catpawai_database(path: &Path) -> CachedDatabase {
                     .or_else(|| current_models.get(&conversation_id).cloned())
                     .unwrap_or_else(|| CATPAWAI_UNKNOWN_MODEL.to_string());
 
-                let normalized_ms = if create_time > 0 && create_time < 100_000_000_000 {
+                let normalized_ms = if create_time > 0 && create_time < 10_000_000_000 {
                     create_time.saturating_mul(1000)
                 } else {
                     create_time

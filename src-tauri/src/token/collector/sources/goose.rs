@@ -1,6 +1,9 @@
 use crate::models::TokenSessionTokens;
 use crate::token::collector::time_utils::update_bounds;
-use crate::token::collector::types::{fingerprint, number, token_session, CachedFile, UsageEvent};
+use crate::token::collector::types::{
+    fingerprint, normalize_usage, number, openai_cached_from_details, token_session, CachedFile,
+    InputSemantics, RawUsage, UsageEvent,
+};
 use serde_json::Value as JsonValue;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -60,7 +63,9 @@ pub fn parse_goose_file(path: &Path) -> CachedFile {
     let mut user_msg_count = 0i64;
 
     let mut total_in = 0i64;
+    let mut total_cached = 0i64;
     let mut total_out = 0i64;
+    let mut total_reasoning = 0i64;
     let mut total_all = 0i64;
 
     for (idx, line) in content.lines().enumerate() {
@@ -84,52 +89,89 @@ pub fn parse_goose_file(path: &Path) -> CachedFile {
         }
 
         if let Some(usage) = val.get("usage") {
+            // OpenAI 式 prompt_tokens 已含缓存命中；明细里的 cached_tokens 才是全新输入的拆分依据。
+            let cached = openai_cached_from_details(usage);
             let in_tok = number(usage, &["prompt_tokens", "input_tokens", "promptTokens"]);
             let out_tok = number(
                 usage,
                 &["completion_tokens", "output_tokens", "completionTokens"],
             );
-            let total = if in_tok + out_tok > 0 {
-                in_tok + out_tok
-            } else {
-                number(usage, &["total_tokens", "tokens"])
-            };
-
-            if total > 0 {
-                let ts_str = val
-                    .get("timestamp")
-                    .or_else(|| val.get("created_at"))
-                    .and_then(JsonValue::as_str)
-                    .unwrap_or("");
-                let iso_ts = if !ts_str.is_empty() {
-                    ts_str.to_string()
+            let reasoning = number(usage, &["reasoning_tokens", "reasoningTokens"]);
+            let (fresh, cached_read, _write, out, reasoning, total) = normalize_usage(RawUsage {
+                input: in_tok,
+                semantics: InputSemantics::InclusiveOfCacheRead,
+                cache_read: cached,
+                cache_write: 0,
+                output: out_tok,
+                reasoning,
+            });
+            if total <= 0 {
+                // 修复：上游仅报 total_tokens 时，根据角色合理分配 input/output
+                // assistant 消息按典型比例 2:1 分配，user 消息全部归入 input
+                let fallback = number(usage, &["total_tokens", "tokens"]);
+                if fallback <= 0 {
+                    continue;
+                }
+                let (estimated_in, estimated_out) = if role == "user" {
+                    (fallback, 0)
                 } else {
-                    String::new()
+                    // assistant 响应：假设输入占 2/3，输出占 1/3
+                    let est_out = fallback / 3;
+                    let est_in = fallback - est_out;
+                    (est_in, est_out)
                 };
-                update_bounds(&mut first_ts, &mut last_ts, &iso_ts);
-
-                total_in += in_tok;
-                total_out += out_tok;
-                total_all += total;
-
+                total_in += estimated_in;
+                total_out += estimated_out;
+                total_all += fallback;
                 events.push(UsageEvent {
                     id: format!("goose_{session_id}_{idx}"),
                     source: "goose".to_string(),
                     model: model_name.clone(),
                     project_key: project_key.clone(),
-                    timestamp: iso_ts,
-                    input_tokens: in_tok,
-                    cached_input_tokens: 0,
-                    cache_creation_input_tokens: 0,
-                    output_tokens: out_tok,
-                    reasoning_output_tokens: 0,
-                    total_tokens: total,
-                    conversation_count: 0,
-                    cost_usd: 0.0,
-                    pricing_available: false,
-                    estimated_tokens: 0,
+                    timestamp: String::new(),
+                    input_tokens: estimated_in,
+                    output_tokens: estimated_out,
+                    total_tokens: fallback,
+                    estimated_tokens: fallback,
+                    ..Default::default()
                 });
+                continue;
             }
+            let ts_str = val
+                .get("timestamp")
+                .or_else(|| val.get("created_at"))
+                .and_then(JsonValue::as_str)
+                .unwrap_or("");
+            let iso_ts = if !ts_str.is_empty() {
+                ts_str.to_string()
+            } else {
+                String::new()
+            };
+            update_bounds(&mut first_ts, &mut last_ts, &iso_ts);
+
+            total_in += fresh;
+            total_cached += cached_read;
+            total_out += out;
+            total_reasoning += reasoning;
+            total_all += total;
+
+            events.push(UsageEvent {
+                id: format!("goose_{session_id}_{idx}"),
+                source: "goose".to_string(),
+                model: model_name.clone(),
+                project_key: project_key.clone(),
+                timestamp: iso_ts,
+                input_tokens: fresh,
+                cached_input_tokens: cached_read,
+                cache_creation_input_tokens: 0,
+                output_tokens: out,
+                reasoning_output_tokens: reasoning,
+                total_tokens: total,
+                conversation_count: 0,
+                cost_usd: 0.0,
+                pricing_available: false,
+                estimated_tokens: 0,
+            });
         }
     }
 
@@ -145,10 +187,10 @@ pub fn parse_goose_file(path: &Path) -> CachedFile {
             user_msg_count,
             TokenSessionTokens {
                 input_tokens: total_in,
-                cached_input_tokens: 0,
+                cached_input_tokens: total_cached,
                 cache_creation_input_tokens: 0,
                 output_tokens: total_out,
-                reasoning_output_tokens: 0,
+                reasoning_output_tokens: total_reasoning,
                 total_tokens: total_all,
             },
             0.0,

@@ -1,11 +1,22 @@
 use crate::models::TokenSessionTokens;
 use crate::token::collector::time_utils::{iso_from_millis, update_bounds};
 use crate::token::collector::types::{
-    database_fingerprint, number, open_readonly_sqlite, token_session, CachedDatabase, UsageEvent,
+    database_fingerprint, normalize_usage, number, open_readonly_sqlite,
+    openai_cached_from_details, openai_reasoning_from_details, token_session, CachedDatabase,
+    InputSemantics, RawUsage, UsageEvent,
 };
 use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+
+/// 路径短哈希：多个 state.vscdb（global + 各 workspace）共用递增下标时，
+/// 事件 id 必须带上库标识，否则聚合去重会互相覆盖。
+fn db_path_tag(path: &Path) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    path.to_string_lossy().hash(&mut hasher);
+    format!("{:08x}", hasher.finish() as u32)
+}
 
 #[derive(Default)]
 struct CursorSessionAccumulator {
@@ -15,6 +26,8 @@ struct CursorSessionAccumulator {
     first_timestamp: String,
     last_timestamp: String,
     input_tokens: i64,
+    cached_input_tokens: i64,
+    cache_creation_input_tokens: i64,
     output_tokens: i64,
     total_tokens: i64,
     user_message_count: i64,
@@ -56,9 +69,42 @@ pub fn collect_cursor_db_paths(home: &Path) -> Vec<PathBuf> {
     paths
 }
 
+/// Cursor 上报口径极其有限：通常只有 total（tokenCount），input/output 可能缺失。
+/// 统一约束 input + output == total：缺谁由 total 补齐，绝不两边硬推导致加总溢出。
+/// 缓存命中只信 prompt_tokens_details.cached_tokens；无法拆分时整体记为估算。
+pub fn cursor_usage(bubble: &JsonValue, total_tokens: i64) -> RawUsage {
+    let input = number(bubble, &["inputTokens", "promptTokens"]);
+    let output = number(bubble, &["outputTokens", "completionTokens"]);
+    let cached = openai_cached_from_details(bubble).max(number(bubble, &["cachedTokens"]));
+
+    let (input, output) = match (input, output) {
+        (0, 0) => (total_tokens, 0),
+        (i, 0) => (i, (total_tokens - i).max(0)),
+        (0, o) => ((total_tokens - o).max(0), o),
+        (i, o) => (i, o),
+    };
+    let output = if output == 0 {
+        total_tokens.saturating_sub(input)
+    } else {
+        output
+    };
+
+    RawUsage {
+        input,
+        // Cursor 的 input/promptTokens 若非零，遵循 OpenAI 习惯（含缓存）；
+        // 无缓存字段时与 Fresh 等价（减 0）。
+        semantics: InputSemantics::InclusiveOfCacheRead,
+        cache_read: cached,
+        output,
+        reasoning: openai_reasoning_from_details(bubble),
+        ..Default::default()
+    }
+}
+
 pub fn parse_cursor_database(path: &Path) -> CachedDatabase {
     let mut events = Vec::new();
     let mut sessions = Vec::new();
+    let path_tag = db_path_tag(path);
 
     let Some(conn) = open_readonly_sqlite(path) else {
         return CachedDatabase {
@@ -68,9 +114,9 @@ pub fn parse_cursor_database(path: &Path) -> CachedDatabase {
     };
 
     let query_res = conn.prepare(
-        "SELECT key, value FROM ItemTable 
-         WHERE key LIKE 'aiService.prompts%' 
-            OR key LIKE 'workbench.panel.aichat.chatdata%' 
+        "SELECT key, value FROM ItemTable
+         WHERE key LIKE 'aiService.prompts%'
+            OR key LIKE 'workbench.panel.aichat.chatdata%'
             OR key LIKE 'composer.composerData%'
             OR key LIKE 'interactive.sessions%'",
     );
@@ -127,11 +173,19 @@ pub fn parse_cursor_database(path: &Path) -> CachedDatabase {
                             if b_type == "ai" || bubble.get("tokenCount").is_some() {
                                 let total_tokens =
                                     number(bubble, &["tokenCount", "tokens", "totalTokens"]);
-                                let input_tokens = number(bubble, &["inputTokens", "promptTokens"])
-                                    .max(total_tokens * 3 / 4);
-                                let output_tokens =
-                                    number(bubble, &["outputTokens", "completionTokens"])
-                                        .max(total_tokens.saturating_sub(input_tokens));
+                                if total_tokens <= 0 {
+                                    continue;
+                                }
+                                let raw = cursor_usage(bubble, total_tokens);
+                                let (input, cached, _write, output, _reasoning, total) =
+                                    normalize_usage(raw);
+                                // 修复：仅当 input/output 完全缺失时才标记为估算
+                                // cached == 0 可能是真实的零缓存命中，不应排除出统计
+                                let has_breakdown = bubble.get("inputTokens").is_some()
+                                    || bubble.get("promptTokens").is_some()
+                                    || bubble.get("outputTokens").is_some()
+                                    || bubble.get("completionTokens").is_some();
+                                let estimated = !has_breakdown;
 
                                 let group = session_groups
                                     .entry(tab_id.to_string())
@@ -147,26 +201,27 @@ pub fn parse_cursor_database(path: &Path) -> CachedDatabase {
                                     &mut group.last_timestamp,
                                     &iso_ts,
                                 );
-                                group.input_tokens += input_tokens;
-                                group.output_tokens += output_tokens;
-                                group.total_tokens += total_tokens;
+                                group.input_tokens += input;
+                                group.cached_input_tokens += cached;
+                                group.output_tokens += output;
+                                group.total_tokens += total;
 
                                 events.push(UsageEvent {
-                                    id: format!("cursor_{}_{created_at}", tab_id),
+                                    id: format!("cursor_{path_tag}_{}_{}", tab_id, created_at),
                                     source: "cursor".to_string(),
                                     model: model_name.clone(),
                                     project_key: "cursor-workspace".to_string(),
                                     timestamp: iso_ts,
-                                    input_tokens,
-                                    cached_input_tokens: 0,
+                                    input_tokens: input,
+                                    cached_input_tokens: cached,
                                     cache_creation_input_tokens: 0,
-                                    output_tokens,
+                                    output_tokens: output,
                                     reasoning_output_tokens: 0,
-                                    total_tokens,
+                                    total_tokens: total,
                                     conversation_count: 0,
                                     cost_usd: 0.0,
                                     pricing_available: false,
-                                    estimated_tokens: 0,
+                                    estimated_tokens: if estimated { total } else { 0 },
                                 });
                             } else if b_type == "user" {
                                 let group = session_groups
@@ -197,33 +252,53 @@ pub fn parse_cursor_database(path: &Path) -> CachedDatabase {
                     } else {
                         String::new()
                     };
-                    let in_tok = number(p, &["inputTokens", "promptTokens"]);
-                    let out_tok = number(p, &["outputTokens", "completionTokens"]);
-                    let total = if in_tok + out_tok > 0 {
-                        in_tok + out_tok
+                    let total_tokens = number(p, &["totalTokens", "tokens"]);
+                    let raw = if total_tokens > 0 {
+                        cursor_usage(p, total_tokens)
                     } else {
-                        number(p, &["totalTokens", "tokens"])
+                        let input = number(p, &["inputTokens", "promptTokens"]);
+                        let output = number(p, &["outputTokens", "completionTokens"]);
+                        if input + output <= 0 {
+                            continue;
+                        }
+                        RawUsage {
+                            input,
+                            semantics: InputSemantics::InclusiveOfCacheRead,
+                            cache_read: openai_cached_from_details(p),
+                            output,
+                            reasoning: openai_reasoning_from_details(p),
+                            ..Default::default()
+                        }
                     };
-
-                    if total > 0 {
-                        events.push(UsageEvent {
-                            id: format!("cursor_prompt_{}_{idx}", ts_ms),
-                            source: "cursor".to_string(),
-                            model: model.to_string(),
-                            project_key: "cursor-workspace".to_string(),
-                            timestamp: iso_ts,
-                            input_tokens: in_tok,
-                            cached_input_tokens: 0,
-                            cache_creation_input_tokens: 0,
-                            output_tokens: out_tok,
-                            reasoning_output_tokens: 0,
-                            total_tokens: total,
-                            conversation_count: 0,
-                            cost_usd: 0.0,
-                            pricing_available: false,
-                            estimated_tokens: 0,
-                        });
+                    let (input, cached, _write, output, _reasoning, total) =
+                        normalize_usage(raw);
+                    if total <= 0 {
+                        continue;
                     }
+                    // 修复：仅当完全无 token 明细时才标记估算
+                    let has_breakdown = p.get("inputTokens").is_some()
+                        || p.get("promptTokens").is_some()
+                        || p.get("outputTokens").is_some()
+                        || p.get("completionTokens").is_some();
+                    let estimated = !has_breakdown;
+
+                    events.push(UsageEvent {
+                        id: format!("cursor_prompt_{path_tag}_{}_{}", ts_ms, idx),
+                        source: "cursor".to_string(),
+                        model: model.to_string(),
+                        project_key: "cursor-workspace".to_string(),
+                        timestamp: iso_ts,
+                        input_tokens: input,
+                        cached_input_tokens: cached,
+                        cache_creation_input_tokens: 0,
+                        output_tokens: output,
+                        reasoning_output_tokens: 0,
+                        total_tokens: total,
+                        conversation_count: 0,
+                        cost_usd: 0.0,
+                        pricing_available: false,
+                        estimated_tokens: if estimated { total } else { 0 },
+                    });
                 }
             }
         }
@@ -241,8 +316,8 @@ pub fn parse_cursor_database(path: &Path) -> CachedDatabase {
                 group.user_message_count,
                 TokenSessionTokens {
                     input_tokens: group.input_tokens,
-                    cached_input_tokens: 0,
-                    cache_creation_input_tokens: 0,
+                    cached_input_tokens: group.cached_input_tokens,
+                    cache_creation_input_tokens: group.cache_creation_input_tokens,
                     output_tokens: group.output_tokens,
                     reasoning_output_tokens: 0,
                     total_tokens: group.total_tokens,
