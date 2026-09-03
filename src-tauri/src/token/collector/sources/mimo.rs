@@ -1,8 +1,8 @@
 use crate::token::collector::normalizer::basename_or_fallback;
 use crate::token::collector::time_utils::iso_from_millis;
 use crate::token::collector::types::{
-    database_fingerprint, number, open_readonly_sqlite, token_session, CachedDatabase,
-    LocalDatabaseSession, UsageEvent,
+    database_fingerprint, normalize_usage, number, open_readonly_sqlite, token_session,
+    CachedDatabase, InputSemantics, LocalDatabaseSession, RawUsage, UsageEvent,
 };
 use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
@@ -124,12 +124,17 @@ pub fn parse_mimo_database(path: &Path) -> CachedDatabase {
                 if role == "assistant" {
                     if let Some(tokens) = value.get("tokens") {
                         let cache = tokens.get("cache").unwrap_or(&JsonValue::Null);
-                        let cached = number(cache, &["read"]);
-                        let cache_creation = number(cache, &["write"]);
-                        let input = number(tokens, &["input"]);
-                        let output = number(tokens, &["output"]);
-                        let reasoning = number(tokens, &["reasoning"]);
-                        let total = input + cached + cache_creation + output + reasoning;
+                        // 实测（真实 DB 探针）：tokens.input 已是全新输入，不含缓存读/写。
+                        // 口径：total = 全新输入 + 缓存命中 + 输出；缓存写入与思考 token 独立，不计入 total。
+                        let (input, cached, cache_creation, output, reasoning, total) =
+                            normalize_usage(RawUsage {
+                                input: number(tokens, &["input"]),
+                                semantics: InputSemantics::Fresh,
+                                cache_read: number(cache, &["read"]),
+                                cache_write: number(cache, &["write"]),
+                                output: number(tokens, &["output"]),
+                                reasoning: number(tokens, &["reasoning"]),
+                            });
 
                         if let Some(session) = sessions.get_mut(&session_id) {
                             session.tokens.input_tokens += input;

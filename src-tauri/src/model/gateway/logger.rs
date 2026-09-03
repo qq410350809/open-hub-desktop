@@ -140,6 +140,10 @@ impl ProxyLogParams {
 /// 客户端 User-Agent 前缀 → 本地模式同名的来源标识（sourceNameMap 可直接复用）。
 /// 命名刻意避开 "unknown" 字样：前端 isKnownSource 会过滤含 unknown 的来源。
 const USER_AGENT_SOURCE_PREFIXES: &[(&str, &str)] = &[
+    // 本软件进程内直调（AI 分析 / 模型测试等）必须最先识别：
+    // 这些请求同样走 /v1/chat/completions 端点，漏判会兜底成 "openai-api"，
+    // 在网关 Token 统计里被错误显示成「OpenAI 协议客户端」。
+    ("openhub", "openhub"),
     ("claude", "claude"),
     ("codex", "codex"),
     ("cursor", "cursor"),
@@ -249,5 +253,58 @@ mod logger_tests {
         let capped = cap_log_body(long).unwrap();
         assert!(capped.chars().count() < MAX_LOG_BODY_CHARS + 60);
         assert!(capped.contains("内容过长已截断"));
+    }
+
+    fn ua(value: &str) -> axum::http::HeaderMap {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::USER_AGENT,
+            axum::http::HeaderValue::from_str(value).unwrap(),
+        );
+        headers
+    }
+
+    #[test]
+    fn internal_self_calls_are_labeled_openhub() {
+        // 进程内直调的三个调用方（AI 分析 / 模型测试 / 模型测试评审）走同一 Chat 端点，
+        // 但都是本软件自主请求，必须识别为 "openhub" 而非端点兜底的 "openai-api"。
+        for agent in [
+            "OpenHub-TokenMapping",
+            "OpenHub-ModelTest",
+            "OpenHub-ModelTestJudge",
+        ] {
+            assert_eq!(
+                client_name_from_headers(&ua(agent), "/v1/chat/completions"),
+                "openhub",
+                "User-Agent={agent}"
+            );
+        }
+    }
+
+    #[test]
+    fn external_clients_keep_protocol_or_agent_labels() {
+        // 已知 agent 的 User-Agent 仍按前缀识别
+        assert_eq!(
+            client_name_from_headers(&ua("claude-cli/2.1.0"), "/v1/messages"),
+            "claude"
+        );
+        assert_eq!(
+            client_name_from_headers(&ua("codex/0.42"), "/v1/chat/completions"),
+            "codex"
+        );
+        // 未知客户端按端点协议兜底（真实外部 OpenAI 协议客户端不受影响）
+        assert_eq!(
+            client_name_from_headers(&ua("some-sdk/1.0"), "/v1/chat/completions"),
+            "openai-api"
+        );
+        assert_eq!(
+            client_name_from_headers(&ua("some-sdk/1.0"), "/v1/responses"),
+            "responses-api"
+        );
+        // 无 User-Agent 的匿名请求仍按端点兜底
+        assert_eq!(
+            client_name_from_headers(&axum::http::HeaderMap::new(), "/v1/messages"),
+            "anthropic-api"
+        );
     }
 }

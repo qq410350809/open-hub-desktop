@@ -4,7 +4,8 @@ use crate::token::collector::normalizer::{
 };
 use crate::token::collector::time_utils::update_bounds;
 use crate::token::collector::types::{
-    fingerprint, number, token_session, CachedFile, UsageEvent, UNKNOWN_CLAUDE_MODEL,
+    fingerprint, normalize_usage, number, token_session, CachedFile, InputSemantics, RawUsage,
+    UsageEvent, UNKNOWN_CLAUDE_MODEL,
 };
 use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
@@ -176,10 +177,16 @@ pub fn parse_claude_file(path: &Path) -> CachedFile {
             &["cache_creation_input_tokens", "cacheCreationInputTokens"],
         );
         let output = number(usage, &["output_tokens", "outputTokens"]);
-        let total = input
-            .saturating_add(cached)
-            .saturating_add(cache_creation)
-            .saturating_add(output);
+        // 口径：total = 全新输入 + 缓存命中 + 输出；缓存写入独立上报，不计入 total。
+        // Anthropic 语义 input 不含缓存（Fresh），缓存写入只是分类字段。
+        let (input, cached, _cache_write, output, _reasoning, total) = normalize_usage(RawUsage {
+            input,
+            semantics: InputSemantics::Fresh,
+            cache_read: cached,
+            cache_write: cache_creation,
+            output,
+            ..Default::default()
+        });
         if total <= 0 || timestamp.is_empty() {
             continue;
         }

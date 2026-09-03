@@ -1,11 +1,12 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
+import { computed, onMounted, ref, watchEffect } from "vue";
 import { icons } from "../../icons";
 import { useToast } from "../../composables/useToast";
 import { useConfirm } from "../../composables/useConfirm";
 import { useModelTest } from "../../composables/modeltest/useModelTest";
 import { BUILTIN_SUITES, type ProbePrompt } from "../../composables/modeltest/builtinSuites";
 import AppTable, { type AppTableColumn } from "../common/AppTable.vue";
+import CustomSelect from "../common/CustomSelect.vue";
 import type { ProbeResult, TestRunRecord } from "../../composables/modeltest/useModelTest";
 import { formatDuration } from "../../utils";
 
@@ -17,9 +18,9 @@ const mt = useModelTest();
 const activeTab = ref<"matrix" | "detail" | "history">("matrix");
 const initialized = ref(false);
 
-// —— 目标选择（渠道分组的模型多选）——
+// —— 目标选择（渠道分组的模型多选，弹窗内完成）——
 const targetPickerOpen = ref(false);
-const expandedChannels = ref<Set<string>>(new Set());
+const targetSearch = ref("");
 
 interface ChannelOption {
   id: string;
@@ -41,12 +42,17 @@ function modelsOfChannel(channelId: string): string[] {
   return list;
 }
 
-function toggleChannelExpand(channelId: string) {
-  const next = new Set(expandedChannels.value);
-  if (next.has(channelId)) next.delete(channelId);
-  else next.add(channelId);
-  expandedChannels.value = next;
-}
+// 搜索过滤：渠道名命中保留该渠道全部模型，否则按模型名过滤
+const filteredTargetChannels = computed(() => {
+  const q = targetSearch.value.trim().toLowerCase();
+  return channelOptions.value
+    .map((c) => {
+      const models = modelsOfChannel(c.id);
+      const channelHit = !!q && c.name.toLowerCase().includes(q);
+      return { ...c, models: q && !channelHit ? models.filter((m) => m.toLowerCase().includes(q)) : models };
+    })
+    .filter((c) => c.models.length > 0);
+});
 
 function isTargetSelected(channelId: string, model: string): boolean {
   return mt.selectedTargets.value.some((t) => t.channelId === channelId && t.model === model);
@@ -63,17 +69,43 @@ function channelSelectedCount(channelId: string): number {
   return mt.selectedTargets.value.filter((t) => t.channelId === channelId).length;
 }
 
-function removeTarget(target: { channelId: string; model: string }) {
-  const list = mt.selectedTargets.value;
-  const index = list.findIndex((t) => t.channelId === target.channelId && t.model === target.model);
-  if (index >= 0) list.splice(index, 1);
+function channelAllSelected(channelId: string, models: string[]): boolean {
+  return models.length > 0 && models.every((m) => isTargetSelected(channelId, m));
 }
 
-function channelNameOf(channelId: string): string {
-  return channelOptions.value.find((c) => c.id === channelId)?.name ?? channelId;
+function toggleChannelModels(channelId: string, models: string[], select: boolean) {
+  if (!select) {
+    mt.selectedTargets.value = mt.selectedTargets.value.filter(
+      (t) => !(t.channelId === channelId && models.includes(t.model)),
+    );
+    return;
+  }
+  for (const model of models) {
+    if (!isTargetSelected(channelId, model)) mt.selectedTargets.value.push({ channelId, model });
+  }
 }
 
-// —— 套件勾选 ——
+function clearAllTargets() {
+  mt.selectedTargets.value = [];
+}
+
+// —— 套件勾选（弹窗内完成）——
+const promptPickerOpen = ref(false);
+
+// 按类别分组展示（保持出现顺序）
+const promptGroups = computed(() => {
+  const groups = new Map<string, ProbePrompt[]>();
+  for (const p of mt.allPrompts.value) {
+    let bucket = groups.get(p.category);
+    if (!bucket) {
+      bucket = [];
+      groups.set(p.category, bucket);
+    }
+    bucket.push(p);
+  }
+  return [...groups.entries()].map(([category, prompts]) => ({ category, prompts }));
+});
+
 function isPromptSelected(id: string): boolean {
   return mt.selectedPromptIds.value.has(id);
 }
@@ -83,6 +115,12 @@ function togglePrompt(id: string) {
   if (next.has(id)) next.delete(id);
   else next.add(id);
   mt.selectedPromptIds.value = next;
+}
+
+function toggleAllPrompts(select: boolean) {
+  mt.selectedPromptIds.value = select
+    ? new Set(mt.allPrompts.value.map((p) => p.id))
+    : new Set();
 }
 
 // —— 自定义提示词弹窗 ——
@@ -106,12 +144,10 @@ function openPromptEditor(prompt?: ProbePrompt) {
       }
     : { name: "", category: "自定义", text: "", maxTokens: 512, checkKind: "none", checkValue: "", judge: false };
   promptEditorOpen.value = true;
-  document.body.classList.add("modal-open");
 }
 
 function closePromptEditor() {
   promptEditorOpen.value = false;
-  document.body.classList.remove("modal-open");
 }
 
 async function savePrompt() {
@@ -189,6 +225,17 @@ const judgeModelValue = computed({
 });
 
 // —— 运行 ——
+// 禁用原因：按钮 disabled 时以 title 展示，避免用户猜测为何不可点
+const canRunReason = computed(() => {
+  if (mt.isRunning.value) return "测试进行中";
+  if (mt.selectedTargets.value.length === 0) return "请先选择被测模型";
+  if (mt.selectedPrompts.value.length === 0) return "请先选择测试题";
+  if (mt.enableJudge.value && !(mt.judgeChannelId.value && mt.judgeModel.value)) {
+    return "请选择评审模型";
+  }
+  return "";
+});
+
 async function handleStartRun() {
   if (!mt.canRun.value) return;
   try {
@@ -307,6 +354,18 @@ const detailResults = computed(() => {
   return mt.currentResults.value.filter((r) => r.channelId === detailFilterChannel.value);
 });
 
+// 渠道筛选候选：从当前结果里提取，含已删除渠道的结果也能筛
+const detailChannelOptions = computed(() => {
+  const seen = new Map<string, string>();
+  for (const r of mt.currentResults.value) {
+    if (!seen.has(r.channelId)) seen.set(r.channelId, r.channelName || r.channelId);
+  }
+  return [
+    { value: "", text: "全部渠道" },
+    ...[...seen.entries()].map(([value, text]) => ({ value, text })),
+  ];
+});
+
 const resultColumns: AppTableColumn[] = [
   { key: "channelName", title: "渠道", width: "130px", sortable: true },
   { key: "model", title: "模型", width: "minmax(160px, 1fr)", sortable: true },
@@ -320,14 +379,31 @@ const resultColumns: AppTableColumn[] = [
 
 function openResultDetail(result: ProbeResult) {
   detailResult.value = result;
-  document.body.classList.add("modal-open");
 }
 
 const detailResult = ref<ProbeResult | null>(null);
 
 function closeResultDetail() {
   detailResult.value = null;
-  document.body.classList.remove("modal-open");
+}
+
+// 任一弹窗打开时锁住页面滚动（统一管理，避免嵌套弹窗叠加时漏删）
+watchEffect(() => {
+  const anyOpen =
+    targetPickerOpen.value ||
+    promptPickerOpen.value ||
+    promptEditorOpen.value ||
+    detailResult.value != null;
+  document.body.classList.toggle("modal-open", anyOpen);
+});
+
+// —— 历史 ——
+async function refreshHistory() {
+  try {
+    await mt.loadHistory();
+  } catch (error) {
+    showToast(`刷新历史失败：${String(error)}`, true);
+  }
 }
 
 function resultStatusText(result: ProbeResult): string {
@@ -397,141 +473,64 @@ onMounted(async () => {
 
 <template>
   <main class="model-test-page mt-page">
-    <!-- ============ 顶部配置区 ============ -->
-    <header class="mt-config-card">
-      <div class="mt-config-row">
-        <div class="mt-config-block is-targets">
-          <div class="mt-block-head">
-            <span class="mt-block-label">被测目标</span>
-            <button type="button" class="mt-link-btn" @click="targetPickerOpen = !targetPickerOpen">
-              {{ targetPickerOpen ? "收起" : "选择模型" }}
-            </button>
-          </div>
-          <div v-if="mt.selectedTargets.value.length === 0" class="mt-empty-targets">
-            尚未选择模型，点击「选择模型」从已启用渠道挑选
-          </div>
-          <div v-else class="mt-target-chips">
-            <span
-              v-for="target in mt.selectedTargets.value"
-              :key="`${target.channelId}::${target.model}`"
-              class="mt-chip"
-            >
-              {{ channelNameOf(target.channelId) }} / {{ target.model }}
-              <button type="button" class="mt-chip-x" aria-label="移除" @click="removeTarget(target)">×</button>
-            </span>
-          </div>
+    <!-- ============ 顶部工具条 ============ -->
+    <header class="mt-toolbar">
+      <div class="mt-toolbar-row">
+        <button
+          type="button"
+          class="mt-picker-trigger"
+          :class="{ 'is-set': mt.selectedTargets.value.length > 0 }"
+          title="选择要测试的渠道与模型"
+          @click="targetPickerOpen = true"
+        >
+          <span class="mt-picker-trigger-label">被测目标</span>
+          <span class="mt-picker-trigger-count" :class="{ 'is-none': mt.selectedTargets.value.length === 0 }">
+            {{ mt.selectedTargets.value.length === 0 ? "未选择" : `${mt.selectedTargets.value.length} 个模型` }}
+          </span>
+          <span class="mt-picker-trigger-caret" v-html="icons.chevron" />
+        </button>
 
-          <!-- 渠道分组选择器 -->
-          <div v-if="targetPickerOpen" class="mt-target-picker">
-            <div v-if="channelOptions.length === 0" class="mt-picker-empty">
-              没有可用渠道，请先在「模型反代」页添加并启用渠道
-            </div>
-            <div v-for="channel in channelOptions" :key="channel.id" class="mt-picker-channel">
-              <button
-                type="button"
-                class="mt-picker-channel-head"
-                @click="toggleChannelExpand(channel.id)"
-              >
-                <span class="mt-picker-arrow" :class="{ open: expandedChannels.has(channel.id) }">▸</span>
-                <span class="mt-picker-channel-name">{{ channel.name }}</span>
-                <span v-if="!channel.enabled" class="mt-picker-channel-disabled">未启用</span>
-                <span v-else-if="channelSelectedCount(channel.id)" class="mt-picker-count">
-                  已选 {{ channelSelectedCount(channel.id) }}
-                </span>
-              </button>
-              <div v-if="expandedChannels.has(channel.id)" class="mt-picker-models">
-                <div v-if="modelsOfChannel(channel.id).length === 0" class="mt-picker-empty">
-                  暂无模型缓存，可在「模型反代」页拉取
-                </div>
-                <button
-                  v-for="model in modelsOfChannel(channel.id)"
-                  :key="model"
-                  type="button"
-                  class="mt-model-option"
-                  :class="{ selected: isTargetSelected(channel.id, model), disabled: !channel.enabled }"
-                  :disabled="!channel.enabled"
-                  @click="toggleTarget(channel.id, model)"
-                >
-                  {{ model }}
-                </button>
-              </div>
-            </div>
+        <button
+          type="button"
+          class="mt-picker-trigger"
+          :class="{ 'is-none': mt.selectedPrompts.value.length === 0 }"
+          title="选择要运行的测试题"
+          @click="promptPickerOpen = true"
+        >
+          <span class="mt-picker-trigger-label">测试题</span>
+          <span class="mt-picker-trigger-count" :class="{ 'is-none': mt.selectedPrompts.value.length === 0 }">
+            {{ mt.selectedPrompts.value.length }} / {{ mt.allPrompts.value.length }}
+          </span>
+          <span class="mt-picker-trigger-caret" v-html="icons.chevron" />
+        </button>
+
+        <div class="mt-toolbar-params">
+          <label class="mt-param" title="同时请求的模型×题目组合数">
+            <span class="mt-param-label">并发</span>
+            <input v-model.number="mt.concurrency.value" type="number" min="1" max="16" class="mt-input" />
+          </label>
+          <label class="mt-param" title="单次请求超时时间">
+            <span class="mt-param-label">超时(秒)</span>
+            <input v-model.number="mt.timeoutSeconds.value" type="number" min="10" max="600" class="mt-input" />
+          </label>
+          <label class="mt-param is-check" title="用另一个模型给主观题打分">
+            <input v-model="mt.enableJudge.value" type="checkbox" class="mt-checkbox" />
+            <span class="mt-param-label">评审模型</span>
+          </label>
+          <div v-if="mt.enableJudge.value" class="mt-param is-judge">
+            <select v-model="judgeModelValue" class="mt-input mt-select" :class="{ 'is-placeholder': !judgeModelValue }">
+              <option value="">选择评审模型…</option>
+              <option v-for="opt in judgeModelOptions" :key="opt.value" :value="opt.value">{{ opt.text }}</option>
+            </select>
           </div>
         </div>
 
-        <div class="mt-config-block">
-          <div class="mt-block-head">
-            <span class="mt-block-label">测试题</span>
-            <span class="mt-block-hint">已选 {{ mt.selectedPrompts.value.length }} / {{ mt.allPrompts.value.length }}</span>
-          </div>
-          <div class="mt-prompt-grid">
-            <button
-              v-for="prompt in BUILTIN_SUITES"
-              :key="prompt.id"
-              type="button"
-              class="mt-prompt-card"
-              :class="{ selected: isPromptSelected(prompt.id) }"
-              @click="togglePrompt(prompt.id)"
-            >
-              <span class="mt-prompt-name">{{ prompt.name }}</span>
-              <span class="mt-prompt-cat">{{ prompt.category }}<template v-if="prompt.judge"> · 评审</template></span>
-            </button>
-            <button
-              v-for="prompt in mt.customPrompts.value"
-              :key="prompt.id"
-              type="button"
-              class="mt-prompt-card is-custom"
-              :class="{ selected: isPromptSelected(prompt.id) }"
-              @click="togglePrompt(prompt.id)"
-            >
-              <span class="mt-prompt-name">{{ prompt.name }}</span>
-              <span class="mt-prompt-cat">{{ prompt.category }}<template v-if="prompt.judge"> · 评审</template></span>
-              <span class="mt-prompt-actions">
-                <i
-                  class="mt-prompt-action"
-                  title="编辑"
-                  @click.stop="openPromptEditor(prompt)"
-                  v-html="icons.code"
-                />
-                <i
-                  class="mt-prompt-action is-danger"
-                  title="删除"
-                  @click.stop="deletePrompt(prompt)"
-                  v-html="icons.close"
-                />
-              </span>
-            </button>
-            <button type="button" class="mt-prompt-card is-add" @click="openPromptEditor()">
-              <span class="mt-prompt-name">＋ 自定义</span>
-            </button>
-          </div>
-        </div>
-      </div>
-
-      <div class="mt-config-row is-params">
-        <label class="mt-param">
-          <span class="mt-param-label">并发数</span>
-          <input v-model.number="mt.concurrency.value" type="number" min="1" max="16" class="mt-input" />
-        </label>
-        <label class="mt-param">
-          <span class="mt-param-label">超时(秒)</span>
-          <input v-model.number="mt.timeoutSeconds.value" type="number" min="10" max="600" class="mt-input" />
-        </label>
-        <label class="mt-param is-check">
-          <input v-model="mt.enableJudge.value" type="checkbox" class="mt-checkbox" />
-          <span class="mt-param-label">启用评审模型</span>
-        </label>
-        <div v-if="mt.enableJudge.value" class="mt-param is-judge">
-          <select v-model="judgeModelValue" class="mt-input mt-select">
-            <option value="">选择评审模型…</option>
-            <option v-for="opt in judgeModelOptions" :key="opt.value" :value="opt.value">{{ opt.text }}</option>
-          </select>
-        </div>
         <div class="mt-run-actions">
           <button
             type="button"
             class="mt-run-btn"
             :disabled="!mt.canRun.value"
+            :title="canRunReason || `共 ${mt.totalTests.value} 项测试`"
             @click="handleStartRun"
           >
             <span v-html="icons.play" /> 运行测试（{{ mt.totalTests.value }} 项）
@@ -606,18 +605,36 @@ onMounted(async () => {
             </div>
           </template>
           <template v-for="prompt in (mt.selectedPrompts.value.length ? mt.selectedPrompts.value : currentPromptList())" :key="prompt.id" #[`cell-${prompt.id}`]="{ row }">
-            <div class="mt-matrix-cell" :class="scoreClass(row.cells[prompt.id])" :title="row.cells[prompt.id]?.error || row.cells[prompt.id]?.autoCheck?.detail || row.cells[prompt.id]?.judge?.reason || ''">
+            <button
+              type="button"
+              class="mt-matrix-cell"
+              :class="[scoreClass(row.cells[prompt.id]), { 'is-clickable': !!row.cells[prompt.id] }]"
+              :title="row.cells[prompt.id]?.error || row.cells[prompt.id]?.autoCheck?.detail || row.cells[prompt.id]?.judge?.reason || ''"
+              @click="row.cells[prompt.id] && openResultDetail(row.cells[prompt.id]!)"
+            >
               <span class="mt-cell-score">{{ cellText(row.cells[prompt.id]) }}</span>
               <span v-if="row.cells[prompt.id]?.durationMs != null" class="mt-cell-dur">
                 {{ formatDurationShort(row.cells[prompt.id]!.durationMs) }}
               </span>
-            </div>
+            </button>
           </template>
         </AppTable>
       </div>
 
       <!-- —— Tab 2：明细 —— -->
       <div v-else-if="activeTab === 'detail'" class="mt-detail">
+        <div class="mt-detail-toolbar">
+          <div class="mt-detail-filter">
+            <span class="mt-param-label">渠道</span>
+            <CustomSelect
+              :options="detailChannelOptions"
+              :model-value="detailFilterChannel"
+              aria-label="按渠道筛选明细"
+              @update:model-value="detailFilterChannel = String($event)"
+            />
+          </div>
+          <span class="mt-detail-count">{{ detailResults.length }} 条结果</span>
+        </div>
         <div v-if="mt.currentResults.value.length === 0" class="mt-body-empty">
           尚无明细数据
         </div>
@@ -648,6 +665,12 @@ onMounted(async () => {
 
       <!-- —— Tab 3：历史 —— -->
       <div v-else class="mt-history">
+        <div class="mt-detail-toolbar">
+          <span class="mt-detail-count">{{ mt.historyRuns.value.length }} 次运行记录</span>
+          <button type="button" class="mt-mini-btn" title="刷新历史记录" @click="refreshHistory">
+            <span v-html="icons.restore" /> 刷新
+          </button>
+        </div>
         <AppTable
           :rows="mt.historyRuns.value"
           :columns="historyColumns"
@@ -730,6 +753,135 @@ onMounted(async () => {
       </div>
     </Teleport>
 
+    <!-- ============ 被测目标选择弹窗 ============ -->
+    <Teleport to="body">
+      <div v-if="targetPickerOpen" class="mt-modal-backdrop" @click.self="targetPickerOpen = false">
+        <section class="mt-modal-card is-picker" role="dialog" aria-modal="true">
+          <header class="mt-modal-header">
+            <h2>选择被测模型</h2>
+            <button type="button" class="mt-modal-close" aria-label="关闭" @click="targetPickerOpen = false">×</button>
+          </header>
+          <div class="mt-modal-body is-flush">
+            <div class="mt-picker-search">
+              <span class="mt-picker-search-icon" v-html="icons.search" />
+              <input
+                v-model="targetSearch"
+                type="text"
+                class="mt-input is-search"
+                placeholder="搜索渠道或模型…"
+              />
+            </div>
+            <div class="mt-picker-scroll">
+              <div v-if="filteredTargetChannels.length === 0" class="mt-picker-empty">
+                {{ channelOptions.length === 0 ? "没有可用渠道，请先在「模型反代」页添加并启用渠道" : "没有匹配的渠道或模型" }}
+              </div>
+              <div v-for="channel in filteredTargetChannels" :key="channel.id" class="mt-picker-channel">
+                <div class="mt-picker-channel-head">
+                  <span class="mt-picker-channel-name">{{ channel.name }}</span>
+                  <span v-if="!channel.enabled" class="mt-picker-channel-disabled">未启用</span>
+                  <span v-else class="mt-picker-channel-count">
+                    {{ channelSelectedCount(channel.id) }} / {{ channel.models.length }}
+                  </span>
+                  <button
+                    v-if="channel.enabled && channel.models.length"
+                    type="button"
+                    class="mt-mini-btn"
+                    :disabled="!channel.enabled"
+                    @click="toggleChannelModels(channel.id, channel.models, !channelAllSelected(channel.id, channel.models))"
+                  >
+                    {{ channelAllSelected(channel.id, channel.models) ? "清空" : "全选" }}
+                  </button>
+                </div>
+                <div class="mt-picker-models">
+                  <div v-if="channel.models.length === 0" class="mt-picker-empty is-inline">
+                    暂无模型缓存，可在「模型反代」页拉取
+                  </div>
+                  <button
+                    v-for="model in channel.models"
+                    :key="model"
+                    type="button"
+                    class="mt-model-option"
+                    :class="{ selected: isTargetSelected(channel.id, model), disabled: !channel.enabled }"
+                    :disabled="!channel.enabled"
+                    @click="toggleTarget(channel.id, model)"
+                  >
+                    <span class="mt-model-check" v-html="icons.check" />
+                    {{ model }}
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+          <footer class="mt-modal-footer is-split">
+            <div class="mt-modal-footer-left">
+              <span class="mt-modal-hint">已选 {{ mt.selectedTargets.value.length }} 个模型</span>
+              <button
+                v-if="mt.selectedTargets.value.length > 0"
+                type="button"
+                class="mt-mini-btn is-danger"
+                @click="clearAllTargets"
+              >清空</button>
+            </div>
+            <button type="button" class="mt-run-btn" @click="targetPickerOpen = false">完成</button>
+          </footer>
+        </section>
+      </div>
+    </Teleport>
+
+    <!-- ============ 测试题选择弹窗 ============ -->
+    <Teleport to="body">
+      <div v-if="promptPickerOpen" class="mt-modal-backdrop" @click.self="promptPickerOpen = false">
+        <section class="mt-modal-card is-picker" role="dialog" aria-modal="true">
+          <header class="mt-modal-header">
+            <h2>选择测试题</h2>
+            <button type="button" class="mt-modal-close" aria-label="关闭" @click="promptPickerOpen = false">×</button>
+          </header>
+          <div class="mt-modal-body is-flush">
+            <div class="mt-picker-scroll">
+              <div v-for="group in promptGroups" :key="group.category" class="mt-prompt-group">
+                <div class="mt-prompt-group-head">
+                  <span class="mt-prompt-group-name">{{ group.category }}</span>
+                  <span class="mt-prompt-group-count">
+                    {{ group.prompts.filter((p) => isPromptSelected(p.id)).length }} / {{ group.prompts.length }}
+                  </span>
+                </div>
+                <div class="mt-prompt-rows">
+                  <button
+                    v-for="prompt in group.prompts"
+                    :key="prompt.id"
+                    type="button"
+                    class="mt-prompt-row"
+                    :class="{ selected: isPromptSelected(prompt.id) }"
+                    @click="togglePrompt(prompt.id)"
+                  >
+                    <span class="mt-prompt-check" v-html="icons.check" />
+                    <span class="mt-prompt-row-name">{{ prompt.name }}</span>
+                    <span v-if="prompt.judge" class="mt-prompt-judge-badge">评审</span>
+                    <span v-if="prompt.id.startsWith('custom-')" class="mt-prompt-row-actions">
+                      <i class="mt-prompt-action" title="编辑" @click.stop="openPromptEditor(prompt)" v-html="icons.code" />
+                      <i class="mt-prompt-action is-danger" title="删除" @click.stop="deletePrompt(prompt)" v-html="icons.trash" />
+                    </span>
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+          <footer class="mt-modal-footer is-split">
+            <div class="mt-modal-hint">已选 {{ mt.selectedPromptIds.value.size }} / {{ mt.allPrompts.value.length }}</div>
+            <div class="mt-modal-footer-actions">
+              <button type="button" class="mt-mini-btn" @click="toggleAllPrompts(mt.selectedPromptIds.value.size < mt.allPrompts.value.length)">
+                {{ mt.selectedPromptIds.value.size < mt.allPrompts.value.length ? "全选" : "清空" }}
+              </button>
+              <button type="button" class="mt-mini-btn" @click="openPromptEditor()">
+                <span v-html="icons.plus" /> 自定义
+              </button>
+              <button type="button" class="mt-run-btn" @click="promptPickerOpen = false">完成</button>
+            </div>
+          </footer>
+        </section>
+      </div>
+    </Teleport>
+
     <!-- ============ 自定义提示词编辑弹窗 ============ -->
     <Teleport to="body">
       <div v-if="promptEditorOpen" class="mt-modal-backdrop" @click.self="closePromptEditor">
@@ -807,112 +959,109 @@ onMounted(async () => {
   color: var(--text);
 }
 
-/* ===================== 配置卡 ===================== */
-.mt-config-card {
+/* ===================== 顶部工具条 ===================== */
+.mt-toolbar {
   background: var(--surface);
   border: 1px solid var(--line);
   border-radius: var(--r-xl, 14px);
-  padding: 16px 18px;
+  padding: 12px 16px;
   display: flex;
   flex-direction: column;
-  gap: 14px;
-}
-
-.mt-config-row {
-  display: grid;
-  grid-template-columns: minmax(280px, 1fr) minmax(320px, 1.4fr);
-  gap: 18px;
-}
-
-.mt-config-row.is-params {
-  grid-template-columns: auto auto auto minmax(200px, 1fr) auto;
-  align-items: center;
   gap: 12px;
-  padding-top: 12px;
-  border-top: 1px solid var(--line);
 }
 
-.mt-config-block {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  min-width: 0;
-}
-
-.mt-block-head {
+.mt-toolbar-row {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-}
-
-.mt-block-label {
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--muted);
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-}
-
-.mt-block-hint {
-  font-size: 12px;
-  color: var(--muted);
-}
-
-.mt-link-btn {
-  background: none;
-  border: none;
-  color: var(--brand);
-  font-size: 12px;
-  cursor: pointer;
-  padding: 2px 6px;
-  border-radius: 4px;
-}
-.mt-link-btn:hover { background: var(--surface-hover); }
-
-.mt-empty-targets {
-  font-size: 13px;
-  color: var(--muted);
-  padding: 8px 0;
-}
-
-.mt-target-chips {
-  display: flex;
   flex-wrap: wrap;
-  gap: 6px;
+  gap: 10px;
 }
 
-.mt-chip {
+.mt-toolbar-params {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  padding: 0 4px;
+  margin-left: 4px;
+  border-left: 1px solid var(--line);
+}
+
+/* —— 弹窗选择器触发按钮 —— */
+.mt-picker-trigger {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
-  padding: 3px 6px 3px 10px;
-  border-radius: var(--r-full, 999px);
-  background: color-mix(in srgb, var(--brand) 12%, transparent);
-  color: var(--brand);
-  font-size: 12px;
-  max-width: 100%;
-}
-
-.mt-chip-x {
-  background: none;
-  border: none;
-  color: inherit;
-  cursor: pointer;
-  font-size: 13px;
-  line-height: 1;
-  padding: 0 2px;
-  opacity: 0.7;
-}
-.mt-chip-x:hover { opacity: 1; }
-
-/* —— 目标选择器 —— */
-.mt-target-picker {
+  gap: 8px;
+  background: var(--page-bg);
   border: 1px solid var(--line);
   border-radius: var(--r-md, 8px);
-  max-height: 240px;
+  padding: 7px 10px;
+  font-size: 13px;
+  color: var(--text);
+  cursor: pointer;
+  max-width: 320px;
+}
+.mt-picker-trigger:hover { border-color: var(--brand); }
+
+.mt-picker-trigger-label {
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.mt-picker-trigger-count {
+  font-weight: 600;
+  font-size: 12.5px;
+  color: var(--brand);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.mt-picker-trigger-count.is-none {
+  color: var(--muted);
+  font-weight: 400;
+}
+
+.mt-picker-trigger-caret {
+  display: inline-flex;
+  color: var(--muted);
+}
+.mt-picker-trigger-caret :deep(svg) { width: 13px; height: 13px; }
+
+/* —— 弹窗选择器 —— */
+.mt-modal-card.is-picker { max-width: 680px; }
+
+.mt-modal-body.is-flush {
+  padding: 0;
+  gap: 0;
+}
+
+.mt-picker-scroll {
+  max-height: 56vh;
   overflow-y: auto;
-  background: var(--page-bg);
+  padding: 4px 18px 14px;
+}
+
+.mt-picker-search {
+  position: relative;
+  padding: 12px 18px;
+  border-bottom: 1px solid var(--line);
+}
+
+.mt-picker-search-icon {
+  position: absolute;
+  left: 30px;
+  top: 50%;
+  transform: translateY(-58%);
+  display: inline-flex;
+  color: var(--muted);
+  pointer-events: none;
+}
+.mt-picker-search-icon :deep(svg) { width: 14px; height: 14px; }
+
+.mt-input.is-search {
+  width: 100%;
+  padding-left: 30px;
 }
 
 .mt-picker-channel + .mt-picker-channel {
@@ -922,26 +1071,11 @@ onMounted(async () => {
 .mt-picker-channel-head {
   display: flex;
   align-items: center;
-  gap: 6px;
-  width: 100%;
-  background: none;
-  border: none;
-  padding: 8px 10px;
-  cursor: pointer;
-  font-size: 13px;
-  color: var(--text);
-  text-align: left;
+  gap: 10px;
+  padding: 10px 0 6px;
 }
-.mt-picker-channel-head:hover { background: var(--surface-hover); }
 
-.mt-picker-arrow {
-  display: inline-block;
-  transition: transform 0.15s;
-  color: var(--muted);
-}
-.mt-picker-arrow.open { transform: rotate(90deg); }
-
-.mt-picker-channel-name { font-weight: 600; }
+.mt-picker-channel-name { font-weight: 600; font-size: 13px; }
 
 .mt-picker-channel-disabled {
   font-size: 11px;
@@ -951,103 +1085,186 @@ onMounted(async () => {
   background: var(--surface-hover);
 }
 
-.mt-picker-count {
-  font-size: 11px;
-  color: var(--brand);
+.mt-picker-channel-count {
+  font-size: 12px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.mt-picker-channel-head .mt-mini-btn {
+  margin-left: auto;
+  padding: 2px 10px;
+  font-size: 11.5px;
 }
 
 .mt-picker-models {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
-  padding: 4px 10px 10px 26px;
+  padding: 0 0 12px;
 }
 
 .mt-model-option {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
   border: 1px solid var(--line);
   background: var(--surface);
   color: var(--text);
   border-radius: var(--r-full, 999px);
-  padding: 3px 10px;
+  padding: 4px 11px;
   font-size: 12px;
   cursor: pointer;
 }
+
+.mt-model-check {
+  display: none;
+  color: var(--brand);
+}
+.mt-model-check :deep(svg) { width: 11px; height: 11px; }
+
 .mt-model-option:hover { border-color: var(--brand); }
 .mt-model-option.selected {
-  background: color-mix(in srgb, var(--brand) 16%, transparent);
+  background: color-mix(in srgb, var(--brand) 14%, transparent);
   border-color: var(--brand);
   color: var(--brand);
 }
+.mt-model-option.selected .mt-model-check { display: inline-flex; }
 .mt-model-option.disabled {
-  opacity: 0.5;
+  opacity: 0.45;
   cursor: not-allowed;
 }
 
 .mt-picker-empty {
   font-size: 12px;
   color: var(--muted);
-  padding: 10px;
+  padding: 16px 0;
+}
+.mt-picker-empty.is-inline { padding: 4px 0 8px; }
+
+.mt-modal-footer.is-split {
+  align-items: center;
+  justify-content: space-between;
 }
 
-/* —— 套件卡片 —— */
-.mt-prompt-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+.mt-modal-footer-left {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.mt-modal-footer-actions {
+  display: flex;
+  align-items: center;
   gap: 8px;
 }
 
-.mt-prompt-card {
-  position: relative;
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
-  align-items: flex-start;
-  padding: 8px 10px;
-  border: 1px solid var(--line);
-  border-radius: var(--r-md, 8px);
-  background: var(--surface);
-  cursor: pointer;
-  text-align: left;
-  color: var(--text);
-}
-.mt-prompt-card:hover { border-color: var(--brand); }
-.mt-prompt-card.selected {
-  border-color: var(--brand);
-  background: color-mix(in srgb, var(--brand) 10%, transparent);
-}
-.mt-prompt-card.is-add {
-  align-items: center;
-  justify-content: center;
-  border-style: dashed;
+.mt-modal-hint {
+  font-size: 12.5px;
   color: var(--muted);
 }
-.mt-prompt-card.is-add:hover { color: var(--brand); }
 
-.mt-prompt-name {
-  font-size: 12.5px;
+.mt-mini-btn :deep(svg) { width: 12px; height: 12px; vertical-align: -1.5px; }
+
+/* —— 测试题弹窗：按类别分组的行为选择 —— */
+.mt-prompt-group + .mt-prompt-group {
+  border-top: 1px solid var(--line);
+}
+
+.mt-prompt-group-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 0 6px;
+}
+
+.mt-prompt-group-name {
+  font-size: 13px;
   font-weight: 600;
 }
 
-.mt-prompt-cat {
-  font-size: 11px;
+.mt-prompt-group-count {
+  font-size: 12px;
   color: var(--muted);
+  font-variant-numeric: tabular-nums;
 }
 
-.mt-prompt-actions {
-  position: absolute;
-  top: 4px;
-  right: 4px;
+.mt-prompt-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding-bottom: 12px;
+}
+
+.mt-prompt-row {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  border: 1px solid transparent;
+  background: none;
+  border-radius: var(--r-md, 8px);
+  padding: 7px 10px;
+  font-size: 13px;
+  color: var(--text);
+  cursor: pointer;
+  text-align: left;
+  width: 100%;
+}
+.mt-prompt-row:hover { background: var(--surface-hover); }
+.mt-prompt-row.selected {
+  background: color-mix(in srgb, var(--brand) 10%, transparent);
+  border-color: color-mix(in srgb, var(--brand) 35%, transparent);
+}
+
+.mt-prompt-check {
+  display: inline-flex;
+  width: 16px;
+  height: 16px;
+  align-items: center;
+  justify-content: center;
+  border: 1.5px solid var(--line);
+  border-radius: 5px;
+  color: transparent;
+  flex: none;
+  transition: background 0.12s, border-color 0.12s;
+}
+.mt-prompt-check :deep(svg) { width: 10px; height: 10px; }
+.mt-prompt-row.selected .mt-prompt-check {
+  background: var(--brand);
+  border-color: var(--brand);
+  color: #fff;
+}
+
+.mt-prompt-row-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mt-prompt-judge-badge {
+  flex: none;
+  font-size: 10.5px;
+  color: var(--brand);
+  border: 1px solid color-mix(in srgb, var(--brand) 40%, transparent);
+  border-radius: 999px;
+  padding: 0 7px;
+  line-height: 16px;
+}
+
+.mt-prompt-row-actions {
+  margin-left: auto;
   display: flex;
   gap: 2px;
-  opacity: 0;
+  opacity: 0.5;
   transition: opacity 0.15s;
 }
-.mt-prompt-card:hover .mt-prompt-actions { opacity: 1; }
+.mt-prompt-row:hover .mt-prompt-row-actions,
+.mt-prompt-row-actions:hover { opacity: 1; }
 
 .mt-prompt-action {
   display: inline-flex;
-  width: 18px;
-  height: 18px;
+  width: 20px;
+  height: 20px;
   align-items: center;
   justify-content: center;
   border-radius: 4px;
@@ -1092,6 +1309,7 @@ onMounted(async () => {
   width: 240px;
   cursor: pointer;
 }
+.mt-select.is-placeholder { color: var(--muted); }
 
 .mt-run-actions {
   display: flex;
@@ -1213,7 +1431,15 @@ onMounted(async () => {
   gap: 1px;
   padding: 4px 6px;
   border-radius: var(--r-md, 8px);
+  border: none;
+  background: none;
+  font: inherit;
+  color: inherit;
+  cursor: default;
+  min-width: 0;
 }
+.mt-matrix-cell.is-clickable { cursor: pointer; }
+.mt-matrix-cell.is-clickable:hover { filter: brightness(0.96); box-shadow: inset 0 0 0 1px var(--line); }
 
 .mt-cell-score {
   font-size: 13px;
@@ -1254,6 +1480,28 @@ onMounted(async () => {
 }
 
 /* ===================== 明细 / 历史 ===================== */
+.mt-detail-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding-bottom: 10px;
+}
+
+.mt-detail-filter {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.mt-detail-filter .mt-param-label { white-space: nowrap; }
+
+.mt-detail-count {
+  font-size: 12px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
 .mt-status {
   font-size: 12px;
   font-weight: 600;
@@ -1438,12 +1686,14 @@ onMounted(async () => {
 
 /* ===================== 响应式 ===================== */
 @media (max-width: 1100px) {
-  .mt-config-row {
-    grid-template-columns: 1fr;
+  .mt-toolbar-params {
+    border-left: none;
+    padding-left: 0;
+    margin-left: 0;
   }
-  .mt-config-row.is-params {
-    flex-wrap: wrap;
-    display: flex;
+  .mt-run-actions {
+    margin-left: 0;
+    width: 100%;
   }
   .mt-form-grid {
     grid-template-columns: 1fr;

@@ -35,31 +35,55 @@ fn zcode_database_extracts_nested_model_on_user_turn() {
 }
 
 #[test]
-fn codex_usage_normalization_keeps_input_and_cached_independent() {
-    // 输入与缓存读是两个独立分量，不得互相扣减（旧实现 input - cached 会产生负数）
-    let usage = CodexUsage {
-        input_tokens: 100,
-        cached_input_tokens: 80,
-        output_tokens: 10,
-        total_tokens: 110,
+fn codex_usage_normalization_infers_inclusive_vs_independent() {
+    // 原生 OpenAI Responses 口径（实测占主导，99/113 会话）：input_tokens 为**总输入**，
+    // cached 是其中的子集，上游 total = input + output。
+    // 旧实现把 cached 当独立分量再叠加一次：命中率从 cached/input（≈98%）腰斩成
+    // cached/(input+cached)（≈50%），total 虚高约 44%——这正是「Codex 缓存率过低」的根因。
+    let native = CodexUsage {
+        input_tokens: 469471,
+        cached_input_tokens: 45888,
+        output_tokens: 867,
+        total_tokens: 470338,
         ..Default::default()
     }
     .normalized();
-    assert_eq!(usage.input_tokens, 100);
-    assert_eq!(usage.cached_input_tokens, 80);
-    assert_eq!(usage.total_tokens, 190);
+    assert_eq!(native.input_tokens, 469471 - 45888);
+    assert_eq!(native.cached_input_tokens, 45888);
+    assert_eq!(native.output_tokens, 867);
+    assert_eq!(native.total_tokens, 470338);
 
-    // 缓存读大于输入时也不得出现负值
-    let top_heavy = CodexUsage {
+    // Anthropic 类中转口径：三分量独立（cached 可大于 input），total = input + cached + output。
+    let relay = CodexUsage {
         input_tokens: 822,
         cached_input_tokens: 23872,
         output_tokens: 118,
+        total_tokens: 24812,
         ..Default::default()
     }
     .normalized();
-    assert_eq!(top_heavy.input_tokens, 822);
-    assert_eq!(top_heavy.cached_input_tokens, 23872);
-    assert_eq!(top_heavy.total_tokens, 24812);
+    assert_eq!(relay.input_tokens, 822);
+    assert_eq!(relay.cached_input_tokens, 23872);
+    assert_eq!(relay.total_tokens, 24812);
+
+    // total 缺失（delta 途中被丢弃）时按 cached 是否为 input 子集判别。
+    let no_total = CodexUsage {
+        input_tokens: 40000,
+        cached_input_tokens: 38000,
+        output_tokens: 500,
+        ..Default::default()
+    }
+    .normalized();
+    assert_eq!(no_total.input_tokens, 2000);
+    assert_eq!(no_total.total_tokens, 40500);
+
+    // 恒等式：fresh + cached + output == total 在两种口径下都必须成立。
+    for usage in [native, relay, no_total] {
+        assert_eq!(
+            usage.input_tokens + usage.cached_input_tokens + usage.output_tokens,
+            usage.total_tokens
+        );
+    }
 }
 
 #[test]
@@ -469,7 +493,8 @@ fn command_code_v3_reads_exact_usage_and_sidecar_model() {
     assert_eq!(session.tokens.cached_input_tokens, 30);
     assert_eq!(session.tokens.cache_creation_input_tokens, 5);
     assert_eq!(session.tokens.output_tokens, 20);
-    assert_eq!(session.total_tokens, 155);
+    // total = 全新输入 + 缓存命中 + 输出；缓存写入(5)独立上报，不计入 total
+    assert_eq!(session.total_tokens, 150);
     assert!((session.cost_usd - 0.25).abs() < f64::EPSILON);
     assert_eq!(
         session.provenance.get("tokenUsage"),
@@ -480,7 +505,7 @@ fn command_code_v3_reads_exact_usage_and_sidecar_model() {
         .iter()
         .find(|event| event.id == "assistant-1")
         .unwrap();
-    assert_eq!(usage_event.total_tokens, 155);
+    assert_eq!(usage_event.total_tokens, 150);
     assert_eq!(usage_event.estimated_tokens, 0);
     assert!(usage_event.pricing_available);
     let _ = fs::remove_dir_all(dir);
@@ -710,9 +735,12 @@ fn copilot_vscode_chat_session_parses_tokens_and_dialogues() {
     assert_eq!(s.source, "copilot");
     assert_eq!(s.session_hash, "openhub:copilot:test-copilot-123");
     assert_eq!(s.turns, 1);
-    assert_eq!(s.tokens.input_tokens, 1500);
+    // promptTokens=1500 为上游总量（含 cachedTokens=500），input 必须是拆分后的全新输入，
+    // 否则 input+cached+output 会双计缓存（total = fresh + cached + output = 1000+500+200）。
+    assert_eq!(s.tokens.input_tokens, 1000);
     assert_eq!(s.tokens.output_tokens, 200);
     assert_eq!(s.tokens.cached_input_tokens, 500);
+    assert_eq!(s.tokens.total_tokens, 1700);
     assert!(s.tokens.reasoning_output_tokens > 0);
     let _ = fs::remove_dir_all(dir);
 }
@@ -771,9 +799,10 @@ fn copilot_delta_operation_log_replays_requests() {
     assert_eq!(s.session_hash, "openhub:copilot:delta-session-1");
     assert_eq!(s.turns, 2);
     // 第一条请求的补写 token 必须被回放出来；第二条请求无显式 token，按文本字节数估算。
+    // promptTokens=3200 为上游总量（含 cachedTokens=800），input 记拆分后的全新输入。
     let req2_prompt_estimate = ("再优化一下边界条件".len() as i64 / 4).max(1) + 128;
     let req2_output_estimate = ("已补充边界条件处理。".len() as i64 / 4).max(1);
-    assert_eq!(s.tokens.input_tokens, 3200 + req2_prompt_estimate);
+    assert_eq!(s.tokens.input_tokens, (3200 - 800) + req2_prompt_estimate);
     assert_eq!(s.tokens.output_tokens, 480 + req2_output_estimate);
     assert_eq!(s.tokens.cached_input_tokens, 800);
     let _ = fs::remove_dir_all(dir);
@@ -1111,6 +1140,127 @@ fn catpawai_real_db_parses_if_exists() {
     }
 }
 
+/// 本机装有 opencode 族工具时，用真实 DB 验证统一口径恒等式：
+/// fresh + cached + output == total（zcode 为含缓存口径、opencode/mimo 为独立口径）。
+#[test]
+fn opencode_family_real_db_identity_if_exists() {
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap();
+    let cases = [
+        (
+            "zcode",
+            crate::token::collector::sources::zcode::zcode_db_path(&home),
+            crate::token::collector::sources::zcode::parse_zcode_database
+                as fn(&std::path::Path) -> CachedDatabase,
+        ),
+        (
+            "opencode",
+            opencode_db_path(&home),
+            parse_opencode_database as fn(&std::path::Path) -> CachedDatabase,
+        ),
+        (
+            "mimo",
+            mimo_db_path(&home),
+            parse_mimo_database as fn(&std::path::Path) -> CachedDatabase,
+        ),
+    ];
+    let mut checked = 0usize;
+    for (name, path, parse) in cases {
+        if !path.is_file() {
+            continue;
+        }
+        checked += 1;
+        let parsed = parse(&path);
+        let fresh: i64 = parsed.events.iter().map(|e| e.input_tokens).sum();
+        let cached: i64 = parsed.events.iter().map(|e| e.cached_input_tokens).sum();
+        let out: i64 = parsed.events.iter().map(|e| e.output_tokens).sum();
+        let total: i64 = parsed.events.iter().map(|e| e.total_tokens).sum();
+        let write: i64 = parsed
+            .events
+            .iter()
+            .map(|e| e.cache_creation_input_tokens)
+            .sum();
+        println!(
+            "{name} real DB: events={}, Fresh={}, CacheRead={}, CacheWrite={}, Output={}, Total={}",
+            parsed.events.len(),
+            fresh,
+            cached,
+            write,
+            out,
+            total
+        );
+        assert_eq!(
+            fresh + cached + out,
+            total,
+            "{name}: total 必须等于 fresh + cached + output"
+        );
+        for event in &parsed.events {
+            assert!(
+                event.input_tokens >= 0 && event.cached_input_tokens >= 0,
+                "{name}: 拆分不得产生负值"
+            );
+        }
+    }
+    if checked == 0 {
+        println!("本机未安装 opencode 族工具，跳过真实 DB 探针");
+    }
+}
+
+/// 本机有 Codex 会话时，验证真实数据上的恒等式 fresh + cached + output == total
+/// 与非负拆分（原生 inclusive 与中转 independent 两种口径混合存在，按事件判别）。
+#[test]
+fn codex_real_sessions_identity_if_exists() {
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap();
+    let base = codex_home(&home);
+    let mut files = Vec::new();
+    for root in [base.join("sessions"), base.join("archived_sessions")] {
+        collect_jsonl_files(
+            &root,
+            &|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .map(|name| name.starts_with("rollout-") && name.ends_with(".jsonl"))
+                    .unwrap_or(false)
+            },
+            &mut files,
+        );
+    }
+    if files.is_empty() {
+        println!("本机无 Codex 会话，跳过真实探针");
+        return;
+    }
+    let mut checked = 0usize;
+    let mut fresh_sum = 0i64;
+    let mut cached_sum = 0i64;
+    for path in files.iter().rev().take(16) {
+        let parsed = parse_codex_file(path);
+        if parsed.events.is_empty() {
+            continue;
+        }
+        checked += 1;
+        for event in &parsed.events {
+            assert_eq!(
+                event.input_tokens + event.cached_input_tokens + event.output_tokens,
+                event.total_tokens,
+                "codex 事件恒等式破坏: {} {}",
+                event.id,
+                event.model
+            );
+            assert!(event.input_tokens >= 0, "fresh 拆分不得为负");
+            fresh_sum += event.input_tokens;
+            cached_sum += event.cached_input_tokens;
+        }
+    }
+    println!(
+        "codex real files checked: {checked}, fresh={fresh_sum}, cached={cached_sum}, hit={:.1}%",
+        100.0 * cached_sum as f64 / (fresh_sum + cached_sum).max(1) as f64
+    );
+    assert!(checked > 0, "存在 rollout 文件但未解析出事件");
+}
+
 #[test]
 fn copilot_transcript_counts_every_agent_turn_as_request() {
     let dir = std::env::temp_dir().join(format!("openhub-test-transcript-{}", std::process::id()));
@@ -1194,4 +1344,183 @@ fn vscode_opencode_log_parses_precise_usage_with_cache_hits() {
     assert!(cached.events[0].timestamp.starts_with("2026-08-25T"));
     assert_eq!(cached.sessions.len(), 1);
     let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn normalize_usage_covers_all_input_semantics() {
+    use crate::token::collector::types::InputSemantics;
+
+    // Fresh：input 即全新输入（Anthropic / codex / opencode / mimo 语义）
+    let (fresh, read, write, out, reasoning, total) = normalize_usage(RawUsage {
+        input: 100,
+        semantics: InputSemantics::Fresh,
+        cache_read: 80,
+        cache_write: 30,
+        output: 10,
+        reasoning: 6,
+    });
+    assert_eq!((fresh, read, write, out, reasoning, total), (100, 80, 30, 10, 6, 190));
+
+    // InclusiveOfCacheRead：OpenAI 语义，prompt 含缓存命中，必须拆分避免双计
+    let (fresh, read, _write, out, _r, total) = normalize_usage(RawUsage {
+        input: 1500,
+        semantics: InputSemantics::InclusiveOfCacheRead,
+        cache_read: 500,
+        output: 200,
+        ..Default::default()
+    });
+    assert_eq!((fresh, read, out, total), (1000, 500, 200, 1700));
+
+    // InclusiveOfAllCache：zcode 语义，input 已含缓存读（真实样本 input=15474, read=11776）
+    let (fresh, read, _write, out, _r, total) = normalize_usage(RawUsage {
+        input: 15474,
+        semantics: InputSemantics::InclusiveOfAllCache,
+        cache_read: 11776,
+        output: 122,
+        ..Default::default()
+    });
+    assert_eq!((fresh, read, out, total), (3698, 11776, 122, 15596));
+
+    // 负数防御：input < cached 时 fresh 不得为负
+    let (fresh, _read, _write, _out, _r, total) = normalize_usage(RawUsage {
+        input: 822,
+        semantics: InputSemantics::InclusiveOfCacheRead,
+        cache_read: 23872,
+        output: 118,
+        ..Default::default()
+    });
+    assert_eq!(fresh, 0);
+    assert_eq!(total, 23872 + 118);
+
+    // 恒等式：fresh + read + output == total（三种语义均须成立）
+    for semantics in [
+        InputSemantics::Fresh,
+        InputSemantics::InclusiveOfCacheRead,
+        InputSemantics::InclusiveOfAllCache,
+    ] {
+        let (f, r, _w, o, _rr, t) = normalize_usage(RawUsage {
+            input: 900,
+            semantics,
+            cache_read: 300,
+            cache_write: 120,
+            output: 45,
+            ..Default::default()
+        });
+        assert_eq!(f + r + o, t, "semantics={semantics:?}");
+    }
+}
+
+#[test]
+fn openai_details_helpers_read_camel_and_snake() {
+    let camel = json!({"promptTokensDetails": {"cachedTokens": 45376},
+                        "completionTokensDetails": {"reasoningTokens": 88}});
+    assert_eq!(openai_cached_from_details(&camel), 45376);
+    assert_eq!(openai_reasoning_from_details(&camel), 88);
+
+    let snake = json!({"prompt_tokens_details": {"cached_tokens": 12},
+                        "completion_tokens_details": {"reasoning_tokens": 3}});
+    assert_eq!(openai_cached_from_details(&snake), 12);
+    assert_eq!(openai_reasoning_from_details(&snake), 3);
+
+    assert_eq!(openai_cached_from_details(&json!({})), 0);
+}
+
+#[test]
+fn goose_parser_splits_cached_tokens_from_openai_prompt() {
+    let dir = std::env::temp_dir().join(format!(
+        "openhub_goose_cache_test_{}",
+        std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = fs::create_dir_all(&dir);
+    let path = dir.join("goose-cache.jsonl");
+    fs::write(
+        &path,
+        json!({
+            "model": "gpt-5",
+            "role": "assistant",
+            "usage": {
+                "prompt_tokens": 45646,
+                "completion_tokens": 278,
+                "prompt_tokens_details": { "cached_tokens": 45376 }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let parsed = parse_goose_file(&path);
+    assert_eq!(parsed.sessions.len(), 1);
+    let s = &parsed.sessions[0];
+    // prompt_tokens 含缓存时必须拆分：fresh = 45646 - 45376 = 270，避免 fresh+cached 双计。
+    assert_eq!(s.tokens.input_tokens, 270);
+    assert_eq!(s.tokens.cached_input_tokens, 45376);
+    assert_eq!(s.tokens.output_tokens, 278);
+    assert_eq!(s.tokens.total_tokens, 270 + 45376 + 278);
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn cursor_usage_keeps_input_plus_output_equal_total() {
+    use crate::token::collector::sources::cursor::cursor_usage;
+    use crate::token::collector::types::normalize_usage;
+
+    // 只有 tokenCount：input 补满 total，output 为 0
+    let (input, cached, _w, output, _r, total) =
+        normalize_usage(cursor_usage(&json!({"tokenCount": 1200}), 1200));
+    assert_eq!((input, cached, output, total), (1200, 0, 0, 1200));
+
+    // input + output 齐全：原样保留
+    let (input, _c, _w, output, _r, total) = normalize_usage(cursor_usage(
+        &json!({"tokenCount": 1200, "inputTokens": 900, "outputTokens": 300}),
+        1200,
+    ));
+    assert_eq!((input, output, total), (900, 300, 1200));
+
+    // 只有 output：input 由 total 倒推
+    let (input, _c, _w, output, _r, total) = normalize_usage(cursor_usage(
+        &json!({"tokenCount": 1200, "outputTokens": 300}),
+        1200,
+    ));
+    assert_eq!((input, output, total), (900, 300, 1200));
+
+    // 带缓存明细：promptTokens=1500 含 cached=500，fresh=1000
+    let (input, cached, _w, output, _r, total) = normalize_usage(cursor_usage(
+        &json!({
+            "tokenCount": 1700,
+            "promptTokens": 1500,
+            "outputTokens": 200,
+            "prompt_tokens_details": { "cached_tokens": 500 }
+        }),
+        1700,
+    ));
+    assert_eq!((input, cached, output, total), (1000, 500, 200, 1700));
+}
+
+#[test]
+fn catpawai_normalize_uses_raw_total_to_avoid_double_count() {
+    // 格式 2（网关独立式）：cacheReadTokens 独立上报，prompt 即全新输入。
+    let (fresh, cached, _w, out, _r, total) = normalize_catpawai_usage_numbers(
+        1134, 138, 1272, 10201, 0, 0, 0,
+    );
+    assert_eq!((fresh, cached, out, total), (1134, 10201, 138, 11473));
+
+    // 格式 1（OpenAI 嵌入式）：cached_tokens 在 details 里，prompt 含缓存需扣减。
+    let (fresh, cached, _w, out, _r, total) = normalize_catpawai_usage_numbers(
+        5000, 800, 5800, 0, 0, 2000, 0,
+    );
+    assert_eq!((fresh, cached, out, total), (3000, 2000, 800, 5800));
+
+    // 两缓存字段并存 + raw_total 证明缓存独立计入：prompt 维持全新输入，不双扣。
+    let (fresh, cached, _w, out, _r, total) = normalize_catpawai_usage_numbers(
+        1134, 138, 1134 + 10201 + 138, 10201, 0, 10201, 0,
+    );
+    assert_eq!((fresh, cached, out, total), (1134, 10201, 138, 11473));
+
+    // 仅 total 可用：以总量扣缓存拆分。
+    let (fresh, cached, _w, out, _r, total) =
+        normalize_catpawai_usage_numbers(0, 0, 6000, 1000, 0, 0, 0);
+    assert_eq!((fresh, cached, out, total), (5000, 1000, 0, 6000));
 }

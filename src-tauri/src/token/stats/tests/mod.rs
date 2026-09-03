@@ -312,7 +312,8 @@ fn catpawai_deduplicates_repeated_usage_rows() {
     assert_eq!(buckets.len(), 1, "should have exactly 1 bucket after dedup");
     let bucket = &buckets[0];
     assert_eq!(bucket.request_count, 1, "should dedup to 1 request");
-    assert_eq!(bucket.total_tokens, 8300, "should keep the larger total");
+    // total = 全新输入 + 缓存命中 + 输出；缓存写入(500)独立上报，不计入 total
+    assert_eq!(bucket.total_tokens, 7800, "should keep the larger total");
     assert_eq!(bucket.input_tokens, 5000, "should keep the larger prompt");
     assert_eq!(
         bucket.cached_input_tokens, 2000,

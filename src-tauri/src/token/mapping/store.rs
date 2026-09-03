@@ -101,6 +101,36 @@ pub fn count_confirmed(database: &Database) -> Result<usize, String> {
     Ok(count as usize)
 }
 
+/// 已确认映射作为 AI 分析的「标准答案」注入提示词：
+/// 同族原始名必须沿用它对应的正式名，避免两批分析得出不一致结果。
+/// exclude_keys 用来排除本批正在（重）判定的条目，防止同一条既当标准又当考题。
+pub fn confirmed_standards(
+    connection: &Connection,
+    exclude_keys: &[String],
+) -> Result<Vec<(String, String)>, String> {
+    let mut statement = connection
+        .prepare(
+            "SELECT raw_model, official_model FROM token_model_mappings
+             WHERE confirmed = 1 AND official_model != ''
+             ORDER BY raw_key",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    Ok(rows
+        .into_iter()
+        .filter(|(raw, _)| {
+            let key = raw_key(raw);
+            !exclude_keys.iter().any(|excluded| *excluded == key)
+        })
+        .collect())
+}
+
 /// 正式模型候选池：模型目录里的规范名，供 AI 选择而非自由生成。
 pub fn official_catalog(connection: &Connection) -> Result<Vec<(String, String, String)>, String> {
     let mut statement = connection
@@ -148,11 +178,7 @@ pub fn apply_ai_results(
             .iter()
             .find(|(name, _, _)| name.eq_ignore_ascii_case(item.official_model.trim()));
         let (official, slug, lab) = match matched {
-            Some((name, slug, lab)) => (
-                name.clone(),
-                Some(slug.clone()),
-                Some(lab.clone()),
-            ),
+            Some((name, slug, lab)) => (name.clone(), Some(slug.clone()), Some(lab.clone())),
             None => continue,
         };
         let guard = if force {
@@ -286,13 +312,38 @@ mod tests {
     fn force_pending_keeps_manual_rows_out() {
         let database = test_database();
         insert_catalog(&database, "GLM-5.3");
-        register_raw_models(&database, &["zai-glm-5-3".to_string(), "alpha-gpt".to_string()]).unwrap();
+        register_raw_models(
+            &database,
+            &["zai-glm-5-3".to_string(), "alpha-gpt".to_string()],
+        )
+        .unwrap();
         set_mapping_manually(&database, "zai-glm-5-3", "GLM-5.3").unwrap();
 
         // 手工行 confirmed = 1 且 origin = manual，force 时也不应进入待分析清单。
         let pending = pending_models(&database, true).unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].raw_model, "alpha-gpt");
+    }
+
+    #[test]
+    fn confirmed_standards_exclude_pending_keys() {
+        let database = test_database();
+        insert_catalog(&database, "GLM-5.3");
+        register_raw_models(
+            &database,
+            &["zai-glm-5-3".to_string(), "glm-5.3-flash".to_string()],
+        )
+        .unwrap();
+        set_mapping_manually(&database, "zai-glm-5-3", "GLM-5.3").unwrap();
+        set_mapping_manually(&database, "glm-5.3-flash", "GLM-5.3").unwrap();
+
+        let connection = database.lock_conn().unwrap();
+        let all = confirmed_standards(&connection, &[]).unwrap();
+        assert_eq!(all.len(), 2);
+        // 排除正在重判的条目，防止同一条既当标准又当考题。
+        let excluded = confirmed_standards(&connection, &["zai-glm-5-3".to_string()]).unwrap();
+        assert_eq!(excluded.len(), 1);
+        assert_eq!(excluded[0].0, "glm-5.3-flash");
     }
 
     #[test]

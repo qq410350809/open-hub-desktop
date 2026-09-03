@@ -122,7 +122,8 @@ pub fn parse_claude_file(
         let cache_read = number(usage, "cache_read_input_tokens");
         let cache_creation = number(usage, "cache_creation_input_tokens");
         let output = number(usage, "output_tokens");
-        let total = input + cache_read + cache_creation + output;
+        // 口径与 collector 一致：total = 全新输入 + 缓存命中 + 输出；缓存写入独立，不计入 total。
+        let total = input + cache_read + output;
         if total <= 0 {
             continue;
         }

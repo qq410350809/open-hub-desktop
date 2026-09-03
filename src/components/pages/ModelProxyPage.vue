@@ -731,7 +731,7 @@ function fmtCompactTokens(n?: number | null): string {
 
 /** 最近使用时间的人性化展示：刚刚/N 分钟前/N 小时前/昨天/N 天前/具体日期 */
 function fmtLastUsed(ts?: string | null): string {
-  if (!ts) return "从未调用";
+  if (!ts || typeof ts !== "string") return "从未调用";
   const t = new Date(ts.replace(" ", "T"));
   if (Number.isNaN(t.getTime())) return ts;
   const diffMs = Date.now() - t.getTime();
@@ -4272,7 +4272,7 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
                   <span v-html="isModelChecked(model) ? icons.check : ''" />
                 </span>
 
-                <!-- 主体区：上行 = 模型名 + 用量统计；下行 = 代理/协议覆盖控件 -->
+                <!-- 主体区：上行 = 模型名 + 用量统计；下行 = 调用 ID + 代理/协议覆盖控件 -->
                 <div class="mp-mcm-content">
                   <div class="mp-mcm-main">
                     <div class="mp-mcm-title-row">
@@ -4287,11 +4287,6 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
                         :title="`今日已调用 ${channelModelStatsMap.get(model.toLowerCase())!.todayRequests} 次 / ${fmtCompactTokens(channelModelStatsMap.get(model.toLowerCase())!.todayTokens)} tokens`"
                       >今日 {{ channelModelStatsMap.get(model.toLowerCase())!.todayRequests }} 次</span>
                     </div>
-                    <code class="mp-mcm-id-code font-mono" :title="'点击复制调用 ID'" @click.stop="selectedChannel && copyModel(model, selectedChannel)">
-                      {{ channelAlias(selectedChannel) }}/{{ model }}
-                      <span class="mp-mcm-copy-icon" v-html="copiedModelId === model ? icons.check : icons.copy" />
-                      <span v-if="copiedModelId === model" class="mp-mcm-copy-ok">已复制</span>
-                    </code>
                   </div>
 
                   <!-- 上行右段：用量统计区 -->
@@ -4333,15 +4328,13 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
                   </div>
                 </div>
 
-                <!-- 底部第四行：Key 专属限制提示 -->
-                <span
-                  v-if="keySupportCountFor(model) >= 0 && !isModelFreeForAllKeys(model)"
-                  class="mp-kg-model-tag mp-mcm-key-tag"
-                  :title="`该渠道有专属 Key 限制：仅 ${keySupportCountFor(model)} 个 Key 支持此模型，调度时可能受 Key 分组配置影响`"
-                >Key 专属 · {{ keySupportCountFor(model) }}</span>
-
-                <!-- 下行：该模型的代理出口策略与上游协议覆盖（默认跟随渠道级配置） -->
-                <div class="mp-mcm-proxy" @click.stop>
+                <!-- 下行配置行：调用 ID 复制 + 代理出口策略 + 上游协议覆盖（默认跟随渠道级配置） -->
+                <div class="mp-mcm-config-row" @click.stop>
+                  <code class="mp-mcm-id-code font-mono" :title="'点击复制调用 ID'" @click="selectedChannel && copyModel(model, selectedChannel)">
+                    {{ channelAlias(selectedChannel) }}/{{ model }}
+                    <span class="mp-mcm-copy-icon" v-html="copiedModelId === model ? icons.check : icons.copy" />
+                    <span v-if="copiedModelId === model" class="mp-mcm-copy-ok">已复制</span>
+                  </code>
                   <span
                     class="mp-mcm-proxy-label"
                     :title="`出网代理策略：默认${channelLevelProxyLabel}；可为本模型单独指定`"
@@ -4419,6 +4412,11 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
                     class="mp-mcm-proxy-dot mp-mcm-protocol-dot"
                     title="本模型上游协议与渠道级配置不同"
                   />
+                  <span
+                    v-if="keySupportCountFor(model) >= 0 && !isModelFreeForAllKeys(model)"
+                    class="mp-kg-model-tag mp-mcm-key-tag"
+                    :title="`该渠道有专属 Key 限制：仅 ${keySupportCountFor(model)} 个 Key 支持此模型，调度时可能受 Key 分组配置影响`"
+                  >Key 专属 · {{ keySupportCountFor(model) }}</span>
                 </div>
               </div>
             </div>
@@ -7654,7 +7652,7 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
 .mp-model-check-list {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 6px;
 }
 
 .mp-mcm-card {
@@ -7662,8 +7660,8 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
   display: flex;
   flex-direction: column;
   align-items: stretch;
-  gap: 8px;
-  padding: 10px 14px;
+  gap: 6px;
+  padding: 9px 14px 9px 38px;
   background: var(--surface-soft);
   border: 1px solid var(--line);
   border-radius: var(--r-md, 10px);
@@ -7671,7 +7669,7 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
   transition: all 0.18s cubic-bezier(0.4, 0, 0.2, 1);
 }
 
-/* 上行：模型主体（名称/状态/调用 ID）+ 右侧用量统计 */
+/* 上行：模型名称/状态徽章 + 右侧用量统计 */
 .mp-mcm-content {
   display: flex;
   align-items: center;
@@ -7679,14 +7677,13 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
   min-width: 0;
 }
 
-/* 下行：代理策略 + 上游协议覆盖控件，独立占满整行不与统计挤压 */
-.mp-mcm-proxy {
+/* 下行：调用 ID + 代理策略 + 上游协议，一条配置行铺满整行 */
+.mp-mcm-config-row {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
-  gap: 5px 6px;
-  margin-left: 32px;
-  position: relative;
+  gap: 5px 8px;
+  min-width: 0;
 }
 
 .mp-mcm-card:hover {
@@ -7713,7 +7710,15 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
   border-color: var(--brand);
 }
 
-/* —— 主体区（名称 + 状态 + 今日 + 调用 ID） —— */
+/* 勾选框固定在卡片左侧垂直居中，主体两行内容整体右移 */
+.mp-mcm-card .mp-mec-check {
+  position: absolute;
+  left: 13px;
+  top: 50%;
+  transform: translateY(-50%);
+}
+
+/* —— 主体区（名称 + 状态 + 今日） —— */
 .mp-mcm-main {
   display: flex;
   flex-direction: column;
@@ -7742,7 +7747,6 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
   display: inline-flex;
   align-items: center;
   gap: 5px;
-  align-self: flex-start;
   font-size: 11.5px;
   color: var(--brand-deep);
   background: color-mix(in srgb, var(--surface) 80%, transparent);
@@ -7751,7 +7755,7 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
   border-radius: 6px;
   cursor: copy;
   transition: all 0.15s ease;
-  max-width: 100%;
+  max-width: min(100%, 320px);
   overflow: hidden;
   white-space: nowrap;
 }
@@ -7787,9 +7791,9 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
   align-items: flex-end;
   justify-content: center;
   gap: 1px;
-  padding: 0 14px;
+  padding: 0 10px;
   border-left: 1px solid var(--line);
-  min-width: 64px;
+  min-width: 56px;
 }
 
 .mp-mcm-stat-val {
@@ -7825,37 +7829,29 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
   align-items: flex-end;
 }
 
+/* 「暂无调用记录」占位：弱化为普通说明文字，与统计数值基线对齐 */
 .mp-mcm-stat-empty .mp-mcm-stat-label {
   font-style: normal;
+  font-size: 11.5px;
 }
 
-/* Key 专属提示：绝对定位贴右下角，不占布局 */
+/* Key 专属提示：配置行尾部的轻量徽标 */
 .mp-mcm-key-tag {
-  position: absolute;
-  right: 10px;
-  bottom: -6px;
+  margin-left: auto;
   font-size: 9.5px;
   padding: 0 6px;
   border-radius: 999px;
   background: var(--surface);
   border: 1px solid color-mix(in srgb, var(--warning) 45%, transparent);
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
 }
 
-/* 行尾模型级代理策略选择 */
-.mp-mcm-proxy {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  flex-shrink: 0;
-  margin-left: 8px;
-  position: relative;
-}
-
-/* 级联子选择（固定通道/自定义节点）：与模式下拉等高。
-   承载任意长度的通道名/节点名，给足宽度，超长仍由 trigger 省略号收尾 */
+/* 级联子选择（固定通道/自定义节点）：主下拉后接同段展示。
+   弹性占据剩余行宽，超长通道名/节点名由 trigger 省略号收尾，永不换行溢出 */
 .mp-mcm-proxy-sub.select-box {
-  width: 190px;
+  flex: 1 1 150px;
+  width: auto;
+  min-width: 120px;
+  max-width: 240px;
 }
 .mp-mcm-proxy-sub .select-trigger {
   color: var(--muted);
@@ -7880,15 +7876,15 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
 }
 
 /* 模型行内统一自定义下拉：宽度由 auto-width 按最长选项（自定义节点）自撑，
-   min-width 保证视觉下限；高度/字号略放大以提升可读性 */
+   min-width 保证视觉下限；与调用 ID 行同高保持配置行基线一致 */
 .mp-mcm-proxy-dd.select-box {
-  height: 28px;
-  min-width: 104px;
+  height: 26px;
+  min-width: 96px;
   border-radius: 6px;
 }
 .mp-mcm-proxy-dd .select-trigger {
   padding: 0 8px;
-  font-size: 12px;
+  font-size: 11.5px;
   font-weight: 500;
 }
 
@@ -7896,27 +7892,20 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
   border-color: color-mix(in srgb, var(--brand) 55%, transparent);
 }
 
-/* 覆盖与渠道级配置不同时的提示圆点 */
+/* 覆盖与渠道级配置不同时的提示圆点：配置行内紧跟所属下拉，上角贴合 */
 .mp-mcm-proxy-dot {
-  position: absolute;
-  top: -3px;
-  right: -3px;
+  display: inline-block;
   width: 7px;
   height: 7px;
   border-radius: 50%;
   background: var(--warning);
   border: 1.5px solid var(--surface-soft);
+  margin: 0 0 -2px -4px;
 }
 
-/* 协议覆盖提示点：定位在协议下拉左上角，避免与代理覆盖点重叠 */
-.mp-mcm-protocol-dot {
-  right: auto;
-  left: -3px;
-}
-
-/* 协议标签与代理标签之间的分隔：下行控件区拉开两组的视觉边界 */
+/* 协议组（标签+下拉）：与代理组保持间距，作为整体参与换行 */
 .mp-mcm-protocol-label {
-  margin-left: 14px;
+  margin-left: 10px;
 }
 
 /* 工具栏扩展控件 */

@@ -1,7 +1,8 @@
 use crate::models::TokenSessionTokens;
 use crate::token::collector::time_utils::{iso_from_millis, update_bounds};
 use crate::token::collector::types::{
-    fingerprint, float_number, number, token_session, CachedFile, UsageEvent,
+    fingerprint, float_number, normalize_usage, number, token_session, CachedFile, InputSemantics,
+    RawUsage, UsageEvent,
 };
 use serde_json::Value as JsonValue;
 use std::fs;
@@ -149,11 +150,24 @@ pub fn parse_cline_file(source_name: &str, path: &Path) -> CachedFile {
                 let cache_write = number(usage, &["cacheWrites", "cache_creation_input_tokens"]);
                 let cost =
                     float_number(usage, &["totalCost", "cost"]).max(float_number(msg, &["cost"]));
-                let total = if in_tok + out_tok > 0 {
-                    in_tok + out_tok
-                } else {
-                    number(usage, &["totalTokens", "tokens"])
-                };
+                // Cline 的 tokensIn 为全新输入（Anthropic 口径，不含缓存），
+                // total = 全新输入 + 缓存命中 + 输出；缓存写入独立上报，不计入 total。
+                // 仅 totalTokens/tokens 可用时整体兜底（语义不明，标记估算）。
+                let is_fallback = in_tok + out_tok + cache_read == 0;
+                let (in_tok, cache_read, _cache_write, out_tok, _reasoning, total) =
+                    if !is_fallback {
+                        normalize_usage(RawUsage {
+                            input: in_tok,
+                            semantics: InputSemantics::Fresh,
+                            cache_read,
+                            cache_write,
+                            output: out_tok,
+                            ..Default::default()
+                        })
+                    } else {
+                        let fallback = number(usage, &["totalTokens", "tokens"]);
+                        (fallback, 0, 0, 0, 0, fallback)
+                    };
 
                 if total > 0 || cost > 0.0 {
                     total_in += in_tok;
@@ -178,7 +192,7 @@ pub fn parse_cline_file(source_name: &str, path: &Path) -> CachedFile {
                         conversation_count: 0,
                         cost_usd: cost,
                         pricing_available: cost > 0.0,
-                        estimated_tokens: 0,
+                        estimated_tokens: if is_fallback { total } else { 0 },
                     });
                 }
             }

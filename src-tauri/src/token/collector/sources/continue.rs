@@ -1,7 +1,10 @@
 use crate::models::TokenSessionTokens;
 use crate::token::collector::normalizer::normalize_workspace_project_key;
 use crate::token::collector::time_utils::update_bounds;
-use crate::token::collector::types::{fingerprint, number, token_session, CachedFile, UsageEvent};
+use crate::token::collector::types::{
+    fingerprint, normalize_usage, number, openai_cached_from_details, token_session, CachedFile,
+    InputSemantics, RawUsage, UsageEvent,
+};
 use serde_json::Value as JsonValue;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -60,6 +63,7 @@ pub fn parse_continue_file(path: &Path) -> CachedFile {
     let mut user_msg_count = 0i64;
 
     let mut total_in = 0i64;
+    let mut total_cached = 0i64;
     let mut total_out = 0i64;
     let mut total_all = 0i64;
 
@@ -94,20 +98,31 @@ pub fn parse_continue_file(path: &Path) -> CachedFile {
                 item,
                 &["completionTokens", "outputTokens", "completion_tokens"],
             );
-            let total = if prompt_tok + comp_tok > 0 {
-                prompt_tok + comp_tok
+            // OpenAI 式 promptTokens 已含缓存命中；按明细拆分全新输入。
+            let cached_tok = openai_cached_from_details(item);
+            let (fresh, cached_read, _write, out, _reasoning, total) = if prompt_tok + comp_tok > 0
+            {
+                normalize_usage(RawUsage {
+                    input: prompt_tok,
+                    semantics: InputSemantics::InclusiveOfCacheRead,
+                    cache_read: cached_tok,
+                    output: comp_tok,
+                    ..Default::default()
+                })
             } else {
                 // 如果没有精准计量，根据内容字数估算 (4 字符 ≈ 1 token)
                 let text_len = match content {
                     Some(JsonValue::String(s)) => s.len(),
                     _ => 0,
                 };
-                if text_len > 0 {
-                    (text_len / 4).max(1) as i64
+                let estimated = if text_len > 0 {
+                    ((text_len / 4).max(1)) as i64
                 } else {
                     0
-                }
+                };
+                (estimated, 0, 0, 0, 0, estimated)
             };
+            let is_estimated = prompt_tok + comp_tok == 0;
 
             if total > 0 {
                 let ts_str = item
@@ -121,8 +136,9 @@ pub fn parse_continue_file(path: &Path) -> CachedFile {
                 };
                 update_bounds(&mut first_ts, &mut last_ts, &iso_ts);
 
-                total_in += prompt_tok;
-                total_out += comp_tok;
+                total_in += fresh;
+                total_cached += cached_read;
+                total_out += out;
                 total_all += total;
 
                 events.push(UsageEvent {
@@ -131,16 +147,16 @@ pub fn parse_continue_file(path: &Path) -> CachedFile {
                     model: model_name.clone(),
                     project_key: project_key.clone(),
                     timestamp: iso_ts,
-                    input_tokens: prompt_tok,
-                    cached_input_tokens: 0,
+                    input_tokens: fresh,
+                    cached_input_tokens: cached_read,
                     cache_creation_input_tokens: 0,
-                    output_tokens: comp_tok,
+                    output_tokens: out,
                     reasoning_output_tokens: 0,
                     total_tokens: total,
                     conversation_count: 0,
                     cost_usd: 0.0,
                     pricing_available: false,
-                    estimated_tokens: if prompt_tok + comp_tok == 0 { total } else { 0 },
+                    estimated_tokens: if is_estimated { total } else { 0 },
                 });
             }
         }
@@ -158,7 +174,7 @@ pub fn parse_continue_file(path: &Path) -> CachedFile {
             user_msg_count,
             TokenSessionTokens {
                 input_tokens: total_in,
-                cached_input_tokens: 0,
+                cached_input_tokens: total_cached,
                 cache_creation_input_tokens: 0,
                 output_tokens: total_out,
                 reasoning_output_tokens: 0,

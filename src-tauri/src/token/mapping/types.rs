@@ -61,6 +61,9 @@ pub struct AnalyzeReport {
     pub skipped_confirmed: usize,
     /// 成功写回映射的条目数
     pub resolved: usize,
+    /// 注入提示词的已确认标准映射条数（批次间取最大值）
+    #[serde(default)]
+    pub standards_used: usize,
     /// AI 未能给出正式模型的原始名
     #[serde(default)]
     pub unresolved: Vec<String>,

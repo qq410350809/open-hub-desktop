@@ -2063,6 +2063,11 @@ kbd { padding: 3px 7px; border: 1px solid var(--line); border-radius: var(--r-xs
   background: var(--page-bg, var(--bg));
 }
 
+.modeltest-panel {
+  flex-direction: column;
+  background: var(--page-bg, var(--bg));
+}
+
 .proxy-pool-page {
   width: 100%;
   min-width: 0;

@@ -141,7 +141,10 @@ mod tests {
             unify_version_separators("claude-sonnet-4-20250514"),
             "claude-sonnet-4-20250514"
         );
-        assert_eq!(rule_base_name("claude-sonnet-4-20250514"), "claude-sonnet-4");
+        assert_eq!(
+            rule_base_name("claude-sonnet-4-20250514"),
+            "claude-sonnet-4"
+        );
     }
 
     #[test]
@@ -154,7 +157,10 @@ mod tests {
     fn variant_suffixes_are_stripped_without_eating_the_family() {
         assert_eq!(rule_base_name("glm-5.3-flash"), "glm-5.3");
         assert_eq!(rule_base_name("gpt-5.6-preview"), "gpt-5.6");
-        assert_eq!(rule_base_name("muse-spark-1.2-contributor-free"), "muse-spark-1.2");
+        assert_eq!(
+            rule_base_name("muse-spark-1.2-contributor-free"),
+            "muse-spark-1.2"
+        );
     }
 
     #[test]

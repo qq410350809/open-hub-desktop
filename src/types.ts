@@ -680,6 +680,7 @@ export interface TokenMappingAnalyzeReport {
   analyzed: number;         // 本次实际送给 AI 的条目数
   skippedConfirmed: number; // 因已确认而跳过的条目数
   resolved: number;         // 成功写回映射的条目数
+  standardsUsed: number;    // 注入提示词的已确认标准映射条数
   unresolved: string[];     // AI 未能给出正式模型的原始名
   warnings: string[];
 }

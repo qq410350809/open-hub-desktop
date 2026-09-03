@@ -54,6 +54,8 @@ pub fn set_token_model_mapping(
 /// 用 AI 补全「原始模型名 → 正式模型」映射。
 /// force = false（默认）时跳过已确认的条目，只分析新增或未决的；
 /// force = true 时重跑全部条目，但手工修改（origin = manual）的行始终保留。
+/// 已确认映射会作为「标准」注入提示词：同族原始名必须沿用标准正式名，
+/// 保证前后多次分析结果一致；本 run 前几批的新结论也会成为后续批的标准。
 /// 请求经进程内网关入口发出（免 Key、免回环端口、免网关开关），channel_id
 /// 定向所选反代渠道：模型名带 {alias}/{model} 前缀走渠道前缀路由。
 #[tauri::command]
@@ -96,14 +98,27 @@ pub async fn analyze_token_model_mappings(
     };
 
     for batch in pending.chunks(ai::BATCH_SIZE) {
-        let candidates = ai::shortlist_candidates(batch, &catalog);
-        if candidates.is_empty() {
+        // 已确认映射作为标准答案注入：同族原始名必须沿用标准里的正式名，
+        // 避免前后两批分析对同类模型给出不一致的映射结果。
+        // 排除本批条目（force 重判时旧结论不再当标准），本 run 前几批的新结论
+        // 则自然进入后续批次的标准池，让单次运行内部也保持一致。
+        let batch_keys: Vec<String> = batch.iter().map(|item| item.raw_key.clone()).collect();
+        let standards = {
+            let connection = ctx.database.lock_conn()?;
+            let all = store::confirmed_standards(&connection, &batch_keys)?;
+            ai::select_standards(batch, &all)
+        };
+        report.standards_used = report.standards_used.max(standards.len());
+
+        let mut candidates = ai::shortlist_candidates(batch, &catalog);
+        if candidates.is_empty() && standards.is_empty() {
             report
                 .unresolved
                 .extend(batch.iter().map(|item| item.raw_model.clone()));
             continue;
         }
-        let prompt = ai::build_prompt(batch, &candidates);
+        candidates = ai::merge_standard_candidates(candidates, &standards);
+        let prompt = ai::build_prompt(batch, &candidates, &standards);
         let items = match ai::request_mapping(&gateway_ctx, &request_model, &prompt).await {
             Ok(items) => items,
             Err(error) => {
@@ -156,8 +171,8 @@ mod tests {
     #[test]
     fn request_model_prefixes_selected_channel_alias() {
         let channels = vec![channel("c1", "x666", true)];
-        let resolved = resolve_request_model(&channels, Some("c1"), "gpt-5.6")
-            .expect("should resolve");
+        let resolved =
+            resolve_request_model(&channels, Some("c1"), "gpt-5.6").expect("should resolve");
         assert_eq!(resolved, "x666/gpt-5.6");
     }
 

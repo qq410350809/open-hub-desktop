@@ -313,9 +313,6 @@ const mappingModelOptions = computed(() => {
   const models = [
     ...new Set(filterChannelModels(channel, mappingProxy.modelsForChannel(channel.id))),
   ];
-  if (mappingModel.value && models.length && !models.includes(mappingModel.value)) {
-    models.unshift(mappingModel.value);
-  }
   return models.map((model) => ({ value: model, text: model }));
 });
 const mappingHasModels = computed(() => mappingModelOptions.value.length > 0);
@@ -706,6 +703,7 @@ const sourceNameMap: Record<string, string> = {
   "command-code": "Command Code",
   dsh: "DeepSeek CLI (DSH)",
   // —— 反代模式：按端点/SDK 推断的客户端标识 ——
+  openhub: "OpenHub",
   sdk: "SDK / 脚本",
   "anthropic-api": "Anthropic 协议客户端",
   "responses-api": "Responses 协议客户端",
@@ -1518,6 +1516,8 @@ let proxyRefreshTimer: number | null = null;
 
 onMounted(() => {
   tokenStatsPageMounted = true;
+  // 预载反代配置与渠道模型缓存（会话级单例）：保证首次打开模型映射弹窗时分析模型下拉即时有值
+  void mappingProxy.loadProxyData().catch(() => {});
   // 反代网关页：挂载即拉取一次，此后 5 秒轮询保持近实时
   if (statsMode.value === "proxy") {
     void proxyStore.loadProxyTokenUsage(store.tokenStatsFrom.value, store.tokenStatsTo.value);
@@ -1747,8 +1747,8 @@ onBeforeUnmount(() => {
                 />
                 <div
                   class="tt-prog-seg is-cache"
-                  :style="{ width: `${shareOf(rangeSplits.cache, bucketTotal.total)}%` }"
-                  :title="`缓存: ${formatCompact(rangeSplits.cache)} (读 ${formatCompact(cacheBreakdown.read)} / 写 ${formatCompact(cacheBreakdown.write)}, ${shareOf(rangeSplits.cache, bucketTotal.total).toFixed(1)}%)`"
+                  :style="{ width: `${shareOf(cacheBreakdown.read, bucketTotal.total)}%` }"
+                  :title="`缓存: ${formatCompact(rangeSplits.cache)} (读 ${formatCompact(cacheBreakdown.read)} / 写 ${formatCompact(cacheBreakdown.write)}, 读占比 ${shareOf(cacheBreakdown.read, bucketTotal.total).toFixed(1)}%)`"
                 />
               </div>
               <div class="tt-kpi-sub-pills">
@@ -2464,6 +2464,7 @@ onBeforeUnmount(() => {
               <div class="tt-mapping-report-stats">
                 <span>送审 <strong>{{ store.tokenModelAnalyzeReport.value.analyzed }}</strong></span>
                 <span>跳过已确认 <strong>{{ store.tokenModelAnalyzeReport.value.skippedConfirmed }}</strong></span>
+                <span>标准 <strong>{{ store.tokenModelAnalyzeReport.value.standardsUsed ?? 0 }}</strong></span>
                 <span>成功 <strong>{{ store.tokenModelAnalyzeReport.value.resolved }}</strong></span>
                 <span>未决 <strong>{{ store.tokenModelAnalyzeReport.value.unresolved.length }}</strong></span>
               </div>

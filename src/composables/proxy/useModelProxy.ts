@@ -206,8 +206,8 @@ export function useModelProxy() {
         proxyConfig.value = cfg;
       }
       if (status) proxyStatus.value = status;
-      await refreshChannelStats();
-      await loadCachedModels();
+      // 渠道统计与模型缓存并行加载；缓存映射需在配置应用后执行（免费渠道过滤依赖渠道配置）
+      await Promise.all([refreshChannelStats(), loadCachedModels()]);
     } catch (e) {
       console.error("加载模型反代配置失败:", e);
     } finally {
