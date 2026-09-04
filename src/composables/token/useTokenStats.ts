@@ -1,4 +1,5 @@
 import { ref } from "vue";
+import { listen, type UnlistenFn } from "../core/events";
 import type {
   RawLogReport,
   RequestHealthReport,
@@ -7,7 +8,11 @@ import type {
   TokenUsageReport,
   LocalAgentPathsReport,
   TokenModelMapping,
+  TokenOfficialModel,
   TokenMappingAnalyzeReport,
+  TokenMappingAnalyzeProgress,
+  TokenInsightReport,
+  InsightEvidencePacket,
 } from "../../types";
 import { localTokenStatsAvailable, runLocalCommand } from "../core/ipc";
 
@@ -42,8 +47,16 @@ const tokenModelMappings = ref<TokenModelMapping[]>([]);
 const tokenModelMappingsLoading = ref(false);
 const tokenModelMappingsError = ref("");
 const tokenModelAnalyzeReport = ref<TokenMappingAnalyzeReport | null>(null);
+const tokenModelAnalyzeProgress = ref<TokenMappingAnalyzeProgress | null>(null);
 const tokenModelAnalyzing = ref(false);
 const tokenModelAnalyzeError = ref("");
+let unlistenTokenModelAnalyzeProgress: UnlistenFn | null = null;
+
+// AI 用量洞察（证据包由页面按当前时间范围确定性构建，AI 只做可追溯解读）
+const tokenInsightReport = ref<TokenInsightReport | null>(null);
+const tokenInsightLoading = ref(false);
+const tokenInsightError = ref("");
+const tokenInsightAnalyzing = ref(false);
 
 // OpenHub 自有 Token 采集状态；只读取本机日志并维护本地缓存。
 const tokenCollectorSyncing = ref(false);
@@ -270,12 +283,28 @@ export interface TokenMappingAnalyzeOptions {
   force?: boolean;
 }
 
-/** 调 AI 分析映射；force = true 时重跑全部条目（手工确认的行始终保留）。 */
+/** 调 AI 生成审核建议；已批准和手工映射永远不会被自动覆盖。 */
 async function analyzeTokenModelMappings(
   options: TokenMappingAnalyzeOptions = {},
 ): Promise<TokenMappingAnalyzeReport | null> {
+  if (tokenModelAnalyzing.value) return null;
   tokenModelAnalyzing.value = true;
   tokenModelAnalyzeError.value = "";
+  tokenModelAnalyzeReport.value = null;
+  tokenModelAnalyzeProgress.value = {
+    stage: "prepare",
+    processed: 0,
+    total: 0,
+    message: "正在准备 AI 辅助识别",
+  };
+  unlistenTokenModelAnalyzeProgress?.();
+  unlistenTokenModelAnalyzeProgress = await listen<TokenMappingAnalyzeProgress>(
+    "token-mapping-analysis-progress",
+    ({ payload }) => {
+      tokenModelAnalyzeProgress.value = payload;
+    },
+    { local: true },
+  );
   try {
     const report = await localCommand<TokenMappingAnalyzeReport>("analyze_token_model_mappings", {
       channelId: options.channelId || null,
@@ -290,10 +319,12 @@ async function analyzeTokenModelMappings(
     return null;
   } finally {
     tokenModelAnalyzing.value = false;
+    unlistenTokenModelAnalyzeProgress?.();
+    unlistenTokenModelAnalyzeProgress = null;
   }
 }
 
-/** 手工修改单条映射；officialModel 传空串表示清除映射（回到未确认）。 */
+/** 手工修改单条映射；officialModel 传空串表示清除映射（回到待识别）。 */
 async function setTokenModelMapping(rawModel: string, officialModel: string): Promise<boolean> {
   try {
     await localCommand<TokenModelMapping>("set_token_model_mapping", {
@@ -305,6 +336,82 @@ async function setTokenModelMapping(rawModel: string, officialModel: string): Pr
   } catch (error) {
     tokenModelMappingsError.value = String(error);
     return false;
+  }
+}
+
+async function reviewTokenModelMapping(
+  command: "approve_token_model_mapping" | "reject_token_model_mapping" | "reopen_token_model_mapping",
+  rawModel: string,
+): Promise<boolean> {
+  try {
+    await localCommand<TokenModelMapping>(command, { rawModel });
+    await loadTokenModelMappings();
+    return true;
+  } catch (error) {
+    tokenModelMappingsError.value = String(error);
+    return false;
+  }
+}
+
+function approveTokenModelMapping(rawModel: string) {
+  return reviewTokenModelMapping("approve_token_model_mapping", rawModel);
+}
+
+function rejectTokenModelMapping(rawModel: string) {
+  return reviewTokenModelMapping("reject_token_model_mapping", rawModel);
+}
+
+function reopenTokenModelMapping(rawModel: string) {
+  return reviewTokenModelMapping("reopen_token_model_mapping", rawModel);
+}
+
+/** 生成 AI 用量洞察。报告会记录范围与模型快照，避免与后续区间混淆。 */
+async function analyzeTokenInsights(packet: InsightEvidencePacket): Promise<TokenInsightReport | null> {
+  if (tokenInsightAnalyzing.value) return null;
+  tokenInsightAnalyzing.value = true;
+  tokenInsightLoading.value = true;
+  tokenInsightError.value = "";
+  try {
+    const report = await localCommand<TokenInsightReport>("analyze_token_insights", { packet });
+    tokenInsightReport.value = report;
+    return report;
+  } catch (error) {
+    tokenInsightError.value = String(error);
+    return null;
+  } finally {
+    tokenInsightAnalyzing.value = false;
+    tokenInsightLoading.value = false;
+  }
+}
+
+function clearTokenInsightReport() {
+  tokenInsightReport.value = null;
+  tokenInsightError.value = "";
+}
+
+/** 获取 Token 统计的正式模型清单（含目录导入 / user 手工 / AI 学习来源）。 */
+async function loadTokenOfficialModels(): Promise<TokenOfficialModel[]> {
+  return localCommand<TokenOfficialModel[]>("get_token_official_models");
+}
+
+/** 添加自定义正式模型（source=user）；已存在时更新名称与分组。 */
+async function addTokenOfficialModel(name: string, lab = "自定义"): Promise<boolean> {
+  try {
+    await localCommand("add_token_official_model", { id: name, name, lab });
+    return true;
+  } catch (error) {
+    tokenModelMappingsError.value = String(error);
+    return false;
+  }
+}
+
+/** 删除自定义/AI 学习来源的正式模型；目录导入的模型删除会被后端拒绝。 */
+async function removeTokenOfficialModel(id: string): Promise<string> {
+  try {
+    await localCommand("remove_token_official_model", { id });
+    return "";
+  } catch (error) {
+    return String(error);
   }
 }
 
@@ -395,13 +502,26 @@ export function useTokenStats() {
     tokenModelMappingsLoading,
     tokenModelMappingsError,
     tokenModelAnalyzeReport,
+    tokenModelAnalyzeProgress,
     tokenModelAnalyzing,
     tokenModelAnalyzeError,
     loadLocalAgentPaths,
     loadTokenModelMappings,
+    loadTokenOfficialModels,
+    addTokenOfficialModel,
+    removeTokenOfficialModel,
     bootstrapTokenModelMappings,
     analyzeTokenModelMappings,
     setTokenModelMapping,
+    approveTokenModelMapping,
+    rejectTokenModelMapping,
+    reopenTokenModelMapping,
+    tokenInsightReport,
+    tokenInsightLoading,
+    tokenInsightError,
+    tokenInsightAnalyzing,
+    analyzeTokenInsights,
+    clearTokenInsightReport,
     syncTokenCollector,
     onRangeChange,
     refreshTokenStats,

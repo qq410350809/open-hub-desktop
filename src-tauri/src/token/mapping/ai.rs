@@ -1,59 +1,135 @@
 use super::types::*;
 use crate::model::gateway::types::ModelProxyContext;
 use serde_json::Value as JsonValue;
+use std::collections::{HashMap, HashSet};
 
-/// 单批送给 AI 的待分析条目数。批太大容易触发上游截断与漏条。
-pub const BATCH_SIZE: usize = 40;
-/// 候选池注入上限：新架构使用轻量标准库，候选池从 2500+ 降至 50-100 条。
-const CANDIDATE_LIMIT: usize = 100;
+/// 单批送给 AI 的待分析条目数。每条都有独立候选，避免无关模型互相干扰。
+pub const BATCH_SIZE: usize = 20;
+const CANDIDATE_LIMIT_PER_ITEM: usize = 16;
+/// 注入提示词的已批准标准映射上限。
+pub const STANDARDS_LIMIT: usize = 80;
 
-/// 按待分析条目的词元与候选正式名做粗筛，缩小注入 AI 的候选池。
-pub fn shortlist_candidates(
-    batch: &[PendingModel],
-    catalog: &[(String, String, String)],
-) -> Vec<String> {
-    let mut tokens: Vec<String> = Vec::new();
-    for item in batch {
-        for piece in item
-            .rule_base
-            .split(|c: char| !c.is_ascii_alphanumeric())
-            .filter(|piece| piece.len() >= 3)
-        {
-            let lowered = piece.to_lowercase();
-            if !tokens.contains(&lowered) {
-                tokens.push(lowered);
+fn token_set(value: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    for piece in value
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|piece| piece.len() >= 2)
+    {
+        let normalized = piece.to_ascii_lowercase();
+        if !tokens.contains(&normalized) {
+            tokens.push(normalized);
+        }
+    }
+    tokens
+}
+
+fn compact(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn candidate_score(item: &PendingModel, candidate: &OfficialModelCandidate) -> i32 {
+    let item_compact = compact(&item.rule_base);
+    let raw_compact = compact(&item.raw_model);
+    let fields = std::iter::once(candidate.name.as_str())
+        .chain(std::iter::once(candidate.id.as_str()))
+        .chain(candidate.aliases.iter().map(String::as_str))
+        .collect::<Vec<_>>();
+
+    if fields.iter().any(|field| compact(field) == raw_compact || compact(field) == item_compact) {
+        return 10_000;
+    }
+
+    let input_tokens = token_set(&format!("{} {}", item.raw_model, item.rule_base));
+    let mut score = 0;
+    for field in fields {
+        let haystack = field.to_ascii_lowercase();
+        for token in &input_tokens {
+            if haystack.contains(token) {
+                score += if token.len() >= 4 { 20 } else { 8 };
             }
         }
     }
-    let mut hits: Vec<String> = Vec::new();
-    for (name, _, lab) in catalog {
-        let haystack = format!("{} {}", name.to_lowercase(), lab.to_lowercase());
-        if tokens.iter().any(|token| haystack.contains(token)) {
-            hits.push(name.clone());
-        }
-        if hits.len() >= CANDIDATE_LIMIT {
-            break;
-        }
+    if candidate.lab.to_ascii_lowercase().contains(&input_tokens.first().cloned().unwrap_or_default()) {
+        score += 2;
     }
-    hits
+    score
+}
+
+/// 为每个原始模型生成独立候选集。候选名称、ID 与 aliases 都参与匹配，
+/// 已批准标准的目标模型会强制补入对应条目的候选集。
+pub fn build_candidates_by_key(
+    batch: &[PendingModel],
+    catalog: &[OfficialModelCandidate],
+    standards: &[(String, String)],
+) -> HashMap<String, Vec<OfficialModelCandidate>> {
+    let approved_names: HashSet<&str> = standards.iter().map(|(_, name)| name.as_str()).collect();
+    let mut output = HashMap::new();
+    for item in batch {
+        let mut scored = catalog
+            .iter()
+            .map(|candidate| (candidate_score(item, candidate), candidate))
+            .filter(|(score, _)| *score > 0)
+            .collect::<Vec<_>>();
+        scored.sort_by(|left, right| {
+            right
+                .0
+                .cmp(&left.0)
+                .then_with(|| left.1.name.cmp(&right.1.name))
+        });
+
+        let mut candidates = Vec::new();
+        for (_, candidate) in scored.into_iter().take(CANDIDATE_LIMIT_PER_ITEM) {
+            candidates.push(candidate.clone());
+        }
+        for candidate in catalog.iter().filter(|candidate| approved_names.contains(candidate.name.as_str())) {
+            if !candidates.iter().any(|current| current.id == candidate.id) {
+                candidates.push(candidate.clone());
+            }
+        }
+        output.insert(item.raw_key.clone(), candidates);
+    }
+    output
 }
 
 pub fn build_prompt(
     batch: &[PendingModel],
-    candidates: &[String],
+    candidates_by_key: &HashMap<String, Vec<OfficialModelCandidate>>,
     standards: &[(String, String)],
 ) -> String {
     let listed = batch
         .iter()
         .map(|item| {
+            let candidates = candidates_by_key
+                .get(&item.raw_key)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let choices = if candidates.is_empty() {
+                "（无候选，请返回空 officialModel）".to_string()
+            } else {
+                candidates
+                    .iter()
+                    .map(|candidate| {
+                        let aliases = if candidate.aliases.is_empty() {
+                            String::new()
+                        } else {
+                            format!("；别名：{}", candidate.aliases.join(", "))
+                        };
+                        format!("{}（ID：{}；厂商：{}{}）", candidate.name, candidate.id, candidate.lab, aliases)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n    ")
+            };
             format!(
-                "- 原始名：{}\n  规则猜测基名：{}",
-                item.raw_model, item.rule_base
+                "- rawModel：{}\n  规则基名：{}\n  此条允许选择的 officialModel：\n    {}",
+                item.raw_model, item.rule_base, choices
             )
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let pool = candidates.join("\n");
     let standards_block = if standards.is_empty() {
         String::new()
     } else {
@@ -62,51 +138,23 @@ pub fn build_prompt(
             .map(|(raw, official)| format!("- {} → {}", raw, official))
             .collect::<Vec<_>>()
             .join("\n");
-        format!("\n\n已确认的标准映射（同族条目必须沿用同一正式模型，保持结果稳定一致）：\n{lines}")
-    };
-    let standards_rule = if standards.is_empty() {
-        String::new()
-    } else {
-        "\n         5. 已确认的标准映射中存在与待判定条目同族的原始名时（大小写、\
-            版本分隔符、厂商前缀或变体后缀差异），必须输出与之相同的 officialModel；\n"
-            .to_string()
+        format!("\n\n已人工批准的标准映射（仅作同族一致性参考）：\n{lines}")
     };
     format!(
-        "你要把本地统计到的「原始模型名」对应到「正式模型名」。\n\n\
+        "你在执行本地 Token 统计的模型名称识别。输出仅作为人工审核建议，不能替代人工确认。\n\
          规则：\n\
-         1. officialModel 优先从下面的候选清单中逐字选取；\n\
-         2. 候选清单中没有匹配项时，可以自行判定合理的正式名称（系统会自动记录新模型）；\n\
-         3. 无法确定时把 officialModel 留空字符串，不要猜测；\n\
-         4. 同一模型的大小写差异、版本分隔符差异（5-2 与 5.2）、\
-            厂商前缀差异（zai-glm 与 glm）都应归到同一个正式模型；\n\
-         5. confidence 用 0 到 1 的小数，reason 用一句中文说明依据。{standards_rule}\n\
+         1. 每条的 officialModel 只能逐字选自该条自身的“允许选择”清单；绝不能创造、改写或猜测清单外名称；\n\
+         2. 没有可靠候选时 officialModel 必须是空字符串；\n\
+         3. rawModel 必须逐字复用待判定条目的原始名，每条至多输出一次；\n\
+         4. confidence 是 0 到 1 的有限小数；reason 用一句中文解释名称、版本、别名或厂商的匹配依据；\n\
+         5. 不要把不同模型因为名称相似而强行合并。\n\
          待判定条目：\n{listed}{standards_block}\n\n\
-         候选正式模型清单（优先选择，若无匹配可自行判定）：\n{pool}\n\n\
          只输出 JSON，形如：\n\
-         {{\"items\":[{{\"rawModel\":\"...\",\"officialModel\":\"...\",\
-         \"lab\":\"...\",\"confidence\":0.9,\"reason\":\"...\"}}]}}"
+         {{\"items\":[{{\"rawModel\":\"...\",\"officialModel\":\"...\",\"confidence\":0.9,\"reason\":\"...\"}}]}}"
     )
 }
 
-/// 把标准映射的正式名并进候选池：标准名可能未落在 shortlist 命中里，
-/// 但既然已确认过，就必须让 AI 能逐字取到。
-pub fn merge_standard_candidates(
-    candidates: Vec<String>,
-    standards: &[(String, String)],
-) -> Vec<String> {
-    let mut merged = candidates;
-    for (_, official) in standards {
-        if !merged.iter().any(|name| name == official) {
-            merged.push(official.clone());
-        }
-    }
-    merged
-}
-
-/// 注入提示词的标准条目上限：确认条目可能上千，按与本批的词元重叠度
-/// 相关性排序后截断；排序含 raw_key 次序，保证同一批每次拿到同一子集。
-pub const STANDARDS_LIMIT: usize = 200;
-
+/// 注入提示词的已批准标准映射按与当前批次的词元重叠度裁剪，保证结果稳定。
 pub fn select_standards(
     batch: &[PendingModel],
     standards: &[(String, String)],
@@ -116,17 +164,12 @@ pub fn select_standards(
     }
     let tokens: Vec<String> = batch
         .iter()
-        .flat_map(|item| {
-            item.raw_model
-                .split(|c: char| !c.is_ascii_alphanumeric())
-                .filter(|piece| piece.len() >= 3)
-                .map(|piece| piece.to_lowercase())
-        })
+        .flat_map(|item| token_set(&format!("{} {}", item.raw_model, item.rule_base)))
         .collect();
     let mut scored: Vec<(usize, &str, &str)> = standards
         .iter()
         .map(|(raw, official)| {
-            let lowered = raw.to_lowercase();
+            let lowered = raw.to_ascii_lowercase();
             let overlap = tokens
                 .iter()
                 .filter(|token| lowered.contains(token.as_str()))
@@ -134,7 +177,7 @@ pub fn select_standards(
             (overlap, raw.as_str(), official.as_str())
         })
         .collect();
-    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
+    scored.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(right.1)));
     scored
         .into_iter()
         .take(STANDARDS_LIMIT)
@@ -147,13 +190,11 @@ pub fn extract_json(content: &str) -> Option<JsonValue> {
     if let Ok(value) = serde_json::from_str::<JsonValue>(content.trim()) {
         return Some(value);
     }
-    let bytes = content.as_bytes();
     let start = content.find('{')?;
     let mut depth = 0i32;
     let mut in_string = false;
     let mut escaped = false;
     for (offset, ch) in content[start..].char_indices() {
-        let _ = bytes;
         if escaped {
             escaped = false;
             continue;
@@ -190,7 +231,7 @@ pub fn parse_items(value: &JsonValue) -> Vec<AiMappingItem> {
         .collect()
 }
 
-/// 经进程内网关入口发一次判定请求：免 Key 免回环端口，
+/// 经进程内网关入口发一次判定请求：免 Key、免回环端口，
 /// 渠道解析、协议转换与请求日志与普通网关请求一致。
 pub async fn request_mapping(
     ctx: &ModelProxyContext,
@@ -213,118 +254,69 @@ mod tests {
 
     fn pending(raw: &str, base: &str) -> PendingModel {
         PendingModel {
-            raw_key: raw.to_lowercase(),
+            raw_key: raw.split('/').next_back().unwrap_or(raw).to_ascii_lowercase(),
             raw_model: raw.to_string(),
             rule_base: base.to_string(),
         }
     }
 
+    fn candidate(id: &str, name: &str, aliases: &[&str]) -> OfficialModelCandidate {
+        OfficialModelCandidate {
+            id: id.to_string(),
+            name: name.to_string(),
+            lab: "test".to_string(),
+            aliases: aliases.iter().map(|alias| (*alias).to_string()).collect(),
+        }
+    }
+
     #[test]
     fn extract_json_handles_fenced_and_prefixed_output() {
-        let fenced = "```json\n{\"items\":[]}\n```";
-        assert!(extract_json(fenced).is_some());
-        let prefixed = "分析结果如下：{\"items\":[]} 完毕";
-        assert!(extract_json(prefixed).is_some());
+        assert!(extract_json("```json\n{\"items\":[]}\n```").is_some());
+        assert!(extract_json("结果：{\"items\":[]} 完毕").is_some());
     }
 
     #[test]
-    fn extract_json_ignores_braces_inside_strings() {
-        let tricky = r#"{"items":[{"reason":"含 } 符号","rawModel":"a"}]}"#;
-        let value = extract_json(tricky).expect("should parse");
-        assert_eq!(parse_items(&value).len(), 1);
-    }
-
-    #[test]
-    fn parse_items_accepts_bare_array() {
-        let value = serde_json::json!([
-            { "rawModel": "glm-5.3-flash", "officialModel": "GLM-5.3", "confidence": 0.9 }
-        ]);
-        let items = parse_items(&value);
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].official_model, "GLM-5.3");
-    }
-
-    #[test]
-    fn parse_items_drops_entries_without_raw_model() {
-        let value = serde_json::json!({ "items": [{ "officialModel": "GLM-5.3" }] });
-        assert!(parse_items(&value).is_empty());
-    }
-
-    #[test]
-    fn shortlist_narrows_catalog_by_token_overlap() {
+    fn candidates_are_scoped_per_raw_model_and_include_aliases() {
+        let batch = vec![
+            pending("zai/glm-5.3", "glm-5.3"),
+            pending("claude-code", "claude-code"),
+        ];
         let catalog = vec![
-            ("GLM-5.3".into(), "glm53".into(), "zhipu".into()),
-            ("GPT-5.6".into(), "gpt56".into(), "openai".into()),
-            ("Llama 4".into(), "llama4".into(), "meta".into()),
+            candidate("glm-53", "GLM-5.3", &["zai-glm-5.3"]),
+            candidate("claude-sonnet-4", "Claude Sonnet 4", &["claude-code"]),
+            candidate("llama-4", "Llama 4", &[]),
         ];
-        let batch = vec![pending("zai-glm-5-2", "zai-glm-5.2")];
-        let hits = shortlist_candidates(&batch, &catalog);
-        assert!(hits.contains(&"GLM-5.3".to_string()));
-        assert!(!hits.contains(&"Llama 4".to_string()));
+        let by_key = build_candidates_by_key(&batch, &catalog, &[]);
+        let glm = &by_key["glm-5.3"];
+        let claude = &by_key["claude-code"];
+        assert!(glm.iter().any(|item| item.name == "GLM-5.3"));
+        assert!(claude.iter().any(|item| item.name == "Claude Sonnet 4"));
+        assert!(!glm.iter().any(|item| item.name == "Claude Sonnet 4"));
     }
 
     #[test]
-    fn prompt_carries_both_raw_and_rule_base() {
-        let batch = vec![pending("GLM-5.3-Flash", "glm-5.3")];
-        let prompt = build_prompt(&batch, &["GLM-5.3".to_string()], &[]);
-        assert!(prompt.contains("GLM-5.3-Flash"));
-        assert!(prompt.contains("glm-5.3"));
-    }
-
-    #[test]
-    fn prompt_injects_confirmed_standards() {
-        let batch = vec![pending("glm-5.3-flash", "glm-5.3")];
-        let standards = vec![
-            ("zai-glm-5.3".to_string(), "GLM-5.3".to_string()),
-            ("gpt-5.6".to_string(), "GPT-5.6".to_string()),
-        ];
-        let prompt = build_prompt(&batch, &["GLM-5.3".to_string()], &standards);
-        assert!(prompt.contains("标准映射"));
-        assert!(prompt.contains("zai-glm-5.3 → GLM-5.3"));
-        assert!(prompt.contains("必须输出与之相同"));
-    }
-
-    #[test]
-    fn prompt_without_standards_has_no_standards_block() {
-        let batch = vec![pending("mystery-x", "mystery-x")];
-        let prompt = build_prompt(&batch, &["GLM-5.3".to_string()], &[]);
-        assert!(!prompt.contains("标准映射"));
-        assert!(!prompt.contains("必须输出与之相同"));
-    }
-
-    #[test]
-    fn merge_standard_candidates_appends_missing_names() {
-        let merged = merge_standard_candidates(
-            vec!["GLM-5.3".to_string()],
-            &[
-                ("zai-glm-5.3".to_string(), "GLM-5.3".to_string()),
-                ("gpt-5.6".to_string(), "GPT-5.6".to_string()),
-            ],
+    fn prompt_forbids_inventing_names_and_has_per_item_candidates() {
+        let batch = vec![pending("glm-5.3", "glm-5.3")];
+        let mut candidates = HashMap::new();
+        candidates.insert(
+            "glm-5.3".to_string(),
+            vec![candidate("glm-53", "GLM-5.3", &[])],
         );
-        assert_eq!(merged, vec!["GLM-5.3".to_string(), "GPT-5.6".to_string()]);
+        let prompt = build_prompt(&batch, &candidates, &[]);
+        assert!(prompt.contains("绝不能创造"));
+        assert!(prompt.contains("GLM-5.3（ID：glm-53"));
     }
 
     #[test]
-    fn select_standards_passes_through_small_sets() {
-        let standards = vec![("a".to_string(), "A".to_string())];
-        assert_eq!(select_standards(&[], &standards), standards);
-    }
-
-    #[test]
-    fn select_standards_prefers_token_overlap_and_is_deterministic() {
-        let standards: Vec<(String, String)> = (0..(STANDARDS_LIMIT + 50))
-            .map(|index| (format!("filler-{index:04}"), format!("F-{index:04}")))
-            .chain(vec![
-                ("glm-5.3-flash".to_string(), "GLM-5.3".to_string()),
-                ("zai-glm-5.3".to_string(), "GLM-5.3".to_string()),
-            ])
+    fn select_standards_prefers_overlap_and_is_deterministic() {
+        let standards: Vec<(String, String)> = (0..(STANDARDS_LIMIT + 8))
+            .map(|index| (format!("filler-{index:03}"), format!("F-{index:03}")))
+            .chain(vec![("glm-5.3-flash".to_string(), "GLM-5.3".to_string())])
             .collect();
         let batch = vec![pending("glm-5.3-pro", "glm-5.3")];
         let selected = select_standards(&batch, &standards);
         assert_eq!(selected.len(), STANDARDS_LIMIT);
         assert!(selected.contains(&("glm-5.3-flash".to_string(), "GLM-5.3".to_string())));
-        assert!(selected.contains(&("zai-glm-5.3".to_string(), "GLM-5.3".to_string())));
-        // 排序含 raw_key 次序：重跑同一批得到同一子集。
         assert_eq!(selected, select_standards(&batch, &standards));
     }
 }

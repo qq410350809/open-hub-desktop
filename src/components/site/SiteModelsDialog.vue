@@ -1,10 +1,10 @@
 <script setup lang="ts">
 import { computed, ref, watch, nextTick } from "vue";
-import { runCommand } from "../../composables/useLibrary";
+import { runCommand, useLibrary } from "../../composables/useLibrary";
 import { icons } from "../../icons";
 import { useStore } from "../../composables/useStore";
 import { logoText } from "../../utils";
-import { systemTypeLabel } from "../../types";
+import { isUnknownSystemType, systemTypeLabel } from "../../types";
 import { useToast } from "../../composables/core/useToast";
 import { useConfirm } from "../../composables/ui/useConfirm";
 
@@ -39,6 +39,7 @@ interface LiveAccountKeys {
 
 const isTauri = "__TAURI_INTERNALS__" in window;
 const store = useStore();
+const { usageSites } = useLibrary();
 const { showToast } = useToast();
 const { confirm } = useConfirm();
 const closeBtnRef = ref<HTMLButtonElement>();
@@ -180,12 +181,12 @@ function onBackdropClick(event: MouseEvent) {
   if (event.target === event.currentTarget) close();
 }
 
-async function refreshModels(mode: "cache" | "models" = "cache") {
+async function refreshModels(mode: "cache" | "keys" | "models" = "cache") {
   const requestedSite = site.value;
   if (!requestedSite) return;
   const requestId = ++liveFetchRequestId;
   liveFetching.value = true;
-  liveFetchingKind.value = mode === "models" ? "models" : null;
+  liveFetchingKind.value = mode === "keys" ? "keys" : mode === "models" ? "models" : null;
   liveError.value = "";
   liveModels.value = [];
   // 同步模型只刷新右侧模型列表：保留左侧 Key 树、来源标签与选中 Key，不重置它们。
@@ -195,7 +196,90 @@ async function refreshModels(mode: "cache" | "models" = "cache") {
     selectedKeyId.value = null;
   }
   try {
-    if (mode !== "cache") {
+    if (mode === "keys") {
+      // 重新拉取各账号的 Key 列表并重建缓存（含模型映射）；
+      // 仅已知架构站点提供该入口，未知站点无 Key 提取能力。
+      const siteUsage = usageSites.value.find((item) => item.siteId === requestedSite.id);
+      const sessions = siteUsage?.sessions?.filter((s) => s.isValid) ?? [];
+      let baseUrl = requestedSite.apiBaseUrl.trim();
+      if (!baseUrl.endsWith("/")) baseUrl += "/";
+      if (sessions.length === 0) {
+        // 没有有效账号，尝试不带 profileId 请求。
+        try {
+          const result = await runCommand<FetchSiteModelsResult>("fetch_site_models_json", {
+            url: baseUrl,
+            siteId: requestedSite.id,
+          });
+          // 同步 Key 成功获取数据后，保存前清理掉这个站点原来的对应旧数据，避免数据冲突与旧 Key 残留
+          await runCommand("clear_site_model_cache_for_site", { siteId: requestedSite.id });
+          await runCommand("save_site_model_cache_for_account", {
+            siteId: requestedSite.id,
+            account: {
+              profileId: "",
+              profileName: "",
+              accountName: "",
+              username: "",
+              keys: result.keys ?? [],
+              keyGroups: result.keyGroups ?? {},
+              keyModels: result.keyModels ?? {},
+              error: "",
+            },
+            result,
+            preserveKeys: false,
+          });
+        } catch {
+          /* 忽略，继续读缓存 */
+        }
+      } else {
+        let clearedOldSiteData = false;
+        for (const session of sessions) {
+          if (requestId !== liveFetchRequestId) return;
+          try {
+            const result = await runCommand<FetchSiteModelsResult>("fetch_site_models_json", {
+              url: baseUrl,
+              siteId: requestedSite.id,
+              profileId: session.profileId,
+            });
+            // 同步 Key 成功获取数据后，首次保存前清理掉这个站点原来的对应旧数据，避免数据冲突与旧 Key 残留
+            if (!clearedOldSiteData) {
+              await runCommand("clear_site_model_cache_for_site", { siteId: requestedSite.id });
+              clearedOldSiteData = true;
+            }
+            await runCommand("save_site_model_cache_for_account", {
+              siteId: requestedSite.id,
+              account: {
+                profileId: session.profileId,
+                profileName: session.profileName,
+                accountName: session.accountName,
+                username: session.username,
+                keys: result.keys ?? [],
+                keyGroups: result.keyGroups ?? {},
+                keyModels: result.keyModels ?? {},
+                error: "",
+              },
+              result,
+              preserveKeys: false,
+            });
+          } catch (error) {
+            await runCommand("save_site_model_cache_for_account", {
+              siteId: requestedSite.id,
+              account: {
+                profileId: session.profileId,
+                profileName: session.profileName,
+                accountName: session.accountName,
+                username: session.username,
+                keys: [],
+                keyGroups: {},
+                keyModels: {},
+                error: String(error),
+              },
+              result: null,
+              preserveKeys: false,
+            });
+          }
+        }
+      }
+    } else if (mode === "models") {
       // 以缓存中的 Key 集合为准逐 Key 拉取 /v1/models（含手动添加的 Key，
       // 与其它入口的「同步 Key」语义一致：不重建 Key 列表，只刷新模型映射）。
       const result = await runCommand<FetchSiteModelsResult>("sync_models_for_cached_keys", {
@@ -408,6 +492,18 @@ async function removeKey(account: LiveAccountKeys, key: string) {
           </div>
 
           <div class="site-models-actions">
+            <!-- 同步 Key：重新拉取站点 API Key 列表；未知架构站点无 Key 提取能力，不提供该入口 -->
+            <button
+              v-if="site && !isUnknownSystemType(site.systemType)"
+              type="button"
+              class="site-models-icon-btn"
+              :disabled="liveFetching"
+              :aria-label="liveFetchingKind === 'keys' ? '正在同步 Key' : '同步 Key：拉取站点 API Key 列表'"
+              title="同步 Key：拉取站点 API Key 列表"
+              @click="refreshModels('keys')"
+            >
+              <span v-html="icons.key" :class="{ 'site-models-spin': liveFetchingKind === 'keys' }" />
+            </button>
             <button
               type="button"
               class="site-models-icon-btn"

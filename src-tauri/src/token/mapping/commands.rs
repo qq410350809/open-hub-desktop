@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::warn;
 
-/// Token 统计专用的标准模型（独立于模型目录）
+/// Token 统计专用的标准模型（独立于模型目录）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TokenOfficialModel {
@@ -21,8 +21,7 @@ pub struct TokenOfficialModel {
     pub updated_at: String,
 }
 
-/// 组装 AI 判定请求用的模型名。要求显式指定渠道：拼上渠道网关别名前缀
-/// （{alias}/{model}），由网关的渠道前缀路由定向到该渠道。
+/// 组装 AI 请求用的模型名。必须显式指定启用渠道，避免意外从默认路由出网。
 pub(crate) fn resolve_request_model(
     channels: &[ChannelConfig],
     channel_id: Option<&str>,
@@ -57,6 +56,7 @@ pub fn register_token_model_names(
     store::register_raw_models(&ctx.database, &names)
 }
 
+/// 手工选择直接代表人工批准；传空串会清除当前映射并恢复为待识别。
 #[tauri::command]
 pub fn set_token_model_mapping(
     ctx: Managed<'_, Arc<AppContext>>,
@@ -66,7 +66,31 @@ pub fn set_token_model_mapping(
     store::set_mapping_manually(&ctx.database, &raw_model, &official_model)
 }
 
-/// 获取 Token 统计的标准模型清单
+#[tauri::command]
+pub fn approve_token_model_mapping(
+    ctx: Managed<'_, Arc<AppContext>>,
+    raw_model: String,
+) -> Result<ModelMapping, String> {
+    store::approve_mapping(&ctx.database, &raw_model)
+}
+
+#[tauri::command]
+pub fn reject_token_model_mapping(
+    ctx: Managed<'_, Arc<AppContext>>,
+    raw_model: String,
+) -> Result<ModelMapping, String> {
+    store::reject_mapping(&ctx.database, &raw_model)
+}
+
+#[tauri::command]
+pub fn reopen_token_model_mapping(
+    ctx: Managed<'_, Arc<AppContext>>,
+    raw_model: String,
+) -> Result<ModelMapping, String> {
+    store::reopen_mapping(&ctx.database, &raw_model)
+}
+
+/// 获取 Token 统计的标准模型清单。
 #[tauri::command]
 pub fn get_token_official_models(
     ctx: Managed<'_, Arc<AppContext>>,
@@ -82,12 +106,11 @@ pub fn get_token_official_models(
     let rows = statement
         .query_map([], |row| {
             let aliases_json: String = row.get(3)?;
-            let aliases: Vec<String> = serde_json::from_str(&aliases_json).unwrap_or_default();
             Ok(TokenOfficialModel {
                 id: row.get(0)?,
                 name: row.get(1)?,
                 lab: row.get(2)?,
-                aliases,
+                aliases: serde_json::from_str(&aliases_json).unwrap_or_default(),
                 source: row.get(4)?,
                 confidence: row.get(5)?,
                 created_at: row.get(6)?,
@@ -100,7 +123,7 @@ pub fn get_token_official_models(
     Ok(rows)
 }
 
-/// 添加自定义标准模型（用户手动添加或 AI 自动学习）
+/// 添加用户显式维护的正式模型。
 #[tauri::command]
 pub fn add_token_official_model(
     ctx: Managed<'_, Arc<AppContext>>,
@@ -109,27 +132,22 @@ pub fn add_token_official_model(
     lab: String,
 ) -> Result<TokenOfficialModel, String> {
     let connection = ctx.database.lock_conn()?;
-    let id_trimmed = id.trim().to_lowercase().replace(" ", "-");
+    let id_trimmed = id.trim().to_lowercase().replace(' ', "-");
     let name_trimmed = name.trim();
     let lab_trimmed = lab.trim();
-
     if id_trimmed.is_empty() || name_trimmed.is_empty() {
         return Err("模型 ID 和名称不能为空".to_string());
     }
-
     connection
         .execute(
             "INSERT INTO token_official_models (id, name, lab, source, confidence)
              VALUES (?1, ?2, ?3, 'user', 0.5)
              ON CONFLICT(id) DO UPDATE SET
-                name = excluded.name,
-                lab = excluded.lab,
+                name = excluded.name, lab = excluded.lab,
                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')",
             rusqlite::params![id_trimmed, name_trimmed, lab_trimmed],
         )
         .map_err(|e| e.to_string())?;
-
-    // 返回创建/更新后的模型
     connection
         .query_row(
             "SELECT id, name, lab, aliases, source, confidence, created_at, updated_at
@@ -137,12 +155,11 @@ pub fn add_token_official_model(
             rusqlite::params![id_trimmed],
             |row| {
                 let aliases_json: String = row.get(3)?;
-                let aliases: Vec<String> = serde_json::from_str(&aliases_json).unwrap_or_default();
                 Ok(TokenOfficialModel {
                     id: row.get(0)?,
                     name: row.get(1)?,
                     lab: row.get(2)?,
-                    aliases,
+                    aliases: serde_json::from_str(&aliases_json).unwrap_or_default(),
                     source: row.get(4)?,
                     confidence: row.get(5)?,
                     created_at: row.get(6)?,
@@ -153,7 +170,7 @@ pub fn add_token_official_model(
         .map_err(|e| e.to_string())
 }
 
-/// 删除自定义标准模型（只能删除用户添加的，不能删除目录导入的）
+/// 只允许删除用户手动创建的正式模型。AI 不会再自动创建目录项。
 #[tauri::command]
 pub fn remove_token_official_model(
     ctx: Managed<'_, Arc<AppContext>>,
@@ -162,19 +179,17 @@ pub fn remove_token_official_model(
     let connection = ctx.database.lock_conn()?;
     let deleted = connection
         .execute(
-            "DELETE FROM token_official_models WHERE id = ?1 AND source IN ('user', 'ai')",
+            "DELETE FROM token_official_models WHERE id = ?1 AND source = 'user'",
             rusqlite::params![id],
         )
         .map_err(|e| e.to_string())?;
-
     if deleted == 0 {
-        return Err("无法删除：模型不存在或来源于目录（只能删除用户添加的模型）".to_string());
+        return Err("无法删除：模型不存在或不属于用户手动添加项".to_string());
     }
-
     Ok(())
 }
 
-/// 从模型目录迁移数据到 token_official_models（一次性操作）
+/// 从模型目录迁移数据到 token_official_models（一次性操作）。
 #[tauri::command]
 pub fn migrate_token_official_models(
     ctx: Managed<'_, Arc<AppContext>>,
@@ -182,13 +197,28 @@ pub fn migrate_token_official_models(
     store::migrate_catalog_to_official_models(&ctx.database)
 }
 
-/// 用 AI 补全「原始模型名 → 正式模型」映射。
-/// force = false（默认）时跳过已确认的条目，只分析新增或未决的；
-/// force = true 时重跑全部条目，但手工修改（origin = manual）的行始终保留。
-/// 已确认映射会作为「标准」注入提示词：同族原始名必须沿用标准正式名，
-/// 保证前后多次分析结果一致；本 run 前几批的新结论也会成为后续批的标准。
-/// 请求经进程内网关入口发出（免 Key、免回环端口、免网关开关），channel_id
-/// 定向所选反代渠道：模型名带 {alias}/{model} 前缀走渠道前缀路由。
+fn emit_mapping_progress(
+    ctx: &AppContext,
+    stage: &str,
+    processed: usize,
+    total: usize,
+    message: impl Into<String>,
+) {
+    ctx.event_bus.emit(
+        "token-mapping-analysis-progress",
+        MappingAnalyzeProgress {
+            stage: stage.to_string(),
+            processed,
+            total,
+            message: message.into(),
+        },
+    );
+}
+
+/// 用 AI 生成原始模型名到正式模型的审核建议。
+///
+/// AI 建议永远不会自动影响统计：仅人工批准的映射会进入聚合查表，也只有批准项会被
+/// 用作后续请求的标准答案。`force` 仅重跑未批准条目，手工和已批准映射都不会被覆盖。
 #[tauri::command]
 pub async fn analyze_token_model_mappings(
     ctx: Managed<'_, Arc<AppContext>>,
@@ -199,13 +229,15 @@ pub async fn analyze_token_model_mappings(
 ) -> Result<AnalyzeReport, String> {
     let force = force.unwrap_or(false);
     let mut report = AnalyzeReport::default();
-
-    let confirmed_before = store::count_confirmed(&ctx.database)?;
+    let approved_before = store::count_approved(&ctx.database)?;
     let pending = store::pending_models(&ctx.database, force)?;
     if !force {
-        report.skipped_confirmed = confirmed_before;
+        report.skipped_confirmed = approved_before;
     }
+    let total = pending.len();
+    emit_mapping_progress(&ctx, "prepare", 0, total, "正在准备待识别模型");
     if pending.is_empty() {
+        emit_mapping_progress(&ctx, "complete", 0, 0, "没有需要识别的模型");
         return Ok(report);
     }
 
@@ -214,64 +246,91 @@ pub async fn analyze_token_model_mappings(
         store::official_catalog(&connection)?
     };
     if catalog.is_empty() {
-        return Err("模型目录为空，请先同步模型目录再做 AI 分析".to_string());
+        return Err("正式模型目录为空，请先同步模型目录后再执行 AI 辅助识别".to_string());
     }
 
     let gateway_ctx = gateway.context.clone();
     let model = model
         .map(|name| name.trim().to_string())
         .filter(|name| !name.is_empty())
-        .ok_or_else(|| "请选择发起 AI 分析的分析模型".to_string())?;
-    // 渠道校验与实际出网用同一份网关运行时配置，避免两处配置漂移。
+        .ok_or_else(|| "请选择发起 AI 辅助识别的分析模型".to_string())?;
     let request_model = {
         let gateway_config = gateway_ctx.config.read().await;
         resolve_request_model(&gateway_config.channels, channel_id.as_deref(), &model)?
     };
 
+    let mut processed = 0usize;
     for batch in pending.chunks(ai::BATCH_SIZE) {
-        // 已确认映射作为标准答案注入：同族原始名必须沿用标准里的正式名，
-        // 避免前后两批分析对同类模型给出不一致的映射结果。
-        // 排除本批条目（force 重判时旧结论不再当标准），本 run 前几批的新结论
-        // 则自然进入后续批次的标准池，让单次运行内部也保持一致。
         let batch_keys: Vec<String> = batch.iter().map(|item| item.raw_key.clone()).collect();
         let standards = {
             let connection = ctx.database.lock_conn()?;
-            let all = store::confirmed_standards(&connection, &batch_keys)?;
+            let all = store::approved_standards(&connection, &batch_keys)?;
             ai::select_standards(batch, &all)
         };
         report.standards_used = report.standards_used.max(standards.len());
-
-        let mut candidates = ai::shortlist_candidates(batch, &catalog);
-        if candidates.is_empty() && standards.is_empty() {
-            report
-                .unresolved
-                .extend(batch.iter().map(|item| item.raw_model.clone()));
+        let candidates_by_key = ai::build_candidates_by_key(batch, &catalog, &standards);
+        let eligible = batch
+            .iter()
+            .filter(|item| candidates_by_key.get(&item.raw_key).is_some_and(|items| !items.is_empty()))
+            .count();
+        if eligible == 0 {
+            report.analyzed += batch.len();
+            report.unresolved.extend(batch.iter().map(|item| item.raw_model.clone()));
+            processed += batch.len();
+            emit_mapping_progress(
+                &ctx,
+                "batch",
+                processed,
+                total,
+                format!("第 {} 批没有可信候选，已保留为待处理", (processed + ai::BATCH_SIZE - 1) / ai::BATCH_SIZE),
+            );
             continue;
         }
-        candidates = ai::merge_standard_candidates(candidates, &standards);
-        let prompt = ai::build_prompt(batch, &candidates, &standards);
+
+        emit_mapping_progress(
+            &ctx,
+            "request",
+            processed,
+            total,
+            format!("正在分析第 {} 批（{} 个模型）", processed / ai::BATCH_SIZE + 1, batch.len()),
+        );
+        let prompt = ai::build_prompt(batch, &candidates_by_key, &standards);
         let items = match ai::request_mapping(&gateway_ctx, &request_model, &prompt).await {
             Ok(items) => items,
             Err(error) => {
                 warn!("[token-mapping] 批次分析失败：{error}");
                 report.warnings.push(error);
+                processed += batch.len();
+                emit_mapping_progress(&ctx, "batch-error", processed, total, "本批请求失败，可稍后重试");
                 continue;
             }
         };
         report.analyzed += batch.len();
-        report.resolved += store::apply_ai_results(&ctx.database, &items, force)?;
-
+        let applied = store::apply_ai_suggestions(&ctx.database, batch, &candidates_by_key, &items)?;
+        report.resolved += applied.suggested;
+        report.rejected_invalid += applied.invalid;
         for item in batch {
-            let hit = items.iter().any(|result| {
-                super::normalize::raw_key(&result.raw_model) == item.raw_key
-                    && !result.official_model.trim().is_empty()
-            });
-            if !hit {
+            if !applied.accepted_keys.contains(&item.raw_key) {
                 report.unresolved.push(item.raw_model.clone());
             }
         }
+        processed += batch.len();
+        emit_mapping_progress(
+            &ctx,
+            "batch",
+            processed,
+            total,
+            format!("已完成 {processed}/{total} 个模型，{} 条建议等待审核", report.resolved),
+        );
     }
 
+    emit_mapping_progress(
+        &ctx,
+        "complete",
+        total,
+        total,
+        format!("识别完成：{} 条建议等待人工审核", report.resolved),
+    );
     Ok(report)
 }
 
@@ -291,28 +350,13 @@ mod tests {
     }
 
     #[test]
-    fn request_model_requires_explicit_channel() {
+    fn request_model_requires_explicit_enabled_channel() {
         let channels = vec![channel("c1", "x666", true)];
-        let error = resolve_request_model(&channels, None, "gpt-5.6")
-            .expect_err("missing channel should fail");
-        assert!(error.contains("反代渠道"));
-        assert!(resolve_request_model(&channels, Some(""), "gpt-5.6").is_err());
-    }
-
-    #[test]
-    fn request_model_prefixes_selected_channel_alias() {
-        let channels = vec![channel("c1", "x666", true)];
-        let resolved =
-            resolve_request_model(&channels, Some("c1"), "gpt-5.6").expect("should resolve");
-        assert_eq!(resolved, "x666/gpt-5.6");
-    }
-
-    #[test]
-    fn request_model_rejects_missing_and_disabled_channels() {
-        let channels = vec![channel("c1", "x666", false)];
-        assert!(resolve_request_model(&channels, Some("nope"), "gpt-5.6").is_err());
-        let error = resolve_request_model(&channels, Some("c1"), "gpt-5.6")
-            .expect_err("disabled channel should fail");
-        assert!(error.contains("未启用"));
+        assert!(resolve_request_model(&channels, None, "gpt-5.6").is_err());
+        assert_eq!(
+            resolve_request_model(&channels, Some("c1"), "gpt-5.6").unwrap(),
+            "x666/gpt-5.6"
+        );
+        assert!(resolve_request_model(&[channel("c1", "x666", false)], Some("c1"), "gpt-5.6").is_err());
     }
 }

@@ -1787,6 +1787,7 @@ pub(crate) fn ensure_charity_feed_sources_table(connection: &Connection) -> Resu
                 origin TEXT NOT NULL DEFAULT 'rule',
                 confidence REAL NOT NULL DEFAULT 0,
                 reason TEXT,
+                review_status TEXT NOT NULL DEFAULT 'pending',
                 confirmed INTEGER NOT NULL DEFAULT 0,
                 updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
             );
@@ -1795,6 +1796,46 @@ pub(crate) fn ensure_charity_feed_sources_table(connection: &Connection) -> Resu
                 ON token_model_mappings(confirmed);
             CREATE INDEX IF NOT EXISTS idx_token_model_mappings_official
                 ON token_model_mappings(official_model);",
+        )
+        .map_err(|error| error.to_string())?;
+
+    let has_review_status: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('token_model_mappings') WHERE name='review_status'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if has_review_status == 0 {
+        connection
+            .execute(
+                "ALTER TABLE token_model_mappings ADD COLUMN review_status TEXT NOT NULL DEFAULT 'pending'",
+                [],
+            )
+            .map_err(|error| error.to_string())?;
+
+        // 旧版本把所有 AI 结果直接标为已确认。升级后必须回到待审核，
+        // 只有手工映射和旧规则/迁移记录继续作为已批准的统计口径。
+        connection
+            .execute_batch(
+                "UPDATE token_model_mappings
+                   SET review_status = CASE
+                     WHEN origin = 'ai' THEN 'suggested'
+                     WHEN confirmed = 1 THEN 'approved'
+                     ELSE 'pending'
+                   END;
+                 UPDATE token_model_mappings
+                   SET confirmed = 0
+                   WHERE review_status != 'approved';
+                 CREATE INDEX IF NOT EXISTS idx_token_model_mappings_review_status
+                   ON token_model_mappings(review_status);",
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    connection
+        .execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_token_model_mappings_review_status
+               ON token_model_mappings(review_status);",
         )
         .map_err(|error| error.to_string())?;
 
@@ -1818,25 +1859,38 @@ fn initialize_token_official_models(connection: &Connection) -> Result<(), Strin
         return Ok(()); // 已初始化过，跳过
     }
 
-    connection
-        .execute_batch(
-            "INSERT OR IGNORE INTO token_official_models (id, name, lab, source, confidence)
-             SELECT
-                LOWER(COALESCE(slug, id)) as id,
-                name,
-                lab,
-                'catalog' as source,
-                1.0 as confidence
-             FROM model_catalog_models
-             WHERE status = 'ga'
-               AND lab IN ('openai','anthropic','google','zhipu','alibaba','deepseek',
-                          'mistral','meta','cohere','01-ai','moonshot','baichuan','minimax')
-               AND kind IN ('chat','reasoning')
-             ORDER BY last_updated DESC",
+    // 模型目录表可能尚未创建（如测试夹具或全新库首次初始化），
+    // 此时跳过目录导入，不阻断标准清单与映射表的建表流程。
+    let catalog_exists: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='model_catalog_models'",
+            [],
+            |row| row.get(0),
         )
-        .map_err(|error| error.to_string())?;
+        .unwrap_or(0);
 
-    // 将已确认映射中的正式模型补录到清单中（数据迁移）
+    if catalog_exists > 0 {
+        connection
+            .execute_batch(
+                "INSERT OR IGNORE INTO token_official_models (id, name, lab, source, confidence)
+                 SELECT
+                    LOWER(COALESCE(slug, id)) as id,
+                    name,
+                    lab,
+                    'catalog' as source,
+                    1.0 as confidence
+                 FROM model_catalog_models
+                 WHERE status = 'ga'
+                   AND lab IN ('openai','anthropic','google','zhipu','alibaba','deepseek',
+                              'mistral','meta','cohere','01-ai','moonshot','baichuan','minimax')
+                   AND kind IN ('chat','reasoning')
+                 ORDER BY last_updated DESC",
+            )
+            .map_err(|error| error.to_string())?;
+    }
+
+    // 将已批准映射中的正式模型补录到清单中（数据迁移）。
+    // review_status 列在旧库上由前面的迁移逻辑保证存在。
     connection
         .execute_batch(
             "INSERT OR IGNORE INTO token_official_models (id, name, lab, source, confidence)

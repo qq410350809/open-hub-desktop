@@ -672,6 +672,8 @@ export interface TokenModelMapping {
   origin: "rule" | "ai" | "manual";
   confidence: number;
   reason: string | null;
+  reviewStatus: "pending" | "suggested" | "approved" | "rejected";
+  /** 兼容旧接口；仅 reviewStatus 为 approved 时为 true。 */
   confirmed: boolean;
   updatedAt: string;
 }
@@ -679,11 +681,69 @@ export interface TokenModelMapping {
 export interface TokenMappingAnalyzeReport {
   analyzed: number;         // 本次实际送给 AI 的条目数
   skippedConfirmed: number; // 因已确认而跳过的条目数
-  resolved: number;         // 成功写回映射的条目数
-  standardsUsed: number;    // 注入提示词的已确认标准映射条数
+  resolved: number;         // 通过本地校验、等待人工审核的建议数
+  rejectedInvalid: number;  // 越批、候选不合法或置信度不合法而被拒绝的条目数
+  standardsUsed: number;    // 注入提示词的已批准标准映射条数
   unresolved: string[];     // AI 未能给出正式模型的原始名
   warnings: string[];
 }
+
+export interface TokenMappingAnalyzeProgress {
+  stage: string;
+  processed: number;
+  total: number;
+  message: string;
+}
+
+/** Token 统计的正式模型清单（含目录导入 / user 手工来源）。 */
+export interface TokenOfficialModel {
+  id: string;
+  name: string;
+  lab: string;
+  aliases: string[];
+  source: string;
+  confidence: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+// —— AI 用量洞察：前端确定性证据 + AI 可追溯解读 ——
+export interface InsightEvidence {
+  /** 程序生成的稳定证据 ID；AI 结论必须引用它。 */
+  id: string;
+  /** 证据中文说明。 */
+  summary: string;
+  /** 关键数值（如总量、百分比）。 */
+  value: string;
+}
+
+export interface InsightEvidencePacket {
+  /** 用户可读的时间范围说明。 */
+  rangeLabel: string;
+  analysisModel: string;
+  evidence: InsightEvidence[];
+}
+
+export interface InsightFinding {
+  title: string;
+  detail: string;
+  severity: "info" | "low" | "medium" | "high";
+  evidence: string[];
+}
+
+export interface TokenInsightReport {
+  rangeLabel: string;
+  analysisModel: string;
+  generatedAt: string;
+  headline: string;
+  findings: InsightFinding[];
+  recommendations: InsightFinding[];
+  evidenceTotal: number;
+  evidenceUsed: number;
+  /** 证据不足或 AI 结论被裁剪时的提示。 */
+  notice: string;
+}
+
 
 // —— 请求/对话活动：多工具直读后的小时桶 ——
 export interface RequestHealthBucket {

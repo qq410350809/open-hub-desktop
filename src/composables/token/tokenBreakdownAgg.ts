@@ -40,13 +40,14 @@ export type ModelMappingLookup = Map<string, string>;
 
 /** 由映射表构建归组查表（只收已确定正式名的行）。 */
 export function buildModelMappingLookup(
-  mappings: { rawKey?: string; rawModel?: string; officialModel?: string }[] | null | undefined,
+  mappings: { rawKey?: string; rawModel?: string; officialModel?: string; reviewStatus?: string; confirmed?: boolean }[] | null | undefined,
 ): ModelMappingLookup | undefined {
   if (!mappings?.length) return undefined;
   const lookup: ModelMappingLookup = new Map();
   for (const item of mappings) {
     const official = (item.officialModel || "").trim();
-    if (!official) continue;
+    // AI 建议尚未经过人工审核，不能改变统计归组口径。
+    if (!official || (item.reviewStatus && item.reviewStatus !== "approved") || (!item.reviewStatus && !item.confirmed)) continue;
     const key = item.rawKey?.trim() || modelRawKey(item.rawModel || "");
     if (key) lookup.set(key, official);
   }
