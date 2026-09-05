@@ -10,7 +10,7 @@ import { icons } from "../../icons";
 import { useStore } from "../../composables/useStore";
 import { usePreferences } from "../../composables/usePreferences";
 import { useProxyTokenStats } from "../../composables/proxy/useProxyTokenStats";
-import { useModelProxy } from "../../composables/proxy/useModelProxy";
+import { useModelProxy, filterChannelModels } from "../../composables/proxy/useModelProxy";
 import { useConfirm } from "../../composables/ui/useConfirm";
 import type {
   TokenModelMapping,
@@ -621,31 +621,51 @@ watch(mappingChannelOptions, (options) => {
   }
 }, { immediate: true });
 
-// 分析模型候选：从官方模型目录获取（用户手工添加 + AI 自动学习 + 数据迁移）
-const mappingModelSuggestions = computed(() => {
+// 分析模型候选（模型名称识别）：所选反代渠道实际可调用的模型。
+// 后端按所选渠道拼「alias/裸模型」前缀精确路由，官方目录名未必能在该渠道调用
+const mappingChannelModelSuggestions = computed(() => {
+  const id = mappingChannelId.value;
+  if (!id) return [];
+  const channel = mappingProxy.proxyConfig.value.channels.find((c) => c.id === id);
+  // 与「管理可用模型」列表同口径：免费渠道过滤 + enabledModels 白名单（null = 全部启用）
+  return [...new Set(filterChannelModels(channel, mappingProxy.modelsForChannel(id)))].sort(
+    (a, b) => a.localeCompare(b, undefined, { numeric: true })
+  );
+});
+
+const mappingModelSelectOptions = computed(() => {
+  return mappingChannelModelSuggestions.value.map((model) => ({
+    value: model,
+    text: model,
+  }));
+});
+
+// 渠道切换 / 候选异步加载完成：当前选择失效则清空，并自动选中首个候选，弹窗即时可用
+watch(
+  mappingChannelModelSuggestions,
+  (list) => {
+    if (mappingModel.value && !list.includes(mappingModel.value)) {
+      mappingModel.value = "";
+    }
+    if (!mappingModel.value && list.length) {
+      mappingModel.value = list[0];
+    }
+  },
+  { immediate: true }
+);
+
+// 洞察分析模型候选：沿用官方模型目录（用户手工添加 + AI 自动学习 + 数据迁移），
+// 裸模型名由网关按渠道白名单匹配路由
+const insightModelSelectOptions = computed(() => {
   const models = new Set<string>();
   for (const group of mappingCatalogGroups.value) {
     for (const option of group.options) {
       models.add(option.value);
     }
   }
-  return [...models].sort((a, b) =>
-    a.localeCompare(b, undefined, { numeric: true })
-  );
-});
-
-const mappingModelSelectOptions = computed(() => {
-  return mappingModelSuggestions.value.map((model) => ({
-    value: model,
-    text: model,
-  }));
-});
-
-// 当模型列表变化时，如果当前选择的模型不在列表中，则清空选择
-watch(mappingModelSuggestions, () => {
-  if (mappingModel.value && !mappingModelSuggestions.value.includes(mappingModel.value)) {
-    mappingModel.value = "";
-  }
+  return [...models]
+    .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }))
+    .map((model) => ({ value: model, text: model }));
 });
 
 async function openMappingDialog() {
@@ -778,13 +798,9 @@ const insightSubmittedRange = computed(() => store.tokenInsightReport.value?.ran
 
 function formatTokenCompact(value: number): string {
   if (value >= 1_000_000_000) return `${(value / 1_000_000_000).toFixed(2)}B`;
-  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(2)}M`;
+  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`;
   if (value >= 1_000) return `${(value / 1_000).toFixed(1)}K`;
   return String(Math.round(value));
-}
-
-function insightModelSuggestions(): string[] {
-  return mappingModelSuggestions.value;
 }
 
 /** 环比对比区间：与所选范围等长的紧邻前段。 */
@@ -988,7 +1004,13 @@ async function runInsightAnalysis() {
 
 function openInsightDialog() {
   insightDialogOpen.value = true;
-  if (!insightModel.value) insightModel.value = mappingModel.value;
+  // 识别弹窗选的是渠道裸模型名，仅当它也在目录候选中时才作为洞察默认值
+  if (
+    !insightModel.value &&
+    insightModelSelectOptions.value.some((opt) => opt.value === mappingModel.value)
+  ) {
+    insightModel.value = mappingModel.value;
+  }
 }
 
 /** 证据 ID → 中文说明，用于报告中的“依据”标注。 */
@@ -3060,6 +3082,9 @@ onBeforeUnmount(() => {
             <p v-if="!mappingHasChannels" class="tt-mapping-error">
               未检测到已启用的反代渠道，请先在「模型代理」页面启用一个渠道。
             </p>
+            <p v-else-if="!mappingInitializing && mappingModelSelectOptions.length === 0" class="tt-mapping-error">
+              所选渠道暂无可用模型，请先在「模型代理 → 管理可用模型」中刷新上游模型并勾选启用
+            </p>
             <p class="tt-mapping-hint">
               <span v-html="icons.info" />
               <span>
@@ -3397,7 +3422,7 @@ onBeforeUnmount(() => {
                 <span>分析模型</span>
                 <CustomSelect
                   v-model="insightModel"
-                  :options="mappingModelSelectOptions"
+                  :options="insightModelSelectOptions"
                   placeholder="选择已生效模型"
                   :searchable="true"
                 />
