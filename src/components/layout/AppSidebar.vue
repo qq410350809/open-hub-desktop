@@ -80,8 +80,8 @@ const navItems = computed(() => [
   },
   {
     id: "modeltest",
-    label: "模型测试",
-    icon: icons.flask,
+    label: "模型验真",
+    icon: icons.shield,
     active: store.page.value === "modeltest",
     onClick: () => store.openModelTest(),
   },

@@ -177,7 +177,9 @@ const widestOptionText = computed(() => {
   return widest;
 });
 
-watch(() => [props.options, props.modelValue], syncDisplay, { deep: true, immediate: true });
+// groups 常为异步加载（如代理池节点候选）：必须纳入 watch 源，
+// 否则挂载时 groups 为空、加载完成后选中文案不会重新解析，下拉看似「未默认选中」
+watch(() => [props.options, props.groups, props.modelValue], syncDisplay, { deep: true, immediate: true });
 
 function toggle(e?: Event) {
   e?.stopPropagation();
