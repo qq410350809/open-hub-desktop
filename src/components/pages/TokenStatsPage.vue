@@ -604,7 +604,13 @@ async function addMappingOfficialModel() {
 // 渠道下拉：仅列出已启用的反代渠道；分析请求必须指定渠道
 const mappingChannelOptions = computed(() => {
   const channels = mappingProxy.proxyConfig.value.channels.filter((channel) => channel.enabled);
-  return channels.map((channel) => ({ value: channel.id, text: channel.name || channel.id }));
+  return channels.map((channel) => {
+    const alias = channel.alias?.trim() || "";
+    if (channel.name && alias) {
+      return { value: channel.id, text: `${channel.name} (${alias})` };
+    }
+    return { value: channel.id, text: channel.name || channel.id };
+  });
 });
 
 // 无渠道可选时禁用分析；有渠道但尚未选中时默认取第一个
@@ -615,13 +621,31 @@ watch(mappingChannelOptions, (options) => {
   }
 }, { immediate: true });
 
-// 分析模型候选：渠道的原始模型列表（不受「管理可用模型」白名单限制），支持自由输入任意模型 ID
+// 分析模型候选：从官方模型目录获取（用户手工添加 + AI 自动学习 + 数据迁移）
 const mappingModelSuggestions = computed(() => {
-  const channel = mappingProxy.proxyConfig.value.channels.find(
-    (item) => item.id === mappingChannelId.value,
+  const models = new Set<string>();
+  for (const group of mappingCatalogGroups.value) {
+    for (const option of group.options) {
+      models.add(option.value);
+    }
+  }
+  return [...models].sort((a, b) =>
+    a.localeCompare(b, undefined, { numeric: true })
   );
-  if (!channel) return [];
-  return [...new Set(mappingProxy.modelsForChannel(channel.id))];
+});
+
+const mappingModelSelectOptions = computed(() => {
+  return mappingModelSuggestions.value.map((model) => ({
+    value: model,
+    text: model,
+  }));
+});
+
+// 当模型列表变化时，如果当前选择的模型不在列表中，则清空选择
+watch(mappingModelSuggestions, () => {
+  if (mappingModel.value && !mappingModelSuggestions.value.includes(mappingModel.value)) {
+    mappingModel.value = "";
+  }
 });
 
 async function openMappingDialog() {
@@ -665,7 +689,7 @@ async function ensureMappingCatalog(force = false) {
   mappingCatalogLoading.value = true;
   mappingCatalogError.value = "";
   try {
-    // 候选来自正式模型清单（目录导入 + user 手工 + AI 学习），自定义模型会实时出现在这里
+    // 候选来自正式模型清单（用户手工添加 + AI 自动学习 + 数据迁移），自定义模型会实时出现在这里
     const models = await runLocalCommand<TokenOfficialModel[]>("get_token_official_models");
     const groups = new Map<string, { value: string; text: string }[]>();
     const seen = new Set<string>();
@@ -2997,22 +3021,22 @@ onBeforeUnmount(() => {
                   :options="mappingChannelOptions"
                   :model-value="mappingChannelId"
                   aria-label="选择反代渠道"
+                  searchable
+                  search-placeholder="搜索渠道..."
                   @update:model-value="mappingChannelId = String($event)"
                 />
               </label>
               <label class="tt-mapping-field">
                 <span>分析模型</span>
-                <input
-                  v-model="mappingModel"
-                  type="text"
-                  class="tt-mapping-model-input"
-                  list="tt-mapping-model-suggestions"
-                  placeholder="输入模型 ID，可自定义"
-                  spellcheck="false"
+                <CustomSelect
+                  :options="mappingModelSelectOptions"
+                  :model-value="mappingModel"
+                  aria-label="选择分析模型"
+                  searchable
+                  search-placeholder="搜索模型..."
+                  placeholder="请选择模型"
+                  @update:model-value="mappingModel = String($event)"
                 />
-                <datalist id="tt-mapping-model-suggestions">
-                  <option v-for="model in mappingModelSuggestions" :key="model" :value="model" />
-                </datalist>
               </label>
               <button
                 type="button"
@@ -3099,7 +3123,17 @@ onBeforeUnmount(() => {
                 >已生效 ({{ mappingConvertedGroups.length }})</button>
               </div>
               <div class="tt-mapping-counter">
-                <span v-if="mappingSuggestedCount > 0" class="tt-mapping-counter-chip is-brand">
+                <button
+                  v-if="mappingSuggestedCount > 0"
+                  type="button"
+                  class="tt-mapping-counter-chip is-brand is-clickable"
+                  :class="{ 'is-active': mappingRawFilter === 'unmapped' }"
+                  @click="setMappingFilter('unmapped')"
+                  :title="mappingRawFilter === 'unmapped' ? '点击显示全部' : '点击仅显示待处理'"
+                >
+                  {{ mappingSuggestedCount }} 条待审核
+                </button>
+                <span v-else class="tt-mapping-counter-chip is-brand">
                   {{ mappingSuggestedCount }} 条待审核
                 </span>
                 <span class="tt-mapping-counter-chip">已生效 {{ mappingApprovedCount }} / 共 {{ mappingCoverage.total }}</span>
@@ -3137,6 +3171,8 @@ onBeforeUnmount(() => {
                   :groups="mappingCatalogGroups"
                   :model-value="mappingBatchTarget"
                   aria-label="选择批量映射目标"
+                  searchable
+                  search-placeholder="搜索模型..."
                   @update:model-value="mappingBatchTarget = String($event)"
                 />
                 <input
@@ -3207,6 +3243,8 @@ onBeforeUnmount(() => {
                         :groups="mappingCatalogGroups"
                         :model-value="row.officialModel"
                         :aria-label="`为 ${row.rawModel} 选择映射目标`"
+                        searchable
+                        search-placeholder="搜索模型..."
                         @update:model-value="onRowTargetChange(row, String($event))"
                       />
                       <span
@@ -3243,6 +3281,7 @@ onBeforeUnmount(() => {
                   <p
                     v-if="mappingEditingKey !== row.rawKey && row.reason && (row.reviewStatus === 'suggested' || row.reviewStatus === 'rejected')"
                     class="tt-mapping-row-reason"
+                    :title="row.reason"
                   >{{ row.reason }}</p>
                 </div>
               </div>
@@ -3356,17 +3395,12 @@ onBeforeUnmount(() => {
             <div class="tt-mapping-controls">
               <label class="tt-mapping-field">
                 <span>分析模型</span>
-                <input
+                <CustomSelect
                   v-model="insightModel"
-                  type="text"
-                  class="tt-mapping-model-input"
-                  list="tt-insight-model-suggestions"
-                  placeholder="输入模型 ID，可自定义"
-                  spellcheck="false"
+                  :options="mappingModelSelectOptions"
+                  placeholder="选择已生效模型"
+                  :searchable="true"
                 />
-                <datalist id="tt-insight-model-suggestions">
-                  <option v-for="model in insightModelSuggestions()" :key="model" :value="model" />
-                </datalist>
               </label>
               <button
                 type="button"
@@ -5136,10 +5170,11 @@ onBeforeUnmount(() => {
   align-items: center;
   flex-wrap: wrap;
   gap: 8px;
-  padding: 8px 10px;
-  border: 1px solid var(--brand);
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--brand) 35%, transparent);
   border-radius: var(--r-md, 8px);
-  background: var(--brand-soft);
+  background: color-mix(in srgb, var(--brand) 8%, transparent);
+  box-shadow: 0 1px 3px rgba(16, 185, 129, 0.08);
 }
 
 .tt-mapping-batch-label {
@@ -5185,27 +5220,50 @@ onBeforeUnmount(() => {
   padding: 6px;
 }
 
+/* 滚动条样式优化 */
+.tt-mapping-list::-webkit-scrollbar {
+  width: 8px;
+}
+
+.tt-mapping-list::-webkit-scrollbar-track {
+  background: transparent;
+  border-radius: var(--r-md, 8px);
+}
+
+.tt-mapping-list::-webkit-scrollbar-thumb {
+  background: var(--line);
+  border-radius: var(--r-md, 8px);
+  border: 2px solid var(--surface);
+}
+
+.tt-mapping-list::-webkit-scrollbar-thumb:hover {
+  background: var(--muted);
+}
+
 .tt-mapping-pane-empty {
   margin: 0;
-  padding: 18px 10px;
+  padding: 28px 10px;
   text-align: center;
-  font-size: 11px;
+  font-size: 12px;
   color: var(--muted);
+  line-height: 1.6;
 }
 
 /* 视图一：原始模型行 —— 主行（勾选/名称/目标/徽章/操作）+ 理由子行 */
 .tt-mapping-row {
   display: flex;
   flex-direction: column;
-  gap: 2px;
-  padding: 5px 8px;
+  gap: 4px;
+  padding: 6px 8px;
   border-radius: var(--r-sm, 6px);
   border: 1px solid transparent;
   font-size: 11px;
+  transition: all 0.12s ease;
 }
 
 .tt-mapping-row:hover {
   background: var(--surface-hover);
+  border-color: var(--line);
 }
 
 .tt-mapping-row.is-suggested {
@@ -5215,10 +5273,15 @@ onBeforeUnmount(() => {
 
 .tt-mapping-row.is-suggested:hover {
   background: color-mix(in srgb, var(--brand) 11%, transparent);
+  border-color: color-mix(in srgb, var(--brand) 30%, transparent);
 }
 
 .tt-mapping-row.is-rejected {
-  opacity: 0.72;
+  opacity: 0.65;
+}
+
+.tt-mapping-row.is-rejected:hover {
+  opacity: 0.85;
 }
 
 .tt-mapping-row-main {
@@ -5231,6 +5294,10 @@ onBeforeUnmount(() => {
 .tt-mapping-row-main input[type="checkbox"] {
   flex: 0 0 auto;
   margin: 0;
+  width: 16px;
+  height: 16px;
+  cursor: pointer;
+  accent-color: var(--brand);
 }
 
 .tt-mapping-row-main .tt-mapping-raw {
@@ -5241,10 +5308,35 @@ onBeforeUnmount(() => {
 .tt-mapping-row-main .tt-mapping-row-select {
   flex: 0 0 230px;
   max-width: none;
+  height: 32px;
+}
+
+/* 行内下拉框的紧凑样式 */
+.tt-mapping-row-select :deep(.select-trigger) {
+  padding: 0 10px;
+  font-size: 11.5px;
+  height: 100%;
+}
+
+.tt-mapping-row-select :deep(.select-trigger svg) {
+  width: 12px;
+}
+
+/* 优化标签区域：固定宽度，防止按钮位置跳动 */
+.tt-mapping-review-badge,
+.tt-origin-badge {
+  flex: 0 0 auto;
+  min-width: 60px;
 }
 
 .tt-mapping-row-spacer {
   flex: 1 1 4px;
+}
+
+/* 操作区域：固定宽度布局 */
+.tt-mapping-review-actions {
+  flex: 0 0 auto;
+  min-width: 110px;
 }
 
 .tt-mapping-row-reason {
@@ -5253,9 +5345,12 @@ onBeforeUnmount(() => {
   font-size: 10.5px;
   line-height: 1.5;
   color: var(--muted);
+  /* 改为多行显示，限制最多3行 */
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
   overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  word-break: break-word;
 }
 
 .tt-mapping-row-custom {
@@ -5270,50 +5365,62 @@ onBeforeUnmount(() => {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 24px;
-  height: 24px;
+  width: 26px;
+  height: 26px;
   padding: 0;
-  border: none;
+  border: 1px solid transparent;
   border-radius: var(--r-sm, 6px);
   background: transparent;
   color: var(--muted);
   cursor: pointer;
+  transition: all 0.15s ease;
 }
 
 .tt-mapping-row-clear:hover:not(:disabled) {
-  background: rgba(239, 68, 68, 0.12);
+  background: rgba(239, 68, 68, 0.08);
+  border-color: rgba(239, 68, 68, 0.25);
   color: #ef4444;
+  transform: scale(1.05);
 }
 
 .tt-mapping-row-clear:disabled {
   opacity: 0.3;
-  cursor: default;
+  cursor: not-allowed;
 }
 
 .tt-mapping-row-clear svg {
-  width: 13px;
-  height: 13px;
+  width: 14px;
+  height: 14px;
 }
 
 .tt-origin-badge {
   flex: 0 0 auto;
   font-style: normal;
   font-size: 10px;
-  padding: 2px 7px;
+  padding: 3px 8px;
   border-radius: var(--r-full, 999px);
   background: var(--surface-hover);
   color: var(--muted);
   white-space: nowrap;
+  border: 1px solid var(--line);
 }
 
 .tt-origin-badge.is-ai {
-  background: var(--brand-soft);
+  background: color-mix(in srgb, var(--brand) 12%, transparent);
   color: var(--brand-deep, var(--brand));
+  border-color: color-mix(in srgb, var(--brand) 25%, transparent);
 }
 
 .tt-origin-badge.is-manual {
-  background: rgba(16, 185, 129, 0.16);
+  background: rgba(16, 185, 129, 0.12);
   color: #10b981;
+  border-color: rgba(16, 185, 129, 0.25);
+}
+
+.tt-origin-badge.is-rule {
+  background: rgba(59, 130, 246, 0.12);
+  color: #3b82f6;
+  border-color: rgba(59, 130, 246, 0.25);
 }
 
 /* 审核状态徽章：待识别 / 待审核 / 已生效 / 已驳回 */
@@ -5321,29 +5428,35 @@ onBeforeUnmount(() => {
   flex: 0 0 auto;
   font-size: 10px;
   font-weight: 600;
-  padding: 2px 7px;
+  padding: 3px 8px;
   border-radius: var(--r-full, 999px);
   white-space: nowrap;
+  border: 1px solid transparent;
 }
 
 .tt-mapping-review-badge.is-pending {
   background: var(--surface-hover);
   color: var(--muted);
+  border-color: var(--line);
 }
 
 .tt-mapping-review-badge.is-suggested {
-  background: color-mix(in srgb, var(--brand) 14%, transparent);
+  background: color-mix(in srgb, var(--brand) 16%, transparent);
   color: var(--brand-deep, var(--brand));
+  border-color: color-mix(in srgb, var(--brand) 35%, transparent);
+  font-weight: 700;
 }
 
 .tt-mapping-review-badge.is-approved {
   background: rgba(16, 185, 129, 0.16);
   color: #10b981;
+  border-color: rgba(16, 185, 129, 0.3);
 }
 
 .tt-mapping-review-badge.is-rejected {
   background: rgba(239, 68, 68, 0.12);
   color: #ef4444;
+  border-color: rgba(239, 68, 68, 0.3);
 }
 
 .tt-mapping-review-actions {
@@ -5356,45 +5469,51 @@ onBeforeUnmount(() => {
 .tt-mapping-approve,
 .tt-mapping-reject,
 .tt-mapping-retry {
-  height: 22px;
-  padding: 0 9px;
+  height: 24px;
+  padding: 0 10px;
   border-radius: var(--r-sm, 6px);
   border: 1px solid transparent;
   font-size: 11px;
   font-weight: 600;
   cursor: pointer;
   white-space: nowrap;
+  transition: all 0.15s ease;
 }
 
 .tt-mapping-approve {
   background: var(--brand);
   color: #fff;
+  box-shadow: 0 1px 3px rgba(16, 185, 129, 0.2);
 }
 
 .tt-mapping-approve:hover {
   background: var(--brand-deep, var(--brand));
+  transform: translateY(-1px);
+  box-shadow: 0 2px 6px rgba(16, 185, 129, 0.3);
 }
 
 .tt-mapping-reject {
-  background: transparent;
+  background: var(--surface);
   border-color: var(--line);
-  color: var(--muted);
+  color: var(--text);
 }
 
 .tt-mapping-reject:hover {
   border-color: rgba(239, 68, 68, 0.45);
+  background: rgba(239, 68, 68, 0.08);
   color: #ef4444;
 }
 
 .tt-mapping-retry {
-  background: transparent;
-  border-color: var(--line);
-  color: var(--muted);
+  background: var(--surface);
+  border-color: color-mix(in srgb, var(--brand) 30%, transparent);
+  color: var(--brand-deep, var(--brand));
 }
 
 .tt-mapping-retry:hover {
+  background: color-mix(in srgb, var(--brand) 12%, transparent);
   border-color: var(--brand);
-  color: var(--brand);
+  transform: translateY(-1px);
 }
 
 /* 识别进度条 */
@@ -5716,6 +5835,24 @@ onBeforeUnmount(() => {
   border-color: color-mix(in srgb, var(--brand) 30%, transparent);
   color: var(--brand-deep, var(--brand));
   font-weight: 600;
+}
+
+/* 可点击的统计芯片 - 作为快速筛选器 */
+.tt-mapping-counter-chip.is-clickable {
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.tt-mapping-counter-chip.is-clickable:hover {
+  background: color-mix(in srgb, var(--brand) 18%, transparent);
+  border-color: var(--brand);
+  transform: translateY(-1px);
+}
+
+.tt-mapping-counter-chip.is-clickable.is-active {
+  background: var(--brand);
+  color: #fff;
+  box-shadow: 0 2px 6px rgba(16, 185, 129, 0.3);
 }
 
 .tt-mapping-raw {

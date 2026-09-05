@@ -695,7 +695,7 @@ export interface TokenMappingAnalyzeProgress {
   message: string;
 }
 
-/** Token 统计的正式模型清单（含目录导入 / user 手工来源）。 */
+/** Token 统计的正式模型清单（用户手工添加 + AI 自动学习 + 数据迁移）。 */
 export interface TokenOfficialModel {
   id: string;
   name: string;

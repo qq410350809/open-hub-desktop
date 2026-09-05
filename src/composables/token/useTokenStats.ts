@@ -389,7 +389,7 @@ function clearTokenInsightReport() {
   tokenInsightError.value = "";
 }
 
-/** 获取 Token 统计的正式模型清单（含目录导入 / user 手工 / AI 学习来源）。 */
+/** 获取 Token 统计的正式模型清单（用户手工添加 + AI 自动学习 + 数据迁移）。 */
 async function loadTokenOfficialModels(): Promise<TokenOfficialModel[]> {
   return localCommand<TokenOfficialModel[]>("get_token_official_models");
 }
@@ -405,7 +405,7 @@ async function addTokenOfficialModel(name: string, lab = "自定义"): Promise<b
   }
 }
 
-/** 删除自定义/AI 学习来源的正式模型；目录导入的模型删除会被后端拒绝。 */
+/** 删除用户手动添加的正式模型；AI 学习和数据迁移的模型无法删除。 */
 async function removeTokenOfficialModel(id: string): Promise<string> {
   try {
     await localCommand("remove_token_official_model", { id });

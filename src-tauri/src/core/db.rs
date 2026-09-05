@@ -1757,7 +1757,7 @@ pub(crate) fn ensure_charity_feed_sources_table(connection: &Connection) -> Resu
 
     // Token 统计专用的标准模型清单（独立于模型目录）。
     // 用于 AI 分析的候选池、用户自定义映射、动态扩充新模型。
-    // source: catalog = 从模型目录初始化 | ai = AI 自动学习 | user = 用户手动添加 | migration = 数据迁移
+    // source: ai = AI 自动学习 | user = 用户手动添加 | migration = 数据迁移
     connection
         .execute_batch(
             "CREATE TABLE IF NOT EXISTS token_official_models (
@@ -1765,7 +1765,7 @@ pub(crate) fn ensure_charity_feed_sources_table(connection: &Connection) -> Resu
                 name TEXT NOT NULL,
                 lab TEXT NOT NULL DEFAULT '',
                 aliases TEXT NOT NULL DEFAULT '[]',
-                source TEXT NOT NULL DEFAULT 'catalog',
+                source TEXT NOT NULL DEFAULT 'user',
                 confidence REAL NOT NULL DEFAULT 1.0,
                 created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
                 updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
@@ -1847,14 +1847,19 @@ pub(crate) fn ensure_charity_feed_sources_table(connection: &Connection) -> Resu
         )
         .map_err(|error| error.to_string())?;
 
-    // 初始化标准模型清单：从模型目录导入主流厂商的 GA 模型
+    // 初始化标准模型清单
     initialize_token_official_models(&connection)?;
 
     Ok(())
 }
 
-/// 从模型目录初始化标准模型清单（仅在表为空时执行）
+/// 初始化标准模型清单（仅在表为空时执行）
 fn initialize_token_official_models(connection: &Connection) -> Result<(), String> {
+    // 清理旧版本从 model_catalog_models 导入的数据
+    connection
+        .execute("DELETE FROM token_official_models WHERE source = 'catalog'", [])
+        .map_err(|error| error.to_string())?;
+
     let count: i64 = connection
         .query_row(
             "SELECT COUNT(*) FROM token_official_models",
@@ -1865,36 +1870,6 @@ fn initialize_token_official_models(connection: &Connection) -> Result<(), Strin
 
     if count > 0 {
         return Ok(()); // 已初始化过，跳过
-    }
-
-    // 模型目录表可能尚未创建（如测试夹具或全新库首次初始化），
-    // 此时跳过目录导入，不阻断标准清单与映射表的建表流程。
-    let catalog_exists: i64 = connection
-        .query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='model_catalog_models'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
-
-    if catalog_exists > 0 {
-        connection
-            .execute_batch(
-                "INSERT OR IGNORE INTO token_official_models (id, name, lab, source, confidence)
-                 SELECT
-                    LOWER(COALESCE(slug, id)) as id,
-                    name,
-                    lab,
-                    'catalog' as source,
-                    1.0 as confidence
-                 FROM model_catalog_models
-                 WHERE status = 'ga'
-                   AND lab IN ('openai','anthropic','google','zhipu','alibaba','deepseek',
-                              'mistral','meta','cohere','01-ai','moonshot','baichuan','minimax')
-                   AND kind IN ('chat','reasoning')
-                 ORDER BY last_updated DESC",
-            )
-            .map_err(|error| error.to_string())?;
     }
 
     // 将已批准映射中的正式模型补录到清单中（数据迁移）。
