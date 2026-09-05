@@ -1,10 +1,10 @@
 /**
- * 模型能力测试状态管理
+ * 模型验真（渠道降智检查 + 指纹检测）状态管理
+ *
+ * 探测题库由后端内置目录（get_detection_suites）维护，前端只按 id 勾选。
  */
 
 import { ref, computed } from "vue";
-import type { ProbePrompt } from "./builtinSuites";
-import { BUILTIN_SUITES } from "./builtinSuites";
 import { useModelProxy } from "../useModelProxy";
 import { runCommand } from "../core/ipc";
 import { listen, type UnlistenFn } from "../core/events";
@@ -18,17 +18,38 @@ export interface ProbeTarget {
   model: string;
 }
 
-export interface JudgeSpec {
-  channelId: string;
-  model: string;
+export interface CheckSpec {
+  kind: string;
+  value: string;
+  tolerance: number;
+}
+
+export interface FamilyExpectation {
+  family: string;
+  patterns: string[];
+}
+
+export interface DetectionProbe {
+  id: string;
+  name: string;
+  category: "identity" | "fingerprint" | "capability";
+  description: string;
+  text: string;
+  /** 同义变体问法（答案不变），发送时随机选择以去除同质化 */
+  variants: string[];
+  maxTokens: number;
+  temperature: number;
+  check?: CheckSpec;
+  expected: FamilyExpectation[];
+  repeats: boolean;
 }
 
 export interface RunParams {
   targets: ProbeTarget[];
-  prompts: ProbePrompt[];
+  probeIds: string[];
+  repeats: number;
   concurrency: number;
   timeoutSeconds: number;
-  judge?: JudgeSpec;
 }
 
 export interface AutoCheckOutcome {
@@ -37,26 +58,23 @@ export interface AutoCheckOutcome {
   detail: string;
 }
 
-export interface JudgeOutcome {
-  score?: number;
-  reason: string;
-}
-
 export interface ProbeResult {
   channelId: string;
   channelName: string;
   model: string;
-  promptId: string;
-  promptName: string;
+  probeId: string;
+  probeName: string;
   category: string;
+  sampleIndex: number;
   ok: boolean;
   durationMs?: number;
   promptTokens?: number;
   completionTokens?: number;
   tokensPerSec?: number;
   autoCheck?: AutoCheckOutcome;
-  score?: number;
-  judge?: JudgeOutcome;
+  familyMatch?: string;
+  /** 实际发送的最终提问（随机变体 + 对话包装后） */
+  requestText?: string;
   error?: string;
   responseText?: string;
 }
@@ -69,26 +87,38 @@ export interface RunProgress {
   result?: ProbeResult;
 }
 
+export type VerdictKind = "ok" | "suspicious" | "impersonation" | "unreachable";
+
+export interface TargetVerdict {
+  channelId: string;
+  channelName: string;
+  model: string;
+  verdict: VerdictKind;
+  claimedFamily?: string;
+  detectedFamily?: string;
+  identityFamily?: string;
+  identityConsistent?: boolean;
+  capabilityPassed: number;
+  capabilityTotal: number;
+  consistencyRate?: number;
+  totalRequests: number;
+  okCount: number;
+  avgDurationMs?: number;
+  avgTokensPerSec?: number;
+  issues: string[];
+  results: ProbeResult[];
+}
+
 export interface TestRunRecord {
   id: number;
   startedAt: string;
   finishedAt?: string;
   status: string;
   targetCount: number;
-  promptCount: number;
+  probeCount: number;
+  repeats: number;
   config: any;
-  summary?: any;
-}
-
-export interface ModelSummary {
-  channelId: string;
-  channelName: string;
-  model: string;
-  total: number;
-  okCount: number;
-  avgScore?: number;
-  avgDurationMs?: number;
-  avgTokensPerSec?: number;
+  summary?: { targets?: TargetVerdict[] };
 }
 
 export interface RunStartInfo {
@@ -101,237 +131,140 @@ export interface RunStartInfo {
 // ============================================================================
 
 const selectedTargets = ref<ProbeTarget[]>([]);
-const selectedPromptIds = ref<Set<string>>(new Set(BUILTIN_SUITES.map((p) => p.id)));
-const customPrompts = ref<ProbePrompt[]>([]);
+const selectedProbeIds = ref<Set<string>>(new Set());
+const suites = ref<DetectionProbe[]>([]);
 
 // Run parameters
+const repeats = ref(3);
 const concurrency = ref(4);
 const timeoutSeconds = ref(120);
-const judgeChannelId = ref("");
-const judgeModel = ref("");
-const enableJudge = ref(true);
 
 // Runtime state
 const isRunning = ref(false);
 const currentRunId = ref<number | null>(null);
 const progress = ref<RunProgress | null>(null);
-const currentResults = ref<ProbeResult[]>([]);
+/** 运行中实时收到的探测明细（结束后由 verdicts 接管展示） */
+const liveResults = ref<ProbeResult[]>([]);
+/** 按目标聚合的验真结论（运行结束载入或历史载入） */
+const verdicts = ref<TargetVerdict[]>([]);
 
 // History
 const historyRuns = ref<TestRunRecord[]>([]);
 const historyLoading = ref(false);
 
-// Last config
-const lastConfigLoaded = ref(false);
-
 // ============================================================================
 // Computed
 // ============================================================================
 
-const allPrompts = computed(() => {
-  return [...BUILTIN_SUITES, ...customPrompts.value];
+const selectedProbes = computed(() =>
+  suites.value.filter((p) => selectedProbeIds.value.has(p.id)),
+);
+
+const totalRequests = computed(() => {
+  const perTarget = selectedProbes.value.reduce(
+    (sum, p) => sum + (p.repeats ? repeats.value : 1),
+    0,
+  );
+  return selectedTargets.value.length * perTarget;
 });
 
-const selectedPrompts = computed(() => {
-  return allPrompts.value.filter((p) => selectedPromptIds.value.has(p.id));
-});
-
-const totalTests = computed(() => {
-  return selectedTargets.value.length * selectedPrompts.value.length;
-});
-
-const canRun = computed(() => {
-  return (
+const canRun = computed(
+  () =>
     !isRunning.value &&
     selectedTargets.value.length > 0 &&
-    selectedPrompts.value.length > 0
-  );
-});
+    selectedProbeIds.value.size > 0,
+);
 
 const progressPercent = computed(() => {
   if (!progress.value || progress.value.total === 0) return 0;
   return Math.round((progress.value.completed / progress.value.total) * 100);
 });
 
-// Group results by model for matrix view
-const resultsByModel = computed(() => {
-  const grouped = new Map<string, ProbeResult[]>();
-  for (const result of currentResults.value) {
-    const key = `${result.channelId}::${result.model}`;
-    if (!grouped.has(key)) {
-      grouped.set(key, []);
-    }
-    grouped.get(key)!.push(result);
-  }
-  return grouped;
-});
-
-// Calculate model summaries
-const modelSummaries = computed(() => {
-  const summaries: ModelSummary[] = [];
-
-  for (const [key, results] of resultsByModel.value.entries()) {
-    const [channelId, model] = key.split("::");
-    const okCount = results.filter((r) => r.ok).length;
-    const scores = results.map((r) => r.score).filter((s) => s !== undefined && s !== null) as number[];
-    const durations = results.map((r) => r.durationMs).filter((d) => d !== undefined && d !== null) as number[];
-    const tps = results.map((r) => r.tokensPerSec).filter((t) => t !== undefined && t !== null) as number[];
-
-    summaries.push({
-      channelId,
-      channelName: results[0]?.channelName || "",
-      model,
-      total: results.length,
-      okCount,
-      avgScore: scores.length > 0 ? scores.reduce((a, b) => a + b, 0) / scores.length : undefined,
-      avgDurationMs: durations.length > 0 ? Math.round(durations.reduce((a, b) => a + b, 0) / durations.length) : undefined,
-      avgTokensPerSec: tps.length > 0 ? Math.round(tps.reduce((a, b) => a + b, 0) / tps.length * 10) / 10 : undefined,
-    });
-  }
-
-  // Sort by avgScore desc
-  summaries.sort((a, b) => (b.avgScore || 0) - (a.avgScore || 0));
-
-  return summaries;
+/** 结论分布（用于历史列表与结果页概览） */
+const verdictCounts = computed(() => {
+  const counts: Record<VerdictKind, number> = {
+    ok: 0,
+    suspicious: 0,
+    impersonation: 0,
+    unreachable: 0,
+  };
+  for (const v of verdicts.value) counts[v.verdict] = (counts[v.verdict] || 0) + 1;
+  return counts;
 });
 
 // ============================================================================
 // Actions
 // ============================================================================
 
+async function loadSuites() {
+  try {
+    const list = await runCommand<DetectionProbe[]>("get_detection_suites");
+    suites.value = list || [];
+    // 首次载入默认全选
+    if (selectedProbeIds.value.size === 0 && suites.value.length > 0) {
+      selectedProbeIds.value = new Set(suites.value.map((p) => p.id));
+    }
+  } catch (error) {
+    console.error("Failed to load detection suites:", error);
+  }
+}
+
 async function startRun() {
   if (!canRun.value) return;
 
-  const judge = enableJudge.value && judgeChannelId.value && judgeModel.value
-    ? { channelId: judgeChannelId.value, model: judgeModel.value }
-    : undefined;
-
   const params: RunParams = {
     targets: selectedTargets.value,
-    prompts: selectedPrompts.value,
+    probeIds: [...selectedProbeIds.value],
+    repeats: repeats.value,
     concurrency: concurrency.value,
     timeoutSeconds: timeoutSeconds.value,
-    judge,
   };
 
-  try {
-    const result = await runCommand<RunStartInfo>("run_model_test", { params });
-    isRunning.value = true;
-    currentRunId.value = result.runId;
-    currentResults.value = [];
-    progress.value = {
-      runId: result.runId,
-      phase: "running",
-      completed: 0,
-      total: result.total,
-    };
-
-    // Save last config
-    await saveLastConfig();
-  } catch (error) {
-    console.error("Failed to start model test:", error);
-    throw error;
-  }
+  const result = await runCommand<RunStartInfo>("run_model_test", { params });
+  isRunning.value = true;
+  currentRunId.value = result.runId;
+  liveResults.value = [];
+  verdicts.value = [];
+  progress.value = {
+    runId: result.runId,
+    phase: "running",
+    completed: 0,
+    total: result.total,
+  };
 }
 
 async function cancelRun() {
   if (!isRunning.value) return;
-
-  try {
-    await runCommand("cancel_model_test");
-  } catch (error) {
-    console.error("Failed to cancel model test:", error);
-  }
+  await runCommand("cancel_model_test");
 }
 
 async function loadHistory(limit = 50) {
   historyLoading.value = true;
   try {
     const runs = await runCommand<TestRunRecord[]>("list_model_test_runs", { limit });
-    historyRuns.value = runs;
+    historyRuns.value = runs || [];
   } catch (error) {
-    console.error("Failed to load test history:", error);
+    console.error("Failed to load detection history:", error);
   } finally {
     historyLoading.value = false;
   }
 }
 
 async function loadRunResults(runId: number) {
-  try {
-    const results = await runCommand<ProbeResult[]>("get_model_test_results", { runId });
-    currentResults.value = results;
-    currentRunId.value = runId;
-  } catch (error) {
-    console.error("Failed to load run results:", error);
-    throw error;
-  }
+  const list = await runCommand<TargetVerdict[]>("get_model_test_results", { runId });
+  verdicts.value = list || [];
+  liveResults.value = [];
+  currentRunId.value = runId;
 }
 
 async function deleteRun(runId: number) {
-  try {
-    await runCommand<number>("delete_model_test_run", { runId });
-    await loadHistory();
-  } catch (error) {
-    console.error("Failed to delete run:", error);
-    throw error;
+  await runCommand<number>("delete_model_test_run", { runId });
+  if (currentRunId.value === runId) {
+    verdicts.value = [];
+    liveResults.value = [];
+    currentRunId.value = null;
   }
-}
-
-async function loadCustomPrompts() {
-  try {
-    const prompts = await runCommand<ProbePrompt[]>("get_model_test_custom_prompts");
-    customPrompts.value = prompts;
-  } catch (error) {
-    console.error("Failed to load custom prompts:", error);
-  }
-}
-
-async function saveCustomPrompts(prompts: ProbePrompt[]) {
-  try {
-    await runCommand("save_model_test_custom_prompts", { prompts });
-    customPrompts.value = prompts;
-  } catch (error) {
-    console.error("Failed to save custom prompts:", error);
-    throw error;
-  }
-}
-
-async function loadLastConfig() {
-  if (lastConfigLoaded.value) return;
-
-  try {
-    const config = await runCommand<any>("get_model_test_last_config");
-    if (config) {
-      if (config.targets) selectedTargets.value = config.targets;
-      if (config.promptIds) selectedPromptIds.value = new Set(config.promptIds);
-      if (config.concurrency) concurrency.value = config.concurrency;
-      if (config.timeoutSeconds) timeoutSeconds.value = config.timeoutSeconds;
-      if (config.judgeChannelId) judgeChannelId.value = config.judgeChannelId;
-      if (config.judgeModel) judgeModel.value = config.judgeModel;
-      if (config.enableJudge !== undefined) enableJudge.value = config.enableJudge;
-    }
-    lastConfigLoaded.value = true;
-  } catch (error) {
-    console.error("Failed to load last config:", error);
-  }
-}
-
-async function saveLastConfig() {
-  const config = {
-    targets: selectedTargets.value,
-    promptIds: Array.from(selectedPromptIds.value),
-    concurrency: concurrency.value,
-    timeoutSeconds: timeoutSeconds.value,
-    judgeChannelId: judgeChannelId.value,
-    judgeModel: judgeModel.value,
-    enableJudge: enableJudge.value,
-  };
-
-  try {
-    await runCommand("save_model_test_last_config", { config });
-  } catch (error) {
-    console.error("Failed to save last config:", error);
-  }
+  await loadHistory();
 }
 
 // ============================================================================
@@ -344,74 +277,63 @@ async function setupProgressListener() {
   if (progressUnlisten) return;
   progressUnlisten = await listen<RunProgress>("model-test-progress", (event) => {
     const data = event.payload;
-
     // 只接受当前运行的事件，防止加载历史结果时被旧事件污染
     if (currentRunId.value !== null && data.runId !== currentRunId.value) return;
 
-    // Update progress
     progress.value = data;
+    if (data.result) liveResults.value.push(data.result);
 
-    // Append result if present
-    if (data.result) {
-      currentResults.value.push(data.result);
-    }
-
-    // Update running state
     if (data.phase === "finished" || data.phase === "cancelled" || data.phase === "error") {
       isRunning.value = false;
+      // 收尾后拉取权威结论（与落库内容一致）
+      void loadRunResults(data.runId).catch(() => {});
       void loadHistory();
     }
   });
 }
 
 // ============================================================================
-// Exports
+// Export
 // ============================================================================
 
 export function useModelTest() {
   const modelProxy = useModelProxy();
 
-  // 首次进入页面时初始化：挂事件监听 + 拉渠道模型缓存 + 载入历史配置
+  // 首次进入页面：挂事件监听 + 加载真实渠道配置（含模型缓存）+ 探测目录 + 历史
   async function init() {
     await setupProgressListener();
-    if (!modelProxy.channelModels || Object.keys(modelProxy.channelModels.value ?? {}).length === 0) {
-      void modelProxy.loadCachedModels();
-    }
-    void loadLastConfig();
-    void loadCustomPrompts();
+    void modelProxy.loadProxyData();
+    void loadSuites();
     void loadHistory();
   }
 
   return {
     // State
     selectedTargets,
-    selectedPromptIds,
-    customPrompts,
-    allPrompts,
-    selectedPrompts,
+    selectedProbeIds,
+    suites,
+    selectedProbes,
 
     // Run params
+    repeats,
     concurrency,
     timeoutSeconds,
-    judgeChannelId,
-    judgeModel,
-    enableJudge,
 
     // Runtime
     isRunning,
     currentRunId,
     progress,
     progressPercent,
-    currentResults,
-    resultsByModel,
-    modelSummaries,
+    liveResults,
+    verdicts,
+    verdictCounts,
 
     // History
     historyRuns,
     historyLoading,
 
     // Computed
-    totalTests,
+    totalRequests,
     canRun,
 
     // Actions
@@ -421,10 +343,6 @@ export function useModelTest() {
     loadHistory,
     loadRunResults,
     deleteRun,
-    loadCustomPrompts,
-    saveCustomPrompts,
-    loadLastConfig,
-    saveLastConfig,
 
     // From modelProxy
     channels: modelProxy.proxyConfig,
