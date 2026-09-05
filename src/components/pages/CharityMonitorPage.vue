@@ -3,12 +3,16 @@ import { computed, onMounted, onUnmounted, ref } from "vue";
 import { icons } from "../../icons";
 import { useStore } from "../../composables/useStore";
 import { useConfirm } from "../../composables/useConfirm";
+import { useCharityNotification } from "../../composables/useCharityNotification";
 import AppTable, { type AppTableColumn } from "../common/AppTable.vue";
 import type { CharityFeedItem, CharityFeedTag, CharitySyncLogEntry } from "../../types";
 import { formatCompactCount as formatCompactCountUtil, formatDuration as formatDurationUtil } from "../../utils";
 
 const store = useStore();
 const { confirm } = useConfirm();
+
+// 启用公益监听通知（语音提醒 + 系统通知）
+const charityNotification = useCharityNotification();
 
 // —— 帖子详情弹窗状态 ——
 const selectedPost = ref<CharityFeedItem | null>(null);

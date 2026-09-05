@@ -220,6 +220,28 @@ pub fn emit_charity_progress(bus: &EventBus, progress: CharitySyncProgress) {
     bus.emit("charity-sync-progress", progress);
 }
 
+/// 发送公益监听新消息通知（语音提醒 + 系统通知）
+pub fn emit_charity_new_message_notification(
+    bus: &EventBus,
+    feed_name: &str,
+    new_count: usize,
+    updated_count: usize,
+) {
+    if new_count > 0 || updated_count > 0 {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let notification = serde_json::json!({
+            "feedName": feed_name,
+            "newCount": new_count,
+            "updatedCount": updated_count,
+            "timestamp": timestamp,
+        });
+        bus.emit("charity-new-message", notification);
+    }
+}
+
 pub fn finish_charity_sync_log(
     bus: &EventBus,
     database: &Database,
@@ -234,6 +256,11 @@ pub fn finish_charity_sync_log(
     updated_count: usize,
     unread_count: usize,
 ) {
+    // 同步成功且有新消息时，发送通知
+    if status == "success" && (new_count > 0 || updated_count > 0) {
+        emit_charity_new_message_notification(bus, &source.name, new_count, updated_count);
+    }
+
     if let Some(id) = log_id {
         let detail_json = serde_json::json!({
             "new": new_count,
