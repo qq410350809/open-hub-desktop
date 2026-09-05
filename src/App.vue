@@ -33,7 +33,6 @@ import ProxyPoolPage from "./components/pages/ProxyPoolPage.vue";
 import TokenStatsPage from "./components/pages/TokenStatsPage.vue";
 import ModelCatalogPage from "./components/pages/ModelCatalogPage.vue";
 import ModelProxyPage from "./components/pages/ModelProxyPage.vue";
-import ModelTestPage from "./components/pages/ModelTestPage.vue";
 
 const store = useStore();
 const { preferences } = usePreferences();
@@ -81,9 +80,6 @@ function onNativeMenuNavigate(page: string) {
       break;
     case "modelproxy":
       store.openModelProxy();
-      break;
-    case "modeltest":
-      store.openModelTest();
       break;
     case "charity":
       store.openCharityMonitor();
@@ -252,7 +248,7 @@ function onKeydown(event: KeyboardEvent) {
     else if (store.linkDialogOpen.value) store.closeLinkDialog();
     else if (store.modalOpen.value) store.closeModal();
       else if (store.page.value === "settings") store.closeSettings();
-    else if (["library", "modelparams", "charity", "proxy", "tokenstats", "gatewaystats", "modeltest"].includes(store.page.value)) store.openTokenStats();
+    else if (["library", "modelparams", "charity", "proxy", "tokenstats", "gatewaystats"].includes(store.page.value)) store.openTokenStats();
   }
 }
 
@@ -266,7 +262,6 @@ function onMenuNavigate(event: Event) {
   if (page === "library") store.openLibrary();
   else if (page === "modelparams") store.openModelParams();
   else if (page === "modelproxy") store.openModelProxy();
-  else if (page === "modeltest") store.openModelTest();
   else if (page === "charity") store.openCharityMonitor();
   else if (page === "proxy") store.openProxyPool();
   else if (page === "tokenstats") store.openTokenStats();
@@ -342,14 +337,6 @@ onUnmounted(() => {
           aria-labelledby="modelproxy-nav"
         >
           <ModelProxyPage />
-        </div>
-        <div
-          v-else-if="store.page.value === 'modeltest'"
-          id="model-test-panel"
-          class="modeltest-panel"
-          aria-labelledby="modeltest-nav"
-        >
-          <ModelTestPage />
         </div>
         <div
           v-else-if="store.page.value === 'charity'"

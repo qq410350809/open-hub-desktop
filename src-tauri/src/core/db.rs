@@ -393,7 +393,6 @@ impl Database {
         ensure_model_proxy_logs_table(&connection)?;
         ensure_channel_daily_stats_table(&connection)?;
         ensure_channel_hourly_stats_table(&connection)?;
-        crate::model::probe::store::ensure_model_test_tables(&connection)?;
         reset_expired_checkin_states(&connection)?;
 
         let has_system_type: i64 = connection

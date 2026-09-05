@@ -5,5 +5,4 @@ export * from "./token";
 export * from "./proxy";
 export * from "./charity";
 export * from "./model";
-export * from "./modeltest";
 export * from "./ui";

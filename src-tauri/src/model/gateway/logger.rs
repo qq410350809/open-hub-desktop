@@ -266,13 +266,9 @@ mod logger_tests {
 
     #[test]
     fn internal_self_calls_are_labeled_openhub() {
-        // 进程内直调的三个调用方（AI 分析 / 模型测试 / 模型测试评审）走同一 Chat 端点，
+        // 进程内直调的调用方（AI 分析）走同一 Chat 端点，
         // 但都是本软件自主请求，必须识别为 "openhub" 而非端点兜底的 "openai-api"。
-        for agent in [
-            "OpenHub-TokenMapping",
-            "OpenHub-ModelTest",
-            "OpenHub-ModelTestJudge",
-        ] {
+        for agent in ["OpenHub-TokenMapping"] {
             assert_eq!(
                 client_name_from_headers(&ua(agent), "/v1/chat/completions"),
                 "openhub",

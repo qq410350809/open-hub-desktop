@@ -749,30 +749,6 @@ macro_rules! rpc_arms {
                 ))
             }
 
-            // —— 模型验真（probe） ——
-            "run_model_test" => {
-                let params: crate::model::probe::RunParams = take($args, &["params"])?;
-                Ok(json!(
-                    crate::model::probe::run_model_test($ctx, $gw, params).await
-                ))
-            }
-            "cancel_model_test" => {
-                Ok(json!(crate::model::probe::cancel_model_test($ctx).await))
-            }
-            "get_detection_suites" => Ok(json!(crate::model::probe::get_detection_suites().await)),
-            "list_model_test_runs" => {
-                let limit: Option<u32> = take_opt($args, &["limit"]).ok().flatten();
-                Ok(json!(crate::model::probe::list_model_test_runs($ctx, limit).await))
-            }
-            "get_model_test_results" => {
-                let run_id: i64 = take($args, &["runId", "run_id"])?;
-                Ok(json!(crate::model::probe::get_model_test_results($ctx, run_id).await))
-            }
-            "delete_model_test_run" => {
-                let run_id: i64 = take($args, &["runId", "run_id"])?;
-                Ok(json!(crate::model::probe::delete_model_test_run($ctx, run_id).await))
-            }
-
             // —— 登录会话 ——
             "get_login_state" => {
                 let token: Option<String> = take_opt($args, &["token"]).ok().flatten();
@@ -1195,7 +1171,6 @@ mod tests {
             model_catalog_runtime: std::sync::Arc::new(
                 crate::model::catalog::ModelCatalogRuntime::new(),
             ),
-            model_probe: std::sync::Arc::new(crate::model::probe::ProbeRuntime::new()),
             event_bus: EventBus::new(),
             data_dir: root.clone(),
             resource_dir: None,

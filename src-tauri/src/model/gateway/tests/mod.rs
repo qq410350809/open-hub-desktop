@@ -1865,7 +1865,6 @@ async fn resolve_channel_api_keys_reads_site_cache_and_dedupes() {
         model_catalog_runtime: std::sync::Arc::new(
             crate::model::catalog::ModelCatalogRuntime::new(),
         ),
-        model_probe: std::sync::Arc::new(crate::model::probe::ProbeRuntime::new()),
         event_bus: crate::context::EventBus::new(),
         data_dir: root.clone(),
         resource_dir: None,
