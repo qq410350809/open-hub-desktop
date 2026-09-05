@@ -791,35 +791,38 @@ function isModelChecked(model: string): boolean {
   return !!channelModelSelection.value[model];
 }
 
-/** 当前选中渠道的模型列表（弹窗数据源：优先取草稿） */
-function selectedChannelModels(): string[] {
-  const models = channelDraftModels.value;
-  const channel = selectedChannel.value;
-
-  // OpenCode 渠道去重：后端可能同时返回 opencode/xxx 与 xxx，优先保留带前缀版本；
-  // 上游只返回裸名时（当前实际行为）裸名必须保留，否则整个列表会被过滤为空
-  if (channel && channel.id === 'opencode') {
-    const alias = channelAlias(channel);
-    const deduplicated = new Set<string>();
-
-    for (const m of models) {
-      if (m.startsWith(`${alias}/`)) {
-        deduplicated.add(m);
-      } else if (!m.includes('/')) {
-        // 裸名：仅当不存在带前缀的同名版本时保留
-        if (!models.includes(`${alias}/${m}`)) {
-          deduplicated.add(m);
-        }
-      } else {
-        // 其他命名空间的模型原样保留
+/** OpenCode 渠道去重：后端可能同时返回 opencode/xxx 与 xxx，优先保留带前缀版本；
+ * 上游只返回裸名时（当前实际行为）裸名必须保留，否则整个列表会被过滤为空 */
+function dedupeChannelModels(channel: ChannelConfig, models: string[]): string[] {
+  if (channel.id !== "opencode") return models;
+  const alias = channelAlias(channel);
+  const deduplicated = new Set<string>();
+  for (const m of models) {
+    if (m.startsWith(`${alias}/`)) {
+      deduplicated.add(m);
+    } else if (!m.includes("/")) {
+      // 裸名：仅当不存在带前缀的同名版本时保留
+      if (!models.includes(`${alias}/${m}`)) {
         deduplicated.add(m);
       }
+    } else {
+      // 其他命名空间的模型原样保留
+      deduplicated.add(m);
     }
-
-    return Array.from(deduplicated);
   }
+  return Array.from(deduplicated);
+}
 
-  return models;
+/** 渠道已知模型列表（未应用白名单），供各弹窗作为勾选数据源 */
+function channelKnownModels(channel: ChannelConfig): string[] {
+  return dedupeChannelModels(channel, modelsForChannel(channel.id));
+}
+
+/** 当前选中渠道的模型列表（弹窗数据源：优先取草稿） */
+function selectedChannelModels(): string[] {
+  const channel = selectedChannel.value;
+  if (!channel) return channelDraftModels.value;
+  return dedupeChannelModels(channel, channelDraftModels.value);
 }
 
 /** 当前勾选数量（按现有模型列表计算），用于头部计数与保存结果 */
@@ -1735,6 +1738,144 @@ async function confirmConvertSites() {
         (c) => c.id !== `site_${site.id}`
       );
     }
+  }
+}
+
+// —— 全渠道「模型管理」弹窗：一个弹窗内统一勾选各渠道对外暴露的模型（仅勾选状态） ——
+
+interface AllModelsDraftState {
+  /** true = 全部启用（白名单 null，上游新增模型自动暴露）；false = 以显式勾选集为准 */
+  all: boolean;
+  /** 显式勾选集（all=false 时生效） */
+  checked: Set<string>;
+}
+
+const allModelsDialogOpen = ref(false);
+const allModelsSearch = ref("");
+const allModelsDraft = ref<Record<string, AllModelsDraftState>>({});
+const savingAllModels = ref(false);
+
+/** 各渠道勾选草稿的展示分组：渠道 + 已知模型列表（total = 全量已知模型数，不随搜索过滤变化） */
+const allModelsGroups = computed(() =>
+  proxyConfig.value.channels.map((channel) => {
+    const models = channelKnownModels(channel);
+    return { channel, models, total: models.length };
+  }),
+);
+
+/** 按搜索词过滤后的分组：仅保留含匹配模型的渠道 */
+const filteredAllModelsGroups = computed(() => {
+  const q = allModelsSearch.value.trim().toLowerCase();
+  if (!q) return allModelsGroups.value;
+  return allModelsGroups.value
+    .map((g) => ({ ...g, models: g.models.filter((m) => m.toLowerCase().includes(q)) }))
+    .filter((g) => g.models.length > 0);
+});
+
+/** 某渠道某模型的当前勾选状态（全选模式下视为全部勾选） */
+function isAllModelChecked(channelId: string, model: string): boolean {
+  const d = allModelsDraft.value[channelId];
+  if (!d) return false;
+  return d.all || d.checked.has(model);
+}
+
+/** 某渠道已勾选模型数（按已知模型列表计） */
+function allChannelCheckedCount(channelId: string): number {
+  const g = allModelsGroups.value.find((x) => x.channel.id === channelId);
+  const d = allModelsDraft.value[channelId];
+  if (!g || !d) return 0;
+  return d.all ? g.models.length : g.models.filter((m) => d.checked.has(m)).length;
+}
+
+/** 勾选/取消某渠道的单个模型；首次从全选态取消时物化为显式勾选集 */
+function toggleAllModel(channelId: string, model: string) {
+  const d = allModelsDraft.value[channelId];
+  if (!d) return;
+  if (d.all) {
+    const g = allModelsGroups.value.find((x) => x.channel.id === channelId);
+    const checked = new Set(g?.models ?? []);
+    checked.delete(model);
+    allModelsDraft.value = {
+      ...allModelsDraft.value,
+      [channelId]: { all: false, checked },
+    };
+    return;
+  }
+  const checked = new Set(d.checked);
+  if (checked.has(model)) checked.delete(model);
+  else checked.add(model);
+  allModelsDraft.value = {
+    ...allModelsDraft.value,
+    [channelId]: { all: false, checked },
+  };
+}
+
+/** 全选某渠道：回到「全部启用」态（白名单 null） */
+function setAllChannelModelsAll(channelId: string) {
+  allModelsDraft.value = {
+    ...allModelsDraft.value,
+    [channelId]: { all: true, checked: new Set() },
+  };
+}
+
+/** 清空某渠道勾选：不对外暴露任何模型 */
+function clearAllChannelModels(channelId: string) {
+  allModelsDraft.value = {
+    ...allModelsDraft.value,
+    [channelId]: { all: false, checked: new Set() },
+  };
+}
+
+function openAllChannelsModelsDialog() {
+  allModelsSearch.value = "";
+  const draft: Record<string, AllModelsDraftState> = {};
+  for (const channel of proxyConfig.value.channels) {
+    const allow = channel.enabledModels;
+    draft[channel.id] =
+      allow == null
+        ? { all: true, checked: new Set() }
+        : { all: false, checked: new Set(allow) };
+  }
+  allModelsDraft.value = draft;
+  allModelsDialogOpen.value = true;
+  // 全局模型缓存为空时读取本地缓存（不主动远程拉取）
+  if (Object.keys(channelModels.value).length === 0) {
+    void loadCachedModels();
+  }
+}
+
+function closeAllChannelsModelsDialog() {
+  allModelsDialogOpen.value = false;
+  allModelsSearch.value = "";
+  allModelsDraft.value = {};
+}
+
+/** 批量保存：按各渠道草稿写回 enabledModels 后统一落库 */
+async function saveAllModelsSelection() {
+  savingAllModels.value = true;
+  try {
+    const draft = allModelsDraft.value;
+    for (const group of allModelsGroups.value) {
+      const d = draft[group.channel.id];
+      if (!d) continue;
+      if (d.all) {
+        group.channel.enabledModels = null;
+        continue;
+      }
+      // 已知列表内的按勾选取值；列表外仍勾选的（既有白名单中缓存已不存在的项）原样保留
+      const staleKept = [...d.checked].filter((m) => !group.models.includes(m));
+      group.channel.enabledModels = [
+        ...group.models.filter((m) => d.checked.has(m)),
+        ...staleKept,
+      ];
+    }
+    const ok = await saveConfig(proxyConfig.value);
+    if (ok) {
+      showToast("已更新各渠道模型勾选状态");
+      closeAllChannelsModelsDialog();
+    }
+  } finally {
+    savingAllModels.value = false;
   }
 }
 
@@ -3038,6 +3179,15 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
         </div>
         <div class="mp-section-actions">
           <small class="text-muted">独立管理各个上游反代通道与内部代理池轮询</small>
+          <button
+            type="button"
+            class="mp-btn mp-btn-ghost mp-btn-sm"
+            title="在一个弹窗内统一勾选各渠道对外暴露的模型"
+            @click="openAllChannelsModelsDialog"
+          >
+            <span v-html="icons.grid" />
+            <span>模型管理</span>
+          </button>
           <button
             type="button"
             class="mp-btn mp-btn-ghost mp-btn-sm"
@@ -4352,18 +4502,26 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
                 class="mp-mcm-card"
                 :class="{ 'is-selected': isModelChecked(model), 'is-expanded': isModelExpanded(model) }"
               >
-                <!-- 收起行：勾选 + 名称 + 状态 + 覆盖标记 + 统计摘要 + 展开钮；点击行主体 = 勾选 -->
+                <!-- 收起行：勾选 + 名称 + 状态 + 覆盖标记 + 统计摘要 + 展开钮；点击行主体 = 展开/收起，仅勾选框 = 勾选 -->
                 <div
                   class="mp-mcm-row"
-                  role="checkbox"
-                  :aria-checked="isModelChecked(model)"
+                  role="button"
+                  :aria-expanded="isModelExpanded(model)"
                   :tabindex="0"
-                  @click="toggleModel(model)"
-                  @keydown.enter.space.prevent="toggleModel(model)"
+                  @click="toggleModelExpanded(model)"
+                  @keydown.enter.space.prevent="toggleModelExpanded(model)"
                 >
-                  <span class="mp-mec-check" aria-hidden="true">
+                  <button
+                    type="button"
+                    class="mp-mec-check"
+                    role="checkbox"
+                    :aria-checked="isModelChecked(model)"
+                    :aria-label="isModelChecked(model) ? `取消启用模型 ${model}` : `启用模型 ${model}`"
+                    :title="isModelChecked(model) ? '点击取消勾选' : '点击勾选启用'"
+                    @click.stop="toggleModel(model)"
+                  >
                     <span v-html="isModelChecked(model) ? icons.check : ''" />
-                  </span>
+                  </button>
                   <span class="mp-model-name-title">{{ model }}</span>
                   <span class="mp-status-pill mp-status-pill-xs" :class="{ active: isModelChecked(model) }">
                     <span class="mp-status-dot" />
@@ -5145,6 +5303,159 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
             >
               <span v-html="icons.plus" />
               <span>{{ savingConfig ? "转换中…" : `批量转换 (${convertSelectedSites.size})` }}</span>
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 弹窗 5: 全渠道模型管理 - 统一勾选各渠道对外暴露的模型 (All Channels Models Modal) -->
+    <div
+      v-if="allModelsDialogOpen"
+      class="mp-modal-backdrop"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="mp-all-models-title"
+    >
+      <div class="mp-modal-box mp-modal-box-wide">
+        <div class="mp-modal-header">
+          <div class="mp-modal-title-group">
+            <div class="mp-modal-badge-icon">
+              <span v-html="icons.grid" />
+            </div>
+            <div>
+              <div class="mp-modal-title-wrap">
+                <h3 id="mp-all-models-title">模型管理</h3>
+                <span class="mp-header-chip">{{ allModelsGroups.length }} 个渠道</span>
+              </div>
+              <small class="text-muted">统一勾选各渠道对外暴露的模型 · 全选 = 全部启用（上游新增模型自动暴露）</small>
+            </div>
+          </div>
+          <button
+            type="button"
+            class="mp-modal-close"
+            title="关闭弹窗 (Esc)"
+            @click="closeAllChannelsModelsDialog"
+          >
+            <span v-html="icons.close" />
+          </button>
+        </div>
+
+        <div class="mp-modal-body">
+          <!-- 模型搜索框 -->
+          <div class="mp-models-modal-toolbar">
+            <div class="mp-search-box flex-1">
+              <span class="mp-search-icon" v-html="icons.search" />
+              <input
+                v-model="allModelsSearch"
+                type="search"
+                placeholder="搜索模型名称…"
+                class="mp-search-input-lg"
+              />
+              <button
+                v-if="allModelsSearch"
+                type="button"
+                class="mp-search-clear-btn"
+                title="清空搜索"
+                @click="allModelsSearch = ''"
+              >
+                <span v-html="icons.close" />
+              </button>
+            </div>
+          </div>
+
+          <!-- 渠道分组：渠道头 + 模型勾选矩阵 -->
+          <div class="mp-all-models-groups">
+            <section
+              v-for="group in filteredAllModelsGroups"
+              :key="group.channel.id"
+              class="mp-all-models-group"
+              :class="{ 'is-disabled': !group.channel.enabled }"
+            >
+              <div class="mp-all-models-group-head">
+                <span class="mp-all-models-group-name">
+                  {{ group.channel.name }}
+                  <span class="mp-title-alias">（{{ channelAlias(group.channel) }}）</span>
+                </span>
+                <span
+                  class="mp-sis-badge"
+                  :class="{ 'is-empty': allChannelCheckedCount(group.channel.id) === 0 }"
+                  :title="`已启用 ${allChannelCheckedCount(group.channel.id)} / ${group.total} 个已知模型`"
+                >已启用 {{ allChannelCheckedCount(group.channel.id) }}/{{ group.total }}</span>
+                <span class="mp-all-models-group-actions">
+                  <button
+                    type="button"
+                    class="mp-btn mp-btn-ghost mp-btn-sm"
+                    :class="{ 'is-active': allModelsDraft[group.channel.id]?.all }"
+                    title="全部启用（白名单置空，上游新增模型自动暴露）"
+                    @click="setAllChannelModelsAll(group.channel.id)"
+                  >
+                    <span v-html="icons.check" />
+                    <span>全选</span>
+                  </button>
+                  <button
+                    type="button"
+                    class="mp-btn mp-btn-ghost mp-btn-sm"
+                    title="取消全部勾选（不对外暴露任何模型）"
+                    @click="clearAllChannelModels(group.channel.id)"
+                  >
+                    <span v-html="icons.close" />
+                    <span>清空</span>
+                  </button>
+                </span>
+              </div>
+
+              <div v-if="group.models.length > 0" class="mp-all-models-grid">
+                <button
+                  v-for="model in group.models"
+                  :key="model"
+                  type="button"
+                  class="mp-all-models-item"
+                  :class="{ 'is-selected': isAllModelChecked(group.channel.id, model) }"
+                  :title="isAllModelChecked(group.channel.id, model) ? '点击取消勾选' : '点击勾选对外暴露'"
+                  @click="toggleAllModel(group.channel.id, model)"
+                >
+                  <span class="mp-mec-check" aria-hidden="true">
+                    <span v-html="isAllModelChecked(group.channel.id, model) ? icons.check : ''" />
+                  </span>
+                  <span class="mp-all-models-item-name">{{ model }}</span>
+                </button>
+              </div>
+              <div v-else class="mp-group-empty-note text-muted text-xs">
+                <span v-if="!group.channel.enabled">该渠道当前已被禁用</span>
+                <span v-else-if="allModelsSearch">未检索到匹配的模型</span>
+                <span v-else>暂无已知模型，可在渠道卡片「管理模型」中刷新上游模型</span>
+              </div>
+            </section>
+          </div>
+
+          <div v-if="filteredAllModelsGroups.length === 0" class="mp-empty-box">
+            <div class="mp-empty-icon" v-html="icons.cpu" />
+            <p>未检索到匹配的模型</p>
+          </div>
+        </div>
+
+        <div class="mp-modal-footer">
+          <div class="mp-modal-footer-hint text-muted text-xs">
+            <span>💡 勾选状态即各渠道对外暴露的模型；如需调整代理出口或协议，请使用各渠道卡片「管理模型」</span>
+          </div>
+          <div class="mp-modal-footer-buttons">
+            <button
+              type="button"
+              class="mp-btn mp-btn-ghost"
+              @click="closeAllChannelsModelsDialog"
+            >
+              取消
+            </button>
+            <button
+              type="button"
+              class="mp-btn mp-btn-primary"
+              :disabled="savingAllModels"
+              title="保存所有渠道的模型勾选状态"
+              @click="saveAllModelsSelection"
+            >
+              <span v-html="icons.check" />
+              <span>{{ savingAllModels ? "保存中…" : "保存" }}</span>
             </button>
           </div>
         </div>
@@ -7849,6 +8160,19 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
   border-color: var(--brand);
 }
 
+/* 勾选框为独立按钮：点击仅切换勾选，不触发行的展开/收起；重置按钮默认样式 */
+button.mp-mec-check {
+  padding: 0;
+  cursor: pointer;
+  font: inherit;
+  color: inherit;
+}
+
+button.mp-mec-check:focus-visible {
+  outline: 2px solid var(--brand);
+  outline-offset: 2px;
+}
+
 /* 模型名占据弹性空间，过长时省略号收尾 */
 .mp-mcm-row .mp-model-name-title {
   flex: 0 1 auto;
@@ -9217,5 +9541,85 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
   display: flex;
   justify-content: flex-end;
   margin-top: 4px;
+}
+
+/* —— 全渠道「模型管理」弹窗 —— */
+.mp-all-models-groups {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.mp-all-models-group {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 10px 12px;
+  background: var(--surface);
+}
+
+.mp-all-models-group.is-disabled {
+  opacity: 0.55;
+}
+
+.mp-all-models-group-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+
+.mp-all-models-group-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.mp-all-models-group-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 6px;
+}
+
+.mp-all-models-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 6px;
+}
+
+.mp-all-models-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  cursor: pointer;
+  text-align: left;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+.mp-all-models-item:hover {
+  border-color: var(--line-strong);
+}
+
+.mp-all-models-item.is-selected {
+  border-color: var(--brand);
+  background: var(--brand-soft);
+}
+
+.mp-all-models-item.is-selected .mp-mec-check {
+  background: var(--brand);
+  border-color: var(--brand);
+}
+
+.mp-all-models-item-name {
+  font-size: 12px;
+  font-family: var(--font-mono, monospace);
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 </style>
