@@ -1,11 +1,25 @@
 use super::types::*;
-use crate::context::AppContext;
 use crate::models::Database;
 use rusqlite::params;
-use std::sync::Arc;
 
 /// 建表（幂等）：在 Database::open 末尾调用。
+/// 旧版评测 schema（含 judge_json / prompt_count）直接清表重建——验真与评测语义不兼容。
 pub(crate) fn ensure_model_test_tables(connection: &rusqlite::Connection) -> Result<(), String> {
+    let legacy: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('model_test_results') WHERE name = 'judge_json'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    if legacy > 0 {
+        connection
+            .execute_batch(
+                "DROP TABLE IF EXISTS model_test_results;
+                 DROP TABLE IF EXISTS model_test_runs;",
+            )
+            .map_err(|error| error.to_string())?;
+    }
     connection
         .execute_batch(
             "CREATE TABLE IF NOT EXISTS model_test_runs (
@@ -14,7 +28,8 @@ pub(crate) fn ensure_model_test_tables(connection: &rusqlite::Connection) -> Res
                 finished_at TEXT,
                 status TEXT NOT NULL DEFAULT 'running',
                 target_count INTEGER NOT NULL DEFAULT 0,
-                prompt_count INTEGER NOT NULL DEFAULT 0,
+                probe_count INTEGER NOT NULL DEFAULT 0,
+                repeats INTEGER NOT NULL DEFAULT 1,
                 config_json TEXT NOT NULL DEFAULT '{}',
                 summary_json TEXT
             );
@@ -24,17 +39,18 @@ pub(crate) fn ensure_model_test_tables(connection: &rusqlite::Connection) -> Res
                 channel_id TEXT NOT NULL,
                 channel_name TEXT NOT NULL,
                 model TEXT NOT NULL,
-                prompt_id TEXT NOT NULL,
-                prompt_name TEXT NOT NULL,
+                probe_id TEXT NOT NULL,
+                probe_name TEXT NOT NULL,
                 category TEXT NOT NULL DEFAULT '',
+                sample_index INTEGER NOT NULL DEFAULT 0,
                 ok INTEGER NOT NULL DEFAULT 0,
                 duration_ms INTEGER,
                 prompt_tokens INTEGER,
                 completion_tokens INTEGER,
                 tokens_per_sec REAL,
                 auto_check_json TEXT,
-                score REAL,
-                judge_json TEXT,
+                family_match TEXT,
+                request_text TEXT,
                 error TEXT,
                 response_text TEXT,
                 created_at TEXT NOT NULL
@@ -42,7 +58,24 @@ pub(crate) fn ensure_model_test_tables(connection: &rusqlite::Connection) -> Res
             CREATE INDEX IF NOT EXISTS idx_model_test_results_run ON model_test_results(run_id);
             CREATE INDEX IF NOT EXISTS idx_model_test_runs_started ON model_test_runs(started_at DESC);",
         )
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    // 新版表若缺 request_text 列（对话伪装功能引入）则幂等补列
+    let has_request_text: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('model_test_results') WHERE name = 'request_text'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    if has_request_text == 0 {
+        connection
+            .execute(
+                "ALTER TABLE model_test_results ADD COLUMN request_text TEXT",
+                [],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 pub(crate) fn insert_run(
@@ -54,12 +87,13 @@ pub(crate) fn insert_run(
     let connection = database.lock_conn()?;
     connection
         .execute(
-            "INSERT INTO model_test_runs (started_at, status, target_count, prompt_count, config_json)
-             VALUES (?1, 'running', ?2, ?3, ?4)",
+            "INSERT INTO model_test_runs (started_at, status, target_count, probe_count, repeats, config_json)
+             VALUES (?1, 'running', ?2, ?3, ?4, ?5)",
             params![
                 started_at,
                 params.targets.len() as i64,
-                params.prompts.len() as i64,
+                params.probe_ids.len() as i64,
+                params.repeats.clamp(1, 5) as i64,
                 config_json
             ],
         )
@@ -93,22 +127,22 @@ pub(crate) fn finish_run(
 
 fn row_to_result(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProbeResult> {
     let auto_check_json: Option<String> = row.get("auto_check_json")?;
-    let judge_json: Option<String> = row.get("judge_json")?;
     Ok(ProbeResult {
         channel_id: row.get("channel_id")?,
         channel_name: row.get("channel_name")?,
         model: row.get("model")?,
-        prompt_id: row.get("prompt_id")?,
-        prompt_name: row.get("prompt_name")?,
+        probe_id: row.get("probe_id")?,
+        probe_name: row.get("probe_name")?,
         category: row.get("category")?,
+        sample_index: row.get::<_, i64>("sample_index")? as u32,
         ok: row.get::<_, i64>("ok")? != 0,
         duration_ms: row.get("duration_ms")?,
         prompt_tokens: row.get("prompt_tokens")?,
         completion_tokens: row.get("completion_tokens")?,
         tokens_per_sec: row.get("tokens_per_sec")?,
         auto_check: auto_check_json.and_then(|json| serde_json::from_str(&json).ok()),
-        score: row.get("score")?,
-        judge: judge_json.and_then(|json| serde_json::from_str(&json).ok()),
+        family_match: row.get("family_match")?,
+        request_text: row.get("request_text")?,
         error: row.get("error")?,
         response_text: row.get("response_text")?,
     })
@@ -119,26 +153,27 @@ pub(crate) fn insert_result(database: &Database, run_id: i64, result: &ProbeResu
     connection
         .execute(
             "INSERT INTO model_test_results (
-                run_id, channel_id, channel_name, model, prompt_id, prompt_name, category,
-                ok, duration_ms, prompt_tokens, completion_tokens, tokens_per_sec,
-                auto_check_json, score, judge_json, error, response_text, created_at
-             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+                run_id, channel_id, channel_name, model, probe_id, probe_name, category,
+                sample_index, ok, duration_ms, prompt_tokens, completion_tokens, tokens_per_sec,
+                auto_check_json, family_match, request_text, error, response_text, created_at
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
             params![
                 run_id,
                 result.channel_id,
                 result.channel_name,
                 result.model,
-                result.prompt_id,
-                result.prompt_name,
+                result.probe_id,
+                result.probe_name,
                 result.category,
+                result.sample_index as i64,
                 result.ok as i64,
                 result.duration_ms.map(|v| v as i64),
                 result.prompt_tokens.map(|v| v as i64),
                 result.completion_tokens.map(|v| v as i64),
                 result.tokens_per_sec,
                 result.auto_check.as_ref().and_then(|c| serde_json::to_string(c).ok()),
-                result.score,
-                result.judge.as_ref().and_then(|c| serde_json::to_string(c).ok()),
+                result.family_match,
+                result.request_text,
                 result.error,
                 result.response_text,
                 crate::model::gateway::current_timestamp(),
@@ -152,7 +187,7 @@ pub(crate) fn list_runs(database: &Database, limit: u32) -> Result<Vec<TestRunRe
     let connection = database.lock_conn()?;
     let mut statement = connection
         .prepare(
-            "SELECT id, started_at, finished_at, status, target_count, prompt_count,
+            "SELECT id, started_at, finished_at, status, target_count, probe_count, repeats,
                     config_json, summary_json
                FROM model_test_runs ORDER BY id DESC LIMIT ?1",
         )
@@ -167,7 +202,8 @@ pub(crate) fn list_runs(database: &Database, limit: u32) -> Result<Vec<TestRunRe
                 finished_at: row.get("finished_at")?,
                 status: row.get("status")?,
                 target_count: row.get("target_count")?,
-                prompt_count: row.get("prompt_count")?,
+                probe_count: row.get("probe_count")?,
+                repeats: row.get("repeats")?,
                 config: serde_json::from_str(&config_json).unwrap_or(serde_json::json!({})),
                 summary: summary_json.and_then(|json| serde_json::from_str(&json).ok()),
             })
@@ -203,9 +239,9 @@ pub(crate) fn get_run_results(
     let connection = database.lock_conn()?;
     let mut statement = connection
         .prepare(
-            "SELECT id, run_id, channel_id, channel_name, model, prompt_id, prompt_name, category,
-                    ok, duration_ms, prompt_tokens, completion_tokens, tokens_per_sec,
-                    auto_check_json, score, judge_json, error, response_text, created_at
+            "SELECT run_id, channel_id, channel_name, model, probe_id, probe_name, category,
+                    sample_index, ok, duration_ms, prompt_tokens, completion_tokens, tokens_per_sec,
+                    auto_check_json, family_match, request_text, error, response_text, created_at
                FROM model_test_results WHERE run_id = ?1 ORDER BY id",
         )
         .map_err(|error| error.to_string())?;
@@ -226,44 +262,6 @@ pub(crate) fn delete_run(database: &Database, run_id: i64) -> Result<u64, String
     Ok(affected as u64)
 }
 
-/// 自定义提示词列表（app_meta JSON）。
-pub(crate) fn get_custom_prompts(database: &Database) -> Result<Vec<ProbePrompt>, String> {
-    let raw = crate::db::read_meta(database, CUSTOM_PROMPTS_META_KEY)?;
-    if raw.trim().is_empty() {
-        return Ok(Vec::new());
-    }
-    serde_json::from_str(&raw).map_err(|error| format!("自定义提示词解析失败：{error}"))
-}
-
-pub(crate) fn save_custom_prompts(
-    database: &Database,
-    prompts: &[ProbePrompt],
-) -> Result<(), String> {
-    let json = serde_json::to_string(prompts).map_err(|error| error.to_string())?;
-    let connection = database.lock_conn()?;
-    crate::db::write_meta(&connection, CUSTOM_PROMPTS_META_KEY, &json)
-}
-
-/// 上次运行配置（页面恢复用）。
-pub(crate) fn get_last_config(ctx: &Arc<AppContext>) -> Result<Option<serde_json::Value>, String> {
-    let raw = crate::db::read_meta(&ctx.database, LAST_CONFIG_META_KEY)?;
-    if raw.trim().is_empty() {
-        return Ok(None);
-    }
-    serde_json::from_str(&raw)
-        .map(Some)
-        .map_err(|error| format!("上次运行配置解析失败：{error}"))
-}
-
-pub(crate) fn save_last_config(
-    ctx: &Arc<AppContext>,
-    config: &serde_json::Value,
-) -> Result<(), String> {
-    let json = serde_json::to_string(config).map_err(|error| error.to_string())?;
-    let connection = ctx.database.lock_conn()?;
-    crate::db::write_meta(&connection, LAST_CONFIG_META_KEY, &json)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -281,19 +279,20 @@ mod tests {
         let database = memory_db("lifecycle");
         let params = RunParams {
             targets: vec![ProbeTarget { channel_id: "c1".into(), model: "m1".into() }],
-            prompts: vec![],
+            probe_ids: vec!["cap-math".into()],
+            repeats: 3,
             concurrency: 2,
             timeout_seconds: 60,
-            judge: None,
         };
         let run_id = insert_run(&database, "2026-01-01 00:00:00", &params).unwrap();
         let result = ProbeResult {
             channel_id: "c1".into(),
             channel_name: "渠道一".into(),
             model: "m1".into(),
-            prompt_id: "p1".into(),
-            prompt_name: "题目一".into(),
-            category: "推理".into(),
+            probe_id: "cap-math".into(),
+            probe_name: "多步应用题".into(),
+            category: "capability".into(),
+            sample_index: 0,
             ok: true,
             duration_ms: Some(1234),
             prompt_tokens: Some(10),
@@ -302,12 +301,12 @@ mod tests {
             auto_check: Some(AutoCheckOutcome {
                 kind: "number".into(),
                 passed: true,
-                detail: "命中 42".into(),
+                detail: "命中 324".into(),
             }),
-            score: Some(10.0),
-            judge: None,
+            family_match: None,
+            request_text: Some("算一下利润".into()),
             error: None,
-            response_text: Some("答案是 42".into()),
+            response_text: Some("324".into()),
         };
         insert_result(&database, run_id, &result).unwrap();
         finish_run(&database, run_id, "finished", &RunSummary::default()).unwrap();
@@ -316,36 +315,18 @@ mod tests {
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].status, "finished");
         assert_eq!(runs[0].target_count, 1);
+        assert_eq!(runs[0].probe_count, 1);
+        assert_eq!(runs[0].repeats, 3);
 
         let results = get_run_results(&database, run_id).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].model, "m1");
-        assert_eq!(results[0].score, Some(10.0));
+        assert_eq!(results[0].sample_index, 0);
         assert_eq!(results[0].auto_check.as_ref().unwrap().kind, "number");
+        assert_eq!(results[0].request_text.as_deref(), Some("算一下利润"));
 
         delete_run(&database, run_id).unwrap();
         assert!(list_runs(&database, 10).unwrap().is_empty());
         assert!(get_run_results(&database, run_id).unwrap().is_empty());
-    }
-
-    #[test]
-    fn custom_prompts_roundtrip() {
-        let database = memory_db("prompts");
-        assert!(get_custom_prompts(&database).unwrap().is_empty());
-        let prompts = vec![ProbePrompt {
-            id: "custom-1".into(),
-            name: "我的题".into(),
-            category: "自定义".into(),
-            text: "1+1=?".into(),
-            max_tokens: 64,
-            temperature: 0.0,
-            check: None,
-            judge: true,
-        }];
-        save_custom_prompts(&database, &prompts).unwrap();
-        let loaded = get_custom_prompts(&database).unwrap();
-        assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].name, "我的题");
-        assert!(loaded[0].judge);
     }
 }

@@ -1,8 +1,10 @@
+use super::fingerprints;
 use super::store;
 use super::types::*;
 use crate::context::AppContext;
 use crate::model::gateway::types::{ChannelConfig, ModelProxyContext};
 use serde_json::{json, Value as JsonValue};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -173,6 +175,29 @@ pub(crate) fn run_auto_check(check: &CheckSpec, content: &str) -> AutoCheckOutco
                 }
             }
         }
+        "exact" => {
+            let normalized: String = content
+                .chars()
+                .filter(|ch| !ch.is_whitespace())
+                .collect::<String>()
+                .to_lowercase();
+            let expected: String = check
+                .value
+                .chars()
+                .filter(|ch| !ch.is_whitespace())
+                .collect::<String>()
+                .to_lowercase();
+            outcome.passed = normalized == expected;
+            outcome.detail = if outcome.passed {
+                "与期望输出完全一致".to_string()
+            } else {
+                format!(
+                    "期望「{}」，实际「{}」",
+                    check.value,
+                    truncate_text(&normalized, 80)
+                )
+            };
+        }
         other => outcome.detail = format!("未知判分类型：{other}"),
     }
     outcome
@@ -187,105 +212,37 @@ fn content_from_payload(payload: &JsonValue) -> String {
         .to_string()
 }
 
-/// 用评审模型给开放题回答打分（0-10）。失败不致命：score 为空并记录原因。
-async fn judge_response(
-    gateway_ctx: &ModelProxyContext,
-    judge_model: &str,
-    prompt: &ProbePrompt,
-    response: &str,
-) -> JudgeOutcome {
-    let mut text = format!(
-        "你是严格的模型能力评审员，请给「被测模型的回答」打 0-10 分。\n\
-         评分标准：0-2 明显胡编、拒答或完全跑题；3-5 部分正确但有明显缺陷；\
-         6-8 大体正确、有小瑕疵；9-10 完全正确且表达清晰。\n\n\
-         【题目】\n{}\n\n【被测模型的回答】\n{}",
-        prompt.text, response
-    );
-    if let Some(check) = prompt.check.as_ref().filter(|check| !check.value.trim().is_empty()) {
-        text.push_str(&format!("\n\n【参考答案要点】\n{}", check.value.trim()));
-    }
-    text.push_str("\n\n只输出 JSON，形如 {\"score\": 8.5, \"reason\": \"一句中文理由\"}");
-
-    let body = json!({
-        "model": judge_model,
-        "temperature": 0,
-        "max_tokens": 512,
-        "stream": false,
-        "messages": [{ "role": "user", "content": text }],
-    });
-    match crate::model::gateway::handlers::chat::internal_chat_completion_body(
-        gateway_ctx,
-        body,
-        "OpenHub-ModelTestJudge",
-    )
-    .await
-    {
-        Err(error) => JudgeOutcome {
-            score: None,
-            reason: format!("评审调用失败：{error}"),
-        },
-        Ok(payload) => {
-            let content = content_from_payload(&payload);
-            let Some(value) = crate::token::mapping::ai::extract_json(&content) else {
-                return JudgeOutcome {
-                    score: None,
-                    reason: format!("评审输出不是 JSON：{}", truncate_text(&content, 200)),
-                };
-            };
-            let score = value
-                .get("score")
-                .and_then(|score| {
-                    score
-                        .as_f64()
-                        .or_else(|| score.as_str().and_then(|raw| raw.trim().parse::<f64>().ok()))
-                })
-                .map(|score| score.clamp(0.0, 10.0));
-            let reason = value
-                .get("reason")
-                .and_then(JsonValue::as_str)
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            match score {
-                Some(score) => JudgeOutcome {
-                    score: Some(score),
-                    reason,
-                },
-                None => JudgeOutcome {
-                    score: None,
-                    reason: format!("评审输出缺少 score：{}", truncate_text(&content, 200)),
-                },
-            }
-        }
-    }
-}
-
 const RESPONSE_TEXT_LIMIT: usize = 60_000;
 
-/// 执行单个「目标×提示词」测试。
+/// 执行单个「目标×探测题×采样」请求。
 async fn execute_one(
     gateway_ctx: &ModelProxyContext,
     job: &JobSpec,
-    prompt: &ProbePrompt,
+    probe: &DetectionProbe,
+    sample_index: u32,
     timeout_seconds: u64,
-    judge_model: Option<&str>,
 ) -> ProbeResult {
     let mut result = ProbeResult {
         channel_id: job.target.channel_id.clone(),
         channel_name: job.channel_name.clone(),
         model: job.target.model.clone(),
-        prompt_id: prompt.id.clone(),
-        prompt_name: prompt.name.clone(),
-        category: prompt.category.clone(),
+        probe_id: probe.id.clone(),
+        probe_name: probe.name.clone(),
+        category: probe.category.clone(),
+        sample_index,
         ..Default::default()
     };
     let started = Instant::now();
+    // 对话伪装：随机变体 + 随机闲聊前缀，去除同质化、避免被渠道识别为测试流量
+    let mut rng = fingerprints::Rng::from_entropy();
+    let (messages, asked) = fingerprints::compose_messages(probe, &mut rng);
+    result.request_text = Some(truncate_text(&asked, 2000));
     let body = json!({
         "model": job.request_model,
-        "temperature": prompt.temperature,
-        "max_tokens": prompt.max_tokens,
+        "temperature": probe.temperature,
+        "max_tokens": probe.max_tokens,
         "stream": false,
-        "messages": [{ "role": "user", "content": prompt.text }],
+        "messages": messages,
     });
     let timeout = Duration::from_secs(timeout_seconds.max(1));
     let call = crate::model::gateway::handlers::chat::internal_chat_completion_body(
@@ -334,26 +291,20 @@ async fn execute_one(
     result.response_text = Some(truncate_text(&content, RESPONSE_TEXT_LIMIT));
     result.ok = true;
 
-    if let Some(check) = &prompt.check {
+    // 家族命中：指纹题按期望答案匹配；身份题按自述关键词检测
+    result.family_match = match probe.category.as_str() {
+        "fingerprint" => fingerprints::match_family(&content, &probe.expected),
+        "identity" => fingerprints::detect_identity_family(&content),
+        _ => None,
+    };
+
+    if let Some(check) = &probe.check {
         let outcome = run_auto_check(check, &content);
         if !outcome.passed {
             result.ok = false;
-            result.error = Some(format!("自动判分未通过：{}", outcome.detail));
-        }
-        if !prompt.judge {
-            result.score = Some(if outcome.passed { 10.0 } else { 0.0 });
+            result.error = Some(format!("判分未通过：{}", outcome.detail));
         }
         result.auto_check = Some(outcome);
-    }
-
-    if prompt.judge {
-        if let Some(judge_model) = judge_model {
-            let outcome = judge_response(gateway_ctx, judge_model, prompt, &content).await;
-            if result.score.is_none() {
-                result.score = outcome.score;
-            }
-            result.judge = Some(outcome);
-        }
     }
     result
 }
@@ -366,94 +317,223 @@ fn average(values: &[f64]) -> Option<f64> {
     }
 }
 
-/// 汇总：按目标（模型维度）与按提示词（题目维度）各聚合一份。
-pub(crate) fn build_summary(params: &RunParams, results: &[ProbeResult]) -> RunSummary {
-    let mut models = Vec::new();
-    for target in &params.targets {
-        let mine: Vec<&ProbeResult> = results
-            .iter()
-            .filter(|result| {
-                result.channel_id == target.channel_id && result.model == target.model
-            })
-            .collect();
-        if mine.is_empty() {
-            continue;
-        }
-        let channel_name = mine[0].channel_name.clone();
-        let durations: Vec<f64> = mine
-            .iter()
-            .filter_map(|result| result.duration_ms.map(|value| value as f64))
-            .collect();
-        let speeds: Vec<f64> = mine.iter().filter_map(|result| result.tokens_per_sec).collect();
-        models.push(ModelSummary {
-            channel_id: target.channel_id.clone(),
-            channel_name,
-            model: target.model.clone(),
-            total: mine.len() as u32,
-            ok_count: mine.iter().filter(|result| result.ok).count() as u32,
-            avg_score: average(
-                &mine
-                    .iter()
-                    .filter_map(|result| result.score)
-                    .collect::<Vec<_>>(),
-            ),
-            avg_duration_ms: average(&durations).map(|value| value.round() as u64),
-            avg_tokens_per_sec: average(&speeds),
-        });
+/// 对某家族投票取多数派；无票或并列返回 None。
+fn plurality_family(votes: &[String]) -> Option<String> {
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for vote in votes {
+        *counts.entry(vote.as_str()).or_default() += 1;
     }
-
-    let mut prompts = Vec::new();
-    for prompt in &params.prompts {
-        let mine: Vec<&ProbeResult> = results
-            .iter()
-            .filter(|result| result.prompt_id == prompt.id)
-            .collect();
-        if mine.is_empty() {
-            continue;
+    let mut best: Option<(&str, usize)> = None;
+    let mut tie = false;
+    for (family, count) in counts {
+        match best {
+            Some((_, best_count)) if count > best_count => {
+                best = Some((family, count));
+                tie = false;
+            }
+            Some((_, best_count)) if count == best_count => tie = true,
+            Some(_) => {}
+            None => best = Some((family, count)),
         }
-        let durations: Vec<f64> = mine
-            .iter()
-            .filter_map(|result| result.duration_ms.map(|value| value as f64))
-            .collect();
-        prompts.push(PromptSummary {
-            prompt_id: prompt.id.clone(),
-            prompt_name: prompt.name.clone(),
-            category: prompt.category.clone(),
-            total: mine.len() as u32,
-            ok_count: mine.iter().filter(|result| result.ok).count() as u32,
-            avg_score: average(
-                &mine
-                    .iter()
-                    .filter_map(|result| result.score)
-                    .collect::<Vec<_>>(),
-            ),
-            avg_duration_ms: average(&durations).map(|value| value.round() as u64),
-        });
     }
-    RunSummary { models, prompts }
+    if tie {
+        None
+    } else {
+        best.map(|(family, _)| family.to_string())
+    }
 }
 
-fn validate_params(params: &RunParams) -> Result<(), String> {
-    if params.targets.is_empty() {
-        return Err("请先选择要测试的模型".to_string());
+/// 按目标聚合验真结论。results 须为同一 run 的全部探测结果。
+pub(crate) fn build_verdicts(results: &[ProbeResult]) -> Vec<TargetVerdict> {
+    // 按「渠道×模型」分组，保持首次出现顺序
+    let mut order: Vec<(String, String)> = Vec::new();
+    let mut groups: HashMap<(String, String), Vec<&ProbeResult>> = HashMap::new();
+    for result in results {
+        let key = (result.channel_id.clone(), result.model.clone());
+        groups.entry(key.clone()).or_default().push(result);
+        if !order.contains(&key) {
+            order.push(key);
+        }
     }
-    if params.prompts.is_empty() {
-        return Err("请至少选择一条测试提示词".to_string());
+
+    order
+        .into_iter()
+        .filter_map(|key| {
+            let mine = groups.get(&key)?;
+            let first = mine[0];
+            let mut verdict = TargetVerdict {
+                channel_id: first.channel_id.clone(),
+                channel_name: first.channel_name.clone(),
+                model: first.model.clone(),
+                total_requests: mine.len() as u32,
+                ok_count: mine.iter().filter(|r| r.ok).count() as u32,
+                ..Default::default()
+            };
+            let mut issues = Vec::new();
+
+            verdict.claimed_family = fingerprints::family_of_model(&verdict.model);
+
+            // 身份自述：命中家族的票取多数派
+            let identity_votes: Vec<String> = mine
+                .iter()
+                .filter(|r| r.category == "identity" && r.ok)
+                .filter_map(|r| r.family_match.clone())
+                .collect();
+            verdict.identity_family = plurality_family(&identity_votes);
+            verdict.identity_consistent = match (&verdict.claimed_family, &verdict.identity_family)
+            {
+                (Some(claimed), Some(reported)) => Some(claimed == reported),
+                _ => None,
+            };
+
+            // 指纹投票
+            let fingerprint_votes: Vec<String> = mine
+                .iter()
+                .filter(|r| r.category == "fingerprint" && r.ok)
+                .filter_map(|r| r.family_match.clone())
+                .collect();
+            verdict.detected_family = plurality_family(&fingerprint_votes);
+
+            // 能力通过率
+            let capability: Vec<&&ProbeResult> = mine
+                .iter()
+                .filter(|r| r.category == "capability")
+                .collect();
+            verdict.capability_total = capability.len() as u32;
+            verdict.capability_passed = capability.iter().filter(|r| r.ok).count() as u32;
+
+            // 一致性：采样数 > 1 的探测题，各采样的判分结论（ok + 家族命中）须一致。
+            // 问法经随机变体包装，原文比对无意义，故比对结论而非文本。
+            let mut sample_groups: HashMap<&str, Vec<(bool, Option<&str>)>> = HashMap::new();
+            for r in mine.iter() {
+                sample_groups
+                    .entry(r.probe_id.as_str())
+                    .or_default()
+                    .push((r.ok, r.family_match.as_deref()));
+            }
+            let repeat_groups: Vec<bool> = sample_groups
+                .values()
+                .filter(|samples| samples.len() > 1)
+                .map(|samples| {
+                    samples.windows(2).all(|pair| pair[0] == pair[1])
+                })
+                .collect();
+            verdict.consistency_rate = if repeat_groups.is_empty() {
+                None
+            } else {
+                let consistent = repeat_groups.iter().filter(|ok| **ok).count();
+                Some(consistent as f64 / repeat_groups.len() as f64)
+            };
+
+            let durations: Vec<f64> = mine
+                .iter()
+                .filter_map(|r| r.duration_ms.map(|v| v as f64))
+                .collect();
+            let speeds: Vec<f64> = mine.iter().filter_map(|r| r.tokens_per_sec).collect();
+            verdict.avg_duration_ms = average(&durations).map(|v| v.round() as u64);
+            verdict.avg_tokens_per_sec = average(&speeds);
+
+            // —— 结论判定 ——
+            verdict.verdict = if verdict.ok_count == 0 {
+                issues.push(format!(
+                    "{} 次探测全部失败，渠道或模型不可用",
+                    verdict.total_requests
+                ));
+                "unreachable".to_string()
+            } else {
+                let mut impersonated = false;
+                if verdict.identity_consistent == Some(false) {
+                    impersonated = true;
+                    issues.push(format!(
+                        "模型自述为「{}」系，与标称「{}」不符",
+                        verdict.identity_family.clone().unwrap_or_default(),
+                        verdict.claimed_family.clone().unwrap_or_default()
+                    ));
+                }
+                if let (Some(claimed), Some(detected)) =
+                    (&verdict.claimed_family, &verdict.detected_family)
+                {
+                    if claimed != detected {
+                        impersonated = true;
+                        issues.push(format!(
+                            "指纹题投票指向「{detected}」系，与标称「{claimed}」不符"
+                        ));
+                    }
+                }
+                if impersonated {
+                    "impersonation".to_string()
+                } else {
+                    let mut suspicious = false;
+                    let capability_rate = if verdict.capability_total > 0 {
+                        verdict.capability_passed as f64 / (verdict.capability_total as f64)
+                    } else {
+                        1.0
+                    };
+                    if verdict.capability_total > 0 && capability_rate < 0.5 {
+                        suspicious = true;
+                        issues.push(format!(
+                            "能力题通过率仅 {}/{}，疑似降智（量化/蒸馏/小模型冒充）",
+                            verdict.capability_passed, verdict.capability_total
+                        ));
+                    }
+                    if verdict.consistency_rate == Some(0.0) {
+                        suspicious = true;
+                        issues.push("重复采样答案完全不一致，渠道可能随机偷换模型".to_string());
+                    }
+                    if verdict.ok_count < verdict.total_requests {
+                        suspicious = true;
+                        issues.push(format!(
+                            "{}/{} 次探测失败",
+                            verdict.total_requests - verdict.ok_count,
+                            verdict.total_requests
+                        ));
+                    }
+                    if suspicious { "suspicious" } else { "ok" }.to_string()
+                }
+            };
+            verdict.issues = issues;
+            verdict.results = mine.iter().map(|r| (*r).clone()).collect();
+            Some(verdict)
+        })
+        .collect()
+}
+
+/// 汇总为整次运行的摘要（存 summary_json，不含明细）。
+pub(crate) fn build_summary(results: &[ProbeResult]) -> RunSummary {
+    RunSummary {
+        targets: build_verdicts(results)
+            .into_iter()
+            .map(|mut verdict| {
+                verdict.results.clear();
+                verdict
+            })
+            .collect(),
+    }
+}
+
+fn validate_params(params: &RunParams) -> Result<Vec<DetectionProbe>, String> {
+    if params.targets.is_empty() {
+        return Err("请先选择要检测的渠道模型".to_string());
+    }
+    if params.probe_ids.is_empty() {
+        return Err("请至少选择一道探测题".to_string());
     }
     if params.targets.iter().any(|target| target.channel_id.trim().is_empty()) {
-        return Err("存在未指定渠道的测试目标".to_string());
+        return Err("存在未指定渠道的检测目标".to_string());
     }
-    if params
-        .prompts
-        .iter()
-        .any(|prompt| prompt.text.trim().is_empty())
-    {
-        return Err("存在提示词内容为空的测试项".to_string());
+    let catalog = fingerprints::builtin_probes();
+    let mut probes = Vec::new();
+    for id in &params.probe_ids {
+        let probe = catalog
+            .iter()
+            .find(|probe| &probe.id == id)
+            .ok_or_else(|| format!("探测题 {id} 不在内置目录中"))?;
+        probes.push(probe.clone());
     }
-    Ok(())
+    Ok(probes)
 }
 
-/// 启动一次测试：校验 → 落库 running → 后台并发执行 → 立即返回运行句柄。
+/// 启动一次验真检测：校验 → 落库 running → 后台并发执行 → 立即返回运行句柄。
 pub async fn start_model_test(
     ctx: Arc<AppContext>,
     gateway_ctx: Arc<ModelProxyContext>,
@@ -465,12 +545,18 @@ pub async fn start_model_test(
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()
     {
-        return Err("已有模型测试正在运行，请等待完成或先取消".to_string());
+        return Err("已有模型验真正在运行，请等待完成或先取消".to_string());
     }
-    if let Err(error) = validate_params(&params) {
+    let cleanup = |runtime: &Arc<crate::model::probe::types::ProbeRuntime>| {
         runtime.running.store(false, Ordering::SeqCst);
-        return Err(error);
-    }
+    };
+    let probes = match validate_params(&params) {
+        Ok(probes) => probes,
+        Err(error) => {
+            cleanup(&runtime);
+            return Err(error);
+        }
+    };
 
     let channels = gateway_ctx.config.read().await.channels.clone();
     let mut jobs = Vec::new();
@@ -478,7 +564,7 @@ pub async fn start_model_test(
         let request_model = match resolve_probe_model(&channels, target) {
             Ok(model) => model,
             Err(error) => {
-                runtime.running.store(false, Ordering::SeqCst);
+                cleanup(&runtime);
                 return Err(error);
             }
         };
@@ -493,33 +579,17 @@ pub async fn start_model_test(
             request_model,
         });
     }
-    let judge_model = match params.judge.as_ref() {
-        Some(spec) => {
-            let resolved = resolve_probe_model(
-                &channels,
-                &ProbeTarget {
-                    channel_id: spec.channel_id.clone(),
-                    model: spec.model.clone(),
-                },
-            );
-            match resolved {
-                Ok(model) => Some(model),
-                Err(error) => {
-                    runtime.running.store(false, Ordering::SeqCst);
-                    return Err(format!("评审模型不可用：{error}"));
-                }
-            }
-        }
-        None => None,
-    };
-    if params.prompts.iter().any(|prompt| prompt.judge) && judge_model.is_none() {
-        runtime.running.store(false, Ordering::SeqCst);
-        return Err("所选提示词包含需要 LLM 评审的开放题，请先选择评审模型".to_string());
-    }
 
-    let total = (jobs.len() * params.prompts.len()) as u32;
+    let repeats = params.repeats.clamp(1, 5);
+    let samples_per_probe: Vec<u32> = probes
+        .iter()
+        .map(|probe| if probe.repeats { repeats } else { 1 })
+        .collect();
+    let total: u32 = (jobs.len() as u32) * samples_per_probe.iter().sum::<u32>();
+
     let _ = store::reap_stale_runs(&ctx.database, None);
-    let run_id = store::insert_run(&ctx.database, &crate::model::gateway::current_timestamp(), &params)?;
+    let run_id =
+        store::insert_run(&ctx.database, &crate::model::gateway::current_timestamp(), &params)?;
 
     let token = CancellationToken::new();
     if let Ok(mut guard) = runtime.active_cancellation.lock() {
@@ -534,8 +604,8 @@ pub async fn start_model_test(
         ctx,
         gateway_ctx,
         params,
+        probes,
         jobs,
-        judge_model,
         run_id,
         total,
         token,
@@ -548,73 +618,85 @@ async fn run_all(
     ctx: Arc<AppContext>,
     gateway_ctx: Arc<ModelProxyContext>,
     params: RunParams,
+    probes: Vec<DetectionProbe>,
     jobs: Vec<JobSpec>,
-    judge_model: Option<String>,
     run_id: i64,
     total: u32,
     token: CancellationToken,
 ) {
     let runtime = ctx.model_probe.clone();
+    let repeats = params.repeats.clamp(1, 5);
     let concurrency = params.concurrency.clamp(1, 16) as usize;
     let semaphore = Arc::new(Semaphore::new(concurrency));
     let completed = Arc::new(AtomicUsize::new(0));
 
-    let mut handles = Vec::with_capacity(jobs.len() * params.prompts.len());
+    let mut task_count = 0usize;
+    let mut handles = Vec::new();
     for job in &jobs {
-        for prompt in &params.prompts {
-            let gateway = gateway_ctx.clone();
-            let job_ctx = ctx.clone();
-            let semaphore = semaphore.clone();
-            let job_token = token.clone();
-            let completed = completed.clone();
-            let job = job.clone();
-            let prompt = prompt.clone();
-            let timeout_seconds = params.timeout_seconds;
-            let judge_model = judge_model.clone();
-            handles.push(crate::context::spawn(async move {
-                let _permit = match semaphore.acquire_owned().await {
-                    Ok(permit) => permit,
-                    Err(error) => {
-                        warn!("[model-test] 信号量获取失败：{error}");
+        for probe in &probes {
+            let samples = if probe.repeats { repeats } else { 1 };
+            for sample_index in 0..samples {
+                task_count += 1;
+                let gateway = gateway_ctx.clone();
+                let job_ctx = ctx.clone();
+                let semaphore = semaphore.clone();
+                let job_token = token.clone();
+                let completed = completed.clone();
+                let job = job.clone();
+                let probe = probe.clone();
+                let timeout_seconds = params.timeout_seconds;
+                handles.push(crate::context::spawn(async move {
+                    let _permit = match semaphore.acquire_owned().await {
+                        Ok(permit) => permit,
+                        Err(error) => {
+                            warn!("[model-test] 信号量获取失败：{error}");
+                            return None;
+                        }
+                    };
+                    let result = if job_token.is_cancelled() {
+                        // 取消后跳过的任务也计入进度，避免进度条永远停在中间
+                        let done = completed.fetch_add(1, Ordering::Relaxed) as u32 + 1;
+                        job_ctx.event_bus.emit(
+                            "model-test-progress",
+                            RunProgress {
+                                run_id,
+                                phase: "running".to_string(),
+                                completed: done,
+                                total,
+                                result: None,
+                            },
+                        );
                         return None;
+                    } else {
+                        execute_one(&gateway, &job, &probe, sample_index, timeout_seconds).await
+                    };
+                    if let Err(error) = store::insert_result(&job_ctx.database, run_id, &result) {
+                        warn!("[model-test] 结果写入失败：{error}");
                     }
-                };
-                if job_token.is_cancelled() {
-                    return None;
-                }
-                let result = execute_one(
-                    &gateway,
-                    &job,
-                    &prompt,
-                    timeout_seconds,
-                    judge_model.as_deref(),
-                )
-                .await;
-                if let Err(error) = store::insert_result(&job_ctx.database, run_id, &result) {
-                    warn!("[model-test] 结果写入失败：{error}");
-                }
-                let done = completed.fetch_add(1, Ordering::Relaxed) as u32 + 1;
-                job_ctx.event_bus.emit(
-                    "model-test-progress",
-                    RunProgress {
-                        run_id,
-                        phase: "running".to_string(),
-                        completed: done,
-                        total,
-                        result: Some(result),
-                    },
-                );
-                Some(())
-            }));
+                    let done = completed.fetch_add(1, Ordering::Relaxed) as u32 + 1;
+                    job_ctx.event_bus.emit(
+                        "model-test-progress",
+                        RunProgress {
+                            run_id,
+                            phase: "running".to_string(),
+                            completed: done,
+                            total,
+                            result: Some(result),
+                        },
+                    );
+                    Some(())
+                }));
+            }
         }
     }
+    debug_assert_eq!(task_count, total as usize);
     let _ = futures_util::future::join_all(handles).await;
 
     // 收集结果重新从库里读，保证与落库内容一致
     let results = store::get_run_results(&ctx.database, run_id).unwrap_or_default();
     let cancelled = token.is_cancelled();
     let status = if cancelled { "cancelled" } else { "finished" };
-    let summary = build_summary(&params, &results);
+    let summary = build_summary(&results);
     if let Err(error) = store::finish_run(&ctx.database, run_id, status, &summary) {
         warn!("[model-test] 运行收尾失败：{error}");
     }
@@ -639,11 +721,11 @@ async fn run_all(
     );
 }
 
-/// 取消当前正在运行的测试。
+/// 取消当前正在运行的检测。
 pub fn cancel_model_test(ctx: &Arc<AppContext>) -> Result<(), String> {
     let runtime = &ctx.model_probe;
     if !runtime.running.load(Ordering::SeqCst) {
-        return Err("当前没有正在运行的模型测试".to_string());
+        return Err("当前没有正在运行的模型验真".to_string());
     }
     let token = runtime
         .active_cancellation
@@ -655,6 +737,6 @@ pub fn cancel_model_test(ctx: &Arc<AppContext>) -> Result<(), String> {
             token.cancel();
             Ok(())
         }
-        None => Err("当前没有正在运行的模型测试".to_string()),
+        None => Err("当前没有正在运行的模型验真".to_string()),
     }
 }

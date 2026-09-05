@@ -1,3 +1,4 @@
+use super::fingerprints;
 use super::runner;
 use super::store;
 use super::types::*;
@@ -5,7 +6,7 @@ use crate::context::{AppContext, Managed};
 use crate::model::gateway::types::ModelProxyState;
 use std::sync::Arc;
 
-/// 启动一次模型能力测试（后台执行，进度经 `model-test-progress` 事件推送）。
+/// 启动一次模型验真检测（后台执行，进度经 `model-test-progress` 事件推送）。
 #[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn run_model_test(
     ctx: Managed<'_, Arc<AppContext>>,
@@ -20,6 +21,12 @@ pub async fn run_model_test(
 #[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn cancel_model_test(ctx: Managed<'_, Arc<AppContext>>) -> Result<(), String> {
     runner::cancel_model_test(ctx.inner())
+}
+
+/// 内置探测目录（前端展示与勾选用，题库由后端维护）。
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub async fn get_detection_suites() -> Result<Vec<DetectionProbe>, String> {
+    Ok(fingerprints::builtin_probes())
 }
 
 #[cfg_attr(feature = "desktop", tauri::command)]
@@ -42,15 +49,19 @@ pub async fn list_model_test_runs(
     .map_err(|error| format!("任务调度失败：{error}"))?
 }
 
+/// 某次检测的按目标验真结论（含全部探测明细）。
 #[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn get_model_test_results(
     ctx: Managed<'_, Arc<AppContext>>,
     run_id: i64,
-) -> Result<Vec<ProbeResult>, String> {
+) -> Result<Vec<TargetVerdict>, String> {
     let ctx = ctx.inner().clone();
-    crate::context::spawn_blocking(move || store::get_run_results(&ctx.database, run_id))
-        .await
-        .map_err(|error| format!("任务调度失败：{error}"))?
+    crate::context::spawn_blocking(move || {
+        let results = store::get_run_results(&ctx.database, run_id)?;
+        Ok(runner::build_verdicts(&results))
+    })
+    .await
+    .map_err(|error| format!("任务调度失败：{error}"))?
 }
 
 #[cfg_attr(feature = "desktop", tauri::command)]
@@ -62,42 +73,4 @@ pub async fn delete_model_test_run(
     crate::context::spawn_blocking(move || store::delete_run(&ctx.database, run_id))
         .await
         .map_err(|error| format!("任务调度失败：{error}"))?
-}
-
-#[cfg_attr(feature = "desktop", tauri::command)]
-pub async fn get_model_test_custom_prompts(
-    ctx: Managed<'_, Arc<AppContext>>,
-) -> Result<Vec<ProbePrompt>, String> {
-    let ctx = ctx.inner().clone();
-    crate::context::spawn_blocking(move || store::get_custom_prompts(&ctx.database))
-        .await
-        .map_err(|error| format!("任务调度失败：{error}"))?
-}
-
-#[cfg_attr(feature = "desktop", tauri::command)]
-pub async fn save_model_test_custom_prompts(
-    ctx: Managed<'_, Arc<AppContext>>,
-    prompts: Vec<ProbePrompt>,
-) -> Result<(), String> {
-    let ctx = ctx.inner().clone();
-    crate::context::spawn_blocking(move || store::save_custom_prompts(&ctx.database, &prompts))
-        .await
-        .map_err(|error| format!("任务调度失败：{error}"))?
-}
-
-#[cfg_attr(feature = "desktop", tauri::command)]
-pub async fn get_model_test_last_config(
-    ctx: Managed<'_, Arc<AppContext>>,
-) -> Result<Option<serde_json::Value>, String> {
-    let ctx = ctx.inner().clone();
-    store::get_last_config(&ctx)
-}
-
-#[cfg_attr(feature = "desktop", tauri::command)]
-pub async fn save_model_test_last_config(
-    ctx: Managed<'_, Arc<AppContext>>,
-    config: serde_json::Value,
-) -> Result<(), String> {
-    let ctx = ctx.inner().clone();
-    store::save_last_config(&ctx, &config)
 }

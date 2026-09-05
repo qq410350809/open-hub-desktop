@@ -749,7 +749,7 @@ macro_rules! rpc_arms {
                 ))
             }
 
-            // —— 模型能力测试（probe） ——
+            // —— 模型验真（probe） ——
             "run_model_test" => {
                 let params: crate::model::probe::RunParams = take($args, &["params"])?;
                 Ok(json!(
@@ -759,6 +759,7 @@ macro_rules! rpc_arms {
             "cancel_model_test" => {
                 Ok(json!(crate::model::probe::cancel_model_test($ctx).await))
             }
+            "get_detection_suites" => Ok(json!(crate::model::probe::get_detection_suites().await)),
             "list_model_test_runs" => {
                 let limit: Option<u32> = take_opt($args, &["limit"]).ok().flatten();
                 Ok(json!(crate::model::probe::list_model_test_runs($ctx, limit).await))
@@ -770,25 +771,6 @@ macro_rules! rpc_arms {
             "delete_model_test_run" => {
                 let run_id: i64 = take($args, &["runId", "run_id"])?;
                 Ok(json!(crate::model::probe::delete_model_test_run($ctx, run_id).await))
-            }
-            "get_model_test_custom_prompts" => Ok(json!(
-                crate::model::probe::get_model_test_custom_prompts($ctx).await
-            )),
-            "save_model_test_custom_prompts" => {
-                let prompts: Vec<crate::model::probe::ProbePrompt> =
-                    take($args, &["prompts"])?;
-                Ok(json!(
-                    crate::model::probe::save_model_test_custom_prompts($ctx, prompts).await
-                ))
-            }
-            "get_model_test_last_config" => Ok(json!(
-                crate::model::probe::get_model_test_last_config($ctx).await
-            )),
-            "save_model_test_last_config" => {
-                let config: serde_json::Value = take($args, &["config"])?;
-                Ok(json!(
-                    crate::model::probe::save_model_test_last_config($ctx, config).await
-                ))
             }
 
             // —— 登录会话 ——

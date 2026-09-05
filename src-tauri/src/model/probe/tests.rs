@@ -29,7 +29,7 @@ fn channel_json(id: &str, alias: &str, enabled: bool) -> ChannelConfig {
 
 #[test]
 fn contains_check_is_case_insensitive_and_multi_keyword() {
-    let outcome = runner::run_auto_check(&check("contains", "111221, 看行"), "下一行是 111221。");
+    let outcome = runner::run_auto_check(&check("contains", "312211, 看行"), "下一行是 312211。");
     assert!(outcome.passed);
 
     let missed = runner::run_auto_check(&check("contains", "abc"), "完全无关的回答");
@@ -73,6 +73,15 @@ fn json_check_tolerates_code_fence() {
 }
 
 #[test]
+fn exact_check_ignores_whitespace_and_case() {
+    let outcome = runner::run_auto_check(&check("exact", "甲乙丙"), "甲\n乙\n丙\n");
+    assert!(outcome.passed);
+
+    let extra = runner::run_auto_check(&check("exact", "甲乙丙"), "第一行：甲\n第二行：乙\n第三行：丙");
+    assert!(!extra.passed);
+}
+
+#[test]
 fn unknown_check_kind_fails() {
     let outcome = runner::run_auto_check(&check("regex", ".*"), "任意");
     assert!(!outcome.passed);
@@ -100,57 +109,220 @@ fn extract_numbers_handles_thousands_and_decimals() {
 }
 
 #[test]
-fn build_summary_aggregates_by_model_and_prompt() {
-    let params = RunParams {
-        targets: vec![target("c1", "m1"), target("c1", "m2")],
-        prompts: vec![super::types::ProbePrompt {
-            id: "p1".into(),
-            name: "题一".into(),
-            category: "推理".into(),
-            text: "t".into(),
-            max_tokens: 64,
-            temperature: 0.0,
-            check: None,
-            judge: false,
-        }],
-        concurrency: 2,
-        timeout_seconds: 60,
-        judge: None,
-    };
-    let mk = |model: &str, prompt: &str, ok: bool, score: Option<f64>, ms: u64| ProbeResult {
+fn family_of_model_infers_claimed_family() {
+    assert_eq!(
+        fingerprints::family_of_model("gpt-4o-2024-11-20").as_deref(),
+        Some("gpt")
+    );
+    assert_eq!(
+        fingerprints::family_of_model("claude-sonnet-4").as_deref(),
+        Some("claude")
+    );
+    assert_eq!(
+        fingerprints::family_of_model("deepseek-r1").as_deref(),
+        Some("deepseek")
+    );
+    assert_eq!(
+        fingerprints::family_of_model("Qwen3-235B").as_deref(),
+        Some("qwen")
+    );
+    assert_eq!(fingerprints::family_of_model("some-random-model"), None);
+}
+
+#[test]
+fn identity_family_detection_prefers_majority_keywords() {
+    // 声称是 GPT 的渠道实际部署了 Qwen：自述里 qwen 关键词占优
+    let text = "我是通义千问（Qwen），由阿里巴巴集团通义实验室开发。";
+    assert_eq!(
+        fingerprints::detect_identity_family(text).as_deref(),
+        Some("qwen")
+    );
+    // 明确自报 Claude
+    assert_eq!(
+        fingerprints::detect_identity_family("I am Claude, made by Anthropic.").as_deref(),
+        Some("claude")
+    );
+    // 无家族线索
+    assert_eq!(fingerprints::detect_identity_family("我是一个人工智能助手。"), None);
+}
+
+#[test]
+fn fingerprint_match_uses_family_patterns() {
+    let probe = fingerprints::builtin_probes()
+        .into_iter()
+        .find(|probe| probe.id == "fp-developer")
+        .expect("fp-developer exists");
+    assert_eq!(
+        fingerprints::match_family("我的开发者是 Anthropic。", &probe.expected).as_deref(),
+        Some("claude")
+    );
+    assert_eq!(
+        fingerprints::match_family("由深度求索（DeepSeek）公司创造。", &probe.expected).as_deref(),
+        Some("deepseek")
+    );
+    assert_eq!(fingerprints::match_family("我不知道。", &probe.expected), None);
+}
+
+#[test]
+fn builtin_probes_are_wellformed() {
+    let probes = fingerprints::builtin_probes();
+    assert!(!probes.is_empty());
+    let mut ids = std::collections::HashSet::new();
+    for probe in &probes {
+        assert!(ids.insert(probe.id.clone()), "重复探测题 id：{}", probe.id);
+        assert!(!probe.text.trim().is_empty());
+        // 去同质化：每题至少 3 个同义变体，且默认文本在变体中
+        assert!(
+            probe.variants.len() >= 3,
+            "探测题 {} 变体不足：{}",
+            probe.id,
+            probe.variants.len()
+        );
+        assert!(
+            probe.variants.iter().any(|v| v == &probe.text),
+            "探测题 {} 的默认文本不在变体中",
+            probe.id
+        );
+        match probe.category.as_str() {
+            "identity" | "capability" => {}
+            "fingerprint" => assert!(
+                !probe.expected.is_empty(),
+                "指纹题 {} 缺少期望答案",
+                probe.id
+            ),
+            other => panic!("未知探测类别：{other}"),
+        }
+    }
+    // 一致性采样题至少有一道
+    assert!(probes.iter().any(|probe| probe.repeats));
+}
+
+#[test]
+fn compose_messages_wraps_probe_in_chat_history() {
+    let probe = fingerprints::builtin_probes()
+        .into_iter()
+        .find(|probe| probe.id == "cap-multiply")
+        .expect("cap-multiply exists");
+    let mut rng = fingerprints::Rng::new(42);
+    let (messages, asked) = fingerprints::compose_messages(&probe, &mut rng);
+    // 至少一轮闲聊 + 最终提问；角色以 user 开始、user 结束、交替出现
+    assert!(messages.len() >= 3 && messages.len() <= 5);
+    assert_eq!(messages.first().unwrap()["role"], "user");
+    assert_eq!(messages.last().unwrap()["role"], "user");
+    for window in messages.windows(2) {
+        assert_ne!(window[0]["role"], window[1]["role"]);
+    }
+    // 最终提问必须是某个变体（可带过渡前缀），判分答案不变
+    assert!(
+        probe.variants.iter().any(|v| asked.ends_with(v.as_str())),
+        "最终提问不在变体集合中：{asked}"
+    );
+}
+
+#[test]
+fn compose_messages_is_randomized_across_calls() {
+    let probe = fingerprints::builtin_probes()
+        .into_iter()
+        .find(|probe| probe.id == "id-direct")
+        .expect("id-direct exists");
+    // 不同种子应产生不同的对话包装（闲聊前缀或变体不同）
+    let mut seen = std::collections::HashSet::new();
+    for seed in 1..=12 {
+        let mut rng = fingerprints::Rng::new(seed);
+        let (messages, _) = fingerprints::compose_messages(&probe, &mut rng);
+        seen.insert(messages);
+    }
+    assert!(seen.len() >= 6, "对话包装随机性不足：{} 种", seen.len());
+}
+
+fn result(probe_id: &str, category: &str, model: &str, ok: bool) -> ProbeResult {
+    ProbeResult {
         channel_id: "c1".into(),
         channel_name: "渠道一".into(),
         model: model.into(),
-        prompt_id: prompt.into(),
-        prompt_name: "题一".into(),
-        category: "推理".into(),
+        probe_id: probe_id.into(),
+        probe_name: probe_id.into(),
+        category: category.into(),
         ok,
-        duration_ms: Some(ms),
-        score,
         ..Default::default()
-    };
+    }
+}
+
+#[test]
+fn verdict_flags_impersonation_on_identity_mismatch() {
+    let mut claimed_qwen = result("id-direct", "identity", "qwen-plus", true);
+    claimed_qwen.family_match = Some("glm".into());
+    let verdicts = runner::build_verdicts(&[claimed_qwen]);
+    assert_eq!(verdicts.len(), 1);
+    assert_eq!(verdicts[0].verdict, "impersonation");
+    assert_eq!(verdicts[0].identity_consistent, Some(false));
+    assert!(!verdicts[0].issues.is_empty());
+}
+
+#[test]
+fn verdict_flags_low_capability_pass_rate() {
     let results = vec![
-        mk("m1", "p1", true, Some(10.0), 1000),
-        mk("m1", "p1", true, Some(6.0), 3000),
-        mk("m2", "p1", false, Some(0.0), 500),
+        result("cap-sequence", "capability", "gpt-4o", true),
+        result("cap-multiply", "capability", "gpt-4o", false),
+        result("cap-snail", "capability", "gpt-4o", false),
+        result("id-direct", "identity", "gpt-4o", true),
     ];
-    let summary = runner::build_summary(&params, &results);
-    assert_eq!(summary.models.len(), 2);
-    let m1 = summary
-        .models
-        .iter()
-        .find(|item| item.model == "m1")
-        .unwrap();
-    assert_eq!(m1.ok_count, 2);
-    assert_eq!(m1.avg_score, Some(8.0));
-    assert_eq!(m1.avg_duration_ms, Some(2000));
-    let m2 = summary
-        .models
-        .iter()
-        .find(|item| item.model == "m2")
-        .unwrap();
-    assert_eq!(m2.ok_count, 0);
-    assert_eq!(summary.prompts.len(), 1);
-    assert_eq!(summary.prompts[0].total, 3);
-    assert_eq!(summary.prompts[0].ok_count, 2);
+    let verdicts = runner::build_verdicts(&results);
+    assert_eq!(verdicts[0].verdict, "suspicious");
+    assert_eq!(verdicts[0].capability_passed, 1);
+    assert_eq!(verdicts[0].capability_total, 3);
+}
+
+#[test]
+fn verdict_ok_when_consistent_and_capable() {
+    let base = result("cap-sequence", "capability", "gpt-4o", true);
+    let mut second = base.clone();
+    second.sample_index = 1;
+    let mut third = base.clone();
+    third.sample_index = 2;
+    let mut identity = result("id-direct", "identity", "gpt-4o", true);
+    identity.family_match = Some("gpt".into());
+    let verdicts = runner::build_verdicts(&[base, second, third, identity]);
+    assert_eq!(verdicts[0].verdict, "ok");
+    assert_eq!(verdicts[0].consistency_rate, Some(1.0));
+    assert_eq!(verdicts[0].identity_consistent, Some(true));
+}
+
+#[test]
+fn verdict_unreachable_when_all_fail() {
+    let results = vec![
+        result("cap-math", "capability", "gpt-4o", false),
+        result("id-direct", "identity", "gpt-4o", false),
+    ];
+    let verdicts = runner::build_verdicts(&results);
+    assert_eq!(verdicts[0].verdict, "unreachable");
+}
+
+#[test]
+fn consistency_detects_verdict_variance() {
+    // 同一采样题两次结果判分结论不一致（问法随机变体，比对结论而非文本）
+    let a = result("cap-sequence", "capability", "gpt-4o", true);
+    let mut b = a.clone();
+    b.sample_index = 1;
+    b.ok = false;
+    let mut identity = result("id-direct", "identity", "gpt-4o", true);
+    identity.family_match = Some("gpt".into());
+    let verdicts = runner::build_verdicts(&[a, b, identity]);
+    assert_eq!(verdicts[0].consistency_rate, Some(0.0));
+    assert_eq!(verdicts[0].verdict, "suspicious");
+}
+
+#[test]
+fn verdicts_group_multiple_targets() {
+    let results = vec![
+        result("cap-math", "capability", "gpt-4o", true),
+        result("cap-math", "capability", "claude-sonnet-4", true),
+        result("cap-json", "capability", "gpt-4o", true),
+    ];
+    let verdicts = runner::build_verdicts(&results);
+    assert_eq!(verdicts.len(), 2);
+    assert_eq!(verdicts[0].model, "gpt-4o");
+    assert_eq!(verdicts[0].total_requests, 2);
+    assert_eq!(verdicts[1].model, "claude-sonnet-4");
+    assert_eq!(verdicts[1].total_requests, 1);
 }
