@@ -151,6 +151,14 @@ impl Database {
                     FOREIGN KEY(site_id) REFERENCES directory_sites(id) ON DELETE CASCADE
                 );
 
+                CREATE TABLE IF NOT EXISTS channel_model_cache (
+                    channel_id TEXT PRIMARY KEY,
+                    channel_name TEXT NOT NULL DEFAULT '',
+                    alias TEXT NOT NULL DEFAULT '',
+                    models_json TEXT NOT NULL DEFAULT '[]',
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+
                 CREATE TABLE IF NOT EXISTS app_meta (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL

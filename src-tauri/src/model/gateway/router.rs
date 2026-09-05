@@ -654,6 +654,11 @@ pub async fn fetch_upstream_models_inner(
         *ctx.cached_fetch_errors.write().await = fetch_errors.clone();
     }
 
+    // 持久化到数据库
+    if let Err(e) = save_channel_models_to_db(ctx, &channel_models).await {
+        warn!("[ModelGateway] 保存渠道模型到数据库失败: {}", e);
+    }
+
     (channel_models, fetch_errors)
 }
 
@@ -695,3 +700,24 @@ fn parse_models_payload(bytes: &[u8]) -> Option<Vec<String>> {
     }
     Some(list)
 }
+
+/// 保存渠道模型列表到数据库，用于持久化缓存
+async fn save_channel_models_to_db(
+    ctx: &ModelProxyContext,
+    channel_models: &[ChannelModelList],
+) -> Result<(), String> {
+    if let Some(app_ctx) = ctx.app_ctx.read().await.as_ref() {
+        let conn = app_ctx.database.0.lock().map_err(|e| format!("获取数据库锁失败: {}", e))?;
+        for item in channel_models {
+            let models_json = serde_json::to_string(&item.models).map_err(|e| e.to_string())?;
+            conn.execute(
+                "INSERT OR REPLACE INTO channel_model_cache (channel_id, channel_name, alias, models_json, updated_at) VALUES (?1, ?2, ?3, ?4, datetime('now'))",
+                rusqlite::params![&item.channel_id, &item.channel_name, &item.alias, models_json],
+            ).map_err(|e| format!("数据库写入失败: {}", e))?;
+        }
+        Ok(())
+    } else {
+        Err("应用上下文未初始化".to_string())
+    }
+}
+

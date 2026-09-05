@@ -136,7 +136,25 @@ pub async fn fetch_model_proxy_models(
 pub async fn get_cached_channel_models(
     state: Managed<'_, ModelProxyState>,
 ) -> Result<Vec<ChannelModelList>, String> {
-    let models = state.context.cached_channel_models.read().await.clone();
+    let mut models = state.context.cached_channel_models.read().await.clone();
+
+    // 如果内存缓存为空，尝试从数据库加载
+    if models.is_empty() {
+        if let Some(app_ctx) = state.context.app_ctx.read().await.as_ref() {
+            match load_channel_models_from_db(&app_ctx.database).await {
+                Ok(loaded) if !loaded.is_empty() => {
+                    models = loaded.clone();
+                    // 更新内存缓存
+                    *state.context.cached_channel_models.write().await = loaded;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!("[ModelGateway] 从数据库加载渠道模型失败: {}", e);
+                }
+            }
+        }
+    }
+
     Ok(models)
 }
 
@@ -651,3 +669,40 @@ pub async fn sync_opencode_site_channels(
     let _database = &*ctx.database;
     sync_model_proxy_site_channels(ctx, state, site_ids).await
 }
+
+/// 从数据库加载渠道模型缓存
+async fn load_channel_models_from_db(
+    db: &std::sync::Arc<crate::models::Database>,
+) -> Result<Vec<ChannelModelList>, String> {
+    let conn = db.0.lock().map_err(|e| format!("获取数据库锁失败: {}", e))?;
+    let mut stmt = conn
+        .prepare("SELECT channel_id, channel_name, alias, models_json FROM channel_model_cache")
+        .map_err(|e| format!("准备查询失败: {}", e))?;
+
+    let rows = stmt
+        .query_map([], |row| {
+            let channel_id: String = row.get(0)?;
+            let channel_name: String = row.get(1)?;
+            let alias: String = row.get(2)?;
+            let models_json: String = row.get(3)?;
+            Ok((channel_id, channel_name, alias, models_json))
+        })
+        .map_err(|e| format!("查询失败: {}", e))?;
+
+    let mut result = Vec::new();
+    for row in rows {
+        let (channel_id, channel_name, alias, models_json) =
+            row.map_err(|e| format!("读取行失败: {}", e))?;
+        let models: Vec<String> = serde_json::from_str(&models_json)
+            .map_err(|e| format!("解析模型JSON失败: {}", e))?;
+        result.push(ChannelModelList {
+            channel_id,
+            channel_name,
+            alias,
+            models,
+        });
+    }
+
+    Ok(result)
+}
+
