@@ -9,7 +9,7 @@ export interface KeyGroupItem {
   id: string;
   name: string;
   enabled: boolean;
-  /** 缺省 round_robin */
+  /** 缺省 independent（独立） */
   mode?: KeyGroupMode;
 }
 

@@ -432,15 +432,15 @@ async fn channel_key_groups_failover_and_filtering() {
     assert_eq!(groups_backup_only.len(), 1);
     assert_eq!(groups_backup_only[0].keys, vec!["key-backup-1"]);
 
-    // 4. 未在 key_groups 中声明的分组（仅由 Key 的 groupName 发现）默认走轮询模式
+    // 4. 未在 key_groups 中声明的分组（仅由 Key 的 groupName 发现）默认走独立模式
     let mut ch_undeclared = ch.clone();
     ch_undeclared.key_groups = None;
     let discovered =
         resolve_channel_key_groups_for_model(&state.context, &ch_undeclared, "gpt-3.5-turbo").await;
     assert_eq!(discovered.len(), 2);
     assert!(
-        discovered.iter().all(|g| !g.is_independent()),
-        "未声明的分组缺省为轮询"
+        discovered.iter().all(|g| g.is_independent()),
+        "未声明的分组缺省为独立"
     );
     assert_eq!(
         discovered[0].name, discovered[0].id,
@@ -451,7 +451,9 @@ async fn channel_key_groups_failover_and_filtering() {
 #[tokio::test]
 async fn legacy_preset_key_groups_are_migrated_to_group_name() {
     use crate::model::gateway::config::sanitize_channel_config;
-    use crate::model::gateway::types::{ChannelKeyRule, KeyGroupItem, KEY_GROUP_MODE_ROUND_ROBIN};
+    use crate::model::gateway::types::{
+        ChannelKeyRule, KeyGroupItem, KEY_GROUP_MODE_INDEPENDENT, KEY_GROUP_MODE_ROUND_ROBIN,
+    };
 
     let mut ch = ChannelConfig {
         id: "legacy_channel".to_string(),
@@ -517,13 +519,58 @@ async fn legacy_preset_key_groups_are_migrated_to_group_name() {
     let groups = ch.key_groups.expect("vip 组保留");
     assert_eq!(groups.len(), 1);
     assert_eq!(groups[0].id, "vip");
-    // 非法 mode 归一为缺省轮询
-    assert_eq!(groups[0].mode, KEY_GROUP_MODE_ROUND_ROBIN);
+    // 非法 mode 归一为缺省独立
+    assert_eq!(groups[0].mode, KEY_GROUP_MODE_INDEPENDENT);
 
     // 指向预设组的 Key 规则清空 group_id，回落到自身 groupName 分组；其余保持不变
     let rules = ch.key_rules.expect("规则保留");
     assert_eq!(rules[0].group_id, "", "primary 归属被清空");
     assert_eq!(rules[1].group_id, "vip", "真实分组归属保留");
+}
+
+#[test]
+fn key_group_mode_migration_rewrites_round_robin_once() {
+    use crate::db::{read_meta_conn, write_meta};
+    use crate::model::gateway::config::load_model_proxy_config;
+    use crate::model::gateway::types::{KEY_GROUP_MODE_INDEPENDENT, KEY_GROUP_MODE_ROUND_ROBIN};
+
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    conn.execute_batch("CREATE TABLE app_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
+        .unwrap();
+
+    let legacy = json!({
+        "enabled": true,
+        "port": 17996,
+        "apiKey": "",
+        "channels": [{
+            "id": "site_x",
+            "name": "X",
+            "enabled": true,
+            "upstreamUrl": "https://x.example/v1",
+            "keyGroups": [
+                { "id": "g1", "name": "组一", "enabled": true, "mode": "round_robin" },
+                { "id": "g2", "name": "组二", "enabled": true, "mode": "independent" }
+            ]
+        }]
+    });
+    write_meta(&conn, "opencode_proxy_config", &legacy.to_string()).unwrap();
+
+    // 首次加载：存量轮询迁移为独立，并落下一次性标记
+    let cfg = load_model_proxy_config(&conn);
+    let channel = cfg.channels.iter().find(|c| c.id == "site_x").expect("渠道保留");
+    let groups = channel.key_groups.as_ref().expect("分组保留");
+    assert_eq!(groups[0].mode, KEY_GROUP_MODE_INDEPENDENT, "存量 round_robin 迁移为 independent");
+    assert_eq!(groups[1].mode, KEY_GROUP_MODE_INDEPENDENT);
+    assert!(!read_meta_conn(&conn, "keyGroupModeDefaultIndependent.v1")
+        .unwrap()
+        .is_empty());
+
+    // 迁移只执行一次：此后用户显式重选的轮询不再被改写
+    write_meta(&conn, "opencode_proxy_config", &legacy.to_string()).unwrap();
+    let cfg2 = load_model_proxy_config(&conn);
+    let channel2 = cfg2.channels.iter().find(|c| c.id == "site_x").unwrap();
+    let groups2 = channel2.key_groups.as_ref().unwrap();
+    assert_eq!(groups2[0].mode, KEY_GROUP_MODE_ROUND_ROBIN, "二次加载不重复迁移");
 }
 
 #[test]

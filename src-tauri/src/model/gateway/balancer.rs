@@ -1,7 +1,7 @@
 use super::policies::opencode::strip_opencode_prefix;
 use super::types::{
     current_timestamp, default_key_group_mode, ChannelConfig, ModelProxyConfig, ModelProxyContext,
-    ProxyRequestLog, KEY_GROUP_MODE_INDEPENDENT,
+    ProxyRequestLog, KEY_GROUP_MODE_INDEPENDENT, KEY_GROUP_MODE_ROUND_ROBIN,
 };
 use serde_json::Value as JsonValue;
 use std::collections::HashSet;
@@ -409,7 +409,7 @@ pub async fn resolve_channel_key_groups_for_model(
                 .unwrap_or_else(|| gid.clone()),
             mode: defined
                 .map(|g| g.mode.clone())
-                .filter(|m| m == KEY_GROUP_MODE_INDEPENDENT)
+                .filter(|m| m == KEY_GROUP_MODE_INDEPENDENT || m == KEY_GROUP_MODE_ROUND_ROBIN)
                 .unwrap_or_else(default_key_group_mode),
             id: gid,
             keys: group_keys,

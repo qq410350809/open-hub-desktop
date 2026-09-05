@@ -19,7 +19,7 @@ pub const KEY_GROUP_MODE_ROUND_ROBIN: &str = "round_robin";
 pub const KEY_GROUP_MODE_INDEPENDENT: &str = "independent";
 
 pub fn default_key_group_mode() -> String {
-    KEY_GROUP_MODE_ROUND_ROBIN.to_string()
+    KEY_GROUP_MODE_INDEPENDENT.to_string()
 }
 
 /// 渠道内的一个 Key 分组。分组身份直接取自 Key 自身的 groupName（站点同步下发），
@@ -31,7 +31,7 @@ pub struct KeyGroupItem {
     pub name: String,
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// round_robin（缺省）= 组内 Key 逐请求轮询；independent = 黏住首个 Key，失败才顺延组内下一个
+    /// independent（缺省）= 黏住首个 Key，失败才顺延组内下一个；round_robin = 组内 Key 逐请求轮询
     #[serde(default = "default_key_group_mode")]
     pub mode: String,
 }

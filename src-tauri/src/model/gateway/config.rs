@@ -1,7 +1,7 @@
 use super::balancer::normalize_key_group_id;
 use super::types::{
     default_channels, default_key_group_mode, ChannelConfig, ModelProxyConfig, OpencodeProxyConfig,
-    KEY_GROUP_MODE_INDEPENDENT,
+    KEY_GROUP_MODE_INDEPENDENT, KEY_GROUP_MODE_ROUND_ROBIN,
 };
 use getrandom::fill as fill_random;
 use rusqlite::Connection;
@@ -54,7 +54,7 @@ pub fn sanitize_channel_config(channel: &mut ChannelConfig) {
                     if g.name.is_empty() {
                         g.name = g.id.clone();
                     }
-                    if g.mode != KEY_GROUP_MODE_INDEPENDENT {
+                    if g.mode != KEY_GROUP_MODE_INDEPENDENT && g.mode != KEY_GROUP_MODE_ROUND_ROBIN {
                         g.mode = default_key_group_mode();
                     }
                     Some(g)
@@ -262,6 +262,26 @@ fn sanitize_model_channel_order(config: &mut ModelProxyConfig) {
     }
 }
 
+/// 一次性迁移标记：存量显式保存为 round_robin 的 Key 分组统一改为 independent。
+/// 仅在标记缺失时执行一次；此后用户主动选择的轮询不再被触碰。
+const KEY_GROUP_MODE_MIGRATION_FLAG: &str = "keyGroupModeDefaultIndependent.v1";
+
+/// 把所有渠道 keyGroups 中的 round_robin 改写为 independent，返回是否有改动。
+fn migrate_key_group_modes_to_independent(config: &mut ModelProxyConfig) -> bool {
+    let mut changed = false;
+    for channel in &mut config.channels {
+        if let Some(groups) = &mut channel.key_groups {
+            for group in groups.iter_mut() {
+                if group.mode == KEY_GROUP_MODE_ROUND_ROBIN {
+                    group.mode = KEY_GROUP_MODE_INDEPENDENT.to_string();
+                    changed = true;
+                }
+            }
+        }
+    }
+    changed
+}
+
 pub fn load_model_proxy_config(conn: &Connection) -> ModelProxyConfig {
     let raw = crate::db::read_meta_conn(conn, "opencode_proxy_config").unwrap_or_default();
 
@@ -281,8 +301,20 @@ pub fn load_model_proxy_config(conn: &Connection) -> ModelProxyConfig {
     }
     let mut cfg = parse_result.unwrap_or_default();
 
+    // 一次性迁移：存量轮询分组 → 独立；标记落 app_meta，重启不重复执行
+    let migrated = if crate::db::read_meta_conn(conn, KEY_GROUP_MODE_MIGRATION_FLAG)
+        .unwrap_or_default()
+        .is_empty()
+    {
+        let changed = migrate_key_group_modes_to_independent(&mut cfg);
+        let _ = crate::db::write_meta(conn, KEY_GROUP_MODE_MIGRATION_FLAG, "1");
+        changed
+    } else {
+        false
+    };
+
     sanitize_model_proxy_config(&mut cfg);
-    if !had_api_key {
+    if migrated || !had_api_key {
         if let Ok(serialized) = serde_json::to_string(&cfg) {
             let _ = crate::db::write_meta(conn, "opencode_proxy_config", &serialized);
         }
