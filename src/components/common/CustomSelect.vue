@@ -5,7 +5,7 @@ const globalActiveSelectId = ref<string | null>(null);
 </script>
 
 <script setup lang="ts">
-import { computed, nextTick, onUnmounted, useAttrs, watch } from "vue";
+import { computed, nextTick, onUnmounted, ref as vueRef, useAttrs, watch } from "vue";
 import { icons } from "../../icons";
 
 const attrs = useAttrs();
@@ -48,6 +48,10 @@ const props = withDefaults(
      * 需要上限时在调用方用 max-width 约束。
      */
     autoWidth?: boolean;
+    /** 是否启用搜索功能 */
+    searchable?: boolean;
+    /** 搜索框占位文本 */
+    searchPlaceholder?: string;
   }>(),
   {
     ariaLabel: undefined,
@@ -55,6 +59,8 @@ const props = withDefaults(
     menuMinWidth: undefined,
     groups: undefined,
     autoWidth: false,
+    searchable: false,
+    searchPlaceholder: "搜索...",
   }
 );
 
@@ -63,13 +69,43 @@ const emit = defineEmits<{
 }>();
 
 const instanceId = `select-${Math.random().toString(36).substring(2, 9)}`;
-const rootRef = ref<HTMLElement>();
-const triggerRef = ref<HTMLButtonElement>();
-const menuRef = ref<HTMLElement>();
-const selectedText = ref("");
+const rootRef = vueRef<HTMLElement>();
+const triggerRef = vueRef<HTMLButtonElement>();
+const menuRef = vueRef<HTMLElement>();
+const searchInputRef = vueRef<HTMLInputElement>();
+const selectedText = vueRef("");
+const searchQuery = vueRef("");
 
 const isOpen = computed(() => globalActiveSelectId.value === instanceId);
-const flipUp = ref(false);
+const flipUp = vueRef(false);
+
+// 搜索过滤逻辑
+const filteredOptions = computed(() => {
+  if (!props.searchable || !searchQuery.value.trim()) {
+    return props.options;
+  }
+  const query = searchQuery.value.toLowerCase();
+  return props.options.filter(opt =>
+    opt.text.toLowerCase().includes(query) ||
+    String(opt.value).toLowerCase().includes(query)
+  );
+});
+
+const filteredGroups = computed(() => {
+  if (!props.searchable || !searchQuery.value.trim() || !props.groups) {
+    return props.groups;
+  }
+  const query = searchQuery.value.toLowerCase();
+  return props.groups
+    .map(group => ({
+      ...group,
+      options: group.options.filter(opt =>
+        opt.text.toLowerCase().includes(query) ||
+        String(opt.value).toLowerCase().includes(query)
+      )
+    }))
+    .filter(group => group.options.length > 0);
+});
 
 // 菜单采用 fixed 定位（相对视口），不依赖 overflow 容器：弹窗/滚动容器
 // 内展开时不会再被 overflow 裁切。坐标在 open 时按 trigger 实时计算。
@@ -154,9 +190,14 @@ function toggle(e?: Event) {
 
 function open() {
   globalActiveSelectId.value = instanceId;
+  searchQuery.value = "";
   nextTick(() => {
     computeMenuPosition();
     requestAnimationFrame(computeMenuPosition);
+    // 如果启用了搜索，自动聚焦搜索框
+    if (props.searchable) {
+      nextTick(() => searchInputRef.value?.focus());
+    }
   });
 }
 
@@ -288,26 +329,23 @@ onUnmounted(() => {
         :style="menuStyle"
         role="listbox"
       >
+        <div v-if="searchable" class="select-search-box">
+          <input
+            ref="searchInputRef"
+            v-model="searchQuery"
+            type="text"
+            class="select-search-input"
+            :placeholder="searchPlaceholder"
+            @keydown.stop
+            @click.stop
+          />
+        </div>
         <div v-if="$slots['menu-header']" class="select-menu-header">
           <slot name="menu-header" />
         </div>
-        <button
-          v-for="opt in options"
-          :key="String(opt.value)"
-          class="select-option"
-          type="button"
-          role="option"
-          :class="{ selected: String(opt.value) === String(modelValue) }"
-          :aria-selected="String(opt.value) === String(modelValue)"
-          :data-select-value="opt.value"
-          @click="selectOption(opt.value, $event)"
-        >
-          {{ opt.text }}
-        </button>
-        <template v-for="group in groups ?? []" :key="group.label">
-          <div class="select-group-label" role="presentation">{{ group.label }}</div>
+        <div class="select-options-list">
           <button
-            v-for="opt in group.options"
+            v-for="opt in filteredOptions"
             :key="String(opt.value)"
             class="select-option"
             type="button"
@@ -319,7 +357,29 @@ onUnmounted(() => {
           >
             {{ opt.text }}
           </button>
-        </template>
+          <template v-for="group in filteredGroups ?? []" :key="group.label">
+            <div class="select-group-label" role="presentation">{{ group.label }}</div>
+            <button
+              v-for="opt in group.options"
+              :key="String(opt.value)"
+              class="select-option"
+              type="button"
+              role="option"
+              :class="{ selected: String(opt.value) === String(modelValue) }"
+              :aria-selected="String(opt.value) === String(modelValue)"
+              :data-select-value="opt.value"
+              @click="selectOption(opt.value, $event)"
+            >
+              {{ opt.text }}
+            </button>
+          </template>
+          <div
+            v-if="filteredOptions.length === 0 && (!filteredGroups || filteredGroups.length === 0)"
+            class="select-no-results"
+          >
+            无匹配结果
+          </div>
+        </div>
       </div>
     </Teleport>
   </div>
