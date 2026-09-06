@@ -358,7 +358,9 @@ pub fn split_items_by_feed(
         .collect()
 }
 
-/// 合并拉取一轮里单个标签的结局。
+/// 合并拉取一轮里单个标签的结局。当前调用方（scheduler）只消费轮次成败副作用，
+/// 字段保留完整结局信息供日志与后续扩展使用。
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct CombinedFeedOutcome {
     pub feed_id: String,
