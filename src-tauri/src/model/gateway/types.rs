@@ -544,6 +544,9 @@ pub struct ModelProxyContext {
     pub cached_channel_models: Arc<RwLock<Vec<ChannelModelList>>>,
     pub cached_fetch_errors: Arc<RwLock<Vec<ChannelModelFetchError>>>,
     pub default_http_client: Arc<tokio::sync::RwLock<Client>>,
+    /// 流式请求专用出网客户端：不带总超时（总超时会掐断长流任务），
+    /// 仅保留连接超时；流式读写的存活判定由 stream.rs 的空闲超时负责。
+    pub default_stream_client: Arc<tokio::sync::RwLock<Client>>,
     /// 平台无关的应用上下文（桌面与 server 共用）；启动后注入。
     pub app_ctx: StdArc<RwLock<Option<StdArc<AppContext>>>>,
     pub key_round_robin: Arc<AtomicUsize>,

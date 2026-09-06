@@ -3759,6 +3759,21 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
             />
             <small>请求失败后最多重试几次（默认 0 = 失败直接返回）；开启代理池的渠道同时受可用节点数限制，失败节点自动移至队尾</small>
           </div>
+
+          <!-- 请求超时（秒） -->
+          <div class="mp-field">
+            <label for="mp-timeout-seconds">请求超时（秒）</label>
+            <input
+              id="mp-timeout-seconds"
+              v-model.number="proxyConfig.timeoutSeconds"
+              type="number"
+              min="10"
+              max="600"
+              class="mp-input font-mono"
+              placeholder="300"
+            />
+            <small>非流式请求为总超时；流式请求为空闲超时——连续该秒数未收到上游任何数据才判定失败，正常吐流的长任务（深度思考/多轮工具循环）不受限。缓冲式上游（首字节要等整体生成完）建议调大到 600（默认 300）</small>
+          </div>
         </form>
 
         <div class="mp-modal-footer">

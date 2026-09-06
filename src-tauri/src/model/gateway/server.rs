@@ -26,6 +26,7 @@ impl ModelProxyState {
             .timeout(Duration::from_secs(300))
             .build()
             .unwrap_or_default();
+        let stream_http_client = build_stream_http_client();
 
         let route_enabled = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let context = ModelProxyContext {
@@ -37,6 +38,7 @@ impl ModelProxyState {
             cached_channel_models: Arc::new(RwLock::new(Vec::new())),
             cached_fetch_errors: Arc::new(RwLock::new(Vec::new())),
             default_http_client: Arc::new(tokio::sync::RwLock::new(http_client)),
+            default_stream_client: Arc::new(tokio::sync::RwLock::new(stream_http_client)),
             app_ctx: Arc::new(RwLock::new(None)),
             key_round_robin: Arc::new(AtomicUsize::new(0)),
             node_round_robin: Arc::new(RwLock::new(HashMap::new())),
@@ -84,6 +86,23 @@ pub async fn refresh_default_http_client(ctx: &ModelProxyContext) {
     if let Ok(client) = Client::builder().timeout(timeout).build() {
         *ctx.default_http_client.write().await = client;
     }
+    if let Ok(client) = build_stream_http_client_checked() {
+        *ctx.default_stream_client.write().await = client;
+    }
+}
+
+/// 流式出网客户端构造参数：连接超时见 [`crate::model::gateway::balancer::STREAM_CONNECT_TIMEOUT`]；
+/// **不设总超时**——reqwest 的 `timeout()` 覆盖整个响应体读取，长流任务（agent
+/// 多轮工具循环、深度思考模型）会被无差别掐断。流式存活判定由转发循环的
+/// 空闲超时负责（见 `stream.rs`，窗口取 `timeout_seconds` 配置）。
+fn build_stream_http_client_checked() -> Result<Client, reqwest::Error> {
+    Client::builder()
+        .connect_timeout(crate::model::gateway::balancer::STREAM_CONNECT_TIMEOUT)
+        .build()
+}
+
+fn build_stream_http_client() -> Client {
+    build_stream_http_client_checked().unwrap_or_default()
 }
 
 #[allow(dead_code)]

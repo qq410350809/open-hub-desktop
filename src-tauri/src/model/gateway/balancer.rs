@@ -650,23 +650,36 @@ async fn first_enabled_pool_node(ctx: &ModelProxyContext) -> Option<String> {
     enabled_pool_nodes(ctx).await.into_iter().next()
 }
 
-/// 出网请求超时：取配置 `timeout_seconds`（clamp 10..=600，缺省 300）。
-/// 该配置此前从未被读取、出网恒为 300s 硬超时，长流任务（agent 多轮工具循环）
-/// 会被无差别掐断；统一经此函数换算。
+/// 流式出网客户端的连接超时：仅约束 TCP/TLS 建连，不覆盖响应体读取；
+/// 流式请求不设总超时，存活判定由转发循环的空闲超时负责（见 `egress_timeout`）。
+pub(crate) const STREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// 出网请求超时窗口：取配置 `timeout_seconds`（clamp 10..=600，缺省 300）。///
+/// 语义按请求形态区分（此前为无差别的 300s 硬总超时，长流任务会被掐断）：
+/// - 非流式：整个请求的总超时；
+/// - 流式：**空闲超时**——出网客户端不带总超时，连续该窗口未收到上游任何数据
+///   才判定传输死亡（`stream.rs` 转发循环里执行）。正常吐流的长任务不再受限。
 pub fn egress_timeout(config: &ModelProxyConfig) -> Duration {
     let secs = config.timeout_seconds.clamp(10, 600);
     Duration::from_secs(secs)
 }
 
+/// 代理候选出网客户端。`streaming=true` 时返回不带总超时的客户端
+/// （直连复用 `default_stream_client`，代理路径现场构建时同样只保留连接超时），
+/// 存活判定交给流式转发循环的空闲超时；非流式保持总超时语义不变。
 pub async fn build_client_for_candidate(
     ctx: &ModelProxyContext,
     candidate: &str,
+    streaming: bool,
 ) -> reqwest::Client {
     let timeout = {
         let cfg = ctx.config.read().await;
         egress_timeout(&cfg)
     };
     if candidate == "__direct__" {
+        if streaming {
+            return ctx.default_stream_client.read().await.clone();
+        }
         return ctx.default_http_client.read().await.clone();
     }
 
@@ -683,12 +696,14 @@ pub async fn build_client_for_candidate(
             match lane {
                 Ok(port) => {
                     if let Ok(proxy) = reqwest::Proxy::all(format!("http://127.0.0.1:{port}")) {
-                        if let Ok(client) = reqwest::Client::builder()
+                        let mut builder = reqwest::Client::builder()
+                            .connect_timeout(STREAM_CONNECT_TIMEOUT)
                             .proxy(proxy)
-                            .pool_max_idle_per_host(0)
-                            .timeout(timeout)
-                            .build()
-                        {
+                            .pool_max_idle_per_host(0);
+                        if !streaming {
+                            builder = builder.timeout(timeout);
+                        }
+                        if let Ok(client) = builder.build() {
                             return client;
                         }
                     }
@@ -697,6 +712,9 @@ pub async fn build_client_for_candidate(
                     warn!("[ModelGateway] 就绪固定通道 {channel_id} 失败: {e}");
                 }
             }
+        }
+        if streaming {
+            return ctx.default_stream_client.read().await.clone();
         }
         return ctx.default_http_client.read().await.clone();
     }
@@ -713,19 +731,25 @@ pub async fn build_client_for_candidate(
         let proxy_url = crate::proxypool::runtime_proxy_url_pub(&runtime);
         if !proxy_url.is_empty() {
             if let Ok(proxy) = reqwest::Proxy::all(&proxy_url) {
-                if let Ok(client) = reqwest::Client::builder()
+                let mut builder = reqwest::Client::builder()
+                    .connect_timeout(STREAM_CONNECT_TIMEOUT)
                     .proxy(proxy)
-                    .pool_max_idle_per_host(0)
-                    .timeout(timeout)
-                    .build()
-                {
+                    .pool_max_idle_per_host(0);
+                if !streaming {
+                    builder = builder.timeout(timeout);
+                }
+                if let Ok(client) = builder.build() {
                     return client;
                 }
             }
         }
     }
 
-    ctx.default_http_client.read().await.clone()
+    if streaming {
+        ctx.default_stream_client.read().await.clone()
+    } else {
+        ctx.default_http_client.read().await.clone()
+    }
 }
 
 pub async fn get_node_display_name(ctx: &ModelProxyContext, candidate: &str) -> String {

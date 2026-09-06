@@ -139,7 +139,7 @@ pub async fn execute_resilient_egress(
             &candidates[(base_node_idx + attempt_idx) % candidates.len()]
         };
         let cand_start = Instant::now();
-        let client = build_client_for_candidate(ctx, cand_id).await;
+        let client = build_client_for_candidate(ctx, cand_id, meta.stream).await;
         let node_display = get_node_display_name(ctx, cand_id).await;
 
         let attempt_req_id = if attempt_idx == 0 {

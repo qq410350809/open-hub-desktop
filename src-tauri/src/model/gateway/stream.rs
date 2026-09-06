@@ -68,6 +68,41 @@ fn sse_event(event: &str, data: &JsonValue) -> String {
     format!("event: {event}\ndata: {data}\n\n")
 }
 
+/// 流中断时按协议追加的显式错误帧（直通链路：客户端协议=上游协议）。
+/// agent 客户端据此识别失败并重试，而不是把空/半截内容当成功。
+fn sse_error_frames(protocol: TargetProtocol, message: &str) -> Vec<String> {
+    match protocol {
+        TargetProtocol::AnthropicMessages => vec![sse_event(
+            "error",
+            &json!({ "type": "error", "error": { "type": "api_error", "message": message } }),
+        )],
+        TargetProtocol::Gemini => vec![format!(
+            "data: {}\n\n",
+            json!({ "error": { "code": 502, "message": message, "status": "UNAVAILABLE" } })
+        )],
+        // Responses 直通走 response.failed 终事件（Codex 系客户端的失败终结形态）
+        TargetProtocol::OpenAiResponses => vec![sse_event(
+            "response.failed",
+            &json!({
+                "type": "response.failed",
+                "response": {
+                    "object": "response",
+                    "status": "failed",
+                    "error": { "code": "upstream_stream_aborted", "message": message },
+                }
+            }),
+        )],
+        TargetProtocol::OpenAiChat => vec![
+            format!(
+                "data: {}\n\n",
+                json!({ "error": { "message": message, "type": "api_error", "code": "upstream_stream_aborted" } })
+            ),
+            // 兼容只认 [DONE] 终止的客户端：错误帧后补标准终止标记
+            "data: [DONE]\n\n".to_string(),
+        ],
+    }
+}
+
 /// Anthropic content block 种类
 #[derive(Clone, Copy, PartialEq)]
 enum AnthropicBlockKind {
@@ -531,6 +566,19 @@ impl AnthropicSseEmitter {
         ));
         events
     }
+
+    /// 流中断收尾：发出 Anthropic 规范的 error 事件（官方 API 中断时同样如此），
+    /// 客户端 SDK 会抛错并可重试；不再伪装成 end_turn 正常收尾
+    fn abort_with_error(&mut self, reason: &str) -> Vec<String> {
+        if self.finished {
+            return Vec::new();
+        }
+        self.finished = true;
+        vec![sse_event(
+            "error",
+            &json!({ "type": "error", "error": { "type": "api_error", "message": reason } }),
+        )]
+    }
 }
 
 // ---------------------------------------------------------------- Responses SSE 发射器
@@ -966,6 +1014,35 @@ impl ResponsesSseEmitter {
                     "model": self.model,
                     "output": finalized.into_iter().map(|(_, item)| item).collect::<Vec<_>>(),
                     "usage": usage,
+                }
+            }),
+        ));
+        events
+    }
+
+    /// 流中断收尾：response.failed 终事件（Codex 系客户端的失败终结形态）。
+    /// 不再伪装成 response.completed 正常收尾。
+    fn fail_with_error(&mut self, reason: &str) -> Vec<String> {
+        if self.finished {
+            return Vec::new();
+        }
+        self.finished = true;
+        let mut events = self.ensure_started();
+        events.push(sse_event(
+            "response.failed",
+            &json!({
+                "type": "response.failed",
+                "response": {
+                    "id": self.response_id,
+                    "object": "response",
+                    "created_at": std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0),
+                    "status": "failed",
+                    "model": self.model,
+                    "output": [],
+                    "error": { "code": "upstream_stream_aborted", "message": reason },
                 }
             }),
         ));
@@ -1497,14 +1574,18 @@ impl ChatEmitter {
         }
     }
 
-    /// 流中断等异常场景的强制收尾：补终帧与 [DONE]，避免客户端悬挂
-    fn abort(&mut self, usage: &UniversalUsage) -> Vec<String> {
+    /// 流中断等异常场景的强制收尾：显式错误帧 + [DONE]，避免客户端悬挂。
+    /// 不再伪装成正常 stop 收尾——那会让客户端把空/半截内容当成功。
+    fn abort(&mut self, reason: &str) -> Vec<String> {
         if self.finished {
             return Vec::new();
         }
         self.finished = true;
         vec![
-            delta_chunk(json!({}), Some("stop"), Some(usage_to_chat_json(usage))),
+            format!(
+                "data: {}\n\n",
+                json!({ "error": { "message": reason, "type": "api_error", "code": "upstream_stream_aborted" } })
+            ),
             "data: [DONE]\n\n".to_string(),
         ]
     }
@@ -1582,27 +1663,15 @@ impl GeminiEmitter {
         vec![format!("data: {}\n\n", chunk)]
     }
 
-    /// 流中断：冲刷未完成的工具参数并给 STOP 终帧，避免客户端悬挂
-    fn abort(&mut self) -> Vec<String> {
+    /// 流中断：显式错误帧结束流，避免客户端悬挂；不再伪装成 STOP 正常收尾
+    fn abort(&mut self, reason: &str) -> Vec<String> {
         if self.finished {
             return Vec::new();
         }
         self.finished = true;
-        let mut parts = Vec::new();
-        for (_index, (name, args)) in std::mem::take(&mut self.pending_tools) {
-            let args_val = serde_json::from_str::<JsonValue>(&args)
-                .unwrap_or_else(|_| json!({ "result": args }));
-            parts.push(json!({ "functionCall": { "name": name, "args": args_val } }));
-        }
         vec![format!(
             "data: {}\n\n",
-            json!({
-                "candidates": [{
-                    "content": { "parts": parts, "role": "model" },
-                    "index": 0,
-                    "finishReason": "STOP",
-                }],
-            })
+            json!({ "error": { "code": 502, "message": reason, "status": "UNAVAILABLE" } })
         )]
     }
 }
@@ -1647,14 +1716,17 @@ impl ClientSseEmitter {
         }
     }
 
-    fn abort(&mut self, usage: &UniversalUsage) -> Vec<String> {
+    /// 流中断收尾：按客户端协议追加**显式错误帧**后结束流。
+    ///
+    /// 此前中断被伪装成正常收尾（Chat 补 finish_reason=stop、Anthropic 补
+    /// end_turn），客户端会把空/半截内容当成功——agent 表现为「收到无动作的
+    /// 空回复」；现在明确上报错误，客户端可识别失败并重试。
+    fn abort(&mut self, reason: &str) -> Vec<String> {
         match self {
-            Self::Chat(e) => e.abort(usage),
-            Self::Gemini(e) => e.abort(),
-            // 中断场景仍须发出协议终帧，避免客户端无限等待；
-            // 已累积的用量一并带上，客户端本地记账不归零
-            Self::Anthropic(e) => e.finish_with_usage(StopReason::EndTurn, usage),
-            Self::Responses(e) => e.finish_with_usage(StopReason::EndTurn, usage),
+            Self::Chat(e) => e.abort(reason),
+            Self::Gemini(e) => e.abort(reason),
+            Self::Anthropic(e) => e.abort_with_error(reason),
+            Self::Responses(e) => e.fail_with_error(reason),
         }
     }
 }
@@ -1753,6 +1825,7 @@ where
         let mut buffered: Vec<String> = Vec::new();
         let mut final_usage = UniversalUsage::default();
         let mut aborted = false;
+        let mut abort_reason: Option<String> = None;
         // 上游 SSE 数据行原文（未解析），供日志全文记录与问题排查
         let mut upstream_raw = String::new();
         let mut emitter = ClientSseEmitter::new(client, &log.id, &model_name, tool_hints.clone(), preferred_tool.clone());
@@ -1785,9 +1858,29 @@ where
             }};
         }
 
+        // 流式空闲超时窗口：出网客户端对流式请求不设总超时（reqwest 的 timeout()
+        // 覆盖整个响应体读取，会无差别掐断长流任务），仅当连续该窗口未收到上游
+        // 任何数据时判定传输死亡。窗口取 `timeout_seconds` 配置（egress_timeout）。
+        let idle_window = {
+            let cfg = ctx.config.read().await;
+            super::balancer::egress_timeout(&cfg)
+        };
+
         tokio::pin!(stream);
 
-        'outer: while let Some(chunk_res) = stream.next().await {
+        'outer: loop {
+            let chunk_res = match tokio::time::timeout(idle_window, stream.next()).await {
+                Ok(Some(chunk_res)) => chunk_res,
+                Ok(None) => break 'outer,
+                Err(_elapsed) => {
+                    abort_reason = Some(format!(
+                        "流式响应空闲超时：{} 秒未收到上游数据",
+                        idle_window.as_secs()
+                    ));
+                    aborted = true;
+                    break 'outer;
+                }
+            };
             match chunk_res {
                 Ok(bytes) => {
                     for line in reader.push(&bytes) {
@@ -1825,7 +1918,9 @@ where
                     }
                 }
                 Err(err) => {
-                    log.error_message = Some(format!("流式响应传输中断: {err}"));
+                    let reason = format!("流式响应传输中断: {err}");
+                    abort_reason = Some(reason.clone());
+                    log.error_message = Some(reason);
                     aborted = true;
                     break 'outer;
                 }
@@ -1858,19 +1953,26 @@ where
             }
         }
 
-        // 收尾：已判定用实际协议 parser；始终未判定则保守回退渠道配置
-        let events = match parser.as_mut() {
-            Some(p) => p.finish(),
-            None => {
-                let mut p = UniversalParser::new(
-                    configured_target,
-                    tool_hints.clone(),
-                    preferred_tool.clone(),
-                );
-                for buffered_line in buffered.drain(..) {
-                    feed_line!(buffered_line.as_str(), p);
+        // 收尾：已判定用实际协议 parser；始终未判定则保守回退渠道配置。
+        // 中断时必须跳过——parser.finish() 会合成 Finish 事件，把中断伪装成
+        // 正常完成（旧缺陷：客户端收到 finish_reason=stop 假终帧而非错误，
+        // 下方的 emitter.abort 因此被幂等跳过，agent 无从感知失败重试）。
+        let events = if aborted {
+            Vec::new()
+        } else {
+            match parser.as_mut() {
+                Some(p) => p.finish(),
+                None => {
+                    let mut p = UniversalParser::new(
+                        configured_target,
+                        tool_hints.clone(),
+                        preferred_tool.clone(),
+                    );
+                    for buffered_line in buffered.drain(..) {
+                        feed_line!(buffered_line.as_str(), p);
+                    }
+                    p.finish()
                 }
-                p.finish()
             }
         };
         for event in events {
@@ -1891,7 +1993,8 @@ where
             }
         }
         if aborted {
-            for out in emitter.abort(&final_usage) {
+            let reason = abort_reason.as_deref().unwrap_or("上游流式响应中断");
+            for out in emitter.abort(reason) {
                 yield Ok(Bytes::from(out));
             }
         }
@@ -1940,10 +2043,29 @@ where
         let mut parser = UniversalParser::new(upstream_protocol, Vec::new(), None);
         let mut final_usage = UniversalUsage::default();
         let mut aborted = false;
+        let mut abort_reason: Option<String> = None;
+
+        // 流式空闲超时窗口：与转换链路同口径（见 proxy_sse_body_with_hints 注释）
+        let idle_window = {
+            let cfg = ctx.config.read().await;
+            super::balancer::egress_timeout(&cfg)
+        };
 
         tokio::pin!(stream);
 
-        while let Some(chunk_res) = stream.next().await {
+        'outer: loop {
+            let chunk_res = match tokio::time::timeout(idle_window, stream.next()).await {
+                Ok(Some(chunk_res)) => chunk_res,
+                Ok(None) => break 'outer,
+                Err(_elapsed) => {
+                    abort_reason = Some(format!(
+                        "流式响应空闲超时：{} 秒未收到上游数据",
+                        idle_window.as_secs()
+                    ));
+                    aborted = true;
+                    break 'outer;
+                }
+            };
             match chunk_res {
                 Ok(bytes) => {
                     for line in reader.push(&bytes) {
@@ -1964,10 +2086,21 @@ where
                     }
                 }
                 Err(err) => {
-                    log.error_message = Some(format!("流式响应传输中断: {err}"));
+                    let reason = format!("流式响应传输中断: {err}");
+                    abort_reason = Some(reason.clone());
+                    log.error_message = Some(reason);
                     aborted = true;
-                    break;
+                    break 'outer;
                 }
+            }
+        }
+
+        // 中断收尾：按客户端协议（直通链路客户端协议=上游协议）追加显式错误帧，
+        // 让 agent 客户端识别失败并重试，而不是把空/半截内容当成功
+        if aborted {
+            let reason = abort_reason.as_deref().unwrap_or("上游流式响应中断");
+            for out in sse_error_frames(upstream_protocol, reason) {
+                yield Ok::<Bytes, std::io::Error>(Bytes::from(out));
             }
         }
 

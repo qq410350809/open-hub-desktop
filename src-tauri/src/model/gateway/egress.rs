@@ -837,6 +837,7 @@ mod egress_tests {
             cached_channel_models: Arc::new(RwLock::new(Vec::new())),
             cached_fetch_errors: Arc::new(RwLock::new(Vec::new())),
             default_http_client: Arc::new(RwLock::new(reqwest::Client::new())),
+            default_stream_client: Arc::new(RwLock::new(reqwest::Client::new())),
             app_ctx: Arc::new(RwLock::new(None)),
             key_round_robin: Arc::new(AtomicUsize::new(0)),
             node_round_robin: Arc::new(RwLock::new(HashMap::new())),
@@ -1555,6 +1556,90 @@ mod egress_tests {
                 .pointer("/usage/completion_tokens_details/reasoning_tokens")
                 .and_then(JsonValue::as_u64),
             Some(200)
+        );
+    }
+
+    /// 上游流中断：Anthropic 客户端须收到显式 `event: error`，而非伪装成
+    /// end_turn 的正常收尾（旧实现把空/半截内容当成功，agent 无从重试）
+    #[tokio::test]
+    async fn upstream_stream_error_reaches_anthropic_client_as_error_event() {
+        let upstream = futures_util::stream::iter(vec![
+            Ok::<Bytes, std::io::Error>(Bytes::from(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"部分内容\"}}]}\n\n",
+            )),
+            Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "boom")),
+        ]);
+        let body = crate::model::gateway::stream::proxy_sse_body(
+            upstream,
+            TargetProtocol::OpenAiChat,
+            crate::model::gateway::stream::SseClientProtocol::Anthropic,
+            test_context(),
+            test_log(),
+            std::time::Instant::now(),
+            "m".to_string(),
+        );
+        let all = collect_stream(body.into_data_stream()).await.join("");
+
+        assert!(all.contains("event: error"), "缺错误事件: {all}");
+        assert!(all.contains("流式响应传输中断"), "错误消息不可丢: {all}");
+        assert!(
+            !all.contains("message_stop"),
+            "中断不得伪装成正常收尾: {all}"
+        );
+    }
+
+    /// 上游流中断：Chat 客户端须收到错误帧 + [DONE]，而非 finish_reason=stop 假终帧
+    #[tokio::test]
+    async fn upstream_stream_error_reaches_chat_client_as_error_frame() {
+        let upstream = futures_util::stream::iter(vec![
+            Ok::<Bytes, std::io::Error>(Bytes::from(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+            )),
+            Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "boom")),
+        ]);
+        let body = crate::model::gateway::stream::proxy_sse_body(
+            upstream,
+            TargetProtocol::OpenAiChat,
+            crate::model::gateway::stream::SseClientProtocol::Chat,
+            test_context(),
+            test_log(),
+            std::time::Instant::now(),
+            "m".to_string(),
+        );
+        let all = collect_stream(body.into_data_stream()).await.join("");
+
+        assert!(all.contains("upstream_stream_aborted"), "缺错误帧: {all}");
+        assert!(all.contains("data: [DONE]"), "缺终止标记: {all}");
+        assert!(
+            !all.contains("\"finish_reason\":\"stop\""),
+            "中断不得伪装成正常 stop: {all}"
+        );
+    }
+
+    /// 直通链路（同协议）上游中断：同样追加协议错误帧，Anthropic 直通补 event: error
+    #[tokio::test]
+    async fn anthropic_passthrough_stream_error_appends_error_event() {
+        let upstream = futures_util::stream::iter(vec![
+            Ok::<Bytes, std::io::Error>(Bytes::from(
+                "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"部分\"}}\n\n",
+            )),
+            Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "boom")),
+        ]);
+        let body = crate::model::gateway::stream::passthrough_sse_body(
+            upstream,
+            TargetProtocol::AnthropicMessages,
+            test_context(),
+            test_log(),
+            std::time::Instant::now(),
+            "m".to_string(),
+        );
+        let all = collect_stream(body.into_data_stream()).await.join("");
+
+        assert!(all.contains("event: error"), "缺错误事件: {all}");
+        assert!(all.contains("流式响应传输中断"), "错误消息不可丢: {all}");
+        assert!(
+            !all.contains("message_stop"),
+            "中断不得伪装成正常收尾: {all}"
         );
     }
 }
