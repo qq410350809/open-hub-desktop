@@ -9,6 +9,8 @@ import {
   channelStatsKey,
   filterChannelModels,
   isValidChannelAlias,
+  extractAliasFromUrl,
+  uniqueChannelAlias,
   type ChannelConfig,
   type KeyGroupItem,
   type ChannelUsageStats,
@@ -1611,48 +1613,6 @@ const filteredConvertibleSites = computed(() => {
       s.name.toLowerCase().includes(q) || s.apiBaseUrl.toLowerCase().includes(q),
   );
 });
-
-/** 从站点 URL 中提取最具代表性的英文单词作为别名 */
-function extractAliasFromUrl(url: string): string {
-  try {
-    const urlObj = new URL(url);
-    const hostname = urlObj.hostname.toLowerCase();
-
-    // 移除常见前缀和后缀
-    let domain = hostname
-      .replace(/^(www\d*|api|gateway|proxy|app)\./i, "")
-      .replace(/\.(com|net|org|io|ai|dev|app|tech|cloud|chat|pro|plus|xyz|cc|me|co)$/i, "");
-
-    // 如果是多级子域名，取最有意义的部分
-    const parts = domain.split(".");
-    if (parts.length > 1) {
-      // 优先取倒数第二个部分（通常是品牌名）
-      domain = parts[parts.length - 2] || parts[parts.length - 1];
-    }
-
-    // 清理特殊字符，只保留字母数字
-    const cleaned = domain.replace(/[^a-z0-9]+/g, "");
-
-    // 如果提取到有效单词，返回；否则回退
-    if (cleaned.length >= 2 && cleaned.length <= 20) {
-      return cleaned;
-    }
-  } catch {
-    // URL 解析失败，尝试简单处理
-  }
-
-  // 回退：从站点名提取
-  const fromName = url.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 24);
-  return fromName || "site";
-}
-
-function uniqueChannelAlias(base: string): string {
-  const existing = new Set(proxyConfig.value.channels.map((c) => channelAlias(c)));
-  if (!existing.has(base)) return base;
-  let i = 2;
-  while (existing.has(`${base}-${i}`)) i += 1;
-  return `${base}-${i}`;
-}
 
 function openSiteConvertDialog() {
   convertSelectedSites.value.clear();
