@@ -29,6 +29,7 @@
   "dependencies": {
     "@tanstack/vue-table": "^9.1.2",
     "@tauri-apps/api": "^2.8.0",
+    "@tauri-apps/plugin-notification": "^2.4.0",
     "@tauri-apps/plugin-opener": "^2.5.0",
     "dompurify": "^3.4.14",
     "echarts": "^6.1.0",

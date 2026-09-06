@@ -17,6 +17,7 @@ import { useTheme } from "./composables/useTheme";
 import { useToast } from "./composables/useToast";
 import { useTooltip } from "./composables/useTooltip";
 import { useContextMenu } from "./composables/useContextMenu";
+import { useCharityNotification } from "./composables/useCharityNotification";
 import AppSidebar from "./components/layout/AppSidebar.vue";
 import SiteLibraryPage from "./components/pages/SiteLibraryPage.vue";
 import SiteFormModal from "./components/site/SiteFormModal.vue";
@@ -38,6 +39,8 @@ const store = useStore();
 const { preferences } = usePreferences();
 const { applyTheme } = useTheme();
 const { message, isError, visible } = useToast();
+// 公益监听通知监听注册在根组件：页面是 v-if 条件挂载，放页面里切走就失效
+useCharityNotification();
 const {
   tooltipText,
   tooltipVisible,
