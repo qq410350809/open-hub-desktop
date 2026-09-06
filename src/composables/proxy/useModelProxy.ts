@@ -297,7 +297,7 @@ export function useModelProxy() {
     }
   }
 
-  async function fetchUpstreamModels(options: { setGlobalFetching?: boolean; channelId?: string } = {}): Promise<Record<string, string[]>> {
+  async function fetchUpstreamModels(options: { setGlobalFetching?: boolean; channelId?: string; silent?: boolean } = {}): Promise<Record<string, string[]>> {
     if (options.setGlobalFetching) {
       fetchingModels.value = true;
     }
@@ -326,10 +326,10 @@ export function useModelProxy() {
           }
         }
       }
-      // 拉取失败的渠道必须可见，否则用户只会看到"列表不变"而无从排查
+      // 拉取失败的渠道必须可见，否则用户只会看到"列表不变"而无从排查（silent 时由调用方展示）
       const errors: unknown[] =
         Array.isArray(res) && Array.isArray(res[1]) ? res[1] : [];
-      if (errors.length > 0) {
+      if (errors.length > 0 && !options.silent) {
         const names = errors
           .map((e: any) => e?.channelName || e?.channel_name || e?.channelId || e?.channel_id || "未知渠道")
           .join("、");
@@ -338,7 +338,9 @@ export function useModelProxy() {
       return map;
     } catch (e) {
       console.warn("拉取模型失败:", e);
-      showToast(`模型列表拉取失败：${String(e)}`, true);
+      if (!options.silent) {
+        showToast(`模型列表拉取失败：${String(e)}`, true);
+      }
       return {};
     } finally {
       if (options.setGlobalFetching) {

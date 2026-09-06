@@ -1754,6 +1754,20 @@ const allModelsDialogOpen = ref(false);
 const allModelsSearch = ref("");
 const allModelsDraft = ref<Record<string, AllModelsDraftState>>({});
 const savingAllModels = ref(false);
+const allModelsSyncing = ref(false);
+
+// —— 同步日志：折叠面板，同步开始时自动展开 ——
+interface AllModelsSyncLogEntry {
+  channel: string;
+  ok: boolean;
+  detail: string;
+}
+const allModelsSyncLogs = ref<AllModelsSyncLogEntry[]>([]);
+const allModelsSyncLogOpen = ref(false);
+
+function appendAllModelsSyncLog(entry: AllModelsSyncLogEntry) {
+  allModelsSyncLogs.value = [...allModelsSyncLogs.value, entry];
+}
 
 /** 各渠道勾选草稿的展示分组：渠道 + 已知模型列表（total = 全量已知模型数，不随搜索过滤变化） */
 const allModelsGroups = computed(() =>
@@ -1826,6 +1840,78 @@ function clearAllChannelModels(channelId: string) {
   };
 }
 
+/** 逐渠道从上游拉取最新模型列表并写入全局缓存（弹窗内同步按钮）。
+ * 每完成一个渠道即写入一条同步日志，无需后端流式事件即可获得实时进度。 */
+async function syncAllChannelsModels() {
+  if (allModelsSyncing.value) return;
+  const channels = proxyConfig.value.channels.filter((c) => c.enabled);
+  if (channels.length === 0) {
+    showToast("没有启用的渠道可同步", true);
+    return;
+  }
+  allModelsSyncing.value = true;
+  allModelsSyncLogs.value = [];
+  allModelsSyncLogOpen.value = true;
+  const startedAt = Date.now();
+  let changed = 0;
+  let failed = 0;
+  try {
+    for (const channel of channels) {
+      try {
+        // fetchUpstreamModels 内部已处理免费渠道过滤，并把成功/失败写入后端缓存；
+        // silent 避免逐渠道循环时连弹 toast，失败详情由同步日志区展示
+        const map = await fetchUpstreamModels({
+          setGlobalFetching: false,
+          channelId: channel.id,
+          silent: true,
+        });
+        const fresh = map[channel.id];
+        if (fresh) {
+          const prev = channelModels.value[channel.id];
+          const isChanged = JSON.stringify(prev) !== JSON.stringify(fresh);
+          channelModels.value = { ...channelModels.value, [channel.id]: fresh };
+          if (isChanged) changed++;
+          appendAllModelsSyncLog({
+            channel: channel.name,
+            ok: true,
+            detail: isChanged
+              ? `成功 · ${fresh.length} 个模型（列表有变化）`
+              : `成功 · ${fresh.length} 个模型`,
+          });
+        } else {
+          failed++;
+          appendAllModelsSyncLog({
+            channel: channel.name,
+            ok: false,
+            detail: "拉取失败：上游未返回模型列表",
+          });
+        }
+      } catch (e) {
+        failed++;
+        appendAllModelsSyncLog({
+          channel: channel.name,
+          ok: false,
+          detail: `拉取失败：${String(e)}`,
+        });
+      }
+    }
+    const seconds = ((Date.now() - startedAt) / 1000).toFixed(1);
+    appendAllModelsSyncLog({
+      channel: "汇总",
+      ok: failed === 0,
+      detail: `共 ${channels.length} 个渠道 · ${changed} 个渠道列表有变化 · ${failed} 个失败 · 耗时 ${seconds}s`,
+    });
+    showToast(
+      failed === 0
+        ? `已同步各渠道最新模型（${changed} 个渠道有变化）`
+        : `同步完成：${failed} 个渠道拉取失败，详见同步日志`,
+      failed > 0,
+    );
+  } finally {
+    allModelsSyncing.value = false;
+  }
+}
+
 function openAllChannelsModelsDialog() {
   allModelsSearch.value = "";
   const draft: Record<string, AllModelsDraftState> = {};
@@ -1838,7 +1924,7 @@ function openAllChannelsModelsDialog() {
   }
   allModelsDraft.value = draft;
   allModelsDialogOpen.value = true;
-  // 全局模型缓存为空时读取本地缓存（不主动远程拉取）
+  // 全局模型缓存为空时读取本地缓存（同步按钮负责远程拉取）
   if (Object.keys(channelModels.value).length === 0) {
     void loadCachedModels();
   }
@@ -1848,6 +1934,8 @@ function closeAllChannelsModelsDialog() {
   allModelsDialogOpen.value = false;
   allModelsSearch.value = "";
   allModelsDraft.value = {};
+  allModelsSyncLogs.value = [];
+  allModelsSyncLogOpen.value = false;
 }
 
 /** 批量保存：按各渠道草稿写回 enabledModels 后统一落库 */
@@ -5345,7 +5433,7 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
         </div>
 
         <div class="mp-modal-body">
-          <!-- 模型搜索框 -->
+          <!-- 模型搜索框 + 同步按钮 -->
           <div class="mp-models-modal-toolbar">
             <div class="mp-search-box flex-1">
               <span class="mp-search-icon" v-html="icons.search" />
@@ -5364,6 +5452,49 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
               >
                 <span v-html="icons.close" />
               </button>
+            </div>
+            <button
+              type="button"
+              class="mp-btn mp-btn-ghost"
+              :disabled="allModelsSyncing"
+              title="从各渠道上游拉取最新可用模型列表"
+              @click="syncAllChannelsModels"
+            >
+              <span :class="{ 'mp-spin': allModelsSyncing }" v-html="icons.restore" />
+              <span>{{ allModelsSyncing ? "正在同步…" : "同步模型" }}</span>
+            </button>
+          </div>
+
+          <!-- 同步日志：可折叠，同步开始时自动展开 -->
+          <div v-if="allModelsSyncLogs.length > 0" class="mp-sync-log">
+            <button
+              type="button"
+              class="mp-sync-log-toggle"
+              :title="allModelsSyncLogOpen ? '收起同步日志' : '展开同步日志'"
+              @click="allModelsSyncLogOpen = !allModelsSyncLogOpen"
+            >
+              <span
+                class="mp-sync-log-chevron"
+                :class="{ 'is-open': allModelsSyncLogOpen }"
+                v-html="icons.chevron"
+              />
+              <span>同步日志</span>
+              <span
+                v-if="allModelsSyncing"
+                class="mp-sync-log-status"
+              >同步中…</span>
+            </button>
+            <div v-if="allModelsSyncLogOpen" class="mp-sync-log-body">
+              <div
+                v-for="(log, i) in allModelsSyncLogs"
+                :key="i"
+                class="mp-sync-log-line"
+                :class="{ 'is-error': !log.ok }"
+              >
+                <span class="mp-sync-log-mark">{{ log.ok ? "✓" : "✗" }}</span>
+                <span class="mp-sync-log-channel">{{ log.channel }}</span>
+                <span class="mp-sync-log-detail">{{ log.detail }}</span>
+              </div>
             </div>
           </div>
 
@@ -5427,7 +5558,7 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
               <div v-else class="mp-group-empty-note text-muted text-xs">
                 <span v-if="!group.channel.enabled">该渠道当前已被禁用</span>
                 <span v-else-if="allModelsSearch">未检索到匹配的模型</span>
-                <span v-else>暂无已知模型，可在渠道卡片「管理模型」中刷新上游模型</span>
+                <span v-else>暂无已知模型，点击顶部「同步模型」从上游拉取</span>
               </div>
             </section>
           </div>
@@ -5440,7 +5571,7 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
 
         <div class="mp-modal-footer">
           <div class="mp-modal-footer-hint text-muted text-xs">
-            <span>💡 勾选状态即各渠道对外暴露的模型；如需调整代理出口或协议，请使用各渠道卡片「管理模型」</span>
+            <span>💡 勾选状态即各渠道对外暴露的模型；点击「同步模型」拉取上游最新列表，如需调整代理出口或协议，请使用各渠道卡片「管理模型」</span>
           </div>
           <div class="mp-modal-footer-buttons">
             <button
@@ -9544,6 +9675,95 @@ button.mp-mec-check:focus-visible {
   display: flex;
   justify-content: flex-end;
   margin-top: 4px;
+}
+
+/* —— 全渠道「模型管理」弹窗：同步日志折叠区 —— */
+.mp-sync-log {
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--surface-soft);
+  overflow: hidden;
+}
+
+.mp-sync-log-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 12px;
+  border: none;
+  background: transparent;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  cursor: pointer;
+  text-align: left;
+}
+
+.mp-sync-log-chevron {
+  display: inline-flex;
+  transition: transform 0.15s ease;
+}
+
+.mp-sync-log-chevron.is-open {
+  transform: rotate(180deg);
+}
+
+.mp-sync-log-chevron :deep(svg) {
+  width: 14px;
+  height: 14px;
+  color: var(--muted);
+}
+
+.mp-sync-log-status {
+  margin-left: auto;
+  font-weight: 500;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.mp-sync-log-body {
+  max-height: 200px;
+  overflow-y: auto;
+  border-top: 1px solid var(--line);
+  padding: 8px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-family: var(--font-mono, monospace);
+  font-size: 11.5px;
+  line-height: 1.6;
+}
+
+.mp-sync-log-line {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.mp-sync-log-mark {
+  flex: none;
+  width: 12px;
+  text-align: center;
+  color: var(--ok, #16a34a);
+}
+
+.mp-sync-log-line.is-error .mp-sync-log-mark {
+  color: var(--danger);
+}
+
+.mp-sync-log-channel {
+  flex: none;
+  font-weight: 600;
+}
+
+.mp-sync-log-detail {
+  color: var(--muted);
+  word-break: break-all;
+}
+
+.mp-sync-log-line.is-error .mp-sync-log-detail {
+  color: var(--danger);
 }
 
 /* —— 全渠道「模型管理」弹窗 —— */
