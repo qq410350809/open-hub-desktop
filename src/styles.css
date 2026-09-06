@@ -1220,6 +1220,14 @@ kbd { padding: 3px 7px; border: 1px solid var(--line); border-radius: var(--r-xs
 .site-models-icon-btn svg { width: 16px; height: 16px; }
 .site-models-close { border-color: transparent; background: transparent; }
 .site-models-close:hover { border-color: var(--line); background: var(--surface-hover); color: var(--text); }
+.site-models-text-btn { height: 36px; padding: 0 12px; display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--surface); color: var(--muted); font-size: 12px; font-weight: 650; white-space: nowrap; cursor: pointer; transition: border-color 0.15s var(--ease), background 0.15s var(--ease), color 0.15s var(--ease); }
+.site-models-text-btn svg { width: 15px; height: 15px; flex: 0 0 auto; }
+.site-models-text-btn:hover { border-color: var(--brand); background: var(--brand-soft); color: var(--brand-deep); }
+.site-models-text-btn:disabled { opacity: 0.55; cursor: wait; }
+.site-models-proxy-btn { border-color: color-mix(in srgb, var(--brand) 45%, transparent); background: var(--brand-soft); color: var(--brand-deep); }
+.site-models-proxy-btn:hover { border-color: var(--brand); background: color-mix(in srgb, var(--brand) 16%, transparent); }
+.site-models-proxy-btn.is-active { border-color: color-mix(in srgb, #bc8cff 45%, transparent); background: color-mix(in srgb, #bc8cff 12%, transparent); color: #bc8cff; }
+.site-models-proxy-btn.is-active:hover { border-color: var(--danger, #f85149); background: color-mix(in srgb, var(--danger, #f85149) 14%, transparent); color: var(--danger, #f85149); }
 
 .dialog-header { padding: 18px 22px; display: flex; align-items: center; justify-content: space-between; gap: 16px; border-bottom: 1px solid var(--line); }
 .header-left { display: flex; align-items: center; gap: 14px; min-width: 0; }

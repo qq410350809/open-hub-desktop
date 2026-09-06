@@ -19,6 +19,7 @@ import type {
   ChannelModelList,
   GatewayOverviewStats,
 } from "./types";
+import type { SiteRecord } from "../../types";
 
 export * from "./types";
 
@@ -106,6 +107,33 @@ export const proxyConfig = ref<OpencodeProxyConfig>({
   timeoutSeconds: 300,
   maxRetries: 0,
 });
+
+/** 站点对应的反代渠道：存在 siteId 关联的渠道即视为「已被反代」 */
+export function siteProxyChannel(siteId: string): ChannelConfig | undefined {
+  if (!siteId) return undefined;
+  return proxyConfig.value.channels.find((c) => c.siteId === siteId);
+}
+
+export function isSiteProxied(siteId: string): boolean {
+  return !!siteProxyChannel(siteId);
+}
+
+/**
+ * 轻量拉取反代配置（不含统计与模型缓存），供站点库等非反代页
+ * 判断站点反代状态；不覆盖拉取失败前的本地状态。
+ */
+export async function refreshProxyConfig() {
+  try {
+    const cfg = await runCommand<OpencodeProxyConfig>("get_opencode_proxy_config");
+    if (!cfg) return;
+    if (!cfg.channels || cfg.channels.length === 0) {
+      cfg.channels = [defaultOpencodeChannel()];
+    }
+    proxyConfig.value = cfg;
+  } catch (e) {
+    console.warn("获取反代配置失败:", e);
+  }
+}
 
 /** 从站点 URL 中提取最具代表性的英文单词作为别名 */
 export function extractAliasFromUrl(url: string): string {
@@ -284,7 +312,7 @@ export function useModelProxy() {
     }
   }
 
-  async function saveConfig(newConfig: OpencodeProxyConfig) {
+  async function saveConfig(newConfig: OpencodeProxyConfig, options: { silent?: boolean } = {}) {
     savingConfig.value = true;
     try {
       // 明细保留天数：空值归一为 0（= 永久保留），避免空串破坏后端反序列化
@@ -298,7 +326,7 @@ export function useModelProxy() {
       });
       if (status) proxyStatus.value = status;
       proxyConfig.value = { ...normalized };
-      showToast("反代配置与渠道设置已保存");
+      if (!options.silent) showToast("反代配置与渠道设置已保存");
       return true;
     } catch (e) {
       showToast(`保存配置失败: ${String(e)}`, true);
@@ -306,6 +334,60 @@ export function useModelProxy() {
     } finally {
       savingConfig.value = false;
     }
+  }
+
+  /** 站点反代渠道 ID：与反代页「站点转换」保持同一命名规则 */
+  const siteChannelId = (siteId: string) => `site_${siteId}`;
+
+  /** 将站点导入为反代渠道（与反代页「站点转换」同构：运行时使用关联站点 Key） */
+  async function addSiteProxyChannel(
+    site: Pick<SiteRecord, "id" | "name" | "apiBaseUrl">,
+  ): Promise<boolean> {
+    if (!site.id) return false;
+    // 幂等：已存在 siteId 关联渠道时直接视为成功
+    if (proxyConfig.value.channels.some((c) => c.siteId === site.id)) return true;
+    const channel: ChannelConfig = {
+      id: siteChannelId(site.id),
+      name: site.name,
+      description: `由站点「${site.name}」转换而来的反代渠道（运行时使用关联站点 Key）`,
+      enabled: true,
+      protocol: "openai",
+      upstreamUrl: site.apiBaseUrl.trim(),
+      apiKey: "",
+      apiKeys: [],
+      useProxyPool: false,
+      proxyMode: "direct",
+      alias: uniqueChannelAlias(extractAliasFromUrl(site.apiBaseUrl)),
+      siteId: site.id,
+      useFixedProxy: false,
+      proxyFixedChannel: null,
+      enabledModels: null,
+    };
+    proxyConfig.value.channels.push(channel);
+    const ok = await saveConfig(proxyConfig.value, { silent: true });
+    if (!ok) {
+      // 保存失败回滚，避免本地状态与后端不一致
+      proxyConfig.value.channels = proxyConfig.value.channels.filter((c) => c.id !== channel.id);
+    }
+    return ok;
+  }
+
+  /** 移除站点的反代渠道（按 siteId 关联，含历史遗留的多条；不影响站点库数据） */
+  async function removeSiteProxyChannel(siteId: string): Promise<boolean> {
+    if (!siteId) return false;
+    const removed = proxyConfig.value.channels.filter((c) => c.siteId === siteId);
+    if (removed.length === 0) return true;
+    proxyConfig.value.channels = proxyConfig.value.channels.filter((c) => c.siteId !== siteId);
+    const ok = await saveConfig(proxyConfig.value, { silent: true });
+    if (ok) {
+      for (const channel of removed) {
+        if (channelModels.value[channel.id]) delete channelModels.value[channel.id];
+      }
+    } else {
+      // 保存失败回滚
+      proxyConfig.value.channels.push(...removed);
+    }
+    return ok;
   }
 
   async function toggleServer() {
@@ -673,6 +755,8 @@ export function useModelProxy() {
     fetchChannelModelStats,
     refreshGatewayOverview,
     saveConfig,
+    addSiteProxyChannel,
+    removeSiteProxyChannel,
     toggleServer,
     fetchUpstreamModels,
     refreshModels,

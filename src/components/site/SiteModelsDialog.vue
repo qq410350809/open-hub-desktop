@@ -7,6 +7,11 @@ import { logoText } from "../../utils";
 import { isUnknownSystemType, systemTypeLabel } from "../../types";
 import { useToast } from "../../composables/core/useToast";
 import { useConfirm } from "../../composables/ui/useConfirm";
+import {
+  useModelProxy,
+  proxyConfig,
+  refreshProxyConfig,
+} from "../../composables/proxy/useModelProxy";
 
 interface LiveModelItem {
   id: string;
@@ -59,6 +64,53 @@ const site = computed(() => store.siteModelsSite.value);
 const liveKeyCount = computed(() =>
   liveAccountKeys.value.reduce((total, account) => total + account.keys.length, 0),
 );
+
+// —— 反代渠道管理：站点与模型反代网关的导入/移除 ——
+const modelProxy = useModelProxy();
+/** 站点当前对应的反代渠道；存在即视为「已反代」 */
+const siteProxy = computed(() =>
+  site.value ? proxyConfig.value.channels.find((c) => c.siteId === site.value?.id) : undefined,
+);
+const proxyBusy = ref(false);
+
+/** 导入反代：将站点创建为反代渠道（运行时使用关联站点 Key） */
+async function importSiteProxy() {
+  const target = site.value;
+  if (!target || proxyBusy.value) return;
+  proxyBusy.value = true;
+  try {
+    // 先刷新配置，避免基于过期数据重复导入
+    await refreshProxyConfig();
+    if (proxyConfig.value.channels.some((c) => c.siteId === target.id)) {
+      showToast("该站点已导入反代", true);
+      return;
+    }
+    const ok = await modelProxy.addSiteProxyChannel(target);
+    if (ok) showToast(`已导入反代：站点「${target.name}」已创建反代渠道`);
+  } finally {
+    proxyBusy.value = false;
+  }
+}
+
+/** 移除反代：删除站点对应的反代渠道（不影响站点库数据） */
+async function removeSiteProxy() {
+  const target = site.value;
+  if (!target || proxyBusy.value) return;
+  const okConfirm = await confirm({
+    title: "移除反代渠道",
+    message: `确定移除站点「${target.name}」的反代渠道吗？该渠道的 Key 分组与模型配置将一并删除，站点库数据不受影响。`,
+    confirmText: "移除",
+    danger: true,
+  });
+  if (!okConfirm) return;
+  proxyBusy.value = true;
+  try {
+    const ok = await modelProxy.removeSiteProxyChannel(target.id);
+    if (ok) showToast(`已移除反代渠道「${target.name}」`);
+  } finally {
+    proxyBusy.value = false;
+  }
+}
 
 const logo = computed(() =>
   site.value ? logoText(site.value.apiBaseUrl, site.value.name) : "",
@@ -164,6 +216,8 @@ watch(
       newKeyGroup.value = "";
       newKeyValue.value = "";
       void refreshModels();
+      // 拉取最新反代渠道配置，驱动「导入反代/移除反代」按钮状态
+      void refreshProxyConfig();
     } else {
       liveFetchRequestId += 1;
       liveFetching.value = false;
@@ -492,27 +546,44 @@ async function removeKey(account: LiveAccountKeys, key: string) {
           </div>
 
           <div class="site-models-actions">
+            <!-- 导入反代/移除反代：站点已有关联渠道时切换为移除；已跑路站点不允许导入 -->
+            <button
+              v-if="site && (siteProxy || !site.isRunaway)"
+              type="button"
+              class="site-models-text-btn site-models-proxy-btn"
+              :class="{ 'is-active': !!siteProxy }"
+              :disabled="proxyBusy"
+              :title="siteProxy
+                ? `移除反代：删除站点「${site.name}」对应的反代渠道（站点库数据不受影响）`
+                : `导入反代：将站点「${site.name}」导入模型反代网关（运行时使用关联站点 Key）`"
+              @click="siteProxy ? removeSiteProxy() : importSiteProxy()"
+            >
+              <span v-html="icons.repeat" />
+              <span>{{ siteProxy ? "移除反代" : "导入反代" }}</span>
+            </button>
             <!-- 同步 Key：重新拉取站点 API Key 列表；未知架构站点无 Key 提取能力，不提供该入口 -->
             <button
               v-if="site && !isUnknownSystemType(site.systemType)"
               type="button"
-              class="site-models-icon-btn"
+              class="site-models-text-btn"
               :disabled="liveFetching"
               :aria-label="liveFetchingKind === 'keys' ? '正在同步 Key' : '同步 Key：拉取站点 API Key 列表'"
               title="同步 Key：拉取站点 API Key 列表"
               @click="refreshModels('keys')"
             >
               <span v-html="icons.key" :class="{ 'site-models-spin': liveFetchingKind === 'keys' }" />
+              <span>同步 Key</span>
             </button>
             <button
               type="button"
-              class="site-models-icon-btn"
+              class="site-models-text-btn"
               :disabled="liveFetching"
               :aria-label="liveFetchingKind === 'models' ? '正在同步模型' : '同步模型：按 Key 逐个拉取 /v1/models 并保存'"
               title="同步模型：按 Key 逐个拉取 /v1/models 并保存"
               @click="refreshModels('models')"
             >
               <span v-html="icons.restore" :class="{ 'site-models-spin': liveFetchingKind === 'models' }" />
+              <span>同步模型</span>
             </button>
             <button
               ref="closeBtnRef"
