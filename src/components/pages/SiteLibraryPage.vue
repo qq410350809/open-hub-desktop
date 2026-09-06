@@ -20,6 +20,10 @@ import {
   normalizeSystemType,
   systemTypeLabel,
 } from "../../types";
+import {
+  isSiteProxied,
+  refreshProxyConfig,
+} from "../../composables/proxy/useModelProxy";
 
 const store = useStore();
 
@@ -400,6 +404,11 @@ function getSiteSessions(siteId: string): ChromeSessionInfo[] {
   return store.chromeUsageAccounts.value[siteId] ?? [];
 }
 
+/** 站点已同步的 Key 总数：各关联账号 apiKeyCount 之和 */
+function getSiteKeyCount(siteId: string): number {
+  return getSiteSessions(siteId).reduce((total, s) => total + (s.apiKeyCount || 0), 0);
+}
+
 /** 未知架构站点：无签到/额度能力，卡片不展示相关内容，也不提供会话同步。 */
 function isUnknownSite(site: Pick<SiteRecord, "systemType">): boolean {
   return isUnknownSystemType(site.systemType);
@@ -723,6 +732,8 @@ onMounted(() => {
   if (!store.loading.value) {
     void store.loadLibrary();
   }
+  // 拉取反代渠道配置，用于站点卡展示「已反代」标识
+  void refreshProxyConfig();
 });
 
 onUnmounted(() => {
@@ -1170,6 +1181,7 @@ onUnmounted(() => {
                     <span v-else-if="site.isPersonal" class="sl-pill sl-pill-personal">在用</span>
                     <span v-else-if="site.isPending" class="sl-pill sl-pill-pending">待定</span>
                     <span v-if="site.isFakeCharity" class="sl-pill sl-pill-fake">伪公益</span>
+                    <span v-if="isSiteProxied(site.id)" class="sl-pill sl-pill-proxy" title="该站点的 Key 已导入模型反代网关（可在「模型反代」页管理）">已反代</span>
                   </div>
                   <small class="sl-card-url" :title="site.apiBaseUrl">{{ site.apiBaseUrl }}</small>
                 </div>
@@ -1217,8 +1229,8 @@ onUnmounted(() => {
             <!-- 账号额度或概览条目 -->
             <div class="sl-card-specs">
               <div class="sl-spec-item">
-                <span class="sl-spec-k">关联会话</span>
-                <strong class="sl-spec-v">{{ getSiteSessions(site.id).length }} 个账号</strong>
+                <span class="sl-spec-k">账号 / Key</span>
+                <strong class="sl-spec-v">{{ getSiteSessions(site.id).length }} 账号 · {{ getSiteKeyCount(site.id) }} Key</strong>
               </div>
               <div v-if="!isUnknownSite(site)" class="sl-spec-item">
                 <span class="sl-spec-k">剩余额度</span>
@@ -1277,7 +1289,9 @@ onUnmounted(() => {
               </div>
 
               <div class="sl-card-footer-actions" @click.stop>
+                <!-- 查看支持模型与 Key：仅在用/待定站点提供 -->
                 <button
+                  v-if="site.isPersonal || site.isPending"
                   type="button"
                   class="sl-action-icon-btn"
                   title="查看支持模型与 Key"
@@ -1366,6 +1380,7 @@ onUnmounted(() => {
                   <span v-if="row.isRunaway" class="sl-pill sl-pill-runaway">跑路</span>
                   <span v-else-if="row.isPersonal" class="sl-pill sl-pill-personal">在用</span>
                   <span v-else-if="row.isPending" class="sl-pill sl-pill-pending">待定</span>
+                  <span v-if="isSiteProxied(row.id)" class="sl-pill sl-pill-proxy" title="该站点的 Key 已导入模型反代网关（可在「模型反代」页管理）">已反代</span>
                 </div>
                 <small class="sl-table-site-url">{{ row.apiBaseUrl }}</small>
               </div>
@@ -1422,7 +1437,9 @@ onUnmounted(() => {
           <!-- 快捷操作列 -->
           <template #cell-actions="{ row }">
             <div class="sl-table-actions-cell" @click.stop>
+              <!-- 查看支持模型与 Key：仅在用/待定站点提供 -->
               <button
+                v-if="row.isPersonal || row.isPending"
                 type="button"
                 class="sl-action-icon-btn"
                 title="查看支持模型与 Key"
@@ -1528,6 +1545,7 @@ onUnmounted(() => {
                     <span v-else-if="site.isPersonal" class="sl-pill sl-pill-personal">在用</span>
                     <span v-else-if="site.isPending" class="sl-pill sl-pill-pending">待定</span>
                     <span v-if="site.isFakeCharity" class="sl-pill sl-pill-fake">伪公益</span>
+                    <span v-if="isSiteProxied(site.id)" class="sl-pill sl-pill-proxy" title="该站点的 Key 已导入模型反代网关（可在「模型反代」页管理）">已反代</span>
                   </div>
                   <small class="sl-card-url" :title="site.apiBaseUrl">{{ site.apiBaseUrl }}</small>
                 </div>
@@ -1693,8 +1711,9 @@ onUnmounted(() => {
               </div>
 
               <div class="sl-topo-footer-actions" @click.stop>
-                <!-- 查看支持模型与 Key -->
+                <!-- 查看支持模型与 Key：仅在用/待定站点提供 -->
                 <button
+                  v-if="site.isPersonal || site.isPending"
                   type="button"
                   class="sl-action-icon-btn"
                   title="查看支持模型与 Key"
@@ -3219,6 +3238,7 @@ onUnmounted(() => {
 .sl-pill-runaway { background: color-mix(in srgb, var(--danger, #f85149) 15%, transparent); color: var(--danger, #f85149); }
 .sl-pill-personal { background: color-mix(in srgb, var(--success, #2ea043) 15%, transparent); color: var(--success, #3fb950); }
 .sl-pill-pending { background: color-mix(in srgb, var(--warning, #d29922) 15%, transparent); color: var(--warning, #d29922); }
+.sl-pill-proxy { background: color-mix(in srgb, #bc8cff 15%, transparent); color: #bc8cff; }
 .sl-pill-fake { background: color-mix(in srgb, #ff7b72 15%, transparent); color: #ff7b72; }
 
 .sl-card-badges {
