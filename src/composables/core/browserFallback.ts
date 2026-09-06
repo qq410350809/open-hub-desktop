@@ -553,6 +553,7 @@ export async function browserFallback<T>(
       icon: new URL("/favicon.ico", url).toString(),
       isPersonal: usageState === "personal",
       isPending: usageState === "pending",
+      useProxyPool: args.useProxyPool === true,
       updatedAt: new Date().toISOString(),
     };
     browserData!.sites.unshift(site);

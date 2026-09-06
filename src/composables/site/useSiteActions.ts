@@ -29,9 +29,13 @@ async function saveSite(input: SiteRecord): Promise<boolean> {
   }
 }
 
-async function importSite(siteUrl: string, usageState: SiteUsageState = "all"): Promise<SiteRecord> {
+async function importSite(
+  siteUrl: string,
+  usageState: SiteUsageState = "all",
+  useProxyPool = false,
+): Promise<SiteRecord> {
   try {
-    const site = await runCommand<SiteRecord>("import_site", { siteUrl, usageState });
+    const site = await runCommand<SiteRecord>("import_site", { siteUrl, usageState, useProxyPool });
     closeModal();
     await loadLibrary();
     const usageLabel = usageState === "personal" ? "在用" : usageState === "pending" ? "待定" : "全部";

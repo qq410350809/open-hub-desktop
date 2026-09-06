@@ -26,6 +26,8 @@ const nameInputRef = ref<HTMLInputElement>();
 const importUrlInputRef = ref<HTMLInputElement>();
 const importUrl = ref("");
 const importUsageState = ref<SiteUsageState>("all");
+/** 导入时选择是否接入代理池固定通道出口 */
+const importUseProxyPool = ref(false);
 const importUsageOptions: Array<{ value: SiteUsageState; text: string; description: string }> = [
   { value: "all", text: "全部", description: "仅加入站点库，不标记使用状态" },
   { value: "personal", text: "在用", description: "导入后直接加入在用站点" },
@@ -121,6 +123,7 @@ watch(
       importUsageState.value = ["personal", "pending"].includes(store.usageFilter.value)
         ? store.usageFilter.value as SiteUsageState
         : "all";
+      importUseProxyPool.value = false;
       activeTab.value = "basic";
       errorMessage.value = "";
       nextTick(() => {
@@ -258,7 +261,7 @@ async function handleImport() {
 
   saving.value = true;
   try {
-    const importedSite = await store.importSite(importUrl.value.trim(), importUsageState.value);
+    const importedSite = await store.importSite(importUrl.value.trim(), importUsageState.value, importUseProxyPool.value);
     const expectedPersonal = importUsageState.value === "personal";
     const expectedPending = importUsageState.value === "pending";
     if (importedSite.isPersonal !== expectedPersonal || importedSite.isPending !== expectedPending) {
@@ -458,7 +461,7 @@ function onBackdropClick(event: MouseEvent) {
                 <label class="check-card">
                   <input v-model="form.useProxyPool" name="useProxyPool" type="checkbox" />
                   <i></i>
-                  <span><strong>使用代理池</strong><small>账号请求按账号固定一个 ≤500ms 节点，失败自动切换</small></span>
+                  <span><strong>使用固定通道</strong><small>账号请求经代理池固定通道出口，账号与通道一一绑定（账号1 走通道1、账号2 走通道2），失败不切换</small></span>
                 </label>
               </div>
               <h3 class="section-title section-spaced">
@@ -614,6 +617,11 @@ function onBackdropClick(event: MouseEvent) {
               </div>
               <small>{{ importUsageOptions.find(option => option.value === importUsageState)?.description }}</small>
             </fieldset>
+            <label class="check-card import-proxy-check" :class="{ 'is-disabled': saving }">
+              <input v-model="importUseProxyPool" name="importUseProxyPool" type="checkbox" :disabled="saving" />
+              <i></i>
+              <span><strong>使用固定通道</strong><small>账号请求经代理池固定通道出口，账号与通道一一绑定（账号1 走通道1、账号2 走通道2），失败不切换</small></span>
+            </label>
             <p v-if="saving" class="import-progress" role="status">正在采集站点资料并归入“{{ importUsageOptions.find(option => option.value === importUsageState)?.text }}”…</p>
           </div>
 

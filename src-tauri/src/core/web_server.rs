@@ -225,8 +225,10 @@ macro_rules! rpc_arms {
             "import_site" => {
                 let site_url: String = take($args, &["siteUrl", "site_url"])?;
                 let usage_state: Option<String> = take_opt($args, &["usageState", "usage_state"])?;
+                let use_proxy_pool: Option<bool> =
+                    take_opt($args, &["useProxyPool", "use_proxy_pool"])?;
                 Ok(json!(
-                    crate::site::library::import_site($ctx, site_url, usage_state).await
+                    crate::site::library::import_site($ctx, site_url, usage_state, use_proxy_pool).await
                 ))
             }
 

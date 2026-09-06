@@ -1,6 +1,7 @@
 use crate::context::{AppContext, Managed};
 use crate::db::*;
 use crate::models::*;
+use crate::proxypool;
 use crate::site::library::*;
 use crate::site::library::{detect_platform, is_newapi, is_sub2api};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -252,6 +253,7 @@ pub async fn import_site(
     ctx: Managed<'_, Arc<AppContext>>,
     site_url: String,
     usage_state: Option<String>,
+    use_proxy_pool: Option<bool>,
 ) -> Result<SiteRecord, String> {
     let database = &*ctx.database;
     let base_url = normalize_import_base_url(&site_url)?;
@@ -272,7 +274,29 @@ pub async fn import_site(
         }
     }
 
-    let client = build_site_http_client(&database, Duration::from_secs(12), 5, "站点资料采集")?;
+    // 探测客户端：勾选「使用固定通道」时，导入期间的网络请求同样经代理池
+    // 默认通道出口（与站点之后的账号请求出口一致）；未勾选走全局网络代理。
+    let client = if use_proxy_pool.unwrap_or(false) {
+        {
+            let connection = database.lock_conn()?;
+            proxypool::ensure_default_proxy_channel(&connection)?;
+        }
+        let lane_port = proxypool::ensure_channel_instance(
+            database,
+            &ctx.proxy_runtime,
+            proxypool::DEFAULT_PROXY_CHANNEL_ID,
+        )
+        .map_err(|error| format!("代理池固定通道不可用，请先在代理池页启动服务：{error}"))?;
+        proxypool::build_proxy_client_with_url(
+            database,
+            &format!("http://127.0.0.1:{lane_port}"),
+            Duration::from_secs(12),
+            5,
+            "站点资料采集（固定通道）",
+        )?
+    } else {
+        build_site_http_client(&database, Duration::from_secs(12), 5, "站点资料采集")?
+    };
     let root_job = crate::context::spawn(fetch_discovery_resource(
         client.clone(),
         base_url.clone(),
@@ -419,6 +443,8 @@ pub async fn import_site(
         supports_checkin,
         checkin_url,
         use_system_proxy: false,
+        // 导入时即可选择接入代理池固定通道出口
+        use_proxy_pool: use_proxy_pool.unwrap_or(false),
         is_personal,
         is_pending,
         ..SiteRecord::default()

@@ -1112,7 +1112,7 @@ onUnmounted(() => {
             :class="{ active: featureFilters.proxyPool }"
             @click="toggleFeature('proxyPool')"
           >
-            🛡️ 走代理池
+            🛡️ 固定通道
           </button>
         </div>
 
@@ -1435,7 +1435,7 @@ onUnmounted(() => {
               <span v-if="row.supportsImmersiveTranslation" title="支持沉浸式翻译">🌐</span>
               <span v-if="row.supportsLdc" title="支持 LDC 支付">💳</span>
               <span v-if="row.supportsNsfw" title="支持 18+ NSFW">🔞</span>
-              <span v-if="row.useProxyPool" title="开启代理池">🛡️</span>
+              <span v-if="row.useProxyPool" title="使用固定通道">🛡️</span>
             </div>
           </template>
 
@@ -1949,8 +1949,8 @@ onUnmounted(() => {
                     <strong class="sl-fact-v">{{ systemTypeLabel(selectedSite.systemType) || "通用系统" }}</strong>
                   </div>
                   <div class="sl-fact-box">
-                    <span class="sl-fact-k">代理池配置</span>
-                    <strong class="sl-fact-v">{{ selectedSite.useProxyPool ? "强制通过 Clash 代理池" : "直连访问" }}</strong>
+                    <span class="sl-fact-k">固定通道</span>
+                    <strong class="sl-fact-v">{{ selectedSite.useProxyPool ? "账号请求走代理池固定通道出口" : "直连访问" }}</strong>
                   </div>
                   <div class="sl-fact-box">
                     <span class="sl-fact-k">最近更新时间</span>
@@ -1970,7 +1970,7 @@ onUnmounted(() => {
                     <span class="sl-cap-pill" :class="{ 'is-disabled': !selectedSite.supportsLdc }">💳 LDC 支付</span>
                     <span class="sl-cap-pill" :class="{ 'is-disabled': !selectedSite.supportsNsfw }">🔞 18+ NSFW</span>
                     <span class="sl-cap-pill" :class="{ 'is-disabled': !selectedSite.requiresInviteCode }">🎟️ 需邀请码</span>
-                    <span class="sl-cap-pill" :class="{ 'is-disabled': !selectedSite.useProxyPool }">🛡️ 代理池接入</span>
+                    <span class="sl-cap-pill" :class="{ 'is-disabled': !selectedSite.useProxyPool }">🛡️ 固定通道</span>
                   </div>
                 </div>
 
