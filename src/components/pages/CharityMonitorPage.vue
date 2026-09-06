@@ -201,7 +201,16 @@ function logSummaryText(entry: CharitySyncLogEntry) {
   if (isRoundLogEntry(entry)) {
     const feeds = entry.detail?.feeds ?? [];
     const okCount = feeds.filter((feed) => feed.status === "success").length;
-    return `${stage}于 ${time} 结束，共 ${feeds.length} 个标签（成功 ${okCount} 个），合计新增 ${entry.detail?.totalNew ?? 0} 条 / 更新 ${entry.detail?.totalUpdated ?? 0} 条。`;
+    // totalNew/totalUpdated 为按帖子去重后的数量；旧日志没有行数字段时两者相等，不追加说明
+    const newPosts = entry.detail?.totalNew ?? 0;
+    const updatedPosts = entry.detail?.totalUpdated ?? 0;
+    const newRows = entry.detail?.totalNewRows ?? newPosts;
+    const updatedRows = entry.detail?.totalUpdatedRows ?? updatedPosts;
+    const rowsNote =
+      newRows > newPosts || updatedRows > updatedPosts
+        ? `（同帖命中多标签，按标签行计新增 ${newRows} / 更新 ${updatedRows} 条）`
+        : "";
+    return `${stage}于 ${time} 结束，共 ${feeds.length} 个标签（成功 ${okCount} 个），合计新增 ${newPosts} 帖 / 更新 ${updatedPosts} 帖${rowsNote}。`;
   }
   if (entry.status === "success") {
     return `${stage}「${entry.feedName}」于 ${time} 通过节点「${node}」完成，耗时 ${formatDuration(liveDurationMs(entry))}。`;
@@ -232,10 +241,13 @@ function logDetailRows(entry: CharitySyncLogEntry): LogDetailCell[][] {
       ]);
     }
     rows.push([
-      { text: "合计" },
+      { text: "合计（标签行）" },
       { text: "" },
-      { text: String(entry.detail?.totalNew ?? 0), cls: "num" },
-      { text: String(entry.detail?.totalUpdated ?? 0), cls: "num" },
+      { text: String(entry.detail?.totalNewRows ?? entry.detail?.totalNew ?? 0), cls: "num" },
+      {
+        text: String(entry.detail?.totalUpdatedRows ?? entry.detail?.totalUpdated ?? 0),
+        cls: "num",
+      },
     ]);
     return rows;
   }
@@ -302,6 +314,22 @@ function formatPublishedAt(value?: string) {
   const ts = parseFeedTimestampMs(value);
   if (!Number.isFinite(ts)) return value || "时间未知";
   return new Intl.DateTimeFormat("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(ts);
+}
+
+// 入库时间可能横跨多年，绝对展示时补上年份
+function formatStoredAt(value?: string) {
+  const raw = (value || "").trim();
+  if (!raw) return "—";
+  const ts = parseFeedTimestampMs(raw);
+  if (!Number.isFinite(ts)) return raw;
+  const sameYear = new Date(ts).getFullYear() === new Date().getFullYear();
+  return new Intl.DateTimeFormat("zh-CN", {
+    ...(sameYear ? {} : { year: "numeric" }),
     month: "2-digit",
     day: "2-digit",
     hour: "2-digit",
@@ -397,6 +425,7 @@ const topicColumns: AppTableColumn[] = [
   { key: "replyCount", title: "回复", width: "80px", align: "right", sortable: true },
   { key: "views", title: "浏览", width: "85px", align: "right", sortable: true },
   { key: "lastActivityAt", title: "最近活跃", width: "100px", sortable: true },
+  { key: "firstSeenAt", title: "入库时间", width: "100px", sortable: true },
   { key: "actions", title: "快捷操作", width: "110px", align: "center", sortable: false },
 ];
 
@@ -763,6 +792,16 @@ onUnmounted(() => {
             </span>
           </template>
 
+          <!-- 入库时间 -->
+          <template #cell-firstSeenAt="{ row }">
+            <span
+              class="cm-activity-chip"
+              :title="row.firstSeenAt ? `入库于 ${formatStoredAt(row.firstSeenAt)}` : ''"
+            >
+              {{ formatRelativeActivity(row.firstSeenAt) }}
+            </span>
+          </template>
+
           <!-- 快捷操作列 -->
           <template #cell-actions="{ row }">
             <div class="cm-actions-cell" @click.stop>
@@ -835,6 +874,10 @@ onUnmounted(() => {
                 <div class="cm-meta-item">
                   <span class="cm-meta-label">最后活跃:</span>
                   <span class="cm-meta-val">{{ formatRelativeActivity(selectedPost.lastActivityAt, selectedPost.publishedAt) }}</span>
+                </div>
+                <div class="cm-meta-item">
+                  <span class="cm-meta-label">入库时间:</span>
+                  <span class="cm-meta-val">{{ formatStoredAt(selectedPost.firstSeenAt) }}</span>
                 </div>
               </div>
 

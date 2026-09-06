@@ -5,6 +5,7 @@ use crate::context::{home_dir, spawn, spawn_blocking, AppContext, EventBus};
 use crate::models::Database;
 use crate::proxypool::{self, is_http_forbidden_error, is_transport_error, ProxyRuntime};
 use crate::site::sync;
+use std::collections::HashSet;
 use std::sync::{atomic::AtomicUsize, atomic::Ordering, Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
@@ -288,9 +289,19 @@ pub fn combined_filter_json_url(feed_names: &[String], order_by_created: bool) -
     url.to_string()
 }
 
-/// 单序列（最新话题 / 最新帖子）结果按标签拆分入库，两条序列互不合并、各自独立持久化；
-/// 返回 (feed_id, feed_name, new_count, updated_count, failed) 列表。
+/// 单序列（最新话题 / 最新帖子）单个标签的入库结局。
 /// 进度事件与 feed meta 由调用方聚合两条序列后统一写入，避免互相覆盖。
+struct PersistedSlice {
+    feed_id: String,
+    new_count: usize,
+    updated_count: usize,
+    failed: bool,
+    /// 本序列该标签下新增/更新的帖子 guid，供轮次汇总按帖子去重
+    new_guids: Vec<String>,
+    updated_guids: Vec<String>,
+}
+
+/// 单序列（最新话题 / 最新帖子）结果按标签拆分入库，两条序列互不合并、各自独立持久化。
 fn persist_split_items(
     monitor: &CharityMonitorRuntime,
     database: &Database,
@@ -298,7 +309,7 @@ fn persist_split_items(
     items: &[CharityFeedItem],
     profile_name: &str,
     account_name: &str,
-) -> Vec<(String, String, usize, usize, bool)> {
+) -> Vec<PersistedSlice> {
     let split = split_items_by_feed(items, sources);
     let mut results = Vec::with_capacity(sources.len());
     for (source, owned) in sources.iter().zip(&split) {
@@ -306,7 +317,14 @@ fn persist_split_items(
             if let Ok(mut errors) = monitor.last_errors.lock() {
                 errors.remove(&source.id);
             }
-            results.push((source.id.clone(), source.name.clone(), 0, 0, false));
+            results.push(PersistedSlice {
+                feed_id: source.id.clone(),
+                new_count: 0,
+                updated_count: 0,
+                failed: false,
+                new_guids: Vec::new(),
+                updated_guids: Vec::new(),
+            });
             continue;
         }
         match persist_feed(
@@ -316,24 +334,32 @@ fn persist_split_items(
             profile_name.to_string(),
             account_name.to_string(),
         ) {
-            Ok(result) => {
+            Ok((result, new_guids, updated_guids)) => {
                 if let Ok(mut errors) = monitor.last_errors.lock() {
                     errors.remove(&source.id);
                 }
-                results.push((
-                    source.id.clone(),
-                    source.name.clone(),
-                    result.new_count,
-                    result.updated_count,
-                    false,
-                ));
+                results.push(PersistedSlice {
+                    feed_id: source.id.clone(),
+                    new_count: result.new_count,
+                    updated_count: result.updated_count,
+                    failed: false,
+                    new_guids,
+                    updated_guids,
+                });
             }
             Err(error) => {
                 let message = format!("入库失败：{error}");
                 if let Ok(mut errors) = monitor.last_errors.lock() {
                     errors.insert(source.id.clone(), message);
                 }
-                results.push((source.id.clone(), source.name.clone(), 0, 0, true));
+                results.push(PersistedSlice {
+                    feed_id: source.id.clone(),
+                    new_count: 0,
+                    updated_count: 0,
+                    failed: true,
+                    new_guids: Vec::new(),
+                    updated_guids: Vec::new(),
+                });
             }
         }
     }
@@ -613,13 +639,14 @@ pub async fn sync_round_combined(
                                 &account_name,
                             )
                         });
-                        let created_new = created_results.iter().map(|r| r.2).sum::<usize>();
-                        let created_updated = created_results.iter().map(|r| r.3).sum::<usize>();
+                        let created_new = created_results.iter().map(|r| r.new_count).sum::<usize>();
+                        let created_updated =
+                            created_results.iter().map(|r| r.updated_count).sum::<usize>();
                         if let Some(id) = created_log_id {
                             update_charity_sync_log(
                                 database,
                                 id,
-                                if created_results.iter().any(|r| r.4) {
+                                if created_results.iter().any(|r| r.failed) {
                                     "error"
                                 } else {
                                     "success"
@@ -687,14 +714,16 @@ pub async fn sync_round_combined(
                                             )
                                         });
                                         let activity_new =
-                                            activity_results.iter().map(|r| r.2).sum::<usize>();
-                                        let activity_updated =
-                                            activity_results.iter().map(|r| r.3).sum::<usize>();
+                                            activity_results.iter().map(|r| r.new_count).sum::<usize>();
+                                        let activity_updated = activity_results
+                                            .iter()
+                                            .map(|r| r.updated_count)
+                                            .sum::<usize>();
                                         if let Some(id) = activity_log_id {
                                             update_charity_sync_log(
                                                 database,
                                                 id,
-                                                if activity_results.iter().any(|r| r.4) {
+                                                if activity_results.iter().any(|r| r.failed) {
                                                     "error"
                                                 } else {
                                                     "success"
@@ -765,22 +794,31 @@ pub async fn sync_round_combined(
                         }
 
                         // —— 聚合两条序列的各标签结果：meta、进度事件、汇总明细各写一次 ——
+                        // 合计按帖子 guid 去重（同帖命中多个标签只计一次），标签行数另行保留
                         let mut outcomes = Vec::with_capacity(sources.len());
                         let mut feeds_detail = Vec::with_capacity(sources.len());
                         let mut summary_parts = Vec::with_capacity(sources.len());
                         let mut notify_labels = Vec::with_capacity(sources.len());
-                        let mut total_new = 0usize;
-                        let mut total_updated = 0usize;
+                        let mut total_new_rows = 0usize;
+                        let mut total_updated_rows = 0usize;
+                        let mut new_guids_seen = HashSet::new();
+                        let mut updated_guids_seen = HashSet::new();
                         tokio::task::block_in_place(|| {
                             for source in sources {
-                                let created = created_results.iter().find(|r| r.0 == source.id);
-                                let activity = activity_results.iter().find(|r| r.0 == source.id);
-                                let new_count = created.map(|r| r.2).unwrap_or(0)
-                                    + activity.map(|r| r.2).unwrap_or(0);
-                                let updated_count = created.map(|r| r.3).unwrap_or(0)
-                                    + activity.map(|r| r.3).unwrap_or(0);
-                                let failed = created.map(|r| r.4).unwrap_or(false)
-                                    || activity.map(|r| r.4).unwrap_or(false);
+                                let created = created_results.iter().find(|r| r.feed_id == source.id);
+                                let activity = activity_results.iter().find(|r| r.feed_id == source.id);
+                                let new_count = created.map(|r| r.new_count).unwrap_or(0)
+                                    + activity.map(|r| r.new_count).unwrap_or(0);
+                                let updated_count = created.map(|r| r.updated_count).unwrap_or(0)
+                                    + activity.map(|r| r.updated_count).unwrap_or(0);
+                                let failed = created.map(|r| r.failed).unwrap_or(false)
+                                    || activity.map(|r| r.failed).unwrap_or(false);
+                                total_new_rows += new_count;
+                                total_updated_rows += updated_count;
+                                for slice in created.iter().chain(activity.iter()) {
+                                    new_guids_seen.extend(slice.new_guids.iter().cloned());
+                                    updated_guids_seen.extend(slice.updated_guids.iter().cloned());
+                                }
                                 let status = if failed { "failed" } else { "success" };
                                 if new_count > 0 || updated_count > 0 {
                                     notify_labels.push(source.name.clone());
@@ -800,8 +838,6 @@ pub async fn sync_round_combined(
                                     &node.name,
                                     new_count + updated_count,
                                 );
-                                total_new += new_count;
-                                total_updated += updated_count;
                                 summary_parts.push(format!(
                                     "{} 新增{} / 更新{}",
                                     source.name, new_count, updated_count
@@ -837,6 +873,8 @@ pub async fn sync_round_combined(
                                 });
                             }
                         });
+                        let total_new = new_guids_seen.len();
+                        let total_updated = updated_guids_seen.len();
                         // 整轮只发一条新消息通知：标签名拼接，携带合计新增/更新数，
                         // 避免多标签同时有动态时连响多条。
                         if total_new > 0 || total_updated > 0 {
@@ -866,12 +904,19 @@ pub async fn sync_round_combined(
                             message.push_str(&format!("（{activity_note}）"));
                         }
                         message.push_str(&format!(
-                            " · {} · 合计新增 {total_new} / 更新 {total_updated}",
+                            " · {} · 合计新增 {total_new} / 更新 {total_updated} 帖",
                             summary_parts.join(" · ")
                         ));
+                        if total_new_rows > total_new || total_updated_rows > total_updated {
+                            message.push_str(&format!(
+                                "（同帖命中多标签，按标签行计新增 {total_new_rows} / 更新 {total_updated_rows}）"
+                            ));
+                        }
                         let detail = serde_json::json!({
                             "totalNew": total_new,
                             "totalUpdated": total_updated,
+                            "totalNewRows": total_new_rows,
+                            "totalUpdatedRows": total_updated_rows,
                             "feeds": feeds_detail,
                         })
                         .to_string();
@@ -1272,7 +1317,7 @@ pub async fn sync_feed_with_fast_nodes(
                             persist_feed(database, source, items, profile_name, account_name)
                         });
                         match persist_result {
-                            Ok(mut result) => {
+                            Ok((mut result, _, _)) => {
                                 result.used_node_id = node.id.clone();
                                 result.used_node_name = node.name.clone();
                                 result.status = "success".into();

@@ -195,6 +195,7 @@ pub fn items_from_topic_list(value: &str) -> Result<Vec<CharityFeedItem>, String
                 last_activity_at,
                 pinned,
                 posters,
+                first_seen_at: String::new(),
             })
         })
         .collect::<Vec<_>>();

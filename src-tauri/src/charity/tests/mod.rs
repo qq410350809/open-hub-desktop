@@ -413,6 +413,7 @@ fn split_items_attributes_topics_by_tag_name() {
         last_activity_at: String::new(),
         pinned: false,
         posters: Vec::new(),
+        first_seen_at: String::new(),
     };
     let items = vec![
         make_item("a", &["公益推广", "ChatGPT"]),

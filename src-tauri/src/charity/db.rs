@@ -342,7 +342,7 @@ pub fn persist_feed(
     mut items: Vec<CharityFeedItem>,
     source_profile_name: String,
     source_account_name: String,
-) -> Result<CharityFeedResult, String> {
+) -> Result<(CharityFeedResult, Vec<String>, Vec<String>), String> {
     let keys = feed_meta_keys(&source.id);
     let initialized_key = keys.initialized.clone();
     let source_key = keys.source_url.clone();
@@ -385,14 +385,18 @@ pub fn persist_feed(
         .map_err(|error| error.to_string())?;
     let mut new_count = 0;
     let mut updated_count = 0;
+    let mut new_guids: Vec<String> = Vec::new();
+    let mut updated_guids: Vec<String> = Vec::new();
     for item in &mut items {
         if let Some((title, link, published_at)) = existing.get(&item.id) {
             if title != &item.title || link != &item.link || published_at != &item.published_at {
                 updated_count += 1;
+                updated_guids.push(item.id.clone());
             }
         } else if initialized {
             item.is_new = true;
             new_count += 1;
+            new_guids.push(item.id.clone());
         }
         transaction
             .execute(
@@ -493,7 +497,7 @@ pub fn persist_feed(
                 .max(0) as usize
         }
     };
-    Ok(CharityFeedResult {
+    let result = CharityFeedResult {
         feed_id: source.id.clone(),
         feed_name: source.name.clone(),
         items,
@@ -514,7 +518,8 @@ pub fn persist_feed(
         offset: 0,
         limit: CHARITY_PAGE_SIZE,
         has_more: false,
-    })
+    };
+    Ok((result, new_guids, updated_guids))
 }
 
 /// 属性快捷筛选下推为 SQL 条件；today 内嵌本地日界的 i64 时间戳（无注入风险）。
@@ -542,6 +547,7 @@ fn charity_sort_column(key: &str) -> &'static str {
         "replyCount" => "reply_count",
         "views" => "views",
         "lastActivityAt" => "last_activity_at",
+        "firstSeenAt" => "first_seen_at",
         _ => "published_at",
     }
 }
@@ -656,7 +662,7 @@ pub fn load_all_feed_items_from_db(
         published_at,
         summary,
         categories,
-        _first_seen_at,
+        first_seen_at,
         reply,
         views,
         likes,
@@ -683,6 +689,12 @@ pub fn load_all_feed_items_from_db(
             item.views = item.views.max(views);
             item.reply_count = item.reply_count.max(reply);
             item.like_count = item.like_count.max(likes);
+            // 同一 guid 在不同 feed 中首次入库时间不同，展示最早的
+            if !first_seen_at.is_empty()
+                && (item.first_seen_at.is_empty() || first_seen_at < item.first_seen_at)
+            {
+                item.first_seen_at = first_seen_at;
+            }
             continue;
         }
         merged.push(CharityFeedItem {
@@ -700,6 +712,7 @@ pub fn load_all_feed_items_from_db(
             last_activity_at: last_activity,
             pinned: pinned != 0,
             posters,
+            first_seen_at,
             feed_ids: vec![feed_id],
             feed_names: vec![feed_name],
         });
@@ -844,6 +857,7 @@ pub fn load_feed_items_from_db(
                     last_activity_at: row.get(11)?,
                     pinned: row.get::<_, i64>(12)? != 0,
                     posters: parsed_posters,
+                    first_seen_at,
                 })
             },
         )

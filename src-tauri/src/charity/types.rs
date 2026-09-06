@@ -66,6 +66,9 @@ pub struct CharityFeedItem {
     pub pinned: bool,
     #[serde(default)]
     pub posters: Vec<String>,
+    /// 首次入库时间（CURRENT_TIMESTAMP，UTC 无时区），抓取侧构造时为空串
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub first_seen_at: String,
     #[serde(default)]
     pub feed_ids: Vec<String>,
     #[serde(default)]

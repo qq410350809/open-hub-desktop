@@ -66,7 +66,7 @@ function playNotificationSound() {
 // 应用前台不弹横幅、dev 模式下通知被系统静默丢弃（历史记录为空），故弃用。
 async function sendSystemNotification(event: CharityNewMessageEvent): Promise<string | null> {
   const title = "公益监听 - 新消息提醒";
-  const body = `「${event.feedName}」有新动态：新增 ${event.newCount} 条，更新 ${event.updatedCount} 条`;
+  const body = `「${event.feedName}」有新动态：新增 ${event.newCount} 帖，更新 ${event.updatedCount} 帖`;
 
   if (isTauri) {
     try {

@@ -153,6 +153,8 @@ export interface CharityFeedItem {
   lastActivityAt: string;
   pinned: boolean;
   posters: string[];
+  /** 首次入库时间（后端 CURRENT_TIMESTAMP，UTC 无时区） */
+  firstSeenAt?: string;
   feedIds?: string[];
   feedNames?: string[];
 }
@@ -208,8 +210,12 @@ export interface CharitySyncLogDetail {
   new?: number;
   updated?: number;
   unread?: number;
+  /** 合计新增/更新帖数（同帖命中多标签去重后） */
   totalNew?: number;
   totalUpdated?: number;
+  /** 按标签行计的原始合计（不去重），供明细表合计行展示 */
+  totalNewRows?: number;
+  totalUpdatedRows?: number;
   feeds?: CharitySyncLogFeedDetail[];
 }
 
