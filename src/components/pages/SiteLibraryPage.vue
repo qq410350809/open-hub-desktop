@@ -1289,6 +1289,16 @@ onUnmounted(() => {
               </div>
 
               <div class="sl-card-footer-actions" @click.stop>
+                <!-- 模型测试：流式对话验证站点模型可用性（仅桌面端支持流式） -->
+                <button
+                  v-if="(site.isPersonal || site.isPending) && isTauri"
+                  type="button"
+                  class="sl-action-icon-btn"
+                  title="模型测试：与站点模型流式对话，验证 Key 与模型可用性"
+                  @click.stop="store.openSiteTestDialog(site)"
+                >
+                  <span v-html="icons.chat" />
+                </button>
                 <!-- 查看支持模型与 Key：仅在用/待定站点提供 -->
                 <button
                   v-if="site.isPersonal || site.isPending"

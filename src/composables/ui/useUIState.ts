@@ -16,6 +16,7 @@ const previewDialogOpen = ref(false);
 const chromeSessionDialogOpen = ref(false);
 const syncDialogOpen = ref(false);
 const siteModelsDialogOpen = ref(false);
+const siteTestDialogOpen = ref(false);
 
 // 链接弹窗数据
 const linkDialogKind = ref<SiteLinkKind>("api");
@@ -28,6 +29,9 @@ const previewTrigger = ref<HTMLElement | null>(null);
 
 // 站点模型弹窗数据
 const siteModelsSite = ref<SiteRecord | null>(null);
+
+// 站点模型测试（对话）弹窗数据
+const siteTestSite = ref<SiteRecord | null>(null);
 
 const editingSite: ComputedRef<SiteRecord | null> = computed(() =>
   editingId.value ? sites.value.find((site) => site.id === editingId.value) ?? null : null,
@@ -51,6 +55,16 @@ function openSiteModelsDialog(site: SiteRecord) {
 function closeSiteModelsDialog() {
   siteModelsDialogOpen.value = false;
   siteModelsSite.value = null;
+}
+
+function openSiteTestDialog(site: SiteRecord) {
+  siteTestSite.value = site;
+  siteTestDialogOpen.value = true;
+}
+
+function closeSiteTestDialog() {
+  siteTestDialogOpen.value = false;
+  siteTestSite.value = null;
 }
 
 function openModal(site?: SiteRecord) {
@@ -102,12 +116,14 @@ export function useUIState() {
     chromeSessionDialogOpen,
     syncDialogOpen,
     siteModelsDialogOpen,
+    siteTestDialogOpen,
     linkDialogKind,
     linkDialogSite,
     linkDialogTrigger,
     previewSite,
     previewTrigger,
     siteModelsSite,
+    siteTestSite,
     editingSite,
     openSettings,
     closeSettings,
@@ -120,6 +136,8 @@ export function useUIState() {
     openGatewayStats,
     openSiteModelsDialog,
     closeSiteModelsDialog,
+    openSiteTestDialog,
+    closeSiteTestDialog,
     openModal,
     closeModal,
     openLinkDialog,

@@ -27,6 +27,7 @@ import SettingsPage from "./components/pages/SettingsPage.vue";
 import SyncSitesDialog from "./components/site/SyncSitesDialog.vue";
 import ChromeSessionDialog from "./components/site/ChromeSessionDialog.vue";
 import SiteModelsDialog from "./components/site/SiteModelsDialog.vue";
+import SiteModelTestDialog from "./components/site/SiteModelTestDialog.vue";
 import ConfirmDialog from "./components/common/ConfirmDialog.vue";
 import ComponentBootstrapDialog from "./components/common/ComponentBootstrapDialog.vue";
 import CharityMonitorPage from "./components/pages/CharityMonitorPage.vue";
@@ -247,6 +248,7 @@ function onKeydown(event: KeyboardEvent) {
     if (store.charitySyncLogOpen.value) store.closeCharitySyncLog();
     else if (store.syncDialogOpen.value) store.closeSyncDialog();
     else if (store.chromeSessionDialogOpen.value) store.closeChromeSessionDialog();
+    else if (store.siteTestDialogOpen.value) store.closeSiteTestDialog();
     else if (store.previewDialogOpen.value) store.closePreview();
     else if (store.linkDialogOpen.value) store.closeLinkDialog();
     else if (store.modalOpen.value) store.closeModal();
@@ -403,6 +405,7 @@ onUnmounted(() => {
   <SyncSitesDialog />
   <ChromeSessionDialog />
   <SiteModelsDialog />
+  <SiteModelTestDialog />
   <ConfirmDialog />
   <ComponentBootstrapDialog v-if="authState === 'ready'" />
   <SettingsPage />

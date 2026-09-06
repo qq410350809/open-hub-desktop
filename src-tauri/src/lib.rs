@@ -365,6 +365,8 @@ pub fn run() {
             crate::site::library::detect_site_system_types,
             crate::model::catalog::get_system_fonts,
             crate::model::catalog::fetch_site_models_json,
+            crate::model::catalog::site_model_chat_stream,
+            crate::model::catalog::site_model_chat_cancel,
             crate::model::catalog::test_site_models_per_channel,
             crate::model::catalog::get_site_model_cache,
             crate::model::catalog::get_all_site_model_caches,
