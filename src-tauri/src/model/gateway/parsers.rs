@@ -2022,9 +2022,10 @@ pub fn universal_to_chat(ur: &UniversalRequest) -> JsonValue {
         "messages": messages,
         "stream": ur.stream,
     });
-    if let Some(v) = ur.max_tokens {
-        out["max_tokens"] = json!(v);
-    }
+    // 刻意不透传 max_tokens：客户端（如 Claude 系）习惯给接近上下文上限的大值，
+    // 而兼容站按模型各自的上限校验（实测 grok-4.6 上限 65536，128000 直接
+    // 400 invalid_parameter），同一渠道不同模型上限还不一致，无法安全 clamp。
+    // 该字段在 OpenAI 协议里可选，缺省时由上游按模型默认上限收口，兼容性最好。
     if let Some(v) = ur.temperature {
         out["temperature"] = json!(v);
     }
@@ -2706,7 +2707,9 @@ mod parser_tests {
         let chat = crate::model::gateway::parsers::universal_to_chat(&ur);
         assert!(chat.get("reasoning_effort").is_none() || chat["reasoning_effort"].is_string());
         assert_eq!(chat["temperature"], 0.3);
-        assert_eq!(chat["max_tokens"], 900);
+        // max_tokens 刻意不透传：兼容站按模型各自上限校验（grok-4.6 实测 65536），
+        // 客户端侧大值会直接 400；缺省交由上游按模型默认收口
+        assert!(chat.get("max_tokens").is_none(), "max_tokens 必须剥离: {chat}");
     }
 
     #[test]
