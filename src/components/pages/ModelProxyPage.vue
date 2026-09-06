@@ -2590,7 +2590,7 @@ export interface ChannelModelGroup {
 
 const gatewayGroupedModels = computed<ChannelModelGroup[]>(() => {
   const q = gatewaySearchQuery.value.trim().toLowerCase();
-  return proxyConfig.value.channels.map((channel) => {
+  const groups = proxyConfig.value.channels.map((channel) => {
     // 该渠道对外可见的模型：按渠道拉取的模型再经白名单勾选结果过滤
     const known = modelsForChannel(channel.id);
     let models = filterChannelModels(channel, known);
@@ -2606,6 +2606,9 @@ const gatewayGroupedModels = computed<ChannelModelGroup[]>(() => {
       totalKnown: known.length,
     };
   });
+  // 搜索过滤后，无匹配模型的渠道整个隐藏，不再渲染空分组
+  if (!q) return groups;
+  return groups.filter((g) => g.models.length > 0);
 });
 
 const totalGatewayModelsCount = computed(() => {
@@ -4557,7 +4560,7 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
                   </button>
                 </div>
 
-                <!-- 展开面板：一行一项低频配置（点击面板不触发勾选） -->
+                <!-- 展开面板：一行一项低频配置（点击面板不触发行展开/收起与勾选） -->
                 <div v-if="isModelExpanded(model)" class="mp-mcm-detail" @click.stop>
                   <div class="mp-mcm-field">
                     <span
