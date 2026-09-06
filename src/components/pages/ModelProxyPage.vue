@@ -2668,6 +2668,19 @@ function channelEnabledModelsCount(channel: ChannelConfig): number {
   return filterChannelModels(channel, modelsForChannel(channel.id)).length;
 }
 
+/** 「模型 ×N」标签悬浮说明：区分白名单激活与全量对外、以及未同步上游模型的情况 */
+function channelModelCountTitle(channel: ChannelConfig): string {
+  const known = modelsForChannel(channel.id).length;
+  const enabled = channelEnabledModelsCount(channel);
+  if (known === 0) {
+    return "尚未同步上游模型，点击卡片「管理模型」或顶部「同步模型」拉取";
+  }
+  if (channel.enabledModels == null) {
+    return `未启用白名单：上游 ${known} 个模型全部对外激活`;
+  }
+  return `白名单已激活 ${enabled} 个模型（上游共 ${known} 个）`;
+}
+
 /** 顶栏「可用模型」徽标数量：优先取后端已按白名单过滤的计数，其次按前端白名单过滤结果兜底 */
 const availableModelsCount = computed(() => {
   if (proxyStatus.value.modelsCount > 0) return proxyStatus.value.modelsCount;
@@ -3302,6 +3315,10 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
                     class="mp-alias-tag"
                     title="未配置 Key：以匿名模式访问 OpenCode 免费模型"
                   >免 Key</span>
+                  <span
+                    class="mp-alias-tag is-models"
+                    :title="channelModelCountTitle(channel)"
+                  >模型 ×{{ channelEnabledModelsCount(channel) }}</span>
                 </span>
               </div>
             </div>
@@ -6808,6 +6825,19 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
   color: #e2c258;
   background: rgba(212, 167, 44, 0.16);
   border-color: rgba(212, 167, 44, 0.4);
+}
+
+/* 已激活模型数标记：蓝紫色调，与站点关联（品牌绿）、固化渠道（黄）区分 */
+.mp-alias-tag.is-models {
+  color: #4c6ef5;
+  background: rgba(76, 110, 245, 0.12);
+  border-color: rgba(76, 110, 245, 0.45);
+}
+
+:global(:root[data-theme="dark"]) .mp-alias-tag.is-models {
+  color: #93a8f8;
+  background: rgba(76, 110, 245, 0.16);
+  border-color: rgba(76, 110, 245, 0.4);
 }
 
 /* 分区头部操作区 */
