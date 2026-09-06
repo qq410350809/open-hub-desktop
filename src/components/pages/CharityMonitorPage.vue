@@ -3,7 +3,7 @@ import { computed, onMounted, onUnmounted, ref } from "vue";
 import { icons } from "../../icons";
 import { useStore } from "../../composables/useStore";
 import { useConfirm } from "../../composables/useConfirm";
-import { useCharityNotification } from "../../composables/useCharityNotification";
+import { sendCharityTestNotification } from "../../composables/useCharityNotification";
 import AppTable, { type AppTableColumn } from "../common/AppTable.vue";
 import type { CharityFeedItem, CharityFeedTag, CharitySyncLogEntry } from "../../types";
 import { formatCompactCount as formatCompactCountUtil, formatDuration as formatDurationUtil } from "../../utils";
@@ -11,8 +11,7 @@ import { formatCompactCount as formatCompactCountUtil, formatDuration as formatD
 const store = useStore();
 const { confirm } = useConfirm();
 
-// 启用公益监听通知（语音提醒 + 系统通知）
-const charityNotification = useCharityNotification();
+// 通知监听已在 App 根组件注册（切页不失效）；页面里只保留测试入口。
 
 // —— 帖子详情弹窗状态 ——
 const selectedPost = ref<CharityFeedItem | null>(null);
@@ -190,8 +189,9 @@ function toggleLogDetail(id: number) {
   expandedLogId.value = expandedLogId.value === id ? null : id;
 }
 
+// 汇总行只认带 feeds 明细的记录；「最新话题 / 最新帖子」请求行走通用渲染
 function isRoundLogEntry(entry: CharitySyncLogEntry) {
-  return entry.feedId === "round" || !!entry.detail?.feeds?.length;
+  return !!entry.detail?.feeds?.length;
 }
 
 function logSummaryText(entry: CharitySyncLogEntry) {
@@ -205,6 +205,9 @@ function logSummaryText(entry: CharitySyncLogEntry) {
   }
   if (entry.status === "success") {
     return `${stage}「${entry.feedName}」于 ${time} 通过节点「${node}」完成，耗时 ${formatDuration(liveDurationMs(entry))}。`;
+  }
+  if (entry.status === "running") {
+    return `「${entry.feedName}」的${stage}于 ${time} 进行中：${entry.message}`;
   }
   if (entry.status === "cancelled") {
     return `「${entry.feedName}」的${stage}于 ${time} 被取消。`;
@@ -234,6 +237,16 @@ function logDetailRows(entry: CharitySyncLogEntry): LogDetailCell[][] {
       { text: String(entry.detail?.totalNew ?? 0), cls: "num" },
       { text: String(entry.detail?.totalUpdated ?? 0), cls: "num" },
     ]);
+    return rows;
+  }
+  // 双请求的请求行（最新话题 / 最新帖子）：展示本请求独立的返回与入库结果
+  if (entry.detail?.kind === "charity-request") {
+    rows.push([{ text: "请求序列" }, { text: entry.feedName }]);
+    rows.push([{ text: "返回条数" }, { text: String(entry.detail.items ?? 0), cls: "num" }]);
+    rows.push([{ text: "新增" }, { text: String(entry.detail.new ?? 0), cls: "num" }]);
+    rows.push([{ text: "更新" }, { text: String(entry.detail.updated ?? 0), cls: "num" }]);
+    rows.push([{ text: "使用节点" }, { text: entry.nodeName || "智能轮询调度" }]);
+    rows.push([{ text: "耗时" }, { text: formatDuration(liveDurationMs(entry)) }]);
     return rows;
   }
   rows.push([{ text: "新增帖子" }, { text: String(entry.detail?.new ?? 0), cls: "num" }]);
@@ -450,6 +463,16 @@ onUnmounted(() => {
           <span v-html="icons.settings" />
           <span>标签管理</span>
           <span class="cm-count-chip">{{ store.charityTags.value.length - 1 }}</span>
+        </button>
+
+        <button
+          type="button"
+          class="cm-btn-secondary"
+          title="播放提示音并发送一条系统通知，验证通知功能是否正常"
+          @click="sendCharityTestNotification()"
+        >
+          <span v-html="icons.flask" />
+          <span>测试通知</span>
         </button>
 
         <button

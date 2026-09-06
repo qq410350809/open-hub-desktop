@@ -273,13 +273,71 @@ pub(crate) fn take_attempt_node(
 
 /// 合并拉取地址：filter.json 一次查询全部标签（逗号为任一匹配，只认标签名称不认 slug），
 /// q 参数交给 url crate 编码，时间戳防缓存仍由 request_topic_list 统一追加。
-pub fn combined_filter_json_url(feed_names: &[String]) -> String {
+/// 去掉 `order:created` 时走上游默认活跃序，用于第二轮补抓被编辑/回复顶起来的老帖。
+pub fn combined_filter_json_url(feed_names: &[String], order_by_created: bool) -> String {
     let mut url = url::Url::parse("https://linux.do/filter.json?").expect("静态地址必然可解析");
     {
         let mut pairs = url.query_pairs_mut();
-        pairs.append_pair("q", &format!("tag:{} order:created", feed_names.join(",")));
+        let query = if order_by_created {
+            format!("tag:{} order:created", feed_names.join(","))
+        } else {
+            format!("tag:{}", feed_names.join(","))
+        };
+        pairs.append_pair("q", &query);
     }
     url.to_string()
+}
+
+/// 单序列（最新话题 / 最新帖子）结果按标签拆分入库，两条序列互不合并、各自独立持久化；
+/// 返回 (feed_id, feed_name, new_count, updated_count, failed) 列表。
+/// 进度事件与 feed meta 由调用方聚合两条序列后统一写入，避免互相覆盖。
+fn persist_split_items(
+    monitor: &CharityMonitorRuntime,
+    database: &Database,
+    sources: &[CharityFeedSource],
+    items: &[CharityFeedItem],
+    profile_name: &str,
+    account_name: &str,
+) -> Vec<(String, String, usize, usize, bool)> {
+    let split = split_items_by_feed(items, sources);
+    let mut results = Vec::with_capacity(sources.len());
+    for (source, owned) in sources.iter().zip(&split) {
+        if owned.1.is_empty() {
+            if let Ok(mut errors) = monitor.last_errors.lock() {
+                errors.remove(&source.id);
+            }
+            results.push((source.id.clone(), source.name.clone(), 0, 0, false));
+            continue;
+        }
+        match persist_feed(
+            database,
+            source,
+            owned.1.clone(),
+            profile_name.to_string(),
+            account_name.to_string(),
+        ) {
+            Ok(result) => {
+                if let Ok(mut errors) = monitor.last_errors.lock() {
+                    errors.remove(&source.id);
+                }
+                results.push((
+                    source.id.clone(),
+                    source.name.clone(),
+                    result.new_count,
+                    result.updated_count,
+                    false,
+                ));
+            }
+            Err(error) => {
+                let message = format!("入库失败：{error}");
+                if let Ok(mut errors) = monitor.last_errors.lock() {
+                    errors.insert(source.id.clone(), message);
+                }
+                results.push((source.id.clone(), source.name.clone(), 0, 0, true));
+            }
+        }
+    }
+    results
 }
 
 /// 按帖子的 tags 名称把合并结果拆分到各标签源（名称与标签源 name 精确匹配）。
@@ -310,8 +368,10 @@ pub struct CombinedFeedOutcome {
     pub updated_count: usize,
 }
 
-/// 整轮合并同步：一次请求覆盖全部标准标签，按 tags 拆分入库；
-/// 每轮只写一条"本轮汇总"日志（运行中 → 结束时更新为汇总说明 + 明细表格数据）。
+/// 整轮合并同步：对全部标准标签串行发起两次独立请求——「最新话题」（创建序）拿最新发帖，
+/// 「最新帖子」（上游默认活跃序）拿被编辑/回复顶起来的老帖；两条序列各自解析、各自按
+/// tags 拆分入库（互不合并，guid 去重由数据库主键保证），最后聚合各标签结果写汇总行；
+/// 每轮写三条日志：两条请求行（running → 各自终态）+ 一条汇总行（明细表格数据）。
 pub async fn sync_round_combined(
     ctx: &Arc<AppContext>,
     database: &Database,
@@ -365,7 +425,7 @@ pub async fn sync_round_combined(
     let combined_source = CharityFeedSource {
         id: "round".into(),
         name: "本轮汇总".into(),
-        json_url: combined_filter_json_url(&feed_names),
+        json_url: combined_filter_json_url(&feed_names, true),
         enabled: true,
         sort_order: 0,
         upstream_protocol: None,
@@ -376,7 +436,18 @@ pub async fn sync_round_combined(
         "本轮汇总",
         stage,
         "running",
-        "合并请求进行中（全部标签一次拉取）",
+        "双序列请求进行中（最新话题 + 最新帖子）",
+        "",
+        "",
+    );
+    // 两次请求各占一行日志：最新话题（创建序）、最新帖子（活跃序补抓）；汇总行只写结论。
+    let created_log_id = append_charity_sync_log(
+        database,
+        "round",
+        "最新话题",
+        stage,
+        "running",
+        "创建序请求进行中（order:created，全部标签一次拉取）",
         "",
         "",
     );
@@ -385,16 +456,18 @@ pub async fn sync_round_combined(
         Ok(client) => client,
         Err(error) => {
             let message = format!("合并同步失败：无法初始化代理客户端：{error}");
-            if let Some(id) = round_log_id {
-                update_charity_sync_log(
-                    database,
-                    id,
-                    "error",
-                    &message,
-                    "",
-                    round_started.elapsed().as_millis() as i64,
-                    "",
-                );
+            for log_id in [round_log_id, created_log_id] {
+                if let Some(id) = log_id {
+                    update_charity_sync_log(
+                        database,
+                        id,
+                        "error",
+                        &message,
+                        "",
+                        round_started.elapsed().as_millis() as i64,
+                        "",
+                    );
+                }
             }
             return fail_all(&message);
         }
@@ -405,16 +478,18 @@ pub async fn sync_round_combined(
     while attempts < CHARITY_MAX_NODE_ATTEMPTS {
         if cancellation.is_cancelled() {
             let message = format!("{CHARITY_SYNC_CANCELLED_PREFIX}：合并同步");
-            if let Some(id) = round_log_id {
-                update_charity_sync_log(
-                    database,
-                    id,
-                    "cancelled",
-                    &message,
-                    "",
-                    round_started.elapsed().as_millis() as i64,
-                    "",
-                );
+            for log_id in [round_log_id, created_log_id] {
+                if let Some(id) = log_id {
+                    update_charity_sync_log(
+                        database,
+                        id,
+                        "cancelled",
+                        &message,
+                        "",
+                        round_started.elapsed().as_millis() as i64,
+                        "",
+                    );
+                }
             }
             return sources
                 .iter()
@@ -435,12 +510,19 @@ pub async fn sync_round_combined(
         }
         attempts += 1;
         let attempt_started = Instant::now();
-        let running_msg = format!(
-            "合并请求进行中 · {}（{}ms）· 第{}次",
+        let round_msg = format!(
+            "双序列请求进行中 · {}（{}ms）· 第{}次",
             node.name, node.latency_ms, attempts
         );
         if let Some(id) = round_log_id {
-            touch_running_charity_sync_log(database, id, &running_msg, &node.name, 0);
+            touch_running_charity_sync_log(database, id, &round_msg, &node.name, 0);
+        }
+        if let Some(id) = created_log_id {
+            let created_msg = format!(
+                "最新话题请求进行中 · {}（{}ms）· 第{}次",
+                node.name, node.latency_ms, attempts
+            );
+            touch_running_charity_sync_log(database, id, &created_msg, &node.name, 0);
         }
 
         if let Err(error) =
@@ -480,9 +562,10 @@ pub async fn sync_round_combined(
                 }
                 result = &mut fetch_future => break result,
                 _ = tokio::time::sleep(tick) => {
+                    let elapsed_ms = attempt_started.elapsed().as_millis() as i64;
                     if let Some(id) = round_log_id {
                         let msg = format!(
-                            "合并请求进行中 · {} · 已用 {:.1}s",
+                            "双序列请求进行中 · {} · 已用 {:.1}s",
                             node.name,
                             attempt_started.elapsed().as_secs_f64()
                         );
@@ -491,7 +574,21 @@ pub async fn sync_round_combined(
                             id,
                             &msg,
                             &node.name,
-                            attempt_started.elapsed().as_millis() as i64,
+                            elapsed_ms,
+                        );
+                    }
+                    if let Some(id) = created_log_id {
+                        let msg = format!(
+                            "最新话题请求进行中 · {} · 已用 {:.1}s",
+                            node.name,
+                            attempt_started.elapsed().as_secs_f64()
+                        );
+                        touch_running_charity_sync_log(
+                            database,
+                            id,
+                            &msg,
+                            &node.name,
+                            elapsed_ms,
                         );
                     }
                 }
@@ -502,110 +599,274 @@ pub async fn sync_round_combined(
             Ok((body, profile_name, account_name, protocol)) => {
                 match items_from_topic_list(&body) {
                     Ok(items) => {
+                        // —— 序列一：最新话题（创建序），独立拆分入库 ——
+                        let created_count = items.len();
+                        let created_results = tokio::task::block_in_place(|| {
+                            persist_split_items(
+                                monitor,
+                                database,
+                                sources,
+                                &items,
+                                &profile_name,
+                                &account_name,
+                            )
+                        });
+                        let created_new = created_results.iter().map(|r| r.2).sum::<usize>();
+                        let created_updated = created_results.iter().map(|r| r.3).sum::<usize>();
+                        if let Some(id) = created_log_id {
+                            update_charity_sync_log(
+                                database,
+                                id,
+                                if created_results.iter().any(|r| r.4) {
+                                    "error"
+                                } else {
+                                    "success"
+                                },
+                                &format!(
+                                    "最新话题请求完成 · 返回 {created_count} 条 · 新增 {created_new} / 更新 {created_updated}"
+                                ),
+                                &node.name,
+                                attempt_started.elapsed().as_millis() as i64,
+                                &serde_json::json!({
+                                    "kind": "charity-request",
+                                    "items": created_count,
+                                    "new": created_new,
+                                    "updated": created_updated,
+                                })
+                                .to_string(),
+                            );
+                        }
+
+                        // —— 序列二：最新帖子（默认活跃序），独立拆分入库；被编辑/回复顶起来
+                        // 的老帖只有这条序列能带回来。失败/取消不重试、不踢节点，
+                        // 序列一已入库的结果照常生效。
+                        let mut activity_results = Vec::new();
+                        let mut activity_note = String::new();
+                        if cancellation.is_cancelled() {
+                            activity_note = "最新帖子补抓因取消跳过".into();
+                        } else {
+                            let activity_log_id = append_charity_sync_log(
+                                database,
+                                "round",
+                                "最新帖子",
+                                stage,
+                                "running",
+                                "活跃序请求进行中（默认排序，补抓被编辑/回复顶起来的老帖）",
+                                &node.name,
+                                "",
+                            );
+                            let plain_source = CharityFeedSource {
+                                id: "round".into(),
+                                name: "本轮汇总".into(),
+                                json_url: combined_filter_json_url(&feed_names, false),
+                                enabled: true,
+                                sort_order: 0,
+                                upstream_protocol: None,
+                            };
+                            let plain_result = tokio::select! {
+                                _ = cancellation.cancelled() => {
+                                    Err("最新帖子补抓因取消中止".to_string())
+                                }
+                                result = fetch_topic_body(ctx, client.clone(), &plain_source) => result,
+                            };
+                            let activity_elapsed = attempt_started.elapsed().as_millis() as i64;
+                            match plain_result {
+                                Ok((plain_body, _, _, _)) => match items_from_topic_list(&plain_body) {
+                                    Ok(plain_items) => {
+                                        let activity_count = plain_items.len();
+                                        activity_results = tokio::task::block_in_place(|| {
+                                            persist_split_items(
+                                                monitor,
+                                                database,
+                                                sources,
+                                                &plain_items,
+                                                &profile_name,
+                                                &account_name,
+                                            )
+                                        });
+                                        let activity_new =
+                                            activity_results.iter().map(|r| r.2).sum::<usize>();
+                                        let activity_updated =
+                                            activity_results.iter().map(|r| r.3).sum::<usize>();
+                                        if let Some(id) = activity_log_id {
+                                            update_charity_sync_log(
+                                                database,
+                                                id,
+                                                if activity_results.iter().any(|r| r.4) {
+                                                    "error"
+                                                } else {
+                                                    "success"
+                                                },
+                                                &format!(
+                                                    "最新帖子请求完成 · 返回 {activity_count} 条 · 新增 {activity_new} / 更新 {activity_updated}"
+                                                ),
+                                                &node.name,
+                                                activity_elapsed,
+                                                &serde_json::json!({
+                                                    "kind": "charity-request",
+                                                    "items": activity_count,
+                                                    "new": activity_new,
+                                                    "updated": activity_updated,
+                                                })
+                                                .to_string(),
+                                            );
+                                        }
+                                    }
+                                    Err(cause) => {
+                                        activity_note =
+                                            format!("最新帖子解析失败，仅最新话题入库：{cause}");
+                                        if let Some(id) = activity_log_id {
+                                            update_charity_sync_log(
+                                                database,
+                                                id,
+                                                "error",
+                                                &format!(
+                                                    "最新帖子结果解析失败，仅最新话题已入库：{cause}"
+                                                ),
+                                                &node.name,
+                                                activity_elapsed,
+                                                "",
+                                            );
+                                        }
+                                    }
+                                },
+                                Err(cause) if is_charity_sync_cancelled(&cause) => {
+                                    activity_note = "最新帖子补抓因取消中止".into();
+                                    if let Some(id) = activity_log_id {
+                                        update_charity_sync_log(
+                                            database,
+                                            id,
+                                            "cancelled",
+                                            "最新帖子补抓因取消中止，仅最新话题已入库",
+                                            &node.name,
+                                            activity_elapsed,
+                                            "",
+                                        );
+                                    }
+                                }
+                                Err(cause) => {
+                                    activity_note =
+                                        format!("最新帖子请求失败，仅最新话题入库：{cause}");
+                                    if let Some(id) = activity_log_id {
+                                        update_charity_sync_log(
+                                            database,
+                                            id,
+                                            "error",
+                                            &format!("最新帖子请求失败，仅最新话题已入库：{cause}"),
+                                            &node.name,
+                                            activity_elapsed,
+                                            "",
+                                        );
+                                    }
+                                }
+                            }
+                        }
+
+                        // —— 聚合两条序列的各标签结果：meta、进度事件、汇总明细各写一次 ——
                         let mut outcomes = Vec::with_capacity(sources.len());
                         let mut feeds_detail = Vec::with_capacity(sources.len());
                         let mut summary_parts = Vec::with_capacity(sources.len());
+                        let mut notify_labels = Vec::with_capacity(sources.len());
                         let mut total_new = 0usize;
                         let mut total_updated = 0usize;
                         tokio::task::block_in_place(|| {
-                            let split = split_items_by_feed(&items, sources);
-                            for (source, owned) in sources.iter().zip(&split) {
-                                let outcome = if owned.1.is_empty() {
-                                    let message = "本轮合并结果中无该标签新帖";
-                                    let _ = write_feed_sync_meta(
-                                        database, &source.id, "success", message, &node.name, 0,
-                                    );
-                                    if let Ok(mut errors) = monitor.last_errors.lock() {
-                                        errors.remove(&source.id);
-                                    }
-                                    CombinedFeedOutcome {
-                                        feed_id: source.id.clone(),
-                                        feed_name: source.name.clone(),
-                                        status: "success",
-                                        new_count: 0,
-                                        updated_count: 0,
-                                    }
+                            for source in sources {
+                                let created = created_results.iter().find(|r| r.0 == source.id);
+                                let activity = activity_results.iter().find(|r| r.0 == source.id);
+                                let new_count = created.map(|r| r.2).unwrap_or(0)
+                                    + activity.map(|r| r.2).unwrap_or(0);
+                                let updated_count = created.map(|r| r.3).unwrap_or(0)
+                                    + activity.map(|r| r.3).unwrap_or(0);
+                                let failed = created.map(|r| r.4).unwrap_or(false)
+                                    || activity.map(|r| r.4).unwrap_or(false);
+                                let status = if failed { "failed" } else { "success" };
+                                if new_count > 0 || updated_count > 0 {
+                                    notify_labels.push(source.name.clone());
+                                }
+                                let meta_message = if failed {
+                                    "入库失败（详见同步日志）".to_string()
+                                } else if new_count + updated_count == 0 {
+                                    "本轮无该标签新帖".to_string()
                                 } else {
-                                    match persist_feed(
-                                        database,
-                                        source,
-                                        owned.1.clone(),
-                                        profile_name.clone(),
-                                        account_name.clone(),
-                                    ) {
-                                        Ok(result) => {
-                                            if let Ok(mut errors) = monitor.last_errors.lock() {
-                                                errors.remove(&source.id);
-                                            }
-                                            CombinedFeedOutcome {
-                                                feed_id: source.id.clone(),
-                                                feed_name: source.name.clone(),
-                                                status: "success",
-                                                new_count: result.new_count,
-                                                updated_count: result.updated_count,
-                                            }
-                                        }
-                                        Err(error) => {
-                                            let message = format!("入库失败：{error}");
-                                            let _ = write_feed_sync_meta(
-                                                database, &source.id, "error", &message,
-                                                &node.name, 0,
-                                            );
-                                            if let Ok(mut errors) = monitor.last_errors.lock() {
-                                                errors.insert(source.id.clone(), message);
-                                            }
-                                            CombinedFeedOutcome {
-                                                feed_id: source.id.clone(),
-                                                feed_name: source.name.clone(),
-                                                status: "failed",
-                                                new_count: 0,
-                                                updated_count: 0,
-                                            }
-                                        }
-                                    }
+                                    format!("新增 {new_count} / 更新 {updated_count}")
                                 };
-                                total_new += outcome.new_count;
-                                total_updated += outcome.updated_count;
+                                let _ = write_feed_sync_meta(
+                                    database,
+                                    &source.id,
+                                    status,
+                                    &meta_message,
+                                    &node.name,
+                                    new_count + updated_count,
+                                );
+                                total_new += new_count;
+                                total_updated += updated_count;
                                 summary_parts.push(format!(
                                     "{} 新增{} / 更新{}",
-                                    outcome.feed_name, outcome.new_count, outcome.updated_count
+                                    source.name, new_count, updated_count
                                 ));
                                 feeds_detail.push(serde_json::json!({
-                                    "id": outcome.feed_id,
-                                    "name": outcome.feed_name,
-                                    "status": outcome.status,
-                                    "new": outcome.new_count,
-                                    "updated": outcome.updated_count,
+                                    "id": source.id.clone(),
+                                    "name": source.name.clone(),
+                                    "status": status,
+                                    "new": new_count,
+                                    "updated": updated_count,
                                 }));
                                 emit_charity_progress(
                                     &bus,
                                     CharitySyncProgress {
-                                        feed_id: outcome.feed_id.clone(),
-                                        feed_name: outcome.feed_name.clone(),
+                                        feed_id: source.id.clone(),
+                                        feed_name: source.name.clone(),
                                         stage: stage.into(),
-                                        status: outcome.status.to_string(),
+                                        status: status.to_string(),
                                         message: String::new(),
                                         used_node_id: String::new(),
                                         used_node_name: node.name.clone(),
-                                        new_count: outcome.new_count,
-                                        updated_count: outcome.updated_count,
+                                        new_count,
+                                        updated_count,
                                         unread_count: 0,
                                     },
                                 );
-                                outcomes.push(outcome);
+                                outcomes.push(CombinedFeedOutcome {
+                                    feed_id: source.id.clone(),
+                                    feed_name: source.name.clone(),
+                                    status,
+                                    new_count,
+                                    updated_count,
+                                });
                             }
                         });
+                        // 整轮只发一条新消息通知：标签名拼接，携带合计新增/更新数，
+                        // 避免多标签同时有动态时连响多条。
+                        if total_new > 0 || total_updated > 0 {
+                            let feed_label = if notify_labels.is_empty() {
+                                "全部标签".to_string()
+                            } else {
+                                notify_labels.join("、")
+                            };
+                            emit_charity_new_message_notification(
+                                &bus,
+                                &feed_label,
+                                total_new,
+                                total_updated,
+                            );
+                        }
                         monitor.set_preferred_node(&node.id);
                         if let Ok(mut q) = queue.lock() {
                             q.push_back_if_absent(node.clone());
                         }
                         let any_failed = outcomes.iter().any(|outcome| outcome.status == "failed");
                         let clock = chrono::Local::now().format("%H:%M:%S");
-                        let message = format!(
-                            "{clock} 本轮同步完成（合并请求，{protocol}，{} · 第{attempts}次） · {} · 合计新增 {total_new} / 更新 {total_updated}",
-                            node.name,
-                            summary_parts.join(" · ")
+                        let mut message = format!(
+                            "{clock} 本轮同步完成（最新话题 + 最新帖子独立入库，{protocol}，{} · 第{attempts}次）",
+                            node.name
                         );
+                        if !activity_note.is_empty() {
+                            message.push_str(&format!("（{activity_note}）"));
+                        }
+                        message.push_str(&format!(
+                            " · {} · 合计新增 {total_new} / 更新 {total_updated}",
+                            summary_parts.join(" · ")
+                        ));
                         let detail = serde_json::json!({
                             "totalNew": total_new,
                             "totalUpdated": total_updated,
@@ -634,16 +895,18 @@ pub async fn sync_round_combined(
             }
             Err(error) => {
                 if is_charity_sync_cancelled(&error) {
-                    if let Some(id) = round_log_id {
-                        update_charity_sync_log(
-                            database,
-                            id,
-                            "cancelled",
-                            &error,
-                            &node.name,
-                            round_started.elapsed().as_millis() as i64,
-                            "",
-                        );
+                    for log_id in [round_log_id, created_log_id] {
+                        if let Some(id) = log_id {
+                            update_charity_sync_log(
+                                database,
+                                id,
+                                "cancelled",
+                                &error,
+                                &node.name,
+                                round_started.elapsed().as_millis() as i64,
+                                "",
+                            );
+                        }
                     }
                     return sources
                         .iter()
@@ -669,20 +932,22 @@ pub async fn sync_round_combined(
         )
     } else {
         format!(
-            "{}（合并请求已尝试 {attempts}/{} 个节点）",
+            "{}（双请求已尝试 {attempts}/{} 个节点）",
             last_error, CHARITY_MAX_NODE_ATTEMPTS
         )
     };
-    if let Some(id) = round_log_id {
-        update_charity_sync_log(
-            database,
-            id,
-            "error",
-            &message,
-            "",
-            round_started.elapsed().as_millis() as i64,
-            "",
-        );
+    for log_id in [round_log_id, created_log_id] {
+        if let Some(id) = log_id {
+            update_charity_sync_log(
+                database,
+                id,
+                "error",
+                &message,
+                "",
+                round_started.elapsed().as_millis() as i64,
+                "",
+            );
+        }
     }
     fail_all(&message)
 }

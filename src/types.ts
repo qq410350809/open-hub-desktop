@@ -201,8 +201,10 @@ export interface CharitySyncLogFeedDetail {
   updated: number;
 }
 
-/** 单标签行：new/updated/unread；汇总行：totalNew/totalUpdated/feeds */
+/** 单标签行：new/updated/unread；汇总行：totalNew/totalUpdated/feeds；请求行（最新话题/最新帖子）：kind/items + new/updated */
 export interface CharitySyncLogDetail {
+  kind?: string;
+  items?: number;
   new?: number;
   updated?: number;
   unread?: number;
