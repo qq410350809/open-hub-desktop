@@ -71,10 +71,14 @@ percent-encoding = "2"
 libc = { version = "0.2" }
 
 # macOS 托盘唤起后修复窗口交通灯（tao TransformProcessType 会置 canHide=false）。
+# objc2-user-notifications：现代 UNUserNotificationCenter 通知（旧 NSUserNotification
+# 在新 macOS 上静默丢通知且前台不弹横幅）。
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 objc2-app-kit = "0.3"
-objc2-foundation = "0.3"
+objc2-foundation = { version = "0.3", features = ["NSBundle", "NSError"] }
+objc2-user-notifications = "0.3"
+block2 = "0.6"
 
 maxminddb = "0.30"
 rfd = { version = "0.17", optional = true }

@@ -394,6 +394,7 @@ pub fn run() {
             charity::update_charity_source,
             charity::remove_charity_source,
             charity::refresh_all_charity_feeds,
+            core::notify::send_system_notification_command,
             token::stats::get_token_stats,
             token::stats::sync_token_data,
             token::stats::get_token_usage,

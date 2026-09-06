@@ -5,6 +5,8 @@ pub mod db;
 #[cfg(feature = "desktop")]
 pub mod file_export;
 pub mod models;
+#[cfg(feature = "desktop")]
+pub mod notify;
 pub mod profile;
 pub mod single_instance;
 #[cfg(feature = "desktop")]

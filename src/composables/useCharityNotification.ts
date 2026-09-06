@@ -1,4 +1,6 @@
 import { onMounted, onUnmounted } from "vue";
+import { isTauri, runCommand } from "./core/ipc";
+import { useToast } from "./core/useToast";
 
 interface CharityNewMessageEvent {
   feedName: string;
@@ -58,40 +60,33 @@ function playNotificationSound() {
   }
 }
 
-// 发送系统通知（Tauri 桌面端走原生通知插件，浏览器环境回退 Web Notification API）
-async function sendSystemNotification(event: CharityNewMessageEvent) {
+// 发送系统通知（Tauri 桌面端走自研 UNUserNotificationCenter 命令，浏览器环境
+// 回退 Web Notification API）。返回 null 表示已发送，否则返回失败原因。
+// 说明：tauri-plugin-notification 在 macOS 落到已废弃的 NSUserNotification API，
+// 应用前台不弹横幅、dev 模式下通知被系统静默丢弃（历史记录为空），故弃用。
+async function sendSystemNotification(event: CharityNewMessageEvent): Promise<string | null> {
   const title = "公益监听 - 新消息提醒";
   const body = `「${event.feedName}」有新动态：新增 ${event.newCount} 条，更新 ${event.updatedCount} 条`;
 
-  if (typeof window !== "undefined" && (window as any).__TAURI__) {
-    // WKWebView / WebView2 不支持 Web Notification，必须走原生插件
-    const { isPermissionGranted, requestPermission, sendNotification } = await import(
-      "@tauri-apps/plugin-notification"
-    );
-
-    let granted = await isPermissionGranted();
-    if (!granted) {
-      granted = (await requestPermission()) === "granted";
+  if (isTauri) {
+    try {
+      await runCommand("send_system_notification", { title, body });
+      return null;
+    } catch (error) {
+      return String(error);
     }
-    if (!granted) {
-      console.warn("系统通知权限未授权，无法弹出通知");
-      return;
-    }
-
-    sendNotification({ title, body });
-    return;
   }
 
   if (!("Notification" in window)) {
     console.warn("当前浏览器不支持系统通知");
-    return;
+    return "当前浏览器环境不支持系统通知";
   }
 
   // 请求通知权限
   if (Notification.permission === "default") {
     const permission = await Notification.requestPermission();
     if (permission !== "granted") {
-      return;
+      return "浏览器通知权限未授权";
     }
   }
 
@@ -114,20 +109,29 @@ async function sendSystemNotification(event: CharityNewMessageEvent) {
     setTimeout(() => {
       notification.close();
     }, 5000);
+    return null;
   }
+
+  return "浏览器通知权限未授权";
 }
 
 // 发送一条测试通知（提示音 + 系统通知），走与真实新消息相同的展示逻辑。
-// 独立导出：页面里的"测试"按钮无需注册事件监听即可调用。
-export function sendCharityTestNotification() {
+// 独立导出：页面里的"测试"按钮无需注册事件监听即可调用；结果直接 toast。
+export async function sendCharityTestNotification() {
   playNotificationSound();
 
-  void sendSystemNotification({
+  const failure = await sendSystemNotification({
     feedName: "测试订阅源",
     newCount: 1,
     updatedCount: 0,
     timestamp: Math.floor(Date.now() / 1000),
   });
+  const { showToast } = useToast();
+  if (failure) {
+    showToast(failure, true);
+  } else {
+    showToast("测试系统通知已发送");
+  }
 }
 
 // 处理新消息事件
@@ -142,15 +146,18 @@ function handleNewMessage(event: CharityNewMessageEvent) {
   playNotificationSound();
 
   // 发送系统通知
-  void sendSystemNotification(event);
+  void sendSystemNotification(event).then((failure) => {
+    if (failure) {
+      console.warn("公益监听系统通知未发送：", failure);
+    }
+  });
 }
 
 export function useCharityNotification() {
   let unlisten: (() => void) | null = null;
 
   onMounted(async () => {
-    // 检查是否在 Tauri 环境
-    if (typeof window !== "undefined" && (window as any).__TAURI__) {
+    if (isTauri) {
       const { listen } = await import("@tauri-apps/api/event");
 
       unlisten = await listen<CharityNewMessageEvent>("charity-new-message", (event) => {
@@ -158,12 +165,7 @@ export function useCharityNotification() {
       });
 
       console.log("公益监听通知已启用");
-    }
-
-    // 预先申请通知权限，避免首条真实通知被权限弹窗吞掉
-    if (typeof window !== "undefined" && (window as any).__TAURI__) {
-      const { requestPermission } = await import("@tauri-apps/plugin-notification");
-      void requestPermission();
+      // 授权流程由 send_system_notification 命令内处理（首启会弹系统授权框）
     } else if ("Notification" in window && Notification.permission === "default") {
       void Notification.requestPermission();
     }
