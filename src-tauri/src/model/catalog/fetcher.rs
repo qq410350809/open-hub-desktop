@@ -391,6 +391,159 @@ pub(crate) async fn reveal_newapi_keys(
     }
 }
 
+/// Cloudflare 盾站点的 Chrome 同源兜底：在站点页面上下文里拉 Key 列表
+/// （必要时揭示完整 Key）与模型列表。仅在直连被盾拦截时调用——
+/// 桥接会打开/复用 Chrome 标签页，失败路径与账号同步一致。
+///
+/// `user_id` 为该账号缓存的 NewAPI 用户 ID，供桥接脚本核对页面身份防串号；
+/// 拿不到时传空（脚本读不到 user 键的新版前端同样按 Cookie 罐裁决身份）。
+pub(crate) async fn chrome_bridge_fetch_keys_models(
+    database: &Database,
+    base_url: &Url,
+    profile_id: &str,
+    user_id: &str,
+    site_id: Option<&str>,
+) -> Result<SiteModelsResult, String> {
+    let should_fetch_models = true;
+    let javascript = sync::chrome_key_models_bridge_script(should_fetch_models);
+    let marker = format!(
+        "openhub-sync-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| "系统时间异常")?
+            .as_nanos()
+    );
+    let browser_url = base_url
+        .join("console/personal")
+        .map_err(|_| "无法生成 Chrome 验证地址")?;
+    let base_str = base_url.to_string();
+    let user_id_owned = user_id.to_string();
+    let profile_id_owned = profile_id.to_string();
+
+    // 静默尝试已有标签（10s）→ 可见标签兜底（25s）。Key 同步的脚本不导航、
+    // 只 fetch，无需账号同步那样的后台阶段；预算计入 fetch_site_models_json
+    // 的 60s 总超时（此前直连失败到此处只剩兜底，总超时天然构成上界）。
+    let bridge_result = {
+        let javascript = javascript.clone();
+        let browser_url = browser_url.to_string();
+        let base_for_silent = base_str.clone();
+        let marker_for_silent = marker.clone();
+        let user_id_for_silent = user_id_owned.clone();
+        let profile_id_for_bridge = profile_id_owned.clone();
+        spawn_blocking(move || {
+            // 先扫一遍已打开的同源标签（含遗留桥接标签）做静默注入
+            let silent = sync::run_javascript_in_existing_chrome_tab(
+                &base_for_silent,
+                &javascript,
+                Duration::from_secs(10),
+            );
+            match silent {
+                Ok(Some(value)) => Ok(value),
+                Ok(None) => sync::run_javascript_in_chrome_profile(
+                    &browser_url,
+                    &profile_id_for_bridge,
+                    &marker_for_silent,
+                    &javascript,
+                    Duration::from_secs(25),
+                    None,
+                    !user_id_for_silent.is_empty(),
+                ),
+                Err(error) => Err(error),
+            }
+        })
+        .await
+        .map_err(|error| format!("Chrome 兜底任务失败：{error}"))?
+    }?;
+    let parsed = sync::parse_chrome_key_models_bridge_result(&bridge_result)?;
+
+    // 解析 Key 列表：明文 Key 直出；否则用 token id 走揭示接口
+    // （页面已过盾，但揭示请求仍从 Rust 直连发出——部分站点仅拦首页，
+    // 失败则把错误带回给上层）
+    let mut keys = parse_api_keys(&parsed.token_list);
+    let mut key_groups = parse_api_key_groups(&parsed.token_list);
+    let mut errors = Vec::new();
+    if keys.is_empty() {
+        let client = build_site_http_client(database, Duration::from_secs(10), 3, "站点模型请求")?;
+        match reveal_newapi_keys(
+            &client,
+            base_url,
+            &NewApiAuth::Legacy {
+                cookie_header: String::new(),
+                user_id: user_id_owned.clone(),
+            },
+            &sync::chrome_user_agent(),
+            &parsed.token_list,
+        )
+        .await
+        {
+            Ok((revealed, groups)) => {
+                keys = revealed;
+                key_groups = groups;
+            }
+            Err(error) => errors.push(format!("Chrome 已取到令牌列表但揭示 Key 失败：{error}")),
+        }
+    }
+
+    // 模型列表：桥接已带回则直接解析；否则用拿到的 Key 直连重试
+    let mut key_models: HashMap<String, Vec<SiteModelItem>> = HashMap::new();
+    let mut all_models: Vec<SiteModelItem> = Vec::new();
+    if let Some(models_json) = &parsed.models {
+        all_models = parse_site_models(models_json);
+    }
+    if all_models.is_empty() && !keys.is_empty() {
+        let client = build_site_http_client(database, Duration::from_secs(10), 3, "站点模型请求")?;
+        if let Ok(result) = fetch_models_with_keys(
+            &client,
+            base_url,
+            keys.clone(),
+            keys.clone(),
+            key_groups.clone(),
+            &sync::chrome_user_agent(),
+            "newapi-key",
+            (!user_id_owned.is_empty()).then_some(user_id_owned.as_str()),
+        )
+        .await
+        {
+            key_models = result.key_models;
+            all_models = result.models;
+        }
+    }
+
+    // 与账号同步的落库口径对齐：把 Chrome 里核对过的 Key/模型写进缓存
+    let result = SiteModelsResult {
+        models: all_models,
+        source: "newapi-key".into(),
+        keys: keys.clone(),
+        key_groups: key_groups.clone(),
+        key_models,
+        errors,
+    };
+    if let Some(site_id) = site_id {
+        let account = SiteModelCacheAccount {
+            profile_id: profile_id.to_string(),
+            profile_name: String::new(),
+            account_name: String::new(),
+            username: String::new(),
+            keys: result.keys.clone(),
+            key_groups: result.key_groups.clone(),
+            key_models: result.key_models.clone(),
+            error: String::new(),
+        };
+        if let Err(error) = save_site_model_cache(database, site_id, &account, Some(&result), false)
+        {
+            return Err(error);
+        }
+    }
+    if result.keys.is_empty() && result.models.is_empty() {
+        return Err(result
+            .errors
+            .last()
+            .cloned()
+            .unwrap_or_else(|| "Chrome 兜底未取得任何 Key 或模型".into()));
+    }
+    Ok(result)
+}
+
 pub(crate) async fn fetch_models_with_keys(
     client: &wreq::Client,
     base_url: &Url,
@@ -1738,7 +1891,35 @@ async fn fetch_site_models_json_inner(
                         }
                     }
                 }
-                Err(error) => errors.push(format!("{profile_id}：{error}")),
+                Err(error) => {
+                    errors.push(format!("{profile_id}：{error}"));
+                    // Cloudflare 盾站点直连全部被 403 挑战拦截（Key 接口与
+                    // /v1/models 一视同仁），浏览器同源 fetch 是唯一路径：
+                    // 复用账号同步的 Chrome 桥接，页面内拉 Key 列表 + 模型。
+                    if is_cloudflare_shield_error(&error) {
+                        match chrome_bridge_fetch_keys_models(
+                            database,
+                            &base_url,
+                            &profile_id,
+                            &model_user_id,
+                            site_id.as_deref(),
+                        )
+                        .await
+                        {
+                            Ok(result) => {
+                                return cache_profile_api_counts(
+                                    database,
+                                    site_id.as_deref(),
+                                    requested_profile_id.as_deref(),
+                                    result,
+                                );
+                            }
+                            Err(bridge_error) => {
+                                errors.push(format!("{profile_id}：Chrome 兜底：{bridge_error}"));
+                            }
+                        }
+                    }
+                }
             }
             if let Some((cached_keys, cached_key_groups)) = cached_model_keys
                 .get(profile_id)

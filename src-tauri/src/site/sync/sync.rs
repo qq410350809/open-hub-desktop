@@ -1669,6 +1669,83 @@ pub(crate) fn chrome_account_bridge_script(
         .replace("__OPENHUB_MARKER__", &marker)
 }
 
+/// NewAPI Key 同步的 Chrome 同源桥接脚本：在站点页面上下文里依次拉取
+/// `/api/token/?p=1&size=20`（Key 列表）与 `/v1/models`（模型列表），
+/// 一次返回两者原文。Key 明文不在 JSON 里时由调用方再走
+/// `/api/token/{id}/key` 揭示（直连此时通常已可用——页面已通过盾）。
+///
+/// Cloudflare 盾站点的直连请求全部被 403 挑战拦截，浏览器同源 fetch
+/// 带着已通过的 cf_clearance 才是唯一可行路径（与账号同步桥接同一机制）。
+pub(crate) fn chrome_key_models_bridge_script(should_fetch_models: bool) -> String {
+    r#"(() => {
+  const pending = "__OPENHUB_PENDING__";
+  const previous = window.__openHubKeySync;
+  if (previous && previous.result) return JSON.stringify(previous.result);
+  const bridge = { started: Date.now(), result: null };
+  window.__openHubKeySync = bridge;
+  const readResponse = async (response) => {
+    const contentType = (response.headers.get("content-type") || "").toLowerCase();
+    const text = await response.text();
+    const lower = text.slice(0, 100000).toLowerCase();
+    const isHtml = contentType.includes("text/html") || /^\s*<!doctype html|^\s*<html/i.test(text);
+    if (isHtml && ([403, 429, 503].includes(response.status) ||
+        lower.includes("cf-chl-") || lower.includes("challenge-platform") ||
+        lower.includes("just a moment") || lower.includes("attention required"))) {
+      return { challenge: true, status: response.status };
+    }
+    if (isHtml) {
+      return { status: response.status, error: "接口返回 HTML" };
+    }
+    try {
+      return { status: response.status, data: JSON.parse(text) };
+    } catch (_) {
+      return { status: response.status, error: "接口没有返回 JSON" };
+    }
+  };
+  (async () => {
+    try {
+      const tokenResponse = await readResponse(await fetch("/api/token/?p=1&size=20", {
+        method: "GET", credentials: "include", cache: "no-store",
+        headers: { "Accept": "application/json" },
+        signal: AbortSignal.timeout(30000)
+      }));
+      if (tokenResponse.challenge) {
+        bridge.result = { ok: false, error: "Cloudflare 验证仍需要浏览器交互" };
+        return;
+      }
+      if (tokenResponse.error || tokenResponse.status < 200 || tokenResponse.status >= 300) {
+        bridge.result = {
+          ok: false,
+          error: tokenResponse.error || `Key 接口 HTTP ${tokenResponse.status}`
+        };
+        return;
+      }
+      bridge.result = { ok: true, tokenList: tokenResponse.data, models: null };
+      if (!__OPENHUB_FETCH_MODELS__) return;
+      // Key 列表成功后再拉模型：失败不推翻 Key 结果，models 置 null 由调用方直连重试
+      try {
+        const modelsResponse = await readResponse(await fetch("/v1/models", {
+          method: "GET", credentials: "include", cache: "no-store",
+          headers: { "Accept": "application/json" },
+          signal: AbortSignal.timeout(30000)
+        }));
+        if (!modelsResponse.challenge && !modelsResponse.error &&
+            modelsResponse.status >= 200 && modelsResponse.status < 300) {
+          bridge.result.models = modelsResponse.data;
+        }
+      } catch (_) {}
+    } catch (error) {
+      bridge.result = { ok: false, error: String(error && error.message || error) };
+    }
+  })();
+  return pending;
+})()"#
+        .replace(
+            "__OPENHUB_FETCH_MODELS__",
+            if should_fetch_models { "true" } else { "false" },
+        )
+}
+
 pub(crate) fn parse_chrome_account_bridge_result(
     value: &str,
 ) -> Result<(SiteAccountSnapshot, ChromeBridgeAccountResult), String> {
@@ -1687,6 +1764,44 @@ pub(crate) fn parse_chrome_account_bridge_result(
         .ok_or_else(|| "Chrome 返回结果缺少账号数据".to_string())
         .and_then(parse_newapi_account)?;
     Ok((account, result))
+}
+
+/// Chrome Key 桥接结果：Key 列表与（可选）模型列表原文。
+#[derive(Debug)]
+pub(crate) struct ChromeKeyModelsBridgeResult {
+    pub(crate) token_list: serde_json::Value,
+    pub(crate) models: Option<serde_json::Value>,
+}
+
+pub(crate) fn parse_chrome_key_models_bridge_result(
+    value: &str,
+) -> Result<ChromeKeyModelsBridgeResult, String> {
+    #[derive(serde::Deserialize)]
+    struct Payload {
+        ok: bool,
+        #[serde(default)]
+        error: String,
+        #[serde(default)]
+        token_list: serde_json::Value,
+        #[serde(default)]
+        models: Option<serde_json::Value>,
+    }
+    let payload = serde_json::from_str::<Payload>(value)
+        .map_err(|error| format!("Chrome 返回的 Key 数据格式无效：{error}"))?;
+    if !payload.ok {
+        return Err(if payload.error.is_empty() {
+            "Chrome Key 请求失败".into()
+        } else {
+            payload.error
+        });
+    }
+    if payload.token_list.is_null() {
+        return Err("Chrome 返回结果缺少 Key 列表".into());
+    }
+    Ok(ChromeKeyModelsBridgeResult {
+        token_list: payload.token_list,
+        models: payload.models,
+    })
 }
 
 /// 单个站点 / 账号同步的硬性总超时：全过程（可达性探测 + 直连 + 静默/后台/
@@ -2707,6 +2822,36 @@ mod tests {
         assert!(!script.contains("credentials: useSessionCookies"));
         assert!(script.contains("method: \"GET\", credentials: \"include\""));
         assert!(script.contains("method: \"POST\", credentials: \"include\""));
+    }
+
+    #[test]
+    fn key_models_bridge_script_fetches_token_and_models() {
+        let script = chrome_key_models_bridge_script(true);
+        // 同源凭证必须带上，cf_clearance 才能生效
+        assert!(script.contains("credentials: \"include\""));
+        assert!(script.contains("/api/token/?p=1&size=20"));
+        assert!(script.contains("/v1/models"));
+        assert!(script.contains("__OPENHUB_PENDING__"));
+        // 关闭模型拉取时不得包含 /v1/models 请求
+        let script_no_models = chrome_key_models_bridge_script(false);
+        assert!(script_no_models.contains("if (!false) return;"));
+    }
+
+    #[test]
+    fn parse_chrome_key_models_bridge_result_rejects_errors() {
+        let err =
+            parse_chrome_key_models_bridge_result(r#"{"ok":false,"error":"Cloudflare 验证仍需要浏览器交互"}"#)
+                .unwrap_err();
+        assert!(err.contains("Cloudflare"));
+        let missing =
+            parse_chrome_key_models_bridge_result(r#"{"ok":true,"tokenList":null,"models":null}"#)
+                .unwrap_err();
+        assert!(missing.contains("缺少 Key 列表"));
+        let ok = parse_chrome_key_models_bridge_result(
+            r#"{"ok":true,"tokenList":{"data":[]},"models":{"data":[{"id":"gpt-x"}]}}"#,
+        )
+        .expect("合法结果应解析成功");
+        assert!(ok.models.is_some());
     }
 
     #[test]
