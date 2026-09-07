@@ -139,6 +139,8 @@ export interface ProxyRequestLog {
   clientName?: string | null;
   /** 出网上游地址（完整 URL，含 path），日志展示「入->出」双地址 */
   upstreamUrl?: string | null;
+  /** 客户端会话标识（x-session-id 等请求头提取），用于按会话聚合排查 */
+  sessionId?: string | null;
 }
 
 export interface ChannelUsageStats {

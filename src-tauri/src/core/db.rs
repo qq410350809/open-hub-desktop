@@ -925,6 +925,7 @@ pub(crate) fn ensure_model_proxy_logs_table(connection: &Connection) -> Result<(
                 node_name TEXT,
                 client_name TEXT,
                 upstream_url TEXT,
+                session_id TEXT,
                 created_at INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_model_proxy_logs_created ON model_proxy_logs(created_at DESC);",
@@ -945,6 +946,7 @@ pub(crate) fn ensure_model_proxy_logs_table(connection: &Connection) -> Result<(
         "client_name",
         "cache_creation_tokens",
         "upstream_url",
+        "session_id",
     ] {
         let has: i64 = connection
             .query_row(

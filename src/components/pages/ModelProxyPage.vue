@@ -3546,6 +3546,10 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
                       <span class="mp-path-label">出</span>
                       <code class="mp-upstream-code" :title="`出网地址：${log.upstreamUrl}`">{{ formatUpstreamUrl(log.upstreamUrl) }}</code>
                     </div>
+                    <div v-if="log.sessionId" class="mp-path-row">
+                      <span class="mp-path-label" title="客户端会话标识（x-session-id 等请求头）">会话</span>
+                      <code class="mp-upstream-code" :title="`客户端会话：${log.sessionId}`">{{ log.sessionId }}</code>
+                    </div>
                   </div>
                 </td>
                 <td>
@@ -4175,6 +4179,13 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
                 <label>调用客户端</label>
                 <div class="mp-ld-val font-mono">
                   <span>{{ selectedLogForDetail.clientName || '--' }}</span>
+                </div>
+              </div>
+
+              <div class="mp-ld-item">
+                <label>客户端会话</label>
+                <div class="mp-ld-val font-mono">
+                  <span :title="selectedLogForDetail.sessionId || ''">{{ selectedLogForDetail.sessionId || '--' }}</span>
                 </div>
               </div>
 

@@ -6,7 +6,7 @@
 
 use super::super::adapters::AnthropicProtocolAdapter;
 use super::super::egress;
-use super::super::logger::{cap_log_body, client_name_from_headers};
+use super::super::logger::{cap_log_body, client_name_from_headers, session_id_from_headers};
 use super::super::pipeline::{
     auth_and_count, dispatch_protocol_egress, resolve_channel_or_404, ClientProtocol,
 };
@@ -115,6 +115,7 @@ pub async fn handle_messages(
 
     let mut log = outcome.base_log(PATH, &raw_model, is_stream, req_body_str);
     log.client_name = Some(client_name_from_headers(&headers, PATH));
+    log.session_id = session_id_from_headers(&headers);
 
     // 流式：快速通道走「原生字节直通 + 兼容修复 + 旁路统计」，杜绝往返转换丢失内容；
     // 跨协议转换路径仍经归一化链路

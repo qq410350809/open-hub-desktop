@@ -4,7 +4,7 @@
 //! 响应侧嗅探上游实际协议后经 IR 回传 Chat。
 
 use super::super::egress;
-use super::super::logger::{cap_log_body, client_name_from_headers};
+use super::super::logger::{cap_log_body, client_name_from_headers, session_id_from_headers};
 use super::super::pipeline::{
     auth_and_count, dispatch_protocol_egress, resolve_channel_or_404, ClientProtocol,
 };
@@ -184,6 +184,7 @@ async fn dispatch_chat_request(
 
     let mut log = outcome.base_log(CHAT_PATH, &raw_model, is_stream, req_body_str);
     log.client_name = Some(client_name_from_headers(headers, CHAT_PATH));
+    log.session_id = session_id_from_headers(headers);
 
     if is_stream {
         // 出网已按渠道目标原生化，响应协议即 outcome.target（嗅探失败时的正确回退）

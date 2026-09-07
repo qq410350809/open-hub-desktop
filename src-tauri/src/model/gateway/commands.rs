@@ -355,7 +355,7 @@ pub async fn get_model_proxy_logs(
                 duration_ms, ttft_ms, prompt_tokens, prompt_cache_hit_tokens,
                 prompt_cache_miss_tokens, cache_creation_tokens, completion_tokens,
                 reasoning_tokens, total_tokens,
-                error_message, request_body, response_body, node_name, client_name, upstream_url
+                error_message, request_body, response_body, node_name, client_name, upstream_url, session_id
          FROM model_proxy_logs
          {where_sql}
          ORDER BY {sort_col} {sort_dir}, rowid DESC
@@ -403,6 +403,7 @@ pub async fn get_model_proxy_logs(
                 node_name: row.get(20)?,
                 client_name: row.get(21)?,
                 upstream_url: row.get::<_, Option<String>>(22)?,
+                session_id: row.get(23)?,
             })
         })
         .map_err(|e| format!("解析日志失败: {e}"))?;

@@ -381,6 +381,9 @@ pub struct ProxyRequestLog {
     pub client_name: Option<String>,
     /// 出网上游地址（完整 URL，含 path），用于日志展示「入->出」双地址
     pub upstream_url: Option<String>,
+    /// 客户端会话标识：从 x-session-id / 会话请求头提取，用于按会话聚合排查
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

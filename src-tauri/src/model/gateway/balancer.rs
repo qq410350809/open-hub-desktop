@@ -517,6 +517,7 @@ pub async fn record_failover_event(
         cache_creation_tokens: None,
         client_name: None,
         upstream_url: None,
+                session_id: None,
     })
     .await;
 }

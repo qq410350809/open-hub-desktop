@@ -815,6 +815,7 @@ mod egress_tests {
             node_name: None,
             client_name: None,
             upstream_url: None,
+            session_id: None,
         };
         // record_log 需要时间戳非空
         log.timestamp = "2026-01-01T00:00:00Z".into();

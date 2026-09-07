@@ -46,6 +46,8 @@ pub struct ProxyLogParams {
     /// 发起请求的客户端标识（User-Agent / 端点推断）
     pub client_name: Option<String>,
     pub upstream_url: Option<String>,
+    /// 客户端会话标识（x-session-id 等）
+    pub session_id: Option<String>,
 }
 
 impl ProxyLogParams {
@@ -84,6 +86,7 @@ impl ProxyLogParams {
             channel_stats_id: None,
             client_name: None,
             upstream_url: None,
+            session_id: None,
         }
     }
 
@@ -99,6 +102,11 @@ impl ProxyLogParams {
 
     pub fn with_client_name(mut self, client_name: Option<String>) -> Self {
         self.client_name = client_name;
+        self
+    }
+
+    pub fn with_session_id(mut self, session_id: Option<String>) -> Self {
+        self.session_id = session_id;
         self
     }
 
@@ -133,6 +141,7 @@ impl ProxyLogParams {
             channel_stats_id: self.channel_stats_id,
             client_name: self.client_name,
             upstream_url: self.upstream_url,
+            session_id: self.session_id,
         }
     }
 }
@@ -187,6 +196,30 @@ pub fn client_name_from_headers(headers: &axum::http::HeaderMap, path: &str) -> 
         p if p.starts_with("/v1/chat") => "openai-api".to_string(),
         _ => "other".to_string(),
     }
+}
+
+/// 从请求头提取客户端会话标识，供日志按会话聚合排查。
+/// 覆盖各客户端的常见约定头：通用 x-session-id、Anthropic 元数据、
+/// OpenAI Assistants、Codex 与 OpenCode 的会话头；长度钳制防滥用。
+pub fn session_id_from_headers(headers: &axum::http::HeaderMap) -> Option<String> {
+    const SESSION_HEADERS: &[&str] = &[
+        "x-session-id",
+        "session_id",
+        "anthropic-metadata-user-id",
+        "x-assistant-session-id",
+        "openai-conversation-id",
+        "x-opencode-session",
+        "x-claude-session-id",
+    ];
+    for name in SESSION_HEADERS {
+        if let Some(value) = headers.get(*name).and_then(|v| v.to_str().ok()) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.chars().take(64).collect());
+            }
+        }
+    }
+    None
 }
 
 /// 记录单次尝试的失败日志，并原子递增 failed_requests 计数器

@@ -5,7 +5,7 @@
 //! 非流式响应原样下发，仅旁路提取 usageMetadata 供日志统计。
 
 use super::super::egress::{self, TargetProtocol};
-use super::super::logger::{cap_log_body, client_name_from_headers};
+use super::super::logger::{cap_log_body, client_name_from_headers, session_id_from_headers};
 use super::super::pipeline::{
     auth_and_count, dispatch_protocol_egress, resolve_channel_or_404, ClientProtocol,
 };
@@ -116,6 +116,7 @@ pub async fn handle_gemini_generate(
 
     let mut log = outcome.base_log(&log_path, raw_model, is_stream, req_body_str);
     log.client_name = Some(client_name_from_headers(&headers, &log_path));
+    log.session_id = session_id_from_headers(&headers);
 
     if is_stream {
         if fast_path {

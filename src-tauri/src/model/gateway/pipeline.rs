@@ -354,6 +354,7 @@ impl EgressOutcome {
             response_body: None,
             node_name: Some(self.success.node_display.clone()),
             upstream_url: Some(self.success.upstream_url.clone()),
+            session_id: None,
             client_name: None,
         }
     }
