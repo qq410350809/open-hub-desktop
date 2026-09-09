@@ -419,6 +419,7 @@ pub fn persist_feed(
                    pinned = excluded.pinned,
                    posters = excluded.posters,
                    last_seen_at = CURRENT_TIMESTAMP",
+                // last_seen_at 仅作诊断字段留存（记录最近一次被上游列表带回的时间），无读取方
                 params![
                     source.id,
                     item.id,
@@ -452,17 +453,6 @@ pub fn persist_feed(
             "INSERT OR REPLACE INTO app_meta (key, value) VALUES
              (?1, '1'), (?2, ?3), (?4, CURRENT_TIMESTAMP)",
             params![initialized_key, source_key, source.json_url, fetched_key],
-        )
-        .map_err(|error| error.to_string())?;
-    transaction
-        .execute(
-            "DELETE FROM charity_feed_items
-             WHERE feed_id = ?1 AND guid NOT IN (
-               SELECT guid FROM charity_feed_items
-               WHERE feed_id = ?1
-               ORDER BY last_seen_at DESC, rowid DESC LIMIT 120
-             )",
-            [source.id.as_str()],
         )
         .map_err(|error| error.to_string())?;
     transaction.commit().map_err(|error| error.to_string())?;
