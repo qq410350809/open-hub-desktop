@@ -192,7 +192,11 @@ mod tests {
     use super::*;
 
     fn temp_home() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("openhub-lt-zc-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "openhub-lt-zc-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(".zcode/v2")).unwrap();
         dir

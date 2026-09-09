@@ -209,7 +209,11 @@ impl ToolAdapter for OpencodeAdapter {
             // （key 形如 "provider/model"，value 形如 "low,high,max"）。
             let mut models_new = Map::new();
             for model in patch.models.iter().filter(|m| m.provider == provider.id) {
-                let short = model.id.split_once('/').map(|(_, s)| s).unwrap_or(&model.id);
+                // 兼容 "provider/model" 与 "alias/model"：只剥供应商标识，保留渠道路由别名。
+                let short = model
+                    .id
+                    .strip_prefix(&format!("{}/", provider.id))
+                    .unwrap_or(&model.id);
                 let mut model_obj = Map::new();
                 model_obj.insert("name".into(), Value::String(model.name.clone()));
                 if model.context_window > 0 || model.max_output > 0 {
@@ -298,7 +302,11 @@ mod tests {
     use super::*;
 
     fn temp_home() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("openhub-lt-oc-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "openhub-lt-oc-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(".config/opencode")).unwrap();
         dir
@@ -368,7 +376,7 @@ mod tests {
         assert_eq!(out["instructions"][0], "中文回复");
         assert_eq!(out["provider"]["p1"]["models"]["m1"]["limit"]["context"], 100_000, "用户供应商不得被改写");
         assert_eq!(out["provider"]["openhub-site_a_acc_0"]["options"]["baseURL"], "http://127.0.0.1:17896/v1");
-        assert_eq!(out["provider"]["openhub-site_a_acc_0"]["models"]["m1"]["limit"]["context"], 500_000);
+        assert_eq!(out["provider"]["openhub-site_a_acc_0"]["models"]["alias/m1"]["limit"]["context"], 500_000);
         assert_eq!(out["model"], "p1/m1");
 
         let _ = std::fs::remove_dir_all(&home);
