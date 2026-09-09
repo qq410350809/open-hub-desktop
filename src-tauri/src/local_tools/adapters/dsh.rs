@@ -1,10 +1,11 @@
-//! DeepSeek CLI (DSH)：`~/.dsh/settings.yaml`。
+//! DeepSeek CLI (DSH)：`~/.dsh/settings.yaml` + `~/.dsh/.credentials.yaml`。
 //!
 //! 管辖字段（其余顶层键如 ui-onboarding 一律不动）：
 //! - 供应商：`llm-pi-ai.providers.*`
 //!   （displayName / apiKeyEnv / api / baseURL / models[]）
 //! - 模型：每供应商 `models[]`（id/contextWindow/maxTokens）
 //! - 思考档：`models[].reasoningEfforts`（map，如 off/high/max）
+//! - 网关 Key：只写入 `.credentials.yaml` 里以 OPENHUB_ 开头的环境变量
 //!
 //! 默认模型选择存于 DSH 会话/profile，不在该文件，故不管理 defaults。
 
@@ -62,11 +63,18 @@ impl ToolAdapter for DshAdapter {
     }
 
     fn config_files(&self, home: &Path) -> Vec<(String, String, PathBuf)> {
-        vec![(
-            "config".into(),
-            "settings.yaml".into(),
-            settings_path(home),
-        )]
+        vec![
+            (
+                "config".into(),
+                "settings.yaml".into(),
+                settings_path(home),
+            ),
+            (
+                "auth".into(),
+                ".credentials.yaml".into(),
+                credentials_path(home),
+            ),
+        ]
     }
 
     fn detect(&self, home: &Path) -> (bool, String) {
@@ -143,7 +151,10 @@ impl ToolAdapter for DshAdapter {
             snap.models.extend(models);
         }
 
-        snap.content_hash = content_hash(&[read_text(&path)?.unwrap_or_default()]);
+        snap.content_hash = content_hash(&[
+            read_text(&path)?.unwrap_or_default(),
+            read_text(&credentials_path(home))?.unwrap_or_default(),
+        ]);
         Ok(snap)
     }
 
@@ -201,10 +212,7 @@ impl ToolAdapter for DshAdapter {
                     Yaml::String(provider.base_url.clone()),
                 );
             }
-            let env_name = format!(
-                "OPENHUB_{}_API_KEY",
-                crate::local_tools::mark::sanitize_id_part(&provider.id).to_ascii_uppercase()
-            );
+            let env_name = credential_env_name(&provider.id);
             provider_map.insert(
                 Yaml::String("apiKeyEnv".into()),
                 Yaml::String(env_name),
@@ -270,8 +278,73 @@ impl ToolAdapter for DshAdapter {
 
         let text = serde_yaml::to_string(&Yaml::Mapping(root)).map_err(|e| e.to_string())?;
         atomic_write(&path, &text)?;
-        Ok(vec!["settings.yaml".to_string()])
+        let mut written = vec!["settings.yaml".to_string()];
+        if upsert_openhub_credentials(home, patch)? {
+            written.push(".credentials.yaml".to_string());
+        }
+        Ok(written)
     }
+}
+
+
+fn credentials_path(home: &Path) -> PathBuf {
+    home.join(".dsh").join(".credentials.yaml")
+}
+
+fn credential_env_name(provider_id: &str) -> String {
+    let provider_id = provider_id.strip_prefix(crate::local_tools::mark::MANAGED_PREFIX)
+        .unwrap_or(provider_id);
+    format!(
+        "OPENHUB_{}_API_KEY",
+        crate::local_tools::mark::sanitize_id_part(provider_id).to_ascii_uppercase()
+    )
+}
+
+/// 只 upsert OpenHub 管辖的凭据键，用户原有 DEEPSEEK_API_KEY 等一律保留。
+fn upsert_openhub_credentials(home: &Path, patch: &ToolConfigPatch) -> Result<bool, String> {
+    let path = credentials_path(home);
+    let existing_text = read_text(&path)?.unwrap_or_default();
+    let mut root = if existing_text.trim().is_empty() {
+        Mapping::new()
+    } else {
+        serde_yaml::from_str::<Yaml>(&existing_text)
+            .ok()
+            .and_then(|v| v.as_mapping().cloned())
+            .ok_or_else(|| ".credentials.yaml 顶层不是映射，已中止写入".to_string())?
+    };
+    let keep: std::collections::HashSet<String> = patch
+        .providers
+        .iter()
+        .filter(|p| is_managed_id(&p.id) && !p.api_key.is_empty())
+        .map(|p| credential_env_name(&p.id))
+        .collect();
+    let stale: Vec<Yaml> = root
+        .keys()
+        .filter(|key| {
+            key.as_str()
+                .map(|id| id.starts_with("OPENHUB_") && id.ends_with("_API_KEY") && !keep.contains(id))
+                .unwrap_or(false)
+        })
+        .cloned()
+        .collect();
+    for key in stale {
+        root.remove(&key);
+    }
+    for provider in &patch.providers {
+        if !is_managed_id(&provider.id) || provider.api_key.is_empty() {
+            continue;
+        }
+        root.insert(
+            Yaml::String(credential_env_name(&provider.id)),
+            Yaml::String(provider.api_key.clone()),
+        );
+    }
+    let next = serde_yaml::to_string(&Yaml::Mapping(root)).map_err(|e| e.to_string())?;
+    if next == existing_text {
+        return Ok(false);
+    }
+    atomic_write(&path, &next)?;
+    Ok(true)
 }
 
 /// ModelEntry 扩展：临时携带思考档信息（快照用）。
@@ -294,7 +367,11 @@ mod tests {
     use crate::local_tools::types::DefaultsSection;
 
     fn temp_home() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("openhub-lt-dsh-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "openhub-lt-dsh-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(".dsh")).unwrap();
         dir
@@ -350,6 +427,9 @@ mod tests {
         assert!(text.contains("baseURL: http://127.0.0.1:17896/v1"));
         assert!(text.contains("contextWindow: 500000"));
         assert!(text.contains("max: max"));
+        let cred = std::fs::read_to_string(credentials_path(&home)).unwrap();
+        assert!(cred.contains("OPENHUB_SITE_D_ACC_0_API_KEY"), "{cred}");
+        assert!(cred.contains("sk-openhub-test"), "{cred}");
 
         let _ = std::fs::remove_dir_all(&home);
     }
