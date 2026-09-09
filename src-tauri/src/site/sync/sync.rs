@@ -1676,9 +1676,32 @@ pub(crate) fn chrome_account_bridge_script(
 ///
 /// Cloudflare 盾站点的直连请求全部被 403 挑战拦截，浏览器同源 fetch
 /// 带着已通过的 cf_clearance 才是唯一可行路径（与账号同步桥接同一机制）。
-pub(crate) fn chrome_key_models_bridge_script(should_fetch_models: bool) -> String {
+pub(crate) fn chrome_key_models_bridge_script(
+    should_fetch_models: bool,
+    user_id: &str,
+) -> String {
     r#"(() => {
   const pending = "__OPENHUB_PENDING__";
+  // 传统 new-api 会话除了 Cookie 还必须带 New-Api-User 头；DB 缓存值优先，
+  // 页面 localStorage 里能读到 id 时兜底（新版前端可能不写缓存值）。
+  const legacyUserId = "__OPENHUB_USER_ID__";
+  if (window.location.protocol !== "http:" && window.location.protocol !== "https:") {
+    return pending;
+  }
+  if (legacyUserId) {
+    try {
+      let storedUser = localStorage.getItem("user") || "null";
+      for (let depth = 0; depth < 2 && typeof storedUser === "string"; depth += 1) {
+        storedUser = JSON.parse(storedUser);
+      }
+      const storedUserId = storedUser?.id ?? storedUser?.data?.id ?? "";
+      // 与账号桥接同一语义：只在能明确读出不同用户 ID 时判串号，
+      // 读不到（新版前端不写 user 键）交由 Profile 隔离的 Cookie 罐裁决。
+      if (storedUserId && String(storedUserId) !== String(legacyUserId)) {
+        return "__OPENHUB_PROFILE_MISMATCH__";
+      }
+    } catch (_) {}
+  }
   const previous = window.__openHubKeySync;
   if (previous && previous.result) return JSON.stringify(previous.result);
   const bridge = { started: Date.now(), result: null };
@@ -1702,11 +1725,12 @@ pub(crate) fn chrome_key_models_bridge_script(should_fetch_models: bool) -> Stri
       return { status: response.status, error: "接口没有返回 JSON" };
     }
   };
+  const requestHeaders = { Accept: "application/json" };
+  if (legacyUserId) requestHeaders["New-Api-User"] = legacyUserId;
   (async () => {
     try {
       const tokenResponse = await readResponse(await fetch("/api/token/?p=1&size=20", {
-        method: "GET", credentials: "include", cache: "no-store",
-        headers: { "Accept": "application/json" },
+        method: "GET", credentials: "include", cache: "no-store", headers: requestHeaders,
         signal: AbortSignal.timeout(30000)
       }));
       if (tokenResponse.challenge) {
@@ -1725,8 +1749,7 @@ pub(crate) fn chrome_key_models_bridge_script(should_fetch_models: bool) -> Stri
       // Key 列表成功后再拉模型：失败不推翻 Key 结果，models 置 null 由调用方直连重试
       try {
         const modelsResponse = await readResponse(await fetch("/v1/models", {
-          method: "GET", credentials: "include", cache: "no-store",
-          headers: { "Accept": "application/json" },
+          method: "GET", credentials: "include", cache: "no-store", headers: requestHeaders,
           signal: AbortSignal.timeout(30000)
         }));
         if (!modelsResponse.challenge && !modelsResponse.error &&
@@ -1740,6 +1763,7 @@ pub(crate) fn chrome_key_models_bridge_script(should_fetch_models: bool) -> Stri
   })();
   return pending;
 })()"#
+        .replace("__OPENHUB_USER_ID__", user_id)
         .replace(
             "__OPENHUB_FETCH_MODELS__",
             if should_fetch_models { "true" } else { "false" },
@@ -1777,6 +1801,7 @@ pub(crate) fn parse_chrome_key_models_bridge_result(
     value: &str,
 ) -> Result<ChromeKeyModelsBridgeResult, String> {
     #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
     struct Payload {
         ok: bool,
         #[serde(default)]
@@ -1805,10 +1830,12 @@ pub(crate) fn parse_chrome_key_models_bridge_result(
 }
 
 /// 单个站点 / 账号同步的硬性总超时：全过程（可达性探测 + 直连 + 静默/后台/
-/// 可见三层兜底）合计超过 60 秒即强制失败并释放界面，避免整个弹窗卡住
-/// 什么都干不了。下方三个阶段预算已压缩到该上限之内，宁可早失败
-/// （失败会计入浏览器兜底冷却），也不长时间占住同步流程。
-const SITE_SYNC_TIMEOUT: Duration = Duration::from_secs(60);
+/// 可见三层兜底）合计超过 90 秒即强制失败并释放界面，避免整个弹窗卡住
+/// 什么都干不了。此前的 60 秒会把 Cloudflare 盾站点的验证标签页（页面
+/// 首载 + challenge 导航 + 桥接轮询）连坐掐断；三层预算合计仍为 45 秒，
+/// 余量供前置探测与慢加载页面消耗，宁可早失败（失败计入浏览器兜底冷却），
+/// 也不长时间占住同步流程。
+const SITE_SYNC_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// 被手动强制停止的账号同步 run_id 集合。取消后在下一个阶段边界
 /// （静默/后台/可见）立即失败返回，不再打开新的 Chrome 标签页；
@@ -1850,7 +1877,7 @@ pub async fn sync_site_account_via_chrome(
     sync_site_account_via_chrome_command(&ctx, site_id, profile_id, run_id).await
 }
 
-/// 手动 Chrome 账号同步入口：统一 60 秒总超时、
+/// 手动 Chrome 账号同步入口：统一 90 秒总超时、
 /// 失败原因与浏览器兜底冷却计数落库。
 pub(crate) async fn sync_site_account_via_chrome_command(
     ctx: &Arc<AppContext>,
@@ -1866,7 +1893,10 @@ pub(crate) async fn sync_site_account_via_chrome_command(
     .await
     {
         Ok(result) => result,
-        Err(_) => Err("账号同步超过 60 秒，已强制终止".to_string()),
+        Err(_) => Err(format!(
+            "账号同步超过 {} 秒，已强制终止",
+            SITE_SYNC_TIMEOUT.as_secs()
+        )),
     };
     if let Err(error) = &outcome {
         // 浏览器兜底的失败原因落库：失败详情原本只出现在当次弹窗日志里，过后无从追溯；
@@ -2310,9 +2340,9 @@ async fn sync_site_account_via_chrome_inner(
         }
     }
 
-    // 三阶段预算与 SITE_SYNC_TIMEOUT（60 秒）的关系：预算合计 45 秒
+    // 三阶段预算与 SITE_SYNC_TIMEOUT（90 秒）的关系：预算合计 45 秒
     // （12+13+20 / 10+13+22），给前置的会话读取、可达性探测、缓存令牌校验
-    // （实测 8~15 秒）留出余量。此前合计恰好 60 秒，任何前置开销都会让最后
+    // （实测 8~15 秒）留出余量。此前总超时恰好 60 秒，任何前置开销都会让最后
     // 的可见验证被总超时连坐掐断——用户还没看到浏览器窗口流程就报失败。
     // 静默/后台失败要尽早让位给可见验证，可见验证也只保留有限窗口。
     let silent_timeout = if use_refresh_auth {
@@ -2826,15 +2856,21 @@ mod tests {
 
     #[test]
     fn key_models_bridge_script_fetches_token_and_models() {
-        let script = chrome_key_models_bridge_script(true);
+        let script = chrome_key_models_bridge_script(true, "99");
         // 同源凭证必须带上，cf_clearance 才能生效
         assert!(script.contains("credentials: \"include\""));
         assert!(script.contains("/api/token/?p=1&size=20"));
         assert!(script.contains("/v1/models"));
         assert!(script.contains("__OPENHUB_PENDING__"));
+        // 传统 new-api 会话必须带 New-Api-User 头，否则 401「未提供 New-Api-User」
+        assert!(script.contains("New-Api-User"));
         // 关闭模型拉取时不得包含 /v1/models 请求
-        let script_no_models = chrome_key_models_bridge_script(false);
+        let script_no_models = chrome_key_models_bridge_script(false, "");
         assert!(script_no_models.contains("if (!false) return;"));
+        // 空用户 ID 也要是合法 JS（占位符替换后仍可为空串）
+        assert!(script_no_models.contains("const legacyUserId = \"\";"));
+        // 有缓存 user_id 时以字面量注入（非空即写入 New-Api-User 头）
+        assert!(script.contains("requestHeaders[\"New-Api-User\"] = legacyUserId;"));
     }
 
     #[test]

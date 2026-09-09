@@ -405,7 +405,7 @@ pub(crate) async fn chrome_bridge_fetch_keys_models(
     site_id: Option<&str>,
 ) -> Result<SiteModelsResult, String> {
     let should_fetch_models = true;
-    let javascript = sync::chrome_key_models_bridge_script(should_fetch_models);
+    let javascript = sync::chrome_key_models_bridge_script(should_fetch_models, user_id);
     let marker = format!(
         "openhub-sync-{}",
         SystemTime::now()
@@ -422,7 +422,9 @@ pub(crate) async fn chrome_bridge_fetch_keys_models(
 
     // 静默尝试已有标签（10s）→ 可见标签兜底（25s）。Key 同步的脚本不导航、
     // 只 fetch，无需账号同步那样的后台阶段；预算计入 fetch_site_models_json
-    // 的 60s 总超时（此前直连失败到此处只剩兜底，总超时天然构成上界）。
+    // 的 90s 总超时。静默阶段未命中时转入可见标签；静默阶段报错时只有
+    // 阻断性配置问题（JS 自动化开关 / macOS 授权）直接失败，其余与账号
+    // 同步一致——降级打开可见标签再试，而不是整个兜底立即放弃。
     let bridge_result = {
         let javascript = javascript.clone();
         let browser_url = browser_url.to_string();
@@ -437,9 +439,8 @@ pub(crate) async fn chrome_bridge_fetch_keys_models(
                 &javascript,
                 Duration::from_secs(10),
             );
-            match silent {
-                Ok(Some(value)) => Ok(value),
-                Ok(None) => sync::run_javascript_in_chrome_profile(
+            let visible = move || {
+                sync::run_javascript_in_chrome_profile(
                     &browser_url,
                     &profile_id_for_bridge,
                     &marker_for_silent,
@@ -447,8 +448,17 @@ pub(crate) async fn chrome_bridge_fetch_keys_models(
                     Duration::from_secs(25),
                     None,
                     !user_id_for_silent.is_empty(),
-                ),
-                Err(error) => Err(error),
+                )
+            };
+            match silent {
+                Ok(Some(value)) => Ok(value),
+                Ok(None) => visible(),
+                Err(silent_error)
+                    if sync::is_blocking_chrome_automation_error(&silent_error) =>
+                {
+                    Err(silent_error)
+                }
+                Err(_) => visible(),
             }
         })
         .await
@@ -1285,8 +1295,10 @@ pub fn get_all_site_model_caches(
     Ok(entries)
 }
 
-/// 单个站点 / 账号同步的硬性总超时：超过即强制失败。
-const SITE_SYNC_TIMEOUT: Duration = Duration::from_secs(60);
+/// 单个站点 / 账号同步的硬性总超时：超过即强制失败。Key 同步在直连之外
+/// 还有 Chrome 浏览器兜底（页面首载 + Cloudflare challenge 桥接），且探测
+/// / 会话读取等前置开销不定，60 秒会把带盾站点连坐掐断，故给到 90 秒。
+const SITE_SYNC_TIMEOUT: Duration = Duration::from_secs(90);
 
 #[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn fetch_site_models_json(
@@ -1301,7 +1313,12 @@ pub async fn fetch_site_models_json(
         fetch_site_models_json_impl(&ctx, database, url, site_id, profile_id),
     )
     .await
-    .map_err(|_| "站点模型同步超过 60 秒，已强制终止".to_string())?
+    .map_err(|_| {
+        format!(
+            "站点模型同步超过 {} 秒，已强制终止",
+            SITE_SYNC_TIMEOUT.as_secs()
+        )
+    })?
 }
 
 /// 站点接口探测超时：探测只关心端点可达性，无需站点同步那样的长超时。

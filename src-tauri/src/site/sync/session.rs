@@ -18,7 +18,7 @@ use url::Url;
 const CHROME_EPOCH_OFFSET_SECONDS: i64 = 11_644_473_600;
 
 /// 带进程级死线的 osascript 调用：AppleEvent 通道拥塞时 `output()` 会无限期
-/// 阻塞，阶段自身的轮询预算拦不住，整个同步会被 60 秒总超时连坐强杀。
+/// 阻塞，阶段自身的轮询预算拦不住，整个同步会被 90 秒总超时连坐强杀。
 /// 超时即 kill 子进程并返回 Err（错误文本含"AppleEvent已超时"，归入瞬态
 /// 错误，由调用方继续轮询直到阶段预算耗尽）。
 #[cfg(target_os = "macos")]
@@ -351,8 +351,18 @@ end run
             javascript,
             &target_tab_id,
         ]);
-        let output = run_osascript_with_deadline(command, Duration::from_secs(8))
-            .map_err(|error| format!("无法调用 Chrome 静默自动化：{error}"))?;
+        let output = match run_osascript_with_deadline(command, Duration::from_secs(8)) {
+            Ok(output) => output,
+            Err(deadline_error) => {
+                // 死线强杀（AppleEvent 通道超时）与 stderr 里的 -1712 同为
+                // 瞬态错误：稍候重试，直到静默阶段预算耗尽再交给上层降级。
+                if is_transient_chrome_automation_error(&deadline_error) {
+                    thread::sleep(Duration::from_millis(300));
+                    continue;
+                }
+                return Err(format!("无法调用 Chrome 静默自动化：{deadline_error}"));
+            }
+        };
         if !output.status.success() {
             let error = String::from_utf8_lossy(&output.stderr).trim().to_string();
             if error.contains("JavaScript from Apple Events")
@@ -540,8 +550,18 @@ end run
     while started.elapsed() < timeout {
         let mut command = Command::new("/usr/bin/osascript");
         command.args(["-e", SCRIPT, "--", marker, javascript, &target_tab_id]);
-        let output = run_osascript_with_deadline(command, Duration::from_secs(8))
-            .map_err(|error| format!("无法调用 Chrome 自动化：{error}"))?;
+        let output = match run_osascript_with_deadline(command, Duration::from_secs(8)) {
+            Ok(output) => output,
+            Err(deadline_error) => {
+                // 死线强杀（AppleEvent 通道超时）与 -1712 同为瞬态错误：
+                // 稍候重试，直到当前阶段预算耗尽。
+                if is_transient_chrome_automation_error(&deadline_error) {
+                    thread::sleep(Duration::from_millis(500));
+                    continue;
+                }
+                return Err(format!("无法调用 Chrome 自动化：{deadline_error}"));
+            }
+        };
         if !output.status.success() {
             let error = String::from_utf8_lossy(&output.stderr).trim().to_string();
             if error.contains("JavaScript from Apple Events")
