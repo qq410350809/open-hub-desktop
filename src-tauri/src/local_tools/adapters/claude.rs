@@ -92,45 +92,52 @@ impl ToolAdapter for ClaudeAdapter {
         let base_url = json_str(&Value::Object(env.clone()), ANTHROPIC_ENV_BASE_URL)
             .unwrap_or_default();
         let auth = json_str(&Value::Object(env.clone()), ANTHROPIC_ENV_AUTH_TOKEN).unwrap_or_default();
+        let managed_provider = root
+            .get(JSON_MARK_KEY)
+            .and_then(|v| v.get("provider"))
+            .and_then(|v| v.as_str())
+            .filter(|id| !id.is_empty())
+            .unwrap_or("anthropic")
+            .to_string();
+        let mapped_models: Vec<String> = DEFAULT_MODEL_ENVS
+            .iter()
+            .filter_map(|key| json_str(&Value::Object(env.clone()), key))
+            .collect();
         snap.providers.push(ProviderEntry {
-            id: "anthropic".into(),
+            id: managed_provider.clone(),
             name: "Anthropic API（当前接入）".into(),
             base_url,
             api_key: auth,
             protocol: "anthropic".into(),
-            models: DEFAULT_MODEL_ENVS
-                .iter()
-                .filter_map(|key| json_str(&Value::Object(env.clone()), key))
-                .collect(),
+            models: mapped_models,
         });
 
         // 模型：顶层 model + DEFAULT_*_MODEL 三档映射。
         let top_model = json_str(&root, "model").unwrap_or_default();
+        let mut per_model_effort = std::collections::BTreeMap::new();
         for key in DEFAULT_MODEL_ENVS {
             let tier = key
                 .trim_start_matches("ANTHROPIC_DEFAULT_")
-                .trim_start_matches("_MODEL")
                 .trim_end_matches("_MODEL")
                 .to_lowercase();
             let Some(value) = json_str(&Value::Object(env.clone()), key) else {
                 continue;
             };
+            per_model_effort.insert(tier.clone(), value.clone());
             snap.models.push(ModelEntry {
-                id: value.clone(),
+                id: value,
                 name: format!("{tier} 档映射"),
-                provider: "anthropic".into(),
+                provider: managed_provider.clone(),
                 ..Default::default()
             });
-            // 兜底：tier 解析异常时至少保留条目。
-            let _ = tier;
         }
 
         snap.defaults = DefaultsSection {
             model: top_model,
-            provider: String::new(),
+            provider: managed_provider,
             reasoning_effort: String::new(),
             reasoning_effort_options: Vec::new(),
-            per_model_effort: Default::default(),
+            per_model_effort,
         };
         snap.context = ContextSection {
             context_window: None,
@@ -180,22 +187,19 @@ impl ToolAdapter for ClaudeAdapter {
         }
 
         // 三档模型映射：defaults.per_model_effort 复用为「档位 → 模型 ID」。
+        // 未给出的档位保持原值，避免生效时把用户已有 opus/sonnet/haiku 映射冲掉。
         for key in DEFAULT_MODEL_ENVS {
             let tier = key
                 .trim_start_matches("ANTHROPIC_DEFAULT_")
                 .trim_end_matches("_MODEL")
                 .to_lowercase();
-            env_updates.push((
-                (*key).to_string(),
-                Value::String(
-                    patch
-                        .defaults
-                        .per_model_effort
-                        .get(&tier)
-                        .cloned()
-                        .unwrap_or_default(),
-                ),
-            ));
+            if let Some(value) = patch.defaults.per_model_effort.get(&tier) {
+                if value.is_empty() {
+                    env_removals.push(*key);
+                } else {
+                    env_updates.push(((*key).to_string(), Value::String(value.clone())));
+                }
+            }
         }
 
         // 上下文与思考（env 部分）。
@@ -244,10 +248,13 @@ impl ToolAdapter for ClaudeAdapter {
             obj.insert("effortLevel".into(), value);
         }
 
-        obj.insert(
-            JSON_MARK_KEY.into(),
-            json!({ "managed": true, "manager": MANAGER_VALUE }),
-        );
+        let mut mark = serde_json::Map::new();
+        mark.insert("managed".into(), json!(true));
+        mark.insert("manager".into(), json!(MANAGER_VALUE));
+        if let Some(provider) = patch.providers.first().filter(|p| !p.id.is_empty()) {
+            mark.insert("provider".into(), json!(provider.id));
+        }
+        obj.insert(JSON_MARK_KEY.into(), Value::Object(mark));
         {
             let env = obj
                 .entry("env")

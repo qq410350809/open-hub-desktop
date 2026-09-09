@@ -392,6 +392,7 @@ function isRowApplied(row: ProxyInventoryRow) {
   if (activeTool.value === "claude") {
     const current = snapshot.value.providers[0];
     if (!current) return false;
+    if (current.id.startsWith("openhub-")) return current.id === row.id;
     const url = (current.baseUrl || "").replace(/\/+$/, "");
     const expected = gatewayBaseUrl.value.replace(/\/+$/, "");
     return url === expected || url === `${expected}/v1`;
@@ -422,6 +423,20 @@ function patchDefaults(selected?: ProxyInventoryRow) {
     defaults.provider = selected.id;
     if (selected.models[0]) defaults.model = selected.models[0];
   }
+  if (activeTool.value === "claude" && selected) {
+    const selectedModels = selected.models;
+    if (selectedModels[0]) defaults.model = selectedModels[0];
+    const tiers = ["opus", "sonnet", "haiku"];
+    tiers.forEach((tier, index) => {
+      const current = defaults.perModelEffort?.[tier] || "";
+      const bareCurrent = current.includes("/") ? current.slice(current.indexOf("/") + 1) : current;
+      const matched = selectedModels.find(
+        (model) => model === current || (bareCurrent && model.endsWith(`/${bareCurrent}`)),
+      );
+      const next = matched || selectedModels[index] || selectedModels[0];
+      if (next) defaults.perModelEffort[tier] = next;
+    });
+  }
   return defaults;
 }
 
@@ -435,8 +450,26 @@ async function applyRows(rows: ProxyInventoryRow[]) {
   if (!gatewayReady.value) {
     showToast("网关未在运行，仍会写入当前端口地址，启动后再用");
   }
-  const providers = rows.map(providerFromRow);
-  const models = rows.flatMap(modelsForPatch);
+  let providers = rows.map(providerFromRow);
+  let models = rows.flatMap(modelsForPatch);
+  if (switchEndpoint.value && rows.length === 1) {
+    const selected = rows[0];
+    const selectedProvider = providers[0];
+    // Codex 可以保存多家供应商；切换时只更新当前条目，已有 OpenHub 条目继续保留。
+    providers = [
+      ...(snapshot.value.providers || []).filter(
+        (provider) => !provider.id.startsWith("openhub-") && provider.id !== selected.id,
+      ),
+      ...(snapshot.value.providers || []).filter(
+        (provider) => provider.id.startsWith("openhub-") && provider.id !== selected.id,
+      ),
+      selectedProvider,
+    ];
+    models = [
+      ...(snapshot.value.models || []).filter((model) => model.provider !== selected.id),
+      ...modelsForPatch(selected),
+    ];
+  }
   const defaults = patchDefaults(rows.length === 1 ? rows[0] : undefined);
   const ok = await saveSnapshot({
     baseHash: snapshot.value.contentHash,
