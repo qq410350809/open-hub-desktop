@@ -1,6 +1,7 @@
 pub(crate) mod charity;
 pub(crate) mod core;
 pub mod kernel;
+pub(crate) mod local_tools;
 pub(crate) mod model;
 pub mod proxypool;
 pub(crate) mod site;
@@ -415,6 +416,11 @@ pub fn run() {
             token::mapping::remove_token_official_model,
             token::mapping::migrate_token_official_models,
             token::insight_commands::analyze_token_insights,
+            local_tools::list_local_tools,
+            local_tools::get_local_tool_config,
+            local_tools::save_local_tool_config,
+            local_tools::list_local_tool_backups,
+            local_tools::restore_local_tool_backup,
             web_server::get_login_state,
             web_server::login,
             web_server::logout,

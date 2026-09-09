@@ -159,6 +159,12 @@ fn is_local_only_command(command: &str) -> bool {
             | "get_token_raw_logs"
             | "get_token_request_health"
             | "get_local_agent_paths"
+            // 本地工具配置管理：读写用户主目录下的工具配置文件，仅限本地数据平面。
+            | "list_local_tools"
+            | "get_local_tool_config"
+            | "save_local_tool_config"
+            | "list_local_tool_backups"
+            | "restore_local_tool_backup"
             | "list_chrome_sessions"
             | "read_chrome_session"
             | "open_url_in_chrome_profile"

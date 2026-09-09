@@ -985,3 +985,118 @@ export interface GeoipDownloadProgress {
   message: string;
 }
 
+
+// —— 本地 AI 编程工具模型配置管理（local_tools）——
+export type LocalToolId =
+  | "claude"
+  | "codex"
+  | "opencode"
+  | "zcode"
+  | "antigravity"
+  | "dsh"
+  | "command-code";
+
+/** 工具如何使用供应商：一路接入 / 一次切一家 / 一次加载全部。 */
+export type LocalToolProviderMode = "single" | "switch" | "all";
+
+export interface LocalToolProviderEntry {
+  id: string;
+  name: string;
+  baseUrl: string;
+  apiKey?: string;
+  protocol: string;
+  models: string[];
+}
+
+export interface LocalToolModelEntry {
+  id: string;
+  name: string;
+  provider: string;
+  contextWindow: number;
+  maxOutput: number;
+}
+
+export interface LocalToolDefaultsSection {
+  model: string;
+  provider: string;
+  reasoningEffort: string;
+  reasoningEffortOptions: string[];
+  perModelEffort: Record<string, string>;
+}
+
+export interface LocalToolContextSection {
+  contextWindow: number | null;
+  autoCompactTokenLimit: number | null;
+  maxOutputTokens: number | null;
+  maxThinkingTokens: number | null;
+}
+
+export interface LocalToolThinkingSection {
+  effortLevel: string;
+  effortLevelOptions: string[];
+  maxThinkingTokens: number | null;
+}
+
+export interface LocalToolConfigFile {
+  kind: string;
+  label: string;
+  path: string;
+  exists: boolean;
+}
+
+export interface LocalToolConfigSnapshot {
+  tool: string;
+  toolName: string;
+  files: LocalToolConfigFile[];
+  providers: LocalToolProviderEntry[];
+  models: LocalToolModelEntry[];
+  defaults: LocalToolDefaultsSection;
+  context: LocalToolContextSection;
+  thinking: LocalToolThinkingSection;
+  contentHash: string;
+  effectNote: string;
+  warning: string;
+  providerMode: LocalToolProviderMode;
+}
+
+export interface LocalToolOverview {
+  tool: string;
+  toolName: string;
+  detected: boolean;
+  hasTokenRecords: boolean;
+  collectedSessions: number;
+  collectedEvents: number;
+  root: string;
+  providerCount: number;
+  defaultModel: string;
+  effectNote: string;
+  providerMode: LocalToolProviderMode;
+}
+
+export interface LocalToolListReport {
+  available: boolean;
+  home: string;
+  tools: LocalToolOverview[];
+  collectedAt: string;
+}
+
+export interface LocalToolConfigPatch {
+  baseHash: string;
+  providers: LocalToolProviderEntry[];
+  models: LocalToolModelEntry[];
+  defaults: LocalToolDefaultsSection;
+  context: LocalToolContextSection;
+  thinking: LocalToolThinkingSection;
+}
+
+export interface LocalToolConfigSaveResult {
+  snapshot: LocalToolConfigSnapshot;
+  backupName: string;
+}
+
+export interface LocalToolBackupEntry {
+  name: string;
+  fileLabel: string;
+  size: number;
+  createdAt: string;
+}

@@ -35,6 +35,7 @@ import ProxyPoolPage from "./components/pages/ProxyPoolPage.vue";
 import TokenStatsPage from "./components/pages/TokenStatsPage.vue";
 import ModelCatalogPage from "./components/pages/ModelCatalogPage.vue";
 import ModelProxyPage from "./components/pages/ModelProxyPage.vue";
+import LocalToolsPage from "./components/pages/LocalToolsPage.vue";
 
 const store = useStore();
 const { preferences } = usePreferences();
@@ -271,6 +272,7 @@ function onMenuNavigate(event: Event) {
   else if (page === "proxy") store.openProxyPool();
   else if (page === "tokenstats") store.openTokenStats();
   else if (page === "gatewaystats") store.openGatewayStats();
+  else if (page === "localtools") store.openLocalTools();
   else if (page === "settings") store.openSettings();
 }
 
@@ -374,6 +376,14 @@ onUnmounted(() => {
           aria-labelledby="gatewaystats-nav"
         >
           <TokenStatsPage mode="proxy" />
+        </div>
+        <div
+          v-else-if="store.page.value === 'localtools'"
+          id="local-tools-panel"
+          class="local-tools-panel"
+          aria-labelledby="localtools-nav"
+        >
+          <LocalToolsPage />
         </div>
       </div>
     </div>

@@ -48,6 +48,14 @@ const navItems = computed(() => [
     onClick: () => store.openGatewayStats(),
   },
   {
+    id: "localtools",
+    label: "本地工具",
+    icon: icons.monitor,
+    active: store.page.value === "localtools",
+    badge: "",
+    onClick: () => store.openLocalTools(),
+  },
+  {
     id: "library",
     label: "站点库",
     icon: icons.database,

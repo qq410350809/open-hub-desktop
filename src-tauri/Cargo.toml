@@ -58,6 +58,8 @@ wreq = { version = "0.15.3", features = ["json", "stream", "gzip", "deflate", "b
 wreq-util = "0.1.0"
 quick-xml = { version = "0.39.4", features = ["serialize"] }
 serde_yaml = "0.9"
+# Codex config.toml 等保格式 TOML 编辑（保留注释与既有排版）。
+toml_edit = "0.22"
 base64 = "0.22"
 sha2 = "0.10"
 hex = "0.4"

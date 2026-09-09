@@ -33,6 +33,12 @@ export const LOCAL_TOKEN_COMMANDS = new Set([
   "reopen_token_model_mapping",
   "analyze_token_model_mappings",
   "analyze_token_insights",
+  // 本地工具模型配置管理（读写用户主目录配置文件，仅本地数据平面）。
+  "list_local_tools",
+  "get_local_tool_config",
+  "save_local_tool_config",
+  "list_local_tool_backups",
+  "restore_local_tool_backup",
 ]);
 
 function localUnavailable(command: string): Error {

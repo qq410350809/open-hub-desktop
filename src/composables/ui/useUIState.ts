@@ -5,7 +5,7 @@ import type { SiteRecord, SiteLinkKind } from "../../types";
 const { sites } = useLibrary();
 
 // 页面状态（tokenstats = 本地客户端统计；gatewaystats = 反代网关服务端统计）
-const page = ref<"library" | "modelparams" | "modelproxy" | "charity" | "proxy" | "tokenstats" | "gatewaystats" | "settings">("tokenstats");
+const page = ref<"library" | "modelparams" | "modelproxy" | "charity" | "proxy" | "tokenstats" | "gatewaystats" | "localtools" | "settings">("tokenstats");
 const editingId = ref<string | null>(null);
 const activeTab = ref<"basic" | "features" | "maintenance">("basic");
 
@@ -46,6 +46,7 @@ function openCharityMonitor() { page.value = "charity"; }
 function openProxyPool() { page.value = "proxy"; }
 function openTokenStats() { page.value = "tokenstats"; }
 function openGatewayStats() { page.value = "gatewaystats"; }
+function openLocalTools() { page.value = "localtools"; }
 
 function openSiteModelsDialog(site: SiteRecord) {
   siteModelsSite.value = site;
@@ -134,6 +135,7 @@ export function useUIState() {
     openProxyPool,
     openTokenStats,
     openGatewayStats,
+    openLocalTools,
     openSiteModelsDialog,
     closeSiteModelsDialog,
     openSiteTestDialog,
