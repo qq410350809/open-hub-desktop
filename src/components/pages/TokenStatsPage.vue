@@ -1939,6 +1939,7 @@ const trendChartOption = computed<EChartsOption>(() => {
       tooltip: {
         trigger: "axis",
         axisPointer: { type: "shadow" },
+        confine: true,
         backgroundColor: isDark ? "rgba(15, 23, 42, 0.95)" : "rgba(255, 255, 255, 0.95)",
         borderColor: isDark ? "rgba(255, 255, 255, 0.15)" : "rgba(0, 0, 0, 0.1)",
         textStyle: { color: isDark ? "#f8fafc" : "#0f172a", fontSize: 12 },
@@ -2006,6 +2007,7 @@ const trendChartOption = computed<EChartsOption>(() => {
     return {
       tooltip: {
         trigger: "axis",
+        confine: true,
         backgroundColor: isDark ? "rgba(15, 23, 42, 0.95)" : "rgba(255, 255, 255, 0.95)",
         borderColor: isDark ? "rgba(255, 255, 255, 0.15)" : "rgba(0, 0, 0, 0.1)",
         textStyle: { color: isDark ? "#f8fafc" : "#0f172a", fontSize: 12 },
@@ -2055,6 +2057,7 @@ const trendChartOption = computed<EChartsOption>(() => {
   return {
     tooltip: {
       trigger: "axis",
+      confine: true,
       backgroundColor: isDark ? "rgba(15, 23, 42, 0.95)" : "rgba(255, 255, 255, 0.95)",
       borderColor: isDark ? "rgba(255, 255, 255, 0.15)" : "rgba(0, 0, 0, 0.1)",
       textStyle: { color: isDark ? "#f8fafc" : "#0f172a", fontSize: 12 },

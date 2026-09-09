@@ -2495,6 +2495,7 @@ function buildRequestsChartOption(points: OverviewChartPoint[]): EChartsOption {
     tooltip: {
       trigger: "axis",
       axisPointer: { type: "shadow" },
+      confine: true,
       backgroundColor: th.tooltipBg,
       borderColor: th.tooltipBorder,
       textStyle: { color: th.tooltipText, fontSize: 12 },
@@ -2554,6 +2555,7 @@ function buildTokensChartOption(points: OverviewChartPoint[]): EChartsOption {
     tooltip: {
       trigger: "axis",
       axisPointer: { type: "shadow" },
+      confine: true,
       backgroundColor: th.tooltipBg,
       borderColor: th.tooltipBorder,
       textStyle: { color: th.tooltipText, fontSize: 12 },
