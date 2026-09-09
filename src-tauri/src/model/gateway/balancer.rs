@@ -5,7 +5,6 @@ use super::types::{
 };
 use serde_json::Value as JsonValue;
 use std::collections::HashSet;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tracing::warn;
 
@@ -419,7 +418,8 @@ pub async fn resolve_channel_key_groups_for_model(
     result
 }
 
-/// 解析渠道当前可用的 API Keys（扁平化全量列表，用于无需区分模型/分组的通用场景）。
+/// 解析渠道当前可用的 API Keys（扁平化全量列表，用于无需区分模型/分组的通用场景，
+/// 如模型列表探测——同一端点须遍历全部 Key 以聚合各账号的模型权限）。
 pub async fn resolve_channel_api_keys(
     ctx: &ModelProxyContext,
     channel: &ChannelConfig,
@@ -436,16 +436,6 @@ pub async fn resolve_channel_api_keys(
         .filter(|k| k.enabled && !disabled_group_ids.contains(k.group_id.as_str()))
         .map(|k| k.key)
         .collect()
-}
-
-/// 选择渠道当前可用的 API Key（全局通用轮询，无模型上下文时的兼容回退）。
-pub async fn select_channel_api_key(ctx: &ModelProxyContext, channel: &ChannelConfig) -> String {
-    let keys = resolve_channel_api_keys(ctx, channel).await;
-    if keys.is_empty() {
-        return String::new();
-    }
-    let idx = ctx.key_round_robin.fetch_add(1, Ordering::Relaxed) % keys.len();
-    keys[idx].clone()
 }
 
 pub fn format_upstream_error_message(status: u16, error_body: &str) -> String {

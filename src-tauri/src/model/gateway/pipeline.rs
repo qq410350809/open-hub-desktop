@@ -5,8 +5,8 @@
 //! 各入口文件只负责：入参解析、客户端协议 ↔ OpenAI 中枢转换、响应回转。
 
 use super::balancer::{
-    resolve_channel, resolve_channel_candidates, resolve_channel_key_groups_for_model,
-    select_channel_api_key, ResolvedKeyGroup,
+    load_channel_all_keys_info, resolve_channel, resolve_channel_candidates,
+    resolve_channel_key_groups_for_model, ResolvedKeyGroup,
 };
 use super::dispatcher::{execute_resilient_egress, EgressRequestMeta, EgressSuccess};
 use super::egress::{self, TargetProtocol};
@@ -363,7 +363,8 @@ impl EgressOutcome {
 /// 单个渠道内的完整尝试：兼容性校验 → 出网准备（含同协议快速通道）→ 弹性调度。
 ///
 /// 渠道内的 Key 分组与出口节点全部耗尽后返回 `Err`；跨渠道故障转移由外层
-/// `dispatch_protocol_egress` 负责。
+/// `dispatch_protocol_egress` 负责。渠道有 Key 但无一支持该模型时同样返回
+/// `Err`（越权拦截：绝不回退使用与模型不匹配的 Key）。
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_single_channel_egress(
     ctx: &ModelProxyContext,
@@ -386,9 +387,42 @@ async fn dispatch_single_channel_egress(
     let key_groups = resolve_channel_key_groups_for_model(ctx, channel, model_to_send).await;
 
     let attempts: Vec<KeyAttempt> = if key_groups.is_empty() {
-        // 无任何可用 Key：单次尝试（空 Key，用于免 Key 渠道）
+        // 空分组有两种成因，必须区分处理：
+        // ① 渠道一个 Key 都没有（免 Key 渠道，如 opencode）：按原样空 Key 单次尝试；
+        // ② 渠道有 Key，但没有任何 Key 声明支持该模型（或 Key/分组全部被禁用）：
+        //    此时改用任意其他 Key 出网即构成越权 —— 该 Key 并未获得此模型的访问授权。
+        //    必须判该渠道无候选并跳过，交由上层跨渠道故障转移，
+        //    让真正有 Key 支持该模型的渠道按「分组顺序 + 组内轮询模式」编排。
+        let all_keys = load_channel_all_keys_info(ctx, channel).await;
+        if !all_keys.is_empty() {
+            let err_msg = if all_keys.iter().all(|k| !k.enabled) {
+                format!("渠道「{chan_alias}」的所有 API Key 均被禁用，已跳过该渠道")
+            } else {
+                format!(
+                    "渠道「{chan_alias}」没有任何 API Key 支持模型「{model_to_send}」，已跳过该渠道（不越权使用其他 Key）"
+                )
+            };
+            record_attempt_failure(
+                ctx,
+                ProxyLogParams::new_failure(
+                    req_id.to_string(),
+                    path.to_string(),
+                    chan_alias.clone(),
+                    raw_model.to_string(),
+                    is_stream,
+                    400,
+                    start_time.elapsed().as_millis() as u64,
+                    Some(err_msg.clone()),
+                    req_body_str.clone(),
+                    None,
+                )
+                .with_channel_stats_id(chan_stats_id.map(|v| v.to_string())),
+            )
+            .await;
+            return Err(incompatible_model_response(err_msg, style));
+        }
         vec![KeyAttempt {
-            key: select_channel_api_key(ctx, channel).await,
+            key: String::new(),
             group_label: String::new(),
         }]
     } else {

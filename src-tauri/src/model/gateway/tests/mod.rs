@@ -264,7 +264,7 @@ fn sanitize_trims_and_prunes_model_channel_order() {
 }
 
 #[tokio::test]
-async fn multi_key_round_robin_selection() {
+async fn multi_key_expansion_preserves_config_order() {
     let ch = ChannelConfig {
         id: "multi".to_string(),
         name: "Multi Key".to_string(),
@@ -296,16 +296,11 @@ async fn multi_key_round_robin_selection() {
     let keys = ch.get_effective_keys();
     assert_eq!(keys, vec!["key-1", "key-2", "key-3"]);
 
+    // 无模型上下文的全量 Key 展开（模型列表探测等场景用）保持配置顺序；
+    // 请求级 Key 轮询已收敛到分组调度（见 pipeline 的 build_key_attempt_queue 测试）
     let state = ModelProxyState::new_with_app(None);
-    let k1 = select_channel_api_key(&state.context, &ch).await;
-    let k2 = select_channel_api_key(&state.context, &ch).await;
-    let k3 = select_channel_api_key(&state.context, &ch).await;
-    let k4 = select_channel_api_key(&state.context, &ch).await;
-
-    assert_eq!(k1, "key-1");
-    assert_eq!(k2, "key-2");
-    assert_eq!(k3, "key-3");
-    assert_eq!(k4, "key-1");
+    let keys = resolve_channel_api_keys(&state.context, &ch).await;
+    assert_eq!(keys, vec!["key-1", "key-2", "key-3"]);
 }
 
 #[tokio::test]
@@ -1154,9 +1149,9 @@ async fn opencode_model_compatibility_and_anonymous_mode() {
     };
 
     let state = ModelProxyState::new_with_app(None);
-    let selected_key = select_channel_api_key(&state.context, &ch_no_key).await;
-    // 匿名模式：未配置 Key 时始终为空字符串
-    assert!(selected_key.is_empty());
+    // 匿名模式：未配置 Key 时可用 Key 列表为空，出网 Key 为空字符串
+    assert!(resolve_channel_api_keys(&state.context, &ch_no_key).await.is_empty());
+    let selected_key = String::new();
 
     // 免费模型在无 Key 匿名模式下通过校验
     assert!(
@@ -1177,8 +1172,11 @@ async fn opencode_model_compatibility_and_anonymous_mode() {
         api_key: "sk-custom-key".to_string(),
         ..ch_no_key
     };
-    let selected_explicit = select_channel_api_key(&state.context, &ch_explicit_key).await;
-    assert_eq!(selected_explicit, "sk-custom-key");
+    assert_eq!(
+        resolve_channel_api_keys(&state.context, &ch_explicit_key).await,
+        vec!["sk-custom-key"]
+    );
+    let selected_explicit = "sk-custom-key";
     assert!(
         check_model_channel_compatibility(&ch_explicit_key, "gpt-4o", &selected_explicit).is_ok()
     );
@@ -2294,6 +2292,136 @@ async fn aliased_request_stays_on_designated_channel_at_dispatch_layer() {
         good_hits.load(Ordering::SeqCst),
         0,
         "未被指派的渠道绝不能收到请求"
+    );
+}
+
+/// 越权拦截（端到端）：渠道有 Key 但没有任何 Key 支持请求的模型时，
+/// 绝不能回退用任意 Key 出网。该渠道必须被静默跳过（上游零请求），
+/// 由跨渠道故障转移交给真正有 Key 支持该模型的渠道承接。
+#[tokio::test]
+async fn channel_without_matching_key_is_skipped_instead_of_privilege_escalation() {
+    use crate::model::gateway::pipeline::{dispatch_protocol_egress, ClientProtocol};
+    use std::sync::atomic::Ordering;
+    use std::time::Instant;
+
+    // 首选渠道：仅有一个 Key，其 supported_models 不含请求模型 → 该模型无匹配 Key
+    let (primary_addr, primary_hits) =
+        spawn_scripted_upstream(vec![(axum::http::StatusCode::OK, valid_chat_payload())]).await;
+    let mut primary = egress_test_channel("primary", format!("http://{primary_addr}/v1"));
+    primary.enabled_models = Some(vec!["shared-model".to_string()]);
+    primary.api_keys = Some(vec!["key-only-other-model".to_string()]);
+    primary.key_rules = Some(vec![ChannelKeyRule {
+        key: "key-only-other-model".to_string(),
+        group_id: String::new(),
+        enabled: true,
+        supported_models: Some(vec!["other-model".to_string()]),
+        fixed_channel_id: None,
+    }]);
+
+    // 后备渠道：免 Key 渠道，正常返回
+    let (backup_addr, backup_hits) =
+        spawn_scripted_upstream(vec![(axum::http::StatusCode::OK, valid_chat_payload())]).await;
+    let mut backup = egress_test_channel("backup", format!("http://{backup_addr}/v1"));
+    backup.enabled_models = Some(vec!["shared-model".to_string()]);
+
+    let state = ModelProxyState::new_with_app(None);
+    let ctx = &state.context;
+    ctx.route_enabled.store(true, Ordering::Release);
+    let config = ModelProxyConfig {
+        enabled: true,
+        max_retries: 0,
+        channels: vec![primary.clone(), backup.clone()],
+        ..ModelProxyConfig::default()
+    };
+
+    let outcome = dispatch_protocol_egress(
+        ctx,
+        &config,
+        &primary,
+        "shared-model",
+        "shared-model",
+        "/v1/chat/completions",
+        "req_no_escalation",
+        false,
+        Instant::now(),
+        &None,
+        crate::model::gateway::egress::EgressBody::native(json!({ "model": "shared-model" })),
+        ClientProtocol::OpenAi,
+    )
+    .await
+    .expect("无匹配 Key 的渠道被跳过后应由后备渠道承接");
+
+    assert_eq!(outcome.chan_alias, "backup", "应由后备渠道实际承接");
+    assert_eq!(
+        primary_hits.load(Ordering::SeqCst),
+        0,
+        "没有任何 Key 支持该模型的渠道绝不能发出越权请求"
+    );
+    assert_eq!(backup_hits.load(Ordering::SeqCst), 1);
+}
+
+/// 越权拦截（单渠道）：全部候选渠道都没有支持该模型的 Key 时，
+/// 返回 400 并说明拦截原因，而不是拿任意 Key 出网。
+#[tokio::test]
+async fn single_channel_without_matching_key_rejects_instead_of_privilege_escalation() {
+    use crate::model::gateway::pipeline::{dispatch_protocol_egress, ClientProtocol};
+    use std::sync::atomic::Ordering;
+    use std::time::Instant;
+
+    let (primary_addr, primary_hits) =
+        spawn_scripted_upstream(vec![(axum::http::StatusCode::OK, valid_chat_payload())]).await;
+    let mut primary = egress_test_channel("primary", format!("http://{primary_addr}/v1"));
+    primary.enabled_models = Some(vec!["shared-model".to_string()]);
+    primary.api_keys = Some(vec!["key-only-other-model".to_string()]);
+    primary.key_rules = Some(vec![ChannelKeyRule {
+        key: "key-only-other-model".to_string(),
+        group_id: String::new(),
+        enabled: true,
+        supported_models: Some(vec!["other-model".to_string()]),
+        fixed_channel_id: None,
+    }]);
+
+    let state = ModelProxyState::new_with_app(None);
+    let ctx = &state.context;
+    ctx.route_enabled.store(true, Ordering::Release);
+    let config = ModelProxyConfig {
+        enabled: true,
+        max_retries: 0,
+        channels: vec![primary.clone()],
+        ..ModelProxyConfig::default()
+    };
+
+    let result = dispatch_protocol_egress(
+        ctx,
+        &config,
+        &primary,
+        "shared-model",
+        "shared-model",
+        "/v1/chat/completions",
+        "req_reject_escalation",
+        false,
+        Instant::now(),
+        &None,
+        crate::model::gateway::egress::EgressBody::native(json!({ "model": "shared-model" })),
+        ClientProtocol::OpenAi,
+    )
+    .await;
+
+    let resp = match result {
+        Ok(_) => panic!("应拒绝请求而非越权出网"),
+        Err(resp) => resp,
+    };
+    assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
+    let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(
+        text.contains("没有任何 API Key 支持"),
+        "错误体应说明越权拦截原因: {text}"
+    );
+    assert_eq!(
+        primary_hits.load(Ordering::SeqCst),
+        0,
+        "被拦截的渠道绝不能发出任何上游请求"
     );
 }
 
