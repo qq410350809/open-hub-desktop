@@ -164,7 +164,6 @@ pub(crate) fn model(id: &str, provider: &str) -> ModelEntry {
 pub(crate) mod antigravity;
 pub(crate) mod claude;
 pub(crate) mod codex;
-pub(crate) mod commandcode;
 pub(crate) mod dsh;
 pub(crate) mod opencode;
 pub(crate) mod zcode;
@@ -177,7 +176,6 @@ pub(crate) fn full_adapters() -> Vec<&'static dyn ToolAdapter> {
         &opencode::OpencodeAdapter,
         &zcode::ZcodeAdapter,
         &dsh::DshAdapter,
-        &commandcode::CommandCodeAdapter,
     ]
 }
 

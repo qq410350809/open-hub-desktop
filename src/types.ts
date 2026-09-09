@@ -993,8 +993,7 @@ export type LocalToolId =
   | "opencode"
   | "zcode"
   | "antigravity"
-  | "dsh"
-  | "command-code";
+  | "dsh";
 
 /** 工具如何使用供应商：一路接入 / 一次切一家 / 一次加载全部。 */
 export type LocalToolProviderMode = "single" | "switch" | "all";

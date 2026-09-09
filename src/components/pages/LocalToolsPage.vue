@@ -112,7 +112,6 @@ const activeOverview = computed(
 
 const PROVIDER_MODE_BY_TOOL: Record<string, LocalToolProviderMode> = {
   claude: "single",
-  "command-code": "single",
   antigravity: "single",
   codex: "switch",
   opencode: "all",
@@ -128,7 +127,6 @@ const providerMode = computed<LocalToolProviderMode>(() =>
 );
 const switchEndpoint = computed(() => providerMode.value === "switch");
 const allEndpoint = computed(() => providerMode.value === "all");
-const officialLoginOnly = computed(() => activeTool.value === "command-code");
 
 const providerModeLabel = computed(() => {
   if (providerMode.value === "single") return "一路接入";
@@ -136,9 +134,6 @@ const providerModeLabel = computed(() => {
   return "一次全部";
 });
 const providerModeHint = computed(() => {
-  if (officialLoginOnly.value) {
-    return "Command Code 走官方登录，不能把反代站点写进它的配置。";
-  }
   if (providerMode.value === "single") {
     return "该工具只有一路接入。点某一行「生效」，会把这一路指到网关，并用该渠道的别名定向。";
   }
@@ -229,7 +224,6 @@ function modelsForInventory(channel: ChannelConfig, account: SiteModelCacheAccou
 }
 
 const inventoryRows = computed<ProxyInventoryRow[]>(() => {
-  if (officialLoginOnly.value) return [];
   const rows: ProxyInventoryRow[] = [];
   for (const channel of proxyConfig.value?.channels ?? []) {
     const alias = channelAlias(channel);
@@ -650,7 +644,7 @@ onUnmounted(() => {
 
       <div v-if="activeTool" class="lt-cockpit-right">
         <button
-          v-if="allEndpoint && !officialLoginOnly"
+          v-if="allEndpoint"
           type="button"
           class="lt-btn-primary"
           :disabled="saving || snapshotLoading || !usableRows.length"
@@ -693,7 +687,7 @@ onUnmounted(() => {
             </h4>
             <p v-if="snapshot?.effectNote" class="section-note">{{ snapshot.effectNote }}</p>
             <p class="section-note">{{ providerModeHint }}</p>
-            <p v-if="!officialLoginOnly" class="section-note">
+            <p class="section-note">
               写入地址 {{ gatewayBaseUrl }} · {{ gatewayReady ? "网关运行中" : "网关未运行" }}
             </p>
           </div>
@@ -702,14 +696,6 @@ onUnmounted(() => {
         <p v-if="snapshot?.warning" class="snapshot-warning">{{ snapshot.warning }}</p>
 
         <div v-if="snapshotLoading || siteCachesLoading" class="detail-loading">读取配置中…</div>
-
-        <template v-else-if="officialLoginOnly">
-          <div class="provider-empty">
-            <div class="provider-empty-icon" v-html="icons.monitor"></div>
-            <strong>不支持第三方站点</strong>
-            <span>Command Code 只走官方登录，不会把反代清单写进它的配置文件。</span>
-          </div>
-        </template>
 
         <template v-else-if="snapshot">
           <div v-if="inventoryRows.length" class="provider-list">

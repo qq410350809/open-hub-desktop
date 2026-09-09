@@ -19,7 +19,6 @@ pub enum ToolId {
     Zcode,
     Antigravity,
     Dsh,
-    CommandCode,
 }
 
 impl ToolId {
@@ -31,7 +30,6 @@ impl ToolId {
             ToolId::Zcode => "zcode",
             ToolId::Antigravity => "antigravity",
             ToolId::Dsh => "dsh",
-            ToolId::CommandCode => "command-code",
         }
     }
 
@@ -44,7 +42,6 @@ impl ToolId {
             "zcode" => ToolId::Zcode,
             "antigravity" => ToolId::Antigravity,
             "dsh" => ToolId::Dsh,
-            "command-code" => ToolId::CommandCode,
             _ => return None,
         })
     }
@@ -57,14 +54,13 @@ impl ToolId {
             ToolId::Zcode => "ZCode",
             ToolId::Antigravity => "Google Antigravity",
             ToolId::Dsh => "DeepSeek CLI (DSH)",
-            ToolId::CommandCode => "Command Code",
         }
     }
 
     /// 该工具如何使用供应商：一路接入 / 一次切一家 / 一次加载全部。
     pub fn provider_mode(&self) -> ProviderMode {
         match self {
-            ToolId::Claude | ToolId::CommandCode | ToolId::Antigravity => ProviderMode::Single,
+            ToolId::Claude | ToolId::Antigravity => ProviderMode::Single,
             ToolId::Codex => ProviderMode::Switch,
             ToolId::Opencode | ToolId::Zcode | ToolId::Dsh => ProviderMode::All,
         }
@@ -143,7 +139,7 @@ pub struct DefaultsSection {
     pub reasoning_effort: String,
     /// 该工具支持的思考级别档位（下拉选项）。
     pub reasoning_effort_options: Vec<String>,
-    /// 按模型的思考级别映射（如 command-code / opencode variants）。
+    /// 按模型的思考级别映射（如 opencode variants）。
     pub per_model_effort: BTreeMap<String, String>,
 }
 
@@ -289,7 +285,6 @@ mod tests {
     #[test]
     fn provider_mode_matches_tool_capability() {
         assert_eq!(ToolId::Claude.provider_mode(), ProviderMode::Single);
-        assert_eq!(ToolId::CommandCode.provider_mode(), ProviderMode::Single);
         assert_eq!(ToolId::Antigravity.provider_mode(), ProviderMode::Single);
         assert_eq!(ToolId::Codex.provider_mode(), ProviderMode::Switch);
         assert_eq!(ToolId::Opencode.provider_mode(), ProviderMode::All);
