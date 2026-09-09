@@ -141,6 +141,20 @@ fn resolves_channels_with_alias_prefix_or_model_whitelist() {
     assert_eq!(model, "deepseek-chat");
 }
 
+#[test]
+fn resolves_models_prefixed_by_openhub_local_provider() {
+    let mut cfg = ModelProxyConfig::default();
+    cfg.channels = vec![
+        order_test_channel("opencode", "opencode", true),
+        order_test_channel("site-a", "x666", true),
+    ];
+
+    let (ch, model) = resolve_channel(&cfg, "openhub-site_a_acc_0/x666/claude-sonnet-5")
+        .expect("OpenHub provider 前缀后仍应按 alias 路由");
+    assert_eq!(ch.id, "site-a");
+    assert_eq!(model, "claude-sonnet-5");
+}
+
 /// 构造最小可用渠道：全暴露（白名单为 None）
 fn order_test_channel(id: &str, alias: &str, enabled: bool) -> ChannelConfig {
     ChannelConfig {

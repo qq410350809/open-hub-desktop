@@ -8,6 +8,17 @@ use std::collections::HashSet;
 use std::time::Duration;
 use tracing::warn;
 
+/// OpenHub 写入部分本地工具时会把自身的 provider id 放在模型名前面，
+/// 例如 `openhub-site_a_acc_0/x666/claude-sonnet`。这个前缀只属于客户端
+/// 配置层，网关仍应按后面的渠道 alias 定向路由。
+fn strip_openhub_provider_prefix(model: &str) -> &str {
+    model
+        .split_once('/')
+        .filter(|(prefix, _)| prefix.starts_with("openhub-"))
+        .map(|(_, rest)| rest)
+        .unwrap_or(model)
+}
+
 /// 渠道是否对外暴露指定模型：白名单为空(None) = 全部暴露，否则须包含该模型（大小写不敏感）
 fn channel_exposes_model(channel: &ChannelConfig, model: &str) -> bool {
     channel.enabled_models.as_ref().map_or(true, |models| {
@@ -26,8 +37,9 @@ pub fn resolve_channel<'a>(
     config: &'a ModelProxyConfig,
     raw_model: &str,
 ) -> Option<(&'a ChannelConfig, String)> {
+    let normalized = strip_openhub_provider_prefix(raw_model);
     // 1. 带前缀别名匹配 (如 x666/claude-sonnet-5)
-    if let Some((prefix, rest)) = raw_model.split_once('/') {
+    if let Some((prefix, rest)) = normalized.split_once('/') {
         if let Some(ch) = config
             .channels
             .iter()
@@ -37,7 +49,7 @@ pub fn resolve_channel<'a>(
         }
     }
 
-    let stripped = strip_opencode_prefix(raw_model);
+    let stripped = strip_opencode_prefix(normalized);
 
     // 2. 用户配置的重叠模型路由顺序：按列表序找首个启用且暴露该模型的渠道。
     //    raw 与 stripped 双查，兼容白名单里同时存在带/不带前缀写法的情况。
@@ -52,7 +64,7 @@ pub fn resolve_channel<'a>(
                     })
                 })
         };
-        if let Some(ch) = lookup(raw_model).or_else(|| lookup(stripped)) {
+        if let Some(ch) = lookup(normalized).or_else(|| lookup(stripped)) {
             return Some((ch, stripped.to_string()));
         }
     }
@@ -63,7 +75,7 @@ pub fn resolve_channel<'a>(
             && c.enabled_models.as_ref().map_or(false, |models| {
                 models
                     .iter()
-                    .any(|m| m.eq_ignore_ascii_case(stripped) || m.eq_ignore_ascii_case(raw_model))
+                    .any(|m| m.eq_ignore_ascii_case(stripped) || m.eq_ignore_ascii_case(normalized))
             })
     }) {
         return Some((ch, stripped.to_string()));
@@ -98,8 +110,9 @@ pub fn resolve_channel_candidates<'a>(
     config: &'a ModelProxyConfig,
     raw_model: &str,
 ) -> Vec<(&'a ChannelConfig, String)> {
+    let normalized = strip_openhub_provider_prefix(raw_model);
     // 带前缀 = 定向指派，不扩展后备渠道（与 resolve_channel 规则 1 对齐）
-    if let Some((prefix, rest)) = raw_model.split_once('/') {
+    if let Some((prefix, rest)) = normalized.split_once('/') {
         if let Some(ch) = config
             .channels
             .iter()
@@ -109,7 +122,7 @@ pub fn resolve_channel_candidates<'a>(
         }
     }
 
-    let stripped = strip_opencode_prefix(raw_model);
+    let stripped = strip_opencode_prefix(normalized);
     let mut ordered: Vec<&'a ChannelConfig> = Vec::new();
     let push = |ch: &'a ChannelConfig, out: &mut Vec<&'a ChannelConfig>| {
         if !out.iter().any(|c| c.id == ch.id) {
@@ -120,7 +133,7 @@ pub fn resolve_channel_candidates<'a>(
     // 1. 用户配置的重叠模型路由顺序：整条列表都是候选，而非只取首个
     if let Some(order) = &config.model_channel_order {
         let ids = order
-            .get(&raw_model.to_lowercase())
+            .get(&normalized.to_lowercase())
             .or_else(|| order.get(&stripped.to_lowercase()));
         if let Some(ids) = ids {
             for channel_id in ids {
@@ -139,7 +152,7 @@ pub fn resolve_channel_candidates<'a>(
             && c.enabled_models.as_ref().is_some_and(|models| {
                 models
                     .iter()
-                    .any(|m| m.eq_ignore_ascii_case(stripped) || m.eq_ignore_ascii_case(raw_model))
+                    .any(|m| m.eq_ignore_ascii_case(stripped) || m.eq_ignore_ascii_case(normalized))
             })
     }) {
         push(ch, &mut ordered);
