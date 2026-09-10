@@ -28,58 +28,39 @@ fn app_data_dir() -> Result<PathBuf, String> {
     Ok(base.join(crate::core::profile::app_support_dir_name()))
 }
 
-/// token 采集统计（source → sessions/events）。
-fn collected_stats() -> std::collections::BTreeMap<String, crate::token::collector::SourceCollectStats>
-{
-    crate::token::collector::aggregator::collected_stats_by_source()
-}
-
 /// 全部支持结构化编辑的工具概览。
+///
+/// 只做存在性探测（stat 配置根目录/关键文件），不解析配置内容；
+/// 供应商数、默认模型等摘要在选中工具后由 get_local_tool_config 按需读取。
 pub(crate) fn build_tool_list(home: &Path) -> ToolListReport {
-    let stats = collected_stats();
     let mut tools = Vec::new();
 
     for adapter in full_adapters() {
         let (detected, root) = adapter.detect(home);
-        let snap_stat = adapter.snapshot(home).ok();
-        let (provider_count, default_model) = match &snap_stat {
-            Some(snap) => (snap.providers.len(), snap.defaults.model.clone()),
-            None => (0, String::new()),
-        };
         let id = adapter.id();
-        let collected = stats.get(id.as_str());
         tools.push(ToolOverview {
             tool: id.as_str().to_string(),
             tool_name: id.display_name().to_string(),
             detected,
-            has_token_records: collected.is_some(),
-            collected_sessions: collected.map(|s| s.sessions).unwrap_or(0),
-            collected_events: collected.map(|s| s.events).unwrap_or(0),
+            has_token_records: false,
+            collected_sessions: 0,
+            collected_events: 0,
             root,
-            provider_count,
-            default_model,
+            provider_count: 0,
+            default_model: String::new(),
             effect_note: adapter.effect_note().to_string(),
             provider_mode: id.provider_mode(),
         });
     }
 
-    // 展示顺序：有 token 记录的在前，其余按名称。
-    tools.sort_by(|a, b| {
-        b.has_token_records
-            .cmp(&a.has_token_records)
-            .then_with(|| a.tool_name.cmp(&b.tool_name))
-    });
+    // 展示顺序按名称。
+    tools.sort_by(|a, b| a.tool_name.cmp(&b.tool_name));
 
-    let collected_at = stats
-        .values()
-        .next()
-        .map(|s| s.updated_at.clone())
-        .unwrap_or_default();
     ToolListReport {
         available: true,
         home: home.display().to_string(),
         tools,
-        collected_at,
+        collected_at: String::new(),
     }
 }
 
