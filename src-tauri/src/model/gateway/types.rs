@@ -307,6 +307,10 @@ pub struct ModelProxyConfig {
     /// 排前的优先承接该模型的无前缀调用；未配置的模型沿用渠道数组顺序。
     #[serde(default)]
     pub model_channel_order: Option<HashMap<String, Vec<String>>>,
+    /// 跨渠道故障转移：首选渠道的全部 Key 耗尽后，是否切换到其他同样提供该模型的渠道
+    /// （仅对不带别名前缀的裸模型名生效；定向请求永不转移）。默认关闭 = 渠道耗尽直接报错。
+    #[serde(default)]
+    pub channel_failover: bool,
 }
 
 impl ModelProxyConfig {
@@ -344,6 +348,7 @@ impl Default for ModelProxyConfig {
             next_channel_stats_id: default_next_channel_stats_id(),
             log_retention_days: None,
             model_channel_order: None,
+            channel_failover: false,
         }
     }
 }
@@ -552,7 +557,12 @@ pub struct ModelProxyContext {
     pub default_stream_client: Arc<tokio::sync::RwLock<Client>>,
     /// 平台无关的应用上下文（桌面与 server 共用）；启动后注入。
     pub app_ctx: StdArc<RwLock<Option<StdArc<AppContext>>>>,
-    pub key_round_robin: Arc<AtomicUsize>,
+    /// 轮询分组的 Key 起点游标，**按「渠道 + 分组」分片**。
+    ///
+    /// 曾是单个全局计数器：建队时对每个轮询组都推进一次，一次请求前进 = 轮询组数，
+    /// 组内 Key 数能整除该步长的组永远选中同一个 Key（两组各 2 Key 时完全不轮转）；
+    /// 其他渠道的请求也会搅动本组起点。现每组各持一份游标，`key_round_robin_for` 按需惰性创建。
+    pub key_round_robin: Arc<RwLock<HashMap<String, Arc<AtomicUsize>>>>,
     /// 出口节点轮询游标，**按渠道分片**。
     ///
     /// 曾是单个全局计数器：渠道 A 因 429 推进游标会让毫不相关的渠道 B
@@ -564,6 +574,20 @@ pub struct ModelProxyContext {
 }
 
 impl ModelProxyContext {
+    /// 取指定渠道内某个轮询分组的 Key 起点游标（不存在则惰性创建）。
+    pub async fn key_round_robin_for(&self, channel_id: &str, group_id: &str) -> Arc<AtomicUsize> {
+        let key = format!("{channel_id}\u{0}{group_id}");
+        if let Some(counter) = self.key_round_robin.read().await.get(&key) {
+            return counter.clone();
+        }
+        self.key_round_robin
+            .write()
+            .await
+            .entry(key)
+            .or_insert_with(|| Arc::new(AtomicUsize::new(0)))
+            .clone()
+    }
+
     /// 取指定渠道的出口节点轮询游标（不存在则惰性创建）。
     ///
     /// 返回 `Arc` 而非借用：调用方持有它跨越 await 点（重试循环中推进游标），

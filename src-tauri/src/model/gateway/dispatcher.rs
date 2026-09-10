@@ -110,6 +110,11 @@ fn build_egress_request(
 
 /// 通用弹性出网请求调度引擎
 /// 统一处理：全局节点轮询、`config.max_retries` 动态重试循环、401 立即退出、429/网络异常自动切 IP 重试、Attempt 独立打点
+///
+/// `max_retries` 是**换出口节点**重试的预算：只有出口候选多于一个（代理池 / pool 模式）
+/// 时才有意义。直连单出口的渠道同一把 Key 重发结果不会变，退化为 0 —— Key 级故障转移
+/// （同组顺延 → 下一组）由 pipeline 负责。OpenCode 免 Key 渠道例外：它没有 Key 可换，
+/// 重试预算是其唯一的容错手段。
 pub async fn execute_resilient_egress(
     ctx: &ModelProxyContext,
     channel: &ChannelConfig,
@@ -122,7 +127,12 @@ pub async fn execute_resilient_egress(
 ) -> Result<EgressSuccess, Response> {
     let candidates =
         get_sorted_egress_candidates(ctx, channel, &meta.rule_model, channel_api_key).await;
-    let max_retries = config.max_retries as usize;
+    let is_opencode = matches_channel_or_url(channel, upstream_url);
+    let max_retries = if candidates.len() > 1 || is_opencode {
+        config.max_retries as usize
+    } else {
+        0
+    };
     let total_attempts_allowed = max_retries + 1;
     let node_round_robin = ctx.node_round_robin_for(&channel.id).await;
     let base_node_idx = node_round_robin.load(Ordering::Relaxed);
@@ -148,12 +158,12 @@ pub async fn execute_resilient_egress(
             format!("{}#{}", meta.req_id, attempt_idx + 1)
         };
 
-        let is_opencode = matches_channel_or_url(channel, upstream_url);
-
         // OpenCode 渠道专属容错：遇到 502/503，或 200 但响应体为空内容（官方已知缺陷）时，
         // 在当前节点等待 1 秒后原地重试一次。
         // 该次重试不受 max_retries 名额约束、不切换节点；每个候选节点各享一次机会，
         // 重试仍失败则切换到其他节点；全部候选耗尽后空内容以 400 返回客户端。所有异常请求均记录失败日志。
+        // 其他渠道不做原地重试：有 Key 的渠道由 pipeline 顺延到下一把 Key，
+        // 「失败重试次数 = 0」对它们必须名副其实。
         let mut inplace_retried = false;
 
         /// 内层发送循环的出口
@@ -186,9 +196,8 @@ pub async fn execute_resilient_egress(
                         || resp.status() == StatusCode::SERVICE_UNAVAILABLE
             );
 
-            // ① 502/503：网关类临时故障，读取错误体记录日志后原地重试。
-            // 对所有渠道通用 —— 站点转换渠道/转发渠道同样受益。
-            if !inplace_retried && retryable_status {
+            // ① 502/503：网关类临时故障，读取错误体记录日志后原地重试（仅 OpenCode 渠道）。
+            if is_opencode && !inplace_retried && retryable_status {
                 inplace_retried = true;
                 let resp = match result {
                     Ok(r) => r,

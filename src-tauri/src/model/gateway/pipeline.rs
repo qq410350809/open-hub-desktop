@@ -5,8 +5,8 @@
 //! 各入口文件只负责：入参解析、客户端协议 ↔ OpenAI 中枢转换、响应回转。
 
 use super::balancer::{
-    load_channel_all_keys_info, resolve_channel, resolve_channel_candidates,
-    resolve_channel_key_groups_for_model, ResolvedKeyGroup,
+    load_channel_all_keys_info, resolve_channel_candidates, resolve_channel_detailed,
+    resolve_channel_key_groups_for_model, ChannelResolution, ResolvedKeyGroup,
 };
 use super::dispatcher::{execute_resilient_egress, EgressRequestMeta, EgressSuccess};
 use super::egress::{self, TargetProtocol};
@@ -19,12 +19,13 @@ use super::types::{
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde_json::json;
+use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
-/// 独立（黏性）分组在单个请求内最多顺延尝试的 Key 数量上限。
-/// 独立组会在组内逐个 Key 故障转移，若组内有大量失效 Key，叠加上游超时会把单请求拖得过长。
-const MAX_INDEPENDENT_ATTEMPTS_PER_GROUP: usize = 8;
+/// 单个分组在单个请求内最多顺延尝试的 Key 数量上限。
+/// 组内会逐个 Key 故障转移，若组内有大量失效 Key，叠加上游超时会把单请求拖得过长。
+const MAX_ATTEMPTS_PER_GROUP: usize = 8;
 
 /// 尝试队列中的一个候选：待用的 Key + 其所属分组名（仅用于日志）
 #[derive(Debug, PartialEq, Eq)]
@@ -35,14 +36,16 @@ pub struct KeyAttempt {
 
 /// 把「分组优先级队列」展平为单个请求内的有序 Key 尝试队列。
 ///
-/// - 轮询组（round_robin）贡献 1 次尝试，Key 由全局计数器在组内轮转选出（逐请求分摊调用量）；
-/// - 独立组（independent）贡献组内前若干个 Key 的有序尝试：黏住首个 Key，
-///   仅在其失败时顺延到组内下一个，至多 `MAX_INDEPENDENT_ATTEMPTS_PER_GROUP` 个。
+/// 两种模式都会在组内**顺延全部可用 Key**（至多 `MAX_ATTEMPTS_PER_GROUP` 个），
+/// 区别只在起点：
+/// - 轮询组（round_robin）：起点由该组游标 `next_start` 逐请求推进，组内 Key 分摊调用量；
+///   当前 Key 失败后接着试组内下一个（旋转序），而不是直接跳组；
+/// - 独立组（independent）：恒从组内首个 Key 起，黏住首 Key，失败才顺延。
 ///
-/// 队列按分组顺序拼接，耗尽即视为该渠道全部候选失败。
+/// 队列按分组顺序拼接：同组 Key 全部失败才进入下一组；全队列耗尽即视为该渠道失败。
 pub fn build_key_attempt_queue(
     groups: &[ResolvedKeyGroup],
-    round_robin: &std::sync::atomic::AtomicUsize,
+    mut next_start: impl FnMut(&ResolvedKeyGroup) -> usize,
     chan_alias: &str,
 ) -> Vec<KeyAttempt> {
     let mut queue: Vec<KeyAttempt> = Vec::new();
@@ -50,34 +53,71 @@ pub fn build_key_attempt_queue(
         if group.keys.is_empty() {
             continue;
         }
-        if group.is_independent() {
-            // 独立组：组内顺序故障转移。限制单组最多尝试的 Key 数，避免大量失效 Key
-            // 叠加上游超时把单个请求拖到不可接受的时长。
-            let take = group.keys.len().min(MAX_INDEPENDENT_ATTEMPTS_PER_GROUP);
-            if take < group.keys.len() {
-                tracing::warn!(
-                    "[ModelGateway] 渠道「{}」独立分组「{}」共 {} 个 Key，本次请求最多尝试前 {} 个",
-                    chan_alias,
-                    group.name,
-                    group.keys.len(),
-                    take
-                );
-            }
-            for key in group.keys.iter().take(take) {
-                queue.push(KeyAttempt {
-                    key: key.clone(),
-                    group_label: group.name.clone(),
-                });
-            }
+        let len = group.keys.len();
+        let start = if group.is_independent() {
+            0
         } else {
-            let idx = round_robin.fetch_add(1, Ordering::Relaxed) % group.keys.len();
+            next_start(group) % len
+        };
+        let take = len.min(MAX_ATTEMPTS_PER_GROUP);
+        if take < len {
+            tracing::warn!(
+                "[ModelGateway] 渠道「{}」分组「{}」共 {} 个 Key，本次请求最多尝试 {} 个",
+                chan_alias,
+                group.name,
+                len,
+                take
+            );
+        }
+        for offset in 0..take {
             queue.push(KeyAttempt {
-                key: group.keys[idx].clone(),
+                key: group.keys[(start + offset) % len].clone(),
                 group_label: group.name.clone(),
             });
         }
     }
     queue
+}
+
+/// 单个 Key 失败后是否值得换下一个 Key 再试。
+///
+/// 只有「与这把 Key 本身相关」的失败才换 Key：鉴权/配额/限流（401/402/403/429）、
+/// 上游或网络故障（5xx、连接失败合成的 502）、超时（408）。
+/// 400/404/413/422 这类由请求内容决定的错误换 Key 结果不会变，
+/// 逐 Key 重放只会白烧配额、拖长响应，应立即返回。
+pub fn should_failover_to_next_key(status: StatusCode) -> bool {
+    status.is_server_error()
+        || matches!(
+            status,
+            StatusCode::UNAUTHORIZED
+                | StatusCode::PAYMENT_REQUIRED
+                | StatusCode::FORBIDDEN
+                | StatusCode::REQUEST_TIMEOUT
+                | StatusCode::TOO_MANY_REQUESTS
+        )
+}
+
+/// 逐候选累积错误响应，最终挑给客户端看的那一个：优先第一个非 401 的错误。
+/// 首个 Key 的 429/5xx 才是请求失败的真实原因，不该被后面某把过期 Key 的 401 覆盖；
+/// 全部都是 401 时返回最后一个。
+#[derive(Default)]
+pub struct ErrorTrail {
+    first_non_auth: Option<Response>,
+    last: Option<Response>,
+}
+
+impl ErrorTrail {
+    pub fn push(&mut self, resp: Response) {
+        if self.first_non_auth.is_none() && resp.status() != StatusCode::UNAUTHORIZED {
+            self.first_non_auth = Some(resp);
+        } else {
+            self.last = Some(resp);
+        }
+    }
+
+    pub fn finish(self) -> Option<Response> {
+        self.first_non_auth.or(self.last)
+    }
 }
 
 /// 客户端入口协议，决定 404/400 错误体的 JSON 形状
@@ -92,13 +132,21 @@ pub enum ClientProtocol {
 
 /// 未找到可用渠道时，按客户端协议返回对应格式的 404 响应体
 pub fn model_not_found_response(raw_model: &str, style: ClientProtocol) -> Response {
+    model_not_found_response_with_message(
+        format!("No available channel for model '{raw_model}'"),
+        style,
+    )
+}
+
+/// 自定义信息的 404 响应体（如定向渠道已禁用）
+pub fn model_not_found_response_with_message(message: String, style: ClientProtocol) -> Response {
     match style {
         ClientProtocol::Gemini => (
             StatusCode::NOT_FOUND,
             axum::Json(json!({
                 "error": {
                     "code": 404,
-                    "message": format!("No available channel for model '{raw_model}'"),
+                    "message": message,
                     "status": "NOT_FOUND"
                 }
             })),
@@ -110,7 +158,7 @@ pub fn model_not_found_response(raw_model: &str, style: ClientProtocol) -> Respo
                 "type": "error",
                 "error": {
                     "type": "not_found_error",
-                    "message": format!("No available channel for model '{raw_model}'")
+                    "message": message
                 }
             })),
         )
@@ -122,7 +170,7 @@ pub fn model_not_found_response(raw_model: &str, style: ClientProtocol) -> Respo
                 "error": {
                     "type": "invalid_request_error",
                     "code": "model_not_found",
-                    "message": format!("No available channel for model '{raw_model}'"),
+                    "message": message,
                     "param": null,
                     "request_id": null
                 }
@@ -133,7 +181,7 @@ pub fn model_not_found_response(raw_model: &str, style: ClientProtocol) -> Respo
             StatusCode::NOT_FOUND,
             axum::Json(json!({
                 "error": {
-                    "message": format!("No available channel for model '{raw_model}'"),
+                    "message": message,
                     "type": "invalid_request_error",
                     "code": "model_not_found"
                 }
@@ -227,7 +275,9 @@ pub fn gateway_error_response(
     (status, axum::Json(body)).into_response()
 }
 
-/// 渠道解析：失败时记录 404 日志并返回对应协议错误体
+/// 渠道解析：失败时记录 404 日志并返回对应协议错误体。
+/// 定向指派（`alias/model`）命中已禁用渠道时同样 404，错误信息写明渠道已禁用 ——
+/// 绝不兜底到其他渠道。
 pub async fn resolve_channel_or_404<'a>(
     ctx: &ModelProxyContext,
     config: &'a ModelProxyConfig,
@@ -239,37 +289,48 @@ pub async fn resolve_channel_or_404<'a>(
     req_body_str: &Option<String>,
     style: ClientProtocol,
 ) -> Result<(&'a ChannelConfig, String), Response> {
-    match resolve_channel(config, raw_model) {
-        Some(pair) => Ok(pair),
-        None => {
-            let dur = start_time.elapsed().as_millis() as u64;
+    // (日志归属渠道别名, 统计 ID, 错误信息)
+    let (log_channel, log_stats_id, err_msg) = match resolve_channel_detailed(config, raw_model) {
+        ChannelResolution::Resolved(ch, model) => return Ok((ch, model)),
+        ChannelResolution::Disabled(ch, _) => (
+            ch.effective_alias(),
+            ch.stats_id.map(|v| v.to_string()),
+            format!(
+                "模型 '{raw_model}' 指定的渠道「{}」已禁用，定向请求不会转发到其他渠道",
+                ch.effective_alias()
+            ),
+        ),
+        ChannelResolution::NotFound => (
             // 404 无法归属到具体渠道，沿用既有惯例计入 opencode 通道（含其统计 ID）
-            let opencode_stats_id = config
+            "opencode".to_string(),
+            config
                 .channels
                 .iter()
                 .find(|c| c.id == "opencode")
                 .and_then(|c| c.stats_id)
-                .map(|v| v.to_string());
-            record_attempt_failure(
-                ctx,
-                ProxyLogParams::new_failure(
-                    req_id.to_string(),
-                    path.to_string(),
-                    "opencode".to_string(),
-                    raw_model.to_string(),
-                    is_stream,
-                    404,
-                    dur,
-                    Some(format!("未找到支持模型 '{raw_model}' 的可用渠道")),
-                    req_body_str.clone(),
-                    None,
-                )
-                .with_channel_stats_id(opencode_stats_id),
-            )
-            .await;
-            Err(model_not_found_response(raw_model, style))
-        }
-    }
+                .map(|v| v.to_string()),
+            format!("未找到支持模型 '{raw_model}' 的可用渠道"),
+        ),
+    };
+    let dur = start_time.elapsed().as_millis() as u64;
+    record_attempt_failure(
+        ctx,
+        ProxyLogParams::new_failure(
+            req_id.to_string(),
+            path.to_string(),
+            log_channel,
+            raw_model.to_string(),
+            is_stream,
+            404,
+            dur,
+            Some(err_msg.clone()),
+            req_body_str.clone(),
+            None,
+        )
+        .with_channel_stats_id(log_stats_id),
+    )
+    .await;
+    Err(model_not_found_response_with_message(err_msg, style))
 }
 
 /// 统一校验渠道与模型兼容性，未通过时记录日志并返回对应协议错误响应
@@ -426,14 +487,30 @@ async fn dispatch_single_channel_egress(
             group_label: String::new(),
         }]
     } else {
-        build_key_attempt_queue(&key_groups, &ctx.key_round_robin, &chan_alias)
+        // 轮询组的起点游标按「渠道 + 分组」分片，建队前先取齐（建队本身是同步的）
+        let mut cursors: HashMap<String, std::sync::Arc<std::sync::atomic::AtomicUsize>> =
+            HashMap::new();
+        for group in key_groups.iter().filter(|g| !g.is_independent()) {
+            let cursor = ctx.key_round_robin_for(&channel.id, &group.id).await;
+            cursors.insert(group.id.clone(), cursor);
+        }
+        build_key_attempt_queue(
+            &key_groups,
+            |group| {
+                cursors
+                    .get(&group.id)
+                    .map(|c| c.fetch_add(1, Ordering::Relaxed))
+                    .unwrap_or(0)
+            },
+            &chan_alias,
+        )
     };
 
     // 出网协议：模型级覆盖优先（响应回转嗅探也按该协议归一）
     let target = channel.target_protocol_for(model_to_send);
-    let mut last_error_response: Option<Response> = None;
+    let mut errors = ErrorTrail::default();
 
-    // 顺序遍历尝试队列：组内（独立组）与组间故障转移已在建队时铺平
+    // 顺序遍历尝试队列：同组顺延 → 下一组，均已在建队时铺平
     for (attempt_idx, attempt) in attempts.iter().enumerate() {
         let selected_key = &attempt.key;
 
@@ -452,7 +529,7 @@ async fn dispatch_single_channel_egress(
         )
         .await
         {
-            last_error_response = Some(err_resp);
+            errors.push(err_resp);
             continue;
         }
 
@@ -503,22 +580,38 @@ async fn dispatch_single_channel_egress(
                 });
             }
             Err(err_resp) => {
-                // 当前 Key 请求失败（例如 401 鉴权失败、429 频次限制或上游故障），
-                // 记录错误并顺延到队列中的下一个候选 Key（独立组内下一个 Key，或下一个分组）
-                tracing::warn!(
-                    "[ModelGateway] 渠道「{}」分组「{}」第 {} 次候选请求模型「{}」失败，自动尝试下一候选 Key...",
-                    chan_alias,
-                    attempt.group_label,
-                    attempt_idx + 1,
-                    model_to_send
-                );
-                last_error_response = Some(err_resp);
+                let status = err_resp.status();
+                // 与请求内容相关的确定性错误（400/404/413/422…）换 Key 也不会变，
+                // 立即返回，不再逐 Key / 逐组重放
+                if !should_failover_to_next_key(status) {
+                    tracing::warn!(
+                        "[ModelGateway] 渠道「{}」分组「{}」请求模型「{}」返回 {}，属请求侧错误，不再尝试其他 Key",
+                        chan_alias,
+                        attempt.group_label,
+                        model_to_send,
+                        status
+                    );
+                    return Err(err_resp);
+                }
+                // 当前 Key 失败（401/403/429/5xx/网络），顺延到队列中的下一个候选 Key
+                // （同组下一个 Key，同组耗尽后进入下一个分组）
+                if attempt_idx + 1 < attempts.len() {
+                    tracing::warn!(
+                        "[ModelGateway] 渠道「{}」分组「{}」第 {} 次候选请求模型「{}」返回 {}，自动尝试下一候选 Key...",
+                        chan_alias,
+                        attempt.group_label,
+                        attempt_idx + 1,
+                        model_to_send,
+                        status
+                    );
+                }
+                errors.push(err_resp);
             }
         }
     }
 
-    // 所有分组均尝试失败，返回最后一个分组的错误响应（或兜底 502）
-    Err(last_error_response.unwrap_or_else(|| {
+    // 所有分组均尝试失败：返回最能说明失败原因的那次错误响应（或兜底 502）
+    Err(errors.finish().unwrap_or_else(|| {
         gateway_error_response(
             style,
             StatusCode::BAD_GATEWAY,
@@ -532,11 +625,11 @@ async fn dispatch_single_channel_egress(
 /// 每个渠道内部已有 Key 分组 × 出口节点两层重试，叠加过多渠道会把单请求拖到不可接受的时长。
 const MAX_CHANNEL_FAILOVER: usize = 3;
 
-/// 出网调度入口：在候选渠道列表上做故障转移。
+/// 出网调度入口：默认只在 handler 选定的渠道上完成「同组顺延 → 下一组」的 Key 故障转移，
+/// 渠道耗尽即直接返回错误。
 ///
-/// 首选渠道的 Key 分组与出口节点全部耗尽后，自动切换到下一个同样提供该模型的渠道
-/// （候选顺序见 `resolve_channel_candidates`，首项即原 `resolve_channel` 的结果，
-/// 故单渠道场景下行为与改动前完全一致）。
+/// 仅当 `config.channel_failover` 开启且请求为裸模型名（非 `alias/model` 定向指派）时，
+/// 才在渠道耗尽后切换到下一个同样声明提供该模型的渠道（候选见 `resolve_channel_candidates`）。
 ///
 /// 返回的 `EgressOutcome.chan_alias` 是**实际成功**的渠道，日志与统计因此归属正确。
 #[allow(clippy::too_many_arguments)]
@@ -554,21 +647,23 @@ pub async fn dispatch_protocol_egress(
     egress_payload: egress::EgressBody,
     style: ClientProtocol,
 ) -> Result<EgressOutcome, Response> {
-    // 候选列表的首项恒为传入的 channel（handler 已用 resolve_channel 选定）；
-    // 其后为后备渠道。带别名前缀的定向请求只会得到单项列表，不做转移。
-    let candidates = resolve_channel_candidates(config, raw_model);
-    let fallbacks: Vec<&ChannelConfig> = candidates
-        .iter()
-        .map(|(ch, _)| *ch)
-        .filter(|ch| ch.id != channel.id)
-        .take(MAX_CHANNEL_FAILOVER.saturating_sub(1))
-        .collect();
+    // 候选列表：定向请求最多只有被指派的渠道自身，裸模型名才可能有后备渠道
+    let fallbacks: Vec<&ChannelConfig> = if config.channel_failover {
+        resolve_channel_candidates(config, raw_model)
+            .iter()
+            .map(|(ch, _)| *ch)
+            .filter(|ch| ch.id != channel.id)
+            .take(MAX_CHANNEL_FAILOVER.saturating_sub(1))
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     let mut chain: Vec<&ChannelConfig> = vec![channel];
     chain.extend(fallbacks);
     let total = chain.len();
 
-    let mut last_error_response: Option<Response> = None;
+    let mut errors = ErrorTrail::default();
     for (idx, cand) in chain.into_iter().enumerate() {
         // 后备渠道的请求 ID 加后缀，与首选渠道的日志区分开
         let chan_req_id = if idx == 0 {
@@ -615,13 +710,13 @@ pub async fn dispatch_protocol_egress(
                         total
                     );
                 }
-                last_error_response = Some(err_resp);
+                errors.push(err_resp);
             }
         }
     }
 
-    // 全部候选渠道均失败：返回最后一个渠道的错误响应
-    Err(last_error_response.unwrap_or_else(|| {
+    // 全部候选渠道均失败：返回最能说明失败原因的错误响应
+    Err(errors.finish().unwrap_or_else(|| {
         gateway_error_response(
             style,
             StatusCode::BAD_GATEWAY,
@@ -680,21 +775,56 @@ mod pipeline_tests {
         }
     }
 
+    /// 用一个原子计数器模拟单组游标
+    fn next_from(counter: &AtomicUsize) -> impl FnMut(&ResolvedKeyGroup) -> usize + '_ {
+        move |_| counter.fetch_add(1, Ordering::Relaxed)
+    }
+
     #[test]
-    fn round_robin_group_rotates_one_key_per_request() {
-        // 轮询组：每次请求只贡献 1 次尝试，Key 随计数器在组内轮转
+    fn round_robin_group_rotates_start_and_walks_whole_group() {
+        // 轮询组：起点随游标逐请求轮转，但队列包含组内全部 Key（旋转序），
+        // 当前 Key 失败后顺延同组下一个而不是直接跳组
         let groups = vec![group("g1", KEY_GROUP_MODE_ROUND_ROBIN, &["k1", "k2", "k3"])];
         let counter = AtomicUsize::new(0);
 
-        let picked: Vec<String> = (0..4)
+        let picked: Vec<Vec<String>> = (0..4)
             .map(|_| {
-                let q = build_key_attempt_queue(&groups, &counter, "ch");
-                assert_eq!(q.len(), 1, "轮询组单请求只尝试 1 个 Key");
-                q[0].key.clone()
+                build_key_attempt_queue(&groups, next_from(&counter), "ch")
+                    .into_iter()
+                    .map(|a| a.key)
+                    .collect()
             })
             .collect();
 
-        assert_eq!(picked, vec!["k1", "k2", "k3", "k1"], "组内均匀轮转并回绕");
+        assert_eq!(picked[0], vec!["k1", "k2", "k3"]);
+        assert_eq!(picked[1], vec!["k2", "k3", "k1"]);
+        assert_eq!(picked[2], vec!["k3", "k1", "k2"]);
+        assert_eq!(picked[3], vec!["k1", "k2", "k3"], "回绕");
+    }
+
+    #[test]
+    fn round_robin_cursor_is_per_group_not_shared() {
+        // 两个各 2 Key 的轮询组：各自独立游标，每组每请求都能轮转
+        // （旧实现共用一个全局计数器，一次请求前进 2，`% 2` 恒等 → 永远不轮转）
+        let groups = vec![
+            group("g1", KEY_GROUP_MODE_ROUND_ROBIN, &["a1", "a2"]),
+            group("g2", KEY_GROUP_MODE_ROUND_ROBIN, &["b1", "b2"]),
+        ];
+        let mut cursors: HashMap<String, AtomicUsize> = HashMap::new();
+        cursors.insert("g1".into(), AtomicUsize::new(0));
+        cursors.insert("g2".into(), AtomicUsize::new(0));
+        let mut next = |g: &ResolvedKeyGroup| cursors[&g.id].fetch_add(1, Ordering::Relaxed);
+
+        let heads = |q: Vec<KeyAttempt>| (q[0].key.clone(), q[2].key.clone());
+        assert_eq!(
+            heads(build_key_attempt_queue(&groups, &mut next, "ch")),
+            ("a1".to_string(), "b1".to_string())
+        );
+        assert_eq!(
+            heads(build_key_attempt_queue(&groups, &mut next, "ch")),
+            ("a2".to_string(), "b2".to_string()),
+            "两组都应轮转到第二个 Key"
+        );
     }
 
     #[test]
@@ -704,33 +834,34 @@ mod pipeline_tests {
         let counter = AtomicUsize::new(0);
 
         for _ in 0..3 {
-            let q = build_key_attempt_queue(&groups, &counter, "ch");
+            let q = build_key_attempt_queue(&groups, next_from(&counter), "ch");
             let keys: Vec<&str> = q.iter().map(|a| a.key.as_str()).collect();
             assert_eq!(keys, vec!["k1", "k2", "k3"], "黏住 k1 且组内顺序转移");
         }
-        assert_eq!(counter.load(Ordering::Relaxed), 0, "独立组不消耗轮询计数器");
+        assert_eq!(counter.load(Ordering::Relaxed), 0, "独立组不消耗轮询游标");
     }
 
     #[test]
     fn mixed_groups_chain_in_priority_order() {
-        // 混合：轮询组贡献 1 个候选，独立组铺开组内全部候选，按分组顺序拼接
+        // 混合：轮询组从游标起点铺开全组，独立组铺开组内全部候选，按分组顺序拼接
         let groups = vec![
             group("rr", KEY_GROUP_MODE_ROUND_ROBIN, &["a1", "a2"]),
             group("indep", KEY_GROUP_MODE_INDEPENDENT, &["b1", "b2"]),
         ];
         let counter = AtomicUsize::new(1);
 
-        let q = build_key_attempt_queue(&groups, &counter, "ch");
+        let q = build_key_attempt_queue(&groups, next_from(&counter), "ch");
         let keys: Vec<&str> = q.iter().map(|a| a.key.as_str()).collect();
-        assert_eq!(keys, vec!["a2", "b1", "b2"]);
+        assert_eq!(keys, vec!["a2", "a1", "b1", "b2"]);
         assert_eq!(q[0].group_label, "rr");
-        assert_eq!(q[1].group_label, "indep");
+        assert_eq!(q[1].group_label, "rr");
+        assert_eq!(q[2].group_label, "indep");
     }
 
     #[test]
-    fn independent_group_caps_attempts_per_request() {
-        // 独立组内 Key 过多时截断，避免失效 Key 叠加上游超时把单请求拖爆
-        let keys: Vec<String> = (0..MAX_INDEPENDENT_ATTEMPTS_PER_GROUP + 5)
+    fn group_caps_attempts_per_request() {
+        // 组内 Key 过多时截断，避免失效 Key 叠加上游超时把单请求拖爆
+        let keys: Vec<String> = (0..MAX_ATTEMPTS_PER_GROUP + 5)
             .map(|i| format!("k{i}"))
             .collect();
         let groups = vec![ResolvedKeyGroup {
@@ -741,8 +872,8 @@ mod pipeline_tests {
         }];
         let counter = AtomicUsize::new(0);
 
-        let q = build_key_attempt_queue(&groups, &counter, "ch");
-        assert_eq!(q.len(), MAX_INDEPENDENT_ATTEMPTS_PER_GROUP);
+        let q = build_key_attempt_queue(&groups, next_from(&counter), "ch");
+        assert_eq!(q.len(), MAX_ATTEMPTS_PER_GROUP);
         assert_eq!(q[0].key, "k0", "截断保留最靠前的 Key");
     }
 
@@ -753,9 +884,46 @@ mod pipeline_tests {
             group("real", KEY_GROUP_MODE_ROUND_ROBIN, &["k1"]),
         ];
         let counter = AtomicUsize::new(0);
-        let q = build_key_attempt_queue(&groups, &counter, "ch");
+        let q = build_key_attempt_queue(&groups, next_from(&counter), "ch");
         assert_eq!(q.len(), 1);
         assert_eq!(q[0].key, "k1");
+    }
+
+    #[test]
+    fn key_failover_only_for_key_related_statuses() {
+        for s in [401u16, 402, 403, 408, 429, 500, 502, 503, 504] {
+            assert!(
+                should_failover_to_next_key(StatusCode::from_u16(s).unwrap()),
+                "{s} 应换 Key"
+            );
+        }
+        for s in [400u16, 404, 413, 415, 422] {
+            assert!(
+                !should_failover_to_next_key(StatusCode::from_u16(s).unwrap()),
+                "{s} 属请求侧错误，不应换 Key"
+            );
+        }
+    }
+
+    #[test]
+    fn error_trail_prefers_first_non_auth_error() {
+        let mk = |s: StatusCode| (s, "x").into_response();
+        // 首个 429 不该被后面的 401 覆盖
+        let mut t = ErrorTrail::default();
+        t.push(mk(StatusCode::TOO_MANY_REQUESTS));
+        t.push(mk(StatusCode::UNAUTHORIZED));
+        assert_eq!(t.finish().unwrap().status(), StatusCode::TOO_MANY_REQUESTS);
+        // 首个是 401、后面出现 502：取 502
+        let mut t = ErrorTrail::default();
+        t.push(mk(StatusCode::UNAUTHORIZED));
+        t.push(mk(StatusCode::BAD_GATEWAY));
+        assert_eq!(t.finish().unwrap().status(), StatusCode::BAD_GATEWAY);
+        // 全是 401：取最后一个（都一样）
+        let mut t = ErrorTrail::default();
+        t.push(mk(StatusCode::UNAUTHORIZED));
+        t.push(mk(StatusCode::UNAUTHORIZED));
+        assert_eq!(t.finish().unwrap().status(), StatusCode::UNAUTHORIZED);
+        assert!(ErrorTrail::default().finish().is_none());
     }
 
     #[tokio::test]

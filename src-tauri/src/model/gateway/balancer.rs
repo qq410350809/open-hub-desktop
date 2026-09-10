@@ -26,27 +26,52 @@ fn channel_exposes_model(channel: &ChannelConfig, model: &str) -> bool {
     })
 }
 
+/// 别名前缀定向解析：`alias/model` 的前缀命中**任意**渠道（不论是否启用）即视为定向指派。
+///
+/// 返回 `(渠道, 裸模型名)`；前缀不匹配任何渠道别名时返回 None —— 此时整段模型名当作
+/// 裸名处理（兼容 `deepseek-ai/DeepSeek-V3` 这类天然带 `/` 的上游模型 ID）。
+fn resolve_alias_designation<'a>(
+    config: &'a ModelProxyConfig,
+    normalized: &str,
+) -> Option<(&'a ChannelConfig, String)> {
+    let (prefix, rest) = normalized.split_once('/')?;
+    config
+        .channels
+        .iter()
+        .find(|c| c.effective_alias().eq_ignore_ascii_case(prefix))
+        .map(|ch| (ch, rest.to_string()))
+}
+
+/// 渠道解析结果：区分「定向指派命中了已禁用渠道」与「完全无渠道可用」，
+/// 前者绝不能兜底到其他渠道。
+#[derive(Debug)]
+pub enum ChannelResolution<'a> {
+    Resolved(&'a ChannelConfig, String),
+    /// `alias/model` 指派的渠道存在但已禁用
+    Disabled(&'a ChannelConfig, String),
+    NotFound,
+}
+
 /// 根据请求模型名解析目标渠道与发送给上游的裸模型名。
 /// 规则：
-/// 1. `alias/裸模型` 优先按别名前缀精确匹配启用渠道；
+/// 1. `alias/裸模型` 前缀命中渠道别名 = 定向指派：渠道启用则直接选用，已禁用则判
+///    `Disabled`，**绝不**落到后续兜底规则（否则定向请求会被悄悄换到别的渠道）；
 /// 2. 「多渠道共同提供的模型」按用户配置的路由顺序（model_channel_order）选取首个可用渠道；
 /// 3. 未配置顺序时，若某个启用渠道的白名单（enabled_models）中包含该模型，则优先分发给该渠道；
 /// 4. 若无匹配，回退至启用的默认 opencode 渠道；
 /// 5. 若默认 opencode 未启用，回退至首个已启用的自定义渠道。
-pub fn resolve_channel<'a>(
+pub fn resolve_channel_detailed<'a>(
     config: &'a ModelProxyConfig,
     raw_model: &str,
-) -> Option<(&'a ChannelConfig, String)> {
+) -> ChannelResolution<'a> {
     let normalized = strip_openhub_provider_prefix(raw_model);
-    // 1. 带前缀别名匹配 (如 x666/claude-sonnet-5)
-    if let Some((prefix, rest)) = normalized.split_once('/') {
-        if let Some(ch) = config
-            .channels
-            .iter()
-            .find(|c| c.enabled && c.effective_alias().eq_ignore_ascii_case(prefix))
-        {
-            return Some((ch, rest.to_string()));
-        }
+    // 1. 带前缀别名匹配 (如 x666/claude-sonnet-5)：定向指派，不参与兜底
+    if let Some((ch, rest)) = resolve_alias_designation(config, normalized) {
+        return if ch.enabled {
+            ChannelResolution::Resolved(ch, rest)
+        } else {
+            ChannelResolution::Disabled(ch, rest)
+        };
     }
 
     let stripped = strip_opencode_prefix(normalized);
@@ -65,7 +90,7 @@ pub fn resolve_channel<'a>(
                 })
         };
         if let Some(ch) = lookup(normalized).or_else(|| lookup(stripped)) {
-            return Some((ch, stripped.to_string()));
+            return ChannelResolution::Resolved(ch, stripped.to_string());
         }
     }
 
@@ -78,48 +103,56 @@ pub fn resolve_channel<'a>(
                     .any(|m| m.eq_ignore_ascii_case(stripped) || m.eq_ignore_ascii_case(normalized))
             })
     }) {
-        return Some((ch, stripped.to_string()));
+        return ChannelResolution::Resolved(ch, stripped.to_string());
     }
 
-    // 3. 回退默认 opencode 渠道（如果已启用）
+    // 4. 回退默认 opencode 渠道（如果已启用）
     if let Some(ch) = config
         .channels
         .iter()
         .find(|c| c.id == "opencode" && c.enabled)
     {
-        return Some((ch, stripped.to_string()));
+        return ChannelResolution::Resolved(ch, stripped.to_string());
     }
 
-    // 4. 若 opencode 渠道未启用，回退到首个已启用的自定义渠道
+    // 5. 若 opencode 渠道未启用，回退到首个已启用的自定义渠道
     if let Some(ch) = config.channels.iter().find(|c| c.enabled) {
-        return Some((ch, stripped.to_string()));
+        return ChannelResolution::Resolved(ch, stripped.to_string());
     }
 
-    None
+    ChannelResolution::NotFound
 }
 
-/// 解析该模型的**全部**可用渠道，按与 `resolve_channel` 一致的优先级排序。
+/// `resolve_channel_detailed` 的简化形态：仅成功解析时返回 Some。
+pub fn resolve_channel<'a>(
+    config: &'a ModelProxyConfig,
+    raw_model: &str,
+) -> Option<(&'a ChannelConfig, String)> {
+    match resolve_channel_detailed(config, raw_model) {
+        ChannelResolution::Resolved(ch, model) => Some((ch, model)),
+        ChannelResolution::Disabled(..) | ChannelResolution::NotFound => None,
+    }
+}
+
+/// 解析该模型的跨渠道故障转移候选，按与 `resolve_channel` 一致的优先级排序。
 ///
-/// 返回列表的首项恒等于 `resolve_channel` 的结果，其后是可用于跨渠道故障转移的
-/// 后备渠道。用于「首选渠道的 Key 与出口全部耗尽后，切换到另一个同样提供该模型
-/// 的渠道」——单渠道的全部候选失败不再直接判定请求失败。
+/// 只收录**明确声明提供该模型**的启用渠道：`model_channel_order` 列表项与白名单
+/// 显式包含该模型的渠道。opencode 兜底与「未设白名单」渠道不再视为候选 ——
+/// 它们并未声明拥有该模型，转移过去只会把失败日志记到无关渠道头上。
 ///
 /// 显式带别名前缀（`alias/model`）的请求是用户的定向指派，不参与故障转移：
-/// 此时只返回该渠道自身。
+/// 此时只返回该渠道自身（渠道已禁用时返回空）。
+///
+/// 列表非空时首项恒等于 `resolve_channel` 的结果；`resolve_channel` 落到兜底规则
+/// （4/5）时本列表为空。
 pub fn resolve_channel_candidates<'a>(
     config: &'a ModelProxyConfig,
     raw_model: &str,
 ) -> Vec<(&'a ChannelConfig, String)> {
     let normalized = strip_openhub_provider_prefix(raw_model);
     // 带前缀 = 定向指派，不扩展后备渠道（与 resolve_channel 规则 1 对齐）
-    if let Some((prefix, rest)) = normalized.split_once('/') {
-        if let Some(ch) = config
-            .channels
-            .iter()
-            .find(|c| c.enabled && c.effective_alias().eq_ignore_ascii_case(prefix))
-        {
-            return vec![(ch, rest.to_string())];
-        }
+    if let Some((ch, rest)) = resolve_alias_designation(config, normalized) {
+        return if ch.enabled { vec![(ch, rest)] } else { Vec::new() };
     }
 
     let stripped = strip_opencode_prefix(normalized);
@@ -155,25 +188,6 @@ pub fn resolve_channel_candidates<'a>(
                     .any(|m| m.eq_ignore_ascii_case(stripped) || m.eq_ignore_ascii_case(normalized))
             })
     }) {
-        push(ch, &mut ordered);
-    }
-
-    // 3. 默认 opencode 渠道
-    if let Some(ch) = config
-        .channels
-        .iter()
-        .find(|c| c.id == "opencode" && c.enabled)
-    {
-        push(ch, &mut ordered);
-    }
-
-    // 4. 其余启用渠道中「未设白名单」的（白名单为 None = 全部暴露，故也能承接该模型）。
-    //    设了白名单但不含该模型的渠道被排除：它们无法处理这个请求。
-    for ch in config
-        .channels
-        .iter()
-        .filter(|c| c.enabled && c.enabled_models.is_none())
-    {
         push(ch, &mut ordered);
     }
 

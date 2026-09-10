@@ -824,7 +824,6 @@ mod egress_tests {
 
     fn test_context() -> crate::model::gateway::types::ModelProxyContext {
         use std::collections::HashMap;
-        use std::sync::atomic::AtomicUsize;
         use std::sync::Arc;
         use tokio::sync::RwLock;
         crate::model::gateway::types::ModelProxyContext {
@@ -840,7 +839,7 @@ mod egress_tests {
             default_http_client: Arc::new(RwLock::new(reqwest::Client::new())),
             default_stream_client: Arc::new(RwLock::new(reqwest::Client::new())),
             app_ctx: Arc::new(RwLock::new(None)),
-            key_round_robin: Arc::new(AtomicUsize::new(0)),
+            key_round_robin: Arc::new(RwLock::new(HashMap::new())),
             node_round_robin: Arc::new(RwLock::new(HashMap::new())),
             log_retention_last_run: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }

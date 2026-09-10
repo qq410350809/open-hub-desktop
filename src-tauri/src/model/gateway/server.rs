@@ -6,7 +6,7 @@ use super::types::{
 use crate::context::AppContext;
 use reqwest::Client;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
@@ -40,7 +40,7 @@ impl ModelProxyState {
             default_http_client: Arc::new(tokio::sync::RwLock::new(http_client)),
             default_stream_client: Arc::new(tokio::sync::RwLock::new(stream_http_client)),
             app_ctx: Arc::new(RwLock::new(None)),
-            key_round_robin: Arc::new(AtomicUsize::new(0)),
+            key_round_robin: Arc::new(RwLock::new(HashMap::new())),
             node_round_robin: Arc::new(RwLock::new(HashMap::new())),
             log_retention_last_run: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
