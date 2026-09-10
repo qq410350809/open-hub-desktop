@@ -91,6 +91,8 @@ export interface OpencodeProxyConfig {
   logRetentionDays?: number;
   /** 多渠道共同提供的模型路由顺序：key=模型名（小写），value=候选渠道 ID 有序列表，排前的优先承接无前缀调用 */
   modelChannelOrder?: Record<string, string[]> | null;
+  /** 跨渠道故障转移：裸模型名请求在首选渠道全部 Key 耗尽后切换到其他提供该模型的渠道；定向请求永不转移。默认关闭 */
+  channelFailover?: boolean;
 }
 
 export interface OpencodeProxyStatus {

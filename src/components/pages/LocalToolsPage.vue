@@ -411,9 +411,16 @@ function rowInitial(row: ProxyInventoryRow) {
   return Array.from(name)[0] || "?";
 }
 
-/** 行标题:供应商唯一标识 = 反代站点英文别名-账号-Key 分组。 */
+/** 行标题:供应商唯一标识 = 反代站点英文别名-账号-Key 分组;同渠道同账号只有一种分组时,分组段不体现。 */
 function rowIdentifier(row: ProxyInventoryRow) {
-  return [row.alias || row.channelName, row.accountLabel, row.group].join("-");
+  const parts = [row.alias || row.channelName, row.accountLabel];
+  const groups = new Set(
+    inventoryRows.value
+      .filter((item) => item.channelId === row.channelId && item.accountLabel === row.accountLabel)
+      .map((item) => item.group),
+  );
+  if (groups.size > 1) parts.push(row.group);
+  return parts.join("-");
 }
 
 function rowSubtitle(row: ProxyInventoryRow) {
