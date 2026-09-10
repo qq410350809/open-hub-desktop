@@ -11,6 +11,7 @@ import {
 import { runCommand } from "../../composables/core/ipc";
 import { useConfirm } from "../../composables/useConfirm";
 import { useToast } from "../../composables/core/useToast";
+import { usePreferences } from "../../composables/usePreferences";
 import CustomSelect from "../common/CustomSelect.vue";
 import { DEFAULT_SERVICE_PORT } from "../../constants";
 import type {
@@ -42,6 +43,7 @@ const {
 const { proxyStatus, proxyConfig, loadCachedModels, modelsForChannel } = useModelProxy();
 const { confirm } = useConfirm();
 const { showToast } = useToast();
+const { preferences, updatePreferences } = usePreferences();
 
 const siteCaches = ref<Record<string, SiteModelCache>>({});
 const siteCachesLoading = ref(false);
@@ -135,12 +137,12 @@ const providerModeLabel = computed(() => {
 });
 const providerModeHint = computed(() => {
   if (providerMode.value === "single") {
-    return "该工具只有一路接入。点某一行「生效」，会把这一路指到网关，并用该渠道的别名定向。";
+    return "该 Agent 只有一路接入。点某一行「生效」，会把这一路指到网关，并用该渠道的别名定向。";
   }
   if (providerMode.value === "switch") {
     return "可同时保留多家，运行时一次只用当前选中的那家。点某一行「生效」会写入该条并设为当前供应商。";
   }
-  return "可一次加载全部反代条目。点顶部「生效」会把当前清单里能用的条目合并进工具配置。";
+  return "可一次加载全部反代条目。点顶部「生效」会把当前清单里能用的条目合并进 Agent 配置。";
 });
 
 interface ProxyInventoryRow {
@@ -154,6 +156,7 @@ interface ProxyInventoryRow {
   protocol: string;
   alias: string;
   siteId: string;
+  group: string;
   models: string[];
 }
 
@@ -199,28 +202,71 @@ function channelKeys(channel: ChannelConfig) {
 }
 
 function accountLabel(account: SiteModelCacheAccount) {
-  return account.accountName || account.profileName || account.username || "账号";
+  const raw = account.accountName || account.profileName || account.username || "账号";
+  // 邮箱形式的账号去掉 @ 后的域名部分，标识更简洁
+  const at = raw.indexOf("@");
+  return at > 0 ? raw.slice(0, at) : raw;
+}
+
+/** 账号在别名表里的键:账号身份(邮箱/用户名)本身,所有站点共用一份别名。 */
+function accountAliasKey(account: SiteModelCacheAccount | null) {
+  const identity = account?.accountName || account?.profileId || account?.username || "default";
+  return identity.toLowerCase();
+}
+
+/** 账号显示名:优先用户设置的别名(全站点共用),否则邮箱去域名的账号名。 */
+function accountDisplayName(account: SiteModelCacheAccount | null) {
+  if (account) {
+    const alias = preferences.accountAliases[accountAliasKey(account)]?.trim();
+    if (alias) return alias;
+  }
+  return account ? accountLabel(account) : "未同步账号";
+}
+
+/** 站点渠道 Key 的分组名：站点缓存的 keyGroups 直接存 key → 分组名。 */
+function siteKeyGroup(account: SiteModelCacheAccount | null, key: string) {
+  return account?.keyGroups?.[key]?.trim() || "默认分组";
+}
+
+/** 手动渠道 Key 的分组名：经 keyRules 的 key → groupId，再查 keyGroups 定义。 */
+function channelKeyGroup(channel: ChannelConfig, key: string) {
+  const groupId = channel.keyRules?.find((rule) => rule.key === key)?.groupId;
+  const group = groupId ? channel.keyGroups?.find((item) => item.id === groupId) : undefined;
+  return group?.name?.trim() || "默认分组";
+}
+
+/** 剥掉模型 id 的命名空间前缀，统一成清单使用的裸名口径。 */
+function bareModelId(id: string) {
+  return id.includes("/") ? id.slice(id.indexOf("/") + 1) : id;
 }
 
 function modelsForInventory(channel: ChannelConfig, account: SiteModelCacheAccount | null, key: string) {
   const alias = channelAlias(channel);
-  const fromKey = key && account?.keyModels?.[key]?.map((item) => item.id).filter(Boolean);
-  const fromAccount = account?.keyModels
-    ? Object.values(account.keyModels).flat().map((item) => item.id).filter(Boolean)
-    : [];
-  const fromCache = channel.siteId
-    ? (siteCaches.value[channel.siteId]?.models ?? []).map((item) => item.id).filter(Boolean)
-    : [];
-  const fromChannel = [
-    ...(channel.enabledModels ?? []),
-    ...modelsForChannel(channel.id),
-  ].filter(Boolean);
-  const unique = new Set<string>();
-  for (const id of [...(fromKey ?? []), ...fromAccount, ...fromCache, ...fromChannel]) {
-    const bare = id.includes("/") ? id.slice(id.indexOf("/") + 1) : id;
-    if (bare) unique.add(bare);
+  const accountKeyModels = account?.keyModels;
+  // 账号拉取过按 Key 的模型映射时，只认该 Key 自己的条目（无条目/为空 = 该 Key 无模型），
+  // 不借用同账号其他 Key 的数据；账号没有 Key 级数据时才回退站点/渠道缓存
+  const hasKeyLevelData = !!accountKeyModels && Object.keys(accountKeyModels).length > 0;
+  const owned: string[] = hasKeyLevelData
+    ? (key ? accountKeyModels?.[key] : undefined)?.map((item) => item.id) ?? []
+    : [
+        ...(channel.siteId
+          ? (siteCaches.value[channel.siteId]?.models ?? []).map((item) => item.id)
+          : []),
+        ...modelsForChannel(channel.id),
+      ];
+  const bare = new Set<string>();
+  for (const id of owned) {
+    const value = bareModelId(id).trim();
+    if (value) bare.add(value);
   }
-  return [...unique].map((model) => (alias ? `${alias}/${model}` : model));
+  // 只保留反代「管理可用模型」勾选的模型；勾选记录可能带前缀，按裸名比对
+  const allow = channel.enabledModels;
+  let visible = [...bare];
+  if (allow) {
+    const allowBare = new Set(allow.map(bareModelId).filter(Boolean));
+    visible = visible.filter((model) => allowBare.has(model));
+  }
+  return visible.map((model) => (alias ? `${alias}/${model}` : model));
 }
 
 const inventoryRows = computed<ProxyInventoryRow[]>(() => {
@@ -233,7 +279,7 @@ const inventoryRows = computed<ProxyInventoryRow[]>(() => {
       const accounts = cache?.accounts?.length ? cache.accounts : [null];
       for (const account of accounts) {
         const keys = (account?.keys ?? []).map((key) => key.trim()).filter(Boolean);
-        const label = account ? accountLabel(account) : "未同步账号";
+        const label = accountDisplayName(account);
         const accountId = account?.profileId || account?.accountName || account?.username || "default";
         if (keys.length) {
           keys.forEach((key, keyIndex) => {
@@ -248,6 +294,7 @@ const inventoryRows = computed<ProxyInventoryRow[]>(() => {
               protocol,
               alias,
               siteId: channel.siteId || "",
+              group: siteKeyGroup(account, key),
               models: modelsForInventory(channel, account, key),
             });
           });
@@ -263,6 +310,7 @@ const inventoryRows = computed<ProxyInventoryRow[]>(() => {
             protocol,
             alias,
             siteId: channel.siteId || "",
+            group: "默认分组",
             models: modelsForInventory(channel, account, ""),
           });
         }
@@ -282,6 +330,7 @@ const inventoryRows = computed<ProxyInventoryRow[]>(() => {
             protocol,
             alias,
             siteId: "",
+            group: channelKeyGroup(channel, key),
             models: modelsForInventory(channel, null, key),
           });
         });
@@ -297,12 +346,14 @@ const inventoryRows = computed<ProxyInventoryRow[]>(() => {
           protocol,
           alias,
           siteId: "",
+          group: "默认分组",
           models: modelsForInventory(channel, null, ""),
         });
       }
     }
   }
-  return rows;
+  // 没有命中任何已选模型的 Key 不展示
+  return rows.filter((row) => row.models.length > 0);
 });
 
 const usableRows = computed(() => inventoryRows.value.filter((row) => !!row.key));
@@ -347,9 +398,7 @@ function modelsForPatch(row: ProxyInventoryRow): LocalToolModelEntry[] {
 function providerFromRow(row: ProxyInventoryRow): LocalToolProviderEntry {
   return {
     id: row.id,
-    name: row.accountLabel && row.accountLabel !== "手动渠道"
-      ? `${row.channelName} · ${row.accountLabel}`
-      : row.channelName,
+    name: rowIdentifier(row),
     baseUrl: gatewayBaseUrl.value,
     apiKey: gatewayKey.value,
     protocol: toolProtocol(row),
@@ -362,13 +411,13 @@ function rowInitial(row: ProxyInventoryRow) {
   return Array.from(name)[0] || "?";
 }
 
+/** 行标题:供应商唯一标识 = 反代站点英文别名-账号-Key 分组。 */
+function rowIdentifier(row: ProxyInventoryRow) {
+  return [row.alias || row.channelName, row.accountLabel, row.group].join("-");
+}
+
 function rowSubtitle(row: ProxyInventoryRow) {
-  const parts = [
-    row.accountLabel,
-    maskKey(row.key),
-    protocolLabel(row.protocol),
-  ];
-  if (row.alias) parts.push(row.alias);
+  const parts = [maskKey(row.key), protocolLabel(row.protocol)];
   if (row.models.length) parts.push(`${row.models.length} 个模型`);
   return parts.join(" · ");
 }
@@ -402,7 +451,7 @@ const allApplied = computed(() =>
 );
 
 function applyBlockedReason(rows: ProxyInventoryRow[]) {
-  if (!snapshot.value) return "尚未读取到工具配置";
+  if (!snapshot.value) return "尚未读取到 Agent 配置";
   if (!gatewayKey.value) return "网关 API Key 尚未生成，请先打开模型反代";
   if (!rows.length) return "当前没有可生效的反代条目";
   if (rows.some((row) => !row.key)) return "有条目还没有 Key，请先到站点库同步";
@@ -557,6 +606,62 @@ async function submitToolSettings() {
   if (ok) closeToolSettings();
 }
 
+// —— 账号别名管理(按站点列全部浏览器账号) ——
+const aliasModalOpen = ref(false);
+const aliasDrafts = reactive<Record<string, string>>({});
+
+/** 别名管理弹窗:按"账号身份"去重后的全部账号(所有站点共用一份别名);附各账号出现的站点名。 */
+const aliasSites = computed(() => {
+  const accounts: Array<{ key: string; defaultLabel: string; profileId: string; sites: string[] }> = [];
+  const byKey = new Map<string, { key: string; defaultLabel: string; profileId: string; sites: string[] }>();
+  for (const channel of proxyConfig.value?.channels ?? []) {
+    if (!channel.siteId) continue;
+    const cache = siteCaches.value[channel.siteId];
+    if (!cache?.accounts?.length) continue;
+    const siteName = channel.name || channelAlias(channel) || channel.id;
+    for (const account of cache.accounts) {
+      const key = accountAliasKey(account);
+      let entry = byKey.get(key);
+      if (!entry) {
+        entry = {
+          key,
+          defaultLabel: accountLabel(account),
+          profileId: account.profileId || account.accountName || account.username || "",
+          sites: [],
+        };
+        byKey.set(key, entry);
+        accounts.push(entry);
+      }
+      if (!entry.sites.includes(siteName)) entry.sites.push(siteName);
+    }
+  }
+  return accounts;
+});
+
+function openAliasModal() {
+  for (const item of aliasSites.value) {
+    aliasDrafts[item.key] = preferences.accountAliases[item.key]?.trim() ?? "";
+  }
+  aliasModalOpen.value = true;
+  document.body.classList.add("modal-open");
+}
+
+function closeAliasModal() {
+  aliasModalOpen.value = false;
+  document.body.classList.remove("modal-open");
+}
+
+function saveAccountAliases() {
+  const next: Record<string, string> = { ...preferences.accountAliases };
+  for (const item of aliasSites.value) {
+    const value = aliasDrafts[item.key]?.trim() ?? "";
+    if (value) next[item.key] = value;
+    else delete next[item.key];
+  }
+  updatePreferences({ accountAliases: next });
+  closeAliasModal();
+}
+
 const backupModalOpen = ref(false);
 function openBackupModal() {
   if (saving.value || snapshotLoading.value) return;
@@ -584,7 +689,7 @@ function formatSize(size: number): string {
   return `${size} B`;
 }
 
-const modalOpen = computed(() => toolSettingsModalOpen.value || backupModalOpen.value);
+const modalOpen = computed(() => toolSettingsModalOpen.value || backupModalOpen.value || aliasModalOpen.value);
 let modalTrigger: HTMLElement | null = null;
 watch(modalOpen, async (open) => {
   if (open) {
@@ -627,12 +732,21 @@ onUnmounted(() => {
   <div class="local-tools-page">
     <header class="lt-cockpit-bar">
       <div class="lt-cockpit-left">
-        <h1>本地工具</h1>
+        <div class="lt-brand-section">
+          <div class="lt-eyebrow-row">
+            <span class="lt-live-dot" />
+            <span class="lt-eyebrow-text">OpenHub · 本地 Agent 接入控制台</span>
+          </div>
+          <div class="lt-title-row">
+            <h1>Agent 配置</h1>
+          </div>
+          <p class="lt-cockpit-subtitle">管理本机 AI 编程 Agent 的供应商接入 · 反代清单一键生效 · 配置备份还原</p>
+        </div>
         <CustomSelect
           class="lt-tool-select"
           :options="toolOptions"
           :model-value="activeTool"
-          aria-label="选择本地工具"
+          aria-label="选择 Agent"
           :menu-min-width="220"
           @update:model-value="chooseTool(String($event))"
         />
@@ -648,7 +762,7 @@ onUnmounted(() => {
           type="button"
           class="lt-btn-primary"
           :disabled="saving || snapshotLoading || !usableRows.length"
-          title="把当前清单里能用的反代条目写入工具"
+          title="把当前清单里能用的反代条目写入 Agent 配置"
           @click="applyAll"
         >
           <span v-html="icons.check"></span>
@@ -662,18 +776,22 @@ onUnmounted(() => {
           <span v-html="icons.clock"></span>
           <span>还原</span>
         </button>
-        <button type="button" class="lt-btn-secondary" title="工具级默认项与上下文" @click="openToolSettings">
+        <button type="button" class="lt-btn-secondary" title="按浏览器账号设置别名" @click="openAliasModal">
+          <span v-html="icons.user"></span>
+          <span>账号别名</span>
+        </button>
+        <button type="button" class="lt-btn-secondary" title="Agent 级默认项与上下文" @click="openToolSettings">
           <span v-html="icons.sliders"></span>
-          <span>工具设置</span>
+          <span>Agent 设置</span>
         </button>
       </div>
     </header>
 
     <div class="local-tools-layout">
       <div v-if="!activeTool" class="empty-state">
-        <div v-html="icons.monitor"></div>
-        <h2>{{ toolListLoading ? "扫描本地工具…" : "暂无可用工具" }}</h2>
-        <p v-if="!toolListLoading">未检测到支持结构化配置的本地工具。</p>
+        <div v-html="icons.sparkles"></div>
+        <h2>{{ toolListLoading ? "扫描本机 Agent…" : "暂无可用 Agent" }}</h2>
+        <p v-if="!toolListLoading">未检测到支持结构化配置的 Agent。</p>
         <button v-if="!toolListLoading" class="secondary-button" type="button" @click="loadToolList">重新扫描</button>
       </div>
 
@@ -708,7 +826,7 @@ onUnmounted(() => {
               <div class="provider-identity">
                 <span class="provider-avatar">{{ rowInitial(row) }}</span>
                 <div>
-                  <strong>{{ row.channelName }}</strong>
+                  <strong>{{ rowIdentifier(row) }}</strong>
                   <span class="provider-meta">{{ rowSubtitle(row) }}</span>
                 </div>
               </div>
@@ -730,21 +848,51 @@ onUnmounted(() => {
           <div v-else class="provider-empty">
             <div class="provider-empty-icon" v-html="icons.monitor"></div>
             <strong>还没有反代条目</strong>
-            <span>先在模型反代里接入站点或手动渠道，这里会按站点、账号、Key 逐条列出。</span>
+            <span>先在模型反代里接入站点或手动渠道并勾选「管理可用模型」；未勾选任何模型的 Key 不会在这里展示。</span>
           </div>
         </template>
       </section>
     </div>
 
     <Teleport to="body">
+      <div v-if="aliasModalOpen" class="modal-backdrop lt-modal-backdrop" @click.self="closeAliasModal">
+        <section class="mini-modal alias-modal" role="dialog" aria-modal="true" tabindex="-1" @keydown="handleDialogKeydown($event, closeAliasModal)">
+          <header class="modal-header">
+            <div>
+              <h2>账号别名</h2>
+              <p>所有站点共用 · 用于供应商标识显示</p>
+            </div>
+            <button class="close-button" type="button" aria-label="关闭账号别名" @click="closeAliasModal" v-html="icons.close"></button>
+          </header>
+          <div class="mini-modal-body">
+            <div v-if="!aliasSites.length" class="alias-empty">还没有已同步账号的站点渠道。</div>
+            <label v-for="item in aliasSites" :key="item.key" class="alias-row">
+              <span class="alias-default" :title="item.profileId">
+                {{ item.defaultLabel }}
+                <small v-if="item.sites.length" class="alias-sites">{{ item.sites.join(" / ") }}</small>
+              </span>
+              <input
+                v-model="aliasDrafts[item.key]"
+                placeholder="别名(留空恢复默认)"
+                maxlength="48"
+              />
+            </label>
+            <p class="alias-hint">别名全站点共用，用于反代清单与写入 Agent 配置的供应商标识，仅在本机生效。</p>
+          </div>
+          <footer class="modal-footer">
+            <button class="secondary-button" type="button" @click="closeAliasModal">取消</button>
+            <button class="primary-button" type="button" @click="saveAccountAliases">保存</button>
+          </footer>
+        </section>
+      </div>
       <div v-if="toolSettingsModalOpen" class="modal-backdrop lt-modal-backdrop" @click.self="closeToolSettings">
         <section class="mini-modal settings-modal" role="dialog" aria-modal="true" tabindex="-1" @keydown="handleDialogKeydown($event, closeToolSettings)">
           <header class="modal-header">
             <div>
-              <h2>工具设置</h2>
+              <h2>Agent 设置</h2>
               <p>{{ activeOverview?.toolName ?? activeTool }}</p>
             </div>
-            <button class="close-button" type="button" aria-label="关闭工具设置" @click="closeToolSettings" v-html="icons.close"></button>
+            <button class="close-button" type="button" aria-label="关闭 Agent 设置" @click="closeToolSettings" v-html="icons.close"></button>
           </header>
           <div class="mini-modal-body">
             <section class="settings-block">
@@ -857,16 +1005,65 @@ onUnmounted(() => {
 .lt-cockpit-left {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 16px;
   min-width: 0;
 }
 
-.lt-cockpit-left h1 {
+/* 品牌区：eyebrow 行 + 标题行 + 副标题，与其他页面驾驶舱对齐 */
+.lt-brand-section {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  flex-shrink: 0;
+}
+
+.lt-eyebrow-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.lt-live-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--success, #2ea043);
+  box-shadow: 0 0 8px var(--success, #2ea043);
+  animation: ltPulse 2s infinite ease-in-out;
+}
+
+@keyframes ltPulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.4; transform: scale(1.25); }
+}
+
+.lt-eyebrow-text {
+  font-size: 10px;
+  font-weight: 750;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--brand);
+}
+
+.lt-title-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.lt-title-row h1 {
   font-size: 18px;
   font-weight: 750;
   color: var(--text);
   margin: 0;
   line-height: 1.2;
+  white-space: nowrap;
+}
+
+.lt-cockpit-subtitle {
+  font-size: 11px;
+  color: var(--muted);
+  margin: 0;
   white-space: nowrap;
 }
 
@@ -1213,6 +1410,26 @@ onUnmounted(() => {
 }
 .save-button:disabled { opacity: 0.5; cursor: not-allowed; }
 .settings-block h4 { margin: 0 0 10px; font-size: 13px; }
+
+/* 账号别名管理弹窗 */
+.alias-modal { width: min(520px, calc(100vw - 48px)); }
+.alias-hint { margin: 0; font-size: 11.5px; color: var(--muted); }
+.alias-empty { font-size: 12.5px; color: var(--muted); text-align: center; padding: 12px 0; }
+.alias-row { display: flex; align-items: center; gap: 10px; }
+.alias-default { flex: 0 0 40%; min-width: 0; font-size: 12.5px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.alias-sites { display: block; font-size: 10.5px; opacity: 0.75; }
+.alias-row input {
+  flex: 1;
+  min-width: 0;
+  height: 34px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  outline: 0;
+  background: var(--surface);
+  color: var(--text);
+  font-size: 12.5px;
+}
 
 @media (max-width: 980px) {
   .lt-cockpit-bar { flex-wrap: wrap; }

@@ -49,8 +49,8 @@ const navItems = computed(() => [
   },
   {
     id: "localtools",
-    label: "本地工具",
-    icon: icons.monitor,
+    label: "Agent 配置",
+    icon: icons.sparkles,
     active: store.page.value === "localtools",
     badge: "",
     onClick: () => store.openLocalTools(),

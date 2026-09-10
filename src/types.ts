@@ -269,6 +269,8 @@ export interface Preferences {
   proxyNodeViewMode: ProxyNodeViewModePreference;
   proxyNodeSortMode: ProxySortMode;
   sidebarCollapsed: boolean;
+  /** 站点账号别名:键 = 站点ID:profileId(或账号名),值 = 用户设置的别名 */
+  accountAliases: Record<string, string>;
 }
 
 export interface MihomoKernelStatus {

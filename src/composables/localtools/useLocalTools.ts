@@ -33,7 +33,7 @@ async function loadToolList() {
   try {
     toolList.value = await runLocalCommand<LocalToolListReport>("list_local_tools");
   } catch (error) {
-    showToast(`本地工具扫描失败：${error}`, true);
+    showToast(`Agent 扫描失败：${error}`, true);
   } finally {
     toolListLoading.value = false;
   }

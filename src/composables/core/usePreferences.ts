@@ -15,6 +15,7 @@ const defaultPreferences: Preferences = {
   proxyNodeViewMode: "list",
   proxyNodeSortMode: "latency",
   sidebarCollapsed: false,
+  accountAliases: {},
 };
 
 function loadPreferences(): Preferences {
@@ -42,6 +43,7 @@ function loadPreferences(): Preferences {
       proxyNodeViewMode: proxyNodeViewMode as ProxyNodeViewModePreference,
       proxyNodeSortMode,
       sidebarCollapsed: Boolean(saved.sidebarCollapsed),
+      accountAliases: saved.accountAliases ?? {},
     };
   } catch {
     return { ...defaultPreferences };
