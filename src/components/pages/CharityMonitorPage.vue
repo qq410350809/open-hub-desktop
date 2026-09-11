@@ -26,8 +26,24 @@ function closePostDetail() {
   document.body.classList.remove("modal-open");
 }
 
+const openingInBrowsers = ref(false);
+
+async function openCharityUrl(url: string) {
+  if (!url || openingInBrowsers.value) return;
+  openingInBrowsers.value = true;
+  try {
+    await store.openExternalInChromeSessions(url);
+  } finally {
+    openingInBrowsers.value = false;
+  }
+}
+
 function openPostInBrowser(item: CharityFeedItem) {
-  void store.openExternal(item.link);
+  void openCharityUrl(item.link);
+}
+
+function linuxDoTagUrl(id: string) {
+  return `https://linux.do/tag/${encodeURIComponent(id.trim())}`;
 }
 
 // —— 快捷复制链接 ——
@@ -138,9 +154,9 @@ async function handleRemoveTag(id: string, name: string) {
   }
 }
 
-// 标签 ID 点击后在浏览器打开对应的 linux.do 标签页
+// 标签 ID 点击后在所有 LINUX.DO 会话浏览器中打开对应标签页
 function openTagInBrowser(id: string) {
-  void store.openExternal(`https://linux.do/tag/${id}-tag/${id}`);
+  void openCharityUrl(linuxDoTagUrl(id));
 }
 
 function startEditProtocol(tag: CharityFeedTag) {
@@ -728,7 +744,7 @@ onUnmounted(() => {
                 <span v-if="isToday(row.publishedAt)" class="cm-new-badge">NEW</span>
                 <h2
                   class="cm-topic-title"
-                  :title="`在浏览器中打开：${row.title}`"
+                  :title="`在所有 LINUX.DO 会话浏览器中打开：${row.title}`"
                   @click.stop="openPostInBrowser(row)"
                 >
                   {{ row.title }}
@@ -817,7 +833,8 @@ onUnmounted(() => {
               <button
                 type="button"
                 class="cm-action-icon-btn"
-                title="在系统默认浏览器中打开"
+                title="在所有 LINUX.DO 会话浏览器中打开"
+                :disabled="openingInBrowsers"
                 @click="openPostInBrowser(row)"
               >
                 <span v-html="icons.external" />
@@ -907,7 +924,7 @@ onUnmounted(() => {
                   {{ selectedPost.summary }}
                 </div>
                 <div v-else class="cm-detail-empty-summary">
-                  该帖子暂无长正文快照，点击下方「在浏览器中打开」可直接查阅完整讨论与回复。
+                  该帖子暂无长正文快照，点击下方「在会话浏览器中打开」可直接查阅完整讨论与回复。
                 </div>
               </div>
 
@@ -930,10 +947,11 @@ onUnmounted(() => {
               <button
                 type="button"
                 class="cm-btn-primary"
+                :disabled="openingInBrowsers"
                 @click="openPostInBrowser(selectedPost!)"
               >
                 <span v-html="icons.external" />
-                <span>在浏览器中打开</span>
+                <span>在会话浏览器中打开</span>
               </button>
               <button type="button" class="cm-btn-cancel" @click="closePostDetail">关闭</button>
             </footer>
@@ -1016,7 +1034,8 @@ onUnmounted(() => {
                         <button
                           type="button"
                           class="cm-tag-id-badge"
-                          :title="`在浏览器中打开标签页（linux.do/tag/${tag.id}-tag/${tag.id}）`"
+                          :title="`在所有 LINUX.DO 会话浏览器中打开标签页（linux.do/tag/${tag.id}）`"
+                          :disabled="openingInBrowsers"
                           @click="openTagInBrowser(tag.id)"
                         >ID: {{ tag.id }}</button>
                         <span class="cm-tag-status-badge" :class="{ 'is-on': tag.enabled !== false }">

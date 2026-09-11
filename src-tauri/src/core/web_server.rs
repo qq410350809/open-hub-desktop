@@ -168,6 +168,7 @@ fn is_local_only_command(command: &str) -> bool {
             | "list_chrome_sessions"
             | "read_chrome_session"
             | "open_url_in_chrome_profile"
+            | "open_url_in_chrome_sessions"
             | "close_chrome_sync_tabs"
             | "get_system_fonts"
     )
@@ -234,7 +235,8 @@ macro_rules! rpc_arms {
                 let use_proxy_pool: Option<bool> =
                     take_opt($args, &["useProxyPool", "use_proxy_pool"])?;
                 Ok(json!(
-                    crate::site::library::import_site($ctx, site_url, usage_state, use_proxy_pool).await
+                    crate::site::library::import_site($ctx, site_url, usage_state, use_proxy_pool)
+                        .await
                 ))
             }
 
@@ -313,6 +315,12 @@ macro_rules! rpc_arms {
                 let profile_id: String = take($args, &["profileId", "profile_id"])?;
                 Ok(json!(
                     crate::site::sync::open_url_in_chrome_profile(url, profile_id).await
+                ))
+            }
+            "open_url_in_chrome_sessions" => {
+                let url: String = take($args, &["url"])?;
+                Ok(json!(
+                    crate::site::sync::open_url_in_chrome_sessions(url).await
                 ))
             }
             "close_chrome_sync_tabs" => {
@@ -540,7 +548,14 @@ macro_rules! rpc_arms {
                 let enabled: Option<bool> = take_opt($args, &["enabled"])?;
                 let upstream_protocol: Option<String> = take_opt($args, &["upstream_protocol"])?;
                 Ok(json!(
-                    crate::charity::update_charity_source($ctx, id, name, enabled, upstream_protocol).await
+                    crate::charity::update_charity_source(
+                        $ctx,
+                        id,
+                        name,
+                        enabled,
+                        upstream_protocol
+                    )
+                    .await
                 ))
             }
             "remove_charity_source" => {

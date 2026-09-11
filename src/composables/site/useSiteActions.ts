@@ -4,7 +4,13 @@ import { useLibrary } from "./useLibrary";
 import { useToast } from "../core/useToast";
 import { useUIState } from "../ui/useUIState";
 import { useConfirm } from "../ui/useConfirm";
-import type { AddressItem, SiteRecord, SiteLinkKind, SiteUsageState } from "../../types";
+import type {
+  AddressItem,
+  OpenUrlInChromeSessionsResult,
+  SiteRecord,
+  SiteLinkKind,
+  SiteUsageState,
+} from "../../types";
 import { systemTypeLabel } from "../../types";
 
 const { loadLibrary } = useLibrary();
@@ -126,6 +132,45 @@ async function openExternalInChromeProfile(url: string, profileId: string) {
   }
 }
 
+function chromeSessionsOpenToast(result: OpenUrlInChromeSessionsResult): string {
+  const names = result.profiles
+    .map((session) => session.accountName.trim() || session.profileName.trim())
+    .filter(Boolean);
+  const unique = [...new Set(names)];
+  const suffix = unique.length ? `（${unique.join("、")}）` : "";
+  if (result.errors.length && result.opened > 0) {
+    return `已在 ${result.opened}/${result.attempted} 个会话浏览器中打开${suffix}`;
+  }
+  return `已在 ${result.opened} 个会话浏览器中打开${suffix}`;
+}
+
+async function openExternalInChromeSessions(url: string) {
+  if (!url) return;
+  if (!isTauri) {
+    await openExternal(url);
+    return;
+  }
+  try {
+    const result = await runCommand<OpenUrlInChromeSessionsResult>("open_url_in_chrome_sessions", { url });
+    if (!result.attempted) {
+      await openExternal(url);
+      return;
+    }
+    if (result.opened === 0) {
+      showToast(result.errors[0] || "无法使用 Chrome 会话打开链接", true);
+      await openExternal(url);
+      return;
+    }
+    showToast(chromeSessionsOpenToast(result));
+    if (result.errors.length) {
+      showToast(`部分账号未能打开：${result.errors.join("；")}`, true);
+    }
+  } catch (error) {
+    showToast(`无法按会话打开链接：${String(error)}`, true);
+    await openExternal(url);
+  }
+}
+
 async function copyAddress(url: string, label: string) {
   try {
     await navigator.clipboard.writeText(url);
@@ -164,6 +209,7 @@ export function useSiteActions() {
     toggleRunaway,
     openExternal,
     openExternalInChromeProfile,
+    openExternalInChromeSessions,
     copyAddress,
     addressItems,
     allAddressItems,

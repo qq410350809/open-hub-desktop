@@ -94,6 +94,19 @@ export interface ChromeSessionValue {
   profileName: string;
 }
 
+export interface OpenedChromeSession {
+  profileId: string;
+  profileName: string;
+  accountName: string;
+}
+
+export interface OpenUrlInChromeSessionsResult {
+  opened: number;
+  attempted: number;
+  profiles: OpenedChromeSession[];
+  errors: string[];
+}
+
 export interface ChromeUsageScanResult {
   scanned: number;
   detected: number;

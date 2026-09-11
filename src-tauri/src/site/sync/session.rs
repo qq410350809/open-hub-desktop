@@ -4,12 +4,13 @@ use crate::context::spawn_blocking;
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde::Serialize;
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     ffi::{c_char, c_void},
     fs,
     io::Read,
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
+    sync::{Mutex, OnceLock},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -27,41 +28,52 @@ fn run_osascript_with_deadline(
     deadline: Duration,
 ) -> Result<std::process::Output, String> {
     command
-        .stdin(Stdio::piped())
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = command
         .spawn()
         .map_err(|error| format!("无法启动 osascript：{error}"))?;
+    let stdout_reader = child.stdout.take().map(|mut pipe| {
+        thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = pipe.read_to_end(&mut buf);
+            buf
+        })
+    });
+    let stderr_reader = child.stderr.take().map(|mut pipe| {
+        thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = pipe.read_to_end(&mut buf);
+            buf
+        })
+    });
     let started = Instant::now();
-    loop {
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(status)) => {
-                let mut stdout = Vec::new();
-                let mut stderr = Vec::new();
-                if let Some(mut pipe) = child.stdout.take() {
-                    let _ = pipe.read_to_end(&mut stdout);
-                }
-                if let Some(mut pipe) = child.stderr.take() {
-                    let _ = pipe.read_to_end(&mut stderr);
-                }
-                return Ok(std::process::Output {
-                    status,
-                    stdout,
-                    stderr,
-                });
-            }
+            Ok(Some(status)) => break status,
             Ok(None) => {
                 if started.elapsed() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
+                    let _ = stdout_reader.map(|handle| handle.join());
+                    let _ = stderr_reader.map(|handle| handle.join());
                     return Err("osascript AppleEvent已超时，已终止本次调用".to_string());
                 }
                 thread::sleep(Duration::from_millis(50));
             }
             Err(error) => return Err(format!("osascript 状态读取失败：{error}")),
         }
-    }
+    };
+    Ok(std::process::Output {
+        status,
+        stdout: stdout_reader
+            .and_then(|handle| handle.join().ok())
+            .unwrap_or_default(),
+        stderr: stderr_reader
+            .and_then(|handle| handle.join().ok())
+            .unwrap_or_default(),
+    })
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -118,6 +130,34 @@ pub struct ChromeSessionValue {
     cookie: String,
     cookie_count: usize,
     profile_name: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenedChromeSession {
+    pub(crate) profile_id: String,
+    pub(crate) profile_name: String,
+    pub(crate) account_name: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenUrlInChromeSessionsResult {
+    pub(crate) opened: usize,
+    pub(crate) attempted: usize,
+    pub(crate) profiles: Vec<OpenedChromeSession>,
+    pub(crate) errors: Vec<String>,
+}
+
+impl OpenUrlInChromeSessionsResult {
+    fn empty() -> Self {
+        Self {
+            opened: 0,
+            attempted: 0,
+            profiles: Vec::new(),
+            errors: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -227,6 +267,16 @@ pub(crate) fn chrome_user_agent() -> String {
 #[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn open_url_in_chrome_profile(url: String, profile_id: String) -> Result<(), String> {
     spawn_blocking(move || open_url_in_chrome_profile_blocking(&url, &profile_id))
+        .await
+        .map_err(|error| format!("启动 Chrome 任务失败：{error}"))?
+}
+
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub async fn open_url_in_chrome_sessions(
+    url: String,
+) -> Result<OpenUrlInChromeSessionsResult, String> {
+    let home_dir = home_dir().ok_or("无法定位用户目录")?;
+    spawn_blocking(move || open_url_in_chrome_sessions_from_home(&home_dir, &url))
         .await
         .map_err(|error| format!("启动 Chrome 任务失败：{error}"))?
 }
@@ -449,7 +499,7 @@ pub(crate) fn run_javascript_in_chrome_profile(
         }
     }
     let existing_tab_ids = chrome_tab_ids();
-    open_url_in_chrome_profile_blocking_with_mode(target_url, profile_id, false, proxy_url)?;
+    open_url_in_chrome_profile_blocking_with_mode(target_url, profile_id, false, proxy_url, false)?;
     let target_tab_id =
         wait_for_new_chrome_tab(&existing_tab_ids, target_url, Duration::from_secs(8));
     run_javascript_in_marked_chrome_tab(marker, javascript, target_tab_id.as_deref(), timeout)
@@ -478,7 +528,7 @@ pub(crate) fn run_javascript_in_background_chrome_profile(
         }
     }
     let existing_tab_ids = chrome_tab_ids();
-    open_url_in_chrome_profile_blocking_with_mode(target_url, profile_id, true, proxy_url)?;
+    open_url_in_chrome_profile_blocking_with_mode(target_url, profile_id, true, proxy_url, false)?;
     let target_tab_id =
         wait_for_new_chrome_tab(&existing_tab_ids, target_url, Duration::from_secs(8));
     let result =
@@ -611,18 +661,521 @@ end run
     Err("等待 Chrome 返回账号数据超时；请完成页面验证后重试".into())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChromeWindowSnapshot {
+    window_id: String,
+    tabs: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ChromeSessionOpenPlan {
+    ActivateTab { tab_id: String, window_id: String },
+    NewTabInWindow { window_id: String },
+    Launch { new_window: bool },
+}
+
+fn parse_chrome_window_snapshot_line(line: &str) -> Option<(String, String, String)> {
+    let mut parts = line.splitn(3, '\t');
+    let window_id = parts.next()?.trim();
+    let tab_id = parts.next()?.trim();
+    let url = parts.next().unwrap_or("").trim();
+    if window_id.is_empty()
+        || tab_id.is_empty()
+        || !window_id
+            .chars()
+            .all(|character| character.is_ascii_digit())
+        || !tab_id.chars().all(|character| character.is_ascii_digit())
+    {
+        return None;
+    }
+    Some((window_id.to_string(), tab_id.to_string(), url.to_string()))
+}
+
+fn group_chrome_window_snapshots(
+    lines: impl IntoIterator<Item = (String, String, String)>,
+) -> Vec<ChromeWindowSnapshot> {
+    let mut windows: Vec<ChromeWindowSnapshot> = Vec::new();
+    for (window_id, tab_id, url) in lines {
+        match windows.last_mut() {
+            Some(window) if window.window_id == window_id => {
+                window.tabs.push((tab_id, url));
+            }
+            _ => windows.push(ChromeWindowSnapshot {
+                window_id,
+                tabs: vec![(tab_id, url)],
+            }),
+        }
+    }
+    windows
+}
+
+fn normalize_chrome_reuse_url(url: &str) -> String {
+    let Ok(parsed) = Url::parse(url.trim()) else {
+        return url.trim().trim_end_matches('/').to_string();
+    };
+    let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
+    let mut path = parsed.path().to_string();
+    if path.len() > 1 {
+        path = path.trim_end_matches('/').to_string();
+    }
+    format!("{}://{host}{path}", parsed.scheme())
+}
+
+fn chrome_tab_url_matches(existing: &str, target: &str) -> bool {
+    !existing.is_empty()
+        && normalize_chrome_reuse_url(existing) == normalize_chrome_reuse_url(target)
+}
+
+fn is_linuxdo_tab_url(url: &str) -> bool {
+    let Ok(parsed) = Url::parse(url.trim()) else {
+        return false;
+    };
+    parsed.host_str().is_some_and(|host| {
+        let host = host.trim_end_matches('.').to_ascii_lowercase();
+        host == "linux.do" || host == "www.linux.do"
+    })
+}
+
+fn preferred_reuse_tab(window: &ChromeWindowSnapshot, target_url: &str) -> Option<(String, bool)> {
+    if let Some((tab_id, _)) = window
+        .tabs
+        .iter()
+        .find(|(_, url)| chrome_tab_url_matches(url, target_url))
+    {
+        return Some((tab_id.clone(), true));
+    }
+    window
+        .tabs
+        .iter()
+        .find(|(_, url)| is_linuxdo_tab_url(url))
+        .map(|(tab_id, _)| (tab_id.clone(), false))
+}
+
+fn parse_chrome_singleton_lock_pid(target: &str) -> Option<u32> {
+    let name = Path::new(target)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or(target);
+    let pid = name.rsplit('-').next()?.parse::<u32>().ok()?;
+    (pid > 0).then_some(pid)
+}
+
+fn extract_http_urls_from_bytes(data: &[u8]) -> HashSet<String> {
+    let mut urls = HashSet::new();
+    let mut index = 0;
+    while index < data.len() {
+        let rest = &data[index..];
+        let https = rest.starts_with(b"https://");
+        let http = rest.starts_with(b"http://");
+        if !https && !http {
+            index += 1;
+            continue;
+        }
+        let mut end = if https { 8 } else { 7 };
+        while index + end < data.len() {
+            let byte = data[index + end];
+            if byte <= 0x20 || byte >= 0x7f || matches!(byte, b'"' | b'\'' | b'<' | b'>' | b'\\') {
+                break;
+            }
+            end += 1;
+            if end > 2048 {
+                break;
+            }
+        }
+        if let Ok(url) = std::str::from_utf8(&data[index..index + end]) {
+            if Url::parse(url).is_ok() {
+                urls.insert(normalize_chrome_reuse_url(url));
+            }
+        }
+        index += end.max(1);
+    }
+    urls
+}
+
+const SNSS_COMMAND_SET_TAB_WINDOW: u8 = 0;
+const SNSS_COMMAND_TAB_CLOSED: u8 = 3;
+const SNSS_COMMAND_WINDOW_CLOSED: u8 = 4;
+const SNSS_COMMAND_TAB_CLOSED2: u8 = 16;
+const SNSS_COMMAND_WINDOW_CLOSED2: u8 = 17;
+
+fn snss_i32(payload: &[u8]) -> Option<i32> {
+    payload.get(..4)?.try_into().ok().map(i32::from_le_bytes)
+}
+
+struct SnssCommandIter<'a> {
+    data: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> SnssCommandIter<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, offset: 0 }
+    }
+}
+
+impl<'a> Iterator for SnssCommandIter<'a> {
+    type Item = (u8, &'a [u8]);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.offset == 0 {
+            if self.data.len() < 8 || self.data.get(..4) != Some(b"SNSS".as_slice()) {
+                return None;
+            }
+            self.offset = 8;
+        }
+        if self.offset + 3 > self.data.len() {
+            return None;
+        }
+        let size =
+            u16::from_le_bytes(self.data[self.offset..self.offset + 2].try_into().ok()?) as usize;
+        self.offset += 2;
+        if size == 0 || self.offset + size > self.data.len() {
+            self.offset = self.data.len();
+            return None;
+        }
+        let command_id = self.data[self.offset];
+        let payload = &self.data[self.offset + 1..self.offset + size];
+        self.offset += size;
+        Some((command_id, payload))
+    }
+}
+
+fn parse_chrome_session_open_window_ids(data: &[u8]) -> HashSet<String> {
+    let mut windows: HashMap<i32, HashSet<i32>> = HashMap::new();
+    for (command_id, payload) in SnssCommandIter::new(data) {
+        match command_id {
+            SNSS_COMMAND_SET_TAB_WINDOW => {
+                let Some(window_id) = snss_i32(payload) else {
+                    continue;
+                };
+                let Some(tab_id) = snss_i32(payload.get(4..).unwrap_or(&[])) else {
+                    continue;
+                };
+                windows.entry(window_id).or_default().insert(tab_id);
+            }
+            SNSS_COMMAND_WINDOW_CLOSED | SNSS_COMMAND_WINDOW_CLOSED2 => {
+                if let Some(window_id) = snss_i32(payload) {
+                    windows.remove(&window_id);
+                }
+            }
+            SNSS_COMMAND_TAB_CLOSED | SNSS_COMMAND_TAB_CLOSED2 => {
+                if let Some(tab_id) = snss_i32(payload) {
+                    for tabs in windows.values_mut() {
+                        tabs.remove(&tab_id);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    windows
+        .into_keys()
+        .map(|window_id| window_id.to_string())
+        .collect()
+}
+
+fn chrome_session_restore_files(profile_dir: &Path, limit: usize) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    for name in ["Current Session", "Last Session"] {
+        let path = profile_dir.join(name);
+        if path.is_file() {
+            files.push(path);
+        }
+    }
+    if let Ok(entries) = fs::read_dir(profile_dir.join("Sessions")) {
+        files.extend(entries.flatten().map(|entry| entry.path()).filter(|path| {
+            path.is_file()
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("Session_"))
+        }));
+    }
+    files.sort_by_key(|path| {
+        std::cmp::Reverse(
+            path.metadata()
+                .and_then(|meta| meta.modified())
+                .unwrap_or(SystemTime::UNIX_EPOCH),
+        )
+    });
+    files.truncate(limit);
+    files
+}
+
+fn collect_profile_open_window_ids(profile_dir: &Path) -> HashSet<String> {
+    let mut ids = HashSet::new();
+    for path in chrome_session_restore_files(profile_dir, 2) {
+        let Ok(data) = fs::read(&path) else {
+            continue;
+        };
+        if data.len() > 8 * 1024 * 1024 {
+            continue;
+        }
+        ids.extend(parse_chrome_session_open_window_ids(&data));
+    }
+    ids
+}
+
+fn assign_chrome_windows_by_session_ids(
+    windows: &[ChromeWindowSnapshot],
+    profile_window_ids: &[(String, HashSet<String>)],
+) -> HashMap<String, Vec<ChromeWindowSnapshot>> {
+    let mut assigned: HashMap<String, Vec<ChromeWindowSnapshot>> = HashMap::new();
+    for window in windows {
+        let mut matches = profile_window_ids
+            .iter()
+            .filter(|(_, ids)| ids.contains(&window.window_id))
+            .map(|(profile_id, _)| profile_id.as_str());
+        let Some(profile_id) = matches.next() else {
+            continue;
+        };
+        if matches.next().is_some() {
+            continue;
+        }
+        assigned
+            .entry(profile_id.to_string())
+            .or_default()
+            .push(window.clone());
+    }
+    assigned
+}
+
+fn assign_chrome_windows_to_profiles(
+    windows: &[ChromeWindowSnapshot],
+    profile_urls: &[(String, HashSet<String>)],
+) -> HashMap<String, Vec<ChromeWindowSnapshot>> {
+    let mut assigned: HashMap<String, Vec<ChromeWindowSnapshot>> = HashMap::new();
+    for window in windows {
+        let window_urls = window
+            .tabs
+            .iter()
+            .map(|(_, url)| normalize_chrome_reuse_url(url))
+            .collect::<HashSet<_>>();
+        let mut best_profile = None;
+        let mut best_score = 0usize;
+        let mut second_score = 0usize;
+        for (profile_id, urls) in profile_urls {
+            let score = urls.intersection(&window_urls).count();
+            if score == 0 {
+                continue;
+            }
+            if score > best_score {
+                second_score = best_score;
+                best_score = score;
+                best_profile = Some(profile_id.as_str());
+            } else if score == best_score {
+                second_score = score;
+            } else if score > second_score {
+                second_score = score;
+            }
+        }
+        if let Some(profile_id) = best_profile {
+            if best_score > second_score {
+                assigned
+                    .entry(profile_id.to_string())
+                    .or_default()
+                    .push(window.clone());
+            }
+        }
+    }
+    assigned
+}
+
+fn exclusive_profile_urls(
+    profile_urls: &[(String, HashSet<String>)],
+) -> Vec<(String, HashSet<String>)> {
+    profile_urls
+        .iter()
+        .enumerate()
+        .map(|(index, (profile_id, urls))| {
+            let exclusive = urls
+                .iter()
+                .filter(|url| {
+                    profile_urls
+                        .iter()
+                        .enumerate()
+                        .all(|(other, (_, other_urls))| {
+                            other == index || !other_urls.contains(*url)
+                        })
+                })
+                .cloned()
+                .collect::<HashSet<_>>();
+            (profile_id.clone(), exclusive)
+        })
+        .collect()
+}
+
+fn assigned_chrome_window_ids(
+    assigned: &HashMap<String, Vec<ChromeWindowSnapshot>>,
+) -> HashSet<String> {
+    assigned
+        .values()
+        .flatten()
+        .map(|window| window.window_id.clone())
+        .collect()
+}
+
+fn merge_assigned_chrome_windows(
+    into: &mut HashMap<String, Vec<ChromeWindowSnapshot>>,
+    extra: HashMap<String, Vec<ChromeWindowSnapshot>>,
+) {
+    for (profile_id, windows) in extra {
+        let entry = into.entry(profile_id).or_default();
+        for window in windows {
+            if !entry
+                .iter()
+                .any(|existing| existing.window_id == window.window_id)
+            {
+                entry.push(window);
+            }
+        }
+    }
+}
+
+fn apply_cached_chrome_window_profiles(
+    windows: &[ChromeWindowSnapshot],
+    assigned_window_ids: &HashSet<String>,
+    assigned_profiles: &HashSet<String>,
+    cache: &HashMap<String, String>,
+) -> HashMap<String, Vec<ChromeWindowSnapshot>> {
+    let windows_by_id = windows
+        .iter()
+        .map(|window| (window.window_id.as_str(), window))
+        .collect::<HashMap<_, _>>();
+    let mut extra: HashMap<String, Vec<ChromeWindowSnapshot>> = HashMap::new();
+    for (window_id, profile_id) in cache {
+        if assigned_window_ids.contains(window_id) || assigned_profiles.contains(profile_id) {
+            continue;
+        }
+        if let Some(window) = windows_by_id.get(window_id.as_str()) {
+            extra
+                .entry(profile_id.clone())
+                .or_default()
+                .push((*window).clone());
+        }
+    }
+    extra
+}
+
+fn remember_chrome_window_profiles(
+    assigned: &HashMap<String, Vec<ChromeWindowSnapshot>>,
+    live_window_ids: &HashSet<String>,
+    allowed_profiles: &HashSet<String>,
+    cache: &mut HashMap<String, String>,
+) {
+    cache.retain(|window_id, profile_id| {
+        live_window_ids.contains(window_id) && allowed_profiles.contains(profile_id)
+    });
+    for (profile_id, windows) in assigned {
+        for window in windows {
+            cache.insert(window.window_id.clone(), profile_id.clone());
+        }
+    }
+}
+
+fn resolve_chrome_windows_for_profiles(
+    windows: &[ChromeWindowSnapshot],
+    profile_urls: &[(String, HashSet<String>)],
+    profile_window_ids: &[(String, HashSet<String>)],
+    cache: &mut HashMap<String, String>,
+) -> HashMap<String, Vec<ChromeWindowSnapshot>> {
+    let mut assigned = assign_chrome_windows_by_session_ids(windows, profile_window_ids);
+    let assigned_window_ids = assigned_chrome_window_ids(&assigned);
+    let remaining = windows
+        .iter()
+        .filter(|window| !assigned_window_ids.contains(&window.window_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    let exclusive = exclusive_profile_urls(profile_urls);
+    merge_assigned_chrome_windows(
+        &mut assigned,
+        assign_chrome_windows_to_profiles(&remaining, &exclusive),
+    );
+    let assigned_window_ids = assigned_chrome_window_ids(&assigned);
+    let remaining = windows
+        .iter()
+        .filter(|window| !assigned_window_ids.contains(&window.window_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    merge_assigned_chrome_windows(
+        &mut assigned,
+        assign_chrome_windows_to_profiles(&remaining, profile_urls),
+    );
+
+    let assigned_window_ids = assigned_chrome_window_ids(&assigned);
+    let assigned_profiles = assigned.keys().cloned().collect::<HashSet<_>>();
+    merge_assigned_chrome_windows(
+        &mut assigned,
+        apply_cached_chrome_window_profiles(
+            windows,
+            &assigned_window_ids,
+            &assigned_profiles,
+            cache,
+        ),
+    );
+
+    let live_window_ids = windows
+        .iter()
+        .map(|window| window.window_id.clone())
+        .collect::<HashSet<_>>();
+    let mut allowed_profiles = profile_urls
+        .iter()
+        .map(|(profile_id, _)| profile_id.clone())
+        .collect::<HashSet<_>>();
+    allowed_profiles.extend(
+        profile_window_ids
+            .iter()
+            .map(|(profile_id, _)| profile_id.clone()),
+    );
+    remember_chrome_window_profiles(&assigned, &live_window_ids, &allowed_profiles, cache);
+    assigned
+}
+
+#[allow(dead_code)]
+fn chrome_window_profile_cache() -> std::sync::MutexGuard<'static, HashMap<String, String>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    CACHE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn plan_chrome_session_open(
+    target_url: &str,
+    profile_running: bool,
+    profile_windows: &[ChromeWindowSnapshot],
+) -> ChromeSessionOpenPlan {
+    for window in profile_windows {
+        if let Some((tab_id, true)) = preferred_reuse_tab(window, target_url) {
+            return ChromeSessionOpenPlan::ActivateTab {
+                tab_id,
+                window_id: window.window_id.clone(),
+            };
+        }
+    }
+    if let Some(window) = profile_windows.first() {
+        return ChromeSessionOpenPlan::NewTabInWindow {
+            window_id: window.window_id.clone(),
+        };
+    }
+    ChromeSessionOpenPlan::Launch {
+        new_window: !profile_running,
+    }
+}
+
 #[cfg(target_os = "macos")]
-fn chrome_tabs() -> Vec<(String, String)> {
+fn chrome_window_snapshots() -> Vec<ChromeWindowSnapshot> {
     const SCRIPT: &str = r#"
 if application "Google Chrome" is not running then return ""
 set tabLines to ""
 tell application "Google Chrome"
     repeat with windowIndex from 1 to (count of windows)
         try
+            set windowId to (id of window windowIndex) as text
             repeat with tabIndex from 1 to (count of tabs of window windowIndex)
                 try
                     set browserTab to tab tabIndex of window windowIndex
-                    set tabLines to tabLines & ((id of browserTab) as text) & tab & (URL of browserTab) & linefeed
+                    set tabLines to tabLines & windowId & tab & ((id of browserTab) as text) & tab & (URL of browserTab) & linefeed
                 end try
             end repeat
         end try
@@ -638,14 +1191,171 @@ return tabLines
     if !output.status.success() {
         return Vec::new();
     }
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| {
-            let (id, url) = line.split_once('\t')?;
-            (!id.is_empty() && id.chars().all(|character| character.is_ascii_digit()))
-                .then(|| (id.to_string(), url.to_string()))
-        })
+    group_chrome_window_snapshots(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(parse_chrome_window_snapshot_line),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn chrome_tabs() -> Vec<(String, String)> {
+    chrome_window_snapshots()
+        .into_iter()
+        .flat_map(|window| window.tabs)
         .collect()
+}
+
+#[cfg(target_os = "macos")]
+#[allow(dead_code)]
+fn chrome_pid_is_alive(pid: u32) -> bool {
+    Command::new("/bin/kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "macos")]
+#[allow(dead_code)]
+fn chrome_profile_is_running(profile_dir: &Path) -> bool {
+    let lock = profile_dir.join("SingletonLock");
+    let Ok(target) = fs::read_link(&lock) else {
+        return false;
+    };
+    parse_chrome_singleton_lock_pid(&target.to_string_lossy()).is_some_and(chrome_pid_is_alive)
+}
+
+#[allow(dead_code)]
+fn collect_profile_open_tab_urls(profile_dir: &Path) -> HashSet<String> {
+    let mut urls = HashSet::new();
+    let mut files = vec![
+        profile_dir.join("Current Session"),
+        profile_dir.join("Current Tabs"),
+        profile_dir.join("Last Session"),
+        profile_dir.join("Last Tabs"),
+    ];
+    if let Ok(entries) = fs::read_dir(profile_dir.join("Sessions")) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                files.push(path);
+            }
+        }
+    }
+    for path in files {
+        let Ok(data) = fs::read(&path) else {
+            continue;
+        };
+        if data.len() > 8 * 1024 * 1024 {
+            continue;
+        }
+        urls.extend(extract_http_urls_from_bytes(&data));
+    }
+    urls
+}
+
+#[cfg(target_os = "macos")]
+#[allow(dead_code)]
+fn run_chrome_tab_reuse_action(action: &str, target_id: &str, url: &str) -> Result<String, String> {
+    const SCRIPT: &str = r#"
+on run argv
+    set actionName to item 1 of argv
+    set targetId to item 2 of argv
+    set targetUrl to item 3 of argv
+    if application "Google Chrome" is not running then return "not-running"
+    tell application "Google Chrome"
+        if actionName is "activate-tab" then
+            repeat with windowIndex from 1 to (count of windows)
+                try
+                    repeat with tabIndex from 1 to (count of tabs of window windowIndex)
+                        try
+                            set browserTab to tab tabIndex of window windowIndex
+                            if ((id of browserTab) as text) is equal to targetId then
+                                set active tab index of window windowIndex to tabIndex
+                                set index of window windowIndex to 1
+                                activate
+                                return "ok"
+                            end if
+                        end try
+                    end repeat
+                end try
+            end repeat
+            return "missing"
+        else if actionName is "navigate-tab" then
+            repeat with windowIndex from 1 to (count of windows)
+                try
+                    repeat with tabIndex from 1 to (count of tabs of window windowIndex)
+                        try
+                            set browserTab to tab tabIndex of window windowIndex
+                            if ((id of browserTab) as text) is equal to targetId then
+                                set URL of browserTab to targetUrl
+                                set active tab index of window windowIndex to tabIndex
+                                set index of window windowIndex to 1
+                                activate
+                                return "ok"
+                            end if
+                        end try
+                    end repeat
+                end try
+            end repeat
+            return "missing"
+        else if actionName is "new-tab" then
+            repeat with windowIndex from 1 to (count of windows)
+                try
+                    if ((id of window windowIndex) as text) is equal to targetId then
+                        make new tab at end of tabs of window windowIndex with properties {URL:targetUrl}
+                        set index of window windowIndex to 1
+                        activate
+                        return "ok"
+                    end if
+                end try
+            end repeat
+            return "missing"
+        end if
+    end tell
+    return "unknown"
+end run
+"#;
+    let mut command = Command::new("/usr/bin/osascript");
+    command.args(["-e", SCRIPT, "--", action, target_id, url]);
+    let output = run_osascript_with_deadline(command, Duration::from_secs(10))?;
+    if !output.status.success() {
+        let error = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if error.is_empty() {
+            "Chrome 复用已打开窗口失败".into()
+        } else {
+            format!("Chrome 复用已打开窗口失败：{error}")
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+#[cfg(target_os = "macos")]
+#[allow(dead_code)]
+fn execute_chrome_session_open_plan(
+    url: &str,
+    profile_id: &str,
+    plan: ChromeSessionOpenPlan,
+) -> Result<(), String> {
+    let new_tab_in_window =
+        |window_id: &str| match run_chrome_tab_reuse_action("new-tab", window_id, url) {
+            Ok(result) if result == "ok" => Ok(()),
+            Ok(result) => Err(format!("Chrome 已打开窗口未能新建标签：{result}")),
+            Err(error) => Err(error),
+        };
+    match plan {
+        ChromeSessionOpenPlan::ActivateTab { tab_id, window_id } => {
+            match run_chrome_tab_reuse_action("activate-tab", &tab_id, "") {
+                Ok(result) if result == "ok" => Ok(()),
+                _ => new_tab_in_window(&window_id),
+            }
+        }
+        ChromeSessionOpenPlan::NewTabInWindow { window_id } => new_tab_in_window(&window_id),
+        ChromeSessionOpenPlan::Launch { new_window } => {
+            open_url_in_chrome_profile_blocking_with_mode(url, profile_id, false, None, new_window)
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -821,7 +1531,7 @@ pub(crate) fn run_javascript_in_background_chrome_profile(
 
 #[cfg(target_os = "macos")]
 fn open_url_in_chrome_profile_blocking(url: &str, profile_id: &str) -> Result<(), String> {
-    open_url_in_chrome_profile_blocking_with_mode(url, profile_id, false, None)
+    open_url_in_chrome_profile_blocking_with_mode(url, profile_id, false, None, false)
 }
 
 #[cfg(target_os = "macos")]
@@ -830,6 +1540,7 @@ fn open_url_in_chrome_profile_blocking_with_mode(
     profile_id: &str,
     background: bool,
     proxy_url: Option<&str>,
+    new_window: bool,
 ) -> Result<(), String> {
     if !is_safe_profile_dir(profile_id) {
         return Err("Chrome Profile 标识无效".into());
@@ -842,6 +1553,9 @@ fn open_url_in_chrome_profile_blocking_with_mode(
     command
         .args(["-na", "Google Chrome", "--args"])
         .arg(format!("--profile-directory={profile_id}"));
+    if new_window {
+        command.arg("--new-window");
+    }
     if let Some(proxy) = proxy_url {
         if !proxy.trim().is_empty() {
             command.arg(format!("--proxy-server={proxy}"));
@@ -872,19 +1586,124 @@ fn validated_external_url(value: &str) -> Result<Url, String> {
 }
 
 #[cfg(target_os = "macos")]
-fn list_chrome_sessions_from_home(
+const CHROME_MULTI_PROFILE_OPEN_GAP: Duration = Duration::from_millis(400);
+
+#[cfg(target_os = "macos")]
+fn opened_chrome_session_from_info(session: &ChromeSessionInfo) -> OpenedChromeSession {
+    OpenedChromeSession {
+        profile_id: session.profile_id.clone(),
+        profile_name: session.profile_name.clone(),
+        account_name: session.account_name.clone(),
+    }
+}
+
+fn format_chrome_session_open_error(session: &OpenedChromeSession, error: &str) -> String {
+    let label = if session.account_name.trim().is_empty() {
+        session.profile_name.as_str()
+    } else {
+        session.account_name.as_str()
+    };
+    format!("{label}：{error}")
+}
+
+fn open_url_in_listed_chrome_sessions<F>(
+    url: &str,
+    sessions: &[OpenedChromeSession],
+    mut open: F,
+) -> OpenUrlInChromeSessionsResult
+where
+    F: FnMut(&str, &OpenedChromeSession) -> Result<(), String>,
+{
+    let parsed = match validated_external_url(url) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            return OpenUrlInChromeSessionsResult {
+                opened: 0,
+                attempted: sessions.len(),
+                profiles: Vec::new(),
+                errors: vec![error],
+            };
+        }
+    };
+    let mut profiles = Vec::new();
+    let mut errors = Vec::new();
+    for session in sessions {
+        match open(parsed.as_str(), session) {
+            Ok(()) => profiles.push(session.clone()),
+            Err(error) => errors.push(format_chrome_session_open_error(session, &error)),
+        }
+    }
+    OpenUrlInChromeSessionsResult {
+        opened: profiles.len(),
+        attempted: sessions.len(),
+        profiles,
+        errors,
+    }
+}
+
+fn open_url_in_chrome_sessions_from_home(
+    home_dir: &Path,
+    url: &str,
+) -> Result<OpenUrlInChromeSessionsResult, String> {
+    let parsed = validated_external_url(url)?;
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = home_dir;
+        let _ = parsed;
+        return Ok(OpenUrlInChromeSessionsResult::empty());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let sessions = match collect_chrome_sessions_from_home(home_dir, parsed.as_str()) {
+            Ok((_, sessions)) => sessions,
+            Err(_) => return Ok(OpenUrlInChromeSessionsResult::empty()),
+        };
+        let targets = sessions
+            .iter()
+            .map(opened_chrome_session_from_info)
+            .collect::<Vec<_>>();
+        if targets.is_empty() {
+            return Ok(OpenUrlInChromeSessionsResult::empty());
+        }
+        // 与站点库 open_url_in_chrome_profile 相同：open -na Chrome --profile-directory
+        // 且不加 --new-window，已打开的账号会在原窗口新建标签。
+        let mut needs_gap = false;
+        Ok(open_url_in_listed_chrome_sessions(
+            parsed.as_str(),
+            &targets,
+            |target_url, session| {
+                if needs_gap {
+                    thread::sleep(CHROME_MULTI_PROFILE_OPEN_GAP);
+                }
+                needs_gap = true;
+                open_url_in_chrome_profile_blocking(target_url, &session.profile_id)
+            },
+        ))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn collect_chrome_sessions_from_home(
     home_dir: &Path,
     target_url: &str,
-) -> Result<Vec<ChromeSessionInfo>, String> {
+) -> Result<(String, Vec<ChromeSessionInfo>), String> {
     let context = chrome_context(home_dir, target_url)?;
     let mut sessions = Vec::new();
+    let mut first_query_error = None;
     for profile in context.profiles {
         let cookie_path = context.root.join(&profile.id).join("Cookies");
         if !cookie_path.is_file() {
             continue;
         }
-        let (_, cookies) =
-            query_profile_cookies(&cookie_path, &profile.name, &context.url, &context.domain)?;
+        let cookies =
+            match query_profile_cookies(&cookie_path, &profile.name, &context.url, &context.domain)
+            {
+                Ok((_, cookies)) => cookies,
+                Err(error) => {
+                    first_query_error.get_or_insert(error);
+                    continue;
+                }
+            };
         if cookies.is_empty() {
             continue;
         }
@@ -924,11 +1743,23 @@ fn list_chrome_sessions_from_home(
             browser_fallback_fail_count: 0,
         });
     }
+    if sessions.is_empty() {
+        if let Some(error) = first_query_error {
+            return Err(error);
+        }
+    }
+    Ok((context.domain, sessions))
+}
 
+#[cfg(target_os = "macos")]
+fn list_chrome_sessions_from_home(
+    home_dir: &Path,
+    target_url: &str,
+) -> Result<Vec<ChromeSessionInfo>, String> {
+    let (domain, sessions) = collect_chrome_sessions_from_home(home_dir, target_url)?;
     if sessions.is_empty() {
         return Err(format!(
-            "所有 Chrome 账号中都没有适用于 {} 的登录 Cookie",
-            context.domain
+            "所有 Chrome 账号中都没有适用于 {domain} 的登录 Cookie"
         ));
     }
     Ok(sessions)
@@ -1658,6 +2489,461 @@ mod tests {
         assert!(validated_external_url("http://localhost:3000/").is_ok());
         assert!(validated_external_url("javascript:alert(1)").is_err());
         assert!(validated_external_url("example.com").is_err());
+    }
+
+    fn sample_opened_session(id: &str, name: &str, account: &str) -> OpenedChromeSession {
+        OpenedChromeSession {
+            profile_id: id.to_string(),
+            profile_name: name.to_string(),
+            account_name: account.to_string(),
+        }
+    }
+
+    #[test]
+    fn opens_all_matching_chrome_sessions_and_keeps_partial_failures() {
+        let sessions = vec![
+            sample_opened_session("Default", "默认", "alice"),
+            sample_opened_session("Profile 1", "工作", "bob"),
+            sample_opened_session("Profile 2", "备用", ""),
+        ];
+        let result = open_url_in_listed_chrome_sessions(
+            "https://linux.do/t/topic/1",
+            &sessions,
+            |_, session| {
+                if session.profile_id == "Profile 1" {
+                    Err("启动失败".into())
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert_eq!(result.attempted, 3);
+        assert_eq!(result.opened, 2);
+        assert_eq!(result.profiles[0].profile_id, "Default");
+        assert_eq!(result.profiles[1].profile_id, "Profile 2");
+        assert_eq!(result.errors, vec!["bob：启动失败"]);
+    }
+
+    #[test]
+    fn rejects_unsafe_url_when_opening_listed_chrome_sessions() {
+        let sessions = vec![sample_opened_session("Default", "默认", "")];
+        let result =
+            open_url_in_listed_chrome_sessions("javascript:alert(1)", &sessions, |_, _| Ok(()));
+        assert_eq!(result.opened, 0);
+        assert_eq!(result.attempted, 1);
+        assert!(result.errors.iter().any(|error| error.contains("http")));
+    }
+
+    #[test]
+    fn treats_empty_chrome_sessions_as_no_attempt() {
+        let result =
+            open_url_in_listed_chrome_sessions("https://linux.do/t/topic/1", &[], |_, _| {
+                panic!("should not open");
+            });
+        assert_eq!(result.attempted, 0);
+        assert_eq!(result.opened, 0);
+        assert!(result.errors.is_empty());
+    }
+
+    #[test]
+    fn serializes_open_url_in_chrome_sessions_result() {
+        let result = OpenUrlInChromeSessionsResult {
+            opened: 1,
+            attempted: 1,
+            profiles: vec![sample_opened_session("Profile 1", "工作", "bob")],
+            errors: vec![],
+        };
+        let value = serde_json::to_value(&result).unwrap();
+        assert_eq!(value["opened"], 1);
+        assert_eq!(value["attempted"], 1);
+        assert_eq!(value["profiles"][0]["profileId"], "Profile 1");
+        assert_eq!(value["profiles"][0]["accountName"], "bob");
+    }
+
+    fn sample_window(window_id: &str, tabs: &[(&str, &str)]) -> ChromeWindowSnapshot {
+        ChromeWindowSnapshot {
+            window_id: window_id.to_string(),
+            tabs: tabs
+                .iter()
+                .map(|(tab_id, url)| (tab_id.to_string(), url.to_string()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn parses_chrome_singleton_lock_pid() {
+        assert_eq!(
+            parse_chrome_singleton_lock_pid("MacBook-Pro-45231"),
+            Some(45231)
+        );
+        assert_eq!(parse_chrome_singleton_lock_pid("127.0.0.1-88"), Some(88));
+        assert_eq!(parse_chrome_singleton_lock_pid("0"), None);
+        assert_eq!(parse_chrome_singleton_lock_pid("not-a-pid"), None);
+    }
+
+    #[test]
+    fn extracts_http_urls_from_session_bytes() {
+        let data =
+            b"xxhttps://linux.do/t/topic/1\0https://mail.google.com/mail\nhttp://localhost:3000/ok";
+        let urls = extract_http_urls_from_bytes(data);
+        assert!(urls.contains(&normalize_chrome_reuse_url("https://linux.do/t/topic/1")));
+        assert!(urls.contains(&normalize_chrome_reuse_url("https://mail.google.com/mail")));
+        assert!(urls.contains(&normalize_chrome_reuse_url("http://localhost:3000/ok")));
+    }
+
+    #[test]
+    fn matches_chrome_tab_urls_without_fragment_or_trailing_slash() {
+        assert!(chrome_tab_url_matches(
+            "https://linux.do/t/topic/1#openhub",
+            "https://linux.do/t/topic/1/"
+        ));
+        assert!(!chrome_tab_url_matches(
+            "https://linux.do/t/topic/2",
+            "https://linux.do/t/topic/1"
+        ));
+    }
+
+    #[test]
+    fn assigns_chrome_windows_to_profiles_by_unique_url_overlap() {
+        let windows = vec![
+            sample_window(
+                "11",
+                &[
+                    ("1", "https://linux.do/t/a"),
+                    ("2", "https://mail.google.com/mail"),
+                ],
+            ),
+            sample_window("22", &[("3", "https://linux.do/t/b")]),
+        ];
+        let profile_urls = vec![
+            (
+                "Default".to_string(),
+                HashSet::from([
+                    normalize_chrome_reuse_url("https://linux.do/t/a"),
+                    normalize_chrome_reuse_url("https://mail.google.com/mail"),
+                ]),
+            ),
+            (
+                "Profile 1".to_string(),
+                HashSet::from([normalize_chrome_reuse_url("https://linux.do/t/b")]),
+            ),
+        ];
+        let assigned = assign_chrome_windows_to_profiles(&windows, &profile_urls);
+        assert_eq!(assigned["Default"][0].window_id, "11");
+        assert_eq!(assigned["Profile 1"][0].window_id, "22");
+    }
+
+    #[test]
+    fn leaves_tied_chrome_windows_unassigned() {
+        let windows = vec![sample_window("11", &[("1", "https://linux.do/t/a")])];
+        let profile_urls = vec![
+            (
+                "Default".to_string(),
+                HashSet::from([normalize_chrome_reuse_url("https://linux.do/t/a")]),
+            ),
+            (
+                "Profile 1".to_string(),
+                HashSet::from([normalize_chrome_reuse_url("https://linux.do/t/a")]),
+            ),
+        ];
+        let assigned = assign_chrome_windows_to_profiles(&windows, &profile_urls);
+        assert!(assigned.is_empty());
+    }
+
+    #[test]
+    fn reuses_existing_tab_when_profile_window_already_has_url() {
+        let windows = vec![sample_window(
+            "11",
+            &[("99", "https://linux.do/t/topic/1#x")],
+        )];
+        assert_eq!(
+            plan_chrome_session_open("https://linux.do/t/topic/1", true, &windows),
+            ChromeSessionOpenPlan::ActivateTab {
+                tab_id: "99".into(),
+                window_id: "11".into()
+            }
+        );
+    }
+
+    #[test]
+    fn opens_new_tab_in_existing_window_when_target_url_is_absent() {
+        let windows = vec![sample_window(
+            "11",
+            &[
+                ("88", "https://mail.google.com/mail"),
+                ("99", "https://linux.do/t/old"),
+            ],
+        )];
+        assert_eq!(
+            plan_chrome_session_open("https://linux.do/t/topic/1", true, &windows),
+            ChromeSessionOpenPlan::NewTabInWindow {
+                window_id: "11".into()
+            }
+        );
+    }
+
+    #[test]
+    fn opens_new_tab_in_existing_window_without_linuxdo_tab() {
+        let windows = vec![sample_window(
+            "11",
+            &[("99", "https://mail.google.com/mail")],
+        )];
+        assert_eq!(
+            plan_chrome_session_open("https://linux.do/t/topic/1", true, &windows),
+            ChromeSessionOpenPlan::NewTabInWindow {
+                window_id: "11".into()
+            }
+        );
+    }
+
+    #[test]
+    fn recognizes_linuxdo_hosts() {
+        assert!(is_linuxdo_tab_url("https://linux.do/t/topic/1"));
+        assert!(is_linuxdo_tab_url("https://www.linux.do/t/topic/1"));
+        assert!(!is_linuxdo_tab_url("https://rate.linux.do/merchant/1"));
+        assert!(!is_linuxdo_tab_url("https://mail.google.com/mail"));
+        assert!(!is_linuxdo_tab_url("not-a-url"));
+    }
+
+    #[test]
+    fn assigns_windows_by_exclusive_urls_even_when_linuxdo_overlaps() {
+        let windows = vec![
+            sample_window(
+                "11",
+                &[
+                    ("1", "https://linux.do/t/shared"),
+                    ("2", "https://mail.google.com/a"),
+                ],
+            ),
+            sample_window(
+                "22",
+                &[
+                    ("3", "https://linux.do/t/shared"),
+                    ("4", "https://github.com/b"),
+                ],
+            ),
+        ];
+        let profile_urls = vec![
+            (
+                "Default".to_string(),
+                HashSet::from([
+                    normalize_chrome_reuse_url("https://linux.do/t/shared"),
+                    normalize_chrome_reuse_url("https://mail.google.com/a"),
+                ]),
+            ),
+            (
+                "Profile 1".to_string(),
+                HashSet::from([
+                    normalize_chrome_reuse_url("https://linux.do/t/shared"),
+                    normalize_chrome_reuse_url("https://github.com/b"),
+                ]),
+            ),
+        ];
+        let mut cache = HashMap::new();
+        let assigned =
+            resolve_chrome_windows_for_profiles(&windows, &profile_urls, &[], &mut cache);
+        assert_eq!(assigned["Default"][0].window_id, "11");
+        assert_eq!(assigned["Profile 1"][0].window_id, "22");
+        assert_eq!(cache.get("11").map(String::as_str), Some("Default"));
+    }
+
+    #[test]
+    fn reuses_cached_window_profile_when_live_urls_are_identical() {
+        let first = vec![
+            sample_window("11", &[("1", "https://linux.do/t/a")]),
+            sample_window("22", &[("2", "https://linux.do/t/b")]),
+        ];
+        let profile_urls = vec![
+            (
+                "Default".to_string(),
+                HashSet::from([normalize_chrome_reuse_url("https://linux.do/t/a")]),
+            ),
+            (
+                "Profile 1".to_string(),
+                HashSet::from([normalize_chrome_reuse_url("https://linux.do/t/b")]),
+            ),
+        ];
+        let mut cache = HashMap::new();
+        resolve_chrome_windows_for_profiles(&first, &profile_urls, &[], &mut cache);
+
+        let second = vec![
+            sample_window("11", &[("1", "https://linux.do/t/topic/9")]),
+            sample_window("22", &[("2", "https://linux.do/t/topic/9")]),
+        ];
+        let later_urls = vec![
+            (
+                "Default".to_string(),
+                HashSet::from([normalize_chrome_reuse_url("https://linux.do/t/topic/9")]),
+            ),
+            (
+                "Profile 1".to_string(),
+                HashSet::from([normalize_chrome_reuse_url("https://linux.do/t/topic/9")]),
+            ),
+        ];
+        let assigned = resolve_chrome_windows_for_profiles(&second, &later_urls, &[], &mut cache);
+        assert_eq!(assigned["Default"][0].window_id, "11");
+        assert_eq!(assigned["Profile 1"][0].window_id, "22");
+    }
+
+    fn snss_command(command_id: u8, payload: &[u8]) -> Vec<u8> {
+        let size = (payload.len() + 1) as u16;
+        let mut out = size.to_le_bytes().to_vec();
+        out.push(command_id);
+        out.extend_from_slice(payload);
+        out
+    }
+
+    fn snss_file(commands: &[(u8, Vec<u8>)]) -> Vec<u8> {
+        let mut data = b"SNSS".to_vec();
+        data.extend_from_slice(&3i32.to_le_bytes());
+        for (command_id, payload) in commands {
+            data.extend(snss_command(*command_id, payload));
+        }
+        data
+    }
+
+    fn snss_set_tab_window(window: i32, tab: i32) -> (u8, Vec<u8>) {
+        let mut payload = window.to_le_bytes().to_vec();
+        payload.extend_from_slice(&tab.to_le_bytes());
+        (0, payload)
+    }
+
+    fn snss_window_closed2(window: i32) -> (u8, Vec<u8>) {
+        let mut payload = window.to_le_bytes().to_vec();
+        payload.extend_from_slice(&[0_u8; 12]);
+        (17, payload)
+    }
+
+    #[test]
+    fn parses_open_session_window_ids_and_ignores_closed_windows() {
+        let data = snss_file(&[
+            snss_set_tab_window(1546485871, 11),
+            snss_set_tab_window(1546487285, 22),
+            snss_window_closed2(1546487285),
+        ]);
+        let ids = parse_chrome_session_open_window_ids(&data);
+        assert_eq!(ids, HashSet::from(["1546485871".to_string()]));
+    }
+
+    #[test]
+    fn assigns_live_windows_by_session_ids_when_urls_tie() {
+        let windows = vec![
+            sample_window("1546485871", &[("1", "https://linux.do/t/topic/9")]),
+            sample_window("1546487285", &[("2", "https://linux.do/t/topic/9")]),
+        ];
+        let profile_urls = vec![
+            (
+                "Profile 15".to_string(),
+                HashSet::from([normalize_chrome_reuse_url("https://linux.do/t/topic/9")]),
+            ),
+            (
+                "Profile 11".to_string(),
+                HashSet::from([normalize_chrome_reuse_url("https://linux.do/t/topic/9")]),
+            ),
+        ];
+        let profile_window_ids = vec![
+            (
+                "Profile 15".to_string(),
+                HashSet::from(["1546485871".to_string()]),
+            ),
+            (
+                "Profile 11".to_string(),
+                HashSet::from(["1546487285".to_string()]),
+            ),
+        ];
+        let mut cache = HashMap::new();
+        let assigned = resolve_chrome_windows_for_profiles(
+            &windows,
+            &profile_urls,
+            &profile_window_ids,
+            &mut cache,
+        );
+        assert_eq!(assigned["Profile 15"][0].window_id, "1546485871");
+        assert_eq!(assigned["Profile 11"][0].window_id, "1546487285");
+        assert_eq!(
+            plan_chrome_session_open("https://linux.do/t/topic/1", false, &assigned["Profile 15"]),
+            ChromeSessionOpenPlan::NewTabInWindow {
+                window_id: "1546485871".into()
+            }
+        );
+        assert_eq!(
+            plan_chrome_session_open("https://linux.do/t/topic/9", false, &assigned["Profile 11"]),
+            ChromeSessionOpenPlan::ActivateTab {
+                tab_id: "2".into(),
+                window_id: "1546487285".into()
+            }
+        );
+    }
+
+    #[test]
+    fn ignores_stale_session_window_ids_that_are_not_live() {
+        let windows = vec![sample_window(
+            "1546485871",
+            &[("1", "https://linux.do/t/a")],
+        )];
+        let profile_window_ids = vec![
+            (
+                "Profile 15".to_string(),
+                HashSet::from(["1546485871".to_string()]),
+            ),
+            (
+                "Profile 13".to_string(),
+                HashSet::from(["1546488863".to_string()]),
+            ),
+        ];
+        let assigned = assign_chrome_windows_by_session_ids(&windows, &profile_window_ids);
+        assert_eq!(assigned["Profile 15"][0].window_id, "1546485871");
+        assert!(!assigned.contains_key("Profile 13"));
+    }
+
+    #[test]
+    fn collects_open_window_ids_from_latest_session_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "openhub-chrome-session-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let sessions = dir.join("Sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(
+            sessions.join("Session_1"),
+            snss_file(&[
+                snss_set_tab_window(11, 1),
+                snss_window_closed2(11),
+                snss_set_tab_window(22, 2),
+            ]),
+        )
+        .unwrap();
+        let ids = collect_profile_open_window_ids(&dir);
+        assert_eq!(ids, HashSet::from(["22".to_string()]));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn launches_without_new_window_when_profile_is_already_running() {
+        assert_eq!(
+            plan_chrome_session_open("https://linux.do/t/topic/1", true, &[]),
+            ChromeSessionOpenPlan::Launch { new_window: false }
+        );
+        assert_eq!(
+            plan_chrome_session_open("https://linux.do/t/topic/1", false, &[]),
+            ChromeSessionOpenPlan::Launch { new_window: true }
+        );
+    }
+
+    #[test]
+    fn groups_chrome_window_snapshot_lines() {
+        let windows = group_chrome_window_snapshots([
+            parse_chrome_window_snapshot_line("11\t21\thttps://a.example/").unwrap(),
+            parse_chrome_window_snapshot_line("11\t22\thttps://b.example/").unwrap(),
+            parse_chrome_window_snapshot_line("12\t31\thttps://c.example/").unwrap(),
+        ]);
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[0].tabs.len(), 2);
+        assert_eq!(windows[1].window_id, "12");
     }
 
     #[test]

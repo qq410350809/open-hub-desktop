@@ -382,6 +382,7 @@ pub fn run() {
             crate::site::sync::list_chrome_sessions,
             crate::site::sync::read_chrome_session,
             crate::site::sync::open_url_in_chrome_profile,
+            crate::site::sync::open_url_in_chrome_sessions,
             crate::site::sync::close_chrome_sync_tabs,
             charity::get_charity_feed,
             charity::mark_charity_feed_read,
