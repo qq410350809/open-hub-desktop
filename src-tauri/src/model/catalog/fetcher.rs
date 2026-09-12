@@ -823,16 +823,16 @@ pub(crate) fn save_site_model_cache(
         )
         .map_err(|error| error.to_string())?;
 
+    // 本次真的从站点拿到了 Key/模型（result 非空且调用方没报错）：
+    // 上一次同步遗留的 sync_error/api_sync_error 只描述旧数据，继续展示
+    // 会让卡片在恢复后仍显示「账号信息同步失败」。这里不再按关键词挑着清，
+    // 「账号同步超过 90 秒」「未扫到登录会话」等历史错误同样应被清掉。
     if result.is_some() && account.error.is_empty() {
         let _ = connection.execute(
-            "UPDATE site_accounts 
-             SET is_valid = 1, 
-                 api_sync_error = '', 
-                 sync_error = CASE 
-                     WHEN sync_error LIKE '%NewAPI%' OR sync_error LIKE '%权限不足%' OR sync_error LIKE '%失效%' 
-                     THEN '' 
-                     ELSE sync_error 
-                 END 
+            "UPDATE site_accounts
+             SET is_valid = 1,
+                 api_sync_error = '',
+                 sync_error = ''
              WHERE site_id = ?1 AND profile_id = ?2",
             params![site_id, account.profile_id],
         );
@@ -961,8 +961,22 @@ pub async fn sync_models_for_cached_keys(
             "models".into(),
         ),
     };
+    // 整体成功（拿到了完整模型列表）说明站点接口已恢复：清掉该站点账号
+    // 行的历史 sync_error，避免卡片在模型已同步成功时仍挂着「账号信息同步失败」。
+    let sync_succeeded = match &result {
+        Ok(result) => result.errors.is_empty() && !result.models.is_empty(),
+        Err(_) => false,
+    };
     {
         let connection = database.lock_conn()?;
+        if sync_succeeded {
+            let _ = connection.execute(
+                "UPDATE site_accounts
+                 SET api_sync_error = '', sync_error = ''
+                 WHERE site_id = ?1",
+                [site_id.as_str()],
+            );
+        }
         for (profile_id, keys, _) in &rows {
             let mut row_models: HashMap<String, Vec<SiteModelItem>> = HashMap::new();
             for key in keys {
