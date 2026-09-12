@@ -2,7 +2,9 @@ use crate::context::{spawn, spawn_blocking, AppContext, EventBus, Managed};
 use crate::db::*;
 use crate::models::*;
 use crate::proxypool;
-use crate::site::library::{is_known_platform, is_newapi, is_newapi_refresh, is_sub2api};
+use crate::site::library::{
+    is_known_platform, is_newapi, is_newapi_refresh, is_pipiwang, is_sub2api,
+};
 use crate::site::sync;
 use crate::site::sync::*;
 use rusqlite::{params, OptionalExtension};
@@ -100,6 +102,8 @@ pub async fn mark_sites_with_chrome_sessions(
                         &["/api/user/auth/refresh", "/api/user/self"]
                     } else if is_sub2api(&system_type) {
                         &["/api/v1/auth/me"]
+                    } else if is_pipiwang(&system_type) {
+                        &["/api/v1/pc/me"]
                     } else {
                         &[]
                     };
@@ -187,11 +191,26 @@ pub async fn mark_sites_with_chrome_sessions(
                  WHERE is_personal = 1 AND supports_checkin = 1",
             )
             .map_err(|error| error.to_string())?;
-        let site_ids = statement
+        let mut site_ids = statement
             .query_map([], |row| row.get::<_, String>(0))
             .map_err(|error| error.to_string())?
             .collect::<Result<HashSet<_>, _>>()
             .map_err(|error| error.to_string())?;
+        // 皮皮智绘系自带每日签到（积分），不必等目录把 supports_checkin 补齐。
+        // 皮皮智绘系自带每日签到（积分），不必等目录把 supports_checkin 补齐。
+        let mut pipiwang_statement = connection
+            .prepare(
+                "SELECT id FROM directory_sites WHERE is_personal = 1 AND system_type = 'pipiwang'",
+            )
+            .map_err(|error| error.to_string())?;
+        let pipiwang_ids = pipiwang_statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?
+            .collect::<Result<HashSet<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        for site_id in pipiwang_ids {
+            site_ids.insert(site_id);
+        }
         site_ids
     };
     // 提取会话只比对浏览器数据，不做 /api/status 站点类型检测。
@@ -201,6 +220,8 @@ pub async fn mark_sites_with_chrome_sessions(
             &["/api/user/self", "/api/user/auth/refresh"]
         } else if is_sub2api(system_type) {
             &["/api/v1/auth/me"]
+        } else if is_pipiwang(system_type) {
+            &["/api/v1/pc/me"]
         } else {
             &[]
         };

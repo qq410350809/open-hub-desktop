@@ -6,13 +6,19 @@ use std::{
 
 const LEVELDB_TABLE_MAGIC: u64 = 0xdb47_7524_8b80_fb57;
 const LOG_BLOCK_SIZE: usize = 32 * 1024;
-const STORAGE_KEYS: [&str; 6] = [
+const STORAGE_KEYS: [&str; 9] = [
     "user",
     "quota_display_type",
     "quota_per_unit",
     "status",
     "auth_token",
     "auth_user",
+    // 皮皮智绘系（ai-image-miniprogram）：Linux.do OAuth 登录后把访问令牌与
+    // 用户信息写在 Local Storage，站点不写任何 Cookie。不读这三个键，
+    // 该站点在扫描阶段完全看不到登录痕迹（同步时表现为未检测到账号）。
+    "pipi_pc_token",
+    "pipi_pc_uid",
+    "pipi_pc_user",
 ];
 
 #[derive(Debug, Clone)]

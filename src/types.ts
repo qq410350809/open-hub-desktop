@@ -346,6 +346,7 @@ export const SYSTEM_TYPES: { value: string; text: string }[] = [
   { value: "newapi2", text: "NewAPI · 刷新令牌" },
   { value: "sub2api", text: "Sub2API" },
   { value: "one-api", text: "One API" },
+  { value: "pipiwang", text: "皮皮智绘" },
 ];
 
 /** 去除空白/中划线/下划线并转小写，用于跨新旧命名比较。 */
@@ -388,6 +389,14 @@ export function isNewApiCompatible(raw: string): boolean {
     "donehub",
     "veloera",
   ].includes(normalized);
+}
+
+/**
+ * 皮皮智绘系（自有积分/签到后端）：不兼容 NewAPI 的 Key/模型接口，
+ * 同步 Key 与模型入口对其隐藏；账号同步只读积分与签到状态。
+ */
+export function isPipiwangType(raw: string): boolean {
+  return normalizeSystemType(raw) === "pipiwang";
 }
 
 export const emptySite = (): SiteRecord => ({

@@ -3,7 +3,7 @@ use crate::db::*;
 use crate::models::*;
 use crate::proxypool;
 use crate::site::library::*;
-use crate::site::library::{is_newapi, is_newapi_refresh, is_sub2api};
+use crate::site::library::{is_newapi, is_newapi_refresh, is_pipiwang, is_sub2api};
 use crate::site::sync;
 use rusqlite::{params, OptionalExtension};
 use serde_json;
@@ -276,6 +276,178 @@ async fn fetch_sub2api_usage(
         .and_then(|value| parse_sub2api_usage(&value))
 }
 
+// ---------------------------------------------------------------- 皮皮智绘系
+
+/// 皮皮智绘系（ai-image-miniprogram，如 img.pipiwangcom.com）的登录凭据：
+/// Linux.do OAuth 登录后前端把 JWT 写进 Local Storage 的 `pipi_pc_token`，
+/// 站点不写任何 Cookie，所有账号/积分/签到接口都只认 `Authorization: Bearer`。
+pub(crate) fn pipiwang_token(values: &HashMap<String, String>) -> Option<String> {
+    values
+        .get("pipi_pc_token")
+        .map(|value| local_scalar(value))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// 皮皮智绘账号展示名：`pipi_pc_user` 里的 nickname；缺失时回退 Local Storage
+/// 的 `pipi_pc_uid` / `user.id`。本地数据不含积分，积分一律由账号接口刷新。
+fn pipiwang_display_name(
+    values: &HashMap<String, String>,
+    user: Option<&serde_json::Value>,
+) -> String {
+    if let Some(user) = user {
+        let nickname = json_string(user, &["/nickname", "/name", "/username"]);
+        if !nickname.is_empty() {
+            return nickname;
+        }
+    }
+    let id = user
+        .map(|user| json_string(user, &["/id", "/userId"]))
+        .unwrap_or_default();
+    let id = if id.is_empty() {
+        values
+            .get("pipi_pc_uid")
+            .map(|value| local_scalar(value))
+            .unwrap_or_default()
+    } else {
+        id
+    };
+    if id.is_empty() {
+        String::new()
+    } else {
+        format!("L站用户{id}")
+    }
+}
+
+pub(crate) fn parse_pipiwang_local_account(
+    values: &HashMap<String, String>,
+) -> Result<SiteAccountSnapshot, String> {
+    let user = values
+        .get("pipi_pc_user")
+        .and_then(|value| parse_local_json(value))
+        .filter(serde_json::Value::is_object);
+    let username = pipiwang_display_name(values, user.as_ref());
+    if username.is_empty() {
+        return Err("Chrome Local Storage 中没有有效的皮皮智绘用户数据".to_string());
+    }
+    Ok(SiteAccountSnapshot {
+        username,
+        remaining: None,
+        used: None,
+        total: None,
+        unit: PIPIWANG_UNIT.into(),
+    })
+}
+
+pub(crate) const PIPIWANG_UNIT: &str = "积分";
+
+/// `/api/v1/pc/me`：账户身份 + 积分余额 + 今日签到状态。
+pub(crate) fn parse_pipiwang_account(
+    value: &serde_json::Value,
+) -> Result<SiteAccountSnapshot, String> {
+    // 未登录时 FastAPI 返回 401 + {"detail": "未登录"}；带令牌返回 user + points。
+    let points = json_number(value, "/points")
+        .or_else(|| json_number(value, "/quota/points"))
+        .ok_or_else(|| api_error_message(value, "皮皮智绘返回的账号数据无效（缺少积分字段）"))?;
+    let mut username = json_string(value, &["/user/nickname", "/user/name", "/nickname"]);
+    if username.is_empty() {
+        let id = json_string(value, &["/user/id", "/user/userId"]);
+        if !id.is_empty() {
+            username = format!("L站用户{id}");
+        }
+    }
+    Ok(SiteAccountSnapshot {
+        username,
+        remaining: Some(points),
+        used: None,
+        total: None,
+        unit: PIPIWANG_UNIT.into(),
+    })
+}
+
+/// 签到状态解析：`/api/v1/pc/me` 与 `/api/v1/pc/checkin/status` 都带 `checkedIn`。
+pub(crate) fn parse_pipiwang_checkin_status(value: &serde_json::Value) -> Result<bool, String> {
+    value
+        .get("checkedIn")
+        .and_then(json_boolish)
+        .or_else(|| value.pointer("/quota/checkedIn").and_then(json_boolish))
+        .ok_or_else(|| api_error_message(value, "皮皮智绘签到状态数据无效"))
+}
+
+async fn fetch_pipiwang_me(
+    client: &wreq::Client,
+    base_url: &str,
+    token: &str,
+    user_agent: &str,
+) -> Result<serde_json::Value, String> {
+    let url = Url::parse(base_url)
+        .map_err(|_| "站点 API 地址无效".to_string())?
+        .join("/api/v1/pc/me")
+        .map_err(|_| "无法生成皮皮智绘账号接口地址".to_string())?;
+    let request = chrome_request_headers(client.get(url), base_url, user_agent).bearer_auth(token);
+    request_json_with_hint(request, "皮皮智绘账号接口", PIPIWANG_AUTH_FAILURE_HINT).await
+}
+
+pub(crate) const PIPIWANG_AUTH_FAILURE_HINT: &str =
+    "（皮皮智绘登录凭证已失效，请在 Chrome 中打开一次该站点并重新登录后同步）";
+
+/// 签到：账号接口返回的 checkedIn 已能判定今日状态；未签到时再调用签到接口。
+pub(crate) async fn refresh_pipiwang_checkin(
+    client: &wreq::Client,
+    base_url: &str,
+    token: &str,
+    user_agent: &str,
+    me: &serde_json::Value,
+    _previous: CheckinSnapshot,
+) -> CheckinSnapshot {
+    let disabled = CheckinSnapshot {
+        enabled: false,
+        checked_in_today: false,
+        error: String::new(),
+    };
+    let Ok(checked_in_today) = parse_pipiwang_checkin_status(me) else {
+        return disabled;
+    };
+    if checked_in_today {
+        return CheckinSnapshot {
+            enabled: true,
+            checked_in_today: true,
+            error: String::new(),
+        };
+    }
+    let Ok(checkin_url) = Url::parse(base_url).and_then(|url| url.join("/api/v1/pc/checkin"))
+    else {
+        return disabled;
+    };
+    let request =
+        chrome_request_headers(client.post(checkin_url), base_url, user_agent).bearer_auth(token);
+    match request_json_with_hint(request, "皮皮智绘签到接口", PIPIWANG_AUTH_FAILURE_HINT).await
+    {
+        Ok(value) => {
+            // 响应为 { already, grantedPoints, ...积分快照 }；already=true 表示今日已签到。
+            let already = value
+                .get("already")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let granted = value.get("grantedPoints").is_some();
+            if already || granted || parse_pipiwang_checkin_status(&value).unwrap_or(false) {
+                CheckinSnapshot {
+                    enabled: true,
+                    checked_in_today: true,
+                    error: String::new(),
+                }
+            } else {
+                disabled
+            }
+        }
+        Err(error) => CheckinSnapshot {
+            enabled: true,
+            checked_in_today: false,
+            error,
+        },
+    }
+}
+
 pub(crate) fn has_local_account_session(
     system_type: &str,
     values: &HashMap<String, String>,
@@ -286,6 +458,9 @@ pub(crate) fn has_local_account_session(
         has_newapi
     } else if is_sub2api(system_type) {
         has_sub2api
+    } else if is_pipiwang(system_type) {
+        // 皮皮智绘只认 Local Storage 里的令牌/用户数据，没有 Cookie 通道。
+        pipiwang_token(values).is_some() || parse_pipiwang_local_account(values).is_ok()
     } else {
         has_newapi || has_sub2api
     }
@@ -1053,20 +1228,26 @@ pub(crate) async fn fetch_site_account(
         CheckinSnapshot::default()
     };
     let inferred_type;
-    let system_type = if is_newapi(system_type) || is_sub2api(system_type) {
-        system_type
-    } else if parse_newapi_local_account(local_values).is_ok() {
-        inferred_type = "new-api".to_string();
-        &inferred_type
-    } else if parse_sub2api_local_account(local_values).is_ok() {
-        inferred_type = "sub2api".to_string();
-        &inferred_type
-    } else {
-        inferred_type = probe_site_system_type(client, base_url)
-            .await
-            .unwrap_or_default();
-        &inferred_type
-    };
+    let system_type =
+        if is_newapi(system_type) || is_sub2api(system_type) || is_pipiwang(system_type) {
+            system_type
+        } else if parse_newapi_local_account(local_values).is_ok() {
+            inferred_type = "new-api".to_string();
+            &inferred_type
+        } else if parse_sub2api_local_account(local_values).is_ok() {
+            inferred_type = "sub2api".to_string();
+            &inferred_type
+        } else if pipiwang_token(local_values).is_some() {
+            // 站点类型未识别但 Local Storage 里有皮皮智绘令牌：按该架构处理，
+            // 不依赖 /api/status 探测（该系站点没有 NewAPI 的探测端点）。
+            inferred_type = "pipiwang".to_string();
+            &inferred_type
+        } else {
+            inferred_type = probe_site_system_type(client, base_url)
+                .await
+                .unwrap_or_default();
+            &inferred_type
+        };
     if is_newapi(system_type) {
         let local_account = parse_newapi_local_account(local_values).ok();
         let base_url_parsed = Url::parse(base_url).map_err(|_| "站点 API 地址无效".to_string())?;
@@ -1260,6 +1441,55 @@ pub(crate) async fn fetch_site_account(
             refreshed: true,
         });
     }
+    // —— 皮皮智绘系（ai-image-miniprogram） ——
+    // 凭据是 Local Storage 里的 JWT（pipi_pc_token），站点没有 Cookie 通道，
+    // 因此直接用 Bearer 请求 /api/v1/pc/me 取昵称、积分与今日签到状态。
+    if is_pipiwang(system_type) {
+        let local_account = parse_pipiwang_local_account(local_values).ok();
+        let Some(token) = pipiwang_token(local_values) else {
+            return match local_account {
+                Some(account) => Ok(SiteAccountRefresh {
+                    account,
+                    is_valid: true,
+                    sync_error:
+                        "Chrome Local Storage 缺少皮皮智绘登录令牌，请在 Chrome 中打开一次该站点完成登录后重新同步"
+                            .into(),
+                    checkin: CheckinSnapshot::default(),
+                    newapi_token: String::new(),
+                    newapi_user_id: String::new(),
+                    refreshed: false,
+                }),
+                None => Err(
+                    "没有找到可用的皮皮智绘登录凭据（Chrome Local Storage 缺少 pipi_pc_token）"
+                        .to_string(),
+                ),
+            };
+        };
+        let me = match fetch_pipiwang_me(client, base_url, &token, user_agent).await {
+            Ok(value) => value,
+            // 账号接口失败时保留上一次同步的积分/昵称（走 Err 分支不覆盖会话缓存），
+            // 只把失败原因写进 sync_error，避免离线一次就把余额清成“未读取”。
+            Err(error) => return Err(error),
+        };
+        let account = parse_pipiwang_account(&me)
+            .or_else(|_| parse_pipiwang_local_account(local_values))
+            .unwrap_or_default();
+        let checkin = if should_checkin {
+            refresh_pipiwang_checkin(client, base_url, &token, user_agent, &me, previous_checkin)
+                .await
+        } else {
+            previous_checkin
+        };
+        return Ok(SiteAccountRefresh {
+            account,
+            is_valid: true,
+            sync_error: String::new(),
+            checkin,
+            newapi_token: String::new(),
+            newapi_user_id: String::new(),
+            refreshed: true,
+        });
+    }
     // —— Sub2API ——
     // 优先用已有 apiKey 走 /v1/usage 获取余额，不再强依赖 Chrome 会话（auth_user/auth_token）。
     let local_account = parse_sub2api_local_account(local_values).ok();
@@ -1380,6 +1610,39 @@ pub(crate) async fn fetch_site_account(
     })
 }
 
+/// Chrome 账号桥接打开的页面必须是站点同源控制台。
+/// AnyRouter 等站点常把 checkinUrl 写成根路径，打开后首页一跳就把 hash marker
+/// 丢掉，AppleScript 随后一直找不到标签，最终报「等待 Chrome 返回账号数据超时」。
+pub(crate) fn chrome_account_bridge_url(
+    base_url: &Url,
+    checkin_url: &str,
+    marker: &str,
+) -> Result<Url, String> {
+    let personal_url = || {
+        base_url
+            .join("/console/personal")
+            .map_err(|_| "无法生成 Chrome 验证地址".to_string())
+    };
+    let console_url = || {
+        base_url
+            .join("/console")
+            .map_err(|_| "无法生成 Chrome 验证地址".to_string())
+    };
+    let mut browser_url = if checkin_url.trim().is_empty() {
+        personal_url()?
+    } else {
+        Url::parse(checkin_url).unwrap_or_else(|_| base_url.clone())
+    };
+    if browser_url.origin() != base_url.origin() {
+        browser_url = personal_url()?;
+    }
+    if browser_url.path().is_empty() || browser_url.path() == "/" {
+        browser_url = console_url()?;
+    }
+    browser_url.set_fragment(Some(marker));
+    Ok(browser_url)
+}
+
 pub(crate) fn chrome_account_bridge_script(
     user_id: Option<&str>,
     current_month: &str,
@@ -1398,8 +1661,43 @@ pub(crate) fn chrome_account_bridge_script(
   const useRefreshAuth = __OPENHUB_USE_REFRESH_AUTH__;
   const shouldCheckin = __OPENHUB_SHOULD_CHECKIN__;
   const allowChallengeNavigation = __OPENHUB_ALLOW_CHALLENGE_NAVIGATION__;
-  const requestTimeout = 30000;
+  const requestTimeout = 8000;
   const pending = "__OPENHUB_PENDING__";
+  const messageOf = (value, fallback) =>
+    value && (value.message || value.msg || value.error) || fallback;
+  const tryParseDocumentAccount = () => {
+    if (window.location.pathname !== "/api/user/self") return null;
+    const text = String((document.body && (document.body.innerText || document.body.textContent)) || "").trim();
+    if (!text.startsWith("{")) return null;
+    try {
+      return JSON.parse(text);
+    } catch (_) {
+      return null;
+    }
+  };
+  const documentLooksLikeChallenge = () => {
+    const html = String((document.documentElement && document.documentElement.outerHTML) || "").slice(0, 100000).toLowerCase();
+    return /var\s+arg1\s*=/.test(html) || (html.includes("acw_sc__v2") && html.length < 20000);
+  };
+  const beginChallengeNavigation = () => {
+    if (!allowChallengeNavigation) {
+      return { ok: false, error: "站点安全验证仍需要浏览器交互（Cloudflare / 阿里云 WAF）" };
+    }
+    if (window.location.pathname !== "/api/user/self") {
+      window.location.assign(`/api/user/self#${token}`);
+      return null;
+    }
+    try {
+      const key = `__openHubChallengeReloads:${token}`;
+      const count = Number(sessionStorage.getItem(key) || 0);
+      if (count >= 2) {
+        return { ok: false, error: "站点安全验证仍需要浏览器交互（Cloudflare / 阿里云 WAF）" };
+      }
+      sessionStorage.setItem(key, String(count + 1));
+    } catch (_) {}
+    window.location.reload();
+    return null;
+  };
   if (window.location.protocol !== "http:" && window.location.protocol !== "https:") {
     return pending;
   }
@@ -1418,10 +1716,45 @@ pub(crate) fn chrome_account_bridge_script(
       }
     } catch (_) {}
   }
+  const documentAccount = tryParseDocumentAccount();
+  if (documentAccount) {
+    const responseUserId = String(documentAccount.data?.id || documentAccount.data?.userId || "");
+    if (legacyUserId && responseUserId && responseUserId !== String(legacyUserId)) {
+      return "__OPENHUB_PROFILE_MISMATCH__";
+    }
+    if (documentAccount.success === true && documentAccount.data && typeof documentAccount.data === "object") {
+      try { sessionStorage.removeItem(`__openHubChallengeReloads:${token}`); } catch (_) {}
+      const result = {
+        ok: true,
+        account: documentAccount,
+        checkinEnabled: false,
+        checkedInToday: false,
+        checkinError: "",
+        apiToken: "",
+        userId: responseUserId || String(legacyUserId || "")
+      };
+      window.__openHubAccountSync = { token, started: Date.now(), state: "done", result };
+      return JSON.stringify(result);
+    }
+    if (documentAccount.success === false) {
+      const result = { ok: false, error: messageOf(documentAccount, "账号接口失败") };
+      window.__openHubAccountSync = { token, started: Date.now(), state: "done", result };
+      return JSON.stringify(result);
+    }
+  }
   const previous = window.__openHubAccountSync;
   if (previous && previous.token === token) {
     if (previous.result) return JSON.stringify(previous.result);
     if (previous.state !== "challenge" || Date.now() - previous.started < 3000) return pending;
+  }
+  if (documentLooksLikeChallenge()) {
+    const outcome = beginChallengeNavigation();
+    if (outcome) {
+      window.__openHubAccountSync = { token, started: Date.now(), state: "done", result: outcome };
+      return JSON.stringify(outcome);
+    }
+    window.__openHubAccountSync = { token, started: Date.now(), state: "challenge", result: null };
+    return pending;
   }
   const bridge = { token, started: Date.now(), state: "running", result: null };
   window.__openHubAccountSync = bridge;
@@ -1459,8 +1792,6 @@ pub(crate) fn chrome_account_bridge_script(
       return { status: response.status, error: "接口没有返回 JSON" };
     }
   };
-  const messageOf = (value, fallback) =>
-    value && (value.message || value.msg || value.error) || fallback;
   (async () => {
     const headers = { "Accept": "application/json" };
     let activeAccessToken = "";
@@ -1470,13 +1801,13 @@ pub(crate) fn chrome_account_bridge_script(
         signal: AbortSignal.timeout(requestTimeout)
       }));
       if (refreshResponse.challenge) {
-        if (!allowChallengeNavigation) {
-          bridge.result = { ok: false, error: "站点安全验证仍需要浏览器交互（Cloudflare / 阿里云 WAF）" };
+        const outcome = beginChallengeNavigation();
+        if (outcome) {
+          bridge.result = outcome;
           return;
         }
         bridge.state = "challenge";
         bridge.started = Date.now();
-        window.location.assign(`/#${token}`);
         return;
       }
       let accessToken = refreshResponse.data?.data?.access_token ||
@@ -1534,6 +1865,29 @@ pub(crate) fn chrome_account_bridge_script(
     } else {
       headers.Authorization = `Bearer ${apiToken}`;
     }
+    const selfResponse = await readResponse(await fetch("/api/user/self", {
+      method: "GET", credentials: "include", cache: "no-store", headers,
+      signal: AbortSignal.timeout(requestTimeout)
+    }));
+    if (selfResponse.challenge) {
+      const outcome = beginChallengeNavigation();
+      if (outcome) {
+        bridge.result = outcome;
+        return;
+      }
+      bridge.state = "challenge";
+      bridge.started = Date.now();
+      return;
+    }
+    if (selfResponse.error || selfResponse.status < 200 || selfResponse.status >= 300) {
+      bridge.result = {
+        ok: false,
+        error: messageOf(selfResponse.data, selfResponse.error || `账号接口 HTTP ${selfResponse.status}`)
+      };
+      return;
+    }
+    const responseUserId = selfResponse.data?.data?.id || selfResponse.data?.data?.userId || "";
+    if (responseUserId) userId = String(responseUserId);
     let checkinEnabled = false;
     let checkedInToday = false;
     let checkinError = "";
@@ -1621,35 +1975,10 @@ pub(crate) fn chrome_account_bridge_script(
               checkedInToday = true;
             }
           }
-        } catch (error) {
-        checkinError = String(error && error.message || error);
-      }
-    }
-    const selfResponse = await readResponse(await fetch("/api/user/self", {
-      method: "GET", credentials: "include", cache: "no-store", headers,
-      signal: AbortSignal.timeout(requestTimeout)
-    }));
-    if (selfResponse.challenge) {
-      if (!allowChallengeNavigation) {
-        bridge.result = { ok: false, error: "站点安全验证仍需要浏览器交互（Cloudflare / 阿里云 WAF）" };
-        return;
-      }
-      bridge.state = "challenge";
-      bridge.started = Date.now();
-      if (window.location.pathname !== "/api/user/self") {
-        window.location.assign(`/api/user/self#${token}`);
-      }
-      return;
-    }
-    if (selfResponse.error || selfResponse.status < 200 || selfResponse.status >= 300) {
-      bridge.result = {
-        ok: false,
-        error: messageOf(selfResponse.data, selfResponse.error || `账号接口 HTTP ${selfResponse.status}`)
-      };
-      return;
-    }
-    const responseUserId = selfResponse.data?.data?.id || selfResponse.data?.data?.userId || "";
-    if (responseUserId) userId = String(responseUserId);
+       } catch (error) {
+       checkinError = String(error && error.message || error);
+     }
+   }
     bridge.result = {
       ok: true,
       account: selfResponse.data,
@@ -1937,6 +2266,149 @@ pub(crate) async fn sync_site_account_via_chrome_command(
     outcome
 }
 
+/// 皮皮智绘账号直连刷新（手动同步入口）：令牌来自 Chrome Local Storage
+/// 的 pipi_pc_token，不经过新 API 的 Cookie/刷新令牌桥接。返回已更新的会话。
+async fn sync_pipiwang_account_via_local_storage(
+    ctx: &Arc<AppContext>,
+    bus: &EventBus,
+    site_id: &str,
+    profile_id: &str,
+    account_label: &str,
+    site_name: &str,
+    api_base_url: &str,
+    system_type: &str,
+    current_month: &str,
+    supports_checkin: bool,
+    run_id: u64,
+) -> Result<sync::ChromeSessionInfo, String> {
+    let database = &*ctx.database;
+    let runtime = &*ctx.proxy_runtime;
+    let home_dir = crate::context::home_dir().ok_or("无法定位用户目录")?;
+    let base_url = Url::parse(api_base_url).map_err(|_| "站点 API 地址无效")?;
+    let origin = base_url.origin().ascii_serialization();
+    if origin == "null" {
+        return Err("站点 API 地址缺少有效来源".into());
+    }
+    let local_target = sync::LocalStorageTarget {
+        site_id: site_id.to_string(),
+        profile_id: profile_id.to_string(),
+        origin,
+    };
+    let local_match = spawn_blocking({
+        let home_dir = home_dir.clone();
+        move || sync::read_local_storage_from_home(&home_dir, &[local_target])
+    })
+    .await
+    .map_err(|error| format!("读取 Chrome Local Storage 任务失败：{error}"))?
+    .into_iter()
+    .next();
+    let local_values = local_match
+        .as_ref()
+        .filter(|item| item.error.is_empty())
+        .map(|item| item.values.clone())
+        .unwrap_or_default();
+    let local_error = local_match
+        .as_ref()
+        .map(|item| item.error.clone())
+        .unwrap_or_default();
+    emit_chrome_account_progress(
+        bus,
+        run_id,
+        "local-account",
+        "running",
+        format!("正在读取 {account_label} 的皮皮智绘本地令牌"),
+    );
+    let proxy_result = proxypool::with_account_proxy(
+        database,
+        runtime,
+        site_id,
+        profile_id,
+        Duration::from_secs(12),
+        3,
+        "皮皮智绘账号请求",
+        move |client| {
+            let api_base_url = api_base_url.to_string();
+            let system_type = system_type.to_string();
+            let local_values = local_values.clone();
+            let local_error = local_error.clone();
+            let current_month = current_month.to_string();
+            let profile_label = account_label.to_string();
+            let user_agent = sync::chrome_user_agent();
+            async move {
+                fetch_site_account(
+                    &client,
+                    &api_base_url,
+                    &system_type,
+                    &local_values,
+                    &local_error,
+                    Err("皮皮智绘不依赖浏览器 Cookie".into()),
+                    &user_agent,
+                    &current_month,
+                    supports_checkin,
+                    CheckinSnapshot::default(),
+                    None,
+                    None,
+                    &[],
+                )
+                .await
+                .map_err(|error| format!("{profile_label}：{error}"))
+            }
+        },
+    )
+    .await;
+    let refresh = match proxy_result {
+        Ok(refresh) => refresh,
+        Err(error) => return Err(format!("皮皮智绘账号请求失败：{error}")),
+    };
+    let connection = database.lock_conn()?;
+    let changed = connection
+        .execute(
+            "UPDATE site_accounts
+             SET username = ?1, remaining = ?2, used = ?3, total = ?4, unit = ?5,
+                 is_valid = 1, sync_error = '', checkin_enabled = ?6,
+                 checked_in_today = ?7, checkin_error = ?8,
+                 checkin_date = date('now', 'localtime'),
+                 browser_fallback_failed_at = 0, browser_fallback_fail_count = 0,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE site_id = ?9 AND profile_id = ?10",
+            params![
+                refresh.account.username,
+                refresh.account.remaining,
+                refresh.account.used,
+                refresh.account.total,
+                refresh.account.unit,
+                refresh.checkin.enabled,
+                refresh.checkin.checked_in_today,
+                refresh.checkin.error,
+                site_id,
+                profile_id,
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    if changed == 0 {
+        return Err(format!(
+            "没有更新到 {site_name} · {account_label} 的账号缓存（该 Chrome Profile 尚未建立本地账号，请先同步会话）"
+        ));
+    }
+    let session = read_cached_usage_sites(&connection)?
+        .into_iter()
+        .find(|site| site.site_id == *site_id)
+        .and_then(|site| {
+            site.sessions
+                .into_iter()
+                .find(|session| session.profile_id == *profile_id)
+        })
+        .ok_or_else(|| "读取皮皮智绘账号缓存失败".to_string())?;
+    emit_chrome_account_progress(
+        bus,
+        run_id,
+        "account-cache",
+        "success",
+        format!("{account_label} 积分与签到状态已保存到 SQLite"),
+    );
+    Ok(session)
+}
+
 async fn sync_site_account_via_chrome_inner(
     ctx: &Arc<AppContext>,
     site_id: String,
@@ -2046,8 +2518,27 @@ async fn sync_site_account_via_chrome_inner(
     } else {
         format!("{profile_name} · {account_name}")
     };
+    // 皮皮智绘的令牌在 Chrome Local Storage 里，账号刷新走直连（不写 Cookie），
+    // 不需要 Chrome 同源桥；NewAPI 才需要桥接。这里在守卫之前截获并直连刷新，
+    // 复用扫描期的 fetch_site_account 分支。
+    if is_pipiwang(&system_type) {
+        return sync_pipiwang_account_via_local_storage(
+            ctx,
+            &bus,
+            &site_id,
+            &profile_id,
+            &account_label,
+            &site_name,
+            &api_base_url,
+            &system_type,
+            &current_month,
+            supports_checkin,
+            run_id,
+        )
+        .await;
+    }
     if !is_newapi(&system_type) {
-        return Err("当前仅对 NewAPI 账号提供 Chrome 同步".into());
+        return Err("当前仅对 NewAPI 与皮皮智绘账号提供 Chrome 同步".into());
     }
 
     emit_chrome_account_progress(
@@ -2481,19 +2972,7 @@ async fn sync_site_account_via_chrome_inner(
                 .map_err(|_| "系统时间异常")?
                 .as_nanos()
         );
-        let mut browser_url = if !checkin_url.trim().is_empty() {
-            Url::parse(&checkin_url).unwrap_or_else(|_| base_url.clone())
-        } else {
-            base_url
-                .join("/console/personal")
-                .map_err(|_| "无法生成 Chrome 验证地址")?
-        };
-        if browser_url.origin() != base_url.origin() {
-            browser_url = base_url
-                .join("/console/personal")
-                .map_err(|_| "无法生成 Chrome 验证地址")?;
-        }
-        browser_url.set_fragment(Some(&marker));
+        let browser_url = chrome_account_bridge_url(&base_url, &checkin_url, &marker)?;
         let javascript = chrome_account_bridge_script(
             user_id.as_deref(),
             &current_month,
@@ -2589,19 +3068,7 @@ async fn sync_site_account_via_chrome_inner(
                     .map_err(|_| "系统时间异常")?
                     .as_nanos()
             );
-            let mut browser_url = if !checkin_url.trim().is_empty() {
-                Url::parse(&checkin_url).unwrap_or_else(|_| base_url.clone())
-            } else {
-                base_url
-                    .join("/console/personal")
-                    .map_err(|_| "无法生成 Chrome 验证地址")?
-            };
-            if browser_url.origin() != base_url.origin() {
-                browser_url = base_url
-                    .join("/console/personal")
-                    .map_err(|_| "无法生成 Chrome 验证地址")?;
-            }
-            browser_url.set_fragment(Some(&marker));
+            let browser_url = chrome_account_bridge_url(&base_url, &checkin_url, &marker)?;
             let javascript = chrome_account_bridge_script(
                 user_id.as_deref(),
                 &current_month,
@@ -2758,6 +3225,47 @@ mod tests {
     }
 
     #[test]
+    fn parses_pipiwang_me_with_points_and_identity() {
+        // 与生产接口一致：/api/v1/pc/me 返回 user + points + quota 快照。
+        let value = serde_json::json!({
+            "user": { "id": 101396, "nickname": "无意皇权" },
+            "points": 550,
+            "quota": { "points": 550, "checkedIn": true },
+            "checkedIn": true
+        });
+        let account = parse_pipiwang_account(&value).unwrap();
+        assert_eq!(account.username, "无意皇权");
+        assert_eq!(account.remaining, Some(550.0));
+        assert_eq!(account.unit, "积分");
+        assert!(parse_pipiwang_checkin_status(&value).unwrap());
+    }
+
+    #[test]
+    fn parses_pipiwang_local_storage_credentials() {
+        let values = HashMap::from([
+            ("pipi_pc_token".to_string(), "jwt-token-abc".to_string()),
+            (
+                "pipi_pc_user".to_string(),
+                r#"{"id":101396,"nickname":"无意皇权"}"#.to_string(),
+            ),
+        ]);
+        assert_eq!(pipiwang_token(&values).as_deref(), Some("jwt-token-abc"));
+        let account = parse_pipiwang_local_account(&values).unwrap();
+        assert_eq!(account.username, "无意皇权");
+        // 缺少 token 的 Local Storage 不算有效登录痕迹。
+        let no_token =
+            HashMap::from([("pipi_pc_user".to_string(), r#"{"id":101396}"#.to_string())]);
+        assert_eq!(pipiwang_token(&no_token), None);
+    }
+
+    #[test]
+    fn rejects_pipiwang_me_without_points() {
+        // 未登录响应（401 detail）缺少 points 字段，解析应报错而不是静默归零。
+        let value = serde_json::json!({ "detail": "未登录" });
+        assert!(parse_pipiwang_account(&value).is_err());
+    }
+
+    #[test]
     fn cloudflare_shield_errors_require_chrome_fallback() {
         // 生产环境实测错误文本（42公益站开启 Cloudflare 人机验证后）。
         let shield = "账号接口 HTTP 403 返回 HTML：Cloudflare 安全验证拦截了直接请求，请先用对应 Chrome 账号打开站点并通过验证";
@@ -2867,6 +3375,42 @@ mod tests {
         assert!(!script.contains("credentials: useSessionCookies"));
         assert!(script.contains("method: \"GET\", credentials: \"include\""));
         assert!(script.contains("method: \"POST\", credentials: \"include\""));
+    }
+
+    #[test]
+    fn chrome_account_bridge_url_rewrites_origin_only_checkin_to_console() {
+        let base = Url::parse("https://anyrouter.top/").unwrap();
+        let url =
+            chrome_account_bridge_url(&base, "https://anyrouter.top/", "openhub-sync-1").unwrap();
+        assert_eq!(url.as_str(), "https://anyrouter.top/console#openhub-sync-1");
+        let slashless =
+            chrome_account_bridge_url(&base, "https://anyrouter.top", "openhub-background-2")
+                .unwrap();
+        assert_eq!(
+            slashless.as_str(),
+            "https://anyrouter.top/console#openhub-background-2"
+        );
+        let empty = chrome_account_bridge_url(&base, "", "openhub-sync-3").unwrap();
+        assert_eq!(
+            empty.as_str(),
+            "https://anyrouter.top/console/personal#openhub-sync-3"
+        );
+        let personal = chrome_account_bridge_url(
+            &base,
+            "https://anyrouter.top/console/personal",
+            "openhub-sync-4",
+        )
+        .unwrap();
+        assert_eq!(
+            personal.as_str(),
+            "https://anyrouter.top/console/personal#openhub-sync-4"
+        );
+        let foreign =
+            chrome_account_bridge_url(&base, "https://example.com/path", "openhub-sync-5").unwrap();
+        assert_eq!(
+            foreign.as_str(),
+            "https://anyrouter.top/console/personal#openhub-sync-5"
+        );
     }
 
     #[test]

@@ -485,6 +485,18 @@ fn sync_failure_error_is_persisted_to_model_cache() {
         key_models: HashMap::new(),
         errors: vec![],
     };
+    // 先预置一条不含旧关键词（NewAPI/权限不足/失效）的历史账号同步错误，
+    // 回归保护：成功同步后必须无条件清掉，卡片才不会一直挂着「账号信息同步失败」。
+    database
+        .0
+        .lock()
+        .unwrap()
+        .execute(
+            "INSERT INTO site_accounts (site_id, profile_id, is_valid, sync_error, api_sync_error)
+             VALUES ('site-ai', 'Profile 11', 0, '账号同步超过 90 秒，已强制终止', '令牌请求失败')",
+            [],
+        )
+        .unwrap();
     let mut account_ok = account.clone();
     account_ok.keys = vec!["sk-live".into()];
     save_site_model_cache(&database, "site-ai", &account_ok, Some(&ok_result), false).unwrap();
@@ -499,6 +511,20 @@ fn sync_failure_error_is_persisted_to_model_cache() {
         )
         .unwrap();
     assert!(saved2.is_empty(), "成功时遗留错误未清：{saved2}");
+    let (sync_error, api_sync_error): (String, String) = database
+        .0
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT sync_error, api_sync_error FROM site_accounts WHERE site_id='site-ai' AND profile_id='Profile 11'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert!(
+        sync_error.is_empty() && api_sync_error.is_empty(),
+        "成功同步后 site_accounts 历史错误未清：sync_error={sync_error:?}, api_sync_error={api_sync_error:?}"
+    );
 }
 
 #[test]
@@ -995,8 +1021,11 @@ fn recognizes_security_gateway_pages_without_treating_regular_html_as_a_shield()
 #[test]
 fn chrome_system_probe_requests_both_status_endpoints_in_parallel() {
     let script = chrome_system_probe_script("openhub-system-123");
-    assert!(script.contains("Promise.all([probe(\"/api/status\"), probe(\"/setup/status\")])"));
-    assert_eq!(script.matches("AbortSignal.timeout(12000)").count(), 1);
+    assert!(script.contains(
+        "Promise.all([probe(\"/api/status\"), probe(\"/setup/status\"), probeStudioFlags()])"
+    ));
+    // probe() 与 probeStudioFlags() 各带一个超时声明。
+    assert_eq!(script.matches("AbortSignal.timeout(12000)").count(), 2);
     assert!(!script.contains("http://"));
     assert!(!script.contains("https://"));
 }
@@ -1039,8 +1068,8 @@ fn chrome_account_bridge_uses_only_fixed_same_origin_endpoints() {
             < script.find("const checkinResponse").unwrap()
     );
     assert!(
-        script.find("const checkinResponse").unwrap()
-            < script.find("fetch(\"/api/user/self\"").unwrap()
+        script.find("fetch(\"/api/user/self\"").unwrap()
+            < script.find("const checkinResponse").unwrap()
     );
     assert!(
         script.contains("method: \"GET\", credentials: \"include\", cache: \"no-store\", headers")
@@ -1052,7 +1081,7 @@ fn chrome_account_bridge_uses_only_fixed_same_origin_endpoints() {
     );
     assert!(script.contains("const useSessionCookies = !apiToken"));
     assert!(script.contains("if (useSessionCookies) {"));
-    assert!(script.contains("const requestTimeout = 30000"));
+    assert!(script.contains("const requestTimeout = 8000"));
     assert_eq!(
         script
             .matches("AbortSignal.timeout(requestTimeout)")
@@ -1061,6 +1090,9 @@ fn chrome_account_bridge_uses_only_fixed_same_origin_endpoints() {
     );
     assert!(!script.contains("account: accessToken"));
     assert!(!script.contains("if (Date.now() - previous.started < 3000) return pending;"));
+    assert!(script.contains("tryParseDocumentAccount"));
+    assert!(script.contains("window.location.reload()"));
+    assert!(script.contains("__openHubChallengeReloads"));
 }
 
 #[test]
@@ -1103,6 +1135,8 @@ fn chrome_account_bridge_recognizes_alibaba_acw_challenge() {
     assert!(script.contains("isChallenge"));
     // 该测试用 legacy Cookie 模式，必须命中 /api/user/self 的 challenge 导航分支。
     assert!(script.contains("window.location.assign(`/api/user/self#${token}`)"));
+    assert!(script.contains("window.location.reload()"));
+    assert!(script.contains("tryParseDocumentAccount"));
 }
 
 #[test]

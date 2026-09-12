@@ -4,7 +4,7 @@ import { runCommand, useLibrary } from "../../composables/useLibrary";
 import { icons } from "../../icons";
 import { useStore } from "../../composables/useStore";
 import { logoText } from "../../utils";
-import { isUnknownSystemType, systemTypeLabel } from "../../types";
+import { isPipiwangType, isUnknownSystemType, systemTypeLabel } from "../../types";
 import { useToast } from "../../composables/core/useToast";
 import { useConfirm } from "../../composables/ui/useConfirm";
 import {
@@ -561,9 +561,9 @@ async function removeKey(account: LiveAccountKeys, key: string) {
               <span v-html="icons.repeat" />
               <span>{{ siteProxy ? "移除反代" : "导入反代" }}</span>
             </button>
-            <!-- 同步 Key：重新拉取站点 API Key 列表；未知架构站点无 Key 提取能力，不提供该入口 -->
+            <!-- 同步 Key：重新拉取站点 API Key 列表；未知架构与皮皮智绘站点（无 NewAPI Key 体系）不提供该入口 -->
             <button
-              v-if="site && !isUnknownSystemType(site.systemType)"
+              v-if="site && !isUnknownSystemType(site.systemType) && !isPipiwangType(site.systemType)"
               type="button"
               class="site-models-text-btn"
               :disabled="liveFetching"
