@@ -26,7 +26,15 @@ pub async fn get_charity_feed(
     let sort_order = sort_order.unwrap_or_else(|| "desc".into());
     if requested == "all" {
         return tokio::task::block_in_place(|| {
-            load_all_feed_items_from_db(&database, offset, limit, &keyword, &filter, &sort_by, &sort_order)
+            load_all_feed_items_from_db(
+                &database,
+                offset,
+                limit,
+                &keyword,
+                &filter,
+                &sort_by,
+                &sort_order,
+            )
         });
     }
     let source = charity_feed_source(&database, requested)?;
@@ -34,7 +42,16 @@ pub async fn get_charity_feed(
     // 附带上一轮同步的失败消息会让人误以为点击本身触发了网络请求。
     // 同步失败已由 charity_sync_logs 记录，前端从同步日志查看。
     let result = tokio::task::block_in_place(|| {
-        load_feed_items_from_db(&database, &source, offset, limit, &keyword, &filter, &sort_by, &sort_order)
+        load_feed_items_from_db(
+            &database,
+            &source,
+            offset,
+            limit,
+            &keyword,
+            &filter,
+            &sort_by,
+            &sort_order,
+        )
     })?;
     Ok(result)
 }

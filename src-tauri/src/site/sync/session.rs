@@ -667,6 +667,9 @@ struct ChromeWindowSnapshot {
     tabs: Vec<(String, String)>,
 }
 
+/// 仅测试覆盖：公益打开已改为 `open_url_in_chrome_profile_blocking`，
+/// 不再走 AppleScript 标签复用规划。
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ChromeSessionOpenPlan {
     ActivateTab { tab_id: String, window_id: String },
@@ -721,11 +724,13 @@ fn normalize_chrome_reuse_url(url: &str) -> String {
     format!("{}://{host}{path}", parsed.scheme())
 }
 
+#[cfg(test)]
 fn chrome_tab_url_matches(existing: &str, target: &str) -> bool {
     !existing.is_empty()
         && normalize_chrome_reuse_url(existing) == normalize_chrome_reuse_url(target)
 }
 
+#[cfg(test)]
 fn is_linuxdo_tab_url(url: &str) -> bool {
     let Ok(parsed) = Url::parse(url.trim()) else {
         return false;
@@ -736,6 +741,7 @@ fn is_linuxdo_tab_url(url: &str) -> bool {
     })
 }
 
+#[cfg(test)]
 fn preferred_reuse_tab(window: &ChromeWindowSnapshot, target_url: &str) -> Option<(String, bool)> {
     if let Some((tab_id, _)) = window
         .tabs
@@ -792,27 +798,36 @@ fn extract_http_urls_from_bytes(data: &[u8]) -> HashSet<String> {
     urls
 }
 
+#[cfg(test)]
 const SNSS_COMMAND_SET_TAB_WINDOW: u8 = 0;
+#[cfg(test)]
 const SNSS_COMMAND_TAB_CLOSED: u8 = 3;
+#[cfg(test)]
 const SNSS_COMMAND_WINDOW_CLOSED: u8 = 4;
+#[cfg(test)]
 const SNSS_COMMAND_TAB_CLOSED2: u8 = 16;
+#[cfg(test)]
 const SNSS_COMMAND_WINDOW_CLOSED2: u8 = 17;
 
+#[cfg(test)]
 fn snss_i32(payload: &[u8]) -> Option<i32> {
     payload.get(..4)?.try_into().ok().map(i32::from_le_bytes)
 }
 
+#[cfg(test)]
 struct SnssCommandIter<'a> {
     data: &'a [u8],
     offset: usize,
 }
 
+#[cfg(test)]
 impl<'a> SnssCommandIter<'a> {
     fn new(data: &'a [u8]) -> Self {
         Self { data, offset: 0 }
     }
 }
 
+#[cfg(test)]
 impl<'a> Iterator for SnssCommandIter<'a> {
     type Item = (u8, &'a [u8]);
 
@@ -840,6 +855,7 @@ impl<'a> Iterator for SnssCommandIter<'a> {
     }
 }
 
+#[cfg(test)]
 fn parse_chrome_session_open_window_ids(data: &[u8]) -> HashSet<String> {
     let mut windows: HashMap<i32, HashSet<i32>> = HashMap::new();
     for (command_id, payload) in SnssCommandIter::new(data) {
@@ -874,6 +890,7 @@ fn parse_chrome_session_open_window_ids(data: &[u8]) -> HashSet<String> {
         .collect()
 }
 
+#[cfg(test)]
 fn chrome_session_restore_files(profile_dir: &Path, limit: usize) -> Vec<PathBuf> {
     let mut files = Vec::new();
     for name in ["Current Session", "Last Session"] {
@@ -902,6 +919,7 @@ fn chrome_session_restore_files(profile_dir: &Path, limit: usize) -> Vec<PathBuf
     files
 }
 
+#[cfg(test)]
 fn collect_profile_open_window_ids(profile_dir: &Path) -> HashSet<String> {
     let mut ids = HashSet::new();
     for path in chrome_session_restore_files(profile_dir, 2) {
@@ -916,6 +934,7 @@ fn collect_profile_open_window_ids(profile_dir: &Path) -> HashSet<String> {
     ids
 }
 
+#[cfg(test)]
 fn assign_chrome_windows_by_session_ids(
     windows: &[ChromeWindowSnapshot],
     profile_window_ids: &[(String, HashSet<String>)],
@@ -940,6 +959,7 @@ fn assign_chrome_windows_by_session_ids(
     assigned
 }
 
+#[cfg(test)]
 fn assign_chrome_windows_to_profiles(
     windows: &[ChromeWindowSnapshot],
     profile_urls: &[(String, HashSet<String>)],
@@ -981,6 +1001,7 @@ fn assign_chrome_windows_to_profiles(
     assigned
 }
 
+#[cfg(test)]
 fn exclusive_profile_urls(
     profile_urls: &[(String, HashSet<String>)],
 ) -> Vec<(String, HashSet<String>)> {
@@ -1005,6 +1026,7 @@ fn exclusive_profile_urls(
         .collect()
 }
 
+#[cfg(test)]
 fn assigned_chrome_window_ids(
     assigned: &HashMap<String, Vec<ChromeWindowSnapshot>>,
 ) -> HashSet<String> {
@@ -1015,6 +1037,7 @@ fn assigned_chrome_window_ids(
         .collect()
 }
 
+#[cfg(test)]
 fn merge_assigned_chrome_windows(
     into: &mut HashMap<String, Vec<ChromeWindowSnapshot>>,
     extra: HashMap<String, Vec<ChromeWindowSnapshot>>,
@@ -1032,6 +1055,7 @@ fn merge_assigned_chrome_windows(
     }
 }
 
+#[cfg(test)]
 fn apply_cached_chrome_window_profiles(
     windows: &[ChromeWindowSnapshot],
     assigned_window_ids: &HashSet<String>,
@@ -1057,6 +1081,7 @@ fn apply_cached_chrome_window_profiles(
     extra
 }
 
+#[cfg(test)]
 fn remember_chrome_window_profiles(
     assigned: &HashMap<String, Vec<ChromeWindowSnapshot>>,
     live_window_ids: &HashSet<String>,
@@ -1073,6 +1098,7 @@ fn remember_chrome_window_profiles(
     }
 }
 
+#[cfg(test)]
 fn resolve_chrome_windows_for_profiles(
     windows: &[ChromeWindowSnapshot],
     profile_urls: &[(String, HashSet<String>)],
@@ -1140,6 +1166,7 @@ fn chrome_window_profile_cache() -> std::sync::MutexGuard<'static, HashMap<Strin
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+#[cfg(test)]
 fn plan_chrome_session_open(
     target_url: &str,
     profile_running: bool,
@@ -1253,109 +1280,6 @@ fn collect_profile_open_tab_urls(profile_dir: &Path) -> HashSet<String> {
         urls.extend(extract_http_urls_from_bytes(&data));
     }
     urls
-}
-
-#[cfg(target_os = "macos")]
-#[allow(dead_code)]
-fn run_chrome_tab_reuse_action(action: &str, target_id: &str, url: &str) -> Result<String, String> {
-    const SCRIPT: &str = r#"
-on run argv
-    set actionName to item 1 of argv
-    set targetId to item 2 of argv
-    set targetUrl to item 3 of argv
-    if application "Google Chrome" is not running then return "not-running"
-    tell application "Google Chrome"
-        if actionName is "activate-tab" then
-            repeat with windowIndex from 1 to (count of windows)
-                try
-                    repeat with tabIndex from 1 to (count of tabs of window windowIndex)
-                        try
-                            set browserTab to tab tabIndex of window windowIndex
-                            if ((id of browserTab) as text) is equal to targetId then
-                                set active tab index of window windowIndex to tabIndex
-                                set index of window windowIndex to 1
-                                activate
-                                return "ok"
-                            end if
-                        end try
-                    end repeat
-                end try
-            end repeat
-            return "missing"
-        else if actionName is "navigate-tab" then
-            repeat with windowIndex from 1 to (count of windows)
-                try
-                    repeat with tabIndex from 1 to (count of tabs of window windowIndex)
-                        try
-                            set browserTab to tab tabIndex of window windowIndex
-                            if ((id of browserTab) as text) is equal to targetId then
-                                set URL of browserTab to targetUrl
-                                set active tab index of window windowIndex to tabIndex
-                                set index of window windowIndex to 1
-                                activate
-                                return "ok"
-                            end if
-                        end try
-                    end repeat
-                end try
-            end repeat
-            return "missing"
-        else if actionName is "new-tab" then
-            repeat with windowIndex from 1 to (count of windows)
-                try
-                    if ((id of window windowIndex) as text) is equal to targetId then
-                        make new tab at end of tabs of window windowIndex with properties {URL:targetUrl}
-                        set index of window windowIndex to 1
-                        activate
-                        return "ok"
-                    end if
-                end try
-            end repeat
-            return "missing"
-        end if
-    end tell
-    return "unknown"
-end run
-"#;
-    let mut command = Command::new("/usr/bin/osascript");
-    command.args(["-e", SCRIPT, "--", action, target_id, url]);
-    let output = run_osascript_with_deadline(command, Duration::from_secs(10))?;
-    if !output.status.success() {
-        let error = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(if error.is_empty() {
-            "Chrome 复用已打开窗口失败".into()
-        } else {
-            format!("Chrome 复用已打开窗口失败：{error}")
-        });
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
-#[cfg(target_os = "macos")]
-#[allow(dead_code)]
-fn execute_chrome_session_open_plan(
-    url: &str,
-    profile_id: &str,
-    plan: ChromeSessionOpenPlan,
-) -> Result<(), String> {
-    let new_tab_in_window =
-        |window_id: &str| match run_chrome_tab_reuse_action("new-tab", window_id, url) {
-            Ok(result) if result == "ok" => Ok(()),
-            Ok(result) => Err(format!("Chrome 已打开窗口未能新建标签：{result}")),
-            Err(error) => Err(error),
-        };
-    match plan {
-        ChromeSessionOpenPlan::ActivateTab { tab_id, window_id } => {
-            match run_chrome_tab_reuse_action("activate-tab", &tab_id, "") {
-                Ok(result) if result == "ok" => Ok(()),
-                _ => new_tab_in_window(&window_id),
-            }
-        }
-        ChromeSessionOpenPlan::NewTabInWindow { window_id } => new_tab_in_window(&window_id),
-        ChromeSessionOpenPlan::Launch { new_window } => {
-            open_url_in_chrome_profile_blocking_with_mode(url, profile_id, false, None, new_window)
-        }
-    }
 }
 
 #[cfg(target_os = "macos")]

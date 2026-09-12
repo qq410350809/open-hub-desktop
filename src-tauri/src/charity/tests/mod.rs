@@ -359,10 +359,8 @@ fn migrates_legacy_tag_json_urls_only_for_generated_addresses() {
 
 #[test]
 fn combined_filter_url_encodes_tag_names_as_or_query() {
-    let url = combined_filter_json_url(
-        &["公益推广".into(), "公益站".into(), "中转站".into()],
-        true,
-    );
+    let url =
+        combined_filter_json_url(&["公益推广".into(), "公益站".into(), "中转站".into()], true);
     assert!(url.starts_with("https://linux.do/filter.json?q=tag%3A"));
     assert!(url.contains("%E5%85%AC%E7%9B%8A%E6%8E%A8%E5%B9%BF"));
     assert!(url.contains("%2C"));

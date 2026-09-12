@@ -639,9 +639,12 @@ pub async fn sync_round_combined(
                                 &account_name,
                             )
                         });
-                        let created_new = created_results.iter().map(|r| r.new_count).sum::<usize>();
-                        let created_updated =
-                            created_results.iter().map(|r| r.updated_count).sum::<usize>();
+                        let created_new =
+                            created_results.iter().map(|r| r.new_count).sum::<usize>();
+                        let created_updated = created_results
+                            .iter()
+                            .map(|r| r.updated_count)
+                            .sum::<usize>();
                         if let Some(id) = created_log_id {
                             update_charity_sync_log(
                                 database,
@@ -700,27 +703,30 @@ pub async fn sync_round_combined(
                             };
                             let activity_elapsed = attempt_started.elapsed().as_millis() as i64;
                             match plain_result {
-                                Ok((plain_body, _, _, _)) => match items_from_topic_list(&plain_body) {
-                                    Ok(plain_items) => {
-                                        let activity_count = plain_items.len();
-                                        activity_results = tokio::task::block_in_place(|| {
-                                            persist_split_items(
-                                                monitor,
-                                                database,
-                                                sources,
-                                                &plain_items,
-                                                &profile_name,
-                                                &account_name,
-                                            )
-                                        });
-                                        let activity_new =
-                                            activity_results.iter().map(|r| r.new_count).sum::<usize>();
-                                        let activity_updated = activity_results
-                                            .iter()
-                                            .map(|r| r.updated_count)
-                                            .sum::<usize>();
-                                        if let Some(id) = activity_log_id {
-                                            update_charity_sync_log(
+                                Ok((plain_body, _, _, _)) => {
+                                    match items_from_topic_list(&plain_body) {
+                                        Ok(plain_items) => {
+                                            let activity_count = plain_items.len();
+                                            activity_results = tokio::task::block_in_place(|| {
+                                                persist_split_items(
+                                                    monitor,
+                                                    database,
+                                                    sources,
+                                                    &plain_items,
+                                                    &profile_name,
+                                                    &account_name,
+                                                )
+                                            });
+                                            let activity_new = activity_results
+                                                .iter()
+                                                .map(|r| r.new_count)
+                                                .sum::<usize>();
+                                            let activity_updated = activity_results
+                                                .iter()
+                                                .map(|r| r.updated_count)
+                                                .sum::<usize>();
+                                            if let Some(id) = activity_log_id {
+                                                update_charity_sync_log(
                                                 database,
                                                 id,
                                                 if activity_results.iter().any(|r| r.failed) {
@@ -741,13 +747,14 @@ pub async fn sync_round_combined(
                                                 })
                                                 .to_string(),
                                             );
+                                            }
                                         }
-                                    }
-                                    Err(cause) => {
-                                        activity_note =
-                                            format!("最新帖子解析失败，仅最新话题入库：{cause}");
-                                        if let Some(id) = activity_log_id {
-                                            update_charity_sync_log(
+                                        Err(cause) => {
+                                            activity_note = format!(
+                                                "最新帖子解析失败，仅最新话题入库：{cause}"
+                                            );
+                                            if let Some(id) = activity_log_id {
+                                                update_charity_sync_log(
                                                 database,
                                                 id,
                                                 "error",
@@ -758,9 +765,10 @@ pub async fn sync_round_combined(
                                                 activity_elapsed,
                                                 "",
                                             );
+                                            }
                                         }
                                     }
-                                },
+                                }
                                 Err(cause) if is_charity_sync_cancelled(&cause) => {
                                     activity_note = "最新帖子补抓因取消中止".into();
                                     if let Some(id) = activity_log_id {
@@ -805,8 +813,10 @@ pub async fn sync_round_combined(
                         let mut updated_guids_seen = HashSet::new();
                         tokio::task::block_in_place(|| {
                             for source in sources {
-                                let created = created_results.iter().find(|r| r.feed_id == source.id);
-                                let activity = activity_results.iter().find(|r| r.feed_id == source.id);
+                                let created =
+                                    created_results.iter().find(|r| r.feed_id == source.id);
+                                let activity =
+                                    activity_results.iter().find(|r| r.feed_id == source.id);
                                 let new_count = created.map(|r| r.new_count).unwrap_or(0)
                                     + activity.map(|r| r.new_count).unwrap_or(0);
                                 let updated_count = created.map(|r| r.updated_count).unwrap_or(0)
@@ -1109,7 +1119,16 @@ pub async fn sync_feed_with_fast_nodes(
                 "",
             );
             let local = tokio::task::block_in_place(|| {
-                load_feed_items_from_db(database, source, 0, CHARITY_PAGE_SIZE, "", "all", "publishedAt", "desc")
+                load_feed_items_from_db(
+                    database,
+                    source,
+                    0,
+                    CHARITY_PAGE_SIZE,
+                    "",
+                    "all",
+                    "publishedAt",
+                    "desc",
+                )
             })?;
             let _ = write_feed_sync_meta(database, &source.id, "skipped", &message, "", 0);
             finish_charity_sync_log(
@@ -1445,7 +1464,16 @@ pub async fn sync_feed_with_fast_nodes(
         let _ = proxypool::restore_proxy_node_transient(database, runtime).await;
     }
     let mut local = tokio::task::block_in_place(|| {
-        load_feed_items_from_db(database, source, 0, CHARITY_PAGE_SIZE, "", "all", "publishedAt", "desc")
+        load_feed_items_from_db(
+            database,
+            source,
+            0,
+            CHARITY_PAGE_SIZE,
+            "",
+            "all",
+            "publishedAt",
+            "desc",
+        )
     })
     .unwrap_or(CharityFeedResult {
         feed_id: source.id.clone(),

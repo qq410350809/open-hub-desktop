@@ -172,15 +172,15 @@ pub fn start_charity_monitor(ctx: Arc<AppContext>) {
                 continue;
             }
 
-            let sources_for_round = match tokio::task::block_in_place(|| load_charity_sources(&database))
-            {
-                Ok(sources) => sources,
-                Err(error) => {
-                    error!("加载公益源列表失败，本轮同步跳过：{error}");
-                    monitor.end_sync();
-                    continue;
-                }
-            };
+            let sources_for_round =
+                match tokio::task::block_in_place(|| load_charity_sources(&database)) {
+                    Ok(sources) => sources,
+                    Err(error) => {
+                        error!("加载公益源列表失败，本轮同步跳过：{error}");
+                        monitor.end_sync();
+                        continue;
+                    }
+                };
             // 标准标签源（地址为程序生成的 tag latest.json）→ 每轮一次 filter.json 合并请求；
             // 自定义源 → 保留各自的独立请求。
             let (standard_sources, custom_sources): (Vec<_>, Vec<_>) = sources_for_round

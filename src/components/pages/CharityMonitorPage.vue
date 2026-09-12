@@ -13,17 +13,13 @@ const { confirm } = useConfirm();
 
 // 通知监听已在 App 根组件注册（切页不失效）；页面里只保留测试入口。
 
-// —— 帖子详情弹窗状态 ——
-const selectedPost = ref<CharityFeedItem | null>(null);
-
-function openPostDetail(item: CharityFeedItem) {
-  selectedPost.value = item;
-  document.body.classList.add("modal-open");
+function isPosterAvatar(value?: string) {
+  return !!value && /^https?:\/\//i.test(value);
 }
 
-function closePostDetail() {
-  selectedPost.value = null;
-  document.body.classList.remove("modal-open");
+function displayAuthorAvatar(item?: { posters?: string[] } | null) {
+  if (!item?.posters?.length) return "";
+  return item.posters.find((value) => isPosterAvatar(value)) || "";
 }
 
 const openingInBrowsers = ref(false);
@@ -442,7 +438,7 @@ const topicColumns: AppTableColumn[] = [
   { key: "views", title: "浏览", width: "85px", align: "right", sortable: true },
   { key: "lastActivityAt", title: "最近活跃", width: "100px", sortable: true },
   { key: "firstSeenAt", title: "入库时间", width: "100px", sortable: true },
-  { key: "actions", title: "快捷操作", width: "110px", align: "center", sortable: false },
+  { key: "actions", title: "快捷操作", width: "80px", align: "center", sortable: false },
 ];
 
 function topicRowClass(row: { pinned?: boolean }) {
@@ -729,9 +725,6 @@ onUnmounted(() => {
           manual-sorting
           :sorting="store.topicSorting.value"
           :row-class="topicRowClass"
-          :selected-key="selectedPost?.id ?? null"
-          clickable
-          @select="(item: any) => openPostDetail(item)"
           @update:page="(page: number) => store.goCharityPage(page)"
           @update:page-size="(size: number) => store.setCharityPageSize(size)"
           @update:sorting="(s: any) => store.setTopicSorting(s)"
@@ -775,7 +768,10 @@ onUnmounted(() => {
           <!-- 作者列 -->
           <template #cell-author="{ row }">
             <div class="cm-author-cell" :title="row.author || '未知作者'">
-              <span class="cm-author-avatar">{{ authorInitials(row.author) }}</span>
+              <span class="cm-author-avatar">
+                <img v-if="displayAuthorAvatar(row)" :src="displayAuthorAvatar(row)" alt="" />
+                <template v-else>{{ authorInitials(row.author) }}</template>
+              </span>
               <span class="cm-author-name">{{ row.author || "—" }}</span>
             </div>
           </template>
@@ -839,14 +835,6 @@ onUnmounted(() => {
               >
                 <span v-html="icons.external" />
               </button>
-              <button
-                type="button"
-                class="cm-action-icon-btn"
-                title="查看详情与提炼信息"
-                @click="openPostDetail(row)"
-              >
-                <span v-html="icons.eye" />
-              </button>
             </div>
           </template>
         </AppTable>
@@ -854,113 +842,10 @@ onUnmounted(() => {
     </div>
 
     <!-- ============================================================
-         三大独立弹窗 (Teleport Modals)
+         独立弹窗 (Teleport Modals)
          ============================================================ -->
 
-    <!-- 1. 帖子详情与快速解析弹窗 (Post Detail Modal) -->
-    <Teleport to="body">
-      <Transition name="cm-modal-fade">
-        <div v-if="selectedPost" class="cm-modal-backdrop">
-          <section class="cm-modal-card is-detail" role="dialog" aria-modal="true">
-            <header class="cm-modal-header">
-              <div class="cm-modal-title-group">
-                <div class="cm-modal-eyebrow">
-                  <span v-if="selectedPost.pinned" class="cm-pin-badge" v-html="icons.pin" />
-                  <span>公益帖子详情</span>
-                </div>
-                <h2>{{ selectedPost.title }}</h2>
-              </div>
-              <button type="button" class="cm-modal-close-btn" aria-label="关闭" @click="closePostDetail">×</button>
-            </header>
-
-            <div class="cm-modal-body">
-              <!-- 元信息横幅 -->
-              <div class="cm-detail-meta-bar">
-                <div class="cm-meta-item">
-                  <span class="cm-meta-label">发布者:</span>
-                  <strong class="cm-meta-val">{{ selectedPost.author || "匿名用户" }}</strong>
-                </div>
-                <div class="cm-meta-item">
-                  <span class="cm-meta-label">发布时间:</span>
-                  <span class="cm-meta-val">{{ formatPublishedAt(selectedPost.publishedAt) }}</span>
-                </div>
-                <div class="cm-meta-item">
-                  <span class="cm-meta-label">回复 / 浏览:</span>
-                  <span class="cm-meta-val">{{ formatCompactCount(selectedPost.replyCount) }} 评 / {{ formatCompactCount(selectedPost.views) }} 阅</span>
-                </div>
-                <div class="cm-meta-item">
-                  <span class="cm-meta-label">最后活跃:</span>
-                  <span class="cm-meta-val">{{ formatRelativeActivity(selectedPost.lastActivityAt, selectedPost.publishedAt) }}</span>
-                </div>
-                <div class="cm-meta-item">
-                  <span class="cm-meta-label">入库时间:</span>
-                  <span class="cm-meta-val">{{ formatStoredAt(selectedPost.firstSeenAt) }}</span>
-                </div>
-              </div>
-
-              <!-- 分类标签 -->
-              <div v-if="selectedPost.categories?.length" class="cm-detail-tags-row">
-                <span
-                  v-for="cat in selectedPost.categories"
-                  :key="cat"
-                  class="cm-category-chip"
-                  :style="{
-                    color: getCategoryTagStyle(cat).color,
-                    background: getCategoryTagStyle(cat).bg,
-                    borderColor: getCategoryTagStyle(cat).border
-                  }"
-                >
-                  {{ cat }}
-                </span>
-              </div>
-
-              <!-- 摘要 / 提取内容 -->
-              <div class="cm-detail-content-box">
-                <div class="cm-detail-section-title">
-                  <span v-html="icons.sparkles" />
-                  <span>帖子摘要与提炼</span>
-                </div>
-                <div v-if="selectedPost.summary" class="cm-detail-text">
-                  {{ selectedPost.summary }}
-                </div>
-                <div v-else class="cm-detail-empty-summary">
-                  该帖子暂无长正文快照，点击下方「在会话浏览器中打开」可直接查阅完整讨论与回复。
-                </div>
-              </div>
-
-              <!-- 原始链接 -->
-              <div class="cm-detail-link-box">
-                <span class="cm-link-label">原始主题链接:</span>
-                <code class="cm-link-code">{{ selectedPost.link }}</code>
-              </div>
-            </div>
-
-            <footer class="cm-modal-footer">
-              <button
-                type="button"
-                class="cm-btn-secondary"
-                @click="copyPostLink(selectedPost!)"
-              >
-                <span v-html="copyFeedbackId === selectedPost.id ? icons.check : icons.copy" />
-                <span>{{ copyFeedbackId === selectedPost.id ? "已复制链接" : "复制链接" }}</span>
-              </button>
-              <button
-                type="button"
-                class="cm-btn-primary"
-                :disabled="openingInBrowsers"
-                @click="openPostInBrowser(selectedPost!)"
-              >
-                <span v-html="icons.external" />
-                <span>在会话浏览器中打开</span>
-              </button>
-              <button type="button" class="cm-btn-cancel" @click="closePostDetail">关闭</button>
-            </footer>
-          </section>
-        </div>
-      </Transition>
-    </Teleport>
-
-    <!-- 2. 标签源管理中心弹窗 (Tag Manager Modal) -->
+    <!-- 标签源管理中心弹窗 (Tag Manager Modal) -->
     <Teleport to="body">
       <Transition name="cm-modal-fade">
         <div v-if="tagManagerOpen" class="cm-modal-backdrop">
@@ -1106,7 +991,7 @@ onUnmounted(() => {
       </Transition>
     </Teleport>
 
-    <!-- 3. 同步与节点诊断日志终端弹窗 (Sync Log Terminal Modal) -->
+    <!-- 同步与节点诊断日志终端弹窗 (Sync Log Terminal Modal) -->
     <Teleport to="body">
       <Transition name="cm-modal-fade">
         <div v-if="store.charitySyncLogOpen.value" class="cm-modal-backdrop">
@@ -1924,6 +1809,13 @@ onUnmounted(() => {
   align-items: center;
   justify-content: center;
   flex-shrink: 0;
+  overflow: hidden;
+}
+
+.cm-author-avatar img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
 }
 
 .cm-author-name {
@@ -2059,10 +1951,6 @@ onUnmounted(() => {
   overflow: hidden;
 }
 
-.cm-modal-card.is-detail {
-  max-width: 720px;
-}
-
 .cm-modal-card.is-tag-mgr {
   max-width: 680px;
 }
@@ -2090,6 +1978,7 @@ onUnmounted(() => {
 .cm-modal-eyebrow {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 5px;
   font-size: 9.5px;
   font-weight: 750;
@@ -2138,7 +2027,7 @@ onUnmounted(() => {
   min-height: 0;
   display: flex;
   flex-direction: column;
-  gap: 14px;
+  gap: 10px;
 }
 
 .cm-modal-footer {
@@ -2166,102 +2055,6 @@ onUnmounted(() => {
 
 .cm-btn-cancel:hover {
   background: var(--surface-hover);
-}
-
-/* Detail Modal Inner Styles */
-.cm-detail-meta-bar {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
-  gap: 8px;
-  padding: 8px 12px;
-  background: var(--page-bg);
-  border-radius: var(--r-md, 8px);
-  border: 1px solid var(--line);
-}
-
-.cm-meta-item {
-  display: flex;
-  flex-direction: column;
-  gap: 1px;
-}
-
-.cm-meta-label {
-  font-size: 10px;
-  color: var(--muted);
-}
-
-.cm-meta-val {
-  font-size: 11.5px;
-  font-weight: 600;
-  color: var(--text);
-}
-
-.cm-detail-tags-row {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  flex-wrap: wrap;
-}
-
-.cm-detail-content-box {
-  background: var(--page-bg);
-  border: 1px solid var(--line);
-  border-radius: var(--r-md, 8px);
-  padding: 12px;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.cm-detail-section-title {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 11px;
-  font-weight: 700;
-  color: var(--brand);
-}
-
-.cm-detail-section-title :deep(svg) {
-  width: 13px;
-  height: 13px;
-}
-
-.cm-detail-text {
-  font-size: 12.5px;
-  line-height: 1.6;
-  color: var(--text);
-  white-space: pre-wrap;
-  word-break: break-word;
-}
-
-.cm-detail-empty-summary {
-  font-size: 12px;
-  color: var(--muted);
-  line-height: 1.5;
-}
-
-.cm-detail-link-box {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  font-size: 11px;
-}
-
-.cm-link-label {
-  color: var(--muted);
-  flex-shrink: 0;
-}
-
-.cm-link-code {
-  font-size: 10.5px;
-  background: var(--page-bg);
-  padding: 2px 6px;
-  border-radius: 4px;
-  color: var(--brand);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 /* Tag Manager Modal Inner Styles */
