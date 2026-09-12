@@ -14,10 +14,12 @@ use std::path::{Path, PathBuf};
 use serde_yaml::{Mapping, Value as Yaml};
 
 use super::{content_hash, snapshot_skeleton, ToolAdapter};
-use crate::local_tools::fsutil::{atomic_write, read_text};
-use crate::local_tools::mark::{is_managed_id, MANAGER_VALUE, YAML_MARK_KEY};
+use crate::local_tools::fsutil::{atomic_write, atomic_write_stamped, read_text};
+use crate::local_tools::mark::{
+    is_managed_id, FINGERPRINT_PLACEHOLDER, MANAGER_VALUE, YAML_FINGERPRINT_KEY, YAML_MARK_KEY,
+};
 use crate::local_tools::types::{
-    ModelEntry, ProviderEntry, ToolId, ToolConfigPatch, ToolConfigSnapshot,
+    ModelEntry, ProviderEntry, ToolConfigPatch, ToolConfigSnapshot, ToolId,
 };
 
 pub(crate) struct DshAdapter;
@@ -64,11 +66,7 @@ impl ToolAdapter for DshAdapter {
 
     fn config_files(&self, home: &Path) -> Vec<(String, String, PathBuf)> {
         vec![
-            (
-                "config".into(),
-                "settings.yaml".into(),
-                settings_path(home),
-            ),
+            ("config".into(), "settings.yaml".into(), settings_path(home)),
             (
                 "auth".into(),
                 ".credentials.yaml".into(),
@@ -94,7 +92,10 @@ impl ToolAdapter for DshAdapter {
             return Ok(snap);
         };
 
-        let section = root.get(SECTION).cloned().unwrap_or(Yaml::Mapping(Mapping::new()));
+        let section = root
+            .get(SECTION)
+            .cloned()
+            .unwrap_or(Yaml::Mapping(Mapping::new()));
         let providers = section
             .get(PROVIDERS_KEY)
             .and_then(|v| v.as_mapping())
@@ -126,7 +127,11 @@ impl ToolAdapter for DshAdapter {
                                 id: Self::yaml_str(&model, "id"),
                                 name: {
                                     let n = Self::yaml_str(&model, "name");
-                                    if n.is_empty() { Self::yaml_str(&model, "id") } else { n }
+                                    if n.is_empty() {
+                                        Self::yaml_str(&model, "id")
+                                    } else {
+                                        n
+                                    }
                                 },
                                 provider: provider_id.to_string(),
                                 context_window: Self::yaml_u64(&model, "contextWindow"),
@@ -141,7 +146,11 @@ impl ToolAdapter for DshAdapter {
                 id: provider_id.to_string(),
                 name: {
                     let n = Self::yaml_str(&obj, "displayName");
-                    if n.is_empty() { provider_id.to_string() } else { n }
+                    if n.is_empty() {
+                        provider_id.to_string()
+                    } else {
+                        n
+                    }
                 },
                 base_url: Self::yaml_str(&obj, "baseURL"),
                 api_key: String::new(),
@@ -213,13 +222,15 @@ impl ToolAdapter for DshAdapter {
                 );
             }
             let env_name = credential_env_name(&provider.id);
-            provider_map.insert(
-                Yaml::String("apiKeyEnv".into()),
-                Yaml::String(env_name),
-            );
+            provider_map.insert(Yaml::String("apiKeyEnv".into()), Yaml::String(env_name));
             provider_map.insert(
                 Yaml::String(YAML_MARK_KEY.into()),
                 Yaml::String(MANAGER_VALUE.into()),
+            );
+            // 落盘时盖成真实指纹（各供应商段同值），用于判断此后有没有被外部改过
+            provider_map.insert(
+                Yaml::String(YAML_FINGERPRINT_KEY.into()),
+                Yaml::String(FINGERPRINT_PLACEHOLDER.into()),
             );
 
             let mut models = Vec::new();
@@ -227,7 +238,10 @@ impl ToolAdapter for DshAdapter {
                 let mut model_map = Mapping::new();
                 model_map.insert(Yaml::String("id".into()), Yaml::String(model.id.clone()));
                 if model.name != model.id {
-                    model_map.insert(Yaml::String("name".into()), Yaml::String(model.name.clone()));
+                    model_map.insert(
+                        Yaml::String("name".into()),
+                        Yaml::String(model.name.clone()),
+                    );
                 }
                 if model.context_window > 0 {
                     model_map.insert(
@@ -261,7 +275,10 @@ impl ToolAdapter for DshAdapter {
             if !models.is_empty() {
                 provider_map.insert(Yaml::String("models".into()), Yaml::Sequence(models));
             }
-            providers.insert(Yaml::String(provider.id.clone()), Yaml::Mapping(provider_map));
+            providers.insert(
+                Yaml::String(provider.id.clone()),
+                Yaml::Mapping(provider_map),
+            );
         }
 
         let section = root
@@ -270,14 +287,11 @@ impl ToolAdapter for DshAdapter {
             .cloned()
             .unwrap_or_default();
         let mut section = section;
-        section.insert(
-            Yaml::String(PROVIDERS_KEY.into()),
-            Yaml::Mapping(providers),
-        );
+        section.insert(Yaml::String(PROVIDERS_KEY.into()), Yaml::Mapping(providers));
         root.insert(Yaml::String(SECTION.into()), Yaml::Mapping(section));
 
         let text = serde_yaml::to_string(&Yaml::Mapping(root)).map_err(|e| e.to_string())?;
-        atomic_write(&path, &text)?;
+        atomic_write_stamped(&path, &text)?;
         let mut written = vec!["settings.yaml".to_string()];
         if upsert_openhub_credentials(home, patch)? {
             written.push(".credentials.yaml".to_string());
@@ -286,13 +300,13 @@ impl ToolAdapter for DshAdapter {
     }
 }
 
-
 fn credentials_path(home: &Path) -> PathBuf {
     home.join(".dsh").join(".credentials.yaml")
 }
 
 fn credential_env_name(provider_id: &str) -> String {
-    let provider_id = provider_id.strip_prefix(crate::local_tools::mark::MANAGED_PREFIX)
+    let provider_id = provider_id
+        .strip_prefix(crate::local_tools::mark::MANAGED_PREFIX)
         .unwrap_or(provider_id);
     format!(
         "OPENHUB_{}_API_KEY",
@@ -322,7 +336,9 @@ fn upsert_openhub_credentials(home: &Path, patch: &ToolConfigPatch) -> Result<bo
         .keys()
         .filter(|key| {
             key.as_str()
-                .map(|id| id.starts_with("OPENHUB_") && id.ends_with("_API_KEY") && !keep.contains(id))
+                .map(|id| {
+                    id.starts_with("OPENHUB_") && id.ends_with("_API_KEY") && !keep.contains(id)
+                })
                 .unwrap_or(false)
         })
         .cloned()
@@ -411,7 +427,10 @@ mod tests {
                 max_output: 32_000,
             }],
             defaults: DefaultsSection {
-                per_model_effort: super::super::map_from(&[("openhub-site_d_acc_0/m1", "off,high,max")]),
+                per_model_effort: super::super::map_from(&[(
+                    "openhub-site_d_acc_0/m1",
+                    "off,high,max",
+                )]),
                 ..Default::default()
             },
             context: Default::default(),
@@ -420,9 +439,15 @@ mod tests {
         adapter.apply(&home, &patch).unwrap();
 
         let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.contains("welcomeNoticeVersion"), "其他顶层键保留：{text}");
+        assert!(
+            text.contains("welcomeNoticeVersion"),
+            "其他顶层键保留：{text}"
+        );
         assert!(text.contains("fastmodel"), "用户供应商必须保留：{text}");
-        assert!(text.contains("https://old/v1"), "用户供应商不得被改写：{text}");
+        assert!(
+            text.contains("https://old/v1"),
+            "用户供应商不得被改写：{text}"
+        );
         assert!(text.contains("openhub-site_d_acc_0"), "{text}");
         assert!(text.contains("baseURL: http://127.0.0.1:17896/v1"));
         assert!(text.contains("contextWindow: 500000"));

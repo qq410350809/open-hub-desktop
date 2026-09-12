@@ -12,11 +12,13 @@ use std::path::{Path, PathBuf};
 use serde_json::{json, Map, Value};
 
 use super::{content_hash, json_str, json_u64, snapshot_skeleton, ToolAdapter};
-use crate::local_tools::fsutil::{atomic_write, read_text};
-use crate::local_tools::mark::{is_managed_id, JSON_MARK_KEY, MANAGER_VALUE};
+use crate::local_tools::fsutil::{atomic_write_stamped, read_text};
+use crate::local_tools::mark::{
+    is_managed_id, FINGERPRINT_PLACEHOLDER, JSON_MARK_KEY, MANAGER_VALUE,
+};
 use crate::local_tools::types::{
-    ContextSection, ModelEntry, ProviderEntry, ThinkingSection, ToolId, ToolConfigPatch,
-    ToolConfigSnapshot,
+    ContextSection, ModelEntry, ProviderEntry, ThinkingSection, ToolConfigPatch,
+    ToolConfigSnapshot, ToolId,
 };
 
 pub(crate) struct ZcodeAdapter;
@@ -80,7 +82,8 @@ impl ToolAdapter for ZcodeAdapter {
                     .unwrap_or_default();
                 snap.providers.push(ProviderEntry {
                     id: id.clone(),
-                    name: json_str(&Value::Object(obj.clone()), "name").unwrap_or_else(|| id.clone()),
+                    name: json_str(&Value::Object(obj.clone()), "name")
+                        .unwrap_or_else(|| id.clone()),
                     base_url: json_str(&options, "baseURL").unwrap_or_default(),
                     api_key: json_str(&options, "apiKey").unwrap_or_default(),
                     protocol: json_str(&Value::Object(obj.clone()), "kind").unwrap_or_default(),
@@ -99,8 +102,11 @@ impl ToolAdapter for ZcodeAdapter {
                     let limit = model.get("limit").cloned().unwrap_or(Value::Null);
                     snap.models.push(ModelEntry {
                         id: model_id.clone(),
-                        name: json_str(&Value::Object(model.as_object().cloned().unwrap_or_default()), "name")
-                            .unwrap_or_else(|| model_id.clone()),
+                        name: json_str(
+                            &Value::Object(model.as_object().cloned().unwrap_or_default()),
+                            "name",
+                        )
+                        .unwrap_or_else(|| model_id.clone()),
                         provider: provider_id.clone(),
                         context_window: json_u64(&limit, "context").unwrap_or(0),
                         max_output: json_u64(&limit, "output").unwrap_or(0),
@@ -174,15 +180,20 @@ impl ToolAdapter for ZcodeAdapter {
             }
             provider_obj.insert(
                 JSON_MARK_KEY.into(),
-                json!({ "managed": true, "manager": MANAGER_VALUE }),
+                json!({
+                    "managed": true,
+                    "manager": MANAGER_VALUE,
+                    // 落盘时盖成真实指纹（各供应商段同值），用于判断此后有没有被外部改过
+                    "fingerprint": FINGERPRINT_PLACEHOLDER,
+                }),
             );
             providers_new.insert(provider.id.clone(), Value::Object(provider_obj));
         }
         root.insert("provider".into(), Value::Object(providers_new));
 
-        let text = serde_json::to_string_pretty(&Value::Object(root)).map_err(|e| e.to_string())?
-            + "\n";
-        atomic_write(&path, &text)?;
+        let text =
+            serde_json::to_string_pretty(&Value::Object(root)).map_err(|e| e.to_string())? + "\n";
+        atomic_write_stamped(&path, &text)?;
         Ok(vec!["v2/config.json".to_string()])
     }
 }
@@ -252,11 +263,23 @@ mod tests {
 
         let out: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(out["agents"]["keep"], true, "其他顶层键必须保留");
-        assert_eq!(out["provider"]["p1"]["options"]["baseURL"], "http://127.0.0.1:1/v1", "用户供应商不得被改写");
+        assert_eq!(
+            out["provider"]["p1"]["options"]["baseURL"], "http://127.0.0.1:1/v1",
+            "用户供应商不得被改写"
+        );
         assert_eq!(out["provider"]["p1"]["options"]["apiKey"], "sk-old");
-        assert_eq!(out["provider"]["p1"]["models"]["m1"]["limit"]["output"], 64000);
-        assert_eq!(out["provider"]["openhub-site_z_acc_0"]["options"]["baseURL"], "http://127.0.0.1:17896/v1");
-        assert_eq!(out["provider"]["openhub-site_z_acc_0"]["models"]["m1"]["limit"]["output"], 128_000);
+        assert_eq!(
+            out["provider"]["p1"]["models"]["m1"]["limit"]["output"],
+            64000
+        );
+        assert_eq!(
+            out["provider"]["openhub-site_z_acc_0"]["options"]["baseURL"],
+            "http://127.0.0.1:17896/v1"
+        );
+        assert_eq!(
+            out["provider"]["openhub-site_z_acc_0"]["models"]["m1"]["limit"]["output"],
+            128_000
+        );
 
         let _ = std::fs::remove_dir_all(&home);
     }

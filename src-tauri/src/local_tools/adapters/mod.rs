@@ -11,8 +11,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use super::types::{
-    ContextSection, DefaultsSection, ModelEntry, ProviderEntry, ThinkingSection, ToolId,
-    ToolConfigFile, ToolConfigPatch, ToolConfigSnapshot,
+    ContextSection, DefaultsSection, ModelEntry, ProviderEntry, ThinkingSection, ToolConfigFile,
+    ToolConfigPatch, ToolConfigSnapshot, ToolId,
 };
 
 /// 配置内容整体哈希（冲突检测用）。FNV-1a 64 位，足够检测误覆盖。
@@ -52,20 +52,24 @@ pub(crate) trait ToolAdapter: Send + Sync {
 }
 
 /// 适配器公共帮助：构造快照骨架。
-pub(crate) fn snapshot_skeleton(
-    adapter: &dyn ToolAdapter,
-    home: &Path,
-) -> ToolConfigSnapshot {
+pub(crate) fn snapshot_skeleton(adapter: &dyn ToolAdapter, home: &Path) -> ToolConfigSnapshot {
     let files = adapter
         .config_files(home)
         .into_iter()
         .map(|(kind, label, path)| {
             let exists = path.is_file();
+            // 载入即检测：有标识且指纹吻合 = 上次是我们写的且没人动过
+            let managed = super::fsutil::read_text(&path)
+                .ok()
+                .flatten()
+                .map(|text| super::mark::inspect(&text))
+                .unwrap_or_default();
             ToolConfigFile {
                 kind,
                 label,
                 path: path.display().to_string(),
                 exists,
+                managed,
             }
         })
         .collect();

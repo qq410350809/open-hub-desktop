@@ -36,6 +36,12 @@ pub(crate) fn atomic_write(path: &Path, content: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// 受管配置写入：先把文本里的指纹占位盖成真实指纹，再原子落盘。
+/// 适配器写自己管辖的配置文件走这里；备份还原等原样回写走 `atomic_write`。
+pub(crate) fn atomic_write_stamped(path: &Path, content: &str) -> Result<(), String> {
+    atomic_write(path, &super::mark::stamp(content))
+}
+
 /// 读取文本文件（UTF-8），不存在时返回 None。
 pub(crate) fn read_text(path: &Path) -> Result<Option<String>, String> {
     match File::open(path) {

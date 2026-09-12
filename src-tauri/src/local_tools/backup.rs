@@ -75,10 +75,7 @@ pub(crate) fn list_backups(base: &Path, tool: &str) -> Vec<ToolBackupEntry> {
                 ),
                 file_label: file.file_name().to_string_lossy().to_string(),
                 size: meta.as_ref().map(|m| m.len()).unwrap_or(0),
-                created_at: stamp
-                    .file_name()
-                    .to_string_lossy()
-                    .replace(['T', 'Z'], " "),
+                created_at: stamp.file_name().to_string_lossy().replace(['T', 'Z'], " "),
             });
         }
     }
@@ -174,12 +171,8 @@ mod tests {
 
         for i in 0..13 {
             fs::write(&cfg, format!("{{\"v\":{i}}}")).unwrap();
-            let stamp = create_backup(
-                &tmp,
-                "test",
-                &[("config.json".into(), cfg.as_path())],
-            )
-            .unwrap();
+            let stamp =
+                create_backup(&tmp, "test", &[("config.json".into(), cfg.as_path())]).unwrap();
             assert!(!stamp.is_empty());
             // 纳秒时间戳在极快循环中仍可能撞名；强制错开保证 13 个独立目录。
             std::thread::sleep(std::time::Duration::from_millis(2));

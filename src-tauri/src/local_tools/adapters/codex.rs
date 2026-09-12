@@ -13,11 +13,14 @@
 use std::path::{Path, PathBuf};
 
 use super::{content_hash, effort_options, snapshot_skeleton, ToolAdapter};
-use crate::local_tools::fsutil::{atomic_write, read_text};
-use crate::local_tools::mark::{COMMENT, MANAGED_PREFIX, TOML_MARK_KEY};
+use crate::local_tools::fsutil::{atomic_write_stamped, read_text};
+use crate::local_tools::mark::{
+    COMMENT, FINGERPRINT_PLACEHOLDER, JSON_MARK_KEY, MANAGED_PREFIX, TOML_FINGERPRINT_KEY,
+    TOML_MARK_KEY,
+};
 use crate::local_tools::types::{
-    ContextSection, DefaultsSection, ModelEntry, ProviderEntry, ThinkingSection, ToolId,
-    ToolConfigPatch, ToolConfigSnapshot,
+    ContextSection, DefaultsSection, ModelEntry, ProviderEntry, ThinkingSection, ToolConfigPatch,
+    ToolConfigSnapshot, ToolId,
 };
 
 pub(crate) struct CodexAdapter;
@@ -45,11 +48,7 @@ impl ToolAdapter for CodexAdapter {
 
     fn config_files(&self, home: &Path) -> Vec<(String, String, PathBuf)> {
         vec![
-            (
-                "config".into(),
-                "config.toml".into(),
-                config_path(home),
-            ),
+            ("config".into(), "config.toml".into(), config_path(home)),
             ("auth".into(), "auth.json".into(), auth_path(home)),
         ]
     }
@@ -143,10 +142,7 @@ impl ToolAdapter for CodexAdapter {
             effort_level_options: effort_options(EFFORTS),
             max_thinking_tokens: None,
         };
-        snap.content_hash = content_hash(&[
-            text,
-            read_text(&auth_path(home))?.unwrap_or_default(),
-        ]);
+        snap.content_hash = content_hash(&[text, read_text(&auth_path(home))?.unwrap_or_default()]);
         Ok(snap)
     }
 
@@ -182,7 +178,10 @@ impl ToolAdapter for CodexAdapter {
             }
             // toml_edit：不存在则创建子表（保留其余键不动）。
             if doc.get("model_providers").is_none() {
-                doc.insert("model_providers", toml_edit::Item::Table(toml_edit::Table::new()));
+                doc.insert(
+                    "model_providers",
+                    toml_edit::Item::Table(toml_edit::Table::new()),
+                );
             }
             let providers = doc
                 .get_mut("model_providers")
@@ -204,7 +203,13 @@ impl ToolAdapter for CodexAdapter {
             if !provider.protocol.is_empty() {
                 set_str(&mut table, "wire_api", &provider.protocol);
             }
-            set_str(&mut table, TOML_MARK_KEY, crate::local_tools::mark::MANAGER_VALUE);
+            set_str(
+                &mut table,
+                TOML_MARK_KEY,
+                crate::local_tools::mark::MANAGER_VALUE,
+            );
+            // 落盘时盖成真实指纹（各供应商表同值），用于判断此后有没有被外部改过
+            set_str(&mut table, TOML_FINGERPRINT_KEY, FINGERPRINT_PLACEHOLDER);
             if table.decor().prefix().is_none() {
                 table.decor_mut().set_prefix(format!("# {COMMENT}\n"));
             }
@@ -214,7 +219,11 @@ impl ToolAdapter for CodexAdapter {
         // 顶层标量。
         set_top_str(&mut doc, "model_provider", &patch.defaults.provider);
         set_top_str(&mut doc, "model", &patch.defaults.model);
-        set_top_str(&mut doc, "model_reasoning_effort", &patch.defaults.reasoning_effort);
+        set_top_str(
+            &mut doc,
+            "model_reasoning_effort",
+            &patch.defaults.reasoning_effort,
+        );
         match patch.context.context_window {
             Some(value) => set_top_int(&mut doc, "model_context_window", value as i64),
             None => {
@@ -229,28 +238,42 @@ impl ToolAdapter for CodexAdapter {
         }
 
         let new_text = doc.to_string();
-        atomic_write(&path, &new_text)?;
+        atomic_write_stamped(&path, &new_text)?;
 
         // auth.json：仅当任一供应商带了 API Key 时写入（Codex 约定单 Key）。
         let mut written = vec!["config.toml".to_string()];
         if let Some(key) = patch
             .providers
             .iter()
-            .filter(|p| crate::local_tools::mark::is_managed_id(&p.id) || p.id.starts_with(MANAGED_PREFIX) || patch.defaults.provider == p.id)
+            .filter(|p| {
+                crate::local_tools::mark::is_managed_id(&p.id)
+                    || p.id.starts_with(MANAGED_PREFIX)
+                    || patch.defaults.provider == p.id
+            })
             .map(|p| p.api_key.as_str())
             .find(|k| !k.is_empty())
         {
             let auth = auth_path(home);
             let existing = read_text(&auth)?
-                .and_then(|text| serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&text).ok())
+                .and_then(|text| {
+                    serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&text).ok()
+                })
                 .unwrap_or_default();
             let mut existing = existing;
             existing.insert(
                 "OPENAI_API_KEY".into(),
                 serde_json::Value::String(key.to_string()),
             );
+            existing.insert(
+                JSON_MARK_KEY.into(),
+                serde_json::json!({
+                    "managed": true,
+                    "manager": crate::local_tools::mark::MANAGER_VALUE,
+                    "fingerprint": FINGERPRINT_PLACEHOLDER,
+                }),
+            );
             let out = serde_json::to_string_pretty(&existing).map_err(|e| e.to_string())? + "\n";
-            atomic_write(&auth, &out)?;
+            atomic_write_stamped(&auth, &out)?;
             written.push("auth.json".to_string());
         }
         Ok(written)
@@ -406,8 +429,14 @@ trust_level = "trusted"
         };
         adapter.apply(&home, &patch3).unwrap();
         let text3 = std::fs::read_to_string(config_path(&home)).unwrap();
-        assert!(!text3.contains("OpenHub 网关"), "删除的 OpenHub 供应商应被移除：{text3}");
-        assert!(text3.contains("[model_providers.custom]"), "用户原有供应商必须保留：{text3}");
+        assert!(
+            !text3.contains("OpenHub 网关"),
+            "删除的 OpenHub 供应商应被移除：{text3}"
+        );
+        assert!(
+            text3.contains("[model_providers.custom]"),
+            "用户原有供应商必须保留：{text3}"
+        );
         assert!(text3.contains("[mcp_servers.router]"), "其他表仍在");
 
         let _ = std::fs::remove_dir_all(&home);

@@ -3,18 +3,27 @@ import { computed, onMounted, onUnmounted } from "vue";
 import { icons } from "../../icons";
 import { useStore } from "../../composables/useStore";
 import { usePreferences } from "../../composables/usePreferences";
-import { useModelProxy } from "../../composables/useModelProxy";
+import { useModelProxy, refreshProxyConfig } from "../../composables/useModelProxy";
+import { useLocalTools } from "../../composables/localtools/useLocalTools";
 import { capabilities } from "../../composables/core/capabilities";
 import { formatCompact, localDateOf, toLocalDate } from "../../composables/tokenStatsAgg";
 
 const store = useStore();
 const { preferences, updatePreferences } = usePreferences();
-const { proxyStatus, refreshStatus: refreshProxyStatus } = useModelProxy();
+const {
+  proxyConfig,
+  proxyConfigLoaded,
+  proxyStatus,
+  refreshStatus: refreshProxyStatus,
+} = useModelProxy();
+const { visibleTools, loadToolList } = useLocalTools();
 
 // 状态与「今日 Token」徽标：挂载即取一次，此后每 60s 轻量刷新（后端为单行聚合查询）
 let proxyStatusTimer: number | null = null;
 onMounted(() => {
+  void refreshProxyConfig();
   refreshProxyStatus();
+  if (capabilities.value.localTokenStats) void loadToolList();
   proxyStatusTimer = window.setInterval(() => refreshProxyStatus(), 60_000);
 });
 onUnmounted(() => {
@@ -52,7 +61,8 @@ const navItems = computed(() => [
     label: "Agent 配置",
     icon: icons.sparkles,
     active: store.page.value === "localtools",
-    badge: "",
+    // 菜单徽标：当前支持结构化配置的 Agent 种类数（含未检测到的）
+    badge: visibleTools.value.length ? String(visibleTools.value.length) : "",
     onClick: () => store.openLocalTools(),
   },
   {
@@ -60,7 +70,8 @@ const navItems = computed(() => [
     label: "站点库",
     icon: icons.database,
     active: store.page.value === "library",
-    badge: String(store.sites.value.length),
+    // 菜单徽标：在用且存活的站点数（不含待定、跑路）
+    badge: String(personalActiveCount.value),
     onClick: () => store.openLibrary(),
   },
   {
@@ -80,9 +91,9 @@ const navItems = computed(() => [
     label: "模型反代",
     icon: icons.repeat,
     active: store.page.value === "modelproxy",
-    // 菜单徽标：反代渠道数（与页面「反代渠道」标签的计数同口径）
-    badge: proxyStatus.value?.channelsCount
-      ? String(proxyStatus.value.channelsCount)
+    // 菜单徽标：反代渠道数（与页面「反代渠道」标签同口径，配置未灌入前不展示占位 1）
+    badge: proxyConfigLoaded.value && proxyConfig.value.channels.length
+      ? String(proxyConfig.value.channels.length)
       : "",
     onClick: () => store.openModelProxy(),
   },
@@ -129,6 +140,11 @@ const todayTokenBadge = computed(() =>
 // 今天反代网关转发的 token 数（后端单行聚合，用于「网关统计」菜单徽标；无数据时显示 0）
 const gatewayTokenBadge = computed(() =>
   formatCompact(proxyStatus.value?.todayTotalTokens ?? 0),
+);
+
+// 站点库徽标口径：在用（isPersonal）且存活（未标记跑路）的站点数
+const personalActiveCount = computed(() =>
+  store.sites.value.filter((site) => site.isPersonal && !site.isRunaway).length,
 );
 
 function toggleSidebar() {

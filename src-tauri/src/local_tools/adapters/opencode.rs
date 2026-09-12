@@ -11,14 +11,16 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{json, Map, Value};
 
-use super::{effort_options, snapshot_skeleton, ToolAdapter};
-use crate::local_tools::fsutil::{atomic_write, read_text};
-use crate::local_tools::mark::{is_managed_id, JSON_MARK_KEY, MANAGER_VALUE};
-use crate::local_tools::types::{
-    DefaultsSection, ModelEntry, ProviderEntry, ThinkingSection, ToolId, ToolConfigPatch,
-    ToolConfigSnapshot,
-};
 use super::{content_hash, json_str, json_u64};
+use super::{effort_options, snapshot_skeleton, ToolAdapter};
+use crate::local_tools::fsutil::{atomic_write_stamped, read_text};
+use crate::local_tools::mark::{
+    is_managed_id, FINGERPRINT_PLACEHOLDER, JSON_MARK_KEY, MANAGER_VALUE,
+};
+use crate::local_tools::types::{
+    DefaultsSection, ModelEntry, ProviderEntry, ThinkingSection, ToolConfigPatch,
+    ToolConfigSnapshot, ToolId,
+};
 
 pub(crate) struct OpencodeAdapter;
 
@@ -88,11 +90,7 @@ impl ToolAdapter for OpencodeAdapter {
     }
 
     fn config_files(&self, home: &Path) -> Vec<(String, String, PathBuf)> {
-        vec![(
-            "config".into(),
-            "opencode.json".into(),
-            config_path(home),
-        )]
+        vec![("config".into(), "opencode.json".into(), config_path(home))]
     }
 
     fn detect(&self, home: &Path) -> (bool, String) {
@@ -136,7 +134,8 @@ impl ToolAdapter for OpencodeAdapter {
                     .unwrap_or_default();
                 snap.providers.push(ProviderEntry {
                     id: id.clone(),
-                    name: json_str(&Value::Object(obj.clone()), "name").unwrap_or_else(|| id.clone()),
+                    name: json_str(&Value::Object(obj.clone()), "name")
+                        .unwrap_or_else(|| id.clone()),
                     base_url: json_str(&options, "baseURL").unwrap_or_default(),
                     api_key: json_str(&options, "apiKey").unwrap_or_default(),
                     protocol: json_str(&Value::Object(obj.clone()), "npm").unwrap_or_default(),
@@ -232,12 +231,7 @@ impl ToolAdapter for OpencodeAdapter {
                         .split(',')
                         .map(str::trim)
                         .filter(|s| !s.is_empty())
-                        .map(|e| {
-                            (
-                                e.to_string(),
-                                json!({ "reasoningEffort": e }),
-                            )
-                        })
+                        .map(|e| (e.to_string(), json!({ "reasoningEffort": e })))
                         .collect();
                     if !variants.is_empty() {
                         model_obj.insert("variants".into(), Value::Object(variants));
@@ -250,7 +244,12 @@ impl ToolAdapter for OpencodeAdapter {
             }
             provider_obj.insert(
                 JSON_MARK_KEY.into(),
-                json!({ "managed": true, "manager": MANAGER_VALUE }),
+                json!({
+                    "managed": true,
+                    "manager": MANAGER_VALUE,
+                    // 落盘时盖成真实指纹（各供应商段同值），用于判断此后有没有被外部改过
+                    "fingerprint": FINGERPRINT_PLACEHOLDER,
+                }),
             );
             providers_new.insert(provider.id.clone(), Value::Object(provider_obj));
         }
@@ -290,9 +289,9 @@ impl ToolAdapter for OpencodeAdapter {
             root.insert("model".into(), Value::String(patch.defaults.model.clone()));
         }
 
-        let text = serde_json::to_string_pretty(&Value::Object(root)).map_err(|e| e.to_string())?
-            + "\n";
-        atomic_write(&path, &text)?;
+        let text =
+            serde_json::to_string_pretty(&Value::Object(root)).map_err(|e| e.to_string())? + "\n";
+        atomic_write_stamped(&path, &text)?;
         Ok(vec!["opencode.json".to_string()])
     }
 }
@@ -374,9 +373,18 @@ mod tests {
         let out: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(out["mcp"]["x"]["type"], "local", "mcp 必须保留");
         assert_eq!(out["instructions"][0], "中文回复");
-        assert_eq!(out["provider"]["p1"]["models"]["m1"]["limit"]["context"], 100_000, "用户供应商不得被改写");
-        assert_eq!(out["provider"]["openhub-site_a_acc_0"]["options"]["baseURL"], "http://127.0.0.1:17896/v1");
-        assert_eq!(out["provider"]["openhub-site_a_acc_0"]["models"]["alias/m1"]["limit"]["context"], 500_000);
+        assert_eq!(
+            out["provider"]["p1"]["models"]["m1"]["limit"]["context"], 100_000,
+            "用户供应商不得被改写"
+        );
+        assert_eq!(
+            out["provider"]["openhub-site_a_acc_0"]["options"]["baseURL"],
+            "http://127.0.0.1:17896/v1"
+        );
+        assert_eq!(
+            out["provider"]["openhub-site_a_acc_0"]["models"]["alias/m1"]["limit"]["context"],
+            500_000
+        );
         assert_eq!(out["model"], "p1/m1");
 
         let _ = std::fs::remove_dir_all(&home);

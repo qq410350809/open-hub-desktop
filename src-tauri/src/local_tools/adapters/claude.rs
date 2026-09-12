@@ -11,11 +11,13 @@ use std::path::{Path, PathBuf};
 use serde_json::{json, Map, Value};
 
 use super::{content_hash, effort_options, json_str, json_u64, snapshot_skeleton, ToolAdapter};
-use crate::local_tools::fsutil::{atomic_write, read_text};
-use crate::local_tools::mark::{CLAUDE_ENV_MARK, JSON_MARK_KEY, MANAGER_VALUE};
+use crate::local_tools::fsutil::{atomic_write_stamped, read_text};
+use crate::local_tools::mark::{
+    CLAUDE_ENV_MARK, FINGERPRINT_PLACEHOLDER, JSON_MARK_KEY, MANAGER_VALUE,
+};
 use crate::local_tools::types::{
-    ContextSection, DefaultsSection, ModelEntry, ProviderEntry, ThinkingSection, ToolId,
-    ToolConfigPatch, ToolConfigSnapshot,
+    ContextSection, DefaultsSection, ModelEntry, ProviderEntry, ThinkingSection, ToolConfigPatch,
+    ToolConfigSnapshot, ToolId,
 };
 
 pub(crate) struct ClaudeAdapter;
@@ -72,7 +74,10 @@ impl ToolAdapter for ClaudeAdapter {
 
     fn detect(&self, home: &Path) -> (bool, String) {
         let root = home.join(".claude");
-        (root.is_dir() || settings_path(home).is_file(), root.display().to_string())
+        (
+            root.is_dir() || settings_path(home).is_file(),
+            root.display().to_string(),
+        )
     }
 
     fn effect_note(&self) -> &'static str {
@@ -89,9 +94,10 @@ impl ToolAdapter for ClaudeAdapter {
         let env = Self::env_of(&root);
 
         // 供应商：BASE_URL + AUTH_TOKEN 合并为一个逻辑供应商条目。
-        let base_url = json_str(&Value::Object(env.clone()), ANTHROPIC_ENV_BASE_URL)
-            .unwrap_or_default();
-        let auth = json_str(&Value::Object(env.clone()), ANTHROPIC_ENV_AUTH_TOKEN).unwrap_or_default();
+        let base_url =
+            json_str(&Value::Object(env.clone()), ANTHROPIC_ENV_BASE_URL).unwrap_or_default();
+        let auth =
+            json_str(&Value::Object(env.clone()), ANTHROPIC_ENV_AUTH_TOKEN).unwrap_or_default();
         let managed_provider = root
             .get(JSON_MARK_KEY)
             .and_then(|v| v.get("provider"))
@@ -142,7 +148,10 @@ impl ToolAdapter for ClaudeAdapter {
         snap.context = ContextSection {
             context_window: None,
             auto_compact_token_limit: None,
-            max_output_tokens: json_u64(&Value::Object(env.clone()), "CLAUDE_CODE_MAX_OUTPUT_TOKENS"),
+            max_output_tokens: json_u64(
+                &Value::Object(env.clone()),
+                "CLAUDE_CODE_MAX_OUTPUT_TOKENS",
+            ),
             max_thinking_tokens: None,
         };
         snap.thinking = ThinkingSection {
@@ -251,6 +260,8 @@ impl ToolAdapter for ClaudeAdapter {
         let mut mark = serde_json::Map::new();
         mark.insert("managed".into(), json!(true));
         mark.insert("manager".into(), json!(MANAGER_VALUE));
+        // 内容指纹：落盘时由 atomic_write_stamped 盖成真实值，下次保存据此判断有没有被外部改过
+        mark.insert("fingerprint".into(), json!(FINGERPRINT_PLACEHOLDER));
         if let Some(provider) = patch.providers.first().filter(|p| !p.id.is_empty()) {
             mark.insert("provider".into(), json!(provider.id));
         }
@@ -262,14 +273,11 @@ impl ToolAdapter for ClaudeAdapter {
             let env_obj = env
                 .as_object_mut()
                 .ok_or("settings.json 的 env 不是对象，已中止写入")?;
-            env_obj.insert(
-                CLAUDE_ENV_MARK.into(),
-                Value::String(MANAGER_VALUE.into()),
-            );
+            env_obj.insert(CLAUDE_ENV_MARK.into(), Value::String(MANAGER_VALUE.into()));
         }
 
         let text = serde_json::to_string_pretty(&root).map_err(|e| e.to_string())? + "\n";
-        atomic_write(&path, &text)?;
+        atomic_write_stamped(&path, &text)?;
         Ok(vec!["settings.json".to_string()])
     }
 }
@@ -340,7 +348,10 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("permissions"), "未知字段必须保留：{text}");
         assert!(text.contains("OTHER_KEEP"));
-        assert!(text.contains("\"x-openhub\""), "必须写入 OpenHub 标识：{text}");
+        assert!(
+            text.contains("\"x-openhub\""),
+            "必须写入 OpenHub 标识：{text}"
+        );
         assert!(text.contains("OPENHUB_MANAGED"), "必须写入环境标识：{text}");
 
         // 再快照 + 再应用一次：幂等。

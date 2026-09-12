@@ -15,6 +15,7 @@ import { usePreferences } from "../../composables/usePreferences";
 import CustomSelect from "../common/CustomSelect.vue";
 import { DEFAULT_SERVICE_PORT } from "../../constants";
 import type {
+  LocalToolConfigFile,
   LocalToolModelEntry,
   LocalToolProviderEntry,
   LocalToolProviderMode,
@@ -235,9 +236,14 @@ function channelKeyGroup(channel: ChannelConfig, key: string) {
   return group?.name?.trim() || "默认分组";
 }
 
-/** 剥掉模型 id 的命名空间前缀，统一成清单使用的裸名口径。 */
-function bareModelId(id: string) {
-  return id.includes("/") ? id.slice(id.indexOf("/") + 1) : id;
+/**
+ * 剥掉模型 id 上的渠道别名前缀（`alias/model` → `model`），统一成清单使用的裸名口径。
+ * 只剥渠道别名：`deepseek-ai/DeepSeek-V3` 这类上游厂商命名空间是模型 ID 的一部分，
+ * 网关会拿它去比对 Key 的模型授权与出网，剥掉会导致「没有任何 Key 支持该模型」。
+ */
+function bareModelId(id: string, alias: string) {
+  const prefix = alias ? `${alias}/` : "";
+  return prefix && id.toLowerCase().startsWith(prefix.toLowerCase()) ? id.slice(prefix.length) : id;
 }
 
 function modelsForInventory(channel: ChannelConfig, account: SiteModelCacheAccount | null, key: string) {
@@ -256,14 +262,14 @@ function modelsForInventory(channel: ChannelConfig, account: SiteModelCacheAccou
       ];
   const bare = new Set<string>();
   for (const id of owned) {
-    const value = bareModelId(id).trim();
+    const value = bareModelId(id, alias).trim();
     if (value) bare.add(value);
   }
   // 只保留反代「管理可用模型」勾选的模型；勾选记录可能带前缀，按裸名比对
   const allow = channel.enabledModels;
   let visible = [...bare];
   if (allow) {
-    const allowBare = new Set(allow.map(bareModelId).filter(Boolean));
+    const allowBare = new Set(allow.map((m) => bareModelId(m, alias)).filter(Boolean));
     visible = visible.filter((model) => allowBare.has(model));
   }
   return visible.map((model) => (alias ? `${alias}/${model}` : model));
@@ -404,6 +410,16 @@ function providerFromRow(row: ProxyInventoryRow): LocalToolProviderEntry {
     protocol: toolProtocol(row),
     models: modelsForPatch(row).map((model) => model.id),
   };
+}
+
+/** 存在的配置文件及其相对本软件上次写入的状态。 */
+const managedFiles = computed(() => (snapshot.value?.files ?? []).filter((file) => file.exists));
+
+/** 生效时的覆盖策略说明：指纹吻合直接覆盖，否则先备份。 */
+function managedStateLabel(file: LocalToolConfigFile) {
+  if (file.managed === "intact") return "本软件写入，未被改动，生效时直接覆盖";
+  if (file.managed === "modified") return "本软件写入后被外部修改，生效时先备份";
+  return "非本软件写入，生效时先备份";
 }
 
 function rowInitial(row: ProxyInventoryRow) {
@@ -815,6 +831,15 @@ onUnmounted(() => {
             <p class="section-note">
               写入地址 {{ gatewayBaseUrl }} · {{ gatewayReady ? "网关运行中" : "网关未运行" }}
             </p>
+            <p v-if="managedFiles.length" class="section-note lt-file-states">
+              <span
+                v-for="file in managedFiles"
+                :key="file.path"
+                class="lt-file-state"
+                :class="`is-${file.managed}`"
+                :title="file.path"
+              >{{ file.label }} · {{ managedStateLabel(file) }}</span>
+            </p>
           </div>
         </header>
 
@@ -1224,6 +1249,16 @@ onUnmounted(() => {
   font-size: 12px;
 }
 
+.lt-file-states { display: flex; flex-wrap: wrap; gap: 6px; }
+.lt-file-state {
+  font-size: 11.5px;
+  padding: 1px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  color: var(--muted);
+}
+.lt-file-state.is-intact { color: var(--success, #2e9e5b); border-color: currentColor; }
+.lt-file-state.is-modified { color: var(--warning, #c98a1a); border-color: currentColor; }
 .snapshot-warning {
   padding: 10px 14px;
   margin: 0 0 12px;

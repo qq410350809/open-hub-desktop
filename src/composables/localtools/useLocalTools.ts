@@ -33,7 +33,10 @@ async function loadToolList() {
   try {
     toolList.value = await runLocalCommand<LocalToolListReport>("list_local_tools");
   } catch (error) {
-    showToast(`Agent 扫描失败：${error}`, true);
+    const message = String(error);
+    if (!message.includes("仅在客户端本地可用")) {
+      showToast(`Agent 扫描失败：${error}`, true);
+    }
   } finally {
     toolListLoading.value = false;
   }
@@ -72,7 +75,10 @@ async function saveSnapshot(patch: LocalToolConfigPatch): Promise<LocalToolConfi
       patch,
     });
     snapshot.value = result.snapshot;
-    showToast(`已写入配置，${result.snapshot.effectNote}`);
+    const backupNote = result.backedUp?.length
+      ? `，已先备份 ${result.backedUp.join("、")}（非本软件写入或已被外部修改）`
+      : "";
+    showToast(`已写入配置${backupNote}，${result.snapshot.effectNote}`);
     return result;
   } catch (error) {
     const message = String(error);

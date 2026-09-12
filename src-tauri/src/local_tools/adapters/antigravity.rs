@@ -13,7 +13,7 @@ use serde_json::{Map, Value};
 use super::{content_hash, json_str, snapshot_skeleton, ToolAdapter};
 use crate::local_tools::fsutil::{atomic_write, read_text};
 use crate::local_tools::types::{
-    DefaultsSection, ProviderEntry, ToolId, ToolConfigPatch, ToolConfigSnapshot,
+    DefaultsSection, ProviderEntry, ToolConfigPatch, ToolConfigSnapshot, ToolId,
 };
 
 pub(crate) struct AntigravityAdapter;
@@ -40,11 +40,7 @@ fn upsert_env_lines(text: &str, pairs: &[(&str, String)]) -> String {
         let mut replaced = false;
         for line in &mut lines {
             let trimmed = line.trim_start();
-            if trimmed.starts_with(key)
-                && trimmed[key.len()..]
-                    .trim_start()
-                    .starts_with('=')
-            {
+            if trimmed.starts_with(key) && trimmed[key.len()..].trim_start().starts_with('=') {
                 *line = format!("{key}={value}");
                 replaced = true;
             }
@@ -83,7 +79,9 @@ impl AntigravityAdapter {
                 if trimmed.is_empty() || trimmed.starts_with('#') {
                     return None;
                 }
-                trimmed.split_once('=').map(|(k, v)| (k.trim().to_string(), v.to_string()))
+                trimmed
+                    .split_once('=')
+                    .map(|(k, v)| (k.trim().to_string(), v.to_string()))
             })
             .collect()
     }
@@ -97,11 +95,7 @@ impl ToolAdapter for AntigravityAdapter {
     fn config_files(&self, home: &Path) -> Vec<(String, String, PathBuf)> {
         vec![
             ("env".into(), ".env".into(), env_path(home)),
-            (
-                "config".into(),
-                "settings.json".into(),
-                settings_path(home),
-            ),
+            ("config".into(), "settings.json".into(), settings_path(home)),
         ]
     }
 
@@ -148,8 +142,10 @@ impl ToolAdapter for AntigravityAdapter {
             provider: "gemini".into(),
             ..Default::default()
         };
-        snap.content_hash =
-            content_hash(&[env_text, read_text(&settings_path(home))?.unwrap_or_default()]);
+        snap.content_hash = content_hash(&[
+            env_text,
+            read_text(&settings_path(home))?.unwrap_or_default(),
+        ]);
         Ok(snap)
     }
 
@@ -180,8 +176,8 @@ impl ToolAdapter for AntigravityAdapter {
         } else {
             root.insert("model".into(), Value::String(patch.defaults.model.clone()));
         }
-        let text = serde_json::to_string_pretty(&Value::Object(root)).map_err(|e| e.to_string())?
-            + "\n";
+        let text =
+            serde_json::to_string_pretty(&Value::Object(root)).map_err(|e| e.to_string())? + "\n";
         atomic_write(&path, &text)?;
         written.push("settings.json".to_string());
         Ok(written)
@@ -209,7 +205,10 @@ mod tests {
             "# 注释\nOTHER=x\n",
             &[("GOOGLE_GEMINI_BASE_URL", "http://g/v1".into())],
         );
-        assert_eq!(out2, "# 注释\nOTHER=x\nGOOGLE_GEMINI_BASE_URL=http://g/v1\n");
+        assert_eq!(
+            out2,
+            "# 注释\nOTHER=x\nGOOGLE_GEMINI_BASE_URL=http://g/v1\n"
+        );
     }
 
     #[test]

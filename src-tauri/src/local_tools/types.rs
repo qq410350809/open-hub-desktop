@@ -81,6 +81,7 @@ pub enum ProviderMode {
 }
 
 impl ProviderMode {
+    #[cfg(test)]
     pub fn as_str(self) -> &'static str {
         match self {
             ProviderMode::Single => "single",
@@ -176,6 +177,8 @@ pub struct ToolConfigFile {
     pub label: String,
     pub path: String,
     pub exists: bool,
+    /// 相对本软件上次写入的状态：unmanaged（无标识）/ intact（指纹吻合）/ modified（被外部改过）。
+    pub managed: super::mark::ManagedState,
 }
 
 /// 工具配置结构化快照。
@@ -255,8 +258,10 @@ pub struct ToolConfigPatch {
 #[serde(default, rename_all = "camelCase")]
 pub struct ToolConfigSaveResult {
     pub snapshot: ToolConfigSnapshot,
-    /// 本次写入创建的备份文件名。
+    /// 本次写入创建的备份文件名；全部文件指纹吻合（直接覆盖）时为空。
     pub backup_name: String,
+    /// 本次被备份的文件 label（无标识或被外部改过的文件）。
+    pub backed_up: Vec<String>,
 }
 
 /// 备份条目。
@@ -273,9 +278,7 @@ pub struct ToolBackupEntry {
 
 /// 保存冲突错误：磁盘内容与 base_hash 不符。
 pub(crate) fn conflict_error(tool: &str) -> String {
-    format!(
-        "{tool} 的配置文件在保存期间被外部程序修改过，为避免覆盖已中止写入；请重新加载后再试"
-    )
+    format!("{tool} 的配置文件在保存期间被外部程序修改过，为避免覆盖已中止写入；请重新加载后再试")
 }
 
 #[cfg(test)]
