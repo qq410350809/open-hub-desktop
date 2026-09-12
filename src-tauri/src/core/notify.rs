@@ -12,7 +12,7 @@ mod imp {
     use objc2::{define_class, MainThreadMarker, MainThreadOnly};
     use objc2_foundation::{NSBundle, NSError, NSString};
     use objc2_user_notifications::{
-        UNAuthorizationOptions, UNNotification, UNMutableNotificationContent,
+        UNAuthorizationOptions, UNMutableNotificationContent, UNNotification,
         UNNotificationPresentationOptions, UNNotificationRequest, UNNotificationSound,
         UNUserNotificationCenter, UNUserNotificationCenterDelegate,
     };
@@ -40,10 +40,8 @@ mod imp {
                 _notification: &UNNotification,
                 completion_handler: &block2::DynBlock<dyn Fn(UNNotificationPresentationOptions)>,
             ) {
-                completion_handler.call((
-                    UNNotificationPresentationOptions::Banner
-                        | UNNotificationPresentationOptions::Sound,
-                ));
+                completion_handler.call((UNNotificationPresentationOptions::Banner
+                    | UNNotificationPresentationOptions::Sound,));
             }
         }
     );
@@ -95,10 +93,9 @@ mod imp {
         let options = UNAuthorizationOptions::Alert | UNAuthorizationOptions::Sound;
         let (granted, auth_error) = {
             let (sender, receiver) = std::sync::mpsc::channel::<(Bool, Option<String>)>();
-            let completion =
-                block2::RcBlock::new(move |granted: Bool, error: *mut NSError| {
-                    let _ = sender.send((granted, ns_error_message(error)));
-                });
+            let completion = block2::RcBlock::new(move |granted: Bool, error: *mut NSError| {
+                let _ = sender.send((granted, ns_error_message(error)));
+            });
             // SAFETY: block 与参数类型和系统声明一致。
             center.requestAuthorizationWithOptions_completionHandler(options, &completion);
             match receiver.recv_timeout(std::time::Duration::from_secs(10)) {
@@ -115,7 +112,9 @@ mod imp {
 
         // 装前台横幅 delegate（OnceLock 保证只装一次；Retained 存在静态里）
         let delegate = &PRESENT_DELEGATE
-            .get_or_init(|| DelegateHandle(ProtocolObject::from_retained(PresentDelegate::new(marker))))
+            .get_or_init(|| {
+                DelegateHandle(ProtocolObject::from_retained(PresentDelegate::new(marker)))
+            })
             .0;
         center.setDelegate(Some(delegate));
 
