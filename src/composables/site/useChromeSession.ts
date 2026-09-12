@@ -408,11 +408,9 @@ async function analyzeChromeUsage(
 }
 
 async function syncChromeSession(site: any, trigger: HTMLElement) {
-  // 未知架构站点没有可识别的签到/额度接口，会话同步（额度/签到/Key 模型）无意义
-  if (isUnknownSystemType(site.systemType)) {
-    showToast(`「${site.name}」是未知架构站点，不支持同步会话与额度`, true);
-    return;
-  }
+  // 未知架构站点没有可识别的签到/余额接口：同步只建立 Chrome 账号会话关联，
+  // 后端扫描会跳过账号接口探测，前端也不做单账号额度刷新。
+  const accountOnly = isUnknownSystemType(site.systemType);
   const requestId = ++chromeSessionRequestId;
   chromeSyncForceStopped = false;
   chromeSessionSyncActive.value = true;
@@ -467,7 +465,9 @@ async function syncChromeSession(site: any, trigger: HTMLElement) {
     appendChromeBrowserSyncLog({
       stage: "account-bundles",
       status: "info",
-      message: `同步计划｜共 ${sessionsToProcess.length} 个账号，将按顺序同步额度与会话资料`,
+      message: accountOnly
+        ? `同步计划｜共 ${sessionsToProcess.length} 个账号，未知架构站点仅同步账号会话，不查询签到与余额`
+        : `同步计划｜共 ${sessionsToProcess.length} 个账号，将按顺序同步额度与会话资料`,
     });
 
     for (const [index, initialSession] of sessionsToProcess.entries()) {
@@ -482,10 +482,19 @@ async function syncChromeSession(site: any, trigger: HTMLElement) {
       appendChromeBrowserSyncLog({
         stage,
         status: "running",
-        message: `${progressLabel}｜${accountLabel}｜开始同步额度`,
+        message: accountOnly
+          ? `${progressLabel}｜${accountLabel}｜开始同步账号`
+          : `${progressLabel}｜${accountLabel}｜开始同步额度`,
       });
       try {
-        if (canSyncAccountViaChrome(session)) {
+        if (accountOnly) {
+          accountMode = "仅同步账号（未知架构：不查询签到与余额）";
+          appendChromeBrowserSyncLog({
+            stage: `${stage}-strategy`,
+            status: "info",
+            message: `账号关联｜${accountLabel}｜已检测到 Chrome 登录会话，仅建立账号关联`,
+          });
+        } else if (canSyncAccountViaChrome(session)) {
           const useRefreshAuth = normalizeSystemType(chromeSessionSite.value?.systemType ?? "") === "newapi2";
           accountMode = useRefreshAuth
             ? "通过 refresh token 取得访问令牌并刷新额度"
@@ -516,7 +525,9 @@ async function syncChromeSession(site: any, trigger: HTMLElement) {
           });
         }
 
-        const bundleSucceeded = accountReady && session.isValid;
+        const bundleSucceeded = accountOnly
+          ? accountReady
+          : accountReady && session.isValid;
         if (bundleSucceeded) {
           completedAccounts += 1;
         } else {
@@ -541,7 +552,9 @@ async function syncChromeSession(site: any, trigger: HTMLElement) {
       status: failedAccounts > 0 ? "error" : "success",
       message: failedAccounts > 0
         ? `同步汇总｜${completedAccounts}/${sessionsToProcess.length} 个账号完成，${failedAccounts} 个失败`
-        : `同步汇总｜${completedAccounts}/${sessionsToProcess.length} 个账号全部完成；额度刷新 ${refreshedAccounts} 个，有效 ${reusedAccounts} 个`,
+        : accountOnly
+          ? `同步汇总｜${completedAccounts}/${sessionsToProcess.length} 个账号已关联 Chrome 会话；未知架构站点不查询签到与余额`
+          : `同步汇总｜${completedAccounts}/${sessionsToProcess.length} 个账号全部完成；额度刷新 ${refreshedAccounts} 个，有效 ${reusedAccounts} 个`,
     });
   } finally {
     if (requestId === chromeSessionRequestId) {

@@ -409,7 +409,7 @@ function getSiteKeyCount(siteId: string): number {
   return getSiteSessions(siteId).reduce((total, s) => total + (s.apiKeyCount || 0), 0);
 }
 
-/** 未知架构站点：无签到/额度能力，卡片不展示相关内容，也不提供会话同步。 */
+/** 未知架构站点：无签到/额度能力，卡片不展示相关内容；会话同步仅建立 Chrome 账号关联。 */
 function isUnknownSite(site: Pick<SiteRecord, "systemType">): boolean {
   return isUnknownSystemType(site.systemType);
 }
@@ -1581,11 +1581,10 @@ onUnmounted(() => {
 
                 <!-- 同步会话 -->
                 <button
-                  v-if="!isUnknownSite(site)"
                   type="button"
                   class="sl-topo-head-btn sl-topo-sync-btn"
                   :class="{ 'is-syncing': store.chromeSessionSyncActive.value && store.chromeSessionSite.value?.id === site.id }"
-                  title="提取或同步此站点的 Chrome 会话与额度"
+                  :title="isUnknownSite(site) ? '仅同步此站点的 Chrome 账号会话（未知架构不查询签到与余额）' : '提取或同步此站点的 Chrome 会话与额度'"
                   @click.stop="store.syncChromeSession(site, $event.currentTarget as HTMLElement)"
                 >
                   <span v-html="icons.restore" />
@@ -1669,7 +1668,6 @@ onUnmounted(() => {
                 <span v-html="icons.user" />
                 <p>暂无关联的 Chrome 账号会话</p>
                 <button
-                  v-if="!isUnknownSite(site)"
                   type="button"
                   class="sl-link-action"
                   @click="store.syncChromeSession(site, $event.currentTarget as HTMLElement)"
@@ -2069,9 +2067,9 @@ onUnmounted(() => {
                 <div class="sl-tab-action-bar">
                   <span class="sl-tab-section-title">已关联 Chrome 授权账号</span>
                   <button
-                    v-if="!isUnknownSite(selectedSite)"
                     type="button"
                     class="sl-btn-secondary"
+                    :title="isUnknownSite(selectedSite) ? '未知架构站点仅同步账号会话，不查询签到与余额' : undefined"
                     @click="store.syncChromeSession(selectedSite, $event.currentTarget as HTMLElement)"
                   >
                     <span v-html="icons.restore" />
@@ -2163,7 +2161,6 @@ onUnmounted(() => {
                   <span v-html="icons.user" />
                   <p>该站点尚未提取或关联 Chrome 授权账号会话</p>
                   <button
-                    v-if="!isUnknownSite(selectedSite)"
                     type="button"
                     class="sl-btn-primary"
                     @click="store.syncChromeSession(selectedSite, $event.currentTarget as HTMLElement)"

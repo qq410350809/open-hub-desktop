@@ -1064,6 +1064,48 @@ fn chrome_account_bridge_uses_only_fixed_same_origin_endpoints() {
 }
 
 #[test]
+fn recognizes_alibaba_waf_shield_errors() {
+    // 阿里云 ESA/WAF 的 JS 挑战：HTTP 200 + HTML，靠 acw_sc__v2 / var arg1 / x-tengine-error
+    // 等特征识别，不能被当成普通 HTML 错误排除 Chrome 兜底。
+    assert!(is_cloudflare_shield_error(
+        "x-tengine-error: denied by http_custom"
+    ));
+    assert!(is_cloudflare_shield_error("站点返回 acw_sc__v2 挑战页"));
+    assert!(is_cloudflare_shield_error("cdn_sec_tc=..."));
+    assert!(is_cloudflare_shield_error("var arg1='0FA76A2C06F3'"));
+    assert!(is_cloudflare_shield_error(
+        "账号接口 HTTP 200 返回 HTML：站点返回了网页而不是 API 数据（可能被安全验证拦截）"
+    ));
+    assert!(requires_chrome_fallback(
+        "账号接口 HTTP 200 返回 HTML：站点返回了网页而不是 API 数据（可能被安全验证拦截）"
+    ));
+}
+
+#[test]
+fn chrome_account_bridge_recognizes_alibaba_acw_challenge() {
+    let script = chrome_account_bridge_script(
+        Some("10288"),
+        "2026-08",
+        "openhub-sync-anyrouter",
+        false,
+        false,
+        true,
+    );
+
+    // 桥接必须把 200 的阿里云 WAF 挑战页识别为 challenge，而不是普通 HTML 错误，
+    // 否则挑战页 reload 后轮询循环已终止，账户/余额永远取不回来。
+    assert!(script.contains("isAlibabaChallenge"));
+    assert!(script.contains("var\\s+arg1\\s*="));
+    assert!(script.contains("acw_sc__v2"));
+    assert!(script.contains("cdn_sec_tc"));
+    assert!(script.contains("x-tengine-error"));
+    assert!(script.contains("denied by http_custom"));
+    assert!(script.contains("isChallenge"));
+    // 该测试用 legacy Cookie 模式，必须命中 /api/user/self 的 challenge 导航分支。
+    assert!(script.contains("window.location.assign(`/api/user/self#${token}`)"));
+}
+
+#[test]
 fn legacy_newapi_bridge_uses_standard_checkin_endpoint() {
     let script = chrome_account_bridge_script(
         Some("10288"),

@@ -128,8 +128,8 @@ const menuEntries = computed<CardMenuEntry[]>(() => {
     { key: "models", label: "查看模型", icon: icons.cpu },
     { key: "preview", label: "查看详情", icon: icons.info },
     { key: "edit", label: "编辑", icon: icons.edit },
-    // 未知架构站点没有签到/额度能力，不提供会话同步
-    ...(isUsage && !isUnknownSystemType(props.site.systemType)
+    // 未知架构站点没有签到/额度能力，同步仅建立 Chrome 账号会话关联
+    ...(isUsage
       ? [{ key: "sync-session", label: "同步会话", icon: icons.sessionImport }]
       : []),
     ...usageTargets.value,

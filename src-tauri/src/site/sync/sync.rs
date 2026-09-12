@@ -694,9 +694,9 @@ pub(crate) async fn request_json_with_hint(
                 .find(|byte| !byte.is_ascii_whitespace());
             if content_type.contains("text/html") || first == Some(b'<') {
                 let reason = if status == wreq::StatusCode::FORBIDDEN {
-                    "Cloudflare 安全验证拦截了直接请求，请先用对应 Chrome 账号打开站点并通过验证"
+                    "站点安全验证（Cloudflare / 阿里云 WAF）拦截了直接请求，请先用对应 Chrome 账号打开站点并通过验证"
                 } else {
-                    "站点返回了网页而不是 API 数据"
+                    "站点返回了网页而不是 API 数据（可能被安全验证拦截），请用对应 Chrome 账号打开站点后重试"
                 };
                 return Err(format!(
                     "{label} HTTP {} 返回 HTML：{reason}",
@@ -782,9 +782,10 @@ pub(crate) fn requires_chrome_fallback(error: &str) -> bool {
     access_token_was_rejected(error) || is_cloudflare_shield_error(error)
 }
 
-/// 判断错误是否属于站点安全盾/网页拦截（Cloudflare 或接口返回 HTML 页面）。
-/// 这类失败意味着直接 HTTP 通道被拦截，但 Chrome 同源请求（在浏览器内执行）
-/// 仍可能正常通过，因此不应把账号/模型同步判定为“无法补救”而排除 Chrome 兜底。
+/// 判断错误是否属于站点安全盾/网页拦截（Cloudflare 或阿里云 ESA/WAF 等接口返回
+/// HTML 页面的情况）。这类失败意味着直接 HTTP 通道被拦截，但 Chrome 同源请求
+/// （在浏览器内执行）仍可能正常通过，因此不应把账号/模型同步判定为“无法补救”
+/// 而排除 Chrome 兜底。
 pub(crate) fn is_cloudflare_shield_error(error: &str) -> bool {
     let lower = error.to_ascii_lowercase();
     lower.contains("cloudflare")
@@ -794,6 +795,12 @@ pub(crate) fn is_cloudflare_shield_error(error: &str) -> bool {
         || lower.contains("just a moment")
         || lower.contains("attention required")
         || lower.contains("cf_clearance")
+        || lower.contains("acw_sc__v2")
+        || lower.contains("acw_tc")
+        || lower.contains("cdn_sec_tc")
+        || lower.contains("x-tengine")
+        || lower.contains("denied by http_custom")
+        || lower.contains("var arg1")
         || lower.contains("返回 html")
         || lower.contains("返回了网页")
 }
@@ -1423,11 +1430,22 @@ pub(crate) fn chrome_account_bridge_script(
     const text = await response.text();
     const lower = text.slice(0, 100000).toLowerCase();
     const isHtml = contentType.includes("text/html") || /^\s*<!doctype html|^\s*<html/i.test(text);
+    // 阿里云 ESA/WAF 的 JS 挑战是 HTTP 200 + text/html，正文含 `var arg1='...'`，
+    // 执行后写 acw_sc__v2 Cookie 并 location.reload()。它没有 Cloudflare 特征、
+    // 状态码也不是 403/429/503，必须单独识别；否则会被当成普通 HTML 错误直接终止，
+    // 挑战页 reload 后桥接不再重跑（AnyRouter 等站点因此取不到余额）。
+    const isAlibabaChallenge = isHtml && (
+      /var\s+arg1\s*=/.test(lower) ||
+      lower.includes("acw_sc__v2") || lower.includes("acw_tc") ||
+      lower.includes("cdn_sec_tc") || lower.includes("denied by http_custom") ||
+      (response.headers.get("x-tengine-error") || "").length > 0
+    );
     const isChallenge = isHtml && (
       [403, 429, 503].includes(response.status) ||
       lower.includes("cf-chl-") || lower.includes("challenge-platform") ||
       lower.includes("just a moment") || lower.includes("attention required") ||
-      lower.includes("cloudflare ray id")
+      lower.includes("cloudflare ray id") ||
+      isAlibabaChallenge
     );
     if (isChallenge) {
       return { challenge: true, status: response.status };
@@ -1453,7 +1471,7 @@ pub(crate) fn chrome_account_bridge_script(
       }));
       if (refreshResponse.challenge) {
         if (!allowChallengeNavigation) {
-          bridge.result = { ok: false, error: "Cloudflare 验证仍需要浏览器交互" };
+          bridge.result = { ok: false, error: "站点安全验证仍需要浏览器交互（Cloudflare / 阿里云 WAF）" };
           return;
         }
         bridge.state = "challenge";
@@ -1528,7 +1546,7 @@ pub(crate) fn chrome_account_bridge_script(
           signal: AbortSignal.timeout(requestTimeout)
         }));
         if (checkinResponse.challenge) {
-          checkinError = "Cloudflare 拦截了签到状态请求";
+          checkinError = "站点安全验证拦截了签到状态请求";
         } else if (checkinResponse.error || checkinResponse.status < 200 || checkinResponse.status >= 300) {
           checkinError = messageOf(
             checkinResponse.data,
@@ -1590,7 +1608,7 @@ pub(crate) fn chrome_account_bridge_script(
               signal: AbortSignal.timeout(requestTimeout)
             }));
             if (postResponse.challenge) {
-              checkinError = "Cloudflare 拦截了签到请求";
+              checkinError = "站点安全验证拦截了签到请求";
             } else if (
               postResponse.error || postResponse.status < 200 || postResponse.status >= 300 ||
               !postResponse.data || postResponse.data.success !== true
@@ -1613,7 +1631,7 @@ pub(crate) fn chrome_account_bridge_script(
     }));
     if (selfResponse.challenge) {
       if (!allowChallengeNavigation) {
-        bridge.result = { ok: false, error: "Cloudflare 验证仍需要浏览器交互" };
+        bridge.result = { ok: false, error: "站点安全验证仍需要浏览器交互（Cloudflare / 阿里云 WAF）" };
         return;
       }
       bridge.state = "challenge";
@@ -1676,10 +1694,7 @@ pub(crate) fn chrome_account_bridge_script(
 ///
 /// Cloudflare 盾站点的直连请求全部被 403 挑战拦截，浏览器同源 fetch
 /// 带着已通过的 cf_clearance 才是唯一可行路径（与账号同步桥接同一机制）。
-pub(crate) fn chrome_key_models_bridge_script(
-    should_fetch_models: bool,
-    user_id: &str,
-) -> String {
+pub(crate) fn chrome_key_models_bridge_script(should_fetch_models: bool, user_id: &str) -> String {
     r#"(() => {
   const pending = "__OPENHUB_PENDING__";
   // 传统 new-api 会话除了 Cookie 还必须带 New-Api-User 头；DB 缓存值优先，
@@ -1734,7 +1749,7 @@ pub(crate) fn chrome_key_models_bridge_script(
         signal: AbortSignal.timeout(30000)
       }));
       if (tokenResponse.challenge) {
-        bridge.result = { ok: false, error: "Cloudflare 验证仍需要浏览器交互" };
+        bridge.result = { ok: false, error: "站点安全验证仍需要浏览器交互（Cloudflare / 阿里云 WAF）" };
         return;
       }
       if (tokenResponse.error || tokenResponse.status < 200 || tokenResponse.status >= 300) {
@@ -2875,9 +2890,10 @@ mod tests {
 
     #[test]
     fn parse_chrome_key_models_bridge_result_rejects_errors() {
-        let err =
-            parse_chrome_key_models_bridge_result(r#"{"ok":false,"error":"Cloudflare 验证仍需要浏览器交互"}"#)
-                .unwrap_err();
+        let err = parse_chrome_key_models_bridge_result(
+            r#"{"ok":false,"error":"Cloudflare 验证仍需要浏览器交互"}"#,
+        )
+        .unwrap_err();
         assert!(err.contains("Cloudflare"));
         let missing =
             parse_chrome_key_models_bridge_result(r#"{"ok":true,"tokenList":null,"models":null}"#)

@@ -69,6 +69,13 @@ pub(crate) fn is_sub2api(system_type: &str) -> bool {
     is_platform(system_type, "sub2api")
 }
 
+/// 站点系统类型是否属于已知架构（判定与前端 KNOWN_SYSTEM_TYPES 一致，
+/// 以 canonical_platform 归一化为准）。未知架构站点在会话同步中只建立
+/// Chrome 账号关联，不调用账号接口探测、不查余额、不签到。
+pub(crate) fn is_known_platform(system_type: &str) -> bool {
+    !canonical_platform(system_type).is_empty()
+}
+
 // ---------------------------------------------------------------- URL 提示
 
 fn parse_url_candidates(value: &str) -> Vec<String> {
@@ -474,5 +481,44 @@ pub(crate) async fn detect_platform(client: &wreq::Client, base_url: &str) -> Pl
     PlatformDetection {
         platform: None,
         challenge,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn known_platform_covers_frontend_system_types() {
+        // 与前端 types.ts SYSTEM_TYPES 枚举保持一致：这些类型走签到/余额接口。
+        for value in [
+            "openai",
+            "codex",
+            "claude",
+            "gemini",
+            "gemini-cli",
+            "antigravity",
+            "cliproxyapi",
+            "anyrouter",
+            "done-hub",
+            "one-hub",
+            "veloera",
+            "new-api",
+            "newapi2",
+            "sub2api",
+            "one-api",
+        ] {
+            assert!(is_known_platform(value), "{value} 应判定为已知架构");
+        }
+        // 归一化别名（大小写/分隔符差异）同样视为已知。
+        assert!(is_known_platform("New API"));
+        assert!(is_known_platform("SUB2API"));
+    }
+
+    #[test]
+    fn unknown_platform_skips_account_refresh() {
+        assert!(!is_known_platform(""));
+        assert!(!is_known_platform("   "));
+        assert!(!is_known_platform("random-blog"));
     }
 }

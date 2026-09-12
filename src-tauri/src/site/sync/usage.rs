@@ -2,7 +2,7 @@ use crate::context::{spawn, spawn_blocking, AppContext, EventBus, Managed};
 use crate::db::*;
 use crate::models::*;
 use crate::proxypool;
-use crate::site::library::{is_newapi, is_newapi_refresh, is_sub2api};
+use crate::site::library::{is_known_platform, is_newapi, is_newapi_refresh, is_sub2api};
 use crate::site::sync;
 use crate::site::sync::*;
 use rusqlite::{params, OptionalExtension};
@@ -558,6 +558,20 @@ pub async fn mark_sites_with_chrome_sessions(
             else {
                 continue;
             };
+            // 未知架构站点：没有可识别的签到/余额接口，不调用账号接口探测与刷新，
+            // 只在下方写库块把 Chrome 账号会话持久化为站点关联（只同步账号）。
+            if !is_known_platform(system_type) {
+                if !site.sessions.is_empty() {
+                    emit_optional_sync_progress(
+                        &bus,
+                        run_id,
+                        &format!("chrome-account-skip-{site_index}"),
+                        "info",
+                        format!("{site_name}：未知架构，仅同步 Chrome 账号，跳过余额与签到"),
+                    );
+                }
+                continue;
+            }
             for (session_index, session) in site.sessions.iter().enumerate() {
                 let base_url = base_url.clone();
                 let system_type = system_type.clone();
