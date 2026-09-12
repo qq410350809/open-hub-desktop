@@ -270,7 +270,9 @@ pub async fn execute_resilient_egress(
                         meta.req_body_str.clone(),
                         Some(node_display.clone()),
                     )
-                    .with_channel_stats_id(meta.channel_stats_id.clone()).with_client_name(meta.client_name.clone()).with_user_agent(meta.user_agent.clone())
+                    .with_channel_stats_id(meta.channel_stats_id.clone())
+                    .with_client_name(meta.client_name.clone())
+                    .with_user_agent(meta.user_agent.clone())
                     .with_upstream_url(Some(upstream_url.to_string()))
                     .with_response_body(cap_log_body(err_text)),
                 )
@@ -325,7 +327,9 @@ pub async fn execute_resilient_egress(
                         meta.req_body_str.clone(),
                         Some(node_display.clone()),
                     )
-                    .with_channel_stats_id(meta.channel_stats_id.clone()).with_client_name(meta.client_name.clone()).with_user_agent(meta.user_agent.clone())
+                    .with_channel_stats_id(meta.channel_stats_id.clone())
+                    .with_client_name(meta.client_name.clone())
+                    .with_user_agent(meta.user_agent.clone())
                     .with_upstream_url(Some(upstream_url.to_string()))
                     .with_response_body(cap_log_body(
                         String::from_utf8_lossy(&body_bytes).to_string(),
@@ -404,7 +408,9 @@ pub async fn execute_resilient_egress(
                             meta.req_body_str.clone(),
                             Some(node_display),
                         )
-                        .with_channel_stats_id(meta.channel_stats_id.clone()).with_client_name(meta.client_name.clone()).with_user_agent(meta.user_agent.clone())
+                        .with_channel_stats_id(meta.channel_stats_id.clone())
+                        .with_client_name(meta.client_name.clone())
+                        .with_user_agent(meta.user_agent.clone())
                         .with_upstream_url(Some(upstream_url.to_string()))
                         .with_response_body(cap_log_body(err_text)),
                     )
@@ -442,7 +448,9 @@ pub async fn execute_resilient_egress(
                             meta.req_body_str.clone(),
                             Some(node_display),
                         )
-                        .with_channel_stats_id(meta.channel_stats_id.clone()).with_client_name(meta.client_name.clone()).with_user_agent(meta.user_agent.clone())
+                        .with_channel_stats_id(meta.channel_stats_id.clone())
+                        .with_client_name(meta.client_name.clone())
+                        .with_user_agent(meta.user_agent.clone())
                         .with_upstream_url(Some(upstream_url.to_string()))
                         .with_response_body(cap_log_body(err_text.clone())),
                     )
@@ -483,7 +491,9 @@ pub async fn execute_resilient_egress(
                             meta.req_body_str.clone(),
                             Some(node_display),
                         )
-                        .with_channel_stats_id(meta.channel_stats_id.clone()).with_client_name(meta.client_name.clone()).with_user_agent(meta.user_agent.clone())
+                        .with_channel_stats_id(meta.channel_stats_id.clone())
+                        .with_client_name(meta.client_name.clone())
+                        .with_user_agent(meta.user_agent.clone())
                         .with_upstream_url(Some(upstream_url.to_string()))
                         .with_response_body(cap_log_body(err_text)),
                     )
@@ -526,7 +536,9 @@ pub async fn execute_resilient_egress(
                         meta.req_body_str.clone(),
                         Some(node_display),
                     )
-                    .with_channel_stats_id(meta.channel_stats_id.clone()).with_client_name(meta.client_name.clone()).with_user_agent(meta.user_agent.clone()),
+                    .with_channel_stats_id(meta.channel_stats_id.clone())
+                    .with_client_name(meta.client_name.clone())
+                    .with_user_agent(meta.user_agent.clone()),
                 )
                 .await;
 

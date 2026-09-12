@@ -407,7 +407,10 @@ mod logger_tests {
     #[test]
     fn locally_supported_clients_are_recognized() {
         for (agent, expected) in [
-            ("deepseek-harness/0.1.5-rc.2 (+https://github.com/deepseek-ai/deepseek-harness)", "dsh"),
+            (
+                "deepseek-harness/0.1.5-rc.2 (+https://github.com/deepseek-ai/deepseek-harness)",
+                "dsh",
+            ),
             ("dsh/0.4.2", "dsh"),
             ("CommandCode/1.0", "command-code"),
             ("command-code/1.0", "command-code"),
