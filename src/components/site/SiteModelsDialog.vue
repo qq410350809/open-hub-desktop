@@ -184,17 +184,36 @@ async function readCachedModels(siteId: string): Promise<boolean> {
       owned_by: model.owned_by || model.ownedBy,
     }));
     apiSource.value = data.apiSource || "none";
-    const accounts = Array.isArray(data.accounts) ? data.accounts : [];
-    liveAccountKeys.value = accounts
-      .slice()
-      .sort((a, b) =>
-        (a.username || a.accountName || a.profileName || "").localeCompare(
-          b.username || b.accountName || b.profileName || "",
-          undefined,
-          { numeric: true, sensitivity: "base" }
-        )
-      );
-    return accounts.length > 0 || liveModels.value.length > 0;
+    const cachedAccounts = Array.isArray(data.accounts) ? data.accounts : [];
+    // 账号来源 = Chrome 会话账号 ∪ 模型缓存账号，按 profileId 合并：
+    // Chrome 上检测到的账号（含未同步过 Key 的）默认就展示，缓存账号
+    // 则把已同步的 Key/分组/模型映射带上，覆盖同 profileId 的占位账号。
+    const chromeAccounts =
+      usageSites.value.find((item) => item.siteId === siteId)?.sessions ?? [];
+    const byProfile = new Map<string, LiveAccountKeys>();
+    for (const session of chromeAccounts) {
+      byProfile.set(session.profileId || session.accountName || session.profileName, {
+        profileId: session.profileId,
+        profileName: session.profileName,
+        accountName: session.accountName,
+        username: session.username,
+        keys: [],
+        keyGroups: {},
+        keyModels: {},
+        error: "",
+      });
+    }
+    for (const account of cachedAccounts) {
+      byProfile.set(account.profileId || account.accountName || account.profileName, account);
+    }
+    liveAccountKeys.value = [...byProfile.values()].sort((a, b) =>
+      (a.username || a.accountName || a.profileName || "").localeCompare(
+        b.username || b.accountName || b.profileName || "",
+        undefined,
+        { numeric: true, sensitivity: "base" }
+      )
+    );
+    return liveAccountKeys.value.length > 0 || liveModels.value.length > 0;
   } catch {
     return false;
   }
