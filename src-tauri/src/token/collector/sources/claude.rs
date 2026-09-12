@@ -1,7 +1,5 @@
 use crate::models::TokenSessionTokens;
-use crate::token::collector::normalizer::{
-    claude_project_from_path, is_common_subfolder, normalize_workspace_project_key,
-};
+use crate::token::collector::normalizer::{claude_project_from_path, project_key_from_location};
 use crate::token::collector::time_utils::update_bounds;
 use crate::token::collector::types::{
     fingerprint, normalize_usage, number, token_session, CachedFile, InputSemantics, RawUsage,
@@ -72,7 +70,8 @@ pub fn parse_claude_file(path: &Path) -> CachedFile {
         .unwrap_or("")
         .to_string();
     let mut session_id = fallback_id.clone();
-    let mut project_key = claude_project_from_path(path);
+    let dir_project_key = claude_project_from_path(path);
+    let mut cwd_key: Option<String> = None;
     let is_subagent_file = path
         .components()
         .any(|component| component.as_os_str() == "subagents");
@@ -103,18 +102,16 @@ pub fn parse_claude_file(path: &Path) -> CachedFile {
                 session_id = value.to_string();
             }
         }
-        if let Some(cwd) = value
-            .get("cwd")
-            .and_then(JsonValue::as_str)
-            .filter(|value| !value.trim().is_empty())
-        {
-            let resolved = normalize_workspace_project_key(cwd, &project_key);
-            if !resolved.is_empty()
-                && (project_key == "Claude"
-                    || is_common_subfolder(&project_key)
-                    || (!is_common_subfolder(&resolved) && resolved != "Claude"))
+        // 会话归属 = 主会话首次进入的工作目录；中途 cd / 进入 worktree 不改变归属。
+        // 子智能体行（isSidechain）的 cwd 常在模块目录或临时目录，不能抢父会话的首次目录。
+        // 目录名反解只作整份日志都没有 cwd 时的兜底。
+        if cwd_key.is_none() && !is_sidechain {
+            if let Some(cwd) = value
+                .get("cwd")
+                .and_then(JsonValue::as_str)
+                .filter(|value| !value.trim().is_empty())
             {
-                project_key = resolved;
+                cwd_key = project_key_from_location(cwd);
             }
         }
         let kind = value.get("type").and_then(JsonValue::as_str).unwrap_or("");
@@ -223,7 +220,6 @@ pub fn parse_claude_file(path: &Path) -> CachedFile {
             } else {
                 message_model.to_string()
             },
-            project_key: project_key.clone(),
             timestamp: if last_user_ts.is_empty() {
                 timestamp
             } else {
@@ -239,6 +235,7 @@ pub fn parse_claude_file(path: &Path) -> CachedFile {
             cost_usd: 0.0,
             pricing_available: false,
             estimated_tokens: 0,
+            ..Default::default()
         };
         let should_replace = usage_events
             .get(&dedup_id)
@@ -252,6 +249,12 @@ pub fn parse_claude_file(path: &Path) -> CachedFile {
     if model.is_empty() {
         model = UNKNOWN_CLAUDE_MODEL.to_string();
     }
+    // 子智能体是独立 jsonl，cwd 经常落在子模块 / tmp；归属跟父项目目录走。
+    let project_key = if is_subagent_file {
+        dir_project_key
+    } else {
+        cwd_key.unwrap_or(dir_project_key)
+    };
     let mut events = usage_events.into_values().collect::<Vec<_>>();
     events.extend(user_events.into_iter().map(|(id, timestamp)| {
         UsageEvent {
@@ -261,12 +264,15 @@ pub fn parse_claude_file(path: &Path) -> CachedFile {
                 .get(&id)
                 .cloned()
                 .unwrap_or_else(|| model.clone()),
-            project_key: project_key.clone(),
             timestamp,
             conversation_count: 1,
             ..Default::default()
         }
     }));
+    // 整个会话统一盖首次 cwd 解析出的键。
+    for event in &mut events {
+        event.project_key = project_key.clone();
+    }
     let tokens = events
         .iter()
         .fold(TokenSessionTokens::default(), |mut total, event| {

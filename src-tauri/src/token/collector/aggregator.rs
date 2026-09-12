@@ -2,6 +2,7 @@ use crate::models::{
     TokenCollectorSyncReport, TokenModelStat, TokenSession, TokenStatsReport, TokenSummary,
     TokenUsageBucket, TokenUsageReport,
 };
+use crate::token::collector::normalizer::{apply_workspace_roots, reset_project_roots_cache};
 use crate::token::collector::sources::*;
 use crate::token::collector::time_utils::{half_hour_key, now_iso};
 use crate::token::collector::types::*;
@@ -81,6 +82,7 @@ pub fn aggregate_events(events: Vec<UsageEvent>) -> TokenUsageReport {
         }
     }
     let mut buckets = buckets.into_values().collect::<Vec<_>>();
+    apply_workspace_roots(&mut buckets, &mut []);
     buckets.sort_by(|left, right| {
         left.timestamp
             .cmp(&right.timestamp)
@@ -142,8 +144,9 @@ pub fn snapshot_from_envelope(
             session_map.insert(session.session_hash.clone(), session.clone());
         }
     }
-    let usage = aggregate_events(events);
+    let mut usage = aggregate_events(events);
     let mut sessions = session_map.into_values().collect::<Vec<_>>();
+    apply_workspace_roots(&mut usage.buckets, &mut sessions);
     sessions.sort_by(|left, right| right.started_at.cmp(&left.started_at));
     CollectedData {
         usage,
@@ -240,6 +243,8 @@ pub fn collected_stats_by_source() -> BTreeMap<String, SourceCollectStats> {
 
 pub fn collect_uncached(force: bool) -> Result<CollectedData, String> {
     let home = PathBuf::from(std::env::var_os("HOME").ok_or("无法定位用户目录")?);
+    // 项目根判定依赖文件系统现状，每轮采集重新探测。
+    reset_project_roots_cache();
     let mut envelope = if force {
         CollectorEnvelope::default()
     } else {

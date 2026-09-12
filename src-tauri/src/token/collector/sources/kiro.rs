@@ -1,5 +1,5 @@
 use crate::models::TokenSessionTokens;
-use crate::token::collector::normalizer::basename_or_fallback;
+use crate::token::collector::normalizer::project_key_or_label;
 use crate::token::collector::sources::claude::claude_user_is_human;
 use crate::token::collector::sources::commandcode::estimate_local_content_tokens;
 use crate::token::collector::time_utils::{iso_from_millis, update_bounds};
@@ -183,7 +183,7 @@ pub fn kiro_project_from_metadata(metadata: &JsonValue) -> String {
         .get("workspacePaths")
         .and_then(JsonValue::as_array)
         .and_then(|paths| paths.iter().find_map(JsonValue::as_str))
-        .map(|path| basename_or_fallback(path, "Kiro"))
+        .map(|path| project_key_or_label(path, "Kiro"))
         .unwrap_or_else(|| "Kiro".to_string())
 }
 
@@ -382,7 +382,7 @@ pub fn parse_kiro_legacy_file(path: &Path) -> CachedFile {
     let project_key = ["workspaceDirectory", "workspacePath", "cwd"]
         .into_iter()
         .find_map(|key| root.get(key).and_then(JsonValue::as_str))
-        .map(|path| basename_or_fallback(path, "Kiro"))
+        .map(|path| project_key_or_label(path, "Kiro"))
         .unwrap_or_else(|| "Kiro".to_string());
     let model = ["modelId", "selectedModel"]
         .into_iter()

@@ -106,13 +106,15 @@ fn reads_catpawai_usage_and_resolves_numeric_model_ids() {
             "#,
     )
     .unwrap();
+    // 工作区文件 URI → 去后缀后的绝对路径作为项目键（用临时目录避免依赖本机真实布局）。
+    let workspace_dir =
+        std::env::temp_dir().join(format!("openhub-catpawai-ws-{}", std::process::id()));
+    let project_dir = workspace_dir.join("sz-v4");
+    fs::create_dir_all(project_dir.join(".git")).unwrap();
+    let workspace_uri = format!("file://{}/sz-v4.code-workspace", workspace_dir.display());
     conn.execute(
         "INSERT INTO t_conversations (conversation_id, workspace_id, title) VALUES (?1, ?2, ?3)",
-        rusqlite::params![
-            "conv-1",
-            "file:///Users/wusuoming/Documents/IdeaProjects/sz-v4.code-workspace",
-            "修复工单",
-        ],
+        rusqlite::params!["conv-1", workspace_uri, "修复工单",],
     )
     .unwrap();
 
@@ -160,7 +162,10 @@ fn reads_catpawai_usage_and_resolves_numeric_model_ids() {
     let bucket = &buckets[0];
     assert_eq!(bucket.source, "catpawai");
     assert_eq!(bucket.model, "DeepSeek-V3");
-    assert_eq!(bucket.project_key, "sz-v4");
+    assert_eq!(
+        bucket.project_key,
+        project_dir.to_string_lossy().to_string()
+    );
     assert_eq!(bucket.conversation_count, 1);
     assert_eq!(bucket.request_count, 1);
     assert_eq!(bucket.total_tokens, 1800);
@@ -172,6 +177,7 @@ fn reads_catpawai_usage_and_resolves_numeric_model_ids() {
     assert_eq!(bucket.output_tokens, 300);
     assert_eq!(bucket.reasoning_output_tokens, 100);
 
+    let _ = fs::remove_dir_all(&workspace_dir);
     let _ = fs::remove_file(&path);
 }
 

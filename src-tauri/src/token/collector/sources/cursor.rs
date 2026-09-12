@@ -1,4 +1,5 @@
 use crate::models::TokenSessionTokens;
+use crate::token::collector::normalizer::vscode_workspace_key_from_db_path;
 use crate::token::collector::time_utils::{iso_from_millis, update_bounds};
 use crate::token::collector::types::{
     database_fingerprint, normalize_usage, number, open_readonly_sqlite,
@@ -105,6 +106,8 @@ pub fn parse_cursor_database(path: &Path) -> CachedDatabase {
     let mut events = Vec::new();
     let mut sessions = Vec::new();
     let path_tag = db_path_tag(path);
+    // workspaceStorage/<hash>/state.vscdb 旁有 workspace.json 指向真实文件夹；globalStorage 落到标签。
+    let project_key = vscode_workspace_key_from_db_path(path, "Cursor");
 
     let Some(conn) = open_readonly_sqlite(path) else {
         return CachedDatabase {
@@ -191,7 +194,7 @@ pub fn parse_cursor_database(path: &Path) -> CachedDatabase {
                                     .entry(tab_id.to_string())
                                     .or_insert_with(|| CursorSessionAccumulator {
                                         session_id: tab_id.to_string(),
-                                        project_key: "cursor-workspace".to_string(),
+                                        project_key: project_key.clone(),
                                         model: model_name.clone(),
                                         ..Default::default()
                                     });
@@ -210,7 +213,7 @@ pub fn parse_cursor_database(path: &Path) -> CachedDatabase {
                                     id: format!("cursor_{path_tag}_{}_{}", tab_id, created_at),
                                     source: "cursor".to_string(),
                                     model: model_name.clone(),
-                                    project_key: "cursor-workspace".to_string(),
+                                    project_key: project_key.clone(),
                                     timestamp: iso_ts,
                                     input_tokens: input,
                                     cached_input_tokens: cached,
@@ -228,7 +231,7 @@ pub fn parse_cursor_database(path: &Path) -> CachedDatabase {
                                     .entry(tab_id.to_string())
                                     .or_insert_with(|| CursorSessionAccumulator {
                                         session_id: tab_id.to_string(),
-                                        project_key: "cursor-workspace".to_string(),
+                                        project_key: project_key.clone(),
                                         model: model_name.clone(),
                                         ..Default::default()
                                     });
@@ -270,8 +273,7 @@ pub fn parse_cursor_database(path: &Path) -> CachedDatabase {
                             ..Default::default()
                         }
                     };
-                    let (input, cached, _write, output, _reasoning, total) =
-                        normalize_usage(raw);
+                    let (input, cached, _write, output, _reasoning, total) = normalize_usage(raw);
                     if total <= 0 {
                         continue;
                     }
@@ -286,7 +288,7 @@ pub fn parse_cursor_database(path: &Path) -> CachedDatabase {
                         id: format!("cursor_prompt_{path_tag}_{}_{}", ts_ms, idx),
                         source: "cursor".to_string(),
                         model: model.to_string(),
-                        project_key: "cursor-workspace".to_string(),
+                        project_key: project_key.clone(),
                         timestamp: iso_ts,
                         input_tokens: input,
                         cached_input_tokens: cached,

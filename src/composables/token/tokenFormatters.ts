@@ -10,6 +10,41 @@ export function isKnownSource(source?: string) {
   return !source.toLowerCase().includes("unknown");
 }
 
+/** 来源/客户端标识 → 友好显示名（本地采集来源与反代推断客户端共用一套键） */
+export const sourceNameMap: Record<string, string> = {
+  claude: "Claude Code",
+  codex: "Codex CLI",
+  cursor: "Cursor",
+  catpawai: "CatPawAI",
+  gemini: "Gemini CLI",
+  opencode: "OpenCode",
+  kiro: "Kiro",
+  copilot: "GitHub Copilot (VS Code)",
+  openclaw: "OpenClaw",
+  goose: "Goose AI",
+  antigravity: "Google Antigravity",
+  zed: "Zed Editor",
+  zcode: "ZCode",
+  windsurf: "Windsurf",
+  aider: "Aider",
+  cline: "Cline",
+  "command-code": "Command Code",
+  dsh: "DeepSeek CLI (DSH)",
+  // —— 反代模式：按端点/SDK 推断的客户端标识 ——
+  openhub: "OpenHub",
+  sdk: "SDK / 脚本",
+  "anthropic-api": "Anthropic 协议客户端",
+  "responses-api": "Responses 协议客户端",
+  "openai-api": "OpenAI 协议客户端",
+  "gemini-api": "Gemini 协议客户端",
+  other: "其他客户端",
+};
+
+/** 客户端标识的友好显示名；未收录时原样返回 */
+export function sourceLabel(source: string): string {
+  return sourceNameMap[source.toLowerCase()] || source || "未知来源";
+}
+
 export function normalizeModelName(name: string): string {
   const trimmed = (name || "").trim();
   if (!trimmed) return trimmed;

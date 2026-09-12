@@ -1,4 +1,4 @@
-use crate::token::collector::normalizer::basename_or_fallback;
+use crate::token::collector::normalizer::project_key_or_label;
 use crate::token::collector::time_utils::iso_from_millis;
 use crate::token::collector::types::{
     database_fingerprint, normalize_usage, number, open_readonly_sqlite, token_session,
@@ -92,7 +92,7 @@ pub fn parse_opencode_database(path: &Path) -> CachedDatabase {
                     .get(&session_id)
                     .map(|session| session.directory.as_str())
                     .unwrap_or_default();
-                let project_key = basename_or_fallback(session_dir, "OpenCode");
+                let project_key = project_key_or_label(session_dir, "OpenCode");
                 let model = opencode_model(&value);
 
                 if let Some(session) = sessions.get_mut(&session_id) {
@@ -166,7 +166,7 @@ pub fn parse_opencode_database(path: &Path) -> CachedDatabase {
             token_session(
                 session_id,
                 "opencode",
-                basename_or_fallback(&session.directory, "OpenCode"),
+                project_key_or_label(&session.directory, "OpenCode"),
                 if session.model.is_empty() {
                     UNKNOWN_OPENCODE_MODEL.to_string()
                 } else {

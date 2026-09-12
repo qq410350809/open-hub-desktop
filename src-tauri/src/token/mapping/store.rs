@@ -218,10 +218,11 @@ pub fn apply_ai_suggestions(
             report.invalid += 1;
             continue;
         }
-        let Some(candidate) = candidates_by_key
-            .get(&key)
-            .and_then(|candidates| candidates.iter().find(|candidate| candidate_matches(candidate, official)))
-        else {
+        let Some(candidate) = candidates_by_key.get(&key).and_then(|candidates| {
+            candidates
+                .iter()
+                .find(|candidate| candidate_matches(candidate, official))
+        }) else {
             report.invalid += 1;
             continue;
         };
@@ -392,7 +393,15 @@ pub fn set_mapping_manually(
                 lab = excluded.lab, origin = excluded.origin, confidence = excluded.confidence,
                 reason = NULL, review_status = excluded.review_status, confirmed = 1,
                 updated_at = excluded.updated_at",
-            params![key, raw_model.trim(), name, id, lab, ORIGIN_MANUAL, REVIEW_APPROVED],
+            params![
+                key,
+                raw_model.trim(),
+                name,
+                id,
+                lab,
+                ORIGIN_MANUAL,
+                REVIEW_APPROVED
+            ],
         )
         .map_err(|e| e.to_string())?;
     transaction.commit().map_err(|e| e.to_string())?;
@@ -507,7 +516,10 @@ mod tests {
         register_raw_models(&database, &["zai/glm-5.3".to_string()]).unwrap();
         let batch = pending_models(&database, false).unwrap();
         let mut candidates = HashMap::new();
-        candidates.insert("glm-5.3".to_string(), official_catalog(&database.lock_conn().unwrap()).unwrap());
+        candidates.insert(
+            "glm-5.3".to_string(),
+            official_catalog(&database.lock_conn().unwrap()).unwrap(),
+        );
         let result = apply_ai_suggestions(
             &database,
             &batch,
@@ -538,15 +550,36 @@ mod tests {
         register_raw_models(&database, &["glm-5.3".to_string()]).unwrap();
         let batch = pending_models(&database, false).unwrap();
         let mut candidates = HashMap::new();
-        candidates.insert("glm-5.3".to_string(), official_catalog(&database.lock_conn().unwrap()).unwrap());
+        candidates.insert(
+            "glm-5.3".to_string(),
+            official_catalog(&database.lock_conn().unwrap()).unwrap(),
+        );
         let result = apply_ai_suggestions(
             &database,
             &batch,
             &candidates,
             &[
-                AiMappingItem { raw_model: "other".into(), official_model: "GLM-5.3".into(), lab: None, confidence: 0.9, reason: None },
-                AiMappingItem { raw_model: "glm-5.3".into(), official_model: "Invented".into(), lab: None, confidence: 0.9, reason: None },
-                AiMappingItem { raw_model: "glm-5.3".into(), official_model: "GLM-5.3".into(), lab: None, confidence: 1.2, reason: None },
+                AiMappingItem {
+                    raw_model: "other".into(),
+                    official_model: "GLM-5.3".into(),
+                    lab: None,
+                    confidence: 0.9,
+                    reason: None,
+                },
+                AiMappingItem {
+                    raw_model: "glm-5.3".into(),
+                    official_model: "Invented".into(),
+                    lab: None,
+                    confidence: 0.9,
+                    reason: None,
+                },
+                AiMappingItem {
+                    raw_model: "glm-5.3".into(),
+                    official_model: "GLM-5.3".into(),
+                    lab: None,
+                    confidence: 1.2,
+                    reason: None,
+                },
             ],
         )
         .unwrap();

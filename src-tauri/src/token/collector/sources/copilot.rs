@@ -623,15 +623,14 @@ pub fn parse_copilot_cli_events(
                     .saturating_add(64)
                     .min(LOCAL_ESTIMATED_CONTEXT_LIMIT);
                 // 口径：total = 全新输入 + 缓存命中 + 输出；思考 token 独立上报，不计入 total。
-                let (_fresh, _read, _write, _out, _reasoning, total_tokens) = normalize_usage(
-                    RawUsage {
+                let (_fresh, _read, _write, _out, _reasoning, total_tokens) =
+                    normalize_usage(RawUsage {
                         input: input_tokens,
                         semantics: InputSemantics::Fresh,
                         cache_write: 0,
                         output: output_tokens,
                         ..Default::default()
-                    },
-                );
+                    });
 
                 events.push(UsageEvent {
                     id: event_id,

@@ -1,5 +1,5 @@
 use crate::models::TokenSessionTokens;
-use crate::token::collector::normalizer::{is_common_subfolder, normalize_workspace_project_key};
+use crate::token::collector::normalizer::project_key_from_location;
 use crate::token::collector::time_utils::update_bounds;
 use crate::token::collector::types::{
     fingerprint, normalize_usage, number, token_session, CachedFile, InputSemantics, RawUsage,
@@ -241,7 +241,7 @@ pub fn parse_codex_file(path: &Path) -> CachedFile {
         .unwrap_or("")
         .to_string();
     let mut session_id = fallback_id;
-    let mut project_key = "Codex".to_string();
+    let mut cwd_key: Option<String> = None;
     let mut current_model = String::new();
     let mut session_model = String::new();
     let mut first_ts = String::new();
@@ -272,13 +272,8 @@ pub fn parse_codex_file(path: &Path) -> CachedFile {
                 session_id = id.to_string();
             }
             if let Some(cwd) = payload.get("cwd").and_then(JsonValue::as_str) {
-                let resolved = normalize_workspace_project_key(cwd, &project_key);
-                if !resolved.is_empty()
-                    && (project_key == "Codex"
-                        || is_common_subfolder(&project_key)
-                        || (!is_common_subfolder(&resolved) && resolved != "Codex"))
-                {
-                    project_key = resolved;
+                if cwd_key.is_none() {
+                    cwd_key = project_key_from_location(cwd);
                 }
             }
             if current_model.is_empty() {
@@ -293,14 +288,10 @@ pub fn parse_codex_file(path: &Path) -> CachedFile {
             continue;
         }
         if kind == "turn_context" {
+            // 会话归属 = 首次进入的工作目录；后续 turn 的 cwd 变化不改变归属。
             if let Some(cwd) = payload.get("cwd").and_then(JsonValue::as_str) {
-                let resolved = normalize_workspace_project_key(cwd, &project_key);
-                if !resolved.is_empty()
-                    && (project_key == "Codex"
-                        || is_common_subfolder(&project_key)
-                        || (!is_common_subfolder(&resolved) && resolved != "Codex"))
-                {
-                    project_key = resolved;
+                if cwd_key.is_none() {
+                    cwd_key = project_key_from_location(cwd);
                 }
             }
             if let Some(model) = payload
@@ -333,7 +324,7 @@ pub fn parse_codex_file(path: &Path) -> CachedFile {
                     } else {
                         current_model.clone()
                     },
-                    project_key: project_key.clone(),
+                    project_key: String::new(),
                     timestamp,
                     conversation_count: 1,
                     ..Default::default()
@@ -365,7 +356,7 @@ pub fn parse_codex_file(path: &Path) -> CachedFile {
                     } else {
                         current_model.clone()
                     },
-                    project_key: project_key.clone(),
+                    project_key: String::new(),
                     timestamp,
                     conversation_count: 1,
                     ..Default::default()
@@ -400,7 +391,7 @@ pub fn parse_codex_file(path: &Path) -> CachedFile {
                     id: signature,
                     source: "codex".to_string(),
                     model,
-                    project_key: project_key.clone(),
+                    project_key: String::new(),
                     timestamp,
                     input_tokens: delta.input_tokens,
                     cached_input_tokens: delta.cached_input_tokens,
@@ -424,6 +415,11 @@ pub fn parse_codex_file(path: &Path) -> CachedFile {
         } else {
             current_model
         };
+    }
+    // 整个会话统一盖首次 cwd 解析出的键。
+    let project_key = cwd_key.unwrap_or_else(|| "Codex".to_string());
+    for event in &mut events {
+        event.project_key = project_key.clone();
     }
     let tokens = events
         .iter()

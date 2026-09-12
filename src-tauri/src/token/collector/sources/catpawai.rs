@@ -1,5 +1,5 @@
 use crate::models::{TokenSession, TokenSessionTokens};
-use crate::token::collector::normalizer::normalize_workspace_project_key;
+use crate::token::collector::normalizer::project_key_or_label;
 use crate::token::collector::time_utils::{iso_from_millis, update_bounds};
 use crate::token::collector::types::{
     database_fingerprint, fingerprint, number, open_readonly_sqlite, token_session, CachedDatabase,
@@ -140,9 +140,10 @@ pub fn normalize_catpawai_usage_numbers(
     } else if cache_read_field > 0
         && cached_from_details > 0
         && raw_total > 0
-        && raw_total == prompt
-            .saturating_add(cached_input)
-            .saturating_add(completion)
+        && raw_total
+            == prompt
+                .saturating_add(cached_input)
+                .saturating_add(completion)
     {
         // 两字段并存：raw_total 证明缓存是独立分量（未被并入 prompt），prompt 即全新输入。
         prompt
@@ -201,7 +202,7 @@ pub fn parse_catpawai_database(path: &Path) -> CachedDatabase {
                     .filter(|v| !v.trim().is_empty())
                     .or_else(|| title.filter(|v| !v.trim().is_empty()))
                     .unwrap_or_else(|| "CatPawAI".to_string());
-                let project = normalize_workspace_project_key(&raw_project, "CatPawAI");
+                let project = project_key_or_label(&raw_project, "CatPawAI");
                 projects.insert(conversation_id.clone(), project);
 
                 // 时间戳判定阈值：< 10^10 视为秒（需乘 1000），>= 10^10 视为毫秒
@@ -252,7 +253,7 @@ pub fn parse_catpawai_database(path: &Path) -> CachedDatabase {
                     .filter(|v| !v.trim().is_empty())
                     .or_else(|| title.filter(|v| !v.trim().is_empty()))
                     .unwrap_or_else(|| "CatPawAI".to_string());
-                let project = normalize_workspace_project_key(&raw_project, "CatPawAI");
+                let project = project_key_or_label(&raw_project, "CatPawAI");
                 projects.entry(conversation_id.clone()).or_insert(project);
 
                 let started_ms = if created_at > 0 && created_at < 10_000_000_000 {
@@ -469,7 +470,7 @@ pub fn parse_catpawai_database(path: &Path) -> CachedDatabase {
             let project_key = projects
                 .get(&conversation_id)
                 .cloned()
-                .unwrap_or_else(|| normalize_workspace_project_key(&session.directory, "CatPawAI"));
+                .unwrap_or_else(|| project_key_or_label(&session.directory, "CatPawAI"));
             let model = if session.model.is_empty() {
                 CATPAWAI_UNKNOWN_MODEL.to_string()
             } else {

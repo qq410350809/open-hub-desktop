@@ -369,7 +369,7 @@ export const KNOWN_SYSTEM_TYPES: ReadonlySet<string> = new Set(
 
 /**
  * 未知架构站点：systemType 为空或不在已知集合。
- * 这类站点无法识别签到/额度接口，不提供会话同步（额度/签到）能力。
+ * 这类站点无法识别签到/额度接口，会话同步仅建立 Chrome 账号关联，不查询签到与余额。
  */
 export function isUnknownSystemType(raw: string): boolean {
   const normalized = normalizeSystemType(raw);
@@ -579,7 +579,10 @@ export interface TokenSession {
   version: number;
   sessionHash: string;
   source: string;
+  /** 项目键：最近一层项目根的绝对路径，或来源标签。 */
   projectKey: string;
+  /** 项目根之上最外层标记目录（Maven 聚合父目录 / 外层仓库）；无则为空。 */
+  workspaceRoot?: string;
   model: string;
   startedAt: string;
   endedAt: string;
@@ -647,8 +650,10 @@ export interface TokenStatsReport {
 export interface TokenUsageBucket {
   source: string;
   model: string;
-  /** 支持项目维度的数据源由 OpenHub 直接填充。 */
+  /** 支持项目维度的数据源由 OpenHub 直接填充：本地为项目根绝对路径或来源标签，反代为渠道名。 */
   projectKey?: string;
+  /** 项目根之上最外层标记目录；无则为空。反代模式恒为空。 */
+  workspaceRoot?: string;
   timestamp: string;
   totalTokens: number;
   billableTotalTokens: number;
@@ -1051,11 +1056,15 @@ export interface LocalToolThinkingSection {
   maxThinkingTokens: number | null;
 }
 
+/** 配置文件相对本软件上次写入的状态：无标识 / 指纹吻合（未被动过）/ 被外部改过 */
+export type LocalToolManagedState = "unmanaged" | "intact" | "modified";
+
 export interface LocalToolConfigFile {
   kind: string;
   label: string;
   path: string;
   exists: boolean;
+  managed: LocalToolManagedState;
 }
 
 export interface LocalToolConfigSnapshot {
@@ -1105,7 +1114,10 @@ export interface LocalToolConfigPatch {
 
 export interface LocalToolConfigSaveResult {
   snapshot: LocalToolConfigSnapshot;
+  /** 本次创建的备份名；全部文件指纹吻合（直接覆盖）时为空 */
   backupName: string;
+  /** 本次被备份的文件（无标识或被外部改过） */
+  backedUp: string[];
 }
 
 export interface LocalToolBackupEntry {

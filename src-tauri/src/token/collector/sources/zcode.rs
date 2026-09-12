@@ -1,4 +1,4 @@
-use crate::token::collector::normalizer::basename_or_fallback;
+use crate::token::collector::normalizer::project_key_or_label;
 use crate::token::collector::time_utils::iso_from_millis;
 use crate::token::collector::types::{
     database_fingerprint, normalize_usage, number, open_readonly_sqlite, token_session,
@@ -131,7 +131,7 @@ pub fn parse_zcode_database(path: &Path) -> CachedDatabase {
                     .get(&session_id)
                     .map(|session| session.directory.as_str())
                     .unwrap_or_default();
-                let project_key = basename_or_fallback(session_dir, "ZCode");
+                let project_key = project_key_or_label(session_dir, "ZCode");
                 let model = zcode_model(&value);
 
                 if let Some(session) = sessions.get_mut(&session_id) {
@@ -209,7 +209,7 @@ pub fn parse_zcode_database(path: &Path) -> CachedDatabase {
             token_session(
                 session_id,
                 "zcode",
-                basename_or_fallback(&session.directory, "ZCode"),
+                project_key_or_label(&session.directory, "ZCode"),
                 if session.model.is_empty() {
                     "zcode-unknown-model".to_string()
                 } else {

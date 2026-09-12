@@ -1,4 +1,4 @@
-use crate::token::collector::normalizer::basename_or_fallback;
+use crate::token::collector::normalizer::project_key_or_label;
 use crate::token::collector::time_utils::iso_from_millis;
 use crate::token::collector::types::{
     database_fingerprint, normalize_usage, number, open_readonly_sqlite, token_session,
@@ -111,7 +111,7 @@ pub fn parse_mimo_database(path: &Path) -> CachedDatabase {
                     .get(&session_id)
                     .map(|session| session.directory.as_str())
                     .unwrap_or_default();
-                let project_key = basename_or_fallback(session_dir, "MiMo");
+                let project_key = project_key_or_label(session_dir, "MiMo");
                 let model = mimo_model(&value);
 
                 if let Some(session) = sessions.get_mut(&session_id) {
@@ -184,7 +184,7 @@ pub fn parse_mimo_database(path: &Path) -> CachedDatabase {
             token_session(
                 session_id,
                 "mimo",
-                basename_or_fallback(&session.directory, "MiMo"),
+                project_key_or_label(&session.directory, "MiMo"),
                 if session.model.is_empty() {
                     "mimo-unknown-model".to_string()
                 } else {

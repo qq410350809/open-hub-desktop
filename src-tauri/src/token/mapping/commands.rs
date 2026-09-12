@@ -191,9 +191,7 @@ pub fn remove_token_official_model(
 
 /// 从模型目录迁移数据到 token_official_models（一次性操作）。
 #[tauri::command]
-pub fn migrate_token_official_models(
-    ctx: Managed<'_, Arc<AppContext>>,
-) -> Result<usize, String> {
+pub fn migrate_token_official_models(ctx: Managed<'_, Arc<AppContext>>) -> Result<usize, String> {
     store::migrate_catalog_to_official_models(&ctx.database)
 }
 
@@ -271,18 +269,27 @@ pub async fn analyze_token_model_mappings(
         let candidates_by_key = ai::build_candidates_by_key(batch, &catalog, &standards);
         let eligible = batch
             .iter()
-            .filter(|item| candidates_by_key.get(&item.raw_key).is_some_and(|items| !items.is_empty()))
+            .filter(|item| {
+                candidates_by_key
+                    .get(&item.raw_key)
+                    .is_some_and(|items| !items.is_empty())
+            })
             .count();
         if eligible == 0 {
             report.analyzed += batch.len();
-            report.unresolved.extend(batch.iter().map(|item| item.raw_model.clone()));
+            report
+                .unresolved
+                .extend(batch.iter().map(|item| item.raw_model.clone()));
             processed += batch.len();
             emit_mapping_progress(
                 &ctx,
                 "batch",
                 processed,
                 total,
-                format!("第 {} 批没有可信候选，已保留为待处理", (processed + ai::BATCH_SIZE - 1) / ai::BATCH_SIZE),
+                format!(
+                    "第 {} 批没有可信候选，已保留为待处理",
+                    (processed + ai::BATCH_SIZE - 1) / ai::BATCH_SIZE
+                ),
             );
             continue;
         }
@@ -292,7 +299,11 @@ pub async fn analyze_token_model_mappings(
             "request",
             processed,
             total,
-            format!("正在分析第 {} 批（{} 个模型）", processed / ai::BATCH_SIZE + 1, batch.len()),
+            format!(
+                "正在分析第 {} 批（{} 个模型）",
+                processed / ai::BATCH_SIZE + 1,
+                batch.len()
+            ),
         );
         let prompt = ai::build_prompt(batch, &candidates_by_key, &standards);
         let items = match ai::request_mapping(&gateway_ctx, &request_model, &prompt).await {
@@ -301,12 +312,19 @@ pub async fn analyze_token_model_mappings(
                 warn!("[token-mapping] 批次分析失败：{error}");
                 report.warnings.push(error);
                 processed += batch.len();
-                emit_mapping_progress(&ctx, "batch-error", processed, total, "本批请求失败，可稍后重试");
+                emit_mapping_progress(
+                    &ctx,
+                    "batch-error",
+                    processed,
+                    total,
+                    "本批请求失败，可稍后重试",
+                );
                 continue;
             }
         };
         report.analyzed += batch.len();
-        let applied = store::apply_ai_suggestions(&ctx.database, batch, &candidates_by_key, &items)?;
+        let applied =
+            store::apply_ai_suggestions(&ctx.database, batch, &candidates_by_key, &items)?;
         report.resolved += applied.suggested;
         report.rejected_invalid += applied.invalid;
         for item in batch {
@@ -320,7 +338,10 @@ pub async fn analyze_token_model_mappings(
             "batch",
             processed,
             total,
-            format!("已完成 {processed}/{total} 个模型，{} 条建议等待审核", report.resolved),
+            format!(
+                "已完成 {processed}/{total} 个模型，{} 条建议等待审核",
+                report.resolved
+            ),
         );
     }
 
@@ -357,6 +378,8 @@ mod tests {
             resolve_request_model(&channels, Some("c1"), "gpt-5.6").unwrap(),
             "x666/gpt-5.6"
         );
-        assert!(resolve_request_model(&[channel("c1", "x666", false)], Some("c1"), "gpt-5.6").is_err());
+        assert!(
+            resolve_request_model(&[channel("c1", "x666", false)], Some("c1"), "gpt-5.6").is_err()
+        );
     }
 }

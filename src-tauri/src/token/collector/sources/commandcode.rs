@@ -1,13 +1,13 @@
 use crate::models::TokenSessionTokens;
 use crate::token::collector::normalizer::{
-    command_code_project_from_path, command_code_sidecar_model, is_common_subfolder,
-    normalize_workspace_project_key,
+    command_code_project_from_path, command_code_sidecar_model, project_key_from_location,
 };
 use crate::token::collector::sources::claude::claude_user_is_human;
 use crate::token::collector::time_utils::update_bounds;
 use crate::token::collector::types::{
     fingerprint, float_number, normalize_usage, number, token_session, CachedFile, FileFingerprint,
-    InputSemantics, RawUsage, UsageEvent, LOCAL_ESTIMATED_CONTEXT_LIMIT, UNKNOWN_COMMAND_CODE_MODEL,
+    InputSemantics, RawUsage, UsageEvent, LOCAL_ESTIMATED_CONTEXT_LIMIT,
+    UNKNOWN_COMMAND_CODE_MODEL,
 };
 use serde_json::{json, Value as JsonValue};
 use std::fs;
@@ -128,7 +128,8 @@ pub fn parse_command_code_file(path: &Path) -> CachedFile {
         .unwrap_or("")
         .to_string();
     let mut session_id = fallback_id;
-    let mut project_key = command_code_project_from_path(path);
+    let dir_project_key = command_code_project_from_path(path);
+    let mut cwd_key: Option<String> = None;
     let mut session_model = command_code_sidecar_model(path);
     let mut first_ts = String::new();
     let mut last_ts = String::new();
@@ -152,18 +153,14 @@ pub fn parse_command_code_file(path: &Path) -> CachedFile {
             {
                 session_id = id.to_string();
             }
-            if let Some(cwd) = value
-                .get("cwd")
-                .and_then(JsonValue::as_str)
-                .filter(|value| !value.trim().is_empty())
-            {
-                let resolved = normalize_workspace_project_key(cwd, &project_key);
-                if !resolved.is_empty()
-                    && (project_key == "Command Code"
-                        || is_common_subfolder(&project_key)
-                        || (!is_common_subfolder(&resolved) && resolved != "Command Code"))
+            // 会话归属 = 首次进入的工作目录；后续 session 行不改变归属。
+            if cwd_key.is_none() {
+                if let Some(cwd) = value
+                    .get("cwd")
+                    .and_then(JsonValue::as_str)
+                    .filter(|value| !value.trim().is_empty())
                 {
-                    project_key = resolved;
+                    cwd_key = project_key_from_location(cwd);
                 }
             }
             continue;
@@ -235,7 +232,7 @@ pub fn parse_command_code_file(path: &Path) -> CachedFile {
                     id: format!("u:{id}"),
                     source: "command-code".to_string(),
                     model: effective_model,
-                    project_key: project_key.clone(),
+                    project_key: String::new(),
                     timestamp,
                     conversation_count: 1,
                     ..Default::default()
@@ -249,32 +246,38 @@ pub fn parse_command_code_file(path: &Path) -> CachedFile {
         if let Some(usage) = command_code_usage(&value) {
             // 口径：total = 全新输入 + 缓存命中 + 输出；缓存写入独立上报，不计入 total。
             // Command Code 转录沿用 Claude Code 的 Anthropic 语义，inputTokens 不含缓存。
-            let (input_tokens, cached_input_tokens, cache_creation_input_tokens, output_tokens, _reasoning, total_tokens) =
-                normalize_usage(RawUsage {
-                    input: number(usage, &["inputTokens", "input_tokens"]),
-                    semantics: InputSemantics::Fresh,
-                    cache_read: number(
-                        usage,
-                        &["cacheReadTokens", "cache_read_tokens", "cachedInputTokens"],
-                    ),
-                    cache_write: number(
-                        usage,
-                        &[
-                            "cacheWriteTokens",
-                            "cache_write_tokens",
-                            "cacheCreationInputTokens",
-                        ],
-                    ),
-                    output: number(usage, &["outputTokens", "output_tokens"]),
-                    ..Default::default()
-                });
+            let (
+                input_tokens,
+                cached_input_tokens,
+                cache_creation_input_tokens,
+                output_tokens,
+                _reasoning,
+                total_tokens,
+            ) = normalize_usage(RawUsage {
+                input: number(usage, &["inputTokens", "input_tokens"]),
+                semantics: InputSemantics::Fresh,
+                cache_read: number(
+                    usage,
+                    &["cacheReadTokens", "cache_read_tokens", "cachedInputTokens"],
+                ),
+                cache_write: number(
+                    usage,
+                    &[
+                        "cacheWriteTokens",
+                        "cache_write_tokens",
+                        "cacheCreationInputTokens",
+                    ],
+                ),
+                output: number(usage, &["outputTokens", "output_tokens"]),
+                ..Default::default()
+            });
             let cost_usd = float_number(usage, &["costUsd", "cost_usd"]);
             exact_usage_events += 1;
             events.push(UsageEvent {
                 id,
                 source: "command-code".to_string(),
                 model: effective_model,
-                project_key: project_key.clone(),
+                project_key: String::new(),
                 timestamp,
                 input_tokens,
                 cached_input_tokens,
@@ -298,7 +301,7 @@ pub fn parse_command_code_file(path: &Path) -> CachedFile {
                 id,
                 source: "command-code".to_string(),
                 model: effective_model,
-                project_key: project_key.clone(),
+                project_key: String::new(),
                 timestamp,
                 input_tokens,
                 output_tokens,
@@ -313,6 +316,11 @@ pub fn parse_command_code_file(path: &Path) -> CachedFile {
 
     if session_model.is_empty() {
         session_model = UNKNOWN_COMMAND_CODE_MODEL.to_string();
+    }
+    // 整个会话统一盖首次 cwd 解析出的键；目录名反解只作无 cwd 时的兜底。
+    let project_key = cwd_key.unwrap_or(dir_project_key);
+    for event in &mut events {
+        event.project_key = project_key.clone();
     }
     let tokens = events
         .iter()

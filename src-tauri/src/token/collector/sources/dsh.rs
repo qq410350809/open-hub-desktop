@@ -1,5 +1,5 @@
 use crate::models::TokenSessionTokens;
-use crate::token::collector::normalizer::normalize_workspace_project_key;
+use crate::token::collector::normalizer::{project_key_from_location, TRANSIENT_PROJECT_KEY};
 use crate::token::collector::time_utils::{iso_from_millis, update_bounds};
 use crate::token::collector::types::{
     fingerprint, normalize_usage, number, token_session, CachedFile, InputSemantics, RawUsage,
@@ -103,12 +103,15 @@ pub fn parse_dsh_file(path: &Path) -> CachedFile {
             {
                 session_id = id.to_string();
             }
-            if let Some(cwd) = value
-                .get("cwd")
-                .and_then(JsonValue::as_str)
-                .filter(|v| !v.is_empty())
-            {
-                project_key = normalize_workspace_project_key(cwd, "DSH");
+            // 会话归属 = 首次进入的工作目录；后续 session 行不改变归属。
+            if project_key.is_empty() {
+                if let Some(cwd) = value
+                    .get("cwd")
+                    .and_then(JsonValue::as_str)
+                    .filter(|v| !v.is_empty())
+                {
+                    project_key = project_key_from_location(cwd).unwrap_or_default();
+                }
             }
             if !timestamp.is_empty() {
                 update_bounds(&mut first_ts, &mut last_ts, &timestamp);
@@ -223,8 +226,8 @@ pub fn parse_dsh_file(path: &Path) -> CachedFile {
             .unwrap_or("dsh-session")
             .to_string();
     }
-    if project_key.is_empty() || project_key == "DSH" {
-        project_key = "临时任务 / 独立会话".to_string();
+    if project_key.is_empty() {
+        project_key = TRANSIENT_PROJECT_KEY.to_string();
     }
     if model.is_empty() {
         model = UNKNOWN_DSH_MODEL.to_string();
@@ -235,7 +238,11 @@ pub fn parse_dsh_file(path: &Path) -> CachedFile {
         usage_events.retain(|k, _| !k.contains(":chunk:"));
     }
 
+    // session 行若晚于用量行出现，早期事件会带着空键；统一以最终解析结果盖章。
     let mut events = usage_events.into_values().collect::<Vec<_>>();
+    for event in &mut events {
+        event.project_key = project_key.clone();
+    }
     events.extend(user_events.into_iter().map(|(id, timestamp)| {
         UsageEvent {
             id: id.clone(),

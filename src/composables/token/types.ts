@@ -12,6 +12,7 @@ export interface TokenSessionLike {
   costUsd?: number;
   source?: string;
   projectKey?: string;
+  workspaceRoot?: string;
   tokens?: TokenTokensLike;
 }
 
@@ -35,6 +36,7 @@ export interface UsageBucketLike {
   source?: string;
   model?: string;
   projectKey?: string;
+  workspaceRoot?: string;
   totalTokens?: number;
   inputTokens?: number;
   cachedInputTokens?: number;

@@ -1,4 +1,5 @@
 use crate::models::TokenSessionTokens;
+use crate::token::collector::normalizer::vscode_workspace_key_from_db_path;
 use crate::token::collector::types::{
     database_fingerprint, normalize_usage, number, open_readonly_sqlite,
     openai_cached_from_details, openai_reasoning_from_details, token_session, CachedDatabase,
@@ -54,6 +55,8 @@ pub fn parse_windsurf_database(path: &Path) -> CachedDatabase {
     let mut events = Vec::new();
     let mut sessions = Vec::new();
     let path_tag = db_path_tag(path);
+    // workspaceStorage/<hash>/state.vscdb 旁有 workspace.json 指向真实文件夹；globalStorage 落到标签。
+    let project_key = vscode_workspace_key_from_db_path(path, "Windsurf");
 
     let Some(conn) = open_readonly_sqlite(path) else {
         return CachedDatabase {
@@ -110,7 +113,8 @@ pub fn parse_windsurf_database(path: &Path) -> CachedDatabase {
                         user_msg_count += 1;
                     }
 
-                    let cached = openai_cached_from_details(step).max(number(step, &["cachedTokens"]));
+                    let cached =
+                        openai_cached_from_details(step).max(number(step, &["cachedTokens"]));
                     let input = number(step, &["inputTokens", "promptTokens", "input_tokens"]);
                     let output =
                         number(step, &["outputTokens", "completionTokens", "output_tokens"]);
@@ -177,7 +181,7 @@ pub fn parse_windsurf_database(path: &Path) -> CachedDatabase {
                         id: format!("windsurf_{path_tag}_{idx}"),
                         source: "windsurf".to_string(),
                         model: model_name.clone(),
-                        project_key: "windsurf-workspace".to_string(),
+                        project_key: project_key.clone(),
                         timestamp,
                         input_tokens: fresh,
                         cached_input_tokens: cached_read,
@@ -188,7 +192,11 @@ pub fn parse_windsurf_database(path: &Path) -> CachedDatabase {
                         conversation_count: 0,
                         cost_usd: 0.0,
                         pricing_available: false,
-                        estimated_tokens: if cached_read == 0 && input == 0 { total } else { 0 },
+                        estimated_tokens: if cached_read == 0 && input == 0 {
+                            total
+                        } else {
+                            0
+                        },
                     });
                 }
             }
@@ -199,7 +207,7 @@ pub fn parse_windsurf_database(path: &Path) -> CachedDatabase {
         sessions.push(token_session(
             format!("windsurf-cascade-{path_tag}"),
             "windsurf",
-            "windsurf-workspace".to_string(),
+            project_key,
             model_name,
             first_ts,
             last_ts,

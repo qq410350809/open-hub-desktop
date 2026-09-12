@@ -95,7 +95,7 @@ pub async fn get_token_raw_logs() -> Result<RawLogReport, String> {
                     .map(|name| name.to_string_lossy().to_string())
                     .unwrap_or_default();
                 let project =
-                    crate::token::collector::normalize_workspace_project_key(&raw_name, "Claude");
+                    crate::token::collector::project_key_from_encoded_dir_name(&raw_name, "Claude");
                 if let Ok(files) = fs::read_dir(&project_dir) {
                     for file in files.flatten() {
                         let path = file.path();

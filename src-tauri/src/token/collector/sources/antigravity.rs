@@ -1,7 +1,6 @@
 use crate::models::TokenSessionTokens;
 use crate::token::collector::normalizer::{
-    basename_or_fallback, extract_antigravity_project_from_transcript,
-    normalize_workspace_project_key,
+    extract_antigravity_project_from_transcript, project_key_from_location,
 };
 use crate::token::collector::sources::commandcode::estimate_local_content_tokens;
 use crate::token::collector::time_utils::update_bounds;
@@ -270,7 +269,6 @@ fn antigravity_database_metadata(path: &Path) -> (String, String) {
             }
             (!candidate.is_empty()).then_some(candidate)
         })
-        .map(|path| basename_or_fallback(&path, "Antigravity"))
         .unwrap_or_default();
 
     (model, project)
@@ -341,14 +339,9 @@ pub fn parse_antigravity_file(path: &Path) -> CachedFile {
     } else {
         database_model
     };
-    let transcript_project = extract_antigravity_project_from_transcript(&text);
-    let project_key = if let Some(tp) = transcript_project {
-        tp
-    } else if !database_project.is_empty() {
-        normalize_workspace_project_key(&database_project, "Antigravity")
-    } else {
-        antigravity_fallback_project(path)
-    };
+    let project_key = extract_antigravity_project_from_transcript(&text)
+        .or_else(|| project_key_from_location(&database_project))
+        .unwrap_or_else(|| antigravity_fallback_project(path));
     let mut first_ts = String::new();
     let mut last_ts = String::new();
     let mut visible_context_tokens = 0i64;

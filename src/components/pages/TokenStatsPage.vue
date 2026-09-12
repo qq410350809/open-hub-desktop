@@ -5,6 +5,7 @@ import type { EChartsOption } from "../../echarts";
 import EChart from "../common/EChart.vue";
 import DateRangeDropdown from "../common/DateRangeDropdown.vue";
 import AppTable, { type AppTableColumn } from "../common/AppTable.vue";
+import type { SortingState } from "@tanstack/table-core";
 import CustomSelect from "../common/CustomSelect.vue";
 import { icons } from "../../icons";
 import { useStore } from "../../composables/useStore";
@@ -37,6 +38,7 @@ import {
   formatTokens,
   isKnownModel,
   isKnownSource,
+  sourceLabel,
   localDateOf,
   parseLocal,
   toLocalDate,
@@ -1306,35 +1308,6 @@ function healthLevelColor(level: number): string {
   return HEALTH_LEVEL_COLORS[level] ?? HEALTH_LEVEL_COLORS[0];
 }
 
-const sourceNameMap: Record<string, string> = {
-  claude: "Claude Code",
-  codex: "Codex CLI",
-  cursor: "Cursor",
-  catpawai: "CatPawAI",
-  gemini: "Gemini CLI",
-  opencode: "OpenCode",
-  kiro: "Kiro",
-  copilot: "GitHub Copilot (VS Code)",
-  openclaw: "OpenClaw",
-  goose: "Goose AI",
-  antigravity: "Google Antigravity",
-  zed: "Zed Editor",
-  "command-code": "Command Code",
-  dsh: "DeepSeek CLI (DSH)",
-  // —— 反代模式：按端点/SDK 推断的客户端标识 ——
-  openhub: "OpenHub",
-  sdk: "SDK / 脚本",
-  "anthropic-api": "Anthropic 协议客户端",
-  "responses-api": "Responses 协议客户端",
-  "openai-api": "OpenAI 协议客户端",
-  "gemini-api": "Gemini 协议客户端",
-  other: "其他客户端",
-};
-
-function sourceLabel(source: string): string {
-  return sourceNameMap[source.toLowerCase()] || source || "未知来源";
-}
-
 function shareOf(value: number, total: number): number {
   return total > 0 ? Math.min(100, (value / total) * 100) : 0;
 }
@@ -1472,8 +1445,17 @@ const topSources = computed(() => bySource.value.slice(0, 5));
 const topModels = computed(() => byModel.value.slice(0, 5));
 
 // 项目用量
+// 项目键由后端给出：本地模式为会话首次进入的工作目录所属项目根的绝对路径（或来源标签），
+// 反代模式为渠道名。工作区根由后端归组后下发。前端只按键分组、派生显示名，不再对键做二次归一化。
 type ProjectUsageItem = {
+  /** 后端项目键（路径 / 标签 / 渠道名）。 */
+  key: string;
+  /** 显示名：路径取末级目录名（同名时补父目录消歧），标签原样。 */
   project: string;
+  /** 缩写路径（家目录折叠为 ~），标签键为空。 */
+  path: string;
+  /** 工作区根：真正的聚合容器或路径归组后的父目录；无则为空。 */
+  workspaceRoot: string;
   sessions: number;
   requests: number;
   requestsEstimated: boolean;
@@ -1487,142 +1469,74 @@ type ProjectUsageItem = {
   reasoning: number;
   costUsd: number;
   estimatedTokens: number;
+  estimatedInput: number;
 };
 
+const HOME_PREFIX_RE = /^(\/Users\/[^/]+|\/home\/[^/]+)(?=\/|$)/;
+
+function isPathKey(key: string) {
+  return key.startsWith("/") || /^[A-Za-z]:\//.test(key);
+}
+
+function abbreviateHome(path: string) {
+  return path.replace(HOME_PREFIX_RE, "~");
+}
+
+function pathBasename(path: string) {
+  const parts = path.split("/").filter(Boolean);
+  return parts[parts.length - 1] || path;
+}
+
+function projectDisplayName(key: string) {
+  if (!isPathKey(key)) return key;
+  if (abbreviateHome(key) === "~") return "~";
+  return pathBasename(key);
+}
+
+function emptyProjectUsage(key: string, workspaceRoot: string): ProjectUsageItem {
+  return {
+    key,
+    project: projectDisplayName(key),
+    path: isPathKey(key) ? abbreviateHome(key) : "",
+    workspaceRoot,
+    sessions: 0,
+    requests: 0,
+    requestsEstimated: false,
+    totalTokens: 0,
+    input: 0,
+    output: 0,
+    cache: 0,
+    cacheRead: 0,
+    cacheWrite: 0,
+    cacheHitRate: null,
+    reasoning: 0,
+    costUsd: 0,
+    estimatedTokens: 0,
+    estimatedInput: 0,
+  };
+}
+
+function finalizeProjectUsage<T extends ProjectUsageItem>(item: T): T {
+  item.cacheHitRate = cacheHitRateOf(item.cacheRead, item.cacheWrite, item.input, item.estimatedInput);
+  return item;
+}
+
+/** 同名不同路径的项目在显示名后补父目录，避免表里出现两个一模一样的名字。 */
+function disambiguateProjectNames(items: ProjectUsageItem[]) {
+  const counts = new Map<string, number>();
+  for (const item of items) counts.set(item.project, (counts.get(item.project) || 0) + 1);
+  for (const item of items) {
+    if ((counts.get(item.project) || 0) < 2 || !isPathKey(item.key)) continue;
+    const parent = abbreviateHome(item.key.split("/").slice(0, -1).join("/") || "/");
+    item.project = `${item.project} · ${parent}`;
+  }
+}
+
 const projectUsage = computed<ProjectUsageItem[]>(() => {
-  const groups = new Map<
-    string,
-    {
-      project: string;
-      sessions: number;
-      requests: number;
-      requestsEstimated: boolean;
-      totalTokens: number;
-      input: number;
-      output: number;
-      cache: number;
-      cacheRead: number;
-      cacheWrite: number;
-      cacheHitRate: number | null;
-      reasoning: number;
-      costUsd: number;
-      estimatedTokens: number;
-      estimatedInput: number;
-    }
-  >();
-
-  const isSessionUuid = (s: string) =>
-    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s.trim()) ||
-    s.startsWith("rollout-") ||
-    s.startsWith("session-");
-
-  const isCommonSubfolderName = (name: string) => {
-    const lower = name.toLowerCase();
-    return [
-      "src",
-      "src-tauri",
-      "docs",
-      "target",
-      "bin",
-      "node_modules",
-      "pkg",
-      "app",
-      "core",
-      "client",
-      "server",
-      "ui",
-      "web",
-      "sys",
-      "staff",
-      "third",
-      "controller",
-      "controllers",
-      "model",
-      "models",
-      "view",
-      "views",
-      "service",
-      "services",
-      "scripts",
-      "frontend",
-      "backend",
-      "dist",
-      "build",
-      "test",
-      "tests",
-      "public",
-      "custom",
-      "applications",
-    ].includes(lower);
-  };
-
-  const normalizeProject = (rawKey?: string) => {
-    let value = rawKey?.trim() || "";
-    if (!value) return "全局 / 独立会话";
-
-    if (isSessionUuid(value)) return "临时任务 / 独立会话";
-
-    if (value.startsWith("file://")) {
-      try {
-        value = decodeURIComponent(value.replace(/^file:\/\//, ""));
-      } catch {
-        value = value.replace(/^file:\/\//, "");
-      }
-    }
-
-    value = value.replace(/\\/g, "/").replace(/\/+$/, "");
-
-    if (value.endsWith(".code-workspace")) {
-      const parts = value.split("/");
-      return parts[parts.length - 1].replace(/\.code-workspace$/, "");
-    }
-
-    if (value.includes("/")) {
-      const parts = value.split("/").filter(Boolean);
-      for (let i = parts.length - 1; i >= 0; i--) {
-        const part = parts[i];
-        if (
-          !isCommonSubfolderName(part) &&
-          part !== "Users" &&
-          part !== "Applications" &&
-          !isSessionUuid(part)
-        ) {
-          return part;
-        }
-      }
-      return parts[parts.length - 1] || "全局 / 独立会话";
-    }
-
-    if (
-      ["VS Code", "Copilot CLI", "Antigravity IDE", "Antigravity CLI", "DSH", "Codex"].includes(
-        value
-      )
-    ) {
-      return "全局 / 独立会话";
-    }
-
-    return value;
-  };
-
-  const ensureGroup = (rawKey?: string) => {
-    const key = normalizeProject(rawKey);
-    const current = groups.get(key) || {
-      project: key,
-      sessions: 0,
-      requests: 0,
-      requestsEstimated: false,
-      totalTokens: 0,
-      input: 0,
-      output: 0,
-      cache: 0,
-      cacheRead: 0,
-      cacheWrite: 0,
-      cacheHitRate: null,
-      reasoning: 0,
-      costUsd: 0,
-      estimatedTokens: 0,
-      estimatedInput: 0,
-    };
+  const groups = new Map<string, ProjectUsageItem>();
+  const ensureGroup = (rawKey: string | undefined, workspaceRoot: string | undefined) => {
+    const key = rawKey?.trim() || "全局 / 独立会话";
+    const current = groups.get(key) || emptyProjectUsage(key, workspaceRoot?.trim() || "");
     groups.set(key, current);
     return current;
   };
@@ -1631,7 +1545,7 @@ const projectUsage = computed<ProjectUsageItem[]>(() => {
   for (const bucket of filteredBuckets.value) {
     if (!bucket.projectKey?.trim()) continue;
     projectBucketSources.add(bucket.source.toLowerCase());
-    const current = ensureGroup(bucket.projectKey);
+    const current = ensureGroup(bucket.projectKey, bucket.workspaceRoot);
     current.sessions += bucket.conversationCount || 0;
     if (bucket.requestCount != null) {
       current.requests += bucket.requestCount || 0;
@@ -1660,7 +1574,7 @@ const projectUsage = computed<ProjectUsageItem[]>(() => {
   if (statsMode.value === "local") {
     for (const session of sessions.value) {
       if (projectBucketSources.has((session.source || "").toLowerCase())) continue;
-      const current = ensureGroup(session.projectKey);
+      const current = ensureGroup(session.projectKey, session.workspaceRoot);
       const sessionTurns = session.turns || 0;
       current.sessions += sessionTurns;
       current.requests += estimateRequestCount({
@@ -1685,20 +1599,154 @@ const projectUsage = computed<ProjectUsageItem[]>(() => {
     }
   }
 
-  return [...groups.values()]
-    .map((item) => ({
-      ...item,
-      cacheHitRate: cacheHitRateOf(item.cacheRead, item.cacheWrite, item.input, item.estimatedInput),
-    }))
+  const items = [...groups.values()]
+    .map(finalizeProjectUsage)
     .filter((item) => item.totalTokens > 0)
     .sort((a, b) => b.totalTokens - a.totalTokens);
+  disambiguateProjectNames(items);
+  return items;
 });
 
-const filteredProjects = computed(() => {
-  const q = projectSearch.value.trim().toLowerCase();
-  if (!q) return projectUsage.value;
-  return projectUsage.value.filter((p) => p.project.toLowerCase().includes(q));
+// —— 项目两级层级：工作区根（路径祖先键 / 兄弟键合成的父目录）→ 其下各项目 ——
+// 后端按已出现的路径键归组，不读项目目录；没有工作区根的项目各自成行。单子项目的工作区不折叠成组，直接平铺。
+type ProjectRow = ProjectUsageItem & {
+  rowId: string;
+  depth: 0 | 1;
+  /** > 0 表示这是可展开的工作区行。 */
+  childCount: number;
+  expanded: boolean;
+  /** 子行里键等于工作区根本身的那一行（直接在仓库根目录工作的用量）。 */
+  isWorkspaceSelf: boolean;
+};
+
+type ProjectGroup = { row: ProjectRow; children: ProjectRow[] };
+
+const expandedProjectGroups = ref(new Set<string>());
+const projectSorting = ref<SortingState>([{ id: "totalTokens", desc: true }]);
+
+function toggleProjectGroup(key: string) {
+  const next = new Set(expandedProjectGroups.value);
+  if (next.has(key)) next.delete(key);
+  else next.add(key);
+  expandedProjectGroups.value = next;
+}
+
+function childProjectName(item: ProjectUsageItem, workspaceKey: string) {
+  if (item.key === workspaceKey) return item.project;
+  if (isPathKey(item.key) && isPathKey(workspaceKey) && item.key.startsWith(`${workspaceKey}/`)) {
+    return item.key.slice(workspaceKey.length + 1);
+  }
+  return item.project;
+}
+
+function leafProjectRow(item: ProjectUsageItem, depth: 0 | 1, workspaceKey: string): ProjectRow {
+  return {
+    ...item,
+    project: depth === 1 ? childProjectName(item, workspaceKey) : item.project,
+    rowId: `${depth ? "c" : "p"}:${item.key}`,
+    depth,
+    childCount: 0,
+    expanded: false,
+    isWorkspaceSelf: depth === 1 && item.key === workspaceKey,
+  };
+}
+
+const projectGroups = computed<ProjectGroup[]>(() => {
+  const byWorkspace = new Map<string, ProjectUsageItem[]>();
+  for (const item of projectUsage.value) {
+    const groupKey = item.workspaceRoot || item.key;
+    const list = byWorkspace.get(groupKey) || [];
+    list.push(item);
+    byWorkspace.set(groupKey, list);
+  }
+  const groups: ProjectGroup[] = [];
+  for (const [groupKey, members] of byWorkspace) {
+    if (members.length === 1) {
+      groups.push({ row: leafProjectRow(members[0], 0, ""), children: [] });
+      continue;
+    }
+    const aggregate = emptyProjectUsage(groupKey, "");
+    for (const member of members) {
+      aggregate.sessions += member.sessions;
+      aggregate.requests += member.requests;
+      aggregate.requestsEstimated ||= member.requestsEstimated;
+      aggregate.totalTokens += member.totalTokens;
+      aggregate.input += member.input;
+      aggregate.output += member.output;
+      aggregate.cache += member.cache;
+      aggregate.cacheRead += member.cacheRead;
+      aggregate.cacheWrite += member.cacheWrite;
+      aggregate.reasoning += member.reasoning;
+      aggregate.costUsd += member.costUsd;
+      aggregate.estimatedTokens += member.estimatedTokens;
+      aggregate.estimatedInput += member.estimatedInput;
+    }
+    finalizeProjectUsage(aggregate);
+    groups.push({
+      row: {
+        ...aggregate,
+        rowId: `g:${groupKey}`,
+        depth: 0,
+        childCount: members.length,
+        expanded: expandedProjectGroups.value.has(groupKey),
+        isWorkspaceSelf: false,
+      },
+      children: members.map((member) => leafProjectRow(member, 1, groupKey)),
+    });
+  }
+  return groups;
 });
+
+const workspaceGroupCount = computed(() => projectGroups.value.filter((group) => group.row.childCount > 0).length);
+
+function compareProjectRows(a: ProjectRow, b: ProjectRow, sorting: SortingState) {
+  const sort = sorting[0];
+  if (!sort) return b.totalTokens - a.totalTokens;
+  const dir = sort.desc ? -1 : 1;
+  const column = sort.id as keyof ProjectRow;
+  const left = a[column];
+  const right = b[column];
+  if (typeof left === "string" && typeof right === "string") return left.localeCompare(right, "zh-CN") * dir;
+  // 命中率未知排到最后，不参与方向翻转
+  if (left == null && right == null) return 0;
+  if (left == null) return 1;
+  if (right == null) return -1;
+  return (Number(left) - Number(right)) * dir;
+}
+
+function projectRowMatches(row: ProjectRow, q: string) {
+  return row.project.toLowerCase().includes(q) || row.path.toLowerCase().includes(q) || row.key.toLowerCase().includes(q);
+}
+
+/** 平铺后的表格行：一级行按当前排序，展开的工作区在其后插入按同样排序的子行。 */
+const filteredProjects = computed<ProjectRow[]>(() => {
+  const q = projectSearch.value.trim().toLowerCase();
+  const sorting = projectSorting.value;
+  const rows: ProjectRow[] = [];
+  const groups = projectGroups.value
+    .map((group) => {
+      if (!q) return group;
+      if (!group.row.childCount) return projectRowMatches(group.row, q) ? group : null;
+      // 搜索命中子项目时只显示命中的子行，并强制展开
+      const children = projectRowMatches(group.row, q) ? group.children : group.children.filter((child) => projectRowMatches(child, q));
+      if (!children.length) return null;
+      return { row: { ...group.row, expanded: true }, children };
+    })
+    .filter((group): group is ProjectGroup => group != null)
+    .sort((a, b) => compareProjectRows(a.row, b.row, sorting));
+  for (const group of groups) {
+    rows.push(group.row);
+    if (group.row.childCount && group.row.expanded) {
+      rows.push(...[...group.children].sort((a, b) => compareProjectRows(a, b, sorting)));
+    }
+  }
+  return rows;
+});
+
+function projectRowClass(row: ProjectRow) {
+  if (row.depth === 1) return "tt-project-row-child";
+  return row.childCount ? "tt-project-row-group" : "";
+}
 
 // —— 趋势与明细数据 ——
 const trendSeries = computed(() =>
@@ -2451,8 +2499,9 @@ onBeforeUnmount(() => {
                 <div class="tt-kpi-meta-text">
                   <span>成功 <strong class="text-success">{{ formatTokens(healthTimeline.totalSuccess) }}</strong> · 失败 <strong :class="{ 'text-danger': healthTimeline.totalFailed > 0 }">{{ formatTokens(healthTimeline.totalFailed) }}</strong></span>
                 </div>
-                <div class="tt-kpi-multiplier-pill">
-                  <span>反代按真实 HTTP 状态码记账 · 成功率口径比本地估算更精确</span>
+                <!-- 口径说明用与 2/4 号卡同款的脚注：文字压到一行，长句保留在 title 里 -->
+                <div class="tt-kpi-footer-note" title="反代按真实 HTTP 状态码记账 · 成功率口径比本地估算更精确">
+                  <span>按真实 HTTP 状态码记账，比本地估算更精确</span>
                 </div>
               </template>
             </div>
@@ -2789,7 +2838,7 @@ onBeforeUnmount(() => {
           <header class="tt-modal-header">
             <div>
               <h2>{{ statsMode === 'local' ? '项目与工作区透视' : '渠道用量透视' }}</h2>
-              <p>{{ statsMode === 'local' ? '从本地日志中自动提取的项目目录与工作区用量' : '反代转发按渠道维度汇总的用量透视' }}</p>
+              <p>{{ statsMode === 'local' ? '按会话首次进入的工作目录归属到项目根；同一工作区下的项目可展开查看' : '反代转发按渠道维度汇总的用量透视' }}</p>
             </div>
             <button type="button" class="tt-modal-close-btn" aria-label="关闭" @click="projectsModalOpen = false">×</button>
           </header>
@@ -2800,22 +2849,46 @@ onBeforeUnmount(() => {
                 <span v-html="icons.search" />
                 <input v-model="projectSearch" type="search" placeholder="按项目名称或路径过滤…" />
               </label>
-              <span class="tt-filter-count">共 {{ filteredProjects.length }} 个工作区</span>
+              <span class="tt-filter-count">
+                共 {{ projectUsage.length }} 个{{ statsMode === 'local' ? '项目' : '渠道' }}<template v-if="workspaceGroupCount"> · {{ workspaceGroupCount }} 个工作区可展开</template>
+              </span>
             </div>
 
             <div class="tt-table-wrap">
               <AppTable
                 :rows="filteredProjects"
                 :columns="projectColumns"
-                :row-key="(item: any) => item.project"
+                :row-key="(item: any) => item.rowId"
+                :row-class="projectRowClass"
                 :page-size="15"
+                manual-sorting
+                :sorting="projectSorting"
                 empty-text="没有匹配的项目记录"
+                @update:sorting="projectSorting = $event"
               >
                 <template #cell-project="{ row }">
-                  <div class="tt-project-cell" :title="row.project">
-                    <span v-if="row.project.includes('临时') || row.project.includes('独立') || row.project.includes('全局')" v-html="icons.chat" />
-                    <span v-else v-html="icons.folder" />
-                    <strong>{{ row.project }}</strong>
+                  <div class="tt-project-cell" :class="{ 'is-child': row.depth === 1 }" :title="row.path || row.project">
+                    <button
+                      v-if="row.childCount"
+                      type="button"
+                      class="tt-project-toggle"
+                      :class="{ expanded: row.expanded }"
+                      :aria-label="row.expanded ? '折叠工作区' : '展开工作区'"
+                      @click.stop="toggleProjectGroup(row.key)"
+                      v-html="icons.chevron"
+                    />
+                    <span v-else class="tt-project-toggle-spacer" />
+                    <span v-if="row.childCount" v-html="icons.layers" />
+                    <span v-else-if="row.path" v-html="icons.folder" />
+                    <span v-else v-html="icons.chat" />
+                    <div class="tt-project-text">
+                      <strong>
+                        {{ row.project }}
+                        <span v-if="row.isWorkspaceSelf" class="tt-project-badge">根目录</span>
+                        <span v-else-if="row.childCount" class="tt-project-badge">{{ row.childCount }} 个项目</span>
+                      </strong>
+                      <small v-if="row.path && row.depth === 0">{{ row.path }}</small>
+                    </div>
                   </div>
                 </template>
                 <template #cell-totalTokens="{ row }"><strong>{{ formatCompact(row.totalTokens) }}</strong></template>
@@ -4568,11 +4641,83 @@ onBeforeUnmount(() => {
   white-space: nowrap;
 }
 
+.tt-project-cell.is-child {
+  padding-left: 18px;
+}
+
 .tt-project-cell :deep(svg) {
   width: 14px;
   height: 14px;
   color: var(--muted);
   flex-shrink: 0;
+}
+
+.tt-project-toggle,
+.tt-project-toggle-spacer {
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+}
+
+.tt-project-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.tt-project-toggle:hover {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+.tt-project-toggle :deep(svg) {
+  width: 12px;
+  height: 12px;
+  transform: rotate(-90deg);
+  transition: transform 0.15s ease;
+}
+
+.tt-project-toggle.expanded :deep(svg) {
+  transform: rotate(0deg);
+}
+
+.tt-project-text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  line-height: 1.25;
+}
+
+.tt-project-text strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tt-project-text small {
+  font-size: 10px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tt-project-badge {
+  margin-left: 6px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: var(--surface-hover);
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 500;
+}
+
+:deep(.tt-project-row-child) {
+  background: var(--surface-soft);
 }
 
 .tt-btn-cancel {

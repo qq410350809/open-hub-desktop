@@ -1,5 +1,5 @@
 use crate::models::TokenSessionTokens;
-use crate::token::collector::normalizer::normalize_workspace_project_key;
+use crate::token::collector::normalizer::project_key_or_label;
 use crate::token::collector::time_utils::update_bounds;
 use crate::token::collector::types::{
     fingerprint, normalize_usage, number, openai_cached_from_details, token_session, CachedFile,
@@ -54,7 +54,7 @@ pub fn parse_continue_file(path: &Path) -> CachedFile {
 
     let mut project_key = "continue-project".to_string();
     if let Some(workspace) = data.get("workspaceDirectory").and_then(JsonValue::as_str) {
-        project_key = normalize_workspace_project_key(workspace, "continue-project");
+        project_key = project_key_or_label(workspace, "continue-project");
     }
 
     let mut events = Vec::new();

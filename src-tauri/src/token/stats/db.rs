@@ -63,7 +63,7 @@ pub fn collect_token_data(
         "running",
         "正在扫描 Codex、Claude 等工具的本地日志",
     );
-    let snapshot = crate::token::collector::collect_snapshot(force)?;
+    let mut snapshot = crate::token::collector::collect_snapshot(force)?;
     emit_token_collector_progress(
         progress_bus,
         "scan",
@@ -79,7 +79,8 @@ pub fn collect_token_data(
         "running",
         "正在合并 Token 用量、会话与请求健康数据",
     );
-    let usage = merge_catpawai_usage(snapshot.usage.clone())?;
+    let mut usage = merge_catpawai_usage(snapshot.usage.clone())?;
+    crate::token::collector::apply_workspace_roots(&mut usage.buckets, &mut snapshot.sessions);
     let health = collect_request_health_snapshot(force)?;
     emit_token_collector_progress(
         progress_bus,
@@ -134,10 +135,11 @@ pub fn seed_token_database_from_caches(database: &Database) -> Result<bool, Stri
     if db::has_token_snapshots(database)? {
         return Ok(false);
     }
-    let Some(snapshot) = crate::token::collector::load_cached_snapshot() else {
+    let Some(mut snapshot) = crate::token::collector::load_cached_snapshot() else {
         return Ok(false);
     };
-    let usage = merge_catpawai_usage(snapshot.usage)?;
+    let mut usage = merge_catpawai_usage(snapshot.usage)?;
+    crate::token::collector::apply_workspace_roots(&mut usage.buckets, &mut snapshot.sessions);
     let health = read_persisted_activity_cache().report;
     db::write_token_snapshots(database, &usage, &snapshot.sessions, &health)?;
     Ok(true)

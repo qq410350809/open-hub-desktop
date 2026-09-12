@@ -66,10 +66,8 @@ pub fn load_catpawai_projects(conn: &Connection) -> BTreeMap<String, String> {
                         .filter(|value| !value.trim().is_empty())
                         .or_else(|| title.filter(|value| !value.trim().is_empty()))
                         .unwrap_or_else(|| "CatPawAI".to_string());
-                    let project = crate::token::collector::normalize_workspace_project_key(
-                        &raw_project,
-                        "CatPawAI",
-                    );
+                    let project =
+                        crate::token::collector::project_key_or_label(&raw_project, "CatPawAI");
                     projects.insert(conversation_id, project);
                 }
             }
@@ -93,10 +91,7 @@ pub fn load_catpawai_projects(conn: &Connection) -> BTreeMap<String, String> {
                             .filter(|value| !value.trim().is_empty())
                             .or_else(|| title.filter(|value| !value.trim().is_empty()))
                             .unwrap_or_else(|| "CatPawAI".to_string());
-                        crate::token::collector::normalize_workspace_project_key(
-                            &raw_project,
-                            "CatPawAI",
-                        )
+                        crate::token::collector::project_key_or_label(&raw_project, "CatPawAI")
                     });
                 }
             }
@@ -128,6 +123,7 @@ pub fn catpawai_bucket_mut<'a>(
     buckets.entry(key).or_insert_with(|| TokenUsageBucket {
         source: CATPAWAI_SOURCE.to_string(),
         model,
+        workspace_root: crate::token::collector::workspace_root_for_key(&project_key),
         project_key,
         timestamp,
         total_tokens: 0,

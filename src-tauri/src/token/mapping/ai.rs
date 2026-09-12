@@ -39,7 +39,10 @@ fn candidate_score(item: &PendingModel, candidate: &OfficialModelCandidate) -> i
         .chain(candidate.aliases.iter().map(String::as_str))
         .collect::<Vec<_>>();
 
-    if fields.iter().any(|field| compact(field) == raw_compact || compact(field) == item_compact) {
+    if fields
+        .iter()
+        .any(|field| compact(field) == raw_compact || compact(field) == item_compact)
+    {
         return 10_000;
     }
 
@@ -53,7 +56,11 @@ fn candidate_score(item: &PendingModel, candidate: &OfficialModelCandidate) -> i
             }
         }
     }
-    if candidate.lab.to_ascii_lowercase().contains(&input_tokens.first().cloned().unwrap_or_default()) {
+    if candidate
+        .lab
+        .to_ascii_lowercase()
+        .contains(&input_tokens.first().cloned().unwrap_or_default())
+    {
         score += 2;
     }
     score
@@ -85,7 +92,10 @@ pub fn build_candidates_by_key(
         for (_, candidate) in scored.into_iter().take(CANDIDATE_LIMIT_PER_ITEM) {
             candidates.push(candidate.clone());
         }
-        for candidate in catalog.iter().filter(|candidate| approved_names.contains(candidate.name.as_str())) {
+        for candidate in catalog
+            .iter()
+            .filter(|candidate| approved_names.contains(candidate.name.as_str()))
+        {
             if !candidates.iter().any(|current| current.id == candidate.id) {
                 candidates.push(candidate.clone());
             }
@@ -118,7 +128,10 @@ pub fn build_prompt(
                         } else {
                             format!("；别名：{}", candidate.aliases.join(", "))
                         };
-                        format!("{}（ID：{}；厂商：{}{}）", candidate.name, candidate.id, candidate.lab, aliases)
+                        format!(
+                            "{}（ID：{}；厂商：{}{}）",
+                            candidate.name, candidate.id, candidate.lab, aliases
+                        )
                     })
                     .collect::<Vec<_>>()
                     .join("\n    ")
@@ -260,7 +273,11 @@ mod tests {
 
     fn pending(raw: &str, base: &str) -> PendingModel {
         PendingModel {
-            raw_key: raw.split('/').next_back().unwrap_or(raw).to_ascii_lowercase(),
+            raw_key: raw
+                .split('/')
+                .next_back()
+                .unwrap_or(raw)
+                .to_ascii_lowercase(),
             raw_model: raw.to_string(),
             rule_base: base.to_string(),
         }

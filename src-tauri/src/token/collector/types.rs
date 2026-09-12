@@ -8,10 +8,22 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
+/// v27：Claude 子智能体归属改跟父项目首次目录，侧链 cwd 不再抢主会话；
+/// 旧缓存里子智能体可能落在子模块/临时目录，必须整体重扫。
+/// v26：工作区归组改为纯路径键拓扑，不再读 pom/.git/package.json；
+/// 项目目录删除后历史会话仍按原路径归并。旧缓存的工作区根不可比，必须整体重扫。
+/// v25：工作区归组收紧，且 `.code-workspace` 多根文件夹按公共父目录定位——
+/// 旧缓存里多根工作区可能落到工作区文件旁的错误目录，必须整体重扫。
+/// v24：项目键收紧——会话 cwd 无仓库/清单标记且位于临时/内部目录（/tmp、/var/folders、
+/// Windows Temp）、家目录本身，或末级目录名是会话 id / UUID / 默认工作区名时，
+/// 不再把 cwd 自身当项目键，统一归入「临时任务 / 独立会话」；
+/// 旧缓存里的临时路径键、UUID 目录键与新键不可比，必须整体重扫。
+/// v23：项目键改为最近项目根的绝对路径（不再取最外层标记目录的 basename），
+/// 旧缓存里的键是目录名，与新键不可比，必须整体重扫。
 /// v22：Codex input 口径实测修正——原生 OpenAI Responses 的 input_tokens 为总输入（含缓存命中），
 /// 需拆分全新输入，否则缓存命中率被腰斩、total 虚高；中转独立口径按事件自动判别。
 /// total 口径不变：total = 全新输入 + 缓存命中 + 输出；缓存写入与思考 token 独立。
-pub const CACHE_VERSION: i64 = 22;
+pub const CACHE_VERSION: i64 = 27;
 pub const CACHE_TTL: Duration = Duration::from_secs(5);
 pub const UNKNOWN_CODEX_MODEL: &str = "codex-unknown-model";
 pub const UNKNOWN_CLAUDE_MODEL: &str = "claude-unknown-model";
@@ -283,7 +295,14 @@ pub fn normalize_usage(raw: RawUsage) -> (i64, i64, i64, i64, i64, i64) {
         }
     };
     let total = fresh.saturating_add(read).saturating_add(raw.output.max(0));
-    (fresh, read, write, raw.output.max(0), raw.reasoning.max(0), total)
+    (
+        fresh,
+        read,
+        write,
+        raw.output.max(0),
+        raw.reasoning.max(0),
+        total,
+    )
 }
 
 /// 读取 OpenAI 式 `prompt_tokens_details.cached_tokens`（camelCase/snake_case 兼容）。
@@ -331,10 +350,7 @@ pub fn open_readonly_sqlite(path: &Path) -> Option<Connection> {
                     continue;
                 } else if is_locked {
                     // 最后一次重试仍然失败
-                    eprintln!(
-                        "[SQLite] 警告：数据库被锁定，跳过采集: {}",
-                        path.display()
-                    );
+                    eprintln!("[SQLite] 警告：数据库被锁定，跳过采集: {}", path.display());
                     eprintln!("[SQLite] 关闭正在使用该数据库的应用后重试");
                     return None;
                 } else {
@@ -365,6 +381,7 @@ pub fn token_session(
         session_hash: format!("openhub:{source}:{id}"),
         source: source.to_string(),
         project_key,
+        workspace_root: String::new(),
         model,
         started_at,
         ended_at,

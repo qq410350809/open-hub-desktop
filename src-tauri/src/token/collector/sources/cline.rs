@@ -154,20 +154,20 @@ pub fn parse_cline_file(source_name: &str, path: &Path) -> CachedFile {
                 // total = 全新输入 + 缓存命中 + 输出；缓存写入独立上报，不计入 total。
                 // 仅 totalTokens/tokens 可用时整体兜底（语义不明，标记估算）。
                 let is_fallback = in_tok + out_tok + cache_read == 0;
-                let (in_tok, cache_read, _cache_write, out_tok, _reasoning, total) =
-                    if !is_fallback {
-                        normalize_usage(RawUsage {
-                            input: in_tok,
-                            semantics: InputSemantics::Fresh,
-                            cache_read,
-                            cache_write,
-                            output: out_tok,
-                            ..Default::default()
-                        })
-                    } else {
-                        let fallback = number(usage, &["totalTokens", "tokens"]);
-                        (fallback, 0, 0, 0, 0, fallback)
-                    };
+                let (in_tok, cache_read, _cache_write, out_tok, _reasoning, total) = if !is_fallback
+                {
+                    normalize_usage(RawUsage {
+                        input: in_tok,
+                        semantics: InputSemantics::Fresh,
+                        cache_read,
+                        cache_write,
+                        output: out_tok,
+                        ..Default::default()
+                    })
+                } else {
+                    let fallback = number(usage, &["totalTokens", "tokens"]);
+                    (fallback, 0, 0, 0, 0, fallback)
+                };
 
                 if total > 0 || cost > 0.0 {
                     total_in += in_tok;

@@ -135,7 +135,8 @@ pub async fn request_insight(
 ) -> Result<RawInsightResponse, String> {
     let prompt = build_prompt(packet);
     let payload =
-        crate::model::gateway::handlers::chat::internal_chat_completion(ctx, model, &prompt).await?;
+        crate::model::gateway::handlers::chat::internal_chat_completion(ctx, model, &prompt)
+            .await?;
     let content = payload
         .pointer("/choices/0/message/content")
         .and_then(JsonValue::as_str)

@@ -6,6 +6,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
+mod dump;
+
 #[test]
 fn zcode_provider_filter_matches_vendor_segments_only() {
     assert!(zcode_provider_allowed("builtin:zai-start-plan"));
@@ -300,9 +302,14 @@ fn kiro_messages_estimate_visible_context_and_ignore_credit_summary() {
     let dir = temp_command_code_dir("kiro");
     let session_dir = dir.join("session-kiro");
     fs::create_dir_all(&session_dir).unwrap();
+    let project_dir = dir.join("project");
+    fs::create_dir_all(project_dir.join(".git")).unwrap();
     fs::write(
         session_dir.join("session.json"),
-        r#"{"id":"sess-kiro","workspacePaths":["/tmp/OpenHub"],"modelId":"auto"}"#,
+        format!(
+            r#"{{"id":"sess-kiro","workspacePaths":["{}"],"modelId":"auto"}}"#,
+            project_dir.display()
+        ),
     )
     .unwrap();
     let path = session_dir.join("messages.jsonl");
@@ -325,7 +332,10 @@ fn kiro_messages_estimate_visible_context_and_ignore_credit_summary() {
     assert_eq!(parsed.sessions.len(), 1);
     let session = &parsed.sessions[0];
     assert_eq!(session.source, "kiro");
-    assert_eq!(session.project_key, "OpenHub");
+    assert_eq!(
+        session.project_key,
+        project_dir.to_string_lossy().to_string()
+    );
     assert_eq!(session.model, "auto");
     assert_eq!(session.turns, 1);
     assert_eq!(parsed.events.len(), 2);
@@ -342,10 +352,12 @@ fn kiro_messages_estimate_visible_context_and_ignore_credit_summary() {
 #[test]
 fn kiro_v1_global_storage_session_is_parsed_on_legacy_macs() {
     let dir = temp_command_code_dir("kiro-v1");
+    let project_dir = dir.join("OpenHub");
+    fs::create_dir_all(project_dir.join(".git")).unwrap();
     let path = dir.join("sess-intel.json");
     fs::write(
-            &path,
-            r#"{
+        &path,
+        r#"{
                 "title":"Intel Mac session",
                 "sessionId":"sess-intel",
                 "workspaceDirectory":"/Users/test/Projects/OpenHub",
@@ -356,15 +368,22 @@ fn kiro_v1_global_storage_session_is_parsed_on_legacy_macs() {
                     {"timestamp":"2026-08-01T01:00:02.000Z","message":{"role":"assistant","content":[{"type":"text","text":"done"}]}},
                     {"timestamp":"2026-08-01T01:00:03.000Z","message":{"role":"system","content":"system context"}}
                 ]
-            }"#,
-        )
-        .unwrap();
+            }"#
+        .replace(
+            "/Users/test/Projects/OpenHub",
+            &project_dir.to_string_lossy(),
+        ),
+    )
+    .unwrap();
 
     let parsed = parse_kiro_legacy_file(&path);
     assert_eq!(parsed.sessions.len(), 1);
     let session = &parsed.sessions[0];
     assert_eq!(session.session_hash, "openhub:kiro:sess-intel");
-    assert_eq!(session.project_key, "OpenHub");
+    assert_eq!(
+        session.project_key,
+        project_dir.to_string_lossy().to_string()
+    );
     assert_eq!(session.model, "claude-sonnet");
     assert_eq!(session.turns, 1);
     assert!(session.total_tokens > 0);
@@ -463,6 +482,8 @@ fn command_code_v2_estimates_tokens_from_local_visible_context() {
 #[test]
 fn command_code_v3_reads_exact_usage_and_sidecar_model() {
     let dir = temp_command_code_dir("v3");
+    let project_dir = dir.join("project");
+    fs::create_dir_all(project_dir.join(".git")).unwrap();
     let path = dir.join("session-v3.jsonl");
     fs::write(
         command_code_meta_path(&path),
@@ -478,7 +499,8 @@ fn command_code_v3_reads_exact_usage_and_sidecar_model() {
                 "\n",
                 r#"{"type":"message","id":"assistant-1","parentId":"user-1","timestamp":"2026-08-12T01:02:00.000Z","message":{"role":"assistant","content":[{"type":"text","text":"hi"}]},"usage":{"inputTokens":100,"outputTokens":20,"cacheReadTokens":30,"cacheWriteTokens":5,"costUsd":0.25}}"#,
                 "\n"
-            ),
+            )
+            .replace("/tmp/OpenHub", &project_dir.to_string_lossy()),
         )
         .unwrap();
 
@@ -486,7 +508,10 @@ fn command_code_v3_reads_exact_usage_and_sidecar_model() {
     assert_eq!(parsed.sessions.len(), 1);
     let session = &parsed.sessions[0];
     assert_eq!(session.source, "command-code");
-    assert_eq!(session.project_key, "OpenHub");
+    assert_eq!(
+        session.project_key,
+        project_dir.to_string_lossy().to_string()
+    );
     assert_eq!(session.model, "deepseek/deepseek-v4-pro");
     assert_eq!(session.turns, 1);
     assert_eq!(session.tokens.input_tokens, 100);
@@ -626,6 +651,154 @@ fn claude_turns_attach_to_their_own_assistant_model() {
     assert_eq!(u2.model, "model-b");
     assert_eq!(u1.conversation_count, 1);
     assert_eq!(u2.conversation_count, 1);
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn session_project_is_fixed_by_first_cwd_even_if_later_lines_change_directory() {
+    let dir = std::env::temp_dir().join(format!("openhub-claude-cwd-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    // 首个 cwd 指向真实仓库；后续换到的目录无标记（若被采纳应归临时任务）。
+    let first_project = dir.join("first-project");
+    fs::create_dir_all(first_project.join(".git")).unwrap();
+    let path = dir.join("session.jsonl");
+    fs::write(
+            &path,
+            concat!(
+                r#"{"type":"user","uuid":"u1","cwd":"/tmp/first-project","timestamp":"2026-08-13T05:00:00.000Z","message":{"role":"user","content":"hello"}}"#,
+                "\n",
+                r#"{"type":"assistant","cwd":"/tmp/first-project","timestamp":"2026-08-13T05:00:01.000Z","message":{"model":"model-a","usage":{"input_tokens":10,"output_tokens":20}}}"#,
+                "\n",
+                r#"{"type":"user","uuid":"u2","cwd":"/tmp/other-project","timestamp":"2026-08-13T05:01:00.000Z","message":{"role":"user","content":"cd elsewhere"}}"#,
+                "\n",
+                r#"{"type":"assistant","cwd":"/tmp/other-project","timestamp":"2026-08-13T05:01:01.000Z","message":{"model":"model-a","usage":{"input_tokens":5,"output_tokens":5}}}"#,
+                "\n",
+            )
+            .replace("/tmp/first-project", &first_project.to_string_lossy()),
+        )
+        .unwrap();
+
+    let parsed = parse_claude_file(&path);
+    let first_key = first_project.to_string_lossy().to_string();
+    assert_eq!(parsed.sessions[0].project_key, first_key);
+    assert!(parsed
+        .events
+        .iter()
+        .all(|event| event.project_key == first_key));
+
+    // Codex：session_meta 之后的 turn_context 换目录同样不改归属。
+    let codex_path = dir.join("rollout-1.jsonl");
+    fs::write(
+            &codex_path,
+            concat!(
+                r#"{"type":"session_meta","timestamp":"2026-08-13T05:00:00.000Z","payload":{"id":"s1","cwd":"/tmp/first-project"}}"#,
+                "\n",
+                r#"{"type":"turn_context","timestamp":"2026-08-13T05:00:01.000Z","payload":{"cwd":"/tmp/other-project","model":"gpt-5"}}"#,
+                "\n",
+                r#"{"type":"event_msg","timestamp":"2026-08-13T05:00:02.000Z","payload":{"type":"user_message","client_id":"c1","message":"hi"}}"#,
+                "\n",
+                r#"{"type":"event_msg","timestamp":"2026-08-13T05:00:03.000Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15},"total_token_usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15}}}}"#,
+                "\n",
+            )
+            .replace("/tmp/first-project", &first_project.to_string_lossy()),
+        )
+        .unwrap();
+    let parsed = parse_codex_file(&codex_path);
+    assert_eq!(parsed.sessions[0].project_key, first_key);
+    assert!(!parsed.events.is_empty());
+    assert!(parsed
+        .events
+        .iter()
+        .all(|event| event.project_key == first_key));
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn claude_sidechain_cwd_does_not_steal_parent_first_directory() {
+    let dir = std::env::temp_dir().join(format!(
+        "openhub-claude-sidechain-cwd-{}",
+        std::process::id()
+    ));
+    let parent = dir.join("parent-repo");
+    let nested = parent.join("module");
+    fs::create_dir_all(parent.join(".git")).unwrap();
+    fs::create_dir_all(&nested).unwrap();
+    let path = dir.join("session.jsonl");
+    let parent_cwd = parent.to_string_lossy();
+    let nested_cwd = nested.to_string_lossy();
+    fs::write(
+        &path,
+        format!(
+            "{}\n{}\n{}\n",
+            format!(
+                r#"{{"type":"user","uuid":"side","isSidechain":true,"cwd":"{nested_cwd}","timestamp":"2026-08-13T05:00:00.000Z","message":{{"role":"user","content":"subagent prompt"}}}}"#
+            ),
+            format!(
+                r#"{{"type":"user","uuid":"u1","cwd":"{parent_cwd}","timestamp":"2026-08-13T05:00:01.000Z","message":{{"role":"user","content":"hello"}}}}"#
+            ),
+            format!(
+                r#"{{"type":"assistant","cwd":"{parent_cwd}","timestamp":"2026-08-13T05:00:02.000Z","message":{{"model":"model-a","usage":{{"input_tokens":10,"output_tokens":20}}}}}}"#
+            ),
+        ),
+    )
+    .unwrap();
+
+    let parsed = parse_claude_file(&path);
+    let parent_key = parent.to_string_lossy().to_string();
+    assert_eq!(parsed.sessions[0].project_key, parent_key);
+    assert!(parsed
+        .events
+        .iter()
+        .all(|event| event.project_key == parent_key));
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn claude_subagent_file_inherits_parent_project_directory() {
+    let dir = std::env::temp_dir().join(format!(
+        "openhub-claude-subagent-dir-{}",
+        std::process::id()
+    ));
+    let parent = dir.join("parent-repo");
+    let nested = parent.join("module");
+    fs::create_dir_all(parent.join(".git")).unwrap();
+    fs::create_dir_all(&nested).unwrap();
+    let encoded = format!(
+        "-{}",
+        parent
+            .to_string_lossy()
+            .trim_start_matches('/')
+            .replace('/', "-")
+    );
+    let path = dir
+        .join("projects")
+        .join(&encoded)
+        .join("subagents")
+        .join("agent.jsonl");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let nested_cwd = nested.to_string_lossy();
+    fs::write(
+        &path,
+        format!(
+            "{}\n{}\n",
+            format!(
+                r#"{{"type":"user","uuid":"u1","cwd":"{nested_cwd}","timestamp":"2026-08-13T05:00:00.000Z","message":{{"role":"user","content":"subagent work"}}}}"#
+            ),
+            format!(
+                r#"{{"type":"assistant","cwd":"{nested_cwd}","timestamp":"2026-08-13T05:00:01.000Z","message":{{"model":"model-a","usage":{{"input_tokens":3,"output_tokens":4}}}}}}"#
+            ),
+        ),
+    )
+    .unwrap();
+
+    let parsed = parse_claude_file(&path);
+    let parent_key = parent.to_string_lossy().to_string();
+    assert_eq!(parsed.sessions[0].project_key, parent_key);
+    assert!(parsed.sessions[0].session_hash.contains(":agent:"));
+    assert!(parsed
+        .events
+        .iter()
+        .all(|event| event.project_key == parent_key));
     let _ = fs::remove_dir_all(dir);
 }
 
@@ -810,31 +983,334 @@ fn copilot_delta_operation_log_replays_requests() {
 
 #[test]
 fn workspace_project_key_normalization_rules() {
+    // 目录布局：聚合父 pom 下多个独立仓库，仓库内还有子模块清单——
+    // 键必须落在仓库根（最近一层 .git）。工作区不再读 pom，单键查询为空。
+    let root = std::env::temp_dir().join(format!(
+        "openhub_project_key_test_{}",
+        std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let aggregate = root.join("shangzhou");
+    let repo_a = aggregate
+        .join("company-new")
+        .join("sza")
+        .join("sza-server-mall-parent");
+    let module_a = repo_a.join("sza-server-mall-boot");
+    let repo_b = aggregate.join("sz-v4").join("szc");
+    let standalone = root.join("ai").join("CLIProxyAPI");
+    let plain_dir = root.join("Downloads").join("books");
+    for dir in [&module_a, &repo_b, &standalone, &plain_dir] {
+        fs::create_dir_all(dir).unwrap();
+    }
+    fs::write(
+        aggregate.join("pom.xml"),
+        "<project><packaging>pom</packaging><modules><module>company-new</module><module>sz-v4</module></modules></project>",
+    )
+    .unwrap();
+    fs::write(
+        aggregate.join("company-new").join("pom.xml"),
+        "<project><packaging>pom</packaging><modules><module>sza</module></modules></project>",
+    )
+    .unwrap();
+    fs::write(repo_a.join("pom.xml"), "").unwrap();
+    fs::create_dir_all(repo_a.join(".git")).unwrap();
+    fs::write(module_a.join("pom.xml"), "").unwrap();
+    fs::write(repo_b.join("pom.xml"), "").unwrap();
+    fs::write(repo_b.join(".git"), "gitdir: elsewhere").unwrap();
+    fs::create_dir_all(standalone.join(".git")).unwrap();
+    fs::write(standalone.join("go.mod"), "").unwrap();
+    reset_project_roots_cache();
+
+    let key = |path: &Path| path.to_string_lossy().to_string();
+
+    // 子模块 cwd → 仓库根；同一聚合父目录下的另一个仓库拿到不同的键。
     assert_eq!(
-        normalize_workspace_project_key("00071cc1-b2c0-46d5-8053-828995d94944", "Codex"),
-        "临时任务 / 独立会话"
+        project_key_from_location(&key(&module_a)).unwrap(),
+        key(&repo_a)
     );
     assert_eq!(
-        normalize_workspace_project_key(
-            "file:///Users/wusuoming/Documents/IdeaProjects/sz-v4.code-workspace",
-            "CatPawAI"
+        project_key_from_location(&key(&repo_b)).unwrap(),
+        key(&repo_b)
+    );
+    assert_ne!(
+        project_key_from_location(&key(&module_a)),
+        project_key_from_location(&key(&repo_b))
+    );
+    // 单键看不到兄弟，工作区只在 assign_workspace_roots 里填。
+    assert_eq!(workspace_root_for_key(&key(&repo_a)), "");
+    assert_eq!(workspace_root_for_key(&key(&repo_b)), "");
+    // 没有外层聚合目录的仓库：没有工作区根。
+    assert_eq!(
+        project_key_from_location(&key(&standalone)).unwrap(),
+        key(&standalone)
+    );
+    assert_eq!(workspace_root_for_key(&key(&standalone)), "");
+    // 无任何标记的目录：不构成项目，归入临时任务，不再把 cwd 自身当键。
+    assert_eq!(
+        project_key_from_location(&key(&plain_dir)).unwrap(),
+        TRANSIENT_PROJECT_KEY
+    );
+    // 家目录本身、系统临时目录、UUID 存储目录、默认工作区名：一律不是项目。
+    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap();
+    assert_eq!(
+        project_key_from_location(&key(&home)).unwrap(),
+        TRANSIENT_PROJECT_KEY
+    );
+    assert_eq!(
+        project_key_from_location("/tmp").unwrap(),
+        TRANSIENT_PROJECT_KEY
+    );
+    assert_eq!(
+        project_key_from_location("/tmp/scratch").unwrap(),
+        TRANSIENT_PROJECT_KEY
+    );
+    let uuid_dir = root
+        .join("projects")
+        .join("00071cc1-b2c0-46d5-8053-828995d94944");
+    fs::create_dir_all(&uuid_dir).unwrap();
+    assert_eq!(
+        project_key_from_location(&key(&uuid_dir)).unwrap(),
+        TRANSIENT_PROJECT_KEY
+    );
+    let default_ws = root.join("workspace").join("default");
+    fs::create_dir_all(&default_ws).unwrap();
+    assert_eq!(
+        project_key_from_location(&key(&default_ws)).unwrap(),
+        TRANSIENT_PROJECT_KEY
+    );
+    // 临时目录下确有仓库标记时仍按项目处理（测试目录本身也建在系统临时目录下）。
+    let temp_repo = root.join("temp").join("realwork");
+    fs::create_dir_all(temp_repo.join(".git")).unwrap();
+    assert_eq!(
+        project_key_from_location(&key(&temp_repo)).unwrap(),
+        key(&temp_repo)
+    );
+    // file:// URI、尾部斜杠、.code-workspace 文件都归一到同一路径形态。
+    assert_eq!(
+        project_key_from_location(&format!("file://{}/", key(&repo_b))).unwrap(),
+        key(&repo_b)
+    );
+    assert_eq!(
+        project_key_from_location(&format!("{}.code-workspace", key(&repo_b))).unwrap(),
+        key(&repo_b)
+    );
+    // 非路径：会话 id 归临时任务，其他标签交给调用方兜底。
+    assert_eq!(
+        project_key_from_location("00071cc1-b2c0-46d5-8053-828995d94944").unwrap(),
+        TRANSIENT_PROJECT_KEY
+    );
+    assert_eq!(project_key_from_location("随手起的标题"), None);
+    assert_eq!(project_key_or_label("", "CatPawAI"), "CatPawAI");
+    assert_eq!(project_key_or_label("ai-agent", "CatPawAI"), "ai-agent");
+    assert!(!is_path_like_key("Copilot CLI"));
+    assert_eq!(workspace_root_for_key("Copilot CLI"), "");
+    // Claude 目录名反解：按文件系统消歧，落到仓库根。
+    let encoded = format!(
+        "-{}",
+        key(&module_a).trim_start_matches('/').replace('/', "-")
+    );
+    assert_eq!(
+        project_key_from_encoded_dir_name(&encoded, "Claude"),
+        key(&repo_a)
+    );
+    assert_eq!(
+        project_key_from_encoded_dir_name(
+            "-Users-wusuoming--copilot-chats-08b47634-e580-4133-b163-2ebefb43f8e3",
+            "Claude"
         ),
-        "sz-v4"
+        TRANSIENT_PROJECT_KEY
     );
+
+    let _ = fs::remove_dir_all(root);
+    reset_project_roots_cache();
+}
+
+#[test]
+fn workspace_assignment_does_not_overmerge_unrelated_repos() {
+    // 纯路径键，目录不必存在。shangzhou 有 company 与 spring-starter-parent 两个直接子键，
+    // 是收藏夹而不是工作区；sz-v4 不是键，sza/szc 按直接父目录合成。
+    let shangzhou = "/Users/nobody/gone/shangzhou".to_string();
+    let company = format!("{shangzhou}/company");
+    let company_szc = format!("{company}/szc");
+    let company_new = format!("{shangzhou}/company-new");
+    let company_new_sza = format!("{company_new}/sza");
+    let mall = format!("{company_new_sza}/sza-server-mall-parent");
+    let sz_v4 = format!("{shangzhou}/sz-v4");
+    let szc = format!("{sz_v4}/szc");
+    let sza = format!("{sz_v4}/sza");
+    let leftover = format!("{shangzhou}/spring-starter-parent");
+    let notes = "/Users/nobody/gone/notes".to_string();
+    let chapter = format!("{notes}/monitor");
+    let draft = format!("{chapter}/draft");
+    let toolbox = "/Users/nobody/gone/toolbox".to_string();
+    let app_a = format!("{toolbox}/OpenHub");
+    let app_b = format!("{toolbox}/LanProxy");
+
+    assert_eq!(workspace_root_for_key(&mall), "");
+    assert_eq!(workspace_root_for_key(&szc), "");
+    assert_eq!(workspace_root_for_key(&leftover), "");
+
+    let assigned = assign_workspace_roots(&[
+        mall.clone(),
+        company_new.clone(),
+        company_new_sza.clone(),
+        company.clone(),
+        company_szc.clone(),
+        szc.clone(),
+        sza.clone(),
+        leftover.clone(),
+        shangzhou.clone(),
+        notes.clone(),
+        chapter.clone(),
+        draft.clone(),
+        toolbox.clone(),
+        app_a.clone(),
+        app_b.clone(),
+    ]);
+    assert_eq!(assigned.get(&mall).unwrap(), &company_new);
+    assert_eq!(assigned.get(&company_new_sza).unwrap(), &company_new);
+    assert_eq!(assigned.get(&company_szc).unwrap(), &company);
+    assert_eq!(assigned.get(&szc).unwrap(), &sz_v4);
+    assert_eq!(assigned.get(&sza).unwrap(), &sz_v4);
+    assert_eq!(assigned.get(&leftover), None);
+    assert_eq!(assigned.get(&company), None);
+    assert_eq!(assigned.get(&chapter).unwrap(), &notes);
+    assert_eq!(assigned.get(&draft).unwrap(), &notes);
+    assert_eq!(assigned.get(&app_a), None);
+    assert_eq!(assigned.get(&app_b), None);
+}
+
+#[test]
+fn workspace_assignment_groups_deleted_project_paths() {
+    // 这些路径在磁盘上不存在：删掉项目后历史会话仍要按路径归并。
+    let root = "/Users/nobody/deleted-tree";
+    let shangzhou = format!("{root}/shangzhou");
+    let company = format!("{shangzhou}/company");
+    let company_szc = format!("{company}/szc");
+    let sza = format!("{shangzhou}/company-new/sza");
+    let mall = format!("{sza}/sza-server-mall-parent");
+    let sz_v4 = format!("{shangzhou}/sz-v4");
+    let sz_v4_sza = format!("{sz_v4}/sza");
+    let sz_v4_szc = format!("{sz_v4}/szc");
+    let staff = format!("{sz_v4_sza}/sza-server-staff-v4-parent");
+    let starter = format!("{shangzhou}/spring-starter-parent");
+    let ideas = format!("{root}/创意点子");
+    let monitor = format!("{ideas}/智能监控辅助系统");
+    let booklet = format!("{monitor}/落地方案分册");
+    let render = format!("{booklet}/_render");
+    let peihu = format!("{root}/peihu/code");
+    let peihu_parent = format!("{peihu}/mjl-server-peihu-parent");
+    let peihu_docs = format!("{peihu}/docs/requirements");
+    let custom = format!("{root}/apps/custom");
+    let openhub = format!("{custom}/OpenHub");
+    let lanproxy = format!("{custom}/LanProxy");
+    let manager = format!("{custom}/local-manager");
+    let books = format!("{root}/books");
+
+    for path in [
+        &mall,
+        &staff,
+        &booklet,
+        &peihu_docs,
+        &openhub,
+        &books,
+        &starter,
+    ] {
+        assert!(
+            !Path::new(path).exists(),
+            "fixture must not exist on disk: {path}"
+        );
+    }
+
+    let assigned = assign_workspace_roots(&[
+        shangzhou.clone(),
+        company.clone(),
+        company_szc.clone(),
+        sza.clone(),
+        mall.clone(),
+        sz_v4_sza.clone(),
+        sz_v4_szc.clone(),
+        staff.clone(),
+        starter.clone(),
+        ideas.clone(),
+        monitor.clone(),
+        booklet.clone(),
+        render.clone(),
+        peihu.clone(),
+        peihu_parent.clone(),
+        peihu_docs.clone(),
+        custom.clone(),
+        openhub.clone(),
+        lanproxy.clone(),
+        manager.clone(),
+        books.clone(),
+        "Copilot CLI".to_string(),
+    ]);
+
+    assert_eq!(assigned.get(&sz_v4_sza).unwrap(), &sz_v4);
+    assert_eq!(assigned.get(&sz_v4_szc).unwrap(), &sz_v4);
+    assert_eq!(assigned.get(&staff).unwrap(), &sz_v4);
+    assert_eq!(assigned.get(&mall).unwrap(), &sza);
+    assert_eq!(assigned.get(&sza), None);
+    assert_eq!(assigned.get(&company_szc).unwrap(), &company);
+    assert_eq!(assigned.get(&company), None);
+    assert_eq!(assigned.get(&starter), None);
+    assert_eq!(assigned.get(&monitor).unwrap(), &ideas);
+    assert_eq!(assigned.get(&booklet).unwrap(), &ideas);
+    assert_eq!(assigned.get(&render).unwrap(), &ideas);
+    assert_eq!(assigned.get(&peihu_parent).unwrap(), &peihu);
+    assert_eq!(assigned.get(&peihu_docs).unwrap(), &peihu);
+    assert_eq!(assigned.get(&openhub), None);
+    assert_eq!(assigned.get(&lanproxy), None);
+    assert_eq!(assigned.get(&manager), None);
+    assert_eq!(assigned.get(&books), None);
+    assert_eq!(assigned.get("Copilot CLI"), None);
+}
+
+#[test]
+fn code_workspace_multi_root_uses_common_parent() {
+    let root = std::env::temp_dir().join(format!(
+        "openhub_code_workspace_{}",
+        std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let shangzhou = root.join("shangzhou");
+    let sz_v4 = shangzhou.join("sz-v4");
+    let starter = shangzhou.join("spring-starter-parent");
+    let group = shangzhou.join("group").join("szf");
+    let ws_dir = starter.join("spring-boot-starter-logback");
+    fs::create_dir_all(&sz_v4).unwrap();
+    fs::create_dir_all(starter.join(".git")).unwrap();
+    fs::create_dir_all(&group).unwrap();
+    fs::create_dir_all(&ws_dir).unwrap();
+    fs::write(shangzhou.join("pom.xml"), "<project></project>").unwrap();
+    fs::create_dir_all(sz_v4.join(".git")).unwrap();
+    let ws_path = ws_dir.join("sz-v4.code-workspace");
+    fs::write(
+        &ws_path,
+        r#"{
+            "folders": [
+                { "path": "../../sz-v4" },
+                { "path": ".." },
+                { "path": "../../group/szf" }
+            ]
+        }"#,
+    )
+    .unwrap();
+    reset_project_roots_cache();
+
+    let key = |path: &Path| path.to_string_lossy().to_string();
     assert_eq!(
-        normalize_workspace_project_key("/Applications/custom/OpenHub/src-tauri", "OpenHub"),
-        "OpenHub"
+        project_key_from_location(&format!("file://{}", ws_path.display())).unwrap(),
+        key(&shangzhou)
     );
-    assert_eq!(
-        decode_encoded_dash_path("-Applications-custom-dsh-client"),
-        "dsh-client"
-    );
-    assert_eq!(
-        decode_encoded_dash_path(
-            "-Users-wusuoming--copilot-chats-08b47634-e580-4133-b163-2ebefb43f8e3"
-        ),
-        "临时任务 / 独立会话"
-    );
+
+    let _ = fs::remove_dir_all(root);
+    reset_project_roots_cache();
 }
 
 #[test]
@@ -897,13 +1373,15 @@ fn continue_parser_reads_tokens_and_messages() {
             .as_nanos()
     ));
     let _ = fs::create_dir_all(&dir);
+    let project_dir = dir.join("my-app");
+    fs::create_dir_all(project_dir.join(".git")).unwrap();
     let path = dir.join("session.json");
     fs::write(
         &path,
         json!({
             "sessionId": "cont-12345",
             "modelTitle": "gpt-4o",
-            "workspaceDirectory": "/Users/test/workspace/my-app",
+            "workspaceDirectory": project_dir.to_string_lossy(),
             "history": [
                 { "role": "user", "content": "Help me fix bug", "promptTokens": 120 },
                 { "role": "assistant", "content": "Fixed!", "completionTokens": 50 }
@@ -917,7 +1395,7 @@ fn continue_parser_reads_tokens_and_messages() {
     assert_eq!(parsed.sessions.len(), 1);
     let s = &parsed.sessions[0];
     assert_eq!(s.source, "continue");
-    assert_eq!(s.project_key, "my-app");
+    assert_eq!(s.project_key, project_dir.to_string_lossy().to_string());
     assert_eq!(s.tokens.input_tokens, 120);
     assert_eq!(s.tokens.output_tokens, 50);
     let _ = fs::remove_dir_all(dir);
@@ -1013,6 +1491,8 @@ fn catpawai_database_parser_extracts_sessions_and_normalized_events() {
             .as_nanos()
     ));
     let _ = fs::create_dir_all(&dir);
+    let project_dir = dir.join("ai-agent");
+    fs::create_dir_all(project_dir.join(".git")).unwrap();
     let db_path = dir.join("globalCache.sqlite");
     let conn = rusqlite::Connection::open(&db_path).unwrap();
     conn.execute_batch(
@@ -1050,7 +1530,7 @@ fn catpawai_database_parser_extracts_sessions_and_normalized_events() {
             "INSERT INTO t_conversations (conversation_id, workspace_id, title, create_time, update_time) VALUES (?1, ?2, ?3, ?4, ?5)",
             rusqlite::params![
                 "conv-agent",
-                "/Users/wusuoming/Documents/IdeaProjects/ai-agent",
+                project_dir.to_string_lossy(),
                 "代码逻辑分析与优化建议",
                 1_782_541_719_482i64,
                 1_783_384_584_742i64,
@@ -1093,7 +1573,10 @@ fn catpawai_database_parser_extracts_sessions_and_normalized_events() {
     let session = &parsed.sessions[0];
     assert_eq!(session.session_hash, "openhub:catpawai:conv-agent");
     assert_eq!(session.source, "catpawai");
-    assert_eq!(session.project_key, "ai-agent");
+    assert_eq!(
+        session.project_key,
+        project_dir.to_string_lossy().to_string()
+    );
     assert_eq!(session.model, "glm-5.2");
     assert_eq!(session.turns, 1);
     assert_eq!(session.tokens.input_tokens, 1134);
@@ -1359,7 +1842,10 @@ fn normalize_usage_covers_all_input_semantics() {
         output: 10,
         reasoning: 6,
     });
-    assert_eq!((fresh, read, write, out, reasoning, total), (100, 80, 30, 10, 6, 190));
+    assert_eq!(
+        (fresh, read, write, out, reasoning, total),
+        (100, 80, 30, 10, 6, 190)
+    );
 
     // InclusiveOfCacheRead：OpenAI 语义，prompt 含缓存命中，必须拆分避免双计
     let (fresh, read, _write, out, _r, total) = normalize_usage(RawUsage {
@@ -1502,21 +1988,18 @@ fn cursor_usage_keeps_input_plus_output_equal_total() {
 #[test]
 fn catpawai_normalize_uses_raw_total_to_avoid_double_count() {
     // 格式 2（网关独立式）：cacheReadTokens 独立上报，prompt 即全新输入。
-    let (fresh, cached, _w, out, _r, total) = normalize_catpawai_usage_numbers(
-        1134, 138, 1272, 10201, 0, 0, 0,
-    );
+    let (fresh, cached, _w, out, _r, total) =
+        normalize_catpawai_usage_numbers(1134, 138, 1272, 10201, 0, 0, 0);
     assert_eq!((fresh, cached, out, total), (1134, 10201, 138, 11473));
 
     // 格式 1（OpenAI 嵌入式）：cached_tokens 在 details 里，prompt 含缓存需扣减。
-    let (fresh, cached, _w, out, _r, total) = normalize_catpawai_usage_numbers(
-        5000, 800, 5800, 0, 0, 2000, 0,
-    );
+    let (fresh, cached, _w, out, _r, total) =
+        normalize_catpawai_usage_numbers(5000, 800, 5800, 0, 0, 2000, 0);
     assert_eq!((fresh, cached, out, total), (3000, 2000, 800, 5800));
 
     // 两缓存字段并存 + raw_total 证明缓存独立计入：prompt 维持全新输入，不双扣。
-    let (fresh, cached, _w, out, _r, total) = normalize_catpawai_usage_numbers(
-        1134, 138, 1134 + 10201 + 138, 10201, 0, 10201, 0,
-    );
+    let (fresh, cached, _w, out, _r, total) =
+        normalize_catpawai_usage_numbers(1134, 138, 1134 + 10201 + 138, 10201, 0, 10201, 0);
     assert_eq!((fresh, cached, out, total), (1134, 10201, 138, 11473));
 
     // 仅 total 可用：以总量扣缓存拆分。

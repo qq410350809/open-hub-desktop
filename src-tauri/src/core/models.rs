@@ -541,8 +541,12 @@ pub struct TokenSession {
     #[serde(alias = "session_hash")]
     pub(crate) session_hash: String,
     pub(crate) source: String,
+    /// 项目键：最近一层项目根的绝对路径，或来源标签（见 collector::normalizer）。
     #[serde(alias = "project_key")]
     pub(crate) project_key: String,
+    /// 工作区根：真正的聚合容器或路径归组后的父目录；无则为空串。由聚合层统一填充。
+    #[serde(alias = "workspace_root")]
+    pub(crate) workspace_root: String,
     pub(crate) model: String,
     #[serde(alias = "started_at")]
     pub(crate) started_at: String,
@@ -673,8 +677,12 @@ pub struct TokenUsageBucket {
     pub(crate) source: String,
     pub(crate) model: String,
     /// 可选项目维度；支持该维度的数据源会由 OpenHub 直接填充。
+    /// 本地采集为项目根绝对路径或来源标签；反代模式为渠道名。
     #[serde(alias = "project_key")]
     pub(crate) project_key: String,
+    /// 工作区根：真正的聚合容器或路径归组后的父目录；无则为空串。由聚合层统一填充，反代模式恒为空。
+    #[serde(alias = "workspace_root")]
+    pub(crate) workspace_root: String,
     pub(crate) timestamp: String,
     #[serde(alias = "total_tokens")]
     pub(crate) total_tokens: i64,
