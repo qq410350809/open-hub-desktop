@@ -4339,8 +4339,8 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
           </button>
         </div>
 
-        <div class="mp-modal-body">
-          <div class="mp-models-modal-toolbar">
+        <div class="mp-modal-body is-flush-top">
+          <div class="mp-models-modal-toolbar is-top-bar">
             <div class="mp-search-box flex-1">
               <span class="mp-search-icon" v-html="icons.search" />
               <input
@@ -4515,7 +4515,7 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
           </button>
         </div>
 
-        <div class="mp-modal-body">
+        <div class="mp-modal-body is-flush-top">
           <!-- 弹窗内部 Tab 切换（渠道未配置任何 Key 时不提供分组调度操作） -->
           <div v-if="channelRawKeys.length > 0" class="mp-inner-tab-nav">
             <button
@@ -4542,7 +4542,7 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
 
           <!-- 视图 1: 模型管理与重叠模型优先级 -->
           <template v-if="channelModalTab === 'models'">
-            <div class="mp-models-modal-toolbar">
+            <div class="mp-models-modal-toolbar is-top-bar">
               <div class="mp-search-box flex-1">
                 <span class="mp-search-icon" v-html="icons.search" />
                 <input
@@ -5454,9 +5454,9 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
           </button>
         </div>
 
-        <div class="mp-modal-body">
+        <div class="mp-modal-body is-flush-top">
           <!-- 模型搜索框 + 同步按钮 -->
-          <div class="mp-models-modal-toolbar">
+          <div class="mp-models-modal-toolbar is-top-bar">
             <div class="mp-search-box flex-1">
               <span class="mp-search-icon" v-html="icons.search" />
               <input
@@ -7888,11 +7888,33 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
   flex-shrink: 0;
 }
 
-/* 模型弹窗高级工具栏 */
+/* 模型弹窗高级工具栏：吸顶，长模型清单滚动时搜索框与同步按钮始终可达 */
 .mp-models-modal-toolbar {
   display: flex;
   align-items: center;
   gap: 12px;
+  position: sticky;
+  top: 0;
+  z-index: 3;
+  background: var(--surface);
+}
+
+/* 工具条通栏：仅横向反向抵消 body 内边距，纵向留白由自身 padding 提供 */
+.mp-models-modal-toolbar.is-top-bar {
+  margin: 0 -20px;
+  padding: 16px 20px 14px;
+  border-bottom: 1px solid var(--line);
+}
+
+/* 含吸顶工具条的弹窗：去掉 body 顶部内边距，让 sticky 的吸附位置（内容盒顶边）与内容区顶边重合。
+   否则工具条会吸附在 padding 之下，滚动内容从它上方露出一条 padding 高的内容，首张卡片也会被工具条压住 */
+.mp-modal-body.is-flush-top {
+  padding-top: 0;
+}
+
+/* 内层 Tab 条原先靠 body 顶部内边距留白，置零后需自行补回 */
+.mp-modal-body.is-flush-top > .mp-inner-tab-nav {
+  margin-top: 20px;
 }
 
 .mp-search-box {
