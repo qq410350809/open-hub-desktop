@@ -453,9 +453,7 @@ pub(crate) async fn chrome_bridge_fetch_keys_models(
             match silent {
                 Ok(Some(value)) => Ok(value),
                 Ok(None) => visible(),
-                Err(silent_error)
-                    if sync::is_blocking_chrome_automation_error(&silent_error) =>
-                {
+                Err(silent_error) if sync::is_blocking_chrome_automation_error(&silent_error) => {
                     Err(silent_error)
                 }
                 Err(_) => visible(),

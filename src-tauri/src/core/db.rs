@@ -924,6 +924,7 @@ pub(crate) fn ensure_model_proxy_logs_table(connection: &Connection) -> Result<(
                 response_body TEXT,
                 node_name TEXT,
                 client_name TEXT,
+                user_agent TEXT,
                 upstream_url TEXT,
                 session_id TEXT,
                 created_at INTEGER NOT NULL
@@ -944,6 +945,7 @@ pub(crate) fn ensure_model_proxy_logs_table(connection: &Connection) -> Result<(
     for column in [
         "node_name",
         "client_name",
+        "user_agent",
         "cache_creation_tokens",
         "upstream_url",
         "session_id",
@@ -1858,15 +1860,16 @@ pub(crate) fn ensure_charity_feed_sources_table(connection: &Connection) -> Resu
 fn initialize_token_official_models(connection: &Connection) -> Result<(), String> {
     // 清理旧版本从 model_catalog_models 导入的数据
     connection
-        .execute("DELETE FROM token_official_models WHERE source = 'catalog'", [])
+        .execute(
+            "DELETE FROM token_official_models WHERE source = 'catalog'",
+            [],
+        )
         .map_err(|error| error.to_string())?;
 
     let count: i64 = connection
-        .query_row(
-            "SELECT COUNT(*) FROM token_official_models",
-            [],
-            |row| row.get(0),
-        )
+        .query_row("SELECT COUNT(*) FROM token_official_models", [], |row| {
+            row.get(0)
+        })
         .unwrap_or(0);
 
     if count > 0 {

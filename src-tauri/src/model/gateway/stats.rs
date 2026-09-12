@@ -56,8 +56,8 @@ impl ModelProxyContext {
                         duration_ms, ttft_ms, prompt_tokens, prompt_cache_hit_tokens,
                         prompt_cache_miss_tokens, cache_creation_tokens, completion_tokens,
                         reasoning_tokens, total_tokens,
-                        error_message, request_body, response_body, node_name, client_name, upstream_url, session_id, created_at
-                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)",
+                        error_message, request_body, response_body, node_name, client_name, upstream_url, session_id, user_agent, created_at
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
                     params![
                         log.id,
                         log.timestamp,
@@ -83,6 +83,7 @@ impl ModelProxyContext {
                         log.client_name,
                         log.upstream_url,
                         log.session_id,
+                        log.user_agent,
                         now_millis,
                     ],
                 )?;

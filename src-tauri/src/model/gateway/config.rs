@@ -54,7 +54,8 @@ pub fn sanitize_channel_config(channel: &mut ChannelConfig) {
                     if g.name.is_empty() {
                         g.name = g.id.clone();
                     }
-                    if g.mode != KEY_GROUP_MODE_INDEPENDENT && g.mode != KEY_GROUP_MODE_ROUND_ROBIN {
+                    if g.mode != KEY_GROUP_MODE_INDEPENDENT && g.mode != KEY_GROUP_MODE_ROUND_ROBIN
+                    {
                         g.mode = default_key_group_mode();
                     }
                     Some(g)
@@ -558,7 +559,7 @@ mod config_tests {
             key_groups: None,
             key_rules: None,
             model_proxy_rules: Some(vec![ModelProxyRule {
-                    protocol: None,
+                protocol: None,
                 model: "m".into(),
                 mode: "invalid".into(),
                 node_id: None,

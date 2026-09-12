@@ -45,6 +45,8 @@ pub struct ProxyLogParams {
     pub channel_stats_id: Option<String>,
     /// 发起请求的客户端标识（User-Agent / 端点推断）
     pub client_name: Option<String>,
+    /// 客户端原始 User-Agent 请求头（截断保存）
+    pub user_agent: Option<String>,
     pub upstream_url: Option<String>,
     /// 客户端会话标识（x-session-id 等）
     pub session_id: Option<String>,
@@ -85,6 +87,7 @@ impl ProxyLogParams {
             node_name,
             channel_stats_id: None,
             client_name: None,
+            user_agent: None,
             upstream_url: None,
             session_id: None,
         }
@@ -105,6 +108,12 @@ impl ProxyLogParams {
         self
     }
 
+    pub fn with_user_agent(mut self, user_agent: Option<String>) -> Self {
+        self.user_agent = user_agent;
+        self
+    }
+
+    #[cfg(test)]
     pub fn with_session_id(mut self, session_id: Option<String>) -> Self {
         self.session_id = session_id;
         self
@@ -140,6 +149,7 @@ impl ProxyLogParams {
             node_name: self.node_name,
             channel_stats_id: self.channel_stats_id,
             client_name: self.client_name,
+            user_agent: self.user_agent,
             upstream_url: self.upstream_url,
             session_id: self.session_id,
         }
@@ -169,6 +179,13 @@ const USER_AGENT_SOURCE_PREFIXES: &[(&str, &str)] = &[
     ("zed", "zed"),
     ("catpawai", "catpawai"),
     ("antigravity", "antigravity"),
+    ("openclaw", "openclaw"),
+    // DeepSeek CLI（DSH）底层 harness 的 UA，无 dsh 字样
+    ("deepseek-harness", "dsh"),
+    // Command Code 的 UA 存在驼峰/连字符两种写法
+    ("commandcode", "command-code"),
+    ("command-code", "command-code"),
+    ("dsh", "dsh"),
 ];
 
 /// 从请求头 User-Agent 与端点路径推断客户端标识。
@@ -190,12 +207,25 @@ pub fn client_name_from_headers(headers: &axum::http::HeaderMap, path: &str) -> 
         return "sdk".to_string();
     }
     match path {
-        "/v1/messages" => "anthropic-api".to_string(),
-        "/v1/responses" => "responses-api".to_string(),
-        p if p.starts_with("/v1/gemini") => "gemini-api".to_string(),
-        p if p.starts_with("/v1/chat") => "openai-api".to_string(),
+        // 后缀匹配而非全等：路由还注册了无 /v1 前缀的别名
+        // （/messages、/responses、/chat/completions），同样按端点协议归档
+        p if p.ends_with("/messages") => "anthropic-api".to_string(),
+        p if p.ends_with("/responses") => "responses-api".to_string(),
+        // Gemini 原生入口有 /v1/gemini 与 /v1beta 两种前缀（模型名在路径里）
+        p if p.contains("/gemini") || p.starts_with("/v1beta") => "gemini-api".to_string(),
+        p if p.ends_with("/chat/completions") => "openai-api".to_string(),
         _ => "other".to_string(),
     }
+}
+
+/// 从请求头提取原始 User-Agent（截断到 256 字符防滥用）；空/缺失返回 None
+pub fn user_agent_from_headers(headers: &axum::http::HeaderMap) -> Option<String> {
+    headers
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(|v| v.chars().take(256).collect())
 }
 
 /// 从请求头提取客户端会话标识，供日志按会话聚合排查。
@@ -238,6 +268,7 @@ pub async fn record_auth_failure_log(
     dur: u64,
     req_body_str: Option<String>,
     client_name: Option<String>,
+    user_agent: Option<String>,
 ) {
     ctx.metrics.total_requests.fetch_add(1, Ordering::Relaxed);
     // 鉴权失败发生在渠道解析前，沿用既有惯例计入 opencode 通道（含其统计 ID）
@@ -265,7 +296,8 @@ pub async fn record_auth_failure_log(
             None,
         )
         .with_channel_stats_id(opencode_stats_id)
-        .with_client_name(client_name),
+        .with_client_name(client_name)
+        .with_user_agent(user_agent),
     )
     .await;
 }
@@ -305,6 +337,85 @@ mod logger_tests {
             assert_eq!(
                 client_name_from_headers(&ua(agent), "/v1/chat/completions"),
                 "openhub",
+                "User-Agent={agent}"
+            );
+        }
+    }
+
+    #[test]
+    fn failure_params_keep_session_id() {
+        let log = ProxyLogParams::new_failure(
+            "req-1".into(),
+            "/v1/chat/completions".into(),
+            "opencode".into(),
+            "gpt-4".into(),
+            false,
+            401,
+            12,
+            Some("unauthorized".into()),
+            None,
+            None,
+        )
+        .with_session_id(Some("sess_abc".into()))
+        .into_log();
+        assert_eq!(log.session_id.as_deref(), Some("sess_abc"));
+    }
+
+    #[test]
+    fn user_agent_header_captured_and_capped() {
+        assert_eq!(user_agent_from_headers(&axum::http::HeaderMap::new()), None);
+        assert_eq!(
+            user_agent_from_headers(&ua("  claude-cli/2.1.0 ")).as_deref(),
+            Some("claude-cli/2.1.0")
+        );
+        let long_ua = "a".repeat(400);
+        assert_eq!(
+            user_agent_from_headers(&ua(&long_ua))
+                .map(|v| v.chars().count())
+                .unwrap_or(0),
+            256
+        );
+    }
+
+    #[test]
+    fn endpoint_fallback_covers_alias_and_v1beta_paths() {
+        // 无 /v1 前缀的别名路径与 /v1beta Gemini 原生路径，兜底标签必须归到正确协议
+        assert_eq!(
+            client_name_from_headers(&axum::http::HeaderMap::new(), "/chat/completions"),
+            "openai-api"
+        );
+        assert_eq!(
+            client_name_from_headers(&axum::http::HeaderMap::new(), "/messages"),
+            "anthropic-api"
+        );
+        assert_eq!(
+            client_name_from_headers(
+                &axum::http::HeaderMap::new(),
+                "/v1beta/models/gemini-2.5-flash:generateContent"
+            ),
+            "gemini-api"
+        );
+        assert_eq!(
+            client_name_from_headers(
+                &axum::http::HeaderMap::new(),
+                "/v1/gemini/models/gemini-2.5-flash:streamGenerateContent"
+            ),
+            "gemini-api"
+        );
+    }
+
+    #[test]
+    fn locally_supported_clients_are_recognized() {
+        for (agent, expected) in [
+            ("deepseek-harness/0.1.5-rc.2 (+https://github.com/deepseek-ai/deepseek-harness)", "dsh"),
+            ("dsh/0.4.2", "dsh"),
+            ("CommandCode/1.0", "command-code"),
+            ("command-code/1.0", "command-code"),
+            ("openclaw/0.9", "openclaw"),
+        ] {
+            assert_eq!(
+                client_name_from_headers(&ua(agent), "/v1/chat/completions"),
+                expected,
                 "User-Agent={agent}"
             );
         }

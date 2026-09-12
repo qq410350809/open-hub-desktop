@@ -124,6 +124,7 @@ pub fn resolve_channel_detailed<'a>(
 }
 
 /// `resolve_channel_detailed` 的简化形态：仅成功解析时返回 Some。
+#[allow(dead_code)]
 pub fn resolve_channel<'a>(
     config: &'a ModelProxyConfig,
     raw_model: &str,
@@ -152,7 +153,11 @@ pub fn resolve_channel_candidates<'a>(
     let normalized = strip_openhub_provider_prefix(raw_model);
     // 带前缀 = 定向指派，不扩展后备渠道（与 resolve_channel 规则 1 对齐）
     if let Some((ch, rest)) = resolve_alias_designation(config, normalized) {
-        return if ch.enabled { vec![(ch, rest)] } else { Vec::new() };
+        return if ch.enabled {
+            vec![(ch, rest)]
+        } else {
+            Vec::new()
+        };
     }
 
     let stripped = strip_opencode_prefix(normalized);
@@ -533,8 +538,9 @@ pub async fn record_failover_event(
         node_name: Some(get_node_display_name(ctx, cand_id).await),
         cache_creation_tokens: None,
         client_name: None,
+        user_agent: None,
         upstream_url: None,
-                session_id: None,
+        session_id: None,
     })
     .await;
 }

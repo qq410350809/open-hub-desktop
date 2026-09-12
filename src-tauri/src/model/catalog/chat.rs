@@ -54,19 +54,51 @@ pub(crate) struct ChatStreamEvent {
 
 impl ChatStreamEvent {
     fn delta(content: Option<String>, reasoning: Option<String>) -> Self {
-        Self { kind: "delta".into(), content, reasoning, message: None, first_token_ms: None, total_ms: None, chars: None }
+        Self {
+            kind: "delta".into(),
+            content,
+            reasoning,
+            message: None,
+            first_token_ms: None,
+            total_ms: None,
+            chars: None,
+        }
     }
 
     fn done(first_token_ms: Option<u128>, total_ms: u128, chars: usize) -> Self {
-        Self { kind: "done".into(), content: None, reasoning: None, message: None, first_token_ms, total_ms: Some(total_ms), chars: Some(chars) }
+        Self {
+            kind: "done".into(),
+            content: None,
+            reasoning: None,
+            message: None,
+            first_token_ms,
+            total_ms: Some(total_ms),
+            chars: Some(chars),
+        }
     }
 
     fn error(message: String) -> Self {
-        Self { kind: "error".into(), content: None, reasoning: None, message: Some(message), first_token_ms: None, total_ms: None, chars: None }
+        Self {
+            kind: "error".into(),
+            content: None,
+            reasoning: None,
+            message: Some(message),
+            first_token_ms: None,
+            total_ms: None,
+            chars: None,
+        }
     }
 
     fn cancelled() -> Self {
-        Self { kind: "cancelled".into(), content: None, reasoning: None, message: Some("已中止".into()), first_token_ms: None, total_ms: None, chars: None }
+        Self {
+            kind: "cancelled".into(),
+            content: None,
+            reasoning: None,
+            message: Some("已中止".into()),
+            first_token_ms: None,
+            total_ms: None,
+            chars: None,
+        }
     }
 }
 
@@ -164,8 +196,7 @@ async fn run_chat_stream(
         }
         (Some("budget"), Some(budget)) => {
             // Anthropic 原生形状 + Qwen thinking_budget，聚合站会自行转换
-            payload["thinking"] =
-                serde_json::json!({ "type": "enabled", "budget_tokens": budget });
+            payload["thinking"] = serde_json::json!({ "type": "enabled", "budget_tokens": budget });
             payload["thinking_budget"] = serde_json::json!(budget);
         }
         (Some(level), _) if matches!(level, "low" | "medium" | "high" | "xhigh" | "max") => {
@@ -192,9 +223,7 @@ async fn run_chat_stream(
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
         let excerpt: String = body.chars().take(ERROR_BODY_CHARS).collect();
-        let _ = channel.send(ChatStreamEvent::error(format!(
-            "HTTP {status}：{excerpt}"
-        )));
+        let _ = channel.send(ChatStreamEvent::error(format!("HTTP {status}：{excerpt}")));
         return Ok(());
     }
 
@@ -210,7 +239,9 @@ async fn run_chat_stream(
             let _ = channel.send(ChatStreamEvent::cancelled());
             return Ok(());
         }
-        let Some(chunk) = stream.next().await else { break };
+        let Some(chunk) = stream.next().await else {
+            break;
+        };
         let chunk = match chunk {
             Ok(chunk) => chunk,
             Err(error) => {
@@ -219,7 +250,9 @@ async fn run_chat_stream(
             }
         };
         for line in reader.push(&chunk) {
-            let Some(rest) = line.strip_prefix("data:") else { continue };
+            let Some(rest) = line.strip_prefix("data:") else {
+                continue;
+            };
             let data = rest.strip_prefix(' ').unwrap_or(rest);
             if data == "[DONE]" {
                 flush_think_tail(&mut splitter, &channel, &mut chars);
@@ -258,7 +291,10 @@ async fn run_chat_stream(
                 .or_else(|| delta.get("reasoning"))
                 .and_then(|v| v.as_str())
                 .unwrap_or_default();
-            let content = delta.get("content").and_then(|v| v.as_str()).unwrap_or_default();
+            let content = delta
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
             if reasoning.is_empty() && content.is_empty() {
                 continue;
             }
@@ -429,7 +465,10 @@ mod tests {
 
     #[test]
     fn plain_content_passes_through() {
-        assert_eq!(feed_all(&["你好，", "世界！"]), (String::new(), "你好，世界！".into()));
+        assert_eq!(
+            feed_all(&["你好，", "世界！"]),
+            (String::new(), "你好，世界！".into())
+        );
     }
 
     #[test]

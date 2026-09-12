@@ -355,7 +355,7 @@ pub async fn get_model_proxy_logs(
                 duration_ms, ttft_ms, prompt_tokens, prompt_cache_hit_tokens,
                 prompt_cache_miss_tokens, cache_creation_tokens, completion_tokens,
                 reasoning_tokens, total_tokens,
-                error_message, request_body, response_body, node_name, client_name, upstream_url, session_id
+                error_message, request_body, response_body, node_name, client_name, upstream_url, session_id, user_agent
          FROM model_proxy_logs
          {where_sql}
          ORDER BY {sort_col} {sort_dir}, rowid DESC
@@ -404,6 +404,7 @@ pub async fn get_model_proxy_logs(
                 client_name: row.get(21)?,
                 upstream_url: row.get::<_, Option<String>>(22)?,
                 session_id: row.get(23)?,
+                user_agent: row.get(24)?,
             })
         })
         .map_err(|e| format!("解析日志失败: {e}"))?;
@@ -675,7 +676,9 @@ pub async fn sync_opencode_site_channels(
 async fn load_channel_models_from_db(
     db: &std::sync::Arc<crate::models::Database>,
 ) -> Result<Vec<ChannelModelList>, String> {
-    let conn = db.0.lock().map_err(|e| format!("获取数据库锁失败: {}", e))?;
+    let conn =
+        db.0.lock()
+            .map_err(|e| format!("获取数据库锁失败: {}", e))?;
     let mut stmt = conn
         .prepare("SELECT channel_id, channel_name, alias, models_json FROM channel_model_cache")
         .map_err(|e| format!("准备查询失败: {}", e))?;
@@ -694,8 +697,8 @@ async fn load_channel_models_from_db(
     for row in rows {
         let (channel_id, channel_name, alias, models_json) =
             row.map_err(|e| format!("读取行失败: {}", e))?;
-        let models: Vec<String> = serde_json::from_str(&models_json)
-            .map_err(|e| format!("解析模型JSON失败: {}", e))?;
+        let models: Vec<String> =
+            serde_json::from_str(&models_json).map_err(|e| format!("解析模型JSON失败: {}", e))?;
         result.push(ChannelModelList {
             channel_id,
             channel_name,
@@ -706,4 +709,3 @@ async fn load_channel_models_from_db(
 
     Ok(result)
 }
-

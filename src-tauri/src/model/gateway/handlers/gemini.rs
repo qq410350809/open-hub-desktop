@@ -5,7 +5,9 @@
 //! 非流式响应原样下发，仅旁路提取 usageMetadata 供日志统计。
 
 use super::super::egress::{self, TargetProtocol};
-use super::super::logger::{cap_log_body, client_name_from_headers, session_id_from_headers};
+use super::super::logger::{
+    cap_log_body, client_name_from_headers, session_id_from_headers, user_agent_from_headers,
+};
 use super::super::pipeline::{
     auth_and_count, dispatch_protocol_egress, resolve_channel_or_404, ClientProtocol,
 };
@@ -65,6 +67,8 @@ pub async fn handle_gemini_generate(
         return res;
     }
 
+    let client_name = client_name_from_headers(&headers, &log_path);
+    let user_agent = user_agent_from_headers(&headers);
     let (chan, model_to_send) = match resolve_channel_or_404(
         &ctx,
         &config,
@@ -75,6 +79,8 @@ pub async fn handle_gemini_generate(
         start_time,
         &req_body_str,
         ClientProtocol::Gemini,
+        Some(client_name.clone()),
+        user_agent.clone(),
     )
     .await
     {
@@ -107,6 +113,8 @@ pub async fn handle_gemini_generate(
         &req_body_str,
         egress_payload,
         ClientProtocol::Gemini,
+        Some(client_name.clone()),
+        user_agent.clone(),
     )
     .await
     {
@@ -115,7 +123,8 @@ pub async fn handle_gemini_generate(
     };
 
     let mut log = outcome.base_log(&log_path, raw_model, is_stream, req_body_str);
-    log.client_name = Some(client_name_from_headers(&headers, &log_path));
+    log.client_name = Some(client_name);
+    log.user_agent = user_agent;
     log.session_id = session_id_from_headers(&headers);
 
     if is_stream {

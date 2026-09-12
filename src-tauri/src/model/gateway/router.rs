@@ -249,52 +249,78 @@ pub async fn handle_models(
     }
 
     let channel_models = ctx.cached_channel_models.read().await.clone();
+    let model_items = build_gateway_model_list(&config, &channel_models);
+
+    Json(json!({
+        "object": "list",
+        "data": model_items
+    }))
+    .into_response()
+}
+
+fn strip_channel_alias_prefix<'a>(alias: &str, model: &'a str) -> &'a str {
+    let prefix = format!("{alias}/");
+    model.strip_prefix(&prefix).unwrap_or(model)
+}
+
+/// 对外暴露的模型 ID：始终带渠道别名前缀，且只带一次。
+pub(crate) fn listed_model_id(alias: &str, model: &str) -> String {
+    format!("{alias}/{}", strip_channel_alias_prefix(alias, model))
+}
+
+fn channel_allows_listed_model(allowed: Option<&Vec<String>>, alias: &str, model: &str) -> bool {
+    let Some(allowed) = allowed else {
+        return true;
+    };
+    let bare = strip_channel_alias_prefix(alias, model);
+    allowed
+        .iter()
+        .any(|item| strip_channel_alias_prefix(alias, item) == bare)
+}
+
+fn push_listed_model(items: &mut Vec<JsonValue>, alias: &str, model: &str) {
+    let id = listed_model_id(alias, model);
+    if items
+        .iter()
+        .any(|item| item.get("id").and_then(JsonValue::as_str) == Some(id.as_str()))
+    {
+        return;
+    }
+    let root = strip_channel_alias_prefix(alias, model);
+    items.push(json!({
+        "id": id,
+        "object": "model",
+        "created": 1700000000,
+        "owned_by": alias,
+        "permission": [],
+        "root": root,
+        "parent": null
+    }));
+}
+
+/// 组装 GET /v1/models 列表。OpenCode 渠道也只暴露 `opencode/{model}`，不再附带裸 ID。
+pub(crate) fn build_gateway_model_list(
+    config: &ModelProxyConfig,
+    channel_models: &[ChannelModelList],
+) -> Vec<JsonValue> {
     let mut model_items = Vec::new();
 
-    for entry in &channel_models {
+    for entry in channel_models {
         let channel = config.channels.iter().find(|c| c.id == entry.channel_id);
         if let Some(ch) = channel {
             if !ch.enabled {
                 continue;
             }
             let eff_alias = ch.effective_alias();
-            let allowed_models = ch.enabled_models.as_ref();
-
             for m in &entry.models {
-                if let Some(allowed) = allowed_models {
-                    if !allowed.contains(m) {
-                        continue;
-                    }
+                if !channel_allows_listed_model(ch.enabled_models.as_ref(), &eff_alias, m) {
+                    continue;
                 }
-
-                let full_id = format!("{eff_alias}/{m}");
-                model_items.push(json!({
-                    "id": full_id,
-                    "object": "model",
-                    "created": 1700000000,
-                    "owned_by": eff_alias,
-                    "permission": [],
-                    "root": m,
-                    "parent": null
-                }));
-
-                // 默认 opencode 渠道的模型额外注入无前缀的裸模型名
-                if ch.id == "opencode" {
-                    model_items.push(json!({
-                        "id": m,
-                        "object": "model",
-                        "created": 1700000000,
-                        "owned_by": "opencode",
-                        "permission": [],
-                        "root": m,
-                        "parent": null
-                    }));
-                }
+                push_listed_model(&mut model_items, &eff_alias, m);
             }
         }
     }
 
-    // 补充显式配置的 enabled_models（若尚未从上游拉取到）
     for ch in &config.channels {
         if !ch.enabled {
             continue;
@@ -302,72 +328,24 @@ pub async fn handle_models(
         let eff_alias = ch.effective_alias();
         if let Some(explicit_models) = &ch.enabled_models {
             for m in explicit_models {
-                let full_id = format!("{eff_alias}/{m}");
-                if !model_items
-                    .iter()
-                    .any(|item| item.get("id").and_then(JsonValue::as_str) == Some(&full_id))
-                {
-                    model_items.push(json!({
-                        "id": full_id,
-                        "object": "model",
-                        "created": 1700000000,
-                        "owned_by": eff_alias,
-                        "permission": [],
-                        "root": m,
-                        "parent": null
-                    }));
-                    if ch.id == "opencode" {
-                        model_items.push(json!({
-                            "id": m,
-                            "object": "model",
-                            "created": 1700000000,
-                            "owned_by": "opencode",
-                            "permission": [],
-                            "root": m,
-                            "parent": null
-                        }));
-                    }
-                }
+                push_listed_model(&mut model_items, &eff_alias, m);
             }
         }
     }
 
-    // 兜底保底模型：避免任何情况下返回空数组给客户端
     if model_items.is_empty() {
-        let defaults = [
+        for m in [
             "deepseek-v4-flash-free",
             "glm-4-flash-free",
             "qwen-2.5-coder-32b",
             "claude-3-7-sonnet",
             "gpt-4o",
-        ];
-        for m in defaults {
-            model_items.push(json!({
-                "id": format!("opencode/{m}"),
-                "object": "model",
-                "created": 1700000000,
-                "owned_by": "opencode",
-                "permission": [],
-                "root": m,
-                "parent": null
-            }));
-            model_items.push(json!({
-                "id": m,
-                "object": "model",
-                "created": 1700000000,
-                "owned_by": "opencode",
-                "permission": [],
-                "root": m,
-                "parent": null
-            }));
+        ] {
+            push_listed_model(&mut model_items, "opencode", m);
         }
     }
 
-    Json(json!({
-        "object": "list",
-        "data": model_items
-    }))
-    .into_response()
+    model_items
 }
 
 /// GET /v1/models/:model_id (单个模型查询)
@@ -429,7 +407,7 @@ pub async fn handle_gemini_models(
                     }
                 }
 
-                let full_id = format!("{eff_alias}/{m}");
+                let full_id = listed_model_id(&eff_alias, &m);
                 gemini_models.push(json!({
                     "name": format!("models/{full_id}"),
                     "version": "001",
@@ -707,7 +685,11 @@ async fn save_channel_models_to_db(
     channel_models: &[ChannelModelList],
 ) -> Result<(), String> {
     if let Some(app_ctx) = ctx.app_ctx.read().await.as_ref() {
-        let conn = app_ctx.database.0.lock().map_err(|e| format!("获取数据库锁失败: {}", e))?;
+        let conn = app_ctx
+            .database
+            .0
+            .lock()
+            .map_err(|e| format!("获取数据库锁失败: {}", e))?;
         for item in channel_models {
             let models_json = serde_json::to_string(&item.models).map_err(|e| e.to_string())?;
             conn.execute(
@@ -720,4 +702,3 @@ async fn save_channel_models_to_db(
         Err("应用上下文未初始化".to_string())
     }
 }
-

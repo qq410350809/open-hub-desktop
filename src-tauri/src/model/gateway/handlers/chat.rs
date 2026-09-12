@@ -4,7 +4,9 @@
 //! 响应侧嗅探上游实际协议后经 IR 回传 Chat。
 
 use super::super::egress;
-use super::super::logger::{cap_log_body, client_name_from_headers, session_id_from_headers};
+use super::super::logger::{
+    cap_log_body, client_name_from_headers, session_id_from_headers, user_agent_from_headers,
+};
 use super::super::pipeline::{
     auth_and_count, dispatch_protocol_egress, resolve_channel_or_404, ClientProtocol,
 };
@@ -140,6 +142,8 @@ async fn dispatch_chat_request(
         req_body_str,
     } = prep;
 
+    let client_name = client_name_from_headers(headers, CHAT_PATH);
+    let user_agent = user_agent_from_headers(headers);
     let (chan, model_to_send) = match resolve_channel_or_404(
         &ctx,
         &config,
@@ -150,6 +154,8 @@ async fn dispatch_chat_request(
         start_time,
         &req_body_str,
         ClientProtocol::OpenAi,
+        Some(client_name.clone()),
+        user_agent.clone(),
     )
     .await
     {
@@ -175,6 +181,8 @@ async fn dispatch_chat_request(
         &req_body_str,
         egress_payload,
         ClientProtocol::OpenAi,
+        Some(client_name.clone()),
+        user_agent.clone(),
     )
     .await
     {
@@ -183,7 +191,8 @@ async fn dispatch_chat_request(
     };
 
     let mut log = outcome.base_log(CHAT_PATH, &raw_model, is_stream, req_body_str);
-    log.client_name = Some(client_name_from_headers(headers, CHAT_PATH));
+    log.client_name = Some(client_name);
+    log.user_agent = user_agent;
     log.session_id = session_id_from_headers(headers);
 
     if is_stream {

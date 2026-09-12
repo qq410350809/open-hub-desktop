@@ -8,20 +8,25 @@ use super::balancer::{
     load_channel_all_keys_info, resolve_channel_candidates, resolve_channel_detailed,
     resolve_channel_key_groups_for_model, ChannelResolution, ResolvedKeyGroup,
 };
-use super::dispatcher::{execute_resilient_egress, EgressRequestMeta, EgressSuccess};
+use super::dispatcher::{
+    execute_resilient_egress, parse_retry_after_value, rate_limit_backoff_ms, EgressRequestMeta,
+    EgressSuccess,
+};
 use super::egress::{self, TargetProtocol};
-use super::logger::{client_name_from_headers, record_attempt_failure, ProxyLogParams};
+use super::logger::{
+    client_name_from_headers, record_attempt_failure, user_agent_from_headers, ProxyLogParams,
+};
 use super::policies::opencode::check_model_channel_compatibility;
 use super::router::check_auth;
 use super::types::{
     current_timestamp, ChannelConfig, ModelProxyConfig, ModelProxyContext, ProxyRequestLog,
 };
-use axum::http::StatusCode;
+use axum::http::{header::RETRY_AFTER, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// 单个分组在单个请求内最多顺延尝试的 Key 数量上限。
 /// 组内会逐个 Key 故障转移，若组内有大量失效 Key，叠加上游超时会把单请求拖得过长。
@@ -83,6 +88,8 @@ pub fn build_key_attempt_queue(
 ///
 /// 只有「与这把 Key 本身相关」的失败才换 Key：鉴权/配额/限流（401/402/403/429）、
 /// 上游或网络故障（5xx、连接失败合成的 502）、超时（408）。
+/// 429 先顺延同组其他 Key，再试本渠道其余外放该模型的 Key；被限流的 Key 进入冷却，
+/// 后续请求跳过它，避免同一把 Key 被客户端连打。
 /// 400/404/413/422 这类由请求内容决定的错误换 Key 结果不会变，
 /// 逐 Key 重放只会白烧配额、拖长响应，应立即返回。
 pub fn should_failover_to_next_key(status: StatusCode) -> bool {
@@ -95,6 +102,30 @@ pub fn should_failover_to_next_key(status: StatusCode) -> bool {
                 | StatusCode::REQUEST_TIMEOUT
                 | StatusCode::TOO_MANY_REQUESTS
         )
+}
+
+fn attach_retry_after(resp: &mut Response, wait_ms: u64) {
+    let secs = wait_ms.div_ceil(1000).max(1);
+    if let Ok(value) = HeaderValue::from_str(&secs.to_string()) {
+        resp.headers_mut().insert(RETRY_AFTER, value);
+    }
+}
+
+fn retry_after_ms_from_response(resp: &Response) -> Option<u64> {
+    parse_retry_after_value(resp.headers().get("retry-after")?.to_str().ok()?)
+}
+
+fn rate_limited_cooldown_response(style: ClientProtocol, remaining: Duration) -> Response {
+    let wait_ms = remaining.as_millis() as u64;
+    let secs = wait_ms.div_ceil(1000).max(1);
+    let mut resp = gateway_error_response(
+        style,
+        StatusCode::TOO_MANY_REQUESTS,
+        "RATE_LIMITED",
+        format!("上游频次受限，冷却中，请 {secs} 秒后再试"),
+    );
+    attach_retry_after(&mut resp, wait_ms);
+    resp
 }
 
 /// 逐候选累积错误响应，最终挑给客户端看的那一个：优先第一个非 401 的错误。
@@ -131,6 +162,7 @@ pub enum ClientProtocol {
 }
 
 /// 未找到可用渠道时，按客户端协议返回对应格式的 404 响应体
+#[allow(dead_code)]
 pub fn model_not_found_response(raw_model: &str, style: ClientProtocol) -> Response {
     model_not_found_response_with_message(
         format!("No available channel for model '{raw_model}'"),
@@ -288,16 +320,19 @@ pub async fn resolve_channel_or_404<'a>(
     start_time: Instant,
     req_body_str: &Option<String>,
     style: ClientProtocol,
+    client_name: Option<String>,
+    user_agent: Option<String>,
 ) -> Result<(&'a ChannelConfig, String), Response> {
     // (日志归属渠道别名, 统计 ID, 错误信息)
     let (log_channel, log_stats_id, err_msg) = match resolve_channel_detailed(config, raw_model) {
         ChannelResolution::Resolved(ch, model) => return Ok((ch, model)),
-        ChannelResolution::Disabled(ch, _) => (
+        ChannelResolution::Disabled(ch, bare) => (
             ch.effective_alias(),
             ch.stats_id.map(|v| v.to_string()),
             format!(
-                "模型 '{raw_model}' 指定的渠道「{}」已禁用，定向请求不会转发到其他渠道",
-                ch.effective_alias()
+                "渠道「{}」已禁用，模型 '{}' 的定向请求不会转发到其他渠道",
+                ch.effective_alias(),
+                bare
             ),
         ),
         ChannelResolution::NotFound => (
@@ -327,7 +362,9 @@ pub async fn resolve_channel_or_404<'a>(
             req_body_str.clone(),
             None,
         )
-        .with_channel_stats_id(log_stats_id),
+        .with_channel_stats_id(log_stats_id)
+        .with_client_name(client_name)
+        .with_user_agent(user_agent),
     )
     .await;
     Err(model_not_found_response_with_message(err_msg, style))
@@ -346,6 +383,8 @@ pub async fn validate_model_channel_request(
     is_stream: bool,
     start_time: Instant,
     req_body_str: &Option<String>,
+    client_name: Option<String>,
+    user_agent: Option<String>,
 ) -> Result<(), Response> {
     if let Err(err_msg) = check_model_channel_compatibility(channel, model_to_send, channel_api_key)
     {
@@ -364,7 +403,9 @@ pub async fn validate_model_channel_request(
                 req_body_str.clone(),
                 None,
             )
-            .with_channel_stats_id(channel.stats_id.map(|v| v.to_string())),
+            .with_channel_stats_id(channel.stats_id.map(|v| v.to_string()))
+            .with_client_name(client_name)
+            .with_user_agent(user_agent),
         )
         .await;
         return Err(incompatible_model_response(err_msg, style));
@@ -417,6 +458,7 @@ impl EgressOutcome {
             upstream_url: Some(self.success.upstream_url.clone()),
             session_id: None,
             client_name: None,
+            user_agent: None,
         }
     }
 }
@@ -440,6 +482,8 @@ async fn dispatch_single_channel_egress(
     req_body_str: &Option<String>,
     egress_payload: egress::EgressBody,
     style: ClientProtocol,
+    client_name: Option<String>,
+    user_agent: Option<String>,
 ) -> Result<EgressOutcome, Response> {
     let chan_alias = channel.effective_alias();
     let chan_stats_id = channel.stats_id;
@@ -477,7 +521,9 @@ async fn dispatch_single_channel_egress(
                     req_body_str.clone(),
                     None,
                 )
-                .with_channel_stats_id(chan_stats_id.map(|v| v.to_string())),
+                .with_channel_stats_id(chan_stats_id.map(|v| v.to_string()))
+                .with_client_name(client_name.clone())
+                .with_user_agent(user_agent.clone()),
             )
             .await;
             return Err(incompatible_model_response(err_msg, style));
@@ -509,10 +555,37 @@ async fn dispatch_single_channel_egress(
     // 出网协议：模型级覆盖优先（响应回转嗅探也按该协议归一）
     let target = channel.target_protocol_for(model_to_send);
     let mut errors = ErrorTrail::default();
+    let candidate_keys: Vec<String> = attempts.iter().map(|a| a.key.clone()).collect();
+    if let Some(remaining) = ctx
+        .rate_limit_all_cooling(&channel.id, model_to_send, &candidate_keys)
+        .await
+    {
+        tracing::warn!(
+            "[ModelGateway] 渠道「{}」模型「{}」的候选 Key 均在 429 冷却（剩余 {}ms），本次不请求上游",
+            chan_alias,
+            model_to_send,
+            remaining.as_millis()
+        );
+        return Err(rate_limited_cooldown_response(style, remaining));
+    }
 
     // 顺序遍历尝试队列：同组顺延 → 下一组，均已在建队时铺平
     for (attempt_idx, attempt) in attempts.iter().enumerate() {
         let selected_key = &attempt.key;
+
+        if let Some(remaining) = ctx
+            .rate_limit_remaining(&channel.id, model_to_send, selected_key)
+            .await
+        {
+            tracing::warn!(
+                "[ModelGateway] 渠道「{}」分组「{}」模型「{}」当前 Key 仍在 429 冷却（剩余 {}ms），跳过",
+                chan_alias,
+                attempt.group_label,
+                model_to_send,
+                remaining.as_millis()
+            );
+            continue;
+        }
 
         if let Err(err_resp) = validate_model_channel_request(
             ctx,
@@ -526,6 +599,8 @@ async fn dispatch_single_channel_egress(
             is_stream,
             start_time,
             req_body_str,
+            client_name.clone(),
+            user_agent.clone(),
         )
         .await
         {
@@ -556,6 +631,8 @@ async fn dispatch_single_channel_egress(
             rule_model: model_to_send.to_string(),
             stream: is_stream,
             req_body_str: req_body_str.clone(),
+            client_name: client_name.clone(),
+            user_agent: user_agent.clone(),
         };
 
         match execute_resilient_egress(
@@ -571,6 +648,8 @@ async fn dispatch_single_channel_egress(
         .await
         {
             Ok(success) => {
+                ctx.clear_rate_limit(&channel.id, model_to_send, selected_key)
+                    .await;
                 return Ok(EgressOutcome {
                     success,
                     chan_alias,
@@ -581,6 +660,25 @@ async fn dispatch_single_channel_egress(
             }
             Err(err_resp) => {
                 let status = err_resp.status();
+                let mut err_resp = err_resp;
+                if status == StatusCode::TOO_MANY_REQUESTS {
+                    let retry_after_ms = retry_after_ms_from_response(&err_resp);
+                    let consecutive = ctx
+                        .rate_limit_consecutive(&channel.id, model_to_send, selected_key)
+                        .await
+                        .saturating_add(1);
+                    let backoff_ms = rate_limit_backoff_ms(consecutive, retry_after_ms);
+                    ctx.mark_rate_limited(&channel.id, model_to_send, selected_key, backoff_ms)
+                        .await;
+                    attach_retry_after(&mut err_resp, backoff_ms);
+                    tracing::warn!(
+                        "[ModelGateway] 渠道「{}」分组「{}」模型「{}」当前 Key 返回 429，冷却 {}ms 后顺延下一把",
+                        chan_alias,
+                        attempt.group_label,
+                        model_to_send,
+                        backoff_ms
+                    );
+                }
                 // 与请求内容相关的确定性错误（400/404/413/422…）换 Key 也不会变，
                 // 立即返回，不再逐 Key / 逐组重放
                 if !should_failover_to_next_key(status) {
@@ -610,15 +708,23 @@ async fn dispatch_single_channel_egress(
         }
     }
 
-    // 所有分组均尝试失败：返回最能说明失败原因的那次错误响应（或兜底 502）
-    Err(errors.finish().unwrap_or_else(|| {
-        gateway_error_response(
-            style,
-            StatusCode::BAD_GATEWAY,
-            "UPSTREAM_UNAVAILABLE",
-            format!("渠道「{chan_alias}」的所有可用 Key 与分组均请求失败"),
-        )
-    }))
+    // 所有分组均尝试失败：返回最能说明失败原因的那次错误响应。
+    // 若一把都没出网（候选 Key 全在冷却中被跳过），回 429 而不是 502。
+    if let Some(resp) = errors.finish() {
+        return Err(resp);
+    }
+    if let Some(remaining) = ctx
+        .rate_limit_all_cooling(&channel.id, model_to_send, &candidate_keys)
+        .await
+    {
+        return Err(rate_limited_cooldown_response(style, remaining));
+    }
+    Err(gateway_error_response(
+        style,
+        StatusCode::BAD_GATEWAY,
+        "UPSTREAM_UNAVAILABLE",
+        format!("渠道「{chan_alias}」的所有可用 Key 与分组均请求失败"),
+    ))
 }
 
 /// 跨渠道故障转移上限：单个请求最多尝试的渠道数。
@@ -646,6 +752,8 @@ pub async fn dispatch_protocol_egress(
     req_body_str: &Option<String>,
     egress_payload: egress::EgressBody,
     style: ClientProtocol,
+    client_name: Option<String>,
+    user_agent: Option<String>,
 ) -> Result<EgressOutcome, Response> {
     // 候选列表：定向请求最多只有被指派的渠道自身，裸模型名才可能有后备渠道
     let fallbacks: Vec<&ChannelConfig> = if config.channel_failover {
@@ -685,6 +793,8 @@ pub async fn dispatch_protocol_egress(
             req_body_str,
             egress_payload.clone(),
             style,
+            client_name.clone(),
+            user_agent.clone(),
         )
         .await
         {
@@ -752,6 +862,7 @@ pub async fn auth_and_count(
             start_time.elapsed().as_millis() as u64,
             req_body_str.clone(),
             Some(client_name_from_headers(headers, path)),
+            user_agent_from_headers(headers),
         )
         .await;
         return Err(res);
@@ -900,7 +1011,7 @@ mod pipeline_tests {
         for s in [400u16, 404, 413, 415, 422] {
             assert!(
                 !should_failover_to_next_key(StatusCode::from_u16(s).unwrap()),
-                "{s} 属请求侧错误，不应换 Key"
+                "{s} 不应换 Key"
             );
         }
     }

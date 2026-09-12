@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
 use std::sync::Arc;
 use std::sync::Arc as StdArc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
 /// 模型网关默认端口：与内嵌 Web 服务同端口，dev 隔离形态走 17996。
@@ -218,7 +218,10 @@ impl ChannelConfig {
     }
 
     /// 出网目标协议：模型级规则覆盖优先，未覆盖或值非法时回退渠道级 protocol。
-    pub fn target_protocol_for(&self, model: &str) -> crate::model::gateway::egress::TargetProtocol {
+    pub fn target_protocol_for(
+        &self,
+        model: &str,
+    ) -> crate::model::gateway::egress::TargetProtocol {
         if let Some(rule) = self.model_proxy_rule(model) {
             if let Some(protocol) = rule.protocol.as_deref().map(str::trim) {
                 if !protocol.is_empty() {
@@ -384,6 +387,9 @@ pub struct ProxyRequestLog {
     pub node_name: Option<String>,
     /// 发起请求的客户端标识（由 User-Agent / 端点推断，如 claude / codex / cursor）
     pub client_name: Option<String>,
+    /// 客户端原始 User-Agent 请求头（截断保存）：识别依据的原始证据
+    #[serde(default)]
+    pub user_agent: Option<String>,
     /// 出网上游地址（完整 URL，含 path），用于日志展示「入->出」双地址
     pub upstream_url: Option<String>,
     /// 客户端会话标识：从 x-session-id / 会话请求头提取，用于按会话聚合排查
@@ -571,6 +577,17 @@ pub struct ModelProxyContext {
     pub node_round_robin: Arc<RwLock<HashMap<String, Arc<AtomicUsize>>>>,
     /// 上次执行明细保留期清理的时刻（epoch 毫秒），用于节流避免每次写入全表扫描
     pub log_retention_last_run: Arc<std::sync::atomic::AtomicU64>,
+    /// 渠道 + 模型 + Key 的 429 冷却：被限流的 Key 暂时跳过，同组/同渠道其他
+    /// 仍外放该模型的 Key 继续试；全部在冷却中才不再打上游。
+    pub rate_limit_cooldowns: Arc<RwLock<HashMap<String, RateLimitCooldown>>>,
+}
+
+/// 单把 Key 在某个模型上的 429 冷却。`until` 到期后允许再试，但 `consecutive`
+/// 保留到该 Key 一次成功为止，连续撞墙会拉长下一次等待。
+#[derive(Clone, Debug)]
+pub struct RateLimitCooldown {
+    pub until: Instant,
+    pub consecutive: u32,
 }
 
 impl ModelProxyContext {
@@ -586,6 +603,97 @@ impl ModelProxyContext {
             .entry(key)
             .or_insert_with(|| Arc::new(AtomicUsize::new(0)))
             .clone()
+    }
+
+    fn rate_limit_key(channel_id: &str, model: &str, api_key: &str) -> String {
+        format!("{channel_id}\u{0}{model}\u{0}{api_key}")
+    }
+
+    /// 这把 Key 在该模型上是否仍在 429 冷却中。到期后返回 `None`，连续失败计数仍保留。
+    pub async fn rate_limit_remaining(
+        &self,
+        channel_id: &str,
+        model: &str,
+        api_key: &str,
+    ) -> Option<Duration> {
+        let key = Self::rate_limit_key(channel_id, model, api_key);
+        let guard = self.rate_limit_cooldowns.read().await;
+        let until = guard.get(&key)?.until;
+        let remaining = until.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            None
+        } else {
+            Some(remaining)
+        }
+    }
+
+    /// 候选 Key 是否全部处于冷却。是则返回其中最早解禁的剩余时间，否则 `None`。
+    pub async fn rate_limit_all_cooling(
+        &self,
+        channel_id: &str,
+        model: &str,
+        api_keys: &[String],
+    ) -> Option<Duration> {
+        if api_keys.is_empty() {
+            return self.rate_limit_remaining(channel_id, model, "").await;
+        }
+        let mut soonest: Option<Duration> = None;
+        for api_key in api_keys {
+            match self.rate_limit_remaining(channel_id, model, api_key).await {
+                Some(duration) => {
+                    soonest = Some(match soonest {
+                        Some(current) => current.min(duration),
+                        None => duration,
+                    });
+                }
+                None => return None,
+            }
+        }
+        soonest
+    }
+
+    pub async fn rate_limit_consecutive(
+        &self,
+        channel_id: &str,
+        model: &str,
+        api_key: &str,
+    ) -> u32 {
+        let key = Self::rate_limit_key(channel_id, model, api_key);
+        self.rate_limit_cooldowns
+            .read()
+            .await
+            .get(&key)
+            .map(|entry| entry.consecutive)
+            .unwrap_or(0)
+    }
+
+    /// 记录这把 Key 的一次 429：拉长冷却并把连续失败计数 +1。
+    pub async fn mark_rate_limited(
+        &self,
+        channel_id: &str,
+        model: &str,
+        api_key: &str,
+        backoff_ms: u64,
+    ) -> u32 {
+        let key = Self::rate_limit_key(channel_id, model, api_key);
+        let mut guard = self.rate_limit_cooldowns.write().await;
+        let consecutive = guard
+            .get(&key)
+            .map(|entry| entry.consecutive.saturating_add(1))
+            .unwrap_or(1);
+        guard.insert(
+            key,
+            RateLimitCooldown {
+                until: Instant::now() + Duration::from_millis(backoff_ms),
+                consecutive,
+            },
+        );
+        consecutive
+    }
+
+    pub async fn clear_rate_limit(&self, channel_id: &str, model: &str, api_key: &str) {
+        let key = Self::rate_limit_key(channel_id, model, api_key);
+        self.rate_limit_cooldowns.write().await.remove(&key);
     }
 
     /// 取指定渠道的出口节点轮询游标（不存在则惰性创建）。

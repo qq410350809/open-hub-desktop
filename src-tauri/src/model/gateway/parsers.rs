@@ -2709,7 +2709,10 @@ mod parser_tests {
         assert_eq!(chat["temperature"], 0.3);
         // max_tokens 刻意不透传：兼容站按模型各自上限校验（grok-4.6 实测 65536），
         // 客户端侧大值会直接 400；缺省交由上游按模型默认收口
-        assert!(chat.get("max_tokens").is_none(), "max_tokens 必须剥离: {chat}");
+        assert!(
+            chat.get("max_tokens").is_none(),
+            "max_tokens 必须剥离: {chat}"
+        );
     }
 
     #[test]

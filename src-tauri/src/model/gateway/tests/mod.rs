@@ -123,6 +123,7 @@ fn resolves_channels_with_alias_prefix_or_model_whitelist() {
         next_channel_stats_id: 101,
         log_retention_days: None,
         model_channel_order: None,
+        channel_failover: false,
     };
 
     // 1. 显式别名前缀
@@ -566,9 +567,16 @@ fn key_group_mode_migration_rewrites_round_robin_once() {
 
     // 首次加载：存量轮询迁移为独立，并落下一次性标记
     let cfg = load_model_proxy_config(&conn);
-    let channel = cfg.channels.iter().find(|c| c.id == "site_x").expect("渠道保留");
+    let channel = cfg
+        .channels
+        .iter()
+        .find(|c| c.id == "site_x")
+        .expect("渠道保留");
     let groups = channel.key_groups.as_ref().expect("分组保留");
-    assert_eq!(groups[0].mode, KEY_GROUP_MODE_INDEPENDENT, "存量 round_robin 迁移为 independent");
+    assert_eq!(
+        groups[0].mode, KEY_GROUP_MODE_INDEPENDENT,
+        "存量 round_robin 迁移为 independent"
+    );
     assert_eq!(groups[1].mode, KEY_GROUP_MODE_INDEPENDENT);
     assert!(!read_meta_conn(&conn, "keyGroupModeDefaultIndependent.v1")
         .unwrap()
@@ -579,7 +587,10 @@ fn key_group_mode_migration_rewrites_round_robin_once() {
     let cfg2 = load_model_proxy_config(&conn);
     let channel2 = cfg2.channels.iter().find(|c| c.id == "site_x").unwrap();
     let groups2 = channel2.key_groups.as_ref().unwrap();
-    assert_eq!(groups2[0].mode, KEY_GROUP_MODE_ROUND_ROBIN, "二次加载不重复迁移");
+    assert_eq!(
+        groups2[0].mode, KEY_GROUP_MODE_ROUND_ROBIN,
+        "二次加载不重复迁移"
+    );
 }
 
 #[test]
@@ -903,6 +914,50 @@ fn opencode_free_model_filter_keeps_only_free_models() {
     );
 }
 
+#[test]
+fn gateway_model_list_prefixes_opencode_ids_once() {
+    let config = ModelProxyConfig::default();
+    let cached = vec![ChannelModelList {
+        channel_id: "opencode".into(),
+        channel_name: "OpenCode".into(),
+        alias: "opencode".into(),
+        models: vec![
+            "big-pickle".into(),
+            "opencode/deepseek-v4-flash-free".into(),
+        ],
+    }];
+    let items = build_gateway_model_list(&config, &cached);
+    let ids: Vec<&str> = items
+        .iter()
+        .filter_map(|item| item.get("id").and_then(|v| v.as_str()))
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["opencode/big-pickle", "opencode/deepseek-v4-flash-free"]
+    );
+    assert!(ids.iter().all(|id| id.starts_with("opencode/")));
+    assert!(!ids.iter().any(|id| *id == "big-pickle"));
+    assert!(!ids.iter().any(|id| id.starts_with("opencode/opencode/")));
+}
+
+#[test]
+fn gateway_model_list_does_not_duplicate_prefixed_enabled_models() {
+    let mut config = ModelProxyConfig::default();
+    config.channels[0].enabled_models = Some(vec![
+        "big-pickle".into(),
+        "opencode/glm-4-flash-free".into(),
+    ]);
+    let items = build_gateway_model_list(&config, &[]);
+    let ids: Vec<&str> = items
+        .iter()
+        .filter_map(|item| item.get("id").and_then(|v| v.as_str()))
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["opencode/big-pickle", "opencode/glm-4-flash-free"]
+    );
+}
+
 #[tokio::test]
 async fn model_proxy_shared_routes_toggle_without_binding_a_second_port() {
     let state = ModelProxyState::new_with_app(None);
@@ -1026,23 +1081,41 @@ async fn node_switching_only_on_429_and_persists_for_next_requests() {
     let cursor = state.context.node_round_robin_for("channel_a").await;
 
     // 1. 正常成功请求：保持当前活跃节点（直连）不变
-    assert_eq!(candidates[cursor.load(Relaxed) % candidates.len()], "__direct__");
-    assert_eq!(candidates[cursor.load(Relaxed) % candidates.len()], "__direct__");
+    assert_eq!(
+        candidates[cursor.load(Relaxed) % candidates.len()],
+        "__direct__"
+    );
+    assert_eq!(
+        candidates[cursor.load(Relaxed) % candidates.len()],
+        "__direct__"
+    );
 
     // 2. 发生 429：推进活跃节点游标
     cursor.fetch_add(1, Relaxed);
 
     // 3. 下一次新请求到来：自动继承并使用新节点（proxy_node_1）
-    assert_eq!(candidates[cursor.load(Relaxed) % candidates.len()], "proxy_node_1");
-    assert_eq!(candidates[cursor.load(Relaxed) % candidates.len()], "proxy_node_1");
+    assert_eq!(
+        candidates[cursor.load(Relaxed) % candidates.len()],
+        "proxy_node_1"
+    );
+    assert_eq!(
+        candidates[cursor.load(Relaxed) % candidates.len()],
+        "proxy_node_1"
+    );
 
     // 4. 再次遇到 429：切换到 proxy_node_2
     cursor.fetch_add(1, Relaxed);
-    assert_eq!(candidates[cursor.load(Relaxed) % candidates.len()], "proxy_node_2");
+    assert_eq!(
+        candidates[cursor.load(Relaxed) % candidates.len()],
+        "proxy_node_2"
+    );
 
     // 5. 循环回直连
     cursor.fetch_add(1, Relaxed);
-    assert_eq!(candidates[cursor.load(Relaxed) % candidates.len()], "__direct__");
+    assert_eq!(
+        candidates[cursor.load(Relaxed) % candidates.len()],
+        "__direct__"
+    );
 }
 
 /// 游标按渠道隔离：一个渠道因 429 切节点，不应拖动其他渠道。
@@ -1111,6 +1184,8 @@ fn egress_request_meta_constructs_properly() {
         rule_model: "claude-3-7-sonnet".to_string(),
         stream: true,
         req_body_str: Some("{}".to_string()),
+        client_name: Some("zcode".to_string()),
+        user_agent: None,
     };
     assert_eq!(meta.req_id, "req_abc");
     assert!(meta.stream);
@@ -1164,7 +1239,9 @@ async fn opencode_model_compatibility_and_anonymous_mode() {
 
     let state = ModelProxyState::new_with_app(None);
     // 匿名模式：未配置 Key 时可用 Key 列表为空，出网 Key 为空字符串
-    assert!(resolve_channel_api_keys(&state.context, &ch_no_key).await.is_empty());
+    assert!(resolve_channel_api_keys(&state.context, &ch_no_key)
+        .await
+        .is_empty());
     let selected_key = String::new();
 
     // 免费模型在无 Key 匿名模式下通过校验
@@ -1447,6 +1524,8 @@ async fn run_egress(
         rule_model: "deepseek-v4-flash-free".to_string(),
         stream: false,
         req_body_str: None,
+        client_name: None,
+        user_agent: None,
     };
     execute_resilient_egress(
         ctx,
@@ -1529,8 +1608,8 @@ async fn opencode_persistent_503_gets_one_inplace_retry_per_node_before_switchin
 async fn non_opencode_channel_does_not_inplace_retry_on_503() {
     use std::sync::atomic::Ordering;
 
-    // 5xx 原地重试已通用化：转发渠道/普通渠道同样享受每节点一次的免费原地重试。
-    // max_retries=0 时仅一次机会，503 后原地重试成功即返回 200。
+    // 5xx 原地重试是 OpenCode 免 Key 渠道的专属容错。有 Key 的普通渠道失败后
+    // 由 pipeline 顺延到下一把 Key；max_retries=0 时同一把 Key 只发一次，直接返回错误。
     let (addr, counter) = spawn_scripted_upstream(vec![
         (
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
@@ -1541,11 +1620,35 @@ async fn non_opencode_channel_does_not_inplace_retry_on_503() {
     .await;
     let channel = egress_test_channel("plain-upstream", format!("http://{addr}/v1"));
 
-    let success = run_egress(&channel, 0)
-        .await
-        .expect("普通渠道首次 503 后原地重试应成功");
-    assert_eq!(success.status, 200);
-    assert_eq!(counter.load(Ordering::SeqCst), 2, "同节点应恰好 2 次");
+    let result = run_egress(&channel, 0).await;
+    assert!(result.is_err(), "普通渠道 503 不做原地重试，直接返回错误");
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        1,
+        "同一把 Key 只应发送 1 次"
+    );
+}
+
+/// 直连单出口的普通渠道：max_retries 是换节点预算，没有第二个出口时退化为 0，
+/// 同一把 Key 不会在同一条路上反复重发（换 Key 由 pipeline 负责）。
+#[tokio::test]
+async fn direct_channel_ignores_node_retry_budget() {
+    use std::sync::atomic::Ordering;
+
+    let (addr, counter) = spawn_scripted_upstream(vec![(
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        r#"{"error":{"message":"boom"}}"#,
+    )])
+    .await;
+    let channel = egress_test_channel("plain-upstream", format!("http://{addr}/v1"));
+
+    let result = run_egress(&channel, 3).await;
+    assert!(result.is_err());
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        1,
+        "直连渠道即便 max_retries=3 也只应发送 1 次"
+    );
 }
 
 #[tokio::test]
@@ -2118,6 +2221,11 @@ fn candidate_list_head_matches_resolve_channel() {
                 assert_eq!(c1.id, c2.id, "首项渠道应与 resolve_channel 一致: {model}");
                 assert_eq!(m1, &m2, "裸模型名应一致: {model}");
             }
+            // resolve_channel 落到 opencode/首个启用渠道兜底时，候选列表为空：
+            // 兜底渠道并未声明提供该模型，不是故障转移候选
+            (None, Some((c2, _))) => {
+                assert_eq!(c2.id, "opencode", "仅兜底解析允许候选列表为空: {model}");
+            }
             (None, None) => {}
             _ => panic!("候选列表与 resolve_channel 的可解析性不一致: {model}"),
         }
@@ -2157,7 +2265,8 @@ fn aliased_request_does_not_expand_to_fallback_channels() {
     assert_eq!(cands[0].1, "gpt-4", "别名前缀应已剥离");
 }
 
-/// 设了白名单但不含该模型的渠道不能作为后备 —— 它处理不了这个请求。
+/// 只有明确声明提供该模型的渠道才是后备：白名单不含该模型的渠道处理不了这个请求；
+/// 未设白名单的渠道虽「全部暴露」，但并未声明拥有该模型，同样不作为转移目标。
 #[test]
 fn candidates_exclude_channels_whose_whitelist_lacks_model() {
     use crate::model::gateway::balancer::resolve_channel_candidates;
@@ -2174,7 +2283,7 @@ fn candidates_exclude_channels_whose_whitelist_lacks_model() {
                 ch.enabled_models = Some(vec!["other-model".to_string()]);
                 ch
             },
-            // 无白名单 = 全部暴露，可作后备
+            // 无白名单 = 全部暴露，但未声明拥有该模型，不作后备
             order_test_channel("open", "open", true),
             // 禁用渠道永不入选
             {
@@ -2190,7 +2299,7 @@ fn candidates_exclude_channels_whose_whitelist_lacks_model() {
         .iter()
         .map(|(c, _)| c.id.as_str())
         .collect();
-    assert_eq!(ids, vec!["has", "open"], "只应包含能承接该模型的启用渠道");
+    assert_eq!(ids, vec!["has"], "只应包含明确声明提供该模型的启用渠道");
 }
 
 /// 端到端跨渠道故障转移：首选渠道恒定 401（不可重试的鉴权失败，渠道内候选立即耗尽）
@@ -2222,6 +2331,7 @@ async fn failover_switches_to_next_channel_when_primary_exhausted() {
     let config = ModelProxyConfig {
         enabled: true,
         max_retries: 0,
+        channel_failover: true,
         channels: vec![primary.clone(), backup.clone()],
         ..ModelProxyConfig::default()
     };
@@ -2239,6 +2349,8 @@ async fn failover_switches_to_next_channel_when_primary_exhausted() {
         &None,
         crate::model::gateway::egress::EgressBody::native(json!({ "model": "shared-model" })),
         ClientProtocol::OpenAi,
+        None,
+        None,
     )
     .await
     .expect("首选渠道耗尽后应转移到后备渠道并成功");
@@ -2297,6 +2409,8 @@ async fn aliased_request_stays_on_designated_channel_at_dispatch_layer() {
         &None,
         crate::model::gateway::egress::EgressBody::native(json!({ "model": "some-model" })),
         ClientProtocol::OpenAi,
+        None,
+        None,
     )
     .await;
 
@@ -2344,6 +2458,7 @@ async fn channel_without_matching_key_is_skipped_instead_of_privilege_escalation
     let config = ModelProxyConfig {
         enabled: true,
         max_retries: 0,
+        channel_failover: true,
         channels: vec![primary.clone(), backup.clone()],
         ..ModelProxyConfig::default()
     };
@@ -2361,6 +2476,8 @@ async fn channel_without_matching_key_is_skipped_instead_of_privilege_escalation
         &None,
         crate::model::gateway::egress::EgressBody::native(json!({ "model": "shared-model" })),
         ClientProtocol::OpenAi,
+        None,
+        None,
     )
     .await
     .expect("无匹配 Key 的渠道被跳过后应由后备渠道承接");
@@ -2418,6 +2535,8 @@ async fn single_channel_without_matching_key_rejects_instead_of_privilege_escala
         &None,
         crate::model::gateway::egress::EgressBody::native(json!({ "model": "shared-model" })),
         ClientProtocol::OpenAi,
+        None,
+        None,
     )
     .await;
 
@@ -2443,20 +2562,34 @@ async fn single_channel_without_matching_key_rejects_instead_of_privilege_escala
 fn backoff_grows_exponentially_and_is_capped() {
     use super::dispatcher::{exponential_backoff_ms, MAX_429_BACKOFF_MS};
 
-    // 500ms 起指数翻倍，而非旧的 500+300*n（上界仅 1.4s，几乎必然落在上游限流窗口内）
-    assert_eq!(exponential_backoff_ms(0), 500);
-    assert_eq!(exponential_backoff_ms(1), 1_000);
-    assert_eq!(exponential_backoff_ms(2), 2_000);
-    assert_eq!(exponential_backoff_ms(3), 4_000);
+    // 5s 起指数翻倍。旧的 500ms 起步对按分钟计的限流窗口几乎无效。
+    assert_eq!(exponential_backoff_ms(0), 5_000);
+    assert_eq!(exponential_backoff_ms(1), 10_000);
+    assert_eq!(exponential_backoff_ms(2), 20_000);
+    assert!(exponential_backoff_ms(3) >= MAX_429_BACKOFF_MS);
 
-    // 第 4 次即达上界；更深的 attempt 不再增长，也不溢出
-    assert!(exponential_backoff_ms(4) >= MAX_429_BACKOFF_MS);
-    for idx in 4..64usize {
+    for idx in 3..64usize {
         assert!(
             exponential_backoff_ms(idx).min(MAX_429_BACKOFF_MS) == MAX_429_BACKOFF_MS,
             "attempt {idx} 截断后应恒为上界"
         );
     }
+}
+
+#[test]
+fn rate_limit_cooldown_backoff_floors_and_doubles() {
+    use super::dispatcher::{
+        rate_limit_backoff_ms, DEFAULT_429_COOLDOWN_MS, MAX_429_COOLDOWN_MS, MIN_429_BACKOFF_MS,
+    };
+
+    assert_eq!(rate_limit_backoff_ms(1, None), DEFAULT_429_COOLDOWN_MS);
+    assert_eq!(rate_limit_backoff_ms(2, None), DEFAULT_429_COOLDOWN_MS * 2);
+    assert_eq!(rate_limit_backoff_ms(3, None), DEFAULT_429_COOLDOWN_MS * 4);
+    assert_eq!(rate_limit_backoff_ms(4, None), MAX_429_COOLDOWN_MS);
+    assert_eq!(rate_limit_backoff_ms(9, None), MAX_429_COOLDOWN_MS);
+    assert_eq!(rate_limit_backoff_ms(1, Some(500)), MIN_429_BACKOFF_MS);
+    assert_eq!(rate_limit_backoff_ms(1, Some(8_000)), 8_000);
+    assert_eq!(rate_limit_backoff_ms(1, Some(999_000)), MAX_429_COOLDOWN_MS);
 }
 
 #[test]
@@ -2476,7 +2609,11 @@ fn retry_after_header_is_honoured_over_local_backoff() {
     assert_eq!(parse_retry_after_ms(&HeaderMap::new()), None);
     for bad in ["", "soon", "-5", "Wed, 21 Oct 2015 07:28:00 GMT", "NaN"] {
         headers.insert("retry-after", HeaderValue::from_str(bad).unwrap());
-        assert_eq!(parse_retry_after_ms(&headers), None, "「{bad}」应回落本地退避");
+        assert_eq!(
+            parse_retry_after_ms(&headers),
+            None,
+            "「{bad}」应回落本地退避"
+        );
     }
 }
 
@@ -2484,7 +2621,11 @@ fn retry_after_header_is_honoured_over_local_backoff() {
 /// 直接构造 `ModelProxyContext` 需要真实 AppContext/HTTP client 等重依赖，
 /// 而被测语义完全落在这张分片 map 上，故只对 map 建模。
 async fn cursor_for(
-    map: &std::sync::Arc<tokio::sync::RwLock<std::collections::HashMap<String, std::sync::Arc<std::sync::atomic::AtomicUsize>>>>,
+    map: &std::sync::Arc<
+        tokio::sync::RwLock<
+            std::collections::HashMap<String, std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+        >,
+    >,
     channel_id: &str,
 ) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
     if let Some(counter) = map.read().await.get(channel_id) {
@@ -2502,8 +2643,11 @@ async fn node_cursor_is_sharded_per_channel() {
     use std::sync::atomic::Ordering;
     use std::sync::Arc as StdArc;
 
-    let map: StdArc<tokio::sync::RwLock<std::collections::HashMap<String, StdArc<std::sync::atomic::AtomicUsize>>>> =
-        StdArc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let map: StdArc<
+        tokio::sync::RwLock<
+            std::collections::HashMap<String, StdArc<std::sync::atomic::AtomicUsize>>,
+        >,
+    > = StdArc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
 
     // 渠道 A 的 429 重试推进自己的游标
     let a = cursor_for(&map, "chan-a").await;
@@ -2521,4 +2665,425 @@ async fn node_cursor_is_sharded_per_channel() {
     let a_again = cursor_for(&map, "chan-a").await;
     assert_eq!(a_again.load(Ordering::SeqCst), 3);
     assert!(StdArc::ptr_eq(&a, &a_again), "同渠道应共享同一游标实例");
+}
+
+// ---------------------------------------------------------------------------
+// 定向路由不兜底 / 跨渠道转移默认关闭 / Key 级故障转移顺序
+// ---------------------------------------------------------------------------
+
+/// 定向指派命中已禁用渠道：绝不能兜底到 opencode 或其他渠道。
+#[test]
+fn aliased_request_to_disabled_channel_never_falls_back() {
+    use crate::model::gateway::balancer::{
+        resolve_channel_candidates, resolve_channel_detailed, ChannelResolution,
+    };
+
+    let cfg = ModelProxyConfig {
+        channels: vec![
+            order_test_channel("opencode", "opencode", true),
+            order_test_channel("x666", "x666", false),
+            order_test_channel("other", "other", true),
+        ],
+        ..ModelProxyConfig::default()
+    };
+
+    match resolve_channel_detailed(&cfg, "x666/claude-sonnet-5") {
+        ChannelResolution::Disabled(ch, model) => {
+            assert_eq!(ch.id, "x666");
+            assert_eq!(model, "claude-sonnet-5");
+        }
+        other => panic!("定向到禁用渠道应判 Disabled，实际 {other:?}"),
+    }
+    assert!(
+        resolve_channel(&cfg, "x666/claude-sonnet-5").is_none(),
+        "禁用渠道的定向请求不得解析到别的渠道"
+    );
+    assert!(
+        resolve_channel_candidates(&cfg, "x666/claude-sonnet-5").is_empty(),
+        "定向请求没有后备渠道"
+    );
+
+    // opencode 也关掉时同样不得落到 other
+    let mut cfg2 = cfg.clone();
+    cfg2.channels[0].enabled = false;
+    assert!(resolve_channel(&cfg2, "x666/claude-sonnet-5").is_none());
+}
+
+/// 前缀不匹配任何渠道别名 = 不是定向指派，整段当作裸模型名（上游厂商命名空间）。
+#[test]
+fn unknown_prefix_is_treated_as_bare_model_name() {
+    let cfg = ModelProxyConfig {
+        channels: vec![order_test_channel("opencode", "opencode", true), {
+            let mut ch = order_test_channel("site", "site", true);
+            ch.enabled_models = Some(vec!["deepseek-ai/DeepSeek-V3".to_string()]);
+            ch
+        }],
+        ..ModelProxyConfig::default()
+    };
+    let (ch, model) = resolve_channel(&cfg, "deepseek-ai/DeepSeek-V3").expect("should resolve");
+    assert_eq!(ch.id, "site", "按白名单命中，而非被当成别名前缀");
+    assert_eq!(model, "deepseek-ai/DeepSeek-V3", "厂商命名空间保留");
+
+    // 带别名 + 厂商命名空间：只剥别名
+    let (ch, model) =
+        resolve_channel(&cfg, "site/deepseek-ai/DeepSeek-V3").expect("should resolve");
+    assert_eq!(ch.id, "site");
+    assert_eq!(model, "deepseek-ai/DeepSeek-V3");
+}
+
+/// 跨渠道故障转移默认关闭：首选渠道耗尽后直接返回错误，后备渠道零请求。
+#[tokio::test]
+async fn channel_failover_is_off_by_default() {
+    use crate::model::gateway::pipeline::{dispatch_protocol_egress, ClientProtocol};
+    use std::sync::atomic::Ordering;
+    use std::time::Instant;
+
+    let (bad_addr, bad_hits) = spawn_scripted_upstream(vec![(
+        axum::http::StatusCode::UNAUTHORIZED,
+        r#"{"error":{"message":"invalid api key"}}"#,
+    )])
+    .await;
+    let (good_addr, good_hits) =
+        spawn_scripted_upstream(vec![(axum::http::StatusCode::OK, valid_chat_payload())]).await;
+
+    let mut primary = egress_test_channel("primary", format!("http://{bad_addr}/v1"));
+    primary.enabled_models = Some(vec!["shared-model".to_string()]);
+    let mut backup = egress_test_channel("backup", format!("http://{good_addr}/v1"));
+    backup.enabled_models = Some(vec!["shared-model".to_string()]);
+
+    let state = ModelProxyState::new_with_app(None);
+    let ctx = &state.context;
+    ctx.route_enabled.store(true, Ordering::Release);
+    let config = ModelProxyConfig {
+        enabled: true,
+        max_retries: 0,
+        channels: vec![primary.clone(), backup.clone()],
+        ..ModelProxyConfig::default()
+    };
+    assert!(!config.channel_failover, "默认关闭");
+
+    let result = dispatch_protocol_egress(
+        ctx,
+        &config,
+        &primary,
+        "shared-model",
+        "shared-model",
+        "/v1/chat/completions",
+        "req_failover_off",
+        false,
+        Instant::now(),
+        &None,
+        crate::model::gateway::egress::EgressBody::native(json!({ "model": "shared-model" })),
+        ClientProtocol::OpenAi,
+        None,
+        None,
+    )
+    .await;
+
+    let resp = match result {
+        Ok(_) => panic!("默认不应跨渠道转移"),
+        Err(resp) => resp,
+    };
+    assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+    assert_eq!(bad_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(good_hits.load(Ordering::SeqCst), 0, "后备渠道不得收到请求");
+}
+
+/// 按 Authorization 头决定响应的 mock 上游：记录每次请求使用的 Key。
+async fn spawn_key_aware_upstream(
+    responder: impl Fn(&str) -> (axum::http::StatusCode, String) + Send + Sync + 'static,
+) -> (
+    std::net::SocketAddr,
+    std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+) {
+    use axum::{http::HeaderMap, routing::post, Router};
+    use std::sync::{Arc, Mutex};
+
+    let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen_route = seen.clone();
+    let responder = Arc::new(responder);
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(move |headers: HeaderMap| {
+            let seen = seen_route.clone();
+            let responder = responder.clone();
+            async move {
+                let key = headers
+                    .get("authorization")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.strip_prefix("Bearer "))
+                    .unwrap_or_default()
+                    .to_string();
+                seen.lock().unwrap().push(key.clone());
+                let (status, body) = responder(&key);
+                (status, [("content-type", "application/json")], body)
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (addr, seen)
+}
+
+fn independent_two_key_channel(base_url: String) -> ChannelConfig {
+    use crate::model::gateway::types::{KeyGroupItem, KEY_GROUP_MODE_INDEPENDENT};
+    let mut ch = egress_test_channel("grouped", base_url);
+    ch.api_keys = Some(vec!["a1".to_string(), "a2".to_string()]);
+    ch.key_groups = Some(vec![KeyGroupItem {
+        id: "ga".to_string(),
+        name: "组 A".to_string(),
+        enabled: true,
+        mode: KEY_GROUP_MODE_INDEPENDENT.to_string(),
+    }]);
+    ch.key_rules = Some(
+        [("a1", "ga"), ("a2", "ga")]
+            .into_iter()
+            .map(|(k, g)| ChannelKeyRule {
+                key: k.to_string(),
+                group_id: g.to_string(),
+                enabled: true,
+                supported_models: None,
+                fixed_channel_id: None,
+            })
+            .collect(),
+    );
+    ch
+}
+
+fn two_group_channel(base_url: String) -> ChannelConfig {
+    use crate::model::gateway::types::{KeyGroupItem, KEY_GROUP_MODE_ROUND_ROBIN};
+    let mut ch = egress_test_channel("grouped", base_url);
+    ch.api_keys = Some(vec!["a1".to_string(), "a2".to_string(), "b1".to_string()]);
+    ch.key_groups = Some(vec![
+        KeyGroupItem {
+            id: "ga".to_string(),
+            name: "组 A".to_string(),
+            enabled: true,
+            mode: KEY_GROUP_MODE_ROUND_ROBIN.to_string(),
+        },
+        KeyGroupItem {
+            id: "gb".to_string(),
+            name: "组 B".to_string(),
+            enabled: true,
+            mode: KEY_GROUP_MODE_ROUND_ROBIN.to_string(),
+        },
+    ]);
+    ch.key_rules = Some(
+        [("a1", "ga"), ("a2", "ga"), ("b1", "gb")]
+            .into_iter()
+            .map(|(k, g)| ChannelKeyRule {
+                key: k.to_string(),
+                group_id: g.to_string(),
+                enabled: true,
+                supported_models: None,
+                fixed_channel_id: None,
+            })
+            .collect(),
+    );
+    ch
+}
+
+async fn run_grouped(
+    channel: &ChannelConfig,
+) -> Result<crate::model::gateway::pipeline::EgressOutcome, axum::response::Response> {
+    let state = ModelProxyState::new_with_app(None);
+    state
+        .context
+        .route_enabled
+        .store(true, std::sync::atomic::Ordering::Release);
+    run_grouped_on(&state.context, channel, "req_grouped").await
+}
+
+async fn run_grouped_on(
+    ctx: &ModelProxyContext,
+    channel: &ChannelConfig,
+    req_id: &str,
+) -> Result<crate::model::gateway::pipeline::EgressOutcome, axum::response::Response> {
+    use crate::model::gateway::pipeline::{dispatch_protocol_egress, ClientProtocol};
+    use std::time::Instant;
+    let config = ModelProxyConfig {
+        enabled: true,
+        max_retries: 2, // 直连渠道应忽略该预算
+        channels: vec![channel.clone()],
+        ..ModelProxyConfig::default()
+    };
+    dispatch_protocol_egress(
+        ctx,
+        &config,
+        channel,
+        "m",
+        "m",
+        "/v1/chat/completions",
+        req_id,
+        false,
+        Instant::now(),
+        &None,
+        crate::model::gateway::egress::EgressBody::native(json!({ "model": "m" })),
+        ClientProtocol::OpenAi,
+        None,
+        None,
+    )
+    .await
+}
+
+/// Key 级故障转移顺序：轮询组内的 Key 先顺延（a1 → a2），同组耗尽才进入下一组（b1）；
+/// 直连渠道不做同 Key 节点重试，每把 Key 恰好一次；全部失败后不再重试直接返回。
+#[tokio::test]
+async fn key_failover_walks_group_then_next_group_then_stops() {
+    let (addr, seen) = spawn_key_aware_upstream(|key| match key {
+        "b1" => (axum::http::StatusCode::OK, valid_chat_payload().to_string()),
+        _ => (
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            r#"{"error":{"message":"rate limited"}}"#.to_string(),
+        ),
+    })
+    .await;
+    let channel = two_group_channel(format!("http://{addr}/v1"));
+
+    let outcome = run_grouped(&channel).await.expect("组 B 的 b1 应成功");
+    assert_eq!(outcome.success.status, 200);
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec!["a1", "a2", "b1"],
+        "429 先顺延同组 Key，再进入下一组外放同模型的 Key"
+    );
+
+    // 全部 429：走完 a1 a2 b1 后直接返回 429，不再有任何重试
+    let (addr, seen) = spawn_key_aware_upstream(|_| {
+        (
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            r#"{"error":{"message":"rate limited"}}"#.to_string(),
+        )
+    })
+    .await;
+    let channel = two_group_channel(format!("http://{addr}/v1"));
+    let resp = run_grouped(&channel)
+        .await
+        .err()
+        .expect("全部失败应返回错误");
+    assert_eq!(resp.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(*seen.lock().unwrap(), vec!["a1", "a2", "b1"]);
+}
+
+/// 请求侧错误（400）与 Key 无关：第一把 Key 返回 400 后立即返回，不再逐 Key 重放。
+#[tokio::test]
+async fn request_side_error_stops_key_failover_immediately() {
+    let (addr, seen) = spawn_key_aware_upstream(|_| {
+        (
+            axum::http::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"context length exceeded"}}"#.to_string(),
+        )
+    })
+    .await;
+    let channel = two_group_channel(format!("http://{addr}/v1"));
+    let resp = run_grouped(&channel).await.err().expect("应返回 400");
+    assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
+    assert_eq!(*seen.lock().unwrap(), vec!["a1"], "400 后不得再试其他 Key");
+}
+
+/// 多把 Key 先后失败时，返回最能说明原因的错误：首把 Key 的 429 不被后面过期 Key 的 401 覆盖。
+#[tokio::test]
+async fn most_informative_error_is_returned_after_key_exhaustion() {
+    let (addr, _seen) = spawn_key_aware_upstream(|key| match key {
+        "a1" => (
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            r#"{"error":{"message":"rate limited"}}"#.to_string(),
+        ),
+        _ => (
+            axum::http::StatusCode::UNAUTHORIZED,
+            r#"{"error":{"message":"invalid api key"}}"#.to_string(),
+        ),
+    })
+    .await;
+    let channel = two_group_channel(format!("http://{addr}/v1"));
+    let resp = run_grouped(&channel).await.err().expect("应失败");
+    assert_eq!(resp.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+}
+
+/// 429 先走完同组、再走本渠道其余外放该模型的 Key；随后这些 Key 进入冷却，
+/// 下一发请求不再打上游。
+#[tokio::test]
+async fn rate_limit_walks_keys_then_cools_them() {
+    let (addr, seen) = spawn_key_aware_upstream(|_| {
+        (
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            r#"{"error":{"message":"rate limited"}}"#.to_string(),
+        )
+    })
+    .await;
+    let channel = two_group_channel(format!("http://{addr}/v1"));
+    let state = ModelProxyState::new_with_app(None);
+    state
+        .context
+        .route_enabled
+        .store(true, std::sync::atomic::Ordering::Release);
+
+    let resp = run_grouped_on(&state.context, &channel, "req_rl1")
+        .await
+        .err()
+        .expect("首次应走完候选后 429");
+    assert_eq!(resp.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec!["a1", "a2", "b1"],
+        "429 应先同组再跨组，把外放该模型的 Key 试完"
+    );
+    let retry_after = resp
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .expect("应带回 Retry-After");
+    assert!(
+        retry_after.parse::<u64>().unwrap_or(0) >= 5,
+        "Retry-After 至少 5 秒，实际 {retry_after}"
+    );
+
+    let resp2 = run_grouped_on(&state.context, &channel, "req_rl2")
+        .await
+        .err()
+        .expect("冷却中应直接 429");
+    assert_eq!(resp2.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec!["a1", "a2", "b1"],
+        "候选 Key 都在冷却时不得再打上游"
+    );
+}
+
+/// 同组下一把 Key 若未限流，429 后应立刻用它做成；后续请求跳过仍在冷却的 Key。
+#[tokio::test]
+async fn rate_limit_failovers_to_healthy_key_and_skips_cooling_one() {
+    let (addr, seen) = spawn_key_aware_upstream(|key| match key {
+        "a2" => (axum::http::StatusCode::OK, valid_chat_payload().to_string()),
+        _ => (
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            r#"{"error":{"message":"rate limited"}}"#.to_string(),
+        ),
+    })
+    .await;
+    let channel = independent_two_key_channel(format!("http://{addr}/v1"));
+    let state = ModelProxyState::new_with_app(None);
+    state
+        .context
+        .route_enabled
+        .store(true, std::sync::atomic::Ordering::Release);
+
+    let outcome = run_grouped_on(&state.context, &channel, "req_rl_ok1")
+        .await
+        .expect("a2 应承接");
+    assert_eq!(outcome.success.status, 200);
+    assert_eq!(*seen.lock().unwrap(), vec!["a1", "a2"]);
+
+    let outcome2 = run_grouped_on(&state.context, &channel, "req_rl_ok2")
+        .await
+        .expect("冷却中的 a1 应被跳过");
+    assert_eq!(outcome2.success.status, 200);
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec!["a1", "a2", "a2"],
+        "第二发不得再打仍在冷却的 a1"
+    );
 }

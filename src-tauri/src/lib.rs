@@ -226,6 +226,16 @@ pub fn run() {
             // —— 模型网关状态：独立管理（命令注入），启动时挂接上下文 ——
             let gateway_state = crate::model::gateway::ModelProxyState::new();
             crate::context::block_on(gateway_state.attach_ctx(ctx.clone()));
+            // 真正 listen 可以等代理恢复，但持久化渠道必须先灌入内存：
+            // 否则第一次 get_opencode_proxy_status 会返回 Default 的 1 条渠道。
+            let persisted_proxy_cfg = {
+                let conn = ctx.database.0.lock().ok();
+                conn.map(|c| crate::model::gateway::load_model_proxy_config(&c))
+                    .unwrap_or_default()
+            };
+            crate::context::block_on(async {
+                *gateway_state.context.config.write().await = persisted_proxy_cfg;
+            });
 
             app.manage(ctx.clone());
             app.manage(gateway_state);

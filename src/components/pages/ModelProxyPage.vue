@@ -22,6 +22,7 @@ import {
 } from "../../composables/useModelProxy";
 import { useLibrary, runCommand } from "../../composables/useLibrary";
 import { useToast } from "../../composables/useToast";
+import { sourceLabel } from "../../composables/token/tokenFormatters";
 import { usePreferences } from "../../composables/usePreferences";
 import EChart from "../common/EChart.vue";
 import type { EChartsOption } from "../../echarts";
@@ -1966,6 +1967,11 @@ function channelSuccessRateBad(channel: ChannelConfig): boolean {
 
 const detailActiveTab = ref<"overview" | "request" | "response" | "reasoning" | "error">("overview");
 
+/** 详情弹窗「调用客户端」的显示名；空值显示 -- */
+function clientLabel(name?: string | null): string {
+  return name ? sourceLabel(name) : "--";
+}
+
 function openLogDetail(log: ProxyRequestLog) {
   selectedLogForDetail.value = log;
   if (log.statusCode >= 400) {
@@ -3521,7 +3527,6 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
                 <th style="width: 70px;" class="mp-th-sortable" title="点击切换：升序 / 降序 / 默认排序" :class="{ 'is-sorted': logSortBy === 'status' }" @click="sortLogsBy('status')">状态<span class="mp-sort-arrow">{{ logSortIndicator('status') }}</span></th>
                 <th style="width: 175px;" class="mp-th-sortable" title="点击切换：升序 / 降序 / 默认排序" :class="{ 'is-sorted': logSortBy === 'tokens' }" @click="sortLogsBy('tokens')">Token 分布<span class="mp-sort-arrow">{{ logSortIndicator('tokens') }}</span></th>
                 <th style="width: 90px;" class="mp-th-sortable" title="点击切换：升序 / 降序 / 默认排序" :class="{ 'is-sorted': logSortBy === 'duration' }" @click="sortLogsBy('duration')">耗时<span class="mp-sort-arrow">{{ logSortIndicator('duration') }}</span></th>
-                <th style="width: 65px; text-align: center;">操作</th>
               </tr>
             </thead>
             <tbody>
@@ -3631,20 +3636,10 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
                     </div>
                   </div>
                 </td>
-                <td style="text-align: center;">
-                  <button
-                    type="button"
-                    class="mp-btn-text"
-                    title="查看该条请求详情与全文报文"
-                    @click.stop="openLogDetail(log)"
-                  >
-                    详情
-                  </button>
-                </td>
               </tr>
 
               <tr v-if="filteredLogs.length === 0">
-                <td colspan="9" class="text-center py-10 text-muted">
+                <td colspan="8" class="text-center py-10 text-muted">
                   <div class="mp-empty-box">
                     <div class="mp-empty-icon" v-html="icons.rows" />
                     <p v-if="loadingLogs">正在读取本地数据库请求日志…</p>
@@ -3780,7 +3775,23 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
               class="mp-input font-mono"
               placeholder="0"
             />
-            <small>请求失败后最多重试几次（默认 0 = 失败直接返回）；开启代理池的渠道同时受可用节点数限制，失败节点自动移至队尾</small>
+            <small>请求失败后同一把 Key 最多换出口节点重试几次（默认 0 = 不重试）。仅对开启代理池的渠道生效；直连渠道失败即按「同分组其他 Key → 其他分组」顺延，Key 用尽直接返回错误</small>
+          </div>
+
+          <!-- 跨渠道故障转移（默认关闭） -->
+          <div class="mp-field">
+            <div class="mp-proxy-pool-row" style="padding: 0;">
+              <label for="mp-channel-failover" style="font-size: 13px; font-weight: 600; color: var(--text); cursor: pointer;">跨渠道故障转移</label>
+              <label class="mp-switch-wrap" :title="proxyConfig.channelFailover ? '点击关闭跨渠道转移' : '点击开启跨渠道转移'">
+                <input
+                  id="mp-channel-failover"
+                  v-model="proxyConfig.channelFailover"
+                  type="checkbox"
+                />
+                <span class="mp-switch-round" />
+              </label>
+            </div>
+            <small>开启后，不带渠道前缀的裸模型名请求在首选渠道全部 Key 失败时，会切换到其他勾选了该模型的渠道；带 <code>别名/模型</code> 前缀的定向请求永不转移。默认关闭 = 渠道耗尽直接报错</small>
           </div>
 
           <!-- 请求超时（秒） -->
@@ -4179,8 +4190,14 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
 
               <div class="mp-ld-item">
                 <label>调用客户端</label>
-                <div class="mp-ld-val font-mono">
-                  <span>{{ selectedLogForDetail.clientName || '--' }}</span>
+                <div class="mp-ld-val font-mono" style="flex-direction: column; align-items: flex-start; gap: 3px;">
+                  <span>{{ clientLabel(selectedLogForDetail.clientName || '') }}</span>
+                  <small
+                    v-if="selectedLogForDetail.userAgent"
+                    class="text-muted"
+                    style="max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 400;"
+                    :title="selectedLogForDetail.userAgent"
+                  >{{ selectedLogForDetail.userAgent }}</small>
                 </div>
               </div>
 
@@ -6069,23 +6086,6 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
   width: 100%;
   max-width: 100%;
   box-sizing: border-box;
-}
-
-.mp-btn-text {
-  background: transparent;
-  border: 1px solid transparent;
-  color: var(--brand);
-  font-size: 11.5px;
-  font-weight: 600;
-  padding: 2px 8px;
-  border-radius: 4px;
-  cursor: pointer;
-  transition: all 0.15s ease;
-}
-
-.mp-btn-text:hover {
-  background: var(--brand-soft);
-  border-color: var(--brand);
 }
 
 /* 卡片基类 */

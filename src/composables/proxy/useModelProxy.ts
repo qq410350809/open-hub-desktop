@@ -106,6 +106,7 @@ export const proxyConfig = ref<OpencodeProxyConfig>({
   channels: [defaultOpencodeChannel()],
   timeoutSeconds: 300,
   maxRetries: 0,
+  channelFailover: false,
 });
 
 /** 站点对应的反代渠道：存在 siteId 关联的渠道即视为「已被反代」 */
@@ -130,6 +131,7 @@ export async function refreshProxyConfig() {
       cfg.channels = [defaultOpencodeChannel()];
     }
     proxyConfig.value = cfg;
+    proxyConfigLoaded.value = true;
   } catch (e) {
     console.warn("获取反代配置失败:", e);
   }
@@ -177,6 +179,9 @@ export function uniqueChannelAlias(base: string): string {
   return `${base}-${i}`;
 }
 
+/** 配置已从后端灌入；侧栏徽标在此之前不展示占位的 1 */
+export const proxyConfigLoaded = ref(false);
+
 export const proxyStatus = ref<OpencodeProxyStatus>({
   running: false,
   port: DEFAULT_SERVICE_PORT,
@@ -186,7 +191,7 @@ export const proxyStatus = ref<OpencodeProxyStatus>({
   failedRequests: 0,
   uptimeSeconds: 0,
   modelsCount: 0,
-  channelsCount: 1,
+  channelsCount: 0,
   totalPromptTokens: 0,
   totalCompletionTokens: 0,
   totalReasoningTokens: 0,
@@ -262,6 +267,7 @@ export function useModelProxy() {
           cfg.channels = [defaultOpencodeChannel()];
         }
         proxyConfig.value = cfg;
+        proxyConfigLoaded.value = true;
       }
       if (status) proxyStatus.value = status;
       // 渠道统计与模型缓存并行加载；缓存映射需在配置应用后执行（免费渠道过滤依赖渠道配置）
@@ -326,6 +332,7 @@ export function useModelProxy() {
       });
       if (status) proxyStatus.value = status;
       proxyConfig.value = { ...normalized };
+      proxyConfigLoaded.value = true;
       if (!options.silent) showToast("反代配置与渠道设置已保存");
       return true;
     } catch (e) {
@@ -721,6 +728,7 @@ export function useModelProxy() {
 
   return {
     proxyConfig,
+    proxyConfigLoaded,
     proxyStatus,
     proxyLoading,
     savingConfig,

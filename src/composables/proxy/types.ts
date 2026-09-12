@@ -139,6 +139,8 @@ export interface ProxyRequestLog {
   nodeName?: string;
   /** 发起请求的客户端标识（User-Agent / 端点推断，如 claude / codex） */
   clientName?: string | null;
+  /** 客户端原始 User-Agent 请求头（截断保存），识别依据的原始证据 */
+  userAgent?: string | null;
   /** 出网上游地址（完整 URL，含 path），日志展示「入->出」双地址 */
   upstreamUrl?: string | null;
   /** 客户端会话标识（x-session-id 等请求头提取），用于按会话聚合排查 */

@@ -11,7 +11,7 @@ use super::policies::opencode::{
 };
 use super::types::{ChannelConfig, ModelProxyConfig, ModelProxyContext};
 use axum::{
-    http::StatusCode,
+    http::{header::RETRY_AFTER, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
 };
 use bytes::Bytes;
@@ -20,25 +20,65 @@ use std::sync::atomic::Ordering;
 use std::time::Instant;
 use tracing::warn;
 
-/// 429 退避的硬上界。上游限流窗口通常按秒计，1.4s 的旧上界几乎必然落在窗口内；
-/// 8s 覆盖常见窗口，同时不至于让客户端以为请求卡死。
-pub(super) const MAX_429_BACKOFF_MS: u64 = 8_000;
+/// 同一次请求内换节点的 429 退避上界。再长会让客户端以为请求卡死；
+/// 跨请求的渠道冷却见 `MAX_429_COOLDOWN_MS`。
+pub(super) const MAX_429_BACKOFF_MS: u64 = 30_000;
+/// 无 Retry-After 时，渠道+模型冷却的起步等待。
+pub(super) const DEFAULT_429_COOLDOWN_MS: u64 = 15_000;
+/// 429 等待下限。500ms 级重试几乎必然落在上游窗口内，再撞一次白烧配额。
+pub(super) const MIN_429_BACKOFF_MS: u64 = 5_000;
+/// 跨请求冷却上界：覆盖常见「N 次 / 5 分钟」窗口的一部分，同时不把客户端挂死。
+pub(super) const MAX_429_COOLDOWN_MS: u64 = 120_000;
 
-/// 无 Retry-After 时的指数退避：500ms 起，每次翻倍（500/1000/2000/4000/8000…），
+/// 无 Retry-After 时的指数退避：5s 起，每次翻倍（5/10/20/30s…），
 /// 由调用方截到 `MAX_429_BACKOFF_MS`。
 pub(super) fn exponential_backoff_ms(attempt_idx: usize) -> u64 {
-    500u64 << attempt_idx.min(6)
+    5_000u64 << attempt_idx.min(4)
+}
+
+/// 跨请求冷却时长：有 Retry-After 时夹到 [5s, 120s]，否则 15s 起随连续 429 翻倍。
+pub(super) fn rate_limit_backoff_ms(consecutive: u32, retry_after_ms: Option<u64>) -> u64 {
+    if let Some(ms) = retry_after_ms {
+        return ms.clamp(MIN_429_BACKOFF_MS, MAX_429_COOLDOWN_MS);
+    }
+    let shift = consecutive.saturating_sub(1).min(3);
+    (DEFAULT_429_COOLDOWN_MS << shift).min(MAX_429_COOLDOWN_MS)
+}
+
+fn attach_retry_after(resp: &mut Response, wait_ms: u64) {
+    let secs = wait_ms.div_ceil(1000).max(1);
+    if let Ok(value) = HeaderValue::from_str(&secs.to_string()) {
+        resp.headers_mut().insert(RETRY_AFTER, value);
+    }
+}
+
+fn upstream_error_response(
+    status: StatusCode,
+    body: bytes::Bytes,
+    retry_after_ms: Option<u64>,
+) -> Response {
+    let mut resp = (status, [("content-type", "application/json")], body).into_response();
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        let wait_ms = retry_after_ms
+            .unwrap_or(DEFAULT_429_COOLDOWN_MS)
+            .clamp(MIN_429_BACKOFF_MS, MAX_429_COOLDOWN_MS);
+        attach_retry_after(&mut resp, wait_ms);
+    }
+    resp
 }
 
 /// 解析上游 `Retry-After`：支持「延迟秒数」形式（RFC 7231 的两种取值中实际唯一常见的一种）。
 /// HTTP-date 形式不解析——需要当前时间基准，且各家限流响应几乎都用秒数。
-pub(super) fn parse_retry_after_ms(headers: &reqwest::header::HeaderMap) -> Option<u64> {
-    let raw = headers.get("retry-after")?.to_str().ok()?.trim().to_string();
-    let secs: f64 = raw.parse().ok()?;
+pub(super) fn parse_retry_after_value(raw: &str) -> Option<u64> {
+    let secs: f64 = raw.trim().parse().ok()?;
     if !secs.is_finite() || secs < 0.0 {
         return None;
     }
     Some((secs * 1000.0) as u64)
+}
+
+pub(super) fn parse_retry_after_ms(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    parse_retry_after_value(headers.get("retry-after")?.to_str().ok()?)
 }
 
 #[derive(Clone, Debug)]
@@ -56,6 +96,10 @@ pub struct EgressRequestMeta {
     pub rule_model: String,
     pub stream: bool,
     pub req_body_str: Option<String>,
+    /// 发起请求的客户端标识（User-Agent / 端点推断）：失败日志也要归属到真实客户端
+    pub client_name: Option<String>,
+    /// 客户端原始 User-Agent 请求头（截断保存）
+    pub user_agent: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -141,6 +185,7 @@ pub async fn execute_resilient_egress(
     let mut last_status = StatusCode::BAD_GATEWAY;
     let mut last_err_bytes = Bytes::new();
     let mut count_429: usize = 0;
+    let mut last_retry_after_ms: Option<u64> = None;
 
     for attempt_idx in 0..total_attempts_allowed {
         let cand_id = if candidates.is_empty() {
@@ -225,7 +270,7 @@ pub async fn execute_resilient_egress(
                         meta.req_body_str.clone(),
                         Some(node_display.clone()),
                     )
-                    .with_channel_stats_id(meta.channel_stats_id.clone())
+                    .with_channel_stats_id(meta.channel_stats_id.clone()).with_client_name(meta.client_name.clone()).with_user_agent(meta.user_agent.clone())
                     .with_upstream_url(Some(upstream_url.to_string()))
                     .with_response_body(cap_log_body(err_text)),
                 )
@@ -280,7 +325,7 @@ pub async fn execute_resilient_egress(
                         meta.req_body_str.clone(),
                         Some(node_display.clone()),
                     )
-                    .with_channel_stats_id(meta.channel_stats_id.clone())
+                    .with_channel_stats_id(meta.channel_stats_id.clone()).with_client_name(meta.client_name.clone()).with_user_agent(meta.user_agent.clone())
                     .with_upstream_url(Some(upstream_url.to_string()))
                     .with_response_body(cap_log_body(
                         String::from_utf8_lossy(&body_bytes).to_string(),
@@ -359,7 +404,7 @@ pub async fn execute_resilient_egress(
                             meta.req_body_str.clone(),
                             Some(node_display),
                         )
-                        .with_channel_stats_id(meta.channel_stats_id.clone())
+                        .with_channel_stats_id(meta.channel_stats_id.clone()).with_client_name(meta.client_name.clone()).with_user_agent(meta.user_agent.clone())
                         .with_upstream_url(Some(upstream_url.to_string()))
                         .with_response_body(cap_log_body(err_text)),
                     )
@@ -374,6 +419,7 @@ pub async fn execute_resilient_egress(
                 } else if status == StatusCode::TOO_MANY_REQUESTS {
                     // Retry-After 必须在 resp.bytes() 消费掉响应前读取
                     let retry_after = parse_retry_after_ms(resp.headers());
+                    last_retry_after_ms = retry_after;
                     let err_bytes = resp.bytes().await.unwrap_or_default();
                     let err_text = String::from_utf8_lossy(&err_bytes).to_string();
                     let formatted = format_upstream_error_message(status.as_u16(), &err_text);
@@ -396,7 +442,7 @@ pub async fn execute_resilient_egress(
                             meta.req_body_str.clone(),
                             Some(node_display),
                         )
-                        .with_channel_stats_id(meta.channel_stats_id.clone())
+                        .with_channel_stats_id(meta.channel_stats_id.clone()).with_client_name(meta.client_name.clone()).with_user_agent(meta.user_agent.clone())
                         .with_upstream_url(Some(upstream_url.to_string()))
                         .with_response_body(cap_log_body(err_text.clone())),
                     )
@@ -409,7 +455,7 @@ pub async fn execute_resilient_egress(
                         // 重试往往落在窗口内再次撞 429，白耗一个重试名额。
                         let backoff_ms = retry_after
                             .unwrap_or_else(|| exponential_backoff_ms(attempt_idx))
-                            .min(MAX_429_BACKOFF_MS);
+                            .clamp(MIN_429_BACKOFF_MS, MAX_429_BACKOFF_MS);
                         tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
                         continue;
                     } else {
@@ -437,7 +483,7 @@ pub async fn execute_resilient_egress(
                             meta.req_body_str.clone(),
                             Some(node_display),
                         )
-                        .with_channel_stats_id(meta.channel_stats_id.clone())
+                        .with_channel_stats_id(meta.channel_stats_id.clone()).with_client_name(meta.client_name.clone()).with_user_agent(meta.user_agent.clone())
                         .with_upstream_url(Some(upstream_url.to_string()))
                         .with_response_body(cap_log_body(err_text)),
                     )
@@ -480,7 +526,7 @@ pub async fn execute_resilient_egress(
                         meta.req_body_str.clone(),
                         Some(node_display),
                     )
-                    .with_channel_stats_id(meta.channel_stats_id.clone()),
+                    .with_channel_stats_id(meta.channel_stats_id.clone()).with_client_name(meta.client_name.clone()).with_user_agent(meta.user_agent.clone()),
                 )
                 .await;
 
@@ -496,13 +542,12 @@ pub async fn execute_resilient_egress(
     }
 
     if !last_err_bytes.is_empty() {
-        // 上游错误体原样透传（保持上游自身协议形状）
-        Err((
+        // 上游错误体原样透传（保持上游自身协议形状）；429 补 Retry-After 给客户端退避。
+        Err(upstream_error_response(
             last_status,
-            [("content-type", "application/json")],
             last_err_bytes,
-        )
-            .into_response())
+            last_retry_after_ms,
+        ))
     } else {
         Err(gateway_error_response(
             client_protocol,

@@ -43,6 +43,7 @@ impl ModelProxyState {
             key_round_robin: Arc::new(RwLock::new(HashMap::new())),
             node_round_robin: Arc::new(RwLock::new(HashMap::new())),
             log_retention_last_run: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            rate_limit_cooldowns: Arc::new(RwLock::new(HashMap::new())),
         };
 
         Self { context }
