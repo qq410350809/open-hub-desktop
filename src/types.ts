@@ -284,6 +284,23 @@ export interface Preferences {
   sidebarCollapsed: boolean;
   /** 站点账号别名:键 = 站点ID:profileId(或账号名),值 = 用户设置的别名 */
   accountAliases: Record<string, string>;
+  /** Agent 配置页的身份模式:按工具记(Missing = 常规模式) */
+  agentIdentityModes: Record<string, LocalToolIdentityMode>;
+  /** Agent 配置页模型级与父级参数持久化配置 */
+  agentModelConfigs?: Record<string, {
+    parentConfigs?: Record<string, {
+      contextWindow?: number | null;
+      maxOutput?: number | null;
+      defaultReasoningEffort?: string;
+      efforts?: string[];
+    }>;
+    childOverrides?: Record<string, {
+      contextWindow?: number | null;
+      maxOutput?: number | null;
+      defaultReasoningEffort?: string;
+      efforts?: string[];
+    }>;
+  }>;
 }
 
 export interface MihomoKernelStatus {
@@ -1135,3 +1152,32 @@ export interface LocalToolBackupEntry {
   size: number;
   createdAt: string;
 }
+
+/** 一致性比对目标：key 为行标识（或整单标识），patch 为该行组装出的配置。 */
+export interface LocalToolDiffTarget {
+  key: string;
+  patch: LocalToolConfigPatch;
+}
+
+/** 单行比对结果。 */
+export interface LocalToolDiffEntry {
+  key: string;
+  /** 磁盘现状与这份配置的预期结果一致（= 该行已生效） */
+  consistent: boolean;
+  /** 差异说明；一致时为空 */
+  differences: string[];
+}
+
+/** 比对报告。 */
+export interface LocalToolDiffReport {
+  tool: string;
+  toolName: string;
+  /** 磁盘上现有的受管供应商标识 */
+  managedProviders: string[];
+  /** 磁盘上现有的受管供应商名下模型 ID */
+  managedModels: string[];
+  entries: LocalToolDiffEntry[];
+}
+
+/** 反代清单的身份模式：按「渠道·账号·Key」逐条，或按「模型 × 站点」。 */
+export type LocalToolIdentityMode = "channel" | "model";

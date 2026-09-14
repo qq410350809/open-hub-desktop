@@ -430,6 +430,7 @@ pub fn run() {
             local_tools::list_local_tools,
             local_tools::get_local_tool_config,
             local_tools::save_local_tool_config,
+            local_tools::diff_local_tool_config,
             local_tools::list_local_tool_backups,
             local_tools::restore_local_tool_backup,
             web_server::get_login_state,

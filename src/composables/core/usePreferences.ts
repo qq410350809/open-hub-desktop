@@ -16,6 +16,8 @@ const defaultPreferences: Preferences = {
   proxyNodeSortMode: "latency",
   sidebarCollapsed: false,
   accountAliases: {},
+  agentIdentityModes: {},
+  agentModelConfigs: {},
 };
 
 function loadPreferences(): Preferences {
@@ -44,6 +46,8 @@ function loadPreferences(): Preferences {
       proxyNodeSortMode,
       sidebarCollapsed: Boolean(saved.sidebarCollapsed),
       accountAliases: saved.accountAliases ?? {},
+      agentIdentityModes: saved.agentIdentityModes ?? {},
+      agentModelConfigs: saved.agentModelConfigs ?? {},
     };
   } catch {
     return { ...defaultPreferences };

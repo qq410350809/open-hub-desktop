@@ -163,6 +163,7 @@ fn is_local_only_command(command: &str) -> bool {
             | "list_local_tools"
             | "get_local_tool_config"
             | "save_local_tool_config"
+            | "diff_local_tool_config"
             | "list_local_tool_backups"
             | "restore_local_tool_backup"
             | "list_chrome_sessions"

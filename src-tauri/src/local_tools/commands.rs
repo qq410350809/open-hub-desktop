@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use crate::context::spawn_blocking;
 use crate::local_tools::adapters::{find_adapter, full_adapters};
 use crate::local_tools::backup;
+use crate::local_tools::diff::{diff_targets, ToolDiffReport, ToolDiffTarget};
 use crate::local_tools::mark::ManagedState;
 use crate::local_tools::types::{
     conflict_error, ToolBackupEntry, ToolConfigPatch, ToolConfigSaveResult, ToolConfigSnapshot,
@@ -109,6 +110,25 @@ pub async fn save_local_tool_config(
     })
     .await
     .map_err(|error| format!("配置保存失败：{error}"))?
+}
+
+/// 比对「清单组装的配置」与磁盘现状，回答每一行是否已经生效。
+///
+/// 只读：把 patch 应用到临时镜像目录后与真实快照做语义比对，
+/// 与 `save_local_tool_config` 共用同一套适配器逻辑，因此结论与真实写入结果一致。
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub async fn diff_local_tool_config(
+    tool: String,
+    targets: Vec<ToolDiffTarget>,
+) -> Result<ToolDiffReport, String> {
+    let id = ToolId::from_str_value(&tool).ok_or_else(|| format!("未知工具：{tool}"))?;
+    let adapter = find_adapter(id).ok_or_else(|| format!("{tool} 不支持结构化配置管理"))?;
+    spawn_blocking(move || {
+        let home = std::env::var_os("HOME").ok_or("无法定位用户目录")?;
+        diff_targets(adapter, &PathBuf::from(home), &targets)
+    })
+    .await
+    .map_err(|error| format!("配置比对失败：{error}"))?
 }
 
 /// 保存主体：hash 冲突检测 → 按「标识 + 指纹」决定是否备份 → 合并写入 → 重新快照。

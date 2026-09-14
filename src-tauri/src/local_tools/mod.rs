@@ -11,6 +11,7 @@
 pub(crate) mod adapters;
 pub(crate) mod backup;
 pub mod commands;
+pub(crate) mod diff;
 pub(crate) mod fsutil;
 pub(crate) mod mark;
 pub(crate) mod types;
