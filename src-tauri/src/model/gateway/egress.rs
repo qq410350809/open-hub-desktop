@@ -426,6 +426,7 @@ pub fn anthropic_response_to_openai(resp: &JsonValue) -> JsonValue {
     msg["content"] = json!(content);
     if !reasoning.is_empty() {
         msg["reasoning_content"] = json!(reasoning);
+        msg["reasoning"] = json!(reasoning);
     }
     if !tool_calls.is_empty() {
         msg["tool_calls"] = json!(tool_calls);
@@ -511,6 +512,7 @@ pub fn gemini_response_to_openai(resp: &JsonValue, model: &str) -> JsonValue {
     msg["content"] = json!(content);
     if !reasoning.is_empty() {
         msg["reasoning_content"] = json!(reasoning);
+        msg["reasoning"] = json!(reasoning);
     }
     if !tool_calls.is_empty() {
         msg["tool_calls"] = json!(tool_calls);
@@ -594,6 +596,7 @@ pub fn responses_response_to_openai(resp: &JsonValue) -> JsonValue {
     msg["content"] = json!(content);
     if !reasoning.is_empty() {
         msg["reasoning_content"] = json!(reasoning);
+        msg["reasoning"] = json!(reasoning);
     }
     if !tool_calls.is_empty() {
         msg["tool_calls"] = json!(tool_calls);
@@ -991,6 +994,52 @@ mod egress_tests {
             Some("hi"),
             "UR 展开的 Anthropic 体为 blocks 结构: {out2}"
         );
+    }
+
+    #[test]
+    fn opencode_muse_spark_egress_automatically_routes_to_responses_with_reasoning_summary() {
+        use crate::model::gateway::egress::EgressBody;
+        let opencode_ch = serde_json::from_value::<ChannelConfig>(json!({
+            "id": "opencode",
+            "name": "OpenCode",
+            "enabled": true,
+            "protocol": "openai",
+            "upstreamUrl": "https://opencode.ai/zen/v1",
+        }))
+        .unwrap();
+
+        // 客户端经由 chat/completions 传入（未显式声明 reasoning）
+        let chat_body = json!({
+            "model": "muse-spark-1.3-contributor-free",
+            "messages": [{"role": "user", "content": "9.11和9.9哪个大？"}]
+        });
+        let ur = crate::model::gateway::parsers::chat_to_universal(
+            &chat_body,
+            "muse-spark-1.3-contributor-free",
+        );
+
+        let (url, egress_body) = prepare_egress_with(
+            &opencode_ch,
+            "",
+            "muse-spark-1.3-contributor-free",
+            EgressBody::Universal(ur),
+            true,
+        );
+
+        // 1. 自动路由到 Responses API 端点
+        assert_eq!(url, "https://opencode.ai/zen/v1/responses");
+        // 2. 自动注入思考与 summary: "auto"
+        assert_eq!(
+            egress_body.pointer("/reasoning/effort").and_then(JsonValue::as_str),
+            Some("high")
+        );
+        assert_eq!(
+            egress_body.pointer("/reasoning/summary").and_then(JsonValue::as_str),
+            Some("auto")
+        );
+        // 3. 自动注入 encrypted_content
+        let include = egress_body.pointer("/include").and_then(JsonValue::as_array).unwrap();
+        assert!(include.iter().any(|v| v == "reasoning.encrypted_content"));
     }
 
     #[tokio::test]

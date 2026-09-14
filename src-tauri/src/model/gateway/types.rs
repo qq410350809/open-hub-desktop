@@ -229,6 +229,11 @@ impl ChannelConfig {
                 }
             }
         }
+        if crate::model::gateway::policies::opencode::is_opencode_channel(self) {
+            if let Some(proto) = crate::model::gateway::policies::opencode::target_protocol_for_opencode_model(model) {
+                return proto;
+            }
+        }
         crate::model::gateway::egress::TargetProtocol::from_channel(self)
     }
 

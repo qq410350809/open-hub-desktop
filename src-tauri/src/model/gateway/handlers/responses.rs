@@ -86,7 +86,7 @@ pub async fn handle_responses(
     // 同协议快速通道：Responses 客户端 → Responses 上游，请求体原生透传。
     // reasoning.encrypted_content 等元素 IR 无法表达，同协议必须直通保真。
     let fast_path =
-        egress::TargetProtocol::from_channel(chan) == egress::TargetProtocol::OpenAiResponses;
+        chan.target_protocol_for(&model_to_send) == egress::TargetProtocol::OpenAiResponses;
     let egress_payload = if fast_path {
         let mut native = body.clone();
         native["model"] = JsonValue::String(model_to_send.clone());

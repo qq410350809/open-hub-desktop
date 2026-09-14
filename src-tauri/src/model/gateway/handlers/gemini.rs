@@ -89,7 +89,7 @@ pub async fn handle_gemini_generate(
     };
 
     // 同协议快速通道：Gemini 客户端 → Gemini 上游，请求体原生透传（模型名走 URL）
-    let fast_path = TargetProtocol::from_channel(chan) == TargetProtocol::Gemini;
+    let fast_path = chan.target_protocol_for(&model_to_send) == TargetProtocol::Gemini;
     let egress_payload = if fast_path {
         crate::model::gateway::egress::EgressBody::Native(body.clone())
     } else {

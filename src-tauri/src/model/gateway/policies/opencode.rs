@@ -57,6 +57,24 @@ pub fn is_opencode_reasoning_model(model: &str) -> bool {
         || name.contains("thinking")
 }
 
+/// 判断指定 OpenCode 模型是否必须走 OpenAI Responses 协议（如 muse-spark）
+pub fn is_opencode_responses_model(model: &str) -> bool {
+    let lower = model.to_lowercase();
+    let name = strip_opencode_prefix(&lower);
+    name.contains("muse-spark") || name.contains("muse")
+}
+
+/// OpenCode 模型的默认上游协议覆盖（仅对 OpenCode 渠道生效）
+pub fn target_protocol_for_opencode_model(
+    model: &str,
+) -> Option<crate::model::gateway::egress::TargetProtocol> {
+    if is_opencode_responses_model(model) {
+        Some(crate::model::gateway::egress::TargetProtocol::OpenAiResponses)
+    } else {
+        None
+    }
+}
+
 /// OpenCode 推理模型缺省思考档位与 Token 预算
 pub fn default_reasoning_for_model(model: &str) -> Option<crate::model::gateway::ir::ReasoningConfig> {
     if is_opencode_reasoning_model(model) {
@@ -279,5 +297,46 @@ mod opencode_policy_tests {
         .expect("渠道可解析");
         pin_channel_config(&mut other);
         assert_eq!(other.alias.as_deref(), Some("keep"));
+    }
+
+    #[test]
+    fn opencode_muse_spark_routes_to_responses_protocol_while_others_stay_chat() {
+        assert!(is_opencode_responses_model("muse-spark-1.3-contributor-free"));
+        assert!(is_opencode_responses_model("opencode/muse-spark-1.2"));
+        assert!(!is_opencode_responses_model("mimo-v2.5-free"));
+        assert!(!is_opencode_responses_model("deepseek-v4-flash-free"));
+
+        let opencode_ch = serde_json::from_value::<ChannelConfig>(json!({
+            "id": "opencode",
+            "name": "OpenCode",
+            "enabled": true,
+            "protocol": "openai",
+            "upstreamUrl": "https://opencode.ai/zen/v1",
+        }))
+        .unwrap();
+
+        assert_eq!(
+            opencode_ch.target_protocol_for("muse-spark-1.3-contributor-free"),
+            crate::model::gateway::egress::TargetProtocol::OpenAiResponses
+        );
+        assert_eq!(
+            opencode_ch.target_protocol_for("mimo-v2.5-free"),
+            crate::model::gateway::egress::TargetProtocol::OpenAiChat
+        );
+
+        // 严格隔离：非 OpenCode 渠道即便模型名称带有 muse-spark，也不受 OpenCode 规则影响
+        let other_ch = serde_json::from_value::<ChannelConfig>(json!({
+            "id": "custom",
+            "name": "Custom Channel",
+            "enabled": true,
+            "protocol": "openai",
+            "upstreamUrl": "https://custom.ai/v1",
+        }))
+        .unwrap();
+
+        assert_eq!(
+            other_ch.target_protocol_for("muse-spark-1.3-contributor-free"),
+            crate::model::gateway::egress::TargetProtocol::OpenAiChat
+        );
     }
 }

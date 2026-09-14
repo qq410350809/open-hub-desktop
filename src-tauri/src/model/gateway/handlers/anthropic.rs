@@ -88,7 +88,7 @@ pub async fn handle_messages(
     // 此前强制转 Chat 导致 cache_control / thinking signature 丢失，
     // Anthropic 上游的 prompt caching 与思考链连续性完全失效，现恢复直通。
     let fast_path =
-        egress::TargetProtocol::from_channel(chan) == egress::TargetProtocol::AnthropicMessages;
+        chan.target_protocol_for(&model_to_send) == egress::TargetProtocol::AnthropicMessages;
     let egress_payload = if fast_path {
         let mut native = body.clone();
         native["model"] = serde_json::Value::String(model_to_send.clone());
