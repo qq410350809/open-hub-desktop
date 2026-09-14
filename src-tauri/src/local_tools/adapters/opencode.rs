@@ -82,6 +82,73 @@ impl OpencodeAdapter {
         }
         models
     }
+
+    /// 汇总各模型的思考档（`models[].variants` 的键），键为 `供应商/模型`，
+    /// 值与 `apply` 写入的口径一致（形如 `low,max`）。
+    ///
+    /// 必须回读：`apply` 会按 per_model_effort 重建 variants，读取不回填的话
+    /// 界面看不到已配档位，且保存时会把用户原有 variants 一并清掉。
+    fn collect_efforts(root: &Map<String, Value>) -> std::collections::BTreeMap<String, String> {
+        let mut out = std::collections::BTreeMap::new();
+        let Some(providers) = root.get("provider").and_then(|v| v.as_object()) else {
+            return out;
+        };
+        for (provider_id, provider) in providers {
+            let Some(models) = provider
+                .as_object()
+                .and_then(|obj| obj.get("models"))
+                .and_then(|v| v.as_object())
+            else {
+                continue;
+            };
+            for (model_id, model) in models {
+                let Some(variants) = model
+                    .as_object()
+                    .and_then(|obj| obj.get("variants"))
+                    .and_then(|v| v.as_object())
+                else {
+                    continue;
+                };
+                let mut efforts: Vec<String> = variants.keys().map(|key| key.to_string()).collect();
+                efforts.sort();
+                if !efforts.is_empty() {
+                    out.insert(format!("{provider_id}/{model_id}"), efforts.join(","));
+                }
+            }
+        }
+        out
+    }
+
+    /// 回读受管模型配置中的默认思考级别（`options.reasoningEffort`）。
+    fn collect_default_effort(root: &Map<String, Value>) -> String {
+        let Some(providers) = root.get("provider").and_then(|v| v.as_object()) else {
+            return String::new();
+        };
+        for (_provider_id, provider) in providers {
+            let Some(models) = provider
+                .as_object()
+                .and_then(|obj| obj.get("models"))
+                .and_then(|v| v.as_object())
+            else {
+                continue;
+            };
+            for (_model_id, model) in models {
+                if let Some(effort) = model
+                    .as_object()
+                    .and_then(|m| m.get("options"))
+                    .and_then(|o| o.as_object())
+                    .and_then(|o| o.get("reasoningEffort"))
+                    .and_then(|e| e.as_str())
+                {
+                    let trimmed = effort.trim();
+                    if !trimmed.is_empty() {
+                        return trimmed.to_string();
+                    }
+                }
+            }
+        }
+        String::new()
+    }
 }
 
 impl ToolAdapter for OpencodeAdapter {
@@ -150,16 +217,17 @@ impl ToolAdapter for OpencodeAdapter {
             }
         }
 
+        let default_effort = Self::collect_default_effort(&root);
         snap.models = Self::collect_models(&root);
         snap.defaults = DefaultsSection {
             model: json_str(&Value::Object(root.clone()), "model").unwrap_or_default(),
             provider: String::new(),
-            reasoning_effort: String::new(),
+            reasoning_effort: default_effort.clone(),
             reasoning_effort_options: effort_options(EFFORTS),
-            per_model_effort: Default::default(),
+            per_model_effort: Self::collect_efforts(&root),
         };
         snap.thinking = ThinkingSection {
-            effort_level: String::new(),
+            effort_level: default_effort,
             effort_level_options: effort_options(EFFORTS),
             max_thinking_tokens: None,
         };
@@ -185,6 +253,7 @@ impl ToolAdapter for OpencodeAdapter {
         for id in stale {
             providers_new.remove(&id);
         }
+        let default_effort = patch.defaults.reasoning_effort.trim();
         for provider in &patch.providers {
             if !is_managed_id(&provider.id) {
                 continue;
@@ -226,7 +295,28 @@ impl ToolAdapter for OpencodeAdapter {
                     model_obj.insert("limit".into(), Value::Object(limit));
                 }
                 let effort_key = format!("{}/{}", provider.id, short);
-                if let Some(efforts) = patch.defaults.per_model_effort.get(&effort_key) {
+                let configured_efforts = patch.defaults.per_model_effort.get(&effort_key);
+                let has_variants = configured_efforts.map(|s| !s.trim().is_empty()).unwrap_or(false);
+                let has_default_effort = !default_effort.is_empty();
+
+                // OpenCode 内核硬编码约束：模型未声明 reasoning: true 时，
+                // 会判定为非推理模型并将 reasoningEffort 作为非法特性剥离。
+                if has_variants || has_default_effort {
+                    model_obj.insert("reasoning".into(), json!(true));
+                }
+
+                // 注入默认思考级别到 options.reasoningEffort：
+                // OpenCode 会话初始默认处于无变体状态，写入 options 可确保免手动按快捷键直接生效。
+                if has_default_effort {
+                    let mut model_options = Map::new();
+                    model_options.insert(
+                        "reasoningEffort".into(),
+                        Value::String(default_effort.to_string()),
+                    );
+                    model_obj.insert("options".into(), Value::Object(model_options));
+                }
+
+                if let Some(efforts) = configured_efforts {
                     let variants: Map<String, Value> = efforts
                         .split(',')
                         .map(str::trim)
@@ -343,6 +433,14 @@ mod tests {
         assert_eq!(snap.models.len(), 1);
         assert_eq!(snap.models[0].context_window, 100_000);
         assert_eq!(snap.defaults.model, "p1/m1");
+        assert_eq!(
+            snap.defaults
+                .per_model_effort
+                .get("p1/m1")
+                .map(String::as_str),
+            Some("low,max"),
+            "已配置的 variants 必须回读，否则界面显示为空且保存时会清掉"
+        );
 
         let patch = ToolConfigPatch {
             base_hash: snap.content_hash.clone(),
@@ -437,4 +535,80 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&home);
     }
+
+    #[test]
+    fn apply_and_snapshot_preserves_reasoning_and_options_effort() {
+        let home = temp_home();
+        let path = config_path(&home);
+        let adapter = OpencodeAdapter;
+
+        let mut per_model_effort = std::collections::BTreeMap::new();
+        per_model_effort.insert("openhub-site_a_acc_0/m_reason".into(), "low,high".into());
+
+        let patch = ToolConfigPatch {
+            base_hash: "".into(),
+            providers: vec![ProviderEntry {
+                id: "openhub-site_a_acc_0".into(),
+                name: "站点 A".into(),
+                base_url: "http://127.0.0.1:17896/v1".into(),
+                api_key: "sk-openhub-test".into(),
+                protocol: "@ai-sdk/openai-compatible".into(),
+                models: vec!["m_reason".into(), "m_plain".into()],
+            }],
+            models: vec![
+                ModelEntry {
+                    id: "m_reason".into(),
+                    name: "推理模型".into(),
+                    provider: "openhub-site_a_acc_0".into(),
+                    context_window: 128_000,
+                    max_output: 8_192,
+                },
+                ModelEntry {
+                    id: "m_plain".into(),
+                    name: "普通模型".into(),
+                    provider: "openhub-site_a_acc_0".into(),
+                    context_window: 128_000,
+                    max_output: 8_192,
+                },
+            ],
+            defaults: DefaultsSection {
+                model: "openhub-site_a_acc_0/m_reason".into(),
+                reasoning_effort: "high".into(),
+                per_model_effort,
+                ..Default::default()
+            },
+            context: Default::default(),
+            thinking: ThinkingSection {
+                effort_level: "high".into(),
+                ..Default::default()
+            },
+        };
+
+        adapter.apply(&home, &patch).unwrap();
+        let out: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let models = &out["provider"]["openhub-site_a_acc_0"]["models"];
+
+        // 包含 variants 或默认思考级别时，必须有 reasoning: true 与 options.reasoningEffort
+        assert_eq!(models["m_reason"]["reasoning"], true);
+        assert_eq!(models["m_reason"]["options"]["reasoningEffort"], "high");
+        assert!(models["m_reason"]["variants"]["low"]["reasoningEffort"] == "low");
+        assert!(models["m_reason"]["variants"]["high"]["reasoningEffort"] == "high");
+
+        // 普通模型因默认思考级别非空，也会获得默认 options.reasoningEffort 及 reasoning: true
+        assert_eq!(models["m_plain"]["reasoning"], true);
+        assert_eq!(models["m_plain"]["options"]["reasoningEffort"], "high");
+        assert!(models["m_plain"].get("variants").is_none());
+
+        // snapshot 回读验证
+        let snap = adapter.snapshot(&home).unwrap();
+        assert_eq!(snap.defaults.reasoning_effort, "high");
+        assert_eq!(snap.thinking.effort_level, "high");
+        assert_eq!(
+            snap.defaults.per_model_effort.get("openhub-site_a_acc_0/m_reason").map(String::as_str),
+            Some("high,low") // sorted
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
 }
+
