@@ -46,6 +46,29 @@ pub fn is_free_opencode_model(model: &str) -> bool {
     name == "big-pickle" || name.contains("free")
 }
 
+/// 判断是否为具备推理能力（思考/思维链）的 OpenCode 模型
+pub fn is_opencode_reasoning_model(model: &str) -> bool {
+    let lower = model.to_lowercase();
+    let name = strip_opencode_prefix(&lower);
+    name.contains("muse-spark")
+        || name.contains("mimo")
+        || name.contains("deepseek")
+        || name.contains("reasoning")
+        || name.contains("thinking")
+}
+
+/// OpenCode 推理模型缺省思考档位与 Token 预算
+pub fn default_reasoning_for_model(model: &str) -> Option<crate::model::gateway::ir::ReasoningConfig> {
+    if is_opencode_reasoning_model(model) {
+        Some(crate::model::gateway::ir::ReasoningConfig {
+            effort: Some("high".to_string()),
+            budget_tokens: Some(16384),
+        })
+    } else {
+        None
+    }
+}
+
 /// 校验请求的模型在目标渠道上是否合法可用
 /// （例如在未配置 Key 的 OpenCode 免费渠道上拦截付费模型）
 pub fn check_model_channel_compatibility(

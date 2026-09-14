@@ -1523,7 +1523,14 @@ impl ChatEmitter {
     fn on_event(&mut self, event: &UniversalStreamEvent) -> Vec<String> {
         match event {
             UniversalStreamEvent::ReasoningDelta(s) => {
-                vec![delta_chunk(json!({ "reasoning_content": s }), None, None)]
+                vec![delta_chunk(
+                    json!({
+                        "reasoning_content": s,
+                        "reasoning": s,
+                    }),
+                    None,
+                    None,
+                )]
             }
             UniversalStreamEvent::TextDelta(s) => {
                 vec![delta_chunk(json!({ "content": s }), None, None)]

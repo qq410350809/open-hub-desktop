@@ -144,6 +144,35 @@ fn prepare_egress_inner(
     // 模型级协议覆盖优先（「管理模型」中为单个模型选择的上游协议）
     let target = channel.target_protocol_for(model);
 
+    let mut universal = universal;
+    // 针对 OpenCode 官方推理模型（如 muse-spark、mimo、deepseek-v4）：
+    // 若客户端未显式传入思考参数（如经由 messages 协议接入），自动注入默认高档位思考与预算，
+    // 抹平 CLI 与反代差异；绝不影响非 OpenCode 渠道
+    if super::policies::opencode::is_opencode_channel(channel)
+        && super::policies::opencode::is_opencode_reasoning_model(model)
+    {
+        if let Some(ur) = universal.as_mut() {
+            if ur.reasoning.is_none() {
+                ur.reasoning = super::policies::opencode::default_reasoning_for_model(model);
+            }
+        }
+        if let Some(obj) = native.as_mut().and_then(|v| v.as_object_mut()) {
+            if target == TargetProtocol::OpenAiChat
+                && !obj.contains_key("reasoning_effort")
+                && !obj.contains_key("reasoningEffort")
+            {
+                obj.insert("reasoning_effort".to_string(), json!("high"));
+            } else if target == TargetProtocol::OpenAiResponses && !obj.contains_key("reasoning") {
+                obj.insert(
+                    "reasoning".to_string(),
+                    json!({ "effort": "high", "summary": "auto" }),
+                );
+                obj.entry("include".to_string())
+                    .or_insert_with(|| json!(["reasoning.encrypted_content"]));
+            }
+        }
+    }
+
     match target {
         // Gemini 原生：模型名走 URL，key 走查询参数；跨协议时由 IR 序列化
         TargetProtocol::Gemini => {
@@ -179,11 +208,22 @@ fn prepare_egress_inner(
         // OpenAI Responses 原生：/v1/responses
         TargetProtocol::OpenAiResponses => {
             let url = normalize_versioned_base(base, "responses");
-            let egress_body = if let Some(ur) = universal {
+            let mut egress_body = if let Some(ur) = universal {
                 super::parsers::universal_to_responses(&ur)
             } else {
                 native.take().unwrap_or_else(|| json!({}))
             };
+            if super::policies::opencode::is_opencode_channel(channel)
+                && super::policies::opencode::is_opencode_reasoning_model(model)
+            {
+                if let Some(obj) = egress_body.as_object_mut() {
+                    if let Some(reasoning) = obj.get_mut("reasoning").and_then(|v| v.as_object_mut()) {
+                        reasoning.entry("summary".to_string()).or_insert_with(|| json!("auto"));
+                    }
+                    obj.entry("include".to_string())
+                        .or_insert_with(|| json!(["reasoning.encrypted_content"]));
+                }
+            }
             (url, egress_body)
         }
         // OpenAI Chat 统一出口（中枢格式原样）

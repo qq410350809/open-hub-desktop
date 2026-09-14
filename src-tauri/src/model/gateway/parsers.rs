@@ -108,6 +108,14 @@ impl ChatParser {
             if !s.is_empty() {
                 out.push(UniversalStreamEvent::ReasoningDelta(s.to_string()));
             }
+        } else if let Some(details) = delta.get("reasoning_details").and_then(JsonValue::as_array) {
+            for d in details {
+                if let Some(s) = d.get("text").and_then(JsonValue::as_str) {
+                    if !s.is_empty() {
+                        out.push(UniversalStreamEvent::ReasoningDelta(s.to_string()));
+                    }
+                }
+            }
         }
         if let Some(s) = delta.get("content").and_then(JsonValue::as_str) {
             if !s.is_empty() {
@@ -676,7 +684,9 @@ impl ResponsesParser {
                     }
                 }
             }
-            Some("response.reasoning_summary_text.delta") => {
+            Some("response.reasoning_summary_text.delta")
+            | Some("response.reasoning_text.delta")
+            | Some("response.reasoning.delta") => {
                 if let Some(t) = jv.get("delta").and_then(JsonValue::as_str) {
                     if !t.is_empty() {
                         out.push(UniversalStreamEvent::ReasoningDelta(t.to_string()));
@@ -684,7 +694,27 @@ impl ResponsesParser {
                 }
             }
             Some("response.output_item.added") => {
-                if jv.pointer("/item/type").and_then(JsonValue::as_str) == Some("function_call") {
+                let item_type = jv.pointer("/item/type").and_then(JsonValue::as_str);
+                if item_type == Some("reasoning") {
+                    if let Some(summary_arr) = jv.pointer("/item/summary").and_then(JsonValue::as_array) {
+                        for s in summary_arr {
+                            if let Some(text) = s.get("text").and_then(JsonValue::as_str) {
+                                if !text.is_empty() {
+                                    out.push(UniversalStreamEvent::ReasoningDelta(text.to_string()));
+                                }
+                            }
+                        }
+                    } else if let Some(text) = jv
+                        .pointer("/item/text")
+                        .or_else(|| jv.pointer("/item/reasoning"))
+                        .or_else(|| jv.pointer("/item/reasoning_content"))
+                        .and_then(JsonValue::as_str)
+                    {
+                        if !text.is_empty() {
+                            out.push(UniversalStreamEvent::ReasoningDelta(text.to_string()));
+                        }
+                    }
+                } else if item_type == Some("function_call") {
                     let item_id = jv
                         .pointer("/item/id")
                         .and_then(JsonValue::as_str)
@@ -739,7 +769,27 @@ impl ResponsesParser {
             }
             Some("response.output_item.done") => {
                 // 兜底：上游缺失 added/delta 帧时按完整块下发
-                if jv.pointer("/item/type").and_then(JsonValue::as_str) == Some("function_call") {
+                let item_type = jv.pointer("/item/type").and_then(JsonValue::as_str);
+                if item_type == Some("reasoning") {
+                    if let Some(summary_arr) = jv.pointer("/item/summary").and_then(JsonValue::as_array) {
+                        for s in summary_arr {
+                            if let Some(text) = s.get("text").and_then(JsonValue::as_str) {
+                                if !text.is_empty() {
+                                    out.push(UniversalStreamEvent::ReasoningDelta(text.to_string()));
+                                }
+                            }
+                        }
+                    } else if let Some(text) = jv
+                        .pointer("/item/text")
+                        .or_else(|| jv.pointer("/item/reasoning"))
+                        .or_else(|| jv.pointer("/item/reasoning_content"))
+                        .and_then(JsonValue::as_str)
+                    {
+                        if !text.is_empty() {
+                            out.push(UniversalStreamEvent::ReasoningDelta(text.to_string()));
+                        }
+                    }
+                } else if item_type == Some("function_call") {
                     let item_id = jv
                         .pointer("/item/id")
                         .and_then(JsonValue::as_str)
@@ -983,14 +1033,24 @@ pub fn chat_to_universal(body: &JsonValue, model: &str) -> UniversalRequest {
         .get("max_completion_tokens")
         .or_else(|| body.get("max_tokens"))
         .and_then(JsonValue::as_u64);
-    ur.response_format = body
-        .get("response_format")
-        .filter(|v| v.is_object())
-        .cloned();
-    if let Some(effort) = body.get("reasoning_effort").and_then(JsonValue::as_str) {
+    if let Some(rf) = body.get("response_format").filter(|v| v.is_object()) {
+        ur.response_format = Some(rf.clone());
+    }
+    let reasoning_effort = body
+        .get("reasoning_effort")
+        .or_else(|| body.get("reasoningEffort"))
+        .and_then(JsonValue::as_str)
+        .or_else(|| body.pointer("/reasoning/effort").and_then(JsonValue::as_str));
+    if let Some(effort) = reasoning_effort {
+        let budget = match effort.to_ascii_lowercase().as_str() {
+            "low" | "minimal" => 2048,
+            "medium" => 8192,
+            "high" | "xhigh" | "max" => 32768,
+            _ => 4096,
+        };
         ur.reasoning = Some(ReasoningConfig {
             effort: Some(effort.to_string()),
-            ..Default::default()
+            budget_tokens: Some(budget),
         });
     }
     match body.get("stop") {
@@ -1152,6 +1212,8 @@ pub fn chat_to_universal(body: &JsonValue, model: &str) -> UniversalRequest {
             "tool_choice",
             "response_format",
             "reasoning_effort",
+            "reasoningEffort",
+            "reasoning",
         ],
     );
     ur
@@ -1212,9 +1274,16 @@ pub fn anthropic_to_universal(body: &JsonValue, model: &str) -> UniversalRequest
     ur.metadata = body.get("metadata").filter(|v| v.is_object()).cloned();
     if let Some(thinking) = body.get("thinking") {
         if thinking.get("type").and_then(JsonValue::as_str) == Some("enabled") {
+            let budget = thinking.get("budget_tokens").and_then(JsonValue::as_u64);
+            let effort = match budget {
+                Some(b) if b <= 4096 => "low",
+                Some(b) if b <= 16384 => "medium",
+                Some(_) => "high",
+                None => "medium",
+            };
             ur.reasoning = Some(ReasoningConfig {
-                effort: None,
-                budget_tokens: thinking.get("budget_tokens").and_then(JsonValue::as_u64),
+                effort: Some(effort.to_string()),
+                budget_tokens: budget,
             });
         }
     }
@@ -2039,7 +2108,21 @@ pub fn universal_to_chat(ur: &UniversalRequest) -> JsonValue {
         out["response_format"] = rf.clone();
     }
     if let Some(reasoning) = &ur.reasoning {
-        if let Some(effort) = &reasoning.effort {
+        let effort = reasoning
+            .effort
+            .clone()
+            .or_else(|| {
+                reasoning.budget_tokens.map(|b| {
+                    if b <= 4096 {
+                        "low".to_string()
+                    } else if b <= 16384 {
+                        "medium".to_string()
+                    } else {
+                        "high".to_string()
+                    }
+                })
+            });
+        if let Some(effort) = effort {
             out["reasoning_effort"] = json!(effort);
         }
     }
@@ -2205,7 +2288,19 @@ pub fn universal_to_anthropic(ur: &UniversalRequest) -> JsonValue {
         out["metadata"] = metadata.clone();
     }
     if let Some(reasoning) = &ur.reasoning {
-        if let Some(budget) = reasoning.budget_tokens {
+        let budget = reasoning
+            .budget_tokens
+            .or_else(|| {
+                reasoning.effort.as_deref().map(|e| {
+                    match e.to_ascii_lowercase().as_str() {
+                        "low" | "minimal" => 2048,
+                        "medium" => 8192,
+                        "high" | "xhigh" | "max" => 32768,
+                        _ => 4096,
+                    }
+                })
+            });
+        if let Some(budget) = budget {
             out["thinking"] = json!({ "type": "enabled", "budget_tokens": budget });
         }
     }
@@ -2461,9 +2556,27 @@ pub fn universal_to_responses(ur: &UniversalRequest) -> JsonValue {
         out["top_p"] = json!(v);
     }
     if let Some(reasoning) = &ur.reasoning {
-        if let Some(effort) = &reasoning.effort {
-            out["reasoning"] = json!({ "effort": effort });
-        }
+        let effort = reasoning
+            .effort
+            .as_deref()
+            .map(|s| s.to_string())
+            .or_else(|| {
+                reasoning.budget_tokens.map(|b| {
+                    if b <= 4096 {
+                        "low".to_string()
+                    } else if b <= 16384 {
+                        "medium".to_string()
+                    } else {
+                        "high".to_string()
+                    }
+                })
+            })
+            .unwrap_or_else(|| "medium".to_string());
+        out["reasoning"] = json!({
+            "effort": effort,
+            "summary": "auto"
+        });
+        out["include"] = json!(["reasoning.encrypted_content"]);
     }
     if !ur.tools.is_empty() {
         let tools: Vec<JsonValue> = ur
@@ -2755,6 +2868,41 @@ mod parser_tests {
         );
         assert_eq!(out["service_tier"], "flex");
         assert_eq!(out["modalities"][0], "text");
+    }
+
+    #[test]
+    fn chat_to_universal_extracts_reasoning_effort_fallbacks() {
+        // 1. 标准蛇形
+        let b1 = json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "low"
+        });
+        let ur1 = crate::model::gateway::parsers::chat_to_universal(&b1, "m");
+        assert_eq!(ur1.reasoning.as_ref().unwrap().effort.as_deref(), Some("low"));
+        let out1 = crate::model::gateway::parsers::universal_to_chat(&ur1);
+        assert_eq!(out1["reasoning_effort"], "low");
+
+        // 2. 驼峰 reasoningEffort
+        let b2 = json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoningEffort": "medium"
+        });
+        let ur2 = crate::model::gateway::parsers::chat_to_universal(&b2, "m");
+        assert_eq!(ur2.reasoning.as_ref().unwrap().effort.as_deref(), Some("medium"));
+        let out2 = crate::model::gateway::parsers::universal_to_chat(&ur2);
+        assert_eq!(out2["reasoning_effort"], "medium");
+        assert!(ur2.extra.get("reasoningEffort").is_none());
+
+        // 3. 嵌套 reasoning.effort
+        let b3 = json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning": { "effort": "high" }
+        });
+        let ur3 = crate::model::gateway::parsers::chat_to_universal(&b3, "m");
+        assert_eq!(ur3.reasoning.as_ref().unwrap().effort.as_deref(), Some("high"));
+        let out3 = crate::model::gateway::parsers::universal_to_chat(&ur3);
+        assert_eq!(out3["reasoning_effort"], "high");
+        assert!(ur3.extra.get("reasoning").is_none());
     }
 
     #[test]
