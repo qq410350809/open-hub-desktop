@@ -6,20 +6,6 @@ use std::{
 
 const LEVELDB_TABLE_MAGIC: u64 = 0xdb47_7524_8b80_fb57;
 const LOG_BLOCK_SIZE: usize = 32 * 1024;
-const STORAGE_KEYS: [&str; 9] = [
-    "user",
-    "quota_display_type",
-    "quota_per_unit",
-    "status",
-    "auth_token",
-    "auth_user",
-    // 皮皮智绘系（ai-image-miniprogram）：Linux.do OAuth 登录后把访问令牌与
-    // 用户信息写在 Local Storage，站点不写任何 Cookie。不读这三个键，
-    // 该站点在扫描阶段完全看不到登录痕迹（同步时表现为未检测到账号）。
-    "pipi_pc_token",
-    "pipi_pc_uid",
-    "pipi_pc_user",
-];
 
 #[derive(Debug, Clone)]
 pub(crate) struct LocalStorageTarget {
@@ -58,28 +44,25 @@ pub(crate) fn read_local_storage_from_home(
 
     let mut matches = Vec::with_capacity(targets.len());
     for (profile_id, profile_targets) in by_profile {
-        let wanted = profile_targets
+        // 会话判定只看桶里该 origin 有没有任意键；wanted 只限定 origin，
+        // 不再按已知平台键白名单排除——未知平台（LiteLLM 白标等）的登录
+        // token 可能存在任何自定义键下，白名单会把它们整个丢掉。
+        let wanted_origins = profile_targets
             .iter()
-            .flat_map(|target| {
-                STORAGE_KEYS
-                    .iter()
-                    .map(|key| (target.origin.clone(), (*key).to_string()))
-            })
+            .map(|target| target.origin.clone())
             .collect::<HashSet<_>>();
         let directory = chrome_root.join(profile_id).join("Local Storage/leveldb");
-        let result = read_profile_storage(&directory, &wanted);
+        let result = read_profile_storage(&directory, &wanted_origins);
         for target in profile_targets {
             match &result {
                 Ok(values) => {
-                    let values = STORAGE_KEYS
+                    // 保留该 origin 下读到的全部键（含未知键），具体键的解析
+                    // 留给签到/余额阶段；这里只负责证明“有会话痕迹”。
+                    let values = values
                         .iter()
-                        .filter_map(|key| {
-                            values
-                                .get(&(target.origin.clone(), (*key).to_string()))
-                                .cloned()
-                                .map(|value| ((*key).to_string(), value))
-                        })
-                        .collect();
+                        .filter(|((origin, _), _)| origin == &target.origin)
+                        .map(|((_, key), value)| (key.clone(), value.clone()))
+                        .collect::<HashMap<_, _>>();
                     matches.push(LocalStorageMatch {
                         site_id: target.site_id.clone(),
                         profile_id: target.profile_id.clone(),
@@ -101,7 +84,7 @@ pub(crate) fn read_local_storage_from_home(
 
 fn read_profile_storage(
     directory: &Path,
-    wanted: &HashSet<(String, String)>,
+    wanted_origins: &HashSet<String>,
 ) -> Result<HashMap<(String, String), String>, String> {
     if !directory.is_dir() {
         return Err("未找到该 Chrome Profile 的 Local Storage".into());
@@ -133,12 +116,18 @@ fn read_profile_storage(
         return Err("无法解析该 Chrome Profile 的 Local Storage".into());
     }
 
+    // 会话判定只看“这个 origin 的桶里有没有键”，不要求键名在已知白名单里：
+    // 未知平台（如 LiteLLM 白标站点）把登录 token 存在任意自定义键下，白名单
+    // 过滤会把这些键整个丢掉，导致“浏览器明明登录过、却提取不到账号”。
+    // 因此这里返回该 origin 下读到的全部键；值能解码则附带值，解码失败以空串
+    // 占位（键存在即证明有会话痕迹），具体值留给签到/余额阶段按已知键再分析。
     let mut latest: HashMap<(String, String), (u64, Option<String>)> = HashMap::new();
     for record in records {
         let Some(storage_key) = decode_storage_key(&record.key) else {
             continue;
         };
-        if !wanted.contains(&storage_key) {
+        let (ref origin, _) = storage_key;
+        if !wanted_origins.contains(origin) {
             continue;
         }
         let value = record.value.as_deref().and_then(decode_blink_string);
@@ -149,7 +138,7 @@ fn read_profile_storage(
     }
     Ok(latest
         .into_iter()
-        .filter_map(|(key, (_, value))| value.map(|value| (key, value)))
+        .map(|(key, (_, value))| (key, value.unwrap_or_default()))
         .collect())
 }
 
@@ -500,5 +489,55 @@ mod tests {
         assert_eq!(records[0].sequence, 7);
         assert_eq!(records[0].key, b"key-1");
         assert_eq!(records[0].value.as_deref(), Some(b"value1".as_slice()));
+    }
+
+    #[test]
+    fn profile_storage_keeps_unknown_custom_keys() {
+        // 回归保护：会话判定只按 origin 过滤，不再按已知平台键白名单排除。
+        // 未知平台（LiteLLM 白标等）把登录 token 存在自定义键下，白名单会
+        // 把整条记录丢掉，导致“浏览器有登录痕迹却提取不到账号”。
+        // 这里构造一个最小 LevelDB WAL，键 `studio-active-conversation-id`
+        // 绝不在旧白名单里，验证它仍被当作会话痕迹返回。
+        let origin = "https://images.aihappy.indevs.in";
+        let mut key: Vec<u8> = Vec::new();
+        key.push(b'_');
+        key.extend_from_slice(b"https://images.aihappy.indevs.in");
+        key.push(0);
+        key.push(1); // blink 编码 1：UTF-8 原始
+        key.extend_from_slice(b"studio-active-conversation-id");
+
+        let mut batch = Vec::new();
+        batch.extend_from_slice(&1_u64.to_le_bytes());
+        batch.extend_from_slice(&1_u32.to_le_bytes());
+        batch.push(1);
+        batch.push(key.len() as u8);
+        batch.extend_from_slice(&key);
+        batch.push(43);
+        batch.extend_from_slice(b"studio-796a176c-d292-414f-8d09-ed4f436c352b");
+
+        let mut log: Vec<u8> = Vec::new();
+        log.extend_from_slice(&[0_u8, 0, 0, 0]);
+        log.extend_from_slice(&u16::to_le_bytes(batch.len() as u16));
+        log.push(1); // full record
+        log.extend_from_slice(&batch);
+
+        let home = std::path::PathBuf::from("target/test-ls-fixture");
+        let leveldb = home.join("Local Storage/leveldb");
+        fs::create_dir_all(&leveldb).unwrap();
+        fs::write(leveldb.join("000001.log"), &log).unwrap();
+
+        let wanted = HashSet::from([origin.into()]);
+        let values = read_profile_storage(&leveldb, &wanted).unwrap();
+        let _ = fs::remove_dir_all(&home);
+
+        let target_key = (
+            "https://images.aihappy.indevs.in".into(),
+            "studio-active-conversation-id".into(),
+        );
+        assert!(values.contains_key(&target_key), "未知键未保留");
+        assert_eq!(
+            values.get(&target_key).cloned(),
+            Some("studio-796a176c-d292-414f-8d09-ed4f436c352b".into())
+        );
     }
 }

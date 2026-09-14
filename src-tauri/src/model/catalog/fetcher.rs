@@ -400,6 +400,7 @@ pub(crate) async fn reveal_newapi_keys(
 pub(crate) async fn chrome_bridge_fetch_keys_models(
     database: &Database,
     base_url: &Url,
+    system_type: &str,
     profile_id: &str,
     user_id: &str,
     site_id: Option<&str>,
@@ -413,8 +414,11 @@ pub(crate) async fn chrome_bridge_fetch_keys_models(
             .map_err(|_| "系统时间异常")?
             .as_nanos()
     );
+    // 桥接页按平台分派（NewAPI → /console/personal，Sub2API → /dashboard），
+    // 其余平台退回站点根路径 —— 有的站点根本没有 /console/personal。
+    let console_path = crate::site::library::console_page_path(system_type).unwrap_or("/");
     let browser_url = base_url
-        .join("console/personal")
+        .join(console_path)
         .map_err(|_| "无法生成 Chrome 验证地址")?;
     let base_str = base_url.to_string();
     let user_id_owned = user_id.to_string();
@@ -1929,6 +1933,7 @@ async fn fetch_site_models_json_inner(
                         match chrome_bridge_fetch_keys_models(
                             database,
                             &base_url,
+                            &system_type,
                             &profile_id,
                             &model_user_id,
                             site_id.as_deref(),

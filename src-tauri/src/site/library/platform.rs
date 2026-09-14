@@ -70,6 +70,23 @@ pub(crate) fn is_sub2api(system_type: &str) -> bool {
     is_platform(system_type, "sub2api")
 }
 
+/// 平台的浏览器控制台页路径（站点同源、带账号 Cookie 的页面）。
+///
+/// 浏览器桥接（账号 / Key 同步）需要打开一个同源页面执行页面内 fetch，
+/// 路径按平台分派；无法从平台类型推断时返回 None，调用方退回站点根路径，
+/// **不要**硬塞 NewAPI 的 `/console/personal` —— 有的站点没有这个地址。
+pub(crate) fn console_page_path(system_type: &str) -> Option<&'static str> {
+    if is_newapi(system_type) {
+        Some("/console/personal")
+    } else if is_sub2api(system_type) {
+        Some("/dashboard")
+    } else if is_pipiwang(system_type) {
+        Some("/profile")
+    } else {
+        None
+    }
+}
+
 /// 皮皮智绘系（ai-image-miniprogram）：Linux.do OAuth 登录，访问令牌（JWT）
 /// 存放在浏览器 Local Storage 的 pipi_pc_token，账号接口是自有积分/签到体系，
 /// 与 NewAPI / Sub2API 都不兼容（不复用它们的 Key 与模型接口）。

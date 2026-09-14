@@ -468,8 +468,9 @@ pub(crate) fn has_local_account_session(
 
 /// 宽松的浏览器会话判定：扫描阶段只回答「浏览器里该站点有没有登录痕迹」，
 /// 不再要求痕迹能解析出完整账号结构。任意 Cookie（含站点自定义会话名、
-/// cf_clearance 等）或 Local Storage 里任意已知键（哪怕只是 status/auth_token
-/// 的残缺数据）都算有会话；真实性由后续账号接口 / Chrome 桥接验证。
+/// cf_clearance 等）或 Local Storage 桶里该站点的任意键（无论键名是否是
+/// 已知平台的键，哪怕只是残缺数据）都算有会话；真实性由后续账号接口 /
+/// Chrome 桥接验证，具体值只在签到/余额阶段才解析。
 /// 旧的强过滤（结构化账号或 new_api_refresh cookie）会把改了键名/Cookie 名
 /// 的站点整站误判成“无会话”，导致同步弹窗老是提示未检测到账号。
 pub(crate) fn has_browser_session_evidence(
@@ -1613,14 +1614,20 @@ pub(crate) async fn fetch_site_account(
 /// Chrome 账号桥接打开的页面必须是站点同源控制台。
 /// AnyRouter 等站点常把 checkinUrl 写成根路径，打开后首页一跳就把 hash marker
 /// 丢掉，AppleScript 随后一直找不到标签，最终报「等待 Chrome 返回账号数据超时」。
+///
+/// 兜底路径按平台分派（NewAPI 系 → `/console/personal`，Sub2API → `/dashboard`）；
+/// 未知平台退回站点根路径而不是硬塞 NewAPI 路径 —— 有的站点根本没有
+/// `/console/personal`，打开只会得到 404。
 pub(crate) fn chrome_account_bridge_url(
     base_url: &Url,
     checkin_url: &str,
+    system_type: &str,
     marker: &str,
 ) -> Result<Url, String> {
-    let personal_url = || {
+    let default_console_url = || {
+        let path = crate::site::library::console_page_path(system_type).unwrap_or("/");
         base_url
-            .join("/console/personal")
+            .join(path)
             .map_err(|_| "无法生成 Chrome 验证地址".to_string())
     };
     let console_url = || {
@@ -1629,12 +1636,12 @@ pub(crate) fn chrome_account_bridge_url(
             .map_err(|_| "无法生成 Chrome 验证地址".to_string())
     };
     let mut browser_url = if checkin_url.trim().is_empty() {
-        personal_url()?
+        default_console_url()?
     } else {
         Url::parse(checkin_url).unwrap_or_else(|_| base_url.clone())
     };
     if browser_url.origin() != base_url.origin() {
-        browser_url = personal_url()?;
+        browser_url = default_console_url()?;
     }
     if browser_url.path().is_empty() || browser_url.path() == "/" {
         browser_url = console_url()?;
@@ -2972,7 +2979,8 @@ async fn sync_site_account_via_chrome_inner(
                 .map_err(|_| "系统时间异常")?
                 .as_nanos()
         );
-        let browser_url = chrome_account_bridge_url(&base_url, &checkin_url, &marker)?;
+        let browser_url =
+            chrome_account_bridge_url(&base_url, &checkin_url, &system_type, &marker)?;
         let javascript = chrome_account_bridge_script(
             user_id.as_deref(),
             &current_month,
@@ -3068,7 +3076,8 @@ async fn sync_site_account_via_chrome_inner(
                     .map_err(|_| "系统时间异常")?
                     .as_nanos()
             );
-            let browser_url = chrome_account_bridge_url(&base_url, &checkin_url, &marker)?;
+            let browser_url =
+                chrome_account_bridge_url(&base_url, &checkin_url, &system_type, &marker)?;
             let javascript = chrome_account_bridge_script(
                 user_id.as_deref(),
                 &current_month,
@@ -3381,16 +3390,21 @@ mod tests {
     fn chrome_account_bridge_url_rewrites_origin_only_checkin_to_console() {
         let base = Url::parse("https://anyrouter.top/").unwrap();
         let url =
-            chrome_account_bridge_url(&base, "https://anyrouter.top/", "openhub-sync-1").unwrap();
-        assert_eq!(url.as_str(), "https://anyrouter.top/console#openhub-sync-1");
-        let slashless =
-            chrome_account_bridge_url(&base, "https://anyrouter.top", "openhub-background-2")
+            chrome_account_bridge_url(&base, "https://anyrouter.top/", "new-api", "openhub-sync-1")
                 .unwrap();
+        assert_eq!(url.as_str(), "https://anyrouter.top/console#openhub-sync-1");
+        let slashless = chrome_account_bridge_url(
+            &base,
+            "https://anyrouter.top",
+            "new-api",
+            "openhub-background-2",
+        )
+        .unwrap();
         assert_eq!(
             slashless.as_str(),
             "https://anyrouter.top/console#openhub-background-2"
         );
-        let empty = chrome_account_bridge_url(&base, "", "openhub-sync-3").unwrap();
+        let empty = chrome_account_bridge_url(&base, "", "new-api", "openhub-sync-3").unwrap();
         assert_eq!(
             empty.as_str(),
             "https://anyrouter.top/console/personal#openhub-sync-3"
@@ -3398,6 +3412,7 @@ mod tests {
         let personal = chrome_account_bridge_url(
             &base,
             "https://anyrouter.top/console/personal",
+            "new-api",
             "openhub-sync-4",
         )
         .unwrap();
@@ -3405,12 +3420,35 @@ mod tests {
             personal.as_str(),
             "https://anyrouter.top/console/personal#openhub-sync-4"
         );
-        let foreign =
-            chrome_account_bridge_url(&base, "https://example.com/path", "openhub-sync-5").unwrap();
+        let foreign = chrome_account_bridge_url(
+            &base,
+            "https://example.com/path",
+            "new-api",
+            "openhub-sync-5",
+        )
+        .unwrap();
         assert_eq!(
             foreign.as_str(),
             "https://anyrouter.top/console/personal#openhub-sync-5"
         );
+    }
+
+    /// 未知平台的兜底路径退回站点根（path 为空时再试 /console），
+    /// 不再硬塞 NewAPI 的 /console/personal —— 有的站点没有这个地址。
+    #[test]
+    fn chrome_account_bridge_url_unknown_platform_falls_back_to_root() {
+        let base = Url::parse("https://example.com/").unwrap();
+        // 空签到地址 → 未知平台退回根路径 → 根路径会被首页跳转丢 marker → 再改试 /console
+        let empty = chrome_account_bridge_url(&base, "", "openai", "m-1").unwrap();
+        assert_eq!(empty.as_str(), "https://example.com/console#m-1");
+        let root =
+            chrome_account_bridge_url(&base, "https://example.com", "openai", "m-2").unwrap();
+        assert_eq!(root.as_str(), "https://example.com/console#m-2");
+        let sub2api = chrome_account_bridge_url(&base, "", "sub2api", "m-3").unwrap();
+        assert_eq!(sub2api.as_str(), "https://example.com/dashboard#m-3");
+        // 皮皮智绘有已知的个人页路径
+        let pipi = chrome_account_bridge_url(&base, "", "pipiwang", "m-4").unwrap();
+        assert_eq!(pipi.as_str(), "https://example.com/profile#m-4");
     }
 
     #[test]

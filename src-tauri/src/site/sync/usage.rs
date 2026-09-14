@@ -418,8 +418,8 @@ pub async fn mark_sites_with_chrome_sessions(
             continue;
         };
         if values.is_empty() {
-            // Local Storage 一个已知键都没有才算真无痕迹；有任意键（含残缺数据）
-            // 就作为会话候选加入，交给账号接口验证。
+            // Local Storage 桶里一个键都没有才算真无痕迹；有任意键（无论键名
+            // 是否在已知平台键之列，含残缺数据）就作为会话候选加入，交给账号接口验证。
             continue;
         }
         let Some(profile) = profile_map.get(profile_id) else {
