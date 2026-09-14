@@ -107,6 +107,10 @@ const gatewaySearchQuery = ref("");
 const channelSearchQuery = ref("");
 const logSearchQuery = ref("");
 const logStatusFilter = ref<"all" | "success" | "error">("all");
+// 反代渠道主列表工具条：搜索 / 启用状态过滤 / 排序（与弹窗内 channelSearchQuery 解耦）
+const channelListSearch = ref("");
+const channelListStatusFilter = ref<"all" | "enabled" | "disabled">("all");
+const channelListSort = ref<"default" | "name" | "requests" | "tokens" | "success">("default");
 const configModalOpen = ref(false);
 const gatewayModelsModalOpen = ref(false);
 const currentMainTab = ref<"console" | "channels" | "logs">("console");
@@ -218,9 +222,13 @@ async function handleSave() {
 }
 
 async function handleChannelSave(channel: ChannelConfig) {
+  const next = channel.enabled;
   const ok = await saveConfig(proxyConfig.value);
   if (ok) {
     showToast(`已更新「${channel.name}」渠道设置`);
+  } else {
+    // 保存失败回滚开关，避免本地状态与后端不一致；并发保存时以最后一次为准
+    channel.enabled = !next;
   }
 }
 
@@ -1536,6 +1544,9 @@ async function confirmDeleteChannel() {
   const targetId = channel.id;
   const name = channel.name;
 
+  // 快照用于保存失败回滚，避免本地列表与后端不一致
+  const snapshot = [...proxyConfig.value.channels];
+  const hadModels = channelModels.value[targetId];
   proxyConfig.value.channels = proxyConfig.value.channels.filter((c) => c.id !== targetId);
   if (channelModels.value[targetId]) {
     delete channelModels.value[targetId];
@@ -1545,6 +1556,101 @@ async function confirmDeleteChannel() {
   if (ok) {
     showToast(`已删除反代渠道「${name}」`);
     closeDeleteChannelModal();
+  } else {
+    proxyConfig.value.channels = snapshot;
+    if (hadModels) channelModels.value = { ...channelModels.value, [targetId]: hadModels };
+  }
+}
+
+// —— 手动新增渠道：不经过站点库，直接接入第三方 OpenAI 兼容上游 ——
+const manualChannelDialogOpen = ref(false);
+const manualChannelSaving = ref(false);
+const manualChannelError = ref("");
+const manualChannelDraft = ref({
+  name: "",
+  alias: "",
+  upstreamUrl: "",
+  protocol: "openai",
+  apiKey: "",
+});
+
+function openManualChannelDialog() {
+  manualChannelDraft.value = { name: "", alias: "", upstreamUrl: "", protocol: "openai", apiKey: "" };
+  manualChannelError.value = "";
+  manualChannelDialogOpen.value = true;
+}
+
+function closeManualChannelDialog() {
+  if (manualChannelSaving.value) return;
+  manualChannelDialogOpen.value = false;
+}
+
+function validateManualChannel(): string {
+  const d = manualChannelDraft.value;
+  if (!d.name.trim()) return "请填写渠道名称";
+  const url = d.upstreamUrl.trim();
+  if (!url) return "请填写上游地址";
+  try {
+    const u = new URL(url);
+    if (u.protocol !== "http:" && u.protocol !== "https:") return "上游地址须以 http(s):// 开头";
+  } catch {
+    return "上游地址不是合法 URL";
+  }
+  const alias = d.alias.trim().toLowerCase() || uniqueChannelAlias(extractAliasFromUrl(url));
+  return validateAlias(alias);
+}
+
+function setManualChannelProtocol(value: string) {
+  if (channelProtocolSelectOptions.some((opt) => opt.value === value)) {
+    manualChannelDraft.value.protocol = value;
+  }
+}
+
+async function confirmManualChannel() {
+  if (manualChannelSaving.value) return;
+  const err = validateManualChannel();
+  if (err) {
+    manualChannelError.value = err;
+    return;
+  }
+  const d = manualChannelDraft.value;
+  const alias = d.alias.trim().toLowerCase() || uniqueChannelAlias(extractAliasFromUrl(d.upstreamUrl.trim()));
+  const base = alias.replace(/[^a-z0-9_-]+/g, "") || `custom-${Date.now().toString(36)}`;
+  const existingIds = new Set(proxyConfig.value.channels.map((c) => c.id));
+  let id = `custom_${base}`;
+  let i = 2;
+  while (existingIds.has(id)) id = `custom_${base}-${i++}`;
+  const apiKey = d.apiKey.trim();
+  const channel: ChannelConfig = {
+    id,
+    name: d.name.trim(),
+    description: "手动创建的上游反代渠道",
+    enabled: true,
+    protocol: d.protocol,
+    upstreamUrl: d.upstreamUrl.trim(),
+    apiKey,
+    apiKeys: apiKey ? [apiKey] : [],
+    useProxyPool: false,
+    proxyMode: "direct",
+    alias,
+    siteId: null,
+    useFixedProxy: false,
+    proxyFixedChannel: null,
+    enabledModels: null,
+  };
+  manualChannelSaving.value = true;
+  try {
+    proxyConfig.value.channels.push(channel);
+    const ok = await saveConfig(proxyConfig.value, { silent: true });
+    if (ok) {
+      showToast(`已新增反代渠道「${channel.name}」`);
+      manualChannelDialogOpen.value = false;
+    } else {
+      proxyConfig.value.channels = proxyConfig.value.channels.filter((c) => c.id !== id);
+      manualChannelError.value = "保存失败，请重试";
+    }
+  } finally {
+    manualChannelSaving.value = false;
   }
 }
 
@@ -2717,6 +2823,60 @@ const filteredChannelModels = computed(() => {
   return list;
 });
 
+/** 反代渠道主列表排序下拉候选 */
+const channelListSortOptions: { value: string; text: string }[] = [
+  { value: "default", text: "默认顺序" },
+  { value: "name", text: "按名称" },
+  { value: "requests", text: "按累计请求" },
+  { value: "tokens", text: "按累计 Token" },
+  { value: "success", text: "按成功率" },
+];
+
+function setChannelListSort(value: string) {
+  if (["default", "name", "requests", "tokens", "success"].includes(value)) {
+    channelListSort.value = value as typeof channelListSort.value;
+  }
+}
+
+/** 主列表启用状态计数（过滤页签角标用，不随搜索变化） */
+const channelListStatusCounts = computed(() => {
+  const all = proxyConfig.value.channels.length;
+  let enabled = 0;
+  for (const c of proxyConfig.value.channels) if (c.enabled) enabled += 1;
+  return { all, enabled, disabled: all - enabled };
+});
+
+/** 反代渠道主列表：搜索（名称/别名/上游地址）+ 启用状态过滤 + 排序 */
+const filteredChannels = computed(() => {
+  const q = channelListSearch.value.trim().toLowerCase();
+  const status = channelListStatusFilter.value;
+  let list = proxyConfig.value.channels.filter((c) => {
+    if (status === "enabled" && !c.enabled) return false;
+    if (status === "disabled" && c.enabled) return false;
+    if (!q) return true;
+    return (
+      c.name.toLowerCase().includes(q) ||
+      channelAlias(c).toLowerCase().includes(q) ||
+      (c.upstreamUrl ?? "").toLowerCase().includes(q)
+    );
+  });
+  const sort = channelListSort.value;
+  if (sort === "name") {
+    list = [...list].sort((a, b) => a.name.localeCompare(b.name, "zh-CN"));
+  } else if (sort === "requests" || sort === "tokens" || sort === "success") {
+    list = [...list].sort((a, b) => {
+      const sa = channelStatsFor(a);
+      const sb = channelStatsFor(b);
+      if (sort === "requests") return (sb.totalRequests ?? 0) - (sa.totalRequests ?? 0);
+      if (sort === "tokens") return (sb.totalTokens ?? 0) - (sa.totalTokens ?? 0);
+      const ra = sa.totalRequests > 0 ? sa.successfulRequests / sa.totalRequests : -1;
+      const rb = sb.totalRequests > 0 ? sb.successfulRequests / sb.totalRequests : -1;
+      return rb - ra;
+    });
+  }
+  return list;
+});
+
 /** 当前页数据：筛选/搜索/排序已由后端 SQL 处理，前端仅透传展示 */
 const filteredLogs = computed<ProxyRequestLog[]>(() => proxyLogs.value);
 
@@ -3254,6 +3414,15 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
           <button
             type="button"
             class="mp-btn mp-btn-ghost mp-btn-sm"
+            title="不经过站点库，直接接入第三方 OpenAI 兼容上游"
+            @click="openManualChannelDialog"
+          >
+            <span v-html="icons.plus" />
+            <span>新增渠道</span>
+          </button>
+          <button
+            type="button"
+            class="mp-btn mp-btn-ghost mp-btn-sm"
             title="在一个弹窗内统一勾选各渠道对外暴露的模型"
             @click="openAllChannelsModelsDialog"
           >
@@ -3272,10 +3441,70 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
         </div>
       </div>
 
-      <div class="mp-channels-grid">
+      <div class="mp-logs-toolbar" style="margin-bottom: 14px;">
+        <div class="mp-search-box flex-1">
+          <span class="mp-search-icon" v-html="icons.search" />
+          <input
+            v-model="channelListSearch"
+            type="search"
+            placeholder="搜索渠道名称、别名、上游地址…"
+            class="mp-search-input-lg"
+          />
+          <button
+            v-if="channelListSearch"
+            type="button"
+            class="mp-search-clear-btn"
+            title="清空搜索"
+            @click="channelListSearch = ''"
+          >
+            <span v-html="icons.close" />
+          </button>
+        </div>
+        <div class="mp-log-filter-tabs">
+          <button
+            type="button"
+            class="mp-log-tab-btn"
+            :class="{ active: channelListStatusFilter === 'all' }"
+            @click="channelListStatusFilter = 'all'"
+          >
+            全部 ({{ channelListStatusCounts.all }})
+          </button>
+          <button
+            type="button"
+            class="mp-log-tab-btn"
+            :class="{ active: channelListStatusFilter === 'enabled' }"
+            @click="channelListStatusFilter = 'enabled'"
+          >
+            已启用 ({{ channelListStatusCounts.enabled }})
+          </button>
+          <button
+            type="button"
+            class="mp-log-tab-btn"
+            :class="{ active: channelListStatusFilter === 'disabled' }"
+            @click="channelListStatusFilter = 'disabled'"
+          >
+            已禁用 ({{ channelListStatusCounts.disabled }})
+          </button>
+        </div>
+        <CustomSelect
+          class="mp-settings-select"
+          placement="bottom"
+          :options="channelListSortOptions"
+          :model-value="channelListSort"
+          aria-label="渠道排序"
+          @update:model-value="setChannelListSort(String($event))"
+        />
+      </div>
+
+      <div v-if="filteredChannels.length === 0" class="mp-empty-box" style="padding: 40px 20px; text-align: center;">
+        <div class="mp-empty-icon" v-html="icons.shield" />
+        <p v-if="proxyConfig.channels.length === 0">还没有反代渠道 · 点击右上「新增渠道」或「站点转换」接入第一个上游</p>
+        <p v-else>未检索到匹配的渠道 · 换个关键词或切换启用状态试试</p>
+      </div>
+      <div v-else class="mp-channels-grid">
         <!-- 渠道卡片 -->
         <div
-          v-for="channel in proxyConfig.channels"
+          v-for="channel in filteredChannels"
           :key="channel.id"
           class="mp-channel-card"
           :class="{ 'is-disabled': !channel.enabled }"
@@ -3287,6 +3516,10 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
               </div>
               <div>
                 <h3>{{ channel.name }}<span class="mp-title-alias">（{{ channelAlias(channel) }}）</span></h3>
+                <div class="mp-channel-upstream font-mono" :title="`${channelProtocolOf(channel)} · ${channel.upstreamUrl}`">
+                  <span class="mp-proto-tag">{{ channelProtocolOf(channel) }}</span>
+                  <code class="mp-upstream-code">{{ formatUpstreamUrl(channel.upstreamUrl) || channel.upstreamUrl }}</code>
+                </div>
                 <span class="mp-card-tags">
                   <span
                     v-if="isBuiltinChannel(channel)"
@@ -3331,10 +3564,11 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
               </div>
             </div>
 
-            <label class="mp-switch-wrap" :title="channel.enabled ? '点击禁用该渠道' : '点击启用该渠道'">
+            <label class="mp-switch-wrap" :title="savingConfig ? '保存中，请稍候' : (channel.enabled ? '点击禁用该渠道' : '点击启用该渠道')">
               <input
                 v-model="channel.enabled"
                 type="checkbox"
+                :disabled="savingConfig"
                 @change="handleChannelSave(channel)"
               />
               <span class="mp-switch-round" />
@@ -5278,6 +5512,125 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
       </div>
     </div>
 
+    <!-- 弹窗: 手动新增反代渠道 (Manual Channel Create Modal) -->
+    <div
+      v-if="manualChannelDialogOpen"
+      class="mp-modal-backdrop"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="mp-manual-channel-title"
+    >
+      <div class="mp-modal-box">
+        <div class="mp-modal-header">
+          <div class="mp-modal-title-group">
+            <div class="mp-modal-badge-icon">
+              <span v-html="icons.plus" />
+            </div>
+            <div>
+              <h3 id="mp-manual-channel-title">新增反代渠道</h3>
+              <small class="text-muted">直接接入第三方 OpenAI 兼容上游 · statsId 由后端自动分配</small>
+            </div>
+          </div>
+          <button
+            type="button"
+            class="mp-modal-close"
+            title="关闭弹窗 (Esc)"
+            @click="closeManualChannelDialog"
+          >
+            <span v-html="icons.close" />
+          </button>
+        </div>
+
+        <div class="mp-modal-body">
+          <div class="mp-settings-field">
+            <div class="mp-settings-field-head"><span>渠道名称</span></div>
+            <input
+              v-model="manualChannelDraft.name"
+              type="text"
+              class="mp-settings-input"
+              placeholder="如 我的中转站"
+            />
+          </div>
+          <div class="mp-settings-field">
+            <div class="mp-settings-field-head">
+              <span>英文别名</span>
+              <small class="text-muted">留空则按上游地址自动生成</small>
+            </div>
+            <input
+              v-model="manualChannelDraft.alias"
+              type="text"
+              class="mp-settings-input"
+              :class="{ 'has-error': !!manualChannelError }"
+              placeholder="仅限英文、数字、- 与 _"
+              @input="manualChannelError = ''"
+            />
+            <p class="mp-settings-hint">网关模型前缀，如 alias/model，全渠道唯一</p>
+          </div>
+          <div class="mp-settings-field">
+            <div class="mp-settings-field-head"><span>上游地址</span></div>
+            <input
+              v-model="manualChannelDraft.upstreamUrl"
+              type="text"
+              class="mp-settings-input"
+              placeholder="https://api.example.com/v1"
+              @input="manualChannelError = ''"
+            />
+          </div>
+          <div class="mp-proxy-pool-box">
+            <div class="mp-proxy-pool-row">
+              <div class="mp-proxy-pool-label"><span>上游协议</span></div>
+              <CustomSelect
+                class="mp-settings-select"
+                :options="channelProtocolSelectOptions"
+                :model-value="manualChannelDraft.protocol"
+                aria-label="新增渠道上游协议"
+                @update:model-value="setManualChannelProtocol(String($event))"
+              />
+            </div>
+            <div class="mp-proxy-pool-status is-inactive">
+              <span>{{ CHANNEL_PROTOCOL_HINTS[manualChannelDraft.protocol] || CHANNEL_PROTOCOL_HINTS.openai }}</span>
+            </div>
+          </div>
+          <div class="mp-settings-field">
+            <div class="mp-settings-field-head">
+              <span>API Key（可选）</span>
+              <small class="text-muted">保存后可在「管理模型 → Keys」追加多 Key</small>
+            </div>
+            <input
+              v-model="manualChannelDraft.apiKey"
+              type="text"
+              class="mp-settings-input"
+              placeholder="sk-…，留空为免 Key 渠道"
+              @input="manualChannelError = ''"
+            />
+          </div>
+          <p v-if="manualChannelError" class="mp-settings-error">{{ manualChannelError }}</p>
+        </div>
+
+        <div class="mp-modal-footer">
+          <div class="mp-modal-footer-buttons">
+            <button
+              type="button"
+              class="mp-btn mp-btn-ghost"
+              :disabled="manualChannelSaving"
+              @click="closeManualChannelDialog"
+            >
+              取消
+            </button>
+            <button
+              type="button"
+              class="mp-btn mp-btn-primary"
+              :disabled="manualChannelSaving"
+              @click="confirmManualChannel"
+            >
+              <span v-html="icons.check" />
+              <span>{{ manualChannelSaving ? "保存中…" : "确认新增" }}</span>
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <!-- 弹窗 4: 站点转换 - 从站点库「在用且存活」站点创建反代渠道 (Site Convert Modal) -->
     <div
       v-if="siteConvertDialogOpen"
@@ -6788,6 +7141,25 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
   font-size: 12px;
   font-weight: 500;
   color: var(--text-muted);
+}
+
+/* 渠道卡片上游地址行：协议徽标 + 截断地址，完整地址悬停可见 */
+.mp-channel-upstream {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 4px 0 6px;
+  min-width: 0;
+  font-size: 11px;
+}
+
+.mp-channel-upstream .mp-upstream-code {
+  font-size: 11px;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
 }
 
 .mp-proto-tag {
