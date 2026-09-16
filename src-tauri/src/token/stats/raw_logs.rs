@@ -806,6 +806,36 @@ pub fn collect_local_agent_paths(home: &Path) -> LocalAgentPathsReport {
         agents.push(finish_agent("openclaw", "OpenClaw", Some(&root), entries));
     }
 
+    // WorkBuddy AI
+    {
+        let root = crate::token::collector::workbuddy_config_dir(home);
+        let mut entries = Vec::new();
+        push_agent_path(
+            &mut entries,
+            "config",
+            "全局设置 settings.json",
+            Some(&root.join("settings.json")),
+        );
+        push_agent_path(
+            &mut entries,
+            "data",
+            "会话项目 projects",
+            Some(&root.join("projects")),
+        );
+        push_agent_path(
+            &mut entries,
+            "data",
+            "会话索引 workbuddy.db",
+            Some(&root.join("workbuddy.db")),
+        );
+        agents.push(finish_agent(
+            "workbuddy",
+            "WorkBuddy AI",
+            Some(&root),
+            entries,
+        ));
+    }
+
     let collected = crate::token::collector::collected_stats_by_source();
     let collected_at = collected
         .values()
@@ -834,6 +864,7 @@ pub fn collected_env_overrides() -> Vec<LocalAgentEnvOverride> {
         "CODEX_HOME",
         "XDG_DATA_HOME",
         "OPENHUB_CATPAWAI_DB_PATH",
+        "WORKBUDDY_CONFIG_DIR",
     ]
     .iter()
     .filter_map(|key| {

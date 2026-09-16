@@ -1271,21 +1271,39 @@ pub fn anthropic_to_universal(body: &JsonValue, model: &str) -> UniversalRequest
             }
         }
     }
-    ur.metadata = body.get("metadata").filter(|v| v.is_object()).cloned();
+    let explicit_effort = body
+        .pointer("/output_config/effort")
+        .or_else(|| body.get("reasoning_effort"))
+        .or_else(|| body.get("reasoningEffort"))
+        .or_else(|| body.pointer("/thinking/effort"))
+        .and_then(JsonValue::as_str);
+
     if let Some(thinking) = body.get("thinking") {
-        if thinking.get("type").and_then(JsonValue::as_str) == Some("enabled") {
+        let t_type = thinking.get("type").and_then(JsonValue::as_str);
+        if t_type == Some("enabled") || t_type == Some("adaptive") {
             let budget = thinking.get("budget_tokens").and_then(JsonValue::as_u64);
-            let effort = match budget {
+            let effort = explicit_effort.unwrap_or_else(|| match budget {
                 Some(b) if b <= 4096 => "low",
                 Some(b) if b <= 16384 => "medium",
                 Some(_) => "high",
                 None => "medium",
-            };
+            });
             ur.reasoning = Some(ReasoningConfig {
                 effort: Some(effort.to_string()),
-                budget_tokens: budget,
+                budget_tokens: budget.or(Some(16384)),
             });
         }
+    } else if let Some(effort) = explicit_effort {
+        let budget = match effort.to_ascii_lowercase().as_str() {
+            "low" | "minimal" => 2048,
+            "medium" => 8192,
+            "high" | "xhigh" | "max" => 32768,
+            _ => 4096,
+        };
+        ur.reasoning = Some(ReasoningConfig {
+            effort: Some(effort.to_string()),
+            budget_tokens: Some(budget),
+        });
     }
 
     // tools

@@ -33,7 +33,7 @@ const currentView = ref<ViewMode>("cards");
 
 // —— 搜索与筛选 ——
 const query = ref("");
-const selectedUsageTab = ref<"all" | "personal" | "pending">("all");
+const selectedUsageTab = ref<"all" | "personal" | "pending" | "proxied">("all");
 const selectedAliveTab = ref<"all" | "active" | "runaway">("all");
 const selectedSystemType = ref("all");
 const selectedLevel = ref("all");
@@ -177,7 +177,7 @@ const metrics = computed(() => {
       if (!isUnknown) totalAccounts += 1;
       if (session.hasAccessToken) accountsWithTokens += 1;
       if (session.checkedInToday) checkedInAccounts += 1;
-      if (!isUnknown && (session.syncError || session.checkinError)) errorAccounts += 1;
+      if (!isUnknown && session.syncError) errorAccounts += 1;
       if (!isUnknown && session.remaining !== null && Number.isFinite(session.remaining)) {
         totalQuotaNumber += session.remaining;
         accountsWithQuota += 1;
@@ -218,6 +218,7 @@ const tabCounts = computed(() => {
     all: allSites.length,
     personal: allSites.filter((s) => s.isPersonal).length,
     pending: allSites.filter((s) => s.isPending).length,
+    proxied: allSites.filter((s) => isSiteProxied(s.id)).length,
     active: allSites.filter((s) => !s.isRunaway).length,
     runaway: allSites.filter((s) => s.isRunaway).length,
   };
@@ -270,6 +271,7 @@ const filteredSites = computed(() => {
     // 1. 使用状态维度 (Dimension 1: Usage state)
     if (selectedUsageTab.value === "personal" && !site.isPersonal) return false;
     if (selectedUsageTab.value === "pending" && !site.isPending) return false;
+    if (selectedUsageTab.value === "proxied" && !isSiteProxied(site.id)) return false;
 
     // 2. 站点存活与健康维度 (Dimension 2: Alive / Operational state)
     if (selectedAliveTab.value === "active" && site.isRunaway) return false;
@@ -330,7 +332,7 @@ const filteredSites = computed(() => {
     }
     if (featureFilters.value.syncError) {
       if (isUnknownSite(site)) return false;
-      const hasErr = sessions.some((s) => s.syncError || s.checkinError || (s.apiSyncError && !s.apiKeyCount && !s.apiModelCount));
+      const hasErr = sessions.some((s) => s.syncError || (s.apiSyncError && !s.apiKeyCount && !s.apiModelCount));
       if (!hasErr) return false;
     }
 
@@ -421,7 +423,6 @@ function getSiteErrorMessage(siteId: string): string {
   const sessions = getSiteSessions(siteId);
   for (const s of sessions) {
     if (s.syncError) return s.syncError;
-    if (s.checkinError) return s.checkinError;
     if (s.apiSyncError && !s.apiKeyCount && !s.apiModelCount) return s.apiSyncError;
   }
   return "";
@@ -703,6 +704,7 @@ function handleGlobalKeydown(e: KeyboardEvent) {
 }
 
 watch(selectedUsageTab, (tab) => {
+  // 已反代是站点库专属视图维度，不参与持久化的使用范围偏好
   if (tab === "personal" || tab === "pending") {
     store.setUsageFilter(tab);
   } else {
@@ -910,6 +912,18 @@ onUnmounted(() => {
               <span v-html="icons.clock" />
               <span>待定</span>
               <b class="sl-tab-badge">{{ tabCounts.pending }}</b>
+            </button>
+            <button
+              type="button"
+              role="tab"
+              class="is-proxied"
+              :class="{ active: selectedUsageTab === 'proxied' }"
+              title="已导入模型反代网关的站点"
+              @click="selectedUsageTab = 'proxied'"
+            >
+              <span v-html="icons.repeat" />
+              <span>已反代</span>
+              <b class="sl-tab-badge">{{ tabCounts.proxied }}</b>
             </button>
           </nav>
 
@@ -1600,7 +1614,7 @@ onUnmounted(() => {
                   v-for="session in getSiteSessions(site.id)"
                   :key="session.profileId"
                   class="sl-topo-session-row"
-                  :class="{ 'has-error': !isUnknownSite(site) && (session.syncError || session.checkinError || (session.apiSyncError && !session.apiKeyCount && !session.apiModelCount)) }"
+                  :class="{ 'has-error': !isUnknownSite(site) && (session.syncError || (session.apiSyncError && !session.apiKeyCount && !session.apiModelCount)) }"
                 >
                   <div class="sl-topo-session-meta">
                     <span class="sl-topo-user-icon" v-html="icons.user" />
@@ -1612,12 +1626,13 @@ onUnmounted(() => {
                           <span v-if="session.hasAccessToken" class="sl-token-pill active" title="已从 Chrome 会话中获取访问令牌">已取令牌</span>
                           <span v-else class="sl-token-pill" title="未获取到访问令牌，需刷新">无令牌</span>
                         </template>
-                        <template v-if="!isUnknownSite(site) && (site.supportsCheckin || session.checkinEnabled)">
+                        <template v-if="!isUnknownSite(site) && (site.supportsCheckin || session.checkinEnabled || session.checkinError)">
                           <span v-if="session.checkedInToday" class="sl-token-pill sl-token-checked" title="今日已成功签到">今日已签到</span>
-                          <span v-else-if="session.checkinEnabled" class="sl-token-pill sl-token-uncheck" title="站点开启签到，今日尚未签到">今日未签到</span>
-                          <span v-else class="sl-token-pill sl-token-disabled" title="站点接口返回404/403/人机验证或功能未启用，无法签到">无法签到</span>
+                          <span v-else-if="session.checkinError" class="sl-token-pill sl-token-disabled" :title="`自动签到失败：${session.checkinError}`">无法签到</span>
+                          <span v-else-if="!session.checkinEnabled" class="sl-token-pill sl-token-disabled" title="站点接口返回404/403/人机验证或功能未启用，无法签到">无法签到</span>
+                          <span v-else class="sl-token-pill sl-token-uncheck" title="站点开启签到，今日尚未签到">今日未签到</span>
                         </template>
-                        <span v-if="!isUnknownSite(site) && (session.syncError || session.checkinError)" class="sl-token-pill sl-token-err" :title="session.syncError || session.checkinError">异常</span>
+                        <span v-if="!isUnknownSite(site) && session.syncError" class="sl-token-pill sl-token-err" :title="session.syncError">异常</span>
                       </div>
                       <small v-if="session.accountUpdatedAt" class="sl-topo-subline">
                         <span class="sl-topo-subtime">{{ formatDate(session.accountUpdatedAt) }}</span>
@@ -2094,12 +2109,13 @@ onUnmounted(() => {
                               <span v-if="session.hasAccessToken" class="sl-token-pill active" title="已从 Chrome 会话中获取访问令牌">已取令牌</span>
                               <span v-else class="sl-token-pill" title="未获取到访问令牌，需刷新">无令牌</span>
                             </template>
-                            <template v-if="!isUnknownSite(selectedSite) && (selectedSite.supportsCheckin || session.checkinEnabled)">
+                            <template v-if="!isUnknownSite(selectedSite) && (selectedSite.supportsCheckin || session.checkinEnabled || session.checkinError)">
                               <span v-if="session.checkedInToday" class="sl-token-pill sl-token-checked" title="今日已成功签到">今日已签到</span>
-                              <span v-else-if="session.checkinEnabled" class="sl-token-pill sl-token-uncheck" title="站点开启签到，今日尚未签到">今日未签到</span>
-                              <span v-else class="sl-token-pill sl-token-disabled" title="站点接口返回404/403/人机验证或功能未启用，无法签到">无法签到</span>
+                              <span v-else-if="session.checkinError" class="sl-token-pill sl-token-disabled" :title="`自动签到失败：${session.checkinError}`">无法签到</span>
+                              <span v-else-if="!session.checkinEnabled" class="sl-token-pill sl-token-disabled" title="站点接口返回404/403/人机验证或功能未启用，无法签到">无法签到</span>
+                              <span v-else class="sl-token-pill sl-token-uncheck" title="站点开启签到，今日尚未签到">今日未签到</span>
                             </template>
-                            <span v-if="!isUnknownSite(selectedSite) && (session.syncError || session.checkinError)" class="sl-token-pill sl-token-err" :title="session.syncError || session.checkinError">异常</span>
+                            <span v-if="!isUnknownSite(selectedSite) && session.syncError" class="sl-token-pill sl-token-err" :title="session.syncError">异常</span>
                           </div>
                         </div>
                       </div>
@@ -2151,9 +2167,9 @@ onUnmounted(() => {
                       </div>
                     </div>
 
-                    <div v-if="!isUnknownSite(selectedSite) && (session.syncError || session.checkinError)" class="sl-drawer-acc-error">
+                    <div v-if="!isUnknownSite(selectedSite) && session.syncError" class="sl-drawer-acc-error">
                       <span v-html="icons.info" />
-                      <span>{{ session.syncError || session.checkinError }}</span>
+                      <span>{{ session.syncError }}</span>
                     </div>
                   </div>
                 </div>
@@ -2785,6 +2801,17 @@ onUnmounted(() => {
 
 .sl-alive-tabs button.is-runaway.active .sl-tab-badge {
   background: var(--danger, #f85149);
+  color: #fff;
+}
+
+.sl-usage-tabs button.is-proxied.active {
+  background: var(--violet-soft);
+  border-color: color-mix(in srgb, var(--violet) 45%, transparent);
+  color: var(--violet);
+}
+
+.sl-usage-tabs button.is-proxied.active .sl-tab-badge {
+  background: var(--violet);
   color: #fff;
 }
 

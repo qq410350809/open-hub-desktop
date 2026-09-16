@@ -14,6 +14,7 @@ pub mod kiro;
 pub mod mimo;
 pub mod opencode;
 pub mod windsurf;
+pub mod workbuddy;
 pub mod zcode;
 pub mod zed;
 
@@ -33,5 +34,6 @@ pub use mimo::*;
 pub use opencode::*;
 pub use r#continue::*;
 pub use windsurf::*;
+pub use workbuddy::*;
 pub use zcode::*;
 pub use zed::*;

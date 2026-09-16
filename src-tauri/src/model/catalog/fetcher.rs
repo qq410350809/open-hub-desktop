@@ -51,6 +51,11 @@ pub(crate) struct SiteModelsResult {
     /// “0 个 Key”而没有任何报错。
     #[serde(default)]
     pub(crate) errors: Vec<String>,
+    /// 实际产出这批 Key 的账号（Chrome Profile）。不带 profile_id 的站点级
+    /// 请求仍会借有效账号的会话抓 Key，调用方落库时按它归属，避免 Key
+    /// 被挂到 profile_id='' 的幽灵行、与真实账号脱钩。
+    #[serde(default)]
+    pub(crate) profile_id: String,
 }
 
 pub(crate) fn json_array_at<'a>(
@@ -193,6 +198,8 @@ pub(crate) fn parse_api_key_entries(value: &serde_json::Value) -> Vec<(String, S
                 json_string(
                     item,
                     &[
+                        // Sub2API 的 group 是对象（如 {"id":..,"name":..}），标识取其中的 name
+                        "/group/name",
                         "/group",
                         "/group_name",
                         "/groupName",
@@ -521,7 +528,8 @@ pub(crate) async fn chrome_bridge_fetch_keys_models(
         }
     }
 
-    // 与账号同步的落库口径对齐：把 Chrome 里核对过的 Key/模型写进缓存
+    // 与账号同步的落库口径对齐：把 Chrome 里核对过的 Key/模型写进缓存，
+    // 并标记 Key 的真实归属（本次桥接使用的 Chrome Profile）。
     let result = SiteModelsResult {
         models: all_models,
         source: "newapi-key".into(),
@@ -529,6 +537,7 @@ pub(crate) async fn chrome_bridge_fetch_keys_models(
         key_groups: key_groups.clone(),
         key_models,
         errors,
+        profile_id: profile_id.to_string(),
     };
     if let Some(site_id) = site_id {
         let account = SiteModelCacheAccount {
@@ -574,6 +583,7 @@ pub(crate) async fn fetch_models_with_keys(
             key_groups: visible_key_groups,
             key_models: HashMap::new(),
             errors: Vec::new(),
+            profile_id: String::new(),
         });
     }
     let models_url = base_url
@@ -632,6 +642,7 @@ pub(crate) async fn fetch_models_with_keys(
         key_groups: visible_key_groups,
         key_models,
         errors,
+        profile_id: String::new(),
     })
 }
 
@@ -710,6 +721,38 @@ pub(crate) fn save_site_model_cache(
     preserve_keys: bool,
 ) -> Result<(), String> {
     let connection = database.lock_conn()?;
+    // 调用方（站点级同步/手动添加）可能只带 profile_id 而账号名为空：
+    // 从 site_accounts 回填该账号的展示名，避免缓存行与账号表脱节。
+    let (profile_name, account_name, username) = {
+        let cached_name = (
+            account.profile_name.clone(),
+            account.account_name.clone(),
+            account.username.clone(),
+        );
+        let has_any_name = !account.profile_name.is_empty()
+            || !account.account_name.is_empty()
+            || !account.username.is_empty();
+        if has_any_name || account.profile_id.is_empty() {
+            cached_name
+        } else {
+            connection
+                .query_row(
+                    "SELECT profile_name, account_name, username
+                     FROM site_accounts WHERE site_id = ?1 AND profile_id = ?2",
+                    params![site_id, account.profile_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(|error| error.to_string())?
+                .unwrap_or(cached_name)
+        }
+    };
     // 同步模型（preserve_keys）时：保留库中已有 Key/分组；拉取失败时模型数据也一并保留，
     // 只更新错误信息，避免把左侧 Key 树或右侧模型列表清空。
     let existing = if preserve_keys {
@@ -814,9 +857,9 @@ pub(crate) fn save_site_model_cache(
             params![
                 site_id,
                 account.profile_id,
-                account.profile_name,
-                account.account_name,
-                account.username,
+                profile_name,
+                account_name,
+                username,
                 api_source,
                 serde_json::to_string(&keys).map_err(|error| error.to_string())?,
                 serde_json::to_string(&key_groups).map_err(|error| error.to_string())?,
@@ -828,14 +871,17 @@ pub(crate) fn save_site_model_cache(
         .map_err(|error| error.to_string())?;
 
     // 本次真的从站点拿到了 Key/模型（result 非空且调用方没报错）：
-    // 上一次同步遗留的 sync_error/api_sync_error 只描述旧数据，继续展示
-    // 会让卡片在恢复后仍显示「账号信息同步失败」。这里不再按关键词挑着清，
-    // 「账号同步超过 90 秒」「未扫到登录会话」等历史错误同样应被清掉。
+    // 上一次同步遗留的 sync_error 只描述旧数据，继续展示会让卡片在恢复后
+    // 仍显示「账号信息同步失败」。这里不再按关键词挑着清，「账号同步超过
+    // 90 秒」「未扫到登录会话」等历史错误同样应被清掉。
+    // 卡片上的 api_sync_error 展示值来自 site_model_cache.error 的 JOIN
+    // 计算（见 read_cached_usage_sites），已在上方 persisted_error='' 清掉；
+    // site_accounts 表没有 api_sync_error 列，这里写它会整条 UPDATE 报
+    // no such column 被静默吞掉，sync_error 反而永远清不掉。
     if result.is_some() && account.error.is_empty() {
         let _ = connection.execute(
             "UPDATE site_accounts
              SET is_valid = 1,
-                 api_sync_error = '',
                  sync_error = ''
              WHERE site_id = ?1 AND profile_id = ?2",
             params![site_id, account.profile_id],
@@ -967,6 +1013,8 @@ pub async fn sync_models_for_cached_keys(
     };
     // 整体成功（拿到了完整模型列表）说明站点接口已恢复：清掉该站点账号
     // 行的历史 sync_error，避免卡片在模型已同步成功时仍挂着「账号信息同步失败」。
+    // site_accounts 没有 api_sync_error 列（卡片展示值由 site_model_cache.error
+    // JOIN 计算得出，成功时在下方 error = '' 清掉），写它会整条 UPDATE 失败。
     let sync_succeeded = match &result {
         Ok(result) => result.errors.is_empty() && !result.models.is_empty(),
         Err(_) => false,
@@ -976,7 +1024,7 @@ pub async fn sync_models_for_cached_keys(
         if sync_succeeded {
             let _ = connection.execute(
                 "UPDATE site_accounts
-                 SET api_sync_error = '', sync_error = ''
+                 SET sync_error = ''
                  WHERE site_id = ?1",
                 [site_id.as_str()],
             );
@@ -1694,6 +1742,8 @@ async fn fetch_site_models_json_inner(
     let mut discovered_keys = Vec::new();
     let mut discovered_key_groups = HashMap::new();
     let mut no_browser_fallback_profiles = HashSet::new();
+    // 实际贡献了 Key 的账号：站点级请求也按它归属落库。
+    let mut discovered_profile_id = String::new();
 
     for profile_id in &profile_ids {
         let values = local_values.get(profile_id).cloned().unwrap_or_default();
@@ -1886,6 +1936,9 @@ async fn fetch_site_models_json_inner(
                 Ok(value) => {
                     match reveal_newapi_keys(&client, &base_url, &auth, &user_agent, &value).await {
                         Ok((keys, key_groups)) => {
+                            if !keys.is_empty() {
+                                discovered_profile_id = profile_id.clone();
+                            }
                             merge_api_keys(&mut discovered_keys, keys.iter().cloned());
                             merge_api_key_groups(&mut discovered_key_groups, key_groups.clone());
                             match fetch_models_with_keys(
@@ -2019,6 +2072,7 @@ async fn fetch_site_models_json_inner(
                                     key_groups: HashMap::new(),
                                     key_models: HashMap::new(),
                                     errors: Vec::new(),
+                                    profile_id: profile_id.clone(),
                                 },
                             );
                         }
@@ -2047,6 +2101,9 @@ async fn fetch_site_models_json_inner(
                 Ok(value) => {
                     let visible_keys = parse_api_keys(&value);
                     let visible_key_groups = parse_api_key_groups(&value);
+                    if !visible_keys.is_empty() {
+                        discovered_profile_id = profile_id.clone();
+                    }
                     merge_api_keys(&mut discovered_keys, visible_keys.iter().cloned());
                     merge_api_key_groups(&mut discovered_key_groups, visible_key_groups.clone());
                     let mut keys = visible_keys.clone();
@@ -2101,6 +2158,8 @@ async fn fetch_site_models_json_inner(
     } else {
         "newapi-key"
     };
+    // discovered_keys 来自具体账号的会话/本地存储：把归属带回给调用方，
+    // 站点级（不带 profile_id）请求也要按真实账号落库。
     cache_profile_api_counts(
         database,
         site_id.as_deref(),
@@ -2112,6 +2171,10 @@ async fn fetch_site_models_json_inner(
             key_groups: discovered_key_groups,
             key_models: HashMap::new(),
             errors,
+            profile_id: requested_profile_id
+                .as_deref()
+                .map(str::to_string)
+                .unwrap_or(discovered_profile_id),
         },
     )
 }

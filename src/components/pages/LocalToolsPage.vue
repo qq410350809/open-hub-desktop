@@ -6,6 +6,7 @@ import {
   useModelProxy,
   refreshProxyConfig,
   channelAlias,
+  isOpenCodeFreeChannel,
   type ChannelConfig,
 } from "../../composables/proxy/useModelProxy";
 import { runCommand } from "../../composables/core/ipc";
@@ -16,12 +17,14 @@ import CustomSelect from "../common/CustomSelect.vue";
 import { DEFAULT_SERVICE_PORT } from "../../constants";
 import type {
   LocalToolConfigFile,
+  LocalToolConfigPatch,
   LocalToolDefaultsSection,
   LocalToolDiffEntry,
   LocalToolIdentityMode,
   LocalToolModelEntry,
   LocalToolProviderEntry,
   LocalToolProviderMode,
+  ModelCapabilities,
   SiteModelCache,
   SiteModelCacheAccount,
   SiteModelCacheEntry,
@@ -55,6 +58,31 @@ const { preferences, updatePreferences } = usePreferences();
 
 const siteCaches = ref<Record<string, SiteModelCache>>({});
 const siteCachesLoading = ref(false);
+
+// —— 身份模式与展开状态（必须置顶，供整个组件依赖项初始化） ——
+const SINGLE_GATEWAY_PROVIDER_ID = "openhub-gateway";
+const expandedKeys = ref<Set<string>>(new Set());
+
+const identityMode = computed<LocalToolIdentityMode>(
+  () => preferences.agentIdentityModes?.[activeTool.value] ?? "channel",
+);
+const modelIdentityMode = computed(() => identityMode.value === "model");
+
+/** 模式切换旁的一句话说明，避免用户只看到两个标签不知差异。 */
+const identityModeCaption = computed(() =>
+  modelIdentityMode.value
+    ? "整份清单合并为一条网关接入；下面按模型列出，展开看提供它的站点 · 账号"
+    : "每个「渠道 · 账号」各成一条供应商条目；下面按账号列出，展开看模型",
+);
+
+function setIdentityMode(mode: LocalToolIdentityMode) {
+  if (mode === identityMode.value) return;
+  updatePreferences({
+    agentIdentityModes: { ...preferences.agentIdentityModes, [activeTool.value]: mode },
+  });
+  // 两种模式的列表结构不同（条目 → 模型），展开态一律收起重来，避免残留上一模式的展开行。
+  expandedKeys.value = new Set();
+}
 
 onMounted(() => {
   void loadToolList();
@@ -177,11 +205,18 @@ interface ProxyInventoryRow {
   accountLabel: string;
   keyIndex: number;
   key: string;
+  /** OpenCode 免 Key 匿名模式：无真实 Key 但网关照常出网，视同有一路可用 Key。 */
+  anonymousKey: boolean;
   protocol: string;
   alias: string;
   siteId: string;
   group: string;
   models: string[];
+}
+
+/** 该行是否可参与生效：有真实 Key，或 OpenCode 匿名模式（匿名 Key 也是 Key）。 */
+function rowHasKey(row: ProxyInventoryRow) {
+  return !!row.key || row.anonymousKey;
 }
 
 function sanitizeIdPart(raw: string) {
@@ -207,6 +242,11 @@ function maskKey(key: string) {
   return `${value.slice(0, prefix)}••••••••${value.slice(-suffix)}`;
 }
 
+/** 无真实 Key 时的组副标题：OpenCode 匿名模式视同有 Key，其余才是真未同步。 */
+function anonymousGroupLabel(row: ProxyInventoryRow | undefined) {
+  return row?.anonymousKey ? "匿名模式（免 Key）" : "未同步 Key";
+}
+
 function protocolLabel(protocol: string) {
   const value = protocol.trim().toLowerCase();
   if (value === "anthropic") return "Anthropic";
@@ -226,7 +266,9 @@ function channelKeys(channel: ChannelConfig) {
 }
 
 function accountLabel(account: SiteModelCacheAccount) {
-  const raw = account.accountName || account.profileName || account.username || "账号";
+  // 站点同步的昵称最直观，优先显示；否则退回邮箱（去域名）/ Profile 名。
+  if (account.username.trim()) return account.username.trim();
+  const raw = account.accountName || account.profileName || "账号";
   // 邮箱形式的账号去掉 @ 后的域名部分，标识更简洁
   const at = raw.indexOf("@");
   return at > 0 ? raw.slice(0, at) : raw;
@@ -323,6 +365,7 @@ const inventoryRows = computed<ProxyInventoryRow[]>(() => {
               accountLabel: label,
               keyIndex,
               key,
+              anonymousKey: false,
               protocol,
               alias,
               siteId: channel.siteId || "",
@@ -339,6 +382,7 @@ const inventoryRows = computed<ProxyInventoryRow[]>(() => {
             accountLabel: label,
             keyIndex: 0,
             key: "",
+            anonymousKey: false,
             protocol,
             alias,
             siteId: channel.siteId || "",
@@ -349,6 +393,10 @@ const inventoryRows = computed<ProxyInventoryRow[]>(() => {
       }
     } else {
       const keys = channelKeys(channel);
+      // 内置 opencode 渠道未配 Key 时走匿名模式，匿名 Key 也算一路可用 Key
+      const anonymous = keys.length === 0 && isOpenCodeFreeChannel(channel);
+      // 手动渠道没有独立账号概念，内置渠道直接用渠道名当展示标识
+      const manualLabel = channel.statsId != null && channel.statsId > 0 && channel.statsId < 101 ? "" : "手动渠道";
       if (keys.length) {
         keys.forEach((key, keyIndex) => {
           rows.push({
@@ -356,9 +404,10 @@ const inventoryRows = computed<ProxyInventoryRow[]>(() => {
             channelId: channel.id,
             channelName: channel.name || alias || channel.id,
             account: "default",
-            accountLabel: "手动渠道",
+            accountLabel: manualLabel,
             keyIndex,
             key,
+            anonymousKey: false,
             protocol,
             alias,
             siteId: "",
@@ -372,9 +421,10 @@ const inventoryRows = computed<ProxyInventoryRow[]>(() => {
           channelId: channel.id,
           channelName: channel.name || alias || channel.id,
           account: "default",
-          accountLabel: "手动渠道",
+          accountLabel: manualLabel,
           keyIndex: 0,
           key: "",
+          anonymousKey: anonymous,
           protocol,
           alias,
           siteId: "",
@@ -388,7 +438,7 @@ const inventoryRows = computed<ProxyInventoryRow[]>(() => {
   return rows.filter((row) => row.models.length > 0);
 });
 
-const usableRows = computed(() => inventoryRows.value.filter((row) => !!row.key));
+const usableRows = computed(() => inventoryRows.value.filter(rowHasKey));
 
 /**
  * 展开区的一个可编辑条目。参数设置跟随**界面粒度**（用户看到的这一项），
@@ -458,7 +508,7 @@ function sortByName(groups: InventoryGroup[]) {
  * 多种分组才需要它来区分（与写入配置的供应商标识同一口径）。
  */
 function sourceLabel(row: ProxyInventoryRow) {
-  const parts = [row.alias || row.channelName, row.accountLabel];
+  const parts = [row.alias || row.channelName, row.accountLabel].filter(Boolean);
   const groups = new Set(
     inventoryRows.value
       .filter((item) => item.channelId === row.channelId && item.accountLabel === row.accountLabel)
@@ -512,7 +562,7 @@ function accountGroups(): InventoryGroup[] {
     if (!group) {
       group = {
         key,
-        title: `${row.alias || row.channelName} · ${row.accountLabel}`,
+        title: [row.alias || row.channelName, row.accountLabel].filter(Boolean).join(" · "),
         subtitle: "",
         detailLabel: "模型",
         entries: [],
@@ -536,8 +586,10 @@ function accountGroups(): InventoryGroup[] {
   }
   for (const group of groups.values()) {
     const head = group.rows[0];
-    const keys = group.rows.filter((row) => !!row.key);
-    const masked = keys.length ? keys.map((row) => maskKey(row.key)).join("、") : "未同步 Key";
+    const keys = group.rows.filter(rowHasKey);
+    const masked = keys.length
+      ? keys.map((row) => (row.key ? maskKey(row.key) : "匿名 Key")).join("、")
+      : anonymousGroupLabel(group.rows[0]);
     const keyGroups = [...new Set(group.rows.map((row) => row.group))];
     group.entries.sort((a, b) => nameCollator.compare(a.label, b.label));
     group.subtitle = [
@@ -549,7 +601,7 @@ function accountGroups(): InventoryGroup[] {
       head.channelName,
       head.siteId ? `站点 ${head.siteId}` : "",
       protocolLabel(head.protocol),
-      `${group.rows.length} 路 Key`,
+      `${group.rows.filter(rowHasKey).length} 路 Key`,
     ].filter(Boolean);
   }
   return sortByName([...groups.values()]);
@@ -591,7 +643,7 @@ function modelGroups(): InventoryGroup[] {
   }
   for (const group of groups.values()) {
     const sites = new Set(group.rows.map((row) => `${row.channelId}::${row.account}`));
-    const withKey = group.rows.filter((row) => !!row.key).length;
+    const withKey = group.rows.filter(rowHasKey).length;
     group.subtitle = `${sites.size} 个站点提供 · ${withKey} 路 Key 可用`;
     group.entries.sort((a, b) => nameCollator.compare(a.label, b.label));
   }
@@ -626,12 +678,12 @@ function groupDiffNote(group: InventoryGroup): string {
 }
 
 function groupCanApply(group: InventoryGroup) {
-  return !wholeListComparison.value && group.rows.some((row) => !!row.key);
+  return !wholeListComparison.value && group.rows.some(rowHasKey);
 }
 
 /** 组内可点击「生效」的条目：默认取第一条带 Key 的。 */
 function groupPrimaryRow(group: InventoryGroup): ProxyInventoryRow | null {
-  return group.rows.find((row) => !!row.key) ?? null;
+  return group.rows.find(rowHasKey) ?? null;
 }
 
 async function applyGroup(group: InventoryGroup) {
@@ -648,17 +700,6 @@ const gatewayBaseUrl = computed(() =>
   activeTool.value === "claude" ? gatewayOrigin.value : `${gatewayOrigin.value}/v1`,
 );
 const gatewayReady = computed(() => !!proxyStatus.value?.running);
-
-// —— 身份模式：常规（渠道·账号） / 模型×站点 ——
-//
-// 两种模式读同一份反代清单、路由到同一个网关，区别只在于「写进 Agent 配置的供应商条目怎么切」：
-// - 常规：每个 (渠道, 账号, Key) 一条供应商，条目下挂该条支持的模型；
-// - 模型×站点：只写一条网关供应商，模型串统一是「渠道别名/裸模型」，
-//   路由身份落在模型 ID 上（网关按别名前缀定向指派），不再随账号/Key 增删而漂移。
-const SINGLE_GATEWAY_PROVIDER_ID = "openhub-gateway";
-
-/** 已展开的清单分组键。默认全部收起：条目多时一屏看清单，展开才看模型。 */
-const expandedKeys = ref<Set<string>>(new Set());
 
 // —— 模型参数（最大窗口 / 最大输出 / 默认思考级别 / 思考级别筛选配置）——
 //
@@ -677,6 +718,119 @@ const THINKING_EFFORT_OPTIONS = [
   "xhigh",
   "max",
 ] as const;
+
+// —— models.dev 按模型能力（思考档位 / 上下文 / 输出上限 / 交错字段等）——
+//
+// 目录快照（Rust 侧 models.dev 富化结果）里已存好每个模型的 reasoning_options 等字段，
+// 这里按清单里出现的 modelId 批量拉取（`get_model_capabilities`，归一化匹配、查不到不臆造），
+// 用于把「这个模型**实际支持**哪些思考档位」体现在逐模型参数行上，
+// 并提供窗口/输出上限的一键载入。
+
+const modelCapabilities = ref<Record<string, ModelCapabilities>>({});
+
+function normalizeModelKey(raw: string): string {
+  let s = raw.trim().toLowerCase();
+  const cut = s.search(/[:@]/);
+  if (cut >= 0) s = s.slice(0, cut);
+  const slash = s.lastIndexOf("/");
+  if (slash >= 0) s = s.slice(slash + 1);
+  return s.replace(/[._]+/g, "-");
+}
+
+/** 该条目对应的 models.dev 能力；未命中或目录未同步时为 null。 */
+function capabilitiesFor(entry: InventoryEntry): ModelCapabilities | null {
+  if (!entry.modelId) return null;
+  const direct = modelCapabilities.value[entry.modelId];
+  if (direct) return direct;
+  // 同归一化键的其它拼写（大小写 / 前缀差异）也算命中
+  const normalized = normalizeModelKey(entry.modelId);
+  for (const [key, caps] of Object.entries(modelCapabilities.value)) {
+    if (normalizeModelKey(key) === normalized) return caps;
+  }
+  return null;
+}
+
+/**
+ * 该模型在 models.dev 声明的思考档位（effort 形态的 values，按档位从低到高）。
+ *
+ * 目录未命中、或该模型只声明 `toggle`（只有开/关）时回落到全局档位列表，
+ * 避免把「没有数据」误呈现成「不支持思考」。
+ */
+function modelEffortOptions(entry: InventoryEntry): string[] {
+  const caps = capabilitiesFor(entry);
+  const efforts =
+    caps?.reasoningOptions.find((option) => option.kind === "effort")?.values ?? [];
+  return efforts.length ? efforts : [...THINKING_EFFORT_OPTIONS];
+}
+
+/** 该模型是否只有开/关式思考（toggle），供 UI 提示「仅支持开/关」。 */
+function modelReasoningToggleOnly(entry: InventoryEntry): boolean {
+  const caps = capabilitiesFor(entry);
+  if (!caps || !caps.reasoningOptions.length) return false;
+  return !caps.reasoningOptions.some((option) => option.kind === "effort");
+}
+
+async function refreshModelCapabilities() {
+  const keys = [
+    ...new Set(
+      inventoryGroups.value
+        .flatMap((group) => group.entries.map((entry) => entry.modelId))
+        .filter((modelId) => modelId && !(modelId in modelCapabilities.value)),
+    ),
+  ];
+  if (!keys.length) return;
+  try {
+    const result = await runCommand<Record<string, ModelCapabilities>>(
+      "get_model_capabilities",
+      { keys },
+    );
+    // 未命中的 key 后端不返回：记为 null，避免每次清单变化都重复请求
+    for (const key of keys) {
+      modelCapabilities.value[key] = result[key] ?? (null as unknown as ModelCapabilities);
+    }
+  } catch {
+    /* 目录尚未同步时静默：参数行回落到全局档位列表 */
+  }
+}
+
+let capabilityDebounce: number | null = null;
+watch(
+  inventoryGroups,
+  () => {
+    if (capabilityDebounce !== null) window.clearTimeout(capabilityDebounce);
+    capabilityDebounce = window.setTimeout(() => {
+      capabilityDebounce = null;
+      void refreshModelCapabilities();
+    }, 300);
+  },
+  { immediate: true, deep: false },
+);
+
+/** 能力摘要徽标：上下文 / 输出上限 / 交错字段 / 快速档，目录未命中时为空。 */
+function capabilityBadges(caps: ModelCapabilities): string[] {
+  const badges: string[] = [];
+  if (caps.contextLength > 0) badges.push(`窗口 ${formatTokenCount(caps.contextLength)}`);
+  if (caps.maxOutputTokens > 0) badges.push(`输出 ${formatTokenCount(caps.maxOutputTokens)}`);
+  if (caps.maxInputTokens && caps.maxInputTokens < caps.contextLength) {
+    badges.push(`输入上限 ${formatTokenCount(caps.maxInputTokens)}`);
+  }
+  if (caps.interleavedFields.length) badges.push(`交错 ${caps.interleavedFields.join("/")}`);
+  if (caps.hasFastMode) badges.push("快速档");
+  const outputs = (caps.outputModalities ?? []).filter((m) => m !== "text");
+  if (outputs.length) badges.push(`输出模态 ${outputs.join("/")}`);
+  return badges;
+}
+
+/** 一键把 models.dev 的窗口/输出上限与思考档位载入为该模型的覆盖参数。 */
+function loadCapabilitiesToChild(entry: InventoryEntry) {
+  const caps = capabilitiesFor(entry);
+  if (!caps) return;
+  const patch: ChildParamOverride = { efforts: modelEffortOptions(entry) };
+  if (caps.contextLength > 0) patch.contextWindow = caps.contextLength;
+  if (caps.maxOutputTokens > 0) patch.maxOutput = caps.maxOutputTokens;
+  setChildOverride(entry, patch);
+  showToast(`已载入 models.dev 参数：${entry.label || entry.modelId}`);
+}
 
 interface ParentParamValue {
   contextWindow: number | null;
@@ -750,7 +904,11 @@ function loadStoredConfigs() {
   if (saved) {
     if (saved.parentConfigs) {
       for (const [k, v] of Object.entries(saved.parentConfigs)) {
-        parentConfigs[k] = { ...v } as ParentParamValue;
+        const val = { ...v } as ParentParamValue;
+        if (!Array.isArray(val.efforts)) {
+          val.efforts = [...THINKING_EFFORT_OPTIONS];
+        }
+        parentConfigs[k] = val;
       }
     }
     if (saved.childOverrides) {
@@ -763,7 +921,12 @@ function loadStoredConfigs() {
 
 function getParentConfig(groupKey: string): ParentParamValue {
   const existing = parentConfigs[groupKey];
-  if (existing) return existing;
+  if (existing) {
+    if (!Array.isArray(existing.efforts)) {
+      existing.efforts = [...THINKING_EFFORT_OPTIONS];
+    }
+    return existing;
+  }
 
   const snap = snapshot.value;
   const initEfforts = snap?.defaults?.reasoningEffortOptions?.length
@@ -783,7 +946,6 @@ function getParentConfig(groupKey: string): ParentParamValue {
   if (!config.efforts.length) {
     config.efforts = [...THINKING_EFFORT_OPTIONS];
   }
-  parentConfigs[groupKey] = config;
   return config;
 }
 
@@ -845,7 +1007,7 @@ function getEffectiveModelParams(groupKey: string, entryKey: string) {
     contextWindow,
     maxOutput,
     defaultReasoningEffort: defaultReasoningEffort ?? "",
-    efforts: efforts ?? [...THINKING_EFFORT_OPTIONS],
+    efforts: Array.isArray(efforts) ? efforts : [...THINKING_EFFORT_OPTIONS],
     isOverridden,
     overriddenCount,
     hasContextWindowOverride,
@@ -966,27 +1128,6 @@ function parseLimitInput(event: Event): number | null {
   return Number.isFinite(value) && value >= 0 ? Math.floor(value) : null;
 }
 
-const identityMode = computed<LocalToolIdentityMode>(
-  () => preferences.agentIdentityModes?.[activeTool.value] ?? "channel",
-);
-const modelIdentityMode = computed(() => identityMode.value === "model");
-
-/** 模式切换旁的一句话说明，避免用户只看到两个标签不知差异。 */
-const identityModeCaption = computed(() =>
-  modelIdentityMode.value
-    ? "整份清单合并为一条网关接入；下面按模型列出，展开看提供它的站点 · 账号"
-    : "每个「渠道 · 账号」各成一条供应商条目；下面按账号列出，展开看模型",
-);
-
-function setIdentityMode(mode: LocalToolIdentityMode) {
-  if (mode === identityMode.value) return;
-  updatePreferences({
-    agentIdentityModes: { ...preferences.agentIdentityModes, [activeTool.value]: mode },
-  });
-  // 两种模式的列表结构不同（条目 → 模型），展开态一律收起重来，避免残留上一模式的展开行。
-  expandedKeys.value = new Set();
-}
-
 function toolProtocol(row: ProxyInventoryRow) {
   if (activeTool.value === "claude") return "anthropic";
   if (activeTool.value === "codex") return "responses";
@@ -1071,7 +1212,7 @@ function managedStateLabel(file: LocalToolConfigFile) {
 
 /** 写进 Agent 配置的供应商标识：站点别名-账号[-Key 分组]。 */
 function rowIdentifier(row: ProxyInventoryRow) {
-  const parts = [row.alias || row.channelName, row.accountLabel];
+  const parts = [row.alias || row.channelName, row.accountLabel].filter(Boolean);
   const groups = new Set(
     inventoryRows.value
       .filter((item) => item.channelId === row.channelId && item.accountLabel === row.accountLabel)
@@ -1122,7 +1263,7 @@ function rowDiff(row: ProxyInventoryRow) {
  * - 一路接入（claude）：磁盘上只能有一路，比对一致的那条就是当前接入。
  */
 function rowState(row: ProxyInventoryRow): "applied" | "current" | "drifted" | "pending" {
-  if (!snapshot.value || !row.key) return "pending";
+  if (!snapshot.value || !rowHasKey(row)) return "pending";
   const entry = rowDiff(row);
   if (wholeListComparison.value) return entry?.consistent ? "applied" : "pending";
   if (switchEndpoint.value) {
@@ -1209,7 +1350,7 @@ function applyBlockedReason(rows: ProxyInventoryRow[]) {
   if (!snapshot.value) return "尚未读取到 Agent 配置";
   if (!gatewayKey.value) return "网关 API Key 尚未生成，请先打开模型反代";
   if (!rows.length) return "当前没有可生效的反代条目";
-  if (rows.some((row) => !row.key)) return "有条目还没有 Key，请先到站点库同步";
+  if (rows.some((row) => !rowHasKey(row))) return "有条目还没有 Key，请先到站点库同步";
   return "";
 }
 
@@ -1264,11 +1405,31 @@ function patchDefaults(rows: ProxyInventoryRow[], providerId: string, whole: boo
  * - 常规：`rows` 各成一条供应商（一次一家的工具只更新被选中的那条，其余受管条目保留）；
  * - 模型×站点：整份清单合并为一条网关供应商，模型串带渠道别名。
  */
-function buildPatch(rows: ProxyInventoryRow[], whole: boolean) {
+function buildPatch(rows: ProxyInventoryRow[], whole: boolean): LocalToolConfigPatch {
   const modelMode = modelIdentityMode.value;
-  const singleProviderId = modelMode ? SINGLE_GATEWAY_PROVIDER_ID : rows[0].id;
-  let providers: LocalToolProviderEntry[];
-  let models: LocalToolModelEntry[];
+  const singleProviderId = modelMode ? SINGLE_GATEWAY_PROVIDER_ID : (rows[0]?.id ?? SINGLE_GATEWAY_PROVIDER_ID);
+  let providers: LocalToolProviderEntry[] = [];
+  let models: LocalToolModelEntry[] = [];
+
+  if (!rows.length) {
+    return {
+      baseHash: snapshot.value?.contentHash ?? "",
+      providers: [],
+      models: [],
+      defaults: patchDefaults([], singleProviderId, whole),
+      context: {
+        contextWindow: null,
+        autoCompactTokenLimit: null,
+        maxOutputTokens: null,
+        maxThinkingTokens: null,
+      },
+      thinking: {
+        effortLevel: "",
+        effortLevelOptions: [...THINKING_EFFORT_OPTIONS],
+        maxThinkingTokens: null,
+      },
+    };
+  }
 
   if (modelMode) {
     providers = [providerFromRows(rows, SINGLE_GATEWAY_PROVIDER_ID)];
@@ -1360,12 +1521,21 @@ async function refreshDiff() {
   await diffTargets(usable.map((row) => ({ key: row.id, patch: buildPatch([row], false) })));
 }
 
+let diffDebounceTimer: number | null = null;
+function scheduleDiff() {
+  if (diffDebounceTimer !== null) clearTimeout(diffDebounceTimer);
+  diffDebounceTimer = window.setTimeout(() => {
+    diffDebounceTimer = null;
+    void refreshDiff();
+  }, 200);
+}
+
 // 配置、清单或身份模式变化后重新比对：徽标始终反映「磁盘现状 vs 当前清单」。
 // 这些依赖变化很频繁（站点缓存刷新也会触发），比对失败静默处理，不打扰用户。
 watch(
   [configRevision, () => usableRows.value, identityMode],
   () => {
-    void refreshDiff();
+    scheduleDiff();
   },
   { immediate: true, flush: "post" },
 );
@@ -1389,7 +1559,7 @@ async function applyRows(rows: ProxyInventoryRow[], whole: boolean) {
 
 async function applyRow(row: ProxyInventoryRow) {
   if (allEndpoint.value || modelIdentityMode.value) return;
-  if (!row.key) {
+  if (!rowHasKey(row)) {
     showToast("这条还没有 Key，请先到站点库同步后再生效", true);
     return;
   }
@@ -1590,6 +1760,10 @@ function handleDialogKeydown(event: KeyboardEvent, close: () => void) {
 }
 
 onUnmounted(() => {
+  if (diffDebounceTimer !== null) {
+    clearTimeout(diffDebounceTimer);
+    diffDebounceTimer = null;
+  }
   if (modalOpen.value) document.body.classList.remove("modal-open");
 });
 </script>
@@ -1863,7 +2037,7 @@ onUnmounted(() => {
                         :key="`parent-${group.key}-${lvl}`"
                         type="button"
                         class="effort-chip"
-                        :class="{ active: getParentConfig(group.key).efforts.includes(lvl) }"
+                        :class="{ active: (getParentConfig(group.key).efforts ?? []).includes(lvl) }"
                         @click="toggleParentEffort(group.key, lvl)"
                       >{{ lvl }}</button>
                     </div>
@@ -1938,6 +2112,21 @@ onUnmounted(() => {
                           v-html="icons.copy"
                         ></button>
                       </div>
+                      <div v-if="capabilitiesFor(entry)" class="model-cap-row">
+                        <span
+                          v-for="badge in capabilityBadges(capabilitiesFor(entry)!)"
+                          :key="badge"
+                          class="model-cap-badge"
+                          title="来自 models.dev 目录"
+                        >{{ badge }}</span>
+                        <span v-if="modelReasoningToggleOnly(entry)" class="model-cap-badge" title="models.dev 仅声明开/关式思考">思考仅开/关</span>
+                        <button
+                          type="button"
+                          class="model-cap-load-btn"
+                          title="把 models.dev 的窗口 / 输出上限 / 思考档位载入为本模型参数"
+                          @click="loadCapabilitiesToChild(entry)"
+                        >载入目录参数</button>
+                      </div>
                     </div>
 
                     <!-- 最大窗口 -->
@@ -1979,7 +2168,7 @@ onUnmounted(() => {
                         @change="setChildOverride(entry, { defaultReasoningEffort: ($event.target as HTMLSelectElement).value || undefined })"
                       >
                         <option value="">继承父级 ({{ getParentConfig(group.key).defaultReasoningEffort || '未设置' }})</option>
-                        <option v-for="lvl in THINKING_EFFORT_OPTIONS" :key="lvl" :value="lvl">{{ lvl }}</option>
+                        <option v-for="lvl in modelEffortOptions(entry)" :key="lvl" :value="lvl">{{ lvl }}</option>
                       </select>
                     </div>
 
@@ -1987,12 +2176,12 @@ onUnmounted(() => {
                     <div class="col-filter">
                       <div class="sub-effort-chips">
                         <button
-                          v-for="lvl in THINKING_EFFORT_OPTIONS"
+                          v-for="lvl in modelEffortOptions(entry)"
                           :key="`${entry.key}-${lvl}`"
                           type="button"
                           class="sub-effort-chip"
                           :class="{
-                            'active': getEffectiveModelParams(group.key, entry.key).efforts.includes(lvl),
+                            'active': (getEffectiveModelParams(group.key, entry.key).efforts ?? []).includes(lvl),
                             'is-custom': getEffectiveModelParams(group.key, entry.key).hasEffortsListOverride,
                           }"
                           :title="getEffectiveModelParams(group.key, entry.key).hasEffortsListOverride ? `切换 ${lvl}` : `继承自父级；点击自定义覆盖`"
@@ -3102,6 +3291,41 @@ onUnmounted(() => {
 .copy-id-btn :deep(svg) {
   width: 12px;
   height: 12px;
+}
+
+.model-cap-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  margin-top: 3px;
+}
+
+.model-cap-badge {
+  display: inline-block;
+  padding: 1px 6px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  font-size: 10px;
+  line-height: 1.5;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.model-cap-load-btn {
+  padding: 1px 6px;
+  border: 1px dashed var(--brand);
+  border-radius: 999px;
+  background: transparent;
+  font-size: 10px;
+  line-height: 1.5;
+  color: var(--brand);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.model-cap-load-btn:hover {
+  background: color-mix(in srgb, var(--brand) 12%, transparent);
 }
 
 .sub-input-wrap {

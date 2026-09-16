@@ -256,13 +256,72 @@ async function startRefresh() {
 const mappingDialogOpen = ref(false);
 const mappingChannelId = ref("");
 const mappingModel = ref("");
-const mappingCatalogGroups = ref<{ label: string; options: { value: string; text: string }[] }[]>([]);
+/** 拉取到的正式模型清单原始数据（含 `firstParty` 标记）；分组由它派生。 */
+const mappingCatalogModels = ref<TokenOfficialModel[]>([]);
 const mappingCatalogLoading = ref(false);
 const mappingCatalogError = ref("");
 const mappingInitializing = ref(false);
 const mappingInitializationError = ref("");
 const mappingProxy = useModelProxy();
 const { confirm: confirmMappingForce } = useConfirm();
+
+/**
+ * 映射目标下拉分组：**只体现原厂模型**——目录里确有原厂官方渠道的条目
+ * （后端 `firstParty`，即 `official_host_count > 0`），加上用户手工添加的自定义项。
+ *
+ * 全量清单有 1900+ 条，绝大多数是三方转售与命名变体（`DeepSeek V4 Flash 0731`、
+ * `AU Anthropic …`、`… (EU)`、`Anthropic: …`），全部塞进下拉会把「原厂」冲淡。
+ *
+ * 注意：**不要**把「当前映射值」混进这个共享下拉（曾如此实现，导致
+ * `DeepSeek V4 Flash (free)` 这类非原厂目标出现在所有行里）。当前值若不是原厂，
+ * 由 `mappingRowSelectOptions` 单独、显式标注后补进**那一行**，不污染全量候选。
+ */
+const mappingCatalogGroups = computed(() => {
+  const groups = new Map<string, { value: string; text: string }[]>();
+  const seen = new Set<string>();
+  for (const model of mappingCatalogModels.value) {
+    const name = model.name.trim();
+    if (!name || seen.has(name) || !model.firstParty) continue;
+    seen.add(name);
+    const lab = model.lab || "其他";
+    let bucket = groups.get(lab);
+    if (!bucket) {
+      bucket = [];
+      groups.set(lab, bucket);
+    }
+    bucket.push({ value: name, text: name });
+  }
+  return [...groups.entries()]
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .map(([label, options]) => ({
+      label,
+      options: options.slice().sort((a, b) => a.text.localeCompare(b.text)),
+    }));
+});
+
+/** 下拉里全部可选的目标值，用于判断某行的当前值是否在原厂候选内。 */
+const mappingTargetValues = computed(() => {
+  const values = new Set<string>();
+  for (const group of mappingCatalogGroups.value) {
+    for (const option of group.options) values.add(option.value);
+  }
+  return values;
+});
+
+/**
+ * 单行的目标下拉选项：常规只有「未映射 / 自定义…」+ 共享原厂分组。
+ *
+ * 当前值若不在原厂候选内（历史遗留或 AI 建议），额外补一条并显式标注
+ * `（非原厂）`——既不让下拉显示空白（看起来像「未映射」），
+ * 也不把它混进共享候选让别的行也看得到。
+ */
+function mappingRowSelectOptions(row: TokenModelMapping) {
+  const current = row.officialModel.trim();
+  if (current && !mappingTargetValues.value.has(current)) {
+    return [...mappingTargetSelectOptions, { value: current, text: `${current}（非原厂）` }];
+  }
+  return mappingTargetSelectOptions;
+}
 
 const mappingOriginLabels: Record<string, string> = {
   rule: "规则",
@@ -582,7 +641,7 @@ async function deleteOfficialModel(name: string) {
     return;
   }
   store.showToast(`已删除 ${name}`);
-  mappingCatalogGroups.value = [];
+  mappingCatalogModels.value = [];
   void ensureMappingCatalog(true);
 }
 
@@ -596,7 +655,7 @@ async function addMappingOfficialModel() {
   if (ok) {
     mappingNewOfficial.value = "";
     store.showToast(`已添加自定义模型 ${name}`);
-    mappingCatalogGroups.value = [];
+    mappingCatalogModels.value = [];
     void ensureMappingCatalog(true);
   } else {
     store.showToast("添加自定义模型失败", true);
@@ -656,14 +715,14 @@ watch(
   { immediate: true }
 );
 
-// 洞察分析模型候选：沿用官方模型目录（用户手工添加 + AI 自动学习 + 数据迁移），
-// 裸模型名由网关按渠道白名单匹配路由
+// 洞察分析模型候选：沿用官方模型目录全量（用户手工添加 + AI 自动学习 + 数据迁移），
+// 裸模型名由网关按渠道白名单匹配路由。
+// 这里刻意**不**套用映射下拉的「仅原厂」过滤——洞察只需要一个能出网的模型名。
 const insightModelSelectOptions = computed(() => {
   const models = new Set<string>();
-  for (const group of mappingCatalogGroups.value) {
-    for (const option of group.options) {
-      models.add(option.value);
-    }
+  for (const model of mappingCatalogModels.value) {
+    const name = model.name.trim();
+    if (name) models.add(name);
   }
   return [...models]
     .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }))
@@ -707,32 +766,14 @@ function closeMappingDialog() {
 
 async function ensureMappingCatalog(force = false) {
   if (mappingCatalogLoading.value) return;
-  if (!force && mappingCatalogGroups.value.length) return;
+  if (!force && mappingCatalogModels.value.length) return;
   mappingCatalogLoading.value = true;
   mappingCatalogError.value = "";
   try {
-    // 候选来自正式模型清单（用户手工添加 + AI 自动学习 + 数据迁移），自定义模型会实时出现在这里
-    const models = await runLocalCommand<TokenOfficialModel[]>("get_token_official_models");
-    const groups = new Map<string, { value: string; text: string }[]>();
-    const seen = new Set<string>();
-    for (const model of models) {
-      const name = model.name.trim();
-      if (!name || seen.has(name)) continue;
-      seen.add(name);
-      const lab = model.lab || "其他";
-      let bucket = groups.get(lab);
-      if (!bucket) {
-        bucket = [];
-        groups.set(lab, bucket);
-      }
-      bucket.push({ value: name, text: name });
-    }
-    mappingCatalogGroups.value = [...groups.entries()]
-      .sort((a, b) => a[0].localeCompare(b[0]))
-      .map(([label, options]) => ({
-        label,
-        options: options.sort((a, b) => a.text.localeCompare(b.text)),
-      }));
+    // 候选来自正式模型清单（用户手工添加 + AI 自动学习 + 数据迁移），
+    // 分组按 `firstParty` 过滤为原厂模型，见 `mappingCatalogGroups`。
+    mappingCatalogModels.value =
+      await runLocalCommand<TokenOfficialModel[]>("get_token_official_models");
   } catch (error) {
     mappingCatalogError.value = String(error);
   } finally {
@@ -798,6 +839,18 @@ const insightDialogOpen = ref(false);
 const insightModel = ref("");
 const insightSubmittedRange = computed(() => store.tokenInsightReport.value?.rangeLabel ?? "");
 
+// —— 已实现但尚未接入模板的能力（映射管理 / 洞察）——
+// 显式引用以通过 noUnusedLocals；等这些能力接到模板后，请删除下面这一整段。
+void [
+  mappingUsageOf,
+  selectAllUnmapped,
+  mappingBatchReady,
+  startRenameTarget,
+  confirmRenameTarget,
+  deleteOfficialModel,
+  insightSubmittedRange,
+];
+
 function formatTokenCompact(value: number): string {
   if (value >= 1_000_000_000) return `${(value / 1_000_000_000).toFixed(2)}B`;
   if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`;
@@ -826,8 +879,6 @@ const insightEvidenceCount = computed(() => buildInsightEvidence().evidence.leng
 /** 从当前筛选桶构建证据包；只包含有数据支撑的证据项。 */
 function buildInsightEvidence(): { rangeLabel: string; evidence: InsightEvidenceItem[] } {
   const evidence: InsightEvidenceItem[] = [];
-  const from = store.tokenStatsFrom.value;
-  const to = store.tokenStatsTo.value;
   const label = rangeLabel.value;
   const buckets = filteredBuckets.value;
   if (!buckets.length) return { rangeLabel: label, evidence };
@@ -1297,6 +1348,7 @@ const PROVIDER_COLORS: Record<string, string> = {
   catpawai: "#ec4899",
   "command-code": "#10b981",
   dsh: "#1e88e5",
+  workbuddy: "#0052d9",
 };
 
 function providerColor(source: string, index = 0): string {
@@ -2758,8 +2810,7 @@ onBeforeUnmount(() => {
                 <template #cell-source="{ row }">
                   <div class="tt-cell-with-dot">
                     <span class="tt-bar-dot" :style="{ background: providerColor(row.source) }" />
-                    <strong>{{ sourceLabel(row.source) }}</strong>
-                    <code class="tt-muted-code">({{ row.source }})</code>
+                    <strong :title="row.source !== sourceLabel(row.source) ? row.source : undefined">{{ sourceLabel(row.source) }}</strong>
                   </div>
                 </template>
                 <template #cell-totalTokens="{ row }"><strong>{{ formatCompact(row.totalTokens) }}</strong></template>
@@ -3340,7 +3391,7 @@ onBeforeUnmount(() => {
                     <template v-else>
                       <CustomSelect
                         class="tt-mapping-row-select"
-                        :options="mappingTargetSelectOptions"
+                        :options="mappingRowSelectOptions(row)"
                         :groups="mappingCatalogGroups"
                         :model-value="row.officialModel"
                         :aria-label="`为 ${row.rawModel} 选择映射目标`"
@@ -4624,11 +4675,6 @@ onBeforeUnmount(() => {
   display: flex;
   align-items: center;
   gap: 6px;
-}
-
-.tt-muted-code {
-  font-size: 10px;
-  color: var(--muted);
 }
 
 .tt-project-cell {

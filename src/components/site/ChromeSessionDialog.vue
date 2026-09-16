@@ -192,7 +192,7 @@ async function openSiteInBrowser(session: ChromeSessionInfo) {
             <div class="chrome-session-avatar" v-html="icons.user" />
             <div class="chrome-session-details">
               <strong>{{ session.profileName }}</strong>
-              <small>{{ session.accountName || session.profileId }} · {{ session.domain }}</small>
+              <small :title="session.accountName">{{ session.username || session.accountName || session.profileId }} · {{ session.domain }}</small>
               <div class="chrome-cookie-names" :title="session.cookieNames.join(', ')">
                 {{ session.cookieNames.slice(0, 5).join(" · ") }}
                 <span v-if="session.cookieNames.length > 5">+{{ session.cookieNames.length - 5 }}</span>

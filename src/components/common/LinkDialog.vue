@@ -76,8 +76,11 @@ async function openAddress(item: AddressItem) {
 }
 
 function profileLabel(session: (typeof profileSessions.value)[number]) {
-  const account = session.accountName.trim();
-  return account ? `${account}（${session.profileName}）` : session.profileName;
+  const account = session.username?.trim() || session.accountName.trim();
+  const detail = account === session.username?.trim() && session.accountName.trim()
+    ? session.accountName.trim()
+    : session.profileName;
+  return account ? `${account}（${detail}）` : session.profileName;
 }
 
 const profileOptions = computed(() =>

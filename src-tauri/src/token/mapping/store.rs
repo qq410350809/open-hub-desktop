@@ -237,7 +237,7 @@ pub fn apply_ai_suggestions(
                    AND origin != 'manual'
                    AND review_status != 'approved'",
                 params![
-                    candidate.name,
+                    candidate.id,
                     candidate.id,
                     candidate.lab,
                     ORIGIN_AI,

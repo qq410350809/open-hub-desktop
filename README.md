@@ -146,7 +146,7 @@ Mihomo 代理内核与 GeoIP 数据库不随安装包分发（减小体积、规
 | 页面读数据 | Component → Composable → `runCommand` → IPC 或 `/api/rpc` → 命令表分发 → SQLite |
 | 后端推送 | Rust `EventBus.emit` → Tauri event（桌面）或 SSE `/api/events`（远程）→ 前端 `listen()` |
 | 模型网关请求 | 客户端 → `/v1/chat/completions` 等入口 → API Key 校验 → 通道路由/负载均衡 → 上游站点 → 流式回传 + 用量记账 |
-| Token 采集 | 后台 Worker 每 20 秒扫描 18 种工具日志 → 指纹去重 → 规范化 → SQLite 快照 |
+| Token 采集 | 后台 Worker 每 20 秒扫描 19 种工具日志 → 指纹去重 → 规范化 → SQLite 快照 |
 
 ---
 
@@ -198,9 +198,9 @@ Mihomo 代理内核与 GeoIP 数据库不随安装包分发（减小体积、规
 - API Key 首次启动自动生成，存于 `app_meta` 配置，可在 Web UI 网关页查看
 
 ### Token 统计（token/collector + token/stats）
-**本地终端平面**——后台每 20 秒增量扫描以下 18 种 AI 工具的本地日志/数据库：
+**本地终端平面**——后台每 20 秒增量扫描以下 19 种 AI 工具的本地日志/数据库：
 
-Claude Code、Codex、Cursor、Cline、Continue、Copilot、Windsurf、Aider、Goose、Kiro、OpenCode、Zed、ZCode、Antigravity、Mimo、Catpawai、CommandCode、DSH
+Claude Code、Codex、Cursor、Cline、Continue、Copilot、Windsurf、Aider、Goose、Kiro、OpenCode、Zed、ZCode、Antigravity、Mimo、Catpawai、CommandCode、DSH、WorkBuddy AI
 
 处理管线：文件指纹去重 → 会话/对话/请求三级解析 → 模型规范化（slug 归一）→ 人机消息区分 → SQLite 快照入库。
 产出：会话/模型/子代理维度统计、日/小时用量桶、成本估算、请求健康报表、原始日志浏览、本地 Agent 路径探测（支持环境变量覆盖）。

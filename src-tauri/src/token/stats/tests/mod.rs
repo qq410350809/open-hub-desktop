@@ -872,3 +872,53 @@ fn mimo_cursor_replays_users_when_session_becomes_allowed() {
     assert_eq!(map.values().map(|a| a.requests).sum::<i64>(), 1);
     let _ = fs::remove_file(&db_path);
 }
+
+#[test]
+fn workbuddy_activity_counts_user_and_assistant_and_explicit_errors() {
+    let mut map = BTreeMap::new();
+    let mut sources = BTreeMap::new();
+
+    // 用户提问 → 一次对话
+    workbuddy_on_line(
+        &json!({"type":"message","role":"user","timestamp":1786687444127u64,
+                "content":[{"type":"input_text","text":"hi"}]}),
+        &mut map,
+        &mut sources,
+    );
+    // 正常助手回复（有用量）→ 一次请求
+    workbuddy_on_line(
+        &json!({"type":"message","role":"assistant","status":"completed","timestamp":1786687449831u64,
+                "message":{"usage":{"input_tokens":8740,"output_tokens":228}}}),
+        &mut map,
+        &mut sources,
+    );
+    // 上游显式报错（providerData.error 带 HTTP 状态）→ 一次请求 + 一次失败
+    workbuddy_on_line(
+        &json!({"type":"message","role":"assistant","status":"incomplete","timestamp":1786687450000u64,
+                "providerData":{"error":{"status":400,"message":"400 bad request"}}}),
+        &mut map,
+        &mut sources,
+    );
+    // 尚未写完的中间态（无用量、无错误）→ 不计入，否则增量扫描会把在途消息永久误判为失败
+    workbuddy_on_line(
+        &json!({"type":"message","role":"assistant","status":"incomplete","timestamp":1786687451000u64}),
+        &mut map,
+        &mut sources,
+    );
+    // 非消息行（工具调用）→ 不计入
+    workbuddy_on_line(
+        &json!({"type":"function_call","name":"Bash","timestamp":1786687452000u64}),
+        &mut map,
+        &mut sources,
+    );
+
+    assert_eq!(map.values().map(|a| a.dialogues).sum::<i64>(), 1);
+    assert_eq!(map.values().map(|a| a.requests).sum::<i64>(), 2);
+    assert_eq!(map.values().map(|a| a.failed).sum::<i64>(), 1);
+    let workbuddy = sources
+        .get("workbuddy")
+        .expect("workbuddy source should exist");
+    assert_eq!(workbuddy.dialogues, 1);
+    assert_eq!(workbuddy.requests, 2);
+    assert_eq!(workbuddy.failed, 1);
+}

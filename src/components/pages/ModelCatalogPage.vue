@@ -2,7 +2,7 @@
 import { computed, onMounted, ref, watch } from "vue";
 import { icons } from "../../icons";
 import { useStore } from "../../composables/useStore";
-import type { ModelCatalogDetail, ModelCatalogItem, ModelCatalogProvider, ModelCatalogHostItem } from "../../types";
+import type { ModelCatalogDetail, ModelCatalogItem, ModelCatalogProvider, ModelCatalogHostItem, ReasoningOption } from "../../types";
 import AppTable, { type AppTableColumn } from "../common/AppTable.vue";
 import CustomSelect from "../common/CustomSelect.vue";
 import { formatTokens as formatTokensUtil, formatTokensFull as formatTokensFullUtil, formatPrice as formatPriceUtil } from "../../utils";
@@ -51,6 +51,17 @@ const detailError = ref("");
 const activeDetailTab = ref<"overview" | "providers" | "pricing">("overview");
 const idCopied = ref(false);
 const providerTablePricedOnly = ref(false);
+/** 渠道明细表：只看原厂官方渠道（用于「官网价 vs 三方价」对照）。 */
+const providerTableOfficialOnly = ref(false);
+/** 供应商矩阵视图：只看原厂自营渠道。 */
+const providerFirstPartyOnly = ref(false);
+
+/**
+ * 渠道性质筛选（官网 / 三方 / 免费 / 订阅）。
+ *
+ * 数据来自 models.dev 与 llmpricing 的组合推导，见 `MODELS_DEV_IMPLEMENTATION_REPORT.md`。
+ */
+const originFilter = ref("all");
 
 // —— 交互式成本计算器状态 ——
 const calcMonthlyInputTokens = ref(10); // 百万 Tokens (M)
@@ -156,15 +167,17 @@ const metrics = computed(() => {
 });
 
 // —— 厂商选项 ——
+// 用 `effectiveLab`（优先归一化后的原始 lab）而非 llmpricing 的原始 `lab`，
+// 否则 175 个 `misc/*` 模型会全部挤进「开源社区」一项。
 const labs = computed(() => {
-  const set = new Set(store.modelCatalog.value.models.map((m) => m.lab).filter(Boolean));
+  const set = new Set(store.modelCatalog.value.models.map((m) => effectiveLab(m)).filter(Boolean));
   return Array.from(set).sort((a, b) => a.localeCompare(b));
 });
 
 const labOptions = computed(() => [
   { value: "all", text: "全部厂商" },
   ...labs.value.map((lab) => {
-    const count = store.modelCatalog.value.models.filter((m) => m.lab === lab).length;
+    const count = store.modelCatalog.value.models.filter((m) => effectiveLab(m) === lab).length;
     return { value: lab, text: `${labLabel(lab)} (${count})` };
   }),
 ]);
@@ -177,6 +190,66 @@ const pricingOptions = [
   { value: "spread", text: "显著价差 (>1.5倍)" },
   { value: "budget", text: "极低单价 (<$0.5/1M)" },
 ];
+
+/**
+ * 渠道性质筛选选项（官网 / 三方 / 免费 / 订阅）。
+ *
+ * 与「价格模式」的区别：这里筛的是**渠道构成**，不是价格区间。
+ */
+const originOptions = [
+  { value: "all", text: "全部渠道构成" },
+  { value: "hasOfficial", text: "有原厂官方渠道" },
+  { value: "noOfficial", text: "纯三方（无官方渠道）" },
+  { value: "officialOnly", text: "仅原厂渠道上架" },
+  { value: "hasSubscription", text: "有订阅制渠道" },
+  { value: "unknownIdentity", text: "厂商身份未确定" },
+];
+
+/**
+ * 取模型的有效厂商：优先归一化后的**原始 lab**（`officialLab`），回落到 `lab`。
+ *
+ * `lab` 是 llmpricing 原始字段，1941 个模型里有 175 个是 `misc`；
+ * `officialLab` 在此基础上补全到只剩 72 个（白牌 / 路由名，刻意不猜）。
+ */
+function effectiveLab(model: ModelCatalogItem): string {
+  return model.officialLab || model.lab || "misc";
+}
+
+/** 三方渠道数 = 总渠道数 − 官方渠道数。 */
+function thirdPartyHostCount(model: ModelCatalogItem): number {
+  return Math.max(0, model.hostCount - model.officialHostCount);
+}
+
+/**
+ * 官方渠道的输入/输出单价。
+ *
+ * 只有当参考价渠道确为原厂（`refOfficial`）时才认为它是「官方价」，
+ * 否则返回 `null`——**不拿三方价冒充官方价**。
+ */
+function officialPrice(model: ModelCatalogItem): { input: number; output: number } | null {
+  if (!model.refOfficial) return null;
+  if (model.refInputCost <= 0 && model.refOutputCost <= 0) return null;
+  return { input: model.refInputCost, output: model.refOutputCost };
+}
+
+/**
+ * 官方价 vs 三方最低价的节省比例（百分比）。
+ *
+ * 返回 `null` 表示无法计算（没有官方价，或最低价渠道本身就是官方）。
+ * 用途：价格对比时回答「走三方比走官网便宜多少」。
+ */
+function thirdPartySaving(model: ModelCatalogItem): number | null {
+  const official = officialPrice(model);
+  if (!official || official.input <= 0) return null;
+  if (model.minInputCost <= 0) return null;
+  // 最低价渠道就是官方渠道时没有「三方折扣」可言。
+  // 用可选链：旧版本同步产生的数据可能没有该字段。
+  if (model.minProvider && (model.officialChannelProviders ?? []).includes(model.minProvider)) {
+    return null;
+  }
+  const saving = 1 - model.minInputCost / official.input;
+  return saving > 0.02 ? Math.round(saving * 100) : null;
+}
 
 const statusOptions = [
   { value: "all", text: "全部状态" },
@@ -194,6 +267,7 @@ const sortOptions = [
   { value: "context_desc", text: "上下文容量 (从大到小)" },
   { value: "host_count_desc", text: "支持渠道数 (从多到少)" },
   { value: "spread_desc", text: "渠道价差倍数 (从高到低)" },
+  { value: "official_gap_desc", text: "三方比官网省幅 (从高到低)" },
 ];
 
 // —— 过滤与排序后的模型列表 ——
@@ -204,12 +278,23 @@ const filteredModels = computed(() => {
     if (activeTab.value !== "all") {
       if ((model.kind || "text") !== activeTab.value) return false;
     }
-    // 2. 厂商筛选
-    if (selectedLab.value !== "all" && model.lab !== selectedLab.value) return false;
+    // 2. 厂商筛选（按归一化后的原始 lab）
+    if (selectedLab.value !== "all" && effectiveLab(model) !== selectedLab.value) return false;
     // 3. 供应商过滤
     if (selectedProviderFilter.value && !model.hostProviders.includes(selectedProviderFilter.value)) {
       return false;
     }
+    // 3b. 渠道构成筛选（官网 / 三方 / 免费 / 订阅）
+    if (originFilter.value === "hasOfficial" && model.officialHostCount <= 0) return false;
+    if (originFilter.value === "noOfficial" && model.officialHostCount > 0) return false;
+    if (originFilter.value === "officialOnly" && thirdPartyHostCount(model) > 0) return false;
+    if (
+      originFilter.value === "hasSubscription" &&
+      (model.subscriptionChannelProviders?.length ?? 0) <= 0
+    ) {
+      return false;
+    }
+    if (originFilter.value === "unknownIdentity" && model.identityResolved) return false;
     // 4. 价格筛选
     if (pricingFilter.value === "paid") {
       const hasPrice = model.refInputCost > 0 || model.refOutputCost > 0 || model.minInputCost > 0 || model.minOutputCost > 0;
@@ -245,10 +330,15 @@ const filteredModels = computed(() => {
       model.name,
       model.slug,
       model.lab,
+      model.officialLab,
+      model.officialModelId,
+      model.canonicalId ?? "",
       model.family ?? "",
       model.knowledge ?? "",
-      labLabel(model.lab),
+      labLabel(effectiveLab(model)),
       ...(model.hostProviders ?? []),
+      ...(model.officialChannelProviders ?? []),
+      ...(model.freeChannelProviders ?? []),
     ].join(" ").toLowerCase();
     return haystack.includes(term);
   });
@@ -276,6 +366,11 @@ const filteredModels = computed(() => {
     list = [...list].sort((a, b) => b.hostCount - a.hostCount);
   } else if (sortBy.value === "spread_desc") {
     list = [...list].sort((a, b) => b.priceSpread - a.priceSpread);
+  } else if (sortBy.value === "official_gap_desc") {
+    // 三方比官网省幅：无法计算（无官方价 / 最低价即官方）的排到最后
+    list = [...list].sort(
+      (a, b) => (thirdPartySaving(b) ?? -1) - (thirdPartySaving(a) ?? -1),
+    );
   }
 
   return list;
@@ -292,7 +387,11 @@ const totalPages = computed(() => Math.max(1, Math.ceil(filteredModels.value.len
 // —— 供应商列表与统计 ——
 const providersList = computed(() => {
   const term = query.value.trim().toLowerCase();
-  const list = store.modelCatalog.value.providers;
+  let list = store.modelCatalog.value.providers;
+  // 仅看原厂自营渠道：排除纯转售 / 聚合网关
+  if (providerFirstPartyOnly.value) {
+    list = list.filter((p) => p.isFirstParty);
+  }
   if (!term) return list;
   return list.filter((p) => p.name.toLowerCase().includes(term) || p.id.toLowerCase().includes(term));
 });
@@ -305,6 +404,7 @@ const tableColumns = computed<AppTableColumn[]>(() => [
   { key: "maxOutputTokens", title: "最大输出", width: "90px", align: "right" as const, sortable: true },
   { key: "refPrice", title: "参考价格 (入/出/1M)", width: "160px", align: "right" as const, sortable: true },
   { key: "minPrice", title: "全网最低价 (1M)", width: "160px", align: "right" as const, sortable: true },
+  { key: "origin", title: "官网 / 三方构成", width: "150px", sortable: false },
   { key: "hostCount", title: "支持渠道", width: "85px", align: "right" as const, sortable: true },
   { key: "aaScores", title: "AA 质量/速度", width: "130px", align: "right" as const, sortable: true },
 ]);
@@ -417,6 +517,20 @@ const tierLabels: Record<string, string> = {
   cloud: "算力云",
 };
 
+const identitySourceLabels: Record<string, string> = {
+  canonical: "models.dev 权威目录",
+  llmpricing_lab: "上游厂商字段",
+  keyword_rule: "名称规则推断",
+  inherited: "同名模型继承",
+  canonical_reverse: "目录反向匹配",
+  unknown: "未能确定",
+};
+
+/** 身份来源的中文文案。`canonical` / `llmpricing_lab` 为上游直接给出，其余为本地推断。 */
+function identitySourceLabel(source?: string | null) {
+  return identitySourceLabels[source || "unknown"] || "未能确定";
+}
+
 function tierLabel(tier?: string | null) {
   return tierLabels[tier || "gateway"] || (tier || "网关").toUpperCase();
 }
@@ -431,6 +545,32 @@ const modalityLabels: Record<string, string> = {
 
 function modalityLabel(mod: string) {
   return modalityLabels[mod.toLowerCase()] || mod.toUpperCase();
+}
+
+// —— models.dev 思考级别与能力参数（详情抽屉「能力参数」区块用）——
+
+/** 取 effort 形态声明的档位列表（上游已按档位从低到高排好序）。 */
+function effortValuesOf(options: ReasoningOption[] | undefined): string[] {
+  return options?.find((option) => option.kind === "effort")?.values ?? [];
+}
+
+/** 模型级思考档位（跨渠道并集）。空数组 = models.dev 未声明档位。 */
+function modelEffortValues(model: ModelCatalogItem): string[] {
+  return effortValuesOf(model.reasoningOptions);
+}
+
+/** 该模型是否只声明了开/关式思考（toggle，无档位）。 */
+function modelReasoningToggleOnly(model: ModelCatalogItem): boolean {
+  const options = model.reasoningOptions ?? [];
+  return options.some((option) => option.kind === "toggle") && !options.some((option) => option.kind === "effort");
+}
+
+/** 渠道级思考档位与模型级不一致的渠道数（同一模型换渠道可调档位可能不同）。 */
+function hostEffortMismatchCount(model: ModelCatalogItem, hosts: ModelCatalogHostItem[]): number {
+  const modelEfforts = JSON.stringify(modelEffortValues(model));
+  return hosts.filter(
+    (host) => (host.reasoningOptions ?? []).length > 0 && JSON.stringify(effortValuesOf(host.reasoningOptions)) !== modelEfforts,
+  ).length;
 }
 
 function formatTokens(value: number): string {
@@ -467,16 +607,23 @@ function createInitialDetail(model: ModelCatalogItem): ModelCatalogDetail {
     .map((pId) => provMap.get(pId))
     .filter((p): p is ModelCatalogProvider => Boolean(p));
 
+  const officialSet = new Set(model.officialChannelProviders ?? []);
+  const freeSet = new Set(model.freeChannelProviders ?? []);
+  const subSet = new Set(model.subscriptionChannelProviders ?? []);
+
   const hosts: ModelCatalogHostItem[] = (model.hostProviders || []).map((pId) => {
     const p = provMap.get(pId);
     const isRef = pId === model.refProvider;
     const isMin = pId === model.minProvider;
+    const official = officialSet.has(pId);
     return {
       provider: pId,
       name: p?.name || pId,
       modelId: null,
       tier: p?.tier || "gateway",
-      subscription: p?.subscription || false,
+      // ⚠️ 订阅制标记只来自 manifest 的 subscription 字段（并剔除 github-copilot），
+      // 不能用「零价」代替——订阅渠道也是零价，但语义不同。
+      subscription: subSet.has(pId),
       input: isMin && model.minInputCost > 0 ? model.minInputCost : isRef && model.refInputCost > 0 ? model.refInputCost : null,
       output: isMin && model.minOutputCost > 0 ? model.minOutputCost : isRef && model.refOutputCost > 0 ? model.refOutputCost : null,
       cacheRead: isMin && model.minCacheReadCost > 0 ? model.minCacheReadCost : isRef && model.refCacheReadCost > 0 ? model.refCacheReadCost : null,
@@ -484,9 +631,11 @@ function createInitialDetail(model: ModelCatalogItem): ModelCatalogDetail {
       context: model.contextLength,
       outputLimit: model.maxOutputTokens,
       status: null,
-      official: isRef && model.refOfficial,
+      official,
       doc: p?.doc || null,
-      isFree: (isMin && model.minInputCost === 0 && model.minOutputCost === 0) || (p?.subscription || false),
+      // ⚠️ 旧实现写成 `|| p?.subscription`，会把订阅渠道误标为免费。
+      // 免费标记必须来自后端推导的 `freeChannelProviders`。
+      isFree: freeSet.has(pId),
       isMin,
       isRef,
     };
@@ -509,6 +658,7 @@ async function openModelDetail(model: ModelCatalogItem) {
   hostsLoading.value = true;
   activeDetailTab.value = "overview";
   providerTablePricedOnly.value = false;
+  providerTableOfficialOnly.value = false;
   try {
     const fullDetail = await store.getModelCatalogDetail(model.id);
     if (selectedId.value === model.id && fullDetail) {
@@ -532,6 +682,93 @@ function filterByProvider(providerId: string) {
   currentPage.value = 1;
 }
 
+// —— 供应商详情弹窗 ——
+//
+// 点击供应商卡片打开：聚合该供应商在目录里的全部信息（接入信息、托管模型、
+// 价格区间、思考档位分布、上下文跨度），数据全部来自本地快照，无需二次请求。
+
+const providerModal = ref<ModelCatalogProvider | null>(null);
+
+/** 该供应商托管的全部模型（从模型列表反查 hostProviders）。 */
+function providerModalModels(provider: ModelCatalogProvider | null): ModelCatalogItem[] {
+  if (!provider) return [];
+  return store.modelCatalog.value.models.filter((model) => model.hostProviders.includes(provider.id));
+}
+
+/** 该供应商作为原厂自营渠道的模型（isFirstParty 且模型 lab 与渠道对应）。 */
+function providerModalOfficialModels(provider: ModelCatalogProvider | null): ModelCatalogItem[] {
+  if (!provider) return [];
+  return providerModalModels(provider).filter(
+    (model) => model.officialChannelProviders.includes(provider.id),
+  );
+}
+
+/** 该渠道某模型条目的价格（分/百万 tokens；免费与订阅显示为 0）。
+ *  目录快照只有参考价 / 最低价聚合，无按渠道价格明细，故这里给区间估算：
+ *  以模型的 ref（原厂）与 min（全网最低）为上下界。 */
+function providerModalPriceRange(models: ModelCatalogItem[]): { min: number; max: number } | null {
+  const inputs = models
+    .filter((model) => model.kind === "text")
+    .map((model) => ({ low: model.minInputCost, high: model.refInputCost }))
+    .filter((range) => range.high > 0);
+  if (!inputs.length) return null;
+  return {
+    min: Math.min(...inputs.map((range) => range.low || range.high)),
+    max: Math.max(...inputs.map((range) => range.high)),
+  };
+}
+
+/** 该供应商托管模型中声明了各思考档位的分布（档位 -> 模型数）。 */
+function providerModalEffortStats(models: ModelCatalogItem[]): Array<{ level: string; count: number }> {
+  const counts = new Map<string, number>();
+  for (const model of models) {
+    const seen = new Set(
+      (model.reasoningOptions ?? []).filter((option) => option.kind === "effort").flatMap((option) => option.values),
+    );
+    for (const level of seen) counts.set(level, (counts.get(level) ?? 0) + 1);
+  }
+  return [...counts.entries()]
+    .map(([level, count]) => ({ level, count }))
+    .sort((a, b) => {
+      const order = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+      const diff = order.indexOf(a.level) - order.indexOf(b.level);
+      return Number.isNaN(diff) ? a.level.localeCompare(b.level) : diff;
+    });
+}
+
+/** 该供应商托管模型的上下文与输出上限跨度。 */
+function providerModalContextSpan(models: ModelCatalogItem[]): { minContext: number; maxContext: number; maxOutput: number } {
+  let minContext = Infinity;
+  let maxContext = 0;
+  let maxOutput = 0;
+  for (const model of models) {
+    if (model.contextLength > 0) {
+      minContext = Math.min(minContext, model.contextLength);
+      maxContext = Math.max(maxContext, model.contextLength);
+    }
+    maxOutput = Math.max(maxOutput, model.maxOutputTokens);
+  }
+  return {
+    minContext: Number.isFinite(minContext) ? minContext : 0,
+    maxContext,
+    maxOutput,
+  };
+}
+
+function openProviderModal(provider: ModelCatalogProvider) {
+  providerModal.value = provider;
+}
+
+function closeProviderModal() {
+  providerModal.value = null;
+}
+
+/** 弹窗内「筛选该供应商模型」：与卡片原来的点击行为一致。 */
+function filterModelsFromModal(providerId: string) {
+  closeProviderModal();
+  filterByProvider(providerId);
+}
+
 function clearProviderFilter() {
   selectedProviderFilter.value = null;
 }
@@ -551,31 +788,49 @@ async function copyModelId(id: string) {
   setTimeout(() => (idCopied.value = false), 2000);
 }
 
-// —— 成本计算器计算 ——
+// —— 成本计算器计算（官网 / 三方 / 免费 三档） ——
 const calculatedCosts = computed(() => {
   if (!selectedModel.value) return null;
   const m = selectedModel.value;
   const inM = calcMonthlyInputTokens.value;
   const outM = calcMonthlyOutputTokens.value;
-
-  const refInputTotal = inM * m.refInputCost;
-  const refOutputTotal = outM * m.refOutputCost;
-  const refTotalUSD = refInputTotal + refOutputTotal;
-
-  const minInputTotal = inM * (m.minInputCost || m.refInputCost);
-  const minOutputTotal = outM * (m.minOutputCost || m.refOutputCost);
-  const minTotalUSD = minInputTotal + minOutputTotal;
-
-  const savedUSD = Math.max(0, refTotalUSD - minTotalUSD);
   const rate = calcCurrency.value === "CNY" ? exchangeRate : 1;
   const symbol = calcCurrency.value === "CNY" ? "¥" : "$";
+  const fmt = (usd: number) => (usd * rate).toFixed(2);
+
+  // ① 官方直销档：参考价渠道确为原厂时才视为官方价，否则仍按参考价估算但标注口径
+  const officialTotalUSD = inM * m.refInputCost + outM * m.refOutputCost;
+
+  // ② 三方档：若最低价渠道本身就是官方渠道，则不存在「三方档」，返回 null。
+  //    ⚠️ 不能直接用 minInputCost——它可能来自官方渠道，会得出「三方比官网便宜」的假结论。
+  const minIsOfficial = Boolean(
+    m.minProvider && (m.officialChannelProviders ?? []).includes(m.minProvider),
+  );
+  const thirdPartyInput = minIsOfficial ? 0 : m.minInputCost;
+  const thirdPartyOutput = minIsOfficial ? 0 : m.minOutputCost;
+  const hasThirdPartyPricing =
+    !minIsOfficial && (thirdPartyInput > 0 || thirdPartyOutput > 0);
+  const thirdPartyTotalUSD = hasThirdPartyPricing
+    ? inM * thirdPartyInput + outM * thirdPartyOutput
+    : null;
+
+  // ③ 免费档：只要存在免费渠道，调用成本即为 0（通常伴随限速或配额）
+  const freeChannelCount = Math.max(m.freeHostCount ?? 0, m.freeChannelCount ?? 0);
+
+  const bestPaidUSD = thirdPartyTotalUSD ?? officialTotalUSD;
+  const savedUSD = Math.max(0, officialTotalUSD - bestPaidUSD);
 
   return {
-    refTotal: (refTotalUSD * rate).toFixed(2),
-    minTotal: (minTotalUSD * rate).toFixed(2),
-    savedTotal: (savedUSD * rate).toFixed(2),
-    savedPercent: refTotalUSD > 0 ? Math.round((savedUSD / refTotalUSD) * 100) : 0,
     symbol,
+    officialTotal: fmt(officialTotalUSD),
+    thirdPartyTotal: thirdPartyTotalUSD === null ? null : fmt(thirdPartyTotalUSD),
+    freeChannelCount,
+    hasFree: freeChannelCount > 0,
+    savedTotal: fmt(savedUSD),
+    savedPercent: officialTotalUSD > 0 ? Math.round((savedUSD / officialTotalUSD) * 100) : 0,
+    /** 官方价是否来自真正的原厂渠道（否则只是「参考价」口径） */
+    officialIsFirstParty: m.refOfficial,
+    minIsOfficial,
   };
 });
 
@@ -583,10 +838,59 @@ const calculatedCosts = computed(() => {
 const drawerHosts = computed(() => {
   if (!detail.value) return [];
   let list = detail.value.hosts || [];
+  // 官网 / 三方对照：只看原厂官方渠道，方便与三方报价直接比对
+  if (providerTableOfficialOnly.value) {
+    list = list.filter((h) => h.official);
+  }
   if (providerTablePricedOnly.value) {
     list = list.filter((h) => !h.subscription && !h.isFree && (h.input !== null || h.output !== null));
   }
   return list;
+});
+
+/** 详情抽屉里「官网渠道 vs 三方渠道」的汇总，供价格对比卡使用。 */
+const detailOriginSummary = computed(() => {
+  const model = selectedModel.value;
+  const hosts = detail.value?.hosts ?? [];
+  const official = hosts.filter((h) => h.official);
+  const thirdParty = hosts.filter((h) => !h.official);
+  const priced = (items: ModelCatalogHostItem[]) =>
+    items.filter((h) => h.input !== null && h.input !== undefined && !h.isFree && !h.subscription);
+
+  const cheapest = (items: ModelCatalogHostItem[]) =>
+    items.reduce<ModelCatalogHostItem | null>(
+      (best, h) => (best === null || (h.input ?? Infinity) < (best.input ?? Infinity) ? h : best),
+      null,
+    );
+
+  const cheapestOfficial = cheapest(priced(official));
+  const cheapestThirdParty = cheapest(priced(thirdParty));
+
+  // 省幅与上面的两栏**同源**计算：三方最低价缺失或没有官方价基准时一律为 null，
+  // 避免出现「无三方报价却显示省了 17%」这种自相矛盾的展示。
+  let saving: number | null = null;
+  if (
+    cheapestOfficial?.input != null &&
+    cheapestOfficial.input > 0 &&
+    cheapestThirdParty?.input != null
+  ) {
+    const ratio = 1 - cheapestThirdParty.input / cheapestOfficial.input;
+    saving = ratio > 0.02 ? Math.round(ratio * 100) : null;
+  }
+
+  return {
+    officialCount: model?.officialHostCount ?? official.length,
+    thirdPartyCount: model ? thirdPartyHostCount(model) : thirdParty.length,
+    officialChannels: model?.officialChannelProviders ?? official.map((h) => h.provider),
+    freeChannels: model?.freeChannelProviders ?? [],
+    subscriptionChannels: model?.subscriptionChannelProviders ?? [],
+    cheapestOfficial,
+    cheapestThirdParty,
+    saving,
+    labTier: model?.labTierHostCount ?? 0,
+    cloudTier: model?.cloudTierHostCount ?? 0,
+    gatewayTier: model?.gatewayTierHostCount ?? 0,
+  };
 });
 
 async function manualSync() {
@@ -596,7 +900,28 @@ async function manualSync() {
   if (selected) await openModelDetail(selected);
 }
 
-watch([query, selectedLab, pricingFilter, statusFilter, sortBy, activeTab, selectedProviderFilter], () => {
+/**
+ * 目录数据来源摘要。
+ *
+ * 目录由两个来源合成：models.dev（主源：模型身份 + 渠道明细 + 官方判定）与
+ * llmpricing（辅源：canonical 归并后的模型清单 + 聚合计数）。这里把两边的
+ * 记录数与抓取时间摆出来，便于判断数据是否新鲜。
+ */
+const catalogSources = computed(() => {
+  const sources = store.modelCatalog.value.sources ?? [];
+  const modelsDev = sources.find((s) => s.source === "models_dev_catalog");
+  const llmpricing = sources.find((s) => s.source === "llmpricing_manifest");
+  const shards = sources.filter((s) => s.source.startsWith("rows-"));
+  return {
+    modelsDev,
+    llmpricing,
+    shardCount: shards.length,
+    // 主源缺失说明快照不完整（旧版本同步或来源行被误删），前端给出明确提示
+    modelsDevMissing: !modelsDev,
+  };
+});
+
+watch([query, selectedLab, pricingFilter, originFilter, statusFilter, sortBy, activeTab, selectedProviderFilter], () => {
   currentPage.value = 1;
 });
 
@@ -633,6 +958,31 @@ onMounted(() => {
               <small>{{ dateText(store.modelCatalog.value.lastSyncedAt) }}</small>
             </div>
           </div>
+
+          <!-- 数据来源：models.dev（主源）+ llmpricing（辅源） -->
+          <div
+            class="mc-sources-card"
+            :title="catalogSources.modelsDevMissing
+              ? '本次快照缺少 models.dev 主数据源，模型身份与官方渠道判定会缺失；点右侧「刷新全网数据」可重建'
+              : '目录由 models.dev（主源）与 llmpricing（辅源）合成'"
+          >
+            <span class="mc-sources-title">数据来源</span>
+            <div class="mc-sources-list">
+              <span v-if="catalogSources.modelsDev" class="mc-source-chip mc-source-primary">
+                models.dev
+                <b>{{ catalogSources.modelsDev.recordCount }} 模型</b>
+              </span>
+              <span v-else class="mc-source-chip mc-source-missing">models.dev 缺失</span>
+              <span v-if="catalogSources.llmpricing" class="mc-source-chip">
+                llmpricing
+                <b>{{ catalogSources.llmpricing.recordCount }} 渠道</b>
+              </span>
+              <span v-if="catalogSources.shardCount" class="mc-source-chip">
+                {{ catalogSources.shardCount }} 个分片
+              </span>
+            </div>
+          </div>
+
           <button
             type="button"
             class="mc-sync-btn"
@@ -804,6 +1154,15 @@ onMounted(() => {
           @update:model-value="pricingFilter = String($event)"
         />
 
+        <!-- 渠道构成（官网 / 三方 / 订阅） -->
+        <CustomSelect
+          class="mc-filter-dropdown"
+          :options="originOptions"
+          :model-value="originFilter"
+          aria-label="渠道构成"
+          @update:model-value="originFilter = String($event)"
+        />
+
         <!-- 状态过滤 -->
         <CustomSelect
           class="mc-filter-dropdown"
@@ -924,14 +1283,15 @@ onMounted(() => {
             <!-- 卡片顶部：厂商 Avatar + 名称 + 类别 + 对比勾选 -->
             <div class="mc-card-head">
               <div class="mc-card-identity">
-                <span class="mc-card-avatar" :class="`mc-tone-${labTone(model.lab)}`">
-                  {{ labInitials(model.lab) }}
+                <span class="mc-card-avatar" :class="`mc-tone-${labTone(effectiveLab(model))}`">
+                  {{ labInitials(effectiveLab(model)) }}
                 </span>
                 <div class="mc-card-title-box">
                   <div class="mc-card-title-row">
                     <h3 :title="model.name || model.id">{{ model.name || model.id }}</h3>
                     <span v-if="model.openWeights" class="mc-pill mc-pill-open" title="开源权重">开源</span>
                     <span v-if="model.status !== 'ga'" class="mc-pill mc-pill-beta">{{ model.status.toUpperCase() }}</span>
+                    <span v-if="!model.identityResolved" class="mc-pill mc-pill-unknown" title="原始厂商未能确定，保留 misc 而非猜测">身份未定</span>
                   </div>
                   <small class="mc-card-id" :title="model.id">{{ model.id }}</small>
                 </div>
@@ -951,8 +1311,8 @@ onMounted(() => {
 
             <!-- 卡片特性徽章栏 -->
             <div class="mc-card-badges">
-              <span class="mc-card-tag" :class="`mc-tone-${labTone(model.lab)}`">
-                {{ labLabel(model.lab) }}
+              <span class="mc-card-tag" :class="`mc-tone-${labTone(effectiveLab(model))}`">
+                {{ labLabel(effectiveLab(model)) }}
               </span>
               <span class="mc-card-tag" :class="`mc-tone-${kindTone(model.kind)}`">
                 <span class="mc-tag-icon" v-html="icons[kindIcon(model.kind)]" />
@@ -1074,8 +1434,8 @@ onMounted(() => {
           <!-- 模型列 -->
           <template #cell-name="{ row }">
             <div class="mc-table-model-cell">
-              <span class="mc-card-avatar mc-avatar-sm" :class="`mc-tone-${labTone(row.lab)}`">
-                {{ labInitials(row.lab) }}
+              <span class="mc-card-avatar mc-avatar-sm" :class="`mc-tone-${labTone(effectiveLab(row))}`">
+                {{ labInitials(effectiveLab(row)) }}
               </span>
               <div class="mc-table-model-info">
                 <div class="mc-table-model-title">
@@ -1091,9 +1451,10 @@ onMounted(() => {
 
           <!-- 厂商列 -->
           <template #cell-lab="{ row }">
-            <span class="mc-card-tag" :class="`mc-tone-${labTone(row.lab)}`">
-              {{ labLabel(row.lab) }}
+            <span class="mc-card-tag" :class="`mc-tone-${labTone(effectiveLab(row))}`">
+              {{ labLabel(effectiveLab(row)) }}
             </span>
+            <small v-if="!row.identityResolved" class="mc-identity-unknown" title="厂商身份未能确定，已保留原始标识">身份未定</small>
           </template>
 
           <!-- 上下文 -->
@@ -1125,11 +1486,47 @@ onMounted(() => {
             </div>
           </template>
 
+          <!-- 官网 / 三方构成 -->
+          <template #cell-origin="{ row }">
+            <div class="mc-origin-cell">
+              <div class="mc-origin-split">
+                <span
+                  class="mc-origin-badge mc-origin-official"
+                  :class="{ 'is-zero': row.officialHostCount <= 0 }"
+                  :title="row.officialChannelProviders?.length
+                    ? `官方渠道：${row.officialChannelProviders.join('、')}`
+                    : '该模型没有原厂官方渠道（或原厂未上架此模型）'"
+                >
+                  官方 {{ row.officialHostCount }}
+                </span>
+                <span
+                  class="mc-origin-badge mc-origin-third"
+                  :class="{ 'is-zero': thirdPartyHostCount(row) <= 0 }"
+                  title="三方渠道数 = 总渠道数 − 官方渠道数"
+                >
+                  三方 {{ thirdPartyHostCount(row) }}
+                </span>
+              </div>
+              <small
+                v-if="thirdPartySaving(row) !== null"
+                class="mc-origin-saving"
+                title="走三方渠道相对官网直销的输入单价省幅"
+              >
+                三方省 {{ thirdPartySaving(row) }}%
+              </small>
+              <small v-else class="mc-origin-saving muted">—</small>
+            </div>
+          </template>
+
           <!-- 渠道数 -->
           <template #cell-hostCount="{ row }">
             <div class="mc-table-host-cell">
               <strong>{{ row.hostCount }}</strong>
-              <small v-if="row.freeHostCount > 0" class="mc-free-tag">{{ row.freeHostCount }} 免费</small>
+              <small v-if="row.freeHostCount > 0" class="mc-free-tag" :title="row.freeChannelProviders?.length
+                ? `免费渠道：${row.freeChannelProviders.join('、')}`
+                : '免费渠道数（上游聚合值）'">
+                {{ row.freeHostCount }} 免费
+              </small>
             </div>
           </template>
 
@@ -1151,6 +1548,10 @@ onMounted(() => {
             <h2>全网接入供应商拓扑渠道（共 {{ providersList.length }} 家）</h2>
             <p>点击任意供应商卡片，可一键筛选并查看其支持的全部模型与 API 接入信息</p>
           </div>
+          <label class="mc-priced-only-toggle">
+            <input v-model="providerFirstPartyOnly" type="checkbox" />
+            <span>仅显示原厂自营渠道</span>
+          </label>
         </div>
 
         <div class="mc-providers-matrix-grid">
@@ -1159,7 +1560,7 @@ onMounted(() => {
             :key="prov.id"
             class="mc-provider-matrix-card"
             :class="{ 'is-active-filter': selectedProviderFilter === prov.id }"
-            @click="filterByProvider(prov.id)"
+            @click="openProviderModal(prov)"
           >
             <div class="mc-pm-card-top">
               <div class="mc-pm-identity">
@@ -1170,6 +1571,8 @@ onMounted(() => {
                     <span class="mc-tier-pill" :class="`mc-tier-${prov.tier || 'gateway'}`">
                       {{ tierLabel(prov.tier) }}
                     </span>
+                    <span v-if="prov.isFirstParty" class="mc-origin-badge mc-origin-official" title="该渠道为某个模型厂商的自营渠道">原厂自营</span>
+                    <span v-else class="mc-origin-badge mc-origin-third" title="三方转售 / 聚合渠道">三方</span>
                     <span v-if="prov.subscription" class="mc-sub-pill">订阅制</span>
                   </div>
                 </div>
@@ -1194,7 +1597,7 @@ onMounted(() => {
 
             <div class="mc-pm-footer">
               <span class="mc-pm-count">托管 <b>{{ prov.count }}</b> 款模型</span>
-              <span class="mc-pm-action">查看模型 &rarr;</span>
+              <span class="mc-pm-action">查看详情 &rarr;</span>
             </div>
           </article>
         </div>
@@ -1233,6 +1636,177 @@ onMounted(() => {
       </div>
     </aside>
 
+    <!-- 6. 供应商详情弹窗 -->
+    <Teleport to="body">
+      <div
+        v-if="providerModal"
+        class="mc-drawer-backdrop"
+        role="dialog"
+        aria-modal="true"
+        :aria-label="providerModal.name"
+        @click.self="closeProviderModal"
+      >
+        <div class="mc-provider-modal">
+          <header class="mc-provider-modal-header">
+            <div class="mc-pm-identity">
+              <span class="mc-pm-avatar mc-provider-modal-avatar">{{ providerModal.name[0] }}</span>
+              <div>
+                <h3 class="mc-provider-modal-title">{{ providerModal.name }}</h3>
+                <div class="mc-pm-tags">
+                  <code class="mc-provider-modal-id">{{ providerModal.id }}</code>
+                  <span class="mc-tier-pill" :class="`mc-tier-${providerModal.tier || 'gateway'}`">
+                    {{ tierLabel(providerModal.tier) }}
+                  </span>
+                  <span
+                    v-if="providerModal.isFirstParty"
+                    class="mc-origin-badge mc-origin-official"
+                  >原厂自营</span>
+                  <span v-else class="mc-origin-badge mc-origin-third">三方</span>
+                  <span v-if="providerModal.subscription" class="mc-sub-pill">订阅制</span>
+                </div>
+              </div>
+            </div>
+            <div class="flex items-center gap-2">
+              <a
+                v-if="providerModal.api"
+                :href="providerModal.api"
+                target="_blank"
+                rel="noreferrer"
+                class="mc-doc-link-btn"
+                title="打开 API 地址"
+              >
+                <code class="mc-provider-modal-api">{{ providerModal.api }}</code>
+              </a>
+              <a
+                v-if="providerModal.doc"
+                :href="providerModal.doc"
+                target="_blank"
+                rel="noreferrer"
+                class="mc-doc-link-btn"
+                title="查看官方文档"
+              >
+                <span v-html="icons.external" />
+                <span>文档</span>
+              </a>
+              <button type="button" class="mc-drawer-close-btn" aria-label="关闭" @click="closeProviderModal">
+                <span v-html="icons.close" />
+              </button>
+            </div>
+          </header>
+
+          <div class="mc-provider-modal-body">
+            <!-- 统计卡 -->
+            <div class="mc-provider-modal-stats">
+              <div class="mc-provider-modal-stat">
+                <span class="mc-provider-modal-stat-label">托管模型</span>
+                <strong class="mc-provider-modal-stat-val">{{ providerModalModels(providerModal).length }}</strong>
+              </div>
+              <div class="mc-provider-modal-stat">
+                <span class="mc-provider-modal-stat-label">原厂直销模型</span>
+                <strong class="mc-provider-modal-stat-val text-emerald">{{ providerModalOfficialModels(providerModal).length }}</strong>
+              </div>
+              <div class="mc-provider-modal-stat">
+                <span class="mc-provider-modal-stat-label">支持思考档位</span>
+                <strong class="mc-provider-modal-stat-val text-violet">{{ providerModalEffortStats(providerModalModels(providerModal)).length }}</strong>
+              </div>
+              <div class="mc-provider-modal-stat">
+                <span class="mc-provider-modal-stat-label">API Key 环境变量</span>
+                <strong class="mc-provider-modal-stat-val font-mono" style="font-size: 13px">
+                  {{ providerModal.env?.length ? providerModal.env.join(', ') : '—' }}
+                </strong>
+              </div>
+            </div>
+
+            <!-- 思考档位分布 -->
+            <div v-if="providerModalEffortStats(providerModalModels(providerModal)).length" class="mc-provider-modal-section">
+              <h4 class="mc-provider-modal-section-title">思考档位分布（托管模型在 models.dev 的声明）</h4>
+              <div class="mc-provider-modal-effort-grid">
+                <div
+                  v-for="stat in providerModalEffortStats(providerModalModels(providerModal))"
+                  :key="stat.level"
+                  class="mc-provider-modal-effort-item"
+                >
+                  <span class="mc-effort-pill">{{ stat.level }}</span>
+                  <b>{{ stat.count }}</b>
+                  <small>款模型</small>
+                </div>
+              </div>
+            </div>
+
+            <!-- 价格与上下文跨度 -->
+            <div class="mc-provider-modal-section">
+              <h4 class="mc-provider-modal-section-title">价格与规格跨度</h4>
+              <div class="mc-provider-modal-specs">
+                <div class="mc-provider-modal-spec">
+                  <span>输入单价区间</span>
+                  <b class="font-mono">
+                    <template v-if="providerModalPriceRange(providerModalModels(providerModal))">
+                      {{ formatPrice(providerModalPriceRange(providerModalModels(providerModal))!.min) }}
+                      ~
+                      {{ formatPrice(providerModalPriceRange(providerModalModels(providerModal))!.max) }}
+                      <small>/ 1M Tokens</small>
+                    </template>
+                    <template v-else>—</template>
+                  </b>
+                </div>
+                <div class="mc-provider-modal-spec">
+                  <span>上下文跨度</span>
+                  <b class="font-mono">
+                    <template v-if="providerModalContextSpan(providerModalModels(providerModal)).maxContext">
+                      {{ formatTokensFull(providerModalContextSpan(providerModalModels(providerModal)).minContext) }}
+                      ~
+                      {{ formatTokensFull(providerModalContextSpan(providerModalModels(providerModal)).maxContext) }}
+                    </template>
+                    <template v-else>—</template>
+                  </b>
+                </div>
+                <div class="mc-provider-modal-spec">
+                  <span>最大单次输出</span>
+                  <b class="font-mono">
+                    <template v-if="providerModalContextSpan(providerModalModels(providerModal)).maxOutput">
+                      {{ formatTokensFull(providerModalContextSpan(providerModalModels(providerModal)).maxOutput) }}
+                    </template>
+                    <template v-else>—</template>
+                  </b>
+                </div>
+              </div>
+            </div>
+
+            <!-- 托管模型列表 -->
+            <div class="mc-provider-modal-section">
+              <h4 class="mc-provider-modal-section-title">托管模型（{{ providerModalModels(providerModal).length }}）</h4>
+              <div class="mc-provider-modal-models">
+                <button
+                  v-for="model in providerModalModels(providerModal).slice(0, 60)"
+                  :key="model.id"
+                  type="button"
+                  class="mc-provider-modal-model-chip"
+                  :title="`${model.name} · 上下文 ${formatTokens(model.contextLength)} · 打开模型详情`"
+                  @click="filterModelsFromModal(providerModal.id); openModelDetail(model)"
+                >
+                  <strong>{{ model.name || model.id }}</strong>
+                  <small v-if="model.reasoningEffortMax" class="text-violet">≤ {{ model.reasoningEffortMax }}</small>
+                </button>
+                <p v-if="providerModalModels(providerModal).length > 60" class="mc-provider-modal-more-hint">
+                  仅展示前 60 款，点击上方「筛选该供应商模型」查看全部
+                </p>
+              </div>
+            </div>
+          </div>
+
+          <footer class="mc-provider-modal-footer">
+            <button
+              type="button"
+              class="mc-provider-modal-filter-btn"
+              @click="filterModelsFromModal(providerModal.id)"
+            >
+              筛选该供应商模型 &rarr;
+            </button>
+          </footer>
+        </div>
+      </div>
+    </Teleport>
+
     <!-- 5. 全景模型详情深度抽屉 (Slide-over Drawer) -->
     <Teleport to="body">
       <div
@@ -1251,12 +1825,13 @@ onMounted(() => {
             <!-- 抽屉头部 -->
             <header class="mc-drawer-header">
               <div class="mc-drawer-head-identity">
-                <span class="mc-drawer-avatar" :class="`mc-tone-${labTone(selectedModel.lab)}`">
-                  {{ labInitials(selectedModel.lab) }}
+                <span class="mc-drawer-avatar" :class="`mc-tone-${labTone(effectiveLab(selectedModel))}`">
+                  {{ labInitials(effectiveLab(selectedModel)) }}
                 </span>
                 <div class="mc-drawer-title-box">
                   <div class="mc-drawer-tags">
-                    <span class="mc-meta-lab">{{ labLabel(selectedModel.lab) }}</span>
+                    <span class="mc-meta-lab">{{ labLabel(effectiveLab(selectedModel)) }}</span>
+                    <span v-if="!selectedModel.identityResolved" class="mc-identity-unknown" title="原始厂商未能确定，保留 misc 而非猜测">身份未定</span>
                     <span class="mc-meta-sep">·</span>
                     <span class="mc-meta-id font-mono">{{ selectedModel.id }}</span>
                     <span class="mc-meta-sep">·</span>
@@ -1524,6 +2099,101 @@ onMounted(() => {
                         </div>
                       </div>
 
+                      <!-- 思考级别（models.dev reasoning_options） -->
+                      <div
+                        v-if="selectedModel.reasoning || modelEffortValues(selectedModel).length || modelReasoningToggleOnly(selectedModel)"
+                        class="mc-glance-item"
+                      >
+                        <span class="mc-glance-label">思考级别（models.dev）</span>
+                        <div class="mc-glance-val">
+                          <div class="mc-modalities-chips-wrap">
+                            <template v-if="modelEffortValues(selectedModel).length">
+                              <span
+                                v-for="lvl in modelEffortValues(selectedModel)"
+                                :key="lvl"
+                                class="mc-effort-pill"
+                                :class="{ 'is-max': lvl === selectedModel.reasoningEffortMax }"
+                              >
+                                {{ lvl }}
+                              </span>
+                            </template>
+                            <span v-else-if="modelReasoningToggleOnly(selectedModel)" class="mc-effort-pill">
+                              仅开 / 关
+                            </span>
+                            <span v-else class="mc-effort-pill">支持（未声明档位）</span>
+                            <span
+                              v-if="selectedModel.reasoningEffortMax"
+                              class="mc-effort-max-badge"
+                              title="跨全部渠道取并集后的最高档"
+                            >
+                              最高档 {{ selectedModel.reasoningEffortMax }}
+                            </span>
+                          </div>
+                          <div
+                            v-if="detail && hostEffortMismatchCount(selectedModel, detail.hosts) > 0"
+                            class="mc-glance-subline"
+                            title="同一模型在不同渠道可调档位可能不同，见渠道明细"
+                          >
+                            {{ hostEffortMismatchCount(selectedModel, detail.hosts) }} 个渠道声明的档位与模型级不同
+                          </div>
+                        </div>
+                      </div>
+
+                      <!-- 交错推理字段 -->
+                      <div v-if="selectedModel.interleavedFields?.length" class="mc-glance-item">
+                        <span class="mc-glance-label">交错推理读取字段</span>
+                        <div class="mc-glance-val">
+                          <div class="mc-modalities-chips-wrap">
+                            <span
+                              v-for="field in selectedModel.interleavedFields"
+                              :key="field"
+                              class="mc-modality-pill font-mono"
+                            >
+                              {{ field }}
+                            </span>
+                          </div>
+                          <div class="mc-glance-subline">渠道在思考与正文间交替输出时，从这些字段读取思考内容</div>
+                        </div>
+                      </div>
+
+                      <!-- 独立输入上限 -->
+                      <div
+                        v-if="selectedModel.maxInputTokens && selectedModel.maxInputTokens < selectedModel.contextLength"
+                        class="mc-glance-item"
+                      >
+                        <span class="mc-glance-label">单次输入上限</span>
+                        <div class="mc-glance-val">
+                          <span class="mc-glance-main-num font-mono">
+                            {{ formatTokensFull(selectedModel.maxInputTokens) }} Tokens
+                          </span>
+                          <div class="mc-glance-subline">
+                            总上下文 {{ formatTokensFull(selectedModel.contextLength) }} 大于单次可输入量
+                          </div>
+                        </div>
+                      </div>
+
+                      <!-- 输出模态 + 快速档 -->
+                      <div
+                        v-if="(selectedModel.outputModalities?.length ?? 0) > 0 || selectedModel.hasFastMode"
+                        class="mc-glance-item"
+                      >
+                        <span class="mc-glance-label">输出能力</span>
+                        <div class="mc-glance-val">
+                          <div class="mc-modalities-chips-wrap">
+                            <span
+                              v-for="mod in selectedModel.outputModalities?.filter((m) => m !== 'text') ?? []"
+                              :key="mod"
+                              class="mc-modality-pill"
+                            >
+                              {{ modalityLabel(mod) }} 输出
+                            </span>
+                            <span v-if="selectedModel.hasFastMode" class="mc-effort-pill is-max" title="部分渠道提供 fast 模式：更快但单价上浮">
+                              ⚡ 快速档
+                            </span>
+                          </div>
+                        </div>
+                      </div>
+
                       <!-- Knowledge cutoff -->
                       <div class="mc-glance-item">
                         <span class="mc-glance-label">知识库截止</span>
@@ -1616,6 +2286,171 @@ onMounted(() => {
                     </p>
                   </div>
 
+                  <!-- 4.5 官网 vs 三方：价格对比与渠道构成（本视图的核心用途） -->
+                  <div class="mc-origin-card">
+                    <div class="mc-section-head-row">
+                      <h3 class="mc-section-title">
+                        <span v-html="icons.shield" />
+                        <span>官网 / 三方渠道分层</span>
+                      </h3>
+                      <button
+                        type="button"
+                        class="mc-link-action-btn"
+                        @click="providerTableOfficialOnly = true; activeDetailTab = 'providers'"
+                      >
+                        <span>只看官网渠道 &rarr;</span>
+                      </button>
+                    </div>
+
+                    <!-- 身份信息 -->
+                    <div class="mc-identity-strip">
+                      <div class="mc-identity-item">
+                        <span class="mc-identity-k">原始厂商 (lab)</span>
+                        <strong class="mc-identity-v">{{ selectedModel.officialLab || "misc" }}</strong>
+                      </div>
+                      <div class="mc-identity-item">
+                        <span class="mc-identity-k">原始模型 ID</span>
+                        <strong class="mc-identity-v font-mono">{{ selectedModel.officialModelId || "—" }}</strong>
+                      </div>
+                      <div class="mc-identity-item">
+                        <span class="mc-identity-k">canonical 标识</span>
+                        <strong class="mc-identity-v font-mono">{{ selectedModel.canonicalId || "—" }}</strong>
+                      </div>
+                      <div class="mc-identity-item">
+                        <span class="mc-identity-k">身份来源</span>
+                        <strong class="mc-identity-v">{{ identitySourceLabel(selectedModel.identitySource) }}</strong>
+                      </div>
+                    </div>
+
+                    <p v-if="!selectedModel.identityResolved" class="mc-identity-warn">
+                      该模型的原始厂商未能确定（多为白牌 / 路由 / 聚合名，如 <code>auto</code>、<code>model-router</code>）。
+                      为避免误判，系统保留 <code>misc</code> 而非猜测，其「官网渠道」判定同样不可用。
+                    </p>
+
+                    <!-- 官网 vs 三方价格对比 -->
+                    <div class="mc-origin-price-grid">
+                      <div class="mc-origin-price-col">
+                        <span class="mc-origin-price-k">原厂官方直销</span>
+                        <template v-if="detailOriginSummary.cheapestOfficial">
+                          <strong class="mc-origin-price-v">
+                            {{ formatPrice(detailOriginSummary.cheapestOfficial.input) }} /
+                            {{ formatPrice(detailOriginSummary.cheapestOfficial.output) }}
+                          </strong>
+                          <small>{{ detailOriginSummary.cheapestOfficial.name }}</small>
+                        </template>
+                        <template v-else-if="officialPrice(selectedModel)">
+                          <strong class="mc-origin-price-v">
+                            {{ formatPrice(officialPrice(selectedModel)!.input) }} /
+                            {{ formatPrice(officialPrice(selectedModel)!.output) }}
+                          </strong>
+                          <small>{{ selectedModel.refProvider ? labLabel(selectedModel.refProvider) : "官方标准" }}</small>
+                        </template>
+                        <template v-else>
+                          <strong class="mc-origin-price-v muted">无官方渠道</strong>
+                          <small>该模型原厂未直接上架</small>
+                        </template>
+                      </div>
+
+                      <div class="mc-origin-price-col">
+                        <span class="mc-origin-price-k">三方渠道最低价</span>
+                        <template v-if="detailOriginSummary.cheapestThirdParty">
+                          <strong class="mc-origin-price-v text-emerald">
+                            {{ formatPrice(detailOriginSummary.cheapestThirdParty.input) }} /
+                            {{ formatPrice(detailOriginSummary.cheapestThirdParty.output) }}
+                          </strong>
+                          <small>{{ detailOriginSummary.cheapestThirdParty.name }}</small>
+                        </template>
+                        <template v-else>
+                          <strong class="mc-origin-price-v muted">暂无三方报价</strong>
+                          <small>—</small>
+                        </template>
+                      </div>
+
+                      <div class="mc-origin-price-col mc-origin-price-col-gap">
+                        <span class="mc-origin-price-k">三方相对官网省幅</span>
+                        <template v-if="detailOriginSummary.saving !== null">
+                          <strong class="mc-origin-price-v text-success">
+                            -{{ detailOriginSummary.saving }}%
+                          </strong>
+                          <small>输入单价对比 · 走三方更省</small>
+                        </template>
+                        <template v-else>
+                          <strong class="mc-origin-price-v muted">—</strong>
+                          <small>
+                            {{ detailOriginSummary.cheapestOfficial ? "三方无价格优势" : "缺少官方价基准" }}
+                          </small>
+                        </template>
+                      </div>
+                    </div>
+
+                    <!-- 渠道构成条 -->
+                    <div class="mc-origin-breakdown">
+                      <div class="mc-origin-stat">
+                        <span class="mc-origin-stat-num text-brand">{{ detailOriginSummary.officialCount }}</span>
+                        <span class="mc-origin-stat-lbl">原厂官方渠道</span>
+                      </div>
+                      <div class="mc-origin-stat">
+                        <span class="mc-origin-stat-num">{{ detailOriginSummary.thirdPartyCount }}</span>
+                        <span class="mc-origin-stat-lbl">三方渠道</span>
+                      </div>
+                      <div class="mc-origin-stat">
+                        <span class="mc-origin-stat-num text-emerald">{{ selectedModel.freeChannelCount }}</span>
+                        <span class="mc-origin-stat-lbl">免费渠道</span>
+                      </div>
+                      <div class="mc-origin-stat">
+                        <span class="mc-origin-stat-num text-warning">{{ detailOriginSummary.subscriptionChannels.length }}</span>
+                        <span class="mc-origin-stat-lbl">订阅制渠道</span>
+                      </div>
+                    </div>
+
+                    <!-- 渠道性质三分（tier 描述渠道自身性质，与是否官方正交） -->
+                    <div class="mc-origin-tier-row">
+                      <span class="mc-origin-tier-lbl">渠道性质分布：</span>
+                      <span class="mc-tier-pill mc-tier-lab">自营 {{ detailOriginSummary.labTier }}</span>
+                      <span class="mc-tier-pill mc-tier-cloud">云厂商 {{ detailOriginSummary.cloudTier }}</span>
+                      <span class="mc-tier-pill mc-tier-gateway">聚合网关 {{ detailOriginSummary.gatewayTier }}</span>
+                    </div>
+
+                    <!-- 官方 / 免费 / 订阅 渠道清单 -->
+                    <div v-if="detailOriginSummary.officialChannels.length" class="mc-channel-chips-row">
+                      <span class="mc-channel-chips-lbl">官方渠道</span>
+                      <span
+                        v-for="pid in detailOriginSummary.officialChannels"
+                        :key="`off-${pid}`"
+                        class="mc-channel-chip mc-channel-chip-official"
+                      >{{ pid }}</span>
+                    </div>
+
+                    <div v-if="detailOriginSummary.freeChannels.length" class="mc-channel-chips-row">
+                      <span class="mc-channel-chips-lbl">免费渠道</span>
+                      <span
+                        v-for="pid in detailOriginSummary.freeChannels"
+                        :key="`free-${pid}`"
+                        class="mc-channel-chip mc-channel-chip-free"
+                      >{{ pid }}</span>
+                    </div>
+
+                    <div v-if="detailOriginSummary.subscriptionChannels.length" class="mc-channel-chips-row">
+                      <span class="mc-channel-chips-lbl">订阅渠道</span>
+                      <span
+                        v-for="pid in detailOriginSummary.subscriptionChannels"
+                        :key="`sub-${pid}`"
+                        class="mc-channel-chip mc-channel-chip-sub"
+                      >{{ pid }}</span>
+                    </div>
+
+                    <p
+                      v-if="!selectedModel.freeChannelCountMatches && selectedModel.freeHostCount > 0"
+                      class="mc-channel-diff-note"
+                    >
+                      免费渠道口径差异：本地逐渠道推导得
+                      <strong>{{ selectedModel.freeChannelCount }}</strong> 家，上游聚合值为
+                      <strong>{{ selectedModel.freeHostCount }}</strong> 家。
+                      以上游聚合值为准（列表中的「免费」标记即取该值）；差异源于 models.dev 与 llmpricing
+                      对个别渠道的收录范围不同。
+                    </p>
+                  </div>
+
                   <!-- 5. 渠道分布与快捷直达 -->
                   <div class="mc-section-block">
                     <div class="mc-section-head-row">
@@ -1658,7 +2493,8 @@ onMounted(() => {
                       </h3>
                       <span class="mc-sub-counts-line">
                         {{ detail.hosts?.filter(h => !h.subscription && !h.isFree && (h.input !== null || h.output !== null)).length || selectedModel.pricedHostCount }} 家公开价格 ·
-                        {{ detail.hosts?.filter(h => h.isFree || (h.input === 0 && h.output === 0)).length || selectedModel.freeHostCount }} 家免费 ·
+                        {{ detail.hosts?.filter(h => h.official).length || selectedModel.officialHostCount }} 家原厂官方 ·
+                        {{ detail.hosts?.filter(h => h.isFree).length || selectedModel.freeHostCount }} 家免费 ·
                         {{ detail.hosts?.filter(h => h.subscription).length || selectedModel.subHostCount }} 家订阅覆盖
                       </span>
                     </div>
@@ -1667,6 +2503,10 @@ onMounted(() => {
                         <span class="is-spinning" v-html="icons.restore" />
                         <span>同步最新报价中…</span>
                       </div>
+                      <label class="mc-priced-only-toggle">
+                        <input v-model="providerTableOfficialOnly" type="checkbox" />
+                        <span>仅显示原厂官方渠道</span>
+                      </label>
                       <label class="mc-priced-only-toggle">
                         <input v-model="providerTablePricedOnly" type="checkbox" />
                         <span>仅显示有公开标价渠道</span>
@@ -1679,6 +2519,7 @@ onMounted(() => {
                       <thead>
                         <tr>
                           <th>服务商</th>
+                          <th>性质</th>
                           <th>分层</th>
                           <th class="text-right">输入</th>
                           <th class="text-right">输出</th>
@@ -1686,6 +2527,7 @@ onMounted(() => {
                           <th class="text-right">缓存写入</th>
                           <th class="text-right">上下文</th>
                           <th class="text-right">最大输出</th>
+                          <th>思考级别</th>
                           <th>状态</th>
                         </tr>
                       </thead>
@@ -1714,6 +2556,20 @@ onMounted(() => {
                                 <small v-if="h.modelId" class="mc-pt-model-slug font-mono" :title="h.modelId">{{ h.modelId }}</small>
                               </div>
                             </div>
+                          </td>
+
+                          <!-- 性质：官方 / 三方 -->
+                          <td>
+                            <span
+                              v-if="h.official"
+                              class="mc-origin-badge mc-origin-official"
+                              title="该渠道是此模型原厂的自营渠道"
+                            >官方</span>
+                            <span
+                              v-else
+                              class="mc-origin-badge mc-origin-third"
+                              title="三方转售 / 聚合渠道"
+                            >三方</span>
                           </td>
 
                           <!-- 分层 -->
@@ -1778,6 +2634,37 @@ onMounted(() => {
                             {{ h.outputLimit ? formatTokensFull(h.outputLimit) : formatTokensFull(selectedModel.maxOutputTokens) }}
                           </td>
 
+                          <!-- 思考级别（渠道自声明） -->
+                          <td>
+                            <div class="mc-pt-effort-cell">
+                              <template v-if="effortValuesOf(h.reasoningOptions).length">
+                                <span
+                                  v-for="lvl in effortValuesOf(h.reasoningOptions)"
+                                  :key="lvl"
+                                  class="mc-effort-pill"
+                                  :class="{ 'is-max': lvl === selectedModel.reasoningEffortMax }"
+                                >
+                                  {{ lvl }}
+                                </span>
+                              </template>
+                              <span
+                                v-else-if="(h.reasoningOptions ?? []).some((option) => option.kind === 'toggle')"
+                                class="mc-effort-pill"
+                                title="该渠道只声明开/关式思考"
+                              >
+                                仅开 / 关
+                              </span>
+                              <span v-else class="muted">—</span>
+                              <span
+                                v-if="effortValuesOf(h.reasoningOptions).join(',') !== modelEffortValues(selectedModel).join(',')"
+                                class="mc-effort-diff-tag"
+                                title="该渠道声明的思考档位与模型级并集不同"
+                              >
+                                异于模型级
+                              </span>
+                            </div>
+                          </td>
+
                           <!-- 状态 -->
                           <td>
                             <span v-if="h.official" class="mc-status-tag-official">官方</span>
@@ -1790,7 +2677,7 @@ onMounted(() => {
                     </table>
                   </div>
                   <p class="mc-providers-table-footnote">
-                    按综合加权单价 (输入×0.75 + 输出×0.25) 从低到高排序。官方原厂直销渠道与最低单价渠道高亮显示。
+                    按综合加权单价 (输入×0.75 + 输出×0.25) 从低到高排序。官方原厂直销渠道与最低单价渠道高亮显示。思考级别为各渠道在 models.dev 的自声明，标「异于模型级」表示与模型级并集档位不一致。
                   </p>
                 </div>
 
@@ -1853,16 +2740,50 @@ onMounted(() => {
 
                     <div v-if="calculatedCosts" class="mc-calc-results-bar">
                       <div class="mc-calc-res-item">
-                        <span>官方参考预估月费</span>
-                        <strong>{{ calculatedCosts.symbol }}{{ calculatedCosts.refTotal }}</strong>
+                        <span>
+                          原厂官方直销月费
+                          <small v-if="!calculatedCosts.officialIsFirstParty" class="mc-calc-caveat">参考价口径</small>
+                        </span>
+                        <strong>{{ calculatedCosts.symbol }}{{ calculatedCosts.officialTotal }}</strong>
                       </div>
+
                       <div class="mc-calc-res-item">
-                        <span>最低渠道预估月费</span>
-                        <strong class="text-emerald">{{ calculatedCosts.symbol }}{{ calculatedCosts.minTotal }}</strong>
+                        <span>三方渠道最低月费</span>
+                        <template v-if="calculatedCosts.thirdPartyTotal !== null">
+                          <strong class="text-emerald">
+                            {{ calculatedCosts.symbol }}{{ calculatedCosts.thirdPartyTotal }}
+                          </strong>
+                        </template>
+                        <template v-else>
+                          <strong class="muted">—</strong>
+                          <small class="mc-calc-caveat">
+                            {{ calculatedCosts.minIsOfficial ? "最低价即官方渠道" : "无三方报价" }}
+                          </small>
+                        </template>
                       </div>
+
+                      <div class="mc-calc-res-item" :class="{ 'mc-calc-res-free': calculatedCosts.hasFree }">
+                        <span>免费渠道月费</span>
+                        <template v-if="calculatedCosts.hasFree">
+                          <strong class="text-emerald">
+                            {{ calculatedCosts.symbol }}0.00
+                          </strong>
+                          <small class="mc-calc-caveat">
+                            {{ calculatedCosts.freeChannelCount }} 家免费渠道 · 通常有限速或配额
+                          </small>
+                        </template>
+                        <template v-else>
+                          <strong class="muted">—</strong>
+                          <small class="mc-calc-caveat">无免费渠道</small>
+                        </template>
+                      </div>
+
                       <div class="mc-calc-res-item mc-calc-res-saved">
-                        <span>预计每月节省金额</span>
-                        <strong>{{ calculatedCosts.symbol }}{{ calculatedCosts.savedTotal }} <small>({{ calculatedCosts.savedPercent }}%)</small></strong>
+                        <span>三方相对官网每月节省</span>
+                        <strong>
+                          {{ calculatedCosts.symbol }}{{ calculatedCosts.savedTotal }}
+                          <small>({{ calculatedCosts.savedPercent }}%)</small>
+                        </strong>
                       </div>
                     </div>
                   </div>
@@ -1902,12 +2823,12 @@ onMounted(() => {
                   <th class="mc-arena-feature-col">对比维度</th>
                   <th v-for="m in comparedModels" :key="m.id">
                     <div class="mc-arena-th-cell">
-                      <span class="mc-card-avatar" :class="`mc-tone-${labTone(m.lab)}`">
-                        {{ labInitials(m.lab) }}
+                      <span class="mc-card-avatar" :class="`mc-tone-${labTone(effectiveLab(m))}`">
+                        {{ labInitials(effectiveLab(m)) }}
                       </span>
                       <div>
                         <strong>{{ m.name || m.id }}</strong>
-                        <small>{{ labLabel(m.lab) }}</small>
+                        <small>{{ labLabel(effectiveLab(m)) }}</small>
                       </div>
                     </div>
                   </th>
@@ -1962,6 +2883,62 @@ onMounted(() => {
                   <td class="mc-arena-feature-col">全网最低渠道价 (/1M)</td>
                   <td v-for="m in comparedModels" :key="m.id">
                     <strong class="text-emerald">{{ formatPrice(m.minInputCost) }} / {{ formatPrice(m.minOutputCost) }}</strong>
+                  </td>
+                </tr>
+                <tr>
+                  <td class="mc-arena-feature-col">原始厂商 / 模型标识</td>
+                  <td v-for="m in comparedModels" :key="m.id">
+                    <div class="mc-arena-identity-cell">
+                      <strong>{{ labLabel(effectiveLab(m)) }}</strong>
+                      <small class="font-mono">{{ m.officialModelId || "—" }}</small>
+                      <small v-if="!m.identityResolved" class="mc-identity-unknown">身份未定</small>
+                    </div>
+                  </td>
+                </tr>
+                <tr>
+                  <td class="mc-arena-feature-col">原厂官方价格 (/1M)</td>
+                  <td v-for="m in comparedModels" :key="m.id">
+                    <template v-if="officialPrice(m)">
+                      <strong>{{ formatPrice(officialPrice(m)!.input) }} / {{ formatPrice(officialPrice(m)!.output) }}</strong>
+                      <small class="mc-arena-cell-note">{{ m.refProvider ? labLabel(m.refProvider) : "官方" }}</small>
+                    </template>
+                    <span v-else class="muted">无官方渠道</span>
+                  </td>
+                </tr>
+                <tr>
+                  <td class="mc-arena-feature-col">官网 / 三方渠道数</td>
+                  <td v-for="m in comparedModels" :key="m.id">
+                    <div class="mc-origin-split">
+                      <span class="mc-origin-badge mc-origin-official" :class="{ 'is-zero': m.officialHostCount <= 0 }">
+                        官方 {{ m.officialHostCount }}
+                      </span>
+                      <span class="mc-origin-badge mc-origin-third" :class="{ 'is-zero': thirdPartyHostCount(m) <= 0 }">
+                        三方 {{ thirdPartyHostCount(m) }}
+                      </span>
+                    </div>
+                  </td>
+                </tr>
+                <tr>
+                  <td class="mc-arena-feature-col">三方相对官网省幅</td>
+                  <td v-for="m in comparedModels" :key="m.id">
+                    <strong v-if="thirdPartySaving(m) !== null" class="text-success">
+                      -{{ thirdPartySaving(m) }}%
+                    </strong>
+                    <span v-else class="muted">—</span>
+                  </td>
+                </tr>
+                <tr>
+                  <td class="mc-arena-feature-col">免费渠道</td>
+                  <td v-for="m in comparedModels" :key="m.id">
+                    <template v-if="m.freeHostCount > 0 || m.freeChannelCount > 0">
+                      <strong class="text-emerald">
+                        {{ Math.max(m.freeHostCount ?? 0, m.freeChannelCount ?? 0) }} 家
+                      </strong>
+                      <small v-if="m.freeChannelProviders?.length" class="mc-arena-cell-note">
+                        {{ m.freeChannelProviders.slice(0, 3).join("、") }}{{ m.freeChannelProviders.length > 3 ? " 等" : "" }}
+                      </small>
+                    </template>
+                    <span v-else class="muted">—</span>
                   </td>
                 </tr>
                 <tr>
@@ -2128,6 +3105,57 @@ onMounted(() => {
   font-size: 9.5px;
   color: var(--muted);
   font-variant-numeric: tabular-nums;
+}
+
+/* —— 数据来源（models.dev 主源 + llmpricing 辅源） —— */
+.mc-sources-card {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 6px 12px;
+  border-radius: var(--r-md);
+  background: var(--surface-soft);
+  border: 1px solid var(--line-soft);
+}
+.mc-sources-title {
+  font-size: 9.5px;
+  color: var(--muted);
+}
+.mc-sources-list {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex-wrap: wrap;
+}
+.mc-source-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10px;
+  font-weight: 600;
+  padding: 1px 7px;
+  border-radius: var(--r-full);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  color: var(--muted);
+}
+.mc-source-chip b {
+  font-weight: 700;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+/* 主数据源用品牌色强调 */
+.mc-source-chip.mc-source-primary {
+  background: var(--brand-soft);
+  border-color: var(--brand-line);
+  color: var(--brand-deep);
+}
+.mc-source-chip.mc-source-primary b { color: var(--brand-deep); }
+/* 主源缺失：明确告警，而不是静默少一半数据 */
+.mc-source-chip.mc-source-missing {
+  background: var(--warning-soft);
+  border-color: color-mix(in srgb, var(--warning) 35%, var(--line));
+  color: var(--warning);
 }
 
 .mc-sync-btn {
@@ -2694,6 +3722,8 @@ onMounted(() => {
 .mc-pill-open { background: var(--success-soft); color: var(--success); }
 .mc-pill-beta { background: var(--warning-soft); color: var(--warning); }
 .mc-pill-reasoning { background: var(--violet-soft); color: var(--violet); }
+/* 原始厂商未能确定（白牌 / 路由 / 聚合名） */
+.mc-pill-unknown { background: var(--warning-soft); color: var(--warning); }
 
 .mc-card-feat {
   font-size: 10px;
@@ -2934,6 +3964,13 @@ onMounted(() => {
   flex-direction: column;
   gap: 16px;
 }
+.mc-matrix-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
 .mc-matrix-header h2 {
   margin: 0;
   font-size: 18px;
@@ -3045,6 +4082,180 @@ onMounted(() => {
 .mc-pm-action {
   font-weight: 600;
   color: var(--brand);
+}
+
+/* —— 供应商详情弹窗 —— */
+.mc-provider-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 130;
+  display: flex;
+  flex-direction: column;
+  margin: auto;
+  width: min(860px, calc(100vw - 48px));
+  height: fit-content;
+  max-height: calc(100vh - 64px);
+  border-radius: var(--r-xl);
+  border: 1px solid var(--line);
+  background: var(--surface);
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.35);
+  overflow: hidden;
+}
+.mc-provider-modal-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 16px;
+  padding: 18px 22px;
+  border-bottom: 1px solid var(--line-soft);
+}
+.mc-provider-modal-avatar {
+  width: 44px;
+  height: 44px;
+  font-size: 20px;
+}
+.mc-provider-modal-title {
+  margin: 0 0 4px;
+  font-size: 18px;
+  font-weight: 700;
+}
+.mc-provider-modal-id {
+  font-size: 11.5px;
+  color: var(--muted);
+  margin-right: 6px;
+}
+.mc-provider-modal-api {
+  font-size: 11.5px;
+  max-width: 320px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.mc-provider-modal-body {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  padding: 18px 22px;
+  overflow-y: auto;
+}
+.mc-provider-modal-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 10px;
+}
+.mc-provider-modal-stat {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 14px;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--r-lg);
+  background: var(--surface-soft, rgba(127, 127, 127, 0.04));
+}
+.mc-provider-modal-stat-label {
+  font-size: 11.5px;
+  color: var(--muted);
+}
+.mc-provider-modal-stat-val {
+  font-size: 20px;
+  font-weight: 700;
+}
+.mc-provider-modal-section-title {
+  margin: 0 0 10px;
+  font-size: 13.5px;
+  font-weight: 600;
+}
+.mc-provider-modal-effort-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+.mc-provider-modal-effort-item {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 8px 12px;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--r-lg);
+}
+.mc-provider-modal-effort-item b {
+  font-size: 16px;
+}
+.mc-provider-modal-effort-item small {
+  color: var(--muted);
+}
+.mc-provider-modal-specs {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.mc-provider-modal-spec {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 12px;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--r-lg);
+}
+.mc-provider-modal-spec span {
+  font-size: 12.5px;
+  color: var(--muted);
+}
+.mc-provider-modal-spec b small {
+  color: var(--muted);
+  font-weight: 400;
+}
+.mc-provider-modal-models {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.mc-provider-modal-model-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-full);
+  background: var(--surface);
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+}
+.mc-provider-modal-model-chip:hover {
+  border-color: var(--brand);
+  background: color-mix(in srgb, var(--brand) 8%, transparent);
+}
+.mc-provider-modal-model-chip strong {
+  font-size: 12px;
+  font-weight: 600;
+}
+.mc-provider-modal-model-chip small {
+  font-size: 10.5px;
+}
+.mc-provider-modal-more-hint {
+  width: 100%;
+  margin: 4px 0 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+.mc-provider-modal-footer {
+  display: flex;
+  justify-content: flex-end;
+  padding: 14px 22px;
+  border-top: 1px solid var(--line-soft);
+}
+.mc-provider-modal-filter-btn {
+  padding: 8px 16px;
+  border: 0;
+  border-radius: var(--r-lg);
+  background: var(--brand);
+  color: #fff;
+  font-weight: 600;
+  cursor: pointer;
+}
+.mc-provider-modal-filter-btn:hover {
+  filter: brightness(1.1);
 }
 
 /* —— 4. 多模型对战 Arena 浮动 Dock —— */
@@ -3548,6 +4759,50 @@ onMounted(() => {
   border: 1px solid rgba(59, 130, 196, 0.2);
 }
 
+/* 思考档位 Chips（models.dev reasoning_options） */
+.mc-effort-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 9px;
+  border-radius: var(--r-full);
+  font-size: 11.5px;
+  font-weight: 600;
+  background: var(--violet-soft, rgba(139, 92, 246, 0.12));
+  color: var(--violet, #8b5cf6);
+  border: 1px solid rgba(139, 92, 246, 0.25);
+}
+.mc-effort-pill.is-max {
+  background: rgba(139, 92, 246, 0.22);
+  font-weight: 700;
+}
+.mc-effort-max-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: var(--r-full);
+  font-size: 11px;
+  color: var(--muted);
+  border: 1px dashed var(--line);
+}
+
+/* 渠道明细表：思考级别单元格 */
+.mc-pt-effort-cell {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 3px;
+}
+.mc-effort-diff-tag {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 6px;
+  border-radius: var(--r-full);
+  font-size: 10px;
+  color: var(--warning, #d97706);
+  border: 1px dashed rgba(217, 119, 6, 0.4);
+  white-space: nowrap;
+}
+
 /* Section Blocks */
 .mc-section-block {
   display: flex;
@@ -3721,7 +4976,8 @@ onMounted(() => {
 
 .mc-calc-results-bar {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  /* 官网 / 三方 / 免费 / 节省 四档，窄屏自动折行 */
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
   gap: 10px;
   padding: 14px;
   border-radius: var(--r-lg);
@@ -3735,6 +4991,21 @@ onMounted(() => {
 .mc-calc-res-item span { font-size: 11px; color: var(--muted); }
 .mc-calc-res-item strong { font-size: 17px; font-weight: 700; color: var(--text); margin-top: 2px; }
 .mc-calc-res-saved strong { color: var(--success); }
+/* 免费档命中时给整格一点强调 */
+.mc-calc-res-free {
+  padding: 6px 10px;
+  margin: -6px -10px;
+  border-radius: var(--r-md);
+  background: var(--success-soft);
+}
+/* 口径说明（如「参考价口径」「最低价即官方渠道」） */
+.mc-calc-caveat {
+  display: block;
+  font-size: 10px;
+  color: var(--faint);
+  font-weight: normal;
+  margin-top: 1px;
+}
 
 /* 渠道全景表格 */
 .mc-providers-table-header {
@@ -3990,6 +5261,20 @@ onMounted(() => {
 }
 .mc-arena-th-cell strong { font-size: 13.5px; color: var(--text); }
 .mc-arena-th-cell small { display: block; font-size: 10.5px; color: var(--muted); font-weight: normal; }
+/* Arena 新增行：身份 / 渠道构成 / 免费渠道 */
+.mc-arena-identity-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.mc-arena-identity-cell strong { font-size: 12.5px; color: var(--text); }
+.mc-arena-identity-cell small { font-size: 10.5px; color: var(--muted); }
+.mc-arena-cell-note {
+  display: block;
+  font-size: 10px;
+  color: var(--muted);
+  margin-top: 2px;
+}
 
 /* 缺省与加载状态 */
 .mc-loading-state, .mc-empty-state {
@@ -4031,4 +5316,246 @@ onMounted(() => {
 .flex { display: flex; }
 .items-center { align-items: center; }
 .gap-1\.5 { gap: 6px; }
+
+/* ============================================================
+   官网 / 三方渠道分层
+   —— 数据由 models.dev（主源）+ llmpricing（辅源）组合推导，
+      详见 MODELS_DEV_IMPLEMENTATION_REPORT.md
+   ============================================================ */
+
+/* —— 列表页：官网/三方构成单元格 —— */
+.mc-origin-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.mc-origin-split {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+.mc-origin-badge {
+  font-size: 10px;
+  font-weight: 700;
+  padding: 1px 6px;
+  border-radius: var(--r-full);
+  white-space: nowrap;
+}
+.mc-origin-official {
+  background: var(--brand-soft);
+  color: var(--brand-deep);
+  border: 1px solid var(--brand-line);
+}
+.mc-origin-third {
+  background: var(--surface-soft);
+  color: var(--muted);
+  border: 1px solid var(--line);
+}
+.mc-origin-badge.is-zero {
+  opacity: .45;
+}
+.mc-origin-saving {
+  font-size: 10px;
+  color: var(--success);
+  font-weight: 600;
+}
+
+/* —— 列表页：身份未确定提示 —— */
+.mc-identity-unknown {
+  display: inline-block;
+  margin-left: 4px;
+  font-size: 9px;
+  padding: 1px 4px;
+  border-radius: 3px;
+  background: var(--warning-soft);
+  color: var(--warning);
+  vertical-align: middle;
+}
+
+/* —— 详情抽屉：官网/三方主卡片 —— */
+.mc-origin-card {
+  margin-top: 14px;
+  padding: 16px;
+  border-radius: var(--r-xl);
+  border: 1px solid var(--line);
+  background: var(--surface-soft);
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.mc-origin-card .mc-section-head-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+/* 身份条 */
+.mc-identity-strip {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 10px;
+}
+.mc-identity-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 9px 11px;
+  border-radius: var(--r-md);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  min-width: 0;
+}
+.mc-identity-k {
+  font-size: 10px;
+  color: var(--muted);
+}
+.mc-identity-v {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.mc-identity-warn {
+  margin: 0;
+  padding: 9px 11px;
+  border-radius: var(--r-md);
+  background: var(--warning-soft);
+  /* 用 color-mix 而非硬编码浅色，保证暗色主题下边框与文字仍有足够对比度 */
+  border: 1px solid color-mix(in srgb, var(--warning) 35%, var(--line));
+  color: var(--warning);
+  font-size: 11px;
+  line-height: 1.6;
+}
+.mc-identity-warn code {
+  padding: 0 3px;
+  border-radius: 3px;
+  background: color-mix(in srgb, var(--warning) 14%, transparent);
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+}
+
+/* 价格对比三栏 */
+.mc-origin-price-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+}
+.mc-origin-price-col {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 12px 14px;
+  border-radius: var(--r-lg);
+  background: var(--surface);
+  border: 1px solid var(--line);
+}
+.mc-origin-price-col-gap {
+  border-color: var(--brand-line);
+  background: var(--brand-soft);
+}
+.mc-origin-price-k {
+  font-size: 10px;
+  color: var(--muted);
+}
+.mc-origin-price-v {
+  font-size: 15px;
+  font-weight: 800;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+.mc-origin-price-col small {
+  font-size: 10px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 渠道构成计数 */
+.mc-origin-breakdown {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 10px;
+}
+.mc-origin-stat {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1px;
+  padding: 9px 10px;
+  border-radius: var(--r-md);
+  background: var(--surface);
+  border: 1px solid var(--line);
+}
+.mc-origin-stat-num { font-size: 18px; font-weight: 800; color: var(--text); }
+.mc-origin-stat-lbl { font-size: 10px; color: var(--muted); }
+
+/* tier 三分 */
+.mc-origin-tier-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.mc-origin-tier-lbl { font-size: 11px; color: var(--muted); }
+.mc-origin-tier-row .mc-tier-pill {
+  font-size: 10px;
+  padding: 2px 8px;
+  border-radius: var(--r-full);
+}
+
+/* 渠道清单 chips */
+.mc-channel-chips-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.mc-channel-chips-lbl {
+  font-size: 11px;
+  color: var(--muted);
+  flex-shrink: 0;
+  padding-top: 2px;
+}
+.mc-channel-chip {
+  font-size: 10px;
+  font-weight: 600;
+  padding: 2px 7px;
+  border-radius: var(--r-full);
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.mc-channel-chip-official {
+  background: var(--brand-soft);
+  color: var(--brand-deep);
+  border: 1px solid var(--brand-line);
+}
+.mc-channel-chip-free {
+  background: var(--success-soft);
+  color: var(--success);
+  border: 1px solid color-mix(in srgb, var(--success) 35%, var(--line));
+}
+.mc-channel-chip-sub {
+  background: var(--warning-soft);
+  color: var(--warning);
+  border: 1px solid color-mix(in srgb, var(--warning) 35%, var(--line));
+}
+
+/* 口径差异提示 */
+.mc-channel-diff-note {
+  margin: 0;
+  padding: 9px 11px;
+  border-radius: var(--r-md);
+  background: var(--info-soft);
+  border: 1px solid color-mix(in srgb, var(--info) 35%, var(--line));
+  color: var(--info);
+  font-size: 11px;
+  line-height: 1.65;
+}
 </style>

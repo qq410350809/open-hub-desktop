@@ -189,10 +189,27 @@ impl AnthropicSseEmitter {
     /// 关闭当前打开的块（若有）
     fn close_open_block(&mut self) -> Vec<String> {
         match self.open_block.take() {
-            Some((idx, _)) => vec![sse_event(
-                "content_block_stop",
-                &json!({ "type": "content_block_stop", "index": idx }),
-            )],
+            Some((idx, kind)) => {
+                let mut events = Vec::new();
+                if kind == AnthropicBlockKind::Thinking {
+                    events.push(sse_event(
+                        "content_block_delta",
+                        &json!({
+                            "type": "content_block_delta",
+                            "index": idx,
+                            "delta": {
+                                "type": "signature_delta",
+                                "signature": "openhub-sig"
+                            }
+                        }),
+                    ));
+                }
+                events.push(sse_event(
+                    "content_block_stop",
+                    &json!({ "type": "content_block_stop", "index": idx }),
+                ));
+                events
+            }
             None => Vec::new(),
         }
     }
@@ -248,7 +265,7 @@ impl AnthropicSseEmitter {
             ),
             AnthropicBlockKind::Thinking => self.open_block(
                 AnthropicBlockKind::Thinking,
-                json!({ "type": "thinking", "thinking": "" }),
+                json!({ "type": "thinking", "thinking": "", "signature": "openhub-sig" }),
             ),
             AnthropicBlockKind::Tool => unreachable!("tool block 必须携带 id/name 元数据"),
         };
@@ -1775,6 +1792,33 @@ fn apply_usage_to_log(log: &mut ProxyRequestLog, usage: &UniversalUsage, ctx: &M
     }
 }
 
+/// 对用于持久化落库的 SSE 数据行进行摘要精简：
+/// 特别是 Responses API 的 response.created 与 response.in_progress 会回显完整
+/// tools 结构和 instructions，长达数十至数百 KB，直接吃光日志上限并截断后续生成内容与用量。
+fn clean_sse_data_for_log(data: &str) -> std::borrow::Cow<'_, str> {
+    if (data.contains(r#""type":"response.created""#)
+        || data.contains(r#""type":"response.in_progress""#))
+        && (data.contains(r#""tools":["#) || data.contains(r#""instructions":"#))
+    {
+        if let Ok(mut val) = serde_json::from_str::<JsonValue>(data) {
+            if let Some(resp) = val.get_mut("response").and_then(|r| r.as_object_mut()) {
+                if let Some(tools) = resp.get_mut("tools") {
+                    if let Some(arr) = tools.as_array() {
+                        *tools = json!(format!("[{} tools omitted in log]", arr.len()));
+                    }
+                }
+                if let Some(inst) = resp.get_mut("instructions") {
+                    if let Some(s) = inst.as_str() {
+                        *inst = json!(format!("[instructions {} chars omitted in log]", s.len()));
+                    }
+                }
+            }
+            return std::borrow::Cow::Owned(val.to_string());
+        }
+    }
+    std::borrow::Cow::Borrowed(data)
+}
+
 /// 统一流式代理出口：上游 SSE（任意协议）→ 嗅探 → Parser → IR → Emitter → 客户端协议。
 ///
 /// 取代「normalized_sse_stream 归一化为 Chat JSON + handler 再 parse」的双重转换链路；
@@ -1847,7 +1891,8 @@ where
                             upstream_raw.push('\n');
                         }
                         upstream_raw.push_str("data: ");
-                        upstream_raw.push_str(data);
+                        let log_data = clean_sse_data_for_log(data);
+                        upstream_raw.push_str(&log_data);
                     }
                     for event in $parser.feed(data) {
                         if !ttft_recorded {

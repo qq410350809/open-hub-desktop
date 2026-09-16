@@ -365,9 +365,9 @@ onUnmounted(() => {
       >
         <span class="usage-account-icon" v-html="icons.user" />
         <div class="usage-account-identity">
-          <strong :title="session.username ? `${accountIdentity(session)}（${session.newapiUserId ? session.newapiUserId + ':' : ''}${session.username}）` : accountIdentity(session)">
-            <span>{{ accountIdentity(session) }}</span>
-            <span v-if="session.username" class="usage-account-username">（{{ session.newapiUserId ? session.newapiUserId + ':' : '' }}{{ session.username }}）</span>
+          <strong :title="`${accountIdentity(session)}${session.username ? `（${session.newapiUserId ? session.newapiUserId + ':' : ''}${session.username}）` : ''}`">
+            <span>{{ session.username || accountIdentity(session) }}</span>
+            <span v-if="session.username" class="usage-account-username">（{{ accountIdentity(session) }}）</span>
           </strong>
           <small>
             <span
@@ -380,9 +380,9 @@ onUnmounted(() => {
               <span
                 v-if="session.checkinEnabled || site.supportsCheckin || session.checkinError"
                 class="usage-account-checkin"
-                :class="{ 'is-checked': session.checkedInToday, 'has-error': session.checkinError, 'is-disabled': !session.checkedInToday && !session.checkinEnabled }"
-                :title="session.checkinError || (session.checkedInToday ? '今日已签到' : (session.checkinEnabled ? '今日未签到' : '无法自动签到（404/403/未启用）'))"
-              >{{ session.checkinError ? "签到异常" : (session.checkedInToday ? "已签到" : (session.checkinEnabled ? "未签到" : "无法签到")) }}</span>
+                :class="{ 'is-checked': session.checkedInToday, 'is-disabled': !session.checkedInToday }"
+                :title="session.checkedInToday ? '今日已签到' : (session.checkinError ? `自动签到失败：${session.checkinError}` : (session.checkinEnabled ? '今日未签到' : '无法自动签到（404/403/未启用）'))"
+              >{{ session.checkedInToday ? "今日已签到" : (session.checkinError || !session.checkinEnabled ? "无法签到" : "今日未签到") }}</span>
               <span v-if="session.apiCountsSynced && !session.apiSyncError">
                 {{ session.apiKeyCount ?? 0 }} 个 Key · {{ session.apiModelCount ?? 0 }} 个模型
               </span>

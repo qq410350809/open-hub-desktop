@@ -2219,10 +2219,70 @@ function parseResponseSegments(body: string | undefined | null): ResponseSegment
     }
   };
 
+  const feedResponsesEvent = (frame: any) => {
+    if (!frame || typeof frame !== "object") return;
+    const t = frame.type;
+    if (typeof t !== "string") return;
+    if (
+      t === "response.reasoning_summary_text.delta" ||
+      t === "response.reasoning_text.delta" ||
+      t === "response.reasoning.delta"
+    ) {
+      const d = frame.delta;
+      if (typeof d === "string" && d) appendSegment(segments, { kind: "reasoning", text: d });
+      return;
+    }
+    if (t === "response.output_text.delta") {
+      const d = frame.delta;
+      if (typeof d === "string" && d) appendSegment(segments, { kind: "text", text: d });
+      return;
+    }
+    if (t === "response.output_item.added" || t === "response.output_item.done") {
+      const item = frame.item ?? {};
+      if (item.type === "reasoning") {
+        if (Array.isArray(item.summary)) {
+          for (const s of item.summary) {
+            if (typeof s?.text === "string" && s.text) {
+              appendSegment(segments, { kind: "reasoning", text: s.text });
+            }
+          }
+        } else if (typeof item.text === "string" && item.text) {
+          appendSegment(segments, { kind: "reasoning", text: item.text });
+        }
+      } else if (item.type === "function_call") {
+        const existing = [...segments].reverse().find(
+          (s) => s.kind === "tool" && (s.callId === item.id || s.callId === item.call_id),
+        );
+        if (!existing) {
+          segments.push({
+            kind: "tool",
+            name: item.name ?? "",
+            args: typeof item.arguments === "string" ? item.arguments : JSON.stringify(item.arguments ?? {}),
+            callId: item.call_id || item.id,
+          });
+        }
+      }
+      return;
+    }
+    if (t === "response.function_call_arguments.delta") {
+      const itemId = frame.item_id;
+      const frag = typeof frame.delta === "string" ? frame.delta : "";
+      const existing = [...segments].reverse().find(
+        (s) => s.kind === "tool" && (itemId ? s.callId === itemId : true),
+      ) as Extract<ResponseSegment, { kind: "tool" }> | undefined;
+      if (existing) {
+        existing.args += frag;
+      } else {
+        segments.push({ kind: "tool", name: "", args: frag, callId: itemId });
+      }
+    }
+  };
+
   const ingestFrame = (frame: any) => {
     if (!frame || typeof frame !== "object") return;
     if (frame.choices?.[0]?.delta) return feedChatDelta(frame.choices[0].delta);
     if (frame.type?.startsWith("content_block")) return feedAnthropicEvent(frame);
+    if (typeof frame.type === "string" && frame.type.startsWith("response.")) return feedResponsesEvent(frame);
   };
 
   // 形态 A：SSE 原文（流式日志保存形态）
@@ -2239,7 +2299,7 @@ function parseResponseSegments(body: string | undefined | null): ResponseSegment
     if (segments.length) return segments;
   }
 
-  // 形态 B：非流式 JSON —— OpenAI Chat / Anthropic Messages / Gemini
+  // 形态 B：非流式 JSON —— OpenAI Chat / Anthropic Messages / Gemini / Responses
   try {
     const jv = JSON.parse(text);
     const msg = jv?.choices?.[0]?.message;
@@ -2277,6 +2337,35 @@ function parseResponseSegments(body: string | undefined | null): ResponseSegment
           appendSegment(segments, p.thought ? { kind: "reasoning", text: p.text } : { kind: "text", text: p.text });
         } else if (p?.functionCall) {
           segments.push({ kind: "tool", name: p.functionCall.name ?? "", args: JSON.stringify(p.functionCall.args ?? {}) });
+        }
+      }
+      if (segments.length) return segments;
+    }
+    if (jv?.object === "response" && Array.isArray(jv.output)) {
+      for (const item of jv.output) {
+        if (item?.type === "reasoning") {
+          if (Array.isArray(item.summary)) {
+            for (const s of item.summary) {
+              if (s?.text) appendSegment(segments, { kind: "reasoning", text: s.text });
+            }
+          } else if (item.text) {
+            appendSegment(segments, { kind: "reasoning", text: item.text });
+          }
+        } else if (item?.type === "message") {
+          if (Array.isArray(item.content)) {
+            for (const c of item.content) {
+              if (c?.type === "output_text" && c.text) appendSegment(segments, { kind: "text", text: c.text });
+            }
+          } else if (typeof item.content === "string") {
+            appendSegment(segments, { kind: "text", text: item.content });
+          }
+        } else if (item?.type === "function_call") {
+          segments.push({
+            kind: "tool",
+            name: item.name ?? "",
+            args: typeof item.arguments === "string" ? item.arguments : JSON.stringify(item.arguments ?? {}),
+            callId: item.call_id || item.id,
+          });
         }
       }
       if (segments.length) return segments;

@@ -642,6 +642,7 @@ type ProxyPoolAccountOption = {
   profileId: string;
   profileName: string;
   accountName: string;
+  username: string;
   sites: { siteId: string; siteName: string; apiBaseUrl: string }[];
 };
 
@@ -657,6 +658,7 @@ const proxyPoolAccounts = computed<ProxyPoolAccountOption[]>(() => {
           profileId: session.profileId,
           profileName: session.profileName,
           accountName: session.accountName,
+          username: session.username,
           sites: [],
         };
         byProfile.set(session.profileId, entry);
@@ -667,7 +669,8 @@ const proxyPoolAccounts = computed<ProxyPoolAccountOption[]>(() => {
     }
   }
   return [...byProfile.values()].sort((left, right) =>
-    (left.accountName || left.profileName).localeCompare(right.accountName || right.profileName, "zh-CN"),
+    (left.username || left.accountName || left.profileName).localeCompare(
+      right.username || right.accountName || right.profileName, "zh-CN"),
   );
 });
 
@@ -2038,7 +2041,7 @@ watch(nodeViewMode, () => {
                           @change="toggleChannelAccount(account.profileId)"
                         />
                         <div class="pp-account-details">
-                          <strong>{{ account.accountName || account.profileName }}</strong>
+                          <strong :title="account.username && account.accountName ? account.accountName : ''">{{ account.username || account.accountName || account.profileName }}</strong>
                           <small>
                             Profile: {{ account.profileId }}
                             <template v-if="isChannelAccountLocked(account.profileId)">

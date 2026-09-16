@@ -350,6 +350,7 @@ pub fn collect_uncached(force: bool) -> Result<CollectedData, String> {
     for path in collect_goose_source_files(&home) {
         files.push(("goose".to_string(), path));
     }
+    files.extend(collect_workbuddy_source_files(&home));
     files.extend(collect_catpawai_source_files(&home));
     for path in collect_vscode_opencode_log_files(&home) {
         files.push(path);
@@ -395,6 +396,7 @@ pub fn collect_uncached(force: bool) -> Result<CollectedData, String> {
             "aider" => parse_aider_file(&path),
             "zed" => parse_zed_file(&path),
             "goose" => parse_goose_file(&path),
+            "workbuddy" => parse_workbuddy_file(&path),
             "catpawai" | "openclaw" => parse_catpawai_file(&source, &path),
             "vscode-opencode" => parse_vscode_opencode_log_file(&path),
             _ => parse_claude_file(&path),

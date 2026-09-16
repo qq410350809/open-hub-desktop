@@ -388,6 +388,7 @@ pub fn run() {
             crate::model::catalog::sync_models_for_cached_keys,
             crate::model::catalog::get_model_catalog,
             crate::model::catalog::get_model_catalog_detail,
+            crate::model::catalog::get_model_capabilities,
             crate::model::catalog::sync_model_catalog,
             crate::site::sync::list_chrome_sessions,
             crate::site::sync::read_chrome_session,

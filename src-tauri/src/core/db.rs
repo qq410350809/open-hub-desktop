@@ -191,6 +191,11 @@ impl Database {
                     raw_json TEXT NOT NULL DEFAULT '{}'
                 );
 
+                -- ⚠️ 注意：`model_catalog_providers` / `model_catalog_models` 的**权威定义**
+                -- 在 `model/catalog/catalog.rs` 的 `ensure_catalog_schema`。这里只是一份
+                -- 引导用的旧结构，`clear_legacy_catalog_if_needed` 会按
+                -- `CATALOG_SCHEMA_VERSION` 判断并 DROP 重建。新增列请改 catalog.rs，
+                -- 不要只改这里——`IF NOT EXISTS` 会让这里的改动对已存在的表无效。
                 CREATE TABLE IF NOT EXISTS model_catalog_models (
                     id TEXT PRIMARY KEY,
                     slug TEXT NOT NULL DEFAULT '',

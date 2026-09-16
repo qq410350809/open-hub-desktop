@@ -2007,3 +2007,117 @@ fn catpawai_normalize_uses_raw_total_to_avoid_double_count() {
         normalize_catpawai_usage_numbers(0, 0, 6000, 1000, 0, 0, 0);
     assert_eq!((fresh, cached, out, total), (5000, 1000, 0, 6000));
 }
+
+fn temp_workbuddy_dir(name: &str) -> PathBuf {
+    let nonce = UNIX_EPOCH
+        .elapsed()
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let dir = std::env::temp_dir().join(format!(
+        "openhub-workbuddy-{name}-{}-{nonce}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// WorkBuddy 转录：`message.usage.input_tokens` 为**总输入**（缓存命中是子集，
+/// prompt_cache_hit + prompt_cache_miss = prompt_tokens）。归一化后不得重复叠加缓存，
+/// 否则 total 虚高、缓存命中率腰斩。
+#[test]
+fn workbuddy_transcript_splits_inclusive_cache_input() {
+    let dir = temp_workbuddy_dir("parse");
+    let path = dir.join("session-1.jsonl");
+    fs::write(
+        &path,
+        concat!(
+            r#"{"id":"u1","timestamp":1789365445267,"type":"message","role":"user","content":[{"type":"input_text","text":"你好"}]}"#,
+            "\n",
+            r#"{"id":"a1","parentId":"u1","timestamp":1789365458882,"type":"message","role":"assistant","providerData":{"model":"deepseek-v4.1-flash","usage":{"inputTokens":99040,"outputTokens":916,"totalTokens":99956,"inputTokensDetails":[{"cached_tokens":98816}],"outputTokensDetails":[{"reasoning_tokens":24}]},"rawUsage":{"prompt_tokens":99040,"completion_tokens":916,"total_tokens":99956,"prompt_cache_hit_tokens":98816,"prompt_cache_miss_tokens":224,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"completion_tokens_details":{"reasoning_tokens":24}}},"message":{"usage":{"input_tokens":99040,"output_tokens":916,"total_tokens":99956,"cache_read_input_tokens":98816}}}"#,
+            "\n",
+            r#"{"id":"f1","timestamp":1789365459000,"type":"function_call","name":"Bash","arguments":"{}"}"#,
+            "\n"
+        ),
+    )
+    .unwrap();
+
+    let parsed = parse_workbuddy_file(&path);
+    assert_eq!(parsed.sessions.len(), 1);
+    let session = &parsed.sessions[0];
+    assert_eq!(session.source, "workbuddy");
+    assert_eq!(session.model, "deepseek-v4.1-flash");
+    assert_eq!(session.turns, 1);
+    // 全新输入 = 99040 - 98816 = 224；total = 224 + 98816 + 916 = 99956。
+    assert_eq!(session.tokens.input_tokens, 224);
+    assert_eq!(session.tokens.cached_input_tokens, 98816);
+    assert_eq!(session.tokens.output_tokens, 916);
+    assert_eq!(session.tokens.reasoning_output_tokens, 24);
+    assert_eq!(session.tokens.total_tokens, 99956);
+    // iso_from_millis 输出 UTC（与 codex/cline 等源一致），下游按 UTC 分桶。
+    assert_eq!(session.started_at, "2026-09-14T05:57:25.267Z");
+    assert_eq!(session.ended_at, "2026-09-14T05:57:39.000Z");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// 同一轮请求只有总量、无明细时也不能把缓存写入计入 total。
+#[test]
+fn workbuddy_transcript_handles_provider_usage_without_message_usage() {
+    let dir = temp_workbuddy_dir("fallback");
+    let path = dir.join("session-2.jsonl");
+    fs::write(
+        &path,
+        concat!(
+            r#"{"id":"a1","timestamp":1789352012493,"type":"message","role":"assistant","providerData":{"requestModelId":"claude-sonnet-4","usage":{"inputTokens":1000,"outputTokens":200,"totalTokens":1200}}}"#,
+            "\n"
+        ),
+    )
+    .unwrap();
+
+    let parsed = parse_workbuddy_file(&path);
+    let session = &parsed.sessions[0];
+    assert_eq!(session.model, "claude-sonnet-4");
+    assert_eq!(session.tokens.input_tokens, 1000);
+    assert_eq!(session.tokens.output_tokens, 200);
+    assert_eq!(session.tokens.total_tokens, 1200);
+    assert_eq!(session.turns, 0);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// 只有 `*.jsonl` 会话转录参与采集；回滚日志与 tool-results 目录必须排除。
+#[test]
+fn workbuddy_collect_skips_rollback_and_tool_results() {
+    let home = temp_workbuddy_dir("collect");
+    let projects = home.join(".workbuddy-ai").join("projects").join("Demo-Project");
+    fs::create_dir_all(&projects).unwrap();
+    let session = projects.join("session-1.jsonl");
+    fs::write(&session, "{}\n").unwrap();
+    fs::write(projects.join("session-1.file-rollback.ndjson"), "{}\n").unwrap();
+    let tool_results = projects.join("session-1").join("tool-results");
+    fs::create_dir_all(&tool_results).unwrap();
+    fs::write(tool_results.join("call_00.txt"), "x").unwrap();
+    fs::write(tool_results.join("nested.jsonl"), "{}\n").unwrap();
+
+    // 用显式目录变体：WorkBuddy 自己会导出 WORKBUDDY_CONFIG_DIR，
+    // 走 env 的版本在测试里会扫到真实数据。
+    let files = collect_workbuddy_source_files_in(&home.join(".workbuddy-ai"));
+    assert_eq!(files.len(), 1, "collected={files:?}");
+    assert_eq!(files[0].0, "workbuddy");
+    assert_eq!(files[0].1, session);
+    let _ = fs::remove_dir_all(&home);
+}
+
+/// WorkBuddy 项目目录名省略了前导 `-`（与 Claude 的 `-Users-name-dir` 不同）；
+/// 修复前反解直接失败，项目归属会退化成 "WorkBuddy" 标签。
+#[test]
+fn workbuddy_project_dir_name_decodes_without_leading_dash() {
+    let dir = temp_workbuddy_dir("decode");
+    let target = dir.join("Demo-App");
+    fs::create_dir_all(&target).unwrap();
+    let encoded = target
+        .to_string_lossy()
+        .trim_start_matches('/')
+        .replace('/', "-");
+    let key = workbuddy_project_from_dir(&encoded);
+    assert_ne!(key, "WorkBuddy");
+    let _ = fs::remove_dir_all(&dir);
+}

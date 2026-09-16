@@ -428,14 +428,15 @@ pub fn parse_antigravity_file(path: &Path) -> CachedFile {
                 ..Default::default()
             });
 
-            // 修复：重置上下文累积，避免长会话中输入 token 10x-100x 虚增
-            // 每次响应后只保留本次输出作为下一轮的上下文基础
-            // 之前的无限累积会导致第 10 轮请求被计为 10 倍输入
-            visible_context_tokens = context_delta;
+            // Agent 循环中每个 PLANNER_RESPONSE 都是一次独立的模型请求（通常以
+            // tool_calls 结尾），其输入 = 此前全部可见上下文；本次输出与工具调用
+            // 同样会进入下一轮请求的上下文，因此这里保持单调累积。
+            // （c6220d5 曾在此重置为 context_delta，误把多轮请求当成同一轮，
+            // 导致输入被低估一个数量级；transcript 无历史全文重复事件，累积安全。）
+            visible_context_tokens = visible_context_tokens.saturating_add(context_delta);
             continue;
         }
 
-        // 其他事件类型（非 PLANNER_RESPONSE）才累积到上下文
         visible_context_tokens = visible_context_tokens.saturating_add(context_delta);
     }
 

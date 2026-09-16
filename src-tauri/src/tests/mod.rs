@@ -392,6 +392,7 @@ fn caches_only_the_profile_api_counts() {
         key_groups: HashMap::new(),
         key_models: HashMap::new(),
         errors: Vec::new(),
+        profile_id: String::new(),
     };
     cache_profile_api_counts(&database, Some("site-a"), Some("Default"), result).unwrap();
     let connection = database.0.lock().unwrap();
@@ -411,14 +412,17 @@ fn sync_failure_error_is_persisted_to_model_cache() {
     // 即便调用方只带了 account.error 空串。目前 key 同步失败后界面只显示
     // "0 个 Key"，看不到失败原因，就是这段阵地空转导致的。
     let connection = Connection::open_in_memory().unwrap();
+    // schema 与真实库对齐（site_accounts 没有 api_sync_error 列，卡片的
+    // api_sync_error 展示值由 site_model_cache.error JOIN 计算得出）：
+    // 若清理语句再写入不存在的列，整条 UPDATE 会失败，下方 sync_error
+    // 清空断言就会失败，正好防住这类静默 bug。
     connection
         .execute_batch(
             "CREATE TABLE site_accounts (
                     site_id TEXT NOT NULL,
                     profile_id TEXT NOT NULL,
                     is_valid INTEGER NOT NULL DEFAULT 0,
-                    sync_error TEXT NOT NULL DEFAULT '',
-                    api_sync_error TEXT NOT NULL DEFAULT ''
+                    sync_error TEXT NOT NULL DEFAULT ''
                  );
                  CREATE TABLE site_model_cache (
                     site_id TEXT NOT NULL,
@@ -446,6 +450,7 @@ fn sync_failure_error_is_persisted_to_model_cache() {
         key_groups: HashMap::new(),
         key_models: HashMap::new(),
         errors: vec!["Profile 11：Sub2API Key 接口请求失败".into()],
+        profile_id: String::new(),
     };
     let account = SiteModelCacheAccount {
         profile_id: "Profile 11".into(),
@@ -484,6 +489,7 @@ fn sync_failure_error_is_persisted_to_model_cache() {
         key_groups: HashMap::new(),
         key_models: HashMap::new(),
         errors: vec![],
+        profile_id: String::new(),
     };
     // 先预置一条不含旧关键词（NewAPI/权限不足/失效）的历史账号同步错误，
     // 回归保护：成功同步后必须无条件清掉，卡片才不会一直挂着「账号信息同步失败」。
@@ -492,8 +498,8 @@ fn sync_failure_error_is_persisted_to_model_cache() {
         .lock()
         .unwrap()
         .execute(
-            "INSERT INTO site_accounts (site_id, profile_id, is_valid, sync_error, api_sync_error)
-             VALUES ('site-ai', 'Profile 11', 0, '账号同步超过 90 秒，已强制终止', '令牌请求失败')",
+            "INSERT INTO site_accounts (site_id, profile_id, is_valid, sync_error)
+             VALUES ('site-ai', 'Profile 11', 0, '账号同步超过 90 秒，已强制终止')",
             [],
         )
         .unwrap();
@@ -511,20 +517,94 @@ fn sync_failure_error_is_persisted_to_model_cache() {
         )
         .unwrap();
     assert!(saved2.is_empty(), "成功时遗留错误未清：{saved2}");
-    let (sync_error, api_sync_error): (String, String) = database
+    let sync_error: String = database
         .0
         .lock()
         .unwrap()
         .query_row(
-            "SELECT sync_error, api_sync_error FROM site_accounts WHERE site_id='site-ai' AND profile_id='Profile 11'",
+            "SELECT sync_error FROM site_accounts WHERE site_id='site-ai' AND profile_id='Profile 11'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        sync_error.is_empty(),
+        "成功同步后 site_accounts 历史错误未清：sync_error={sync_error:?}"
+    );
+}
+
+#[test]
+fn save_site_model_cache_backfills_account_names() {
+    // 回归保护：站点级同步（弹窗无有效会话分支）只带 profile_id、账号名全空。
+    // 落库时必须从 site_accounts 回填该账号的展示名，否则缓存行与账号脱节，
+    // Key 会显示成无名幽灵账号（黑与白公益站 Key 挂错账号的根因之一）。
+    let connection = Connection::open_in_memory().unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE site_accounts (
+                    site_id TEXT NOT NULL,
+                    profile_id TEXT NOT NULL,
+                    is_valid INTEGER NOT NULL DEFAULT 0,
+                    sync_error TEXT NOT NULL DEFAULT '',
+                    profile_name TEXT NOT NULL DEFAULT '',
+                    account_name TEXT NOT NULL DEFAULT '',
+                    username TEXT NOT NULL DEFAULT ''
+                 );
+                 INSERT INTO site_accounts (site_id, profile_id, profile_name, account_name, username)
+                 VALUES ('site-ai', 'Profile 11', '吴锁明', 'qq410350809@gmail.com', 'qq410350809@gmail.com');
+                 CREATE TABLE site_model_cache (
+                    site_id TEXT NOT NULL,
+                    profile_id TEXT NOT NULL,
+                    profile_name TEXT NOT NULL DEFAULT '',
+                    account_name TEXT NOT NULL DEFAULT '',
+                    username TEXT NOT NULL DEFAULT '',
+                    api_source TEXT NOT NULL DEFAULT '',
+                    keys_json TEXT NOT NULL DEFAULT '[]',
+                    groups_json TEXT NOT NULL DEFAULT '{}',
+                    models_json TEXT NOT NULL DEFAULT '[]',
+                    key_models_json TEXT NOT NULL DEFAULT '{}',
+                    error TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY (site_id, profile_id)
+                 );",
+        )
+        .unwrap();
+    let database = Database(std::sync::Mutex::new(connection));
+
+    let result = SiteModelsResult {
+        models: vec![],
+        source: "newapi-key".into(),
+        keys: vec!["sk-one".into()],
+        key_groups: HashMap::new(),
+        key_models: HashMap::new(),
+        errors: Vec::new(),
+        profile_id: "Profile 11".into(),
+    };
+    // 调用方只带 profile_id（与修复后的弹窗无会话分支一致）
+    let account = SiteModelCacheAccount {
+        profile_id: "Profile 11".into(),
+        profile_name: String::new(),
+        account_name: String::new(),
+        username: String::new(),
+        keys: vec!["sk-one".into()],
+        key_groups: HashMap::new(),
+        key_models: HashMap::new(),
+        error: "".into(),
+    };
+    save_site_model_cache(&database, "site-ai", &account, Some(&result), false).unwrap();
+    let (profile_name, account_name): (String, String) = database
+        .0
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT profile_name, account_name FROM site_model_cache
+             WHERE site_id='site-ai' AND profile_id='Profile 11'",
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert!(
-        sync_error.is_empty() && api_sync_error.is_empty(),
-        "成功同步后 site_accounts 历史错误未清：sync_error={sync_error:?}, api_sync_error={api_sync_error:?}"
-    );
+    assert_eq!(profile_name, "吴锁明", "profile_name 未从账号表回填");
+    assert_eq!(account_name, "qq410350809@gmail.com", "account_name 未从账号表回填");
 }
 
 #[test]
@@ -798,13 +878,19 @@ fn extracts_enabled_api_keys_from_newapi_and_sub2api_responses() {
                 { "api_key": "sk-sub2api-enabled", "is_active": true },
                 { "apiKey": "sk-sub2api-disabled", "is_active": false },
                 { "secret_key": "raw-key-value", "key_prefix": "sub2-", "group_name": "pro" },
-                { "key": "sk-****masked" }
+                { "key": "sk-****masked" },
+                {
+                    "api_key": "sk-sub2api-group-object",
+                    "is_active": true,
+                    "name": "我的 Key",
+                    "group": { "id": 3, "name": "default" }
+                }
             ]
         }
     });
     assert_eq!(
         parse_api_keys(&sub2api),
-        ["raw-key-value", "sk-sub2api-enabled", "sub2-raw-key-value"]
+        ["raw-key-value", "sk-sub2api-enabled", "sk-sub2api-group-object", "sub2-raw-key-value"]
     );
     let sub2api_groups = parse_api_key_groups(&sub2api);
     assert_eq!(
@@ -814,6 +900,11 @@ fn extracts_enabled_api_keys_from_newapi_and_sub2api_responses() {
     assert_eq!(
         sub2api_groups.get("sub2-raw-key-value"),
         Some(&"pro".to_string())
+    );
+    // 分组标识取 group.name，而不是 Key 自身的 name
+    assert_eq!(
+        sub2api_groups.get("sk-sub2api-group-object"),
+        Some(&"default".to_string())
     );
 
     let masked_newapi = serde_json::json!({

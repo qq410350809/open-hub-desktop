@@ -1,6 +1,7 @@
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { runCommand, isTauri } from "../core/ipc";
 import { useLibrary } from "./useLibrary";
+import { useChromeSession } from "./useChromeSession";
 import { useToast } from "../core/useToast";
 import { useUIState } from "../ui/useUIState";
 import { useConfirm } from "../ui/useConfirm";
@@ -14,6 +15,7 @@ import type {
 import { systemTypeLabel } from "../../types";
 
 const { loadLibrary } = useLibrary();
+const { chromeUsageAccounts } = useChromeSession();
 const { showToast } = useToast();
 const { confirm } = useConfirm();
 const { editingId, closeModal } = useUIState();
@@ -133,8 +135,19 @@ async function openExternalInChromeProfile(url: string, profileId: string) {
 }
 
 function chromeSessionsOpenToast(result: OpenUrlInChromeSessionsResult): string {
+  // 优先用账号缓存里的站点昵称（profileId 映射），没有缓存时回退邮箱/Profile 名。
+  const nicknameByProfile = new Map<string, string>();
+  for (const sessions of Object.values(chromeUsageAccounts.value)) {
+    for (const session of sessions) {
+      if (session.username) nicknameByProfile.set(session.profileId, session.username);
+    }
+  }
   const names = result.profiles
-    .map((session) => session.accountName.trim() || session.profileName.trim())
+    .map((session) =>
+      nicknameByProfile.get(session.profileId)
+      || session.accountName.trim()
+      || session.profileName.trim()
+    )
     .filter(Boolean);
   const unique = [...new Set(names)];
   const suffix = unique.length ? `（${unique.join("、")}）` : "";

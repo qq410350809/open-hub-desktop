@@ -797,8 +797,9 @@ pub async fn mark_sites_with_chrome_sessions(
             if !session.checkin_error.is_empty() {
                 details.push(format!("签到失败：{}", session.checkin_error));
             }
-            let has_warning = (!session.sync_error.is_empty() && !is_refresh_handoff)
-                || !session.checkin_error.is_empty();
+            // 签到失败只反映在状态小字“无法签到”上，不纳入异常告警：
+            // 它每天重复出现（未签到 → 自动签到失败），按告警统计会永久误报。
+            let has_warning = !session.sync_error.is_empty() && !is_refresh_handoff;
             emit_optional_sync_progress(
                 &bus,
                 run_id,
@@ -824,8 +825,7 @@ pub async fn mark_sites_with_chrome_sessions(
         .iter()
         .flat_map(|site| &site.sessions)
         .filter(|session| {
-            (session.sync_error != NEWAPI_REFRESH_HANDOFF_MESSAGE && !session.sync_error.is_empty())
-                || !session.checkin_error.is_empty()
+            session.sync_error != NEWAPI_REFRESH_HANDOFF_MESSAGE && !session.sync_error.is_empty()
         })
         .count();
 

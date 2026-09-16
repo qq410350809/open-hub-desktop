@@ -648,6 +648,61 @@ pub fn collect_kiro_activity_incremental(
     );
 }
 
+/// WorkBuddy：用户提问记一次对话；每次助手回复记一次请求。
+/// 与 claude 同口径——只有 `providerData.error` 这种显式错误才算失败，
+/// 无用量且无错误的行视为尚未写完的中间态，不计入（避免增量扫描把在途消息误判为失败）。
+pub fn workbuddy_on_line(
+    value: &JsonValue,
+    map: &mut BTreeMap<String, HealthAgg>,
+    sources: &mut BTreeMap<String, HealthAgg>,
+) {
+    if value.get("type").and_then(JsonValue::as_str) != Some("message") {
+        return;
+    }
+    let Some(hour) = hour_key_from_ts(&crate::token::collector::workbuddy_timestamp(value)) else {
+        return;
+    };
+    match value.get("role").and_then(JsonValue::as_str) {
+        Some("user") => record(map, sources, "workbuddy", hour, 1, 0, 0, 0),
+        Some("assistant") => {
+            let has_error = value
+                .get("providerData")
+                .and_then(|data| data.get("error"))
+                .map(|error| !error.is_null())
+                .unwrap_or(false);
+            let usage_tokens = value
+                .get("message")
+                .and_then(|message| message.get("usage"))
+                .map(|usage| {
+                    json_i64(usage, "input_tokens")
+                        + json_i64(usage, "output_tokens")
+                        + json_i64(usage, "cache_read_input_tokens")
+                })
+                .unwrap_or(0);
+            if has_error {
+                record(map, sources, "workbuddy", hour, 0, 1, 0, 1);
+            } else if usage_tokens > 0 {
+                record(map, sources, "workbuddy", hour, 0, 1, 0, 0);
+            }
+        }
+        _ => {}
+    }
+}
+
+pub fn collect_workbuddy_activity_incremental(
+    root: &Path,
+    map: &mut BTreeMap<String, HealthAgg>,
+    sources: &mut BTreeMap<String, HealthAgg>,
+    cursors: &mut FileCursorMap,
+) {
+    collect_jsonl_incremental(
+        root,
+        &|path| crate::token::collector::is_workbuddy_transcript_path(path),
+        cursors,
+        &mut |value| workbuddy_on_line(value, map, sources),
+    );
+}
+
 pub fn collect_copilot_activity_incremental(
     home: &Path,
     map: &mut BTreeMap<String, HealthAgg>,
@@ -1072,6 +1127,15 @@ pub fn collect_request_health_snapshot(force: bool) -> Result<RequestHealthRepor
             .entry("copilot".to_string())
             .or_default();
         collect_copilot_activity_incremental(&home, &mut map, &mut sources, cursors);
+    }
+
+    let workbuddy_root = crate::token::collector::workbuddy_config_dir(&home).join("projects");
+    if workbuddy_root.is_dir() {
+        let cursors = envelope
+            .file_cursors
+            .entry("workbuddy".to_string())
+            .or_default();
+        collect_workbuddy_activity_incremental(&workbuddy_root, &mut map, &mut sources, cursors);
     }
 
     let report = maps_to_report(map, sources);

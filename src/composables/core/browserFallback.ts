@@ -451,6 +451,10 @@ export async function browserFallback<T>(
         mk("opencode", "OpenCode", `${home}.local/share/opencode`, [
           { kind: "database", label: "数据库 opencode.db", path: `${home}.local/share/opencode/opencode.db`, exists: false },
         ]),
+        mk("workbuddy", "WorkBuddy AI", `${home}.workbuddy-ai`, [
+          { kind: "config", label: "全局设置 settings.json", path: `${home}.workbuddy-ai/settings.json`, exists: false },
+          { kind: "data", label: "会话项目 projects", path: `${home}.workbuddy-ai/projects`, exists: false },
+        ]),
       ],
     } as T;
   }
@@ -494,6 +498,10 @@ export async function browserFallback<T>(
     const model = allPreviewModels.find((item) => item.id === key || item.slug === key);
     if (!model) throw new Error("模型参数不存在");
     const matchedProviders = previewProviders.filter((p) => model.hostProviders.includes(p.id));
+    // 预览数据同样走「官网 / 三方」推导结果，避免与真实后端语义不一致
+    const officialSet = new Set(model.officialChannelProviders ?? []);
+    const freeSet = new Set(model.freeChannelProviders ?? []);
+    const subSet = new Set(model.subscriptionChannelProviders ?? []);
     const detail: ModelCatalogDetail = {
       model,
       providers: matchedProviders,
@@ -502,7 +510,7 @@ export async function browserFallback<T>(
         name: p.name,
         modelId: null,
         tier: p.tier,
-        subscription: p.subscription,
+        subscription: subSet.has(p.id),
         input: p.id === model.minProvider ? model.minInputCost : p.id === model.refProvider ? model.refInputCost : null,
         output: p.id === model.minProvider ? model.minOutputCost : p.id === model.refProvider ? model.refOutputCost : null,
         cacheRead: p.id === model.minProvider ? model.minCacheReadCost : p.id === model.refProvider ? model.refCacheReadCost : null,
@@ -510,15 +518,51 @@ export async function browserFallback<T>(
         context: model.contextLength,
         outputLimit: model.maxOutputTokens,
         status: null,
-        official: p.id === model.refProvider && model.refOfficial,
+        official: officialSet.has(p.id),
         doc: p.doc,
-        isFree: false,
+        isFree: freeSet.has(p.id),
         isMin: p.id === model.minProvider,
         isRef: p.id === model.refProvider,
       })),
       raw: { id: model.id, name: model.name, preview: true },
     };
     return structuredClone(detail) as T;
+  }
+  if (command === "get_model_capabilities") {
+    // 与 Rust 侧 `normalize_model_id` 同口径的最小归一化：去变体后缀、取末段、标点统一。
+    const normalize = (raw: string) => {
+      let s = raw.trim().toLowerCase();
+      const cut = s.search(/[:@]/);
+      if (cut >= 0) s = s.slice(0, cut);
+      const slash = s.lastIndexOf("/");
+      if (slash >= 0) s = s.slice(slash + 1);
+      return s.replace(/[._]+/g, "-");
+    };
+    const keys = (args.keys as string[] | undefined) ?? [];
+    const out: Record<string, unknown> = {};
+    for (const key of keys) {
+      const normalized = normalize(key);
+      const model = allPreviewModels.find(
+        (item) => normalize(item.id) === normalized || normalize(item.officialModelId) === normalized,
+      );
+      if (!model) continue;
+      out[key] = {
+        reasoningOptions: model.reasoningOptions ?? [],
+        reasoningEffortMax: model.reasoningEffortMax ?? null,
+        contextLength: model.contextLength,
+        maxOutputTokens: model.maxOutputTokens,
+        maxInputTokens: model.maxInputTokens ?? null,
+        outputModalities: model.outputModalities ?? [],
+        interleavedFields: model.interleavedFields ?? [],
+        hasFastMode: model.hasFastMode ?? false,
+        supportsTemperature: model.temperature,
+        supportsToolCall: model.toolCall,
+        supportsStructuredOutput: model.structured,
+        supportsReasoning: model.reasoning,
+        openWeights: model.openWeights,
+      };
+    }
+    return out as T;
   }
   if (command === "sync_model_catalog") {
     const result: ModelCatalogSyncResult = {

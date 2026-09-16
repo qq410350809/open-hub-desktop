@@ -759,6 +759,14 @@ export interface TokenOfficialModel {
   confidence: number;
   createdAt: string;
   updatedAt: string;
+  /**
+   * 是否为「原厂模型」：模型目录中存在该模型的官方（原厂）渠道
+   * （目录 `officialHostCount > 0`，按注册表 id 或 name 匹配）。
+   *
+   * 目录未同步时为 `false`。映射目标下拉据此过滤纯三方/转售变体；
+   * 用户手工添加的条目恒为 `true`。
+   */
+  firstParty: boolean;
 }
 
 // —— AI 用量洞察：前端确定性证据 + AI 可追溯解读 ——
@@ -915,6 +923,16 @@ export interface ModelCatalogProvider {
   subscription: boolean;
   count: number;
   dateModified?: string | null;
+  /**
+   * 该渠道是否为某个 lab 的自营（原厂）渠道。
+   *
+   * ⚠️ 与 `tier` 无关：`tier === 'lab'` 只说明渠道自身是模型厂商/自营云，
+   * 不代表它是任意模型的原厂渠道。例如 `nvidia`（tier=lab）代售 30+ 个 lab 的模型，
+   * `azure`（tier=lab）对上架 microsoft 模型是原厂、对上架 openai 模型却不是。
+   */
+  isFirstParty: boolean;
+  /** 该渠道要求的 API Key 环境变量名（models.dev `providers[*].env`），如 `["OPENAI_API_KEY"]`。 */
+  env?: string[];
 }
 
 export interface ModelCatalogSourceStatus {
@@ -971,6 +989,147 @@ export interface ModelCatalogItem {
   benchmarkCount: number;
   releaseDate?: string | null;
   lastUpdated?: string | null;
+
+  // ───────── 模型身份：原始 lab / 原始 modelId ─────────
+  /**
+   * 归一化后的**原始 lab**。来自 models.dev canonical 层、llmpricing 的 `lab`，
+   * 或关键词/同名继承推断。**未确定时保持 `'misc'`**，绝不臆造。
+   *
+   * 与 `lab` 的区别：`lab` 是 llmpricing 原始字段（1941 个模型中有 175 个是 `misc`），
+   * `officialLab` 在此基础上补全了 103 个；剩余 72 个是白牌/路由名（`auto`、`model-router`
+   * 等），保持 `misc` 并置 `identityResolved = false`。
+   */
+  officialLab: string;
+  /** 原始 modelId（**保留上游原拼写**，如 `z-ai/glm-5.2`、`MiniMax-M3`）。 */
+  officialModelId: string;
+  /** models.dev canonical id（如 `zhipuai/glm-5.2`），未定位到时为 null。 */
+  canonicalId?: string | null;
+  /**
+   * 身份来源。`canonical` / `llmpricing_lab` 为上游直接给出；
+   * `keyword_rule` / `inherited` / `canonical_reverse` 为本地推断；`unknown` 为未确定。
+   */
+  identitySource:
+    | 'canonical'
+    | 'llmpricing_lab'
+    | 'keyword_rule'
+    | 'inherited'
+    | 'canonical_reverse'
+    | 'unknown';
+  /** 身份是否已确定。`false` 表示 `officialLab` 仍是 `'misc'` 占位。 */
+  identityResolved: boolean;
+
+  // ───────── 官网 / 三方渠道分层 ─────────
+  /**
+   * 官方（原厂）渠道数量。
+   *
+   * 判定：`provider` 属于该 lab 的原厂别名表 **且** 该渠道确实上架了此模型。
+   * 两个条件缺一不可——`openai/gpt-oss-120b` 不在 `openai` 渠道上架，官方渠道数即为 0。
+   * 实测与 llmpricing 详情页 `official` 标记 23/23 一致。
+   */
+  officialHostCount: number;
+  /**
+   * 官方（原厂）渠道 id 列表（已去重、已排序）。
+   *
+   * 前端据此即可在**不拉取详情**的情况下做「仅官网渠道」筛选与价格对比。
+   */
+  officialChannelProviders: string[];
+  /** `tier === 'lab'` 的渠道数量（描述渠道自身性质，不等于官方渠道）。 */
+  labTierHostCount: number;
+  /** `tier === 'cloud'` 的渠道数量。 */
+  cloudTierHostCount: number;
+  /** `tier === 'gateway'` 的渠道数量。 */
+  gatewayTierHostCount: number;
+
+  // ───────── 免费渠道（本地推导，替代 HTML 爬取）─────────
+  /**
+   * 本地推导的免费渠道数量（已剔除订阅制渠道）。
+   *
+   * 判定：`input === 0 && output === 0 && !subscription`，其中「零价」取
+   * **任一变体零价即算**（同一渠道可能同时登记付费与 `:free` 两个条目，
+   * 实测 `unorouter` 对 glm-5.2 即如此）。
+   *
+   * 与 `freeHostCount` 的关系：`freeHostCount` 是 llmpricing 上游聚合值（权威），
+   * 本字段是本地逐渠道推导值，实测一致率 97.4%。
+   */
+  freeChannelCount: number;
+  /** 本地推导的免费渠道 id 列表（已去重）。 */
+  freeChannelProviders: string[];
+  /**
+   * 订阅制渠道 id 列表（已去重）。
+   *
+   * 订阅渠道「用时不另计费」，与免费渠道语义不同，**不计入** `freeChannelCount`。
+   */
+  subscriptionChannelProviders: string[];
+  /** 免费渠道数据来源：`derived`（本地推导）/ `upstream`（仅上游聚合值，无明细）。 */
+  freeChannelSource: 'derived' | 'upstream';
+  /**
+   * 本地推导的免费渠道数是否与上游 `freeHostCount` 一致。
+   * 不一致时以 `freeHostCount` 为准，本字段供 UI 提示口径差异。
+   */
+  freeChannelCountMatches: boolean;
+
+  // ───────── 思考级别与输出能力（models.dev 渠道层聚合）─────────
+  /**
+   * 模型级思考级别选项（跨全部渠道取并集）。
+   *
+   * 两种形态：`{kind:'toggle'}`（只能开/关）与
+   * `{kind:'effort', values:['none','low','medium','high','xhigh','max']}`（多档位）。
+   */
+  reasoningOptions?: ReasoningOption[];
+  /** 模型支持的最高思考档位；无 effort 档位时为 null。 */
+  reasoningEffortMax?: string | null;
+  /** 模型级输出模态（跨渠道取并集），可能是 `image` / `video` / `audio`。 */
+  outputModalities?: string[];
+  /** 模型级最大输入上限（`limit.input`），总上下文可能大于单次可输入量。 */
+  maxInputTokens?: number | null;
+  /** 支持交错推理的读取字段名（跨渠道去重，如 `reasoning_content`）。 */
+  interleavedFields?: string[];
+  /** 是否有渠道提供「快速模式」（额外计费档）。 */
+  hasFastMode?: boolean;
+  /** models.dev canonical 层附加信息（描述 / 许可证 / 链接 / 权重 / 基准明细）。 */
+  modelsDevExtras?: ModelsDevModelExtras;
+}
+
+/** models.dev `reasoning_options` 的元素。 */
+export interface ReasoningOption {
+  /** `toggle`（开/关）或 `effort`（多档位）。 */
+  kind: 'toggle' | 'effort' | string;
+  /** `effort` 形态下的可选档位；`toggle` 形态为空。 */
+  values: string[];
+}
+
+/** models.dev canonical 层附加信息（仅详情页使用，打包为 JSON 列）。 */
+export interface ModelsDevModelExtras {
+  description?: string | null;
+  license?: string | null;
+  /** 官方链接：`[{label, url, type}]`（type 如 `paper` / `model_card`）。 */
+  links: any[];
+  /** 权重下载：`[{label, url, quantization?}]`。 */
+  weights: any[];
+  /** 基准测试明细：`[{name, score, metric, source?, date?, harness?}]`。 */
+  benchmarks: any[];
+}
+
+/**
+ * 单个模型的 models.dev 能力（`get_model_capabilities` 的返回单元）。
+ *
+ * 供「模型参数」按模型呈现思考档位与上下文/输出上限等属性，
+ * 字段与 [`ModelCatalogItem`] 的富化子集一致。
+ */
+export interface ModelCapabilities {
+  reasoningOptions: ReasoningOption[];
+  reasoningEffortMax?: string | null;
+  contextLength: number;
+  maxOutputTokens: number;
+  maxInputTokens?: number | null;
+  outputModalities: string[];
+  interleavedFields: string[];
+  hasFastMode: boolean;
+  supportsTemperature: boolean;
+  supportsToolCall: boolean;
+  supportsStructuredOutput: boolean;
+  supportsReasoning: boolean;
+  openWeights: boolean;
 }
 
 export interface ModelCatalogSnapshot {
@@ -995,6 +1154,16 @@ export interface ModelCatalogHostItem {
   cacheWrite?: number | null;
   context?: number | null;
   outputLimit?: number | null;
+  /** 独立输入上限（models.dev `limit.input`）。总上下文可能大于单次可输入量。 */
+  inputLimit?: number | null;
+  /** 输出模态（models.dev `modalities.output`），可能是 `image` / `video` / `audio`。 */
+  outputModalities?: string[];
+  /** 该渠道声明的思考级别选项（可能与模型级聚合声明不一致，分开展示）。 */
+  reasoningOptions?: ReasoningOption[];
+  /** 交错推理的读取字段名（如 `reasoning_content`）。 */
+  interleavedField?: string | null;
+  /** 快速模式（`experimental.modes.fast`），含额外计费与请求覆盖。 */
+  fastMode?: any | null;
   status?: string | null;
   official: boolean;
   doc?: string | null;

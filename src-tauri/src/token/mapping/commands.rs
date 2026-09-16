@@ -4,6 +4,7 @@ use super::types::*;
 use crate::context::{AppContext, Managed};
 use crate::model::gateway::types::{ChannelConfig, ModelProxyState};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::sync::Arc;
 use tracing::warn;
 
@@ -19,6 +20,111 @@ pub struct TokenOfficialModel {
     pub confidence: f64,
     pub created_at: String,
     pub updated_at: String,
+    /// 是否为「原厂模型」：模型目录中存在该模型的官方渠道，且该渠道是
+    /// **已核实的原厂供应商**（`model_catalog_providers.is_first_party = 1`，
+    /// 与模型目录页「原厂自营」同一份口径），按注册表 `id`（目录 slug）或
+    /// `name` 匹配。
+    ///
+    /// 用户手工添加（`source = 'user'`）恒为 `true`。目录未同步或结构过旧时
+    /// 一律 `false`，绝不臆造。
+    pub first_party: bool,
+}
+
+/// 表是否存在指定列。用于兼容尚未按权威 DDL 重建的旧库。
+fn has_column(
+    connection: &rusqlite::Connection,
+    table: &str,
+    column: &str,
+) -> Result<bool, String> {
+    let count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
+            rusqlite::params![table, column],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(count > 0)
+}
+
+/// 已核实的原厂（自营）渠道 id 集合。
+///
+/// 判据：`model_catalog_providers.is_first_party = 1`——即原厂别名表
+/// （[`lab_registry::LAB_OFFICIAL_HOSTS`]）登记过的自营渠道，与模型目录页
+/// 「原厂自营」供应商矩阵同一份口径。
+///
+/// ⚠️ 刻意**不**用 `tier = 'lab'` 兜底：tier 只描述渠道自身性质，未登记的
+/// 自营云（如 `sarvam`）也会是 `tier = lab`，但它们不在已核实的原厂名单里；
+/// 放进来就会重新出现「超出原厂范围」。
+///
+/// providers 表缺失或仍是旧结构时返回空集。
+fn vetted_official_providers(connection: &rusqlite::Connection) -> Result<HashSet<String>, String> {
+    if !has_column(connection, "model_catalog_providers", "is_first_party")? {
+        return Ok(HashSet::new());
+    }
+    let mut statement = connection
+        .prepare("SELECT id FROM model_catalog_providers WHERE is_first_party = 1")
+        .map_err(|e| e.to_string())?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    Ok(rows
+        .into_iter()
+        .map(|id| id.trim().to_lowercase())
+        .filter(|id| !id.is_empty())
+        .collect())
+}
+
+/// 目录中「确为原厂模型」的 slug / name 小写集合。
+///
+/// 需要 `model_catalog_models.official_host_count` 与
+/// `official_channel_providers_json` 两列；缺失（目录尚未同步/结构过旧）时返回空集。
+fn first_party_keys(connection: &rusqlite::Connection) -> Result<HashSet<String>, String> {
+    if !has_column(connection, "model_catalog_models", "official_host_count")?
+        || !has_column(connection, "model_catalog_models", "official_channel_providers_json")?
+    {
+        return Ok(HashSet::new());
+    }
+    let vetted = vetted_official_providers(connection)?;
+    let mut statement = connection
+        .prepare(
+            "SELECT slug, name, official_channel_providers_json
+             FROM model_catalog_models WHERE official_host_count > 0",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+
+    let mut keys = HashSet::new();
+    for (slug, name, channels_json) in rows {
+        let channels: Vec<String> = serde_json::from_str(&channels_json).unwrap_or_default();
+        // 供应商性质无法判定时（providers 表缺失）退回「有官方渠道即算」，
+        // 宁可多给也不把候选清空。
+        let is_first_party = vetted.is_empty()
+            || channels
+                .iter()
+                .any(|channel| vetted.contains(&channel.trim().to_lowercase()));
+        if !is_first_party {
+            continue;
+        }
+        for key in [slug, name] {
+            let key = key.trim().to_lowercase();
+            if !key.is_empty() {
+                keys.insert(key);
+            }
+        }
+    }
+    Ok(keys)
 }
 
 /// 组装 AI 请求用的模型名。必须显式指定启用渠道，避免意外从默认路由出网。
@@ -96,6 +202,7 @@ pub fn get_token_official_models(
     ctx: Managed<'_, Arc<AppContext>>,
 ) -> Result<Vec<TokenOfficialModel>, String> {
     let connection = ctx.database.lock_conn()?;
+    let first_party = first_party_keys(&connection)?;
     let mut statement = connection
         .prepare(
             "SELECT id, name, lab, aliases, source, confidence, created_at, updated_at
@@ -106,12 +213,20 @@ pub fn get_token_official_models(
     let rows = statement
         .query_map([], |row| {
             let aliases_json: String = row.get(3)?;
+            let id: String = row.get(0)?;
+            let name: String = row.get(1)?;
+            let source: String = row.get(4)?;
+            // 用户显式添加的自定义模型始终可选；目录匹配只对自动导入的条目生效。
+            let first_party = source == "user"
+                || first_party.contains(&id.trim().to_lowercase())
+                || first_party.contains(&name.trim().to_lowercase());
             Ok(TokenOfficialModel {
-                id: row.get(0)?,
-                name: row.get(1)?,
+                first_party,
+                id,
+                name,
                 lab: row.get(2)?,
                 aliases: serde_json::from_str(&aliases_json).unwrap_or_default(),
-                source: row.get(4)?,
+                source,
                 confidence: row.get(5)?,
                 created_at: row.get(6)?,
                 updated_at: row.get(7)?,
@@ -156,6 +271,8 @@ pub fn add_token_official_model(
             |row| {
                 let aliases_json: String = row.get(3)?;
                 Ok(TokenOfficialModel {
+                    // 用户显式添加的正式模型始终视为可选目标，无需等待目录同步。
+                    first_party: true,
                     id: row.get(0)?,
                     name: row.get(1)?,
                     lab: row.get(2)?,
@@ -381,5 +498,148 @@ mod tests {
         assert!(
             resolve_request_model(&[channel("c1", "x666", false)], Some("c1"), "gpt-5.6").is_err()
         );
+    }
+
+    fn catalog_connection() -> rusqlite::Connection {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE model_catalog_models (
+                    id TEXT PRIMARY KEY,
+                    slug TEXT NOT NULL DEFAULT '',
+                    name TEXT NOT NULL DEFAULT '',
+                    official_host_count INTEGER NOT NULL DEFAULT 0,
+                    official_channel_providers_json TEXT NOT NULL DEFAULT '[]'
+                );
+                CREATE TABLE model_catalog_providers (
+                    id TEXT PRIMARY KEY,
+                    tier TEXT,
+                    is_first_party INTEGER NOT NULL DEFAULT 0
+                );",
+            )
+            .unwrap();
+        connection
+    }
+
+    fn insert_catalog_row(
+        connection: &rusqlite::Connection,
+        id: &str,
+        slug: &str,
+        name: &str,
+        official_channels: &[&str],
+    ) {
+        connection
+            .execute(
+                "INSERT INTO model_catalog_models
+                    (id, slug, name, official_host_count, official_channel_providers_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    id,
+                    slug,
+                    name,
+                    official_channels.len() as i64,
+                    serde_json::to_string(official_channels).unwrap()
+                ],
+            )
+            .unwrap();
+    }
+
+    fn insert_provider(
+        connection: &rusqlite::Connection,
+        id: &str,
+        tier: &str,
+        is_first_party: bool,
+    ) {
+        connection
+            .execute(
+                "INSERT INTO model_catalog_providers (id, tier, is_first_party)
+                 VALUES (?1, ?2, ?3)",
+                rusqlite::params![id, tier, is_first_party as i64],
+            )
+            .unwrap();
+    }
+
+    /// 只有「目录中确有原厂渠道」的条目才进候选集，且 slug / name 大小写不敏感。
+    #[test]
+    fn first_party_keys_keep_only_models_with_official_channels() {
+        let connection = catalog_connection();
+        insert_provider(&connection, "zhipuai", "lab", true);
+        insert_provider(&connection, "openai", "lab", true);
+        insert_catalog_row(&connection, "zhipuai/glm-5.2", "glm52", "GLM-5.2", &["zhipuai", "zai"]);
+        insert_catalog_row(&connection, "openai/gpt-oss-120b", "gptoss120b", "GPT OSS 120B", &[]);
+
+        let keys = first_party_keys(&connection).unwrap();
+        assert!(keys.contains("glm52"), "slug 应命中");
+        assert!(keys.contains("glm-5.2"), "name 应按小写写入");
+        assert!(
+            !keys.contains("gptoss120b"),
+            "无原厂渠道的模型不得进入候选集"
+        );
+        assert!(!keys.contains("gpt oss 120b"));
+    }
+
+    /// 聚合路由方把自己的路由名登记为「官方渠道」，不得算原厂模型。
+    #[test]
+    fn first_party_keys_exclude_gateway_self_declared_official() {
+        let connection = catalog_connection();
+        insert_provider(&connection, "trustedrouter", "gateway", false);
+        insert_provider(&connection, "deepseek", "lab", true);
+        // 路由方自封「官方渠道」
+        insert_catalog_row(&connection, "trustedrouter/auto", "auto", "Auto", &["trustedrouter"]);
+        // 同一供应商同时是原厂与三方
+        insert_catalog_row(
+            &connection,
+            "deepseek/deepseek-v4-pro",
+            "deepseekv4pro",
+            "DeepSeek V4 Pro",
+            &["deepseek", "nano-gpt"],
+        );
+
+        let keys = first_party_keys(&connection).unwrap();
+        assert!(
+            !keys.contains("auto"),
+            "聚合路由方自封的官方渠道不得算原厂"
+        );
+        assert!(keys.contains("deepseekv4pro"), "真原厂渠道应保留");
+        assert!(keys.contains("deepseek v4 pro"));
+    }
+
+    /// 未登记进原厂别名表的「tier=lab」自营云不是已核实的原厂供应商——
+    /// 判定必须严格按 `is_first_party` 数据，不能拿 tier 兜底。
+    #[test]
+    fn first_party_keys_require_vetted_first_party_provider() {
+        let connection = catalog_connection();
+        // sarvam-like：tier=lab 但不在原厂别名表
+        insert_provider(&connection, "sarvam", "lab", false);
+        insert_provider(&connection, "anthropic", "lab", true);
+        insert_catalog_row(&connection, "sarvam/sarvam-105b", "sarvam105b", "Sarvam 105B", &["sarvam"]);
+        insert_catalog_row(&connection, "anthropic/claude-opus-5", "claudeopus5", "Claude Opus 5", &["anthropic"]);
+
+        let keys = first_party_keys(&connection).unwrap();
+        assert!(
+            !keys.contains("sarvam105b"),
+            "未登记的自营云不得凭 tier=lab 混入原厂候选"
+        );
+        assert!(keys.contains("claudeopus5"), "已核实原厂应保留");
+    }
+
+    /// 目录表仍是旧结构（无官方渠道列）时不得报错，也不得臆造原厂。
+    #[test]
+    fn first_party_keys_tolerate_legacy_catalog_schema() {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE model_catalog_models (
+                    id TEXT PRIMARY KEY,
+                    slug TEXT NOT NULL DEFAULT '',
+                    name TEXT NOT NULL DEFAULT ''
+                );",
+            )
+            .unwrap();
+        assert!(first_party_keys(&connection).unwrap().is_empty());
+
+        // 表还不存在时同样返回空集，而不是 Err。
+        let empty = rusqlite::Connection::open_in_memory().unwrap();
+        assert!(first_party_keys(&empty).unwrap().is_empty());
     }
 }

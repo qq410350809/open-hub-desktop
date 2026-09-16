@@ -196,11 +196,34 @@ function open() {
   nextTick(() => {
     computeMenuPosition();
     requestAnimationFrame(computeMenuPosition);
+    // 打开时把选中项滚进可视区：选项列表可能很长（如按 lab 分组的数百个模型）
+    scrollToSelected();
     // 如果启用了搜索，自动聚焦搜索框
     if (props.searchable) {
       nextTick(() => searchInputRef.value?.focus());
     }
   });
+}
+
+/**
+ * 把当前选中项滚动到菜单可视区（不够长或未选中时不动）。
+ *
+ * 用矩形差值手动调 `scrollTop` 而不用 `scrollIntoView`：后者会把页面的
+ * 滚动容器也一起滚，弹窗场景下会让整个页面跳动。
+ */
+function scrollToSelected() {
+  const menu = menuRef.value;
+  const list = menu?.querySelector<HTMLElement>(".select-options-list");
+  if (!list) return;
+  const selected = list.querySelector<HTMLElement>(".select-option.selected");
+  if (!selected) return;
+  const listRect = list.getBoundingClientRect();
+  const selRect = selected.getBoundingClientRect();
+  if (selRect.top < listRect.top) {
+    list.scrollTop += selRect.top - listRect.top;
+  } else if (selRect.bottom > listRect.bottom) {
+    list.scrollTop += selRect.bottom - listRect.bottom;
+  }
 }
 
 function close() {

@@ -121,7 +121,7 @@ impl AnthropicProtocolAdapter {
             .and_then(JsonValue::as_str)
             .unwrap_or("");
         if !reasoning.trim().is_empty() {
-            content_blocks.push(json!({ "type": "thinking", "thinking": reasoning }));
+            content_blocks.push(json!({ "type": "thinking", "thinking": reasoning, "signature": "openhub-sig" }));
         }
 
         // 提取文本内容

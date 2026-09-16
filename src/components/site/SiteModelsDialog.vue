@@ -26,6 +26,8 @@ interface FetchSiteModelsResult {
   keyGroups?: Record<string, string>;
   keyModels?: Record<string, LiveModelItem[]>;
   errors?: string[];
+  /** 实际产出这批 Key 的账号（Chrome Profile）；空表示无归属。 */
+  profileId?: string;
 }
 
 type ModelApiSource = "newapi-key" | "sub2api-key" | "pricing" | "models" | "none";
@@ -277,18 +279,21 @@ async function refreshModels(mode: "cache" | "keys" | "models" = "cache") {
       let baseUrl = requestedSite.apiBaseUrl.trim();
       if (!baseUrl.endsWith("/")) baseUrl += "/";
       if (sessions.length === 0) {
-        // 没有有效账号，尝试不带 profileId 请求。
+        // 没有有效账号，尝试不带 profileId 请求。后端会借有效账号的会话抓取，
+        // 并在 result.profileId 标注 Key 的真实归属：按它落库，避免 Key
+        // 脱离账号挂到无名行；后端没给归属时才退回站点级（profileId 空串）。
         try {
           const result = await runCommand<FetchSiteModelsResult>("fetch_site_models_json", {
             url: baseUrl,
             siteId: requestedSite.id,
           });
+          const ownerId = result.profileId || "";
           // 同步 Key 成功获取数据后，保存前清理掉这个站点原来的对应旧数据，避免数据冲突与旧 Key 残留
           await runCommand("clear_site_model_cache_for_site", { siteId: requestedSite.id });
           await runCommand("save_site_model_cache_for_account", {
             siteId: requestedSite.id,
             account: {
-              profileId: "",
+              profileId: ownerId,
               profileName: "",
               accountName: "",
               username: "",

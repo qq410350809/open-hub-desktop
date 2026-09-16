@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, onUnmounted, ref, computed } from "vue";
+import { onMounted, onUnmounted, ref, computed, onErrorCaptured } from "vue";
 import LoginView from "./components/auth/LoginView.vue";
 import {
   AuthExpiredError,
@@ -71,8 +71,27 @@ const loginHintUsername = ref("");
 let businessStarted = false;
 let removeAuthExpiredListener: (() => void) | null = null;
 let authProbeTimer: number | null = null;
-// 原生菜单 → 前端联动（后端 on_menu_event 发出）。
 let menuUnlisteners: UnlistenFn[] = [];
+
+const pageError = ref<{ message: string; stack?: string } | null>(null);
+
+onErrorCaptured((err, _instance, info) => {
+  console.error("[OpenHub] 页面渲染异常已捕获：", err, info);
+  pageError.value = {
+    message: err instanceof Error ? err.message : String(err),
+    stack: err instanceof Error ? err.stack : undefined,
+  };
+  return false; // 阻止异常向上传播导致根应用卸载白屏
+});
+
+function reloadApp() {
+  window.location.reload();
+}
+
+function dismissPageError() {
+  pageError.value = null;
+  store.openTokenStats();
+}
 
 /** 处理原生菜单的页面导航（与右键菜单 oh-menu-navigate 同一通路）。 */
 function onNativeMenuNavigate(page: string) {
@@ -442,4 +461,101 @@ onUnmounted(() => {
       </button>
     </template>
   </div>
+
+  <!-- 全局错误边界保护弹窗：防止任何子页面异常导致白屏崩溃 -->
+  <div v-if="pageError" class="oh-error-boundary-mask">
+    <div class="oh-error-boundary-dialog" role="alertdialog" aria-modal="true">
+      <div class="oh-error-header">
+        <span class="oh-error-badge">⚠️ 页面渲染保护</span>
+        <button type="button" class="close-button" aria-label="关闭" @click="dismissPageError">&times;</button>
+      </div>
+      <div class="oh-error-body">
+        <p class="oh-error-title">该模块在渲染计算时遇到未捕获异常，已成功拦截以保护应用正常运行：</p>
+        <pre class="oh-error-pre">{{ pageError.message }}</pre>
+        <pre v-if="pageError.stack" class="oh-error-stack">{{ pageError.stack }}</pre>
+      </div>
+      <div class="oh-error-footer">
+        <button type="button" class="btn btn-secondary" @click="reloadApp">重新加载客户端</button>
+        <button type="button" class="btn btn-primary" @click="dismissPageError">返回本地统计页</button>
+      </div>
+    </div>
+  </div>
 </template>
+
+<style scoped>
+.oh-error-boundary-mask {
+  position: fixed;
+  inset: 0;
+  z-index: 99999;
+  background: rgba(0, 0, 0, 0.65);
+  backdrop-filter: blur(4px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+.oh-error-boundary-dialog {
+  background: var(--bg-card, #1c1d21);
+  border: 1px solid var(--border-color, #2e3038);
+  border-radius: 12px;
+  max-width: 640px;
+  width: 100%;
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.5);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+.oh-error-header {
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--border-color, #2e3038);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.oh-error-badge {
+  font-size: 14px;
+  font-weight: 600;
+  color: #ff9800;
+}
+.oh-error-body {
+  padding: 20px;
+  max-height: 60vh;
+  overflow-y: auto;
+}
+.oh-error-title {
+  font-size: 13px;
+  color: var(--text-secondary, #a0a5b5);
+  margin-bottom: 12px;
+}
+.oh-error-pre {
+  background: rgba(255, 68, 68, 0.1);
+  border: 1px solid rgba(255, 68, 68, 0.25);
+  color: #ff6b6b;
+  padding: 12px;
+  border-radius: 6px;
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  font-family: monospace;
+}
+.oh-error-stack {
+  margin-top: 8px;
+  background: rgba(0, 0, 0, 0.3);
+  padding: 10px;
+  border-radius: 6px;
+  font-size: 11px;
+  color: var(--text-muted, #727788);
+  white-space: pre-wrap;
+  word-break: break-all;
+  font-family: monospace;
+  max-height: 160px;
+  overflow-y: auto;
+}
+.oh-error-footer {
+  padding: 14px 20px;
+  border-top: 1px solid var(--border-color, #2e3038);
+  display: flex;
+  justify-content: flex-end;
+  gap: 12px;
+}
+</style>
