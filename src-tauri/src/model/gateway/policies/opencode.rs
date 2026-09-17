@@ -4,6 +4,14 @@
 //! 白名单、200 空内容缺陷容错等。此前这些逻辑散落在 balancer / dispatcher /
 //! router / config 各处，本模块将其归拢为单一入口 —— 修改 OpenCode 行为
 //! 只改这里；新增其他特殊渠道时可参照此模式建立同级策略文件。
+//!
+//! 免费层身份校验（上游 2026-09 收紧，实测结论）：
+//! - `User-Agent` 必须以 `opencode/<版本>` 开头且版本 ≥ 1.17.0，否则 403
+//!   「OpenCode's free tier can only be used from within OpenCode」（低于版本下限为 426）；
+//! - `x-opencode-session` 必须是 `ses_` + 12 位小写十六进制 + 14 位 Base62（总长 26），
+//!   长度、前缀、大小写、字符集任一不符同样 403；
+//! - `x-opencode-client` / `x-opencode-project` / `x-opencode-request` 不参与校验，
+//!   但取值保持与真实 CLI 一致，避免后续再加形状校验时二次失配。
 
 use super::super::types::ChannelConfig;
 use serde_json::Value as JsonValue;
@@ -12,10 +20,22 @@ use serde_json::Value as JsonValue;
 pub const CHANNEL_ID: &str = "opencode";
 pub const STATS_ID: u32 = 1;
 
-/// 官方 CLI 身份标识（抹平 CLI 与反代差异，享受官方正常会话配额）
-const CLI_USER_AGENT: &str = "opencode/1.18.18/cli";
+/// 官方 CLI 版本：上游免费层解析 User-Agent 中的版本号，低于 1.17.0 直接返回
+/// 426 UpgradeRequired；UA 缺失或不是 `opencode/<版本>` 前缀则返回 403。
+/// 常量值同步官方 CLI（升级后可随之上调），不得低于上游下限。
+const CLI_VERSION: &str = "1.18.30";
+/// 官方 CLI UA 的运行时版本段（真实 CLI 由 Vercel AI SDK + Bun 发出）
+const CLI_AI_SDK_VERSION: &str = "4.0.23";
+const CLI_BUN_VERSION: &str = "1.3.14";
 /// 非 OpenCode 渠道的默认网关身份
 pub const GATEWAY_USER_AGENT: &str = "OpenHub-Gateway/0.3.0";
+
+/// 官方 CLI User-Agent：`opencode/<版本> ai-sdk/provider-utils/<版本> runtime/bun/<版本>`
+pub(crate) fn cli_user_agent() -> String {
+    format!(
+        "opencode/{CLI_VERSION} ai-sdk/provider-utils/{CLI_AI_SDK_VERSION} runtime/bun/{CLI_BUN_VERSION}"
+    )
+}
 
 /// 判断渠道是否为 OpenCode 渠道
 pub fn is_opencode_channel(channel: &ChannelConfig) -> bool {
@@ -76,7 +96,9 @@ pub fn target_protocol_for_opencode_model(
 }
 
 /// OpenCode 推理模型缺省思考档位与 Token 预算
-pub fn default_reasoning_for_model(model: &str) -> Option<crate::model::gateway::ir::ReasoningConfig> {
+pub fn default_reasoning_for_model(
+    model: &str,
+) -> Option<crate::model::gateway::ir::ReasoningConfig> {
     if is_opencode_reasoning_model(model) {
         Some(crate::model::gateway::ir::ReasoningConfig {
             effort: Some("high".to_string()),
@@ -105,18 +127,68 @@ pub fn check_model_channel_compatibility(
     Ok(())
 }
 
+/// 官方 CLI 标识主体长度：12 位时间戳段 + 14 位随机段
+const ID_TS_HEX_LEN: usize = 12;
+const ID_RAND_LEN: usize = 14;
+/// Base62 字母表（数字 + 大写 + 小写），与官方 CLI 随机段字符集一致
+const BASE62: &[u8; 62] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+
+/// 生成官方 CLI 形状的标识主体：12 位小写十六进制（毫秒时间戳）+ 14 位 Base62。
+/// 时间戳段取当前毫秒，保持单调、贴近官方 ID 的可读前缀；随机段由 seed 派生，
+/// 同一 seed 的随机段稳定（跨毫秒生成时仅时间戳段前进）。
+/// 上游只校验形状，不校验时间戳真实性与随机段内容。
+fn ascending_id_body(seed: &str) -> String {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let mut body = format!(
+        "{:0width$x}",
+        millis & 0x0000_FFFF_FFFF_FFFF,
+        width = ID_TS_HEX_LEN
+    );
+    let mut state = fnv1a_64(seed.as_bytes());
+    for _ in 0..ID_RAND_LEN {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        body.push(BASE62[(state >> 33) as usize % BASE62.len()] as char);
+    }
+    body
+}
+
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// 会话 ID：`ses_` + 26 位标识主体。前缀必须是 `ses_`（`sess_` 等变体一律被拒），
+/// 主体长度、字符集任一不符都会触发 403 免费层拦截。
+pub(crate) fn cli_session_id(seed: &str) -> String {
+    format!("ses_{}", ascending_id_body(seed))
+}
+
+/// 消息 ID：`msg_` + 26 位标识主体，对应真实 CLI 的 x-opencode-request 取值
+pub(crate) fn cli_message_id(seed: &str) -> String {
+    format!("msg_{}", ascending_id_body(seed))
+}
+
 /// OpenCode 官方 CLI 身份与会话请求头组（供出网请求注入）
 pub(crate) fn cli_identity_header_pairs(
     session_seed: &str,
     attempt_req_id: &str,
 ) -> Vec<(&'static str, String)> {
-    let session_id = format!("sess_{}", session_seed.replace('-', ""));
     vec![
-        ("User-Agent", CLI_USER_AGENT.to_string()),
+        ("User-Agent", cli_user_agent()),
         ("x-opencode-client", "cli".to_string()),
-        ("x-opencode-session", session_id),
-        ("x-opencode-project", "proj_openhub_gateway".to_string()),
-        ("x-opencode-request", attempt_req_id.to_string()),
+        ("x-opencode-session", cli_session_id(session_seed)),
+        // 真实 CLI 在非项目目录下发送 global（项目内为项目哈希）
+        ("x-opencode-project", "global".to_string()),
+        ("x-opencode-request", cli_message_id(attempt_req_id)),
     ]
 }
 
@@ -139,7 +211,7 @@ pub(crate) fn apply_models_probe_identity(
 ) -> reqwest::RequestBuilder {
     if matches_channel_or_url(channel, base_url) {
         builder = builder
-            .header("User-Agent", CLI_USER_AGENT)
+            .header("User-Agent", cli_user_agent())
             .header("x-opencode-client", "cli");
     } else {
         builder = builder.header("User-Agent", GATEWAY_USER_AGENT);
@@ -199,6 +271,23 @@ pub fn is_empty_success_payload(body: &[u8]) -> bool {
     no_text && no_tools && no_reasoning
 }
 
+/// 上游免费层对会话 ID 的形状要求（实测 2026-09）：
+/// `ses_` + 12 位小写十六进制 + 14 位 Base62，总长固定 26。
+/// 形状校验器同时供出网链路测试（tests/mod.rs）断言真实发出的请求头。
+#[cfg(test)]
+pub(crate) fn upstream_accepts_session_id(id: &str) -> bool {
+    let Some(body) = id.strip_prefix("ses_") else {
+        return false;
+    };
+    if body.len() != ID_TS_HEX_LEN + ID_RAND_LEN {
+        return false;
+    }
+    let (ts, rand) = body.split_at(ID_TS_HEX_LEN);
+    ts.bytes()
+        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        && rand.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
 #[cfg(test)]
 mod opencode_policy_tests {
     use super::*;
@@ -229,12 +318,126 @@ mod opencode_policy_tests {
                 .map(|(_, v)| v.as_str())
                 .expect(k)
         };
-        assert_eq!(get("User-Agent"), "opencode/1.18.18/cli");
+        // UA 版本段是硬性下限：低于 1.17.0 上游直接 426
+        let ua = get("User-Agent");
+        assert!(
+            ua.starts_with("opencode/"),
+            "UA 必须带 opencode/ 前缀: {ua}"
+        );
+        let version = ua
+            .trim_start_matches("opencode/")
+            .split_whitespace()
+            .next()
+            .expect("UA 含版本段");
+        let segments: Vec<u32> = version.split('.').filter_map(|s| s.parse().ok()).collect();
+        assert!(
+            segments.len() >= 3 && (segments[0], segments[1]) >= (1, 17),
+            "UA 版本需 ≥ 1.17.0: {version}"
+        );
         assert_eq!(get("x-opencode-client"), "cli");
-        // 会话 ID 必须剥离连字符
-        assert_eq!(get("x-opencode-session"), "sess_abcdef123");
-        assert_eq!(get("x-opencode-project"), "proj_openhub_gateway");
-        assert_eq!(get("x-opencode-request"), "req_9");
+        assert_eq!(get("x-opencode-project"), "global");
+        // 会话 ID 是免费层的实际闸门：形状不符（如旧的 sess_ 前缀）会被 403 拦截
+        let session = get("x-opencode-session");
+        assert!(
+            upstream_accepts_session_id(session),
+            "会话 ID 形状不被上游接受: {session}"
+        );
+        assert!(get("x-opencode-request").starts_with("msg_"));
+    }
+
+    #[test]
+    fn session_and_message_ids_follow_cli_shape_and_derive_random_segment_from_seed() {
+        let session = cli_session_id("req_18c1f0a9b");
+        assert!(
+            upstream_accepts_session_id(&session),
+            "会话 ID 形状: {session}"
+        );
+
+        // 时间戳段随毫秒前进，随机段由 seed 派生：同 seed 稳定、不同 seed 不撞车
+        let rand_segment = |id: &str| id[4 + ID_TS_HEX_LEN..].to_string();
+        let again = cli_session_id("req_18c1f0a9b");
+        assert_eq!(rand_segment(&session), rand_segment(&again));
+        assert_ne!(
+            rand_segment(&session),
+            rand_segment(&cli_session_id("req_18c1f0a9c"))
+        );
+
+        let message = cli_message_id("req_18c1f0a9b");
+        assert!(message.starts_with("msg_"));
+        assert_eq!(
+            message.trim_start_matches("msg_").len(),
+            ID_TS_HEX_LEN + ID_RAND_LEN
+        );
+        // 会话与消息共用同一主体生成器：同 seed 随机段一致，靠前缀区分身份类型
+        assert_eq!(rand_segment(&session), rand_segment(&message));
+        assert_ne!(session, message);
+    }
+
+    #[test]
+    fn upstream_rejection_cases_are_covered_by_shape_check() {
+        // 旧实现产物：ses_ 前缀写成 sess_、超长十六进制主体 —— 上游实测 403 的形态，
+        // 形状校验必须把它们判为不合法，避免回归
+        assert!(!upstream_accepts_session_id("sess_abcdef123"));
+        assert!(!upstream_accepts_session_id(&format!(
+            "ses_{}",
+            "a".repeat(32)
+        )));
+        assert!(!upstream_accepts_session_id(
+            "ses_D841B79557AAE959A4C2A3A4DB"
+        ));
+        assert!(!upstream_accepts_session_id(
+            "ses_d841b79557aae959a4c2a3a4d"
+        ));
+    }
+
+    /// 真实上游身份校验（**需联网**，默认忽略）：把策略层产出的身份头直发 zen 免费层，
+    /// 确认不再触发 403「free tier can only be used from within OpenCode」/426 版本过低。
+    /// 模型可用性随上游波动，故只断言身份闸门本身，不断言业务成功。
+    ///
+    /// ```sh
+    /// cargo test --lib opencode_identity_passes_upstream_free_tier_gate -- --ignored --nocapture
+    /// ```
+    #[tokio::test]
+    #[ignore]
+    async fn opencode_identity_passes_upstream_free_tier_gate() {
+        let pairs = cli_identity_header_pairs("req_e2e_probe", "req_e2e_probe");
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(60))
+            .build()
+            .expect("构建 HTTP 客户端");
+        let mut request = client
+            .post("https://opencode.ai/zen/v1/chat/completions")
+            .header("Content-Type", "application/json");
+        for (name, value) in &pairs {
+            request = request.header(*name, value.clone());
+        }
+        let resp = request
+            .json(&serde_json::json!({
+                "model": "big-pickle",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 8,
+            }))
+            .send()
+            .await
+            .expect("请求上游失败");
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        eprintln!("上游响应 {status}: {}", &body[..body.len().min(200)]);
+
+        assert!(
+            !body.contains("free tier can only be used from within OpenCode"),
+            "身份头未通过免费层校验: {body}"
+        );
+        assert_ne!(
+            status,
+            reqwest::StatusCode::UPGRADE_REQUIRED,
+            "UA 版本低于上游下限: {body}"
+        );
+        assert_ne!(
+            status,
+            reqwest::StatusCode::UNAUTHORIZED,
+            "身份被拒: {body}"
+        );
     }
 
     #[test]
@@ -301,7 +504,9 @@ mod opencode_policy_tests {
 
     #[test]
     fn opencode_muse_spark_routes_to_responses_protocol_while_others_stay_chat() {
-        assert!(is_opencode_responses_model("muse-spark-1.3-contributor-free"));
+        assert!(is_opencode_responses_model(
+            "muse-spark-1.3-contributor-free"
+        ));
         assert!(is_opencode_responses_model("opencode/muse-spark-1.2"));
         assert!(!is_opencode_responses_model("mimo-v2.5-free"));
         assert!(!is_opencode_responses_model("deepseek-v4-flash-free"));

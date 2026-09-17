@@ -1397,12 +1397,14 @@ async fn spawn_scripted_upstream_with_arrivals(
 }
 
 /// mock 上游构建实体（不做预热，避免与预热入口形成 async 递归）。
-async fn spawn_mock_upstream(
+/// 返回地址、请求计数器、到达时间戳、每次请求的请求头快照（出网身份断言用）。
+async fn spawn_mock_upstream_capturing(
     script: Vec<(axum::http::StatusCode, &'static str)>,
 ) -> (
     std::net::SocketAddr,
     std::sync::Arc<std::sync::atomic::AtomicUsize>,
     std::sync::Arc<std::sync::Mutex<Vec<std::time::Instant>>>,
+    std::sync::Arc<std::sync::Mutex<Vec<axum::http::HeaderMap>>>,
 ) {
     use axum::{routing::post, Router};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1410,18 +1412,22 @@ async fn spawn_mock_upstream(
 
     let counter = Arc::new(AtomicUsize::new(0));
     let arrivals = Arc::new(Mutex::new(Vec::new()));
+    let headers_log: Arc<Mutex<Vec<axum::http::HeaderMap>>> = Arc::new(Mutex::new(Vec::new()));
     let script = Arc::new(script);
     let script_for_route = script.clone();
     let counter_for_route = counter.clone();
     let arrivals_for_route = arrivals.clone();
+    let headers_for_route = headers_log.clone();
     let app = Router::new().route(
         "/v1/chat/completions",
-        post(move || {
+        post(move |headers: axum::http::HeaderMap| {
             let script = script_for_route.clone();
             let counter = counter_for_route.clone();
             let arrivals = arrivals_for_route.clone();
+            let headers_log = headers_for_route.clone();
             async move {
                 arrivals.lock().unwrap().push(std::time::Instant::now());
+                headers_log.lock().unwrap().push(headers);
                 let n = counter.fetch_add(1, Ordering::SeqCst);
                 let (status, body) = if n < script.len() {
                     script[n]
@@ -1437,6 +1443,18 @@ async fn spawn_mock_upstream(
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
+    (addr, counter, arrivals, headers_log)
+}
+
+/// mock 上游构建实体（不带请求头快照，保持既有调用点简洁）。
+async fn spawn_mock_upstream(
+    script: Vec<(axum::http::StatusCode, &'static str)>,
+) -> (
+    std::net::SocketAddr,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    std::sync::Arc<std::sync::Mutex<Vec<std::time::Instant>>>,
+) {
+    let (addr, counter, arrivals, _headers) = spawn_mock_upstream_capturing(script).await;
     (addr, counter, arrivals)
 }
 
@@ -1676,6 +1694,55 @@ async fn opencode_502_retries_inplace_once_then_succeeds() {
     assert_eq!(success.status, 200);
     assert_eq!(counter.load(Ordering::SeqCst), 2);
     assert!(elapsed >= Duration::from_millis(1000));
+}
+
+#[tokio::test]
+async fn opencode_channel_egress_carries_upstream_accepted_cli_identity() {
+    use crate::model::gateway::policies::opencode::upstream_accepts_session_id;
+
+    // 上游免费层按 UA 版本 + 会话 ID 形状判定「请求来自 OpenCode 客户端」：
+    // 旧实现发的 sess_<hex> 会话前缀被 403 拦截（OpenCode's free tier ...）。
+    // 这里断言真实出网请求（经 dispatcher 完整链路）带齐可通过该校验的身份头。
+    let (addr, _counter, _arrivals, headers_log) =
+        spawn_mock_upstream_capturing(vec![(axum::http::StatusCode::OK, valid_chat_payload())])
+            .await;
+    let channel = egress_test_channel("opencode", format!("http://{addr}/v1"));
+
+    run_egress(&channel, 0).await.expect("mock 上游应返回成功");
+
+    let headers = headers_log.lock().unwrap();
+    let sent = headers.first().expect("mock 上游应收到一次请求");
+    let header = |name: &str| {
+        sent.get(name)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string()
+    };
+
+    let ua = header("user-agent");
+    assert!(
+        ua.starts_with("opencode/"),
+        "UA 必须带 opencode/ 前缀: {ua}"
+    );
+    let version = ua
+        .trim_start_matches("opencode/")
+        .split_whitespace()
+        .next()
+        .unwrap_or_default();
+    let segments: Vec<u32> = version.split('.').filter_map(|s| s.parse().ok()).collect();
+    assert!(
+        segments.len() >= 3 && (segments[0], segments[1]) >= (1, 17),
+        "UA 版本需 ≥ 1.17.0（上游下限）: {version}"
+    );
+
+    let session = header("x-opencode-session");
+    assert!(
+        upstream_accepts_session_id(&session),
+        "会话 ID 形状不被上游接受: {session}"
+    );
+    assert_eq!(header("x-opencode-client"), "cli");
+    assert_eq!(header("x-opencode-project"), "global");
+    assert!(header("x-opencode-request").starts_with("msg_"));
 }
 
 #[tokio::test]
