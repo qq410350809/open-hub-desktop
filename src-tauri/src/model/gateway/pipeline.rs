@@ -14,7 +14,8 @@ use super::dispatcher::{
 };
 use super::egress::{self, TargetProtocol};
 use super::logger::{
-    client_name_from_headers, record_attempt_failure, user_agent_from_headers, ProxyLogParams,
+    client_name_from_headers, record_attempt_failure, session_id_from_headers,
+    user_agent_from_headers, ProxyLogParams,
 };
 use super::policies::opencode::check_model_channel_compatibility;
 use super::router::check_auth;
@@ -322,6 +323,7 @@ pub async fn resolve_channel_or_404<'a>(
     style: ClientProtocol,
     client_name: Option<String>,
     user_agent: Option<String>,
+    session_id: Option<String>,
 ) -> Result<(&'a ChannelConfig, String), Response> {
     // (日志归属渠道别名, 统计 ID, 错误信息)
     let (log_channel, log_stats_id, err_msg) = match resolve_channel_detailed(config, raw_model) {
@@ -364,7 +366,8 @@ pub async fn resolve_channel_or_404<'a>(
         )
         .with_channel_stats_id(log_stats_id)
         .with_client_name(client_name)
-        .with_user_agent(user_agent),
+        .with_user_agent(user_agent)
+        .with_session_id(session_id),
     )
     .await;
     Err(model_not_found_response_with_message(err_msg, style))
@@ -385,6 +388,7 @@ pub async fn validate_model_channel_request(
     req_body_str: &Option<String>,
     client_name: Option<String>,
     user_agent: Option<String>,
+    session_id: Option<String>,
 ) -> Result<(), Response> {
     if let Err(err_msg) = check_model_channel_compatibility(channel, model_to_send, channel_api_key)
     {
@@ -405,7 +409,8 @@ pub async fn validate_model_channel_request(
             )
             .with_channel_stats_id(channel.stats_id.map(|v| v.to_string()))
             .with_client_name(client_name)
-            .with_user_agent(user_agent),
+            .with_user_agent(user_agent)
+            .with_session_id(session_id),
         )
         .await;
         return Err(incompatible_model_response(err_msg, style));
@@ -484,6 +489,7 @@ async fn dispatch_single_channel_egress(
     style: ClientProtocol,
     client_name: Option<String>,
     user_agent: Option<String>,
+    session_id: Option<String>,
 ) -> Result<EgressOutcome, Response> {
     let chan_alias = channel.effective_alias();
     let chan_stats_id = channel.stats_id;
@@ -523,7 +529,8 @@ async fn dispatch_single_channel_egress(
                 )
                 .with_channel_stats_id(chan_stats_id.map(|v| v.to_string()))
                 .with_client_name(client_name.clone())
-                .with_user_agent(user_agent.clone()),
+                .with_user_agent(user_agent.clone())
+                .with_session_id(session_id.clone()),
             )
             .await;
             return Err(incompatible_model_response(err_msg, style));
@@ -601,6 +608,7 @@ async fn dispatch_single_channel_egress(
             req_body_str,
             client_name.clone(),
             user_agent.clone(),
+            session_id.clone(),
         )
         .await
         {
@@ -633,6 +641,7 @@ async fn dispatch_single_channel_egress(
             req_body_str: req_body_str.clone(),
             client_name: client_name.clone(),
             user_agent: user_agent.clone(),
+            session_id: session_id.clone(),
         };
 
         match execute_resilient_egress(
@@ -754,6 +763,7 @@ pub async fn dispatch_protocol_egress(
     style: ClientProtocol,
     client_name: Option<String>,
     user_agent: Option<String>,
+    session_id: Option<String>,
 ) -> Result<EgressOutcome, Response> {
     // 候选列表：定向请求最多只有被指派的渠道自身，裸模型名才可能有后备渠道
     let fallbacks: Vec<&ChannelConfig> = if config.channel_failover {
@@ -795,6 +805,7 @@ pub async fn dispatch_protocol_egress(
             style,
             client_name.clone(),
             user_agent.clone(),
+            session_id.clone(),
         )
         .await
         {
@@ -863,6 +874,7 @@ pub async fn auth_and_count(
             req_body_str.clone(),
             Some(client_name_from_headers(headers, path)),
             user_agent_from_headers(headers),
+            session_id_from_headers(headers),
         )
         .await;
         return Err(res);

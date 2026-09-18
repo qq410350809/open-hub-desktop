@@ -100,6 +100,8 @@ pub struct EgressRequestMeta {
     pub client_name: Option<String>,
     /// 客户端原始 User-Agent 请求头（截断保存）
     pub user_agent: Option<String>,
+    /// 客户端会话标识（x-session-id 等）
+    pub session_id: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -273,6 +275,7 @@ pub async fn execute_resilient_egress(
                     .with_channel_stats_id(meta.channel_stats_id.clone())
                     .with_client_name(meta.client_name.clone())
                     .with_user_agent(meta.user_agent.clone())
+                    .with_session_id(meta.session_id.clone())
                     .with_upstream_url(Some(upstream_url.to_string()))
                     .with_response_body(cap_log_body(err_text)),
                 )
@@ -330,6 +333,7 @@ pub async fn execute_resilient_egress(
                     .with_channel_stats_id(meta.channel_stats_id.clone())
                     .with_client_name(meta.client_name.clone())
                     .with_user_agent(meta.user_agent.clone())
+                    .with_session_id(meta.session_id.clone())
                     .with_upstream_url(Some(upstream_url.to_string()))
                     .with_response_body(cap_log_body(
                         String::from_utf8_lossy(&body_bytes).to_string(),
@@ -408,16 +412,17 @@ pub async fn execute_resilient_egress(
                             meta.req_body_str.clone(),
                             Some(node_display),
                         )
-                        .with_channel_stats_id(meta.channel_stats_id.clone())
-                        .with_client_name(meta.client_name.clone())
-                        .with_user_agent(meta.user_agent.clone())
-                        .with_upstream_url(Some(upstream_url.to_string()))
-                        .with_response_body(cap_log_body(err_text)),
-                    )
-                    .await;
+                    .with_channel_stats_id(meta.channel_stats_id.clone())
+                    .with_client_name(meta.client_name.clone())
+                    .with_user_agent(meta.user_agent.clone())
+                    .with_session_id(meta.session_id.clone())
+                    .with_upstream_url(Some(upstream_url.to_string()))
+                    .with_response_body(cap_log_body(err_text)),
+                )
+                .await;
 
-                    return Err((
-                        StatusCode::UNAUTHORIZED,
+                return Err((
+                    StatusCode::UNAUTHORIZED,
                         [("content-type", "application/json")],
                         err_bytes,
                     )
@@ -448,15 +453,16 @@ pub async fn execute_resilient_egress(
                             meta.req_body_str.clone(),
                             Some(node_display),
                         )
-                        .with_channel_stats_id(meta.channel_stats_id.clone())
-                        .with_client_name(meta.client_name.clone())
-                        .with_user_agent(meta.user_agent.clone())
-                        .with_upstream_url(Some(upstream_url.to_string()))
-                        .with_response_body(cap_log_body(err_text.clone())),
-                    )
-                    .await;
+                    .with_channel_stats_id(meta.channel_stats_id.clone())
+                    .with_client_name(meta.client_name.clone())
+                    .with_user_agent(meta.user_agent.clone())
+                    .with_session_id(meta.session_id.clone())
+                    .with_upstream_url(Some(upstream_url.to_string()))
+                    .with_response_body(cap_log_body(err_text.clone())),
+                )
+                .await;
 
-                    if count_429 <= max_retries {
+                if count_429 <= max_retries {
                         node_round_robin.fetch_add(1, Ordering::Relaxed);
                         // 上游明确给出 Retry-After 时以它为准（截到上界），否则退回指数退避。
                         // 旧实现是线性 500+300*n（上界仅 1.4s），对上游按秒计的限流窗口太短，
@@ -491,15 +497,16 @@ pub async fn execute_resilient_egress(
                             meta.req_body_str.clone(),
                             Some(node_display),
                         )
-                        .with_channel_stats_id(meta.channel_stats_id.clone())
-                        .with_client_name(meta.client_name.clone())
-                        .with_user_agent(meta.user_agent.clone())
-                        .with_upstream_url(Some(upstream_url.to_string()))
-                        .with_response_body(cap_log_body(err_text)),
-                    )
-                    .await;
+                    .with_channel_stats_id(meta.channel_stats_id.clone())
+                    .with_client_name(meta.client_name.clone())
+                    .with_user_agent(meta.user_agent.clone())
+                    .with_session_id(meta.session_id.clone())
+                    .with_upstream_url(Some(upstream_url.to_string()))
+                    .with_response_body(cap_log_body(err_text)),
+                )
+                .await;
 
-                    if status.is_client_error() {
+                if status.is_client_error() {
                         return Err((
                             status,
                             [("content-type", "application/json")],
@@ -538,7 +545,8 @@ pub async fn execute_resilient_egress(
                     )
                     .with_channel_stats_id(meta.channel_stats_id.clone())
                     .with_client_name(meta.client_name.clone())
-                    .with_user_agent(meta.user_agent.clone()),
+                    .with_user_agent(meta.user_agent.clone())
+                    .with_session_id(meta.session_id.clone()),
                 )
                 .await;
 

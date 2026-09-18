@@ -113,7 +113,6 @@ impl ProxyLogParams {
         self
     }
 
-    #[cfg(test)]
     pub fn with_session_id(mut self, session_id: Option<String>) -> Self {
         self.session_id = session_id;
         self
@@ -269,6 +268,7 @@ pub async fn record_auth_failure_log(
     req_body_str: Option<String>,
     client_name: Option<String>,
     user_agent: Option<String>,
+    session_id: Option<String>,
 ) {
     ctx.metrics.total_requests.fetch_add(1, Ordering::Relaxed);
     // 鉴权失败发生在渠道解析前，沿用既有惯例计入 opencode 通道（含其统计 ID）
@@ -297,7 +297,8 @@ pub async fn record_auth_failure_log(
         )
         .with_channel_stats_id(opencode_stats_id)
         .with_client_name(client_name)
-        .with_user_agent(user_agent),
+        .with_user_agent(user_agent)
+        .with_session_id(session_id),
     )
     .await;
 }

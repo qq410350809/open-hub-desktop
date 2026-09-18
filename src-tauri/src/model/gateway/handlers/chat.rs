@@ -144,6 +144,7 @@ async fn dispatch_chat_request(
 
     let client_name = client_name_from_headers(headers, CHAT_PATH);
     let user_agent = user_agent_from_headers(headers);
+    let session_id = session_id_from_headers(headers);
     let (chan, model_to_send) = match resolve_channel_or_404(
         &ctx,
         &config,
@@ -156,6 +157,7 @@ async fn dispatch_chat_request(
         ClientProtocol::OpenAi,
         Some(client_name.clone()),
         user_agent.clone(),
+        session_id.clone(),
     )
     .await
     {
@@ -183,6 +185,7 @@ async fn dispatch_chat_request(
         ClientProtocol::OpenAi,
         Some(client_name.clone()),
         user_agent.clone(),
+        session_id.clone(),
     )
     .await
     {
@@ -193,7 +196,7 @@ async fn dispatch_chat_request(
     let mut log = outcome.base_log(CHAT_PATH, &raw_model, is_stream, req_body_str);
     log.client_name = Some(client_name);
     log.user_agent = user_agent;
-    log.session_id = session_id_from_headers(headers);
+    log.session_id = session_id;
 
     if is_stream {
         // 出网已按渠道目标原生化，响应协议即 outcome.target（嗅探失败时的正确回退）

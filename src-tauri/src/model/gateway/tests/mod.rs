@@ -1186,6 +1186,7 @@ fn egress_request_meta_constructs_properly() {
         req_body_str: Some("{}".to_string()),
         client_name: Some("zcode".to_string()),
         user_agent: None,
+        session_id: None,
     };
     assert_eq!(meta.req_id, "req_abc");
     assert!(meta.stream);
@@ -1544,6 +1545,7 @@ async fn run_egress(
         req_body_str: None,
         client_name: None,
         user_agent: None,
+        session_id: None,
     };
     execute_resilient_egress(
         ctx,
@@ -2418,6 +2420,7 @@ async fn failover_switches_to_next_channel_when_primary_exhausted() {
         ClientProtocol::OpenAi,
         None,
         None,
+        None,
     )
     .await
     .expect("首选渠道耗尽后应转移到后备渠道并成功");
@@ -2476,6 +2479,7 @@ async fn aliased_request_stays_on_designated_channel_at_dispatch_layer() {
         &None,
         crate::model::gateway::egress::EgressBody::native(json!({ "model": "some-model" })),
         ClientProtocol::OpenAi,
+        None,
         None,
         None,
     )
@@ -2545,6 +2549,7 @@ async fn channel_without_matching_key_is_skipped_instead_of_privilege_escalation
         ClientProtocol::OpenAi,
         None,
         None,
+        None,
     )
     .await
     .expect("无匹配 Key 的渠道被跳过后应由后备渠道承接");
@@ -2602,6 +2607,7 @@ async fn single_channel_without_matching_key_rejects_instead_of_privilege_escala
         &None,
         crate::model::gateway::egress::EgressBody::native(json!({ "model": "shared-model" })),
         ClientProtocol::OpenAi,
+        None,
         None,
         None,
     )
@@ -2844,6 +2850,7 @@ async fn channel_failover_is_off_by_default() {
         ClientProtocol::OpenAi,
         None,
         None,
+        None,
     )
     .await;
 
@@ -2990,6 +2997,7 @@ async fn run_grouped_on(
         &None,
         crate::model::gateway::egress::EgressBody::native(json!({ "model": "m" })),
         ClientProtocol::OpenAi,
+        None,
         None,
         None,
     )

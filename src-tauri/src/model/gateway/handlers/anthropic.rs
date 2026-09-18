@@ -65,6 +65,7 @@ pub async fn handle_messages(
 
     let client_name = client_name_from_headers(&headers, PATH);
     let user_agent = user_agent_from_headers(&headers);
+    let session_id = session_id_from_headers(&headers);
     let (chan, model_to_send) = match resolve_channel_or_404(
         &ctx,
         &config,
@@ -77,6 +78,7 @@ pub async fn handle_messages(
         ClientProtocol::Anthropic,
         Some(client_name.clone()),
         user_agent.clone(),
+        session_id.clone(),
     )
     .await
     {
@@ -114,6 +116,7 @@ pub async fn handle_messages(
         ClientProtocol::Anthropic,
         Some(client_name.clone()),
         user_agent.clone(),
+        session_id.clone(),
     )
     .await
     {
@@ -124,7 +127,7 @@ pub async fn handle_messages(
     let mut log = outcome.base_log(PATH, &raw_model, is_stream, req_body_str);
     log.client_name = Some(client_name);
     log.user_agent = user_agent;
-    log.session_id = session_id_from_headers(&headers);
+    log.session_id = session_id;
 
     // 流式：快速通道走「原生字节直通 + 兼容修复 + 旁路统计」，杜绝往返转换丢失内容；
     // 跨协议转换路径仍经归一化链路
