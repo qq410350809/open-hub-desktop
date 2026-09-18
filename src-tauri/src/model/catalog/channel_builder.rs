@@ -70,6 +70,8 @@ pub struct HostBuildInput<'a> {
     pub lab: &'a str,
     /// llmpricing 的模型 id（如 `zhipuai/glm-5.2`），用于跨源匹配 models.dev 渠道。
     pub model_id: &'a str,
+    /// llmpricing 的展示名，用于「同名兜底匹配」（id 拼写差异过大时的最后手段）。
+    pub model_name: &'a str,
     /// llmpricing 分片的 `hostProviders`——**渠道范围以此为准**。
     pub host_providers: &'a [String],
     /// llmpricing 的参考价渠道。
@@ -90,6 +92,8 @@ pub struct HostBuildStats {
     pub subscription: usize,
     /// 判定为官方（原厂）的渠道数。
     pub official: usize,
+    /// 通过「同名唯一」兜底匹配到 models.dev 数据的原厂渠道数（id 拼写差异过大时）。
+    pub name_fallback: usize,
     /// `hostProviders` 中在 models.dev 查不到定价的渠道数（数据缺口，非错误）。
     pub missing_models_dev: usize,
 }
@@ -136,10 +140,22 @@ pub fn build_hosts(
 
     for provider in input.host_providers {
         let meta = provider_meta.get(provider).cloned().unwrap_or_default();
-        let variants: &[&ModelsDevChannel] = grouped.get(provider).map(Vec::as_slice).unwrap_or(&[]);
+        let official = official_set.iter().any(|id| id == provider);
+
+        // 直配：按归一化 id 找该渠道的变体。原厂渠道直配为空时，用「同名唯一」兜底——
+        // llmpricing 与 models.dev 的 id 拼写可能差太多（open-mixtral-8x22b vs
+        // mixtral-8x22b-instruct-v0.1），但展示名一致，此时该渠道确实上架了此模型。
+        let mut variants: Vec<&ModelsDevChannel> =
+            grouped.get(provider).cloned().unwrap_or_default();
+        if variants.is_empty() && official {
+            variants = index.channels_for_provider_name(provider, input.model_name);
+            if !variants.is_empty() {
+                stats.name_fallback += 1;
+            }
+        }
 
         // 展示价：优先非 `:free` 变体；只有 `:free` 时退而用之。
-        let primary = pick_primary_variant(variants);
+        let primary = pick_primary_variant(&variants);
         let display = primary;
 
         // 免费判定：**任一变体零价即免费**。
@@ -190,9 +206,9 @@ pub fn build_hosts(
             cache_write: display.and_then(|channel| channel.cache_write),
             context: display.and_then(|channel| channel.context),
             output_limit: display.and_then(|channel| channel.output_limit),
-            input_limit: merge_input_limit(variants),
-            output_modalities: merge_output_modalities(variants),
-            reasoning_options: merge_reasoning_options(variants),
+            input_limit: merge_input_limit(&variants),
+            output_modalities: merge_output_modalities(&variants),
+            reasoning_options: merge_reasoning_options(&variants),
             interleaved_field: variants
                 .iter()
                 .find_map(|channel| channel.interleaved_field.clone()),
@@ -404,6 +420,7 @@ mod tests {
         let input = HostBuildInput {
             lab: "zhipuai",
             model_id: "zhipuai/glm-5.2",
+            model_name: "GLM-5.2",
             host_providers: &list,
             ref_provider: Some("zhipuai"),
             min_provider: Some("openrouter"),
@@ -490,6 +507,7 @@ mod tests {
         let input = HostBuildInput {
             lab: "zhipuai",
             model_id: "zhipuai/glm-5.2",
+            model_name: "GLM-5.2",
             host_providers: &list,
             ref_provider: None,
             min_provider: None,
@@ -504,6 +522,79 @@ mod tests {
         assert!(!mystery.is_free);
         assert!(!mystery.official);
         assert_eq!(mystery.name, "Mystery");
+    }
+
+    #[test]
+    fn official_host_with_name_only_match_gets_priced() {
+        // mistral 渠道在 models.dev 用 `open-mixtral-8x22b` 上架，而 llmpricing 的 id 是
+        // `mixtral-8x22b-instruct-v0.1`——归一化后对不上，但展示名完全一致。
+        let value = json!({
+            "models": { "mistral/mixtral-8x22b-instruct-v0.1": { "id": "mixtral-8x22b-instruct-v0.1", "name": "Mixtral 8x22B" } },
+            "providers": {
+                "mistral": { "id": "mistral", "name": "Mistral", "models": {
+                    "open-mixtral-8x22b": { "id": "open-mixtral-8x22b", "name": "Mixtral 8x22B",
+                                            "cost": { "input": 2.0, "output": 6.0 } }
+                }}
+            }
+        });
+        let index = super::super::models_dev::build_index(&value).expect("index");
+        let mut meta = BTreeMap::new();
+        meta.insert(
+            "mistral".to_string(),
+            ProviderMeta { name: "Mistral".to_string(), tier: Some("lab".to_string()), subscription: false, doc: None },
+        );
+        let providers = vec!["mistral".to_string()];
+        let input = HostBuildInput {
+            lab: "mistral",
+            model_id: "mistral/mixtral-8x22b-instruct-v0.1",
+            model_name: "Mixtral 8x22B",
+            host_providers: &providers,
+            ref_provider: Some("mistral"),
+            min_provider: None,
+        };
+        let out = build_hosts(&index, &meta, &input);
+        assert_eq!(out.stats.name_fallback, 1, "同名兜底应命中一次");
+        assert_eq!(out.stats.missing_models_dev, 0);
+        let mistral = out.hosts.iter().find(|h| h.provider == "mistral").unwrap();
+        assert_eq!(mistral.input, Some(2.0));
+        assert_eq!(mistral.output, Some(6.0));
+        assert!(mistral.official);
+        // 展示 modelId 用 models.dev 的原拼写
+        assert_eq!(mistral.model_id.as_deref(), Some("open-mixtral-8x22b"));
+    }
+
+    #[test]
+    fn ambiguous_name_does_not_fallback() {
+        // llmpricing 的 id 与 models.dev 完全对不上（直配必空），只能靠同名字兜底；
+        // 但该渠道下 `GPT-5.4` 有两个同名条目（不同日期变体），同名歧义时必须放弃，不能猜。
+        let value = json!({
+            "models": { "unorouter/gpt-5.4": { "id": "gpt-5.4", "name": "GPT-5.4" } },
+            "providers": {
+                "unorouter": { "id": "unorouter", "name": "UnoRouter", "models": {
+                    "gpt-5.4": { "id": "gpt-5.4", "name": "GPT-5.4", "cost": { "input": 0.3, "output": 0.9 } },
+                    "gpt-5.4-0410": { "id": "gpt-5.4-0410", "name": "GPT-5.4", "cost": { "input": 0.2, "output": 0.6 } }
+                }}
+            }
+        });
+        let index = super::super::models_dev::build_index(&value).expect("index");
+        let mut meta = BTreeMap::new();
+        meta.insert(
+            "unorouter".to_string(),
+            ProviderMeta { name: "UnoRouter".to_string(), tier: Some("gateway".to_string()), subscription: false, doc: None },
+        );
+        let providers = vec!["unorouter".to_string()];
+        let input = HostBuildInput {
+            lab: "unorouter",
+            model_id: "unorouter/对不上-的-id",
+            model_name: "GPT-5.4",
+            host_providers: &providers,
+            ref_provider: None,
+            min_provider: None,
+        };
+        let out = build_hosts(&index, &meta, &input);
+        assert_eq!(out.stats.name_fallback, 0, "同名歧义时不兜底");
+        let host = out.hosts.iter().find(|h| h.provider == "unorouter").unwrap();
+        assert_eq!(host.input, None, "歧义时不凭名字认模型");
     }
 
     /// 全量保真度自查：对真实 llmpricing 分片的每个模型跑一遍组合构建，
@@ -575,11 +666,17 @@ mod tests {
         let mut under = 0usize;
         let mut total = 0usize;
 
+        // 原厂渠道价覆盖率（官方渠道行里能拿到 input/output 的占比）：
+        // 「有原厂渠道但没价」正是用户抱怨的场景，把覆盖率纳入自查。
+        let mut official_rows = 0usize;
+        let mut official_priced = 0usize;
+
         for row in &rows {
             let Some(model_id) = row.get("id").and_then(Value::as_str) else {
                 continue;
             };
             let lab = row.get("lab").and_then(Value::as_str).unwrap_or("misc");
+            let name = row.get("name").and_then(Value::as_str).unwrap_or("");
             let host_providers: Vec<String> = row
                 .get("hostProviders")
                 .and_then(Value::as_array)
@@ -605,11 +702,21 @@ mod tests {
             let input = HostBuildInput {
                 lab,
                 model_id,
+                model_name: name,
                 host_providers: &host_providers,
                 ref_provider,
                 min_provider,
             };
             let out = build_hosts(&index, &provider_meta, &input);
+
+            for host in &out.hosts {
+                if host.official {
+                    official_rows += 1;
+                    if host.input.is_some() || host.output.is_some() {
+                        official_priced += 1;
+                    }
+                }
+            }
 
             let want_sub = row.get("subHostCount").and_then(Value::as_u64).unwrap_or(0) as usize;
             let want_free = row.get("freeHostCount").and_then(Value::as_u64).unwrap_or(0) as usize;
@@ -643,6 +750,10 @@ mod tests {
         eprintln!(
             "有无免费渠道  二值一致 {binary_exact}/{total} = {:.1}%  (多报 {over} / 漏报 {under})",
             pct(binary_exact)
+        );
+        eprintln!(
+            "原厂渠道行    {official_priced}/{official_rows} 有公开价 = {:.1}%",
+            official_priced as f64 / official_rows as f64 * 100.0
         );
         // 保真度门槛：低于这些阈值说明上游数据形态变了，需要重新校准。
         assert!(pct(sub_exact) >= 99.0, "subHostCount 一致率跌破 99%");

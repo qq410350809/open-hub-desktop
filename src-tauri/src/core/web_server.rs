@@ -455,6 +455,10 @@ macro_rules! rpc_arms {
                 ))
             }
             "get_model_catalog" => Ok(json!(crate::model::catalog::get_model_catalog($ctx))),
+            "get_model_capabilities" => {
+                let keys: Vec<String> = take($args, &["keys"])?;
+                Ok(json!(crate::model::catalog::get_model_capabilities($ctx, keys)))
+            }
             "get_model_catalog_detail" => {
                 let canonical_key: Option<String> =
                     take_opt($args, &["canonicalKey", "canonical_key"])?;

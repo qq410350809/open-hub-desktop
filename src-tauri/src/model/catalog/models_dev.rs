@@ -39,7 +39,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 /// models.dev 全量目录（canonical 层 + provider 层，单文件）。
@@ -161,6 +161,24 @@ pub fn canonical_model_id(canonical_id: &str) -> &str {
         Some((_, model_id)) => model_id,
         None => canonical_id,
     }
+}
+
+/// 归一化展示名：小写 + 只保留字母数字（去掉空格 / 括号 / 破折号等）。
+///
+/// 用于「同名兜底匹配」：与 [`normalize_model_id`] 不同，这里**只比较名字**，
+/// 不剥后缀、不补边界，避免两个语义不同的模型被误认为同名。
+///
+/// 自检样例：
+/// ```text
+/// Magistral Small        -> magistralsmall
+/// nemotron-3-super       -> nemotrons3super
+/// Inkling (256K)         -> inkling256k
+/// ```
+pub fn normalize_display_name(raw: &str) -> String {
+    raw.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .flat_map(|c| c.to_lowercase())
+        .collect()
 }
 
 /// provider 层单个模型条目。
@@ -397,6 +415,15 @@ pub struct ModelsDevIndex {
     pub canonical_by_normalized: BTreeMap<String, Vec<String>>,
     /// provider id -> 渠道元信息（name / npm / api / doc）。
     pub provider_meta: BTreeMap<String, ModelsDevProvider>,
+    /// `(渠道 id, 归一化展示名)` -> 该渠道下同名模型的归一化 id 集合。
+    ///
+    /// 仅用于「渠道声明名与 llmpricing 展示名一致」时的兜底匹配：两边 id 拼写
+    /// 差异过大（`open-mixtral-8x22b` vs `mixtral-8x22b-instruct-v0.1`）无法靠
+    /// [`normalize_model_id`] 归一，但展示名往往一模一样。
+    ///
+    /// 存集合而非单个 id，是为了让调用方**只在同名唯一时**才敢用——
+    /// 实测有 63 处同渠道重名，不能凭名字认模型。
+    pub provider_name_index: BTreeMap<(String, String), BTreeSet<String>>,
 }
 
 /// models.dev 索引查询接口。部分方法目前只被回归测试使用，保留作为对外查询面。
@@ -451,6 +478,44 @@ impl ModelsDevIndex {
                 .push(channel);
         }
         grouped
+    }
+
+    /// 按归一化展示名查该渠道的渠道记录（同名兜底匹配）。
+    ///
+    /// llmpricing 与 models.dev 的模型 id 拼写可能差异过大（如
+    /// `open-mixtral-8x22b` vs `mixtral-8x22b-instruct-v0.1`），无法靠
+    /// [`normalize_model_id`] 归一化对齐，但展示名（上游 `name` 字段）常常完全一致。
+    ///
+    /// ⚠️ 安全性：**只有在该渠道下同名归一化 id 恰有一个时**才返回记录。
+    /// 同名歧义（实测 63 处同渠道重名）时返回空，绝不凭名字认模型。
+    pub fn channels_for_provider_name(
+        &self,
+        provider: &str,
+        display_name: &str,
+    ) -> Vec<&ModelsDevChannel> {
+        let normalized_name = normalize_display_name(display_name);
+        if normalized_name.is_empty() {
+            return Vec::new();
+        }
+        let Some(ids) = self
+            .provider_name_index
+            .get(&(provider.to_string(), normalized_name))
+        else {
+            return Vec::new();
+        };
+        if ids.len() != 1 {
+            return Vec::new();
+        }
+        let Some(id) = ids.iter().next() else {
+            return Vec::new();
+        };
+        self.provider
+            .get(id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+            .iter()
+            .filter(|channel| channel.provider == provider)
+            .collect()
     }
 
     /// 按归一化裸 id 查候选 canonical id 列表。
@@ -555,6 +620,7 @@ pub fn build_index(value: &Value) -> Result<ModelsDevIndex, String> {
 
     // provider 层索引
     let mut provider: BTreeMap<String, Vec<ModelsDevChannel>> = BTreeMap::new();
+    let mut provider_name_index: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
     for (provider_id, provider_entry) in &catalog.providers {
         let provider_name = provider_entry
             .name
@@ -639,6 +705,18 @@ pub fn build_index(value: &Value) -> Result<ModelsDevIndex, String> {
                 raw: model_value.clone(),
             };
 
+            // 同名索引：用渠道声明的展示名建索引（不参与归一化比对，仅作兜底）。
+            let display_name = model_value
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let normalized_name = normalize_display_name(display_name);
+            if !normalized_name.is_empty() {
+                provider_name_index
+                    .entry((provider_id.clone(), normalized_name))
+                    .or_default()
+                    .insert(channel.normalized_id.clone());
+            }
             provider
                 .entry(channel.normalized_id.clone())
                 .or_default()
@@ -651,6 +729,7 @@ pub fn build_index(value: &Value) -> Result<ModelsDevIndex, String> {
         provider,
         canonical_by_normalized,
         provider_meta: catalog.providers,
+        provider_name_index,
     })
 }
 

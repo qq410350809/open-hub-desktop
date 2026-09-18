@@ -84,8 +84,28 @@ pub const LAB_OFFICIAL_HOSTS: &[(&str, &[&str])] = &[
     ("bytedance-seed", &[]),
 ];
 
+/// 明确**不是**模型原厂、不得靠「lab 名 == 渠道名」自动成为原厂的渠道。
+///
+/// 这些是聚合 / 路由平台：它们把自家虚拟路由条目（`auto` / `free` / `fast` / `cheap` /
+/// `fusion` / `zdr` …）登记成 llmpricing 里的 `lab`，从而命中 [`official_hosts`] 的
+/// 同名退化规则，被误判成「原厂渠道」。它们并不研发模型，必须显式排除。
+///
+/// ⚠️ 与 [`LAB_OFFICIAL_HOSTS`] 的留空条目（`amazon` / `bytedance-seed`）同性质：
+/// 都是「上游数据形态会误导判定」时的人工校准。**不要凭直觉增删**，每次改动都要
+/// 用真实目录数据核对受影响的模型集合。
+pub const NON_FIRST_PARTY_PROVIDERS: &[&str] = &[
+    // 虚拟路由条目：auto / fast / cheap / free / e2e / synth / zdr / fusion*
+    "trustedrouter",
+    "orcarouter",
+    "pioneer",
+];
+
 /// 取某 lab 的原厂渠道候选集。未在 [`LAB_OFFICIAL_HOSTS`] 中登记时退化为 `[lab]` 自身。
 pub fn official_hosts(lab: &str) -> Vec<&str> {
+    // 路由 / 聚合平台不研发模型，其同名「lab」不是真实厂商，直接判定无原厂渠道。
+    if NON_FIRST_PARTY_PROVIDERS.contains(&lab) {
+        return Vec::new();
+    }
     match LAB_OFFICIAL_HOSTS
         .iter()
         .find(|(known, _)| *known == lab)
@@ -422,6 +442,35 @@ mod tests {
         let hosting: Vec<String> = vec!["azure".into(), "azure-cognitive-services".into()];
         assert_eq!(official_channels_for("microsoft", &hosting).len(), 2);
         assert!(official_channels_for("openai", &hosting).is_empty());
+    }
+
+    #[test]
+    fn router_platforms_are_not_treated_as_first_party() {
+        // ⚠️ 这条规则不要「优化」掉：路由平台把虚拟条目（auto / free / fast / fusion）
+        // 登记成同名 lab，会命中「lab == 渠道名即原厂」的退化规则而假冒原厂。
+        for platform in NON_FIRST_PARTY_PROVIDERS {
+            assert!(
+                official_hosts(platform).is_empty(),
+                "{platform} 是聚合/路由平台，不应有原厂渠道"
+            );
+            // 即便该平台确实"上架"了这些虚拟条目，也不能算官方
+            let hosting: Vec<String> = vec![platform.to_string(), "openrouter".into()];
+            assert!(
+                official_channels_for(platform, &hosting).is_empty(),
+                "{platform} 的自封 lab 不应产生官方渠道"
+            );
+            assert!(
+                !is_first_party_provider(platform),
+                "{platform} 不应被标为原厂渠道"
+            );
+        }
+
+        // 真实厂商不受影响：同名单渠道仍算原厂
+        let hosting: Vec<String> = vec!["deepseek".into()];
+        assert_eq!(
+            official_channels_for("deepseek", &hosting),
+            vec!["deepseek".to_string()]
+        );
     }
 
     #[test]

@@ -1180,6 +1180,7 @@ fn enrich_model_with_models_dev(
     let build_input = HostBuildInput {
         lab: &identity.lab,
         model_id: &item.id,
+        model_name: &item.name,
         host_providers: &item.host_providers,
         ref_provider: item.ref_provider.as_deref(),
         min_provider: item.min_provider.as_deref(),
