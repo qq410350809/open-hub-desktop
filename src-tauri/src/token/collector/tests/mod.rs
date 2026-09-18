@@ -2121,3 +2121,503 @@ fn workbuddy_project_dir_name_decodes_without_leading_dash() {
     assert_ne!(key, "WorkBuddy");
     let _ = fs::remove_dir_all(&dir);
 }
+
+fn temp_pi_dir(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "openhub-pi-{name}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = fs::create_dir_all(&dir);
+    dir
+}
+
+/// 建一个只含采集器所需列的最小 pi.sqlite。
+fn build_pi_db(path: &Path) {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    conn.execute_batch(
+        r#"
+            CREATE TABLE projects (
+                id INTEGER PRIMARY KEY,
+                path TEXT NOT NULL UNIQUE,
+                name TEXT NOT NULL,
+                pinned INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL,
+                last_opened_at INTEGER NOT NULL
+            );
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL DEFAULT '',
+                project_id INTEGER,
+                provider_id TEXT,
+                model_id TEXT,
+                deleted_at INTEGER,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE turns (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'running',
+                provider_id TEXT,
+                model_id TEXT,
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                usage_json TEXT,
+                started_at INTEGER NOT NULL,
+                ended_at INTEGER
+            );
+            CREATE TABLE messages (
+                mid INTEGER PRIMARY KEY,
+                id TEXT NOT NULL UNIQUE,
+                session_id TEXT NOT NULL,
+                turn_id TEXT,
+                seq INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                tool_name TEXT,
+                is_error INTEGER NOT NULL DEFAULT 0,
+                text TEXT,
+                created_at INTEGER NOT NULL
+            );
+            "#,
+    )
+    .unwrap();
+}
+
+/// 往 turn 里补消息：`role` 决定它算对话（user）还是请求（assistant）。
+fn insert_pi_message(conn: &rusqlite::Connection, turn_id: &str, index: i64, role: &str) {
+    conn.execute(
+        "INSERT INTO messages (id, session_id, turn_id, seq, role, created_at) \
+         VALUES (?1, 'unused', ?2, ?3, ?4, 1789689000000)",
+        rusqlite::params![
+            format!("m-{turn_id}-{index}"),
+            turn_id,
+            index,
+            role
+        ],
+    )
+    .unwrap();
+}
+
+/// pi 的 usage_json 口径实测：`totalTokens = inputTokens + outputTokens + cacheReadTokens
+/// + cacheWriteTokens`，即 inputTokens 已是全新输入（不含缓存命中）；思考与缓存写入独立、
+/// 不计入 total。对话数取 user 消息、请求数取 assistant 消息（一次模型调用），
+/// 所以「一轮对话」会拆成 1 条对话事件 + N 条请求事件；两条事件 id 必须不同，
+/// 否则会被 `aggregate_events` 按 `source:id` 去重合并。
+/// 这里把 turn 合计均分到 5 次请求上：5 条事件各自的分量之和必须恰好等于 turn 合计。
+#[test]
+fn pi_database_splits_fresh_input_from_cache_read() {
+    let dir = temp_pi_dir("parse");
+    let project_dir = dir.join("Demo-App");
+    fs::create_dir_all(project_dir.join(".git")).unwrap();
+    let db_path = dir.join("pi.sqlite");
+    build_pi_db(&db_path);
+
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute(
+        "INSERT INTO projects (id, path, name, created_at, last_opened_at) VALUES (1, ?1, 'Demo-App', 1, 1)",
+        rusqlite::params![project_dir.to_string_lossy()],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO sessions (id, title, project_id, model_id, created_at, updated_at) \
+         VALUES ('s1', '演示会话', 1, 'deepseek-v4.1-flash', 1789689000000, 1789689168566)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO turns (id, session_id, status, model_id, input_tokens, output_tokens, usage_json, started_at, ended_at) \
+         VALUES ('t1', 's1', 'completed', 'deepseek-v4.1-flash', 15006, 11981, ?1, 1789689077629, 1789689168566)",
+        rusqlite::params![
+            json!({
+                "cacheReadTokens": 630912,
+                "cacheWriteTokens": 5334,
+                "inputTokens": 15006,
+                "outputTokens": 11981,
+                "reasoningTokens": 7473,
+                "totalTokens": 657899,
+            })
+            .to_string()
+        ],
+    )
+    .unwrap();
+    // 一轮对话 = 1 条用户消息 + 5 次模型调用。
+    insert_pi_message(&conn, "t1", 0, "user");
+    for index in 1..=5 {
+        insert_pi_message(&conn, "t1", index, "assistant");
+    }
+    drop(conn);
+
+    let parsed = parse_pi_database(&db_path);
+
+    let requests: Vec<_> = parsed
+        .events
+        .iter()
+        .filter(|event| event.id.starts_with("pi_t1_assistant_"))
+        .collect();
+    assert_eq!(requests.len(), 5, "每条 assistant 消息 = 一次请求事件");
+    assert_eq!(
+        requests.iter().map(|e| e.input_tokens).sum::<i64>(),
+        15_006,
+        "均分后全新输入之和必须等于 turn 合计"
+    );
+    assert_eq!(
+        requests.iter().map(|e| e.cached_input_tokens).sum::<i64>(),
+        630_912
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .map(|e| e.cache_creation_input_tokens)
+            .sum::<i64>(),
+        5_334,
+        "缓存写入独立上报，不参与 total"
+    );
+    assert_eq!(
+        requests.iter().map(|e| e.output_tokens).sum::<i64>(),
+        11_981
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .map(|e| e.reasoning_output_tokens)
+            .sum::<i64>(),
+        7_473
+    );
+    assert_eq!(
+        requests.iter().map(|e| e.total_tokens).sum::<i64>(),
+        657_899,
+        "均分不改变桶内总量"
+    );
+    for event in &requests {
+        assert_eq!(event.source, "pi");
+        assert_eq!(event.conversation_count, 0);
+        assert_eq!(
+            event.total_tokens,
+            event.input_tokens + event.cached_input_tokens + event.output_tokens,
+            "单条事件也要满足全链路恒等式"
+        );
+    }
+
+    let dialogues: Vec<_> = parsed
+        .events
+        .iter()
+        .filter(|event| event.conversation_count > 0)
+        .collect();
+    assert_eq!(dialogues.len(), 1, "一轮对话只发一条对话事件");
+    assert_eq!(dialogues[0].total_tokens, 0);
+
+    assert_eq!(parsed.sessions.len(), 1);
+    let session = &parsed.sessions[0];
+    assert_eq!(session.source, "pi");
+    assert_eq!(session.turns, 1, "会话轮次 = 对话数（用户提问）");
+    assert_eq!(session.tokens.total_tokens, 657_899);
+    assert_eq!(session.tokens.input_tokens, 15_006);
+    assert_eq!(session.tokens.cached_input_tokens, 630_912);
+    assert_eq!(session.tokens.reasoning_output_tokens, 7_473);
+    assert_ne!(session.project_key, PI_DEFAULT_PROJECT_LABEL);
+    assert!(
+        session.project_key.ends_with("Demo-App"),
+        "project_key={}",
+        session.project_key
+    );
+
+    // 聚合后：1 轮对话、5 次请求，total 与库内自报一致。
+    let report = aggregate_events(parsed.events.clone());
+    assert_eq!(report.buckets.len(), 1);
+    let bucket = &report.buckets[0];
+    assert_eq!(bucket.source, "pi");
+    assert_eq!(bucket.conversation_count, 1);
+    assert_eq!(
+        bucket.request_count, 5,
+        "请求数必须反映真实模型调用次数，而不是每轮 1 次"
+    );
+    assert_eq!(bucket.total_tokens, 657_899);
+    assert_eq!(
+        bucket.input_tokens + bucket.cached_input_tokens + bucket.output_tokens,
+        bucket.total_tokens
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// 无项目归属的会话退化成标签分组；usage_json 缺失时退回 turns 的冗余列。
+#[test]
+fn pi_database_falls_back_to_turn_columns_without_usage_json() {
+    let dir = temp_pi_dir("fallback");
+    let db_path = dir.join("pi.sqlite");
+    build_pi_db(&db_path);
+
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute(
+        "INSERT INTO sessions (id, title, project_id, model_id, created_at, updated_at) \
+         VALUES ('s2', '独立会话', NULL, NULL, 1789543900000, 1789544250495)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO turns (id, session_id, status, model_id, input_tokens, output_tokens, usage_json, started_at, ended_at) \
+         VALUES ('t2', 's2', 'aborted', NULL, 49, 167, NULL, 1789543963101, 1789544250495)",
+        [],
+    )
+    .unwrap();
+    // 1 次用户提问 + 1 次模型调用。
+    insert_pi_message(&conn, "t2", 0, "user");
+    insert_pi_message(&conn, "t2", 1, "assistant");
+    drop(conn);
+
+    let parsed = parse_pi_database(&db_path);
+
+    let assistant = parsed
+        .events
+        .iter()
+        .find(|event| event.id == "pi_t2_assistant_0")
+        .expect("助手用量事件应存在");
+    assert_eq!(assistant.input_tokens, 49);
+    assert_eq!(assistant.cached_input_tokens, 0);
+    assert_eq!(assistant.output_tokens, 167);
+    assert_eq!(assistant.total_tokens, 216);
+    assert_eq!(assistant.model, UNKNOWN_PI_MODEL);
+
+    assert_eq!(parsed.sessions.len(), 1);
+    assert_eq!(parsed.sessions[0].project_key, PI_DEFAULT_PROJECT_LABEL);
+    assert_eq!(parsed.sessions[0].model, UNKNOWN_PI_MODEL);
+    assert_eq!(parsed.sessions[0].turns, 1);
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// 进行中的 turn（ended_at 为空）用量尚未落库，已删除会话跟随客户端可见状态，两者都不统计。
+#[test]
+fn pi_database_skips_running_turns_and_deleted_sessions() {
+    let dir = temp_pi_dir("skip");
+    let db_path = dir.join("pi.sqlite");
+    build_pi_db(&db_path);
+
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute(
+        "INSERT INTO sessions (id, title, model_id, created_at, updated_at) VALUES \
+         ('alive', '在用', 'glm-5.3-flash', 1, 2), \
+         ('gone', '已删除', 'glm-5.3-flash', 1, 2)",
+        [],
+    )
+    .unwrap();
+    conn.execute("UPDATE sessions SET deleted_at = 3 WHERE id = 'gone'", [])
+        .unwrap();
+    conn.execute(
+        "INSERT INTO turns (id, session_id, status, model_id, input_tokens, output_tokens, usage_json, started_at, ended_at) VALUES \
+         ('run', 'alive', 'running', 'glm-5.3-flash', 0, 0, NULL, 1789689518920, NULL), \
+         ('del', 'gone', 'completed', 'glm-5.3-flash', 10, 20, NULL, 1789689000000, 1789689001000), \
+         ('ok', 'alive', 'completed', 'glm-5.3-flash', 10, 20, NULL, 1789689000000, 1789689002000)",
+        [],
+    )
+    .unwrap();
+    // 'run'（进行中）与 'del'（会话已删除）都补上消息，用来证明它们被排除的原因是
+    // 状态 / 删除，而不是「没有消息」；'ok' 给 1 次提问 + 2 次模型调用。
+    insert_pi_message(&conn, "run", 0, "user");
+    insert_pi_message(&conn, "run", 1, "assistant");
+    insert_pi_message(&conn, "del", 0, "user");
+    insert_pi_message(&conn, "del", 1, "assistant");
+    insert_pi_message(&conn, "ok", 0, "user");
+    insert_pi_message(&conn, "ok", 1, "assistant");
+    insert_pi_message(&conn, "ok", 2, "assistant");
+    drop(conn);
+
+    let parsed = parse_pi_database(&db_path);
+
+    assert!(parsed
+        .events
+        .iter()
+        .all(|event| !event.id.starts_with("pi_run")));
+    assert!(parsed
+        .events
+        .iter()
+        .all(|event| !event.id.starts_with("pi_del")));
+    assert_eq!(parsed.sessions.len(), 1, "只应保留未删除且有 turn 的会话");
+    assert_eq!(parsed.sessions[0].session_hash, "openhub:pi:alive");
+    assert_eq!(parsed.sessions[0].turns, 1, "会话轮次只数用户提问");
+    assert_eq!(parsed.sessions[0].tokens.total_tokens, 30);
+
+    let requests: Vec<_> = parsed
+        .events
+        .iter()
+        .filter(|event| event.id.starts_with("pi_ok_assistant_"))
+        .collect();
+    assert_eq!(requests.len(), 2, "2 条 assistant 消息 = 2 次请求");
+    assert_eq!(
+        requests.iter().map(|e| e.total_tokens).sum::<i64>(),
+        30,
+        "均分后总量仍等于 turn 合计"
+    );
+
+    let report = aggregate_events(parsed.events.clone());
+    assert_eq!(report.buckets[0].conversation_count, 1);
+    assert_eq!(report.buckets[0].request_count, 2);
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// 有用量但一条消息都没落库的 turn（起了 turn 随即中断）不产生任何统计。
+#[test]
+fn pi_database_skips_turns_without_messages() {
+    let dir = temp_pi_dir("nomsg");
+    let db_path = dir.join("pi.sqlite");
+    build_pi_db(&db_path);
+
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute(
+        "INSERT INTO sessions (id, title, model_id, created_at, updated_at) \
+         VALUES ('s3', '空转', 'glm-5.3-flash', 1, 2)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO turns (id, session_id, status, model_id, input_tokens, output_tokens, usage_json, started_at, ended_at) \
+         VALUES ('empty', 's3', 'aborted', 'glm-5.3-flash', 0, 0, NULL, 1789689000000, 1789689001000)",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    let parsed = parse_pi_database(&db_path);
+    assert!(parsed.events.is_empty(), "无消息的 turn 不应产生对话或请求");
+    assert!(parsed.sessions.is_empty());
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// 本机装有 PI-Desktop 时，用真实库校验统一口径恒等式与库内自报总量。
+/// pi 自报的 `totalTokens` 含缓存写入，本仓库统一口径刻意不含，两者差值须恰为 Σ(cacheWriteTokens)。
+#[test]
+fn pi_real_db_identity_if_exists() {
+    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap();
+    let db_path = pi_db_path(&home);
+    if !db_path.is_file() {
+        return;
+    }
+    let parsed = parse_pi_database(&db_path);
+    if parsed.events.is_empty() {
+        return;
+    }
+
+    let fresh: i64 = parsed.events.iter().map(|e| e.input_tokens).sum();
+    let cached: i64 = parsed.events.iter().map(|e| e.cached_input_tokens).sum();
+    let out: i64 = parsed.events.iter().map(|e| e.output_tokens).sum();
+    let total: i64 = parsed.events.iter().map(|e| e.total_tokens).sum();
+    assert_eq!(
+        fresh + cached + out,
+        total,
+        "fresh + cached + output == total"
+    );
+
+    println!(
+        "PI-Desktop real DB: {} sessions, {} events, total={total}",
+        parsed.sessions.len(),
+        parsed.events.len()
+    );
+
+    // 与本仓库统一口径交叉校验：total == Σ(全新输入 + 缓存命中 + 输出)，缓存写入不计入。
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let field = |name: &str| format!("COALESCE(json_extract(t.usage_json, '$.{name}'), 0)");
+    let sum_where = |expr: &str, extra: &str| -> i64 {
+        let sql = format!(
+            "SELECT COALESCE(SUM({expr}), 0) FROM turns t \
+             LEFT JOIN sessions s ON s.id = t.session_id \
+             WHERE t.ended_at IS NOT NULL AND t.ended_at > 0 AND s.deleted_at IS NULL \
+               AND ({extra})"
+        );
+        conn.query_row(&sql, [], |row| row.get(0)).unwrap()
+    };
+    let expected = sum_where(
+        &format!(
+            "CASE WHEN json_extract(t.usage_json, '$.totalTokens') IS NOT NULL \
+                  THEN {inp} + {read} + {out} \
+                  ELSE t.input_tokens + t.output_tokens END",
+            inp = field("inputTokens"),
+            read = field("cacheReadTokens"),
+            out = field("outputTokens"),
+        ),
+        "1 = 1",
+    );
+    assert_eq!(
+        total, expected,
+        "事件 total 之和应等于 全新输入 + 缓存命中 + 输出"
+    );
+
+    // 只看 usage_json 存在的行：pi 自报 totalTokens 比本仓库口径多出的部分应恰为缓存写入。
+    let with_usage = "t.usage_json IS NOT NULL";
+    let reported = sum_where(&field("totalTokens"), with_usage);
+    let fresh_plus_read = sum_where(
+        &format!(
+            "{} + {} + {}",
+            field("inputTokens"),
+            field("cacheReadTokens"),
+            field("outputTokens")
+        ),
+        with_usage,
+    );
+    let cache_write = sum_where(&field("cacheWriteTokens"), with_usage);
+    assert_eq!(
+        reported - fresh_plus_read,
+        cache_write,
+        "pi 自报 totalTokens 比本仓库口径多出的部分应恰为缓存写入"
+    );
+
+    // 对话数 = 用户消息条数；请求数 = assistant 消息条数（agent 循环里一次模型调用一条），
+    // 所以请求数必然远大于对话数；这里逐一与库内实测对齐。
+    let count_messages = |role: &str| -> i64 {
+        conn.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM messages m JOIN turns t ON t.id = m.turn_id \
+                 LEFT JOIN sessions s ON s.id = t.session_id \
+                 WHERE m.role = '{role}' AND t.ended_at IS NOT NULL AND t.ended_at > 0 \
+                   AND s.deleted_at IS NULL"
+            ),
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+    let dialogues = count_messages("user");
+    let requests = count_messages("assistant");
+    let dialogue_events = parsed
+        .events
+        .iter()
+        .filter(|event| event.conversation_count > 0)
+        .count() as i64;
+    let request_events = parsed
+        .events
+        .iter()
+        .filter(|event| event.conversation_count == 0 && event.total_tokens > 0)
+        .count() as i64;
+    let session_turns: i64 = parsed.sessions.iter().map(|session| session.turns).sum();
+
+    assert_eq!(dialogue_events, dialogues, "对话事件数应等于真实用户消息数");
+    assert_eq!(session_turns, dialogues, "会话轮次应等于对话数");
+    // 有用量但没有 assistant 消息的 turn 会退化成 1 条请求事件，故按此上界核对。
+    let turns_without_assistant: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM turns t LEFT JOIN sessions s ON s.id = t.session_id \
+             WHERE t.ended_at IS NOT NULL AND t.ended_at > 0 AND s.deleted_at IS NULL \
+               AND (COALESCE(json_extract(t.usage_json, '$.totalTokens'), 0) > 0 \
+                    OR t.input_tokens > 0 OR t.output_tokens > 0) \
+               AND NOT EXISTS (SELECT 1 FROM messages m \
+                               WHERE m.turn_id = t.id AND m.role = 'assistant')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        request_events,
+        requests + turns_without_assistant,
+        "请求事件数应等于真实模型调用次数"
+    );
+    assert!(
+        requests > dialogues,
+        "agent 循环里一轮对话会有多次模型调用：dialogues={dialogues} requests={requests}"
+    );
+    println!("PI-Desktop real DB: {dialogues} dialogues / {requests} requests");
+}

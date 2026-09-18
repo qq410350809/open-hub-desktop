@@ -455,6 +455,10 @@ export async function browserFallback<T>(
           { kind: "config", label: "全局设置 settings.json", path: `${home}.workbuddy-ai/settings.json`, exists: false },
           { kind: "data", label: "会话项目 projects", path: `${home}.workbuddy-ai/projects`, exists: false },
         ]),
+        mk("pi", "PI-Desktop", `${home}.pi-desktop`, [
+          { kind: "database", label: "会话数据库 pi.sqlite", path: `${home}.pi-desktop/pi.sqlite`, exists: false },
+          { kind: "data", label: "会话记录 sessions", path: `${home}.pi-desktop/sessions`, exists: false },
+        ]),
       ],
     } as T;
   }

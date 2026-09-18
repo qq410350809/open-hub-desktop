@@ -922,3 +922,100 @@ fn workbuddy_activity_counts_user_and_assistant_and_explicit_errors() {
     assert_eq!(workbuddy.requests, 2);
     assert_eq!(workbuddy.failed, 1);
 }
+
+/// pi 的健康统计：**一行 turn = 一次 agent 执行**，对话数取用户消息、请求数取 assistant 消息
+/// （agent 循环里一次模型调用一条），所以请求数必然远大于对话数；状态决定成功 / 失败。
+/// 水位线必须落在 `ended_at`，否则「扫描时还在 running、之后才结束」的 turn 会被永久跳过。
+#[test]
+fn pi_activity_counts_dialogues_requests_and_uses_ended_at_as_water_level() {
+    let db_path = std::env::temp_dir().join(format!("openhub-tt-pi-{}.db", std::process::id()));
+    let _ = fs::remove_file(&db_path);
+    let conn = Connection::open(&db_path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE turns (
+            id TEXT PRIMARY KEY,
+            status TEXT NOT NULL DEFAULT 'running',
+            ended_at INTEGER
+        );
+        CREATE TABLE messages (
+            id TEXT PRIMARY KEY,
+            turn_id TEXT,
+            role TEXT NOT NULL
+        );",
+    )
+    .unwrap();
+    let insert_turn = |conn: &Connection, id: &str, status: &str, ended_at: Option<i64>| {
+        conn.execute(
+            "INSERT INTO turns (id, status, ended_at) VALUES (?1, ?2, ?3)",
+            rusqlite::params![id, status, ended_at],
+        )
+        .unwrap();
+    };
+    // 给 turn 补 n 条指定角色的消息。
+    let insert_messages = |conn: &Connection, turn_id: &str, role: &str, count: i64| {
+        for index in 0..count {
+            conn.execute(
+                "INSERT INTO messages (id, turn_id, role) VALUES (?1, ?2, ?3)",
+                rusqlite::params![format!("{turn_id}-{role}-{index}"), turn_id, role],
+            )
+            .unwrap();
+        }
+    };
+
+    let mut map: BTreeMap<String, HealthAgg> = BTreeMap::new();
+    let mut sources: BTreeMap<String, HealthAgg> = BTreeMap::new();
+    let mut cursor = SqliteCursor::default();
+
+    // 进行中的 turn（ended_at 为空）用量尚未落库，不统计 —— 即便已经有消息。
+    insert_turn(&conn, "run", "running", None);
+    insert_messages(&conn, "run", "user", 1);
+    insert_messages(&conn, "run", "assistant", 4);
+    // 一轮对话 + 5 次模型调用。
+    insert_turn(&conn, "ok", "completed", Some(1_782_000_000_000));
+    insert_messages(&conn, "ok", "user", 1);
+    insert_messages(&conn, "ok", "assistant", 5);
+    // 一轮对话 + 2 次模型调用，最后以错误收尾。
+    insert_turn(&conn, "bad", "error", Some(1_782_000_100_000));
+    insert_messages(&conn, "bad", "user", 1);
+    insert_messages(&conn, "bad", "assistant", 2);
+    // 用户中断：计请求，成败都不计。
+    insert_turn(&conn, "cut", "aborted", Some(1_782_000_200_000));
+    insert_messages(&conn, "cut", "user", 1);
+    insert_messages(&conn, "cut", "assistant", 3);
+    // 一条消息都没有的 turn 不产生统计，但水位线仍要推进（否则每轮都会重扫）。
+    insert_turn(&conn, "empty", "aborted", Some(1_782_000_250_000));
+
+    collect_pi_activity_incremental(&db_path, &mut map, &mut sources, &mut cursor);
+
+    let agg = sources.get("pi").expect("pi source should exist");
+    assert_eq!(agg.dialogues, 3, "对话数 = 用户消息条数");
+    assert_eq!(agg.requests, 10, "请求数 = assistant 消息条数");
+    assert_eq!(agg.success, 5, "completed 的调用都算成功");
+    assert_eq!(agg.failed, 1, "error 记 1 次失败");
+    assert!(
+        agg.requests > agg.dialogues,
+        "一轮对话会有多次模型调用：dialogues={} requests={}",
+        agg.dialogues,
+        agg.requests
+    );
+    assert_eq!(
+        cursor.max_time_created, 1_782_000_250_000,
+        "水位线应推进到最大 ended_at（含无消息的 turn）"
+    );
+
+    // 之后才结束的 turn：ended_at 大于水位线，仍必须被采集。
+    insert_turn(&conn, "late", "completed", Some(1_782_000_300_000));
+    insert_messages(&conn, "late", "user", 1);
+    insert_messages(&conn, "late", "assistant", 1);
+    collect_pi_activity_incremental(&db_path, &mut map, &mut sources, &mut cursor);
+    assert_eq!(sources["pi"].dialogues, 4);
+    assert_eq!(sources["pi"].requests, 11);
+    assert_eq!(sources["pi"].success, 6);
+    assert_eq!(cursor.max_time_created, 1_782_000_300_000);
+
+    // 同一水位重复采集不应重复计数。
+    collect_pi_activity_incremental(&db_path, &mut map, &mut sources, &mut cursor);
+    assert_eq!(sources["pi"].requests, 11);
+
+    let _ = fs::remove_file(&db_path);
+}

@@ -237,7 +237,11 @@ pub fn apply_ai_suggestions(
                    AND origin != 'manual'
                    AND review_status != 'approved'",
                 params![
-                    candidate.id,
+                    // 与 `set_mapping_manually` 同口径：`official_model` 存**显示名**，
+                    // `official_slug` 存注册表 id。AI 返回的可能是 id 或别名
+                    // （`candidate_matches` 三者都收），落库前一律归一到候选的标准名，
+                    // 否则显示名列会混进 slug，既对不上正式清单也让「原厂」判定失效。
+                    candidate.name,
                     candidate.id,
                     candidate.lab,
                     ORIGIN_AI,
@@ -438,28 +442,69 @@ fn extract_lab_from_name(name: &str) -> String {
     }
 }
 
-/// 从 model_catalog_models 初始化 token_official_models（一次性操作）。
-pub fn migrate_catalog_to_official_models(database: &Database) -> Result<usize, String> {
+/// 修正历史遗留的 `official_model`：早期 AI 落库把注册表 **id** 写进了这一列，
+/// 而该列按约定应存**显示名**（见 [`set_mapping_manually`]）。混入的 slug 会让
+/// 统计分组对不上正式清单，也会让「原厂」判定整体失效。
+///
+/// 只做无歧义的重写：该值能命中某注册表条目的 `id`、且没有任何条目的 `name`
+/// 与它相同（即它确实是 id 而不是某个模型的名字）时才替换为对应显示名，
+/// 同时把 id 补进 `official_slug`。幂等，可每次启动执行。
+pub fn normalize_mapping_official_names(database: &Database) -> Result<usize, String> {
     let connection = database.lock_conn()?;
-    let catalog_exists: i64 = connection
-        .query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='model_catalog_models'",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(|e| e.to_string())?;
-    if catalog_exists == 0 {
-        return Ok(0);
-    }
     connection
         .execute(
-            "INSERT OR IGNORE INTO token_official_models (id, name, lab, source, confidence)
-             SELECT LOWER(COALESCE(slug, id)), name, COALESCE(lab, ''), 'catalog', 1.0
-             FROM model_catalog_models
-             WHERE name IS NOT NULL AND name != ''",
+            "UPDATE token_model_mappings
+                SET official_model = (
+                      SELECT o.name FROM token_official_models o
+                       WHERE o.id = token_model_mappings.official_model COLLATE NOCASE
+                    ),
+                    official_slug = COALESCE(
+                      NULLIF(token_model_mappings.official_slug, ''),
+                      token_model_mappings.official_model
+                    )
+              WHERE official_model != ''
+                AND NOT EXISTS (
+                      SELECT 1 FROM token_official_models n
+                       WHERE n.name = token_model_mappings.official_model COLLATE NOCASE
+                    )
+                AND EXISTS (
+                      SELECT 1 FROM token_official_models i
+                       WHERE i.id = token_model_mappings.official_model COLLATE NOCASE
+                    )",
             [],
         )
         .map_err(|e| e.to_string())
+}
+
+/// 从 model_catalog_models 初始化 token_official_models（一次性操作）。
+pub fn migrate_catalog_to_official_models(database: &Database) -> Result<usize, String> {
+    let inserted = {
+        let connection = database.lock_conn()?;
+        let catalog_exists: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='model_catalog_models'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if catalog_exists == 0 {
+            0
+        } else {
+            connection
+                .execute(
+                    "INSERT OR IGNORE INTO token_official_models (id, name, lab, source, confidence)
+                     SELECT LOWER(COALESCE(slug, id)), name, COALESCE(lab, ''), 'catalog', 1.0
+                     FROM model_catalog_models
+                     WHERE name IS NOT NULL AND name != ''",
+                    [],
+                )
+                .map_err(|e| e.to_string())?
+        }
+    };
+    // 注册表就绪后再修存量映射：这一步依赖 `token_official_models` 里的 id→name 对照，
+    // 放在填表之后才能生效。
+    normalize_mapping_official_names(database)?;
+    Ok(inserted)
 }
 
 #[cfg(test)]
@@ -541,6 +586,93 @@ mod tests {
         let row = list_mappings(&database).unwrap().remove(0);
         assert_eq!(row.review_status, REVIEW_APPROVED);
         assert!(row.confirmed);
+    }
+
+    /// AI 可能回 id 或别名（`candidate_matches` 三者都收），但落库必须归一到显示名：
+    /// `official_model` = 标准名、`official_slug` = 注册表 id。否则显示名列混进 slug，
+    /// 会同时打乱统计分组与「原厂」判定。
+    #[test]
+    fn ai_suggestion_persists_display_name_not_slug() {
+        let database = test_database();
+        insert_catalog(&database, "glm-53", "GLM-5.3", &["glm53"]);
+        register_raw_models(&database, &["zai/glm-5.3".to_string()]).unwrap();
+        let batch = pending_models(&database, false).unwrap();
+        let mut candidates = HashMap::new();
+        candidates.insert(
+            "glm-5.3".to_string(),
+            official_catalog(&database.lock_conn().unwrap()).unwrap(),
+        );
+        // AI 回的是 id 形态
+        let result = apply_ai_suggestions(
+            &database,
+            &batch,
+            &candidates,
+            &[AiMappingItem {
+                raw_model: "glm-5.3".to_string(),
+                official_model: "glm-53".to_string(),
+                lab: None,
+                confidence: 0.9,
+                reason: None,
+            }],
+        )
+        .unwrap();
+        assert_eq!(result.suggested, 1);
+        let row = list_mappings(&database).unwrap().remove(0);
+        assert_eq!(row.official_model, "GLM-5.3", "必须落显示名");
+        assert_eq!(row.official_slug.as_deref(), Some("glm-53"), "slug 单独存");
+    }
+
+    /// 存量修复：`official_model` 里混进的 slug 要还原成显示名，并把 id 补进 slug 列。
+    #[test]
+    fn normalizes_legacy_slug_in_official_model() {
+        let database = test_database();
+        insert_catalog(&database, "glm-53", "GLM-5.3", &["glm53"]);
+        insert_catalog(&database, "gpt56sol", "GPT-5.6 Sol", &[]);
+        {
+            let connection = database.lock_conn().unwrap();
+            for (raw_key, stored) in [("zk", "glm-53"), ("zk2", "gpt56sol")] {
+                connection
+                    .execute(
+                        "INSERT INTO token_model_mappings (raw_key, raw_model, official_model, origin)
+                         VALUES (?1, ?1, ?2, 'ai')",
+                        params![raw_key, stored],
+                    )
+                    .unwrap();
+            }
+        }
+
+        let fixed = normalize_mapping_official_names(&database).unwrap();
+        assert_eq!(fixed, 2);
+        let rows = list_mappings(&database).unwrap();
+        let glm = rows.iter().find(|r| r.raw_key == "zk").unwrap();
+        assert_eq!(glm.official_model, "GLM-5.3", "slug 应还原为显示名");
+        assert_eq!(glm.official_slug.as_deref(), Some("glm-53"), "id 应补进 slug");
+
+        // 幂等：再跑一次不应有任何改动。
+        assert_eq!(normalize_mapping_official_names(&database).unwrap(), 0);
+    }
+
+    /// 该值本身就是某个模型的名字时不得改写——即使它同时撞上另一条目的 id。
+    #[test]
+    fn normalization_skips_values_that_are_already_a_name() {
+        let database = test_database();
+        insert_catalog(&database, "glm-53", "GLM-5.3", &[]);
+        // 另一个模型的名字恰好等于上一条目的 id
+        insert_catalog(&database, "glm53", "glm-53", &[]);
+        {
+            let connection = database.lock_conn().unwrap();
+            connection
+                .execute(
+                    "INSERT INTO token_model_mappings (raw_key, raw_model, official_model, origin)
+                     VALUES ('zk', 'zk', 'glm-53', 'manual')",
+                    [],
+                )
+                .unwrap();
+        }
+
+        assert_eq!(normalize_mapping_official_names(&database).unwrap(), 0);
+        let row = list_mappings(&database).unwrap().remove(0);
+        assert_eq!(row.official_model, "glm-53", "已是合法名字时保持原样");
     }
 
     #[test]

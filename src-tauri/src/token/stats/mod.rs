@@ -2,6 +2,7 @@ pub mod catpawai;
 pub mod commands;
 pub mod db;
 pub mod health;
+pub mod pi;
 pub mod raw_logs;
 pub mod types;
 pub mod worker;
@@ -12,6 +13,8 @@ pub use commands::*;
 pub use db::*;
 #[allow(unused_imports)]
 pub use health::*;
+#[allow(unused_imports)]
+pub use pi::*;
 #[allow(unused_imports)]
 pub use raw_logs::*;
 #[allow(unused_imports)]

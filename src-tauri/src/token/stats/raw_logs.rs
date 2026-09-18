@@ -836,6 +836,31 @@ pub fn collect_local_agent_paths(home: &Path) -> LocalAgentPathsReport {
         ));
     }
 
+    // PI-Desktop
+    {
+        let root = crate::token::collector::pi_data_dir(home);
+        let mut entries = Vec::new();
+        push_agent_path(
+            &mut entries,
+            "database",
+            "会话数据库 pi.sqlite",
+            Some(&root.join("pi.sqlite")),
+        );
+        push_agent_path(
+            &mut entries,
+            "data",
+            "会话附件 attachments",
+            Some(&root.join("attachments")),
+        );
+        push_agent_path(
+            &mut entries,
+            "data",
+            "会话记录 sessions",
+            Some(&root.join("sessions")),
+        );
+        agents.push(finish_agent("pi", "PI-Desktop", Some(&root), entries));
+    }
+
     let collected = crate::token::collector::collected_stats_by_source();
     let collected_at = collected
         .values()
@@ -865,6 +890,7 @@ pub fn collected_env_overrides() -> Vec<LocalAgentEnvOverride> {
         "XDG_DATA_HOME",
         "OPENHUB_CATPAWAI_DB_PATH",
         "WORKBUDDY_CONFIG_DIR",
+        "PI_DESKTOP_HOME",
     ]
     .iter()
     .filter_map(|key| {

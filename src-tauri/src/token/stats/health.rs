@@ -1,5 +1,6 @@
 use crate::models::RequestHealthReport;
 use crate::token::stats::catpawai::collect_catpawai_activity_incremental;
+use crate::token::stats::pi::collect_pi_activity_incremental;
 use crate::token::stats::types::*;
 use serde_json::Value as JsonValue;
 use std::collections::{BTreeMap, HashSet};
@@ -1136,6 +1137,12 @@ pub fn collect_request_health_snapshot(force: bool) -> Result<RequestHealthRepor
             .entry("workbuddy".to_string())
             .or_default();
         collect_workbuddy_activity_incremental(&workbuddy_root, &mut map, &mut sources, cursors);
+    }
+
+    let pi_db = crate::token::collector::pi_db_path(&home);
+    if pi_db.is_file() {
+        let cursor = envelope.sqlite_cursors.entry("pi".to_string()).or_default();
+        collect_pi_activity_incremental(&pi_db, &mut map, &mut sources, cursor);
     }
 
     let report = maps_to_report(map, sources);

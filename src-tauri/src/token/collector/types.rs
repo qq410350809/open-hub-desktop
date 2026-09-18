@@ -34,6 +34,7 @@ pub const UNKNOWN_KIRO_MODEL: &str = "kiro-auto-model";
 pub const UNKNOWN_DSH_MODEL: &str = "dsh-unknown-model";
 pub const UNKNOWN_COPILOT_MODEL: &str = "copilot-auto-model";
 pub const UNKNOWN_WORKBUDDY_MODEL: &str = "workbuddy-unknown-model";
+pub const UNKNOWN_PI_MODEL: &str = "pi-unknown-model";
 pub const LOCAL_ESTIMATED_CONTEXT_LIMIT: i64 = 64_000;
 
 pub fn xdg_data_home(home: &Path) -> PathBuf {

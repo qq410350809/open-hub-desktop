@@ -198,9 +198,9 @@ Mihomo 代理内核与 GeoIP 数据库不随安装包分发（减小体积、规
 - API Key 首次启动自动生成，存于 `app_meta` 配置，可在 Web UI 网关页查看
 
 ### Token 统计（token/collector + token/stats）
-**本地终端平面**——后台每 20 秒增量扫描以下 19 种 AI 工具的本地日志/数据库：
+**本地终端平面**——后台每 20 秒增量扫描以下 20 种 AI 工具的本地日志/数据库：
 
-Claude Code、Codex、Cursor、Cline、Continue、Copilot、Windsurf、Aider、Goose、Kiro、OpenCode、Zed、ZCode、Antigravity、Mimo、Catpawai、CommandCode、DSH、WorkBuddy AI
+Claude Code、Codex、Cursor、Cline、Continue、Copilot、Windsurf、Aider、Goose、Kiro、OpenCode、Zed、ZCode、Antigravity、Mimo、Catpawai、CommandCode、DSH、WorkBuddy AI、PI-Desktop
 
 处理管线：文件指纹去重 → 会话/对话/请求三级解析 → 模型规范化（slug 归一）→ 人机消息区分 → SQLite 快照入库。
 产出：会话/模型/子代理维度统计、日/小时用量桶、成本估算、请求健康报表、原始日志浏览、本地 Agent 路径探测（支持环境变量覆盖）。

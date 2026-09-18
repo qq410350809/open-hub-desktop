@@ -418,6 +418,7 @@ pub fn collect_uncached(force: bool) -> Result<CollectedData, String> {
             "zcode".to_string(),
             zcode_db_path(&home),
         ),
+        ("pi".to_string(), "pi".to_string(), pi_db_path(&home)),
     ];
     for (idx, db_path) in catpawai_db_paths(&home).into_iter().enumerate() {
         database_sources.push((format!("catpawai_{idx}"), "catpawai".to_string(), db_path));
@@ -463,6 +464,7 @@ pub fn collect_uncached(force: bool) -> Result<CollectedData, String> {
                 "opencode" => parse_opencode_database(&path),
                 "mimo" => parse_mimo_database(&path),
                 "zcode" => parse_zcode_database(&path),
+                "pi" => parse_pi_database(&path),
                 "catpawai" => parse_catpawai_database(&path),
                 _ => parse_opencode_database(&path),
             };
