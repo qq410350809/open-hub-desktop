@@ -1823,6 +1823,14 @@ const allModelsDraft = ref<Record<string, AllModelsDraftState>>({});
 const savingAllModels = ref(false);
 const allModelsSyncing = ref(false);
 
+/** 单渠道同步进行中的渠道 ID（null = 没有单渠道同步在跑） */
+const syncingChannelId = ref<string | null>(null);
+
+/** 是否有任一同步任务在跑（整批或单渠道）：所有同步入口据此互斥，避免并发拉取上游 */
+const allModelsAnySyncing = computed(
+  () => allModelsSyncing.value || syncingChannelId.value !== null,
+);
+
 // —— 同步日志：折叠面板，同步开始时自动展开 ——
 interface AllModelsSyncLogEntry {
   channel: string;
@@ -1858,6 +1866,12 @@ function isAllModelChecked(channelId: string, model: string): boolean {
   const d = allModelsDraft.value[channelId];
   if (!d) return false;
   return d.all || d.checked.has(model);
+}
+
+/** 模型芯片悬停提示：首行给出完整模型 ID（芯片内文本被省略号截断），次行给出当前点击行为 */
+function allModelItemTitle(channelId: string, model: string): string {
+  const action = isAllModelChecked(channelId, model) ? "点击取消勾选" : "点击勾选对外暴露";
+  return `${model}\n${action}`;
 }
 
 /** 某渠道已勾选模型数（按已知模型列表计） */
@@ -1907,10 +1921,34 @@ function clearAllChannelModels(channelId: string) {
   };
 }
 
-/** 逐渠道从上游拉取最新模型列表并写入全局缓存（弹窗内同步按钮）。
+/** 拉取单个渠道的上游模型并写入本地缓存；返回结果供调用方写日志与提示。
+ * 批量同步与单渠道同步共用，保证两处的免费过滤口径与日志文案一致。 */
+async function pullChannelModels(
+  channel: ChannelConfig,
+): Promise<{ ok: true; changed: boolean; count: number } | { ok: false; detail: string }> {
+  try {
+    // fetchUpstreamModels 内部已处理免费渠道过滤，并把成功/失败写入后端缓存；
+    // silent 避免逐个渠道拉取时连弹 toast，失败详情由同步日志与调用方提示展示
+    const map = await fetchUpstreamModels({
+      setGlobalFetching: false,
+      channelId: channel.id,
+      silent: true,
+    });
+    const fresh = map[channel.id];
+    if (!fresh) return { ok: false, detail: "上游未返回模型列表" };
+    const previous = channelModels.value[channel.id];
+    const changed = JSON.stringify(previous) !== JSON.stringify(fresh);
+    channelModels.value = { ...channelModels.value, [channel.id]: fresh };
+    return { ok: true, changed, count: fresh.length };
+  } catch (e) {
+    return { ok: false, detail: String(e) };
+  }
+}
+
+/** 逐渠道从上游拉取最新模型列表并写入全局缓存（弹窗顶部「同步模型」）。
  * 每完成一个渠道即写入一条同步日志，无需后端流式事件即可获得实时进度。 */
 async function syncAllChannelsModels() {
-  if (allModelsSyncing.value) return;
+  if (allModelsAnySyncing.value) return;
   const channels = proxyConfig.value.channels.filter((c) => c.enabled);
   if (channels.length === 0) {
     showToast("没有启用的渠道可同步", true);
@@ -1924,41 +1962,22 @@ async function syncAllChannelsModels() {
   let failed = 0;
   try {
     for (const channel of channels) {
-      try {
-        // fetchUpstreamModels 内部已处理免费渠道过滤，并把成功/失败写入后端缓存；
-        // silent 避免逐渠道循环时连弹 toast，失败详情由同步日志区展示
-        const map = await fetchUpstreamModels({
-          setGlobalFetching: false,
-          channelId: channel.id,
-          silent: true,
+      const result = await pullChannelModels(channel);
+      if (result.ok) {
+        if (result.changed) changed++;
+        appendAllModelsSyncLog({
+          channel: channel.name,
+          ok: true,
+          detail: result.changed
+            ? `成功 · ${result.count} 个模型（列表有变化）`
+            : `成功 · ${result.count} 个模型`,
         });
-        const fresh = map[channel.id];
-        if (fresh) {
-          const prev = channelModels.value[channel.id];
-          const isChanged = JSON.stringify(prev) !== JSON.stringify(fresh);
-          channelModels.value = { ...channelModels.value, [channel.id]: fresh };
-          if (isChanged) changed++;
-          appendAllModelsSyncLog({
-            channel: channel.name,
-            ok: true,
-            detail: isChanged
-              ? `成功 · ${fresh.length} 个模型（列表有变化）`
-              : `成功 · ${fresh.length} 个模型`,
-          });
-        } else {
-          failed++;
-          appendAllModelsSyncLog({
-            channel: channel.name,
-            ok: false,
-            detail: "拉取失败：上游未返回模型列表",
-          });
-        }
-      } catch (e) {
+      } else {
         failed++;
         appendAllModelsSyncLog({
           channel: channel.name,
           ok: false,
-          detail: `拉取失败：${String(e)}`,
+          detail: `拉取失败：${result.detail}`,
         });
       }
     }
@@ -1977,6 +1996,50 @@ async function syncAllChannelsModels() {
   } finally {
     allModelsSyncing.value = false;
   }
+}
+
+/** 单渠道同步（分组头「同步」按钮）：只拉取该渠道，结果写一条日志并即时提示 */
+async function syncOneChannelModels(channel: ChannelConfig) {
+  if (allModelsAnySyncing.value) return;
+  if (!channel.enabled) {
+    showToast(`${channel.name} 已禁用，无法同步模型`, true);
+    return;
+  }
+  syncingChannelId.value = channel.id;
+  try {
+    const result = await pullChannelModels(channel);
+    if (!result.ok) {
+      appendAllModelsSyncLog({
+        channel: channel.name,
+        ok: false,
+        detail: `拉取失败：${result.detail}`,
+      });
+      showToast(`${channel.name} 同步失败：${result.detail}`, true);
+      return;
+    }
+    appendAllModelsSyncLog({
+      channel: channel.name,
+      ok: true,
+      detail: result.changed
+        ? `成功 · ${result.count} 个模型（列表有变化）`
+        : `成功 · ${result.count} 个模型`,
+    });
+    showToast(
+      result.changed
+        ? `${channel.name} 已同步：${result.count} 个模型（列表有变化）`
+        : `${channel.name} 已同步：${result.count} 个模型`,
+    );
+  } finally {
+    syncingChannelId.value = null;
+  }
+}
+
+/** 分组头「同步」按钮的悬停说明：把禁用原因与当前进度讲清楚 */
+function syncChannelButtonTitle(channel: ChannelConfig): string {
+  if (!channel.enabled) return "该渠道已禁用，无法从上游同步模型";
+  if (syncingChannelId.value === channel.id) return "正在从上游拉取该渠道的模型列表…";
+  if (allModelsSyncing.value) return "正在批量同步全部渠道，请稍候";
+  return "只同步该渠道：从上游拉取最新模型列表（不改动勾选状态）";
 }
 
 function openAllChannelsModelsDialog() {
@@ -5920,7 +5983,7 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
             <button
               type="button"
               class="mp-btn mp-btn-ghost"
-              :disabled="allModelsSyncing"
+              :disabled="allModelsAnySyncing"
               title="从各渠道上游拉取最新可用模型列表"
               @click="syncAllChannelsModels"
             >
@@ -6000,6 +6063,26 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
                     <span v-html="icons.close" />
                     <span>清空</span>
                   </button>
+                  <!-- 禁用按钮不派发鼠标事件（且已 pointer-events:none），提示挂在包裹层上，
+                       否则「为何不能同步」的说明在禁用态永远看不到 -->
+                  <span
+                    class="mp-sync-btn-wrap"
+                    :class="{ 'is-disabled': !group.channel.enabled || allModelsAnySyncing }"
+                    :title="syncChannelButtonTitle(group.channel)"
+                  >
+                    <button
+                      type="button"
+                      class="mp-btn mp-btn-ghost mp-btn-sm"
+                      :disabled="!group.channel.enabled || allModelsAnySyncing"
+                      @click="syncOneChannelModels(group.channel)"
+                    >
+                      <span
+                        :class="{ 'mp-spin': syncingChannelId === group.channel.id }"
+                        v-html="icons.restore"
+                      />
+                      <span>{{ syncingChannelId === group.channel.id ? "同步中…" : "同步" }}</span>
+                    </button>
+                  </span>
                 </span>
               </div>
 
@@ -6010,7 +6093,7 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
                   type="button"
                   class="mp-all-models-item"
                   :class="{ 'is-selected': isAllModelChecked(group.channel.id, model) }"
-                  :title="isAllModelChecked(group.channel.id, model) ? '点击取消勾选' : '点击勾选对外暴露'"
+                  :title="allModelItemTitle(group.channel.id, model)"
                   @click="toggleAllModel(group.channel.id, model)"
                 >
                   <span class="mp-mec-check" aria-hidden="true">
@@ -6022,7 +6105,7 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
               <div v-else class="mp-group-empty-note text-muted text-xs">
                 <span v-if="!group.channel.enabled">该渠道当前已被禁用</span>
                 <span v-else-if="allModelsSearch">未检索到匹配的模型</span>
-                <span v-else>暂无已知模型，点击顶部「同步模型」从上游拉取</span>
+                <span v-else>暂无已知模型，点本组「同步」或顶部「同步模型」从上游拉取</span>
               </div>
             </section>
           </div>
@@ -6035,7 +6118,7 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
 
         <div class="mp-modal-footer">
           <div class="mp-modal-footer-hint text-muted text-xs">
-            <span>💡 勾选状态即各渠道对外暴露的模型；点击「同步模型」拉取上游最新列表，如需调整代理出口或协议，请使用各渠道卡片「管理模型」</span>
+            <span>💡 勾选状态即各渠道对外暴露的模型；点「同步模型」拉取全部渠道，或用各分组右侧「同步」只拉取该渠道；如需调整代理出口或协议，请使用各渠道卡片「管理模型」</span>
           </div>
           <div class="mp-modal-footer-buttons">
             <button
@@ -6347,6 +6430,19 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
   height: 30px;
   padding: 0 10px;
   font-size: 12px;
+}
+
+/* 禁用态按钮：此前只挂了 disabled 属性，视觉上仍像可点（透明度/指针都没变），补齐反馈。
+   pointer-events: none 顺带让变体的 hover 规则（.mp-btn-ghost:hover / .mp-btn-primary:hover
+   与本规则同特异性且写在后面）彻底失效，避免禁用态仍变色/上浮。 */
+.mp-btn:disabled {
+  opacity: 0.5;
+  pointer-events: none;
+}
+
+/* 整组已置灰时不再叠加禁用透明度（0.55 × 0.5 ≈ 0.28 几乎看不见），与组内其它控件保持一致 */
+.mp-all-models-group.is-disabled .mp-btn:disabled {
+  opacity: 1;
 }
 
 .mp-btn :deep(svg) {
@@ -10303,6 +10399,16 @@ button.mp-mec-check:focus-visible {
   margin-left: auto;
   display: flex;
   gap: 6px;
+}
+
+/* 「同步」按钮的包裹层：禁用按钮不派发鼠标事件（且自身 pointer-events:none），
+   提示与禁用光标都挂在它身上（只做包裹，不占额外空间） */
+.mp-sync-btn-wrap {
+  display: inline-flex;
+}
+
+.mp-sync-btn-wrap.is-disabled {
+  cursor: not-allowed;
 }
 
 .mp-all-models-grid {

@@ -13,15 +13,21 @@ function getTooltipText(target: HTMLElement): string {
   if (target.matches(".tag-overflow") && target.dataset.hiddenTags)
     return `已隐藏：${target.dataset.hiddenTags}`;
   if (target.dataset.tooltip) return target.dataset.tooltip;
-  if (target.dataset.uiTooltip) return target.dataset.uiTooltip;
+  // 实时 title 优先于缓存：Vue 重渲染 title 后（如勾选状态变化）需立即生效，避免旧提示残留
   const title = target.getAttribute("title")?.trim();
   if (title) {
     target.dataset.uiTooltip = title;
     target.removeAttribute("title");
-    if (target.matches("button") && !target.getAttribute("aria-label"))
+    // 仅在没有手写 aria-label、或当前 aria-label 仍是本工具上次写入的值时才同步，
+    // 避免覆盖模板自带文案；存值而非标记位，日后模板改成动态 aria-label 也不会被锁死
+    const currentLabel = target.getAttribute("aria-label");
+    if (target.matches("button") && (!currentLabel || currentLabel === target.dataset.autoAria)) {
       target.setAttribute("aria-label", title);
+      target.dataset.autoAria = title;
+    }
     return title;
   }
+  if (target.dataset.uiTooltip) return target.dataset.uiTooltip;
   if (target.matches('button[aria-label],[role="button"][aria-label]'))
     return target.getAttribute("aria-label")?.trim() ?? "";
   return "";

@@ -7,6 +7,7 @@ import { useUIState } from "../ui/useUIState";
 import { useConfirm } from "../ui/useConfirm";
 import type {
   AddressItem,
+  ChromeSessionInfo,
   OpenUrlInChromeSessionsResult,
   SiteRecord,
   SiteLinkKind,
@@ -134,6 +135,56 @@ async function openExternalInChromeProfile(url: string, profileId: string) {
   }
 }
 
+/** 站点关联的 Chrome 账号会话（与卡片 / 列表同口径：不按筛选、不按会话有效性过滤） */
+function siteSessions(siteId: string): ChromeSessionInfo[] {
+  if (!siteId) return [];
+  return chromeUsageAccounts.value[siteId] ?? [];
+}
+
+/** 账号显示名：`用户名（账户名）`，缺失或与账号重名时退回单一名称；失效 / 异常会话额外标注。
+ *
+ *  后端在 Profile 名为 `Default` / `您的 Chrome` 之类时会用账号名顶替 profile_name
+ *  （见 core/db.rs 的会话读取），直接拼接会出现 `a@b.com（a@b.com）` 这种重复文案。 */
+function sessionLabel(session: ChromeSessionInfo): string {
+  const account = session.username?.trim() || session.accountName.trim();
+  const detail =
+    account === session.username?.trim() && session.accountName.trim()
+      ? session.accountName.trim()
+      : session.profileName;
+  const base = account
+    ? detail && detail !== account
+      ? `${account}（${detail}）`
+      : account
+    : session.profileName;
+  if (!session.isValid) return `${base} · 会话失效`;
+  if (session.syncError) return `${base} · 同步异常`;
+  return base;
+}
+
+/** 用哪个 Chrome Profile 打开站点地址：显式选择 > 该站点第一个账号 > 空串。
+ *
+ *  规则：只要站点关联了账号就走账号的 Chrome Profile，**只有没有任何账号**时才回退
+ *  系统默认浏览器 —— 单账号站点同样应该落在那个账号的浏览器里。 */
+function preferredProfileId(siteId: string, chosenProfileId = ""): string {
+  const sessions = siteSessions(siteId);
+  // 显式选择必须是本站点自己的账号：陈旧 / 串站点的 profileId 一律忽略，退回第一个账号
+  if (chosenProfileId && sessions.some((session) => session.profileId === chosenProfileId)) {
+    return chosenProfileId;
+  }
+  return sessions[0]?.profileId ?? "";
+}
+
+/** 打开站点地址：有关联账号 → 该账号的 Chrome Profile；没有任何账号 → 系统默认浏览器 */
+async function openSiteAddress(url: string, siteId: string, chosenProfileId = "") {
+  if (!url) return;
+  const profileId = preferredProfileId(siteId, chosenProfileId);
+  if (profileId) {
+    await openExternalInChromeProfile(url, profileId);
+    return;
+  }
+  await openExternal(url);
+}
+
 function chromeSessionsOpenToast(result: OpenUrlInChromeSessionsResult): string {
   // 优先用账号缓存里的站点昵称（profileId 映射），没有缓存时回退邮箱/Profile 名。
   const nicknameByProfile = new Map<string, string>();
@@ -221,6 +272,10 @@ export function useSiteActions() {
     setUsageState,
     toggleRunaway,
     openExternal,
+    siteSessions,
+    sessionLabel,
+    preferredProfileId,
+    openSiteAddress,
     openExternalInChromeProfile,
     openExternalInChromeSessions,
     copyAddress,

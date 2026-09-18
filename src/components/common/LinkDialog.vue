@@ -4,7 +4,7 @@ import { icons } from "../../icons";
 import { useStore } from "../../composables/useStore";
 import type { AddressItem, SiteLinkKind } from "../../types";
 
-import CustomSelect from "./CustomSelect.vue";
+import LinkAccountPicker from "./LinkAccountPicker.vue";
 
 const store = useStore();
 
@@ -22,12 +22,6 @@ const linkDialogTitles: Record<SiteLinkKind, string> = {
 const visibleAddressItems = computed<AddressItem[]>(() => {
   if (!store.linkDialogSite.value) return [];
   return store.addressItems(store.linkDialogSite.value, store.linkDialogKind.value);
-});
-
-const profileSessions = computed(() => {
-  const site = store.linkDialogSite.value;
-  if (!site || store.usageFilter.value !== "personal") return [];
-  return (store.chromeUsageAccounts.value[site.id] ?? []).filter((session) => session.isValid);
 });
 
 const subtitle = computed(() =>
@@ -48,14 +42,12 @@ watch(
   },
 );
 
+// 关闭弹窗时清掉已选账户，避免下次打开沿用到别的站点；
+// 打开时由选择器默认选中第一个账号（单账号站点无需用户操作）
 watch(
-  () => [
-    store.linkDialogOpen.value,
-    store.linkDialogSite.value?.id,
-    profileSessions.value.map((session) => session.profileId).join("|"),
-  ],
+  () => [store.linkDialogOpen.value, store.linkDialogSite.value?.id],
   ([open]) => {
-    selectedProfileId.value = open ? profileSessions.value[0]?.profileId ?? "" : "";
+    if (!open) selectedProfileId.value = "";
   },
 );
 
@@ -68,27 +60,11 @@ function onBackdropClick(event: MouseEvent) {
 }
 
 async function openAddress(item: AddressItem) {
-  if (selectedProfileId.value) {
-    await store.openExternalInChromeProfile(item.url, selectedProfileId.value);
-  } else {
-    await store.openExternal(item.url);
-  }
+  const site = store.linkDialogSite.value;
+  if (!site) return;
+  // 有关联账号 → 用所选（或第一个）账号的 Chrome Profile；没有任何账号 → 系统默认浏览器
+  await store.openSiteAddress(item.url, site.id, selectedProfileId.value);
 }
-
-function profileLabel(session: (typeof profileSessions.value)[number]) {
-  const account = session.username?.trim() || session.accountName.trim();
-  const detail = account === session.username?.trim() && session.accountName.trim()
-    ? session.accountName.trim()
-    : session.profileName;
-  return account ? `${account}（${detail}）` : session.profileName;
-}
-
-const profileOptions = computed(() =>
-  profileSessions.value.map((session) => ({
-    value: session.profileId,
-    text: profileLabel(session),
-  })),
-);
 
 async function copyAddress(item: AddressItem) {
   await store.copyAddress(item.url, item.label);
@@ -126,21 +102,10 @@ async function copyAddress(item: AddressItem) {
             v-html="icons.close"
           />
         </header>
-        <div v-if="profileSessions.length" class="link-account-picker">
-          <span class="link-account-icon" v-html="icons.user" />
-          <label for="link-browser-account">
-            <strong>浏览器账户</strong>
-            <small>使用所选 Chrome Profile 打开地址</small>
-          </label>
-          <div class="link-account-select">
-            <CustomSelect
-              :options="profileOptions"
-              :model-value="selectedProfileId"
-              aria-label="浏览器账户"
-              @update:model-value="selectedProfileId = String($event)"
-            />
-          </div>
-        </div>
+        <LinkAccountPicker
+          v-model="selectedProfileId"
+          :site-id="store.linkDialogSite.value?.id ?? ''"
+        />
         <div class="address-list">
           <div
             v-for="(item, index) in visibleAddressItems"

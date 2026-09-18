@@ -5,9 +5,12 @@ import { formatDate, formatRateLimit, logoText } from "../../utils";
 import { useStore } from "../../composables/useStore";
 import type { AddressItem } from "../../types";
 
+import LinkAccountPicker from "./LinkAccountPicker.vue";
+
 const store = useStore();
 
 const closeBtnRef = ref<HTMLButtonElement>();
+const selectedProfileId = ref("");
 
 const site = computed(() => store.previewSite.value);
 
@@ -78,7 +81,9 @@ function onBackdropClick(event: MouseEvent) {
 }
 
 async function openAddress(item: AddressItem) {
-  await store.openExternal(item.url);
+  if (!site.value) return;
+  // 有关联账号 → 用所选（或第一个）账号的 Chrome Profile；没有任何账号 → 系统默认浏览器
+  await store.openSiteAddress(item.url, site.value.id, selectedProfileId.value);
 }
 
 async function copyAddress(item: AddressItem) {
@@ -88,6 +93,14 @@ async function copyAddress(item: AddressItem) {
 async function openProfile(url: string) {
   await store.openExternal(url);
 }
+
+// 关闭预览时清掉已选账户，避免下次打开沿用到别的站点
+watch(
+  () => store.previewDialogOpen.value,
+  (open) => {
+    if (!open) selectedProfileId.value = "";
+  },
+);
 </script>
 
 <template>
@@ -179,6 +192,12 @@ async function openProfile(url: string) {
           <!-- 相关链接 -->
           <section class="preview-section">
             <h3>相关链接 <span>{{ previewAddressItems.length }}</span></h3>
+            <!-- 有关联账号时选择用哪个账号的 Chrome 浏览器打开这些地址 -->
+            <LinkAccountPicker
+              v-model="selectedProfileId"
+              :site-id="site.id"
+              class="preview-link-account"
+            />
             <div class="preview-link-list">
               <template v-if="previewAddressItems.length">
                 <div

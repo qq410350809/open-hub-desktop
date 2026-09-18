@@ -6,7 +6,7 @@ import { formatDate, formatRateLimit, logoText } from "../../utils";
 import { useStore } from "../../composables/useStore";
 import { runCommand, isTauri } from "../../composables/useLibrary";
 import AppTable, { type AppTableColumn } from "../common/AppTable.vue";
-import CustomSelect from "../common/CustomSelect.vue";
+import LinkAccountPicker from "../common/LinkAccountPicker.vue";
 import type {
   ChromeSessionInfo,
   SiteModelCache,
@@ -95,6 +95,15 @@ const selectedSite = computed<SiteRecord | null>(() => {
   if (!selectedSiteId.value) return null;
   return store.sites.value.find((s) => s.id === selectedSiteId.value) ?? null;
 });
+
+/** 抽屉「相关直达链接」选中的浏览器账户（切换站点时重置，由选择器默认选中第一个账号） */
+const drawerProfileId = ref("");
+watch(
+  () => selectedSite.value?.id,
+  () => {
+    drawerProfileId.value = "";
+  },
+);
 
 // —— 快捷热门芯片列表 (仅展示有数值 count > 0 的项，支持换行与展开/收起) ——
 const isChipsExpanded = ref(false);
@@ -403,7 +412,17 @@ const tableColumns = computed<AppTableColumn[]>(() => [
 
 // —— 辅助格式化方法 ——
 function getSiteSessions(siteId: string): ChromeSessionInfo[] {
-  return store.chromeUsageAccounts.value[siteId] ?? [];
+  return store.siteSessions(siteId);
+}
+
+/** 抽屉「打开」按钮的悬停说明：讲清会用哪个账号的浏览器打开 */
+function addressOpenTitle(siteId: string): string {
+  const sessions = store.siteSessions(siteId);
+  const first = sessions[0];
+  if (!first) return "使用系统默认浏览器打开";
+  const suffix =
+    sessions.length > 1 ? `；另有 ${sessions.length - 1} 个账号可在「账号与额度」中分别打开` : "";
+  return `使用「${store.sessionLabel(first)}」的 Chrome 账户打开${suffix}`;
 }
 
 /** 站点已同步的 Key 总数：各关联账号 apiKeyCount 之和 */
@@ -2032,6 +2051,12 @@ onUnmounted(() => {
                     <span v-html="icons.link" />
                     <strong>相关直达链接</strong>
                   </div>
+                  <!-- 有关联账号时选择用哪个账号的 Chrome 浏览器打开这些地址 -->
+                  <LinkAccountPicker
+                    v-model="drawerProfileId"
+                    :site-id="selectedSite.id"
+                    class="sl-link-account"
+                  />
                   <div class="sl-links-list">
                     <div v-if="selectedSite.apiBaseUrl" class="sl-link-item">
                       <div>
@@ -2039,7 +2064,7 @@ onUnmounted(() => {
                         <small>{{ selectedSite.apiBaseUrl }}</small>
                       </div>
                       <div class="sl-link-item-actions">
-                        <button type="button" class="sl-btn-xs" @click="store.openExternal(selectedSite.apiBaseUrl)">打开</button>
+                        <button type="button" class="sl-btn-xs" aria-label="打开 API 服务地址" :title="addressOpenTitle(selectedSite.id)" @click="store.openSiteAddress(selectedSite.apiBaseUrl, selectedSite.id, drawerProfileId)">打开</button>
                         <button type="button" class="sl-btn-xs" @click="copyText(selectedSite.apiBaseUrl, 'API 地址')">复制</button>
                       </div>
                     </div>
@@ -2049,7 +2074,7 @@ onUnmounted(() => {
                         <small>{{ selectedSite.checkinUrl }}</small>
                       </div>
                       <div class="sl-link-item-actions">
-                        <button type="button" class="sl-btn-xs" @click="store.openExternal(selectedSite.checkinUrl)">打开</button>
+                        <button type="button" class="sl-btn-xs" aria-label="打开签到地址" :title="addressOpenTitle(selectedSite.id)" @click="store.openSiteAddress(selectedSite.checkinUrl, selectedSite.id, drawerProfileId)">打开</button>
                         <button type="button" class="sl-btn-xs" @click="copyText(selectedSite.checkinUrl, '签到地址')">复制</button>
                       </div>
                     </div>
@@ -2059,7 +2084,7 @@ onUnmounted(() => {
                         <small>{{ selectedSite.benefitUrl }}</small>
                       </div>
                       <div class="sl-link-item-actions">
-                        <button type="button" class="sl-btn-xs" @click="store.openExternal(selectedSite.benefitUrl)">打开</button>
+                        <button type="button" class="sl-btn-xs" aria-label="打开福利站地址" :title="addressOpenTitle(selectedSite.id)" @click="store.openSiteAddress(selectedSite.benefitUrl, selectedSite.id, drawerProfileId)">打开</button>
                         <button type="button" class="sl-btn-xs" @click="copyText(selectedSite.benefitUrl, '福利站地址')">复制</button>
                       </div>
                     </div>
@@ -2069,7 +2094,7 @@ onUnmounted(() => {
                         <small>{{ selectedSite.statusUrl }}</small>
                       </div>
                       <div class="sl-link-item-actions">
-                        <button type="button" class="sl-btn-xs" @click="store.openExternal(selectedSite.statusUrl)">打开</button>
+                        <button type="button" class="sl-btn-xs" aria-label="打开系统状态页" :title="addressOpenTitle(selectedSite.id)" @click="store.openSiteAddress(selectedSite.statusUrl, selectedSite.id, drawerProfileId)">打开</button>
                         <button type="button" class="sl-btn-xs" @click="copyText(selectedSite.statusUrl, '状态页地址')">复制</button>
                       </div>
                     </div>
@@ -4571,6 +4596,13 @@ onUnmounted(() => {
 }
 
 .sl-links-list {
+/* 抽屉里的浏览器账户选择行：收成一张卡片，压掉选择器自带的下边框避免与链接列表叠线 */
+.sl-link-account.link-account-picker {
+  margin-bottom: 10px;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--r-sm);
+}
+
   display: flex;
   flex-direction: column;
   gap: 8px;

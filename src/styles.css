@@ -645,9 +645,9 @@ kbd { padding: 3px 7px; border: 1px solid var(--line); border-radius: var(--r-xs
 .link-account-picker label strong { font-size: 12px; }
 .link-account-picker label small { margin-top: 2px; overflow: hidden; color: var(--faint); white-space: nowrap; text-overflow: ellipsis; font-size: 10px; }
 .link-account-select { position: relative; min-width: 0; }
-.link-account-select select { width: 100%; height: 38px; padding: 0 34px 0 11px; appearance: none; border: 1px solid var(--line); border-radius: var(--r-sm); outline: 0; background: var(--surface); color: var(--text); font-size: 11px; text-overflow: ellipsis; }
-.link-account-select select:focus { border-color: color-mix(in srgb,var(--brand) 55%,var(--line)); box-shadow: 0 0 0 3px var(--brand-glow); }
-.link-account-select > span { position: absolute; top: 50%; right: 10px; display: grid; place-items: center; color: var(--faint); transform: translateY(-50%); pointer-events: none; }
+/* 选择器内部是 CustomSelect（`.select-box` + `.select-trigger`），其样式由组件自带规则负责；
+   这里原来给原生 <select> 写的宽度 / 边框 / 箭头定位已随组件化失效，删掉以免日后误调
+   `.select-box select { display: none }` 时把隐藏的原生控件暴露出来。 */
 .link-account-select svg { width: 14px; height: 14px; }
 .address-list { min-height: 0; grid-row: 3; padding: 8px; overflow-y: auto; overscroll-behavior: contain; background: var(--surface-soft); }
 .address-row { min-width: 0; min-height: 72px; padding: 13px 12px 13px 15px; display: grid; grid-template-columns: minmax(0,1fr) 76px; align-items: center; gap: 12px; border-bottom: 1px solid var(--line-soft); background: var(--surface); border-radius: var(--r-sm); margin-bottom: 4px; }
@@ -823,6 +823,9 @@ kbd { padding: 3px 7px; border: 1px solid var(--line); border-radius: var(--r-xs
 .preview-tags span { padding: 5px 9px; border: 1px solid var(--line); border-radius: var(--r-xs); color: var(--muted); font-size: 11px; }
 .preview-tags span.muted { color: var(--faint); }
 .preview-link-list, .preview-maintainers { border-top: 1px solid var(--line-soft); }
+/* 预览弹窗「相关链接」里的浏览器账户行：收成一张卡片，并压掉选择器自带的下边框（避免与
+   链接列表的上边框叠成双线） */
+.preview-link-account.link-account-picker { margin-bottom: 10px; border: 1px solid var(--line-soft); border-radius: var(--r-sm); }
 .preview-link-row { min-width: 0; min-height: 58px; display: grid; grid-template-columns: 130px minmax(0,1fr) 70px; align-items: center; gap: 12px; border-bottom: 1px solid var(--line-soft); }
 .preview-link-row > div:first-child { min-width: 0; display: flex; flex-direction: column; }
 .preview-link-row strong, .preview-maintainer-row strong { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: 11px; }

@@ -309,18 +309,46 @@ const mappingTargetValues = computed(() => {
 });
 
 /**
+ * 注册表索引，`name` 优先于 `id`。
+ *
+ * `official_model` 这一列按约定存**显示名**，但早期 AI 落库写的是注册表 id
+ * （形如 `glm52`），存量行需要按 id 兜底解析，否则真原厂会被判成「非原厂」。
+ * 两个 Map 分开是为了保持优先级：某值本身已是某个模型的名字时，不再拿它去撞
+ * 另一个条目的 id。
+ */
+const mappingCatalogIndex = computed(() => {
+  const byName = new Map<string, TokenOfficialModel>();
+  const byId = new Map<string, TokenOfficialModel>();
+  for (const model of mappingCatalogModels.value) {
+    const name = model.name.trim().toLowerCase();
+    if (name && !byName.has(name)) byName.set(name, model);
+    const id = model.id.trim().toLowerCase();
+    if (id && !byId.has(id)) byId.set(id, model);
+  }
+  return { byName, byId };
+});
+
+/**
  * 单行的目标下拉选项：常规只有「未映射 / 自定义…」+ 共享原厂分组。
  *
- * 当前值若不在原厂候选内（历史遗留或 AI 建议），额外补一条并显式标注
- * `（非原厂）`——既不让下拉显示空白（看起来像「未映射」），
- * 也不把它混进共享候选让别的行也看得到。
+ * 当前值若不在原厂候选内，额外补一条——既不让下拉显示空白（看起来像「未映射」），
+ * 也不把它混进共享候选让别的行也看得到。补的这条会先按注册表解析：
+ * 解析到原厂模型就显示其正式名（存量 slug 属这种情况，**不是**「非原厂」），
+ * 只有确实解析不到原厂条目时才标注 `（非原厂）`。
  */
 function mappingRowSelectOptions(row: TokenModelMapping) {
   const current = row.officialModel.trim();
-  if (current && !mappingTargetValues.value.has(current)) {
-    return [...mappingTargetSelectOptions, { value: current, text: `${current}（非原厂）` }];
+  if (!current || mappingTargetValues.value.has(current)) return mappingTargetSelectOptions;
+  const key = current.toLowerCase();
+  const index = mappingCatalogIndex.value;
+  const entry = index.byName.get(key) ?? index.byId.get(key);
+  if (entry?.firstParty) {
+    return [...mappingTargetSelectOptions, { value: current, text: entry.name.trim() }];
   }
-  return mappingTargetSelectOptions;
+  return [
+    ...mappingTargetSelectOptions,
+    { value: current, text: `${entry?.name.trim() || current}（非原厂）` },
+  ];
 }
 
 const mappingOriginLabels: Record<string, string> = {
@@ -682,16 +710,47 @@ watch(mappingChannelOptions, (options) => {
   }
 }, { immediate: true });
 
-// 分析模型候选（模型名称识别）：所选反代渠道实际可调用的模型。
-// 后端按所选渠道拼「alias/裸模型」前缀精确路由，官方目录名未必能在该渠道调用
+/**
+ * 模型名匹配键：剥掉 `lab/` 前缀后只留字母数字（小写）。
+ *
+ * 渠道拼写常带前缀（`google/gemma-4-31B-it`、`z-ai/glm-5.2`），目录名不带；
+ * 先剥前缀再比对，才能认出「同一模型的不同写法」。只用于归集判定，不用于展示。
+ */
+function normalizeModelMatchKey(name: string): string {
+  const bare = name.includes("/") ? name.slice(name.lastIndexOf("/") + 1) : name;
+  return normalizeModelDisplayName(bare);
+}
+
+/** 原厂（自营）模型的匹配键集合：含目录名、注册表 id 与别名，用于把渠道拼写归集回原厂。 */
+const firstPartyModelKeys = computed(() => {
+  const keys = new Set<string>();
+  for (const model of mappingCatalogModels.value) {
+    if (!model.firstParty) continue;
+    for (const raw of [model.name, model.id, ...(model.aliases ?? [])]) {
+      const key = normalizeModelMatchKey(raw);
+      if (key) keys.add(key);
+    }
+  }
+  return keys;
+});
+
+// 分析模型候选（模型名称识别）：所选反代渠道实际可调用的模型里，**只留原厂模型**。
+//
+// 渠道暴露的名字大量是同一原厂模型的变种拼法（`GLM-5.2-think`、`DeepSeek-V4-Pro-0813-think`、
+// 日期后缀、`-highspeed`……），它们在统计侧本来就归集到原厂模型，全列出来只会把选择变乱。
+// 保留渠道自己的拼写而不是替换成目录名——后端按「alias/裸模型」前缀精确路由，
+// 目录名未必能在该渠道调用。渠道一个原厂模型都没有时（如只暴露 free 变体）退回全量，
+// 否则该渠道将无法发起识别。
 const mappingChannelModelSuggestions = computed(() => {
   const id = mappingChannelId.value;
   if (!id) return [];
   const channel = mappingProxy.proxyConfig.value.channels.find((c) => c.id === id);
   // 与「管理可用模型」列表同口径：免费渠道过滤 + enabledModels 白名单（null = 全部启用）
-  return [...new Set(filterChannelModels(channel, mappingProxy.modelsForChannel(id)))].sort(
-    (a, b) => a.localeCompare(b, undefined, { numeric: true })
-  );
+  const callable = [...new Set(filterChannelModels(channel, mappingProxy.modelsForChannel(id)))];
+  const officialKeys = firstPartyModelKeys.value;
+  const official = callable.filter((model) => officialKeys.has(normalizeModelMatchKey(model)));
+  const list = official.length > 0 ? official : callable;
+  return list.sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
 });
 
 const mappingModelSelectOptions = computed(() => {
@@ -715,16 +774,50 @@ watch(
   { immediate: true }
 );
 
-// 洞察分析模型候选：沿用官方模型目录全量（用户手工添加 + AI 自动学习 + 数据迁移），
-// 裸模型名由网关按渠道白名单匹配路由。
-// 这里刻意**不**套用映射下拉的「仅原厂」过滤——洞察只需要一个能出网的模型名。
+/**
+ * 模型名归一化：小写并去掉所有非字母数字字符。
+ *
+ * 用于下拉去重——同一模型在 `token_official_models` 里可能有多种写法
+ * （目录导入用压缩 id `glm52`，数据迁移/用 AI 识别用原名 `GLM-5.2`），
+ * 直接按字符串去重会让它们各占一项。
+ */
+function normalizeModelDisplayName(name: string): string {
+  return name.toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+
+/**
+ * 同名条目里选更可读的一个：优先带分隔符的写法（`GLM-5.2` 优于 `glm52`）。
+ *
+ * 两者可读性相同时保留先出现的（列表已按 confidence/lab/name 排序，故更权威）。 */
+function preferReadableModelName(left: string, right: string): string {
+  const score = (name: string) => (/[\s.-]/.test(name) ? 1 : 0) * 10 + (name.length > 6 ? 1 : 0);
+  return score(right) > score(left) ? right : left;
+}
+
+// 洞察分析模型候选：只列**原厂（自营）模型**，与映射下拉同一口径。
+//
+// 目录里其余条目都是原厂模型在各方渠道的变种写法（`GLM-5.2 Caveman`、
+// `GLM-5.2 Honey`、`DeepSeek V4 Flash 0731 (EU)`……），统计侧本来就归集到原厂模型，
+// 混进下拉只会把「选哪个」变成翻近两千条长清单。
+//
+// 同一模型可能有多条不同写法（`GLM-5.2` 与 `glm52`），按归一化名再合并一次，
+// 保留可读性更好的那个。裸模型名由网关按渠道白名单匹配路由。
+//
+// 与后端 `first_party_keys` 同一防御姿势：目录未同步（`firstParty` 全为 false）时
+// 退回全量，宁可多给也不把候选清空。
 const insightModelSelectOptions = computed(() => {
-  const models = new Set<string>();
-  for (const model of mappingCatalogModels.value) {
+  const all = mappingCatalogModels.value;
+  const official = all.filter((model) => model.firstParty);
+  const byNormalized = new Map<string, string>();
+  for (const model of official.length > 0 ? official : all) {
     const name = model.name.trim();
-    if (name) models.add(name);
+    if (!name) continue;
+    const key = normalizeModelDisplayName(name);
+    if (!key) continue;
+    const existing = byNormalized.get(key);
+    byNormalized.set(key, existing ? preferReadableModelName(existing, name) : name);
   }
-  return [...models]
+  return [...byNormalized.values()]
     .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }))
     .map((model) => ({ value: model, text: model }));
 });
@@ -1057,13 +1150,23 @@ async function runInsightAnalysis() {
 
 function openInsightDialog() {
   insightDialogOpen.value = true;
-  // 识别弹窗选的是渠道裸模型名，仅当它也在目录候选中时才作为洞察默认值
-  if (
-    !insightModel.value &&
-    insightModelSelectOptions.value.some((opt) => opt.value === mappingModel.value)
-  ) {
-    insightModel.value = mappingModel.value;
+  // 识别弹窗选的是渠道裸模型名，仅当它（或同一模型的另一种写法）也在目录候选中时
+  // 才作为洞察默认值。下拉已按归一化名去重，故这里也按归一化名匹配，
+  // 并采用下拉里实际存在的那个写法，避免默认值不在选项中而显示为空白。
+  if (insightModel.value) {
+    // 下拉口径收窄到原厂后，早先选中的非原厂变种可能已不在候选里 → 清空重选
+    const stillOffered = insightModelSelectOptions.value.some(
+      (opt) => normalizeModelDisplayName(opt.value) === normalizeModelDisplayName(insightModel.value),
+    );
+    if (stillOffered) return;
+    insightModel.value = "";
   }
+  const target = normalizeModelDisplayName(mappingModel.value);
+  if (!target) return;
+  const hit = insightModelSelectOptions.value.find(
+    (opt) => normalizeModelDisplayName(opt.value) === target,
+  );
+  if (hit) insightModel.value = hit.value;
 }
 
 /** 证据 ID → 中文说明，用于报告中的“依据”标注。 */
@@ -1349,6 +1452,7 @@ const PROVIDER_COLORS: Record<string, string> = {
   "command-code": "#10b981",
   dsh: "#1e88e5",
   workbuddy: "#0052d9",
+  pi: "#06b6d4",
 };
 
 function providerColor(source: string, index = 0): string {

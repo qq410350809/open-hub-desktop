@@ -251,6 +251,39 @@ function thirdPartySaving(model: ModelCatalogItem): number | null {
   return saving > 0.02 ? Math.round(saving * 100) : null;
 }
 
+/**
+ * 原厂价的状态（仅用模型级聚合字段判断，用于对比表等无 hosts 的视图）。
+ *
+ * 有公开标价 -> `{ kind: "price" }`；原厂免费 -> `{ kind: "free" }`；
+ * 原厂已上架但未标价 -> `{ kind: "unpriced" }`；原厂未上架 -> `{ kind: "none" }`。
+ */
+function officialPriceState(model: ModelCatalogItem):
+  | { kind: "price"; input: number; output: number }
+  | { kind: "free" }
+  | { kind: "unpriced" }
+  | { kind: "none" } {
+  const price = officialPrice(model);
+  if (price) return { kind: "price", ...price };
+  if (model.officialHostCount <= 0) return { kind: "none" };
+  // 原厂免费：官方渠道集合与免费渠道集合有交集，说明原厂自营渠道当前免费提供。
+  const officialFree = (model.officialChannelProviders ?? []).some((pid) =>
+    (model.freeChannelProviders ?? []).includes(pid),
+  );
+  if (officialFree) return { kind: "free" };
+  return { kind: "unpriced" };
+}
+
+/** 对比表「原厂官方价格」单元格文案。 */
+function officialPriceCellText(model: ModelCatalogItem): string {
+  const state = officialPriceState(model);
+  if (state.kind === "price") {
+    return `${formatPrice(state.input)} / ${formatPrice(state.output)}`;
+  }
+  if (state.kind === "free") return "免费";
+  if (state.kind === "unpriced") return "原厂已上架 · 未标价";
+  return "无官方渠道";
+}
+
 const statusOptions = [
   { value: "all", text: "全部状态" },
   { value: "ga", text: "正式版 (GA)" },
@@ -385,13 +418,28 @@ const paginatedModels = computed(() => {
 const totalPages = computed(() => Math.max(1, Math.ceil(filteredModels.value.length / pageSize.value)));
 
 // —— 供应商列表与统计 ——
+/** 供应商矩阵视图的独立搜索词（只过滤供应商，不污染全局模型搜索）。 */
+const providerQuery = ref("");
+/** 供应商矩阵视图的渠道层级筛选：`all` | `lab` | `cloud` | `gateway`。 */
+const providerTierFilter = ref<"all" | "lab" | "cloud" | "gateway">("all");
+/** 供应商矩阵视图：只看订阅制渠道。 */
+const providerSubOnly = ref(false);
+
 const providersList = computed(() => {
-  const term = query.value.trim().toLowerCase();
   let list = store.modelCatalog.value.providers;
   // 仅看原厂自营渠道：排除纯转售 / 聚合网关
   if (providerFirstPartyOnly.value) {
     list = list.filter((p) => p.isFirstParty);
   }
+  // 渠道层级：自营 lab / 算力云 cloud / 聚合网关 gateway
+  if (providerTierFilter.value !== "all") {
+    list = list.filter((p) => (p.tier || "gateway") === providerTierFilter.value);
+  }
+  // 订阅制渠道
+  if (providerSubOnly.value) {
+    list = list.filter((p) => p.subscription);
+  }
+  const term = providerQuery.value.trim().toLowerCase();
   if (!term) return list;
   return list.filter((p) => p.name.toLowerCase().includes(term) || p.id.toLowerCase().includes(term));
 });
@@ -689,6 +737,9 @@ function filterByProvider(providerId: string) {
 
 const providerModal = ref<ModelCatalogProvider | null>(null);
 
+/** 供应商详情弹窗内「托管模型」列表：仅看该渠道作为「原厂自营」托管的模型。 */
+const providerModalOfficialOnly = ref(false);
+
 /** 该供应商托管的全部模型（从模型列表反查 hostProviders）。 */
 function providerModalModels(provider: ModelCatalogProvider | null): ModelCatalogItem[] {
   if (!provider) return [];
@@ -701,6 +752,45 @@ function providerModalOfficialModels(provider: ModelCatalogProvider | null): Mod
   return providerModalModels(provider).filter(
     (model) => model.officialChannelProviders.includes(provider.id),
   );
+}
+
+/** 弹窗内「托管模型」列表当前展示的模型（按是否只看原厂切换）。 */
+function providerModalShownModels(provider: ModelCatalogProvider | null): ModelCatalogItem[] {
+  return providerModalOfficialOnly.value
+    ? providerModalOfficialModels(provider)
+    : providerModalModels(provider);
+}
+
+/**
+ * 该渠道作为**原厂**为哪些 lab 的模型自营（去重后的 lab 列表）。
+ *
+ * `isFirstParty` 描述的是「该渠道是某个厂商的自营渠道」，**不是**「它上架的所有模型
+ * 都算原厂」。例如 Azure 是微软自营云，但只对 `microsoft` 的 Phi 系列算原厂，
+ * 上架 OpenAI / Anthropic 等模型时是三方托管。矩阵徽标要带上这层归属，
+ * 否则用户会误以为「该渠道本身是原厂」。
+ */
+function providerOfficialLabs(provider: ModelCatalogProvider | null): string[] {
+  const labs = new Set<string>();
+  for (const model of providerModalOfficialModels(provider)) {
+    labs.add(effectiveLab(model));
+  }
+  return [...labs].sort();
+}
+
+/** 原厂归属文案：`微软` / `微软、Meta`；非原厂返回空串。 */
+function providerOfficialOwnership(provider: ModelCatalogProvider | null): string {
+  const labs = providerOfficialLabs(provider);
+  return labs.map((lab) => labLabel(lab)).join("、");
+}
+
+/** 矩阵徽标的悬停说明：把「原厂归属 + 上架总数」讲清楚。 */
+function providerOfficialBadgeTitle(provider: ModelCatalogProvider): string {
+  const labs = providerOfficialLabs(provider);
+  if (!labs.length) {
+    return "该渠道为某个模型厂商的自营渠道（对其它厂商的模型属于三方托管）";
+  }
+  const ownership = labs.map((lab) => labLabel(lab)).join("、");
+  return `该渠道是「${ownership}」的自营渠道，仅对这些厂商的模型算原厂；上架其它厂商模型属三方托管`;
 }
 
 /** 该渠道某模型条目的价格（分/百万 tokens；免费与订阅显示为 0）。
@@ -788,6 +878,24 @@ async function copyModelId(id: string) {
   setTimeout(() => (idCopied.value = false), 2000);
 }
 
+/**
+ * llmpricing.dev 模型详情页地址：`https://llmpricing.dev/m/{id}/`。
+ *
+ * 本地目录的渠道明细是「llmpricing 圈渠道范围 + models.dev 填价」的组合推导，
+ * 是非爬取的静态快照；llmpricing 网页是按需动态渲染的全量渠道表（含 HTML 内嵌
+ * 的 hosts 数组）。两者统计口径可能不一致：本页以本地聚合为准，需要核对原始
+ * 全量渠道时打开网页版。
+ */
+const llmpricingModelUrl = computed(() => {
+  const id = selectedModel.value?.id;
+  return id ? `https://llmpricing.dev/m/${encodeURIComponent(id)}/` : "";
+});
+
+async function openLlmpricingModelPage() {
+  if (!llmpricingModelUrl.value) return;
+  await store.openExternal(llmpricingModelUrl.value);
+}
+
 // —— 成本计算器计算（官网 / 三方 / 免费 三档） ——
 const calculatedCosts = computed(() => {
   if (!selectedModel.value) return null;
@@ -863,6 +971,13 @@ const detailOriginSummary = computed(() => {
       null,
     );
 
+  // 原厂渠道的免费判定：官方渠道行里 isFree（原厂自营的窗口期免费/开源权重），
+  // 与「有官方渠道但 models.dev 未给价」（input 为 null）是两回事，分开统计。
+  const officialFree = official.filter((h) => h.isFree && !h.subscription);
+  const officialUnpriced = official.filter(
+    (h) => !h.isFree && !h.subscription && h.input === null && h.output === null,
+  );
+
   const cheapestOfficial = cheapest(priced(official));
   const cheapestThirdParty = cheapest(priced(thirdParty));
 
@@ -884,6 +999,10 @@ const detailOriginSummary = computed(() => {
     officialChannels: model?.officialChannelProviders ?? official.map((h) => h.provider),
     freeChannels: model?.freeChannelProviders ?? [],
     subscriptionChannels: model?.subscriptionChannelProviders ?? [],
+    // 有原厂渠道但没有公开标价的模型：展示「原厂已上架 · 未公开标价」，
+    // 不能因为没价格就误报成「无官方渠道」（后者要求原厂根本没上架）。
+    officialFreeCount: officialFree.length,
+    officialUnpriced: officialUnpriced.length > 0,
     cheapestOfficial,
     cheapestThirdParty,
     saving,
@@ -1470,7 +1589,12 @@ onMounted(() => {
           <!-- 参考价格 -->
           <template #cell-refPrice="{ row }">
             <div class="mc-table-price-cell">
-              <span>{{ formatPrice(row.refInputCost) }} / {{ formatPrice(row.refOutputCost) }}</span>
+              <template v-if="row.refProvider && row.refInputCost <= 0 && row.refOutputCost <= 0">
+                <span class="mc-free-price">免费</span>
+              </template>
+              <template v-else>
+                <span>{{ formatPrice(row.refInputCost) }} / {{ formatPrice(row.refOutputCost) }}</span>
+              </template>
               <small>{{ row.refProvider ? labLabel(row.refProvider) : "官方" }}</small>
             </div>
           </template>
@@ -1548,9 +1672,46 @@ onMounted(() => {
             <h2>全网接入供应商拓扑渠道（共 {{ providersList.length }} 家）</h2>
             <p>点击任意供应商卡片，可一键筛选并查看其支持的全部模型与 API 接入信息</p>
           </div>
+        </div>
+
+        <div class="mc-matrix-filters">
+          <div class="mc-search-box mc-matrix-search">
+            <span v-html="icons.search" />
+            <input
+              v-model="providerQuery"
+              type="search"
+              placeholder="搜索供应商名称或 ID…"
+            />
+            <button v-if="providerQuery" type="button" class="mc-clear-search" @click="providerQuery = ''">
+              <span v-html="icons.close" />
+            </button>
+          </div>
+
+          <div class="mc-matrix-chip-group" role="tablist" aria-label="渠道层级筛选">
+            <button
+              v-for="opt in [
+                { value: 'all', text: '全部层级' },
+                { value: 'lab', text: '自营直销' },
+                { value: 'cloud', text: '算力云' },
+                { value: 'gateway', text: '聚合网关' },
+              ]"
+              :key="opt.value"
+              type="button"
+              class="mc-chip"
+              :class="{ active: providerTierFilter === opt.value }"
+              @click="providerTierFilter = opt.value as typeof providerTierFilter"
+            >
+              {{ opt.text }}
+            </button>
+          </div>
+
+          <label class="mc-priced-only-toggle">
+            <input v-model="providerSubOnly" type="checkbox" />
+            <span>仅订阅制</span>
+          </label>
           <label class="mc-priced-only-toggle">
             <input v-model="providerFirstPartyOnly" type="checkbox" />
-            <span>仅显示原厂自营渠道</span>
+            <span>仅原厂自营</span>
           </label>
         </div>
 
@@ -1571,24 +1732,36 @@ onMounted(() => {
                     <span class="mc-tier-pill" :class="`mc-tier-${prov.tier || 'gateway'}`">
                       {{ tierLabel(prov.tier) }}
                     </span>
-                    <span v-if="prov.isFirstParty" class="mc-origin-badge mc-origin-official" title="该渠道为某个模型厂商的自营渠道">原厂自营</span>
+                    <span v-if="prov.isFirstParty" class="mc-origin-badge mc-origin-official" :title="providerOfficialBadgeTitle(prov)">
+                      原厂自营<span v-if="providerOfficialOwnership(prov)" class="mc-origin-ownership">·{{ providerOfficialOwnership(prov) }}</span>
+                    </span>
                     <span v-else class="mc-origin-badge mc-origin-third" title="三方转售 / 聚合渠道">三方</span>
                     <span v-if="prov.subscription" class="mc-sub-pill">订阅制</span>
                   </div>
                 </div>
               </div>
 
-              <a
-                v-if="prov.doc"
-                :href="prov.doc"
-                target="_blank"
-                rel="noreferrer"
-                class="mc-doc-link-btn"
-                title="查看供应商官方文档"
-                @click.stop
-              >
-                <span v-html="icons.external" />
-              </a>
+              <div class="mc-pm-card-actions">
+                <button
+                  type="button"
+                  class="mc-pm-card-filter-btn"
+                  title="筛选：回到模型列表只看该供应商托管的模型"
+                  @click.stop="filterByProvider(prov.id)"
+                >
+                  <span v-html="icons.sliders" />
+                </button>
+                <a
+                  v-if="prov.doc"
+                  :href="prov.doc"
+                  target="_blank"
+                  rel="noreferrer"
+                  class="mc-doc-link-btn"
+                  title="查看供应商官方文档"
+                  @click.stop
+                >
+                  <span v-html="icons.external" />
+                </a>
+              </div>
             </div>
 
             <p v-if="prov.api" class="mc-pm-api">
@@ -1660,7 +1833,8 @@ onMounted(() => {
                   <span
                     v-if="providerModal.isFirstParty"
                     class="mc-origin-badge mc-origin-official"
-                  >原厂自营</span>
+                    :title="providerOfficialBadgeTitle(providerModal)"
+                  >原厂自营<span v-if="providerOfficialOwnership(providerModal)" class="mc-origin-ownership">·{{ providerOfficialOwnership(providerModal) }}</span></span>
                   <span v-else class="mc-origin-badge mc-origin-third">三方</span>
                   <span v-if="providerModal.subscription" class="mc-sub-pill">订阅制</span>
                 </div>
@@ -1704,6 +1878,10 @@ onMounted(() => {
               <div class="mc-provider-modal-stat">
                 <span class="mc-provider-modal-stat-label">原厂直销模型</span>
                 <strong class="mc-provider-modal-stat-val text-emerald">{{ providerModalOfficialModels(providerModal).length }}</strong>
+                <small
+                  v-if="providerOfficialOwnership(providerModal)"
+                  class="mc-provider-modal-stat-note"
+                >归属：{{ providerOfficialOwnership(providerModal) }}</small>
               </div>
               <div class="mc-provider-modal-stat">
                 <span class="mc-provider-modal-stat-label">支持思考档位</span>
@@ -1774,10 +1952,18 @@ onMounted(() => {
 
             <!-- 托管模型列表 -->
             <div class="mc-provider-modal-section">
-              <h4 class="mc-provider-modal-section-title">托管模型（{{ providerModalModels(providerModal).length }}）</h4>
+              <div class="mc-provider-modal-section-head">
+                <h4 class="mc-provider-modal-section-title">
+                  托管模型（{{ providerModalShownModels(providerModal).length }}）
+                </h4>
+                <label class="mc-priced-only-toggle">
+                  <input v-model="providerModalOfficialOnly" type="checkbox" />
+                  <span>仅看原厂自营</span>
+                </label>
+              </div>
               <div class="mc-provider-modal-models">
                 <button
-                  v-for="model in providerModalModels(providerModal).slice(0, 60)"
+                  v-for="model in providerModalShownModels(providerModal).slice(0, 60)"
                   :key="model.id"
                   type="button"
                   class="mc-provider-modal-model-chip"
@@ -1787,8 +1973,8 @@ onMounted(() => {
                   <strong>{{ model.name || model.id }}</strong>
                   <small v-if="model.reasoningEffortMax" class="text-violet">≤ {{ model.reasoningEffortMax }}</small>
                 </button>
-                <p v-if="providerModalModels(providerModal).length > 60" class="mc-provider-modal-more-hint">
-                  仅展示前 60 款，点击上方「筛选该供应商模型」查看全部
+                <p v-if="providerModalShownModels(providerModal).length > 60" class="mc-provider-modal-more-hint">
+                  仅展示前 60 款，点击下方「筛选该供应商模型」查看全部
                 </p>
               </div>
             </div>
@@ -1858,6 +2044,15 @@ onMounted(() => {
               </div>
 
               <div class="mc-drawer-head-actions">
+                <button
+                  type="button"
+                  class="mc-btn-llmpricing"
+                  title="打开 llmpricing.dev 的模型详情页：网页版按需渲染全部渠道（含未收录入本地快照的三方渠道），用于核对完整渠道明细"
+                  @click="openLlmpricingModelPage"
+                >
+                  <span v-html="icons.external" />
+                  <span>llmpricing.dev 网页版</span>
+                </button>
                 <button
                   type="button"
                   class="mc-btn-copy-id"
@@ -2345,6 +2540,14 @@ onMounted(() => {
                           </strong>
                           <small>{{ selectedModel.refProvider ? labLabel(selectedModel.refProvider) : "官方标准" }}</small>
                         </template>
+                        <template v-else-if="detailOriginSummary.officialFreeCount > 0">
+                          <strong class="mc-origin-price-v">免费</strong>
+                          <small>原厂官方渠道当前免费提供</small>
+                        </template>
+                        <template v-else-if="detailOriginSummary.officialUnpriced">
+                          <strong class="mc-origin-price-v muted">原厂已上架 · 未公开标价</strong>
+                          <small>有原厂官方渠道，但未给出公开 token 单价</small>
+                        </template>
                         <template v-else>
                           <strong class="mc-origin-price-v muted">无官方渠道</strong>
                           <small>该模型原厂未直接上架</small>
@@ -2495,7 +2698,9 @@ onMounted(() => {
                         {{ detail.hosts?.filter(h => !h.subscription && !h.isFree && (h.input !== null || h.output !== null)).length || selectedModel.pricedHostCount }} 家公开价格 ·
                         {{ detail.hosts?.filter(h => h.official).length || selectedModel.officialHostCount }} 家原厂官方 ·
                         {{ detail.hosts?.filter(h => h.isFree).length || selectedModel.freeHostCount }} 家免费 ·
-                        {{ detail.hosts?.filter(h => h.subscription).length || selectedModel.subHostCount }} 家订阅覆盖
+                        {{ detail.hosts?.filter(h => h.subscription).length || selectedModel.subHostCount }} 家订阅覆盖 ·
+                        本地快照按「llmpricing 渠道范围 + models.dev 定价」组合推导，不含网页版按需展开的全部三方渠道；
+                        <a class="mc-inline-ext-link" :href="llmpricingModelUrl" target="_blank" rel="noreferrer">网页版全量渠道 &rarr;</a>
                       </span>
                     </div>
                     <div class="flex items-center gap-3">
@@ -2898,9 +3103,17 @@ onMounted(() => {
                 <tr>
                   <td class="mc-arena-feature-col">原厂官方价格 (/1M)</td>
                   <td v-for="m in comparedModels" :key="m.id">
-                    <template v-if="officialPrice(m)">
-                      <strong>{{ formatPrice(officialPrice(m)!.input) }} / {{ formatPrice(officialPrice(m)!.output) }}</strong>
+                    <template v-if="officialPriceState(m).kind === 'price'">
+                      <strong>{{ officialPriceCellText(m) }}</strong>
                       <small class="mc-arena-cell-note">{{ m.refProvider ? labLabel(m.refProvider) : "官方" }}</small>
+                    </template>
+                    <template v-else-if="officialPriceState(m).kind === 'free'">
+                      <strong class="text-success">免费</strong>
+                      <small class="mc-arena-cell-note">官方渠道免费提供</small>
+                    </template>
+                    <template v-else-if="officialPriceState(m).kind === 'unpriced'">
+                      <strong class="muted">原厂已上架 · 未标价</strong>
+                      <small class="mc-arena-cell-note">官方渠道未公开 token 单价</small>
                     </template>
                     <span v-else class="muted">无官方渠道</span>
                   </td>
@@ -3942,6 +4155,10 @@ onMounted(() => {
   font-size: 11.5px;
   font-family: ui-monospace, monospace;
 }
+.mc-free-price {
+  color: var(--success);
+  font-weight: 600;
+}
 .mc-table-price-cell small {
   font-size: 9.5px;
   color: var(--muted);
@@ -3980,6 +4197,33 @@ onMounted(() => {
   margin: 4px 0 0;
   font-size: 12px;
   color: var(--muted);
+}
+
+/* 供应商矩阵筛选工具栏 */
+.mc-matrix-filters {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 10px 12px;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--r-lg);
+  background: var(--surface-soft);
+}
+.mc-matrix-search {
+  flex: 1 1 220px;
+  min-width: 200px;
+  max-width: 340px;
+}
+.mc-matrix-chip-group {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.mc-matrix-chip-group .mc-chip {
+  padding: 5px 10px;
+  font-size: 11.5px;
 }
 
 .mc-providers-matrix-grid {
@@ -4059,6 +4303,26 @@ onMounted(() => {
 }
 .mc-doc-link-btn:hover { color: var(--brand); }
 .mc-doc-link-btn :deep(svg) { width: 14px; height: 14px; }
+
+/* 供应商卡片右上角动作区：筛选 + 文档 */
+.mc-pm-card-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  margin-left: auto;
+}
+.mc-pm-card-filter-btn {
+  color: var(--muted);
+  display: flex;
+  padding: 4px;
+  background: none;
+  border: none;
+  cursor: pointer;
+  border-radius: 4px;
+  transition: color 0.15s ease;
+}
+.mc-pm-card-filter-btn:hover { color: var(--brand); }
+.mc-pm-card-filter-btn :deep(svg) { width: 14px; height: 14px; }
 
 .mc-pm-api code {
   font-size: 10.5px;
@@ -4160,10 +4424,29 @@ onMounted(() => {
   font-size: 20px;
   font-weight: 700;
 }
+.mc-provider-modal-stat-note {
+  font-size: 10.5px;
+  color: var(--muted);
+  line-height: 1.3;
+}
 .mc-provider-modal-section-title {
   margin: 0 0 10px;
   font-size: 13.5px;
   font-weight: 600;
+}
+.mc-provider-modal-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+.mc-provider-modal-section-head .mc-provider-modal-section-title {
+  margin: 0;
+}
+.mc-provider-modal-section-head .mc-priced-only-toggle {
+  flex-shrink: 0;
+  font-size: 11.5px;
 }
 .mc-provider-modal-effort-grid {
   display: flex;
@@ -4474,6 +4757,34 @@ onMounted(() => {
 }
 .mc-btn-copy-id:hover { background: var(--surface-hover); }
 .mc-btn-copy-id :deep(svg) { width: 12px; height: 12px; }
+
+/* llmpricing.dev 网页版入口：本地快照是组合推导的静态数据，
+   核对完整渠道明细时打开网页版（动态渲染全部三方渠道）。 */
+.mc-btn-llmpricing {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 12px;
+  border-radius: var(--r-md);
+  font-size: 12px;
+  font-weight: 600;
+  border: 1px solid color-mix(in srgb, var(--brand) 40%, transparent);
+  background: var(--surface-soft);
+  color: var(--brand-deep);
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+.mc-btn-llmpricing:hover {
+  background: var(--brand-soft);
+  border-color: var(--brand);
+}
+.mc-btn-llmpricing :deep(svg) { width: 12px; height: 12px; }
+.mc-inline-ext-link {
+  color: var(--brand-deep);
+  font-weight: 600;
+  text-decoration: none;
+}
+.mc-inline-ext-link:hover { text-decoration: underline; }
 
 .mc-compare-toggle-btn {
   display: inline-flex;
@@ -5354,6 +5665,11 @@ onMounted(() => {
 }
 .mc-origin-badge.is-zero {
   opacity: .45;
+}
+/* 原厂徽标后的归属厂商（如「·微软」）：弱化，强调「原厂自营」本身。 */
+.mc-origin-ownership {
+  font-weight: 600;
+  opacity: .78;
 }
 .mc-origin-saving {
   font-size: 10px;
