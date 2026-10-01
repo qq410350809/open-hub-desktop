@@ -42,6 +42,11 @@
   --warning: #d97706;
   --warning-soft: #fffbeb;
 
+  /* —— 模型状态条（逐时健康度竖条的交通灯配色，按参考样式取样；明暗主题共用） —— */
+  --model-status-ok: #63c469;
+  --model-status-warn: #ffaf44;
+  --model-status-bad: #fc725a;
+
   /* —— 侧栏 —— */
   --sidebar: #f7faf8;
   --sidebar-soft: #edf4f0;
@@ -1387,7 +1392,9 @@ kbd { padding: 3px 7px; border: 1px solid var(--line); border-radius: var(--r-xs
 .site-models-key-remove:disabled { opacity: 0.5; cursor: not-allowed; }
 
 .site-models-panel { flex: 1 1 auto; min-width: 0; min-height: 0; display: flex; flex-direction: column; background: var(--surface); }
-.site-models-panel-head { min-height: 56px; padding: 10px 16px; display: flex; align-items: center; justify-content: space-between; gap: 14px; border-bottom: 1px solid var(--line); }
+/* 面板头两行：上行标题 + 搜索，下行独占的色条口径说明——说明不再和标题挤一行换行叠字。 */
+.site-models-panel-head { padding: 10px 16px; display: flex; flex-direction: column; gap: 7px; border-bottom: 1px solid var(--line); }
+.site-models-panel-top { min-height: 34px; display: flex; align-items: center; justify-content: space-between; gap: 14px; }
 .site-models-panel-title { min-width: 0; display: flex; align-items: center; gap: 9px; }
 .site-models-panel-title strong { flex: 0 0 auto; color: var(--text); font-size: 13.5px; font-weight: 700; }
 .site-models-source { min-width: 0; overflow: hidden; color: var(--faint); white-space: nowrap; text-overflow: ellipsis; font-size: 11px; }
@@ -1457,9 +1464,30 @@ kbd { padding: 3px 7px; border: 1px solid var(--line); border-radius: var(--r-xs
 .site-models-item { width: 100%; min-width: 0; display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 9px 11px; border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--surface); color: inherit; font: inherit; text-align: left; -webkit-appearance: none; appearance: none; cursor: pointer; transition: border-color 0.15s var(--ease), background 0.15s var(--ease); }
 .site-models-item:hover { border-color: var(--brand); background: var(--brand-soft); }
 .site-models-item:focus-visible { outline: 2px solid color-mix(in srgb, var(--brand) 55%, transparent); outline-offset: 1px; }
-.site-models-item-info { min-width: 0; display: flex; flex-direction: column; }
+/* info 必须吃掉整张卡片的可用宽度：状态条里的格子是 flex-basis:0，
+   若 info 按内容收缩，整条只会剩 min-content 宽，竖条被压成针状。 */
+.site-models-item-info { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; }
 .site-models-item-info strong { min-width: 0; overflow: hidden; color: var(--text); white-space: nowrap; text-overflow: ellipsis; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 12px; font-weight: 600; }
-.site-models-item-vendor { min-width: 0; margin-top: 2px; overflow: hidden; color: var(--faint); white-space: nowrap; text-overflow: ellipsis; font-size: 10.5px; }
+.site-models-item-vendor { min-width: 0; overflow: hidden; color: var(--faint); white-space: nowrap; text-overflow: ellipsis; font-size: 10.5px; }
+.site-models-item-health { display: block; margin-top: 6px; }
+.site-models-item-health-value { flex: 0 0 auto; min-width: 34px; text-align: right; font-size: 10.5px; font-weight: 600; font-variant-numeric: tabular-nums; }
+/* 逐时状态条：24 格竖条，比例 1:1 对齐参考图——高 = 条宽 × 3.0、缝 = 条宽 × 0.375、圆角 2px。
+   宽度铺满整行，高度由 aspect-ratio 等比换算（W = 24w + 23×0.375w = 32.625w，
+   h = 3w ⇒ W/h = 10.875，单缝 = 0.375/32.625 = 1.149%W），
+   因此无论卡片多宽，格子形状与图完全一致（宽度只是整体缩放）。
+   灰格 = 该整点无流量（不是 0%）。 */
+.site-models-item-health-strip { display: flex; align-items: stretch; aspect-ratio: 10.875; gap: 3px; column-gap: 1.149%; }
+.site-models-item-health-slot { flex: 1 1 0; min-width: 2px; border-radius: 2px; background: color-mix(in srgb, var(--faint) 26%, transparent); transition: background 0.15s var(--ease); }
+.site-models-item-health-slot.is-healthy { background: var(--model-status-ok); }
+.site-models-item-health-slot.is-degraded { background: var(--model-status-warn); }
+.site-models-item-health-slot.is-down { background: var(--model-status-bad); }
+/* 标题行：模型 ID 左侧省略，成功率贴右——状态条独占下一整行。 */
+.site-models-item-head { min-width: 0; display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.site-models-item-health-value.is-healthy { color: var(--success); }
+.site-models-item-health-value.is-degraded { color: var(--warning); }
+.site-models-item-health-value.is-down { color: var(--danger); }
+/* 口径说明独占面板头第二行：左对齐小字，不再和标题挤一行换行叠字。 */
+.site-models-health-note { margin: 0; color: var(--faint); font-size: 10.5px; line-height: 1.55; }
 .site-models-item-copy { flex: 0 0 auto; width: 16px; height: 16px; color: var(--faint); }
 .site-models-item-copy svg { width: 16px; height: 16px; }
 .site-models-item:hover .site-models-item-copy { color: var(--brand-deep); }
@@ -1484,7 +1512,7 @@ kbd { padding: 3px 7px; border: 1px solid var(--line); border-radius: var(--r-xs
   .site-models-title { font-size: 14px; }
   .site-models-url { font-size: 11px; }
   .site-models-icon-btn { width: 32px; height: 32px; }
-  .site-models-panel-head { flex-direction: column; align-items: stretch; gap: 8px; padding: 10px 12px; }
+  .site-models-panel-top { flex-direction: column; align-items: stretch; gap: 8px; }
   .site-models-search { flex: 1 1 auto; width: 100%; }
   .site-models-scroll { padding: 10px 10px 12px; }
   .site-models-grid { grid-template-columns: 1fr; }

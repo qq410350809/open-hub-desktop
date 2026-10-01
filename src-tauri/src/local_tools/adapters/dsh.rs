@@ -123,8 +123,13 @@ impl ToolAdapter for DshAdapter {
                                         .collect()
                                 })
                                 .unwrap_or_default();
+                            let id = Self::yaml_str(model, "id");
+                            // 空档位也必须回填，避免回读后丢失明确的清除设置。
+                            snap.defaults
+                                .per_model_effort
+                                .insert(format!("{provider_id}/{id}"), efforts.join(","));
                             ModelEntry {
-                                id: Self::yaml_str(&model, "id"),
+                                id,
                                 name: {
                                     let n = Self::yaml_str(&model, "name");
                                     if n.is_empty() {
@@ -136,8 +141,9 @@ impl ToolAdapter for DshAdapter {
                                 provider: provider_id.to_string(),
                                 context_window: Self::yaml_u64(&model, "contextWindow"),
                                 max_output: Self::yaml_u64(&model, "maxTokens"),
+                                // DSH 的 reasoningEfforts 是「档位→取值」映射，没有逐模型默认档概念。
+                                reasoning_effort: String::new(),
                             }
-                            .with_efforts(efforts)
                         })
                         .collect()
                 })
@@ -363,20 +369,6 @@ fn upsert_openhub_credentials(home: &Path, patch: &ToolConfigPatch) -> Result<bo
     Ok(true)
 }
 
-/// ModelEntry 扩展：临时携带思考档信息（快照用）。
-trait WithEfforts {
-    fn with_efforts(self, efforts: Vec<String>) -> ModelEntry;
-}
-
-impl WithEfforts for ModelEntry {
-    fn with_efforts(mut self, efforts: Vec<String>) -> Self {
-        if !efforts.is_empty() {
-            self.name = format!("{}|{}", self.name, efforts.join(","));
-        }
-        self
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -408,6 +400,8 @@ mod tests {
         assert_eq!(snap.providers.len(), 1);
         assert_eq!(snap.models.len(), 1);
         assert_eq!(snap.models[0].context_window, 100_000);
+        assert_eq!(snap.models[0].name, "m1");
+        assert_eq!(snap.defaults.per_model_effort["fastmodel/m1"], "off,high");
 
         let patch = ToolConfigPatch {
             base_hash: snap.content_hash.clone(),
@@ -425,6 +419,7 @@ mod tests {
                 provider: "openhub-site_d_acc_0".into(),
                 context_window: 500_000,
                 max_output: 32_000,
+                reasoning_effort: String::new(),
             }],
             defaults: DefaultsSection {
                 per_model_effort: super::super::map_from(&[(
@@ -491,6 +486,137 @@ mod tests {
         assert!(text.contains("fastmodel"), "用户供应商必须保留：{text}");
         assert!(text.contains("openhub-site_d_acc_0"), "{text}");
         assert!(text.contains("x-openhub: OpenHub"), "{text}");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn efforts_roundtrip_keeps_names_limits_and_explicit_clears() {
+        let home = temp_home();
+        let path = settings_path(&home);
+        let fixture = r#"
+ui-onboarding:
+  welcomeNoticeVersion: 1
+llm-pi-ai:
+  customSection: keep
+  providers:
+    openhub-site_d_acc_0:
+      displayName: 站点 D
+      api: openai-completions
+      baseURL: https://example.invalid/v1
+      customProvider: keep
+      models:
+        - id: alias/reason
+          name: Reason | display name
+          contextWindow: 128000
+          maxTokens: 8192
+          customModel: rebuilt
+          reasoningEfforts:
+            off: null
+            high: high
+            max: max
+        - id: clear
+          name: Clear efforts
+          contextWindow: 64000
+          maxTokens: 4096
+          reasoningEfforts:
+            high: high
+        - id: empty
+          contextWindow: 32000
+          maxTokens: 2048
+          reasoningEfforts: {}
+        - id: missing
+          contextWindow: 16000
+          maxTokens: 1024
+    personal:
+      customProvider: keep
+      models:
+        - id: untouched
+          customModel: keep
+"#;
+        std::fs::write(&path, fixture).unwrap();
+        let before: Yaml = serde_yaml::from_str(fixture).unwrap();
+        let adapter = DshAdapter;
+        let snap = adapter.snapshot(&home).unwrap();
+        let expected_models = snap.models.clone();
+        assert_eq!(snap.models[0].name, "Reason | display name");
+        assert_eq!(snap.models[2].name, "empty");
+        assert_eq!(
+            snap.defaults.per_model_effort["openhub-site_d_acc_0/alias/reason"],
+            "off,high,max"
+        );
+        assert_eq!(
+            snap.defaults.per_model_effort["openhub-site_d_acc_0/clear"],
+            "high"
+        );
+        assert_eq!(
+            snap.defaults.per_model_effort["openhub-site_d_acc_0/empty"],
+            ""
+        );
+        assert_eq!(
+            snap.defaults.per_model_effort["openhub-site_d_acc_0/missing"],
+            ""
+        );
+
+        let mut patch = ToolConfigPatch {
+            providers: snap.providers,
+            models: snap.models,
+            defaults: snap.defaults,
+            ..Default::default()
+        };
+        patch
+            .defaults
+            .per_model_effort
+            .insert("openhub-site_d_acc_0/clear".into(), " \t ".into());
+        adapter.apply(&home, &patch).unwrap();
+
+        let out: Yaml = serde_yaml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let provider = &out[SECTION][PROVIDERS_KEY]["openhub-site_d_acc_0"];
+        let models = provider["models"].as_sequence().unwrap();
+        assert_eq!(models[0]["name"].as_str(), Some("Reason | display name"));
+        assert_eq!(
+            models[0]["reasoningEfforts"]
+                .as_mapping()
+                .unwrap()
+                .get(Yaml::String("off".into())),
+            Some(&Yaml::Null)
+        );
+        assert_eq!(models[0]["reasoningEfforts"]["max"].as_str(), Some("max"));
+        for model in &models[1..] {
+            assert!(model["reasoningEfforts"].as_mapping().unwrap().is_empty());
+        }
+        // 沿用既有重建边界：顶层/section/供应商扩展保留，受管模型扩展不保留。
+        assert_eq!(out["ui-onboarding"], before["ui-onboarding"]);
+        assert_eq!(out[SECTION]["customSection"].as_str(), Some("keep"));
+        assert_eq!(provider["customProvider"].as_str(), Some("keep"));
+        assert!(models[0].get("customModel").is_none());
+        assert_eq!(
+            out[SECTION][PROVIDERS_KEY]["personal"],
+            before[SECTION][PROVIDERS_KEY]["personal"]
+        );
+
+        let reread = adapter.snapshot(&home).unwrap();
+        assert_eq!(reread.models, expected_models);
+        let mut expected_efforts = patch.defaults.per_model_effort;
+        expected_efforts.insert("openhub-site_d_acc_0/clear".into(), String::new());
+        assert_eq!(reread.defaults.per_model_effort, expected_efforts);
+        adapter
+            .apply(
+                &home,
+                &ToolConfigPatch {
+                    providers: reread.providers,
+                    models: reread.models,
+                    defaults: reread.defaults,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let roundtrip = adapter.snapshot(&home).unwrap();
+        assert_eq!(roundtrip.models, expected_models);
+        assert_eq!(roundtrip.defaults.per_model_effort, expected_efforts);
+        let roundtrip_yaml: Yaml =
+            serde_yaml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(roundtrip_yaml, out);
+
         let _ = std::fs::remove_dir_all(&home);
     }
 }

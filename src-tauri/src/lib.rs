@@ -427,7 +427,6 @@ pub fn run() {
             token::mapping::add_token_official_model,
             token::mapping::remove_token_official_model,
             token::mapping::migrate_token_official_models,
-            token::insight_commands::analyze_token_insights,
             local_tools::list_local_tools,
             local_tools::get_local_tool_config,
             local_tools::save_local_tool_config,

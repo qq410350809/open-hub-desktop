@@ -11,8 +11,6 @@ import type {
   TokenOfficialModel,
   TokenMappingAnalyzeReport,
   TokenMappingAnalyzeProgress,
-  TokenInsightReport,
-  InsightEvidencePacket,
 } from "../../types";
 import { localTokenStatsAvailable, runLocalCommand } from "../core/ipc";
 
@@ -52,11 +50,6 @@ const tokenModelAnalyzing = ref(false);
 const tokenModelAnalyzeError = ref("");
 let unlistenTokenModelAnalyzeProgress: UnlistenFn | null = null;
 
-// AI 用量洞察（证据包由页面按当前时间范围确定性构建，AI 只做可追溯解读）
-const tokenInsightReport = ref<TokenInsightReport | null>(null);
-const tokenInsightLoading = ref(false);
-const tokenInsightError = ref("");
-const tokenInsightAnalyzing = ref(false);
 
 // OpenHub 自有 Token 采集状态；只读取本机日志并维护本地缓存。
 const tokenCollectorSyncing = ref(false);
@@ -365,29 +358,6 @@ function reopenTokenModelMapping(rawModel: string) {
   return reviewTokenModelMapping("reopen_token_model_mapping", rawModel);
 }
 
-/** 生成 AI 用量洞察。报告会记录范围与模型快照，避免与后续区间混淆。 */
-async function analyzeTokenInsights(packet: InsightEvidencePacket): Promise<TokenInsightReport | null> {
-  if (tokenInsightAnalyzing.value) return null;
-  tokenInsightAnalyzing.value = true;
-  tokenInsightLoading.value = true;
-  tokenInsightError.value = "";
-  try {
-    const report = await localCommand<TokenInsightReport>("analyze_token_insights", { packet });
-    tokenInsightReport.value = report;
-    return report;
-  } catch (error) {
-    tokenInsightError.value = String(error);
-    return null;
-  } finally {
-    tokenInsightAnalyzing.value = false;
-    tokenInsightLoading.value = false;
-  }
-}
-
-function clearTokenInsightReport() {
-  tokenInsightReport.value = null;
-  tokenInsightError.value = "";
-}
 
 /** 获取 Token 统计的正式模型清单（用户手工添加 + AI 自动学习 + 数据迁移）。 */
 async function loadTokenOfficialModels(): Promise<TokenOfficialModel[]> {
@@ -516,12 +486,6 @@ export function useTokenStats() {
     approveTokenModelMapping,
     rejectTokenModelMapping,
     reopenTokenModelMapping,
-    tokenInsightReport,
-    tokenInsightLoading,
-    tokenInsightError,
-    tokenInsightAnalyzing,
-    analyzeTokenInsights,
-    clearTokenInsightReport,
     syncTokenCollector,
     onRangeChange,
     refreshTokenStats,

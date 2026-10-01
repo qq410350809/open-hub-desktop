@@ -1,6 +1,7 @@
 use crate::context::EventBus;
 use crate::models::*;
 use crate::proxypool::geoip::{classify_ip, geoip_country, open_geoip_reader};
+use crate::proxypool::ip_info::{normalize_ip, persist_node_info, IpInfoBatch};
 use crate::proxypool::runtime::{
     append_controller_path, controller_client, controller_url, ensure_global_runtime, load_state,
     runtime_controller_port, speed_test_plan,
@@ -280,12 +281,42 @@ pub(crate) fn apply_exit_ip_geoip(
     );
 }
 
+/// 本轮实际完成的节点才清空旧出口类型；失败/未回显不能继承历史出口。
+pub(crate) fn write_probe_result(
+    database: &Database,
+    node_id: &str,
+    latency: Option<i64>,
+    download_ms: Option<i64>,
+    primary_ip: Option<&str>,
+) -> Result<(), String> {
+    let download_ms = latency.and(download_ms);
+    database.lock_conn()?.execute(
+        "UPDATE proxy_pool_nodes
+         SET latency_ms=?2, test_status=CASE WHEN ?2 IS NULL THEN 'error' ELSE 'success' END,
+             channel_latency_ms=?3, channel_test_status=CASE WHEN ?3 IS NULL THEN 'error' ELSE 'success' END,
+             channel_tested_at=CURRENT_TIMESTAMP, tested_at=CURRENT_TIMESTAMP,
+             primary_ip=?4, ip_info_json=''
+         WHERE id=?1",
+        params![node_id, latency, download_ms, primary_ip.unwrap_or_default()],
+    ).map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+pub(crate) fn normalize_test_run_id(run_id: Option<&str>, fallback_id: u64) -> String {
+    run_id
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(|id| id.chars().take(128).collect())
+        .unwrap_or_else(|| fallback_id.to_string())
+}
+
 pub async fn run_proxy_node_pool(
     bus: &EventBus,
     database: &Database,
     runtime: &ProxyRuntime,
     requested_node_ids: Option<HashSet<String>>,
     channel_test: bool,
+    run_id: Option<String>,
 ) -> Result<ProxyPoolState, String> {
     let nodes = {
         let connection = database.lock_conn()?;
@@ -323,11 +354,16 @@ pub async fn run_proxy_node_pool(
     };
 
     let test_lease = runtime.start_proxy_test()?;
+    let run_id = normalize_test_run_id(run_id.as_deref(), test_lease.id);
     let cancellation = test_lease.cancellation.clone();
 
     // 全局单实例：测速 lane 是实例内预配的固定 SPEED-lane，不再拉临时进程。
     // 配置装载全量节点且代理名已改写为节点 id，切组直接用节点 id 寻址。
-    let _op_guard = runtime.runtime_op_lock.lock().await;
+    let _op_guard = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => return load_state(database, runtime),
+        guard = runtime.runtime_op_lock.lock() => guard,
+    };
     tokio::task::block_in_place(|| ensure_global_runtime(database, runtime))?;
     let plan = speed_test_plan(runtime)?;
     let lane_count = plan.lanes.len().min(total).max(1);
@@ -339,31 +375,11 @@ pub async fn run_proxy_node_pool(
     // delay 失败两列都置 error（连不通的节点不再白等下载超时）。
     // 不预清空旧网速：本轮被取消/漏测的节点保留历史指标，避免一次
     // 异常测速（如实例端口冲突全挂）把既有 ms/网速数据全部清掉。
-    let full_success_sql = "UPDATE proxy_pool_nodes SET latency_ms=?2, test_status='success', channel_latency_ms=?3, channel_test_status='success', channel_tested_at=CURRENT_TIMESTAMP, tested_at=CURRENT_TIMESTAMP WHERE id=?1";
-    let header_only_sql = "UPDATE proxy_pool_nodes SET latency_ms=?2, test_status='success', channel_latency_ms=NULL, channel_test_status='error', channel_tested_at=CURRENT_TIMESTAMP, tested_at=CURRENT_TIMESTAMP WHERE id=?1";
-    let fail_sql = "UPDATE proxy_pool_nodes SET latency_ms=NULL, test_status='error', channel_latency_ms=NULL, channel_test_status='error', channel_tested_at=CURRENT_TIMESTAMP, tested_at=CURRENT_TIMESTAMP WHERE id=?1";
-    let write_probe_result =
-        |node_id: &str, ttfb: Option<i64>, download_ms: Option<i64>| -> Result<(), String> {
-            let connection = database.lock_conn()?;
-            if let (Some(ttfb), Some(download_ms)) = (ttfb, download_ms) {
-                connection
-                    .execute(full_success_sql, params![node_id, ttfb, download_ms])
-                    .map_err(|error| error.to_string())?;
-            } else if let Some(ttfb) = ttfb {
-                connection
-                    .execute(header_only_sql, params![node_id, ttfb])
-                    .map_err(|error| error.to_string())?;
-            } else {
-                connection
-                    .execute(fail_sql, [node_id])
-                    .map_err(|error| error.to_string())?;
-            }
-            Ok(())
-        };
 
     let completed = Arc::new(AtomicUsize::new(0));
     let client = controller_client()?;
     let geoip_reader = open_geoip_reader(runtime);
+    let ip_info_batch = IpInfoBatch::new();
 
     // 延迟口径：控制器 delay 接口的测试 URL（设置页"测速地址"，默认 gstatic 204）
     let delay_url = {
@@ -390,11 +406,13 @@ pub async fn run_proxy_node_pool(
             let client = client.clone();
             let bus = bus.clone();
             let cancellation = cancellation.clone();
+            let run_id = run_id.clone();
             let group_name = lane.group_name.clone();
             let listen_port = lane.listen_port;
             let delay_url = delay_url.clone();
             let geoip_reader = geoip_reader.as_ref();
             let completed = Arc::clone(&completed);
+            let ip_info_batch = &ip_info_batch;
             async move {
                 for node_id in my_nodes {
                     if cancellation.is_cancelled() {
@@ -403,6 +421,7 @@ pub async fn run_proxy_node_pool(
                     bus.emit(
                         progress_event,
                         ProxyNodeTestProgress {
+                            run_id: run_id.clone(),
                             node_id: node_id.clone(),
                             phase: "started".to_string(),
                             status: "testing".to_string(),
@@ -411,15 +430,25 @@ pub async fn run_proxy_node_pool(
                             ..Default::default()
                         },
                     );
-                    if let Err(error) =
-                        select_lane_node(&client, controller_port, &group_name, &node_id).await
-                    {
+                    let selected = tokio::select! {
+                        biased;
+                        _ = cancellation.cancelled() => break,
+                        result = select_lane_node(&client, controller_port, &group_name, &node_id) => result,
+                    };
+                    if cancellation.is_cancelled() {
+                        break;
+                    }
+                    if let Err(error) = selected {
                         warn!("切换测速节点失败 {node_id}: {error}");
-                        let _ = write_probe_result(&node_id, None, None);
+                        let _ = write_probe_result(database, &node_id, None, None, None);
+                        if cancellation.is_cancelled() {
+                            break;
+                        }
                         let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
                         bus.emit(
                             progress_event,
                             ProxyNodeTestProgress {
+                                run_id: run_id.clone(),
                                 node_id,
                                 phase: "completed".to_string(),
                                 latency_ms: None,
@@ -428,6 +457,7 @@ pub async fn run_proxy_node_pool(
                                 stage: "speed".to_string(),
                                 completed: done,
                                 total,
+                                ..Default::default()
                             },
                         );
                         continue;
@@ -439,38 +469,79 @@ pub async fn run_proxy_node_pool(
                     // - 出口 IP：经 lane 的回显抓取，仅用于落库 + geoip 纠错
                     //   国家分组，失败不影响节点判定与延迟/网速。
                     let proxy_url = format!("http://127.0.0.1:{listen_port}");
-                    let (latency, echo, download_ms) = future::join3(
-                        controller_proxy_delay(&client, controller_port, &node_id, &delay_url),
-                        ip_echo_probe_with_fallback(&proxy_url),
-                        download_throughput_probe(
-                            proxy_url.clone(),
-                            CHANNEL_SPEED_TEST_URL.to_string(),
-                        ),
-                    )
-                    .await;
+                    let (latency, echo, download_ms) = tokio::select! {
+                        biased;
+                        _ = cancellation.cancelled() => break,
+                        probes = future::join3(
+                            controller_proxy_delay(&client, controller_port, &node_id, &delay_url),
+                            ip_echo_probe_with_fallback(&proxy_url),
+                            download_throughput_probe(
+                                proxy_url.clone(),
+                                CHANNEL_SPEED_TEST_URL.to_string(),
+                            ),
+                        ) => probes,
+                    };
+                    if cancellation.is_cancelled() {
+                        break;
+                    }
                     let (download_ms, status) = if latency.is_some() {
                         (download_ms, "success")
                     } else {
                         (None, "error")
                     };
-                    if let (Some(_), Some((_, exit_ip))) = (latency, echo) {
-                        apply_exit_ip_geoip(database, geoip_reader, &node_id, &exit_ip);
+                    let primary_ip = echo.as_ref().and_then(|(_, ip)| normalize_ip(ip));
+                    let _ = write_probe_result(database, &node_id, latency, download_ms, primary_ip.as_deref());
+                    if let (Some(_), Some(exit_ip)) = (latency, primary_ip.as_deref()) {
+                        apply_exit_ip_geoip(database, geoip_reader, &node_id, exit_ip);
                     }
-                    let _ = write_probe_result(&node_id, latency, download_ms);
+                    if cancellation.is_cancelled() {
+                        break;
+                    }
                     let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
                     bus.emit(
                         progress_event,
                         ProxyNodeTestProgress {
-                            node_id,
+                            run_id: run_id.clone(),
+                            node_id: node_id.clone(),
                             phase: "completed".to_string(),
                             latency_ms: latency,
                             speed_ms: download_ms,
+                            primary_ip: primary_ip.clone(),
+                            ip_info: None,
                             status: status.to_string(),
                             stage: "speed".to_string(),
                             completed: done,
                             total,
                         },
                     );
+                    // completed 已立即提交测速结果；类型查询仍借用当前 lane，必须
+                    // await/取消完毕才允许下一节点切组，不能启动脱离 lease 的后台任务。
+                    if let (Some(_), Some(exit_ip)) = (latency, primary_ip.as_deref()) {
+                        if let Some(info) = ip_info_batch.lookup(database, exit_ip, &proxy_url, &cancellation).await {
+                            let saved = persist_node_info(database, &node_id, &info, &cancellation).await;
+                            if cancellation.is_cancelled() {
+                                break;
+                            }
+                            if saved != Some(false) {
+                                bus.emit(
+                                    progress_event,
+                                    ProxyNodeTestProgress {
+                                        run_id: run_id.clone(),
+                                        node_id,
+                                        phase: "ip-info".into(),
+                                        primary_ip: Some(exit_ip.to_string()),
+                                        ip_info: Some(info),
+                                        latency_ms: latency,
+                                        speed_ms: download_ms,
+                                        status: status.into(),
+                                        stage: "speed".into(),
+                                        completed: completed.load(Ordering::Relaxed),
+                                        total,
+                                    },
+                                );
+                            }
+                        }
+                    }
                 }
             }
         })

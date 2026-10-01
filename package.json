@@ -8,6 +8,7 @@
     "dev": "vite",
     "build": "vue-tsc && vite build",
     "check:version": "node scripts/check-version.mjs",
+    "test:agent-model-params": "node scripts/test-agent-model-params.mjs",
     "package:server": "node scripts/package-server.mjs",
     "preview": "vite preview",
     "integrated:dev": "tauri dev",

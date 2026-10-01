@@ -6,6 +6,7 @@ use crate::model::catalog::models_dev::{
     normalize_model_id, ReasoningOption, ModelsDevIndex, MODELS_DEV_CATALOG_URL,
     MODELS_DEV_ETAG_META_KEY, MODELS_DEV_SOURCE,
 };
+use crate::model::catalog::nearest::{Candidate, Match, NearestIndex};
 use crate::models::Database;
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -1942,10 +1943,23 @@ pub(crate) struct ModelCapabilities {
     pub supports_structured_output: bool,
     pub supports_reasoning: bool,
     pub open_weights: bool,
+
+    // ───────── 匹配出处（Agent 配置页据此披露「这个默认值是从哪来的」）─────────
+    /// 命中的目录条目 id（`lab/modelId`）。
+    pub matched_id: String,
+    /// 该条目声明的**原始 model id**（上游原拼写，如 `z-ai/glm-5.2`）。
+    pub matched_model_id: String,
+    /// 匹配强度：`exact` / `variant` / `alias` / `nearest`（见
+    /// [`crate::model::catalog::nearest::MatchKind`]）。非 `exact` 时 UI 会加「≈」前缀。
+    pub match_kind: String,
+    /// 强度指示：全等类恒为 `1.0`，`nearest` 为有序字符 Dice。**不是概率**。
+    pub match_score: f32,
+    /// 匹配算法版本，供前端作废旧的能力缓存（包含 miss 缓存）。
+    pub match_version: u32,
 }
 
 impl ModelCapabilities {
-    fn from_item(item: &ModelCatalogItem) -> Self {
+    fn from_item(item: &ModelCatalogItem, matched: &Match) -> Self {
         ModelCapabilities {
             reasoning_options: item.reasoning_options.clone(),
             reasoning_effort_max: item.reasoning_effort_max.clone(),
@@ -1960,44 +1974,68 @@ impl ModelCapabilities {
             supports_structured_output: item.structured,
             supports_reasoning: item.reasoning,
             open_weights: item.open_weights,
+            matched_id: item.id.clone(),
+            matched_model_id: item.official_model_id.clone(),
+            match_kind: matched.kind.as_str().to_string(),
+            match_score: matched.score,
+            match_version: CAPABILITY_MATCH_VERSION,
         }
     }
 }
 
 /// 按模型 id 列表查询 models.dev 能力，返回 `请求原样 id -> 能力` 的映射。
 ///
-/// 匹配走 [`normalize_model_id`]，与目录同步时的跨层匹配同一口径：请求 id 可以是
-/// `alias/deepseek-v4`、`z-ai/glm-5.2`、`glm-5.2:free` 等任意拼写，归一化后命中即可。
-/// **查不到的 key 不出现在结果里**（不臆造），前端据此回落到全局档位列表。
+/// 完整 / 裸 ID 强精确优先，再尝试保留模型身份的标准化与受限别名。
+/// 歧义或未知身份差异不返回条目；不会改写 Agent 已明确自定义的参数。
 #[cfg_attr(feature = "desktop", tauri::command)]
 pub fn get_model_capabilities(
     ctx: Managed<'_, Arc<AppContext>>,
     keys: Vec<String>,
 ) -> Result<BTreeMap<String, ModelCapabilities>, String> {
     let snapshot = get_model_catalog_inner(&ctx.database)?;
+    Ok(capabilities_for_keys(&snapshot.models, &keys))
+}
 
-    // 归一化裸 id -> 目录条目（先建索引，再逐 key 命中）。同一归一化键多命中时取第一个，
-    // 与 canonical 反查的「不做模糊匹配」一致，宁可少给也不认错。
-    let mut by_normalized: BTreeMap<String, &ModelCatalogItem> = BTreeMap::new();
-    for item in &snapshot.models {
-        for candidate in [
-            normalize_model_id(&item.official_model_id),
-            normalize_model_id(&item.id),
-        ] {
-            if !candidate.is_empty() {
-                by_normalized.entry(candidate).or_insert(item);
-            }
-        }
-    }
+/// 匹配算法版本：前端会把它连同缓存值一起存下，版本不符即重新请求。
+///
+/// - `1`（隐式）：只有归一化**全等**命中（`nearest` 上线前）。
+/// - `2`：强精确、保守变体 / 渠道别名与身份约束的最近邻。
+pub const CAPABILITY_MATCH_VERSION: u32 = 2;
+
+/// 纯函数版：在给定目录条目集合里解析一批请求 key（便于离线单测，命令层只做取数）。
+///
+/// 匹配走 [`NearestIndex`]；碰撞拒绝，不按目录顺序任取首项。
+/// **查不到的 key 不出现在结果里**（不臆造），前端据此回落到 Agent 级/父级默认值。
+pub(crate) fn capabilities_for_keys(
+    models: &[ModelCatalogItem],
+    keys: &[String],
+) -> BTreeMap<String, ModelCapabilities> {
+    let index = NearestIndex::new(
+        models
+            .iter()
+            .map(|item| Candidate {
+                keys: vec![item.id.clone(), item.official_model_id.clone()],
+                effort_values: item
+                    .reasoning_options
+                    .iter()
+                    .filter(|option| option.kind == "effort")
+                    .flat_map(|option| option.values.iter().cloned())
+                    .collect(),
+            })
+            .collect(),
+    );
 
     let mut out: BTreeMap<String, ModelCapabilities> = BTreeMap::new();
     for raw in keys {
-        let normalized = normalize_model_id(&raw);
-        if let Some(item) = by_normalized.get(&normalized) {
-            out.insert(raw, ModelCapabilities::from_item(item));
-        }
+        let Some(matched) = index.resolve(raw) else {
+            continue;
+        };
+        out.insert(
+            raw.clone(),
+            ModelCapabilities::from_item(&models[matched.index], &matched),
+        );
     }
-    Ok(out)
+    out
 }
 
 #[cfg_attr(feature = "desktop", tauri::command)]
@@ -3069,6 +3107,293 @@ mod tests {
             format!("{hash:016x}")
         };
         assert_ne!(mutated_fingerprint, current, "DDL 变化后指纹必须变化");
+    }
+
+    // ─────────────── capabilities_for_keys：逐模型能力解析（Agent 配置页默认参数来源） ───────────────
+
+    /// 构造一个最小目录条目，只需 `id` / `official_model_id` / 能力字段。
+    fn capability_item(id: &str, official_model_id: &str, context: i64, output: i64) -> ModelCatalogItem {
+        ModelCatalogItem {
+            id: id.to_string(),
+            slug: String::new(),
+            name: id.to_string(),
+            lab: String::new(),
+            kind: "text".to_string(),
+            family: None,
+            knowledge: None,
+            status: "ga".to_string(),
+            open_weights: false,
+            reasoning: true,
+            tool_call: true,
+            attachment: false,
+            structured: false,
+            temperature: true,
+            input_modalities: vec!["text".to_string()],
+            context_length: context,
+            context_min: 0,
+            context_max: 0,
+            max_output_tokens: output,
+            ref_provider: None,
+            ref_official: false,
+            ref_input_cost: 0.0,
+            ref_output_cost: 0.0,
+            ref_cache_read_cost: 0.0,
+            min_provider: None,
+            min_input_cost: 0.0,
+            min_output_cost: 0.0,
+            min_cache_read_cost: 0.0,
+            price_spread: 0.0,
+            blended_min: None,
+            blended_trusted: None,
+            blended_ref: None,
+            host_count: 0,
+            priced_host_count: 0,
+            free_host_count: 0,
+            sub_host_count: 0,
+            host_providers: Vec::new(),
+            aa_idx: None,
+            aa_coding: None,
+            aa_agentic: None,
+            aa_speed: None,
+            aa_ttft: None,
+            aa_task_cost: None,
+            benchmark_count: 0,
+            release_date: None,
+            last_updated: None,
+            official_lab: String::new(),
+            official_model_id: official_model_id.to_string(),
+            canonical_id: None,
+            identity_source: "test".to_string(),
+            identity_resolved: true,
+            official_host_count: 0,
+            official_channel_providers: Vec::new(),
+            lab_tier_host_count: 0,
+            cloud_tier_host_count: 0,
+            gateway_tier_host_count: 0,
+            free_channel_count: 0,
+            free_channel_providers: Vec::new(),
+            subscription_channel_providers: Vec::new(),
+            free_channel_source: String::new(),
+            free_channel_count_matches: false,
+            reasoning_options: vec![ReasoningOption {
+                kind: "effort".to_string(),
+                values: vec!["low".into(), "high".into()],
+            }],
+            reasoning_effort_max: Some("high".to_string()),
+            output_modalities: vec!["text".to_string()],
+            max_input_tokens: None,
+            interleaved_fields: Vec::new(),
+            has_fast_mode: false,
+            models_dev_extras: Default::default(),
+        }
+    }
+
+    #[test]
+    fn capabilities_resolve_variant_and_alias() {
+        let models = vec![
+            capability_item(
+                "anthropic/claude-sonnet-4-5", "claude-sonnet-4-5", 200_000, 64_000,
+            ),
+            capability_item("openai/gpt-5-codex", "gpt-5-codex", 400_000, 128_000),
+            capability_item("zhipuai/glm-5.2", "z-ai/glm-5.2", 200_000, 32_000),
+            capability_item("meta/llama-3.3-70b", "llama-3.3-70b", 128_000, 8_000),
+        ];
+        let cases = [
+            ("claude-sonnet-4-5-20250929", 0, "variant"),
+            ("gpt-5-codex-high", 1, "variant"),
+            ("zai-org-glm-5-2", 2, "alias"),
+            ("llama3.3:70b", 3, "variant"),
+            ("@cf/meta/llama-3.3-70b", 3, "alias"),
+        ];
+        let keys = cases
+            .iter()
+            .map(|(key, _, _)| key.to_string())
+            .collect::<Vec<_>>();
+        let out = capabilities_for_keys(&models, &keys);
+        assert_eq!(out.len(), cases.len());
+        for (key, index, kind) in cases {
+            let value = &out[key];
+            assert_eq!(value.matched_id, models[index].id, "{key}");
+            assert_eq!(value.context_length, models[index].context_length);
+            assert_eq!(value.max_output_tokens, models[index].max_output_tokens);
+            assert_eq!(value.match_kind, kind);
+            assert_eq!(value.match_score, 1.0);
+            assert_eq!(value.match_version, 2);
+        }
+        assert!(capabilities_for_keys(&[], &keys).is_empty());
+    }
+
+    #[test]
+    fn capabilities_strong_exact_keeps_each_models_specs() {
+        let mut models = vec![
+            capability_item("acme/rocket", "rocket", 100_000, 4_000),
+            capability_item("acme/rocket-thinking", "rocket-thinking", 200_000, 16_000),
+            capability_item("acme/rocket-turbo", "rocket-turbo", 50_000, 2_000),
+        ];
+        let keys = ["rocket", " ROCKET-THINKING ", "acme/rocket-turbo"].map(String::from);
+        for _ in 0..2 {
+            let out = capabilities_for_keys(&models, &keys);
+            for (key, id, context, output) in [
+                (keys[0].as_str(), "acme/rocket", 100_000, 4_000),
+                (keys[1].as_str(), "acme/rocket-thinking", 200_000, 16_000),
+                (keys[2].as_str(), "acme/rocket-turbo", 50_000, 2_000),
+            ] {
+                let value = &out[key];
+                assert_eq!(value.matched_id, id);
+                assert_eq!(value.context_length, context);
+                assert_eq!(value.max_output_tokens, output);
+                assert_eq!(value.match_kind, "exact");
+            }
+            models.reverse();
+        }
+    }
+
+    #[test]
+    fn capabilities_reject_bare_collisions_but_keep_qualified_ids() {
+        let mut models = vec![
+            capability_item("acme/rocket", "rocket", 100_000, 4_000),
+            capability_item("other/rocket", "rocket", 200_000, 8_000),
+        ];
+        let keys = [
+            "rocket", "rocket-high", "acme/rocket", "other/rocket", "unknown/rocket",
+        ].map(String::from);
+        for _ in 0..2 {
+            let out = capabilities_for_keys(&models, &keys);
+            assert_eq!(out.len(), 2);
+            assert_eq!(out["acme/rocket"].context_length, 100_000);
+            assert_eq!(out["other/rocket"].context_length, 200_000);
+            models.reverse();
+        }
+    }
+
+    #[test]
+    fn capabilities_do_not_guess_when_ambiguous() {
+        // 同一已知快照的两条目录记录；单独各自都能通过 L3（分数 52/54 > .90）。
+        // 合并后才拒绝，验证的是唯一性而非分数门槛或身份守卫。
+        let mut models = vec![
+            capability_item(
+                "anthropic/claude-sonnet-4-5-20250929", "claude-sonnet-4-5-20250929",
+                200_000, 64_000,
+            ),
+            capability_item(
+                "other/claude-sonnet-4-5-20250929", "claude-sonnet-4-5-20250929",
+                100_000, 32_000,
+            ),
+        ];
+        let key = "claude-sonnet-4-5-2025-09-29".to_string();
+        for model in &models {
+            let out = capabilities_for_keys(
+                std::slice::from_ref(model), std::slice::from_ref(&key),
+            );
+            let value = &out[&key];
+            assert_eq!(value.match_kind, "nearest");
+            assert!(value.match_score >= 0.90);
+            assert!((value.match_score - 52.0 / 54.0).abs() < 0.0001);
+        }
+        for _ in 0..2 {
+            assert!(capabilities_for_keys(&models, std::slice::from_ref(&key)).is_empty());
+            models.reverse();
+        }
+    }
+
+    #[test]
+    fn capabilities_reject_identity_siblings_including_long_names() {
+        for (candidate, request) in [
+            ("deepseek-v4", "deepseek-v4-flash"),
+            ("llama-3.3-70b", "llama3.3:8b"),
+            ("llama-3.3-70b", "llama-3-70b"),
+            (
+                "long-model-series-release-3-4-70b",
+                "long-model-series-release-4-3-70b",
+            ),
+            (
+                "long-model-series-release-3-3-70b",
+                "long-model-series-release-3-4-70b",
+            ),
+            (
+                "long-model-series-release-3-3-70b",
+                "other-model-series-release-3-3-70b",
+            ),
+        ] {
+            let model = capability_item(&format!("acme/{candidate}"), candidate, 100_000, 4_000);
+            assert!(
+                capabilities_for_keys(&[model], &[request.to_string()]).is_empty(),
+                "{request}"
+            );
+        }
+        let base = "acme-super-long-model-family-series-release-3-3-70b";
+        let model = capability_item(&format!("acme/{base}"), base, 100_000, 4_000);
+        let keys = [
+            "flash", "mini", "codex", "coder", "pro", "max", "fast", "turbo",
+            "thinking", "instruct", "preview", "fp8", "extra",
+        ].map(|suffix| format!("{base}-{suffix}"));
+        assert!(capabilities_for_keys(&[model], &keys).is_empty());
+    }
+
+    #[test]
+    fn capabilities_serialize_all_fields_and_match_metadata() {
+        for (id, official, request, kind) in [
+            (
+                "acme/rocket-thinking", "rocket-thinking", " ROCKET-THINKING ", "exact",
+            ),
+            (
+                "openai/gpt-5-codex", "gpt-5-codex", "gpt-5-codex-high", "variant",
+            ),
+            (
+                "zhipuai/glm-5.2", "z-ai/glm-5.2", "zai-org-glm-5-2", "alias",
+            ),
+            (
+                "anthropic/claude-sonnet-4-5-20250929", "claude-sonnet-4-5-20250929",
+                "claude-sonnet-4-5-2025-09-29", "nearest",
+            ),
+        ] {
+            for enabled in [true, false] {
+                let mut model = capability_item(id, official, 321_000, 12_345);
+                model.reasoning_options.push(ReasoningOption {
+                    kind: "toggle".into(),
+                    values: vec![],
+                });
+                model.reasoning_effort_max = enabled.then(|| "high".to_string());
+                model.max_input_tokens = enabled.then_some(300_000);
+                model.output_modalities = vec!["text".into(), "audio".into()];
+                model.interleaved_fields = vec!["reasoning_content".into()];
+                model.has_fast_mode = enabled;
+                model.temperature = !enabled;
+                model.tool_call = enabled;
+                model.structured = !enabled;
+                model.reasoning = enabled;
+                model.open_weights = !enabled;
+                let out = capabilities_for_keys(&[model], &[request.to_string(), "absent".into()]);
+                assert_eq!(out.len(), 1);
+                let score = if kind == "nearest" { 52.0_f32 / 54.0 } else { 1.0 };
+                let expected = json!({
+                    "reasoningOptions": [
+                        { "kind": "effort", "values": ["low", "high"] },
+                        { "kind": "toggle", "values": [] }
+                    ],
+                    "reasoningEffortMax": enabled.then_some("high"),
+                    "contextLength": 321_000,
+                    "maxOutputTokens": 12_345,
+                    "maxInputTokens": enabled.then_some(300_000),
+                    "outputModalities": ["text", "audio"],
+                    "interleavedFields": ["reasoning_content"],
+                    "hasFastMode": enabled,
+                    "supportsTemperature": !enabled,
+                    "supportsToolCall": enabled,
+                    "supportsStructuredOutput": !enabled,
+                    "supportsReasoning": enabled,
+                    "openWeights": !enabled,
+                    "matchedId": id,
+                    "matchedModelId": official,
+                    "matchKind": kind,
+                    "matchScore": score,
+                    "matchVersion": 2
+                });
+                let serialized = serde_json::to_value(&out).unwrap();
+                assert_eq!(serialized[request], expected, "{kind}");
+                assert_eq!(serialized.as_object().unwrap().len(), 1);
+            }
+        }
     }
 
     /// 库结构已是最新（版本号与指纹都匹配）时，**不应**无谓重建。

@@ -325,7 +325,10 @@ macro_rules! rpc_arms {
                 ))
             }
             "close_chrome_sync_tabs" => {
-                Ok(json!(crate::site::sync::close_chrome_sync_tabs().await))
+                let scope_url: Option<String> = take_opt($args, &["scopeUrl", "scope_url"])?;
+                Ok(json!(
+                    crate::site::sync::close_chrome_sync_tabs(scope_url).await
+                ))
             }
 
             // —— 代理池 ——
@@ -391,8 +394,9 @@ macro_rules! rpc_arms {
                     take_opt($args, &["channelId", "channel_id"]).ok().flatten();
                 let node_ids: Option<Vec<String>> =
                     take_opt($args, &["nodeIds", "node_ids"]).ok().flatten();
+                let run_id: Option<String> = take_opt($args, &["runId", "run_id"]).ok().flatten();
                 Ok(json!(
-                    crate::proxypool::test_proxy_channel_nodes($ctx, channel_id, node_ids).await
+                    crate::proxypool::test_proxy_channel_nodes($ctx, channel_id, node_ids, run_id).await
                 ))
             }
             "set_active_proxy_node" => {
@@ -407,17 +411,22 @@ macro_rules! rpc_arms {
             }
             "test_proxy_node" => {
                 let node_id: String = take($args, &["nodeId", "node_id"])?;
+                let run_id: Option<String> = take_opt($args, &["runId", "run_id"]).ok().flatten();
                 Ok(json!(
-                    crate::proxypool::test_proxy_node($ctx, node_id).await
+                    crate::proxypool::test_proxy_node($ctx, node_id, run_id).await
                 ))
             }
             "test_proxy_nodes" => {
                 let node_ids: Vec<String> = take($args, &["nodeIds", "node_ids"])?;
+                let run_id: Option<String> = take_opt($args, &["runId", "run_id"]).ok().flatten();
                 Ok(json!(
-                    crate::proxypool::test_proxy_nodes($ctx, node_ids).await
+                    crate::proxypool::test_proxy_nodes($ctx, node_ids, run_id).await
                 ))
             }
-            "test_all_proxy_nodes" => Ok(json!(crate::proxypool::test_all_proxy_nodes($ctx).await)),
+            "test_all_proxy_nodes" => {
+                let run_id: Option<String> = take_opt($args, &["runId", "run_id"]).ok().flatten();
+                Ok(json!(crate::proxypool::test_all_proxy_nodes($ctx, run_id).await))
+            }
             "cancel_proxy_node_tests" => Ok(json!(crate::proxypool::cancel_proxy_node_tests($ctx))),
 
             // —— 模型目录 / 模型缓存 ——

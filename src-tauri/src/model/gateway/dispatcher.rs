@@ -1,6 +1,6 @@
 use super::balancer::{
-    build_client_for_candidate, format_upstream_error_message, get_node_display_name,
-    get_sorted_egress_candidates,
+    build_client_for_candidate, egress_timeout, format_upstream_error_message,
+    get_node_display_name, get_sorted_egress_candidates,
 };
 use super::egress::TargetProtocol;
 use super::logger::{cap_log_body, record_attempt_failure, ProxyLogParams};
@@ -79,6 +79,36 @@ pub(super) fn parse_retry_after_value(raw: &str) -> Option<u64> {
 
 pub(super) fn parse_retry_after_ms(headers: &reqwest::header::HeaderMap) -> Option<u64> {
     parse_retry_after_value(headers.get("retry-after")?.to_str().ok()?)
+}
+
+/// 带空闲窗口的整段响应读取：每个数据块到达都会重置计时，只有连续 `idle`
+/// 无任何字节才算失败；总时长不设上限。
+///
+/// OpenCode 免费层闸门强制上游流式后，非流式客户端请求必须把整个 SSE 读完
+/// 才能回给客户端，而推理模型单次生成可长达数分钟 —— 客户端总超时会把健康
+/// 长生成掐死，并把 `unwrap_or_default()` 吞出的空 body 误报成「200 空内容」
+/// （实测 timeoutSeconds=300 时必现）。因此超时语义必须是「无数据窗口」：
+/// 只要上游持续吐字，读多久都不算超时。
+pub(super) async fn read_body_idle(
+    resp: reqwest::Response,
+    idle: std::time::Duration,
+) -> Result<Bytes, String> {
+    use futures_util::StreamExt;
+    let mut stream = resp.bytes_stream();
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        match tokio::time::timeout(idle, stream.next()).await {
+            Ok(Some(Ok(chunk))) => buf.extend_from_slice(&chunk),
+            Ok(Some(Err(error))) => return Err(format!("读取上游响应失败: {error}")),
+            Ok(None) => return Ok(Bytes::from(buf)),
+            Err(_) => {
+                return Err(format!(
+                    "上游连续 {} 秒无数据（读取超时）",
+                    idle.as_secs()
+                ))
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -183,6 +213,14 @@ pub async fn execute_resilient_egress(
     let node_round_robin = ctx.node_round_robin_for(&channel.id).await;
     let base_node_idx = node_round_robin.load(Ordering::Relaxed);
 
+    // OpenCode 闸门强制上游流式：非流式客户端请求也要把整个 SSE 读完才能回给
+    // 客户端，生成可长达数分钟。这类请求必须用无总超时的流式客户端，超时语义
+    // 交给「空闲窗口」（响应头等待与 read_body_idle 共用 timeoutSeconds）——
+    // 旧实现用带300s 总超时的客户端预读，健康长生成一到 5 分钟就被掐断，
+    // 空 body 再被 unwrap_or_default() 吞掉、误报成「200 空内容」。
+    let opencode_nonstream = is_opencode && !meta.stream;
+    let read_idle = egress_timeout(config);
+
     let mut last_error = String::new();
     let mut last_status = StatusCode::BAD_GATEWAY;
     let mut last_err_bytes = Bytes::new();
@@ -196,7 +234,8 @@ pub async fn execute_resilient_egress(
             &candidates[(base_node_idx + attempt_idx) % candidates.len()]
         };
         let cand_start = Instant::now();
-        let client = build_client_for_candidate(ctx, cand_id, meta.stream).await;
+        // 非流式 OpenCode 请求同样取无总超时的流式客户端（见上方 opencode_nonstream 注释）
+        let client = build_client_for_candidate(ctx, cand_id, meta.stream || is_opencode).await;
         let node_display = get_node_display_name(ctx, cand_id).await;
 
         let attempt_req_id = if attempt_idx == 0 {
@@ -219,11 +258,14 @@ pub async fn execute_resilient_egress(
             Done(Result<reqwest::Response, reqwest::Error>),
             /// 本节点判定失败（原地重试后仍为空内容），转入常规节点切换流程
             NodeFailedEmpty,
+            /// 等响应头 / 读响应体触发空闲超时（失败日志已在打断点记录），
+            /// 转入节点轮换；预算耗尽后以 504 如实返回客户端
+            ReadTimeout(String),
         }
 
         // 内层循环仅在触发原地重试时多转一圈，其余情况原样返回发送结果
         let send_step: SendStep = loop {
-            let result = build_egress_request(
+            let send_fut = build_egress_request(
                 &client,
                 upstream_url,
                 body,
@@ -233,8 +275,45 @@ pub async fn execute_resilient_egress(
                 &meta.req_id,
                 TargetProtocol::from_channel(channel),
             )
-            .send()
-            .await;
+            .send();
+            // 非流式 OpenCode 请求：流式客户端只有连接超时，若上游连响应头都
+            // 不给，必须有一个「无数据即死」的兜底（同为空闲窗口语义）。
+            let result = if opencode_nonstream {
+                match tokio::time::timeout(read_idle, send_fut).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        let msg = format!(
+                            "上游 {} 秒未返回响应头（读取超时）",
+                            read_idle.as_secs()
+                        );
+                        record_attempt_failure(
+                            ctx,
+                            ProxyLogParams::new_failure(
+                                attempt_req_id.clone(),
+                                meta.path.clone(),
+                                meta.channel_id.clone(),
+                                meta.model.clone(),
+                                meta.stream,
+                                504,
+                                cand_start.elapsed().as_millis() as u64,
+                                Some(msg.clone()),
+                                meta.req_body_str.clone(),
+                                Some(node_display.clone()),
+                            )
+                            .with_channel_stats_id(meta.channel_stats_id.clone())
+                            .with_client_name(meta.client_name.clone())
+                            .with_user_agent(meta.user_agent.clone())
+                            .with_session_id(meta.session_id.clone())
+                            .with_upstream_url(Some(upstream_url.to_string())),
+                        )
+                        .await;
+                        warn!("[ModelGateway] {msg}，节点 {node_display}");
+                        break SendStep::ReadTimeout(msg);
+                    }
+                }
+            } else {
+                send_fut.await
+            };
 
             let retryable_status = matches!(
                 &result,
@@ -251,7 +330,8 @@ pub async fn execute_resilient_egress(
                     Err(_) => unreachable!("retryable_status 仅在 result 为 Ok 时成立"),
                 };
                 let status = resp.status();
-                let err_bytes = resp.bytes().await.unwrap_or_default();
+                // 空闲窗口读取：错误体也可能在无总超时的流式客户端上卡住
+                let err_bytes = read_body_idle(resp, read_idle).await.unwrap_or_default();
                 let err_text = String::from_utf8_lossy(&err_bytes).to_string();
                 let formatted = format_upstream_error_message(status.as_u16(), &err_text);
                 last_err_bytes = err_bytes.clone();
@@ -298,7 +378,37 @@ pub async fn execute_resilient_egress(
                     Err(_) => unreachable!("matches! 已确保 result 为 Ok"),
                 };
                 let status = resp.status();
-                let body_bytes = resp.bytes().await.unwrap_or_default();
+                // 空闲窗口整段读取：正在读的是被闸门强制成流式的上游响应，
+                // 健康生成可持续数分钟 —— 连续 read_idle 无数据才算失败，
+                // 超时如实上报（不再被 unwrap_or_default() 吞成空内容误报）。
+                let body_bytes = match read_body_idle(resp, read_idle).await {
+                    Ok(bytes) => bytes,
+                    Err(msg) => {
+                        record_attempt_failure(
+                            ctx,
+                            ProxyLogParams::new_failure(
+                                attempt_req_id.clone(),
+                                meta.path.clone(),
+                                meta.channel_id.clone(),
+                                meta.model.clone(),
+                                meta.stream,
+                                504,
+                                cand_start.elapsed().as_millis() as u64,
+                                Some(msg.clone()),
+                                meta.req_body_str.clone(),
+                                Some(node_display.clone()),
+                            )
+                            .with_channel_stats_id(meta.channel_stats_id.clone())
+                            .with_client_name(meta.client_name.clone())
+                            .with_user_agent(meta.user_agent.clone())
+                            .with_session_id(meta.session_id.clone())
+                            .with_upstream_url(Some(upstream_url.to_string())),
+                        )
+                        .await;
+                        warn!("[ModelGateway] {msg}，节点 {node_display}");
+                        break SendStep::ReadTimeout(msg);
+                    }
+                };
                 if !is_empty_success_payload(&body_bytes) {
                     // 内容有效：把预读的 body 重新打包为完整 Response 返回，上层无感知
                     let rebuilt = axum::http::Response::builder()
@@ -357,6 +467,19 @@ pub async fn execute_resilient_egress(
             break SendStep::Done(result);
         };
 
+        // 空闲超时（等响应头 / 读体）：失败日志已在打断点记录，这里如实以
+        // 504 收尾；与空内容判负一样参与节点轮换（预算耗尽即返回客户端）。
+        if let SendStep::ReadTimeout(msg) = &send_step {
+            last_status = StatusCode::GATEWAY_TIMEOUT;
+            last_error = msg.clone();
+            if attempt_idx < max_retries {
+                node_round_robin.fetch_add(1, Ordering::Relaxed);
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                continue;
+            }
+            break;
+        }
+
         // 空内容视为错误请求：与 5xx 同样参与节点轮换；预算耗尽后向客户端返回 400
         if matches!(send_step, SendStep::NodeFailedEmpty) {
             last_status = StatusCode::BAD_REQUEST;
@@ -373,7 +496,7 @@ pub async fn execute_resilient_egress(
 
         let send_result = match send_step {
             SendStep::Done(r) => r,
-            SendStep::NodeFailedEmpty => unreachable!("已在上方拦截"),
+            SendStep::NodeFailedEmpty | SendStep::ReadTimeout(_) => unreachable!("已在上方拦截"),
         };
 
         match send_result {

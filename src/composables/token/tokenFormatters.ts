@@ -32,6 +32,7 @@ export const sourceNameMap: Record<string, string> = {
   dsh: "DeepSeek CLI (DSH)",
   workbuddy: "WorkBuddy AI",
   pi: "PI-Desktop",
+  freebuff: "Freebuff",
   // —— 反代模式：按端点/SDK 推断的客户端标识 ——
   openhub: "OpenHub",
   sdk: "SDK / 脚本",

@@ -160,6 +160,54 @@ pub async fn mark_sites_with_chrome_sessions(
             })
             .collect::<Vec<_>>()
     };
+    // 跨主机签到地址（如 Fengwind 的签到在 api-welfalre.fengwind.com）：
+    // 签到接口不在 API 主域上，且签到域的登录令牌键名不同（welfare_token），
+    // 需要单独记录并读取该域的 Local Storage 才能查到签到状态。
+    let cross_checkin_urls: HashMap<String, String> = {
+        let host_of = |value: &str| {
+            Url::parse(value)
+                .ok()
+                .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+        };
+        let connection = database.lock_conn()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT id, checkin_url, api_base_url, system_type
+                 FROM directory_sites
+                 WHERE TRIM(checkin_url) <> '' AND TRIM(api_base_url) <> ''",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        rows.into_iter()
+            .filter(|(id, _, _, system_type)| {
+                is_sub2api(system_type)
+                    && site_matches_requested_scope(
+                        id,
+                        requested_site_id.as_deref(),
+                        site_id_was_supplied,
+                        &requested_site_ids,
+                        site_ids_were_supplied,
+                    )
+            })
+            .filter_map(|(id, checkin_url, api_base_url, _)| {
+                // 同主机的签到地址直接用 API 主域探测，无需单独读取。
+                let api_host = host_of(&api_base_url)?;
+                let checkin_host = host_of(&checkin_url)?;
+                (checkin_host != api_host).then_some((id, checkin_url))
+            })
+            .collect()
+    };
     let account_refresh_site_ids = {
         let connection = database.lock_conn()?;
         let condition = if refresh_pending {
@@ -373,6 +421,43 @@ pub async fn mark_sites_with_chrome_sessions(
             local_storage.len()
         ),
     );
+    // 跨主机签到域单独读一份 Local Storage（welfare_token 等签到域令牌在 API
+    // 主域的桶里读不到）；键仍是 (site_id, profile_id)，仅签到阶段使用。
+    let checkin_local_storage: HashMap<
+        (String, String),
+        (HashMap<String, String>, String),
+    > = {
+        let checkin_local_targets = cross_checkin_urls
+            .iter()
+            .filter_map(|(site_id, checkin_url)| {
+                let origin = Url::parse(checkin_url)
+                    .ok()
+                    .map(|url| url.origin().ascii_serialization())
+                    .filter(|origin| origin != "null")?;
+                Some((site_id.clone(), origin))
+            })
+            .flat_map(|(site_id, origin)| {
+                profiles.iter().map(move |profile| sync::LocalStorageTarget {
+                    site_id: site_id.clone(),
+                    profile_id: profile.id.clone(),
+                    origin: origin.clone(),
+                })
+            })
+            .collect::<Vec<_>>();
+        if checkin_local_targets.is_empty() {
+            HashMap::new()
+        } else {
+            spawn_blocking({
+                let home_dir = home_dir.clone();
+                move || sync::read_local_storage_from_home(&home_dir, &checkin_local_targets)
+            })
+            .await
+            .map_err(|error| format!("读取 Chrome Local Storage 任务失败：{error}"))?
+            .into_iter()
+            .map(|item| ((item.site_id, item.profile_id), (item.values, item.error)))
+            .collect::<HashMap<_, _>>()
+        }
+    };
     let profile_map = profiles
         .into_iter()
         .map(|profile| (profile.id.clone(), profile))
@@ -513,6 +598,7 @@ pub async fn mark_sites_with_chrome_sessions(
             // 签到状态：缓存在读取时已按当天折算（昨天的签到会被归零），
             // 因此扫描结果缺失时可直接沿用缓存，避免重启后签到记录丢失。
             session.checked_in_today = session.checked_in_today || cached.checked_in_today;
+            session.checkin_enabled = session.checkin_enabled || cached.checkin_enabled;
             session.checkin_error = if session.checkin_error.is_empty() {
                 cached.checkin_error.clone()
             } else {
@@ -651,6 +737,20 @@ pub async fn mark_sites_with_chrome_sessions(
                             "Chrome Local Storage 中没有该站点的数据".into(),
                         )
                     });
+                // 跨主机签到：签到地址与签到域令牌一并交给刷新阶段。
+                let checkin_url = cross_checkin_urls
+                    .get(&site.site_id)
+                    .cloned()
+                    .unwrap_or_default();
+                let checkin_local_values = if checkin_url.is_empty() {
+                    HashMap::new()
+                } else {
+                    checkin_local_storage
+                        .get(&(site.site_id.clone(), session.profile_id.clone()))
+                        .filter(|(_, error)| error.is_empty())
+                        .map(|(values, _)| values.clone())
+                        .unwrap_or_default()
+                };
                 let cached_token = if session.newapi_token.is_empty() {
                     None
                 } else {
@@ -706,6 +806,8 @@ pub async fn mark_sites_with_chrome_sessions(
                             let cached_uid = cached_uid.clone();
                             let cached_sub2api_keys = cached_sub2api_keys.clone();
                             let previous_checkin = previous_checkin.clone();
+                            let checkin_url = checkin_url.clone();
+                            let checkin_local_values = checkin_local_values.clone();
                             async move {
                                 fetch_site_account(
                                     &client,
@@ -721,6 +823,8 @@ pub async fn mark_sites_with_chrome_sessions(
                                     cached_token,
                                     cached_uid,
                                     &cached_sub2api_keys,
+                                    &checkin_url,
+                                    &checkin_local_values,
                                 )
                                 .await
                             }
@@ -739,6 +843,10 @@ pub async fn mark_sites_with_chrome_sessions(
             }
         }
         for (site_index, session_index, site_name, profile_label, progress_stage, job) in jobs {
+            // 先取归属：session 是可变借用，之后无法再从 matched_sites 读 site_id。
+            let clear_site_id = matched_sites[site_index].site_id.clone();
+            let clear_profile_id =
+                matched_sites[site_index].sessions[session_index].profile_id.clone();
             let session = &mut matched_sites[site_index].sessions[session_index];
             match job.await {
                 Ok(Ok(refresh)) => {
@@ -749,9 +857,19 @@ pub async fn mark_sites_with_chrome_sessions(
                     session.unit = refresh.account.unit;
                     session.is_valid = refresh.is_valid;
                     session.sync_error = refresh.sync_error;
-                    session.checkin_enabled = refresh.checkin.enabled;
-                    session.checked_in_today = refresh.checkin.checked_in_today;
-                    session.checkin_error = refresh.checkin.error;
+                    // 签到状态写回不能降级：上面已把当天缓存折算进 session，
+                    // 刷新失败/端点缺失返回的空快照不得把「今日已签到」打回未签到。
+                    session.checkin_enabled = session.checkin_enabled || refresh.checkin.enabled;
+                    session.checked_in_today =
+                        session.checked_in_today || refresh.checkin.checked_in_today;
+                    // 错误信息只允许刷新结果覆盖（新失败原因优先），但当天已签到时清掉陈旧错误。
+                    session.checkin_error = if session.checked_in_today {
+                        String::new()
+                    } else if !refresh.checkin.error.is_empty() {
+                        refresh.checkin.error
+                    } else {
+                        session.checkin_error.clone()
+                    };
                     session.newapi_token = refresh.newapi_token;
                     session.has_access_token = !session.newapi_token.is_empty();
                     session.newapi_user_id = refresh.newapi_user_id;
@@ -761,6 +879,15 @@ pub async fn mark_sites_with_chrome_sessions(
                         session.browser_fallback_failed_at = 0;
                         session.browser_fallback_fail_count = 0;
                         session.browser_fallback_cooldown_ms = 0;
+                    }
+                    // 凭据已续期：删掉上一次「令牌失效」留下的陈旧 Key/模型错误行，
+                    // 否则卡片会一直挂着「请重新登录后同步账号」，看起来像同步没生效。
+                    if refresh.refreshed {
+                        drop_stale_model_credential_error(
+                            database,
+                            &clear_site_id,
+                            &clear_profile_id,
+                        );
                     }
                 }
                 Ok(Err(error)) => session.sync_error = error,
@@ -1096,4 +1223,43 @@ pub async fn mark_sites_with_chrome_sessions(
         newly_marked,
         sites: matched_sites,
     })
+}
+
+/// 账号刚成功续期凭据（refresh 拿到有效令牌）时，顺手删掉该账号「上一次 Key/模型
+/// 同步因凭据失效而失败、且没留下任何 Key/模型」的缓存行。
+///
+/// 卡片据此行渲染「Key 与模型同步失败，点击重试」并原样附上旧错误原文
+/// （如「NewAPI Key 接口 HTTP 401…请重新登录后同步账号」）。账号同步既然已经成功，
+/// 那条错误要求的补救动作就已完成，继续展示只会让人以为同步没生效；而且该行没有
+/// 任何 Key/模型数据，等价于「未同步」——删掉后卡片回到「未同步，点击同步」的真实状态。
+///
+/// 只处理凭据类错误（401 / 令牌失效文案）：网络、解析、站点确实没有 Key 等其他失败
+/// 原因与登录状态无关，保留原样以免掩盖真实问题。
+fn drop_stale_model_credential_error(database: &Database, site_id: &str, profile_id: &str) {
+    let Ok(connection) = database.lock_conn() else {
+        return;
+    };
+    let existing: Option<(String, String, String)> = connection
+        .query_row(
+            "SELECT error, keys_json, models_json
+             FROM site_model_cache WHERE site_id = ?1 AND profile_id = ?2",
+            params![site_id, profile_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .ok()
+        .flatten();
+    let Some((error, keys_json, models_json)) = existing else {
+        return;
+    };
+    let no_keys = matches!(keys_json.trim(), "" | "[]");
+    let no_models = matches!(models_json.trim(), "" | "[]");
+    if !(no_keys && no_models) || !access_token_was_rejected(&error) {
+        return;
+    }
+    // 清理失败不影响账号同步结果，下次同步会再试。
+    let _ = connection.execute(
+        "DELETE FROM site_model_cache WHERE site_id = ?1 AND profile_id = ?2",
+        params![site_id, profile_id],
+    );
 }

@@ -173,7 +173,7 @@ fn prepare_egress_inner(
         }
     }
 
-    match target {
+    let (url, mut egress_body) = match target {
         // Gemini 原生：模型名走 URL，key 走查询参数；跨协议时由 IR 序列化
         TargetProtocol::Gemini => {
             let egress_body = if let Some(ur) = universal {
@@ -237,7 +237,15 @@ fn prepare_egress_inner(
             ensure_include_usage(&mut out, is_stream);
             (url, out)
         }
+    };
+    // OpenCode 免费层请求体闸门（stream + 内建工具清单）；仅 Chat 出口体，
+    // Responses 出口的闸门形态未确认（上游该端点当前整体 500），维持原样。
+    if target == TargetProtocol::OpenAiChat
+        && super::policies::opencode::is_opencode_channel(channel)
+    {
+        super::policies::opencode::apply_chat_body_gate(&mut egress_body);
     }
+    (url, egress_body)
 }
 
 /// 规范化拼接带版本前缀的上游端点：
@@ -331,13 +339,35 @@ pub fn detect_response_protocol_from_sse_data(data: &str) -> Option<TargetProtoc
 ///
 /// 先嗅探实际协议再分发解析器：配置与实际不一致时以实际为准；
 /// 嗅探失败回退配置值。判定为 Chat（已是中枢格式）或非 JSON 时原样透传。
+///
+/// 上游回 SSE 而客户端是非流式时（OpenCode 免费层强制 `stream:true`，
+/// 见 `policies::opencode::apply_chat_body_gate`），先聚合为单个
+/// `chat.completion` JSON 再走归一化，使各协议入口的非流式路径无需感知该差异。
 pub fn normalize_response_bytes(target: TargetProtocol, model: &str, raw: &[u8]) -> Vec<u8> {
-    let Ok(jv) = serde_json::from_slice::<JsonValue>(raw) else {
-        return raw.to_vec();
+    let mut aggregated = false;
+    let jv = match serde_json::from_slice::<JsonValue>(raw) {
+        Ok(jv) => jv,
+        Err(_) => match aggregate_chat_sse(raw, model) {
+            Some(jv) => {
+                aggregated = true;
+                jv
+            }
+            None => return raw.to_vec(),
+        },
     };
-    let effective = detect_response_protocol_from_json(&jv).unwrap_or(target);
+    let effective = if aggregated {
+        TargetProtocol::OpenAiChat
+    } else {
+        detect_response_protocol_from_json(&jv).unwrap_or(target)
+    };
     match effective {
-        TargetProtocol::OpenAiChat => raw.to_vec(),
+        TargetProtocol::OpenAiChat => {
+            if aggregated {
+                serde_json::to_vec(&jv).unwrap_or_else(|_| raw.to_vec())
+            } else {
+                raw.to_vec()
+            }
+        }
         TargetProtocol::AnthropicMessages => {
             serde_json::to_vec(&anthropic_response_to_openai(&jv)).unwrap_or_else(|_| raw.to_vec())
         }
@@ -347,6 +377,157 @@ pub fn normalize_response_bytes(target: TargetProtocol, model: &str, raw: &[u8])
             serde_json::to_vec(&responses_response_to_openai(&jv)).unwrap_or_else(|_| raw.to_vec())
         }
     }
+}
+
+/// OpenAI Chat SSE 流 → 单个 `chat.completion` JSON。
+///
+/// 仅当输入是 Chat 形态的 SSE（`data:` 帧含 `choices`/`usage`）时返回 `Some`；
+/// 非 SSE、其他协议流（Anthropic/Gemini/Responses 的 `event:` 帧）或没有任何
+/// 可解析数据帧时返回 `None`，由调用方按原样透传。
+fn aggregate_chat_sse(raw: &[u8], model: &str) -> Option<JsonValue> {
+    let text = std::str::from_utf8(raw).ok()?;
+
+    let mut id: Option<String> = None;
+    let mut created: Option<u64> = None;
+    let mut model_name: Option<String> = None;
+    let mut content = String::new();
+    let mut reasoning = String::new();
+    let mut finish_reason: Option<String> = None;
+    let mut usage: Option<JsonValue> = None;
+    // index → (id, name, arguments 增量拼接)
+    let mut tool_calls: Vec<(usize, String, String, String)> = Vec::new();
+    let mut saw_chat_chunk = false;
+
+    for line in text.lines() {
+        let line = line.trim_end_matches('\r');
+        let Some(data) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let data = data.trim();
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+        let Ok(chunk) = serde_json::from_str::<JsonValue>(data) else {
+            continue;
+        };
+        // 必须是 Chat 形态：拒绝 Anthropic/Gemini/Responses 流帧
+        if chunk.get("choices").is_none() && chunk.get("usage").is_none() {
+            continue;
+        }
+        saw_chat_chunk = true;
+        if let Some(v) = chunk.get("id").and_then(JsonValue::as_str) {
+            id = Some(v.to_string());
+        }
+        if let Some(v) = chunk.get("created").and_then(JsonValue::as_u64) {
+            created = Some(v);
+        }
+        if let Some(v) = chunk.get("model").and_then(JsonValue::as_str) {
+            model_name = Some(v.to_string());
+        }
+        if chunk.get("usage").is_some_and(|u| !u.is_null()) {
+            usage = chunk.get("usage").cloned();
+        }
+        let Some(first) = chunk
+            .get("choices")
+            .and_then(JsonValue::as_array)
+            .and_then(|c| c.first())
+        else {
+            continue;
+        };
+        if let Some(fr) = first.get("finish_reason").and_then(JsonValue::as_str) {
+            finish_reason = Some(fr.to_string());
+        }
+        let Some(delta) = first.get("delta") else {
+            continue;
+        };
+        if let Some(s) = delta.get("content").and_then(JsonValue::as_str) {
+            content.push_str(s);
+        }
+        for key in ["reasoning_content", "reasoning"] {
+            if let Some(s) = delta.get(key).and_then(JsonValue::as_str) {
+                reasoning.push_str(s);
+            }
+        }
+        if let Some(tcs) = delta.get("tool_calls").and_then(JsonValue::as_array) {
+            for tc in tcs {
+                let index = tc.get("index").and_then(JsonValue::as_u64).unwrap_or(0) as usize;
+                let slot = match tool_calls.iter_mut().find(|(i, ..)| *i == index) {
+                    Some(slot) => slot,
+                    None => {
+                        tool_calls.push((index, String::new(), String::new(), String::new()));
+                        tool_calls.last_mut().expect("just pushed")
+                    }
+                };
+                if let Some(v) = tc.get("id").and_then(JsonValue::as_str) {
+                    if slot.1.is_empty() {
+                        slot.1 = v.to_string();
+                    }
+                }
+                if let Some(name) = tc.pointer("/function/name").and_then(JsonValue::as_str) {
+                    if slot.2.is_empty() {
+                        slot.2 = name.to_string();
+                    }
+                }
+                if let Some(args) = tc.pointer("/function/arguments").and_then(JsonValue::as_str) {
+                    slot.3.push_str(args);
+                }
+            }
+        }
+    }
+    if !saw_chat_chunk {
+        return None;
+    }
+
+    tool_calls.sort_by_key(|(i, ..)| *i);
+    let has_tools = !tool_calls.is_empty();
+    let mut message = serde_json::Map::new();
+    message.insert("role".to_string(), json!("assistant"));
+    message.insert(
+        "content".to_string(),
+        if content.is_empty() {
+            if has_tools { json!(null) } else { json!("") }
+        } else {
+            json!(content)
+        },
+    );
+    if !reasoning.is_empty() {
+        message.insert("reasoning_content".to_string(), json!(reasoning));
+    }
+    if has_tools {
+        let calls: Vec<JsonValue> = tool_calls
+            .iter()
+            .enumerate()
+            .map(|(n, (_, call_id, name, args))| {
+                json!({
+                    "id": if call_id.is_empty() { format!("call_{n}") } else { call_id.clone() },
+                    "type": "function",
+                    "function": { "name": name, "arguments": args },
+                })
+            })
+            .collect();
+        message.insert("tool_calls".to_string(), json!(calls));
+    }
+
+    let out = json!({
+        "id": id.unwrap_or_else(|| "chatcmpl-aggregated".to_string()),
+        "object": "chat.completion",
+        "created": created.unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+        }),
+        "model": model_name.unwrap_or_else(|| model.to_string()),
+        "choices": [{
+            "index": 0,
+            "message": message,
+            "finish_reason": finish_reason.unwrap_or_else(|| if has_tools { "tool_calls" } else { "stop" }.to_string()),
+        }],
+        "usage": usage.unwrap_or_else(|| json!({
+            "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0
+        })),
+    });
+    Some(out)
 }
 
 fn empty_chat_response(model: &str) -> JsonValue {
@@ -1731,6 +1912,129 @@ mod egress_tests {
         assert!(
             !all.contains("message_stop"),
             "中断不得伪装成正常收尾: {all}"
+        );
+    }
+
+    #[test]
+    fn prepare_egress_opencode_chat_channel_applies_free_tier_gate() {
+        let opencode_ch = serde_json::from_value::<ChannelConfig>(json!({
+            "id": "opencode",
+            "name": "OpenCode",
+            "enabled": true,
+            "protocol": "openai",
+            "upstreamUrl": "https://opencode.ai/zen/v1",
+        }))
+        .unwrap();
+
+        // 客户端无 tools 的普通 chat 请求 → 强制流式 + 注入内建工具 stub + tool_choice none
+        let (url, body) = prepare_egress(
+            &opencode_ch,
+            "",
+            "mimo-v2.6-flash-free",
+            &json!({
+                "model": "mimo-v2.6-flash-free",
+                "messages": [{ "role": "user", "content": "hi" }],
+            }),
+            false,
+        );
+        assert!(url.ends_with("/chat/completions"));
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["tool_choice"], "none");
+        let tools = body["tools"].as_array().expect("注入的 tools");
+        assert!(
+            tools.len() >= 5,
+            "内建工具 stub 必须凑够上游闸门数量线: {}",
+            tools.len()
+        );
+
+        // 客户端带工具 → 追加缺失 stub，保留客户端 tool_choice
+        let with_tools = json!({
+            "model": "mimo-v2.6-flash-free",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "stream": true,
+            "tools": [{ "type": "function", "function": {
+                "name": "Bash", "description": "d",
+                "parameters": { "type": "object", "properties": {} } } }],
+            "tool_choice": "auto",
+        });
+        let (_, body) = prepare_egress(&opencode_ch, "", "mimo-v2.6-flash-free", &with_tools, true);
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["tool_choice"], "auto");
+        let names: Vec<&str> = body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t.pointer("/function/name").and_then(JsonValue::as_str))
+            .collect();
+        assert!(names.contains(&"Bash"));
+        assert!(names.contains(&"bash"));
+
+        // 非 OpenCode 渠道不受影响
+        let mut other = channel_with_protocol("openai");
+        other.base_url = "https://other.example/v1".to_string();
+        let (_, body) = prepare_egress(&other, "sk-x", "gpt-4o", &json!({
+            "model": "gpt-4o",
+            "messages": [{ "role": "user", "content": "hi" }],
+        }), false);
+        assert!(body.get("tools").is_none(), "其他渠道不得注入工具");
+        assert_eq!(
+            body["stream"], false,
+            "其他渠道保持客户端流式语义"
+        );
+    }
+
+    #[test]
+    fn normalize_aggregates_forced_sse_into_chat_json() {
+        // OpenCode 强制流式后，非流式客户端路径把 SSE 聚合成单个 chat.completion
+        let sse = concat!(
+            "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1790000000,\"model\":\"big-pickle\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hel\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1790000000,\"model\":\"big-pickle\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"lo\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1790000000,\"model\":\"big-pickle\",\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":2,\"total_tokens\":9}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let out = normalize_response_bytes(TargetProtocol::OpenAiChat, "big-pickle", sse.as_bytes());
+        let jv: JsonValue = serde_json::from_slice(&out).expect("聚合结果必须是 JSON");
+        assert_eq!(jv["object"], "chat.completion");
+        assert_eq!(jv["model"], "big-pickle");
+        assert_eq!(jv["choices"][0]["message"]["content"], "Hello");
+        assert_eq!(jv["choices"][0]["finish_reason"], "stop");
+        assert_eq!(jv["usage"]["total_tokens"], 9);
+    }
+
+    #[test]
+    fn normalize_aggregates_sse_tool_call_deltas() {
+        let sse = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"index\":0,\"id\":\"call_abc\",\"type\":\"function\",\"function\":{\"name\":\"Bash\",\"arguments\":\"\"}}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"command\\\":\\\"ls\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let out = normalize_response_bytes(TargetProtocol::OpenAiChat, "m", sse.as_bytes());
+        let jv: JsonValue = serde_json::from_slice(&out).expect("聚合结果必须是 JSON");
+        let tc = &jv["choices"][0]["message"]["tool_calls"][0];
+        assert_eq!(tc["id"], "call_abc");
+        assert_eq!(tc["function"]["name"], "Bash");
+        assert_eq!(tc["function"]["arguments"], "{\"command\":\"ls\"}");
+        assert_eq!(jv["choices"][0]["finish_reason"], "tool_calls");
+    }
+
+    #[test]
+    fn normalize_passthrough_for_json_and_non_sse() {
+        // 原生 JSON 原样透传
+        let json_raw = br#"{"id":"x","object":"chat.completion","choices":[]}"#;
+        assert_eq!(
+            normalize_response_bytes(TargetProtocol::OpenAiChat, "m", json_raw),
+            json_raw.to_vec()
+        );
+        // 既非 JSON 也非 Chat SSE（如 HTML 错误页、其他协议流）原样透传
+        let html = b"<html>bad gateway</html>";
+        assert_eq!(
+            normalize_response_bytes(TargetProtocol::OpenAiChat, "m", html),
+            html.to_vec()
+        );
+        let anthropic_sse = b"data: {\"type\":\"message_start\",\"message\":{}}\n\n";
+        assert_eq!(
+            normalize_response_bytes(TargetProtocol::OpenAiChat, "m", anthropic_sse),
+            anthropic_sse.to_vec()
         );
     }
 }

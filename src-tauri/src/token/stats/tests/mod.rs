@@ -2,8 +2,8 @@
 use super::*;
 use crate::db as app_db;
 use crate::models::{
-    Database, RequestHealthBucket, RequestHealthReport, TokenStatsReport, TokenUsageBucket,
-    TokenUsageReport,
+    Database, RequestHealthBucket, RequestHealthReport, RequestHealthSourceSummary,
+    TokenStatsReport, TokenUsageBucket, TokenUsageReport,
 };
 use rusqlite::Connection;
 use serde_json::json;
@@ -1016,6 +1016,135 @@ fn pi_activity_counts_dialogues_requests_and_uses_ended_at_as_water_level() {
     // 同一水位重复采集不应重复计数。
     collect_pi_activity_incremental(&db_path, &mut map, &mut sources, &mut cursor);
     assert_eq!(sources["pi"].requests, 11);
+
+    let _ = fs::remove_file(&db_path);
+}
+
+/// 请求健康报告会被序列化进本地活动缓存与 SQLite 快照再读回来，多词字段必须能往返：
+/// 只把序列化侧改成 camelCase、反序列化侧仍按 snake_case 解析，会让 `by_source` /
+/// `preceding_buckets` 回读时静默变成空数组。
+#[test]
+fn request_health_report_round_trips_multi_word_fields() {
+    let report = RequestHealthReport {
+        available: true,
+        buckets: vec![RequestHealthBucket {
+            hour: "2026-09-24T01:00:00.000Z".to_string(),
+            dialogues: 1,
+            requests: 2,
+            success: 2,
+            failed: 0,
+        }],
+        preceding_buckets: vec![RequestHealthBucket {
+            hour: "2026-09-23T23:00:00.000Z".to_string(),
+            dialogues: 1,
+            requests: 1,
+            success: 1,
+            failed: 0,
+        }],
+        by_source: vec![RequestHealthSourceSummary {
+            source: "freebuff".to_string(),
+            dialogues: 3,
+            requests: 4,
+            success: 4,
+            failed: 0,
+        }],
+    };
+
+    let payload = serde_json::to_string(&report).unwrap();
+    assert!(payload.contains("\"bySource\""), "写入侧为 camelCase");
+    let parsed: RequestHealthReport = serde_json::from_str(&payload).unwrap();
+    assert_eq!(parsed.preceding_buckets.len(), 1);
+    assert_eq!(parsed.by_source.len(), 1, "按来源汇总不能回读成空");
+    assert_eq!(parsed.by_source[0].source, "freebuff");
+    assert_eq!(parsed.by_source[0].requests, 4);
+
+    // snake_case 的外部载荷仍要能解析（网关 / 远端形态的历史数据）。
+    let legacy: RequestHealthReport = serde_json::from_str(
+        r#"{"available":true,"buckets":[],"preceding_buckets":[],"by_source":[{"source":"pi","dialogues":1,"requests":2,"success":2,"failed":0}]}"#,
+    )
+    .unwrap();
+    assert_eq!(legacy.by_source[0].source, "pi");
+}
+
+/// Freebuff 的请求健康：`user` 消息计对话；带用量的 assistant 消息计请求 + 成功；
+/// 只有 `usageIncomplete`（客户端自报用量不完整 / 用户中断）的应答计请求但不计成败；
+/// 无用量的 assistant 行（流式进行中）不产生统计。水位线用 `messages.seq`，重复采集不翻倍。
+#[test]
+fn freebuff_activity_counts_dialogues_requests_from_local_messages() {
+    let db_path =
+        std::env::temp_dir().join(format!("openhub-tt-freebuff-{}.db", std::process::id()));
+    let _ = fs::remove_file(&db_path);
+    let conn = Connection::open(&db_path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE messages (
+            seq INTEGER PRIMARY KEY AUTOINCREMENT,
+            thread_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            metrics_json TEXT NOT NULL DEFAULT '{}',
+            ts INTEGER NOT NULL
+        );",
+    )
+    .unwrap();
+
+    let mut map: BTreeMap<String, HealthAgg> = BTreeMap::new();
+    let mut sources: BTreeMap<String, HealthAgg> = BTreeMap::new();
+    let mut cursor = SqliteCursor::default();
+
+    let insert = |role: &str, metrics: serde_json::Value, ts: i64| {
+        conn.execute(
+            "INSERT INTO messages (thread_id, role, metrics_json, ts) VALUES ('t1', ?1, ?2, ?3)",
+            rusqlite::params![role, metrics.to_string(), ts],
+        )
+        .unwrap();
+    };
+    // ts 用毫秒：2026-09-24T01:30:00.000Z
+    let base = 1_790_213_400_000i64;
+    insert("user", json!({}), base);
+    insert(
+        "assistant",
+        json!({ "usage": { "inputTokens": 100, "cachedInputTokens": 40, "outputTokens": 20 } }),
+        base + 1_000,
+    );
+    // 中断 / 用量不完整：计请求，不计成败。
+    insert("user", json!({}), base + 2_000);
+    insert(
+        "assistant",
+        json!({ "usageIncomplete": true }),
+        base + 3_000,
+    );
+    // 无用量应答（流式进行中 / 空应答）：不产生统计。
+    insert("assistant", json!({}), base + 4_000);
+
+    collect_freebuff_activity_incremental(&db_path, &mut map, &mut sources, &mut cursor);
+
+    let agg = sources
+        .get("freebuff")
+        .expect("freebuff source should exist");
+    assert_eq!(agg.dialogues, 2, "对话数 = user 消息条数");
+    assert_eq!(
+        agg.requests, 2,
+        "有用量 + 用量不完整的 assistant 各计 1 次请求"
+    );
+    assert_eq!(agg.success, 1);
+    assert_eq!(agg.failed, 0);
+    assert_eq!(cursor.max_time_created, 5, "水位线推进到最大 seq");
+
+    // 重复采集（水位未推进）不重复计数。
+    collect_freebuff_activity_incremental(&db_path, &mut map, &mut sources, &mut cursor);
+    assert_eq!(sources["freebuff"].dialogues, 2);
+    assert_eq!(sources["freebuff"].requests, 2);
+
+    // 新回合：回退后写入的行 seq 更大，仍必须被采集到。
+    insert("user", json!({}), base + 5_000);
+    insert(
+        "assistant",
+        json!({ "usage": { "inputTokens": 10, "outputTokens": 5 } }),
+        base + 6_000,
+    );
+    collect_freebuff_activity_incremental(&db_path, &mut map, &mut sources, &mut cursor);
+    assert_eq!(sources["freebuff"].dialogues, 3);
+    assert_eq!(sources["freebuff"].requests, 3);
+    assert_eq!(sources["freebuff"].success, 2);
 
     let _ = fs::remove_file(&db_path);
 }

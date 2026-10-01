@@ -5,7 +5,7 @@ import { formatDate, formatRateLimit, logoText } from "../../utils";
 import { useStore } from "../../composables/useStore";
 import TagList from "../common/TagList.vue";
 import type { ChromeSessionInfo, SiteRecord } from "../../types";
-import { isUnknownSystemType, normalizeSystemType, systemTypeLabel } from "../../types";
+import { isUnknownSystemType, normalizeSystemType, supportsKeyDiscovery, systemTypeLabel } from "../../types";
 
 const props = defineProps<{
   site: SiteRecord;
@@ -249,6 +249,33 @@ function runMenuAction(key: string, event: Event) {
   menuOpen.value = false;
 }
 
+/// 卡片上「Key 与模型」两个按钮必须走真正的 Key/模型同步
+/// （fetch_site_models_json → save_site_model_cache_for_account）。
+/// 此前这里误接了账号/额度同步（syncChromeSession）：点「重试」只刷新余额与
+/// 访问令牌，不重跑 Key/模型发现，site_model_cache.error 永远不被重写，
+/// 卡片上那条「NewAPI Key 接口 HTTP 401…」会一直挂着。
+async function handleKeyModelSync(session: ChromeSessionInfo) {
+  if (store.syncingModelKeys.value || store.syncingSites.value) return;
+  // 未知架构与无 Key 接口的站点没有可发现的 Key，交给「站点模型」弹窗手动维护。
+  if (!supportsKeyDiscovery(props.site.systemType)) {
+    store.showToast("该架构不支持自动发现 Key，请在站点模型弹窗里手动维护", true);
+    return;
+  }
+  if (!session.isValid) {
+    store.showToast("该账号会话无效，请先同步账号额度后再试", true);
+    return;
+  }
+  store.showToast("开始同步 Key 与模型…");
+  const summary = await store.syncAllModelKeys([props.site.id]);
+  if (summary.succeeded + summary.failed === 0) return;
+  store.showToast(
+    summary.failed > 0
+      ? `Key 与模型同步：${summary.succeeded} 个账号成功，${summary.failed} 个失败`
+      : `Key 与模型已同步：${summary.keyCount} 个 Key、${summary.modelCount} 个模型`,
+    summary.failed > 0,
+  );
+}
+
 function onDocumentPointerDown(event: PointerEvent) {
   if (!menuOpen.value) return;
   const target = event.target;
@@ -391,14 +418,14 @@ onUnmounted(() => {
                 class="usage-account-api-action is-error"
                 type="button"
                 :title="`${session.apiSyncError}\n点击重新同步`"
-                @click="store.syncChromeSession(site, $event.currentTarget as HTMLElement)"
+                @click="handleKeyModelSync(session)"
               >Key 与模型同步失败，点击重试</button>
               <button
                 v-else
                 class="usage-account-api-action"
                 type="button"
                 title="点击同步 Key 与模型"
-                @click="store.syncChromeSession(site, $event.currentTarget as HTMLElement)"
+                @click="handleKeyModelSync(session)"
               >Key 与模型未同步，点击同步</button>
             </template>
           </small>

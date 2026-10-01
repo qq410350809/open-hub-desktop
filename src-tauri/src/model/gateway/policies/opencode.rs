@@ -12,9 +12,16 @@
 //!   长度、前缀、大小写、字符集任一不符同样 403；
 //! - `x-opencode-client` / `x-opencode-project` / `x-opencode-request` 不参与校验，
 //!   但取值保持与真实 CLI 一致，避免后续再加形状校验时二次失配。
+//!
+//! 请求体校验（上游 2026-09-30 收紧，实测结论）：
+//! - `stream` 必须为 `true`（`stream:false` 一律 403，与身份头无关）；
+//! - `tools` 必须包含 ≥5 个 OpenCode CLI 内建工具名（大小写敏感；
+//!   描述与参数结构不参与校验），缺失同样 403。真实 CLI 的工具数组、
+//!   标题生成请求的系统提示词（相似度足够时）都能过闸门；
+//!   反代场景下用最小 stub 注入满足该清单（见 [`apply_chat_body_gate`]）。
 
 use super::super::types::ChannelConfig;
-use serde_json::Value as JsonValue;
+use serde_json::{json, Value as JsonValue};
 
 /// 内置固化渠道 ID 与统计 ID（1-100 保留段）
 pub const CHANNEL_ID: &str = "opencode";
@@ -217,6 +224,80 @@ pub(crate) fn apply_models_probe_identity(
         builder = builder.header("User-Agent", GATEWAY_USER_AGENT);
     }
     builder
+}
+
+/// OpenCode CLI 内建工具名清单（上游请求体闸门核对用，实测 2026-09-30）。
+/// `tools` 数组包含其中 ≥5 个（大小写敏感）即放行；描述与参数结构不参与校验。
+/// 取自官方 CLI 1.18.33 的工具注册表（不含用户插件/MCP 工具）。
+pub const CLI_BUILTIN_TOOL_NAMES: &[&str] = &[
+    "bash",
+    "edit",
+    "glob",
+    "grep",
+    "read",
+    "skill",
+    "task",
+    "todowrite",
+    "webfetch",
+    "websearch",
+    "write",
+];
+
+/// 注入 stub 的描述：显式弃用措辞，引导模型优先使用客户端自带的真实工具。
+const STUB_TOOL_DESCRIPTION: &str = "Deprecated legacy tool. Do not use this tool.";
+
+/// OpenCode 免费层请求体闸门（上游 2026-09-30 收紧，实测结论）：
+/// - `stream` 必须为 `true`；
+/// - `tools` 必须包含 ≥5 个 [`CLI_BUILTIN_TOOL_NAMES`] 内的名字。
+///
+/// 反代应对策略（仅对 OpenAI Chat 出口体调用）：
+/// - 强制 `stream: true`（非流式客户端请求由响应侧归一化链路聚合回 JSON，
+///   见 `egress::normalize_response_bytes`）；缺省时补 `stream_options.include_usage`；
+/// - 为缺失的内建工具补最小 stub（名称 + 弃用描述 + 空 schema）——
+///   闸门只认名字，不看描述与结构；客户端已带同名工具时不重复注入；
+/// - 客户端原本没有 `tools` 时置 `tool_choice: "none"`，防止模型回传
+///   客户端无法处理的工具调用（实测上游接受该取值）。
+pub fn apply_chat_body_gate(body: &mut JsonValue) {
+    let Some(obj) = body.as_object_mut() else {
+        return;
+    };
+    obj.insert("stream".to_string(), json!(true));
+    obj.entry("stream_options".to_string())
+        .or_insert_with(|| json!({ "include_usage": true }));
+
+    let tools_value = obj
+        .entry("tools".to_string())
+        .or_insert_with(|| json!([]));
+    let Some(tools) = tools_value.as_array_mut() else {
+        return;
+    };
+    let had_tools = !tools.is_empty();
+    let existing: Vec<String> = tools
+        .iter()
+        .map(|t| {
+            t.pointer("/function/name")
+                .or_else(|| t.get("name"))
+                .and_then(JsonValue::as_str)
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect();
+    for name in CLI_BUILTIN_TOOL_NAMES {
+        if existing.iter().any(|n| n == name) {
+            continue;
+        }
+        tools.push(json!({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": STUB_TOOL_DESCRIPTION,
+                "parameters": { "type": "object", "properties": {}, "required": [] },
+            }
+        }));
+    }
+    if !had_tools {
+        obj.insert("tool_choice".to_string(), json!("none"));
+    }
 }
 
 /// 内置固化：别名固定为 opencode（网关模型前缀依赖它）、协议固定、统计 ID 固化。
@@ -543,5 +624,76 @@ mod opencode_policy_tests {
             other_ch.target_protocol_for("muse-spark-1.3-contributor-free"),
             crate::model::gateway::egress::TargetProtocol::OpenAiChat
         );
+    }
+
+    #[test]
+    fn chat_body_gate_forces_stream_and_injects_builtin_stubs() {
+        // 上游免费层：stream 必须为 true、tools 必须含 ≥5 个内建工具名
+        let mut body = json!({
+            "model": "mimo-v2.6-flash-free",
+            "messages": [{ "role": "user", "content": "hi" }],
+        });
+        apply_chat_body_gate(&mut body);
+        assert_eq!(body["stream"], true, "闸门要求 stream=true");
+        assert_eq!(
+            body["stream_options"]["include_usage"],
+            true,
+            "强制流式后补 usage 回传"
+        );
+        assert_eq!(
+            body["tool_choice"],
+            "none",
+            "客户端无 tools 时禁用工具调用"
+        );
+        let tools = body["tools"].as_array().expect("tools 数组");
+        assert_eq!(tools.len(), CLI_BUILTIN_TOOL_NAMES.len());
+        for name in CLI_BUILTIN_TOOL_NAMES {
+            assert!(
+                tools.iter().any(|t| t.pointer("/function/name")
+                    .and_then(JsonValue::as_str)
+                    .is_some_and(|n| n == *name)),
+                "缺少内建工具 {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn chat_body_gate_preserves_client_tools_choice_and_skips_duplicates() {
+        let mut body = json!({
+            "stream": false,
+            "stream_options": { "include_usage": false },
+            "tools": [
+                { "type": "function", "function": { "name": "Bash", "description": "d",
+                  "parameters": { "type": "object", "properties": { "command": { "type": "string" } } } } },
+                { "type": "function", "function": { "name": "bash", "description": "lower",
+                  "parameters": { "type": "object", "properties": {} } } },
+            ],
+            "tool_choice": "auto",
+        });
+        apply_chat_body_gate(&mut body);
+
+        assert_eq!(body["stream"], true, "非流式客户端也强制流式上游");
+        assert_eq!(
+            body["stream_options"]["include_usage"],
+            false,
+            "客户端显式 stream_options 不被覆盖"
+        );
+        assert_eq!(body["tool_choice"], "auto", "客户端 tool_choice 保留");
+
+        let names: Vec<&str> = body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t.pointer("/function/name").and_then(JsonValue::as_str))
+            .collect();
+        assert_eq!(
+            names.iter().filter(|n| **n == "bash").count(),
+            1,
+            "客户端已带内建同名工具不得重复注入"
+        );
+        assert_eq!(names.iter().filter(|n| **n == "Bash").count(), 1);
+        for builtin in CLI_BUILTIN_TOOL_NAMES {
+            assert!(names.contains(builtin), "缺少内建工具 {builtin}");
+        }
     }
 }

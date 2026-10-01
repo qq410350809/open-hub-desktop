@@ -16,7 +16,6 @@ import { useConfirm } from "../../composables/ui/useConfirm";
 import type {
   TokenModelMapping,
   TokenOfficialModel,
-  InsightEvidence as InsightEvidenceItem,
 } from "../../types";
 import {
   bucketModelTotals,
@@ -785,43 +784,6 @@ function normalizeModelDisplayName(name: string): string {
   return name.toLowerCase().replace(/[^a-z0-9]+/g, "");
 }
 
-/**
- * 同名条目里选更可读的一个：优先带分隔符的写法（`GLM-5.2` 优于 `glm52`）。
- *
- * 两者可读性相同时保留先出现的（列表已按 confidence/lab/name 排序，故更权威）。 */
-function preferReadableModelName(left: string, right: string): string {
-  const score = (name: string) => (/[\s.-]/.test(name) ? 1 : 0) * 10 + (name.length > 6 ? 1 : 0);
-  return score(right) > score(left) ? right : left;
-}
-
-// 洞察分析模型候选：只列**原厂（自营）模型**，与映射下拉同一口径。
-//
-// 目录里其余条目都是原厂模型在各方渠道的变种写法（`GLM-5.2 Caveman`、
-// `GLM-5.2 Honey`、`DeepSeek V4 Flash 0731 (EU)`……），统计侧本来就归集到原厂模型，
-// 混进下拉只会把「选哪个」变成翻近两千条长清单。
-//
-// 同一模型可能有多条不同写法（`GLM-5.2` 与 `glm52`），按归一化名再合并一次，
-// 保留可读性更好的那个。裸模型名由网关按渠道白名单匹配路由。
-//
-// 与后端 `first_party_keys` 同一防御姿势：目录未同步（`firstParty` 全为 false）时
-// 退回全量，宁可多给也不把候选清空。
-const insightModelSelectOptions = computed(() => {
-  const all = mappingCatalogModels.value;
-  const official = all.filter((model) => model.firstParty);
-  const byNormalized = new Map<string, string>();
-  for (const model of official.length > 0 ? official : all) {
-    const name = model.name.trim();
-    if (!name) continue;
-    const key = normalizeModelDisplayName(name);
-    if (!key) continue;
-    const existing = byNormalized.get(key);
-    byNormalized.set(key, existing ? preferReadableModelName(existing, name) : name);
-  }
-  return [...byNormalized.values()]
-    .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }))
-    .map((model) => ({ value: model, text: model }));
-});
-
 async function openMappingDialog() {
   mappingDialogOpen.value = true;
   mappingView.value = "raw";
@@ -927,12 +889,7 @@ async function reopenMapping(row: TokenModelMapping) {
   store.showToast(`已将 ${row.rawModel} 放回待识别队列`);
 }
 
-// —— AI 用量洞察：证据构建（确定性计算，全部可追溯） ——
-const insightDialogOpen = ref(false);
-const insightModel = ref("");
-const insightSubmittedRange = computed(() => store.tokenInsightReport.value?.rangeLabel ?? "");
-
-// —— 已实现但尚未接入模板的能力（映射管理 / 洞察）——
+// —— 已实现但尚未接入模板的能力（映射管理）——
 // 显式引用以通过 noUnusedLocals；等这些能力接到模板后，请删除下面这一整段。
 void [
   mappingUsageOf,
@@ -941,246 +898,8 @@ void [
   startRenameTarget,
   confirmRenameTarget,
   deleteOfficialModel,
-  insightSubmittedRange,
 ];
 
-function formatTokenCompact(value: number): string {
-  if (value >= 1_000_000_000) return `${(value / 1_000_000_000).toFixed(2)}B`;
-  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`;
-  if (value >= 1_000) return `${(value / 1_000).toFixed(1)}K`;
-  return String(Math.round(value));
-}
-
-/** 环比对比区间：与所选范围等长的紧邻前段。 */
-function previousRangeDates(): { from: string; to: string } | null {
-  const from = store.tokenStatsFrom.value;
-  const to = store.tokenStatsTo.value;
-  if (!from || !to) return null;
-  const fromDate = parseLocal(from);
-  const toDate = parseLocal(to);
-  const days = Math.round((toDate.getTime() - fromDate.getTime()) / 86_400_000) + 1;
-  if (days <= 0 || days > 366) return null;
-  const prevTo = new Date(fromDate);
-  prevTo.setDate(prevTo.getDate() - 1);
-  const prevFrom = new Date(prevTo);
-  prevFrom.setDate(prevFrom.getDate() - (days - 1));
-  return { from: toLocalDate(prevFrom), to: toLocalDate(prevTo) };
-}
-
-const insightEvidenceCount = computed(() => buildInsightEvidence().evidence.length);
-
-/** 从当前筛选桶构建证据包；只包含有数据支撑的证据项。 */
-function buildInsightEvidence(): { rangeLabel: string; evidence: InsightEvidenceItem[] } {
-  const evidence: InsightEvidenceItem[] = [];
-  const label = rangeLabel.value;
-  const buckets = filteredBuckets.value;
-  if (!buckets.length) return { rangeLabel: label, evidence };
-
-  const total = bucketTotal.value.total;
-  const conversations = bucketTotal.value.conversations;
-  let requests = 0;
-  let requestsEstimated = false;
-  let costUsd = 0;
-  for (const bucket of buckets) {
-    if (bucket.requestCount != null) requests += bucket.requestCount;
-    else requestsEstimated = true;
-    costUsd += bucket.costUsd || 0;
-  }
-  const dayCount = Math.max(1, rangeDays.value);
-  evidence.push({
-    id: "total",
-    summary: `本期总消耗 ${formatTokenCompact(total)} tokens，覆盖 ${dayCount} 天，对话 ${conversations} 轮`,
-    value: `total=${formatTokenCompact(total)}; days=${dayCount}; dailyAvg=${formatTokenCompact(total / dayCount)}`,
-  });
-  evidence.push({
-    id: "requests",
-    summary: requestsEstimated
-      ? `API 请求总数无法从该来源精确统计（按输出估算约 ${formatTokenCompact(requests)}）`
-      : `API 请求总数 ${formatTokenCompact(requests)}`,
-    value: `requests=${requests}${requestsEstimated ? "; estimated=true" : ""}`,
-  });
-  if (costUsd > 0) {
-    evidence.push({
-      id: "cost",
-      summary: `来源上报成本合计 $${costUsd.toFixed(2)}`,
-      value: `costUsd=${costUsd.toFixed(2)}`,
-    });
-  }
-
-  // 环比：等长紧邻前段
-  const previous = previousRangeDates();
-  if (previous) {
-    const prevBuckets = allBuckets.value.filter((bucket) => {
-      if (!isKnownModel(bucket.model) || !isKnownSource(bucket.source)) return false;
-      const day = localDateOf(bucket.timestamp);
-      return day >= previous.from && day <= previous.to;
-    });
-    const prevTotal = prevBuckets.reduce((sum, bucket) => sum + (bucket.totalTokens || 0), 0);
-    if (prevTotal > 0 || total > 0) {
-      const change = prevTotal > 0 ? ((total - prevTotal) / prevTotal) * 100 : null;
-      evidence.push({
-        id: "period_change",
-        summary: change == null
-          ? `上期（${previous.from} ~ ${previous.to}）消耗 ${formatTokenCompact(prevTotal)}，本期 ${formatTokenCompact(total)}（上期无数据，无法计算百分比）`
-          : `环比上期（${previous.from} ~ ${previous.to}，消耗 ${formatTokenCompact(prevTotal)}）变化 ${change >= 0 ? "+" : ""}${change.toFixed(1)}%`,
-        value: `current=${formatTokenCompact(total)}; previous=${formatTokenCompact(prevTotal)}; change=${change == null ? "n/a" : `${change.toFixed(1)}%`}`,
-      });
-    }
-  }
-
-  // 缓存命中率
-  const cache = cacheBreakdown.value;
-  if (cache.hitRate != null) {
-    evidence.push({
-      id: "cache",
-      summary: `缓存读取 ${formatTokenCompact(cache.read)} / 写入 ${formatTokenCompact(cache.write)}，命中率 ${(cache.hitRate * 100).toFixed(1)}%`,
-      value: `hitRate=${(cache.hitRate * 100).toFixed(1)}%`,
-    });
-  }
-
-  // Top 模型集中度（映射后口径）
-  const models = byModel.value;
-  if (models.length) {
-    const top = models.slice(0, 3);
-    const topShare = top.reduce((sum, item) => sum + shareOf(item.totalTokens, total), 0);
-    evidence.push({
-      id: "models",
-      summary: `Top${top.length} 模型 ${top.map((item) => `${item.model}(${formatTokenCompact(item.totalTokens)}, ${shareOf(item.totalTokens, total).toFixed(1)}%)`).join("、")}，合计占比 ${topShare.toFixed(1)}%`,
-      value: `topModels=${topShare.toFixed(1)}%`,
-    });
-    const top1 = models[0];
-    evidence.push({
-      id: "top_model",
-      summary: `用量最高的模型是 ${top1.model}，${formatTokenCompact(top1.totalTokens)} tokens（占 ${shareOf(top1.totalTokens, total).toFixed(1)}%），请求 ${formatTokenCompact(top1.requests)} 次，缓存命中 ${top1.cacheHitRate == null ? "未知" : `${(top1.cacheHitRate * 100).toFixed(1)}%`}`,
-      value: `model=${top1.model}; share=${shareOf(top1.totalTokens, total).toFixed(1)}%`,
-    });
-  }
-
-  // Top 工具集中度
-  const sources = bySource.value;
-  if (sources.length) {
-    const top = sources.slice(0, 3);
-    evidence.push({
-      id: "sources",
-      summary: `Top${top.length} 工具 ${top.map((item) => `${sourceLabel(item.source)}(${formatTokenCompact(item.totalTokens)}, ${shareOf(item.totalTokens, total).toFixed(1)}%)`).join("、")}`,
-      value: `topSources=${top.map((item) => item.source).join(",")}`,
-    });
-  }
-
-  // 项目 / 渠道集中度
-  if (projectUsage.value.length) {
-    const top = projectUsage.value[0];
-    evidence.push({
-      id: "projects",
-      summary: `用量最高的${statsMode.value === "local" ? "项目" : "渠道"}是 ${top.project}，${formatTokenCompact(top.totalTokens)} tokens（占 ${shareOf(top.totalTokens, total).toFixed(1)}%）`,
-      value: `project=${top.project}; share=${shareOf(top.totalTokens, total).toFixed(1)}%`,
-    });
-  }
-
-  // 日趋势峰值：找出显著高于日均的日期（> 2 倍日均且 > 1000 tokens）
-  const dailyEntries = [...dailyMap.value.entries()].sort((a, b) => a[0].localeCompare(b[0]));
-  if (dailyEntries.length >= 3) {
-    const values = dailyEntries.map(([, stat]) => stat.total);
-    const mean = values.reduce((sum, value) => sum + value, 0) / values.length;
-    const peaks = dailyEntries
-      .filter(([, stat]) => stat.total > mean * 2 && stat.total > 1000)
-      .sort((a, b) => b[1].total - a[1].total)
-      .slice(0, 3);
-    if (peaks.length) {
-      evidence.push({
-        id: "peaks",
-        summary: `日均 ${formatTokenCompact(mean)}；有 ${peaks.length} 天显著高于均值：${peaks.map(([date, stat]) => `${date}（${formatTokenCompact(stat.total)}，${(stat.total / mean).toFixed(1)}x）`).join("、")}`,
-        value: `dailyAvg=${formatTokenCompact(mean)}; peaks=${peaks.map(([date]) => date).join(",")}`,
-      });
-    }
-    const quietDays = dailyEntries.filter(([, stat]) => stat.total === 0).length;
-    if (quietDays > 0) {
-      evidence.push({
-        id: "gaps",
-        summary: `所选范围内有 ${quietDays} 天完全没有用量记录`,
-        value: `quietDays=${quietDays}`,
-      });
-    }
-  }
-
-  // 数据质量提示：估算比例
-  const estimatedTokens = buckets.reduce((sum, bucket) => sum + (bucket.estimatedTokens || 0), 0);
-  if (estimatedTokens > 0 && total > 0) {
-    const ratio = (estimatedTokens / total) * 100;
-    evidence.push({
-      id: "data_quality",
-      summary: `${ratio.toFixed(1)}% 的 tokens 来自本地估算而非来源直接上报，相关数字存在不确定性`,
-      value: `estimatedRatio=${ratio.toFixed(1)}%`,
-    });
-  }
-
-  return { rangeLabel: label, evidence };
-}
-
-/** 提交洞察分析：范围以提交时为准并写入报告快照。 */
-async function runInsightAnalysis() {
-  if (store.tokenInsightAnalyzing.value) return;
-  const { rangeLabel: label, evidence } = buildInsightEvidence();
-  if (!evidence.length) {
-    store.showToast("当前时间范围没有可用数据，先调整日期区间", true);
-    return;
-  }
-  const model = insightModel.value.trim();
-  if (!model) {
-    store.showToast("请先填写分析模型 ID", true);
-    return;
-  }
-  const report = await store.analyzeTokenInsights({
-    rangeLabel: label,
-    analysisModel: model,
-    evidence,
-  });
-  if (report) {
-    store.showToast(
-      report.findings.length || report.recommendations.length
-        ? `洞察完成：${report.findings.length} 项发现 / ${report.recommendations.length} 项建议`
-        : "AI 未能给出可信结论",
-      !(report.findings.length || report.recommendations.length),
-    );
-    insightDialogOpen.value = true;
-  } else {
-    store.showToast(store.tokenInsightError.value || "洞察分析失败", true);
-  }
-}
-
-function openInsightDialog() {
-  insightDialogOpen.value = true;
-  // 识别弹窗选的是渠道裸模型名，仅当它（或同一模型的另一种写法）也在目录候选中时
-  // 才作为洞察默认值。下拉已按归一化名去重，故这里也按归一化名匹配，
-  // 并采用下拉里实际存在的那个写法，避免默认值不在选项中而显示为空白。
-  if (insightModel.value) {
-    // 下拉口径收窄到原厂后，早先选中的非原厂变种可能已不在候选里 → 清空重选
-    const stillOffered = insightModelSelectOptions.value.some(
-      (opt) => normalizeModelDisplayName(opt.value) === normalizeModelDisplayName(insightModel.value),
-    );
-    if (stillOffered) return;
-    insightModel.value = "";
-  }
-  const target = normalizeModelDisplayName(mappingModel.value);
-  if (!target) return;
-  const hit = insightModelSelectOptions.value.find(
-    (opt) => normalizeModelDisplayName(opt.value) === target,
-  );
-  if (hit) insightModel.value = hit.value;
-}
-
-/** 证据 ID → 中文说明，用于报告中的“依据”标注。 */
-function findingEvidenceText(ids: string[]): string {
-  return ids.join("、");
-}
-
-const insightReportTime = computed(() => {
-  const raw = store.tokenInsightReport.value?.generatedAt ?? "";
-  if (!raw) return "";
-  const date = new Date(raw);
-  if (Number.isNaN(date.getTime())) return raw;
-  return date.toLocaleString("zh-CN", { hour12: false });
-});
 
 
 // —— 本地 AI Agent 路径诊断弹窗 ——
@@ -1453,6 +1172,7 @@ const PROVIDER_COLORS: Record<string, string> = {
   dsh: "#1e88e5",
   workbuddy: "#0052d9",
   pi: "#06b6d4",
+  freebuff: "#00a86b",
 };
 
 function providerColor(source: string, index = 0): string {
@@ -2508,17 +2228,6 @@ onBeforeUnmount(() => {
         >
           <span v-html="icons.sliders" />
           <span>明细总账</span>
-        </button>
-
-        <button
-          v-if="statsMode === 'local'"
-          type="button"
-          class="tt-pill-btn"
-          title="让 AI 解读当前时间范围的用量数据，每个结论可追溯到证据"
-          @click="openInsightDialog"
-        >
-          <span v-html="icons.sparkles" />
-          <span>AI 洞察 ({{ insightEvidenceCount }})</span>
         </button>
 
         <button
@@ -3626,121 +3335,6 @@ onBeforeUnmount(() => {
       </div>
     </Transition>
 
-    <!-- AI 用量洞察弹窗（证据可追溯解读） -->
-    <Transition name="tt-modal-fade">
-      <div v-if="insightDialogOpen" class="tt-modal-backdrop">
-        <section class="tt-modal-card is-wide" role="dialog" aria-modal="true">
-          <header class="tt-modal-header">
-            <div>
-              <h2>AI 用量洞察</h2>
-              <p>证据由程序从当前时间范围数据计算得出；AI 只做解读，每个结论都标注了依据的证据。</p>
-            </div>
-            <button type="button" class="tt-modal-close-btn" aria-label="关闭" @click="insightDialogOpen = false">×</button>
-          </header>
-
-          <div class="tt-modal-body">
-            <p class="tt-mapping-hint">
-              <span v-html="icons.info" />
-              <span>
-                分析范围：<strong>{{ rangeLabel }}</strong>（共 {{ insightEvidenceCount }} 条证据）。
-                洞察请求只在本地桌面客户端经进程内网关入口发往所选渠道；已生成的报告会保留其范围快照，
-                切换日期后不会自动刷新。
-              </span>
-            </p>
-
-            <div class="tt-mapping-controls">
-              <label class="tt-mapping-field">
-                <span>分析模型</span>
-                <CustomSelect
-                  v-model="insightModel"
-                  :options="insightModelSelectOptions"
-                  placeholder="选择已生效模型"
-                  :searchable="true"
-                />
-              </label>
-              <button
-                type="button"
-                class="tt-btn-primary"
-                :disabled="store.tokenInsightAnalyzing.value || !insightModel.trim() || insightEvidenceCount === 0"
-                @click="runInsightAnalysis"
-              >
-                <span :class="{ 'is-spinning': store.tokenInsightAnalyzing.value }" v-html="icons.sparkles" />
-                <span>{{ store.tokenInsightAnalyzing.value ? "解读中…" : "生成洞察" }}</span>
-              </button>
-            </div>
-            <p v-if="!insightEvidenceCount" class="tt-mapping-error">
-              当前时间范围没有可用数据，请调整日期区间后重试。
-            </p>
-            <p v-if="store.tokenInsightError.value" class="tt-mapping-error">{{ store.tokenInsightError.value }}</p>
-
-            <!-- 报告：仅在范围匹配时展示 -->
-            <template v-if="store.tokenInsightReport.value">
-              <div
-                v-if="store.tokenInsightReport.value.rangeLabel !== rangeLabel"
-                class="tt-insight-stale"
-              >
-                以下报告生成于「{{ store.tokenInsightReport.value.rangeLabel }}」（{{ insightReportTime }}，模型 {{ store.tokenInsightReport.value.analysisModel }}），
-                与当前所选范围不同，可重新生成。
-              </div>
-              <div class="tt-insight-report">
-                <p v-if="store.tokenInsightReport.value.headline" class="tt-insight-headline">
-                  {{ store.tokenInsightReport.value.headline }}
-                </p>
-                <p v-if="store.tokenInsightReport.value.notice" class="tt-mapping-unresolved">
-                  {{ store.tokenInsightReport.value.notice }}
-                </p>
-                <div class="tt-insight-meta">
-                  <span>范围 {{ store.tokenInsightReport.value.rangeLabel }}</span>
-                  <span>模型 {{ store.tokenInsightReport.value.analysisModel }}</span>
-                  <span>{{ insightReportTime }}</span>
-                  <span>证据引用 {{ store.tokenInsightReport.value.evidenceUsed }} / {{ store.tokenInsightReport.value.evidenceTotal }}</span>
-                </div>
-
-                <section v-if="store.tokenInsightReport.value.findings.length" class="tt-insight-section">
-                  <h4>发现</h4>
-                  <div
-                    v-for="(finding, index) in store.tokenInsightReport.value.findings"
-                    :key="`f-${index}`"
-                    class="tt-insight-item"
-                    :class="`is-${finding.severity}`"
-                  >
-                    <div class="tt-insight-item-head">
-                      <i class="tt-insight-severity" :class="`is-${finding.severity}`" />
-                      <strong>{{ finding.title }}</strong>
-                    </div>
-                    <p v-if="finding.detail">{{ finding.detail }}</p>
-                    <small class="tt-insight-evidence">依据：{{ findingEvidenceText(finding.evidence) }}</small>
-                  </div>
-                </section>
-
-                <section v-if="store.tokenInsightReport.value.recommendations.length" class="tt-insight-section">
-                  <h4>建议</h4>
-                  <div
-                    v-for="(item, index) in store.tokenInsightReport.value.recommendations"
-                    :key="`r-${index}`"
-                    class="tt-insight-item"
-                  >
-                    <div class="tt-insight-item-head">
-                      <i class="tt-insight-severity is-info" />
-                      <strong>{{ item.title }}</strong>
-                    </div>
-                    <p v-if="item.detail">{{ item.detail }}</p>
-                    <small class="tt-insight-evidence">依据：{{ findingEvidenceText(item.evidence) }}</small>
-                  </div>
-                </section>
-              </div>
-            </template>
-          </div>
-
-          <footer class="tt-modal-footer">
-            <span class="tt-footer-hint">
-              洞察只读取当前页面已加载的统计快照，不会上传原始日志；无证据支撑的 AI 结论会被自动忽略。
-            </span>
-            <button type="button" class="tt-btn-cancel" @click="insightDialogOpen = false">关闭</button>
-          </footer>
-        </section>
-      </div>
-    </Transition>
 
     <!-- 本地 AI Agent 路径诊断弹窗 (Local Agent Inspector Modal) -->
     <Transition name="tt-modal-fade">
@@ -5884,117 +5478,6 @@ onBeforeUnmount(() => {
   transition: width 0.25s ease;
 }
 
-/* ============================================================
-   AI 用量洞察弹窗 (AI Insight Modal)
-   ============================================================ */
-.tt-insight-report {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-}
-
-.tt-insight-headline {
-  margin: 0;
-  padding: 12px 14px;
-  border-radius: var(--r-md, 8px);
-  background: color-mix(in srgb, var(--brand) 10%, transparent);
-  border: 1px solid color-mix(in srgb, var(--brand) 30%, transparent);
-  font-size: 13.5px;
-  font-weight: 650;
-  line-height: 1.6;
-  color: var(--text);
-}
-
-.tt-insight-meta {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-}
-
-.tt-insight-meta span {
-  padding: 2px 8px;
-  border-radius: var(--r-full, 999px);
-  background: var(--surface-hover);
-  color: var(--muted);
-  font-size: 10.5px;
-  white-space: nowrap;
-}
-
-.tt-insight-section {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.tt-insight-section h4 {
-  margin: 0;
-  font-size: 12px;
-  font-weight: 700;
-  color: var(--muted);
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-}
-
-.tt-insight-item {
-  padding: 10px 12px;
-  border: 1px solid var(--line);
-  border-left-width: 3px;
-  border-radius: var(--r-sm, 6px);
-  background: var(--page-bg);
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-
-.tt-insight-item.is-high { border-left-color: #ef4444; }
-.tt-insight-item.is-medium { border-left-color: #f97316; }
-.tt-insight-item.is-low { border-left-color: #eab308; }
-.tt-insight-item.is-info { border-left-color: var(--brand); }
-
-.tt-insight-item-head {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.tt-insight-item-head strong {
-  font-size: 12.5px;
-  font-weight: 650;
-}
-
-.tt-insight-item p {
-  margin: 0;
-  font-size: 12px;
-  line-height: 1.6;
-  color: var(--text);
-}
-
-.tt-insight-severity {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  flex-shrink: 0;
-}
-
-.tt-insight-severity.is-high { background: #ef4444; }
-.tt-insight-severity.is-medium { background: #f97316; }
-.tt-insight-severity.is-low { background: #eab308; }
-.tt-insight-severity.is-info { background: var(--brand); }
-
-.tt-insight-evidence {
-  font-size: 10.5px;
-  color: var(--muted);
-}
-
-.tt-insight-stale {
-  padding: 8px 12px;
-  border-radius: var(--r-md, 8px);
-  border: 1px solid color-mix(in srgb, #f97316 40%, transparent);
-  background: color-mix(in srgb, #f97316 10%, transparent);
-  color: var(--text);
-  font-size: 11.5px;
-  line-height: 1.6;
-}
 
 
 /* 视图二：转换后模型分组行 */

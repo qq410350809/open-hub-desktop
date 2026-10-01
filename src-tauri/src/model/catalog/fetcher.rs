@@ -56,6 +56,10 @@ pub(crate) struct SiteModelsResult {
     /// 被挂到 profile_id='' 的幽灵行、与真实账号脱钩。
     #[serde(default)]
     pub(crate) profile_id: String,
+    /// 全站模型健康度（模型 ID → 健康度），来自 NewAPI 的
+    /// `/api/perf-metrics/summary`。站点没有该路由或未启用采集时为空。
+    #[serde(default)]
+    pub(crate) model_health: HashMap<String, SiteModelHealth>,
 }
 
 pub(crate) fn json_array_at<'a>(
@@ -528,6 +532,14 @@ pub(crate) async fn chrome_bridge_fetch_keys_models(
         }
     }
 
+    // 全站模型健康度：盾站点直连必被 403，只能靠页面内同源 fetch 带回。
+    // 桥接没带回（老站点无该路由）就留空，不算错误。
+    let model_health = parsed
+        .health
+        .as_ref()
+        .map(|value| parse_perf_metrics_health(value, PERF_METRICS_WINDOW_HOURS))
+        .unwrap_or_default();
+
     // 与账号同步的落库口径对齐：把 Chrome 里核对过的 Key/模型写进缓存，
     // 并标记 Key 的真实归属（本次桥接使用的 Chrome Profile）。
     let result = SiteModelsResult {
@@ -538,6 +550,7 @@ pub(crate) async fn chrome_bridge_fetch_keys_models(
         key_models,
         errors,
         profile_id: profile_id.to_string(),
+        model_health,
     };
     if let Some(site_id) = site_id {
         let account = SiteModelCacheAccount {
@@ -548,6 +561,7 @@ pub(crate) async fn chrome_bridge_fetch_keys_models(
             keys: result.keys.clone(),
             key_groups: result.key_groups.clone(),
             key_models: result.key_models.clone(),
+            model_health: result.model_health.clone(),
             error: String::new(),
         };
         if let Err(error) = save_site_model_cache(database, site_id, &account, Some(&result), false)
@@ -584,6 +598,7 @@ pub(crate) async fn fetch_models_with_keys(
             key_models: HashMap::new(),
             errors: Vec::new(),
             profile_id: String::new(),
+            model_health: HashMap::new(),
         });
     }
     let models_url = base_url
@@ -643,7 +658,129 @@ pub(crate) async fn fetch_models_with_keys(
         key_models,
         errors,
         profile_id: String::new(),
+        model_health: HashMap::new(),
     })
+}
+
+/// 模型健康度的统计窗口小时数。取 24 与 NewAPI 前端默认一致：窗口越长，
+/// 单次聚合越重，而界面只需要「近一天」这一个粒度。
+pub(crate) const PERF_METRICS_WINDOW_HOURS: i64 = 24;
+
+/// 拉取健康度的独立超时。刻意远小于站点的 90s 同步总预算：它是补偿信息，
+/// 慢站点上宁可这一轮没有标签，也不能把 Key/模型同步一起拖到超时失败。
+const PERF_METRICS_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// 解析 NewAPI `/api/perf-metrics/summary` 的响应。
+///
+/// 响应形如 `{ success, data: { window_start, window_end, models: [
+/// { model_name, avg_latency_ms, success_rate, avg_tps, recent_success_series } ] } }`。
+///
+/// **单位**：`success_rate` 是 0~100 的百分数（上游 `successRate()` 直接返回
+/// `successCount / requestCount * 100`），这里统一归一化到 0~1。按 0~1 解读
+/// 会让 99.87% 被当成「大于 0.995」显示成 100%，界面就只剩 0 和 100。
+///
+/// `recent_success_series` 逐整点序列会随健康度一起带回：界面要用它画
+/// 「近 24 小时逐时状态条」。它上游已按整点对齐，且**只包含有流量的整点**
+/// （`QuerySummaryAll` 侧 requestCount==0 的桶会被跳过），所以这里同样
+/// 不补零——界面按 `window_start` 对号入座，缺槽画灰底，避免把「无流量」
+/// 显示成「成功率为 0」。
+///
+/// 解析不出 `data.models` 一律返回空映射而不是报错：老版本与魔改站点没有
+/// 这条路由，站点侧也可能没启用性能采集，模型可用性判定仍以 `/v1/models`
+/// 为准，不能因为缺健康度就判定同步失败。
+pub(crate) fn parse_perf_metrics_health(
+    value: &serde_json::Value,
+    window_hours: i64,
+) -> HashMap<String, SiteModelHealth> {
+    let Some(items) = json_array_at(value, &["/data/models", "/models"]) else {
+        return HashMap::new();
+    };
+    let window_start = json_number(value, "/data/window_start")
+        .map(|value| value.round() as i64)
+        .filter(|value| *value > 0);
+    items
+        .iter()
+        .filter_map(|item| {
+            let model_name = json_string(item, &["/model_name", "/id", "/name"]);
+            if model_name.is_empty() {
+                return None;
+            }
+            Some((
+                model_name,
+                SiteModelHealth {
+                    success_rate: json_number(item, "/success_rate")
+                        .map(|percent| (percent / 100.0).clamp(0.0, 1.0)),
+                    avg_latency_ms: json_number(item, "/avg_latency_ms")
+                        .map(|value| value.round() as i64),
+                    avg_tps: json_number(item, "/avg_tps"),
+                    window_hours,
+                    window_start,
+                    series: parse_perf_metrics_series(item),
+                },
+            ))
+        })
+        .collect()
+}
+
+/// 解析单个模型的 `recent_success_series`（逐整点成功率）。
+///
+/// 同顶层字段一样是 0~100 的百分数，逐点归一到 0~1；时间戳按升序排列，
+/// 顺带挡掉非整数或非正的时间戳（脏点会让界面槽位整体错位）。
+fn parse_perf_metrics_series(item: &serde_json::Value) -> Vec<SiteModelHealthPoint> {
+    let Some(points) = json_array_at(item, &["/recent_success_series"]) else {
+        return Vec::new();
+    };
+    let mut series: Vec<SiteModelHealthPoint> = points
+        .iter()
+        .filter_map(|point| {
+            let ts = json_number(point, "/ts")?;
+            if !(ts > 0.0) {
+                return None;
+            }
+            Some(SiteModelHealthPoint {
+                ts: ts.round() as i64,
+                success_rate: json_number(point, "/success_rate")
+                    .map(|percent| (percent / 100.0).clamp(0.0, 1.0)),
+            })
+        })
+        .collect();
+    series.sort_by_key(|point| point.ts);
+    series
+}
+
+/// 拉取 `/api/perf-metrics/summary?hours=24`，返回全站模型健康度。
+///
+/// 全程软失败，且都收敛成「空映射」这一个出口：路由不存在（404）、未登录、
+/// 站点未启用采集、超时都只是没有标签，**不写 errors、不影响 Key 与模型同步
+/// 主流程**。鉴权复用 `apply_newapi_auth`——刷新令牌模式下是 Bearer 访问
+/// 令牌，传统 Cookie 模式下是 Cookie + New-Api-User，两者该接口都接受
+/// （它只要 user 级鉴权）。
+pub(crate) async fn fetch_perf_metrics_health(
+    client: &wreq::Client,
+    base_url: &Url,
+    auth: &NewApiAuth,
+    user_agent: &str,
+) -> HashMap<String, SiteModelHealth> {
+    let Ok(url) = base_url.join(&format!(
+        "/api/perf-metrics/summary?hours={PERF_METRICS_WINDOW_HOURS}"
+    )) else {
+        return HashMap::new();
+    };
+    let request = apply_newapi_auth(
+        chrome_request_headers(client.get(url), base_url.as_str(), user_agent),
+        auth,
+    );
+    // 再包一层超时：HTTP client 的 timeout 是整站共用的 6s，这里显式收口，
+    // 让「健康度慢」这件事在代码里就注定只影响自己。
+    match tokio::time::timeout(
+        PERF_METRICS_TIMEOUT,
+        request_json(request, "模型性能指标接口"),
+    )
+    .await
+    {
+        Ok(Ok(value)) => parse_perf_metrics_health(&value, PERF_METRICS_WINDOW_HOURS),
+        Ok(Err(_)) | Err(_) => HashMap::new(),
+    }
 }
 
 pub(crate) fn merge_api_keys(target: &mut Vec<String>, keys: impl IntoIterator<Item = String>) {
@@ -758,7 +895,7 @@ pub(crate) fn save_site_model_cache(
     let existing = if preserve_keys {
         connection
             .query_row(
-                "SELECT keys_json, groups_json, models_json, key_models_json, api_source
+                "SELECT keys_json, groups_json, models_json, key_models_json, health_json, api_source
                  FROM site_model_cache WHERE site_id = ?1 AND profile_id = ?2",
                 params![site_id, account.profile_id],
                 |row| {
@@ -768,6 +905,7 @@ pub(crate) fn save_site_model_cache(
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
                         row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
                     ))
                 },
             )
@@ -808,9 +946,11 @@ pub(crate) fn save_site_model_cache(
         .map(|item| item.key_models.clone())
         .filter(|map| !map.is_empty())
         .or_else(|| {
-            existing.as_ref().and_then(|(_, _, _, key_models_json, _)| {
-                serde_json::from_str(key_models_json).ok()
-            })
+            existing
+                .as_ref()
+                .and_then(|(_, _, _, key_models_json, ..)| {
+                    serde_json::from_str(key_models_json).ok()
+                })
         })
         .unwrap_or_default();
 
@@ -819,12 +959,27 @@ pub(crate) fn save_site_model_cache(
     key_groups.retain(|k, _| key_set.contains(k.as_str()));
     key_models.retain(|k, _| key_set.contains(k.as_str()));
 
+    // 全站模型健康度：只在本次真的取到时覆盖，否则保留旧值。
+    // 「同步模型」（preserve_keys）不回带健康度，若一并清空会把上一次
+    // 「同步 Key」拉到的标签抹掉，界面上模型健康度就变成时有时无。
+    let model_health = [
+        result.map(|item| item.model_health.clone()),
+        Some(account.model_health.clone()),
+        existing
+            .as_ref()
+            .and_then(|(_, _, _, _, health_json, _)| serde_json::from_str(health_json).ok()),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|health| !health.is_empty())
+    .unwrap_or_default();
+
     let api_source = result
         .map(|item| item.source.clone())
         .or_else(|| {
             existing
                 .as_ref()
-                .and_then(|(_, _, _, _, source)| (!source.is_empty()).then(|| source.clone()))
+                .and_then(|(_, _, _, _, _, source)| (!source.is_empty()).then(|| source.clone()))
         })
         .unwrap_or_default();
     // 同步失败原因落库：调用方传入的 account.error 常为空，而后端收集的
@@ -869,6 +1024,17 @@ pub(crate) fn save_site_model_cache(
             ],
         )
         .map_err(|error| error.to_string())?;
+
+    // 健康度单独写、失败只丢标签：它进主 UPSERT 的话，序列化异常或列缺失
+    // 会让整条缓存写入报错，Key/模型同步结果被连带吞掉——补偿信息不能
+    // 绑架主流程。解析来源已保证是有限数（json_number 过滤 NaN/Inf），
+    // 这里的兜底只是不让任何意外波及上面那条写入。
+    let health_json = serde_json::to_string(&model_health).unwrap_or_else(|_| "{}".to_string());
+    let _ = connection.execute(
+        "UPDATE site_model_cache SET health_json = ?3
+         WHERE site_id = ?1 AND profile_id = ?2",
+        params![site_id, account.profile_id, health_json],
+    );
 
     // 本次真的从站点拿到了 Key/模型（result 非空且调用方没报错）：
     // 上一次同步遗留的 sync_error 只描述旧数据，继续展示会让卡片在恢复后
@@ -1084,19 +1250,37 @@ pub fn add_site_model_cache_key(
     profile_name: Option<String>,
     username: Option<String>,
 ) -> Result<bool, String> {
-    let trimmed = key.trim().to_string();
+    let database = &*ctx.database;
+    add_site_model_cache_key_inner(
+        database,
+        &site_id,
+        &profile_id,
+        &key,
+        group_name.as_deref().unwrap_or_default(),
+        profile_name.as_deref().unwrap_or_default(),
+        username.as_deref().unwrap_or_default(),
+    )
+}
+
+pub(crate) fn add_site_model_cache_key_inner(
+    database: &Database,
+    site_id: &str,
+    profile_id: &str,
+    key: &str,
+    group_name: &str,
+    profile_name: &str,
+    username: &str,
+) -> Result<bool, String> {
+    let trimmed = key.trim();
     if trimmed.is_empty() {
         return Err("Key 不能为空".to_string());
     }
-    let group = {
-        let raw = group_name.unwrap_or_default().trim().to_string();
-        if raw.is_empty() {
-            "默认分组".to_string()
-        } else {
-            raw
-        }
+    let raw_group = group_name.trim();
+    let group = if raw_group.is_empty() {
+        "默认分组".to_string()
+    } else {
+        raw_group.to_string()
     };
-    let database = &*ctx.database;
     let connection = database.lock_conn()?;
     let row: Option<(String, String)> = connection
         .query_row(
@@ -1106,18 +1290,45 @@ pub fn add_site_model_cache_key(
         )
         .optional()
         .map_err(|error| error.to_string())?;
-    // 行不存在时只允许站点级（profile_id 为空）自动建行：给任意 profile_id
-    // 凭空造行会在会话列表里渲染出不存在的账号。
+    // 行不存在时只允许两种建行：站点级（profile_id 为空）直接建；带
+    // profile_id 的必须在 site_accounts 里有真实账号——凭空造行会被
+    // read_cached_usage_sites 的缓存行 UNION 分支当成会话吐给前端，渲染出
+    // 不存在的账号。真实账号则照常建行（会话已扫描到但还没同步过 Key 的
+    // 账号就落在这里），并从账号表回填展示名，避免缓存行与账号表脱节。
+    let mut profile_name = profile_name.to_string();
+    let mut username = username.to_string();
+    let mut account_name = String::new();
     let (row_exists, keys_json, groups_json) = match row {
         Some((keys_json, groups_json)) => (true, keys_json, groups_json),
         None if profile_id.is_empty() => (false, "[]".to_string(), "{}".to_string()),
-        None => return Err("目标账号不存在：请先同步会话建立账号信息，再手动添加 Key".to_string()),
+        None => {
+            let known: Option<(String, String, String)> = connection
+                .query_row(
+                    "SELECT profile_name, account_name, username FROM site_accounts
+                     WHERE site_id = ?1 AND profile_id = ?2",
+                    params![site_id, profile_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()
+                .map_err(|error| error.to_string())?;
+            let Some((known_profile, known_account, known_username)) = known else {
+                return Err("目标账号不存在：请先同步会话建立账号信息，再手动添加 Key".to_string());
+            };
+            if profile_name.is_empty() {
+                profile_name = known_profile;
+            }
+            if username.is_empty() {
+                username = known_username;
+            }
+            account_name = known_account;
+            (false, "[]".to_string(), "{}".to_string())
+        }
     };
     let mut keys: Vec<String> = serde_json::from_str(&keys_json).unwrap_or_default();
-    if keys.iter().any(|item| item == &trimmed) {
+    if keys.iter().any(|item| item == trimmed) {
         return Ok(false);
     }
-    keys.push(trimmed);
+    keys.push(trimmed.to_string());
     let mut key_groups: HashMap<String, String> =
         serde_json::from_str(&groups_json).unwrap_or_default();
     key_groups.insert(keys.last().expect("just pushed").clone(), group);
@@ -1137,19 +1348,22 @@ pub fn add_site_model_cache_key(
                     profile_id,
                     serde_json::to_string(&keys).map_err(|error| error.to_string())?,
                     serde_json::to_string(&key_groups).map_err(|error| error.to_string())?,
-                    profile_name.unwrap_or_default(),
-                    username.unwrap_or_default(),
+                    profile_name,
+                    username,
                 ],
             )
             .map_err(|error| error.to_string())?;
     } else {
         connection
             .execute(
-                "INSERT INTO site_model_cache (site_id, profile_id, keys_json, groups_json, error)
-                 VALUES (?1, ?2, ?3, ?4, '')",
+                "INSERT INTO site_model_cache (site_id, profile_id, profile_name, account_name, username, keys_json, groups_json, error)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, '')",
                 params![
                     site_id,
                     profile_id,
+                    profile_name,
+                    account_name,
+                    username,
                     serde_json::to_string(&keys).map_err(|error| error.to_string())?,
                     serde_json::to_string(&key_groups).map_err(|error| error.to_string())?,
                 ],
@@ -1234,18 +1448,20 @@ pub fn get_site_model_cache(
     let connection = database.lock_conn()?;
     let mut statement = connection
         .prepare(
-            "SELECT profile_id, profile_name, account_name, username, api_source, keys_json, groups_json, models_json, key_models_json, error
+            "SELECT profile_id, profile_name, account_name, username, api_source, keys_json, groups_json, models_json, key_models_json, health_json, error
              FROM site_model_cache WHERE site_id = ?1 ORDER BY profile_name, account_name, profile_id",
         )
         .map_err(|error| error.to_string())?;
     let mut models = Vec::new();
     let mut api_source = String::new();
+    let mut model_health: HashMap<String, SiteModelHealth> = HashMap::new();
     let accounts = statement
         .query_map([site_id.as_str()], |row| {
             let keys_json: String = row.get(5)?;
             let groups_json: String = row.get(6)?;
             let models_json: String = row.get(7)?;
             let key_models_json: String = row.get(8)?;
+            let health_json: String = row.get(9)?;
             let account_models: Vec<SiteModelItem> =
                 serde_json::from_str(&models_json).unwrap_or_default();
             let keys: Vec<String> = serde_json::from_str(&keys_json).unwrap_or_default();
@@ -1266,18 +1482,33 @@ pub fn get_site_model_cache(
                 keys,
                 key_groups,
                 key_models,
-                error: row.get(9)?,
+                model_health: serde_json::from_str(&health_json).unwrap_or_default(),
+                error: row.get(10)?,
             })
         })
         .map_err(|error| error.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| error.to_string())?;
+    // 健康度是全站口径，同一站点各账号行拿到的是同一份数据；按「先到先得」
+    // 合并即可，不需要比较新旧。带逐时序列的行优先：部分账号可能是旧版本
+    // 落库的数据（只有聚合值），别用它把状态条的槽位挤掉。
+    for account in &accounts {
+        for (model_id, health) in &account.model_health {
+            let entry = model_health
+                .entry(model_id.clone())
+                .or_insert_with(|| health.clone());
+            if entry.series.is_empty() && !health.series.is_empty() {
+                *entry = health.clone();
+            }
+        }
+    }
     models.sort_by(|left, right| left.id.cmp(&right.id));
     models.dedup_by(|left, right| left.id == right.id);
     Ok(SiteModelCache {
         models,
         api_source,
         accounts,
+        model_health,
     })
 }
 
@@ -1291,7 +1522,7 @@ pub fn get_all_site_model_caches(
     let connection = database.lock_conn()?;
     let mut statement = connection
         .prepare(
-            "SELECT site_id, profile_id, profile_name, account_name, username, api_source, keys_json, groups_json, models_json, key_models_json, error
+            "SELECT site_id, profile_id, profile_name, account_name, username, api_source, keys_json, groups_json, models_json, key_models_json, health_json, error
              FROM site_model_cache ORDER BY site_id, profile_name, account_name, profile_id",
         )
         .map_err(|error| error.to_string())?;
@@ -1302,6 +1533,7 @@ pub fn get_all_site_model_caches(
             let groups_json: String = row.get(7)?;
             let models_json: String = row.get(8)?;
             let key_models_json: String = row.get(9)?;
+            let health_json: String = row.get(10)?;
             Ok((
                 row.get::<_, String>(0)?,
                 SiteModelCacheAccount {
@@ -1312,7 +1544,8 @@ pub fn get_all_site_model_caches(
                     keys: serde_json::from_str(&keys_json).unwrap_or_default(),
                     key_groups: serde_json::from_str(&groups_json).unwrap_or_default(),
                     key_models: serde_json::from_str(&key_models_json).unwrap_or_default(),
-                    error: row.get(10)?,
+                    model_health: serde_json::from_str(&health_json).unwrap_or_default(),
+                    error: row.get(11)?,
                 },
                 serde_json::from_str::<Vec<SiteModelItem>>(&models_json).unwrap_or_default(),
                 row.get::<_, String>(5)?,
@@ -1335,6 +1568,7 @@ pub fn get_all_site_model_caches(
                         models: Vec::new(),
                         api_source: String::new(),
                         accounts: Vec::new(),
+                        model_health: HashMap::new(),
                     },
                 });
                 entries.last_mut().expect("just pushed")
@@ -1342,6 +1576,13 @@ pub fn get_all_site_model_caches(
         };
         if entry.cache.api_source.is_empty() && !api_source.is_empty() {
             entry.cache.api_source = api_source;
+        }
+        for (model_id, health) in &account.model_health {
+            entry
+                .cache
+                .model_health
+                .entry(model_id.clone())
+                .or_insert_with(|| health.clone());
         }
         entry.cache.models.extend(account_models);
         entry.cache.accounts.push(account);
@@ -1941,19 +2182,26 @@ async fn fetch_site_models_json_inner(
                             }
                             merge_api_keys(&mut discovered_keys, keys.iter().cloned());
                             merge_api_key_groups(&mut discovered_key_groups, key_groups.clone());
-                            match fetch_models_with_keys(
-                                &client,
-                                &base_url,
-                                keys.clone(),
-                                keys,
-                                key_groups,
-                                &user_agent,
-                                "newapi-key",
-                                (!model_user_id.is_empty()).then_some(model_user_id.as_str()),
-                            )
-                            .await
-                            {
-                                Ok(result) => {
+                            // 模型逐 Key 拉取与全站健康度互不依赖，并发发起，
+                            // 避免给站点的 90s 同步总预算再加一次串行往返。
+                            let (models_outcome, health) = tokio::join!(
+                                fetch_models_with_keys(
+                                    &client,
+                                    &base_url,
+                                    keys.clone(),
+                                    keys,
+                                    key_groups,
+                                    &user_agent,
+                                    "newapi-key",
+                                    (!model_user_id.is_empty()).then_some(model_user_id.as_str()),
+                                ),
+                                fetch_perf_metrics_health(&client, &base_url, &auth, &user_agent),
+                            );
+                            match models_outcome {
+                                Ok(mut result) => {
+                                    // 健康度缺失（老站点无该路由 / 未启用采集）
+                                    // 只是没有标签而已，不算同步失败。
+                                    result.model_health = health;
                                     return cache_profile_api_counts(
                                         database,
                                         site_id.as_deref(),
@@ -2073,6 +2321,8 @@ async fn fetch_site_models_json_inner(
                                     key_models: HashMap::new(),
                                     errors: Vec::new(),
                                     profile_id: profile_id.clone(),
+                                    // Sub2API 没有 NewAPI 那套性能指标接口。
+                                    model_health: HashMap::new(),
                                 },
                             );
                         }
@@ -2175,6 +2425,7 @@ async fn fetch_site_models_json_inner(
                 .as_deref()
                 .map(str::to_string)
                 .unwrap_or(discovered_profile_id),
+            model_health: HashMap::new(),
         },
     )
 }

@@ -459,6 +459,10 @@ export async function browserFallback<T>(
           { kind: "database", label: "会话数据库 pi.sqlite", path: `${home}.pi-desktop/pi.sqlite`, exists: false },
           { kind: "data", label: "会话记录 sessions", path: `${home}.pi-desktop/sessions`, exists: false },
         ]),
+        mk("freebuff", "Freebuff", `${home}.config/freebuff-desktop`, [
+          { kind: "database", label: "项目会话库 projects", path: `${home}.config/freebuff-desktop/projects`, exists: false },
+          { kind: "config", label: "客户端状态 state.json", path: `${home}.config/freebuff-desktop/state.json`, exists: false },
+        ]),
       ],
     } as T;
   }
@@ -533,23 +537,19 @@ export async function browserFallback<T>(
     return structuredClone(detail) as T;
   }
   if (command === "get_model_capabilities") {
-    // 与 Rust 侧 `normalize_model_id` 同口径的最小归一化：去变体后缀、取末段、标点统一。
-    const normalize = (raw: string) => {
-      let s = raw.trim().toLowerCase();
-      const cut = s.search(/[:@]/);
-      if (cut >= 0) s = s.slice(0, cut);
-      const slash = s.lastIndexOf("/");
-      if (slash >= 0) s = s.slice(slash + 1);
-      return s.replace(/[._]+/g, "-");
-    };
+    // 静态预览只做唯一精确匹配；保留厂商、尺寸、版本和语义后缀，不伪装后端近似算法。
+    const normalize = (raw: string) => raw.trim().toLowerCase();
+    const bare = (raw: string) => raw.slice(raw.lastIndexOf("/") + 1);
     const keys = (args.keys as string[] | undefined) ?? [];
     const out: Record<string, unknown> = {};
     for (const key of keys) {
       const normalized = normalize(key);
-      const model = allPreviewModels.find(
-        (item) => normalize(item.id) === normalized || normalize(item.officialModelId) === normalized,
+      const full = allPreviewModels.filter((item) => normalize(item.id) === normalized || normalize(item.officialModelId) === normalized);
+      const candidates = full.length ? full : key.includes("/") ? [] : allPreviewModels.filter(
+        (item) => bare(normalize(item.id)) === normalized || bare(normalize(item.officialModelId)) === normalized,
       );
-      if (!model) continue;
+      if (candidates.length !== 1) continue;
+      const model = candidates[0];
       out[key] = {
         reasoningOptions: model.reasoningOptions ?? [],
         reasoningEffortMax: model.reasoningEffortMax ?? null,
@@ -564,6 +564,12 @@ export async function browserFallback<T>(
         supportsStructuredOutput: model.structured,
         supportsReasoning: model.reasoning,
         openWeights: model.openWeights,
+        // 预览模式只有全等命中（无最近邻算法），如实标注，避免与真机行为分叉。
+        matchedId: model.id,
+        matchedModelId: model.officialModelId,
+        matchKind: "exact" as const,
+        matchScore: 1,
+        matchVersion: 2,
       };
     }
     return out as T;

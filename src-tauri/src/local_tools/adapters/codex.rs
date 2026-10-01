@@ -121,6 +121,7 @@ impl ToolAdapter for CodexAdapter {
                 provider: active_provider.clone(),
                 context_window: get_i64("model_context_window").unwrap_or(0),
                 max_output: 0,
+                reasoning_effort: String::new(),
             }]
         };
 

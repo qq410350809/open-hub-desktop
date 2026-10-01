@@ -1623,7 +1623,468 @@ fn catpawai_real_db_parses_if_exists() {
     }
 }
 
-/// 本机装有 opencode 族工具时，用真实 DB 验证统一口径恒等式：
+/// Freebuff Desktop 采集器：`inputTokens` 是**含缓存命中**的总输入（客户端自报
+/// `totalTokens = inputTokens + outputTokens`），归一化后全新输入 = input - cached，
+/// 且本仓库口径的 total 与客户端自报值一致。
+#[test]
+fn freebuff_database_parser_extracts_sessions_and_inclusive_input_events() {
+    let dir = std::env::temp_dir().join(format!(
+        "openhub_freebuff_collector_test_{}",
+        std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = fs::create_dir_all(&dir);
+    let project_dir = dir.join("ai-agent");
+    fs::create_dir_all(project_dir.join(".git")).unwrap();
+    let db_path = dir.join("desktop-v2.db");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute_batch(
+        r#"
+            CREATE TABLE threads (
+                id TEXT PRIMARY KEY,
+                project_path TEXT NOT NULL,
+                model TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE messages (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                thread_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                metrics_json TEXT NOT NULL DEFAULT '{}',
+                ts INTEGER NOT NULL
+            );
+            CREATE TABLE freebuff_storage_metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            "#,
+    )
+    .unwrap();
+    // 库级默认模型：线程未显式选模型时用它兜底。
+    conn.execute(
+        "INSERT INTO freebuff_storage_metadata (key, value) VALUES ('default_model_migration', 'glm-5.3-flash-2026-09-05')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO threads (id, project_path, model, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![
+            "thread-1",
+            project_dir.to_string_lossy(),
+            "",
+            1_789_743_480_000i64,
+            1_789_744_300_000i64
+        ],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO messages (thread_id, role, metrics_json, ts) VALUES (?1, 'user', '{}', ?2)",
+        rusqlite::params!["thread-1", 1_789_743_480_554i64],
+    )
+    .unwrap();
+    let metrics = serde_json::json!({
+        "context": { "usedTokens": 202_219, "windowTokens": 1_048_576 },
+        "usage": {
+            "inputTokens": 1_725_218,
+            "cachedInputTokens": 1_576_448,
+            "outputTokens": 71_781,
+            "reasoningOutputTokens": 64_926,
+            "totalTokens": 1_796_999
+        },
+        "costUsd": 0
+    })
+    .to_string();
+    conn.execute(
+        "INSERT INTO messages (thread_id, role, metrics_json, ts) VALUES (?1, 'assistant', ?2, ?3)",
+        rusqlite::params!["thread-1", metrics, 1_789_744_297_954i64],
+    )
+    .unwrap();
+    // 没有 usage 的 assistant 消息（中断 / 纯文本应答）不产生事件。
+    conn.execute(
+        "INSERT INTO messages (thread_id, role, metrics_json, ts) VALUES (?1, 'assistant', '{}', ?2)",
+        rusqlite::params!["thread-1", 1_789_744_297_954i64],
+    )
+    .unwrap();
+
+    let parsed = crate::token::collector::sources::freebuff::parse_freebuff_database(&db_path);
+
+    assert_eq!(parsed.events.len(), 2);
+    let conversation = &parsed.events[0];
+    assert_eq!(conversation.source, "freebuff");
+    assert_eq!(conversation.conversation_count, 1);
+    assert_eq!(conversation.total_tokens, 0);
+    assert_eq!(conversation.timestamp, "2026-09-18T14:58:00.554Z");
+    let request = parsed
+        .events
+        .iter()
+        .find(|event| event.conversation_count == 0)
+        .expect("assistant usage event");
+    assert_eq!(request.timestamp, "2026-09-18T15:11:37.954Z");
+    assert_eq!(request.model, "glm-5.3-flash-2026-09-05");
+    assert_eq!(request.input_tokens, 1_725_218 - 1_576_448);
+    assert_eq!(request.cached_input_tokens, 1_576_448);
+    assert_eq!(request.output_tokens, 71_781);
+    assert_eq!(request.reasoning_output_tokens, 64_926);
+    // 与客户端自报 totalTokens 一致：全新输入 + 缓存命中 + 输出。
+    assert_eq!(request.total_tokens, 1_796_999);
+    assert!(!request.pricing_available);
+    // 事件 id 带线程 id：两个项目库的 seq 各自从 1 起，id 必须跨库唯一。
+    assert_eq!(conversation.id, "freebuff_thread-1_1_user");
+    assert_eq!(request.id, "freebuff_thread-1_2_assistant");
+
+    assert_eq!(parsed.sessions.len(), 1);
+    let session = &parsed.sessions[0];
+    assert_eq!(session.session_hash, "openhub:freebuff:thread-1");
+    assert_eq!(session.source, "freebuff");
+    assert_eq!(session.model, "glm-5.3-flash-2026-09-05");
+    assert_eq!(
+        session.project_key,
+        project_dir.to_string_lossy().to_string()
+    );
+    assert_eq!(session.turns, 1);
+    assert_eq!(session.tokens.input_tokens, 1_725_218 - 1_576_448);
+    assert_eq!(session.tokens.cached_input_tokens, 1_576_448);
+    assert_eq!(session.tokens.output_tokens, 71_781);
+    assert_eq!(session.tokens.reasoning_output_tokens, 64_926);
+    assert_eq!(session.tokens.total_tokens, 1_796_999);
+    // 会话起止取消息级真实活动窗口（线程行 updated_at 比最后一条消息晚）。
+    assert_eq!(session.started_at, "2026-09-18T14:58:00.554Z");
+    assert_eq!(session.ended_at, "2026-09-18T15:11:37.954Z");
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn freebuff_usage_clamps_cache_to_input() {
+    let raw = freebuff_usage(&json!({
+        "inputTokens": 100,
+        "cachedInputTokens": 40,
+        "outputTokens": 20,
+        "reasoningOutputTokens": 15
+    }))
+    .expect("usage");
+    assert_eq!(normalize_usage(raw), (60, 40, 0, 20, 15, 120));
+    // cached > input 的脏数据被夹到 input 以内，total 不反超客户端自报值。
+    let dirty = freebuff_usage(&json!({
+        "inputTokens": 10,
+        "cachedInputTokens": 50,
+        "outputTokens": 5
+    }))
+    .expect("usage");
+    assert_eq!(normalize_usage(dirty), (0, 10, 0, 5, 0, 15));
+    assert!(freebuff_usage(&json!({})).is_none());
+    assert!(freebuff_usage(&json!([])).is_none());
+}
+
+#[test]
+fn freebuff_model_prefers_thread_model_then_database_default() {
+    assert_eq!(
+        freebuff_resolve_model(Some("glm-5.2"), Some("glm-5.3")),
+        "glm-5.2"
+    );
+    assert_eq!(
+        freebuff_resolve_model(Some("  "), Some("glm-5.3")),
+        "glm-5.3"
+    );
+    assert_eq!(freebuff_resolve_model(None, None), UNKNOWN_FREEBUFF_MODEL);
+}
+
+/// 本机装有 Freebuff Desktop 时用真实库验证统一口径恒等式：
+/// fresh + cached + output == total。
+#[test]
+fn freebuff_real_db_parses_if_exists() {
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap();
+    let db_paths = crate::token::collector::sources::freebuff::freebuff_db_paths(&home);
+    if let Some(db_path) = db_paths.first() {
+        let parsed = crate::token::collector::sources::freebuff::parse_freebuff_database(db_path);
+        println!(
+            "Freebuff real DB test: found {} sessions, {} events",
+            parsed.sessions.len(),
+            parsed.events.len()
+        );
+        assert!(!parsed.sessions.is_empty(), "Real DB should have sessions");
+        for event in &parsed.events {
+            assert_eq!(
+                event.input_tokens + event.cached_input_tokens + event.output_tokens,
+                event.total_tokens
+            );
+        }
+        // 与本仓库统一口径交叉校验：事件 total 之和 == Σ(inputTokens + outputTokens)
+        // （客户端自报口径；`cachedInputTokens` 已含在 input 内，故两边恒等）。
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        let expected: i64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(COALESCE(json_extract(metrics_json, '$.usage.inputTokens'), 0) \
+                 + COALESCE(json_extract(metrics_json, '$.usage.outputTokens'), 0)), 0) \
+                 FROM messages WHERE role = 'assistant'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let actual: i64 = parsed.events.iter().map(|event| event.total_tokens).sum();
+        assert_eq!(actual, expected, "Freebuff 口径应与客户端自报一致");
+    }
+}
+
+/// 库发现：只认 `projects/<项目>/desktop*.db`，按目录与文件名稳定排序，
+/// 进程锁库与 `-wal` / `-shm` 伴生文件都不算用量来源。
+#[test]
+fn freebuff_db_paths_discovers_project_databases_in_stable_order() {
+    // 环境变量覆盖会改变基准目录，规避以免污染真实目录。
+    if std::env::var_os("FREEBUFF_DESKTOP_HOME").is_some()
+        || std::env::var_os("XDG_CONFIG_HOME").is_some()
+    {
+        return;
+    }
+    let home = std::env::temp_dir().join(format!(
+        "openhub_freebuff_home_{}",
+        std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let base = freebuff_data_dir(&home);
+    let a_project = base.join("projects").join("a-proj");
+    let b_project = base.join("projects").join("b-proj");
+    fs::create_dir_all(&a_project).unwrap();
+    fs::create_dir_all(&b_project).unwrap();
+    fs::write(a_project.join("desktop-v2.db"), b"").unwrap();
+    fs::write(a_project.join("desktop-v2.db-wal"), b"").unwrap();
+    fs::write(b_project.join("desktop-v2.db"), b"").unwrap();
+    fs::write(base.join("state.json.orchestrator-lock.sqlite"), b"").unwrap();
+
+    let paths = freebuff_db_paths(&home);
+    assert_eq!(paths.len(), 2, "只统计项目库，不含 -wal / 进程锁库");
+    assert!(paths[0].to_string_lossy().contains("a-proj"));
+    assert!(paths[1].to_string_lossy().contains("b-proj"));
+
+    let _ = fs::remove_dir_all(&home);
+}
+
+/// 事件 id 必须跨库唯一：两个项目库各自的 `seq` 都从 1 开始，id 不带线程 id 就会在
+/// `source:id` 去重时互相覆盖，静默丢掉其中一个项目的数据。
+#[test]
+fn freebuff_event_ids_stay_unique_across_project_databases() {
+    let dir = std::env::temp_dir().join(format!(
+        "openhub_freebuff_multidb_{}",
+        std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let make_db = |name: &str, thread_id: &str| -> PathBuf {
+        let project_dir = dir.join(name);
+        fs::create_dir_all(project_dir.join(".git")).unwrap();
+        let db_path = project_dir.join("desktop-v2.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            r#"
+                CREATE TABLE threads (
+                    id TEXT PRIMARY KEY,
+                    project_path TEXT NOT NULL,
+                    model TEXT,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
+                CREATE TABLE messages (
+                    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                    thread_id TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    metrics_json TEXT NOT NULL DEFAULT '{}',
+                    ts INTEGER NOT NULL
+                );
+                "#,
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO threads (id, project_path, model, created_at, updated_at) \
+             VALUES (?1, ?2, 'glm-5.2', ?3, ?3)",
+            rusqlite::params![
+                thread_id,
+                project_dir.to_string_lossy(),
+                1_789_743_480_000i64
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages (thread_id, role, metrics_json, ts) VALUES (?1, 'user', '{}', ?2)",
+            rusqlite::params![thread_id, 1_789_743_480_554i64],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages (thread_id, role, metrics_json, ts) VALUES (?1, 'assistant', ?2, ?3)",
+            rusqlite::params![
+                thread_id,
+                serde_json::json!({
+                    "usage": { "inputTokens": 100, "cachedInputTokens": 40, "outputTokens": 20 }
+                })
+                .to_string(),
+                1_789_743_490_000i64
+            ],
+        )
+        .unwrap();
+        db_path
+    };
+
+    let first = crate::token::collector::sources::freebuff::parse_freebuff_database(&make_db(
+        "project-a",
+        "thread-a",
+    ));
+    let second = crate::token::collector::sources::freebuff::parse_freebuff_database(&make_db(
+        "project-b",
+        "thread-b",
+    ));
+
+    assert_eq!(first.events.len(), 2);
+    assert_eq!(second.events.len(), 2);
+    assert_eq!(first.events[0].id, "freebuff_thread-a_1_user");
+    assert_eq!(first.events[1].id, "freebuff_thread-a_2_assistant");
+    let first_ids = first
+        .events
+        .iter()
+        .map(|event| event.id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    for event in &second.events {
+        assert!(
+            !first_ids.contains(&event.id),
+            "事件 id 跨库冲突：{}",
+            event.id
+        );
+    }
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+/// 客户端「回退 / 编辑」（`DELETE FROM messages WHERE seq >= ?`）会物理删掉助手行与其
+/// `metrics_json.usage`。带历史合并的解析必须把这些**已经消耗掉**的用量留在统计里，
+/// 同时不把回退掉的对话计数重复累计；线程被整体删除后则不再复活。
+#[test]
+fn freebuff_history_keeps_rewound_usage_without_resurrecting_deleted_threads() {
+    let dir = std::env::temp_dir().join(format!(
+        "openhub_freebuff_rewind_{}",
+        std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let project_dir = dir.join("project");
+    fs::create_dir_all(project_dir.join(".git")).unwrap();
+    let db_path = project_dir.join("desktop-v2.db");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute_batch(
+        r#"
+            CREATE TABLE threads (
+                id TEXT PRIMARY KEY,
+                project_path TEXT NOT NULL,
+                model TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE messages (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                thread_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                metrics_json TEXT NOT NULL DEFAULT '{}',
+                ts INTEGER NOT NULL
+            );
+            "#,
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO threads (id, project_path, model, created_at, updated_at) \
+         VALUES ('thread-r', ?1, 'glm-5.3', ?2, ?2)",
+        rusqlite::params![project_dir.to_string_lossy(), 1_789_743_480_000i64],
+    )
+    .unwrap();
+    let insert = |role: &str, metrics: String, ts: i64| {
+        conn.execute(
+            "INSERT INTO messages (thread_id, role, metrics_json, ts) VALUES ('thread-r', ?1, ?2, ?3)",
+            rusqlite::params![role, metrics, ts],
+        )
+        .unwrap();
+    };
+    insert("user", "{}".to_string(), 1_789_743_480_554);
+    insert(
+        "assistant",
+        serde_json::json!({
+            "usage": { "inputTokens": 1_000, "cachedInputTokens": 400, "outputTokens": 100 }
+        })
+        .to_string(),
+        1_789_743_490_000,
+    );
+
+    let before = crate::token::collector::sources::freebuff::parse_freebuff_database(&db_path);
+    assert_eq!(before.events.len(), 2);
+    let rewound_total = before
+        .events
+        .iter()
+        .map(|event| event.total_tokens)
+        .sum::<i64>();
+    // 客户端自报 inputTokens 含缓存命中：全新输入 600 + 缓存命中 400 + 输出 100。
+    assert_eq!(rewound_total, 1_100);
+
+    // 回退：客户端删掉该用户消息及其后的所有行，再写入新的提问（seq 继续自增）。
+    conn.execute(
+        "DELETE FROM messages WHERE thread_id = 'thread-r' AND seq >= 1",
+        [],
+    )
+    .unwrap();
+    insert("user", "{}".to_string(), 1_789_743_600_000);
+
+    let after = crate::token::collector::sources::freebuff::parse_freebuff_database_with_history(
+        &db_path,
+        &before.events,
+    );
+    // 库内只剩新的提问：用量事件靠合并保留，回退掉的对话计数不复活。
+    assert_eq!(after.events.len(), 2);
+    assert_eq!(
+        after
+            .events
+            .iter()
+            .filter(|event| event.conversation_count > 0)
+            .count(),
+        1
+    );
+    assert_eq!(
+        after
+            .events
+            .iter()
+            .map(|event| event.total_tokens)
+            .sum::<i64>(),
+        rewound_total
+    );
+    // 幂等：同一份历史再合并一次不会翻倍。
+    let again = crate::token::collector::sources::freebuff::parse_freebuff_database_with_history(
+        &db_path,
+        &after.events,
+    );
+    assert_eq!(
+        again
+            .events
+            .iter()
+            .map(|event| event.total_tokens)
+            .sum::<i64>(),
+        rewound_total
+    );
+
+    // 线程被客户端删除（消息级联删掉）：历史随之丢弃，不复活已删除会话的用量。
+    conn.execute("DELETE FROM threads WHERE id = 'thread-r'", [])
+        .unwrap();
+    conn.execute("DELETE FROM messages WHERE thread_id = 'thread-r'", [])
+        .unwrap();
+    let deleted = crate::token::collector::sources::freebuff::parse_freebuff_database_with_history(
+        &db_path,
+        &after.events,
+    );
+    assert!(deleted.events.is_empty());
+
+    let _ = fs::remove_dir_all(dir);
+}
 /// fresh + cached + output == total（zcode 为含缓存口径、opencode/mimo 为独立口径）。
 #[test]
 fn opencode_family_real_db_identity_if_exists() {
@@ -2087,7 +2548,10 @@ fn workbuddy_transcript_handles_provider_usage_without_message_usage() {
 #[test]
 fn workbuddy_collect_skips_rollback_and_tool_results() {
     let home = temp_workbuddy_dir("collect");
-    let projects = home.join(".workbuddy-ai").join("projects").join("Demo-Project");
+    let projects = home
+        .join(".workbuddy-ai")
+        .join("projects")
+        .join("Demo-Project");
     fs::create_dir_all(&projects).unwrap();
     let session = projects.join("session-1.jsonl");
     fs::write(&session, "{}\n").unwrap();
@@ -2192,12 +2656,7 @@ fn insert_pi_message(conn: &rusqlite::Connection, turn_id: &str, index: i64, rol
     conn.execute(
         "INSERT INTO messages (id, session_id, turn_id, seq, role, created_at) \
          VALUES (?1, 'unused', ?2, ?3, ?4, 1789689000000)",
-        rusqlite::params![
-            format!("m-{turn_id}-{index}"),
-            turn_id,
-            index,
-            role
-        ],
+        rusqlite::params![format!("m-{turn_id}-{index}"), turn_id, index, role],
     )
     .unwrap();
 }

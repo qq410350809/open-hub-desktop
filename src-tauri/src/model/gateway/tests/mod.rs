@@ -3162,3 +3162,38 @@ async fn rate_limit_failovers_to_healthy_key_and_skips_cooling_one() {
         "第二发不得再打仍在冷却的 a1"
     );
 }
+
+#[tokio::test]
+async fn read_body_idle_passes_through_stream_and_times_out_on_stall() {
+    use futures_util::stream;
+    use futures_util::StreamExt;
+
+    // 正常流：全部块到达后原样返回
+    let body = reqwest::Body::wrap_stream(stream::iter(vec![
+        Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"hello ")),
+        Ok(bytes::Bytes::from_static(b"world")),
+    ]));
+    let resp = reqwest::Response::from(axum::http::Response::new(body));
+    let got = crate::model::gateway::dispatcher::read_body_idle(
+        resp,
+        std::time::Duration::from_secs(2),
+    )
+    .await
+    .expect("正常流不应报错");
+    assert_eq!(got, bytes::Bytes::from_static(b"hello world"));
+
+    // 停摆流：首块之后永不再有数据 → 连续空闲窗口触发超时（总时长不设限）
+    let stalled =
+        stream::iter(vec![Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"partial"))])
+            .chain(stream::pending());
+    let resp = reqwest::Response::from(axum::http::Response::new(reqwest::Body::wrap_stream(
+        stalled,
+    )));
+    let err = crate::model::gateway::dispatcher::read_body_idle(
+        resp,
+        std::time::Duration::from_millis(100),
+    )
+    .await
+    .expect_err("停摆流必须触发空闲超时");
+    assert!(err.contains("无数据"), "超时文案应说明无数据: {err}");
+}

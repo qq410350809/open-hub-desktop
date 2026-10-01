@@ -1,6 +1,7 @@
 pub mod clash_sub;
 pub mod commands;
 pub mod geoip;
+pub(crate) mod ip_info;
 pub mod parser;
 pub mod rotator;
 pub mod runtime;

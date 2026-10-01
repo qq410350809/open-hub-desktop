@@ -179,6 +179,8 @@ const USER_AGENT_SOURCE_PREFIXES: &[(&str, &str)] = &[
     ("catpawai", "catpawai"),
     ("antigravity", "antigravity"),
     ("openclaw", "openclaw"),
+    // Freebuff Desktop（Codebuff 系 Electron agent）实测 UA 为 `Freebuff/<版本> (<平台>)`
+    ("freebuff", "freebuff"),
     // DeepSeek CLI（DSH）底层 harness 的 UA，无 dsh 字样
     ("deepseek-harness", "dsh"),
     // Command Code 的 UA 存在驼峰/连字符两种写法
@@ -416,6 +418,8 @@ mod logger_tests {
             ("CommandCode/1.0", "command-code"),
             ("command-code/1.0", "command-code"),
             ("openclaw/0.9", "openclaw"),
+            // Freebuff Desktop 客户端实测 UA：`Freebuff/<版本> (<平台>)`
+            ("Freebuff/0.9.0 (darwin, arm64)", "freebuff"),
         ] {
             assert_eq!(
                 client_name_from_headers(&ua(agent), "/v1/chat/completions"),

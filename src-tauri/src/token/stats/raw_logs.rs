@@ -861,6 +861,27 @@ pub fn collect_local_agent_paths(home: &Path) -> LocalAgentPathsReport {
         agents.push(finish_agent("pi", "PI-Desktop", Some(&root), entries));
     }
 
+    // Freebuff Desktop
+    {
+        let root = crate::token::collector::freebuff_data_dir(home);
+        let mut entries = Vec::new();
+        for db_path in crate::token::collector::freebuff_db_paths(home) {
+            push_agent_path(
+                &mut entries,
+                "database",
+                "项目会话库 desktop-v2.db",
+                Some(&db_path),
+            );
+        }
+        push_agent_path(
+            &mut entries,
+            "config",
+            "客户端状态 state.json",
+            Some(&root.join("state.json")),
+        );
+        agents.push(finish_agent("freebuff", "Freebuff", Some(&root), entries));
+    }
+
     let collected = crate::token::collector::collected_stats_by_source();
     let collected_at = collected
         .values()

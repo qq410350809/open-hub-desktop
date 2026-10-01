@@ -3,8 +3,10 @@ import { computed, ref, watch, nextTick } from "vue";
 import { runCommand, useLibrary } from "../../composables/useLibrary";
 import { icons } from "../../icons";
 import { useStore } from "../../composables/useStore";
-import { logoText } from "../../utils";
+import { logoText, describeModelHealth, describeModelStatusStrip, describeModelStatusStripTitle, MODEL_STATUS_SLOT_COUNT } from "../../utils";
+import type { ModelHealthBadge, ModelStatusSlot } from "../../utils";
 import { isPipiwangType, isUnknownSystemType, systemTypeLabel } from "../../types";
+import type { SiteModelHealth } from "../../types";
 import { useToast } from "../../composables/core/useToast";
 import { useConfirm } from "../../composables/ui/useConfirm";
 import {
@@ -28,6 +30,8 @@ interface FetchSiteModelsResult {
   errors?: string[];
   /** 实际产出这批 Key 的账号（Chrome Profile）；空表示无归属。 */
   profileId?: string;
+  /** 全站模型健康度（模型 ID → 健康度）；站点无该接口时为空。 */
+  modelHealth?: Record<string, SiteModelHealth>;
 }
 
 type ModelApiSource = "newapi-key" | "sub2api-key" | "pricing" | "models" | "none";
@@ -56,6 +60,8 @@ const liveFetching = ref(false);
 const liveFetchingKind = ref<"keys" | "models" | null>(null);
 const liveError = ref("");
 const liveModels = ref<LiveModelItem[]>([]);
+/** 全站模型健康度（模型 ID → 健康度），来自 NewAPI 的性能指标接口。 */
+const modelHealth = ref<Record<string, SiteModelHealth>>({});
 const liveAccountKeys = ref<LiveAccountKeys[]>([]);
 const apiSource = ref<ModelApiSource>("none");
 /** 当前选中的 API Key；选中后右侧只显示该 Key 对应的模型。 */
@@ -170,10 +176,59 @@ const modelCountLabel = computed(() => {
   return q ? `${filteredLiveModels.value.length} / ${total}` : String(total);
 });
 
+/** 站点是否上报过任何模型健康度；用于在面板上给出一次性的口径说明。 */
+const hasModelHealth = computed(() => Object.keys(modelHealth.value).length > 0);
+
+// 每个模型只解析一次：模板里徽标要读 level/label/title 三处，
+// 逐次调用会把同样的格式化跑三遍。
+const healthBadges = computed(() => {
+  const badges = new Map<string, ModelHealthBadge>();
+  for (const [modelId, health] of Object.entries(modelHealth.value)) {
+    const badge = describeModelHealth(health);
+    if (badge) badges.set(modelId, badge);
+  }
+  return badges;
+});
+
+function healthBadgeOf(modelId: string) {
+  return healthBadges.value.get(modelId);
+}
+
+// 逐时状态条：每个模型都有一条 24 格条带——有流量的整点上色，
+// 没流量的整点留灰（模型整条没有流量就是 24 格全灰）。
+// 无数据模型没有自己的 windowStart，用同站点任一模型的窗口起点对齐，
+// 保证全灰条带和有数据条带落在同一条时间轴上。
+const statusStrips = computed(() => {
+  const strips = new Map<string, ModelStatusSlot[]>();
+  const healthMap = modelHealth.value;
+  const fallbackWindowStart = Object.values(healthMap).find(
+    (health) => typeof health.windowStart === "number" && (health.windowStart ?? 0) > 0,
+  )?.windowStart;
+  for (const model of currentActiveModels.value) {
+    strips.set(model.id, describeModelStatusStrip(healthMap[model.id], fallbackWindowStart));
+  }
+  return strips;
+});
+
+function statusStripOf(modelId: string) {
+  return statusStrips.value.get(modelId) ?? [];
+}
+
+/** 状态条容器口径说明；任一健康度条目即可提供窗口小时数。 */
+const statusStripTitle = computed(() =>
+  describeModelStatusStripTitle(Object.values(modelHealth.value)[0]),
+);
+
+/** 状态条可读性兜底：给 role=img 一句完整描述，供读屏而非鼠标悬停使用。 */
+const statusStripLabel = computed(
+  () => `近 24 小时逐时成功率状态条，共 ${MODEL_STATUS_SLOT_COUNT} 个时段`,
+);
+
 interface LocalSiteModelCache {
   models: LiveModelItem[];
   apiSource: ModelApiSource;
   accounts: LiveAccountKeys[];
+  modelHealth?: Record<string, SiteModelHealth>;
 }
 
 async function readCachedModels(siteId: string): Promise<boolean> {
@@ -185,6 +240,9 @@ async function readCachedModels(siteId: string): Promise<boolean> {
       ...model,
       owned_by: model.owned_by || model.ownedBy,
     }));
+    // 同步 Key 时顺带抓的全站健康度。站点没有该接口时为空，
+    // 界面只是不显示徽标，模型列表本身不受影响。
+    modelHealth.value = data.modelHealth ?? {};
     apiSource.value = data.apiSource || "none";
     const cachedAccounts = Array.isArray(data.accounts) ? data.accounts : [];
     // 账号来源 = Chrome 会话账号 ∪ 模型缓存账号，按 profileId 合并：
@@ -229,6 +287,7 @@ watch(
       document.body.classList.add("modal-open");
       liveModels.value = [];
       liveAccountKeys.value = [];
+      modelHealth.value = {};
       liveError.value = "";
       searchQuery.value = "";
       apiSource.value = "none";
@@ -757,30 +816,37 @@ async function removeKey(account: LiveAccountKeys, key: string) {
 
           <div class="site-models-panel">
             <div class="site-models-panel-head">
-              <div class="site-models-panel-title">
-                <strong>{{ selectedKeyId ? "选中 Key 的模型" : "支持的模型" }}</strong>
-                <small class="site-models-source">{{
-                  selectedKeyId ? maskApiKey(selectedKeyId) : apiSourceLabel
-                }}</small>
-                <span class="site-models-count">{{ modelCountLabel }}</span>
+              <div class="site-models-panel-top">
+                <div class="site-models-panel-title">
+                  <strong>{{ selectedKeyId ? "选中 Key 的模型" : "支持的模型" }}</strong>
+                  <small class="site-models-source">{{
+                    selectedKeyId ? maskApiKey(selectedKeyId) : apiSourceLabel
+                  }}</small>
+                  <span class="site-models-count">{{ modelCountLabel }}</span>
+                </div>
+
+                <label class="site-models-search">
+                  <span v-html="icons.search" />
+                  <input
+                    v-model="searchQuery"
+                    type="text"
+                    placeholder="搜索模型标识或厂商…"
+                  />
+                  <button
+                    v-if="searchQuery"
+                    type="button"
+                    class="site-models-search-clear"
+                    aria-label="清除搜索"
+                    @click="searchQuery = ''"
+                    v-html="icons.close"
+                  />
+                </label>
               </div>
 
-              <label class="site-models-search">
-                <span v-html="icons.search" />
-                <input
-                  v-model="searchQuery"
-                  type="text"
-                  placeholder="搜索模型标识或厂商…"
-                />
-                <button
-                  v-if="searchQuery"
-                  type="button"
-                  class="site-models-search-clear"
-                  aria-label="清除搜索"
-                  @click="searchQuery = ''"
-                  v-html="icons.close"
-                />
-              </label>
+              <p v-if="hasModelHealth" class="site-models-health-note">
+                色条为站点上报的<b>全站</b>口径近 24 小时逐时成功率（与当前 Key
+                无关，仅作健康度参考）：绿 ≥90%，橙 50%~90%，红 &lt;50%，灰 = 该时段无流量，悬停可看具体时段；能否使用以该 Key 的模型列表为准。
+              </p>
             </div>
 
             <div class="site-models-scroll">
@@ -814,14 +880,37 @@ async function removeKey(account: LiveAccountKeys, key: string) {
                   :key="model.id"
                   type="button"
                   class="site-models-item"
-                  :title="`复制模型 ID：${model.id}`"
+                  :title="healthBadgeOf(model.id)?.title || `复制模型 ID：${model.id}`"
                   @click="copyModelId(model.id)"
                 >
                   <span class="site-models-item-info">
-                    <strong :title="model.id">{{ model.id }}</strong>
-                    <small v-if="model.owned_by" class="site-models-item-vendor"
-                      >by {{ model.owned_by }}</small
-                    >
+                    <span class="site-models-item-head">
+                      <strong :title="model.id">{{ model.id }}</strong>
+                      <span
+                        v-if="healthBadgeOf(model.id)"
+                        class="site-models-item-health-value"
+                        :class="`is-${healthBadgeOf(model.id)!.level}`"
+                        :title="healthBadgeOf(model.id)!.title"
+                      >{{ healthBadgeOf(model.id)!.label }}</span>
+                    </span>
+                    <!-- 状态条：每个模型都画满 24 格——有流量的整点上色，
+                         没流量的整点留灰（模型没有任何流量时整条全灰）。 -->
+                    <span v-if="hasModelHealth" class="site-models-item-health">
+                      <span
+                        class="site-models-item-health-strip"
+                        role="img"
+                        :aria-label="statusStripLabel"
+                        :title="statusStripTitle"
+                      >
+                        <span
+                          v-for="slot in statusStripOf(model.id)"
+                          :key="slot.ts"
+                          class="site-models-item-health-slot"
+                          :class="slot.level ? `is-${slot.level}` : 'is-idle'"
+                          :title="slot.title"
+                        />
+                      </span>
+                    </span>
                   </span>
                   <span class="site-models-item-copy" v-html="icons.copy" aria-hidden="true" />
                 </button>

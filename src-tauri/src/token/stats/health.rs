@@ -1,5 +1,6 @@
 use crate::models::RequestHealthReport;
 use crate::token::stats::catpawai::collect_catpawai_activity_incremental;
+use crate::token::stats::freebuff::collect_freebuff_activity;
 use crate::token::stats::pi::collect_pi_activity_incremental;
 use crate::token::stats::types::*;
 use serde_json::Value as JsonValue;
@@ -1144,6 +1145,9 @@ pub fn collect_request_health_snapshot(force: bool) -> Result<RequestHealthRepor
         let cursor = envelope.sqlite_cursors.entry("pi".to_string()).or_default();
         collect_pi_activity_incremental(&pi_db, &mut map, &mut sources, cursor);
     }
+
+    // Freebuff Desktop：一个项目一个库，水位线按库路径分别维护。
+    collect_freebuff_activity(&home, &mut map, &mut sources, &mut envelope.sqlite_cursors);
 
     let report = maps_to_report(map, sources);
     envelope.report = report.clone();

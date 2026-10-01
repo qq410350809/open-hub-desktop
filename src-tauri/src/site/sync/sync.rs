@@ -190,14 +190,18 @@ pub(crate) fn parse_sub2api_account(
 pub(crate) fn parse_sub2api_usage(
     value: &serde_json::Value,
 ) -> Result<SiteAccountSnapshot, String> {
-    let code_valid = value
-        .get("code")
-        .is_some_and(|code| code.as_i64() == Some(0) || code.as_str() == Some("0"));
-    let status_valid = value
-        .pointer("/data/status")
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|status| status.eq_ignore_ascii_case("active"));
-    if !code_valid && !status_valid {
+    // 新版 Sub2API 的 /v1/usage 返回扁平结构：{"balance":…,"daily_usage":[…],
+    // "isValid":…,"planName":…}，既没有 code 也没有 data.status。旧逻辑要求二者
+    // 必有一个，于是把所有合法的用量响应都判成“数据无效”，Key 路径彻底失效，
+    // 只能退回 auth_token 会话端点；会话一过期整站就报 401——同一站点两个 Chrome
+    // Profile 一个成功、一个失败，就是这么来的。
+    // 改为先读余额：只有明确失败的信封才判错，读不到余额时才回落到信封判定。
+    let explicit_failure = value.get("success").and_then(json_boolish) == Some(false)
+        || value.get("code").is_some_and(|code| {
+            code.as_i64().is_some_and(|code| code != 0)
+                || code.as_str().is_some_and(|code| code != "0")
+        });
+    if explicit_failure {
         return Err(api_error_message(value, "Sub2API 返回的用量数据无效"));
     }
     let remaining = [
@@ -209,7 +213,20 @@ pub(crate) fn parse_sub2api_usage(
     ]
     .iter()
     .find_map(|pointer| json_number(value, pointer));
-    let remaining = remaining.ok_or_else(|| "Sub2API 用量响应缺少有效的余额字段".to_string())?;
+    let remaining = remaining.ok_or_else(|| {
+        let code_valid = value
+            .get("code")
+            .is_some_and(|code| code.as_i64() == Some(0) || code.as_str() == Some("0"));
+        let status_valid = value
+            .pointer("/data/status")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|status| status.eq_ignore_ascii_case("active"));
+        if code_valid || status_valid {
+            "Sub2API 用量响应缺少有效的余额字段".to_string()
+        } else {
+            api_error_message(value, "Sub2API 返回的用量数据无效")
+        }
+    })?;
     let used = ["/data/used", "/data/quota/used", "/used"]
         .iter()
         .find_map(|pointer| json_number(value, pointer));
@@ -271,7 +288,7 @@ async fn fetch_sub2api_usage(
         .map_err(|_| "无法生成 Sub2API 用量接口地址".to_string())?;
     let request =
         chrome_request_headers(client.get(url), base_url, user_agent).bearer_auth(api_key);
-    request_json_with_hint(request, "Sub2API 用量接口", SUB2API_AUTH_FAILURE_HINT)
+    request_json_with_hint(request, "Sub2API 用量接口", SUB2API_API_KEY_FAILURE_HINT)
         .await
         .and_then(|value| parse_sub2api_usage(&value))
 }
@@ -521,6 +538,70 @@ pub(crate) fn has_newapi_refresh_cookie_name<'a>(names: impl IntoIterator<Item =
         .any(|name| name.trim() == "new_api_refresh")
 }
 
+/// 目标 Chrome Profile 自己的 NewAPI 登录会话 ID。
+///
+/// `new_api_refresh` Cookie 的值形如 `<sid>.<随机串>`，而站点签发的访问令牌
+/// （JWT）里的 `sid` 声明就是同一个值；NewAPI 前端不写 `localStorage.user` 的
+/// 站点没有别的可比对象，这是判断"这条令牌是否真的属于这个 Profile"的唯一
+/// 可靠依据（同一个 Profile 里会话轮换后 `sid` 保持不变）。
+pub(crate) fn newapi_refresh_session_id(cookie_header: &str) -> Option<String> {
+    cookie_header
+        .split(';')
+        .filter_map(|pair| pair.trim().strip_prefix("new_api_refresh="))
+        .find_map(|value| {
+            let sid = value.split('.').next().unwrap_or("").trim();
+            (sid.len() >= 8
+                && sid
+                    .chars()
+                    .all(|character| character.is_ascii_hexdigit() || character == '-'))
+            .then(|| sid.to_string())
+        })
+}
+
+/// 从 NewAPI 访问令牌（JWT）里读出 `sid`（登录会话 ID）。令牌不透明时返回 None。
+pub(crate) fn newapi_token_session_id(token: &str) -> Option<String> {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    let payload = token.split('.').nth(1)?.trim_end_matches('=');
+    let decoded = URL_SAFE_NO_PAD.decode(payload).ok()?;
+    let value = serde_json::from_slice::<serde_json::Value>(&decoded).ok()?;
+    value
+        .get("sid")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|sid| !sid.is_empty())
+        .map(str::to_string)
+}
+
+/// 桥接返回的令牌是否来自另一个登录会话。
+///
+/// 返回 `Some(实际会话 ID)` 表示能明确判定串号（复用到了别的 Chrome Profile 的
+/// 同站点页面）；返回 `None` 表示无法判定或一致，按可用处理。
+fn bridge_session_mismatch(
+    result: &ChromeBridgeAccountResult,
+    expected: Option<&str>,
+) -> Option<String> {
+    let expected = expected?;
+    let actual = newapi_token_session_id(&result.api_token)?;
+    (!actual.eq_ignore_ascii_case(expected)).then_some(actual)
+}
+/// 读取某个 Chrome Profile 自己的 NewAPI 登录会话 ID（读不到时返回 None）。
+async fn profile_newapi_session_id(
+    base_url: &Url,
+    profile_id: &str,
+    home_dir: &std::path::Path,
+) -> Option<String> {
+    let target_url = base_url.to_string();
+    let profile = profile_id.to_string();
+    let home = home_dir.to_path_buf();
+    spawn_blocking(move || {
+        sync::read_chrome_cookie_header_from_home(&home, &target_url, &profile)
+    })
+    .await
+    .ok()
+    .and_then(|value| value.ok())
+    .as_deref()
+    .and_then(newapi_refresh_session_id)
+}
 /// 按名判断 Cookie 头中是否含指定项（保留给测试与通用判定使用）
 #[allow(dead_code)]
 pub(crate) fn cookie_header_has_name(cookie_header: &str, expected_name: &str) -> bool {
@@ -786,39 +867,90 @@ pub(crate) fn sub2api_response_succeeded(value: &serde_json::Value) -> bool {
 }
 
 pub(crate) fn parse_sub2api_checkin_status(value: &serde_json::Value) -> Result<bool, String> {
-    if value.get("success").and_then(json_boolish) == Some(false)
-        || value.get("code").is_some_and(|code| {
-            code.as_i64().is_some_and(|code| code != 0)
-                || code.as_str().is_some_and(|code| code != "0")
-        })
-    {
+    let success_failed = value.get("success").and_then(json_boolish) == Some(false);
+    // 部分发行版用字符串 code（"SUCCESS"/"OK"），只有纯数字且非 0 才算失败。
+    let code_failed = value.get("code").is_some_and(|code| match code {
+        serde_json::Value::Number(code) => code.as_i64().is_some_and(|code| code != 0),
+        serde_json::Value::String(code) => code
+            .trim()
+            .parse::<i64>()
+            .map(|code| code != 0)
+            .unwrap_or(false),
+        _ => false,
+    });
+    if success_failed || code_failed {
         return Err(api_error_message(value, "Sub2API 签到状态数据无效"));
     }
-    [
+    let explicit = [
         "/data/checked_in_today",
         "/data/checked_in",
         "/data/is_checked_in",
         "/data/has_checked_in",
         "/data/today_checked",
+        "/data/checked",
         "/checked_in_today",
         "/checked_in",
         "/is_checked_in",
         "/has_checked_in",
         "/today_checked",
+        "/checked",
         "/data/status",
         "/status",
         "/data",
     ]
     .iter()
-    .find_map(|pointer| value.pointer(pointer).and_then(json_boolish))
-    .ok_or_else(|| "Sub2API 签到状态缺少今日签到字段".to_string())
+    .find_map(|pointer| value.pointer(pointer).and_then(json_boolish));
+    if let Some(explicit) = explicit {
+        return Ok(explicit);
+    }
+    // 部分发行版（如呆瓜）没有显式「今日已签到」字段，用 can_checkin
+    // （今日是否还能签）与 today_reward（今日已发放的奖励）表达。
+    let can_checkin = ["/data/can_checkin", "/can_checkin"]
+        .iter()
+        .find_map(|pointer| value.pointer(pointer))
+        .and_then(json_boolish);
+    let today_reward = ["/data/today_reward", "/today_reward"]
+        .iter()
+        .find_map(|pointer| value.pointer(pointer))
+        .filter(|reward| !reward.is_null());
+    match (can_checkin, today_reward) {
+        (Some(true), _) => Ok(false),
+        (Some(false), Some(_)) => Ok(true),
+        (Some(false), None) => {
+            // 不能签但也没有今日奖励：仅在没有「不可签」信号时才认定为已签到，
+            // 否则交由上层保留旧状态，避免把「功能未开放」误写成已签到。
+            let unavailable = ["enabled", "unavailable_reason", "unavailable"]
+                .iter()
+                .any(|key| {
+                    value
+                        .pointer(&format!("/data/{key}"))
+                        .or_else(|| value.pointer(&format!("/{key}")))
+                        .is_some_and(|signal| match *key {
+                            "enabled" => json_boolish(signal) == Some(false),
+                            _ => !signal.is_null(),
+                        })
+                });
+            if unavailable {
+                Err("Sub2API 签到状态无法确认今日是否已签到".to_string())
+            } else {
+                Ok(true)
+            }
+        }
+        (None, Some(_)) => Ok(true),
+        (None, None) => Err("Sub2API 签到状态缺少今日签到字段".to_string()),
+    }
 }
 
 /// Sub2API 没有 NewAPI 的“访问令牌”概念，登录凭据是 Local Storage 里的
 /// `auth_token`（可直接当模型 Key 用）。401 失效提示必须说清楚是登录令牌，
-/// 不能套用 NewAPI 的“账号令牌/访问令牌”说法。
+/// 并告诉用户去哪个 Chrome 账号里续期，不能套用 NewAPI 的说法。
 pub(crate) const SUB2API_AUTH_FAILURE_HINT: &str =
-    "（Sub2API 登录令牌（auth_token）已失效或过期，请重新登录后同步账号）";
+    "（Sub2API 登录令牌（auth_token）已失效或过期：请在对应的 Chrome 账号里打开该站点完成登录续期后重试）";
+
+/// Sub2API 的 `/v1/usage` 只认 `sk-` 密钥：401 说明这条 Key 已被站点删除或禁用，
+/// 与会话登录令牌无关，必须与登录失效分开提示，否则用户会被引去重新登录。
+pub(crate) const SUB2API_API_KEY_FAILURE_HINT: &str =
+    "（该 Sub2API API Key 已失效或被删除：请在站点控制台确认后重新同步该账号的 Key 与模型）";
 
 /// NewAPI 刷新令牌移交提示：本地会话已失效、浏览器存在 new_api_refresh 时，
 /// 必须由 Chrome 同源请求刷新（轮换的 HttpOnly Cookie 只有浏览器内请求能写回）。
@@ -861,8 +993,30 @@ pub(crate) async fn request_json_with_hint(
     let body = body
         .strip_prefix(&[0xef, 0xbb, 0xbf])
         .unwrap_or(body.as_ref());
-    let value = match serde_json::from_slice::<serde_json::Value>(body) {
-        Ok(value) => value,
+    let value = decode_json_body(status, &content_type, body, label)?;
+    if !status.is_success() {
+        let mut message = format!(
+            "{label} HTTP {}：{}",
+            status.as_u16(),
+            api_error_message(&value, "请求失败")
+        );
+        if status == wreq::StatusCode::UNAUTHORIZED {
+            message.push_str(auth_failure_hint);
+        }
+        return Err(message);
+    }
+    Ok(value)
+}
+
+/// 把响应体解析为 JSON；HTML 兜底页与非法 JSON 翻译成可读错误。
+fn decode_json_body(
+    status: wreq::StatusCode,
+    content_type: &str,
+    body: &[u8],
+    label: &str,
+) -> Result<serde_json::Value, String> {
+    match serde_json::from_slice::<serde_json::Value>(body) {
+        Ok(value) => Ok(value),
         Err(error) => {
             let first = body
                 .iter()
@@ -879,24 +1033,70 @@ pub(crate) async fn request_json_with_hint(
                     status.as_u16()
                 ));
             }
-            return Err(format!(
+            Err(format!(
                 "{label}返回了无法解析的数据：{}",
                 friendly_json_parse_error(&error, body)
-            ));
+            ))
+        }
+    }
+}
+
+/// 端点探测结果：Sub2API 各发行版的签到路径不同，需要区分
+/// 「这个候选路径不存在（换下一个）」与「端点存在但请求失败（直接报错）」。
+pub(crate) enum JsonEndpointProbe {
+    Found(serde_json::Value),
+    Missing,
+    Failed(String),
+}
+
+/// 探测候选端点：404/405 与「2xx 但返回的不是 JSON（被 SPA 前端路由接管）」
+/// 视为路径不存在；其余失败（401 盾、网络错误）原样返回，交给调用方报错。
+pub(crate) async fn probe_json_endpoint(
+    request: wreq::RequestBuilder,
+    label: &str,
+    auth_failure_hint: &str,
+) -> JsonEndpointProbe {
+    let response = match request.send().await {
+        Ok(response) => response,
+        Err(error) => return JsonEndpointProbe::Failed(format!("{label}请求失败：{error:#}")),
+    };
+    let status = response.status();
+    if status == wreq::StatusCode::NOT_FOUND || status == wreq::StatusCode::METHOD_NOT_ALLOWED {
+        return JsonEndpointProbe::Missing;
+    }
+    let content_type = response
+        .headers()
+        .get(wreq::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let body = match response.bytes().await {
+        Ok(body) => body,
+        Err(error) => {
+            return JsonEndpointProbe::Failed(format!("{label}响应读取失败：{error:#}"));
         }
     };
-    if !status.is_success() {
-        let mut message = format!(
-            "{label} HTTP {}：{}",
-            status.as_u16(),
-            api_error_message(&value, "请求失败")
-        );
-        if status == wreq::StatusCode::UNAUTHORIZED {
-            message.push_str(auth_failure_hint);
+    let body = body
+        .strip_prefix(&[0xef, 0xbb, 0xbf])
+        .unwrap_or(body.as_ref());
+    match decode_json_body(status, &content_type, body, label) {
+        Ok(value) if status.is_success() => JsonEndpointProbe::Found(value),
+        Ok(value) => {
+            let mut message = format!(
+                "{label} HTTP {}：{}",
+                status.as_u16(),
+                api_error_message(&value, "请求失败")
+            );
+            if status == wreq::StatusCode::UNAUTHORIZED {
+                message.push_str(auth_failure_hint);
+            }
+            JsonEndpointProbe::Failed(message)
         }
-        return Err(message);
+        // 2xx 却不是 JSON：路径被站点前端路由接管（SPA 兜底返回 index.html），
+        // 说明该 API 路径不存在，按候选不适用处理。
+        Err(_) if status.is_success() => JsonEndpointProbe::Missing,
+        Err(error) => JsonEndpointProbe::Failed(error),
     }
-    Ok(value)
 }
 
 /// 把 serde_json 的语法报错翻译成用户能看懂的提示，并附一小段原文预览，
@@ -1104,96 +1304,27 @@ pub(crate) async fn refresh_newapi_checkin(
     }
 }
 
-pub(crate) async fn refresh_sub2api_checkin(
-    client: &wreq::Client,
-    base_url: &str,
-    auth_token: &str,
-    user_agent: &str,
-    _previous: CheckinSnapshot,
+/// Sub2API 各发行版的签到端点对（状态查询, 签到动作）。路径随发行版不同：
+/// 实测 `/api/v1/redeem/checkin*` 在所有真实站点上均 404，硬编码单一路径会让
+/// 签到状态永远查不到。按顺序探测，404/SPA 兜底视为该候选不适用。
+pub(crate) const SUB2API_CHECKIN_ENDPOINTS: &[(&str, &str)] = &[
+    ("/api/v1/checkin/status", "/api/v1/checkin"),
+    ("/api/v1/check-in", "/api/v1/check-in"),
+    ("/api/checkin/status", "/api/checkin"),
+    ("/api/v1/redeem/checkin/status", "/api/v1/redeem/checkin"),
+];
+
+/// 签到状态刷新失败时的回退：
+/// - 当天已确认签到过的，保留「已签到」并清空错误 —— 状态查询失败不能把
+///   已签到打回未签到（这正是「当天签到过却显示未签到」的成因）；
+/// - 否则带上失败原因，让界面显示「无法签到」而不是无信息的默认值。
+pub(crate) fn sub2api_checkin_fallback(
+    previous: CheckinSnapshot,
+    error: String,
 ) -> CheckinSnapshot {
-    let base_url = match Url::parse(base_url) {
-        Ok(url) => url,
-        Err(_) => {
-            return CheckinSnapshot {
-                enabled: false,
-                checked_in_today: false,
-                error: String::new(),
-            };
-        }
-    };
-    let status_url = match base_url.join("/api/v1/redeem/checkin/status") {
-        Ok(url) => url,
-        Err(_) => {
-            return CheckinSnapshot {
-                enabled: false,
-                checked_in_today: false,
-                error: String::new(),
-            };
-        }
-    };
-    let checkin_url = match base_url.join("/api/v1/redeem/checkin") {
-        Ok(url) => url,
-        Err(_) => {
-            return CheckinSnapshot {
-                enabled: false,
-                checked_in_today: false,
-                error: String::new(),
-            };
-        }
-    };
-    let headers = |request: wreq::RequestBuilder| {
-        chrome_request_headers(request, base_url.as_str(), user_agent).bearer_auth(auth_token)
-    };
-    let value = match request_json_with_hint(
-        headers(client.get(status_url)),
-        "Sub2API 签到状态接口",
-        SUB2API_AUTH_FAILURE_HINT,
-    )
-    .await
-    {
-        Ok(value) => value,
-        Err(_) => {
-            return CheckinSnapshot {
-                enabled: false,
-                checked_in_today: false,
-                error: String::new(),
-            };
-        }
-    };
-    let checked_in_today = match parse_sub2api_checkin_status(&value) {
-        Ok(value) => value,
-        Err(_) => {
-            return CheckinSnapshot {
-                enabled: false,
-                checked_in_today: false,
-                error: String::new(),
-            };
-        }
-    };
-    if checked_in_today {
-        return CheckinSnapshot {
-            enabled: true,
-            checked_in_today: true,
-            error: String::new(),
-        };
-    }
-    let value = match request_json_with_hint(
-        headers(client.post(checkin_url)),
-        "Sub2API 签到接口",
-        SUB2API_AUTH_FAILURE_HINT,
-    )
-    .await
-    {
-        Ok(value) => value,
-        Err(_) => {
-            return CheckinSnapshot {
-                enabled: false,
-                checked_in_today: false,
-                error: String::new(),
-            };
-        }
-    };
-    if sub2api_response_succeeded(&value) {
+    if previous.checked_in_today {
+        // checked=true 的路径写库时 enabled 必为 true（两者同源写入），
+        // 这里显式置 true 防御脏数据。
         CheckinSnapshot {
             enabled: true,
             checked_in_today: true,
@@ -1201,11 +1332,175 @@ pub(crate) async fn refresh_sub2api_checkin(
         }
     } else {
         CheckinSnapshot {
-            enabled: false,
+            enabled: previous.enabled,
             checked_in_today: false,
-            error: String::new(),
+            error,
         }
     }
+}
+
+/// 从签到域（checkin_url 独立于 API 主机时）的 Local Storage 里取登录令牌。
+/// 键名随发行版不同：welfalre 系存 `welfare_token`，标准 sub2api 存 `auth_token`。
+/// 主域 auth_token 在签到域上会被拒（实测返回 invalid token），必须按域取。
+pub(crate) fn checkin_origin_token(values: &HashMap<String, String>) -> Option<String> {
+    ["welfare_token", "auth_token"]
+        .iter()
+        .find_map(|key| values.get(*key))
+        .map(|token| token.trim().trim_matches('"'))
+        .filter(|token| !token.is_empty())
+        .map(str::to_string)
+}
+
+/// 候选 (签到基础地址, 令牌) 列表：
+/// 1. 跨主机 checkin_url + 该域自己的令牌（welfalre 系的 welfare_token）；
+/// 2. 跨主机 checkin_url + 主域 auth_token（同后端的两域名可能互通）；
+/// 3. API 基地址 + 主域 auth_token（同主机签到的常规路径）。
+/// 同 origin 同令牌去重，无令牌的组合跳过；无任何组合时上层直接回退。
+pub(crate) fn sub2api_checkin_probes(
+    base_url: &str,
+    auth_token: &str,
+    checkin_url: &str,
+    checkin_token: &str,
+) -> Vec<(String, String)> {
+    fn push(probes: &mut Vec<(String, String)>, url: &str, token: &str) {
+        let url = url.trim();
+        let token = token.trim();
+        if url.is_empty() || token.is_empty() {
+            return;
+        }
+        let Ok(parsed) = Url::parse(url) else {
+            return;
+        };
+        let origin = parsed.origin().ascii_serialization();
+        if origin == "null" {
+            return;
+        }
+        if probes.iter().any(|(existing_url, existing_token)| {
+            existing_token == token
+                && Url::parse(existing_url)
+                    .is_ok_and(|existing| existing.origin().ascii_serialization() == origin)
+        }) {
+            return;
+        }
+        probes.push((parsed.to_string(), token.to_string()));
+    }
+    let mut probes = Vec::new();
+    push(&mut probes, checkin_url, checkin_token);
+    push(&mut probes, checkin_url, auth_token);
+    push(&mut probes, base_url, auth_token);
+    probes
+}
+
+pub(crate) async fn refresh_sub2api_checkin(
+    client: &wreq::Client,
+    base_url: &str,
+    auth_token: &str,
+    checkin_url: &str,
+    checkin_token: &str,
+    user_agent: &str,
+    previous: CheckinSnapshot,
+) -> CheckinSnapshot {
+    let probes = sub2api_checkin_probes(base_url, auth_token, checkin_url, checkin_token);
+    if probes.is_empty() {
+        return sub2api_checkin_fallback(
+            previous,
+            "缺少 Sub2API 登录令牌（auth_token），无法刷新签到状态".to_string(),
+        );
+    }
+    let mut last_error: Option<String> = None;
+    'probe: for (probe_base, probe_token) in &probes {
+        let probe_base = match Url::parse(probe_base) {
+            Ok(url) => url,
+            Err(_) => continue,
+        };
+        let headers = |request: wreq::RequestBuilder| {
+            chrome_request_headers(request, probe_base.as_str(), user_agent)
+                .bearer_auth(probe_token.as_str())
+        };
+        for (status_path, action_path) in SUB2API_CHECKIN_ENDPOINTS {
+            let status_url = match probe_base.join(status_path) {
+                Ok(url) => url,
+                Err(_) => continue,
+            };
+            let status_value = match probe_json_endpoint(
+                headers(client.get(status_url)),
+                "Sub2API 签到状态接口",
+                SUB2API_AUTH_FAILURE_HINT,
+            )
+            .await
+            {
+                JsonEndpointProbe::Found(value) => value,
+                JsonEndpointProbe::Missing => continue,
+                JsonEndpointProbe::Failed(error) => {
+                    // 401（令牌失效）对所有候选路径都一样，但换路径探测成本很低，
+                    // 继续尝试以免某发行版只有部分路径需要认证。
+                    last_error = Some(error);
+                    continue;
+                }
+            };
+            let checked_in_today = match parse_sub2api_checkin_status(&status_value) {
+                Ok(checked) => checked,
+                Err(error) => {
+                    last_error = Some(error);
+                    continue;
+                }
+            };
+            if checked_in_today {
+                return CheckinSnapshot {
+                    enabled: true,
+                    checked_in_today: true,
+                    error: String::new(),
+                };
+            }
+            // 状态接口命中且今日未签到：用配对的签到动作端点执行签到。
+            let action_url = match probe_base.join(action_path) {
+                Ok(url) => url,
+                Err(_) => continue,
+            };
+            let value = match probe_json_endpoint(
+                headers(client.post(action_url)).json(&serde_json::json!({})),
+                "Sub2API 签到接口",
+                SUB2API_AUTH_FAILURE_HINT,
+            )
+            .await
+            {
+                JsonEndpointProbe::Found(value) => value,
+                JsonEndpointProbe::Missing => {
+                    last_error = Some(format!("签到动作接口不存在（{action_path}）"));
+                    continue;
+                }
+                JsonEndpointProbe::Failed(error) => {
+                    // 换一个（基础地址, 令牌）组合再试，最后统一回退。
+                    last_error = Some(error);
+                    continue 'probe;
+                }
+            };
+            if sub2api_response_succeeded(&value) {
+                return CheckinSnapshot {
+                    enabled: true,
+                    checked_in_today: true,
+                    error: String::new(),
+                };
+            }
+            let message = api_error_message(&value, "Sub2API 签到失败");
+            // 站点把「重复签到」当失败返回，但语义上就是今日已签到。
+            if message.contains("已签到") || message.to_ascii_lowercase().contains("already") {
+                return CheckinSnapshot {
+                    enabled: true,
+                    checked_in_today: true,
+                    error: String::new(),
+                };
+            }
+            return sub2api_checkin_fallback(previous, message);
+        }
+    }
+    let error = last_error.unwrap_or_else(|| {
+        format!(
+            "站点未提供签到接口（{} 条候选路径均不存在）",
+            SUB2API_CHECKIN_ENDPOINTS.len()
+        )
+    });
+    sub2api_checkin_fallback(previous, error)
 }
 
 pub(crate) async fn fetch_site_account(
@@ -1222,6 +1517,10 @@ pub(crate) async fn fetch_site_account(
     cached_newapi_token: Option<String>,
     cached_newapi_user_id: Option<String>,
     cached_sub2api_keys: &[String],
+    // 跨主机签到地址（如 Fengwind 的签到在 api-welfalre.fengwind.com）及其
+    // 域下的 Local Storage：签到接口不在 API 主域上时靠它定位与鉴权。
+    checkin_url: &str,
+    checkin_local_values: &HashMap<String, String>,
 ) -> Result<SiteAccountRefresh, String> {
     let previous_checkin = if should_checkin {
         previous_checkin
@@ -1306,10 +1605,20 @@ pub(crate) async fn fetch_site_account(
         };
 
         // 1. 优先尝试已缓存的访问令牌（长效凭据）
+        // 缓存令牌必须属于这个 Chrome Profile 自己的登录会话：串号的缓存
+        // （例如从别的 Profile 页面复用写进来的令牌）会让整站账号数据长期
+        // 认成别人，这里按会话 ID 直接丢弃，改走本 Profile 的 Cookie 路径。
+        let expected_session = newapi_refresh_session_id(&cookie_header);
         let mut api_token = cached_newapi_token
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
+            .filter(|token| {
+                match (newapi_token_session_id(token), expected_session.as_deref()) {
+                    (Some(actual), Some(expected)) => actual.eq_ignore_ascii_case(expected),
+                    _ => true,
+                }
+            })
             .unwrap_or("")
             .to_string();
 
@@ -1518,14 +1827,20 @@ pub(crate) async fn fetch_site_account(
     }
 
     let checkin = if should_checkin {
-        match &auth_token {
-            Some(token) => {
-                refresh_sub2api_checkin(client, base_url, token, user_agent, previous_checkin).await
-            }
-            None => CheckinSnapshot::default(),
-        }
+        let auth_token = auth_token.as_deref().unwrap_or_default();
+        let checkin_token = checkin_origin_token(checkin_local_values).unwrap_or_default();
+        refresh_sub2api_checkin(
+            client,
+            base_url,
+            auth_token,
+            checkin_url,
+            &checkin_token,
+            user_agent,
+            previous_checkin,
+        )
+        .await
     } else {
-        CheckinSnapshot::default()
+        previous_checkin
     };
 
     // 候选 apiKey：仅使用已缓存的 Sub2API API Key。/v1/usage 只认 sk-... 密钥，
@@ -1562,7 +1877,10 @@ pub(crate) async fn fetch_site_account(
             .map_err(|_| "无法生成账号接口地址".to_string())?;
         let request =
             chrome_request_headers(client.get(url), base_url, user_agent).bearer_auth(token);
-        let account = request_json(request, "账号接口")
+        // 401 在这里只说明 Local Storage 里的 auth_token 过期（浏览器侧可用
+        // refresh_token 续期），必须给 Sub2API 自己的提示，不能套用 NewAPI 的
+        // “账号令牌/访问令牌”说法误导用户。
+        let account = request_json_with_hint(request, "账号接口", SUB2API_AUTH_FAILURE_HINT)
             .await
             .and_then(|value| parse_sub2api_account(&value));
         return match account {
@@ -1578,7 +1896,11 @@ pub(crate) async fn fetch_site_account(
             Err(error) => Ok(SiteAccountRefresh {
                 account: local_account.clone().unwrap_or_default(),
                 is_valid: local_account.is_some(),
-                sync_error: error,
+                sync_error: if candidate_keys.is_empty() {
+                    format!("{error}（该账号暂无可用 API Key，可先同步该账号的 Key 与模型，之后就不再依赖浏览器会话）")
+                } else {
+                    error
+                },
                 checkin,
                 newapi_token: String::new(),
                 newapi_user_id: String::new(),
@@ -1657,17 +1979,40 @@ pub(crate) fn chrome_account_bridge_script(
     use_refresh_auth: bool,
     should_checkin: bool,
     allow_challenge_navigation: bool,
+    expected_session: Option<&str>,
 ) -> String {
     let user_id =
         serde_json::to_string(user_id.unwrap_or_default()).unwrap_or_else(|_| "\"\"".into());
     let current_month = serde_json::to_string(current_month).unwrap_or_else(|_| "\"\"".into());
     let marker = serde_json::to_string(marker).unwrap_or_else(|_| "\"\"".into());
+    let expected_session = serde_json::to_string(expected_session.unwrap_or_default())
+        .unwrap_or_else(|_| "\"\"".into());
     r#"(() => {
   const token = __OPENHUB_MARKER__;
   const legacyUserId = __OPENHUB_USER_ID__;
   const useRefreshAuth = __OPENHUB_USE_REFRESH_AUTH__;
   const shouldCheckin = __OPENHUB_SHOULD_CHECKIN__;
   const allowChallengeNavigation = __OPENHUB_ALLOW_CHALLENGE_NAVIGATION__;
+  // 目标 Chrome Profile 自己的登录会话 ID：复用其它窗口里已打开的站点页面时，
+  // 页面跑在哪个 Profile 的 Cookie 罐里决定了拿到谁的令牌。NewAPI 前端不写
+  // `localStorage.user` 的站点没有别的可比对象，这里用令牌里的 `sid` 兜底，
+  // 串号就回 PROFILE_MISMATCH，由调用方改开目标 Profile 的新标签。
+  const expectedSession = __OPENHUB_EXPECTED_SESSION__;
+  const sessionOf = (value) => {
+    if (!value || typeof value !== "string") return "";
+    const parts = value.split(".");
+    if (parts.length < 2) return "";
+    try {
+      const base64 = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+      const padded = base64 + "=".repeat((4 - (base64.length % 4)) % 4);
+      const text = atob(padded);
+      const bytes = Uint8Array.from(text, (character) => character.charCodeAt(0));
+      const payload = JSON.parse(new TextDecoder().decode(bytes));
+      return typeof payload?.sid === "string" ? payload.sid : "";
+    } catch (_) {
+      return "";
+    }
+  };
   const requestTimeout = 8000;
   const pending = "__OPENHUB_PENDING__";
   const messageOf = (value, fallback) =>
@@ -1751,6 +2096,8 @@ pub(crate) fn chrome_account_bridge_script(
   }
   const previous = window.__openHubAccountSync;
   if (previous && previous.token === token) {
+    // 页面所在 Profile 与目标 Profile 不是同一个登录会话：交给调用方改开新标签。
+    if (previous.profileMismatch) return "__OPENHUB_PROFILE_MISMATCH__";
     if (previous.result) return JSON.stringify(previous.result);
     if (previous.state !== "challenge" || Date.now() - previous.started < 3000) return pending;
   }
@@ -1860,6 +2207,14 @@ pub(crate) fn chrome_account_bridge_script(
             (typeof tokenResponse.data?.data === "string" ? tokenResponse.data.data : "");
           if (permanentToken) apiToken = permanentToken;
         }
+    // 令牌必须属于目标 Profile 自己的登录会话：复用到的页面若开在别的 Chrome
+    // 账号窗口里，这里拿到的就是那个账号的令牌，直接判串号，由调用方改开新标签。
+    if (expectedSession && apiToken && sessionOf(apiToken) &&
+        sessionOf(apiToken) !== expectedSession) {
+      bridge.state = "done";
+      bridge.profileMismatch = true;
+      return;
+    }
       } catch (_) {}
     }
     // 传统 Cookie 模式不获取访问令牌，直接带 New-Api-User 与 session Cookie 请求。
@@ -2021,12 +2376,14 @@ pub(crate) fn chrome_account_bridge_script(
             },
         )
         .replace("__OPENHUB_MARKER__", &marker)
+        .replace("__OPENHUB_EXPECTED_SESSION__", &expected_session)
 }
 
 /// NewAPI Key 同步的 Chrome 同源桥接脚本：在站点页面上下文里依次拉取
-/// `/api/token/?p=1&size=20`（Key 列表）与 `/v1/models`（模型列表），
-/// 一次返回两者原文。Key 明文不在 JSON 里时由调用方再走
-/// `/api/token/{id}/key` 揭示（直连此时通常已可用——页面已通过盾）。
+/// `/api/token/?p=1&size=20`（Key 列表）、`/v1/models`（模型列表）与
+/// `/api/perf-metrics/summary?hours=24`（全站模型健康度），一次返回三者
+/// 原文。Key 明文不在 JSON 里时由调用方再走 `/api/token/{id}/key` 揭示
+/// （直连此时通常已可用——页面已通过盾）。
 ///
 /// Cloudflare 盾站点的直连请求全部被 403 挑战拦截，浏览器同源 fetch
 /// 带着已通过的 cf_clearance 才是唯一可行路径（与账号同步桥接同一机制）。
@@ -2095,19 +2452,35 @@ pub(crate) fn chrome_key_models_bridge_script(should_fetch_models: bool, user_id
         };
         return;
       }
-      bridge.result = { ok: true, tokenList: tokenResponse.data, models: null };
+      bridge.result = { ok: true, tokenList: tokenResponse.data, models: null, health: null };
       if (!__OPENHUB_FETCH_MODELS__) return;
-      // Key 列表成功后再拉模型：失败不推翻 Key 结果，models 置 null 由调用方直连重试
-      try {
-        const modelsResponse = await readResponse(await fetch("/v1/models", {
+      // Key 列表成功后再拉模型与健康度：失败不推翻 Key 结果，对应字段
+      // 置 null 由调用方直连重试。
+      //
+      // 两个请求并发发出：桥接整体只有 10s/25s 预算（静默 → 可见标签），
+      // 串行多一个往返就可能把 Key 同步本身拖超时——那才是真正的主流程。
+      // 各自 catch：任一 fetch 抛错都只丢自己的字段，绝不能冒泡到外层
+      // catch 把上面已经拿到的 Key 结果覆盖成失败。
+      // 健康度超时给到 6s，远小于桥接预算，对一个汇总接口够用了。
+      const [modelsResponse, healthResponse] = await Promise.all([
+        readResponse(await fetch("/v1/models", {
           method: "GET", credentials: "include", cache: "no-store", headers: requestHeaders,
           signal: AbortSignal.timeout(30000)
-        }));
-        if (!modelsResponse.challenge && !modelsResponse.error &&
-            modelsResponse.status >= 200 && modelsResponse.status < 300) {
-          bridge.result.models = modelsResponse.data;
-        }
-      } catch (_) {}
+        })).catch(() => ({ status: 0, error: "模型请求超时" })),
+        readResponse(await fetch("/api/perf-metrics/summary?hours=24", {
+          method: "GET", credentials: "include", cache: "no-store", headers: requestHeaders,
+          signal: AbortSignal.timeout(6000)
+        })).catch(() => ({ status: 0, error: "健康度请求超时" }))
+      ]);
+      if (!modelsResponse.challenge && !modelsResponse.error &&
+          modelsResponse.status >= 200 && modelsResponse.status < 300) {
+        bridge.result.models = modelsResponse.data;
+      }
+      // 老版本 / 魔改站点没有这条路由：404 直接留 null，绝不影响 Key 与模型。
+      if (!healthResponse.challenge && !healthResponse.error &&
+          healthResponse.status >= 200 && healthResponse.status < 300) {
+        bridge.result.health = healthResponse.data;
+      }
     } catch (error) {
       bridge.result = { ok: false, error: String(error && error.message || error) };
     }
@@ -2141,11 +2514,12 @@ pub(crate) fn parse_chrome_account_bridge_result(
     Ok((account, result))
 }
 
-/// Chrome Key 桥接结果：Key 列表与（可选）模型列表原文。
+/// Chrome Key 桥接结果：Key 列表、模型列表与（可选）全站模型健康度原文。
 #[derive(Debug)]
 pub(crate) struct ChromeKeyModelsBridgeResult {
     pub(crate) token_list: serde_json::Value,
     pub(crate) models: Option<serde_json::Value>,
+    pub(crate) health: Option<serde_json::Value>,
 }
 
 pub(crate) fn parse_chrome_key_models_bridge_result(
@@ -2161,6 +2535,8 @@ pub(crate) fn parse_chrome_key_models_bridge_result(
         token_list: serde_json::Value,
         #[serde(default)]
         models: Option<serde_json::Value>,
+        #[serde(default)]
+        health: Option<serde_json::Value>,
     }
     let payload = serde_json::from_str::<Payload>(value)
         .map_err(|error| format!("Chrome 返回的 Key 数据格式无效：{error}"))?;
@@ -2177,6 +2553,7 @@ pub(crate) fn parse_chrome_key_models_bridge_result(
     Ok(ChromeKeyModelsBridgeResult {
         token_list: payload.token_list,
         models: payload.models,
+        health: payload.health,
     })
 }
 
@@ -2356,6 +2733,8 @@ async fn sync_pipiwang_account_via_local_storage(
                     None,
                     None,
                     &[],
+                    "",
+                    &HashMap::new(),
                 )
                 .await
                 .map_err(|error| format!("{profile_label}：{error}"))
@@ -2676,6 +3055,17 @@ async fn sync_site_account_via_chrome_inner(
     let has_refresh_cookie =
         has_newapi_refresh_cookie_name(cookie_names.iter().map(String::as_str));
     let use_refresh_auth = is_newapi_refresh(&system_type);
+    // 桥接会优先复用"任意 Chrome 窗口里已打开的站点页面"，而那条路径只按 URL
+    // 匹配、不区分 Chrome Profile：同站点在另一个 Profile 里也登录着时，取回的
+    // 是那个账号的令牌、余额与签到状态。NewAPI 前端不写 `localStorage.user` 的
+    // 站点（例如 iMeagicAPI）在桥接脚本里无从核对，只能在这里用
+    // `new_api_refresh` Cookie 的会话 ID 兜底：只有当返回令牌的 `sid` 与目标
+    // Profile 自己的会话对不上时才判定串号。
+    let expected_session = if use_refresh_auth {
+        profile_newapi_session_id(&base_url, &profile_id, &home_dir).await
+    } else {
+        None
+    };
     let local_values = local_match
         .as_ref()
         .filter(|item| item.error.is_empty())
@@ -2726,7 +3116,25 @@ async fn sync_site_account_via_chrome_inner(
     let mut resolved_account = None;
 
     // 只有刷新令牌模式才读取访问令牌缓存；Cookie 模式没有该机制。
-    if use_refresh_auth {
+    // 令牌必须与目标 Profile 自己的登录会话一致：串号的缓存（复用到了别的
+    // Chrome Profile 页面写进来的）会长期把那个账号的数据写到这一行，
+    // 必须先剔除，再交给本 Profile 自己的浏览器路径重新获取。
+    let cached_token_is_foreign = expected_session.as_deref().is_some_and(|expected| {
+        cached_token
+            .as_deref()
+            .and_then(newapi_token_session_id)
+            .is_some_and(|actual| !actual.eq_ignore_ascii_case(expected))
+    });
+    if cached_token_is_foreign {
+        emit_chrome_account_progress(
+            &bus,
+            run_id,
+            "token-cache",
+            "info",
+            format!("{account_label} 的缓存凭证属于另一个 Chrome 会话，已跳过并改用本 Profile 重新获取"),
+        );
+    }
+    if use_refresh_auth && !cached_token_is_foreign {
         if let Some(cached_token) = &cached_token {
             if !cached_token.is_empty() {
                 emit_chrome_account_progress(
@@ -2892,6 +3300,7 @@ async fn sync_site_account_via_chrome_inner(
             use_refresh_auth,
             supports_checkin,
             false,
+            expected_session.as_deref(),
         );
         emit_chrome_account_progress(
             &bus,
@@ -2913,16 +3322,27 @@ async fn sync_site_account_via_chrome_inner(
         .await;
         match silent_attempt {
             Ok(Ok(Some(value))) => match parse_chrome_account_bridge_result(&value) {
-                Ok(parsed) => {
-                    emit_chrome_account_progress(
+                Ok(parsed) => match bridge_session_mismatch(&parsed.1, expected_session.as_deref()) {
+                    // 复用已打开标签页只按 URL 匹配、不区分 Chrome Profile，
+                    // 这里跳过别人的会话，继续走 Profile 隔离的后台/可见路径。
+                    Some(actual) => emit_chrome_account_progress(
                         &bus,
                         run_id,
                         "browser-bypass",
                         "success",
-                        "已通过现有 Chrome 页面静默获取账号数据",
-                    );
-                    resolved_account = Some(parsed);
-                }
+                        format!("现有 Chrome 页面属于另一个账号的会话（{actual}），已跳过以免串号"),
+                    ),
+                    None => {
+                        emit_chrome_account_progress(
+                            &bus,
+                            run_id,
+                            "browser-bypass",
+                            "success",
+                            "已通过现有 Chrome 页面静默获取账号数据",
+                        );
+                        resolved_account = Some(parsed);
+                    }
+                },
                 Err(error) => emit_chrome_account_progress(
                     &bus,
                     run_id,
@@ -2988,6 +3408,7 @@ async fn sync_site_account_via_chrome_inner(
             use_refresh_auth,
             supports_checkin,
             true,
+            expected_session.as_deref(),
         );
         emit_chrome_account_progress(
             &bus,
@@ -3023,16 +3444,25 @@ async fn sync_site_account_via_chrome_inner(
         .await;
         match background_attempt {
             Ok(Ok(value)) => match parse_chrome_account_bridge_result(&value) {
-                Ok(parsed) => {
-                    emit_chrome_account_progress(
+                Ok(parsed) => match bridge_session_mismatch(&parsed.1, expected_session.as_deref()) {
+                    Some(actual) => emit_chrome_account_progress(
                         &bus,
                         run_id,
                         "browser-background",
                         "success",
-                        "后台 Chrome 已完成账号请求，临时标签已关闭",
-                    );
-                    resolved_account = Some(parsed);
-                }
+                        format!("后台 Chrome 页面属于另一个账号的会话（{actual}），已跳过以免串号"),
+                    ),
+                    None => {
+                        emit_chrome_account_progress(
+                            &bus,
+                            run_id,
+                            "browser-background",
+                            "success",
+                            "后台 Chrome 已完成账号请求，临时标签已关闭",
+                        );
+                        resolved_account = Some(parsed);
+                    }
+                },
                 Err(error) => emit_chrome_account_progress(
                     &bus,
                     run_id,
@@ -3085,6 +3515,7 @@ async fn sync_site_account_via_chrome_inner(
                 use_refresh_auth,
                 supports_checkin,
                 true,
+                expected_session.as_deref(),
             );
             emit_chrome_account_progress(
                 &bus,
@@ -3128,6 +3559,24 @@ async fn sync_site_account_via_chrome_inner(
             parsed
         }
     };
+    // 桥接复用了"任意 Chrome 窗口里已打开的站点页面"，同站点在另一个 Chrome
+    // Profile 里也登录着时，拿回来的是那个账号的令牌与余额；NewAPI 前端不写
+    // `localStorage.user` 的站点在桥接脚本里无法判串号。这里按会话 ID 兜底：
+    // 能明确判定串号就拒绝写入，绝不把别人的账号数据落到这一行。
+    if let Some(actual) = bridge_session_mismatch(&result, expected_session.as_deref()) {
+        if let Ok(connection) = database.lock_conn() {
+            // 清掉可能已经写错的缓存凭证，避免下一轮直接复用别人的访问令牌。
+            let _ = connection.execute(
+                "UPDATE site_accounts SET newapi_token = '', newapi_user_id = ''
+                 WHERE site_id = ?1 AND profile_id = ?2",
+                params![site_id, profile_id],
+            );
+        }
+        return Err(format!(
+            "{account_label} 的 Chrome 会话与本地 Profile 不一致（会话 ID {actual}，期望 {}）：已拒绝写入以免串号，请确认该 Chrome Profile 已登录此站点账号后重试",
+            expected_session.as_deref().unwrap_or("")
+        ));
+    }
 
     emit_chrome_account_progress(
         &bus,
@@ -3194,6 +3643,50 @@ mod tests {
     use super::*;
 
     #[test]
+    fn reads_newapi_refresh_session_id_from_cookie_header() {
+        let header = "new_api_has_session=1; new_api_refresh=04818b15-bc60-4707-acba-b9b8271cb91b.9f2c8d";
+        assert_eq!(
+            newapi_refresh_session_id(header).as_deref(),
+            Some("04818b15-bc60-4707-acba-b9b8271cb91b")
+        );
+        // 缺 Cookie 或格式不符时无法判定，必须返回 None 而不是猜一个
+        assert_eq!(newapi_refresh_session_id("new_api_has_session=1"), None);
+        assert_eq!(newapi_refresh_session_id("new_api_refresh=abc.def"), None);
+    }
+
+    #[test]
+    fn detects_cross_profile_account_by_jwt_session() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        let sid = "04818b15-bc60-4707-acba-b9b8271cb91b";
+        let payload =
+            URL_SAFE_NO_PAD.encode(serde_json::json!({ "sub": "971", "sid": sid }).to_string());
+        let token = format!("header.{payload}.signature");
+        assert_eq!(newapi_token_session_id(&token).as_deref(), Some(sid));
+        assert_eq!(newapi_token_session_id("opaque-token"), None);
+
+        let result = ChromeBridgeAccountResult {
+            ok: true,
+            error: String::new(),
+            account: None,
+            checkin_enabled: false,
+            checked_in_today: false,
+            checkin_error: String::new(),
+            api_token: token,
+            user_id: "971".into(),
+        };
+        // 与目标 Profile 的会话一致：不判串号
+        assert_eq!(bridge_session_mismatch(&result, Some(sid)), None);
+        // 目标 Profile 是另一个会话：判定串号并给出实际会话 ID
+        assert_eq!(
+            bridge_session_mismatch(&result, Some("8c4418b0-8f03-4f6e-9a0d-1b2c3d4e5f60"))
+                .as_deref(),
+            Some(sid)
+        );
+        // 无法判定（拿不到目标会话）时不得误判
+        assert_eq!(bridge_session_mismatch(&result, None), None);
+    }
+
+    #[test]
     fn parses_sub2api_usage_with_remaining_used_total() {
         let value = serde_json::json!({
             "code": 0,
@@ -3228,8 +3721,33 @@ mod tests {
     }
 
     #[test]
-    fn rejects_sub2api_usage_without_valid_envelope() {
-        let value = serde_json::json!({ "data": { "remaining": 1.0 } });
+    fn parses_flat_sub2api_usage_shape_without_envelope() {
+        // 线上 /v1/usage 的真实形状：余额直接挂顶层，没有 code 也没有 data.status。
+        let value = serde_json::json!({
+            "balance": 296.3339283,
+            "daily_usage": [{ "date": "2026-09-07", "requests": 8 }],
+            "isValid": true,
+            "mode": "wallet",
+            "planName": "Pro"
+        });
+        let account = parse_sub2api_usage(&value).expect("扁平结构必须能解析出余额");
+        assert_eq!(account.remaining, Some(296.3339283));
+        assert_eq!(account.unit, "USD");
+    }
+
+    #[test]
+    fn rejects_sub2api_usage_without_balance_or_envelope() {
+        // 既没有余额、也没有可识别的成功信封：仍然必须判错。
+        let value = serde_json::json!({ "message": "something went wrong" });
+        assert!(parse_sub2api_usage(&value).is_err());
+    }
+
+    #[test]
+    fn rejects_sub2api_usage_explicit_failure_even_with_balance() {
+        // 明确失败的信封不得因为带了余额字段就被当成成功。
+        let value = serde_json::json!({ "code": 401, "message": "Token has expired" });
+        assert!(parse_sub2api_usage(&value).is_err());
+        let value = serde_json::json!({ "success": false, "balance": 1.0 });
         assert!(parse_sub2api_usage(&value).is_err());
     }
 
@@ -3379,7 +3897,7 @@ mod tests {
     #[test]
     fn chrome_account_bridge_script_always_includes_credentials() {
         let script =
-            chrome_account_bridge_script(Some("42"), "2026-08", "openhub-test", false, true, true);
+            chrome_account_bridge_script(Some("42"), "2026-08", "openhub-test", false, true, true, None);
         assert!(!script.contains("credentials: \"omit\""));
         assert!(!script.contains("credentials: useSessionCookies"));
         assert!(script.contains("method: \"GET\", credentials: \"include\""));
@@ -3545,7 +4063,7 @@ mod tests {
     #[test]
     fn chrome_account_bridge_script_includes_checkin_log_fallback() {
         let script =
-            chrome_account_bridge_script(Some("42"), "2026-08", "openhub-test", false, true, true);
+            chrome_account_bridge_script(Some("42"), "2026-08", "openhub-test", false, true, true, None);
         // 状态接口报"功能未启用"（含 success:false + 提示语）时应携带当天签到日志查询
         // （type=4 和 type=1），兜底结果标记 checkinResolvedViaLog，绝不触发自动代签。
         assert!(script.contains("/api/log/self"));

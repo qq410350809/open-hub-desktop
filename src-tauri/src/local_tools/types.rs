@@ -123,6 +123,12 @@ pub struct ModelEntry {
     pub context_window: u64,
     /// 最大输出 token 数；0 表示不支持。
     pub max_output: u64,
+    /// 该模型的默认思考级别（目录给「最高可配置档位」）。空串 = 不指定。
+    ///
+    /// 目前只有 OpenCode 真正落盘（`options.reasoningEffort`）；其它适配器读回恒为空，
+    /// 因此差异比对也不会因此产生假漂移。
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub reasoning_effort: String,
 }
 
 /// 默认模型与思考级别。

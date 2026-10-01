@@ -227,6 +227,56 @@ pub struct ChromeUsageScanResult {
     pub(crate) sites: Vec<sync::ChromeSiteSessionMatch>,
 }
 
+/// NewAPI `/api/perf-metrics/summary` 提供的模型健康度。
+///
+/// 口径提醒：这是**全站聚合**数据——按模型统计所有用户近 N 小时的
+/// 成功/失败、延迟与出字速度，与「当前用户」「当前 Key」无关。所以它只能
+/// 作为健康度标签，**不能**当作「这个 Key 能不能用这个模型」的判据
+/// （那由逐 Key 查询 `/v1/models` 决定）；站点侧未启用性能采集时它整体为空。
+///
+/// 另注：站点**只为窗口内确有请求的模型**下发条目（上游 `QuerySummaryAll`
+/// 会跳过 requestCount==0 的模型）。所以「出现在列表里」本身就等于
+/// 「近 N 小时有流量」，不需要再单独找一个标志位来表达。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SiteModelHealth {
+    /// 近窗口请求成功率，**已从站点的 0~100 归一化到 0~1**。
+    ///
+    /// 归一是必须的：上游 `successRate()` 直接返回百分数
+    /// （`successCount / requestCount * 100`），按 0~1 解读会让 99.87%
+    /// 被当成「大于 0.995」而显示成 100%，界面就只剩 0 和 100 两个值。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) success_rate: Option<f64>,
+    /// 平均响应延迟（毫秒）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) avg_latency_ms: Option<i64>,
+    /// 平均出字速度（tokens/s）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) avg_tps: Option<f64>,
+    /// 统计窗口小时数。
+    #[serde(default)]
+    pub(crate) window_hours: i64,
+    /// 窗口起点（Unix 秒，整点）。界面按它把逐时序列对号入座到固定槽位：
+    /// 槽位数固定为 `window_hours` 个，**没有流量的整点没有数据点**，
+    /// 界面据此留灰槽——序列本身不补零，否则无法区分「无流量」与「0% 成功」。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) window_start: Option<i64>,
+    /// 逐整点成功率（0~1），只含窗口内确有流量的整点。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) series: Vec<SiteModelHealthPoint>,
+}
+
+/// 模型健康度逐时段采样点：一个整点一条。
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SiteModelHealthPoint {
+    /// 该采样点所属整点的 Unix 秒（站点已按整点对齐）。
+    pub(crate) ts: i64,
+    /// 该整点请求成功率，与顶层字段同口径，**已从 0~100 归一化到 0~1**。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) success_rate: Option<f64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SiteModelCacheAccount {
@@ -240,6 +290,9 @@ pub struct SiteModelCacheAccount {
     /// 每个 Key 对应的模型列表（逐 Key 查询 /v1/models 的结果）。
     #[serde(default)]
     pub(crate) key_models: HashMap<String, Vec<SiteModelItem>>,
+    /// 本账号同步时取到的全站模型健康度（模型 ID → 健康度）。
+    #[serde(default)]
+    pub(crate) model_health: HashMap<String, SiteModelHealth>,
     pub(crate) error: String,
 }
 
@@ -249,6 +302,10 @@ pub struct SiteModelCache {
     pub(crate) models: Vec<SiteModelItem>,
     pub(crate) api_source: String,
     pub(crate) accounts: Vec<SiteModelCacheAccount>,
+    /// 各账号行 model_health 合并后的站点级视图（模型 ID → 健康度）。
+    /// 健康度本身是全站口径，合并只是为了避免界面逐账号各查一次。
+    #[serde(default)]
+    pub(crate) model_health: HashMap<String, SiteModelHealth>,
 }
 
 /// 跨站点聚合用：站点 ID + 该站点的模型缓存。
@@ -359,6 +416,21 @@ pub struct ProxySubscription {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyIpInfo {
+    pub(crate) ip: String,
+    /// residential 仅表示疑似住宅出口，不是住宅网络保证。
+    pub(crate) kind: String,
+    pub(crate) isp: String,
+    pub(crate) organization: String,
+    pub(crate) asn: String,
+    pub(crate) source: String,
+    pub(crate) checked_at: String,
+    pub(crate) status: String,
+    pub(crate) error: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct ProxyNode {
     pub(crate) id: String,
@@ -378,6 +450,7 @@ pub struct ProxyNode {
     pub(crate) country_name: String,
     pub(crate) classification: String,
     pub(crate) primary_ip: String,
+    pub(crate) ip_info: Option<ProxyIpInfo>,
     pub(crate) updated_at: String,
 }
 
@@ -447,12 +520,15 @@ pub struct ProxySourceProgress {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct ProxyNodeTestProgress {
+    pub(crate) run_id: String,
     pub(crate) node_id: String,
     pub(crate) phase: String,
     /// 连通指标：GET 响应头到达耗时（TTFB）
     pub(crate) latency_ms: Option<i64>,
     /// 网速指标：body 下载完成的总耗时；未下载完（超时/失败）为 None
     pub(crate) speed_ms: Option<i64>,
+    pub(crate) primary_ip: Option<String>,
+    pub(crate) ip_info: Option<ProxyIpInfo>,
     pub(crate) status: String,
     /// 测速阶段标记：latency=普通延迟，connectivity=通道测速连通阶段，speed=通道测速网速阶段
     pub(crate) stage: String,
@@ -778,17 +854,22 @@ pub struct RequestHealthSourceSummary {
     pub(crate) failed: i64,
 }
 
+/// 请求健康总报告。
+///
+/// **读写都按 camelCase**：这份报告会被序列化进本地活动缓存 / SQLite 快照再读回来
+/// （`token-activity-cache.json`、`token_cache_snapshots.kind='health'`），若只把
+/// 序列化侧改成 camelCase 而反序列化侧仍按 snake_case 解析，多词字段（by_source /
+/// preceding_buckets）会在回读时静默变空。保留 snake_case 别名兼容外部载荷。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(
-    default,
-    rename_all(serialize = "camelCase", deserialize = "snake_case")
-)]
+#[serde(default, rename_all = "camelCase")]
 pub struct RequestHealthReport {
     pub(crate) available: bool,
     pub(crate) buckets: Vec<RequestHealthBucket>,
     /// 所选区间之前的健康桶（反代模式补偿：健康矩阵在区间起点前补位时取数；本地模式为空）
+    #[serde(alias = "preceding_buckets")]
     pub(crate) preceding_buckets: Vec<RequestHealthBucket>,
     /// 分工具汇总（便于对账；UI 可先不展示）
+    #[serde(alias = "by_source")]
     pub(crate) by_source: Vec<RequestHealthSourceSummary>,
 }
 

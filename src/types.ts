@@ -324,6 +324,39 @@ export interface SiteModelItem {
   ownedBy?: string;
 }
 
+/**
+ * 模型健康度（NewAPI `/api/perf-metrics/summary`）。
+ *
+ * 注意两点口径：
+ * 1. 这是**全站聚合**数据，按模型统计所有用户近 windowHours 小时的
+ *    成功/失败、延迟与出字速度，与当前用户、当前 Key 无关。它只是健康度
+ *    标签，不代表「这个 Key 能用这个模型」——那要看该 Key 的 `/v1/models` 列表。
+ * 2. 站点**只为窗口内确有请求的模型**下发条目，所以「有这条记录」本身就等于
+ *    「近 windowHours 小时有流量」。模型不在这张表里就是没有数据，界面不显示徽标。
+ */
+export interface SiteModelHealth {
+  /** 近窗口请求成功率，0~1（已从站点的 0~100 归一化）。 */
+  successRate?: number;
+  /** 平均响应延迟（毫秒）。 */
+  avgLatencyMs?: number;
+  /** 平均出字速度（tokens/s）。 */
+  avgTps?: number;
+  /** 统计窗口小时数。 */
+  windowHours?: number;
+  /** 窗口起点（Unix 秒，整点）。界面按它对号入座到固定槽位。 */
+  windowStart?: number;
+  /** 逐整点成功率（0~1）。只含窗口内确有流量的整点，缺槽代表无流量。 */
+  series?: SiteModelHealthPoint[];
+}
+
+/** 模型健康度逐时段采样点：一个整点一条。 */
+export interface SiteModelHealthPoint {
+  /** 该采样点所属整点的 Unix 秒。 */
+  ts: number;
+  /** 该整点请求成功率，0~1（已从站点的 0~100 归一化）。 */
+  successRate?: number;
+}
+
 export interface SiteModelCacheAccount {
   profileId: string;
   profileName: string;
@@ -332,6 +365,8 @@ export interface SiteModelCacheAccount {
   keys: string[];
   keyGroups?: Record<string, string>;
   keyModels?: Record<string, SiteModelItem[]>;
+  /** 本账号同步时取到的全站模型健康度（模型 ID → 健康度）。 */
+  modelHealth?: Record<string, SiteModelHealth>;
   error?: string;
 }
 
@@ -339,6 +374,8 @@ export interface SiteModelCache {
   models: SiteModelItem[];
   apiSource?: string;
   accounts: SiteModelCacheAccount[];
+  /** 各账号行合并后的站点级健康度视图（模型 ID → 健康度）。 */
+  modelHealth?: Record<string, SiteModelHealth>;
 }
 
 export interface SiteModelCacheEntry {
@@ -416,6 +453,18 @@ export function isPipiwangType(raw: string): boolean {
   return normalizeSystemType(raw) === "pipiwang";
 }
 
+/**
+ * 是否支持通过 Chrome 会话发现并同步 API Key 与模型（NewAPI 系与 Sub2API）。
+ *
+ * 只有这类站点的余额/用量能走 Key 接口，所以“从未同步过 Key 的有效账号”必须纳入
+ * 首次同步，否则它的 Key 缓存永远是空的：Sub2API 只能退回会话令牌，
+ * 令牌一过期整站就报 401（同一站点两个 Chrome 账号一个成功、一个失败）。
+ * 未知架构与皮皮智绘没有这些接口，纳入只会换来一串错误，因此排除。
+ */
+export function supportsKeyDiscovery(raw: string): boolean {
+  return isNewApiCompatible(raw) || normalizeSystemType(raw) === "sub2api";
+}
+
 export const emptySite = (): SiteRecord => ({
   id: "",
   name: "",
@@ -459,6 +508,18 @@ export interface ProxySubscription {
   updatedAt: string;
 }
 
+export interface ProxyIpInfo {
+  ip: string;
+  kind: "hosting" | "residential" | "mobile" | "unknown";
+  isp: string;
+  organization: string;
+  asn: string;
+  source: string;
+  checkedAt: string;
+  status: "success" | "error";
+  error: string;
+}
+
 export interface ProxyNode {
   id: string;
   subscriptionNames: string[];
@@ -477,6 +538,7 @@ export interface ProxyNode {
   countryName: string;
   classification: string;
   primaryIp: string;
+  ipInfo?: ProxyIpInfo | null;
   updatedAt: string;
 }
 
@@ -545,11 +607,15 @@ export interface ProxySourceProgress {
 
 export interface ProxyNodeTestProgress {
   nodeId: string;
-  phase: "started" | "completed";
+  /** 请求轮次标识；旧服务可缺失，但新测速会话只接收完全匹配的事件。 */
+  runId?: string;
+  phase: "started" | "completed" | "ip-info";
   /** 连通指标：GET 响应头到达耗时（TTFB） */
   latencyMs: number | null;
   /** 网速指标：body 下载完成的总耗时；未下载完（超时/失败）为 null */
   speedMs?: number | null;
+  primaryIp?: string | null;
+  ipInfo?: ProxyIpInfo | null;
   status: string;
   /** latency=普通延迟测速；connectivity=通道测速连通阶段；speed=通道测速网速阶段 */
   stage?: "latency" | "connectivity" | "speed" | string;
@@ -769,42 +835,6 @@ export interface TokenOfficialModel {
   firstParty: boolean;
 }
 
-// —— AI 用量洞察：前端确定性证据 + AI 可追溯解读 ——
-export interface InsightEvidence {
-  /** 程序生成的稳定证据 ID；AI 结论必须引用它。 */
-  id: string;
-  /** 证据中文说明。 */
-  summary: string;
-  /** 关键数值（如总量、百分比）。 */
-  value: string;
-}
-
-export interface InsightEvidencePacket {
-  /** 用户可读的时间范围说明。 */
-  rangeLabel: string;
-  analysisModel: string;
-  evidence: InsightEvidence[];
-}
-
-export interface InsightFinding {
-  title: string;
-  detail: string;
-  severity: "info" | "low" | "medium" | "high";
-  evidence: string[];
-}
-
-export interface TokenInsightReport {
-  rangeLabel: string;
-  analysisModel: string;
-  generatedAt: string;
-  headline: string;
-  findings: InsightFinding[];
-  recommendations: InsightFinding[];
-  evidenceTotal: number;
-  evidenceUsed: number;
-  /** 证据不足或 AI 结论被裁剪时的提示。 */
-  notice: string;
-}
 
 
 // —— 请求/对话活动：多工具直读后的小时桶 ——
@@ -1116,6 +1146,9 @@ export interface ModelsDevModelExtras {
  * 供「模型参数」按模型呈现思考档位与上下文/输出上限等属性，
  * 字段与 [`ModelCatalogItem`] 的富化子集一致。
  */
+/** 目录匹配强度（与 Rust `nearest::MatchKind` 的 `as_str()` 一一对应）。 */
+export type CapabilityMatchKind = "exact" | "variant" | "alias" | "nearest";
+
 export interface ModelCapabilities {
   reasoningOptions: ReasoningOption[];
   reasoningEffortMax?: string | null;
@@ -1130,6 +1163,20 @@ export interface ModelCapabilities {
   supportsStructuredOutput: boolean;
   supportsReasoning: boolean;
   openWeights: boolean;
+
+  /** 命中的目录条目 id（`lab/modelId`）。 */
+  matchedId?: string;
+  /** 该条目声明的原始 model id（上游原拼写）。 */
+  matchedModelId?: string;
+  /** 匹配强度；非 exact 时 UI 加「≈」前缀披露这是近似命中。 */
+  matchKind?: CapabilityMatchKind;
+  /** 强度指示（全等类恒 1.0，nearest 为 Dice 系数）。不是概率，仅用于提示。 */
+  matchScore?: number;
+  /**
+   * 匹配算法版本。缓存值版本不符时必须作废重取：
+   * miss 的 key 会被缓存为 null，不作废就永远看不到新算法的改善。
+   */
+  matchVersion?: number;
 }
 
 export interface ModelCatalogSnapshot {
@@ -1228,6 +1275,8 @@ export interface LocalToolModelEntry {
   provider: string;
   contextWindow: number;
   maxOutput: number;
+  /** 逐模型默认思考级别（目录给「该模型最高可配置档位」）；缺省表示不指定。 */
+  reasoningEffort?: string;
 }
 
 export interface LocalToolDefaultsSection {

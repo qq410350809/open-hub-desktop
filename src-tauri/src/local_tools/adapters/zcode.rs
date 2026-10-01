@@ -110,6 +110,8 @@ impl ToolAdapter for ZcodeAdapter {
                         provider: provider_id.clone(),
                         context_window: json_u64(&limit, "context").unwrap_or(0),
                         max_output: json_u64(&limit, "output").unwrap_or(0),
+                        // 该适配器不写逐模型默认思考级别，读回恒为空。
+                        reasoning_effort: String::new(),
                     });
                 }
             }
@@ -254,6 +256,7 @@ mod tests {
                 provider: "openhub-site_z_acc_0".into(),
                 context_window: 200_000,
                 max_output: 128_000,
+                reasoning_effort: String::new(),
             }],
             defaults: Default::default(),
             context: Default::default(),

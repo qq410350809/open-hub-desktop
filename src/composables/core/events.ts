@@ -39,7 +39,7 @@ function parseSseFrame(frame: string): void {
   if (data) dispatchMessage(data);
 }
 
-async function consumeStream(controller: AbortController): Promise<void> {
+async function consumeStream(controller: AbortController, onReady: () => void): Promise<void> {
   const token = getSessionToken();
   const response = await fetch("/api/events", {
     headers: {
@@ -56,6 +56,8 @@ async function consumeStream(controller: AbortController): Promise<void> {
   if (!response.body) throw new Error("OpenHub 事件服务未返回流");
 
   const reader = response.body.getReader();
+  // SSE 是长连接；收到有效响应头后监听即已就绪，不能等流关闭才返回。
+  onReady();
   const decoder = new TextDecoder();
   let buffer = "";
   while (!controller.signal.aborted) {
@@ -88,7 +90,7 @@ function ensureBrowserSource(): Promise<void> {
     resolveReady = resolve;
   });
   streamReady = ready;
-  void consumeStream(controller)
+  void consumeStream(controller, resolveReady)
     .then(() => {
       resolveReady();
       if (!controller.signal.aborted) scheduleReconnect();

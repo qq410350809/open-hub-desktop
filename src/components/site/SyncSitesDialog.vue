@@ -18,12 +18,19 @@ const scopeLabel = computed(() => {
     const usageLabel = store.syncDialogUsage.value === "pending" ? "待定" : "在用";
     return `当前筛选中的 ${store.syncDialogSiteIds.value.length} 个${usageLabel}站点`;
   }
+  if (store.syncDialogMode.value === "session") {
+    return `已选 ${store.syncDialogSiteIds.value.length} 个站点`;
+  }
   return "全量公共站点（存活与跑路）";
 });
 
-const dialogTitle = computed(() =>
-  store.syncDialogMode.value === "quota" ? "额度同步" : "同步公共库",
-);
+const dialogTitle = computed(() => {
+  switch (store.syncDialogMode.value) {
+    case "quota": return "额度同步";
+    case "session": return "批量会话同步";
+    default: return "同步公共库";
+  }
+});
 
 const runStateLabel = computed(() => {
   switch (store.syncRunState.value) {
@@ -115,6 +122,7 @@ function onBackdropClick(event: MouseEvent) {
             <h2 id="sync-sites-title">{{ dialogTitle }}</h2>
             <p v-if="store.syncDialogMode.value === 'remote'">验证 Chrome 登录状态后同步{{ scopeLabel }}</p>
             <p v-else-if="store.syncDialogMode.value === 'quota'">刷新当前分类内的账号额度，不改变全部 / 在用 / 待定归类</p>
+            <p v-else>逐个站点同步 Chrome 账号会话与额度：站点之间最多 2 路并行，站内账号按顺序处理</p>
           </div>
           <button
             ref="closeBtnRef"
@@ -185,6 +193,7 @@ function onBackdropClick(event: MouseEvent) {
                 <strong>本次同步范围</strong>
                 <p v-if="store.syncDialogMode.value === 'remote'">{{ scopeLabel }} · 匹配站点地址更新已有记录（保留站点类型与在用状态），新站点将自动录入</p>
                 <p v-else-if="store.syncDialogMode.value === 'quota'">{{ scopeLabel }} · 仅刷新额度与账号缓存，站点归类保持不变</p>
+                <p v-else>{{ scopeLabel }} · 同步每个站点已关联的 Chrome 账号会话、额度与签到状态</p>
               </div>
             </div>
 
@@ -257,7 +266,11 @@ function onBackdropClick(event: MouseEvent) {
             </button>
             <button class="primary-button" type="button" @click="store.syncSites()">
               <span v-html="icons.restore" />
-              <span>{{ store.syncDialogMode.value === 'quota' ? '开始额度同步' : '同步公共库' }}</span>
+              <span>
+                {{ store.syncDialogMode.value === 'quota' ? '开始额度同步'
+                  : store.syncDialogMode.value === 'session' ? '开始会话同步'
+                  : '同步公共库' }}
+              </span>
             </button>
           </template>
           <template v-else>
@@ -266,7 +279,13 @@ function onBackdropClick(event: MouseEvent) {
               <span>{{ runStateLabel }}</span>
             </div>
             <button
-              v-if="store.syncRunState.value === 'error'"
+              v-if="store.syncDialogMode.value === 'session' && store.syncingSites.value"
+              class="secondary-button"
+              type="button"
+              @click="store.stopSessionSync()"
+            >强制停止</button>
+            <button
+              v-else-if="store.syncRunState.value === 'error'"
               class="secondary-button"
               type="button"
               @click="store.syncSites()"

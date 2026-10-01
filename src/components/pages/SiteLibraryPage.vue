@@ -2,7 +2,8 @@
 import { capabilities } from "../../composables/core/capabilities";
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { icons } from "../../icons";
-import { formatDate, formatRateLimit, logoText } from "../../utils";
+import { formatDate, formatRateLimit, logoText, describeModelHealth, describeModelStatusStrip, describeModelStatusStripTitle, MODEL_STATUS_SLOT_COUNT } from "../../utils";
+import type { ModelHealthBadge, ModelStatusSlot } from "../../utils";
 import { useStore } from "../../composables/useStore";
 import { runCommand, isTauri } from "../../composables/useLibrary";
 import AppTable, { type AppTableColumn } from "../common/AppTable.vue";
@@ -677,6 +678,46 @@ const drawerFilteredModels = computed<SiteModelItem[]>(() => {
   return list.filter((m) => m.id.toLowerCase().includes(q) || (m.ownedBy && m.ownedBy.toLowerCase().includes(q)));
 });
 
+/** 抽屉里的模型健康度徽标。健康度是全站聚合口径，仅作参考。 */
+const drawerHealthBadges = computed(() => {
+  const badges = new Map<string, ModelHealthBadge>();
+  for (const [modelId, health] of Object.entries(drawerModelCache.value?.modelHealth ?? {})) {
+    const badge = describeModelHealth(health);
+    if (badge) badges.set(modelId, badge);
+  }
+  return badges;
+});
+
+function drawerModelHealthBadge(modelId: string) {
+  return drawerHealthBadges.value.get(modelId);
+}
+
+/** 逐时状态条：与「支持的模型」弹窗同一套 24 格竖条；每个模型都画满 24 格，
+ *  有流量的整点上色、没流量的留灰，无数据模型用同站点窗口起点对齐。 */
+const drawerStatusStrips = computed(() => {
+  const strips = new Map<string, ModelStatusSlot[]>();
+  const healthMap = drawerModelCache.value?.modelHealth ?? {};
+  const fallbackWindowStart = Object.values(healthMap).find(
+    (health) => typeof health.windowStart === "number" && (health.windowStart ?? 0) > 0,
+  )?.windowStart;
+  for (const model of drawerFilteredModels.value) {
+    strips.set(model.id, describeModelStatusStrip(healthMap[model.id], fallbackWindowStart));
+  }
+  return strips;
+});
+
+function drawerStatusStripOf(modelId: string) {
+  return drawerStatusStrips.value.get(modelId) ?? [];
+}
+
+const drawerStatusStripTitle = computed(() =>
+  describeModelStatusStripTitle(Object.values(drawerModelCache.value?.modelHealth ?? {})[0]),
+);
+
+const drawerStatusStripLabel = computed(
+  () => `近 24 小时逐时成功率状态条，共 ${MODEL_STATUS_SLOT_COUNT} 个时段`,
+);
+
 // —— 批量操作 ——
 async function batchSetUsage(state: "personal" | "pending" | "unused") {
   if (!batchSelectedIds.value.length) return;
@@ -706,8 +747,9 @@ async function batchSyncSession() {
   if (selectedSites.length === 1) {
     store.syncChromeSession(selectedSites[0], document.body);
   } else {
-    const hasPending = selectedSites.some((s) => s.isPending);
-    store.openSyncDialog("quota", hasPending ? "pending" : "personal", batchSelectedIds.value);
+    // 多选会话同步：站点级并行（上限 2），站内账号串行；
+    // 未知架构站点保留在范围内（仅建立 Chrome 账号关联）。
+    store.openSyncDialog("session", undefined, batchSelectedIds.value);
   }
   clearBatchSelection();
 }
@@ -2299,7 +2341,32 @@ onUnmounted(() => {
                   >
                     <div class="sl-model-item-info">
                       <strong class="font-mono">{{ m.id }}</strong>
-                      <small v-if="m.ownedBy" class="text-faint">厂商: {{ m.ownedBy }}</small>
+                      <div class="sl-model-item-meta">
+                        <small v-if="m.ownedBy" class="text-faint">厂商: {{ m.ownedBy }}</small>
+                      <small
+                        v-if="drawerModelHealthBadge(m.id)"
+                        class="sl-model-health"
+                        :class="`sl-model-health-${drawerModelHealthBadge(m.id)!.level}`"
+                        :title="drawerModelHealthBadge(m.id)!.title"
+                        >{{ drawerModelHealthBadge(m.id)!.label }}</small
+                      >
+                      </div>
+                      <!-- 逐时状态条：灰格 = 该整点无流量；旧缓存无序列时不渲染 -->
+                      <span
+                        v-if="drawerStatusStripOf(m.id)"
+                        class="sl-model-health-strip"
+                        role="img"
+                        :aria-label="drawerStatusStripLabel"
+                        :title="drawerStatusStripTitle"
+                      >
+                        <span
+                          v-for="slot in drawerStatusStripOf(m.id)"
+                          :key="slot.ts"
+                          class="sl-model-health-slot"
+                          :class="slot.level ? `is-${slot.level}` : 'is-idle'"
+                          :title="slot.title"
+                        />
+                      </span>
                     </div>
                     <button type="button" class="sl-model-copy-btn" title="复制模型 ID">
                       <span v-html="icons.copy" />
@@ -4896,6 +4963,7 @@ onUnmounted(() => {
 }
 
 .sl-model-item-info {
+  flex: 1 1 auto;
   display: flex;
   flex-direction: column;
   min-width: 0;
@@ -4907,6 +4975,83 @@ onUnmounted(() => {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.sl-model-item-meta {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  margin-top: 2px;
+  overflow: hidden;
+}
+
+/* 厂商文字要先让位：flex 子项默认 min-width:auto 拒绝压缩，
+   会把后面的色条挤成 0 宽，先收窄自己并省略。 */
+.sl-model-item-meta > .text-faint {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.sl-model-health {
+  flex: 0 0 auto;
+  padding: 0 5px;
+  border: 1px solid transparent;
+  border-radius: var(--r-full);
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 15px;
+  white-space: nowrap;
+}
+
+/* 逐时状态条：与「支持的模型」弹窗同一套 24 格竖条，比例对齐参考图
+   （高 = 条宽 × 3.0、缝 = 条宽 × 0.375、圆角 2px）；宽度铺满、高度等比换算。 */
+.sl-model-health-strip {
+  margin-top: 4px;
+  display: flex;
+  align-items: stretch;
+  aspect-ratio: 10.875;
+  gap: 3px;
+  column-gap: 1.149%;
+}
+
+.sl-model-health-slot {
+  flex: 1 1 0;
+  min-width: 2px;
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--faint, #8b949e) 26%, transparent);
+  transition: background 0.15s ease;
+}
+
+.sl-model-health-slot.is-healthy { background: var(--model-status-ok, #63c469); }
+.sl-model-health-slot.is-degraded { background: var(--model-status-warn, #ffaf44); }
+.sl-model-health-slot.is-down { background: var(--model-status-bad, #fc725a); }
+
+.sl-model-health-healthy {
+  border-color: color-mix(in srgb, var(--success) 32%, transparent);
+  background: var(--success-soft);
+  color: var(--success);
+}
+
+.sl-model-health-degraded {
+  border-color: color-mix(in srgb, var(--warning) 32%, transparent);
+  background: var(--warning-soft);
+  color: var(--warning);
+}
+
+.sl-model-health-down {
+  border-color: color-mix(in srgb, var(--danger) 32%, transparent);
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.sl-model-health-idle {
+  border-color: var(--line);
+  background: var(--surface-soft);
+  color: var(--faint);
 }
 
 .sl-model-copy-btn {

@@ -145,6 +145,7 @@ impl Database {
                     keys_json TEXT NOT NULL DEFAULT '[]',
                     groups_json TEXT NOT NULL DEFAULT '{}',
                     models_json TEXT NOT NULL DEFAULT '[]',
+                    health_json TEXT NOT NULL DEFAULT '{}',
                     error TEXT NOT NULL DEFAULT '',
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     PRIMARY KEY (site_id, profile_id),
@@ -345,6 +346,7 @@ impl Database {
                     country_name TEXT NOT NULL DEFAULT '',
                     classification TEXT NOT NULL DEFAULT '',
                     primary_ip TEXT NOT NULL DEFAULT '',
+                    ip_info_json TEXT NOT NULL DEFAULT '',
                     is_enabled INTEGER NOT NULL DEFAULT 1,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -789,6 +791,23 @@ pub(crate) fn ensure_site_model_cache_columns(connection: &Connection) -> Result
                 [],
             )
             .map_err(|error| error.to_string())?;
+    }
+    let has_health = connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('site_model_cache') WHERE name = 'health_json'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| error.to_string())?
+        > 0;
+    if !has_health {
+        // 尽力而为：健康度是补偿信息，ALTER 失败（库只读/被占用）不该让
+        // 整个应用启动失败。列没补上时，save_site_model_cache 里那条独立的
+        // health UPDATE 会静默失败，表现为「模型没有健康度标签」而非同步失败。
+        let _ = connection.execute(
+            "ALTER TABLE site_model_cache ADD COLUMN health_json TEXT NOT NULL DEFAULT '{}'",
+            [],
+        );
     }
     Ok(())
 }
@@ -1658,6 +1677,7 @@ pub(crate) fn ensure_proxy_pool_node_columns(connection: &Connection) -> Result<
         ("country_name", "TEXT NOT NULL DEFAULT ''"),
         ("classification", "TEXT NOT NULL DEFAULT ''"),
         ("primary_ip", "TEXT NOT NULL DEFAULT ''"),
+        ("ip_info_json", "TEXT NOT NULL DEFAULT ''"),
         ("channel_latency_ms", "INTEGER"),
         ("channel_test_status", "TEXT NOT NULL DEFAULT ''"),
         ("channel_tested_at", "TEXT NOT NULL DEFAULT ''"),
@@ -1681,6 +1701,26 @@ pub(crate) fn ensure_proxy_pool_node_columns(connection: &Connection) -> Result<
                 .map_err(|error| error.to_string())?;
         }
     }
+    connection
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS proxy_ip_info_cache (
+                ip TEXT PRIMARY KEY,
+                info_json TEXT NOT NULL,
+                source TEXT NOT NULL,
+                checked_at TEXT NOT NULL,
+                expires_at INTEGER NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_proxy_ip_info_cache_expiry
+                 ON proxy_ip_info_cache(expires_at);
+             -- 任何出口地址变更（包括旧的 GeoIP 修复路径）都不能继承旧标签。
+             CREATE TRIGGER IF NOT EXISTS clear_proxy_ip_info_on_exit_change
+             AFTER UPDATE OF primary_ip ON proxy_pool_nodes
+             WHEN OLD.primary_ip IS NOT NEW.primary_ip
+             BEGIN
+                 UPDATE proxy_pool_nodes SET ip_info_json='' WHERE id=NEW.id;
+             END;",
+        )
+        .map_err(|error| error.to_string())?;
     // 已有数据：先用节点名快速回填国家，避免首次分组再全量分析。
     connection
         .execute(
@@ -2336,5 +2376,42 @@ mod site_upsert_tests {
             )
             .unwrap();
         assert_eq!(cache_count, 1);
+    }
+
+    #[test]
+    fn adds_health_json_to_legacy_model_cache_tables() {
+        // 旧版库里的 site_model_cache 没有 health_json，迁移必须补上，
+        // 否则 save_site_model_cache 里的 health_json 写入会整条报错，
+        // Key/模型同步结果被静默吞掉。
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE site_model_cache (
+                    site_id TEXT NOT NULL,
+                    profile_id TEXT NOT NULL,
+                    keys_json TEXT NOT NULL DEFAULT '[]',
+                    error TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY (site_id, profile_id)
+                 );",
+            )
+            .unwrap();
+
+        ensure_site_model_cache_columns(&connection).unwrap();
+        // 幂等：重复执行不能再报 duplicate column。
+        ensure_site_model_cache_columns(&connection).unwrap();
+
+        let columns: Vec<String> = connection
+            .prepare("SELECT name FROM pragma_table_info('site_model_cache')")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        for expected in ["groups_json", "key_models_json", "health_json"] {
+            assert!(
+                columns.iter().any(|name| name == expected),
+                "缺少列 {expected}，实际 {columns:?}"
+            );
+        }
     }
 }

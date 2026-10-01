@@ -49,7 +49,12 @@ async function loadToolList() {
   }
 }
 
+let snapshotSeq = 0;
 async function selectTool(tool: string) {
+  snapshotSeq += 1;
+  diffSeq += 1;
+  diffLoading.value = false;
+  snapshotLoading.value = false;
   activeTool.value = tool;
   snapshot.value = null;
   diffReport.value = null;
@@ -60,18 +65,22 @@ async function selectTool(tool: string) {
 /** 实时读盘重新快照（打开工具 / 冲突后重载）。 */
 async function reloadSnapshot() {
   if (!activeTool.value) return;
+  const tool = activeTool.value;
+  const seq = ++snapshotSeq;
   snapshotLoading.value = true;
   diffReport.value = null;
   try {
-    snapshot.value = await runLocalCommand<LocalToolConfigSnapshot>(
+    const next = await runLocalCommand<LocalToolConfigSnapshot>(
       "get_local_tool_config",
-      { tool: activeTool.value },
+      { tool },
     );
+    if (seq !== snapshotSeq || tool !== activeTool.value) return;
+    snapshot.value = next;
     configRevision.value += 1;
   } catch (error) {
-    showToast(`配置读取失败：${error}`, true);
+    if (seq === snapshotSeq) showToast(`配置读取失败：${error}`, true);
   } finally {
-    snapshotLoading.value = false;
+    if (seq === snapshotSeq) snapshotLoading.value = false;
   }
 }
 
@@ -107,17 +116,22 @@ async function diffTargets(
 
 /** 保存配置。冲突时返回 false 并弹提示（调用方可据此询问重载）。 */
 async function saveSnapshot(patch: LocalToolConfigPatch): Promise<LocalToolConfigSaveResult | null> {
-  if (!activeTool.value || !snapshot.value) return null;
+  if (!activeTool.value || !snapshot.value || saving.value || snapshotLoading.value) return null;
+  const tool = activeTool.value;
+  const seq = ++snapshotSeq;
   saving.value = true;
   try {
     const result = await runLocalCommand<LocalToolConfigSaveResult>("save_local_tool_config", {
-      tool: activeTool.value,
+      tool,
       patch,
     });
-    snapshot.value = result.snapshot;
-    // 写入后磁盘已变，落库前的比对结论作废，由调用方重新比对。
-    diffReport.value = null;
-    configRevision.value += 1;
+    if (activeTool.value === tool && snapshotSeq === seq) {
+      snapshot.value = result.snapshot;
+      diffSeq += 1;
+      diffLoading.value = false;
+      diffReport.value = null;
+      configRevision.value += 1;
+    }
     const backupNote = result.backedUp?.length
       ? `，已先备份 ${result.backedUp.join("、")}（非本软件写入或已被外部修改）`
       : "";

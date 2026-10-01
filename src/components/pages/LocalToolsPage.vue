@@ -14,6 +14,11 @@ import { useConfirm } from "../../composables/useConfirm";
 import { useToast } from "../../composables/core/useToast";
 import { usePreferences } from "../../composables/usePreferences";
 import { useModelCatalog } from "../../composables/model/useModelCatalog";
+import {
+  THINKING_EFFORT_OPTIONS, SOURCE_LABELS, catalogEfforts, catalogParams,
+  resolveModelParams, snapshotParams, hydrateModelParams, patchModelParams,
+  modelParamGroupKey, type ModelParamOverride,
+} from "../../composables/localtools/modelParams";
 import CustomSelect from "../common/CustomSelect.vue";
 import { DEFAULT_SERVICE_PORT } from "../../constants";
 import type {
@@ -26,6 +31,7 @@ import type {
   LocalToolProviderEntry,
   LocalToolProviderMode,
   ModelCapabilities,
+  CapabilityMatchKind,
   SiteModelCache,
   SiteModelCacheAccount,
   SiteModelCacheEntry,
@@ -56,7 +62,7 @@ const { proxyStatus, proxyConfig, loadCachedModels, modelsForChannel } = useMode
 const { confirm } = useConfirm();
 const { showToast } = useToast();
 const { preferences, updatePreferences } = usePreferences();
-const { modelCatalogSyncing } = useModelCatalog();
+const { modelCatalog, modelCatalogSyncing } = useModelCatalog();
 
 const siteCaches = ref<Record<string, SiteModelCache>>({});
 const siteCachesLoading = ref(false);
@@ -705,93 +711,37 @@ const gatewayReady = computed(() => !!proxyStatus.value?.running);
 
 // —— 模型参数（最大窗口 / 最大输出 / 默认思考级别 / 思考级别筛选配置）——
 //
-// 父子级联与覆盖机制：
-// 1. 父列表（每个渠道/供应商）：定义基准默认值（最大窗口、最大输出、默认思考级别、思考级别筛选配置）。
-// 2. 子列表（该渠道下属的具体模型）：默认全部继承父级配置（显示占位与继承标记）；
-//    用户在子列表中修改任意字段，即视为覆盖父级配置（高亮显示已覆盖标记，并支持一键恢复继承）。
-// 3. 有效值计算：子级覆盖优先 > 父级配置 > 工具默认。落盘时写入完整配置。
+// 有效值：逐字段自定义 > 模型父级显式覆盖 > 目录 > 磁盘回读 > Agent 默认。
+// 默认值不持久化为覆盖；默认思考档无目录声明，保持 Agent 全局设置。
+// 目录返回结果只按请求原始 ID 缓存，前端不做第二套模糊匹配。
+const CAPABILITY_MATCH_VERSION = 2;
+const modelCapabilities = ref<Record<string, ModelCapabilities | null>>({});
+const capabilityError = ref("");
+let capabilityEpoch = 0;
+/** 后端未返回匹配元信息（旧版二进制）：仍用其窗口/输出/档位，只是不能披露匹配强度。 */
+const capabilityLegacyPayload = ref(false);
+let disposed = false;
+let capabilityRequest: Promise<void> | null = null;
 
-const THINKING_EFFORT_OPTIONS = [
-  "off",
-  "minimal",
-  "low",
-  "medium",
-  "high",
-  "xhigh",
-  "max",
-] as const;
-
-// —— models.dev 按模型能力（思考档位 / 上下文 / 输出上限 / 交错字段等）——
-//
-// 目录快照（Rust 侧 models.dev 富化结果）里已存好每个模型的 reasoning_options 等字段，
-// 这里按清单里出现的 modelId 批量拉取（`get_model_capabilities`，归一化匹配、查不到不臆造），
-// 用于把「这个模型**实际支持**哪些思考档位」体现在逐模型参数行上，
-// 并提供窗口/输出上限的一键载入。
-
-const modelCapabilities = ref<Record<string, ModelCapabilities>>({});
-
-function normalizeModelKey(raw: string): string {
-  let s = raw.trim().toLowerCase();
-  const cut = s.search(/[:@]/);
-  if (cut >= 0) s = s.slice(0, cut);
-  const slash = s.lastIndexOf("/");
-  if (slash >= 0) s = s.slice(slash + 1);
-  return s.replace(/[._]+/g, "-");
-}
-
-/** 该条目对应的 models.dev 能力；未命中或目录未同步时为 null。 */
 function capabilitiesFor(entry: InventoryEntry): ModelCapabilities | null {
-  if (!entry.modelId) return null;
-  const direct = modelCapabilities.value[entry.modelId];
-  if (direct) return direct;
-  // 同归一化键的其它拼写（大小写 / 前缀差异）也算命中
-  const normalized = normalizeModelKey(entry.modelId);
-  for (const [key, caps] of Object.entries(modelCapabilities.value)) {
-    if (normalizeModelKey(key) === normalized) return caps;
-  }
-  return null;
+  return modelCapabilities.value[entry.modelId] ?? null;
 }
 
-/**
- * 模型在 models.dev 声明的思考档位，已归一化到本页词表（`none` → `off`）。
- *
- * 模型行的芯片全集固定用规范词表 [`THINKING_EFFORT_OPTIONS`]，与父级「思考级别筛选配置」
- * 同一口径 —— 不能拿目录声明值当全集：目录用 `none`、本页用 `off`，且声明集常与父级
- * 勾选集不相交（父级选了 off/xhigh，模型只声明 low/medium/high），当全集会导致
- * 「父级勾选的档位在模型行整块消失、词表还对不上」。声明值改用本函数作支持标记，
- * 只用于提示与一键载入。
- *
- * 返回空数组表示「目录无数据」（未命中或只声明 `toggle`），不表示「不支持思考」；
- * 调用方据此区分「未声明该档」与「目录没数据」，避免误标。
- */
 function declaredModelEfforts(entry: InventoryEntry): string[] {
-  const caps = capabilitiesFor(entry);
-  const values =
-    caps?.reasoningOptions.find((option) => option.kind === "effort")?.values ?? [];
-  const out: string[] = [];
-  for (const raw of values) {
-    const level = raw.trim().toLowerCase();
-    const normalized = level === "none" ? "off" : level;
-    if (
-      (THINKING_EFFORT_OPTIONS as readonly string[]).includes(normalized) &&
-      !out.includes(normalized)
-    ) {
-      out.push(normalized);
-    }
-  }
-  return out;
+  return catalogEfforts(capabilitiesFor(entry)) ?? [];
 }
 
 /** 该档是否未被 models.dev 声明；目录无数据时不判定，避免把「没数据」标成「不支持」。 */
 function childEffortUndeclared(entry: InventoryEntry, level: string): boolean {
-  const declared = declaredModelEfforts(entry);
-  return declared.length > 0 && !declared.includes(level);
+  const declared = catalogEfforts(capabilitiesFor(entry));
+  return declared !== null && !declared.includes(level);
 }
 
 /** 模型行档位按钮的提示：区分「切换/继承」与「目录未声明该档」。 */
 function childEffortChipTitle(groupKey: string, entry: InventoryEntry, level: string): string {
-  const overridden = getEffectiveModelParams(groupKey, entry.key, entry.modelId).hasEffortsListOverride;
-  const base = overridden ? `切换 ${level}` : (modelIdentityMode.value ? "继承自父级；点击自定义覆盖" : `切换 ${level}`);
+  const effective = getEffectiveModelParams(groupKey, entry.key, entry.modelId);
+  const selected = displayedModelEfforts(groupKey, entry).includes(level);
+  const base = `当前来源：${SOURCE_LABELS[effective.effortsSource]}；${selected ? "已选" : "未选"} ${level}，点击自定义`;
   return childEffortUndeclared(entry, level) ? `${base}（models.dev 未声明该档）` : base;
 }
 
@@ -799,57 +749,65 @@ function childEffortChipTitle(groupKey: string, entry: InventoryEntry, level: st
 function modelReasoningToggleOnly(entry: InventoryEntry): boolean {
   const caps = capabilitiesFor(entry);
   if (!caps || !caps.reasoningOptions.length) return false;
-  return !caps.reasoningOptions.some((option) => option.kind === "effort");
+  return caps.reasoningOptions.some((option) => option.kind === "toggle") && !caps.reasoningOptions.some((option) => option.kind === "effort");
 }
 
-async function refreshModelCapabilities() {
-  const keys = [
-    ...new Set(
-      inventoryGroups.value
-        .flatMap((group) => group.entries.map((entry) => entry.modelId))
-        .filter((modelId) => modelId && !(modelId in modelCapabilities.value)),
-    ),
-  ];
-  if (!keys.length) return;
-  try {
-    const result = await runCommand<Record<string, ModelCapabilities>>(
-      "get_model_capabilities",
-      { keys },
-    );
-    // 未命中的 key 后端不返回：记为 null，避免每次清单变化都重复请求
-    for (const key of keys) {
-      modelCapabilities.value[key] = result[key] ?? (null as unknown as ModelCapabilities);
-    }
-  } catch {
-    /* 目录尚未同步时静默：参数行回落到全局档位列表 */
+async function refreshModelCapabilities(): Promise<void> {
+  if (disposed) return;
+  if (capabilityRequest) {
+    await capabilityRequest;
+    return refreshModelCapabilities();
   }
+  const queries = new Map<string, string>();
+  for (const row of inventoryRows.value) {
+    for (const model of row.models) {
+      if (model && !(model in modelCapabilities.value)) queries.set(model, bareModelId(model, row.alias));
+    }
+  }
+  // 只剥已知路由别名，保留如 z-ai/、meta/ 等上游身份；缓存仍用原始路由 ID。
+  const keys = [...new Set(queries.values())];
+  if (!keys.length) return;
+  const epoch = capabilityEpoch;
+  const request = (async () => {
+    try {
+      const result = await runCommand<Record<string, ModelCapabilities>>("get_model_capabilities", { keys });
+      if (epoch !== capabilityEpoch) return; // 同步前的旧响应不能污染新缓存。
+      // 旧版后端不返回匹配元信息（matchVersion / matchedId），但窗口、输出、档位字段一直都在。
+      // 不能因为没有元信息就整批丢弃 —— 那会让整个页面退回「全部未设」。
+      let legacyPayload = false;
+      for (const [model, key] of queries) {
+        const caps = result[key] ?? null;
+        if (caps && caps.matchVersion !== CAPABILITY_MATCH_VERSION) legacyPayload = true;
+        modelCapabilities.value[model] = caps;
+      }
+      capabilityLegacyPayload.value = legacyPayload;
+      capabilityError.value = "";
+    } catch (error) {
+      if (epoch === capabilityEpoch) capabilityError.value = String(error);
+      throw error;
+    }
+  })();
+  capabilityRequest = request;
+  try { await request; } finally { capabilityRequest = null; }
+  if (epoch !== capabilityEpoch) await refreshModelCapabilities();
 }
 
 let capabilityDebounce: number | null = null;
-watch(
-  inventoryGroups,
-  () => {
-    if (capabilityDebounce !== null) window.clearTimeout(capabilityDebounce);
-    capabilityDebounce = window.setTimeout(() => {
-      capabilityDebounce = null;
-      void refreshModelCapabilities();
-    }, 300);
-  },
-  { immediate: true, deep: false },
-);
+watch(inventoryGroups, () => {
+  if (capabilityDebounce !== null) window.clearTimeout(capabilityDebounce);
+  capabilityDebounce = window.setTimeout(() => {
+    capabilityDebounce = null;
+    void refreshModelCapabilities().catch(() => {});
+  }, 300);
+}, { immediate: true });
 
-// 目录同步完成后清空缓存并重新拉取：首次进入页面时可能目录尚未同步完，
-// modelCapabilities 中所有 key 被标记为 null，之后不会重试。
-// 监听同步状态变化，从 true→false（完成）时清空并重新请求。
-watch(
-  () => modelCatalogSyncing.value,
-  (syncing, prev) => {
-    if (prev && !syncing) {
-      modelCapabilities.value = {};
-      void refreshModelCapabilities();
-    }
-  },
-);
+watch([() => modelCatalog.value.lastSyncedAt, modelCatalogSyncing], ([next, syncing], [prev, wasSyncing]) => {
+  if (next !== prev || (wasSyncing && !syncing)) {
+    capabilityEpoch += 1;
+    modelCapabilities.value = {};
+    void refreshModelCapabilities().catch(() => {});
+  }
+});
 
 /** 能力摘要徽标：上下文 / 输出上限 / 交错字段 / 快速档，目录未命中时为空。 */
 function capabilityBadges(caps: ModelCapabilities): string[] {
@@ -866,15 +824,27 @@ function capabilityBadges(caps: ModelCapabilities): string[] {
   return badges;
 }
 
+/**
+ * 参数输入框的占位提示：显示**当前生效值**及其来源（自定义 / 父级 / 目录 / 配置文件 / 全局）。
+ * 输入框 value 只承载用户自定义值 —— 生效值不等于用户值，混在一起会让「清除自定义」失义。
+ */
+function effectivePlaceholder(groupKey: string, entry: InventoryEntry, field: "contextWindow" | "maxOutput"): string {
+  const effective = getEffectiveModelParams(groupKey, entry.key, entry.modelId);
+  const value = field === "contextWindow" ? effective.contextWindow : effective.maxOutput;
+  const source = field === "contextWindow" ? effective.contextWindowSource : effective.maxOutputSource;
+  const prefix = source === "catalog"
+    ? (catalogMatchFor(entry.modelId)?.matchKind === "exact" ? "目录" : "≈目录")
+    : SOURCE_LABELS[source] ?? "未设";
+  return value ? `${prefix}: ${formatTokenCount(value)}` : "未设";
+}
+
 /** 一键把 models.dev 的窗口/输出上限与思考档位载入为该模型的覆盖参数。 */
 function loadCapabilitiesToChild(entry: InventoryEntry) {
   const caps = capabilitiesFor(entry);
   if (!caps) return;
   // 载入的是目录声明档位（已归一到本页词表），而非全集：这是「按目录收敛」的显式动作
   const declared = declaredModelEfforts(entry);
-  const patch: ChildParamOverride = declared.length ? { efforts: declared } : {};
-  if (caps.contextLength > 0) patch.contextWindow = caps.contextLength;
-  if (caps.maxOutputTokens > 0) patch.maxOutput = caps.maxOutputTokens;
+  const patch: ChildParamOverride = catalogParams(caps);
   if (!Object.keys(patch).length) {
     showToast("该模型在 models.dev 没有可用参数", true);
     return;
@@ -887,22 +857,75 @@ function loadCapabilitiesToChild(entry: InventoryEntry) {
   );
 }
 
-interface ParentParamValue {
-  contextWindow: number | null;
-  maxOutput: number | null;
-  defaultReasoningEffort: string;
-  efforts: string[];
+/** 匹配元信息只用于披露；实际字段默认值由 resolveModelParams 统一计算。 */
+function catalogMatchFor(modelId: string): { matchedId: string; matchKind: CapabilityMatchKind; matchScore: number; legacy: boolean } | null {
+  const caps = modelCapabilities.value[modelId];
+  if (!caps) return null;
+  const legacy = caps.matchVersion !== CAPABILITY_MATCH_VERSION;
+  const bare = modelId.slice(modelId.lastIndexOf("/") + 1);
+  return {
+    // 旧版后端不返回命中 ID，用请求名兜底，避免整块来源提示消失。
+    matchedId: caps.matchedId ?? bare,
+    matchKind: caps.matchKind ?? "exact",
+    matchScore: caps.matchScore ?? 1,
+    legacy,
+  };
 }
 
-interface ChildParamOverride {
-  contextWindow?: number | null;
-  maxOutput?: number | null;
-  defaultReasoningEffort?: string;
-  efforts?: string[];
+/** 父级栏字段提示：生效默认值 + 来源（目录 / 配置文件 / Agent 默认）。 */
+function parentDefaultHint(groupKey: string, field: "contextWindow" | "maxOutput"): string {
+  const resolved = getParentConfig(groupKey);
+  const value = field === "contextWindow" ? resolved.contextWindow : resolved.maxOutput;
+  const source = field === "contextWindow" ? resolved.contextWindowSource : resolved.maxOutputSource;
+  if (value == null) {
+    return source === "catalog" ? "目录未声明" : "未匹配 · 用 Agent 默认";
+  }
+  const label = source === "catalog" ? "目录" : SOURCE_LABELS[source] ?? "默认";
+  return `${label}: ${formatTokenCount(value)}`;
 }
 
-const parentConfigs = reactive<Record<string, ParentParamValue>>({});
+/**
+ * 默认思考级别的兜底提示：目录最高可配置档位 / 父级 / Agent 全局。
+ *
+ * 目录只声明「支持哪些档位 + 最高档」，因此默认档取 **最高可配置档位**；
+ * 未声明（未命中 / 仅 toggle / 不支持思考）返回「未声明」，不臆造。
+ */
+function effortDefaultHint(groupKey: string, entry?: InventoryEntry): string {
+  const resolved = entry
+    ? getEffectiveModelParams(groupKey, entry.key, entry.modelId)
+    : getParentConfig(groupKey);
+  const value = resolved.defaultReasoningEffort || "";
+  if (!value) return "未声明";
+  return `${SOURCE_LABELS[resolved.defaultReasoningEffortSource] ?? "默认"}: ${value}`;
+}
+
+/** 目录徽标文案：`目录 · glm-5-2`（近似命中加 ≈ 前缀并注明强度）。 */
+function catalogBadgeText(modelId: string): string {
+  const matched = catalogMatchFor(modelId);
+  if (!matched) return "";
+  const approximate = matched.matchKind !== "exact";
+  return `${approximate ? "≈目录" : "目录"} · ${matched.matchedId}`;
+}
+
+/** 目录徽标 tooltip：说明匹配强度与「默认参考」语义。 */
+function catalogBadgeTitle(modelId: string): string {
+  const matched = catalogMatchFor(modelId);
+  if (!matched) return "";
+  const kindLabel: Record<string, string> = {
+    exact: "精确命中",
+    variant: "变体拼写（日期戳/档位后缀）",
+    alias: "渠道拼写前缀",
+    nearest: "近似匹配",
+  };
+  const score = matched.matchKind === "nearest" ? `，相似度 ${matched.matchScore.toFixed(2)}` : "";
+  return `默认参数引用自模型全景控制台：${matched.matchedId}（${kindLabel[matched.matchKind] ?? matched.matchKind}${score}）。未覆盖字段会随目录更新；点击生效后写入 Agent 支持的配置项。`;
+}
+
+type ChildParamOverride = ModelParamOverride;
+const parentConfigs = reactive<Record<string, ModelParamOverride>>({});
 const childOverrides = reactive<Record<string, ChildParamOverride>>({});
+/** Agent 配置文件回读的逐模型值：参与生效值计算但**不是**用户自定义（不落盘、不算覆盖）。 */
+const hydratedOverrides = reactive<Record<string, ChildParamOverride>>({});
 const sublistSearch = reactive<Record<string, string>>({});
 
 const CONTEXT_PRESETS = [
@@ -954,59 +977,31 @@ function persistConfigs() {
 }
 
 function loadStoredConfigs() {
-  if (!activeTool.value) return;
   const saved = preferences.agentModelConfigs?.[activeTool.value];
-  if (saved) {
-    if (saved.parentConfigs) {
-      for (const [k, v] of Object.entries(saved.parentConfigs)) {
-        const val = { ...v } as ParentParamValue;
-        if (!Array.isArray(val.efforts)) {
-          val.efforts = [...THINKING_EFFORT_OPTIONS];
-        }
-        parentConfigs[k] = val;
-      }
-    }
-    if (saved.childOverrides) {
-      for (const [k, v] of Object.entries(saved.childOverrides)) {
-        childOverrides[k] = { ...v } as ChildParamOverride;
-      }
-    }
+  // 旧版没有来源标记，不能凭数值相等推断是默认还是自定义；保留用户数据。
+  for (const [key, value] of Object.entries(saved?.parentConfigs ?? {})) {
+    parentConfigs[key] = patchModelParams({}, value);
+  }
+  for (const [key, value] of Object.entries(saved?.childOverrides ?? {})) {
+    childOverrides[key] = patchModelParams({}, value);
   }
 }
 
-function getParentConfig(groupKey: string): ParentParamValue {
-  const existing = parentConfigs[groupKey];
-  if (existing) {
-    if (!Array.isArray(existing.efforts)) {
-      existing.efforts = [...THINKING_EFFORT_OPTIONS];
-    }
-    return existing;
-  }
-
-  const snap = snapshot.value;
-  const initEfforts = snap?.defaults?.reasoningEffortOptions?.length
-    ? [...snap.defaults.reasoningEffortOptions]
-    : snap?.thinking?.effortLevelOptions?.length
-      ? [...snap.thinking.effortLevelOptions]
-      : [...THINKING_EFFORT_OPTIONS];
-
-  const defaultEffort = snap?.defaults?.reasoningEffort || snap?.thinking?.effortLevel || "";
-
-  const config: ParentParamValue = {
-    contextWindow: snap?.context?.contextWindow ?? null,
-    maxOutput: snap?.context?.maxOutputTokens ?? null,
-    defaultReasoningEffort: defaultEffort,
-    efforts: initEfforts.filter((e) => (THINKING_EFFORT_OPTIONS as readonly string[]).includes(e)),
-  };
-  if (!config.efforts.length) {
-    config.efforts = [...THINKING_EFFORT_OPTIONS];
-  }
-  return config;
+function getParentConfig(groupKey: string) {
+  const group = inventoryGroups.value.find((g) => g.key === groupKey);
+  // 常规模式一组里是不同模型，不能拿第一个模型的目录档位冒充整组筛选。
+  const caps = modelIdentityMode.value && group?.entries[0] ? capabilitiesFor(group.entries[0]) : null;
+  return resolveModelParams({}, parentConfigs[groupKey], caps, {}, snapshotParams(snapshot.value));
 }
 
-function setParentConfig(groupKey: string, patch: Partial<ParentParamValue>) {
-  const current = getParentConfig(groupKey);
-  parentConfigs[groupKey] = { ...current, ...patch };
+function setParentConfig(groupKey: string, patch: ModelParamOverride) {
+  // 只保存显式修改，不把当前目录/快照计算值拷贝到 override。
+  parentConfigs[groupKey] = patchModelParams(parentConfigs[groupKey] ?? {}, patch);
+  persistConfigs();
+}
+
+function resetParentConfig(groupKey: string) {
+  delete parentConfigs[groupKey];
   persistConfigs();
 }
 
@@ -1018,8 +1013,14 @@ function applyOutputPresetToParent(groupKey: string, value: number) {
   setParentConfig(groupKey, { maxOutput: value });
 }
 
+/** 父级筛选栏当前点亮的档。常规模式只认用户显式勾选，避免把 Agent 默认全集画成已筛选。 */
+function parentEffortSelection(groupKey: string): string[] {
+  if (!modelIdentityMode.value) return parentConfigs[groupKey]?.efforts ?? [];
+  return getParentConfig(groupKey).efforts ?? [];
+}
+
 function toggleParentEffort(groupKey: string, level: string) {
-  const current = getParentConfig(groupKey).efforts ?? [];
+  const current = parentEffortSelection(groupKey);
   const next = current.includes(level)
     ? current.filter((item) => item !== level)
     : [...current, level];
@@ -1039,97 +1040,27 @@ function getChildOverride(entryKey: string): ChildParamOverride {
 }
 
 function getEffectiveModelParams(groupKey: string, entryKey: string, modelId?: string) {
-  const child = getChildOverride(entryKey);
+  // 父级用户配置两种模式都要参与逐字段解析：常规模式的分组是「渠道·账号」，
+  // 模型×站点模式的分组是「模型」本身。思考级别筛选由 resolveModelParams 按
+  // 「自定义 > 父级筛选 > 目录」落到模型行，不再被目录声明全集盖掉。
+  return resolveModelParams(getChildOverride(entryKey), parentConfigs[groupKey],
+    modelId ? modelCapabilities.value[modelId] ?? null : null,
+    hydratedOverrides[entryKey], snapshotParams(snapshot.value));
+}
 
-  const hasContextWindowOverride = child.contextWindow !== undefined;
-  const hasMaxOutputOverride = child.maxOutput !== undefined;
-  const hasEffortOverride = child.defaultReasoningEffort !== undefined;
-  const hasEffortsListOverride = child.efforts !== undefined;
-
-  // 两种模式共用：未覆盖 efforts 时优先从 models.dev 匹配该模型实际支持的思考档位
-  const modelDerivedEfforts = (() => {
-    if (hasEffortsListOverride || !modelId) return null;
-    // 通过 modelId 构造临时 InventoryEntry 调用 declaredModelEfforts
-    const tempEntry: InventoryEntry = { key: entryKey, label: "", modelId, mono: false, scope: [] };
-    const declared = declaredModelEfforts(tempEntry);
-    return declared.length > 0 ? declared : null;
-  })();
-
-  // 常规模式：无父级统一配置，子模型参数独立设置，未设项回退到 Agent 级快照
-  if (!modelIdentityMode.value) {
-    const snap = snapshot.value;
-    const fallbackContext = snap?.context?.contextWindow ?? null;
-    const fallbackOutput = snap?.context?.maxOutputTokens ?? null;
-    const fallbackEffort = snap?.defaults?.reasoningEffort || snap?.thinking?.effortLevel || "";
-    const fallbackEfforts = snap?.defaults?.reasoningEffortOptions?.length
-      ? [...snap.defaults.reasoningEffortOptions]
-      : snap?.thinking?.effortLevelOptions?.length
-        ? [...snap.thinking.effortLevelOptions]
-        : [...THINKING_EFFORT_OPTIONS];
-
-    const contextWindow = hasContextWindowOverride ? child.contextWindow : fallbackContext;
-    const maxOutput = hasMaxOutputOverride ? child.maxOutput : fallbackOutput;
-    const defaultReasoningEffort = hasEffortOverride ? child.defaultReasoningEffort : fallbackEffort;
-    // 未覆盖时优先用 models.dev 匹配到的思考档位，其次回退到 Agent 级快照
-    const efforts = hasEffortsListOverride
-      ? child.efforts
-      : (modelDerivedEfforts ?? fallbackEfforts);
-
-    const isOverridden = hasContextWindowOverride || hasMaxOutputOverride || hasEffortOverride || hasEffortsListOverride;
-    const overriddenCount = (hasContextWindowOverride ? 1 : 0)
-      + (hasMaxOutputOverride ? 1 : 0)
-      + (hasEffortOverride ? 1 : 0)
-      + (hasEffortsListOverride ? 1 : 0);
-
-    return {
-      contextWindow,
-      maxOutput,
-      defaultReasoningEffort: defaultReasoningEffort ?? "",
-      efforts: Array.isArray(efforts) ? efforts : [...THINKING_EFFORT_OPTIONS],
-      isOverridden,
-      overriddenCount,
-      hasContextWindowOverride,
-      hasMaxOutputOverride,
-      hasEffortOverride,
-      hasEffortsListOverride,
-    };
-  }
-
-  // 模型×站点模式：子模型默认继承父级配置，可逐项覆盖
-  const parent = getParentConfig(groupKey);
-
-  const contextWindow = hasContextWindowOverride ? child.contextWindow : parent.contextWindow;
-  const maxOutput = hasMaxOutputOverride ? child.maxOutput : parent.maxOutput;
-  const defaultReasoningEffort = hasEffortOverride ? child.defaultReasoningEffort : parent.defaultReasoningEffort;
-  // 未覆盖时优先用 models.dev 匹配到的思考档位，其次继承父级
-  const efforts = hasEffortsListOverride
-    ? child.efforts
-    : (modelDerivedEfforts ?? parent.efforts);
-
-  const isOverridden = hasContextWindowOverride || hasMaxOutputOverride || hasEffortOverride || hasEffortsListOverride;
-  const overriddenCount = (hasContextWindowOverride ? 1 : 0)
-    + (hasMaxOutputOverride ? 1 : 0)
-    + (hasEffortOverride ? 1 : 0)
-    + (hasEffortsListOverride ? 1 : 0);
-
-  return {
-    contextWindow,
-    maxOutput,
-    defaultReasoningEffort: defaultReasoningEffort ?? "",
-    efforts: Array.isArray(efforts) ? efforts : [...THINKING_EFFORT_OPTIONS],
-    isOverridden,
-    overriddenCount,
-    hasContextWindowOverride,
-    hasMaxOutputOverride,
-    hasEffortOverride,
-    hasEffortsListOverride,
-  };
+/** 模型行实际点亮的思考档：未自定义时按父级筛选与目录声明求交，不点亮目录未声明档。 */
+function displayedModelEfforts(groupKey: string, entry: InventoryEntry): string[] {
+  const effective = getEffectiveModelParams(groupKey, entry.key, entry.modelId);
+  if (effective.hasEffortsListOverride) return effective.efforts;
+  const declared = catalogEfforts(capabilitiesFor(entry));
+  if (declared === null) return effective.efforts;
+  return effective.efforts.filter((level) => declared.includes(level));
 }
 
 function setChildOverride(entry: InventoryEntry, patch: Partial<ChildParamOverride>) {
   for (const key of entry.scope) {
     const current = childOverrides[key] ?? {};
-    childOverrides[key] = { ...current, ...patch };
+    childOverrides[key] = patchModelParams(current, patch);
   }
   persistConfigs();
 }
@@ -1148,7 +1079,7 @@ function resetAllChildren(group: InventoryGroup) {
 }
 
 function toggleChildEffort(groupKey: string, entry: InventoryEntry, level: string) {
-  const currentEfforts = getEffectiveModelParams(groupKey, entry.key, entry.modelId).efforts ?? [];
+  const currentEfforts = displayedModelEfforts(groupKey, entry);
   const next = currentEfforts.includes(level)
     ? currentEfforts.filter((item) => item !== level)
     : [...currentEfforts, level];
@@ -1175,69 +1106,9 @@ function filteredEntries(group: InventoryGroup): InventoryEntry[] {
 }
 
 function hydrateFromSnapshot() {
+  Object.keys(hydratedOverrides).forEach((key) => delete hydratedOverrides[key]);
   const snap = snapshot.value;
-  if (!snap) return;
-
-  for (const group of inventoryGroups.value) {
-    if (!parentConfigs[group.key]) {
-      getParentConfig(group.key);
-    }
-  }
-
-  for (const model of snap.models) {
-    const key = settingsKey(model.provider, model.id);
-    if (!childOverrides[key] && (model.contextWindow > 0 || model.maxOutput > 0)) {
-      childOverrides[key] = {
-        contextWindow: model.contextWindow > 0 ? model.contextWindow : undefined,
-        maxOutput: model.maxOutput > 0 ? model.maxOutput : undefined,
-      };
-    }
-  }
-
-  // Agent 级默认思考档位列表：与之一致的 perModelEffort 是旧版默认值冗余写入，
-  // 不应加载为 override —— 否则会阻止 getEffectiveModelParams 从 models.dev 获取该模型实际档位。
-  const agentDefaultEfforts = new Set(
-    snap.defaults?.reasoningEffortOptions?.length
-      ? snap.defaults.reasoningEffortOptions
-      : snap.thinking?.effortLevelOptions?.length
-        ? snap.thinking.effortLevelOptions
-        : THINKING_EFFORT_OPTIONS,
-  );
-  const isStaleDefault = (raw: string) => {
-    const parts = raw.split(",").map((s) => s.trim()).filter(Boolean);
-    return parts.length === agentDefaultEfforts.size
-      && parts.every((p) => agentDefaultEfforts.has(p));
-  };
-
-  for (const [effortKey, rawEffort] of Object.entries(snap.defaults.perModelEffort ?? {})) {
-    const at = effortKey.indexOf("/");
-    if (at > 0) {
-      const providerId = effortKey.slice(0, at);
-      const shortId = effortKey.slice(at + 1);
-      const key = settingsKey(providerId, modelIdForPatch(shortId, providerId));
-      if (!childOverrides[key]?.efforts && rawEffort && !isStaleDefault(rawEffort)) {
-        const efforts = rawEffort.split(",").map((s) => s.trim()).filter(Boolean);
-        if (efforts.length) {
-          childOverrides[key] = {
-            ...(childOverrides[key] ?? {}),
-            efforts,
-          };
-        }
-      }
-    }
-  }
-
-  // 清除 loadStoredConfigs 加载的旧版默认值 efforts（与 Agent 级默认列表完全一致的 override）
-  for (const [key, override] of Object.entries(childOverrides)) {
-    if (override.efforts && override.efforts.length === agentDefaultEfforts.size
-      && override.efforts.every((e) => agentDefaultEfforts.has(e))) {
-      delete childOverrides[key].efforts;
-      if (childOverrides[key].contextWindow === undefined && childOverrides[key].maxOutput === undefined
-        && childOverrides[key].defaultReasoningEffort === undefined) {
-        delete childOverrides[key];
-      }
-    }
-  }
+  if (snap?.tool === activeTool.value) Object.assign(hydratedOverrides, hydrateModelParams(snap));
 }
 
 watch(
@@ -1245,6 +1116,7 @@ watch(
   () => {
     Object.keys(parentConfigs).forEach((k) => delete parentConfigs[k]);
     Object.keys(childOverrides).forEach((k) => delete childOverrides[k]);
+    Object.keys(hydratedOverrides).forEach((k) => delete hydratedOverrides[k]);
     loadStoredConfigs();
     hydrateFromSnapshot();
   },
@@ -1287,10 +1159,11 @@ function modelIdForPatch(model: string, providerId: string) {
 }
 
 function modelsForPatch(row: ProxyInventoryRow, providerId: string): LocalToolModelEntry[] {
-  const groupKey = `${row.channelId}::${row.account}`;
+  // 与 UI 的 model::裸模型名分组键一致，不能拿渠道键查模型父级。
   return row.models.map((model) => {
     const id = modelIdForPatch(model, providerId);
     const targetKey = settingsKey(providerId, id);
+    const groupKey = modelParamGroupKey(modelIdentityMode.value, row.channelId, row.account, model);
     const effective = getEffectiveModelParams(groupKey, targetKey, model);
     return {
       id,
@@ -1298,6 +1171,8 @@ function modelsForPatch(row: ProxyInventoryRow, providerId: string): LocalToolMo
       provider: providerId,
       contextWindow: effective.contextWindow ?? 0,
       maxOutput: effective.maxOutput ?? 0,
+      // 逐模型默认思考级别：目录给「最高可配置档位」，用户可在行内覆盖。
+      ...(effective.defaultReasoningEffort ? { reasoningEffort: effective.defaultReasoningEffort } : {}),
     };
   });
 }
@@ -1307,15 +1182,13 @@ function perModelEffortForPatch(rows: ProxyInventoryRow[]) {
   const out: Record<string, string> = { ...(snapshot.value?.defaults.perModelEffort ?? {}) };
   for (const row of rows) {
     const providerId = writeProviderId(row);
-    const groupKey = `${row.channelId}::${row.account}`;
     for (const model of row.models) {
       const modelId = modelIdForPatch(model, providerId);
       const targetKey = settingsKey(providerId, modelId);
+      const groupKey = modelParamGroupKey(modelIdentityMode.value, row.channelId, row.account, model);
       const effective = getEffectiveModelParams(groupKey, targetKey, model);
       const effortKey = perModelEffortKey(providerId, modelId);
-      if (effective.efforts && effective.efforts.length) {
-        out[effortKey] = effective.efforts.join(",");
-      }
+      out[effortKey] = effective.efforts.join(","); // 空列表也写入，清除旧的自定义 variants。
     }
   }
   return out;
@@ -1593,33 +1466,13 @@ function buildPatch(rows: ProxyInventoryRow[], whole: boolean): LocalToolConfigP
   }
 
   const defaults = patchDefaults(rows, singleProviderId, whole);
-  defaults.perModelEffort = perModelEffortForPatch(rows);
+  if (activeTool.value === "opencode" || activeTool.value === "dsh") {
+    defaults.perModelEffort = perModelEffortForPatch(rows);
+  } // Claude map 是档位→模型 ID，保留 patchDefaults 刚算出的映射。
 
-  // 父级统一参数仅在模型×站点模式生效：同一模型跨站点参数一致，父级定义基准。
-  // 常规模式各供应商/模型独立，无父级统一设置，直接沿用 Agent 级快照值。
-  const headRow = rows[0];
-  const headGroupKey = headRow ? `${headRow.channelId}::${headRow.account}` : "";
-  const parentCfg = modelMode ? getParentConfig(headGroupKey) : null;
-
-  if (parentCfg?.defaultReasoningEffort) {
-    defaults.reasoningEffort = parentCfg.defaultReasoningEffort;
-  }
-  if (parentCfg?.efforts && parentCfg.efforts.length) {
-    defaults.reasoningEffortOptions = parentCfg.efforts;
-  }
-
-  const context = {
-    contextWindow: parentCfg?.contextWindow ?? snapshot.value?.context?.contextWindow ?? null,
-    autoCompactTokenLimit: snapshot.value?.context?.autoCompactTokenLimit ?? null,
-    maxOutputTokens: parentCfg?.maxOutput ?? snapshot.value?.context?.maxOutputTokens ?? null,
-    maxThinkingTokens: snapshot.value?.context?.maxThinkingTokens ?? null,
-  };
-
-  const thinking = {
-    effortLevel: parentCfg?.defaultReasoningEffort || snapshot.value?.thinking?.effortLevel || "",
-    effortLevelOptions: parentCfg?.efforts && parentCfg.efforts.length ? parentCfg.efforts : (snapshot.value?.thinking?.effortLevelOptions ?? [...THINKING_EFFORT_OPTIONS]),
-    maxThinkingTokens: snapshot.value?.thinking?.maxThinkingTokens ?? null,
-  };
+  // 模型级参数不能投射为所有模型共用的全局限制；全局设置保持快照原值。
+  const context = { ...snapshot.value!.context };
+  const thinking = { ...snapshot.value!.thinking };
 
   return {
     baseHash: snapshot.value?.contentHash ?? "",
@@ -1650,7 +1503,10 @@ function diffKeyForRow(row: ProxyInventoryRow) {
 }
 
 async function refreshDiff() {
-  if (!snapshot.value) return;
+  if (!snapshot.value || disposed) return;
+  const tool = activeTool.value;
+  try { await refreshModelCapabilities(); } catch { return; }
+  if (disposed || tool !== activeTool.value || !snapshot.value) return;
   const usable = usableRows.value;
   if (!usable.length) return;
   if (wholeListComparison.value) {
@@ -1672,27 +1528,37 @@ function scheduleDiff() {
 // 配置、清单或身份模式变化后重新比对：徽标始终反映「磁盘现状 vs 当前清单」。
 // 这些依赖变化很频繁（站点缓存刷新也会触发），比对失败静默处理，不打扰用户。
 watch(
-  [configRevision, () => usableRows.value, identityMode],
+  [configRevision, () => usableRows.value, identityMode, parentConfigs, childOverrides, modelCapabilities],
   () => {
     scheduleDiff();
   },
-  { immediate: true, flush: "post" },
+  { immediate: true, deep: true, flush: "post" },
 );
 
+const applying = ref(false);
 async function applyRows(rows: ProxyInventoryRow[], whole: boolean) {
-  if (!snapshot.value || saving.value || snapshotLoading.value) return;
-  const blocked = applyBlockedReason(rows);
-  if (blocked) {
-    showToast(blocked, true);
-    return;
-  }
-  if (!gatewayReady.value) {
-    showToast("网关未在运行，仍会写入当前端口地址，启动后再用");
-  }
-  const ok = await saveSnapshot(buildPatch(rows, whole));
-  if (ok) {
-    await loadToolList();
-    await refreshDiff();
+  if (disposed || !snapshot.value || applying.value || saving.value || snapshotLoading.value) return;
+  applying.value = true;
+  const tool = activeTool.value;
+  const mode = identityMode.value;
+  const inventory = inventoryRows.value;
+  try {
+    try { await refreshModelCapabilities(); } catch {
+      showToast("目录参数读取失败，已中止写入，请重试：" + capabilityError.value, true);
+      return;
+    }
+    if (disposed || tool !== activeTool.value || mode !== identityMode.value || !snapshot.value || saving.value || snapshotLoading.value) return;
+    if (inventory !== inventoryRows.value) {
+      showToast("清单已更新，请确认当前模型后重新生效", true);
+      return;
+    }
+    const blocked = applyBlockedReason(rows);
+    if (blocked) { showToast(blocked, true); return; }
+    if (!gatewayReady.value) showToast("网关未在运行，仍会写入当前端口地址，启动后再用");
+    const ok = await saveSnapshot(buildPatch(rows, whole));
+    if (ok) { await loadToolList(); await refreshDiff(); }
+  } finally {
+    applying.value = false;
   }
 }
 
@@ -1899,6 +1765,9 @@ function handleDialogKeydown(event: KeyboardEvent, close: () => void) {
 }
 
 onUnmounted(() => {
+  disposed = true;
+  capabilityEpoch += 1;
+  if (capabilityDebounce !== null) window.clearTimeout(capabilityDebounce);
   if (diffDebounceTimer !== null) {
     clearTimeout(diffDebounceTimer);
     diffDebounceTimer = null;
@@ -1940,14 +1809,14 @@ onUnmounted(() => {
           <button
             type="button"
             class="lt-btn-primary"
-            :disabled="!canApplyAll || saving || snapshotLoading || !usableRows.length"
+            :disabled="!canApplyAll || applying || saving || snapshotLoading || !usableRows.length"
             :title="canApplyAll
               ? '把当前清单里能用的反代条目写入 Agent 配置'
               : '该模式按单条生效，请点清单里某一行的「生效」'"
             @click="applyAll"
           >
             <span v-html="icons.check"></span>
-            {{ saving ? "写入中…" : allApplied ? "已全部生效" : "生效" }}
+            {{ applying && !saving ? "读取目录…" : saving ? "写入中…" : allApplied ? "已全部生效" : "生效" }}
           </button>
           <button type="button" class="lt-btn-secondary" title="重新读取配置" @click="reload">
             <span v-html="icons.restore"></span>
@@ -2027,6 +1896,12 @@ onUnmounted(() => {
         <div v-if="snapshotLoading || siteCachesLoading" class="detail-loading">读取配置中…</div>
 
         <template v-else-if="snapshot">
+          <p class="parent-config-hint">未自定义字段自动引用模型全景目录；目录更新后需点「生效」写入。旧版已存覆盖会保留，可用「恢复默认」清除。</p>
+          <p v-if="activeTool === 'claude' || activeTool === 'codex'" class="parent-config-hint">此 Agent 仅支持全局上下文/思考设置；下列逐模型参数仅供参考，不写入其配置文件。</p>
+          <p v-else-if="activeTool === 'zcode'" class="parent-config-hint">此 Agent 适配器仅写入逐模型窗口与输出；思考档位仅供参考。</p>
+          <p v-if="capabilityLegacyPayload" class="parent-config-hint">当前运行的后端未返回匹配来源信息（旧版本）：窗口 / 输出 / 档位仍按目录取值，但无法显示「≈ 近似」来源。重启或重新构建应用后即可显示。</p>
+          <p v-else-if="capabilityError" class="parent-config-hint">目录参数读取失败：{{ capabilityError }}</p>
+          <p v-if="capabilityError" role="alert" class="provider-diff">目录读取失败：{{ capabilityError }}；点击生效时会重试，读取失败将中止写入。</p>
           <div v-if="inventoryGroups.length" class="provider-list">
             <article
               v-for="group in inventoryGroups"
@@ -2075,7 +1950,7 @@ onUnmounted(() => {
                     class="use-button"
                     :class="{ active: groupState(group) === 'applied' }"
                     type="button"
-                    :disabled="saving || groupState(group) === 'applied'"
+                    :disabled="applying || saving || groupState(group) === 'applied'"
                     :title="groupState(group) === 'drifted' ? '重新写入该条' : '写入该条并生效'"
                     @click="applyGroup(group)"
                   >
@@ -2085,16 +1960,17 @@ onUnmounted(() => {
                 </div>
               </div>
 
-              <!-- 父列表配置栏（仅模型×站点模式：同模型跨站点参数一致，父级统一定义基准配置） -->
-              <div v-if="modelIdentityMode" class="parent-config-bar">
+              <!-- 父列表配置栏：模型×站点是同模型统一覆盖；常规模式按渠道·账号筛选思考级别，落到该组每个模型 ID。 -->
+              <div class="parent-config-bar">
                 <div class="parent-config-title">
-                  <span class="parent-config-badge">父级默认配置</span>
-                  <span class="parent-config-hint">下属 {{ group.entries.length }} 个站点默认继承此配置；子列表中可单独覆盖</span>
+                  <span class="parent-config-badge">{{ modelIdentityMode ? "同模型统一覆盖" : "该渠道思考级别筛选" }}</span>
+                  <span class="parent-config-hint">{{ modelIdentityMode ? "只覆盖显式修改的字段；其余继续使用各模型目录默认值。" : "勾选的档位会显示在下方每个模型 ID 上，并与该模型目录声明求交。" }}</span>
+                  <button v-if="Object.keys(parentConfigs[group.key] ?? {}).length" class="cfg-text-btn" type="button" @click="resetParentConfig(group.key)">清除父级覆盖</button>
                 </div>
 
                 <div class="parent-config-grid">
                   <!-- 最大窗口 -->
-                  <div class="cfg-field">
+                  <div v-if="modelIdentityMode" class="cfg-field">
                     <div class="cfg-label-row">
                       <label>最大窗口</label>
                       <div class="cfg-presets">
@@ -2112,14 +1988,14 @@ onUnmounted(() => {
                       class="cfg-input"
                       type="number"
                       min="0"
-                      placeholder="默认未设 (如 128000)"
-                      :value="getParentConfig(group.key).contextWindow ?? ''"
-                      @input="setParentConfig(group.key, { contextWindow: parseLimitInput($event) })"
+                      :placeholder="parentDefaultHint(group.key, 'contextWindow')"
+                      :value="parentConfigs[group.key]?.contextWindow ?? ''"
+                      @input="setParentConfig(group.key, { contextWindow: parseLimitInput($event) ?? undefined })"
                     />
                   </div>
 
                   <!-- 最大输出 -->
-                  <div class="cfg-field">
+                  <div v-if="modelIdentityMode" class="cfg-field">
                     <div class="cfg-label-row">
                       <label>最大输出</label>
                       <div class="cfg-presets">
@@ -2137,14 +2013,14 @@ onUnmounted(() => {
                       class="cfg-input"
                       type="number"
                       min="0"
-                      placeholder="默认未设 (如 8192)"
-                      :value="getParentConfig(group.key).maxOutput ?? ''"
-                      @input="setParentConfig(group.key, { maxOutput: parseLimitInput($event) })"
+                      :placeholder="parentDefaultHint(group.key, 'maxOutput')"
+                      :value="parentConfigs[group.key]?.maxOutput ?? ''"
+                      @input="setParentConfig(group.key, { maxOutput: parseLimitInput($event) ?? undefined })"
                     />
                   </div>
 
                   <!-- 默认思考级别 -->
-                  <div class="cfg-field">
+                  <div v-if="modelIdentityMode" class="cfg-field">
                     <div class="cfg-label-row">
                       <label>默认思考级别</label>
                       <span v-if="getParentConfig(group.key).defaultReasoningEffort" class="cfg-current-val">
@@ -2153,10 +2029,11 @@ onUnmounted(() => {
                     </div>
                     <select
                       class="cfg-select"
+                      title="该模型的默认思考级别；留空则用目录最高可配置档位"
                       :value="getParentConfig(group.key).defaultReasoningEffort"
                       @change="setParentConfig(group.key, { defaultReasoningEffort: ($event.target as HTMLSelectElement).value })"
                     >
-                      <option value="">未设置 / 默认</option>
+                      <option value="">跟随默认（{{ effortDefaultHint(group.key) }}）</option>
                       <option v-for="lvl in THINKING_EFFORT_OPTIONS" :key="lvl" :value="lvl">{{ lvl }}</option>
                     </select>
                   </div>
@@ -2176,7 +2053,7 @@ onUnmounted(() => {
                         :key="`parent-${group.key}-${lvl}`"
                         type="button"
                         class="effort-chip"
-                        :class="{ active: (getParentConfig(group.key).efforts ?? []).includes(lvl) }"
+                        :class="{ active: parentEffortSelection(group.key).includes(lvl) }"
                         @click="toggleParentEffort(group.key, lvl)"
                       >{{ lvl }}</button>
                     </div>
@@ -2204,7 +2081,7 @@ onUnmounted(() => {
                       v-if="modelIdentityMode && groupOverriddenCount(group) > 0"
                       type="button"
                       class="sublist-reset-all-btn"
-                      title="清空当前所有子模型的覆盖参数，全部恢复继承父级配置"
+                      title="清除当前子模型自定义，恢复目录/父级默认"
                       @click="resetAllChildren(group)"
                     >
                       全部重置为继承
@@ -2239,7 +2116,7 @@ onUnmounted(() => {
                         >
                           已覆盖 {{ getEffectiveModelParams(group.key, entry.key, entry.modelId).overriddenCount }} 项
                         </span>
-                        <span v-else-if="modelIdentityMode" class="inherit-tag" title="当前完全继承父级配置">继承父级</span>
+                        <span v-else class="inherit-tag" title="使用各字段的目录/父级默认；详情见输入框和档位提示">使用默认</span>
                       </div>
                       <div class="model-id-row">
                         <code class="model-id-code" :title="entry.modelId || entry.label">{{ entry.modelId || entry.label }}</code>
@@ -2251,21 +2128,30 @@ onUnmounted(() => {
                           v-html="icons.copy"
                         ></button>
                       </div>
-                      <div v-if="capabilitiesFor(entry)" class="model-cap-row">
-                        <span
-                          v-for="badge in capabilityBadges(capabilitiesFor(entry)!)"
-                          :key="badge"
-                          class="model-cap-badge"
-                          title="来自 models.dev 目录"
-                        >{{ badge }}</span>
+                      <div v-if="capabilitiesFor(entry) || catalogMatchFor(entry.modelId)" class="model-cap-row">
+                        <template v-if="catalogBadgeText(entry.modelId)">
+                          <span
+                            class="model-cap-badge is-catalog"
+                            :title="catalogBadgeTitle(entry.modelId)"
+                          >{{ catalogBadgeText(entry.modelId) }}</span>
+                        </template>
+                        <template v-if="capabilitiesFor(entry)">
+                          <span
+                            v-for="badge in capabilityBadges(capabilitiesFor(entry)!)"
+                            :key="badge"
+                            class="model-cap-badge"
+                            title="来自 models.dev 目录"
+                          >{{ badge }}</span>
+                        </template>
                         <span v-if="modelReasoningToggleOnly(entry)" class="model-cap-badge" title="models.dev 仅声明开/关式思考">思考仅开/关</span>
                         <button
                           type="button"
                           class="model-cap-load-btn"
-                          title="把 models.dev 的窗口 / 输出上限 / 思考档位载入为本模型参数"
+                          title="把目录值固化为本模型的自定义参数（目录值本就是默认参考；固化后不再跟随目录更新）"
                           @click="loadCapabilitiesToChild(entry)"
-                        >载入目录参数</button>
+                        >固化为自定义参数</button>
                       </div>
+                      <div v-else class="model-cap-row"><span class="model-cap-badge">{{ entry.modelId in modelCapabilities ? '目录未匹配 · 使用配置文件/Agent 默认' : capabilityError ? '目录读取失败' : '目录匹配中…' }}</span></div>
                     </div>
 
                     <!-- 最大窗口 -->
@@ -2276,7 +2162,7 @@ onUnmounted(() => {
                           :class="{ 'is-active-override': getEffectiveModelParams(group.key, entry.key, entry.modelId).hasContextWindowOverride }"
                           type="number"
                           min="0"
-                          :placeholder="modelIdentityMode ? '继承: ' + (formatTokenCount(getParentConfig(group.key).contextWindow) || '未设') : '未设 (如 128000)'"
+                          :placeholder="effectivePlaceholder(group.key, entry, 'contextWindow')"
                           :value="getChildOverride(entry.key).contextWindow ?? ''"
                           @input="setChildOverride(entry, { contextWindow: parseLimitInput($event) ?? undefined })"
                         />
@@ -2291,7 +2177,7 @@ onUnmounted(() => {
                           :class="{ 'is-active-override': getEffectiveModelParams(group.key, entry.key, entry.modelId).hasMaxOutputOverride }"
                           type="number"
                           min="0"
-                          :placeholder="modelIdentityMode ? '继承: ' + (formatTokenCount(getParentConfig(group.key).maxOutput) || '未设') : '未设 (如 8192)'"
+                          :placeholder="effectivePlaceholder(group.key, entry, 'maxOutput')"
                           :value="getChildOverride(entry.key).maxOutput ?? ''"
                           @input="setChildOverride(entry, { maxOutput: parseLimitInput($event) ?? undefined })"
                         />
@@ -2302,16 +2188,17 @@ onUnmounted(() => {
                     <div class="col-effort">
                       <select
                         class="sub-select"
+                        title="留空则跟随目录最高可配置档位 / 父级 / Agent 默认"
                         :class="{ 'is-active-override': getEffectiveModelParams(group.key, entry.key, entry.modelId).hasEffortOverride }"
                         :value="getChildOverride(entry.key).defaultReasoningEffort ?? ''"
                         @change="setChildOverride(entry, { defaultReasoningEffort: ($event.target as HTMLSelectElement).value || undefined })"
                       >
-                        <option value="">{{ modelIdentityMode ? '继承父级 (' + (getParentConfig(group.key).defaultReasoningEffort || '未设置') + ')' : '未设置 / 默认' }}</option>
+                        <option value="">跟随默认（{{ effortDefaultHint(group.key, entry) }}）</option>
                         <option
                           v-for="lvl in THINKING_EFFORT_OPTIONS"
                           :key="lvl"
                           :value="lvl"
-                        >{{ lvl }}{{ childEffortUndeclared(entry, lvl) ? '（未声明）' : '' }}</option>
+                        >{{ lvl }}{{ childEffortUndeclared(entry, lvl) ? '（目录未声明）' : '' }}</option>
                       </select>
                     </div>
 
@@ -2324,7 +2211,7 @@ onUnmounted(() => {
                           type="button"
                           class="sub-effort-chip"
                           :class="{
-                            'active': (getEffectiveModelParams(group.key, entry.key, entry.modelId).efforts ?? []).includes(lvl),
+                            'active': displayedModelEfforts(group.key, entry).includes(lvl),
                             'is-custom': getEffectiveModelParams(group.key, entry.key, entry.modelId).hasEffortsListOverride,
                             'is-undeclared': childEffortUndeclared(entry, lvl),
                           }"
@@ -2335,10 +2222,10 @@ onUnmounted(() => {
                           v-if="getEffectiveModelParams(group.key, entry.key, entry.modelId).hasEffortsListOverride"
                           type="button"
                           class="sub-effort-reset-btn"
-                          :title="modelIdentityMode ? '恢复继承父级思考级别筛选' : '清除自定义思考级别筛选'"
+                          title="清除该项覆盖，恢复目录/父级默认"
                           @click="setChildEffortsInherited(entry)"
                         >
-                          {{ modelIdentityMode ? '恢复继承' : '清除自定义' }}
+                          恢复默认
                         </button>
                       </div>
                     </div>
@@ -2349,10 +2236,10 @@ onUnmounted(() => {
                         v-if="getEffectiveModelParams(group.key, entry.key, entry.modelId).isOverridden"
                         type="button"
                         class="row-reset-btn"
-                        :title="modelIdentityMode ? '重置所有项为继承父级' : '清除当前模型的自定义参数'"
+                        title="清除该模型自定义，恢复目录/父级默认"
                         @click="resetChildOverride(entry)"
                       >
-                        {{ modelIdentityMode ? '重置为继承' : '清除自定义' }}
+                        恢复默认
                       </button>
                     </div>
                   </div>
@@ -3454,6 +3341,12 @@ onUnmounted(() => {
   line-height: 1.5;
   color: var(--muted);
   white-space: nowrap;
+}
+
+.model-cap-badge.is-catalog {
+  border-color: color-mix(in srgb, var(--brand) 55%, var(--line));
+  color: var(--brand);
+  background: color-mix(in srgb, var(--brand) 7%, transparent);
 }
 
 .model-cap-load-btn {

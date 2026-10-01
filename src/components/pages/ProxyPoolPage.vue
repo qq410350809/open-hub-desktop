@@ -6,6 +6,8 @@ import { usePreferences } from "../../composables/usePreferences";
 import { runCommand } from "../../composables/core/ipc";
 import { KERNEL_DOWNLOAD_MIRRORS } from "../../composables/useProxyPool";
 import CustomSelect from "../common/CustomSelect.vue";
+import ProxyIpBadge from "../common/ProxyIpBadge.vue";
+import { PROXY_IP_KIND_LABELS, proxyIpDetails, proxyIpKind, proxyIpSearchText } from "../../composables/proxy/proxyIpInfo";
 import type {
   ProxyChannel,
   ProxyNode,
@@ -38,6 +40,12 @@ const sourceLinks = ref("");
 const editingId = ref("");
 const selectedSource = ref("all");
 const nodeSearchQuery = ref("");
+const ipKindFilter = ref("all");
+const ipKindFilterOptions = [
+  { value: "all", text: "全部 IP 类型" },
+  ...Object.entries(PROXY_IP_KIND_LABELS).map(([value, text]) => ({ value, text })),
+  { value: "unidentified", text: "未识别" },
+];
 
 // 延迟级别过滤
 const latencyFilter = ref<"200" | "500" | "1000" | "2000" | "error" | "all">("500");
@@ -207,6 +215,7 @@ function rebuildDisplayNodes() {
   const next = store.proxyPool.value.nodes
     .filter((node) => {
       if (sName && !node.subscriptionNames.includes(sName)) return false;
+      if (ipKindFilter.value !== "all" && proxyIpKind(node) !== ipKindFilter.value) return false;
       if (query) {
         const match = [
           node.name,
@@ -216,6 +225,7 @@ function rebuildDisplayNodes() {
           node.countryName,
           node.countryCode,
           node.proxyType,
+          proxyIpSearchText(node),
         ].some((val) => val && String(val).toLowerCase().includes(query));
         if (!match) return false;
       }
@@ -721,6 +731,8 @@ const channelCandidateNodes = computed(() => {
         node.server,
         String(node.port),
         node.proxyType,
+        node.primaryIp,
+        proxyIpSearchText(node),
       ].some((value) => value && String(value).toLowerCase().includes(query));
     })
     .sort((left, right) => compareByMode(left, right, channelNodeSortMode.value));
@@ -1105,7 +1117,7 @@ function nodeDetailTitle(node: ProxyNode) {
     node.name,
     `协议：${protocolLabel(node.proxyType)}${node.udp ? " · UDP" : ""}`,
     `地址：${endpoint(node)}`,
-    node.primaryIp ? `IP：${node.primaryIp}` : "",
+    proxyIpDetails(node),
     nodeCountryLabel(node)
       ? `地区：${nodeCountryLabel(node)}${node.countryCode && node.countryCode !== "ZZ" ? ` (${node.countryCode})` : ""}`
       : "",
@@ -1150,7 +1162,7 @@ onBeforeUnmount(() => {
 });
 watch(() => store.proxyPool.value, syncSettings, { deep: false });
 watch(
-  () => [selectedSource.value, latencyFilter.value, speedFilter.value, nodeSortMode.value, nodeSearchQuery.value, store.proxyNodesRevision.value] as const,
+  () => [selectedSource.value, latencyFilter.value, speedFilter.value, ipKindFilter.value, nodeSortMode.value, nodeSearchQuery.value, store.proxyNodesRevision.value] as const,
   () => {
     rebuildDisplayNodes();
     void nextTick(scheduleInitialChunks);
@@ -1384,6 +1396,7 @@ watch(nodeViewMode, () => {
                   正在测速中…
                 </span>
                 <span v-else class="pp-channel-unset-text">未固定出口节点</span>
+                <ProxyIpBadge v-if="channel.node" :node="channel.node" />
               </div>
               <span
                 v-if="channel.node"
@@ -1484,6 +1497,14 @@ watch(nodeViewMode, () => {
             aria-label="网速范围筛选"
             @update:model-value="speedFilter = $event as any"
           />
+          <div class="pp-strip-divider" />
+          <CustomSelect
+            class="pp-strip-dropdown"
+            :options="ipKindFilterOptions"
+            :model-value="ipKindFilter"
+            aria-label="出口 IP 类型筛选"
+            @update:model-value="ipKindFilter = String($event)"
+          />
         </div>
 
         <div class="pp-strip-right">
@@ -1494,7 +1515,7 @@ watch(nodeViewMode, () => {
               v-model="nodeSearchQuery"
               class="pp-search-input"
               type="search"
-              placeholder="搜索节点名称 / IP / 地区 / 协议…"
+              placeholder="搜索名称 / IP / 地区 / ISP / ASN / 类型…"
             />
             <button
               v-if="nodeSearchQuery"
@@ -1518,6 +1539,9 @@ watch(nodeViewMode, () => {
           </button>
         </div>
       </section>
+      <p class="pp-hint-text pp-ip-info-notice">
+        测速成功后自动查询 ip-api.com（仅发送出口 IP），查询失败不影响测速；结果有缓存、仅供参考，疑似家宽不保证为住宅网络。悬浮类型标签可查看详情。
+      </p>
 
       <!-- 节点呈现区域 (Node Presentation Area) -->
       <section class="pp-nodes-section" aria-label="代理节点展示">
@@ -1568,6 +1592,7 @@ watch(nodeViewMode, () => {
               <span v-if="node.primaryIp || ipAnalysisByNode.get(node.id)?.primaryIp" class="pp-node-ip-chip">
                 {{ node.primaryIp || ipAnalysisByNode.get(node.id)?.primaryIp }}
               </span>
+              <ProxyIpBadge :node="node" />
               <span class="pp-node-source-chip">{{ nodeSourceLabel(node) }}</span>
             </div>
 
@@ -1697,6 +1722,7 @@ watch(nodeViewMode, () => {
                       <span v-if="node.primaryIp || ipAnalysisByNode.get(node.id)?.primaryIp" class="pp-node-ip-chip">
                         {{ node.primaryIp || ipAnalysisByNode.get(node.id)?.primaryIp }}
                       </span>
+                      <ProxyIpBadge :node="node" />
                       <span class="pp-node-source-chip">{{ nodeSourceLabel(node) }}</span>
                     </div>
 
@@ -1737,6 +1763,8 @@ watch(nodeViewMode, () => {
           <strong>{{
             !store.proxyPool.value.nodes.length
               ? "暂无可用代理节点，请点击右上角「导入来源」添加订阅"
+              : ipKindFilter !== 'all' || nodeSearchQuery
+                ? "没有匹配的节点，可调整 IP 类型、搜索或测速筛选条件"
               : latencyFilter === "error"
                 ? "当前来源下没有失败/超时节点"
                 : latencyFilter === "all"
@@ -1975,7 +2003,7 @@ watch(nodeViewMode, () => {
                           v-model="channelNodeQuery"
                           class="pp-search-input"
                           type="search"
-                          placeholder="搜索候选节点名称 / 地区…"
+                          placeholder="搜索名称 / IP / ISP / ASN / 类型…"
                         />
                       </div>
                       <span class="pp-candidate-count-pill">{{ channelCandidateNodes.length }} 个候选节点</span>
@@ -1999,6 +2027,7 @@ watch(nodeViewMode, () => {
                         <div class="pp-candidate-info">
                           <strong>{{ node.name }}</strong>
                           <small>{{ [nodeCountryLabel(node), endpoint(node)].filter(Boolean).join(" · ") }}</small>
+                          <ProxyIpBadge :node="node" />
                         </div>
                         <span class="pp-candidate-rate-badge" :class="channelLatencyClass(node)" title="连通延迟（ms）">
                           {{ channelLatencyText(node) }}
@@ -3200,6 +3229,12 @@ watch(nodeViewMode, () => {
   border: 1px solid var(--line);
   border-radius: var(--r-lg, 10px);
   padding: 6px 10px;
+  flex-shrink: 0;
+}
+
+.pp-ip-info-notice {
+  margin: 0;
+  padding: 0 4px;
   flex-shrink: 0;
 }
 

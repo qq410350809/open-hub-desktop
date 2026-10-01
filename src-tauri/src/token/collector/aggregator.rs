@@ -429,6 +429,17 @@ pub fn collect_uncached(force: bool) -> Result<CollectedData, String> {
     for (idx, db_path) in collect_windsurf_db_paths(&home).into_iter().enumerate() {
         database_sources.push((format!("windsurf_{idx}"), "windsurf".to_string(), db_path));
     }
+    for db_path in freebuff_db_paths(&home) {
+        // 一个项目一个库：缓存键**绑定库路径**。用 `freebuff_{idx}` 这类序号键会随项目目录
+        // 增删漂移，指纹就可能落在另一个库上——若两库大小/时间恰好相同（客户端同批创建的
+        // 空库很容易如此），旧数据会被当成本库数据复用。键里同时带上路径，历史合并才拿得到
+        // 本库自己上一轮的解析结果。
+        database_sources.push((
+            format!("freebuff:{}", db_path.to_string_lossy()),
+            "freebuff".to_string(),
+            db_path,
+        ));
+    }
 
     let live_databases = database_sources
         .iter()
@@ -465,6 +476,14 @@ pub fn collect_uncached(force: bool) -> Result<CollectedData, String> {
                 "mimo" => parse_mimo_database(&path),
                 "zcode" => parse_zcode_database(&path),
                 "pi" => parse_pi_database(&path),
+                "freebuff" => parse_freebuff_database_with_history(
+                    &path,
+                    envelope
+                        .databases
+                        .get(&cache_key)
+                        .map(|cached| cached.events.as_slice())
+                        .unwrap_or_default(),
+                ),
                 "catpawai" => parse_catpawai_database(&path),
                 _ => parse_opencode_database(&path),
             };
@@ -624,7 +643,8 @@ pub fn build_token_stats(
             "sources": [
                 "codex", "claude", "command-code", "antigravity", "kiro", "dsh",
                 "opencode", "mimo", "zcode", "catpawai", "copilot", "cursor",
-                "cline", "roo-code", "continue", "aider", "zed", "goose", "windsurf", "openclaw"
+                "cline", "roo-code", "continue", "aider", "zed", "goose", "windsurf",
+                "openclaw", "pi", "workbuddy", "freebuff"
             ]
         }),
     }

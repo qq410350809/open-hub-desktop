@@ -1,6 +1,7 @@
 pub(crate) use crate::db::{read_meta, write_meta};
 use crate::models::*;
 use crate::proxypool::geoip::{classify_node_location, open_geoip_reader};
+use crate::proxypool::ip_info::parse_stored_info;
 use crate::proxypool::parser::{basic_node_config_error, sanitize_proxy_node_json, stable_id};
 use crate::proxypool::rotator::channel_candidate_nodes;
 use crate::proxypool::types::*;
@@ -148,7 +149,7 @@ pub fn load_state(database: &Database, runtime: &ProxyRuntime) -> Result<ProxyPo
                     COALESCE(n.classification, ''), COALESCE(n.primary_ip, ''),
                     COALESCE(GROUP_CONCAT(DISTINCT s.name), ''),
                     n.channel_latency_ms,
-                    COALESCE(n.channel_test_status, '')
+                    COALESCE(n.channel_test_status, ''), n.ip_info_json
              FROM proxy_pool_nodes n
              LEFT JOIN proxy_subscription_nodes sn ON sn.node_id = n.id
              LEFT JOIN proxy_subscriptions s ON s.id = sn.subscription_id
@@ -158,6 +159,8 @@ pub fn load_state(database: &Database, runtime: &ProxyRuntime) -> Result<ProxyPo
         .map_err(|error| error.to_string())?
         .query_map([], |row| {
             let names: String = row.get(15)?;
+            let primary_ip: String = row.get(14)?;
+            let ip_info_json: String = row.get(18)?;
             Ok(ProxyNode {
                 id: row.get(0)?,
                 name: row.get(1)?,
@@ -173,7 +176,8 @@ pub fn load_state(database: &Database, runtime: &ProxyRuntime) -> Result<ProxyPo
                 country_code: row.get(11)?,
                 country_name: row.get(12)?,
                 classification: row.get(13)?,
-                primary_ip: row.get(14)?,
+                ip_info: parse_stored_info(&ip_info_json, &primary_ip),
+                primary_ip,
                 channel_latency_ms: row.get(16)?,
                 channel_test_status: row.get(17)?,
                 subscription_names: names
@@ -203,7 +207,7 @@ pub fn load_state(database: &Database, runtime: &ProxyRuntime) -> Result<ProxyPo
             if node.classification.trim().is_empty() || node.classification == "unresolved" {
                 node.classification = class;
             }
-            if node.primary_ip.trim().is_empty() && !ip.is_empty() {
+            if node.tested_at.is_empty() && node.primary_ip.trim().is_empty() && !ip.is_empty() {
                 node.primary_ip = ip;
             }
             let _ = connection.execute(

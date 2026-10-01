@@ -216,7 +216,7 @@ fn compare_snapshots(actual: &ToolConfigSnapshot, expected: &ToolConfigSnapshot)
         .chain(actual_providers.keys())
         .copied()
         .collect();
-    let model_limits = |snapshot: &ToolConfigSnapshot| -> BTreeMap<String, (String, u64, u64)> {
+    let model_limits = |snapshot: &ToolConfigSnapshot| -> BTreeMap<String, (String, u64, u64, String)> {
         snapshot
             .models
             .iter()
@@ -224,7 +224,12 @@ fn compare_snapshots(actual: &ToolConfigSnapshot, expected: &ToolConfigSnapshot)
             .map(|m| {
                 (
                     m.id.clone(),
-                    (m.name.clone(), m.context_window, m.max_output),
+                    (
+                        m.name.clone(),
+                        m.context_window,
+                        m.max_output,
+                        m.reasoning_effort.clone(),
+                    ),
                 )
             })
             .collect()
@@ -247,6 +252,13 @@ fn compare_snapshots(actual: &ToolConfigSnapshot, expected: &ToolConfigSnapshot)
                         "模型「{id}」的最大输出不一致：当前 {}，清单为 {}",
                         show_limit(have.2),
                         show_limit(want.2)
+                    ));
+                }
+                if have.3 != want.3 {
+                    out.push(format!(
+                        "模型「{id}」的默认思考级别不一致：当前 {}，清单为 {}",
+                        show(&have.3),
+                        show(&want.3)
                     ));
                 }
             }
@@ -716,6 +728,7 @@ mod tests {
                     provider: "openhub-gateway".into(),
                     context_window: 200_000,
                     max_output: 32_000,
+                    reasoning_effort: "max".into(),
                 }],
                 defaults: DefaultsSection {
                     model: "openhub-gateway/alias/m1".into(),
@@ -786,6 +799,30 @@ mod tests {
             report.entries[0].differences
         );
 
+        // 只改逐模型默认思考级别 → 也必须报出差异（本次新增的比对维度）。
+        let mut changed = patch.clone();
+        changed.models[0].reasoning_effort = "high".into();
+        let report = diff_targets(
+            &OpencodeAdapter,
+            &home,
+            &[ToolDiffTarget {
+                key: WHOLE_KEY.into(),
+                patch: changed,
+            }],
+        )
+        .unwrap();
+        assert!(
+            !report.entries[0].consistent,
+            "改了逐模型默认档必须判为不一致"
+        );
+        assert!(
+            report.entries[0]
+                .differences
+                .iter()
+                .any(|d| d.contains("默认思考级别")),
+            "{:?}",
+            report.entries[0].differences
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -833,6 +870,9 @@ mod tests {
                         id: provider_model.into(),
                         name: model.into(),
                         provider: "openhub-gateway".into(),
+                        // 逐模型默认思考级别随 patch 下发；只有 OpenCode 会读回，
+                        // 其它适配器两侧恒为空、不得因此产生假漂移。
+                        reasoning_effort: "max".into(),
                         ..Default::default()
                     }],
                     defaults: DefaultsSection {

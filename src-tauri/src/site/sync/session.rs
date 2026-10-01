@@ -1375,32 +1375,55 @@ end run
     let _ = run_osascript_with_deadline(command, Duration::from_secs(10));
 }
 
+/// 把可选的站点 URL 换算成标签清理作用域前缀（`origin/`）。
+/// `None`/空串 → 空串（全局清理语义）。以 `/` 结尾可避免同主机不同端口的误匹配。
+fn chrome_sync_tab_scope_prefix(scope_url: Option<&str>) -> Result<String, String> {
+    match scope_url {
+        Some(url) if !url.trim().is_empty() => {
+            let parsed = validated_external_url(url)?;
+            Ok(format!("{}/", parsed.origin().ascii_serialization()))
+        }
+        _ => Ok(String::new()),
+    }
+}
+
+/// 关闭 OpenHub 同步遗留的桥接标签。
+///
+/// `scope_url` 为 `Some` 时只清理该站点 origin 下的标签——多站点并行同步时
+/// 必须按站点作用域清理，否则一个站点收尾会关掉其他站点仍在使用的桥接标签。
+/// `None` 保持旧的全局清理语义（强制停止、弹窗关闭时全部收尾）。
 #[cfg(target_os = "macos")]
-fn close_openhub_sync_tabs() -> Result<(), String> {
+fn close_openhub_sync_tabs(scope_url: Option<&str>) -> Result<(), String> {
+    let scope_prefix = chrome_sync_tab_scope_prefix(scope_url)?;
     const SCRIPT: &str = r##"
-if application "Google Chrome" is not running then return
-set targetMarkers to {"#openhub-sync-", "#openhub-models-", "#openhub-background-", "#openhub-silent-"}
-tell application "Google Chrome"
-    repeat with windowIndex from (count of windows) to 1 by -1
-        try
-            repeat with tabIndex from (count of tabs of window windowIndex) to 1 by -1
-                try
-                    set browserTab to tab tabIndex of window windowIndex
-                    set tabUrl to URL of browserTab
-                    repeat with targetMarker in targetMarkers
-                        if tabUrl contains (targetMarker as text) then
-                            close browserTab
-                            exit repeat
+on run argv
+    set scopePrefix to item 1 of argv
+    if application "Google Chrome" is not running then return
+    set targetMarkers to {"#openhub-sync-", "#openhub-models-", "#openhub-background-", "#openhub-silent-"}
+    tell application "Google Chrome"
+        repeat with windowIndex from (count of windows) to 1 by -1
+            try
+                repeat with tabIndex from (count of tabs of window windowIndex) to 1 by -1
+                    try
+                        set browserTab to tab tabIndex of window windowIndex
+                        set tabUrl to URL of browserTab
+                        if (scopePrefix is "") or (tabUrl starts with scopePrefix) then
+                            repeat with targetMarker in targetMarkers
+                                if tabUrl contains (targetMarker as text) then
+                                    close browserTab
+                                    exit repeat
+                                end if
+                            end repeat
                         end if
-                    end repeat
-                end try
-            end repeat
-        end try
-    end repeat
-end tell
+                    end try
+                end repeat
+            end try
+        end repeat
+    end tell
+end run
 "##;
     let mut command = Command::new("/usr/bin/osascript");
-    command.args(["-e", SCRIPT]);
+    command.args(["-e", SCRIPT, "--", &scope_prefix]);
     let output = run_osascript_with_deadline(command, Duration::from_secs(10))
         .map_err(|error| format!("无法调用 Chrome 标签清理自动化：{error}"))?;
     if output.status.success() {
@@ -1416,13 +1439,13 @@ end tell
 }
 
 #[cfg(not(target_os = "macos"))]
-fn close_openhub_sync_tabs() -> Result<(), String> {
+fn close_openhub_sync_tabs(_scope_url: Option<&str>) -> Result<(), String> {
     Ok(())
 }
 
 #[cfg_attr(feature = "desktop", tauri::command)]
-pub async fn close_chrome_sync_tabs() -> Result<(), String> {
-    spawn_blocking(close_openhub_sync_tabs)
+pub async fn close_chrome_sync_tabs(scope_url: Option<String>) -> Result<(), String> {
+    spawn_blocking(move || close_openhub_sync_tabs(scope_url.as_deref()))
         .await
         .map_err(|error| format!("清理 Chrome 同步标签任务失败：{error}"))?
 }
@@ -2939,6 +2962,25 @@ mod tests {
             chrome_tab_id_from_pending("__OPENHUB_TAB_PENDING__:1; quit"),
             None
         );
+    }
+
+    #[test]
+    fn scopes_sync_tab_cleanup_to_site_origin() {
+        // 作用域前缀以 origin + "/" 结尾：同主机不同端口的站点不会被误清。
+        assert_eq!(
+            chrome_sync_tab_scope_prefix(Some("https://example.com/console/personal")).unwrap(),
+            "https://example.com/"
+        );
+        assert_eq!(
+            chrome_sync_tab_scope_prefix(Some("https://example.com:8443/dashboard")).unwrap(),
+            "https://example.com:8443/"
+        );
+        // None/空串 → 空串（全局清理语义，强制停止与关闭弹窗使用）。
+        assert_eq!(chrome_sync_tab_scope_prefix(None).unwrap(), "");
+        assert_eq!(chrome_sync_tab_scope_prefix(Some("  ")).unwrap(), "");
+        // 非 http(s) 或残缺地址直接拒绝，避免把无意义字符串当作清理范围。
+        assert!(chrome_sync_tab_scope_prefix(Some("not a url")).is_err());
+        assert!(chrome_sync_tab_scope_prefix(Some("ftp://example.com/x")).is_err());
     }
 
     #[test]

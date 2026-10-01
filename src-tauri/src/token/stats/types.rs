@@ -10,7 +10,9 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 pub const CATPAWAI_SOURCE: &str = "catpawai";
-pub const ACTIVITY_CACHE_VERSION: u32 = 8;
+/// v9：`RequestHealthReport` 的多词字段（by_source / preceding_buckets）读写键名不一致，
+/// 历史缓存里的「按来源汇总」恒为空数组；修正后必须整体重扫一次，汇总才会基于全量历史重建。
+pub const ACTIVITY_CACHE_VERSION: u32 = 9;
 pub const ACTIVITY_CACHE_TTL: Duration = Duration::from_secs(15);
 pub const TOKEN_COLLECT_INTERVAL: Duration = Duration::from_secs(20);
 
