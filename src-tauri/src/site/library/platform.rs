@@ -39,7 +39,9 @@ pub(crate) fn canonical_platform(raw: &str) -> String {
         "geminicli" => "gemini-cli".into(),
         "antigravity" => "antigravity".into(),
         "cliproxyapi" | "cpa" | "cliproxapi" => "cliproxyapi".into(),
-        "pipiwang" | "pipi" | "pipizhihui" => "pipiwang".into(),
+        // 「白与黑」解析方法待补：先只占位一个规范名，别让它落进未知架构，
+        // 站点类型下拉里能选到、也不会被当成 NewAPI 系误判。
+        "baiheibai" | "baiyuhe" | "hybgzs" => "baiheibai".into(),
         _ => String::new(),
     }
 }
@@ -70,6 +72,39 @@ pub(crate) fn is_sub2api(system_type: &str) -> bool {
     is_platform(system_type, "sub2api")
 }
 
+/// 该站点架构是否用「访问令牌」鉴权。
+///
+/// 只有 NewAPI 刷新令牌形态（`newapi2`）与已适配令牌的自定义架构（白与黑）
+/// 才谈得上访问令牌：Cookie 形态（`new-api` / `done-hub` / `one-hub` 等）
+/// 的鉴权只有浏览器会话 Cookie，给它挂令牌字段只会让人误以为填了就能生效。
+/// 站点健康度同样按这条判定决定要不要抓——它走的就是令牌通道。
+pub(crate) fn uses_access_token(system_type: &str) -> bool {
+    is_newapi_refresh(system_type) || is_platform(system_type, "baiheibai")
+}
+
+/// 该架构的访问令牌是否完全由用户维护（同步只能读、不能写）。
+///
+/// 「白与黑」这类已适配令牌、但还没有账号接口实现的架构，令牌是用户从站点后台
+/// 复制粘贴进来的：同步管线自己拿不到新值，任何“整行重写”都必须原样保留它，
+/// 否则用户填一次、下一次同步就被清成空串（再点开「站点令牌」就是个空输入框）。
+/// 与 newapi2 相对：那里的令牌由同步自己获取/刷新，允许同步写回、失效清空。
+pub(crate) fn access_token_is_user_owned(system_type: &str) -> bool {
+    uses_access_token(system_type) && !is_newapi(system_type)
+}
+
+/// 用户在站点表单里显式选了「未知类型」时写入的 `system_type` 值。
+///
+/// 与空串（从未设置、留给程序自动识别）是两种不同意图，必须分开：
+/// 空串会拿 Chrome Local Storage / `/api/status` 去猜架构，猜中就按该架构
+/// 走账号与 Key 流程；显式未知是用户声明「这不是任何已知架构」，此时任何
+/// 推断都不该发生——否则界面显示未知类型，弹出的却是 NewAPI 的报错。
+pub(crate) const EXPLICIT_UNKNOWN_SYSTEM_TYPE: &str = "unknown";
+
+/// 是否为用户显式设置的「未知类型」（区别于空串＝未设置、允许自动识别）。
+pub(crate) fn is_explicit_unknown(system_type: &str) -> bool {
+    system_type.trim().eq_ignore_ascii_case(EXPLICIT_UNKNOWN_SYSTEM_TYPE)
+}
+
 /// 平台的浏览器控制台页路径（站点同源、带账号 Cookie 的页面）。
 ///
 /// 浏览器桥接（账号 / Key 同步）需要打开一个同源页面执行页面内 fetch，
@@ -80,18 +115,9 @@ pub(crate) fn console_page_path(system_type: &str) -> Option<&'static str> {
         Some("/console/personal")
     } else if is_sub2api(system_type) {
         Some("/dashboard")
-    } else if is_pipiwang(system_type) {
-        Some("/profile")
     } else {
         None
     }
-}
-
-/// 皮皮智绘系（ai-image-miniprogram）：Linux.do OAuth 登录，访问令牌（JWT）
-/// 存放在浏览器 Local Storage 的 pipi_pc_token，账号接口是自有积分/签到体系，
-/// 与 NewAPI / Sub2API 都不兼容（不复用它们的 Key 与模型接口）。
-pub(crate) fn is_pipiwang(system_type: &str) -> bool {
-    is_platform(system_type, "pipiwang")
 }
 
 /// 站点系统类型是否属于已知架构（判定与前端 KNOWN_SYSTEM_TYPES 一致，
@@ -166,10 +192,6 @@ pub(crate) fn detect_platform_by_url_hint(value: &str) -> Option<&'static str> {
         if host.contains("sub2api") {
             return Some("sub2api");
         }
-        // 皮皮智绘系：站点域名固定带 pipiwang（如 img.pipiwangcom.com）。
-        if host.contains("pipiwang") {
-            return Some("pipiwang");
-        }
     }
     None
 }
@@ -218,10 +240,6 @@ fn title_hint(title: &str) -> Option<&'static str> {
     }
     if compact.contains("oneapi") {
         return Some("one-api");
-    }
-    // 皮皮智绘系站点首页标题固定为「皮皮智绘 · AI 创作」。
-    if compact.contains("皮皮智绘") || compact.contains("pipiwang") {
-        return Some("pipiwang");
     }
     None
 }
@@ -335,40 +353,6 @@ async fn probe_cliproxyapi(client: &wreq::Client, base_url: &str) -> bool {
     false
 }
 
-/// 探测皮皮智绘系（ai-image-miniprogram）专属端点：`/api/v1/pc/studio-flags`
-/// 无需认证，固定返回带 `videoEnabled` / `imageRetentionDays` 的 JSON；
-/// NewAPI / Sub2API 系站点没有该路径，命中即判定为 pipiwang。
-async fn probe_pipiwang(client: &wreq::Client, base_url: &str) -> bool {
-    let Ok(base) = Url::parse(base_url) else {
-        return false;
-    };
-    let Ok(url) = base.join("/api/v1/pc/studio-flags") else {
-        return false;
-    };
-    let Ok(response) = client
-        .get(url)
-        .header(header::USER_AGENT, "OpenHub-Desktop/0.3")
-        .timeout(Duration::from_secs(6))
-        .send()
-        .await
-    else {
-        return false;
-    };
-    if !response.status().is_success() {
-        return false;
-    }
-    let Ok(json) = response.json::<Value>().await else {
-        return false;
-    };
-    let Some(object) = json.as_object() else {
-        return false;
-    };
-    object
-        .get("videoEnabled")
-        .and_then(Value::as_bool)
-        .is_some()
-        && object.contains_key("imageRetentionDays")
-}
 
 // ---------------------------------------------------------------- 分类判定
 /// `/api/status`（success=true）区分 veloera / new-api / one-api，规则与 metapi 一致。
@@ -471,18 +455,11 @@ pub(crate) async fn detect_platform(client: &wreq::Client, base_url: &str) -> Pl
         let base_url = base_url.to_string();
         async move { probe_title(&client, &base_url).await }
     });
-    let pipiwang_job = crate::context::spawn({
-        let client = client.clone();
-        let base_url = base_url.to_string();
-        async move { probe_pipiwang(&client, &base_url).await }
-    });
-
     let status_probe = status_job.await.ok().flatten();
     let auth_me_probe = auth_me_job.await.ok().flatten();
     let models_probe = models_job.await.ok().flatten();
     let cpa_hit = cpa_job.await.ok().unwrap_or(false);
     let title = title_job.await.ok().flatten();
-    let pipiwang_hit = pipiwang_job.await.ok().unwrap_or(false);
 
     // 1) 首页 <title> 高置信提示（title-first 平台）
     if let Some(title) = title.as_deref() {
@@ -500,14 +477,6 @@ pub(crate) async fn detect_platform(client: &wreq::Client, base_url: &str) -> Pl
     if cpa_hit {
         return PlatformDetection {
             platform: Some("cliproxyapi".into()),
-            challenge: false,
-        };
-    }
-
-    // 3) 皮皮智绘系专属端点（自有积分/签到后端，先于 NewAPI 系判定）
-    if pipiwang_hit {
-        return PlatformDetection {
-            platform: Some("pipiwang".into()),
             challenge: false,
         };
     }
@@ -588,30 +557,39 @@ mod tests {
             "newapi2",
             "sub2api",
             "one-api",
-            "pipiwang",
+            "baiheibai",
         ] {
             assert!(is_known_platform(value), "{value} 应判定为已知架构");
         }
         // 归一化别名（大小写/分隔符差异）同样视为已知。
         assert!(is_known_platform("New API"));
         assert!(is_known_platform("SUB2API"));
-        assert!(is_pipiwang("pipiwang"));
-        assert!(is_pipiwang("Pipi Wang"));
-        assert!(!is_pipiwang("new-api"));
     }
 
     #[test]
-    fn pipiwang_is_detected_by_url_and_title_hints() {
-        assert_eq!(
-            detect_platform_by_url_hint("https://img.pipiwangcom.com/"),
-            Some("pipiwang")
-        );
-        assert_eq!(title_hint("皮皮智绘 · AI 创作"), Some("pipiwang"));
-        assert_eq!(
-            canonical_platform("PipiWang"),
-            "pipiwang",
-            "别名归一化后应指向 pipiwang"
-        );
+    fn only_token_authenticated_platforms_have_access_tokens() {
+        // 用访问令牌鉴权的架构：NewAPI 刷新令牌形态 + 已适配令牌的自定义架构。
+        assert!(uses_access_token("newapi2"));
+        assert!(uses_access_token("NewAPI2"));
+        assert!(uses_access_token("newapi_refresh"));
+        assert!(uses_access_token("baiheibai"));
+        // Cookie 形态没有「访问令牌」这回事：鉴权只有浏览器会话 Cookie，
+        // 给它写令牌字段只会显示「有访问令牌」而实际仍在用 Cookie 同步。
+        for cookie_platform in ["new-api", "done-hub", "one-hub", "one-api", "veloera", "anyrouter"] {
+            assert!(
+                !uses_access_token(cookie_platform),
+                "{cookie_platform} 是 Cookie 形态，不该有访问令牌"
+            );
+        }
+        assert!(!uses_access_token(""));
+        assert!(!uses_access_token("unknown"));
+        // 令牌归用户所有：同步整行重写时必须原样保留（白与黑）。
+        assert!(access_token_is_user_owned("baiheibai"));
+        assert!(access_token_is_user_owned("hybgzs"));
+        // newapi2 的令牌由同步自己获取与刷新，允许同步写回、失效清空。
+        assert!(!access_token_is_user_owned("newapi2"));
+        assert!(!access_token_is_user_owned("new-api"));
+        assert!(!access_token_is_user_owned(""));
     }
 
     #[test]

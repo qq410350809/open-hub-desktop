@@ -4,8 +4,9 @@ import { icons } from "../../icons";
 import { formatDate, formatRateLimit, logoText } from "../../utils";
 import { useStore } from "../../composables/useStore";
 import TagList from "../common/TagList.vue";
+import SiteTokenEditor from "./SiteTokenEditor.vue";
 import type { ChromeSessionInfo, SiteRecord } from "../../types";
-import { isUnknownSystemType, normalizeSystemType, supportsKeyDiscovery, systemTypeLabel } from "../../types";
+import { isUnknownSystemType, normalizeSystemType, supportsKeyDiscovery, supportsSiteToken, systemTypeLabel } from "../../types";
 
 const props = defineProps<{
   site: SiteRecord;
@@ -86,6 +87,11 @@ function accountQuota(session: ChromeSessionInfo): string {
     maximumFractionDigits: 2,
   }).format(session.remaining);
   return session.unit ? `${amount} ${session.unit}` : amount;
+}
+
+/** 令牌保存/清除后刷新用量数据，让卡片上的「有/无访问令牌」立刻跟着变。 */
+async function onTokenSaved() {
+  await store.loadLibrary();
 }
 
 // —— ⋯ 更多操作菜单 ——
@@ -397,6 +403,15 @@ onUnmounted(() => {
             <span v-if="session.username" class="usage-account-username">（{{ accountIdentity(session) }}）</span>
           </strong>
           <small>
+            <!-- 自动取不到登录凭据时的兜底：账号自己维护站点令牌（现阶段仅白与黑） -->
+            <SiteTokenEditor
+              v-if="supportsSiteToken(site.systemType)"
+              :site-id="site.id"
+              :profile-id="session.profileId"
+              :account-label="session.username || accountIdentity(session)"
+              :has-token="session.hasAccessToken"
+              @saved="onTokenSaved"
+            />
             <span
               v-if="normalizeSystemType(site.systemType) === 'newapi2'"
               class="usage-account-token"

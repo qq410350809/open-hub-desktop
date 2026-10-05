@@ -510,6 +510,7 @@ impl Database {
                    WHERE LOWER(TRIM(system_type)) = 'google';",
             )
             .map_err(|error| error.to_string())?;
+        clear_baiheibai_checkin_state(&connection)?;
         Ok(Self(std::sync::Mutex::new(connection)))
     }
 
@@ -662,6 +663,29 @@ pub(crate) fn migrate_legacy_favorites_to_personal(connection: &Connection) -> R
         .execute_batch(
             "UPDATE directory_sites SET is_personal = 1 WHERE favorite = 1;
              UPDATE directory_sites SET favorite = 0 WHERE favorite <> 0;",
+        )
+        .map_err(|error| error.to_string())
+}
+
+/// 「白与黑」类型站点没有签到集成：启动时把签到相关数据清零（幂等）。
+///
+/// 历史版本曾把该架构当成 NewAPI/Sub2API 系处理，站点行带着
+/// supports_checkin/checkin_url，账号行也可能残留 checkin_enabled 等状态，
+/// 界面上会挂着「无法签到/今日未签到」的误导提示。此处一次性抹平：
+/// 之后所有签到行为（候选站点查询、状态药丸、签到地址链接）都由这些
+/// 字段驱动，清零即全部消失。
+pub(crate) fn clear_baiheibai_checkin_state(connection: &Connection) -> Result<(), String> {
+    connection
+        .execute_batch(
+            "UPDATE directory_sites
+                SET supports_checkin = 0, checkin_url = '', checkin_note = ''
+              WHERE LOWER(TRIM(system_type)) IN ('baiheibai', 'baiyuhe', 'hybgzs');
+             UPDATE site_accounts
+                SET checkin_enabled = 0, checked_in_today = 0, checkin_error = ''
+              WHERE site_id IN (
+                    SELECT id FROM directory_sites
+                     WHERE LOWER(TRIM(system_type)) IN ('baiheibai', 'baiyuhe', 'hybgzs')
+              );",
         )
         .map_err(|error| error.to_string())
 }
@@ -1290,6 +1314,16 @@ pub(crate) fn read_cached_usage_sites(
              FROM site_accounts sa
              LEFT JOIN site_model_cache smc
                ON smc.site_id = sa.site_id AND smc.profile_id = sa.profile_id
+             -- 会话不只有 Cookie：不少站点只靠 Local Storage 里的登录态工作，
+             -- Cookie 计数天然为 0。它们由「同步出来的实质数据」证明会话存在。
+             -- 三者皆无才是空行：一个 Cookie/令牌都没有、也没 Key/模型/额度，
+             -- 那只是曾经被记了一行，留着只会让人反复点出「没有可用凭据」。
+             WHERE sa.cookie_count > 0
+                OR sa.cookie_names NOT IN ('', '[]')
+                OR sa.newapi_token != ''
+                OR COALESCE(smc.keys_json, '') NOT IN ('', '[]')
+                OR COALESCE(smc.models_json, '') NOT IN ('', '[]')
+                OR sa.remaining IS NOT NULL
              UNION ALL
              SELECT smc.site_id, smc.profile_id, '' as domain, 0 as cookie_count, '[]' as cookie_names,
                     smc.profile_name, smc.account_name, smc.username,
@@ -1304,12 +1338,15 @@ pub(crate) fn read_cached_usage_sites(
              FROM site_model_cache smc
              LEFT JOIN site_accounts sa
                ON sa.site_id = smc.site_id AND sa.profile_id = smc.profile_id
-             WHERE sa.profile_id IS NULL
-               -- profile_id 为空的行是「站点级 Key 缓存」（无账号时拉取/手动管理
-               -- 的 Key），不是 Chrome 会话：吐出去会渲染成只有时间戳的幽灵账号行，
-               -- 且删除按钮对它必然空操作。
-               AND smc.profile_id != ''
-             ORDER BY 1, 2",
+              WHERE sa.profile_id IS NULL
+                -- profile_id 为空的行是「站点级 Key 缓存」（无账号时拉取/手动管理
+                -- 的 Key），不是 Chrome 会话：吐出去会渲染成只有时间戳的幽灵账号行，
+                -- 且删除按钮对它必然空操作。
+                AND smc.profile_id != ''
+                -- 同上：只有模型缓存、没有浏览器会话的行不是账号。缓存本身继续
+                -- 更新 Key 与模型，但不该在站点上渲染成「0 个 Cookie」的空账号。
+                AND (smc.keys_json NOT IN ('', '[]') OR smc.models_json NOT IN ('', '[]'))
+              ORDER BY 1, 2",
         )
         .map_err(|error| error.to_string())?;
     let rows = statement

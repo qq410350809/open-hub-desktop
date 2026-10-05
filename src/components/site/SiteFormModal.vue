@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, reactive, watch, computed, nextTick } from "vue";
 import { icons } from "../../icons";
-import { emptySite, SYSTEM_TYPES, type Maintainer, type ExtensionLink, type SiteRecord, type SiteUsageState } from "../../types";
+import { emptySite, EXPLICIT_UNKNOWN_SYSTEM_TYPE, isBaiheibaiSystem, SYSTEM_TYPES, type Maintainer, type ExtensionLink, type SiteRecord, type SiteUsageState } from "../../types";
 import { useStore } from "../../composables/useStore";
 import CustomSelect from "../common/CustomSelect.vue";
 
@@ -12,8 +12,12 @@ const registrationLevelOptions = [
   { value: 3, text: "LV3" },
 ];
 
+// 「自动识别」与「未知类型」是两回事：前者把架构判断交给程序（按浏览器里的
+// 痕迹猜，猜中就按该架构同步），后者是用户声明这个站点不属于任何已知架构，
+// 同步时不再推断、也不会报出与设置相矛盾的错误。
 const systemTypeOptions = [
-  { value: "", text: "未知类型" },
+  { value: "", text: "自动识别（未设置）" },
+  { value: EXPLICIT_UNKNOWN_SYSTEM_TYPE, text: "未知类型（不推断）" },
   ...SYSTEM_TYPES,
 ];
 
@@ -142,6 +146,20 @@ const selectedTags = computed(() =>
 );
 
 const suggestedTagsList = computed(() => store.suggestedTags.value);
+
+/** 「白与黑」没有签到集成：表单不出现签到相关项，后端保存时也会清零对应字段。 */
+const checkinFieldsVisible = computed(() => !isBaiheibaiSystem(form.systemType));
+
+watch(
+  () => form.systemType,
+  (type) => {
+    if (isBaiheibaiSystem(type)) {
+      form.supportsCheckin = false;
+      form.checkinUrl = "";
+      form.checkinNote = "";
+    }
+  },
+);
 
 function isTagSelected(tag: string): boolean {
   return selectedTags.value.includes(tag);
@@ -438,7 +456,7 @@ function onBackdropClick(event: MouseEvent) {
                 <span v-html="icons.settings" /> 功能开关
               </h3>
               <div class="feature-switches">
-                <label class="check-card">
+                <label v-if="checkinFieldsVisible" class="check-card">
                   <input v-model="form.supportsCheckin" name="supportsCheckin" type="checkbox" />
                   <i></i>
                   <span><strong>支持签到</strong><small>是否支持每日签到</small></span>
@@ -468,7 +486,7 @@ function onBackdropClick(event: MouseEvent) {
                 <span v-html="icons.link" /> 相关链接
               </h3>
               <div class="form-grid two-cols">
-                <label class="field">
+                <label v-if="checkinFieldsVisible" class="field">
                   <span>签到页 URL</span>
                   <input v-model="form.checkinUrl" name="checkinUrl" type="url" placeholder="默认 APIBaseUrl + /console/personal" />
                 </label>
@@ -476,7 +494,7 @@ function onBackdropClick(event: MouseEvent) {
                   <span>福利站 URL</span>
                   <input v-model="form.benefitUrl" name="benefitUrl" type="url" placeholder="https://…" />
                 </label>
-                <label class="field">
+                <label v-if="checkinFieldsVisible" class="field">
                   <span>签到说明</span>
                   <input v-model="form.checkinNote" name="checkinNote" placeholder="例如：每日签到送 10 刀" />
                 </label>

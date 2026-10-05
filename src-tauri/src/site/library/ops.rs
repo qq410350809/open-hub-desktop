@@ -45,6 +45,13 @@ pub(crate) fn normalize_site(mut site: SiteRecord) -> Result<SiteRecord, String>
     }
     site.api_base_url = validate_url(&site.api_base_url, "API BASE URL", true)?;
     site.system_type = canonical_system_type(&site.system_type);
+    // 「白与黑」没有签到集成：签到相关字段一律清零，杜绝 NewAPI/Sub2API 的
+    // 自动签到流程（supports_checkin → /api/user/checkin 等）套用到该架构。
+    if library::is_platform(&site.system_type, "baiheibai") {
+        site.supports_checkin = false;
+        site.checkin_url = String::new();
+        site.checkin_note = String::new();
+    }
     site.checkin_url = validate_url(&site.checkin_url, "签到页 URL", false)?;
     site.benefit_url = validate_url(&site.benefit_url, "福利站 URL", false)?;
     site.status_url = validate_url(&site.status_url, "状态页 URL", false)?;
@@ -476,29 +483,8 @@ pub(crate) fn chrome_system_probe_script(marker: &str) -> String {
       return null;
     }
   };
-  // 皮皮智绘系专属指纹：studio-flags 免登录返回 videoEnabled + imageRetentionDays。
-  const probeStudioFlags = async () => {
-    try {
-      const response = await fetch("/api/v1/pc/studio-flags", {
-        method: "GET",
-        credentials: "include",
-        cache: "no-store",
-        headers: { Accept: "application/json" },
-        signal: AbortSignal.timeout(12000)
-      });
-      const text = await response.text();
-      let hit = false;
-      try {
-        const data = JSON.parse(text);
-        hit = !!data && typeof data.videoEnabled === "boolean" && ("imageRetentionDays" in data);
-      } catch (_) {}
-      return { status: response.status, isJson: hit, hit };
-    } catch (_) {
-      return null;
-    }
-  };
-  Promise.all([probe("/api/status"), probe("/setup/status"), probeStudioFlags()])
-    .then(([newapi, sub2api, pipiwang]) => { bridge.result = { ok: true, newapi, sub2api, pipiwang }; })
+  Promise.all([probe("/api/status"), probe("/setup/status")])
+    .then(([newapi, sub2api]) => { bridge.result = { ok: true, newapi, sub2api }; })
     .catch((error) => { bridge.result = { ok: false, error: String(error) }; });
   return pending;
 })()"#
@@ -509,15 +495,6 @@ pub(crate) fn parse_chrome_system_probe(value: &str) -> Option<String> {
     let value = serde_json::from_str::<serde_json::Value>(value).ok()?;
     if value.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
         return None;
-    }
-    // 皮皮智绘系（studio-flags 命中 videoEnabled/imageRetentionDays）优先于
-    // NewAPI/Sub2API 判定：它的后端与两者都不兼容。
-    if value
-        .pointer("/pipiwang/hit")
-        .and_then(serde_json::Value::as_bool)
-        == Some(true)
-    {
-        return Some("pipiwang".to_string());
     }
     let parse = |name: &str| {
         let value = value.get(name)?;

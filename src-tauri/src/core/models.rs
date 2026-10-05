@@ -227,7 +227,12 @@ pub struct ChromeUsageScanResult {
     pub(crate) sites: Vec<sync::ChromeSiteSessionMatch>,
 }
 
-/// NewAPI `/api/perf-metrics/summary` 提供的模型健康度。
+/// 站点上报的模型健康度。
+///
+/// 两个来源（解析侧都归一到同一结构）：
+/// - NewAPI 原生 `/api/perf-metrics/summary`：逐整点序列，窗口固定 24h；
+/// - 「模型状态」增强模块 `/api/enhancements/model-status/status/all`
+///   （x666 等魔改 NewAPI 只有它）：管理员可配窗口与时间格宽，附带请求总数。
 ///
 /// 口径提醒：这是**全站聚合**数据——按模型统计所有用户近 N 小时的
 /// 成功/失败、延迟与出字速度，与「当前用户」「当前 Key」无关。所以它只能
@@ -256,25 +261,39 @@ pub struct SiteModelHealth {
     /// 统计窗口小时数。
     #[serde(default)]
     pub(crate) window_hours: i64,
-    /// 窗口起点（Unix 秒，整点）。界面按它把逐时序列对号入座到固定槽位：
-    /// 槽位数固定为 `window_hours` 个，**没有流量的整点没有数据点**，
-    /// 界面据此留灰槽——序列本身不补零，否则无法区分「无流量」与「0% 成功」。
+    /// 近窗口请求总数（站点给出时）。
+    ///
+    /// 只服务于界面「这条成功率基于多少次请求」的提示：请求量极低时成功率
+    /// 本身没有统计意义，读者需要知道分母。站点没下发就缺省，不影响判定。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) requests: Option<u64>,
+    /// 窗口起点（Unix 秒）。界面按它与 `window_hours` 把窗口等分成固定格数
+    /// （`MODEL_STATUS_SLOT_COUNT`），把序列对号入座：**没有流量的时段
+    /// 没有数据点**，界面据此留灰槽——序列本身不补零，否则无法区分
+    /// 「无流量」与「0% 成功」。
+    ///
+    /// perf-metrics 给的是整点对齐的起点；「模型状态」增强模块的时间格可以是
+    /// 30 分钟等非整点粒度，起点就是最早时间格的开始——界面按相对位置
+    /// （起点 + 格宽）定位，不需要整点。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) window_start: Option<i64>,
-    /// 逐整点成功率（0~1），只含窗口内确有流量的整点。
+    /// 逐时段成功率（0~1），只含窗口内确有流量的时段。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) series: Vec<SiteModelHealthPoint>,
 }
 
-/// 模型健康度逐时段采样点：一个整点一条。
+/// 模型健康度逐时段采样点：一个时间格一条。
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SiteModelHealthPoint {
-    /// 该采样点所属整点的 Unix 秒（站点已按整点对齐）。
+    /// 该采样点所属时间格起点的 Unix 秒（与 `window_start` 同格宽对齐）。
     pub(crate) ts: i64,
-    /// 该整点请求成功率，与顶层字段同口径，**已从 0~100 归一化到 0~1**。
+    /// 该时段请求成功率，与顶层字段同口径，**已从 0~100 归一化到 0~1**。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) success_rate: Option<f64>,
+    /// 该时段请求总数；站点没下发（perf-metrics 序列）时缺省。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) requests: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -51,6 +51,96 @@ fn migrates_legacy_favorites_to_personal_sites() {
 }
 
 #[test]
+fn clears_checkin_state_for_baiheibai_rows_on_startup() {
+    let connection = Connection::open_in_memory().unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE directory_sites (
+                id TEXT PRIMARY KEY,
+                system_type TEXT NOT NULL DEFAULT '',
+                supports_checkin INTEGER NOT NULL DEFAULT 0,
+                checkin_url TEXT NOT NULL DEFAULT '',
+                checkin_note TEXT NOT NULL DEFAULT ''
+             );
+             INSERT INTO directory_sites (id, system_type, supports_checkin, checkin_url, checkin_note) VALUES
+                ('baiheibai', 'baiheibai', 1, 'https://cdk.hybgzs.com/gas-station/checkin', '信任等级越高签到奖励越多'),
+                ('alias', 'hybgzs', 1, 'https://example.com/checkin', 'note'),
+                ('newapi', 'new-api', 1, 'https://example.com/console/personal', 'keep');
+             CREATE TABLE site_accounts (
+                site_id TEXT NOT NULL,
+                profile_id TEXT NOT NULL,
+                checkin_enabled INTEGER NOT NULL DEFAULT 0,
+                checked_in_today INTEGER NOT NULL DEFAULT 0,
+                checkin_error TEXT NOT NULL DEFAULT ''
+             );
+             INSERT INTO site_accounts (site_id, profile_id, checkin_enabled, checked_in_today, checkin_error) VALUES
+                ('baiheibai', 'p1', 1, 1, '旧错误'),
+                ('alias', 'p1', 1, 0, ''),
+                ('newapi', 'p1', 1, 1, '');",
+        )
+        .unwrap();
+
+    clear_baiheibai_checkin_state(&connection).unwrap();
+
+    let site_rows: Vec<(String, i64, String, String)> = connection
+        .prepare(
+            "SELECT id, supports_checkin, checkin_url, checkin_note
+             FROM directory_sites ORDER BY id",
+        )
+        .unwrap()
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        site_rows,
+        vec![
+            ("alias".into(), 0, "".into(), "".into()),
+            ("baiheibai".into(), 0, "".into(), "".into()),
+            (
+                "newapi".into(),
+                1,
+                "https://example.com/console/personal".into(),
+                "keep".into()
+            ),
+        ]
+    );
+
+    let account_rows: Vec<(String, i64, i64, String)> = connection
+        .prepare(
+            "SELECT site_id, checkin_enabled, checked_in_today, checkin_error
+             FROM site_accounts ORDER BY site_id",
+        )
+        .unwrap()
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        account_rows,
+        vec![
+            ("alias".into(), 0, 0, "".into()),
+            ("baiheibai".into(), 0, 0, "".into()),
+            ("newapi".into(), 1, 1, "".into()),
+        ]
+    );
+}
+
+#[test]
 fn normalizes_import_urls_to_the_site_origin() {
     assert_eq!(
         normalize_import_base_url(" https://example.com/console/?tab=1#account ")
@@ -717,6 +807,137 @@ fn save_site_model_cache_backfills_account_names() {
 }
 
 #[test]
+fn record_site_model_cache_errors_writes_back_per_account() {
+    // 回归保护：站点级同步没取到任何 Key 时，失败原因要按 profile_id 写回各自
+    // 缓存行，由界面在账号下方显示；不落到顶层，也不该凭空造出空壳账号行。
+    let connection = Connection::open_in_memory().unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE site_accounts (
+                    site_id TEXT NOT NULL,
+                    profile_id TEXT NOT NULL,
+                    profile_name TEXT NOT NULL DEFAULT '',
+                    account_name TEXT NOT NULL DEFAULT '',
+                    username TEXT NOT NULL DEFAULT ''
+                 );
+                 INSERT INTO site_accounts (site_id, profile_id, profile_name, account_name, username)
+                 VALUES ('site-ai', 'Profile 11', '吴锁明', 'qq410350809@gmail.com', 'qq410350809@gmail.com');
+                 CREATE TABLE site_model_cache (
+                    site_id TEXT NOT NULL,
+                    profile_id TEXT NOT NULL,
+                    profile_name TEXT NOT NULL DEFAULT '',
+                    account_name TEXT NOT NULL DEFAULT '',
+                    username TEXT NOT NULL DEFAULT '',
+                    api_source TEXT NOT NULL DEFAULT '',
+                    keys_json TEXT NOT NULL DEFAULT '[]',
+                    groups_json TEXT NOT NULL DEFAULT '{}',
+                    models_json TEXT NOT NULL DEFAULT '[]',
+                    key_models_json TEXT NOT NULL DEFAULT '{}',
+                    health_json TEXT NOT NULL DEFAULT '{}',
+                    error TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY (site_id, profile_id)
+                 );
+                 INSERT INTO site_model_cache (site_id, profile_id, keys_json)
+                 VALUES ('site-ai', 'Profile 11', '[\"sk-keep\"]');",
+        )
+        .unwrap();
+    let database = Database(std::sync::Mutex::new(connection));
+
+    record_site_model_cache_errors(
+        &database,
+        "site-ai",
+        &[
+            "Profile 11：旧版 NewAPI 本地 user 缺少用户 ID".to_string(),
+            // 不属于任何账号的站点级错误没有账号可挂，必须跳过。
+            "站点模型同步超过 90 秒，已强制终止".to_string(),
+        ],
+    )
+    .unwrap();
+
+    let rows: Vec<(String, String, String)> = {
+        let connection = database.0.lock().unwrap();
+        let mut statement = connection
+            .prepare(
+                "SELECT profile_id, keys_json, error FROM site_model_cache
+                  WHERE site_id='site-ai' ORDER BY profile_id",
+            )
+            .unwrap();
+        statement
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    assert_eq!(rows.len(), 1, "不该为无归属的站点级错误新增缓存行：{rows:?}");
+    assert_eq!(rows[0].0, "Profile 11");
+    assert_eq!(
+        rows[0].1, "[\"sk-keep\"]",
+        "写回失败原因时不能动已有 Key"
+    );
+    assert_eq!(rows[0].2, "旧版 NewAPI 本地 user 缺少用户 ID");
+}
+
+#[test]
+fn record_site_model_cache_errors_fills_missing_row() {
+    // 账号还没被同步过 Key（没有缓存行）时也要能显示失败原因：
+    // 按账号表补一行带展示名的记录，而不是让错误凭空消失。
+    let connection = Connection::open_in_memory().unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE site_accounts (
+                    site_id TEXT NOT NULL,
+                    profile_id TEXT NOT NULL,
+                    profile_name TEXT NOT NULL DEFAULT '',
+                    account_name TEXT NOT NULL DEFAULT '',
+                    username TEXT NOT NULL DEFAULT ''
+                 );
+                 INSERT INTO site_accounts (site_id, profile_id, profile_name, account_name, username)
+                 VALUES ('site-ai', 'Profile 15', '猫', 'wusuoming@gmail.com', '');
+                 CREATE TABLE site_model_cache (
+                    site_id TEXT NOT NULL,
+                    profile_id TEXT NOT NULL,
+                    profile_name TEXT NOT NULL DEFAULT '',
+                    account_name TEXT NOT NULL DEFAULT '',
+                    username TEXT NOT NULL DEFAULT '',
+                    api_source TEXT NOT NULL DEFAULT '',
+                    keys_json TEXT NOT NULL DEFAULT '[]',
+                    groups_json TEXT NOT NULL DEFAULT '{}',
+                    models_json TEXT NOT NULL DEFAULT '[]',
+                    key_models_json TEXT NOT NULL DEFAULT '{}',
+                    health_json TEXT NOT NULL DEFAULT '{}',
+                    error TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY (site_id, profile_id)
+                 );",
+        )
+        .unwrap();
+    let database = Database(std::sync::Mutex::new(connection));
+
+    record_site_model_cache_errors(&database, "site-ai", &["Profile 15：读取失败".to_string()])
+        .unwrap();
+
+    let (profile_name, account_name, error, keys_json): (String, String, String, String) =
+        database
+            .0
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT profile_name, account_name, error, keys_json FROM site_model_cache
+                 WHERE site_id='site-ai' AND profile_id='Profile 15'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+    assert_eq!(profile_name, "猫", "补行时未带出账号表展示名");
+    assert_eq!(account_name, "wusuoming@gmail.com");
+    assert_eq!(error, "读取失败");
+    assert_eq!(keys_json, "[]", "补行不应带任何 Key");
+}
+
+#[test]
 fn extracts_newapi_account_from_local_storage() {
     let values = HashMap::from([
         (
@@ -778,23 +999,99 @@ fn separates_newapi_cookie_and_refresh_auth_modes() {
 }
 
 #[test]
-fn browser_session_evidence_accepts_any_cookie_or_local_key() {
-    // 宽松判定：无 Cookie 且无 Local Storage 键才判“无会话”。
-    assert!(!has_browser_session_evidence("new-api", None, 0));
+fn browser_session_evidence_requires_real_login_signal() {
+    // 没有会话信息就没有这个账号：既无结构化账号数据、又无登录类 Cookie 的
+    // Chrome 配置不该被列成站点账号。
+    assert!(!has_browser_session_evidence("new-api", None, &[]));
     assert!(!has_browser_session_evidence(
         "new-api",
         Some(&HashMap::new()),
-        0
+        &[]
     ));
-    // 任意 Cookie（站点自定义会话名也算）即视为有会话。
-    assert!(has_browser_session_evidence("new-api", None, 1));
-    assert!(has_browser_session_evidence("sub2api", None, 3));
-    // Local Storage 任意已知键（残缺账号数据，如仅 status）也算。
+    // 人机验证 / 统计 Cookie 只证明访问过站点，不证明有登录会话。
+    // 人机验证 / 统计 Cookie 只证明访问过站点，不证明有登录会话。
+    // `cf_*` / `__cf*` 一律按前缀忽略：Cloudflare 会随验证方式新增名字
+    // （cf_clearance、cf_chl_*、__cf_bm、__cf_ob、__cfwaitingroom…），
+    // 逐个列名单一定会漏，所以按**包含**判定（`cf_` / `__cf` / `-cf-`）。
+    for noise in [
+        "cf_clearance",
+        "CF_CLEARANCE",
+        "cf_chl_2",
+        "__cf_bm",
+        "__cf_ob",
+        "__cfwaitingroom",
+        "x-cf-challenge",
+        "acw_tc",
+        " _cfuvid ",
+    ] {
+        assert!(
+            !has_browser_session_evidence("new-api", None, &[noise.to_string()]),
+            "{noise} 不该算会话证据"
+        );
+    }
+    // 只有噪音 Cookie 的域（真实例子：黑与白公益站的 Profile 15 只剩 __cf_ob）
+    // 不该凭空建出账号行。
+    assert!(!has_browser_session_evidence(
+        "baiheibai",
+        None,
+        &["__cf_ob".to_string(), "cf_clearance".to_string()]
+    ));
+    // Local Storage 里只有 UI 噪音键（真实例子：黑与白公益站 Profile 11
+    // 只有 iconify* 与 theme）也不算会话痕迹。
+    let ui_only = HashMap::from([
+        ("iconify7".to_string(), "[]".to_string()),
+        ("iconify11".to_string(), "[]".to_string()),
+        ("theme".to_string(), "dark".to_string()),
+    ]);
+    assert!(!has_session_storage_keys(&ui_only));
+    assert!(!has_browser_session_evidence(
+        "baiheibai",
+        Some(&ui_only),
+        &[]
+    ));
+    // 与登录有关的键仍然算（哪怕只是残缺数据，交给账号接口验证）。
+    let real = HashMap::from([
+        ("user".to_string(), "{}".to_string()),
+        ("iconify7".to_string(), "[]".to_string()),
+    ]);
+    assert!(has_session_storage_keys(&real));
+    assert!(is_session_storage_key("user"));
+    assert!(is_session_storage_key("pipi_pc_token"));
+    assert!(!is_session_storage_key("iconify13"));
+    assert!(!is_session_storage_key("THEME"));
+    // Cloudflare 的标记键也可能落进 Local Storage，同样按包含判定。
+    assert!(!is_session_storage_key("cf_clearance"));
+    assert!(!is_session_storage_key("__cf_ob"));
+    assert!(!has_browser_session_evidence(
+        "new-api",
+        None,
+        &["cf_clearance".to_string()]
+    ));
+    // 登录类 Cookie（站点自定义会话名也算）即视为有会话。
+    assert!(has_browser_session_evidence(
+        "new-api",
+        None,
+        &["session".to_string()]
+    ));
+    assert!(has_browser_session_evidence(
+        "sub2api",
+        None,
+        &["cf_clearance".to_string(), "server_name_session".to_string()]
+    ));
+    // 残缺的 Local Storage 键（只有 status 之类，解析不出账号）不算会话。
     let partial = HashMap::from([("status".to_string(), r#"{"ok":true}"#.to_string())]);
-    assert!(has_browser_session_evidence("new-api", Some(&partial), 0));
+    assert!(!has_browser_session_evidence(
+        "new-api",
+        Some(&partial),
+        &[]
+    ));
     // 结构化账号数据依旧是会话证据。
     let valid = HashMap::from([("user".into(), r#"{"id":10288,"username":"wudixm"}"#.into())]);
-    assert!(has_browser_session_evidence("NewAPI", Some(&valid), 0));
+    assert!(has_browser_session_evidence(
+        "NewAPI",
+        Some(&valid),
+        &["cf_clearance".to_string()]
+    ));
 }
 
 #[test]
@@ -1230,6 +1527,300 @@ fn normalizes_remote_optional_urls_without_rejecting_the_sync() {
 }
 
 #[test]
+fn clears_checkin_fields_for_baiheibai_sites_on_normalize() {
+    // 「白与黑」（含别名写法）没有签到集成：签到字段在所有保存路径上清零。
+    let mut site = SiteRecord::default();
+    site.name = "黑与白公益站".into();
+    site.api_base_url = "https://ai.hybgzs.com/".into();
+    site.system_type = "hybgzs".into();
+    site.supports_checkin = true;
+    site.checkin_url = "https://cdk.hybgzs.com/gas-station/checkin".into();
+    site.checkin_note = "信任等级越高签到奖励越多".into();
+
+    let site = normalize_site(site).unwrap();
+    assert_eq!(site.system_type, "baiheibai");
+    assert!(!site.supports_checkin);
+    assert_eq!(site.checkin_url, "");
+    assert_eq!(site.checkin_note, "");
+
+    // NewAPI 系的签到字段不受影响，原样保留。
+    let mut newapi = SiteRecord::default();
+    newapi.name = "示例站".into();
+    newapi.api_base_url = "https://example.com/".into();
+    newapi.system_type = "new-api".into();
+    newapi.supports_checkin = true;
+    newapi.checkin_url = "https://example.com/console/personal".into();
+    newapi.checkin_note = "每日签到".into();
+
+    let newapi = normalize_site(newapi).unwrap();
+    assert!(newapi.supports_checkin);
+    assert_eq!(newapi.checkin_url, "https://example.com/console/personal");
+    assert_eq!(newapi.checkin_note, "每日签到");
+}
+
+#[test]
+fn parses_paginated_token_lists_from_custom_backends() {
+    // GoFrame 风格分页（「白与黑」等自定义后端的常见形状）：列表在 data.list。
+    let goframe = serde_json::json!({
+        "code": 0,
+        "message": "",
+        "data": {
+            "list": [{ "id": 7, "key": "sk-abcdef123456", "status": 1 }],
+            "total": 1,
+            "page": 1,
+            "size": 10
+        }
+    });
+    assert_eq!(parse_api_keys(&goframe), vec!["sk-abcdef123456"]);
+    assert_eq!(parse_newapi_token_ids(&goframe), vec!["7"]);
+
+    // records 分页 + 掩码 Key：明文取不到时必须拿到 ID 走揭示接口。
+    let masked = serde_json::json!({
+        "code": 0,
+        "data": {
+            "records": [{ "id": "abc-1", "key": "sk-****", "status": 1 }],
+            "total": 1
+        }
+    });
+    assert!(parse_api_keys(&masked).is_empty());
+    assert_eq!(parse_newapi_token_ids(&masked), vec!["abc-1"]);
+}
+
+#[test]
+fn parses_baiheibai_slot_status_health_shape() {
+    // 取自「白与黑」真实响应：/api/model_health/slot_status?group=GLM&window=24h
+    // （data.models[].slot_data，success_rate 为 0~100 百分数、total_requests 为请求数）。
+    let payload = serde_json::json!({
+        "data": {
+            "cache_ttl": 30,
+            "enabled": true,
+            "group": "GLM",
+            "models": [{
+                "current_status": "red",
+                "display_name": "glm-5.3-flash",
+                "model_name": "glm-5.3-flash",
+                "slot_data": [
+                    { "end_time": 1791093312, "slot": 1, "start_time": 1791091512, "status": "red",
+                      "success_count": 0, "success_rate": 0, "total_requests": 2 },
+                    { "end_time": 1791095112, "slot": 2, "start_time": 1791093312, "status": "red",
+                      "success_count": 1, "success_rate": 14.29, "total_requests": 7 },
+                    { "end_time": 1791096912, "slot": 3, "start_time": 1791095112, "status": "red",
+                      "success_count": 0, "success_rate": 0, "total_requests": 1 }
+                ]
+            }]
+        },
+        "success": true
+    });
+
+    let health = parse_model_status_health(&payload);
+    let item = health
+        .get("glm-5.3-flash")
+        .expect("slot_status 应解析出模型健康度");
+    assert_eq!(item.series.len(), 3, "slot_data 应逐格转成时间序列");
+    let total: u64 = item.series.iter().filter_map(|point| point.requests).sum();
+    assert_eq!(total, 10, "请求数应随序列带回");
+    let rate = item
+        .success_rate
+        .expect("站点没给汇总时应按请求数加权算出成功率");
+    // (0*2 + 0.1429*7 + 0*1) / 10 ≈ 0.1
+    assert!((rate - 0.1).abs() < 0.001, "实际 {rate}");
+}
+
+#[test]
+fn parses_recent_success_rates_without_timestamps() {
+    // 「南梁 API」（旧版/魔改 NewAPI）只回 recent_success_rates：
+    // 0~100 的数字数组、无时间戳，上游语义为升序（最后一个最新）。
+    let payload = serde_json::json!({
+        "data": {
+            "models": [{
+                "model_name": "deepseek-v4-pro-次",
+                "avg_latency_ms": 30652,
+                "success_rate": 96.45,
+                "avg_tps": 264.16,
+                "recent_success_rates": [100, 100, 0]
+            }]
+        },
+        "success": true
+    });
+    let health = parse_perf_metrics_health(&payload, 24);
+    let item = health
+        .get("deepseek-v4-pro-次")
+        .expect("应解析出模型健康度");
+    assert_eq!(item.avg_latency_ms, Some(30652));
+    assert_eq!(item.avg_tps, Some(264.16));
+    assert_eq!(item.series.len(), 3, "recent_success_rates 应转成时间序列");
+    let rates: Vec<f64> = item
+        .series
+        .iter()
+        .map(|point| point.success_rate.expect("序列点应有成功率"))
+        .collect();
+    assert_eq!(rates, vec![1.0, 1.0, 0.0], "顺序应保持升序（旧→新）");
+    let timestamps: Vec<i64> = item.series.iter().map(|point| point.ts).collect();
+    assert!(
+        timestamps.windows(2).all(|pair| pair[1] - pair[0] == 3600),
+        "无时间戳时应按 1 小时间距铺开，实际 {timestamps:?}"
+    );
+
+    // 新版 NewAPI 的 recent_success_series 仍然优先，不受回退影响。
+    let modern = serde_json::json!({
+        "data": {
+            "models": [{
+                "model_name": "glm-5.3",
+                "recent_success_series": [
+                    {"ts": 1750003200, "success_rate": 62.5},
+                    {"ts": 1750006800, "success_rate": 100}
+                ],
+                "recent_success_rates": [1, 2]
+            }]
+        }
+    });
+    let health = parse_perf_metrics_health(&modern, 24);
+    let item = health.get("glm-5.3").unwrap();
+    assert_eq!(item.series.len(), 2);
+    assert_eq!(item.series[0].success_rate, Some(0.625));
+    assert_eq!(item.series[0].ts, 1750003200);
+}
+
+#[test]
+fn parses_perf_metrics_model_detail_series() {
+    // 「CUN.AI」逐模型明细接口 `/api/perf-metrics?model=X` 的真实形状：
+    // data.groups[].series 带 ts 与 0~100 的 success_rate。
+    let payload = serde_json::json!({
+        "data": {
+            "model_name": "glm-5.3",
+            "series_schema": "dbcd0a3c01b55203",
+            "groups": [
+                {
+                    "group": "vip",
+                    "success_rate": 50,
+                    "series": [{ "ts": 1791100800, "success_rate": 50, "avg_latency_ms": 100 }]
+                },
+                {
+                    "group": "default",
+                    "success_rate": 76.49,
+                    "series": [
+                        { "ts": 1791097200, "success_rate": 87.5, "avg_latency_ms": 1036 },
+                        { "ts": 1791100800, "success_rate": 88.88, "avg_latency_ms": 1083 },
+                        { "ts": 1791104400, "success_rate": 38.09, "avg_latency_ms": 2269 }
+                    ]
+                }
+            ]
+        },
+        "success": true
+    });
+    let series = parse_perf_metrics_model_detail(&payload);
+    assert_eq!(series.len(), 3, "应取序列最长的分组");
+    assert_eq!(series[0].ts, 1791097200);
+    assert!((series[0].success_rate.unwrap() - 0.875).abs() < 1e-9);
+    assert!((series[2].success_rate.unwrap() - 0.3809).abs() < 1e-9);
+    assert!(series.iter().all(|point| point.requests.is_none()));
+
+    // 没有分组数据（窗口内无流量）时返回空。
+    let empty = serde_json::json!({ "data": { "model_name": "x", "groups": [] } });
+    assert!(parse_perf_metrics_model_detail(&empty).is_empty());
+}
+
+#[test]
+fn parses_user_model_status_health_and_models() {
+    // 取自「Agent Router」真实响应：/api/user/model-status
+    // 心跳按等级映射槽位（ok→1.0、warn→0.6、none→留灰），
+    // 窗口汇总取 success_rate_24h，bucket_seconds 为格宽。
+    let payload = serde_json::json!({
+        "data": {
+            "generated_at": "2026-10-05T15:25:08+08:00",
+            "window_hours": 24,
+            "bucket_seconds": 1200,
+            "tiles": { "success_rate_24h": 96.54, "models_up": 7, "models_total": 7 },
+            "models": [
+                {
+                    "name": "deepseek-v4-flash",
+                    "status": "operational",
+                    "current_tier": "ok",
+                    "heartbeat": ["warn", "ok", "none", "ok"],
+                    "heartbeat_start": 1791099600,
+                    "success_rate_24h": 96.43,
+                    "avg_latency_ms": 10292
+                },
+                {
+                    "name": "claude-fable-5",
+                    "status": "no_traffic",
+                    "current_tier": "none",
+                    "heartbeat": ["none", "none"],
+                    "heartbeat_start": 1791099600,
+                    "success_rate_24h": null,
+                    "avg_latency_ms": 0
+                }
+            ]
+        },
+        "success": true
+    });
+
+    let health = parse_user_model_status_health(&payload);
+    assert_eq!(health.len(), 1, "无流量模型不应产生健康度条目");
+    let item = health.get("deepseek-v4-flash").expect("应解析出模型健康度");
+    assert_eq!(item.window_hours, 24);
+    assert_eq!(item.window_start, Some(1791099600));
+    assert!((item.success_rate.unwrap() - 0.9643).abs() < 1e-9);
+    assert_eq!(item.avg_latency_ms, Some(10292));
+    // 心跳序列：warn=0.6、ok=1.0、none 跳过（第 3 格留灰，序列里没有 ts 对应点）
+    assert_eq!(item.series.len(), 3, "none 不应产生数据点");
+    assert_eq!(item.series[0].ts, 1791099600);
+    assert!((item.series[0].success_rate.unwrap() - 0.6).abs() < 1e-9);
+    assert_eq!(item.series[1].ts, 1791099600 + 1200);
+    assert!((item.series[1].success_rate.unwrap() - 1.0).abs() < 1e-9);
+    assert_eq!(item.series[2].ts, 1791099600 + 3 * 1200, "跳过 none 后 ts 仍按原始下标");
+
+    // 模型清单同源解析（去重排序）。
+    let models = parse_user_model_status_models(&payload);
+    assert_eq!(
+        models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+        vec!["claude-fable-5", "deepseek-v4-flash"]
+    );
+
+    // 非该接口形状：返回空，不影响其它健康度通道。
+    assert!(parse_user_model_status_health(&serde_json::json!({ "success": false })).is_empty());
+    assert!(parse_user_model_status_models(&serde_json::json!({ "data": {} })).is_empty());
+}
+
+#[tokio::test]
+async fn reveal_newapi_keys_explains_why_no_token_id() {
+    let client = wreq::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .no_proxy()
+        .build()
+        .expect("测试用 HTTP 客户端");
+    let base = url::Url::parse("https://example.com/").unwrap();
+    let auth = NewApiAuth::Legacy {
+        cookie_header: String::new(),
+        user_id: String::new(),
+    };
+
+    // 站点明确失败：必须回站点自己的 message，而不是笼统的「没有令牌 ID」。
+    let denied = serde_json::json!({ "success": false, "message": "无权进行此操作" });
+    let error = reveal_newapi_keys(&client, &base, &auth, "ua", &denied)
+        .await
+        .unwrap_err();
+    assert!(error.contains("无权进行此操作"), "实际：{error}");
+
+    // 确实没有令牌：说清是空列表。
+    let empty = serde_json::json!({ "success": true, "data": { "items": [], "total": 0 } });
+    let error = reveal_newapi_keys(&client, &base, &auth, "ua", &empty)
+        .await
+        .unwrap_err();
+    assert!(error.contains("令牌列表为空"), "实际：{error}");
+
+    // 形状不认识：附原文片段便于定位（这几种分支都不发起网络请求）。
+    let weird = serde_json::json!({ "hello": "world" });
+    let error = reveal_newapi_keys(&client, &base, &auth, "ua", &weird)
+        .await
+        .unwrap_err();
+    assert!(
+        error.contains("响应形状无法识别") && error.contains("hello"),
+        "实际：{error}"
+    );
+}
+
+#[test]
 fn recognizes_supported_remote_site_systems() {
     let explicit = serde_json::json!({ "siteType": "sub2api" });
     assert_eq!(
@@ -1271,6 +1862,31 @@ fn recognizes_supported_remote_site_systems() {
 
     let unknown = serde_json::json!({ "apiBaseUrl": "https://example.com/" });
     assert!(infer_remote_system_type(unknown.as_object().unwrap()).is_empty());
+}
+
+#[test]
+fn explicit_unknown_system_type_is_not_the_same_as_unset() {
+    // 回归保护：显式选「未知类型」必须与「从未设置」区分开。
+    // 空串＝未设置，程序仍按浏览器里的痕迹自动识别架构；显式 unknown 是用户
+    // 声明「不是任何已知架构」，任何架构推断都不能发生——否则界面显示未知类型，
+    // 弹出来的却是 NewAPI 的流程与报错。
+    assert!(is_explicit_unknown("unknown"));
+    assert!(is_explicit_unknown("  UNKNOWN  "));
+    assert!(
+        !is_explicit_unknown(""),
+        "空串是未设置，必须保留自动识别能力"
+    );
+    assert!(!is_explicit_unknown("new-api"));
+    assert!(
+        !is_newapi("unknown") && !is_sub2api("unknown"),
+        "显式未知不应被当成任何已知架构"
+    );
+    assert_eq!(canonical_platform("unknown"), "");
+    assert_eq!(
+        console_page_path("unknown"),
+        None,
+        "显式未知不应被塞进 NewAPI 的控制台路径"
+    );
 }
 
 #[test]
@@ -1362,11 +1978,9 @@ fn recognizes_security_gateway_pages_without_treating_regular_html_as_a_shield()
 #[test]
 fn chrome_system_probe_requests_both_status_endpoints_in_parallel() {
     let script = chrome_system_probe_script("openhub-system-123");
-    assert!(script.contains(
-        "Promise.all([probe(\"/api/status\"), probe(\"/setup/status\"), probeStudioFlags()])"
-    ));
-    // probe() 与 probeStudioFlags() 各带一个超时声明。
-    assert_eq!(script.matches("AbortSignal.timeout(12000)").count(), 2);
+    assert!(script.contains("Promise.all([probe(\"/api/status\"), probe(\"/setup/status\")])"));
+    // 单个 probe() 带一个超时声明。
+    assert_eq!(script.matches("AbortSignal.timeout(12000)").count(), 1);
     assert!(!script.contains("http://"));
     assert!(!script.contains("https://"));
 }
@@ -1750,9 +2364,223 @@ fn perf_metrics_health_is_ignored_for_non_newapi_sites() {
     );
 }
 
+/// 「模型状态」增强模块（x666 这类没有 perf-metrics 的魔改 NewAPI）的响应体。
+///
+/// 字段口径按站点自己的前端实现：`data` 直接是模型数组，`generated_at` /
+/// `ready` 在顶层；成功率是 **0~100 的百分数**；时间格按管理员配置的
+/// `slot_minutes`（这里 30 分钟）切，`total_requests == 0` 的格子是站点
+/// 画灰的「无请求」，**不是**成功率 0%。
+fn model_status_enhancement_payload() -> serde_json::Value {
+    const WINDOW_START: i64 = 1750003200;
+    const SLOT_SECONDS: i64 = 1800;
+    let mut slots = Vec::new();
+    for index in 0..48 {
+        let start = WINDOW_START + index * SLOT_SECONDS;
+        // 第 1 个小时两格 100%/90% 各 10 次 → 加权 95%；
+        // 第 2 个小时两格全线失败；第 4 个小时两格显式 0 请求 → 该槽留灰。
+        let (rate, requests): (f64, i64) = match index {
+            0 => (100.0, 10),
+            1 => (90.0, 10),
+            2 | 3 => (0.0, 4),
+            6 | 7 => (100.0, 0),
+            _ => (98.0, 6),
+        };
+        slots.push(serde_json::json!({
+            "slot": index,
+            "start_time": start,
+            "end_time": start + SLOT_SECONDS,
+            "status": "green",
+            "total_requests": requests,
+            "success_rate": rate,
+        }));
+    }
+    serde_json::json!({
+        "success": true,
+        "generated_at": WINDOW_START + 48 * SLOT_SECONDS,
+        "ready": true,
+        "refresh_failed": false,
+        "data": [
+            {
+                "model_name": "grok-4.7",
+                "display_name": "Grok 4.7",
+                "group_name": "coding-plus",
+                "total_requests": 120,
+                "success_count": 117,
+                "error_count": 3,
+                "success_rate": 97.5,
+                "current_status": "green",
+                "recent_avg_first_response_time": 1500,
+                "recent_avg_output_token_speed": 42.5,
+                "slot_data": slots
+            },
+            {
+                // 筛掉低请求模型后仍可能回传的空壳：没有流量就不该有健康度条目。
+                "model_name": "quiet-model",
+                "total_requests": 0,
+                "success_rate": 100,
+                "slot_data": [{
+                    "slot": 0,
+                    "start_time": WINDOW_START,
+                    "end_time": WINDOW_START + SLOT_SECONDS,
+                    "status": "green",
+                    "total_requests": 0,
+                    "success_rate": 100
+                }]
+            }
+        ]
+    })
+}
+
+#[test]
+fn parses_model_status_enhancement_into_model_health() {
+    let health = parse_model_status_health(&model_status_enhancement_payload());
+    assert_eq!(
+        health.len(),
+        1,
+        "无流量模型不该产出健康度条目，实际 {:?}",
+        health.keys().collect::<Vec<_>>()
+    );
+    let grok = health.get("grok-4.7").expect("grok-4.7 缺少健康度");
+
+    // 0~100 百分数必须归一到 0~1，与 perf-metrics 保持同一口径；
+    // 按 0~1 解读会让界面只剩 0 和 100 两个值。
+    assert!(
+        (grok.success_rate.unwrap() - 0.975).abs() < 1e-12,
+        "站点发的是 97.5（百分数），应归一成 0.975，实际 {:?}",
+        grok.success_rate
+    );
+    assert_eq!(
+        grok.avg_latency_ms,
+        Some(1500),
+        "近期平均首字延迟应映射成平均延迟"
+    );
+    assert_eq!(grok.avg_tps, Some(42.5));
+    assert_eq!(
+        grok.requests,
+        Some(120),
+        "窗口请求总数要带回来，界面靠它说明成功率的分母"
+    );
+    assert_eq!(grok.window_hours, 24, "24 小时窗口");
+    assert_eq!(grok.window_start, Some(1750003200), "起点取最早时间格");
+}
+
+#[test]
+fn model_status_slots_roll_up_into_fixed_strip_buckets() {
+    let health = parse_model_status_health(&model_status_enhancement_payload());
+    let grok = health.get("grok-4.7").expect("grok-4.7 缺少健康度");
+    let series = &grok.series;
+    let base = 1750003200;
+
+    // 30 分钟的时间格必须并进固定的 24 槽：第 1 槽 (100%×10 + 90%×10)/20 = 95%，
+    // 槽内按请求数加权而不是简单平均。
+    let first = series
+        .iter()
+        .find(|point| point.ts == base)
+        .expect("首个槽位应有数据");
+    assert!(
+        (first.success_rate.unwrap() - 0.95).abs() < 1e-9,
+        "槽内应按请求数加权，实际 {:?}",
+        first.success_rate
+    );
+    assert_eq!(first.requests, Some(20));
+
+    // 全线失败的槽照实下发 0%——它与「无流量」必须是两回事。
+    let second = series
+        .iter()
+        .find(|point| point.ts == base + 3600)
+        .expect("第 2 槽应有数据");
+    assert_eq!(second.success_rate, Some(0.0));
+    assert_eq!(second.requests, Some(8));
+
+    // 显式 0 请求的两格所在槽不下发数据点 → 界面留灰，不能画成 0%。
+    assert!(
+        !series.iter().any(|point| point.ts == base + 3 * 3600),
+        "无流量槽不该被补成 0%"
+    );
+    assert_eq!(series.len(), 23, "24 槽里应恰好只有 1 个灰槽");
+
+    let timestamps = series.iter().map(|point| point.ts).collect::<Vec<_>>();
+    let mut sorted = timestamps.clone();
+    sorted.sort();
+    assert_eq!(timestamps, sorted, "序列必须按时间升序供界面按序铺槽");
+}
+
+#[test]
+fn model_status_window_follows_real_span_so_the_newest_slot_survives() {
+    // 时间格粒度管理员可配（此处 1440 分钟 = 1 天）：窗口必须按真实跨度算，
+    // 否则最近那一格会被挤出窗口——而它恰恰是用户最关心的「现在」。
+    const WINDOW_START: i64 = 1750003200;
+    const DAY: i64 = 86400;
+    let slots: Vec<serde_json::Value> = (0..7)
+        .map(|day| {
+            serde_json::json!({
+                "start_time": WINDOW_START + day * DAY,
+                "end_time": WINDOW_START + (day + 1) * DAY,
+                "total_requests": 5,
+                "success_rate": 90.0
+            })
+        })
+        .collect();
+    let payload = serde_json::json!({
+        "success": true,
+        "data": [{
+            "model_name": "glm-5.3-200k",
+            "total_requests": 35,
+            "success_rate": 90.0,
+            "slot_data": slots
+        }]
+    });
+
+    let health = parse_model_status_health(&payload);
+    let model = health
+        .get("glm-5.3-200k")
+        .expect("glm-5.3-200k 缺少健康度");
+    assert_eq!(model.window_hours, 168, "7 天跨度应是 168 小时");
+    assert_eq!(model.window_start, Some(WINDOW_START));
+    assert_eq!(
+        model.series.len(),
+        7,
+        "7 个相隔一天的时间格应落在 7 个不同的槽"
+    );
+    // 序列点的 ts 是**槽**起点而非时间格起点：最近一格落在第 20 槽，
+    // 只要它没被挤出 24 槽窗口，界面就能画出「现在」的状态。
+    let step = model.window_hours * 3600 / MODEL_STATUS_SLOT_COUNT;
+    assert!(
+        6 * DAY < 24 * step,
+        "窗口必须覆盖全部时间格，实际 step={step}"
+    );
+    assert_eq!(
+        model.series.last().map(|point| point.ts),
+        Some(WINDOW_START + (6 * DAY / step) * step),
+        "最近一格必须留在窗口内"
+    );
+}
+
+#[test]
+fn site_model_health_parser_picks_the_right_shape() {
+    // 同一个入口要能吃下两种响应：先按 perf-metrics 形状解析，
+    // 解析不出再试「模型状态」增强模块的形状，都失败才认定本站没有健康度。
+    let perf = serde_json::from_str(PERF_METRICS_SUMMARY_JSON).unwrap();
+    assert_eq!(parse_site_model_health(&perf).len(), 3);
+
+    assert_eq!(parse_site_model_health(&model_status_enhancement_payload()).len(), 1);
+
+    // 路由不存在（404 错误体）/ 未登录，一律空映射、绝不报错。
+    for payload in [
+        serde_json::json!({"message": "not found", "success": false}),
+        serde_json::json!({"message": "Unauthorized, not logged in and no access token provided", "success": false}),
+        serde_json::json!({"success": true, "data": {"models": []}}),
+    ] {
+        assert!(
+            parse_site_model_health(&payload).is_empty(),
+            "软失败形状不该产出健康度：{payload}"
+        );
+    }
+}
+
 #[test]
 fn chrome_key_models_bridge_also_fetches_perf_metrics() {
-    let script = chrome_key_models_bridge_script(true, "10288");
+    let script = chrome_key_models_bridge_script(true, "10288", "/api/token/?p=1&size=20");
     assert!(script.contains("fetch(\"/api/perf-metrics/summary?hours=24\""));
     // 健康度是纯附加信息：必须与 Key/模型分离，失败只把字段留 null。
     assert!(script.contains("health: null"));
@@ -1769,9 +2597,44 @@ fn chrome_key_models_bridge_also_fetches_perf_metrics() {
 }
 
 #[test]
-fn chrome_key_models_bridge_health_cannot_break_the_main_flow() {
-    let script = chrome_key_models_bridge_script(true, "10288");
+fn chrome_key_models_bridge_falls_back_to_model_status_module() {
+    let script = chrome_key_models_bridge_script(true, "10288", "/api/token/?p=1&size=20");
 
+    // x666 这类魔改 NewAPI 没有 perf-metrics（404 Invalid URL），桥接必须在
+    // 同一套会话里改拉「模型状态」增强模块，且顺序固定：先要登录态的全量接口
+    // （普通账号会被站点按角色拒掉），再试站点开放的公开嵌入接口。
+    let mut cursor = 0usize;
+    for path in [
+        "\"/api/enhancements/model-status/status/all\"",
+        "\"/api/enhancements/model-status/embed/status/all\"",
+    ] {
+        let index = script
+            .find(path)
+            .unwrap_or_else(|| panic!("桥接脚本缺少 {path} 的回退请求"));
+        assert!(index > cursor, "{path} 应排在上一条之后");
+        cursor = index;
+    }
+
+    // 回退只在原生接口没拿到时才发：先要 perf-metrics，失败才走增强模块。
+    let perf_fetch = script
+        .find("fetch(\"/api/perf-metrics/summary")
+        .expect("桥接脚本没有拉取性能指标");
+    assert!(
+        perf_fetch < cursor,
+        "先要原生 perf-metrics，拿不到才回退到增强模块"
+    );
+
+    // 登录态接口对普通账号可能返回 200 + success:false（x666 回「无权进行此
+    // 操作」），这种响应绝不能被存成健康度，否则界面多出一坨解析不出的空数据。
+    assert!(
+        script.contains("payload.success !== false"),
+        "桥接必须把 success:false 认成失败并继续尝试公开嵌入接口"
+    );
+}
+
+#[test]
+fn chrome_key_models_bridge_health_cannot_break_the_main_flow() {
+    let script = chrome_key_models_bridge_script(true, "10288", "/api/token/?p=1&size=20");
     // 1) 桥接只有 10s/25s 预算，健康度必须与模型并发而不是串行多一个往返，
     //    并且自带一个远小于预算的超时。
     assert!(
@@ -2023,4 +2886,10 @@ fn model_only_sync_keeps_previously_synced_health() {
     );
     assert_eq!(stored.get("claude-flaky").unwrap().success_rate, Some(0.625));
 }
+
+
+
+
+
+
 

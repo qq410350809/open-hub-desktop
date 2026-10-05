@@ -1,6 +1,7 @@
 use crate::context::home_dir;
 #[allow(unused_imports)]
 use crate::context::spawn_blocking;
+use crate::site::sync::sync::is_login_cookie_name;
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde::Serialize;
 use std::{
@@ -1654,9 +1655,12 @@ fn collect_chrome_sessions_from_home(
         if cookies.is_empty() {
             continue;
         }
+        // 只收登录类 Cookie：`cf_clearance` / `__cf_ob` 这类人机验证与风控
+        // 下发物不代表账号登录，混进名单会让卡片上多出一个空账号。
         let mut cookie_names = cookies
             .iter()
             .map(|cookie| cookie.name.clone())
+            .filter(|name| is_login_cookie_name(name))
             .collect::<Vec<_>>();
         cookie_names.sort();
         cookie_names.dedup();
@@ -1731,10 +1735,15 @@ fn read_chrome_session_from_home(
     let (database_version, cookies) =
         query_profile_cookies(&cookie_path, &profile.name, &context.url, &context.domain)?;
     if cookies.is_empty() {
-        return Err(format!(
-            "Chrome Profile「{}」中没有适用于 {} 的登录 Cookie",
-            profile.name, context.domain
-        ));
+        // 「没有 cookie」是一种结果，不是读取失败：调用方要区分「读不出来」
+        // （Profile 不存在、库被锁、解密失败）与「这个域下确实没有 cookie」，
+        // 否则界面会把没有的东西报成错误。返回空值 + 域，由调用方按「没有」展示。
+        return Ok(ChromeSessionValue {
+            domain: context.domain.clone(),
+            cookie: String::new(),
+            cookie_count: 0,
+            profile_name: profile.name.clone(),
+        });
     }
 
     let mut cookie_pairs = Vec::with_capacity(cookies.len());
@@ -1867,8 +1876,9 @@ pub(crate) fn site_sessions_from_home(
                     continue;
                 }
                 found_cookie_database = true;
-                // 待定/会话探测：只要该域名下有 Cookie 就算有浏览器会话。
-                // 不按 path / top_frame 过滤，避免漏掉登录态。
+                // 会话探测：该域名下有**登录类** Cookie 才算有浏览器会话。
+                // 只有 `cf_clearance` / `__cf_ob` 这类人机验证下发物的域不算：
+                // 它们只说明浏览器访问过站点，据此建出的账号行什么也做不了。
                 match query_profile_domain_has_cookies(&cookie_path, &profile.name, &domain) {
                     Ok(has_cookies) => {
                         successful_queries += 1;
@@ -1879,16 +1889,21 @@ pub(crate) fn site_sessions_from_home(
                                         let mut names = cookies
                                             .into_iter()
                                             .map(|cookie| cookie.name)
+                                            .filter(|name| is_login_cookie_name(name))
                                             .collect::<Vec<_>>();
                                         names.sort();
                                         names.dedup();
                                         names
                                     })
                                     .unwrap_or_default();
+                            // 过滤后什么都不剩 = 只有噪音 Cookie，不算会话。
+                            if cookie_names.is_empty() {
+                                continue;
+                            }
                             sessions.push(ChromeSessionInfo {
                                 profile_id: profile.id.clone(),
                                 domain: domain.clone(),
-                                cookie_count: cookie_names.len().max(1),
+                                cookie_count: cookie_names.len(),
                                 cookie_names,
                                 profile_name: profile.name.clone(),
                                 account_name: profile.account_name.clone(),

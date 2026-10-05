@@ -3,9 +3,9 @@ import { computed, ref, watch, nextTick } from "vue";
 import { runCommand, useLibrary } from "../../composables/useLibrary";
 import { icons } from "../../icons";
 import { useStore } from "../../composables/useStore";
-import { logoText, describeModelHealth, describeModelStatusStrip, describeModelStatusStripTitle, MODEL_STATUS_SLOT_COUNT } from "../../utils";
+import { logoText, describeModelHealth, describeModelStatusStrip, describeModelStatusStripTitle, describeModelWindowLabel, MODEL_STATUS_SLOT_COUNT } from "../../utils";
 import type { ModelHealthBadge, ModelStatusSlot } from "../../utils";
-import { isPipiwangType, isUnknownSystemType, systemTypeLabel } from "../../types";
+import { isUnknownSystemType, systemTypeLabel } from "../../types";
 import type { SiteModelHealth } from "../../types";
 import { useToast } from "../../composables/core/useToast";
 import { useConfirm } from "../../composables/ui/useConfirm";
@@ -179,6 +179,11 @@ const modelCountLabel = computed(() => {
 /** 站点是否上报过任何模型健康度；用于在面板上给出一次性的口径说明。 */
 const hasModelHealth = computed(() => Object.keys(modelHealth.value).length > 0);
 
+/** 站点是否上报过任何模型健康度：上报过就画 24 格条带。
+ *  只给汇总成功率、没给逐时段序列的（旧数据里连 series 字段都没有）条带是
+ *  24 格灰，但那是「有健康度、只是没有时段分布」，不该连条带一起藏掉。 */
+const hasStatusStrip = computed(() => Object.keys(modelHealth.value).length > 0);
+
 // 每个模型只解析一次：模板里徽标要读 level/label/title 三处，
 // 逐次调用会把同样的格式化跑三遍。
 const healthBadges = computed(() => {
@@ -194,18 +199,19 @@ function healthBadgeOf(modelId: string) {
   return healthBadges.value.get(modelId);
 }
 
-// 逐时状态条：每个模型都有一条 24 格条带——有流量的整点上色，
-// 没流量的整点留灰（模型整条没有流量就是 24 格全灰）。
-// 无数据模型没有自己的 windowStart，用同站点任一模型的窗口起点对齐，
-// 保证全灰条带和有数据条带落在同一条时间轴上。
+// 状态条：每个模型都有一条 24 格条带——有流量的时段上色，没流量的留灰
+// （模型整条没有流量就是 24 格全灰）。
+// 无数据模型没有自己的 windowStart/格宽，用同站点任一有数据模型的窗口对齐，
+// 保证全灰条带和有数据条带落在同一条时间轴上（格宽也跟着窗口走，否则
+// 7 天窗口的站点会错位）。
 const statusStrips = computed(() => {
   const strips = new Map<string, ModelStatusSlot[]>();
   const healthMap = modelHealth.value;
-  const fallbackWindowStart = Object.values(healthMap).find(
+  const fallbackHealth = Object.values(healthMap).find(
     (health) => typeof health.windowStart === "number" && (health.windowStart ?? 0) > 0,
-  )?.windowStart;
+  );
   for (const model of currentActiveModels.value) {
-    strips.set(model.id, describeModelStatusStrip(healthMap[model.id], fallbackWindowStart));
+    strips.set(model.id, describeModelStatusStrip(healthMap[model.id], fallbackHealth));
   }
   return strips;
 });
@@ -214,14 +220,20 @@ function statusStripOf(modelId: string) {
   return statusStrips.value.get(modelId) ?? [];
 }
 
-/** 状态条容器口径说明；任一健康度条目即可提供窗口小时数。 */
+/** 状态条容器口径说明；任一健康度条目即可提供窗口与格宽。 */
 const statusStripTitle = computed(() =>
   describeModelStatusStripTitle(Object.values(modelHealth.value)[0]),
 );
 
 /** 状态条可读性兜底：给 role=img 一句完整描述，供读屏而非鼠标悬停使用。 */
 const statusStripLabel = computed(
-  () => `近 24 小时逐时成功率状态条，共 ${MODEL_STATUS_SLOT_COUNT} 个时段`,
+  () =>
+    `${describeModelWindowLabel(Object.values(modelHealth.value)[0])}成功率状态条，共 ${MODEL_STATUS_SLOT_COUNT} 个时段`,
+);
+
+/** 说明段落里的窗口口径：站点窗口不是 24 小时时不能写死「近 24 小时逐时」。 */
+const healthNoteWindow = computed(() =>
+  describeModelWindowLabel(Object.values(modelHealth.value)[0]),
 );
 
 interface LocalSiteModelCache {
@@ -244,7 +256,11 @@ async function readCachedModels(siteId: string): Promise<boolean> {
     // 界面只是不显示徽标，模型列表本身不受影响。
     modelHealth.value = data.modelHealth ?? {};
     apiSource.value = data.apiSource || "none";
-    const cachedAccounts = Array.isArray(data.accounts) ? data.accounts : [];
+    const cachedAccounts = (Array.isArray(data.accounts) ? data.accounts : []).filter(
+      // 历史遗留的空壳行：既无账号归属（profileId 空）又没有任何 Key，
+      // 只是一次失败的站点级同步落下的残骸，没有「账号」可言，直接忽略。
+      (account: LiveAccountKeys) => Boolean(account.profileId) || (account.keys?.length ?? 0) > 0,
+    );
     // 账号来源 = Chrome 会话账号 ∪ 模型缓存账号，按 profileId 合并：
     // Chrome 上检测到的账号（含未同步过 Key 的）默认就展示，缓存账号
     // 则把已同步的 Key/分组/模型映射带上，覆盖同 profileId 的占位账号。
@@ -334,38 +350,49 @@ async function refreshModels(mode: "cache" | "keys" | "models" = "cache") {
       // 重新拉取各账号的 Key 列表并重建缓存（含模型映射）；
       // 仅已知架构站点提供该入口，未知站点无 Key 提取能力。
       const siteUsage = usageSites.value.find((item) => item.siteId === requestedSite.id);
-      const sessions = siteUsage?.sessions?.filter((s) => s.isValid) ?? [];
+      // 不按 isValid 过滤：isValid=0 只说明上次账号刷新没拿到登录凭据，账号行与
+      // Chrome profile 都还在，逐账号同步仍能借缓存凭据取 Key，失败原因也会按
+      // 账号落到各自的 error 上。过滤掉等于让这些账号彻底没有同步机会。
+      const sessions = siteUsage?.sessions ?? [];
       let baseUrl = requestedSite.apiBaseUrl.trim();
       if (!baseUrl.endsWith("/")) baseUrl += "/";
       if (sessions.length === 0) {
-        // 没有有效账号，尝试不带 profileId 请求。后端会借有效账号的会话抓取，
-        // 并在 result.profileId 标注 Key 的真实归属：按它落库，避免 Key
-        // 脱离账号挂到无名行；后端没给归属时才退回站点级（profileId 空串）。
+        // 站点上还没有任何账号记录，尝试不带 profileId 请求。后端会借有效账号的
+        // 会话抓取，并在 result.profileId 标注 Key 的真实归属：按它落库，避免 Key
+        // 脱离账号挂到无名行；后端没给出归属（profileId 为空）或一个 Key
+        // 都没取到时，就当作「没有」——不落库。后端已把每个账号的失败原因写回
+        // 它自己的缓存行，界面在账号下方显示「读取失败」，顶层不再挂诊断。
         try {
           const result = await runCommand<FetchSiteModelsResult>("fetch_site_models_json", {
             url: baseUrl,
             siteId: requestedSite.id,
           });
           const ownerId = result.profileId || "";
-          // 同步 Key 成功获取数据后，保存前清理掉这个站点原来的对应旧数据，避免数据冲突与旧 Key 残留
-          await runCommand("clear_site_model_cache_for_site", { siteId: requestedSite.id });
-          await runCommand("save_site_model_cache_for_account", {
-            siteId: requestedSite.id,
-            account: {
-              profileId: ownerId,
-              profileName: "",
-              accountName: "",
-              username: "",
-              keys: result.keys ?? [],
-              keyGroups: result.keyGroups ?? {},
-              keyModels: result.keyModels ?? {},
-              error: "",
-            },
-            result,
-            preserveKeys: false,
-          });
+          const keys = result.keys ?? [];
+          // 「没有」就不落库，但也不能提前 return：还得往下读缓存，
+          // 否则刚写回各账号的失败原因没机会渲染成账号下方的「读取失败」。
+          if (ownerId && keys.length > 0) {
+            // 同步 Key 成功获取数据后，保存前清理掉这个站点原来的对应旧数据，避免数据冲突与旧 Key 残留
+            await runCommand("clear_site_model_cache_for_site", { siteId: requestedSite.id });
+            await runCommand("save_site_model_cache_for_account", {
+              siteId: requestedSite.id,
+              account: {
+                profileId: ownerId,
+                profileName: "",
+                accountName: "",
+                username: "",
+                keys,
+                keyGroups: result.keyGroups ?? {},
+                keyModels: result.keyModels ?? {},
+                error: "",
+              },
+              result,
+              preserveKeys: false,
+            });
+          }
         } catch {
-          /* 忽略，继续读缓存 */
+          // 不在顶层提示：单个账号的读取失败由后端写回各账号行、在账号下方显示。
+          // 这里只是「没取到 Key」，不额外弹一条全局诊断。
         }
       } else {
         let clearedOldSiteData = false;
@@ -419,10 +446,14 @@ async function refreshModels(mode: "cache" | "keys" | "models" = "cache") {
     } else if (mode === "models") {
       // 以缓存中的 Key 集合为准逐 Key 拉取 /v1/models（含手动添加的 Key，
       // 与其它入口的「同步 Key」语义一致：不重建 Key 列表，只刷新模型映射）。
+      // 站点健康度由后端并发抓取（与 Key 是两条独立通道，任一方失败都不牵连
+      // 另一方）；这里不需要单独去拉，下面读缓存即是最新数据。
       const result = await runCommand<FetchSiteModelsResult>("sync_models_for_cached_keys", {
         siteId: requestedSite.id,
       });
       if (requestId !== liveFetchRequestId) return;
+      // 模型拉失败时后端仍会返回结果（错误在 errors 里），健康度照样跟着回来；
+      // 只有下面这行报错提示，不能因此中断后面的读缓存。
       if (result.errors?.length && liveKeyCount.value === 0) {
         liveError.value = result.errors.join("\n");
       }
@@ -430,9 +461,18 @@ async function refreshModels(mode: "cache" | "keys" | "models" = "cache") {
     await store.loadLibrary();
     const cached = await readCachedModels(requestedSite.id);
     if (requestId !== liveFetchRequestId) return;
-    if (!cached) {
+    // 已经报出具体原因（同步失败 / 无可用账号）时不再用通用文案盖掉。
+    if (!liveError.value && !cached) {
       liveError.value = "暂无本地模型数据，请先同步或手动添加 Key。";
-    } else if (liveModels.value.length === 0 && liveKeyCount.value === 0) {
+    } else if (
+      !liveError.value &&
+      liveModels.value.length === 0 &&
+      liveKeyCount.value === 0 &&
+      // 账号行已经各自显示「读取失败」时，顶层不再重复一条泛化提示。
+      // 有健康度数据时同理：那一轮模型没拉成、但健康度到了，不该整屏只报失败。
+      !liveAccountKeys.value.some((account) => account.error) &&
+      !hasModelHealth.value
+    ) {
       liveError.value = "本地同步数据中没有可用 Key 或模型。";
     }
   } catch (error) {
@@ -644,9 +684,9 @@ async function removeKey(account: LiveAccountKeys, key: string) {
               <span v-html="icons.repeat" />
               <span>{{ siteProxy ? "移除反代" : "导入反代" }}</span>
             </button>
-            <!-- 同步 Key：重新拉取站点 API Key 列表；未知架构与皮皮智绘站点（无 NewAPI Key 体系）不提供该入口 -->
+            <!-- 同步 Key：重新拉取站点 API Key 列表；未知架构站点（无 NewAPI Key 体系）不提供该入口 -->
             <button
-              v-if="site && !isUnknownSystemType(site.systemType) && !isPipiwangType(site.systemType)"
+              v-if="site && !isUnknownSystemType(site.systemType)"
               type="button"
               class="site-models-text-btn"
               :disabled="liveFetching"
@@ -762,6 +802,7 @@ async function removeKey(account: LiveAccountKeys, key: string) {
                         />
                       </div>
                       <div class="site-models-tree-children">
+                        <p v-if="account.error" class="site-models-account-error">{{ account.error }}</p>
                         <template v-if="account.keys.length > 0">
                           <div
                             v-for="(key, keyIndex) in account.keys"
@@ -804,7 +845,7 @@ async function removeKey(account: LiveAccountKeys, key: string) {
                             </button>
                           </div>
                         </template>
-                        <p v-else class="site-models-side-empty">暂无 Key</p>
+                        <p v-else-if="!account.error" class="site-models-side-empty">暂无 Key</p>
                       </div>
                     </div>
                   </template>
@@ -844,8 +885,8 @@ async function removeKey(account: LiveAccountKeys, key: string) {
               </div>
 
               <p v-if="hasModelHealth" class="site-models-health-note">
-                色条为站点上报的<b>全站</b>口径近 24 小时逐时成功率（与当前 Key
-                无关，仅作健康度参考）：绿 ≥90%，橙 50%~90%，红 &lt;50%，灰 = 该时段无流量，悬停可看具体时段；能否使用以该 Key 的模型列表为准。
+                数字徽标为<b>最近有流量时段</b>的成功率（与色条最后一个亮块一致）；色条为站点上报的<b>全站</b>口径{{ healthNoteWindow }}逐时段成功率（与当前 Key
+                无关，仅作健康度参考）：绿 ≥90%，橙 50%~90%，红 &lt;50%，灰 = 该时段无流量，悬停可看具体时段与请求量；能否使用以该 Key 的模型列表为准。
               </p>
             </div>
 
@@ -886,6 +927,9 @@ async function removeKey(account: LiveAccountKeys, key: string) {
                   <span class="site-models-item-info">
                     <span class="site-models-item-head">
                       <strong :title="model.id">{{ model.id }}</strong>
+                      <!-- 拷贝图标紧跟模型 ID：它复制的就是这段文本，
+                           放卡片最右会离复制对象太远（整卡可点，图标只是提示）。 -->
+                      <span class="site-models-item-copy" v-html="icons.copy" aria-hidden="true" />
                       <span
                         v-if="healthBadgeOf(model.id)"
                         class="site-models-item-health-value"
@@ -893,9 +937,9 @@ async function removeKey(account: LiveAccountKeys, key: string) {
                         :title="healthBadgeOf(model.id)!.title"
                       >{{ healthBadgeOf(model.id)!.label }}</span>
                     </span>
-                    <!-- 状态条：每个模型都画满 24 格——有流量的整点上色，
-                         没流量的整点留灰（模型没有任何流量时整条全灰）。 -->
-                    <span v-if="hasModelHealth" class="site-models-item-health">
+                    <!-- 状态条：每个模型都画满 24 格——有流量的时段上色，
+                         没流量的时段留灰（模型没有任何流量时整条全灰）。 -->
+                    <span v-if="hasStatusStrip" class="site-models-item-health">
                       <span
                         class="site-models-item-health-strip"
                         role="img"
@@ -912,7 +956,6 @@ async function removeKey(account: LiveAccountKeys, key: string) {
                       </span>
                     </span>
                   </span>
-                  <span class="site-models-item-copy" v-html="icons.copy" aria-hidden="true" />
                 </button>
               </div>
             </div>

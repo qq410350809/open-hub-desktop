@@ -6,13 +6,18 @@ import { useUIState } from "../ui/useUIState";
 import { useConfirm } from "../ui/useConfirm";
 import type {
   ChromeSessionInfo,
-  ChromeSessionValue,
   ChromeUsageScanResult,
   SyncLogEntry,
   SyncProgressStatus,
   SyncSitesProgress,
 } from "../../types";
-import { isNewApiCompatible, isUnknownSystemType, normalizeSystemType } from "../../types";
+import {
+  isBaiheibaiSystem,
+  isNewApiCompatible,
+  isUnknownSystemType,
+  normalizeSystemType,
+  supportsSiteToken,
+} from "../../types";
 
 const { sites, usageSites, loadLibrary } = useLibrary();
 const { showToast } = useToast();
@@ -25,7 +30,6 @@ const chromeSessionTrigger = ref<HTMLElement | null>(null);
 const chromeSessions = ref<ChromeSessionInfo[]>([]);
 const chromeSessionsLoading = ref(false);
 const chromeSessionsError = ref("");
-const chromeSessionCopyingProfileId = ref("");
 const chromeBrowserSyncingProfileId = ref("");
 const chromeModelsSyncing = ref(false);
 // 覆盖整轮同步（扫描 → 逐账号资料/Key/模型 → 清理标签页）的总开关。
@@ -164,7 +168,7 @@ interface ChromeAccountSyncOptions {
 }
 
 /**
- * 刷新单个账号的余额、签到和认证信息。
+ * 刷新单个账号的余额和认证信息（签到仅对有签到集成的架构执行）。
  * 成功返回后端回传的会话（已含最新冷却与错误状态），失败返回 null。
  */
 async function runChromeAccountSync(
@@ -176,6 +180,10 @@ async function runChromeAccountSync(
   const shouldStop = options.shouldStop ?? (() => chromeSyncForceStopped);
   if (shouldStop()) return null;
   if (!site) return null;
+  // 「白与黑」没有签到集成，日志文案不提签到，避免误导。
+  const accountScopeLabel = isBaiheibaiSystem(site.systemType)
+    ? "余额与认证信息"
+    : "余额、签到和认证信息";
   const reloadLibrary = options.reloadLibrary ?? true;
   // 只有属于当前弹窗站点的请求才更新弹窗状态（批量并行时其它站点不污染弹窗）。
   const dialogScoped = chromeSessionDialogOpen.value && chromeSessionSite.value?.id === site.id;
@@ -186,7 +194,7 @@ async function runChromeAccountSync(
   log({
     stage,
     status: "running",
-    message: `账号资料｜${accountLabel}｜正在刷新余额、签到和认证信息`,
+    message: `账号资料｜${accountLabel}｜正在刷新${accountScopeLabel}`,
   });
   if (dialogScoped) chromeBrowserSyncingProfileId.value = session.profileId;
   try {
@@ -207,7 +215,7 @@ async function runChromeAccountSync(
     log({
       stage,
       status: "success",
-      message: `账号资料｜${accountLabel}｜完成：余额、签到和认证信息已更新`,
+      message: `账号资料｜${accountLabel}｜完成：${accountScopeLabel}已更新`,
     });
     return refreshed;
   } catch (error) {
@@ -332,47 +340,6 @@ async function deleteSiteAccount(site: any, session: ChromeSessionInfo) {
   }
 }
 
-async function copyChromeSession(session: ChromeSessionInfo) {
-  const site = chromeSessionSite.value;
-  const url = site?.checkinUrl?.trim() || site?.apiBaseUrl?.trim() || "";
-  if (!url) {
-    showToast("该站点地址已失效", true);
-    appendChromeBrowserSyncLog({
-      stage: "copy-failed",
-      status: "error",
-      message: "站点地址已失效，无法读取会话",
-    });
-    return;
-  }
-  appendChromeBrowserSyncLog({
-    stage: `copy-start-${session.profileId}`,
-    status: "running",
-    message: `正在从 Chrome「${session.profileName}」读取 ${session.domain} 的 Cookie…`,
-  });
-  chromeSessionCopyingProfileId.value = session.profileId;
-  try {
-    const value = await runCommand<ChromeSessionValue>("read_chrome_session", {
-      url,
-      profileId: session.profileId,
-    });
-    await navigator.clipboard.writeText(value.cookie);
-    appendChromeBrowserSyncLog({
-      stage: `copy-start-${session.profileId}`,
-      status: "success",
-      message: `已从 Chrome「${value.profileName}」读取 ${value.domain} 的 ${value.cookieCount} 个 Cookie 并复制到剪贴板`,
-    });
-    showToast(`已从 Chrome「${value.profileName}」读取 ${value.domain} 的 ${value.cookieCount} 个 Cookie 并复制`);
-  } catch (error) {
-    appendChromeBrowserSyncLog({
-      stage: `copy-start-${session.profileId}`,
-      status: "error",
-      message: `读取 Chrome 会话失败：${String(error)}`,
-    });
-    showToast(`读取 Chrome 会话失败：${String(error)}`, true);
-  } finally {
-    chromeSessionCopyingProfileId.value = "";
-  }
-}
 
 async function closeChromeSessionDialog() {
   if (chromeBrowserSyncingProfileId.value || chromeModelsSyncing.value) {
@@ -564,6 +531,27 @@ async function syncSiteAccountBundles(
           session = refreshed;
           refreshedAccounts += 1;
         }
+      } else if (supportsSiteToken(site.systemType)) {
+        // 「令牌由用户维护」的架构（白与黑）没有浏览器凭据通道：后端会用账号行里
+        // 保存的站点令牌调站点自己的额度接口，全程不拉起 Chrome。
+        accountMode = "用站点访问令牌刷新额度";
+        log({
+          stage: `${stage}-strategy`,
+          status: "info",
+          message: `账号额度｜${accountLabel}｜使用站点访问令牌刷新额度`,
+        });
+        const refreshed = await runChromeAccountSync(session, {
+          site,
+          reloadLibrary: false,
+          log,
+          shouldStop,
+          runIdOverride: options.allocateRunId?.(),
+        });
+        accountReady = refreshed !== null;
+        if (refreshed) {
+          session = refreshed;
+          refreshedAccounts += 1;
+        }
       } else if (session.isValid) {
         reusedAccounts += 1;
         log({
@@ -702,7 +690,6 @@ export function useChromeSession() {
     chromeSessions,
     chromeSessionsLoading,
     chromeSessionsError,
-    chromeSessionCopyingProfileId,
     chromeBrowserSyncingProfileId,
     chromeModelsSyncing,
     chromeSessionSyncActive,
@@ -723,7 +710,6 @@ export function useChromeSession() {
     syncSiteAccountBundles,
     cancelAllChromeAccountSyncs,
     syncAccountViaChrome,
-    copyChromeSession,
     deleteSiteAccount,
     closeChromeSessionDialog,
     analyzeChromeUsage,

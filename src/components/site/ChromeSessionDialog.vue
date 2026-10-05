@@ -80,10 +80,6 @@ function onBackdropClick(event: MouseEvent) {
   if (event.target === event.currentTarget) close();
 }
 
-async function copySession(session: ChromeSessionInfo) {
-  await store.copyChromeSession(session);
-}
-
 async function syncViaChrome(session: ChromeSessionInfo) {
   await store.syncAccountViaChrome(session);
 }
@@ -220,15 +216,6 @@ async function openSiteInBrowser(session: ChromeSessionInfo) {
                 :disabled="store.chromeSessionSyncActive.value"
                 @click="syncViaChrome(session)"
                 v-html="icons.restore"
-              />
-              <button
-                class="copy-address"
-                type="button"
-                :aria-label="`复制 ${session.profileName} 的会话`"
-                title="复制会话"
-                :disabled="store.chromeSessionCopyingProfileId.value === session.profileId || store.chromeSessionSyncActive.value"
-                @click="copySession(session)"
-                v-html="icons.copy"
               />
             </div>
             </article>

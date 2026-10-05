@@ -319,7 +319,7 @@ async function syncAllModelKeys(
           if (!session.isValid) return false;
           // 已有 Key 的账号照旧刷新。
           if (session.apiKeyCount > 0) return true;
-          // 其余情况只在支持 Key 接口的架构上处理：未知平台与皮皮智绘纳入只会换来错误。
+          // 其余情况只在支持 Key 接口的架构上处理：未知平台纳入只会换来错误。
           if (!supportsKeyDiscovery(site.systemType)) return false;
           // 从未同步过 → 首次发现（漏掉它，账号的 Key 缓存永远是空的，Sub2API 余额
           // 只能退回会话令牌，令牌一过期整站就报 401）；上次同步失败 → 重试

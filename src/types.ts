@@ -343,18 +343,25 @@ export interface SiteModelHealth {
   avgTps?: number;
   /** 统计窗口小时数。 */
   windowHours?: number;
-  /** 窗口起点（Unix 秒，整点）。界面按它对号入座到固定槽位。 */
+  /** 近窗口请求总数。用于提示「成功率的分母是多少」，站点没下发时缺省。 */
+  requests?: number;
+  /**
+   * 窗口起点（Unix 秒）。界面按它与 `windowHours` 把窗口等分成
+   * `MODEL_STATUS_SLOT_COUNT` 格，对号入座后缺槽代表无流量。
+   */
   windowStart?: number;
-  /** 逐整点成功率（0~1）。只含窗口内确有流量的整点，缺槽代表无流量。 */
+  /** 逐时段成功率（0~1）。只含窗口内确有流量的时段，缺槽代表无流量。 */
   series?: SiteModelHealthPoint[];
 }
 
-/** 模型健康度逐时段采样点：一个整点一条。 */
+/** 模型健康度逐时段采样点：一个时间格一条。 */
 export interface SiteModelHealthPoint {
-  /** 该采样点所属整点的 Unix 秒。 */
+  /** 该采样点所属时段起点的 Unix 秒。 */
   ts: number;
-  /** 该整点请求成功率，0~1（已从站点的 0~100 归一化）。 */
+  /** 该时段请求成功率，0~1（已从站点的 0~100 归一化）。 */
   successRate?: number;
+  /** 该时段请求总数；站点没下发请求数时缺省。 */
+  requests?: number;
 }
 
 export interface SiteModelCacheAccount {
@@ -400,7 +407,7 @@ export const SYSTEM_TYPES: { value: string; text: string }[] = [
   { value: "newapi2", text: "NewAPI · 刷新令牌" },
   { value: "sub2api", text: "Sub2API" },
   { value: "one-api", text: "One API" },
-  { value: "pipiwang", text: "皮皮智绘" },
+  { value: "baiheibai", text: "白与黑" },
 ];
 
 /** 去除空白/中划线/下划线并转小写，用于跨新旧命名比较。 */
@@ -410,6 +417,7 @@ export function normalizeSystemType(raw: string): string {
 
 /** 系统类型的友好展示名（如 newapi2 → NewAPI · 刷新令牌）；未知类型回退为原始值。 */
 export function systemTypeLabel(raw: string): string {
+  if (isExplicitUnknownSystemType(raw)) return "未知类型";
   const normalized = normalizeSystemType(raw);
   const match = SYSTEM_TYPES.find(
     (item) => normalizeSystemType(item.value) === normalized,
@@ -431,6 +439,20 @@ export function isUnknownSystemType(raw: string): boolean {
   return !normalized || !KNOWN_SYSTEM_TYPES.has(normalized);
 }
 
+/**
+ * 用户在站点表单里显式选的「未知类型」写入值。
+ *
+ * 与空串（从未设置）是两种意图：空串留给程序按浏览器里的痕迹自动识别架构，
+ * 显式未知则是用户声明「这不是任何已知架构」，后端据此跳过所有架构推断，
+ * 不会拿 NewAPI 的流程和报错去套一个用户已否认的站点。
+ */
+export const EXPLICIT_UNKNOWN_SYSTEM_TYPE = "unknown";
+
+/** 是否为显式选择的「未知类型」（区别于空串＝未设置、允许自动识别）。 */
+export function isExplicitUnknownSystemType(raw: string): boolean {
+  return raw.trim().toLowerCase() === EXPLICIT_UNKNOWN_SYSTEM_TYPE;
+}
+
 /** 判断系统类型是否属于/兼容 NewAPI 架构（NewAPI / AnyRouter / One API / One Hub / Done Hub / Veloera）。 */
 export function isNewApiCompatible(raw: string): boolean {
   const normalized = normalizeSystemType(raw);
@@ -446,23 +468,37 @@ export function isNewApiCompatible(raw: string): boolean {
 }
 
 /**
- * 皮皮智绘系（自有积分/签到后端）：不兼容 NewAPI 的 Key/模型接口，
- * 同步 Key 与模型入口对其隐藏；账号同步只读积分与签到状态。
+ * 是否支持账号级「站点令牌」维护入口。
+ *
+ * 现阶段只有「白与黑」这一站点类型有：它的登录凭据不来自浏览器会话，
+ * 由用户自己把站点令牌贴进来，之后账号与 Key 同步都用它鉴权。其它架构
+ * 的凭据一律来自 Chrome 会话（Cookie / Local Storage），挂这个入口只会
+ * 让用户以为填了就能生效。
  */
-export function isPipiwangType(raw: string): boolean {
-  return normalizeSystemType(raw) === "pipiwang";
+export function supportsSiteToken(raw: string): boolean {
+  return normalizeSystemType(raw) === "baiheibai";
 }
 
 /**
- * 是否支持通过 Chrome 会话发现并同步 API Key 与模型（NewAPI 系与 Sub2API）。
+ * 是否为「白与黑」架构。
+ *
+ * 该架构没有签到集成：自动签到、签到状态展示、签到地址等一律不适用，
+ * 表单与界面据此隐藏签到相关内容（后端 normalize 也会清零对应字段）。
+ */
+export function isBaiheibaiSystem(raw: string): boolean {
+  return normalizeSystemType(raw) === "baiheibai";
+}
+
+/**
+ * 是否支持通过 Chrome 会话发现并同步 API Key 与模型（NewAPI 系、Sub2API 与「白与黑」）。
  *
  * 只有这类站点的余额/用量能走 Key 接口，所以“从未同步过 Key 的有效账号”必须纳入
  * 首次同步，否则它的 Key 缓存永远是空的：Sub2API 只能退回会话令牌，
  * 令牌一过期整站就报 401（同一站点两个 Chrome 账号一个成功、一个失败）。
- * 未知架构与皮皮智绘没有这些接口，纳入只会换来一串错误，因此排除。
+ * 未知架构没有这些接口，纳入只会换来一串错误，因此排除。
  */
 export function supportsKeyDiscovery(raw: string): boolean {
-  return isNewApiCompatible(raw) || normalizeSystemType(raw) === "sub2api";
+  return isNewApiCompatible(raw) || normalizeSystemType(raw) === "sub2api" || isBaiheibaiSystem(raw);
 }
 
 export const emptySite = (): SiteRecord => ({

@@ -228,7 +228,15 @@ pub async fn fetch_topic_body(
                         )
                     })
                     .await
-                    .map_err(|error| format!("读取 Chrome Cookie 任务失败：{error}"))??;
+                    .map_err(|error| format!("读取 Chrome Cookie 任务失败：{error}"))?
+                    // 空 Cookie = 该 profile 下这个源没有登录 Cookie，鉴权无从谈起。
+                    .and_then(|cookie| {
+                        if cookie.trim().is_empty() {
+                            Err("该 Chrome 配置下没有此源的登录 Cookie".to_string())
+                        } else {
+                            Ok(cookie)
+                        }
+                    })?;
                     let (body, protocol) =
                         request_topic_list(&client, &source_clone, Some(&cookie_header)).await?;
                     Ok::<_, String>((body, profile.name, profile.account_name, protocol))

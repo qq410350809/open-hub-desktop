@@ -33,6 +33,8 @@ import {
   formatLogTime,
   formatLogFull,
 } from "../../utils";
+import type { SiteModelCacheEntry, SiteModelHealth } from "../../types";
+import ModelHealthIndicator from "../common/ModelHealthIndicator.vue";
 import CustomSelect from "../common/CustomSelect.vue";
 import DateRangeDropdown from "../common/DateRangeDropdown.vue";
 import { API_PATH_V1, API_PATH_GEMINI, API_PATH_MESSAGES, DEFAULT_SERVICE_PORT } from "../../constants";
@@ -237,6 +239,8 @@ function handleOpenGatewayModelsModal() {
   if (Object.keys(channelModels.value).length === 0) {
     loadCachedModels();
   }
+  // 模型卡片要展示站点健康度，同一批数据顺带填各站点摘要。
+  void ensureSiteModelHealth();
 }
 
 function closeGatewayModelsModal() {
@@ -250,6 +254,8 @@ async function handleOpenChannelModelsModal(channel: ChannelConfig) {
   channelDraftKeyGroups.value = [];
   newKeyGroupName.value = "";
   channelModelsModalOpen.value = true;
+  // 模型列表要展示站点健康度。
+  void ensureSiteModelHealth();
   // Key 行通道绑定下拉需要通道候选；两路加载完成后归一化各 Key 与模型规则的通道引用（名称 → ID）
   void Promise.all([
     loadProxyPoolOptions(),
@@ -1668,6 +1674,10 @@ interface SiteCacheSummary {
 }
 const siteCacheSummaries = ref<Record<string, SiteCacheSummary>>({});
 
+/** 各站点上报的模型健康度：站点 ID → 模型 ID → 健康度。模型列表用它上色。 */
+const siteModelHealth = ref<Record<string, Record<string, SiteModelHealth>>>({});
+let siteModelHealthLoading: Promise<void> | null = null;
+
 function siteCacheSummary(siteId: string): SiteCacheSummary | undefined {
   return siteCacheSummaries.value[siteId];
 }
@@ -1675,10 +1685,9 @@ function siteCacheSummary(siteId: string): SiteCacheSummary | undefined {
 /** 一次拉取全部站点缓存，统计各站点的 Key（去重）、模型、账号数 */
 async function refreshSiteCacheSummaries() {
   try {
-    const entries = await runCommand<
-      { siteId: string; cache: { models?: unknown[]; accounts?: { keys?: string[] }[] } }[]
-    >("get_all_site_model_caches");
+    const entries = await runCommand<SiteModelCacheEntry[]>("get_all_site_model_caches");
     const next: Record<string, SiteCacheSummary> = {};
+    const health: Record<string, Record<string, SiteModelHealth>> = {};
     for (const entry of entries ?? []) {
       const keySet = new Set<string>();
       for (const account of entry.cache?.accounts ?? []) {
@@ -1692,11 +1701,83 @@ async function refreshSiteCacheSummaries() {
         modelCount: entry.cache?.models?.length ?? 0,
         accountCount: entry.cache?.accounts?.length ?? 0,
       };
+      health[entry.siteId] = entry.cache?.modelHealth ?? {};
     }
     siteCacheSummaries.value = next;
+    siteModelHealth.value = health;
   } catch {
     /* 忽略：摘要缺失时按 0 展示 */
   }
+}
+
+/**
+ * 拉取站点健康度，供三个模型列表展示成功率与时段条。
+ * 只在打开列表弹窗时触发（并发调用共享同一个请求），避免进页面就把全站
+ * 健康度 JSON 读进内存；同一批数据也已算出各站点摘要，顺带填上摘要表。
+ */
+function ensureSiteModelHealth(): Promise<void> {
+  if (siteModelHealthLoading) return siteModelHealthLoading;
+  siteModelHealthLoading = refreshSiteCacheSummaries().finally(() => {
+    siteModelHealthLoading = null;
+  });
+  return siteModelHealthLoading;
+}
+
+/** 某站点下某个模型的健康度；渠道没有关联站点时返回 undefined。 */
+function channelModelHealth(
+  channel: ChannelConfig | null | undefined,
+  model: string,
+): SiteModelHealth | undefined {
+  const siteId = channel?.siteId;
+  if (!siteId) return undefined;
+  return siteModelHealth.value[siteId]?.[model];
+}
+
+/** 同站点任一带窗口起点的健康度：给没有自身起点的条目对齐时间轴与格宽。 */
+function siteHealthFallback(channel: ChannelConfig | null | undefined): SiteModelHealth | undefined {
+  const siteId = channel?.siteId;
+  if (!siteId) return undefined;
+  const map = siteModelHealth.value[siteId];
+  if (!map) return undefined;
+  return Object.values(map).find(
+    (health) => typeof health.windowStart === "number" && (health.windowStart ?? 0) > 0,
+  );
+}
+
+/** 该渠道所属站点是否上报过任何健康度：没有则整批模型都不画条带。 */
+function siteHasModelHealth(channel: ChannelConfig | null | undefined): boolean {
+  const siteId = channel?.siteId;
+  if (!siteId) return false;
+  return Object.keys(siteModelHealth.value[siteId] ?? {}).length > 0;
+}
+
+/**
+ * 同步模型之后顺带刷新这些渠道所属站点的健康度，让列表里的成功率与时段条
+ * 跟着本次同步一起更新。健康度接口按站点登录态放行，与逐 Key 拉模型列表是
+ * 两条路，所以单独调一次；站点不支持或凭据取不到时后端返回空、这里静默跳过。
+ */
+async function refreshChannelHealth(channels: ChannelConfig[]) {
+  const siteIds = new Set<string>();
+  for (const channel of channels) {
+    if (channel.siteId) siteIds.add(channel.siteId);
+  }
+  if (siteIds.size === 0) return;
+  for (const siteId of siteIds) {
+    try {
+      await runCommand("refresh_site_model_health", { siteId });
+    } catch {
+      /* 没有健康度接口的站点跳过 */
+    }
+  }
+  // 强制重读：并发的首次加载可能还在路上，复用它会拿到同步前的数据。
+  siteModelHealthLoading = null;
+  await ensureSiteModelHealth();
+}
+
+/** 顶栏「同步模型」：拉完各渠道模型列表后顺带刷新站点健康度。 */
+async function handleRefreshModels() {
+  await refreshModels();
+  void refreshChannelHealth(proxyConfig.value.channels);
 }
 
 /** 在用且存活（未标记跑路）的站点；已转换为渠道的排除在外 */
@@ -1993,6 +2074,8 @@ async function syncAllChannelsModels() {
         : `同步完成：${failed} 个渠道拉取失败，详见同步日志`,
       failed > 0,
     );
+    // 顺带刷新这些渠道所属站点的健康度，模型列表的成功率与时段条一起更新。
+    void refreshChannelHealth(channels);
   } finally {
     allModelsSyncing.value = false;
   }
@@ -2029,6 +2112,8 @@ async function syncOneChannelModels(channel: ChannelConfig) {
         ? `${channel.name} 已同步：${result.count} 个模型（列表有变化）`
         : `${channel.name} 已同步：${result.count} 个模型`,
     );
+    // 顺带刷新该渠道所属站点的健康度。
+    void refreshChannelHealth([channel]);
   } finally {
     syncingChannelId.value = null;
   }
@@ -2054,6 +2139,8 @@ function openAllChannelsModelsDialog() {
   }
   allModelsDraft.value = draft;
   allModelsDialogOpen.value = true;
+  // 模型列表要展示站点健康度。
+  void ensureSiteModelHealth();
   // 全局模型缓存为空时读取本地缓存（同步按钮负责远程拉取）
   if (Object.keys(channelModels.value).length === 0) {
     void loadCachedModels();
@@ -4750,7 +4837,7 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
               class="mp-btn mp-btn-ghost"
               :disabled="fetchingModels"
               title="重新拉取并更新网关模型列表"
-              @click="refreshModels"
+              @click="handleRefreshModels"
             >
               <span :class="{ 'mp-spin': fetchingModels }" v-html="icons.restore" />
               <span>{{ fetchingModels ? "正在拉取…" : "刷新列表" }}</span>
@@ -4809,7 +4896,19 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
                   <div class="mp-mec-left">
                     <div class="mp-mec-title-row">
                       <span class="mp-model-free-badge">{{ channelAlias(group.channel) }}</span>
-                      <span class="mp-model-name-title">{{ model }}</span>
+                  <span class="mp-model-name-title">{{ model }}</span>
+                  <!-- 站点上报的健康度徽标；时段条放在展开面板，避免挤占单行布局 -->
+                  <ModelHealthIndicator
+                    :health="channelModelHealth(selectedChannel, model)"
+                    :fallback="siteHealthFallback(selectedChannel)"
+                    :strip="false"
+                  />
+                      <!-- 站点上报的健康度：徽标贴在模型名后，时段条另起一行 -->
+                      <ModelHealthIndicator
+                        :health="channelModelHealth(group.channel, model)"
+                        :fallback="siteHealthFallback(group.channel)"
+                        :strip="false"
+                      />
                       <span
                         v-if="(channelOverlapByModel.get(model.toLowerCase())?.length ?? 0) >= 2"
                         class="mp-overlap-badge"
@@ -4820,6 +4919,12 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
                       <span class="mp-mec-id-label">调用 ID</span>
                       <code class="mp-mec-id-code">{{ channelAlias(group.channel) }}/{{ model }}</code>
                     </div>
+                    <ModelHealthIndicator
+                      v-if="siteHasModelHealth(group.channel)"
+                      :health="channelModelHealth(group.channel, model)"
+                      :fallback="siteHealthFallback(group.channel)"
+                      :badge="false"
+                    />
                   </div>
 
                   <div class="mp-mec-right">
@@ -5058,6 +5163,18 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
 
                 <!-- 展开面板：一行一项低频配置（点击面板不触发行展开/收起与勾选） -->
                 <div v-if="isModelExpanded(model)" class="mp-mcm-detail" @click.stop>
+                  <div v-if="siteHasModelHealth(selectedChannel)" class="mp-mcm-field">
+                    <span class="mp-mcm-field-label" title="站点上报的全站口径逐时段成功率（与具体 Key 无关，仅作健康度参考）">
+                      健康度
+                    </span>
+                    <div class="mp-mcm-field-control">
+                      <ModelHealthIndicator
+                        :health="channelModelHealth(selectedChannel, model)"
+                        :fallback="siteHealthFallback(selectedChannel)"
+                        :badge="false"
+                      />
+                    </div>
+                  </div>
                   <div class="mp-mcm-field">
                     <span
                       class="mp-mcm-field-label"
@@ -6100,6 +6217,13 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
                     <span v-html="isAllModelChecked(group.channel.id, model) ? icons.check : ''" />
                   </span>
                   <span class="mp-all-models-item-name">{{ model }}</span>
+                  <ModelHealthIndicator
+                    v-if="siteHasModelHealth(group.channel)"
+                    stacked
+                    class="mp-all-models-item-health"
+                    :health="channelModelHealth(group.channel, model)"
+                    :fallback="siteHealthFallback(group.channel)"
+                  />
                 </button>
               </div>
               <div v-else class="mp-group-empty-note text-muted text-xs">
@@ -8745,6 +8869,9 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
   gap: 8px;
 }
 
+/* 状态条按固定高宽比绘制：卡片很宽时不限宽会变得过高，只保留可读的一段。 */
+.mp-mec-left :deep(.site-models-item-health) { max-width: 280px; }
+
 .mp-model-free-badge {
   font-size: 10px;
   font-weight: 800;
@@ -9005,6 +9132,9 @@ button.mp-mec-check:focus-visible {
   flex: 1;
   min-width: 0;
 }
+
+/* 展开面板里的健康度条带同样限宽，条带过高会挤掉同列其它字段。 */
+.mp-mcm-field-control :deep(.site-models-item-health) { max-width: 320px; }
 
 .mp-mcm-id-code {
   display: inline-flex;
@@ -10421,6 +10551,7 @@ button.mp-mec-check:focus-visible {
   display: flex;
   align-items: center;
   gap: 8px;
+  flex-wrap: wrap;
   padding: 7px 10px;
   border-radius: 8px;
   border: 1px solid var(--line);
@@ -10428,6 +10559,12 @@ button.mp-mec-check:focus-visible {
   cursor: pointer;
   text-align: left;
   transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+/* 健康度块独占一行：模型名再长也只在自己的行里省略，不压缩 24 格状态条。 */
+.mp-all-models-item-health {
+  flex: 1 0 100%;
+  margin-top: 2px;
 }
 
 .mp-all-models-item:hover {

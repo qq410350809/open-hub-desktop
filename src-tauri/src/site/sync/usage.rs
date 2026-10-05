@@ -3,16 +3,117 @@ use crate::db::*;
 use crate::models::*;
 use crate::proxypool;
 use crate::site::library::{
-    is_known_platform, is_newapi, is_newapi_refresh, is_pipiwang, is_sub2api,
+    access_token_is_user_owned, is_explicit_unknown, is_known_platform, is_newapi,
+    is_newapi_refresh, is_platform, is_sub2api, uses_access_token,
 };
 use crate::site::sync;
 use crate::site::sync::*;
 use rusqlite::{params, OptionalExtension};
+use serde::Serialize;
 use serde_json;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use url::Url;
+
+/// 读取某账号已保存的站点令牌，供「设置站点令牌」回填。
+///
+/// 明文返回给调用方（界面放进密码框，默认掩码）：不回填的话用户打开就是空
+/// 输入框，改一个字段顺手保存就会把原令牌清掉。
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub fn get_site_account_token(
+    ctx: Managed<'_, Arc<AppContext>>,
+    site_id: String,
+    profile_id: String,
+) -> Result<SiteAccountToken, String> {
+    let database = &*ctx.database;
+    let connection = database.lock_conn()?;
+    connection
+        .query_row(
+            "SELECT newapi_token, newapi_user_id FROM site_accounts
+              WHERE site_id = ?1 AND profile_id = ?2",
+            params![site_id, profile_id],
+            |row| {
+                Ok(SiteAccountToken {
+                    token: row.get(0)?,
+                    user_id: row.get(1)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|error| error.to_string())
+        .map(|value| {
+            value.unwrap_or(SiteAccountToken {
+                token: String::new(),
+                user_id: String::new(),
+            })
+        })
+}
+
+/// 某账号已保存的站点令牌。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SiteAccountToken {
+    pub(crate) token: String,
+    pub(crate) user_id: String,
+}
+
+/// 手动维护某个账号的站点令牌（访问令牌）。
+///
+/// 自动同步取不到登录凭据时（站点改了登录流程、浏览器里已退出、Local Storage
+/// 被清），用户可以自己从站点后台复制令牌贴进来，令牌与用户 ID 一起写入
+/// `site_accounts`，之后的账号/Key/健康度同步就直接用它鉴权。
+///
+/// 只有用令牌鉴权的架构才允许写入（NewAPI 刷新令牌形态、白与黑）。Cookie 形态
+/// 的鉴权只有浏览器会话 Cookie，没有「访问令牌」这回事——给它写一个不会生效的
+/// 字段，只会让界面显示「有访问令牌」而实际仍在用 Cookie 同步，直接拒绝。
+///
+/// 令牌与用户 ID 都传空串表示清除：恢复成「完全依赖浏览器会话」。用户 ID
+/// 允许留空——它只影响 NewAPI 的 `new-api-user` 头，令牌本身能鉴权时不影响。
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub fn set_site_account_token(
+    ctx: Managed<'_, Arc<AppContext>>,
+    site_id: String,
+    profile_id: String,
+    token: String,
+    user_id: Option<String>,
+) -> Result<bool, String> {
+    let database = &*ctx.database;
+    let token = token.trim().to_string();
+    let user_id = user_id.unwrap_or_default().trim().to_string();
+    let connection = database.lock_conn()?;
+    let system_type: String = connection
+        .query_row(
+            "SELECT system_type FROM directory_sites WHERE id = ?1",
+            [site_id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap_or_default();
+    if !token.is_empty() && !uses_access_token(&system_type) {
+        let label = crate::site::library::canonical_platform(&system_type);
+        return Err(if label.is_empty() {
+            "该站点不是用访问令牌鉴权的架构（Cookie 形态），没有可设置的站点令牌".to_string()
+        } else {
+            format!("{label} 不是用访问令牌鉴权的架构，没有可设置的站点令牌")
+        });
+    }
+    let updated = connection
+        .execute(
+            "UPDATE site_accounts
+                SET newapi_token = ?3,
+                    newapi_user_id = ?4,
+                    is_valid = 1,
+                    sync_error = '',
+                    updated_at = CURRENT_TIMESTAMP
+              WHERE site_id = ?1 AND profile_id = ?2",
+            params![site_id, profile_id, token, user_id],
+        )
+        .map_err(|error| error.to_string())?;
+    if updated == 0 {
+        return Err("未找到该账号记录，请先同步站点账号".to_string());
+    }
+    Ok(!token.is_empty())
+}
 
 #[cfg_attr(feature = "desktop", tauri::command)]
 pub fn delete_site_account(
@@ -102,8 +203,6 @@ pub async fn mark_sites_with_chrome_sessions(
                         &["/api/user/auth/refresh", "/api/user/self"]
                     } else if is_sub2api(&system_type) {
                         &["/api/v1/auth/me"]
-                    } else if is_pipiwang(&system_type) {
-                        &["/api/v1/pc/me"]
                     } else {
                         &[]
                     };
@@ -239,26 +338,11 @@ pub async fn mark_sites_with_chrome_sessions(
                  WHERE is_personal = 1 AND supports_checkin = 1",
             )
             .map_err(|error| error.to_string())?;
-        let mut site_ids = statement
+        let site_ids: HashSet<String> = statement
             .query_map([], |row| row.get::<_, String>(0))
             .map_err(|error| error.to_string())?
             .collect::<Result<HashSet<_>, _>>()
             .map_err(|error| error.to_string())?;
-        // 皮皮智绘系自带每日签到（积分），不必等目录把 supports_checkin 补齐。
-        // 皮皮智绘系自带每日签到（积分），不必等目录把 supports_checkin 补齐。
-        let mut pipiwang_statement = connection
-            .prepare(
-                "SELECT id FROM directory_sites WHERE is_personal = 1 AND system_type = 'pipiwang'",
-            )
-            .map_err(|error| error.to_string())?;
-        let pipiwang_ids = pipiwang_statement
-            .query_map([], |row| row.get::<_, String>(0))
-            .map_err(|error| error.to_string())?
-            .collect::<Result<HashSet<_>, _>>()
-            .map_err(|error| error.to_string())?;
-        for site_id in pipiwang_ids {
-            site_ids.insert(site_id);
-        }
         site_ids
     };
     // 提取会话只比对浏览器数据，不做 /api/status 站点类型检测。
@@ -268,8 +352,6 @@ pub async fn mark_sites_with_chrome_sessions(
             &["/api/user/self", "/api/user/auth/refresh"]
         } else if is_sub2api(system_type) {
             &["/api/v1/auth/me"]
-        } else if is_pipiwang(system_type) {
-            &["/api/v1/pc/me"]
         } else {
             &[]
         };
@@ -491,9 +573,10 @@ pub async fn mark_sites_with_chrome_sessions(
                 .get(&(site.site_id.clone(), session.profile_id.clone()))
                 .filter(|(_, error)| error.is_empty())
                 .map(|(values, _)| values);
-            // 宽松会话判定：任意 Cookie 或任意已知 Local Storage 键即保留，
-            // 不再要求结构化账号数据或特定 Cookie 名（详见函数注释）。
-            has_browser_session_evidence(system_type, local_values, session.cookie_count)
+            // 没有会话信息就不该出现这个账号：结构化账号数据与登录类 Cookie
+            // 两者皆无的 Chrome 配置直接剔除，免得站点卡片上留一个点什么都做不了
+            // 的空账号（同步时只会反复报「没有可用凭据」）。
+            has_browser_session_evidence(system_type, local_values, &session.cookie_names)
         });
         !site.sessions.is_empty()
     });
@@ -502,9 +585,10 @@ pub async fn mark_sites_with_chrome_sessions(
         let Some((base_url, _system_type, _)) = account_targets.get(site_id) else {
             continue;
         };
-        if values.is_empty() {
-            // Local Storage 桶里一个键都没有才算真无痕迹；有任意键（无论键名
-            // 是否在已知平台键之列，含残缺数据）就作为会话候选加入，交给账号接口验证。
+        // 只有 UI 噪音键（`iconify*` / `theme` …）的桶不算会话痕迹：站点前端
+        // 写几个图标缓存就会凭空多出一个空账号；真正与登录有关的键（含残缺
+        // 数据）仍作为会话候选加入，交给账号接口验证。
+        if values.is_empty() || !has_session_storage_keys(values) {
             continue;
         }
         let Some(profile) = profile_map.get(profile_id) else {
@@ -567,9 +651,11 @@ pub async fn mark_sites_with_chrome_sessions(
     // 账号缓存在重启/重新扫描前是被下面“全删后重插”覆盖的，这里先把缓存里的
     // 签到/余额/令牌并回扫描结果，避免上一轮的账号业务数据被无会话结果冲掉。
     for site in &mut matched_sites {
-        let use_refresh_auth = account_targets
+        // 令牌要并回扫描结果的架构：newapi2，以及「令牌由用户维护」的白与黑。
+        // 不并回来，下面 INSERT OR REPLACE 整行重写时就把用户填的令牌清成空串。
+        let keeps_access_token = account_targets
             .get(&site.site_id)
-            .is_some_and(|(_, system_type, _)| is_newapi_refresh(system_type));
+            .is_some_and(|(_, system_type, _)| uses_access_token(system_type));
         for session in &mut site.sessions {
             let Some(cached) =
                 cached_accounts.get(&(site.site_id.clone(), session.profile_id.clone()))
@@ -612,7 +698,7 @@ pub async fn mark_sites_with_chrome_sessions(
             session.browser_fallback_cooldown_ms = cached.browser_fallback_cooldown_ms;
             session.browser_fallback_failed_at = cached.browser_fallback_failed_at;
             session.browser_fallback_fail_count = cached.browser_fallback_fail_count;
-            if use_refresh_auth
+            if keeps_access_token
                 && session.newapi_token.is_empty()
                 && !cached.newapi_token.is_empty()
             {
@@ -623,6 +709,49 @@ pub async fn mark_sites_with_chrome_sessions(
                 session.newapi_user_id = cached.newapi_user_id.clone();
             }
         }
+    }
+
+    // —— 白与黑：无凭据账号在会话装配阶段直接剔除，一开始就是最终集合 ——
+    // 它的登录凭据只可能来自浏览器登录态（该 API 域的 Cookie）或用户手填的
+    // 「站点令牌」，两者皆无的会话没有任何可请求的通道。这里在建单/写库之前
+    // 就把这类会话从集合里拿掉：后续同步循环遇到的直接就是真实账号（不再
+    // 先全量出来、循环里再逐个跳过），账号列表也不会保留空行；被剔除账号的
+    // 历史残留行由写库阶段的「全删后重插」顺带清掉。
+    for site in &mut matched_sites {
+        let Some((base_url, system_type, _)) = account_targets.get(&site.site_id) else {
+            continue;
+        };
+        if !is_platform(system_type, "baiheibai") {
+            continue;
+        }
+        let base_url = base_url.clone();
+        let mut kept_sessions = Vec::new();
+        for session in std::mem::take(&mut site.sessions) {
+            // 已配置站点令牌：无需浏览器登录态，直接保留。
+            if !session.newapi_token.trim().is_empty() {
+                kept_sessions.push(session);
+                continue;
+            }
+            // 没有令牌则读该 API 域的登录 Cookie：读不到任何 Cookie 才剔除。
+            let cookie_home_dir = home_dir.clone();
+            let cookie_url = base_url.clone();
+            let profile_id_for_cookie = session.profile_id.clone();
+            let has_cookie = spawn_blocking(move || {
+                sync::read_chrome_cookie_header_from_home(
+                    &cookie_home_dir,
+                    &cookie_url,
+                    &profile_id_for_cookie,
+                )
+            })
+            .await
+            .ok()
+            .and_then(|result| result.ok())
+            .unwrap_or_default();
+            if !has_cookie.trim().is_empty() {
+                kept_sessions.push(session);
+            }
+        }
+        site.sessions = kept_sessions;
     }
 
     // Local Storage 里能解析出账号的，也视为浏览器有会话（即使 Cookie 查询因 path/分区漏掉）。
@@ -718,7 +847,11 @@ pub async fn mark_sites_with_chrome_sessions(
                     .cloned()
                     .unwrap_or_default();
                 let cookie_home_dir = home_dir.clone();
-                let cookie_endpoint = if use_refresh_auth {
+                // Cookie 要按目标接口定域与路径：白与黑的额度接口认的是浏览器会话，
+                // NewAPI 系按认证形态读 /api/user/self 或 refresh。
+                let cookie_endpoint = if is_platform(&system_type, "baiheibai") {
+                    "/api/user/profile"
+                } else if use_refresh_auth {
                     "/api/user/auth/refresh"
                 } else {
                     "/api/user/self"
@@ -768,10 +901,16 @@ pub async fn mark_sites_with_chrome_sessions(
                 let job_database = ctx.database.clone();
                 let job_runtime = ctx.proxy_runtime.clone();
                 let job = spawn(async move {
-                    let needs_cookie = is_newapi(&system_type)
-                        || (system_type.trim().is_empty()
-                            && (parse_newapi_local_account(&local_values).is_ok()
-                                || has_refresh_cookie));
+                    // 显式「未知类型」不去猜架构：既不当 NewAPI 读 Cookie，
+                    // 也不按 Local Storage 痕迹推断，避免与用户设置相矛盾。
+                    // 白与黑的额度接口只认浏览器会话（访问令牌会被 403 拒），
+                    // 所以它同样要读 Cookie；NewAPI 系按自己的认证形态读。
+                    let needs_cookie = !is_explicit_unknown(&system_type)
+                        && (is_newapi(&system_type)
+                            || is_platform(&system_type, "baiheibai")
+                            || (system_type.trim().is_empty()
+                                && (parse_newapi_local_account(&local_values).is_ok()
+                                    || has_refresh_cookie)));
                     let cookie_header = if needs_cookie {
                         let profile_id_for_cookie = profile_id.clone();
                         spawn_blocking(move || {
@@ -783,6 +922,19 @@ pub async fn mark_sites_with_chrome_sessions(
                         })
                         .await
                         .map_err(|error| format!("读取 Chrome Cookie 任务失败：{error}"))?
+                        // 读到空串 = 这个 profile 下该域没有登录 Cookie。这是
+                        // 「没有凭据」，不是「读取失败」，按前者报给账号行。
+                        .and_then(|cookie| {
+                            // 白与黑没有 Cookie 不算致命：登录态可能只是过期了，
+                            // 交给刷新阶段给出具体提示（NewAPI 系则直接当无凭据）。
+                            if cookie.trim().is_empty()
+                                && !is_platform(&system_type, "baiheibai")
+                            {
+                                Err("没有找到可用的 NewAPI 登录凭据".to_string())
+                            } else {
+                                Ok(cookie)
+                            }
+                        })
                     } else {
                         Ok(String::new())
                     };
@@ -870,9 +1022,16 @@ pub async fn mark_sites_with_chrome_sessions(
                     } else {
                         session.checkin_error.clone()
                     };
-                    session.newapi_token = refresh.newapi_token;
-                    session.has_access_token = !session.newapi_token.is_empty();
-                    session.newapi_user_id = refresh.newapi_user_id;
+                    // 「令牌由用户维护」的架构（白与黑）：令牌是用户从站点后台手动贴进来的，
+                    // 同步只读不写——刷新结果（对这类架构恒为空）不得覆盖它，用户 ID 同理。
+                    let user_owned_token = account_targets
+                        .get(&clear_site_id)
+                        .is_some_and(|(_, system_type, _)| access_token_is_user_owned(system_type));
+                    if !user_owned_token {
+                        session.newapi_token = refresh.newapi_token;
+                        session.has_access_token = !session.newapi_token.is_empty();
+                        session.newapi_user_id = refresh.newapi_user_id;
+                    }
                     // 真正从站点取到数据：上次同步遗留的浏览器兜底冷却一并清零，
                     // 否则直连已恢复、界面冷却倒计时却还在，自动同步继续被跳过。
                     if refresh.refreshed {

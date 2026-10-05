@@ -206,7 +206,7 @@ export type ModelHealthLevel = "healthy" | "degraded" | "down";
 
 /**
  * 成功率 → 展示等级的唯一阈值来源（0~1 入参，越界自动钳位）。
- * 徽标、进度条与逐时状态条必须共用这一处，否则同一模型会出现
+ * 徽标、进度条与状态条必须共用这一处，否则同一模型会出现
  * 「标签写橙色 60%、条子画红色」这类自相矛盾的展示。
  */
 export function modelHealthLevelOf(successRate: number): ModelHealthLevel {
@@ -224,103 +224,176 @@ export interface ModelHealthBadge {
   title: string;
 }
 
-/** 状态条槽位数：与站点窗口小时数一致（同步固定请求 hours=24），逐格一个整点。 */
+/**
+ * 状态条槽数：解析侧与界面共用的常数——统计窗口被等分成这么多格。
+ *
+ * 站点的时间格粒度是可配的（NewAPI 原生逐整点；「模型状态」增强模块
+ * 30 分钟起），固定槽数让不同粒度的站点落到界面上是同一根条带，
+ * 也不会因为站点给了 48 个格就挤爆容器。
+ */
 export const MODEL_STATUS_SLOT_COUNT = 24;
 
-const STATUS_SLOT_SECONDS = 3600;
+/** 状态条格宽（秒）：窗口小时数 ÷ 槽数，最小 1 分钟。 */
+function statusSlotSeconds(windowHours?: number): number {
+  const hours =
+    typeof windowHours === "number" && Number.isFinite(windowHours) && windowHours > 0
+      ? windowHours
+      : 24;
+  return Math.max(60, Math.round((hours * 3600) / MODEL_STATUS_SLOT_COUNT));
+}
 
-/** 状态条上的一个槽位，对应窗口内一个整点。 */
+/** 状态条上的一个槽位，对应窗口内一个时段。 */
 export interface ModelStatusSlot {
-  /** 该槽位对应的整点（Unix 秒）。 */
+  /** 该槽位对应时段的起点（Unix 秒）。 */
   ts: number;
-  /** 成功率等级；该整点无流量（站点未下发数据点）时为 null，界面留灰槽。 */
+  /** 成功率等级；该时段无流量（站点未下发数据点）时为 null，界面留灰槽。 */
   level: ModelHealthLevel | null;
   /** 成功率（0~1）；无流量时缺省。 */
   successRate?: number;
-  /** 单格悬浮提示：整点 + 成功率 / 无流量说明。 */
+  /** 该时段请求总数；站点没下发请求数时缺省。 */
+  requests?: number;
+  /** 单格悬浮提示：时段 + 成功率（+ 请求量）/ 无流量说明。 */
   title: string;
 }
 
-/** 整点时间戳格式化成 `MM-DD HH:00`（本地时区），跨天时仍能分辨。 */
-function formatHourLabel(ts: number): string {
+/** 时间戳格式化成 `MM-DD HH:00`（本地时区）；格宽不足 1 小时时精确到分。 */
+function formatSlotLabel(ts: number, slotSeconds: number): string {
   const date = new Date(ts * 1000);
   const month = String(date.getMonth() + 1).padStart(2, "0");
   const day = String(date.getDate()).padStart(2, "0");
   const hour = String(date.getHours()).padStart(2, "0");
+  if (slotSeconds < 3600) {
+    const minute = String(date.getMinutes()).padStart(2, "0");
+    return `${month}-${day} ${hour}:${minute}`;
+  }
   return `${month}-${day} ${hour}:00`;
 }
 
+/** 一个槽位内聚合的多条数据点（站点格宽比界面格宽细时会合并）。 */
+interface ModelStatusBucket {
+  weighted: number;
+  weight: number;
+  requests: number;
+  counted: boolean;
+}
+
 /**
- * 把逐时健康度翻成固定 24 格的竖条状态条（图片样式：绿 = 成功率达标，
- * 橙/红逐级下降，灰 = 该整点无流量）。
+ * 把逐时段健康度翻成固定 `MODEL_STATUS_SLOT_COUNT` 格的竖条状态条
+ * （图片样式：绿 = 成功率达标，橙/红逐级下降，灰 = 该时段无流量）。
  *
- * 站点只为**有流量**的整点下发数据点，所以这里按 `windowStart` 对号入座：
- * 没有数据点的格子留 null（灰槽）。不允许用 0 填补——「无流量」和
- * 「成功率 0%」是完全不同的结论，前者是没数据、后者是全线失败。
+ * 站点只为**有流量**的时段下发数据点，所以这里按 `windowStart` + 格宽
+ * 对号入座：没有数据点的格子留 null（灰槽）。不允许用 0 填补——
+ * 「无流量」和「成功率 0%」是完全不同的结论，前者是没数据、后者是全线失败。
+ *
+ * 格宽由 `windowHours / 槽位数` 推出：NewAPI 原生逐时数据（24h → 1h 格）
+ * 的结果与按整点对号入座完全一致；「模型状态」增强模块这类窗口、格宽都
+ * 可配的站点则按同一比例尺缩放，序列里比格宽更细的点按请求数加权合并。
  *
  * 窗口起点的取值顺序：站点给的 `windowStart` → 最后一个数据点倒推
- * （老版本/魔改站点不给窗口时保证条带仍按整点对齐）→ 调用方给的
- * `fallbackWindowStart`（同站点其它模型的窗口，让无数据模型的全灰条带
- * 与有数据条带对齐）→ 当前整点。
+ * （老版本/魔改站点不给窗口时保证条带仍贴着最近的时段）→ 调用方给的
+ * `fallback`（同站点其它模型的窗口与格宽，让无数据模型的全灰条带与
+ * 有数据条带对齐）→ 当前时刻倒推。
  *
  * **永远返回 24 格**，没有序列数据时整条全灰：模型在窗口内没有流量也是
  * 一种状态，界面要能一眼看出「这条是空的」，而不是干脆不渲染。
  */
 export function describeModelStatusStrip(
   health?: SiteModelHealth | null,
-  fallbackWindowStart?: number,
+  fallback?: SiteModelHealth | null,
 ): ModelStatusSlot[] {
   const points = Array.isArray(health?.series) ? health.series : [];
-  const rates = new Map<number, number>();
+  // 无自身数据的模型用同站点窗口的格宽，否则 7 天窗口的站点会退化成整点、
+  // 全灰条带与有数据条带对不上时间轴。
+  const slotSeconds = statusSlotSeconds((health ?? fallback)?.windowHours);
+
   let lastTs = 0;
   for (const point of points) {
     const rawTs = point?.ts;
-    if (typeof rawTs !== "number" || !Number.isFinite(rawTs) || rawTs <= 0) continue;
-    const ts = Math.floor(rawTs / STATUS_SLOT_SECONDS) * STATUS_SLOT_SECONDS;
-    lastTs = Math.max(lastTs, ts);
-    const rate = point.successRate;
-    if (typeof rate === "number" && Number.isFinite(rate)) {
-      rates.set(ts, Math.min(1, Math.max(0, rate)));
+    if (typeof rawTs === "number" && Number.isFinite(rawTs) && rawTs > 0) {
+      lastTs = Math.max(lastTs, rawTs);
     }
   }
   const windowStart = (() => {
     const start = health?.windowStart;
     if (typeof start === "number" && Number.isFinite(start) && start > 0) {
-      return Math.floor(start / STATUS_SLOT_SECONDS) * STATUS_SLOT_SECONDS;
+      return start;
     }
     if (lastTs > 0) {
-      return lastTs - (MODEL_STATUS_SLOT_COUNT - 1) * STATUS_SLOT_SECONDS;
+      return lastTs - (MODEL_STATUS_SLOT_COUNT - 1) * slotSeconds;
     }
+    const fallbackStart = fallback?.windowStart;
     if (
-      typeof fallbackWindowStart === "number" &&
-      Number.isFinite(fallbackWindowStart) &&
-      fallbackWindowStart > 0
+      typeof fallbackStart === "number" &&
+      Number.isFinite(fallbackStart) &&
+      fallbackStart > 0
     ) {
-      return Math.floor(fallbackWindowStart / STATUS_SLOT_SECONDS) * STATUS_SLOT_SECONDS;
+      return fallbackStart;
     }
-    const nowHour = Math.floor(Date.now() / 1000 / STATUS_SLOT_SECONDS) * STATUS_SLOT_SECONDS;
-    return nowHour - (MODEL_STATUS_SLOT_COUNT - 1) * STATUS_SLOT_SECONDS;
+    const now = Math.floor(Date.now() / 1000);
+    return now - (MODEL_STATUS_SLOT_COUNT - 1) * slotSeconds;
   })();
+
+  const buckets = new Map<number, ModelStatusBucket>();
+  for (const point of points) {
+    const rawTs = point?.ts;
+    if (typeof rawTs !== "number" || !Number.isFinite(rawTs) || rawTs <= 0) continue;
+    const rate = point.successRate;
+    if (typeof rate !== "number" || !Number.isFinite(rate)) continue;
+    const index = Math.floor((rawTs - windowStart) / slotSeconds);
+    if (index < 0 || index >= MODEL_STATUS_SLOT_COUNT) continue;
+    const requests =
+      typeof point.requests === "number" && Number.isFinite(point.requests) && point.requests >= 0
+        ? point.requests
+        : null;
+    const weight = requests && requests > 0 ? requests : 1;
+    const bucket = buckets.get(index) ?? { weighted: 0, weight: 0, requests: 0, counted: false };
+    bucket.weighted += Math.min(1, Math.max(0, rate)) * weight;
+    bucket.weight += weight;
+    if (requests !== null) {
+      bucket.requests += requests;
+      bucket.counted = true;
+    }
+    buckets.set(index, bucket);
+  }
+
   return Array.from({ length: MODEL_STATUS_SLOT_COUNT }, (_, index) => {
-    const ts = windowStart + index * STATUS_SLOT_SECONDS;
-    const label = formatHourLabel(ts);
-    const rate = rates.get(ts);
-    if (rate === undefined) {
+    const ts = windowStart + index * slotSeconds;
+    const label = formatSlotLabel(ts, slotSeconds);
+    const bucket = buckets.get(index);
+    if (!bucket || bucket.weight <= 0) {
       return { ts, level: null, title: `${label} 无流量数据` };
     }
+    const rate = bucket.weighted / bucket.weight;
+    const requests = bucket.counted ? `，${bucket.requests} 次请求` : "";
     return {
       ts,
       level: modelHealthLevelOf(rate),
       successRate: rate,
-      title: `${label} 成功率 ${formatSuccessRate(rate)}`,
+      requests: bucket.counted ? bucket.requests : undefined,
+      title: `${label} 成功率 ${formatSuccessRate(rate)}${requests}`,
     };
   });
 }
 
+/**
+ * 状态条窗口口径的短描述，如「近 24 小时逐时」——说明文字、读屏 label
+ * 与提示都要跟着站点实际窗口走：增强模块的窗口可以是 7 天、格宽 7 小时。
+ */
+export function describeModelWindowLabel(health?: SiteModelHealth | null): string {
+  const hours =
+    typeof health?.windowHours === "number" && Number.isFinite(health.windowHours)
+      ? health.windowHours
+      : 24;
+  const slotHours = hours / MODEL_STATUS_SLOT_COUNT;
+  if (Math.abs(slotHours - 1) < 1e-9) return `近 ${hours} 小时逐时`;
+  const minutes = Math.round(slotHours * 60);
+  const span = minutes >= 60 ? `${+(minutes / 60).toFixed(2)} 小时` : `${minutes} 分钟`;
+  return `近 ${hours} 小时，每格 ${span}`;
+}
+
 /** 状态条容器的整体说明（口径 + 配色含义），绑到容器的 title/aria-label。 */
 export function describeModelStatusStripTitle(health?: SiteModelHealth | null): string {
-  const hours = health?.windowHours ?? 24;
-  return `近 ${hours} 小时逐时成功率（站点全站口径，与当前 Key 无关）：绿色 ≥90%，橙色 50%~90%，红色 <50%，灰色为该时段无流量。悬停各格查看具体时段。`;
+  return `${describeModelWindowLabel(health)}成功率（站点全站口径，与当前 Key 无关）：绿色 ≥90%，橙色 50%~90%，红色 <50%，灰色为该时段无流量。悬停各格查看具体时段。`;
 }
 
 /** 毫秒转人类可读时长：<1s 毫秒，<1min 秒，其余分钟。 */
@@ -339,8 +412,13 @@ function formatSuccessRate(rate: number): string {
 }
 
 /**
- * 把 NewAPI `/api/perf-metrics/summary` 的全站模型健康度翻成一条进度条 +
- * 百分比。这是**全站聚合**口径（所有用户的流量），与当前用户/当前 Key 无关，
+ * 把 NewAPI 的模型健康度翻成一条进度条 + 百分比。
+ *
+ * 百分比取状态条**最后一个有色方块**的成功率（最近有流量的时段），与条带
+ * 共用同一套分桶：条带最后一个亮块是红色、徽标却写窗口均值这类自相矛盾
+ * 不会再出现。没有逐时段数据（旧缓存 / 站点不下发明细）时退回窗口汇总值。
+ *
+ * 这是**全站聚合**口径（所有用户的流量），与当前用户/当前 Key 无关，
  * 所以悬浮提示里必须点明，避免被当成「我的 Key 能不能用」的结论。
  *
  * 站点只返回 0~100 的百分数，Rust 侧已归一化到 0~1；这里不再做二次换算。
@@ -349,7 +427,16 @@ export function describeModelHealth(health?: SiteModelHealth | null): ModelHealt
   if (!health) return null;
   const hours = health.windowHours ?? 24;
   const scope = `站点全站口径（所有用户的流量），近 ${hours} 小时`;
-  const rate = health.successRate;
+  const slots = describeModelStatusStrip(health, null);
+  let latestSlot: ModelStatusSlot | null = null;
+  for (let index = slots.length - 1; index >= 0; index -= 1) {
+    const slot = slots[index];
+    if (slot.level && typeof slot.successRate === "number") {
+      latestSlot = slot;
+      break;
+    }
+  }
+  const rate = latestSlot?.successRate ?? health.successRate;
   if (typeof rate !== "number" || !Number.isFinite(rate)) {
     return {
       level: "degraded",
@@ -360,7 +447,21 @@ export function describeModelHealth(health?: SiteModelHealth | null): ModelHealt
   }
   const clamped = Math.min(1, Math.max(0, rate));
   const level: ModelHealthLevel = modelHealthLevelOf(clamped);
-  const details = [`成功率 ${formatSuccessRate(clamped)}`];
+  const details: string[] = [];
+  if (latestSlot) {
+    // 最近时段的口径随站点窗口走（原生 1 小时、增强模块可更长），
+    // slot.title 自带时段标签，这里直接带上，避免读者把「最近时段」当整点。
+    details.push(`最近时段 ${latestSlot.title}`);
+    if (typeof health.successRate === "number" && Number.isFinite(health.successRate)) {
+      details.push(`窗口平均 ${formatSuccessRate(Math.min(1, Math.max(0, health.successRate)))}`);
+    }
+  } else {
+    details.push(`成功率 ${formatSuccessRate(clamped)}`);
+    if (typeof health.requests === "number" && health.requests > 0) {
+      // 站点没给分母时成功率无法证伪：100% 可能来自 1 次请求，也可能是 1 万次。
+      details.push(`窗口内 ${health.requests} 次请求`);
+    }
+  }
   if (typeof health.avgLatencyMs === "number" && health.avgLatencyMs > 0) {
     details.push(`平均延迟 ${formatLatency(health.avgLatencyMs)}`);
   }

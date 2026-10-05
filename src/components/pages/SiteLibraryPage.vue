@@ -2,12 +2,13 @@
 import { capabilities } from "../../composables/core/capabilities";
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { icons } from "../../icons";
-import { formatDate, formatRateLimit, logoText, describeModelHealth, describeModelStatusStrip, describeModelStatusStripTitle, MODEL_STATUS_SLOT_COUNT } from "../../utils";
+import { formatDate, formatRateLimit, logoText, describeModelHealth, describeModelStatusStrip, describeModelStatusStripTitle, describeModelWindowLabel, MODEL_STATUS_SLOT_COUNT } from "../../utils";
 import type { ModelHealthBadge, ModelStatusSlot } from "../../utils";
 import { useStore } from "../../composables/useStore";
 import { runCommand, isTauri } from "../../composables/useLibrary";
 import AppTable, { type AppTableColumn } from "../common/AppTable.vue";
 import LinkAccountPicker from "../common/LinkAccountPicker.vue";
+import SiteTokenEditor from "../site/SiteTokenEditor.vue";
 import type {
   ChromeSessionInfo,
   SiteModelCache,
@@ -19,6 +20,7 @@ import {
   isUnknownSystemType,
   isNewApiCompatible,
   normalizeSystemType,
+  supportsSiteToken,
   systemTypeLabel,
 } from "../../types";
 import {
@@ -241,7 +243,7 @@ const systemTypeOptions = computed(() => [
     const count = countBySystem(st.value);
     return { value: st.value, text: `${st.text} (${count})` };
   }),
-  { value: "unknown", text: `其他 / 未知 (${store.sites.value.filter((s) => !s.systemType).length})` },
+  { value: "unknown", text: `其他 / 未知 (${store.sites.value.filter((s) => isUnknownSystemType(s.systemType)).length})` },
 ]);
 
 const levelOptions = [
@@ -304,7 +306,8 @@ const filteredSites = computed(() => {
     if (selectedSystemType.value !== "all") {
       const siteNorm = normalizeSystemType(site.systemType);
       if (selectedSystemType.value === "unknown") {
-        if (site.systemType && siteNorm) return false;
+        // 空串（未设置）与显式「未知类型」都算未知：两者都不属于任何已知架构。
+        if (!isUnknownSystemType(site.systemType)) return false;
       } else {
         if (siteNorm !== normalizeSystemType(selectedSystemType.value)) return false;
       }
@@ -628,28 +631,6 @@ async function copyText(text: string, label = "内容") {
   setTimeout(() => (idCopied.value = false), 2000);
 }
 
-async function copySessionCookie(site: SiteRecord, session: ChromeSessionInfo) {
-  const url = site.checkinUrl?.trim() || site.apiBaseUrl?.trim() || "";
-  if (!url) {
-    store.showToast("该站点地址无效", true);
-    return;
-  }
-  try {
-    const value = await runCommand<{ cookie: string; cookieCount: number; profileName: string }>("read_chrome_session", {
-      url,
-      profileId: session.profileId,
-    });
-    if (value?.cookie) {
-      await navigator.clipboard.writeText(value.cookie);
-      store.showToast(`已复制「${value.profileName}」的 ${value.cookieCount} 个 Cookie 到剪贴板`);
-    } else {
-      store.showToast("未检测到有效 Cookie", true);
-    }
-  } catch (err) {
-    store.showToast(`读取 Cookie 失败: ${String(err)}`, true);
-  }
-}
-
 function maskApiKey(key: string): string {
   const value = key.trim();
   if (!value) return "—";
@@ -692,16 +673,16 @@ function drawerModelHealthBadge(modelId: string) {
   return drawerHealthBadges.value.get(modelId);
 }
 
-/** 逐时状态条：与「支持的模型」弹窗同一套 24 格竖条；每个模型都画满 24 格，
- *  有流量的整点上色、没流量的留灰，无数据模型用同站点窗口起点对齐。 */
+/** 状态条：与「支持的模型」弹窗同一套 24 格竖条；每个模型都画满 24 格，
+ *  有流量的时段上色、没流量的留灰，无数据模型用同站点的窗口起点与格宽对齐。 */
 const drawerStatusStrips = computed(() => {
   const strips = new Map<string, ModelStatusSlot[]>();
   const healthMap = drawerModelCache.value?.modelHealth ?? {};
-  const fallbackWindowStart = Object.values(healthMap).find(
+  const fallbackHealth = Object.values(healthMap).find(
     (health) => typeof health.windowStart === "number" && (health.windowStart ?? 0) > 0,
-  )?.windowStart;
+  );
   for (const model of drawerFilteredModels.value) {
-    strips.set(model.id, describeModelStatusStrip(healthMap[model.id], fallbackWindowStart));
+    strips.set(model.id, describeModelStatusStrip(healthMap[model.id], fallbackHealth));
   }
   return strips;
 });
@@ -710,12 +691,25 @@ function drawerStatusStripOf(modelId: string) {
   return drawerStatusStrips.value.get(modelId) ?? [];
 }
 
+/** 站点是否上报过任何模型健康度：上报过就画 24 格条带。
+ *  只给汇总成功率、没给逐时段序列的站点（旧数据里连 series 字段都没有）
+ *  条带是 24 格灰，但那是「有健康度、只是没有时段分布」，不能连条带一起
+ *  藏掉——否则用户看到徽标有成功率、下面却什么都没有。 */
+const drawerHasStatusStrip = computed(
+  () => Object.keys(drawerModelCache.value?.modelHealth ?? {}).length > 0,
+);
+
 const drawerStatusStripTitle = computed(() =>
   describeModelStatusStripTitle(Object.values(drawerModelCache.value?.modelHealth ?? {})[0]),
 );
 
+/** 窗口口径随站点走：原生 perf-metrics 是 24h 逐时，增强模块可配 7 天/每格 7 小时。 */
+const drawerWindowLabel = computed(() =>
+  describeModelWindowLabel(Object.values(drawerModelCache.value?.modelHealth ?? {})[0]),
+);
+
 const drawerStatusStripLabel = computed(
-  () => `近 24 小时逐时成功率状态条，共 ${MODEL_STATUS_SLOT_COUNT} 个时段`,
+  () => `${drawerWindowLabel.value}成功率状态条，共 ${MODEL_STATUS_SLOT_COUNT} 个时段`,
 );
 
 // —— 批量操作 ——
@@ -1709,15 +1703,20 @@ onUnmounted(() => {
                       </small>
                     </div>
                     <div class="sl-topo-session-btns">
-                      <!-- 复制 Cookie 按钮 -->
-                      <button
-                        type="button"
-                        class="sl-action-icon-btn"
-                        :title="`复制「${session.profileName}」的 Chrome Cookie`"
-                        @click.stop="copySessionCookie(site, session)"
-                      >
-                        <span v-html="icons.copy" />
-                      </button>
+                      <!-- 账号行只保留「在 Chrome 打开」与「解除关联」两个真能
+                           改变状态的操作；复制 Cookie 没有对应的后续用法
+                           （Cookie 由后端按需自己读），已移除。 -->
+                      <!-- 站点令牌：现阶段仅「白与黑」类型有（凭据不来自浏览器会话） -->
+                      <SiteTokenEditor
+                        v-if="supportsSiteToken(site.systemType)"
+                        compact
+                        class="sl-topo-token-btn"
+                        :site-id="site.id"
+                        :profile-id="session.profileId"
+                        :account-label="session.username || session.accountName || session.profileName"
+                        :has-token="session.hasAccessToken"
+                        @saved="store.loadLibrary()"
+                      />
                       <!-- 在 Chrome 对应配置中打开站点 -->
                       <button
                         type="button"
@@ -2351,9 +2350,9 @@ onUnmounted(() => {
                         >{{ drawerModelHealthBadge(m.id)!.label }}</small
                       >
                       </div>
-                      <!-- 逐时状态条：灰格 = 该整点无流量；旧缓存无序列时不渲染 -->
+                      <!-- 状态条：站点上报过健康度就整列画满 24 格，灰格 = 该时段无流量 -->
                       <span
-                        v-if="drawerStatusStripOf(m.id)"
+                        v-if="drawerHasStatusStrip"
                         class="sl-model-health-strip"
                         role="img"
                         :aria-label="drawerStatusStripLabel"
@@ -4152,6 +4151,10 @@ onUnmounted(() => {
 }
 
 .sl-topo-card-footer {
+  /* 贴卡片底部：账号数量不同的卡片（有的 1 个、有的 2 个）在网格里已被拉到
+     等高，底栏若紧跟内容就会各自停在半空、图标横不平齐。留白交给账号区与
+     底栏之间，底栏图标才在同一水平线上。 */
+  margin-top: auto;
   display: flex;
   justify-content: space-between;
   align-items: center;

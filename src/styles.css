@@ -1349,6 +1349,7 @@ kbd { padding: 3px 7px; border: 1px solid var(--line); border-radius: var(--r-xs
 .site-models-side-label small { margin-left: auto; color: var(--faint); font-size: 10px; font-weight: 650; font-variant-numeric: tabular-nums; }
 .site-models-side-scroll { flex: 1 1 0; min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
 .site-models-side-empty { margin: 0; min-height: 40px; display: grid; place-items: center; color: var(--faint); font-size: 11px; }
+.site-models-account-error { margin: 2px 0 6px; padding: 6px 8px; border-radius: 8px; background: var(--danger-soft); color: var(--danger); font-size: 11px; line-height: 1.5; word-break: break-word; }
 
 .site-models-tree-node { border-bottom: 1px solid var(--line-soft); }
 .site-models-tree-node:last-child { border-bottom: 0; }
@@ -1482,13 +1483,16 @@ kbd { padding: 3px 7px; border: 1px solid var(--line); border-radius: var(--r-xs
 .site-models-item-health-slot.is-degraded { background: var(--model-status-warn); }
 .site-models-item-health-slot.is-down { background: var(--model-status-bad); }
 /* 标题行：模型 ID 左侧省略，成功率贴右——状态条独占下一整行。 */
-.site-models-item-head { min-width: 0; display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+/* 模型 ID 后面紧跟拷贝图标，成功率数值靠行尾对齐：ID 过长时先省略，
+   图标与数值都不被挤掉。 */
+.site-models-item-head { min-width: 0; display: flex; align-items: baseline; gap: 6px; }
+.site-models-item-head .site-models-item-health-value { margin-left: auto; }
 .site-models-item-health-value.is-healthy { color: var(--success); }
 .site-models-item-health-value.is-degraded { color: var(--warning); }
 .site-models-item-health-value.is-down { color: var(--danger); }
 /* 口径说明独占面板头第二行：左对齐小字，不再和标题挤一行换行叠字。 */
 .site-models-health-note { margin: 0; color: var(--faint); font-size: 10.5px; line-height: 1.55; }
-.site-models-item-copy { flex: 0 0 auto; width: 16px; height: 16px; color: var(--faint); }
+.site-models-item-copy { flex: 0 0 auto; align-self: center; width: 16px; height: 16px; color: var(--faint); }
 .site-models-item-copy svg { width: 16px; height: 16px; }
 .site-models-item:hover .site-models-item-copy { color: var(--brand-deep); }
 
