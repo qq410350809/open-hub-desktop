@@ -194,24 +194,31 @@ export function formatPrice(cost: number | undefined | null): string {
 }
 
 /**
- * 模型健康度的展示等级。
- * - `healthy` 成功率 ≥ 90%
- * - `degraded` 成功率在 50%~90%
- * - `down` 成功率 < 50%
+ * 模型健康度的展示等级（六级配色：0 灰 = 无流量，1~5 由红到绿逐级变好）。
+ * - 1 红   严重：成功率 < 50%
+ * - 2 橙   较差：50% ~ 70%
+ * - 3 黄   亚健康：70% ~ 85%
+ * - 4 浅绿 轻微异常：85% ~ 95%
+ * - 5 绿   健康：≥ 95%
  *
- * 没有「无流量」这一档：站点只为窗口内确有请求的模型下发条目，
- * 模型不在健康度表里就是没有数据，界面直接不显示徽标，而不是显示 0%。
+ * 等级 0（灰）单独表达「无流量/无数据」，不在这套 1~5 的等级里：站点只为
+ * 窗口内确有请求的模型下发条目，模型不在健康度表里就是没有数据，界面直接
+ * 不显示徽标，而不是显示 0%。
  */
-export type ModelHealthLevel = "healthy" | "degraded" | "down";
+export type ModelHealthLevel = 1 | 2 | 3 | 4 | 5;
 
 /**
  * 成功率 → 展示等级的唯一阈值来源（0~1 入参，越界自动钳位）。
  * 徽标、进度条与状态条必须共用这一处，否则同一模型会出现
- * 「标签写橙色 60%、条子画红色」这类自相矛盾的展示。
+ * 「标签写黄色 80%、条子画绿色」这类自相矛盾的展示。
  */
 export function modelHealthLevelOf(successRate: number): ModelHealthLevel {
   const clamped = Math.min(1, Math.max(0, successRate));
-  return clamped >= 0.9 ? "healthy" : clamped >= 0.5 ? "degraded" : "down";
+  if (clamped < 0.5) return 1;
+  if (clamped < 0.7) return 2;
+  if (clamped < 0.85) return 3;
+  if (clamped < 0.95) return 4;
+  return 5;
 }
 
 export interface ModelHealthBadge {
@@ -246,7 +253,7 @@ function statusSlotSeconds(windowHours?: number): number {
 export interface ModelStatusSlot {
   /** 该槽位对应时段的起点（Unix 秒）。 */
   ts: number;
-  /** 成功率等级；该时段无流量（站点未下发数据点）时为 null，界面留灰槽。 */
+  /** 成功率等级（1~5）；该时段无流量（站点未下发数据点）时为 null，界面留灰槽（等级 0）。 */
   level: ModelHealthLevel | null;
   /** 成功率（0~1）；无流量时缺省。 */
   successRate?: number;
@@ -279,7 +286,7 @@ interface ModelStatusBucket {
 
 /**
  * 把逐时段健康度翻成固定 `MODEL_STATUS_SLOT_COUNT` 格的竖条状态条
- * （图片样式：绿 = 成功率达标，橙/红逐级下降，灰 = 该时段无流量）。
+ * （图片样式：六级配色——绿/浅绿/黄/橙/红逐级下降，灰 = 该时段无流量）。
  *
  * 站点只为**有流量**的时段下发数据点，所以这里按 `windowStart` + 格宽
  * 对号入座：没有数据点的格子留 null（灰槽）。不允许用 0 填补——
@@ -392,7 +399,7 @@ export function describeModelWindowLabel(health?: SiteModelHealth | null): strin
 
 /** 状态条容器的整体说明（口径 + 配色含义），绑到容器的 title/aria-label。 */
 export function describeModelStatusStripTitle(health?: SiteModelHealth | null): string {
-  return `${describeModelWindowLabel(health)}成功率（站点全站口径，与当前 Key 无关）：绿色 ≥90%，橙色 50%~90%，红色 <50%，灰色为该时段无流量。悬停各格查看具体时段。`;
+  return `${describeModelWindowLabel(health)}成功率（站点全站口径，与当前 Key 无关）：绿色 ≥95%，浅绿 85%~95%，黄色 70%~85%，橙色 50%~70%，红色 <50%，灰色为该时段无流量。悬停各格查看具体时段。`;
 }
 
 /** 毫秒转人类可读时长：<1s 毫秒，<1min 秒，其余分钟。 */
@@ -438,7 +445,7 @@ export function describeModelHealth(health?: SiteModelHealth | null): ModelHealt
   const rate = latestSlot?.successRate ?? health.successRate;
   if (typeof rate !== "number" || !Number.isFinite(rate)) {
     return {
-      level: "degraded",
+      level: 2,
       label: "成功率未知",
       width: 0,
       title: `${scope}有请求记录，但站点未返回成功率。`,

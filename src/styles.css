@@ -42,10 +42,18 @@
   --warning: #d97706;
   --warning-soft: #fffbeb;
 
-  /* —— 模型状态条（逐时健康度竖条的交通灯配色，按参考样式取样；明暗主题共用） —— */
-  --model-status-ok: #63c469;
-  --model-status-warn: #ffaf44;
-  --model-status-bad: #fc725a;
+  /* —— 模型状态条（逐时健康度竖条的六级配色：绿 › 浅绿 › 黄 › 橙 › 红，灰 = 无流量；明暗主题共用） —— */
+  --model-status-lv5: #63c469;
+  --model-status-lv4: #9ed36a;
+  --model-status-lv3: #f2ca4a;
+  --model-status-lv2: #ffaf44;
+  --model-status-lv1: #fc725a;
+  /* 徽标数字用色：比条带更深/更亮一档，保证明暗主题下都清晰可读（暗色值见 dark 主题块） */
+  --model-status-text-lv5: #059669;
+  --model-status-text-lv4: #65a30d;
+  --model-status-text-lv3: #ca8a04;
+  --model-status-text-lv2: #ea580c;
+  --model-status-text-lv1: #e11d48;
 
   /* —— 侧栏 —— */
   --sidebar: #f7faf8;
@@ -120,6 +128,13 @@
   --info-soft: #082f49;
   --warning: #fbbf24;
   --warning-soft: #352507;
+
+  /* 模型状态条徽标数字用色（暗色）：条带五色明暗共用，仅数字换成亮色一档 */
+  --model-status-text-lv5: #34d399;
+  --model-status-text-lv4: #a3e635;
+  --model-status-text-lv3: #fbbf24;
+  --model-status-text-lv2: #fb923c;
+  --model-status-text-lv1: #f43f5e;
 
   --sidebar: #0e1813;
   --sidebar-soft: #14221b;
@@ -1479,17 +1494,21 @@ kbd { padding: 3px 7px; border: 1px solid var(--line); border-radius: var(--r-xs
    灰格 = 该整点无流量（不是 0%）。 */
 .site-models-item-health-strip { display: flex; align-items: stretch; aspect-ratio: 10.875; gap: 3px; column-gap: 1.149%; }
 .site-models-item-health-slot { flex: 1 1 0; min-width: 2px; border-radius: 2px; background: color-mix(in srgb, var(--faint) 26%, transparent); transition: background 0.15s var(--ease); }
-.site-models-item-health-slot.is-healthy { background: var(--model-status-ok); }
-.site-models-item-health-slot.is-degraded { background: var(--model-status-warn); }
-.site-models-item-health-slot.is-down { background: var(--model-status-bad); }
+.site-models-item-health-slot.is-lv5 { background: var(--model-status-lv5); }
+.site-models-item-health-slot.is-lv4 { background: var(--model-status-lv4); }
+.site-models-item-health-slot.is-lv3 { background: var(--model-status-lv3); }
+.site-models-item-health-slot.is-lv2 { background: var(--model-status-lv2); }
+.site-models-item-health-slot.is-lv1 { background: var(--model-status-lv1); }
 /* 标题行：模型 ID 左侧省略，成功率贴右——状态条独占下一整行。 */
 /* 模型 ID 后面紧跟拷贝图标，成功率数值靠行尾对齐：ID 过长时先省略，
    图标与数值都不被挤掉。 */
 .site-models-item-head { min-width: 0; display: flex; align-items: baseline; gap: 6px; }
 .site-models-item-head .site-models-item-health-value { margin-left: auto; }
-.site-models-item-health-value.is-healthy { color: var(--success); }
-.site-models-item-health-value.is-degraded { color: var(--warning); }
-.site-models-item-health-value.is-down { color: var(--danger); }
+.site-models-item-health-value.is-lv5 { color: var(--model-status-text-lv5); }
+.site-models-item-health-value.is-lv4 { color: var(--model-status-text-lv4); }
+.site-models-item-health-value.is-lv3 { color: var(--model-status-text-lv3); }
+.site-models-item-health-value.is-lv2 { color: var(--model-status-text-lv2); }
+.site-models-item-health-value.is-lv1 { color: var(--model-status-text-lv1); }
 /* 口径说明独占面板头第二行：左对齐小字，不再和标题挤一行换行叠字。 */
 .site-models-health-note { margin: 0; color: var(--faint); font-size: 10.5px; line-height: 1.55; }
 .site-models-item-copy { flex: 0 0 auto; align-self: center; width: 16px; height: 16px; color: var(--faint); }

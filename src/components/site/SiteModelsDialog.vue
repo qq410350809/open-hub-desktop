@@ -886,7 +886,7 @@ async function removeKey(account: LiveAccountKeys, key: string) {
 
               <p v-if="hasModelHealth" class="site-models-health-note">
                 数字徽标为<b>最近有流量时段</b>的成功率（与色条最后一个亮块一致）；色条为站点上报的<b>全站</b>口径{{ healthNoteWindow }}逐时段成功率（与当前 Key
-                无关，仅作健康度参考）：绿 ≥90%，橙 50%~90%，红 &lt;50%，灰 = 该时段无流量，悬停可看具体时段与请求量；能否使用以该 Key 的模型列表为准。
+                无关，仅作健康度参考）：绿 ≥95%，浅绿 85%~95%，黄 70%~85%，橙 50%~70%，红 &lt;50%，灰 = 该时段无流量，悬停可看具体时段与请求量；能否使用以该 Key 的模型列表为准。
               </p>
             </div>
 
@@ -933,7 +933,7 @@ async function removeKey(account: LiveAccountKeys, key: string) {
                       <span
                         v-if="healthBadgeOf(model.id)"
                         class="site-models-item-health-value"
-                        :class="`is-${healthBadgeOf(model.id)!.level}`"
+                        :class="`is-lv${healthBadgeOf(model.id)!.level}`"
                         :title="healthBadgeOf(model.id)!.title"
                       >{{ healthBadgeOf(model.id)!.label }}</span>
                     </span>
@@ -950,7 +950,7 @@ async function removeKey(account: LiveAccountKeys, key: string) {
                           v-for="slot in statusStripOf(model.id)"
                           :key="slot.ts"
                           class="site-models-item-health-slot"
-                          :class="slot.level ? `is-${slot.level}` : 'is-idle'"
+                          :class="slot.level ? `is-lv${slot.level}` : 'is-idle'"
                           :title="slot.title"
                         />
                       </span>

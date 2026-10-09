@@ -2345,7 +2345,7 @@ onUnmounted(() => {
                       <small
                         v-if="drawerModelHealthBadge(m.id)"
                         class="sl-model-health"
-                        :class="`sl-model-health-${drawerModelHealthBadge(m.id)!.level}`"
+                        :class="`sl-model-health-lv${drawerModelHealthBadge(m.id)!.level}`"
                         :title="drawerModelHealthBadge(m.id)!.title"
                         >{{ drawerModelHealthBadge(m.id)!.label }}</small
                       >
@@ -2362,7 +2362,7 @@ onUnmounted(() => {
                           v-for="slot in drawerStatusStripOf(m.id)"
                           :key="slot.ts"
                           class="sl-model-health-slot"
-                          :class="slot.level ? `is-${slot.level}` : 'is-idle'"
+                          :class="slot.level ? `is-lv${slot.level}` : 'is-idle'"
                           :title="slot.title"
                         />
                       </span>
@@ -5029,26 +5029,40 @@ onUnmounted(() => {
   transition: background 0.15s ease;
 }
 
-.sl-model-health-slot.is-healthy { background: var(--model-status-ok, #63c469); }
-.sl-model-health-slot.is-degraded { background: var(--model-status-warn, #ffaf44); }
-.sl-model-health-slot.is-down { background: var(--model-status-bad, #fc725a); }
+.sl-model-health-slot.is-lv5 { background: var(--model-status-lv5, #63c469); }
+.sl-model-health-slot.is-lv4 { background: var(--model-status-lv4, #9ed36a); }
+.sl-model-health-slot.is-lv3 { background: var(--model-status-lv3, #f2ca4a); }
+.sl-model-health-slot.is-lv2 { background: var(--model-status-lv2, #ffaf44); }
+.sl-model-health-slot.is-lv1 { background: var(--model-status-lv1, #fc725a); }
 
-.sl-model-health-healthy {
-  border-color: color-mix(in srgb, var(--success) 32%, transparent);
-  background: var(--success-soft);
-  color: var(--success);
+.sl-model-health-lv5 {
+  border-color: color-mix(in srgb, var(--model-status-lv5, #63c469) 35%, transparent);
+  background: color-mix(in srgb, var(--model-status-lv5, #63c469) 14%, var(--surface));
+  color: var(--model-status-text-lv5, #059669);
 }
 
-.sl-model-health-degraded {
-  border-color: color-mix(in srgb, var(--warning) 32%, transparent);
-  background: var(--warning-soft);
-  color: var(--warning);
+.sl-model-health-lv4 {
+  border-color: color-mix(in srgb, var(--model-status-lv4, #9ed36a) 35%, transparent);
+  background: color-mix(in srgb, var(--model-status-lv4, #9ed36a) 14%, var(--surface));
+  color: var(--model-status-text-lv4, #65a30d);
 }
 
-.sl-model-health-down {
-  border-color: color-mix(in srgb, var(--danger) 32%, transparent);
-  background: var(--danger-soft);
-  color: var(--danger);
+.sl-model-health-lv3 {
+  border-color: color-mix(in srgb, var(--model-status-lv3, #f2ca4a) 35%, transparent);
+  background: color-mix(in srgb, var(--model-status-lv3, #f2ca4a) 14%, var(--surface));
+  color: var(--model-status-text-lv3, #ca8a04);
+}
+
+.sl-model-health-lv2 {
+  border-color: color-mix(in srgb, var(--model-status-lv2, #ffaf44) 35%, transparent);
+  background: color-mix(in srgb, var(--model-status-lv2, #ffaf44) 14%, var(--surface));
+  color: var(--model-status-text-lv2, #ea580c);
+}
+
+.sl-model-health-lv1 {
+  border-color: color-mix(in srgb, var(--model-status-lv1, #fc725a) 35%, transparent);
+  background: color-mix(in srgb, var(--model-status-lv1, #fc725a) 14%, var(--surface));
+  color: var(--model-status-text-lv1, #e11d48);
 }
 
 .sl-model-health-idle {

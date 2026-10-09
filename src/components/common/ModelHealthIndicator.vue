@@ -70,7 +70,7 @@ const stripLabel = computed(
     <span
       v-if="badge"
       class="site-models-item-health-value"
-      :class="`is-${badge.level}`"
+      :class="`is-lv${badge.level}`"
       :title="badge.title"
     >{{ badge.label }}</span>
     <span class="site-models-item-health">
@@ -84,7 +84,7 @@ const stripLabel = computed(
           v-for="slot in slots"
           :key="slot.ts"
           class="site-models-item-health-slot"
-          :class="slot.level ? `is-${slot.level}` : 'is-idle'"
+          :class="slot.level ? `is-lv${slot.level}` : 'is-idle'"
           :title="slot.title"
         />
       </span>
@@ -94,7 +94,7 @@ const stripLabel = computed(
     <span
       v-if="badge"
       class="site-models-item-health-value"
-      :class="`is-${badge.level}`"
+      :class="`is-lv${badge.level}`"
       :title="badge.title"
     >{{ badge.label }}</span>
     <span v-if="strip" class="site-models-item-health">
@@ -108,7 +108,7 @@ const stripLabel = computed(
           v-for="slot in slots"
           :key="slot.ts"
           class="site-models-item-health-slot"
-          :class="slot.level ? `is-${slot.level}` : 'is-idle'"
+          :class="slot.level ? `is-lv${slot.level}` : 'is-idle'"
           :title="slot.title"
         />
       </span>
