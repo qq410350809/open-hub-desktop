@@ -154,6 +154,14 @@ pub fn delete_site_account(
     Ok(())
 }
 
+/// 自动签到的站点范围：在用或待定，且站点支持签到。
+///
+/// 「待定」= 浏览器里有该站点会话、但还没归入在用——签到拿额度正是它转正的
+/// 常见理由，所以一并放行。未在用（既非在用也非待定）不代执行每日签到这类
+/// 写动作。额度刷新与签到范围不同：额度是只读探测，未在用站点也会被刷新。
+pub(crate) const CHECKIN_SITE_IDS_SQL: &str = "SELECT id FROM directory_sites
+     WHERE supports_checkin = 1 AND (is_personal = 1 OR is_pending = 1)";
+
 #[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn mark_sites_with_chrome_sessions(
     ctx: Managed<'_, Arc<AppContext>>,
@@ -333,10 +341,7 @@ pub async fn mark_sites_with_chrome_sessions(
     let checkin_site_ids = {
         let connection = database.lock_conn()?;
         let mut statement = connection
-            .prepare(
-                "SELECT id FROM directory_sites
-                 WHERE is_personal = 1 AND supports_checkin = 1",
-            )
+            .prepare(CHECKIN_SITE_IDS_SQL)
             .map_err(|error| error.to_string())?;
         let site_ids: HashSet<String> = statement
             .query_map([], |row| row.get::<_, String>(0))
