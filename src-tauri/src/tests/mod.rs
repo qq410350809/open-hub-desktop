@@ -1782,6 +1782,76 @@ fn parses_user_model_status_health_and_models() {
     assert!(parse_user_model_status_models(&serde_json::json!({ "data": {} })).is_empty());
 }
 
+#[test]
+fn resolves_public_embed_health_host() {
+    // x666 的逐模型健康度只在工具子域公开下发，按注册域识别（含 www 与更深子域）。
+    let some = |url: &str| {
+        crate::model::catalog::public_embed_health_url(&url::Url::parse(url).unwrap()).is_some()
+    };
+    assert!(some("https://x666.me/"));
+    assert!(some("https://www.x666.me/api/"));
+    assert!(some("https://tool.x666.me/"));
+    assert!(!some("https://example.com/"));
+    // 后缀必须落在域名边界上，不能被「x666.me.evil.com」这类主机蒙混过关。
+    assert!(!some("https://x666.me.evil.com/"));
+    assert!(!some("https://notx666.me/"));
+}
+
+#[test]
+fn parses_x666_public_embed_status() {
+    // 取自「薄荷 API」(x666) 公开嵌入接口的真实形状：
+    // data 是数组，每条 = 一个模型 × slot_data（1 小时格，success_rate 为 0~100）。
+    let payload = serde_json::json!({
+        "data": [
+            {
+                "model_name": "grok-4.7",
+                "current_status": "red",
+                "success_rate": 72.79,
+                "total_requests": 23215,
+                "slot_data": [
+                    { "slot": 0, "start_time": 1791108158, "end_time": 1791111758,
+                      "status": "red", "success_rate": 40, "total_requests": 120 },
+                    { "slot": 1, "start_time": 1791111758, "end_time": 1791115358,
+                      "status": "green", "success_rate": 100, "total_requests": 80 },
+                    { "slot": 2, "start_time": 1791115358, "end_time": 1791118958,
+                      "status": "green", "success_rate": 100, "total_requests": 0 }
+                ]
+            },
+            {
+                "model_name": "glm-5.3-200k",
+                "current_status": "red",
+                "success_rate": 0,
+                "total_requests": 910,
+                "slot_data": [
+                    { "slot": 0, "start_time": 1791108158, "end_time": 1791111758,
+                      "status": "red", "success_rate": 0, "total_requests": 910 }
+                ]
+            },
+            {
+                // 无请求也无有色格子：应在解析时丢弃（界面没有可讲的状态）。
+                "model_name": "idle-model",
+                "current_status": "green",
+                "success_rate": 100,
+                "total_requests": 0,
+                "slot_data": [
+                    { "slot": 0, "start_time": 1791108158, "end_time": 1791111758,
+                      "status": "green", "success_rate": 100, "total_requests": 0 }
+                ]
+            }
+        ],
+        "success": true
+    });
+    let health = parse_model_status_health(&payload);
+    assert_eq!(health.len(), 2, "无流量模型应被丢弃");
+    let grok = health.get("grok-4.7").expect("应解析出 grok-4.7");
+    // 零请求格留灰（不出数据点），有流量的两格进入序列。
+    assert_eq!(grok.series.len(), 2, "total_requests=0 的格不应产生数据点");
+    assert!(grok.series.iter().all(|point| point.success_rate != Some(1.0) || point.requests != Some(0)));
+    let glm = health.get("glm-5.3-200k").expect("应解析出 glm-5.3-200k");
+    assert_eq!(glm.series.len(), 1);
+    assert_eq!(glm.series[0].success_rate, Some(0.0), "0% 是确切失败，不是无数据");
+}
+
 #[tokio::test]
 async fn reveal_newapi_keys_explains_why_no_token_id() {
     let client = wreq::Client::builder()
@@ -2887,9 +2957,215 @@ fn model_only_sync_keeps_previously_synced_health() {
     assert_eq!(stored.get("claude-flaky").unwrap().success_rate, Some(0.625));
 }
 
+/// 自动签到范围：在用 + 待定（都算「自己会用的站」），未在用不代执行。
+#[test]
+fn checkin_scope_covers_personal_and_pending_sites() {
+    let connection = Connection::open_in_memory().unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE directory_sites (
+                id TEXT PRIMARY KEY,
+                is_personal INTEGER NOT NULL DEFAULT 0,
+                is_pending INTEGER NOT NULL DEFAULT 0,
+                supports_checkin INTEGER NOT NULL DEFAULT 0
+             );
+             INSERT INTO directory_sites (id, is_personal, is_pending, supports_checkin) VALUES
+                ('personal-checkin', 1, 0, 1),
+                ('pending-checkin', 0, 1, 1),
+                ('idle-checkin', 0, 0, 1),
+                ('pending-no-checkin', 0, 1, 0),
+                ('personal-no-checkin', 1, 0, 0);",
+        )
+        .unwrap();
+    let mut statement = connection
+        .prepare(crate::site::sync::usage::CHECKIN_SITE_IDS_SQL)
+        .unwrap();
+    let mut ids: Vec<String> = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    ids.sort();
+    assert_eq!(
+        ids,
+        vec!["pending-checkin".to_string(), "personal-checkin".to_string()],
+        "仅「在用/待定 + 支持签到」参与自动签到"
+    );
+}
 
+/// 一次性探测（默认忽略）：fengwind 模型市场接口的真实形状与 auth_token。
+#[tokio::test]
+#[ignore]
+async fn probe_fengwind_model_market() {
+    use std::time::Duration;
 
+    let home = std::env::var("HOME").expect("HOME");
+    let home_path = std::path::PathBuf::from(&home);
+    let origin = "https://api.fengwind.com";
+    let target = crate::site::sync::LocalStorageTarget {
+        site_id: "fw".into(),
+        profile_id: "Profile 11".into(),
+        origin: origin.into(),
+    };
+    let matches = crate::site::sync::read_local_storage_from_home(&home_path, &[target]);
+    println!("PROBE local matches={}", matches.len());
+    let values = matches.first().map(|m| &m.values).cloned().unwrap_or_default();
+    let keys: Vec<String> = values.keys().map(|k| {
+        let chars: Vec<char> = k.chars().collect();
+        if chars.len() > 40 { format!("{}...", chars[..40].iter().collect::<String>()) } else { k.clone() }
+    }).collect();
+    println!("PROBE storage keys={keys:?}");
+    let auth_token = values
+        .get("auth_token")
+        .or_else(|| values.values().find(|v| v.starts_with("sk-") || !v.is_empty()))
+        .cloned()
+        .unwrap_or_default();
+    println!("PROBE auth_token len={}", auth_token.len());
+    if auth_token.is_empty() { return; }
 
+    let client = wreq::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .no_proxy()
+        .build()
+        .expect("probe client");
+    let url = "https://api.fengwind.com/api/v1/model-market?group_by=model&sort_by=model&sort_order=asc&page=1&page_size=100&timezone=Asia%2FShanghai";
+    let response = client
+        .get(url)
+        .header("accept", "application/json")
+        .header("authorization", format!("Bearer {auth_token}"))
+        .send()
+        .await
+        .expect("请求 model-market");
+    let status = response.status();
+    let text = response.text().await.unwrap_or_default();
+    std::fs::write("/tmp/fw_market_full.json", &text).unwrap();
+    println!("PROBE raw status={status} bytes={}", text.len());
+    let expected_total = serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|v| v.pointer("/data/total").and_then(serde_json::Value::as_u64))
+        .unwrap_or(0);
+    let health = crate::model::catalog::fetch_sub2api_model_market_health(
+        &client,
+        &url::Url::parse("https://api.fengwind.com/").unwrap(),
+        &auth_token,
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+    )
+    .await;
+    let with_series = health.values().filter(|h| !h.series.is_empty()).count();
+    let mut names: Vec<&String> = health.keys().collect();
+    names.sort();
+    println!(
+        "PROBE 分页聚合后 models={} (站点 total={expected_total}) with_series={with_series}",
+        health.len()
+    );
+    println!("PROBE 样例模型(前10)={:?}", &names[..names.len().min(10)]);
+    for probe in ["bge-m3", "claude-opus-4-8", "gemini-2.5-flash"] {
+        if let Some(h) = health.get(probe) {
+            println!(
+                "PROBE {probe}: rate={:?} series={} window_h={} req={:?}",
+                h.success_rate, h.series.len(), h.window_hours, h.requests
+            );
+        } else {
+            println!("PROBE {probe}: 缺失");
+        }
+    }
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+        if let Some(data) = value.get("data") {
+            println!("PROBE data keys={:?}", data.as_object().map(|o| o.keys().cloned().collect::<Vec<_>>()));
+            if let Some(channels) = data.get("channels").and_then(serde_json::Value::as_array) {
+                println!("PROBE channels={}", channels.len());
+            }
+            if let Some(models) = data.get("models").and_then(serde_json::Value::as_array) {
+                println!("PROBE models={}", models.len());
+                if let Some(first) = models.first() {
+                    println!("PROBE model[0]={}", serde_json::to_string(first).unwrap_or_default().chars().take(900).collect::<String>());
+                }
+            } else {
+                if let Some(object) = data.as_object() {
+                    for (k, v) in object {
+                        let text = serde_json::to_string(v).unwrap_or_default();
+                        println!("PROBE data.{k} len={} head={}", text.len(), text.chars().take(140).collect::<String>());
+                    }
+                }
+            }
+        }
+    }
+}
 
+/// 一次性探测（默认忽略）：sub2api 通道（collect_site_model_health）真实站点写库。
+#[tokio::test]
+#[ignore]
+async fn probe_fengwind_collect_health() {
+    use std::time::{Duration, Instant};
 
-
+    let database = health_test_database();
+    let site_id = "fengwind-probe";
+    let profile_id = "Profile 11";
+    let home2 = std::env::var("HOME").expect("HOME");
+    {
+        let connection = database.0.lock().unwrap();
+        connection
+            .execute(
+                "INSERT INTO site_model_cache (site_id, profile_id) VALUES (?1, ?2)",
+                rusqlite::params![site_id, profile_id],
+            )
+            .unwrap();
+    }
+    let client = wreq::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .no_proxy()
+        .build()
+        .expect("probe client");
+    let base = url::Url::parse("https://api.fengwind.com/").unwrap();
+    let started = Instant::now();
+    let t0 = Instant::now();
+    let token = crate::site::sync::read_local_storage_from_home(
+        &std::path::PathBuf::from(&home2),
+        &[crate::site::sync::LocalStorageTarget {
+            site_id: "fw".into(),
+            profile_id: profile_id.into(),
+            origin: "https://api.fengwind.com".into(),
+        }],
+    );
+    println!(
+        "PROBE LS 读取 {:.2}s keys={:?}",
+        t0.elapsed().as_secs_f64(),
+        token.first().map(|m| m.values.len()).unwrap_or(0)
+    );
+    let auth_token = token
+        .first()
+        .and_then(|m| m.values.get("auth_token").cloned())
+        .map(|v| crate::site::sync::local_scalar(&v))
+        .unwrap_or_default();
+    let t1 = Instant::now();
+    let direct = crate::model::catalog::fetch_sub2api_model_market_health(
+        &client,
+        &base,
+        &auth_token,
+        &crate::site::sync::chrome_user_agent(),
+    )
+    .await;
+    println!("PROBE 直调 fetch {:.2}s models={}", t1.elapsed().as_secs_f64(), direct.len());
+    let health = crate::model::catalog::collect_site_model_health(
+        &database,
+        &client,
+        &base,
+        site_id,
+        "sub2api",
+        &[profile_id.to_string()],
+    )
+    .await
+    .expect("collect 不应报错");
+    let stored = read_health_json(&database, site_id, profile_id);
+    println!(
+        "PROBE collect models={} stored_bytes={} elapsed={:.1}s",
+        health.len(),
+        stored.len(),
+        started.elapsed().as_secs_f64()
+    );
+    let mut names: Vec<&String> = health.keys().collect();
+    names.sort();
+    println!("PROBE 前 10: {:?}", &names[..names.len().min(10)]);
+    assert!(!health.is_empty(), "sub2api 通道应抓到模型市场健康度");
+    assert_ne!(stored, "{}", "健康度应写入 health_json");
+}

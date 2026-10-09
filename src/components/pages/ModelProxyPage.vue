@@ -32,6 +32,7 @@ import {
   formatLogDate,
   formatLogTime,
   formatLogFull,
+  modelHealthValue,
 } from "../../utils";
 import type { SiteModelCacheEntry, SiteModelHealth } from "../../types";
 import ModelHealthIndicator from "../common/ModelHealthIndicator.vue";
@@ -1900,6 +1901,8 @@ interface AllModelsDraftState {
 
 const allModelsDialogOpen = ref(false);
 const allModelsSearch = ref("");
+/** 过滤健康度为 0% 的模型（无健康度数据不属于「0 健康度」，不受影响） */
+const allModelsHealthyOnly = ref(false);
 const allModelsDraft = ref<Record<string, AllModelsDraftState>>({});
 const savingAllModels = ref(false);
 const allModelsSyncing = ref(false);
@@ -1933,12 +1936,25 @@ const allModelsGroups = computed(() =>
   }),
 );
 
-/** 按搜索词过滤后的分组：仅保留含匹配模型的渠道 */
+/** 按搜索词与「过滤 0 健康度」过滤后的分组：仅保留含匹配模型的渠道。
+ *  过滤只影响展示，分组头的「已启用 N/M」与「全选」始终按全量已知模型计算。 */
 const filteredAllModelsGroups = computed(() => {
   const q = allModelsSearch.value.trim().toLowerCase();
-  if (!q) return allModelsGroups.value;
+  const healthyOnly = allModelsHealthyOnly.value;
+  if (!q && !healthyOnly) return allModelsGroups.value;
   return allModelsGroups.value
-    .map((g) => ({ ...g, models: g.models.filter((m) => m.toLowerCase().includes(q)) }))
+    .map((g) => ({
+      ...g,
+      models: g.models.filter((m) => {
+        if (q && !m.toLowerCase().includes(q)) return false;
+        if (healthyOnly) {
+          const value = modelHealthValue(channelModelHealth(g.channel, m));
+          // 无健康度数据（null）≠ 0 健康度：保留；只隐藏确证 0% 的模型。
+          if (value !== null && value <= 0) return false;
+        }
+        return true;
+      }),
+    }))
     .filter((g) => g.models.length > 0);
 });
 
@@ -3044,6 +3060,8 @@ const availableModelsCount = computed(() => {
 const channelModelSortMode = ref<"discovery" | "usage">("discovery");
 /** 仅看已启用的模型 */
 const channelModelEnabledOnly = ref(false);
+/** 过滤健康度为 0% 的模型（无健康度数据的模型不属于「0 健康度」，不受影响） */
+const channelModelHealthyOnly = ref(false);
 
 const filteredChannelModels = computed(() => {
   const q = channelSearchQuery.value.trim().toLowerCase();
@@ -3052,6 +3070,13 @@ const filteredChannelModels = computed(() => {
   if (q) list = list.filter((m) => m.toLowerCase().includes(q) || `${alias}/${m}`.toLowerCase().includes(q));
   if (channelModelEnabledOnly.value) {
     list = list.filter((m) => isModelChecked(m));
+  }
+  if (channelModelHealthyOnly.value) {
+    list = list.filter((m) => {
+      const value = modelHealthValue(channelModelHealth(selectedChannel.value, m));
+      // 无健康度数据（null）≠ 0 健康度：保留；只有确证 0% 的模型才过滤掉。
+      return value == null || value > 0;
+    });
   }
   if (channelModelSortMode.value === "usage") {
     const stats = channelModelStatsMap.value;
@@ -5086,6 +5111,13 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
                 <input v-model="channelModelEnabledOnly" type="checkbox" />
                 <span>仅看已启用</span>
               </label>
+              <label
+                class="mp-toolbar-switch"
+                title="隐藏健康度为 0% 的模型（无健康度数据的模型不属于 0 健康度，不受影响）"
+              >
+                <input v-model="channelModelHealthyOnly" type="checkbox" />
+                <span>过滤 0 健康度</span>
+              </label>
               <div class="mp-toolbar-sort">
                 <CustomSelect
                   class="mp-sort-dd"
@@ -6077,7 +6109,7 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
         </div>
 
         <div class="mp-modal-body is-flush-top">
-          <!-- 模型搜索框 + 同步按钮 -->
+          <!-- 模型搜索框 + 过滤 + 同步按钮 -->
           <div class="mp-models-modal-toolbar is-top-bar">
             <div class="mp-search-box flex-1">
               <span class="mp-search-icon" v-html="icons.search" />
@@ -6097,6 +6129,13 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
                 <span v-html="icons.close" />
               </button>
             </div>
+            <label
+              class="mp-toolbar-switch"
+              title="隐藏健康度为 0% 的模型（无健康度数据的模型不属于 0 健康度，不受影响）；只影响列表展示，不改动勾选状态"
+            >
+              <input v-model="allModelsHealthyOnly" type="checkbox" />
+              <span>过滤 0 健康度</span>
+            </label>
             <button
               type="button"
               class="mp-btn mp-btn-ghost"
@@ -6228,7 +6267,7 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
               </div>
               <div v-else class="mp-group-empty-note text-muted text-xs">
                 <span v-if="!group.channel.enabled">该渠道当前已被禁用</span>
-                <span v-else-if="allModelsSearch">未检索到匹配的模型</span>
+                <span v-else-if="allModelsSearch || allModelsHealthyOnly">当前过滤条件下没有匹配的模型</span>
                 <span v-else>暂无已知模型，点本组「同步」或顶部「同步模型」从上游拉取</span>
               </div>
             </section>
@@ -6236,7 +6275,7 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
 
           <div v-if="filteredAllModelsGroups.length === 0" class="mp-empty-box">
             <div class="mp-empty-icon" v-html="icons.cpu" />
-            <p>未检索到匹配的模型</p>
+            <p>{{ allModelsSearch || allModelsHealthyOnly ? "当前过滤条件下没有匹配的模型" : "未检索到匹配的模型" }}</p>
           </div>
         </div>
 

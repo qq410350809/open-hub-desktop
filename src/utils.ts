@@ -375,8 +375,7 @@ export function describeModelStatusStrip(
   });
 }
 
-/**
- * 状态条窗口口径的短描述，如「近 24 小时逐时」——说明文字、读屏 label
+/** 状态条窗口口径的短描述，如「近 24 小时逐时」——说明文字、读屏 label
  * 与提示都要跟着站点实际窗口走：增强模块的窗口可以是 7 天、格宽 7 小时。
  */
 export function describeModelWindowLabel(health?: SiteModelHealth | null): string {
@@ -475,4 +474,25 @@ export function describeModelHealth(health?: SiteModelHealth | null): ModelHealt
     width: Math.max(1, clamped * 100),
     title: `${scope}：${details.join("，")}。该数据与当前 Key 无关，不能据此判断本 Key 是否可用。`,
   };
+}
+
+/**
+ * 徽标展示的健康度数值（0~1），与 `describeModelHealth` 完全同源：
+ * 状态条最后一个有色方块的成功率，没有逐时段数据时回落窗口汇总值。
+ *
+ * 返回 `null` 表示没有任何可用的健康度数字——这是「无健康度数据」，
+ * 与「健康度为 0%」是两回事（后者是确切的失败结论）。注意区分：
+ * 「过滤 0 健康度」这类列表辅助应过滤 `value === 0`，而不是把
+ * `null` 一起过滤掉。
+ */
+export function modelHealthValue(health?: SiteModelHealth | null): number | null {
+  if (!health) return null;
+  const slots = describeModelStatusStrip(health, null);
+  for (let index = slots.length - 1; index >= 0; index -= 1) {
+    const slot = slots[index];
+    if (slot.level && typeof slot.successRate === "number") return slot.successRate;
+  }
+  const rate = health.successRate;
+  if (typeof rate !== "number" || !Number.isFinite(rate)) return null;
+  return Math.min(1, Math.max(0, rate));
 }

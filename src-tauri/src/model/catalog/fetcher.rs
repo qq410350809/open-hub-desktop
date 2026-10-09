@@ -1,4 +1,4 @@
-use crate::context::{home_dir, spawn_blocking, AppContext, Managed};
+use crate::context::{home_dir, spawn, spawn_blocking, AppContext, Managed};
 use crate::db::*;
 use crate::models::*;
 use crate::proxypool;
@@ -1246,8 +1246,9 @@ pub(crate) async fn fetch_model_status_health(
 }
 
 /// 模型健康度的统一入口：先要原生 perf-metrics（逐整点序列），站点没有这条
-/// 路由时依次回退「模型状态」增强模块与站点状态接口 `/api/user/model-status`
-/// （Agent Router 等站点只有后者）。任一级都只是软失败，全空即「本站没有健康度」。
+/// 路由时依次回退「模型状态」增强模块、站点状态接口 `/api/user/model-status`
+/// （Agent Router 等），最后是站点自建监控站的公开嵌入接口（x666 等，见
+/// `PUBLIC_EMBED_STATUS_URLS`）。任一级都只是软失败，全空即「本站没有健康度」。
 pub(crate) async fn fetch_site_model_health(
     client: &wreq::Client,
     base_url: &Url,
@@ -1262,7 +1263,308 @@ pub(crate) async fn fetch_site_model_health(
     if !health.is_empty() {
         return health;
     }
-    fetch_user_model_status_health(client, base_url, auth, user_agent).await
+    let health = fetch_user_model_status_health(client, base_url, auth, user_agent).await;
+    if !health.is_empty() {
+        return health;
+    }
+    match public_embed_health_url(base_url) {
+        Some(url) => {
+            fetch_public_health_endpoint(client, url, user_agent, parse_model_status_health).await
+        }
+        None => HashMap::new(),
+    }
+}
+
+/// 站点自建监控站的公开嵌入健康度接口：`站点 API 主机的注册域` → `接口地址`。
+///
+/// 这类站点的「模型状态」路由只在主域且要求登录（未登录回 401），逐模型 ×
+/// 逐时段状态由独立工具子域公开下发（实测 x666：主域 `/api/enhancements/
+/// model-status/status/all` 401，`tool.x666.me/api/model-status/embed/status/all`
+/// 匿名可读、11 个模型各带 24 格 slot_data）。响应形状与「模型状态」增强模块
+/// 一致，因此复用 `parse_model_status_health`。用 `all` 而不是 `batch`：
+/// batch 只回一个名为 "batch" 的聚合条目，没有逐模型数据。
+const PUBLIC_EMBED_STATUS_URLS: [(&str, &str); 1] = [(
+    "x666.me",
+    "https://tool.x666.me/api/model-status/embed/status/all?window=24h",
+)];
+
+/// 站点 API 主机（忽略 `www.`）对应的公开嵌入健康度接口。
+pub(crate) fn public_embed_health_url(base_url: &Url) -> Option<&'static str> {
+    let host = base_url.host_str()?.to_ascii_lowercase();
+    let host = host.strip_prefix("www.").unwrap_or(&host);
+    PUBLIC_EMBED_STATUS_URLS
+        .iter()
+        .find(|(domain, _)| host == *domain || host.ends_with(&format!(".{domain}")))
+        .map(|(_, url)| *url)
+}
+
+/// 拉取公开嵌入接口（跨域子域，无需登录）。
+///
+/// 刻意不注入站点鉴权：请求发往另一个主机，主域的 Cookie / 访问令牌不该外带。
+async fn fetch_public_health_endpoint(
+    client: &wreq::Client,
+    url: &str,
+    user_agent: &str,
+    parse: impl FnOnce(&serde_json::Value) -> HashMap<String, SiteModelHealth>,
+) -> HashMap<String, SiteModelHealth> {
+    let Ok(url) = Url::parse(url) else {
+        return HashMap::new();
+    };
+    let request = chrome_request_headers(client.get(url.clone()), url.as_str(), user_agent);
+    match tokio::time::timeout(
+        PERF_METRICS_TIMEOUT,
+        request_json(request, "站点公开状态接口"),
+    )
+    .await
+    {
+        Ok(Ok(value)) => parse(&value),
+        Ok(Err(_)) | Err(_) => HashMap::new(),
+    }
+}
+
+/// Sub2API「模型市场」健康度接口（fengwind 等站点）。
+///
+/// 与 NewAPI 的 perf-metrics 不同：它按 (模型 × 渠道) 展开逐时段健康度，
+/// `data.items[].health.buckets` 是固定格宽的时间格，`bucket_seconds` 给出格宽。
+/// 鉴权用浏览器会话令牌 `auth_token`（Chrome Local Storage 里的登录令牌）——
+/// 既不是 API Key 也不是 Cookie：用 Key 请求会回 `INVALID_TOKEN`。
+///
+/// **必须分页取全**：`page_size=100` 是服务端硬上限（传 500 回空），模型总数
+/// 超过 100 时只取第 1 页会安静漏掉后面的模型。分页由
+/// `fetch_sub2api_model_market_health` 负责；`page` 在请求时动态拼接。
+pub(crate) const SUB2API_MODEL_MARKET_PATH: &str = "/api/v1/model-market";
+pub(crate) const SUB2API_MODEL_MARKET_QUERY: &str =
+    "group_by=model&sort_by=model&sort_order=asc&page_size=100&timezone=Asia%2FShanghai";
+/// 分页上限：仅作异常站点的兜底护栏，正常由 `total` / 无新增提前终止。
+const SUB2API_MODEL_MARKET_MAX_PAGES: u32 = 20;
+
+/// 解析 `2026-10-05T11:45:00Z` 这类 RFC3339 时间串为 Unix 秒。
+fn parse_iso_timestamp(value: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|time| time.timestamp())
+}
+
+/// 解析 Sub2API「模型市场」健康度。
+///
+/// 响应形如 `{ data: { bucket_seconds, range, window_start, window_end,
+/// items: [ { model, channel, health: { buckets: [ { bucket_start,
+/// success_count, failure_count, sample_count, success_rate } ] },
+/// performance: { avg_ttft_ms, generation_tps } } ] } }`。
+///
+/// `items` 是 (模型 × 渠道) 组合，同一模型可能落在多个渠道：这里按模型把
+/// 时间格对齐求和，得到「该模型在整站的表现」——界面按模型展示健康度，分渠道
+/// 没有落点。无样本（`sample_count` 为 0）的格子不出数据点（界面留灰），与
+/// 其它通道「无流量 ≠ 0% 失败」的语义一致。
+pub(crate) fn parse_sub2api_model_market_health(
+    value: &serde_json::Value,
+) -> HashMap<String, SiteModelHealth> {
+    let Some(items) = json_array_at(value, &["/data/items", "/data/list", "/items"]) else {
+        return HashMap::new();
+    };
+    // 模型名 → 逐时间格累计 (成功数, 样本数)；延迟/TPS 另存候选。
+    let mut slots: HashMap<String, HashMap<i64, (u64, u64)>> = HashMap::new();
+    let mut latency: HashMap<String, (u64, i64)> = HashMap::new();
+    let mut tps: HashMap<String, (u64, f64)> = HashMap::new();
+    for item in items {
+        let model = json_string(item, &["/model", "/model_name", "/id"]);
+        if model.is_empty() {
+            continue;
+        }
+        // 延迟/TPS 取样本最多的那条渠道：同模型不同渠道差异大，简单平均没有意义。
+        let weight = json_number(item, "/performance/ttft_sample_count")
+            .unwrap_or(0.0)
+            .max(json_number(item, "/performance/generation_sample_count").unwrap_or(0.0))
+            .max(0.0) as u64;
+        if weight > 0 {
+            if let Some(ttft) = json_number(item, "/performance/avg_ttft_ms") {
+                if latency.get(&model).is_none_or(|(current, _)| weight > *current) {
+                    latency.insert(model.clone(), (weight, ttft.round() as i64));
+                }
+            }
+            if let Some(speed) = json_number(item, "/performance/generation_tps") {
+                if tps.get(&model).is_none_or(|(current, _)| weight > *current) {
+                    tps.insert(model.clone(), (weight, speed));
+                }
+            }
+        }
+        let Some(buckets) = json_array_at(item, &["/health/buckets", "/buckets"]) else {
+            continue;
+        };
+        let entry = slots.entry(model).or_default();
+        for bucket in buckets {
+            let Some(ts) = parse_iso_timestamp(&json_string(bucket, &["/bucket_start", "/start"]))
+            else {
+                continue;
+            };
+            let sample = json_number(bucket, "/sample_count").unwrap_or(0.0).max(0.0) as u64;
+            if sample == 0 {
+                continue;
+            }
+            let success = json_number(bucket, "/success_count").unwrap_or(0.0).max(0.0) as u64;
+            let slot = entry.entry(ts).or_insert((0, 0));
+            slot.0 = slot.0.saturating_add(success);
+            slot.1 = slot.1.saturating_add(sample);
+        }
+    }
+
+    let window_start = parse_iso_timestamp(&json_string(value, &["/data/window_start"]));
+    let window_end = parse_iso_timestamp(&json_string(value, &["/data/window_end"]));
+    let mut health = HashMap::new();
+    for (model, buckets) in slots {
+        if buckets.is_empty() {
+            continue;
+        }
+        let mut times: Vec<i64> = buckets.keys().copied().collect();
+        times.sort_unstable();
+        let mut series = Vec::with_capacity(times.len());
+        let mut total_success = 0u64;
+        let mut total_sample = 0u64;
+        for ts in &times {
+            let (success, sample) = buckets[ts];
+            total_success = total_success.saturating_add(success);
+            total_sample = total_sample.saturating_add(sample);
+            series.push(SiteModelHealthPoint {
+                ts: *ts,
+                success_rate: (sample > 0)
+                    .then(|| (success as f64 / sample as f64).clamp(0.0, 1.0)),
+                requests: Some(sample),
+            });
+        }
+        // 窗口：优先用站点给的起止；缺了就用时间格覆盖的跨度，按小时向上取整。
+        let first = *times.first().unwrap_or(&0);
+        let last = *times.last().unwrap_or(&first);
+        let start = window_start.unwrap_or(first);
+        let end = window_end.filter(|end| *end > start).unwrap_or(last);
+        let hours = (((end - start).max(3600) as f64) / 3600.0).ceil() as i64;
+        health.insert(
+            model.clone(),
+            SiteModelHealth {
+                success_rate: (total_sample > 0)
+                    .then(|| (total_success as f64 / total_sample as f64).clamp(0.0, 1.0)),
+                avg_latency_ms: latency.get(&model).map(|(_, value)| *value),
+                avg_tps: tps.get(&model).map(|(_, value)| *value),
+                window_hours: hours.max(1),
+                requests: Some(total_sample),
+                window_start: Some(start),
+                series,
+            },
+        );
+    }
+    health
+}
+
+/// 用浏览器会话令牌分页拉取 Sub2API「模型市场」健康度（fengwind 等）。
+///
+/// 逐页累加 `data.items`，再把合并后的形状交回纯解析器。终止条件：
+/// 页面为空、已收模型数达到站点上报的 `total`、或本页没有新增模型
+/// （服务端 `page>=3` 会重复返回末页，靠这一条跳出）。
+pub(crate) async fn fetch_sub2api_model_market_health(
+    client: &wreq::Client,
+    base_url: &Url,
+    auth_token: &str,
+    user_agent: &str,
+) -> HashMap<String, SiteModelHealth> {
+    if auth_token.trim().is_empty() {
+        return HashMap::new();
+    }
+    let mut all_items: Vec<serde_json::Value> = Vec::new();
+    // 保留首屏的窗口字段：分页只切 items，窗口口径每页一致。
+    let mut window_start = serde_json::Value::Null;
+    let mut window_end = serde_json::Value::Null;
+    let mut seen_models: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut total: Option<u64> = None;
+    for page in 1..=SUB2API_MODEL_MARKET_MAX_PAGES {
+        let path = format!(
+            "{SUB2API_MODEL_MARKET_PATH}?{SUB2API_MODEL_MARKET_QUERY}&page={page}"
+        );
+        let Ok(url) = base_url.join(&path) else {
+            break;
+        };
+        let request = chrome_request_headers(client.get(url), base_url.as_str(), user_agent)
+            .bearer_auth(auth_token);
+        let Ok(Ok(value)) = tokio::time::timeout(
+            PERF_METRICS_TIMEOUT,
+            request_json_with_hint(request, "Sub2API 模型市场", SUB2API_AUTH_FAILURE_HINT),
+        )
+        .await
+        else {
+            break;
+        };
+        if page == 1 {
+            total = json_number(&value, "/data/total")
+                .map(|value| value.max(0.0).round() as u64)
+                .filter(|value| *value > 0);
+            window_start = value
+                .pointer("/data/window_start")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            window_end = value
+                .pointer("/data/window_end")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+        }
+        let Some(items) = json_array_at(&value, &["/data/items", "/data/list", "/items"]) else {
+            break;
+        };
+        if items.is_empty() {
+            break;
+        }
+        let before = seen_models.len();
+        for item in items {
+            let model = json_string(item, &["/model", "/model_name", "/id"]);
+            if !model.is_empty() {
+                seen_models.insert(model);
+            }
+            all_items.push(item.clone());
+        }
+        // 本页没有带来任何新模型：服务端在末页之后重复返回同一页，停。
+        if page > 1 && seen_models.len() == before {
+            break;
+        }
+        if let Some(total) = total {
+            if seen_models.len() as u64 >= total {
+                break;
+            }
+        }
+    }
+    if all_items.is_empty() {
+        return HashMap::new();
+    }
+    let merged = serde_json::json!({
+        "data": {
+            "window_start": window_start,
+            "window_end": window_end,
+            "items": all_items,
+        }
+    });
+    parse_sub2api_model_market_health(&merged)
+}
+
+/// 读 Chrome Local Storage 里 Sub2API 的会话令牌 `auth_token`（模型市场接口凭据）。
+fn sub2api_auth_token_from_home(
+    home: &std::path::Path,
+    base_url: &Url,
+    profile_id: &str,
+) -> String {
+    let Some(origin) = Some(base_url.origin().ascii_serialization())
+        .filter(|origin| origin != "null" && !origin.is_empty())
+    else {
+        return String::new();
+    };
+    sync::read_local_storage_from_home(
+        home,
+        &[sync::LocalStorageTarget {
+            site_id: String::new(),
+            profile_id: profile_id.to_string(),
+            origin,
+        }],
+    )
+    .into_iter()
+    .find_map(|item| item.values.get("auth_token").cloned())
+    .map(|value| local_scalar(&value))
+    .filter(|value| !value.is_empty())
+    .unwrap_or_default()
 }
 
 /// 站点状态接口路径（Agent Router 等站点的模型状态页数据源）。
@@ -2139,7 +2441,7 @@ async fn fetch_platform_model_health(
     }
 }
 
-async fn collect_site_model_health(
+pub(crate) async fn collect_site_model_health(
     database: &Database,
     client: &wreq::Client,
     base_url: &Url,
@@ -2163,15 +2465,56 @@ async fn collect_site_model_health(
     // 401），令牌一旦过期健康度就会永远停在旧快照上——所以令牌路径拿不到数据
     // 时回退读 Chrome Cookie 走会话鉴权（实测健康度接口认会话），代价只在
     // 失败路径上多读一次浏览器 Cookie。
+    // 站点自建监控站的公开嵌入接口（x666 等）匿名可读，不依赖令牌或会话，
+    // 任意架构的站点只要在 `PUBLIC_EMBED_STATUS_URLS` 里就能抓。
+    //
+    // Sub2API（fengwind 等）的健康度走它自己的「模型市场」接口，凭据是
+    // Chrome Local Storage 里的会话令牌 auth_token（Key 会回 INVALID_TOKEN，
+    // Cookie 也不是它的鉴权方式），所以按 sub2api 单独开一条通道。
+    let public_embed = public_embed_health_url(base_url).is_some();
+    let sub2api = is_sub2api(system_type);
     let token_form = uses_access_token(system_type);
     let cookie_form = !token_form && is_newapi(system_type);
-    if (!token_form && !cookie_form) || profile_ids.is_empty() {
+    if (!token_form && !cookie_form && !public_embed && !sub2api) || profile_ids.is_empty() {
         return Ok(HashMap::new());
     }
     let home = home_dir().ok_or("无法定位用户目录")?;
     let user_agent = sync::chrome_user_agent();
     let mut merged: HashMap<String, SiteModelHealth> = HashMap::new();
     for profile_id in profile_ids {
+        if sub2api {
+            // Sub2API：读 Chrome Local Storage 的会话令牌 → 模型市场接口。
+            let auth_token = {
+                let home = home.clone();
+                let base_url = base_url.clone();
+                let profile_id = profile_id.clone();
+                spawn_blocking(move || {
+                    sub2api_auth_token_from_home(&home, &base_url, &profile_id)
+                })
+                .await
+                .unwrap_or_default()
+            };
+            if !auth_token.is_empty() {
+                let health =
+                    fetch_sub2api_model_market_health(client, base_url, &auth_token, &user_agent)
+                        .await;
+                if !health.is_empty() {
+                    let health_json =
+                        serde_json::to_string(&health).unwrap_or_else(|_| "{}".to_string());
+                    let connection = database.lock_conn()?;
+                    let _ = connection.execute(
+                        "UPDATE site_model_cache SET health_json = ?3, updated_at = CURRENT_TIMESTAMP
+                          WHERE site_id = ?1 AND profile_id = ?2",
+                        params![site_id, profile_id, health_json],
+                    );
+                    drop(connection);
+                    if merged.is_empty() {
+                        merged = health;
+                    }
+                }
+            }
+            continue;
+        }
         let (token, user_id) = {
             let connection = database.lock_conn()?;
             connection
@@ -2217,7 +2560,10 @@ async fn collect_site_model_health(
             .and_then(|result| result.ok())
             .unwrap_or_default();
             let cookie_header = cookie_header.trim().to_string();
-            if !cookie_header.is_empty() {
+            // 没有 Cookie 也继续：站点自建监控站的公开嵌入接口（x666 等）匿名
+            // 可读，不需要任何登录态；有 Cookie 时一并带上，让主域的鉴权路由
+            // （enhancements / user/model-status）也有机会命中。
+            if !cookie_header.is_empty() || public_embed_health_url(base_url).is_some() {
                 let auth = NewApiAuth::Legacy {
                     cookie_header,
                     user_id,
@@ -3634,6 +3980,21 @@ async fn fetch_site_models_json_inner(
             };
             // 已有登录令牌（auth_token）优先直接使用：用它同步模型列表，
             // 不再通过 /api/v1/keys 获取 Key。只有直接同步失败才回落到 Key 接口。
+            // 健康度（模型市场接口）是补偿信息：与模型列表并发拉，失败只留空，
+            // 绝不拖垮模型同步主流程。
+            let client_health = client.clone();
+            let base_url_health = base_url.clone();
+            let auth_token_health = auth_token.clone();
+            let user_agent_health = user_agent.clone();
+            let mut health_task = Some(spawn(async move {
+                fetch_sub2api_model_market_health(
+                    &client_health,
+                    &base_url_health,
+                    &auth_token_health,
+                    &user_agent_health,
+                )
+                .await
+            }));
             let direct_models_url = base_url
                 .join("/v1/models")
                 .map_err(|_| "无法生成 /v1/models 地址".to_string())?;
@@ -3652,6 +4013,10 @@ async fn fetch_site_models_json_inner(
                         let models = parse_site_models(&value);
                         if !models.is_empty() {
                             merge_api_keys(&mut discovered_keys, [auth_token.clone()]);
+                            let model_health = match health_task.take() {
+                                Some(task) => task.await.unwrap_or_default(),
+                                None => HashMap::new(),
+                            };
                             return cache_profile_api_counts(
                                 database,
                                 site_id.as_deref(),
@@ -3664,8 +4029,7 @@ async fn fetch_site_models_json_inner(
                                     key_models: HashMap::new(),
                                     errors: Vec::new(),
                                     profile_id: profile_id.clone(),
-                                    // Sub2API 没有 NewAPI 那套性能指标接口。
-                                    model_health: HashMap::new(),
+                                    model_health,
                                 },
                             );
                         }
@@ -3713,7 +4077,13 @@ async fn fetch_site_models_json_inner(
                     )
                     .await
                     {
-                        Ok(result) => {
+                        Ok(mut result) => {
+                            // 健康度（模型市场）与 Key 拉取并发进行，这里取回；
+                            // 失败/超时只留空，不影响模型列表。
+                            result.model_health = match health_task.take() {
+                                Some(task) => task.await.unwrap_or_default(),
+                                None => HashMap::new(),
+                            };
                             return cache_profile_api_counts(
                                 database,
                                 site_id.as_deref(),
@@ -3727,6 +4097,11 @@ async fn fetch_site_models_json_inner(
                 Err(error) => sub2api_errors.push(error),
             }
             if !sub2api_errors.is_empty() {
+                // 两条模型路径都没走到取回健康度的那一步：中止后台任务，
+                // 避免无人消费的分页拉取白白继续（结果也无处可挂）。
+                if let Some(task) = health_task.take() {
+                    task.abort();
+                }
                 if sub2api_errors
                     .iter()
                     .all(|error| access_token_was_rejected(error))
