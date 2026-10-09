@@ -245,7 +245,9 @@ function goCharityPage(page: number) {
 }
 
 function scheduleLocalReload(feedId = selectedTagId.value) {
-  if (feedId !== selectedTagId.value) {
+  // 「全部」视图聚合所有标签的帖子：任一标签同步完成都应刷新列表，
+  // 不能因为事件的 feedId（具体标签）与当前选中项（all）不同就跳过。
+  if (selectedTagId.value !== "all" && feedId !== selectedTagId.value) {
     void refreshSidebarCounts();
     return;
   }

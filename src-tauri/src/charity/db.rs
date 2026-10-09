@@ -1,7 +1,7 @@
 use crate::charity::types::*;
 use crate::context::EventBus;
 use crate::models::Database;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use std::collections::HashMap;
 
 pub fn load_charity_sources(database: &Database) -> Result<Vec<CharityFeedSource>, String> {
@@ -561,11 +561,6 @@ pub fn load_all_feed_items_from_db(
 ) -> Result<CharityFeedResult, String> {
     let limit = limit.clamp(1, CHARITY_PAGE_LIMIT_MAX);
     let filter_clause = charity_filter_clause(filter);
-    let order_clause = format!(
-        "{} {}, rowid DESC",
-        charity_sort_column(sort_by),
-        charity_sort_direction(sort_order)
-    );
     let connection = database.lock_conn()?;
     // 「全部」是前端聚合的虚拟标签，没有自己的 meta 键；取各真实 feed 里最新的同步时间。
     let fetched_at = connection
@@ -603,92 +598,204 @@ pub fn load_all_feed_items_from_db(
             .max(0) as usize
     };
 
-    let mut statement = connection
-        .prepare(
-            &format!(
+    // 先按去重后的 guid 分页，再取这些 guid 对应的所有标签行合并。
+    // 旧实现对 charity_feed_items 行做 OFFSET，但 total_count 用 COUNT(DISTINCT guid)，
+    // 同一帖跨多个标签时行级 offset 会把重复行计入，翻页必然重复/漏帖。
+    let group_order_clause = format!(
+        "{} {}, guid DESC",
+        charity_sort_column(sort_by),
+        charity_sort_direction(sort_order)
+    );
+    let page_guids = {
+        let mut statement = connection
+            .prepare(&format!(
+                "SELECT guid FROM (
+                     SELECT guid,
+                            MAX(title) AS title,
+                            MAX(author) AS author,
+                            MAX(published_at) AS published_at,
+                            MAX(reply_count) AS reply_count,
+                            MAX(views) AS views,
+                            MAX(like_count) AS like_count,
+                            MAX(last_activity_at) AS last_activity_at,
+                            MIN(first_seen_at) AS first_seen_at
+                     FROM charity_feed_items
+                     WHERE (?3 = '' OR title LIKE ?3 OR author LIKE ?3 OR categories LIKE ?3){filter_clause}
+                     GROUP BY guid
+                 ) AS grouped
+                 ORDER BY {group_order_clause}
+                 LIMIT ?1 OFFSET ?2"
+            ))
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map(params![limit as i64, offset as i64, key_pat], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        rows
+    };
+    if page_guids.is_empty() {
+        return Ok(CharityFeedResult {
+            feed_id: "all".into(),
+            feed_name: "全部".into(),
+            items: Vec::new(),
+            fetched_at,
+            changed: false,
+            new_count: 0,
+            updated_count: 0,
+            initialized: true,
+            source_profile_name: String::new(),
+            source_account_name: String::new(),
+            status: "local".into(),
+            message: String::new(),
+            used_node_id: String::new(),
+            used_node_name: String::new(),
+            unread_count: 0,
+            skipped: false,
+            total_count,
+            offset,
+            limit,
+            has_more: offset < total_count,
+        });
+    }
+    let placeholders = page_guids
+        .iter()
+        .enumerate()
+        .map(|(index, _)| format!("?{}", index + 1))
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut rows_by_guid: HashMap<String, Vec<_>> = HashMap::new();
+    {
+        let mut statement = connection
+            .prepare(&format!(
                 "SELECT guid, title, link, author, published_at, summary, categories, first_seen_at,
                         reply_count, views, like_count, last_activity_at, pinned, posters, feed_id
                  FROM charity_feed_items
-                 WHERE (?3 = '' OR title LIKE ?3 OR author LIKE ?3 OR categories LIKE ?3){filter_clause}
-                 ORDER BY {order_clause}
-                 LIMIT ?1 OFFSET ?2"
-            ),
-        )
-        .map_err(|error| error.to_string())?;
-    let all = statement
-        .query_map(params![(limit * 8) as i64, offset as i64, key_pat], |row| {
-            let categories: String = row.get(6)?;
-            let posters_raw: String = row.get(13)?;
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, String>(5)?,
-                serde_json::from_str::<Vec<String>>(&categories).unwrap_or_default(),
-                row.get::<_, String>(7)?,
-                row.get::<_, i64>(8)?,
-                row.get::<_, i64>(9)?,
-                row.get::<_, i64>(10)?,
-                row.get::<_, String>(11)?,
-                row.get::<_, i64>(12)?,
-                serde_json::from_str::<Vec<String>>(&posters_raw).unwrap_or_default(),
-                row.get::<_, String>(14)?,
+                 WHERE guid IN ({placeholders})
+                 ORDER BY published_at DESC, rowid DESC"
             ))
-        })
-        .map_err(|error| error.to_string())?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| error.to_string())?;
-    drop(statement);
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map(params_from_iter(page_guids.iter()), |row| {
+                let categories: String = row.get(6)?;
+                let posters_raw: String = row.get(13)?;
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    serde_json::from_str::<Vec<String>>(&categories).unwrap_or_default(),
+                    row.get::<_, String>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, i64>(9)?,
+                    row.get::<_, i64>(10)?,
+                    row.get::<_, String>(11)?,
+                    row.get::<_, i64>(12)?,
+                    serde_json::from_str::<Vec<String>>(&posters_raw).unwrap_or_default(),
+                    row.get::<_, String>(14)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        for row in rows {
+            rows_by_guid.entry(row.0.clone()).or_default().push(row);
+        }
+    }
     drop(connection);
 
-    let mut merged: Vec<CharityFeedItem> = Vec::new();
-    for (
-        guid,
-        title,
-        link,
-        author,
-        published_at,
-        summary,
-        categories,
-        first_seen_at,
-        reply,
-        views,
-        likes,
-        last_activity,
-        pinned,
-        posters,
-        feed_id,
-    ) in all
-    {
-        let feed_name = {
-            let conn = database.lock_db();
-            conn.query_row(
-                "SELECT name FROM charity_feed_sources WHERE id = ?1",
-                params![&feed_id],
-                |row| row.get::<_, String>(0),
-            )
-            .unwrap_or_default()
-        };
-        if let Some(item) = merged.iter_mut().find(|existing| existing.id == guid) {
-            if !item.feed_ids.iter().any(|id| id == &feed_id) {
-                item.feed_ids.push(feed_id);
-                item.feed_names.push(feed_name);
-            }
-            item.views = item.views.max(views);
-            item.reply_count = item.reply_count.max(reply);
-            item.like_count = item.like_count.max(likes);
-            // 同一 guid 在不同 feed 中首次入库时间不同，展示最早的
-            if !first_seen_at.is_empty()
-                && (item.first_seen_at.is_empty() || first_seen_at < item.first_seen_at)
-            {
-                item.first_seen_at = first_seen_at;
-            }
+    // feed_id → name 一次性查表，避免旧实现每行锁一次库查一次源名。
+    let feed_names = {
+        let conn = database.lock_db();
+        let mut statement = conn
+            .prepare("SELECT id, name FROM charity_feed_sources")
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        rows.into_iter().collect::<HashMap<_, _>>()
+    };
+
+    let mut items: Vec<CharityFeedItem> = Vec::with_capacity(page_guids.len());
+    for guid in page_guids.iter() {
+        let Some(rows) = rows_by_guid.remove(guid) else {
             continue;
+        };
+        let mut first_seen = String::new();
+        let mut reply = 0i64;
+        let mut views = 0i64;
+        let mut likes = 0i64;
+        let mut last_activity = String::new();
+        let mut pinned = false;
+        let mut title = String::new();
+        let mut link = String::new();
+        let mut author = String::new();
+        let mut published_at = String::new();
+        let mut summary = String::new();
+        let mut categories: Vec<String> = Vec::new();
+        let mut posters: Vec<String> = Vec::new();
+        let mut feed_ids: Vec<String> = Vec::new();
+        let mut feed_names_for_item: Vec<String> = Vec::new();
+        for (
+            _guid,
+            row_title,
+            row_link,
+            row_author,
+            row_published_at,
+            row_summary,
+            row_categories,
+            row_first_seen_at,
+            row_reply,
+            row_views,
+            row_likes,
+            row_last_activity,
+            row_pinned,
+            row_posters,
+            feed_id,
+        ) in rows
+        {
+            if title.is_empty() {
+                title = row_title;
+                link = row_link;
+                author = row_author;
+                published_at = row_published_at;
+                summary = row_summary;
+                categories = row_categories;
+                last_activity = row_last_activity.clone();
+                posters = row_posters;
+            }
+            reply = reply.max(row_reply);
+            views = views.max(row_views);
+            likes = likes.max(row_likes);
+            last_activity = if last_activity.is_empty() || row_last_activity > last_activity {
+                row_last_activity
+            } else {
+                last_activity
+            };
+            pinned = pinned || row_pinned != 0;
+            if !row_first_seen_at.is_empty()
+                && (first_seen.is_empty() || row_first_seen_at < first_seen)
+            {
+                first_seen = row_first_seen_at;
+            }
+            if !feed_ids.iter().any(|id| id == &feed_id) {
+                feed_ids.push(feed_id.clone());
+                feed_names_for_item.push(
+                    feed_names
+                        .get(&feed_id)
+                        .cloned()
+                        .unwrap_or_default(),
+                );
+            }
         }
-        merged.push(CharityFeedItem {
-            id: guid,
+        items.push(CharityFeedItem {
+            id: guid.clone(),
             title,
             link,
             author,
@@ -700,15 +807,16 @@ pub fn load_all_feed_items_from_db(
             views,
             like_count: likes,
             last_activity_at: last_activity,
-            pinned: pinned != 0,
+            pinned,
             posters,
-            first_seen_at,
-            feed_ids: vec![feed_id],
-            feed_names: vec![feed_name],
+            first_seen_at: first_seen,
+            feed_ids,
+            feed_names: feed_names_for_item,
+            tag_ids: Vec::new(),
+            tag_slugs: Vec::new(),
         });
     }
 
-    let items = merged.into_iter().take(limit).collect::<Vec<_>>();
     let item_count = items.len();
 
     Ok(CharityFeedResult {
@@ -848,6 +956,8 @@ pub fn load_feed_items_from_db(
                     pinned: row.get::<_, i64>(12)? != 0,
                     posters: parsed_posters,
                     first_seen_at,
+                    tag_ids: Vec::new(),
+                    tag_slugs: Vec::new(),
                 })
             },
         )

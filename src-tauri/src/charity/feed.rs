@@ -138,6 +138,33 @@ pub fn items_from_topic_list(value: &str) -> Result<Vec<CharityFeedItem>, String
                 .collect::<Vec<_>>();
             categories.sort();
             categories.dedup();
+            let mut tag_ids = topic
+                .get("tags")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|tag| tag.get("id"))
+                .filter_map(|value| {
+                    value
+                        .as_u64()
+                        .map(|id| id.to_string())
+                        .or_else(|| value.as_str().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string))
+                })
+                .collect::<Vec<_>>();
+            tag_ids.sort();
+            tag_ids.dedup();
+            let mut tag_slugs = topic
+                .get("tags")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|tag| tag.get("slug").and_then(|value| value.as_str()))
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            tag_slugs.sort();
+            tag_slugs.dedup();
             let posts_count = topic
                 .get("posts_count")
                 .and_then(serde_json::Value::as_i64)
@@ -186,8 +213,6 @@ pub fn items_from_topic_list(value: &str) -> Result<Vec<CharityFeedItem>, String
                     .map(plain_text)
                     .unwrap_or_default(),
                 categories,
-                feed_ids: Vec::new(),
-                feed_names: Vec::new(),
                 is_new: false,
                 reply_count,
                 views,
@@ -196,6 +221,10 @@ pub fn items_from_topic_list(value: &str) -> Result<Vec<CharityFeedItem>, String
                 pinned,
                 posters,
                 first_seen_at: String::new(),
+                feed_ids: Vec::new(),
+                feed_names: Vec::new(),
+                tag_ids,
+                tag_slugs,
             })
         })
         .collect::<Vec<_>>();
@@ -205,7 +234,6 @@ pub fn items_from_topic_list(value: &str) -> Result<Vec<CharityFeedItem>, String
             .cmp(&left.published_at)
             .then_with(|| topic_id(&right.link).cmp(&topic_id(&left.link)))
     });
-    items.truncate(40);
     if items.is_empty() {
         Err("标签主题列表中没有找到有效帖子".into())
     } else {

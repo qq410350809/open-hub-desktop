@@ -152,10 +152,7 @@ pub async fn request_topic_list(
         .header("Sec-Fetch-Dest", "empty")
         .header("Sec-Fetch-Mode", "cors")
         .header("Sec-Fetch-Site", "same-origin")
-        .header(
-            "Referer",
-            format!("https://linux.do/tag/{}/l/latest", source.id),
-        );
+        .header("Referer", referer_for_source(source));
     if let Some(cookie_header) = cookie_header.filter(|value| !value.trim().is_empty()) {
         request = request.header(reqwest::header::COOKIE, cookie_header);
     }
@@ -261,6 +258,34 @@ pub async fn fetch_topic_body(
                 .cloned()
                 .unwrap_or_else(|| format!("无法读取 Linux.do {}标签", source.name)))
         }
+    }
+}
+
+/// 请求 Referer：标准标签页用 /tag/{id}/l/latest；自定义 JSON 或 filter.json
+/// 合并请求没有对应 HTML 标签页，回退到 /latest，避免构造出 tag/round 这类无效地址。
+fn referer_for_source(source: &CharityFeedSource) -> String {
+    if let Some(rest) = source.json_url.strip_prefix("https://linux.do/tag/") {
+        if let Some((tag_key, tail)) = rest.split_once('/') {
+            if !tag_key.is_empty() {
+                if tail.starts_with("l/") || tail.starts_with("l?") {
+                    return format!("https://linux.do/tag/{tag_key}/l/latest");
+                }
+                return format!("https://linux.do/tag/{tag_key}");
+            }
+        }
+    }
+    "https://linux.do/latest".to_string()
+}
+
+/// 同步日志用的身份标签：命中 Chrome 登录 Cookie 时显示配置名与账号名，
+/// 匿名兜底时明确标注——避免登录态请求静默失败、数据悄悄缺登录可见内容。
+fn sync_identity_label(profile_name: &str, account_name: &str) -> String {
+    let profile = profile_name.trim();
+    let account = account_name.trim();
+    match (profile.is_empty(), account.is_empty()) {
+        (true, _) => "匿名请求".to_string(),
+        (false, true) => profile.to_string(),
+        (false, false) => format!("{profile}（{account}）"),
     }
 }
 
@@ -374,7 +399,10 @@ fn persist_split_items(
     results
 }
 
-/// 按帖子的 tags 名称把合并结果拆分到各标签源（名称与标签源 name 精确匹配）。
+/// 按帖子的上游标签归属到各标签源：tags[].id / tags[].slug 与源 id 精确匹配，
+/// 同时保留显示名匹配兜底——源 id 由用户配置，未必等于上游标签 id
+/// （例如「福利羊毛」源 id 为 60，而上游标签 id 是 2725），任一命中即归属该源，
+/// 既避免源改名后被误漏，也避免 id 体系不一致时整源漏收。
 pub fn split_items_by_feed(
     items: &[CharityFeedItem],
     sources: &[CharityFeedSource],
@@ -384,7 +412,17 @@ pub fn split_items_by_feed(
         .map(|source| {
             let owned = items
                 .iter()
-                .filter(|item| item.categories.iter().any(|tag| tag == &source.name))
+                .filter(|item| {
+                    let precise = item
+                        .tag_ids
+                        .iter()
+                        .any(|tag_id| tag_id == &source.id)
+                        || item
+                            .tag_slugs
+                            .iter()
+                            .any(|tag_slug| tag_slug == &source.id);
+                    precise || item.categories.iter().any(|tag| tag == &source.name)
+                })
                 .cloned()
                 .collect::<Vec<_>>();
             (source.id.clone(), owned)
@@ -635,6 +673,8 @@ pub async fn sync_round_combined(
             Ok((body, profile_name, account_name, protocol)) => {
                 match items_from_topic_list(&body) {
                     Ok(items) => {
+                        // 本轮实际请求身份（Chrome 登录 Profile / 匿名兜底），随三条日志一并留痕
+                        let identity = sync_identity_label(&profile_name, &account_name);
                         // —— 序列一：最新话题（创建序），独立拆分入库 ——
                         let created_count = items.len();
                         let created_results = tokio::task::block_in_place(|| {
@@ -663,7 +703,7 @@ pub async fn sync_round_combined(
                                     "success"
                                 },
                                 &format!(
-                                    "最新话题请求完成 · 返回 {created_count} 条 · 新增 {created_new} / 更新 {created_updated}"
+                                    "最新话题请求完成 · 返回 {created_count} 条 · 新增 {created_new} / 更新 {created_updated} · 身份：{identity}"
                                 ),
                                 &node.name,
                                 attempt_started.elapsed().as_millis() as i64,
@@ -743,7 +783,7 @@ pub async fn sync_round_combined(
                                                     "success"
                                                 },
                                                 &format!(
-                                                    "最新帖子请求完成 · 返回 {activity_count} 条 · 新增 {activity_new} / 更新 {activity_updated}"
+                                                    "最新帖子请求完成 · 返回 {activity_count} 条 · 新增 {activity_new} / 更新 {activity_updated} · 身份：{identity}"
                                                 ),
                                                 &node.name,
                                                 activity_elapsed,
@@ -915,7 +955,7 @@ pub async fn sync_round_combined(
                         let any_failed = outcomes.iter().any(|outcome| outcome.status == "failed");
                         let clock = chrono::Local::now().format("%H:%M:%S");
                         let mut message = format!(
-                            "{clock} 本轮同步完成（最新话题 + 最新帖子独立入库，{protocol}，{} · 第{attempts}次）",
+                            "{clock} 本轮同步完成（最新话题 + 最新帖子独立入库，{protocol}，{} · 第{attempts}次 · 身份：{identity}）",
                             node.name
                         );
                         if !activity_note.is_empty() {

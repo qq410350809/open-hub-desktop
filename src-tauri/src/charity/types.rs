@@ -73,6 +73,12 @@ pub struct CharityFeedItem {
     pub feed_ids: Vec<String>,
     #[serde(default)]
     pub feed_names: Vec<String>,
+    /// 帖子上游标签 id（合并同步时按 id 精确归属，避免显示名改动导致漏配）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tag_ids: Vec<String>,
+    /// 帖子上游标签 slug，兼容按 slug 配置的标签源
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tag_slugs: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]

@@ -412,6 +412,8 @@ fn split_items_attributes_topics_by_tag_name() {
         pinned: false,
         posters: Vec::new(),
         first_seen_at: String::new(),
+        tag_ids: Vec::new(),
+        tag_slugs: Vec::new(),
     };
     let items = vec![
         make_item("a", &["公益推广", "ChatGPT"]),
@@ -429,6 +431,90 @@ fn split_items_attributes_topics_by_tag_name() {
     assert_eq!(
         split[1].1.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(),
         ["b"]
+    );
+}
+
+#[test]
+fn split_items_falls_back_to_tag_name_when_source_id_differs() {
+    // 源 id 由用户配置，未必等于上游标签 id（如「福利羊毛」源 id 60 / 上游标签 id 2725），
+    // 带上游标签信息时也必须保留显示名兜底，否则整源断收。
+    let sources = vec![CharityFeedSource {
+        id: "60".into(),
+        name: "福利羊毛".into(),
+        json_url: charity_tag_json_url("60"),
+        enabled: true,
+        sort_order: 7,
+        upstream_protocol: None,
+    }];
+    let make_item = |id: &str, tags: &[&str], tag_ids: &[&str]| CharityFeedItem {
+        id: id.into(),
+        title: id.into(),
+        link: String::new(),
+        author: String::new(),
+        published_at: String::new(),
+        summary: String::new(),
+        categories: tags.iter().map(|t| t.to_string()).collect(),
+        feed_ids: Vec::new(),
+        feed_names: Vec::new(),
+        is_new: false,
+        reply_count: 0,
+        views: 0,
+        like_count: 0,
+        last_activity_at: String::new(),
+        pinned: false,
+        posters: Vec::new(),
+        first_seen_at: String::new(),
+        tag_ids: tag_ids.iter().map(|t| t.to_string()).collect(),
+        tag_slugs: tag_ids.iter().map(|t| format!("{t}-tag")).collect(),
+    };
+    let items = vec![
+        make_item("a", &["福利羊毛", "薅羊毛"], &["2725"]),
+        make_item("b", &["公益推广"], &["1515"]),
+    ];
+    let split = split_items_by_feed(&items, &sources);
+    assert_eq!(
+        split[0].1.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(),
+        ["a"]
+    );
+}
+
+#[test]
+fn split_items_matches_by_upstream_tag_id_even_after_rename() {
+    // 源显示名被改动后，tags[].id 仍应与源 id 精确匹配。
+    let sources = vec![CharityFeedSource {
+        id: "2725".into(),
+        name: "福利羊毛（已改名）".into(),
+        json_url: charity_tag_json_url("2725"),
+        enabled: true,
+        sort_order: 7,
+        upstream_protocol: None,
+    }];
+    let make_item = |id: &str, tags: &[&str], tag_ids: &[&str]| CharityFeedItem {
+        id: id.into(),
+        title: id.into(),
+        link: String::new(),
+        author: String::new(),
+        published_at: String::new(),
+        summary: String::new(),
+        categories: tags.iter().map(|t| t.to_string()).collect(),
+        feed_ids: Vec::new(),
+        feed_names: Vec::new(),
+        is_new: false,
+        reply_count: 0,
+        views: 0,
+        like_count: 0,
+        last_activity_at: String::new(),
+        pinned: false,
+        posters: Vec::new(),
+        first_seen_at: String::new(),
+        tag_ids: tag_ids.iter().map(|t| t.to_string()).collect(),
+        tag_slugs: tag_ids.iter().map(|t| format!("{t}-tag")).collect(),
+    };
+    let items = vec![make_item("a", &["福利羊毛"], &["2725"])];
+    let split = split_items_by_feed(&items, &sources);
+    assert_eq!(
+        split[0].1.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(),
+        ["a"]
     );
 }
 
