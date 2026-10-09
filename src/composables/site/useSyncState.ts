@@ -22,7 +22,7 @@ const { sites, usageSites, loadLibrary } = useLibrary();
 const { showToast } = useToast();
 const { filteredSites, runawayFilter, usageFilter } = useFilterState();
 const { syncDialogOpen } = useUIState();
-const { analyzeChromeUsage, syncSiteAccountBundles, cancelAllChromeAccountSyncs, chromeSessionSyncActive } = useChromeSession();
+const { analyzeChromeUsage, syncSiteAccountBundles, closeChromeSyncTabs, cancelAllChromeAccountSyncs, chromeSessionSyncActive } = useChromeSession();
 const { openExternal } = useSiteActions();
 
 /** 批量会话同步的站点级并发上限：Chrome AppleEvent 通道与可见标签焦点互相挤占，
@@ -52,6 +52,8 @@ let syncTimer: number | null = null;
 let remoteUserRequestId = 0;
 /** 批量会话同步的强制停止标记：停止后不再取新站点/账号，并取消全部在途 run。 */
 let sessionSyncForceStopped = false;
+/** 批量额度同步的强制停止标记：与「会话同步」同款撤销语义（逐站点/逐账号边界生效）。 */
+let quotaSyncForceStopped = false;
 
 const remoteLoginUrl = REMOTE_LOGIN_URL;
 
@@ -177,8 +179,8 @@ function receiveSyncProgress(progress: SyncSitesProgress) {
 }
 
 function receiveNestedChromeSyncProgress(progress: SyncSitesProgress) {
-  // 嵌套段位只由批量会话同步分配（syncRunId * 10000 + 序号）。
-  if (syncDialogMode.value !== "session") return;
+  // 嵌套段位由批量会话同步与批量额度同步分配（syncRunId * 10000 + 序号）。
+  if (syncDialogMode.value !== "session" && syncDialogMode.value !== "quota") return;
   if (Math.floor(progress.runId / 10_000) !== syncRunId) return;
   appendSyncLog({
     ...progress,
@@ -442,7 +444,7 @@ async function syncAllModelKeys(
  * - 每个账号的后端 runId 按 `syncRunId * 10000 + 序号` 分配，让嵌套的
  *   chrome-account-sync-progress 事件能按 floor(runId / 10000) === syncRunId
  *   路由回本弹窗日志（ChromeSessionDialog 的进度通道不受影响）。
- * - 停止走 sessionSyncForceStopped + cancelAllChromeAccountSyncs()：
+ * - 停止走 stopBatchSync（sessionSyncForceStopped + cancelAllChromeAccountSyncs()）：
  *   不再取新站点/新账号，并在途请求在后端阶段边界立即失败。
  */
 async function runSessionSyncBatch(runId: number) {
@@ -615,12 +617,17 @@ async function runSessionSyncBatchInner(runId: number) {
   stopSyncTimer();
 }
 
-/** 强制停止批量会话同步：不再取新站点/账号，并取消全部在途 run（后端阶段边界失败）。 */
-async function stopSessionSync() {
-  if (syncDialogMode.value !== "session" || !syncingSites.value) return;
-  sessionSyncForceStopped = true;
+/** 强制停止批量同步（会话 / 额度共用）：不再取新站点/账号，并取消全部在途 run（后端阶段边界失败）。 */
+async function stopBatchSync() {
+  const mode = syncDialogMode.value;
+  if ((mode !== "session" && mode !== "quota") || !syncingSites.value) return;
+  if (mode === "quota") {
+    quotaSyncForceStopped = true;
+  } else {
+    sessionSyncForceStopped = true;
+  }
   appendSyncLog({
-    stage: "session-stop",
+    stage: `${mode}-stop`,
     status: "error",
     message: "已请求强制停止：不再开始新的站点/账号，正在取消在途请求",
   });
@@ -653,7 +660,7 @@ async function syncSites() {
       appendSyncLog({
         stage: "scope",
         status: "info",
-        message: `额度同步范围：当前 ${siteIds.length} 个${usageLabel}站点；保持全部/在用/待定归类不变`,
+        message: `额度同步范围：当前 ${siteIds.length} 个${usageLabel}站点；按站点顺序逐个同步，站内账号按顺序处理，归类保持不变`,
       });
       if (siteIds.length === 0) {
         appendSyncLog({ stage: "quota-empty", status: "info", message: `当前没有可同步额度的${usageLabel}站点` });
@@ -662,24 +669,116 @@ async function syncSites() {
         showToast(`当前没有可同步额度的${usageLabel}站点`, true);
         return;
       }
-      const accountResult = await analyzeChromeUsage(
-        false,
-        undefined,
-        runId,
-        siteIds,
-        false,
-        syncDialogUsage.value === "pending",
-      );
-      if (!accountResult) throw new Error("额度同步失败");
-      appendSyncLog({
-        stage: "quota-complete",
-        status: accountResult.warnings > 0 ? "error" : "success",
-        message: `额度同步完成：${accountResult.accounts} 个合法账号${accountResult.warnings ? `，${accountResult.warnings} 个警告` : ""}`,
-      });
-      syncRunState.value = "complete";
-      stopSyncTimer();
-      showToast(`已同步 ${usageLabel}站点额度：${accountResult.accounts} 个账号${accountResult.warnings ? `，${accountResult.warnings} 个警告` : ""}`);
-      return;
+      // 与「提取 / 同步站点会话和额度」共用同一套管线：按选中站点顺序，
+      // 逐个站点执行「扫描提取会话 + syncSiteAccountBundles 逐账号同步额度（浏览器兜底）」，
+      // 站点之间不并发，避免桥接标签与站点接口互相抢占。
+      if (chromeSessionSyncActive.value) {
+        appendSyncLog({ stage: "quota-busy", status: "error", message: "已有 Chrome 会话同步正在进行，请等待结束后重试" });
+        showToast("已有 Chrome 会话同步正在进行", true);
+        syncRunState.value = "error";
+        stopSyncTimer();
+        return;
+      }
+      chromeSessionSyncActive.value = true;
+      try {
+        const siteMap = new Map(sites.value.map((site) => [site.id, site]));
+        const targets = siteIds
+          .map((id) => siteMap.get(id))
+          .filter((site): site is NonNullable<typeof site> => Boolean(site));
+        const totals = { total: 0, completed: 0, failed: 0, refreshed: 0, reused: 0 };
+        let skippedSites = 0;
+        let totalWarnings = 0;
+        let runSeq = 0;
+
+        for (const [siteIndex, site] of targets.entries()) {
+          if (quotaSyncForceStopped) break;
+          const progressLabel = `站点 ${siteIndex + 1}/${targets.length}`;
+          appendSyncLog({
+            stage: `quota-site-${site.id}`,
+            status: "running",
+            message: `${progressLabel}｜${site.name}：正在提取会话并同步额度`,
+          });
+          try {
+            const scan = await analyzeChromeUsage(false, site.id, runId, undefined, false, Boolean(site.isPending));
+            if (quotaSyncForceStopped) break;
+            if (!scan) throw new Error("会话扫描失败");
+            totalWarnings += scan.warnings;
+            const sessions = scan.sites.find((item) => item.siteId === site.id)?.sessions ?? [];
+            if (sessions.length === 0) {
+              skippedSites += 1;
+              appendSyncLog({
+                stage: `quota-site-${site.id}`,
+                status: "info",
+                message: `${progressLabel}｜${site.name}：未检测到 Chrome 账号会话，已跳过`,
+              });
+              continue;
+            }
+            const summary = await syncSiteAccountBundles(site, sessions, {
+              log: (entry) =>
+                appendSyncLog({
+                  ...entry,
+                  stage: `quota-${site.id}-${entry.stage}`,
+                  message: `${site.name}｜${entry.message}`,
+                }),
+              shouldStop: () => quotaSyncForceStopped,
+              allocateRunId: () => runId * 10_000 + (++runSeq),
+            });
+            totals.total += summary.total;
+            totals.completed += summary.completed;
+            totals.failed += summary.failed;
+            totals.refreshed += summary.refreshed;
+            totals.reused += summary.reused;
+            appendSyncLog({
+              stage: `quota-site-${site.id}`,
+              status: summary.failed > 0 ? "error" : "success",
+              message: `${progressLabel}｜${site.name}：${summary.completed}/${summary.total} 个账号完成${summary.failed > 0 ? `，${summary.failed} 个失败` : ""}`,
+            });
+          } catch (error) {
+            appendSyncLog({
+              stage: `quota-site-${site.id}`,
+              status: "error",
+              message: `${progressLabel}｜${site.name} 同步失败：${String(error)}`,
+            });
+          } finally {
+            // 与单站点流程一致：站点收尾再清理一次桥接标签，覆盖账号循环提前退出的残留。
+            await closeChromeSyncTabs("站点收尾", `site-${site.id}`, site.apiBaseUrl, (entry) =>
+              appendSyncLog({
+                ...entry,
+                stage: `quota-${site.id}-${entry.stage}`,
+                message: `${site.name}｜${entry.message}`,
+              }),
+            );
+          }
+        }
+
+        await loadLibrary();
+        if (quotaSyncForceStopped) {
+          appendSyncLog({
+            stage: "quota-stopped",
+            status: "error",
+            message: `已强制停止：${totals.completed}/${totals.total} 个账号完成，剩余站点未处理`,
+          });
+          showToast(`额度同步已强制停止：完成 ${totals.completed} 个账号`, true);
+        } else {
+          appendSyncLog({
+            stage: "quota-complete",
+            status: totals.failed > 0 ? "error" : "success",
+            message: `额度同步完成：${targets.length - skippedSites} 个站点、${totals.total} 个账号；完成 ${totals.completed}${totals.failed > 0 ? `，失败 ${totals.failed} 个` : ""}${totals.refreshed > 0 ? `，浏览器刷新 ${totals.refreshed} 个` : ""}${totalWarnings > 0 ? `；${totalWarnings} 个警告` : ""}`,
+          });
+          showToast(
+            totals.failed > 0
+              ? `额度同步完成：${totals.completed} 个账号成功，${totals.failed} 个失败`
+              : `已同步 ${targets.length - skippedSites} 个${usageLabel}站点额度：${totals.total} 个账号`,
+            totals.failed > 0,
+          );
+        }
+        syncRunState.value = "complete";
+        stopSyncTimer();
+        return;
+      } finally {
+        chromeSessionSyncActive.value = false;
+        quotaSyncForceStopped = false;
+      }
     }
     const result = await runCommand<SyncSitesResult>("sync_remote_sites", { runId });
     await loadLibrary();
@@ -726,7 +825,7 @@ export function useSyncState() {
     receiveSyncProgress,
     receiveNestedChromeSyncProgress,
     syncSites,
-    stopSessionSync,
+    stopBatchSync,
     detectSyncedSiteTypes,
     syncAllModelKeys,
   };

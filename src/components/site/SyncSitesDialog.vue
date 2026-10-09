@@ -121,7 +121,7 @@ function onBackdropClick(event: MouseEvent) {
           <div>
             <h2 id="sync-sites-title">{{ dialogTitle }}</h2>
             <p v-if="store.syncDialogMode.value === 'remote'">验证 Chrome 登录状态后同步{{ scopeLabel }}</p>
-            <p v-else-if="store.syncDialogMode.value === 'quota'">刷新当前分类内的账号额度，不改变全部 / 在用 / 待定归类</p>
+            <p v-else-if="store.syncDialogMode.value === 'quota'">按站点顺序逐个刷新所选站点的账号额度，站内账号按顺序处理；不改变全部 / 在用 / 待定归类</p>
             <p v-else>逐个站点同步 Chrome 账号会话与额度：站点之间最多 2 路并行，站内账号按顺序处理</p>
           </div>
           <button
@@ -192,7 +192,7 @@ function onBackdropClick(event: MouseEvent) {
               <div>
                 <strong>本次同步范围</strong>
                 <p v-if="store.syncDialogMode.value === 'remote'">{{ scopeLabel }} · 匹配站点地址更新已有记录（保留站点类型与在用状态），新站点将自动录入</p>
-                <p v-else-if="store.syncDialogMode.value === 'quota'">{{ scopeLabel }} · 仅刷新额度与账号缓存，站点归类保持不变</p>
+                <p v-else-if="store.syncDialogMode.value === 'quota'">{{ scopeLabel }} · 逐个站点顺序刷新额度与账号缓存，站点归类保持不变</p>
                 <p v-else>{{ scopeLabel }} · 同步每个站点已关联的 Chrome 账号会话、额度与签到状态</p>
               </div>
             </div>
@@ -279,10 +279,10 @@ function onBackdropClick(event: MouseEvent) {
               <span>{{ runStateLabel }}</span>
             </div>
             <button
-              v-if="store.syncDialogMode.value === 'session' && store.syncingSites.value"
+              v-if="(store.syncDialogMode.value === 'session' || store.syncDialogMode.value === 'quota') && store.syncingSites.value"
               class="secondary-button"
               type="button"
-              @click="store.stopSessionSync()"
+              @click="store.stopBatchSync()"
             >强制停止</button>
             <button
               v-else-if="store.syncRunState.value === 'error'"

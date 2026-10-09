@@ -708,6 +708,7 @@ export function useChromeSession() {
     startChromeBrowserSyncLog,
     runChromeAccountSync,
     syncSiteAccountBundles,
+    closeChromeSyncTabs,
     cancelAllChromeAccountSyncs,
     syncAccountViaChrome,
     deleteSiteAccount,

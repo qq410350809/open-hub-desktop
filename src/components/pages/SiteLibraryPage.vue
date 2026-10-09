@@ -1566,7 +1566,7 @@ onUnmounted(() => {
             <button
               type="button"
               class="sl-btn-secondary"
-              title="同步拓扑站点的 Chrome 账号会话与可用额度"
+              title="按站点顺序逐个同步拓扑站点的 Chrome 账号会话与可用额度"
               @click="store.openSyncDialog('quota', selectedUsageTab === 'pending' ? 'pending' : 'personal')"
             >
               <span v-html="icons.restore" />
