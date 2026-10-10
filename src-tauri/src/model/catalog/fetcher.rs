@@ -3605,20 +3605,42 @@ async fn fetch_site_models_json_inner(
 
             if let Err(error) = &remote_result {
                 if used_cached_token && !access_token_was_rejected(error) {
-                    // 遇盾（Cloudflare/HTML/网络拦截）不是令牌失效：直接请求被挡，
-                    // Chrome 同源兜底是唯一可行路径，不能排除在 Chrome 兜底之外；
-                    // 只有确证令牌类问题才跳过 Chrome。
-                    let is_shield = is_cloudflare_shield_error(error);
-                    if !is_shield {
-                        no_browser_fallback_profiles.insert(profile_id.clone());
-                    }
-                    errors.push(format!(
-                        "{profile_id}：缓存访问令牌请求失败，{}：{error}",
-                        if is_shield {
-                            "将转 Chrome 同源兜底获取模型"
-                        } else {
-                            "不执行 refresh token"
+                    // 直连失败分两类：遇盾（HTML 挑战）与网络层不可用（超时/连接失败）。
+                    // 两者都意味着桌面端直连通道已废，浏览器同源请求是唯一可行路径，
+                    // 必须真的调起 Chrome 兜底——过去这里只写日志然后 continue，
+                    // 文案说「将转 Chrome 兜底」却从不执行，站点全部账号一律失败。
+                    if needs_browser_bridge(error) {
+                        errors.push(format!(
+                            "{profile_id}：缓存访问令牌请求失败，转 Chrome 同源兜底获取模型：{error}"
+                        ));
+                        match chrome_bridge_fetch_keys_models(
+                            database,
+                            &base_url,
+                            &system_type,
+                            &profile_id,
+                            &model_user_id,
+                            site_id.as_deref(),
+                        )
+                        .await
+                        {
+                            Ok(result) => {
+                                return cache_profile_api_counts(
+                                    database,
+                                    site_id.as_deref(),
+                                    requested_profile_id.as_deref(),
+                                    result,
+                                );
+                            }
+                            Err(bridge_error) => {
+                                errors.push(format!("{profile_id}：Chrome 兜底：{bridge_error}"));
+                            }
                         }
+                        continue;
+                    }
+                    // 确证令牌类问题才跳过 Chrome 兜底，保持原行为。
+                    no_browser_fallback_profiles.insert(profile_id.clone());
+                    errors.push(format!(
+                        "{profile_id}：缓存访问令牌请求失败，不执行 refresh token：{error}"
                     ));
                     continue;
                 }
@@ -3757,10 +3779,10 @@ async fn fetch_site_models_json_inner(
                 }
                 Err(error) => {
                     errors.push(format!("{profile_id}：{error}"));
-                    // Cloudflare 盾站点直连全部被 403 挑战拦截（Key 接口与
-                    // /v1/models 一视同仁），浏览器同源 fetch 是唯一路径：
-                    // 复用账号同步的 Chrome 桥接，页面内拉 Key 列表 + 模型。
-                    if is_cloudflare_shield_error(&error) {
+                    // 直连失败（Cloudflare 403 挑战，或超时/连接失败）时，浏览器同源
+                    // fetch 是唯一可行路径：复用账号同步的 Chrome 桥接，页面内拉
+                    // Key 列表 + 模型。仅遇盾判定会漏掉「直连超时」这类站点。
+                    if needs_browser_bridge(&error) {
                         match chrome_bridge_fetch_keys_models(
                             database,
                             &base_url,

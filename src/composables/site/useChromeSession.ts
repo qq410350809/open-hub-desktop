@@ -14,6 +14,7 @@ import type {
 import {
   isBaiheibaiSystem,
   isNewApiCompatible,
+  isSub2ApiSystem,
   isUnknownSystemType,
   normalizeSystemType,
   supportsSiteToken,
@@ -88,7 +89,10 @@ function needsChromeAccountFallback(session: ChromeSessionInfo): boolean {
 }
 
 function canSyncAccountViaChromeFor(site: any, session: ChromeSessionInfo): boolean {
-  return isNewApiCompatible(site?.systemType ?? "") && needsChromeAccountFallback(session);
+  const systemType = site?.systemType ?? "";
+  // Sub2API 与 NewAPI 一样支持浏览器兜底：直连被 WAF 拦截时，页面内同源请求能过盾。
+  const supportsChromeBridge = isNewApiCompatible(systemType) || isSub2ApiSystem(systemType);
+  return supportsChromeBridge && needsChromeAccountFallback(session);
 }
 
 function canSyncAccountViaChrome(session: ChromeSessionInfo): boolean {
@@ -552,6 +556,15 @@ async function syncSiteAccountBundles(
           session = refreshed;
           refreshedAccounts += 1;
         }
+      } else if (session.isValid && session.syncError) {
+        // 缓存数据仍在，但最近一次额度刷新失败：不能当作同步成功。
+        accountReady = false;
+        accountMode = "沿用本地缓存（额度刷新失败）";
+        log({
+          stage: `${stage}-strategy`,
+          status: "error",
+          message: `账号额度｜${accountLabel}｜额度刷新失败，沿用本地缓存：${session.syncError}`,
+        });
       } else if (session.isValid) {
         reusedAccounts += 1;
         log({

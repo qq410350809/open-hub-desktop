@@ -2075,7 +2075,9 @@ fn chrome_account_bridge_uses_only_fixed_same_origin_endpoints() {
     assert!(script.contains("`/api/user/checkin?month=${encodeURIComponent(\"2026-08\")}`"));
     assert!(script.contains("fetch(\"/api/user/checkin\""));
     assert!(script.contains("`/api/log/self?p=1&page_size=20&type="));
-    assert_eq!(script.matches("fetch(").count(), 6);
+    // 7 个 fetch：refresh / token / self / checkin(GET) / checkin(POST) / log(self) 各一，
+    // 外加 Sub2API 分支的 /api/v1/auth/me（运行期由 useSub2Api 开关跳过）。
+    assert_eq!(script.matches("fetch(").count(), 7);
     assert!(!script.contains("http://"));
     assert!(!script.contains("https://"));
     assert!(!script.contains("turnstile"));
@@ -2112,7 +2114,7 @@ fn chrome_account_bridge_uses_only_fixed_same_origin_endpoints() {
         script
             .matches("AbortSignal.timeout(requestTimeout)")
             .count(),
-        6
+        7
     );
     assert!(!script.contains("account: accessToken"));
     assert!(!script.contains("if (Date.now() - previous.started < 3000) return pending;"));
@@ -2137,6 +2139,29 @@ fn recognizes_alibaba_waf_shield_errors() {
     assert!(requires_chrome_fallback(
         "账号接口 HTTP 200 返回 HTML：站点返回了网页而不是 API 数据（可能被安全验证拦截）"
     ));
+}
+
+#[test]
+fn recognizes_direct_request_unavailable_as_bridge_trigger() {
+    // 线上实测（喵喵聚合）：/api/token 直连超时，站点既不返回 HTML 也没有盾特征，
+    // 旧逻辑只认遇盾，于是 Chrome 兜底永不触发，该站点全部账号一律失败。
+    assert!(is_direct_request_unavailable(
+        "error sending request for url (https://ai.yangwj.me/api/token/?p=1&size=20): operation timed out"
+    ));
+    assert!(is_direct_request_unavailable(
+        "NewAPI Key 接口响应读取失败：request or response body error: operation timed out"
+    ));
+    assert!(is_direct_request_unavailable("connection refused"));
+    assert!(needs_browser_bridge(
+        "error sending request for url (https://x/api/token): operation timed out"
+    ));
+    // 遇盾仍照旧触发兜底。
+    assert!(needs_browser_bridge(
+        "账号接口 HTTP 403 返回 HTML：站点安全验证（Cloudflare / 阿里云 WAF）拦截了直接请求"
+    ));
+    // 令牌类拒绝不属于直连不可用（由调用方另行处理，不重复触发）。
+    assert!(!is_direct_request_unavailable("账号接口 HTTP 401：Token has expired"));
+    assert!(!needs_browser_bridge("账号接口 HTTP 401：Token has expired"));
 }
 
 #[test]

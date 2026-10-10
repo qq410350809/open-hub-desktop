@@ -1110,6 +1110,30 @@ pub(crate) fn is_cloudflare_shield_error(error: &str) -> bool {
         || lower.contains("返回了网页")
 }
 
+/// 直连失败是否属于网络层不可用（超时 / 连接失败 / 响应体读取失败）。
+///
+/// 这类失败和遇盾在「直连通道已废」上是同一结论：站点的 Key/账号接口对桌面端
+/// 直连超时或被拦（实测某些 NewAPI 站点 /api/token 直连 6~20s 后超时，而浏览器
+/// 同源请求正常返回），继续在直连上重试只是白等。遇盾有专门的 HTML 特征，超时却
+/// 没有任何响应可判定，必须在错误文本上识别，否则 Chrome 兜底永远不会触发，
+/// 表现为一个站点所有账号都报「operation timed out」。
+pub(crate) fn is_direct_request_unavailable(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("operation timed out")
+        || lower.contains("timed out")
+        || lower.contains("timeout")
+        || lower.contains("error sending request")
+        || lower.contains("connection refused")
+        || lower.contains("connection reset")
+        || lower.contains("broken pipe")
+        || lower.contains("request or response body error")
+}
+
+/// 直连失败后是否应移交 Chrome 同源兜底：遇盾（HTML 挑战）或网络层不可用。
+pub(crate) fn needs_browser_bridge(error: &str) -> bool {
+    is_cloudflare_shield_error(error) || is_direct_request_unavailable(error)
+}
+
 pub(crate) fn chrome_request_headers(
     request: wreq::RequestBuilder,
     base_url: &str,
@@ -1905,8 +1929,11 @@ pub(crate) async fn fetch_site_account(
             }),
             Err(error) => Ok(SiteAccountRefresh {
                 account: local_account.clone().unwrap_or_default(),
-                is_valid: local_account.is_some(),
-                sync_error: if candidate_keys.is_empty() {
+                // 遇盾（403 HTML）时直连通道已不可用，只有 Chrome 同源请求能恢复，
+                // 置 is_valid=false 让前端进入浏览器兜底。缺 Key/令牌过期等其它错误
+                // 保留缓存展示，不误触发浏览器。
+                is_valid: local_account.is_some() && !requires_chrome_fallback(&error),
+                sync_error: if candidate_keys.is_empty() && !requires_chrome_fallback(&error) {
                     format!("{error}（该账号暂无可用 API Key，可先同步该账号的 Key 与模型，之后就不再依赖浏览器会话）")
                 } else {
                     error
@@ -1991,6 +2018,55 @@ pub(crate) fn chrome_account_bridge_script(
     allow_challenge_navigation: bool,
     expected_session: Option<&str>,
 ) -> String {
+    chrome_account_bridge_script_with_mode(
+        user_id,
+        current_month,
+        marker,
+        use_refresh_auth,
+        false,
+        should_checkin,
+        allow_challenge_navigation,
+        expected_session,
+    )
+}
+
+/// Sub2API 账号同步的 Chrome 同源桥接脚本。
+///
+/// Sub2API 没有 NewAPI 的 `/api/user/self` 会话端点，登录凭据是 Local Storage 里的
+/// `auth_token`（Bearer）与 `auth_user`。直连 HTTP 会被 Cloudflare / 阿里云 WAF 以
+/// 403 HTML 拦截，而浏览器同源 fetch 带着已通过的挑战 Cookie 可以正常返回，因此
+/// 这里复用同一条桥接标签页通道，在页面上下文里调 `/api/v1/auth/me` 取余额。
+pub(crate) fn chrome_sub2api_account_bridge_script(
+    user_id: Option<&str>,
+    current_month: &str,
+    marker: &str,
+    should_checkin: bool,
+    allow_challenge_navigation: bool,
+    expected_session: Option<&str>,
+) -> String {
+    chrome_account_bridge_script_with_mode(
+        user_id,
+        current_month,
+        marker,
+        false,
+        true,
+        should_checkin,
+        allow_challenge_navigation,
+        expected_session,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn chrome_account_bridge_script_with_mode(
+    user_id: Option<&str>,
+    current_month: &str,
+    marker: &str,
+    use_refresh_auth: bool,
+    use_sub2api: bool,
+    should_checkin: bool,
+    allow_challenge_navigation: bool,
+    expected_session: Option<&str>,
+) -> String {
     let user_id =
         serde_json::to_string(user_id.unwrap_or_default()).unwrap_or_else(|_| "\"\"".into());
     let current_month = serde_json::to_string(current_month).unwrap_or_else(|_| "\"\"".into());
@@ -2001,6 +2077,7 @@ pub(crate) fn chrome_account_bridge_script(
   const token = __OPENHUB_MARKER__;
   const legacyUserId = __OPENHUB_USER_ID__;
   const useRefreshAuth = __OPENHUB_USE_REFRESH_AUTH__;
+  const useSub2Api = __OPENHUB_USE_SUB2API__;
   const shouldCheckin = __OPENHUB_SHOULD_CHECKIN__;
   const allowChallengeNavigation = __OPENHUB_ALLOW_CHALLENGE_NAVIGATION__;
   // 目标 Chrome Profile 自己的登录会话 ID：复用其它窗口里已打开的站点页面时，
@@ -2025,8 +2102,26 @@ pub(crate) fn chrome_account_bridge_script(
   };
   const requestTimeout = 8000;
   const pending = "__OPENHUB_PENDING__";
-  const messageOf = (value, fallback) =>
-    value && (value.message || value.msg || value.error) || fallback;
+  // 站点把 message/msg/error 写成对象（如 {"message":{"error":"..."}}）时，
+  // 直接把对象塞进 error 字段会让 Rust 侧 `String` 反序列化失败
+  // （invalid type: map, expected a string），整次同步报废。这里统一收敛成字符串：
+  // 优先取字段里的字符串值，嵌套对象再取一层 message/msg/error，兜底 stringify。
+  const asMessageText = (value) => {
+    if (value == null) return "";
+    if (typeof value === "string") return value;
+    if (typeof value === "number" || typeof value === "boolean") return String(value);
+    if (typeof value === "object") {
+      const nested = value.message || value.msg || value.error;
+      if (typeof nested === "string" && nested) return nested;
+      if (nested && typeof nested === "object") return asMessageText(nested);
+      try { return JSON.stringify(value); } catch (_) { return ""; }
+    }
+    return "";
+  };
+  const messageOf = (value, fallback) => {
+    const text = value ? asMessageText(value.message || value.msg || value.error) : "";
+    return text || asMessageText(fallback);
+  };
   const tryParseDocumentAccount = () => {
     if (window.location.pathname !== "/api/user/self") return null;
     const text = String((document.body && (document.body.innerText || document.body.textContent)) || "").trim();
@@ -2159,6 +2254,69 @@ pub(crate) fn chrome_account_bridge_script(
   (async () => {
     const headers = { "Accept": "application/json" };
     let activeAccessToken = "";
+    if (useSub2Api) {
+      // Sub2API 的登录凭据只存在页面 Local Storage：auth_token（Bearer）与
+      // auth_user（账号快照）。直连被 WAF 拦截时，只有页面内同源 fetch 能过盾。
+      let storedToken = "";
+      try {
+        storedToken = String(localStorage.getItem("auth_token") || "").trim().replace(/^"|"$/g, "");
+        if (!storedToken) {
+          storedToken = String(localStorage.getItem("welfare_token") || "").trim().replace(/^"|"$/g, "");
+        }
+      } catch (_) {}
+      if (!storedToken) {
+        bridge.result = {
+          ok: false,
+          error: "Chrome Local Storage 中没有 Sub2API 登录令牌（auth_token）"
+        };
+        return;
+      }
+      headers.Authorization = `Bearer ${storedToken}`;
+      // 串号防护：目标 Profile 的令牌是唯一可比对的会话标识，这里不做
+      // JWT 解析（Sub2API 令牌形状不固定），交由调用方的 Profile 隔离裁决。
+      let meResponse = await readResponse(await fetch("/api/v1/auth/me", {
+        method: "GET", credentials: "include", cache: "no-store", headers,
+        signal: AbortSignal.timeout(requestTimeout)
+      }));
+      if (meResponse.challenge) {
+        const outcome = beginChallengeNavigation();
+        if (outcome) {
+          bridge.result = outcome;
+          return;
+        }
+        bridge.state = "challenge";
+        bridge.started = Date.now();
+        return;
+      }
+      if (meResponse.error || meResponse.status < 200 || meResponse.status >= 300) {
+        bridge.result = {
+          ok: false,
+          error: messageOf(meResponse.data, meResponse.error || `账号接口 HTTP ${meResponse.status}`)
+        };
+        return;
+      }
+      // 余额优先取会话端点；响应里没有余额字段时回退 Local Storage 的 auth_user 快照。
+      let accountValue = meResponse.data;
+      if (!accountValue || typeof accountValue !== "object") {
+        try {
+          let storedUser = localStorage.getItem("auth_user") || "";
+          for (let depth = 0; depth < 2 && typeof storedUser === "string"; depth += 1) {
+            storedUser = JSON.parse(storedUser);
+          }
+          if (storedUser && typeof storedUser === "object") accountValue = { data: storedUser };
+        } catch (_) {}
+      }
+      bridge.result = {
+        ok: true,
+        account: accountValue,
+        checkinEnabled: false,
+        checkedInToday: false,
+        checkinError: "",
+        apiToken: storedToken,
+        userId: String(accountValue?.data?.id || accountValue?.data?.userId || "")
+      };
+      return;
+    }
     if (useRefreshAuth) {
       const refreshResponse = await readResponse(await fetch("/api/user/auth/refresh", {
         method: "POST", credentials: "include", cache: "no-store", headers,
@@ -2376,6 +2534,10 @@ pub(crate) fn chrome_account_bridge_script(
             "__OPENHUB_USE_REFRESH_AUTH__",
             if use_refresh_auth { "true" } else { "false" },
         )
+        .replace(
+            "__OPENHUB_USE_SUB2API__",
+            if use_sub2api { "true" } else { "false" },
+        )
         .replace("__OPENHUB_SHOULD_CHECKIN__", if should_checkin { "true" } else { "false" })
         .replace(
             "__OPENHUB_ALLOW_CHALLENGE_NAVIGATION__",
@@ -2536,8 +2698,14 @@ pub(crate) fn chrome_key_models_bridge_script(
         )
 }
 
-pub(crate) fn parse_chrome_account_bridge_result(
+/// 桥接结果解析：按站点架构选择账号解析器。
+///
+/// Sub2API 的桥接响应结构与 NewAPI（`{success,data}`）不同（`{code,data}` 或扁平
+/// 结构），套用 `parse_newapi_account` 会把合法响应判成“数据无效”。系统类型为空时
+/// 沿用 NewAPI 语义。
+pub(crate) fn parse_chrome_account_bridge_result_for(
     value: &str,
+    system_type: &str,
 ) -> Result<(SiteAccountSnapshot, ChromeBridgeAccountResult), String> {
     let result = serde_json::from_str::<ChromeBridgeAccountResult>(value)
         .map_err(|error| format!("Chrome 返回的账号数据格式无效：{error}"))?;
@@ -2548,11 +2716,17 @@ pub(crate) fn parse_chrome_account_bridge_result(
             format!("Chrome 账号请求失败：{}", result.error)
         });
     }
-    let account = result
+    let raw = result
         .account
-        .as_ref()
-        .ok_or_else(|| "Chrome 返回结果缺少账号数据".to_string())
-        .and_then(parse_newapi_account)?;
+        .clone()
+        .ok_or_else(|| "Chrome 返回结果缺少账号数据".to_string())?;
+    let account = if is_sub2api(system_type) {
+        // Sub2API 的 /api/v1/auth/me 返回 `{code,data:{...}}`，/v1/usage 返回扁平
+        // 结构；两个解析器都试一遍，任一成功即用。
+        parse_sub2api_account(&raw).or_else(|_| parse_sub2api_usage(&raw))
+    } else {
+        parse_newapi_account(&raw)
+    }?;
     Ok((account, result))
 }
 
@@ -2971,8 +3145,11 @@ async fn sync_site_account_via_chrome_inner(
         )
         .await;
     }
-    if !is_newapi(&system_type) {
-        return Err("当前仅对 NewAPI 账号提供 Chrome 同步".into());
+    // Sub2API 的账号同步同样走 Chrome 同源桥接：WAF 拦截直连时，只有页面上下文里的
+    // fetch（带已通过的挑战 Cookie）能取到余额。
+    let use_sub2api = is_sub2api(&system_type);
+    if !is_newapi(&system_type) && !use_sub2api {
+        return Err("当前仅对 NewAPI / Sub2API 账号提供 Chrome 同步".into());
     }
 
     emit_chrome_account_progress(
@@ -3118,8 +3295,14 @@ async fn sync_site_account_via_chrome_inner(
         .as_ref()
         .filter(|item| item.error.is_empty())
         .map(|item| &item.values);
-    let local_account_valid =
-        local_values.is_some_and(|values| parse_newapi_local_account(values).is_ok());
+    let local_account_valid = local_values.is_some_and(|values| {
+        if use_sub2api {
+            parse_sub2api_local_account(values).is_ok()
+                || checkin_origin_token(values).is_some()
+        } else {
+            parse_newapi_local_account(values).is_ok()
+        }
+    });
     // 宽松放行门槛（与扫描的 has_browser_session_evidence 对齐）：refresh cookie、
     // 可解析本地账号、数据库缓存的 user id、任意已知 Local Storage 键、任意 Cookie，
     // 五者有其一就走桥接——真实性由页面上下文里的接口响应裁决，而不是在这里预判。
@@ -3142,7 +3325,13 @@ async fn sync_site_account_via_chrome_inner(
     {
         return Err(local_match
             .and_then(|item| (!item.error.is_empty()).then_some(item.error))
-            .unwrap_or_else(|| "没有找到可用的 NewAPI 本地账号或刷新会话".into()));
+            .unwrap_or_else(|| {
+                if use_sub2api {
+                    "没有找到可用的 Sub2API 本地账号或登录令牌".into()
+                } else {
+                    "没有找到可用的 NewAPI 本地账号或刷新会话".into()
+                }
+            }));
     }
     emit_chrome_account_progress(
         &bus,
@@ -3151,7 +3340,9 @@ async fn sync_site_account_via_chrome_inner(
         "success",
         format!(
             "{account_label} 认证策略：{}",
-            if use_refresh_auth {
+            if use_sub2api {
+                "Sub2API 会话（Local Storage auth_token → Bearer）"
+            } else if use_refresh_auth {
                 "NewAPI 刷新令牌（new_api_refresh → Bearer Token）"
             } else if user_id.is_some() {
                 "传统 NewAPI 会话（session Cookie + New-Api-User）"
@@ -3331,8 +3522,38 @@ async fn sync_site_account_via_chrome_inner(
         return Err("同步已被手动强制停止".into());
     }
 
-    // refresh 模式下即使没有 user_id 也允许静默请求（bridge 脚本不依赖 user_id）
-    let can_silent = (user_id.is_some() || use_refresh_auth) && resolved_account.is_none();
+    // 桥接脚本按架构分派：Sub2API 用 auth_token 会话端点，其余走 NewAPI 通道。
+    let build_bridge_script = |marker: &str, allow_challenge_navigation: bool| -> String {
+        if use_sub2api {
+            chrome_sub2api_account_bridge_script(
+                user_id.as_deref(),
+                &current_month,
+                marker,
+                supports_checkin,
+                allow_challenge_navigation,
+                expected_session.as_deref(),
+            )
+        } else {
+            chrome_account_bridge_script(
+                user_id.as_deref(),
+                &current_month,
+                marker,
+                use_refresh_auth,
+                supports_checkin,
+                allow_challenge_navigation,
+                expected_session.as_deref(),
+            )
+        }
+    };
+    // 桥接结果解析同样按架构分派。
+    let parse_bridge_result = |value: &str| {
+        parse_chrome_account_bridge_result_for(value, &system_type)
+    };
+
+    // refresh 模式下即使没有 user_id 也允许静默请求（bridge 脚本不依赖 user_id）；
+    // Sub2API 同理：登录令牌来自页面 Local Storage，不依赖 user_id。
+    let can_silent =
+        (user_id.is_some() || use_refresh_auth || use_sub2api) && resolved_account.is_none();
     if can_silent {
         let silent_marker = format!(
             "openhub-silent-{}",
@@ -3341,15 +3562,7 @@ async fn sync_site_account_via_chrome_inner(
                 .map_err(|_| "系统时间异常")?
                 .as_nanos()
         );
-        let silent_javascript = chrome_account_bridge_script(
-            user_id.as_deref(),
-            &current_month,
-            &silent_marker,
-            use_refresh_auth,
-            supports_checkin,
-            false,
-            expected_session.as_deref(),
-        );
+        let silent_javascript = build_bridge_script(&silent_marker, false);
         emit_chrome_account_progress(
             &bus,
             run_id,
@@ -3369,7 +3582,7 @@ async fn sync_site_account_via_chrome_inner(
         })
         .await;
         match silent_attempt {
-            Ok(Ok(Some(value))) => match parse_chrome_account_bridge_result(&value) {
+            Ok(Ok(Some(value))) => match parse_bridge_result(&value) {
                 Ok(parsed) => match bridge_session_mismatch(&parsed.1, expected_session.as_deref()) {
                     // 复用已打开标签页只按 URL 匹配、不区分 Chrome Profile，
                     // 这里跳过别人的会话，继续走 Profile 隔离的后台/可见路径。
@@ -3449,15 +3662,7 @@ async fn sync_site_account_via_chrome_inner(
         );
         let browser_url =
             chrome_account_bridge_url(&base_url, &checkin_url, &system_type, &marker)?;
-        let javascript = chrome_account_bridge_script(
-            user_id.as_deref(),
-            &current_month,
-            &marker,
-            use_refresh_auth,
-            supports_checkin,
-            true,
-            expected_session.as_deref(),
-        );
+        let javascript = build_bridge_script(&marker, true);
         emit_chrome_account_progress(
             &bus,
             run_id,
@@ -3491,7 +3696,7 @@ async fn sync_site_account_via_chrome_inner(
         })
         .await;
         match background_attempt {
-            Ok(Ok(value)) => match parse_chrome_account_bridge_result(&value) {
+            Ok(Ok(value)) => match parse_bridge_result(&value) {
                 Ok(parsed) => match bridge_session_mismatch(&parsed.1, expected_session.as_deref()) {
                     Some(actual) => emit_chrome_account_progress(
                         &bus,
@@ -3556,15 +3761,7 @@ async fn sync_site_account_via_chrome_inner(
             );
             let browser_url =
                 chrome_account_bridge_url(&base_url, &checkin_url, &system_type, &marker)?;
-            let javascript = chrome_account_bridge_script(
-                user_id.as_deref(),
-                &current_month,
-                &marker,
-                use_refresh_auth,
-                supports_checkin,
-                true,
-                expected_session.as_deref(),
-            );
+            let javascript = build_bridge_script(&marker, true);
             emit_chrome_account_progress(
                 &bus,
                 run_id,
@@ -3596,7 +3793,7 @@ async fn sync_site_account_via_chrome_inner(
             })
             .await
             .map_err(|error| format!("Chrome 同步任务失败：{error}"))??;
-            let parsed = parse_chrome_account_bridge_result(&bridge_result)?;
+            let parsed = parse_bridge_result(&bridge_result)?;
             emit_chrome_account_progress(
                 &bus,
                 run_id,
@@ -3640,8 +3837,10 @@ async fn sync_site_account_via_chrome_inner(
     let connection = database.lock_conn()?;
     // 令牌由用户维护的架构（白与黑）：令牌是用户从站点后台手动贴进来的，同步只读不写，
     // 桥接拿回什么都原样写回库里的旧值——这条 UPDATE 写的是整行。
-    let user_owned_token = access_token_is_user_owned(&system_type);
-    let api_token = if user_owned_token {
+    // Sub2API 同理：它的 auth_token 是浏览器登录会话令牌，不是 NewAPI 访问令牌，
+    // 写进 newapi_token 列会被额度直连路径当成 API 凭证误用，因此同样只读不写。
+    let read_only_token = access_token_is_user_owned(&system_type) || use_sub2api;
+    let api_token = if read_only_token {
         connection
             .query_row(
                 "SELECT newapi_token FROM site_accounts WHERE site_id = ?1 AND profile_id = ?2",
@@ -3654,7 +3853,7 @@ async fn sync_site_account_via_chrome_inner(
     } else {
         result.api_token.clone()
     };
-    let api_user_id = if user_owned_token {
+    let api_user_id = if read_only_token {
         connection
             .query_row(
                 "SELECT newapi_user_id FROM site_accounts WHERE site_id = ?1 AND profile_id = ?2",
@@ -3666,6 +3865,42 @@ async fn sync_site_account_via_chrome_inner(
             .unwrap_or_default()
     } else {
         result.user_id.clone()
+    };
+    // Sub2API 桥接只取余额，不查签到（签到由额度同步的 refresh_sub2api_checkin 负责）。
+    // 这里不能用桥接返回的空签到覆盖缓存，否则手动同步一次会把「今日已签到」打回未签到。
+    let (checkin_enabled, checked_in_today, checkin_error) = if use_sub2api {
+        let cached = connection
+            .query_row(
+                "SELECT checkin_enabled, checked_in_today, checkin_error
+                 FROM site_accounts WHERE site_id = ?1 AND profile_id = ?2",
+                params![site_id, profile_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)? != 0,
+                        row.get::<_, i64>(1)? != 0,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .unwrap_or((false, false, String::new()));
+        // 桥接若真的带回了签到信息（未来的 Sub2API 支持），以桥接为准。
+        if result.checkin_enabled || result.checked_in_today {
+            (
+                result.checkin_enabled,
+                result.checked_in_today,
+                result.checkin_error.clone(),
+            )
+        } else {
+            cached
+        }
+    } else {
+        (
+            result.checkin_enabled,
+            result.checked_in_today,
+            result.checkin_error.clone(),
+        )
     };
     let changed = connection
         .execute(
@@ -3684,9 +3919,9 @@ async fn sync_site_account_via_chrome_inner(
                 account.used,
                 account.total,
                 account.unit,
-                result.checkin_enabled,
-                result.checked_in_today,
-                result.checkin_error,
+                checkin_enabled,
+                checked_in_today,
+                checkin_error,
                 api_token,
                 api_user_id,
                 site_id,
@@ -4135,9 +4370,30 @@ mod tests {
     }
 
     #[test]
+    fn bridge_result_tolerates_non_string_error_fields() {
+        // 线上实测：站点把 message 写成对象时，严格的 String 反序列化会报
+        // invalid type: map, expected a string，整次同步报废。这里必须宽松收敛。
+        let raw = serde_json::json!({
+            "ok": false,
+            "error": { "message": "Unauthorized, not logged in", "code": 401 }
+        })
+        .to_string();
+        let result: ChromeBridgeAccountResult =
+            serde_json::from_str(&raw).expect("对象型 error 不应导致解析失败");
+        assert!(!result.ok);
+        assert_eq!(result.error, "Unauthorized, not logged in");
+
+        // 数字与布尔同样收敛成字符串，而不是报错。
+        let numeric = serde_json::json!({ "ok": true, "userId": 12345, "apiToken": true }).to_string();
+        let result: ChromeBridgeAccountResult = serde_json::from_str(&numeric).unwrap();
+        assert_eq!(result.user_id, "12345");
+        assert_eq!(result.api_token, "true");
+    }
+
+    #[test]
     fn local_day_unix_range_spans_exactly_one_day() {
         let (start, end) = local_day_unix_range();
-        // 区间长度固定为 86400 秒（23:59:59 - 00:00:00）。
+        // 区间长度固定为 86400 秒（00:00:00 - 00:00:00）。
         assert_eq!(end - start, 86_399);
         // start 转回本地时区后应落在本地当天 00:00:00（秒偏移为 0）。
         assert_eq!((start + local_utc_offset_secs()) % 86_400, 0);
@@ -4163,5 +4419,55 @@ mod tests {
         assert!(script.contains("checkinResolvedViaLog"));
         assert!(script.contains("!checkinResolvedViaLog"));
         assert!(script.contains("checkinEnabled && !checkedInToday"));
+    }
+
+    #[test]
+    fn sub2api_bridge_script_uses_local_storage_token_and_session_endpoint() {
+        let script = chrome_sub2api_account_bridge_script(
+            None,
+            "2026-08",
+            "openhub-test",
+            false,
+            true,
+            None,
+        );
+        // 登录令牌只来自页面 Local Storage，且必须走同源会话端点。
+        assert!(script.contains("const useSub2Api = true"));
+        assert!(script.contains("localStorage.getItem(\"auth_token\")"));
+        assert!(script.contains("/api/v1/auth/me"));
+        // Sub2API 分支必须在 NewAPI 通道之前返回：模板虽共用，但运行期不会走到
+        // `/api/user/self`。用分支顺序断言，而不是断言脚本里没有该字符串。
+        let sub2api_branch = script.find("if (useSub2Api) {").expect("缺少 Sub2API 分支");
+        let refresh_branch = script.find("if (useRefreshAuth) {").expect("缺少刷新分支");
+        assert!(
+            sub2api_branch < refresh_branch,
+            "Sub2API 分支必须先于 NewAPI 刷新分支执行"
+        );
+    }
+
+    #[test]
+    fn newapi_bridge_script_keeps_sub2api_mode_off() {
+        let script =
+            chrome_account_bridge_script(Some("42"), "2026-08", "openhub-test", false, true, true, None);
+        assert!(script.contains("const useSub2Api = false"));
+        assert!(script.contains("/api/user/self"));
+    }
+
+    #[test]
+    fn bridge_result_parser_dispatches_by_system_type() {
+        // Sub2API 的 `{code,data}` 信封被 NewAPI 解析器判为无效，必须按架构分派。
+        let raw = serde_json::json!({
+            "ok": true,
+            "account": {
+                "code": 0,
+                "data": { "username": "alice", "remaining": 7.5, "unit": "USD" }
+            }
+        })
+        .to_string();
+        let (account, _) =
+            parse_chrome_account_bridge_result_for(&raw, "sub2api").expect("Sub2API 信封应能解析");
+        assert_eq!(account.remaining, Some(7.5));
+        // 同一份响应交给 NewAPI 语义则解析失败，证明分派确实生效。
+        assert!(parse_chrome_account_bridge_result_for(&raw, "").is_err());
     }
 }

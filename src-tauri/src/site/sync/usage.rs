@@ -1058,6 +1058,8 @@ pub async fn mark_sites_with_chrome_sessions(
                 Err(error) => session.sync_error = format!("账号同步任务失败：{error}"),
             }
             let amount = session.remaining.unwrap_or(0.0);
+            // 四舍五入后为 0 的负数（如 -0.001）会显示成 "-0"，统一按 0 展示。
+            let amount = if amount.abs() < 0.005 { 0.0 } else { amount };
             let mut amount_text = format!("{amount:.2}");
             while amount_text.contains('.') && amount_text.ends_with('0') {
                 amount_text.pop();

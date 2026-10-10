@@ -407,19 +407,55 @@ pub(crate) fn site_matches_requested_scope(
 #[serde(rename_all = "camelCase")]
 pub struct ChromeBridgeAccountResult {
     pub(crate) ok: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_lenient_string")]
     pub(crate) error: String,
     pub(crate) account: Option<serde_json::Value>,
     #[serde(default)]
     pub(crate) checkin_enabled: bool,
     #[serde(default)]
     pub(crate) checked_in_today: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_lenient_string")]
     pub(crate) checkin_error: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_lenient_string")]
     pub(crate) api_token: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_lenient_string")]
     pub(crate) user_id: String,
+}
+
+/// 把任意 JSON 值收敛成字符串。
+///
+/// 站点可能把 message/error 等字段写成对象或数字；此时严格的 `String` 反序列化会直接
+/// 失败（invalid type: map, expected a string），整次账号同步报废。这里宽松处理：
+/// 字符串原样返回，其它类型取嵌套的 message/msg/error 文本，再兜底 JSON 序列化。
+fn deserialize_lenient_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(json_value_to_message(value.as_ref()))
+}
+
+fn json_value_to_message(value: Option<&serde_json::Value>) -> String {
+    match value {
+        None | Some(serde_json::Value::Null) => String::new(),
+        Some(serde_json::Value::String(text)) => text.clone(),
+        Some(serde_json::Value::Number(number)) => number.to_string(),
+        Some(serde_json::Value::Bool(flag)) => flag.to_string(),
+        Some(serde_json::Value::Object(map)) => {
+            for key in ["message", "msg", "error"] {
+                if let Some(nested) = map.get(key) {
+                    if !nested.is_null() {
+                        let text = json_value_to_message(Some(nested));
+                        if !text.is_empty() {
+                            return text;
+                        }
+                    }
+                }
+            }
+            serde_json::to_string(value.unwrap()).unwrap_or_default()
+        }
+        Some(other) => serde_json::to_string(other).unwrap_or_default(),
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

@@ -498,7 +498,17 @@ export function isBaiheibaiSystem(raw: string): boolean {
  * 未知架构没有这些接口，纳入只会换来一串错误，因此排除。
  */
 export function supportsKeyDiscovery(raw: string): boolean {
-  return isNewApiCompatible(raw) || normalizeSystemType(raw) === "sub2api" || isBaiheibaiSystem(raw);
+  return isNewApiCompatible(raw) || isSub2ApiSystem(raw) || isBaiheibaiSystem(raw);
+}
+
+/**
+ * 是否为 Sub2API 架构。
+ *
+ * 账号/额度同步的实现按此分派：Sub2API 没有 NewAPI 的 `/api/user/self` 会话端点，
+ * 登录凭据是浏览器 Local Storage 里的 `auth_token`（见 `chrome_sub2api_account_bridge_script`）。
+ */
+export function isSub2ApiSystem(raw: string): boolean {
+  return normalizeSystemType(raw) === "sub2api";
 }
 
 export const emptySite = (): SiteRecord => ({

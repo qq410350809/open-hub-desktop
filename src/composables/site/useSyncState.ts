@@ -359,7 +359,15 @@ async function syncAllModelKeys(
   let keyCount = 0;
   let modelCount = 0;
   try {
-    const clearedSites = new Set<string>();
+    // 先清空本次要同步站点的旧 Key/模型缓存，再开始逐账号拉取。
+    // 必须集中在并发池之前做：clear_site_model_cache_for_site 按 site_id 删除
+    // 该站点【全部账号】的缓存行，如果放进池里"每个站点清一次"，同一站点的两个
+    // 账号被不同 worker 并发处理时就会互相踩：后一个 worker 的 clear 会把前一个
+    // 已经写入的账号行删掉，表现为"每次同步总有一个账号成功、另一个失败/为空"。
+    const targetSiteIds = [...new Set(targets.map((target) => target.site.id))];
+    for (const siteId of targetSiteIds) {
+      await runCommand("clear_site_model_cache_for_site", { siteId });
+    }
     let nextTargetIndex = 0;
     const workerCount = Math.min(3, targets.length);
     await Promise.all(Array.from({ length: workerCount }, async () => {
@@ -372,10 +380,6 @@ async function syncAllModelKeys(
           let baseUrl = site.apiBaseUrl.trim();
           if (!baseUrl.endsWith("/")) baseUrl += "/";
           const result = await runCommand<SyncedSiteModelsResult>("fetch_site_models_json", { url: baseUrl, siteId: site.id, profileId: session.profileId });
-          if (!clearedSites.has(site.id)) {
-            await runCommand("clear_site_model_cache_for_site", { siteId: site.id });
-            clearedSites.add(site.id);
-          }
           await runCommand("save_site_model_cache_for_account", {
             siteId: site.id,
             account: {
