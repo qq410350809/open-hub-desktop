@@ -1467,6 +1467,12 @@ kbd { padding: 3px 7px; border: 1px solid var(--line); border-radius: var(--r-xs
 .site-models-search-clear:hover { background: var(--surface-hover); color: var(--text); }
 .site-models-search-clear svg { width: 12px; height: 12px; }
 
+.site-models-panel-tools { display: flex; align-items: center; gap: 8px; flex: 0 1 auto; min-width: 0; }
+/* 「隐藏无效」开关：左侧搜索框已占主位，这里保持与工具栏按钮同高、不抢宽度 */
+.site-models-filter-btn { flex: 0 0 auto; }
+.site-models-filter-btn.is-active { border-color: color-mix(in srgb, var(--brand) 45%, transparent); background: var(--brand-soft); color: var(--brand-deep); }
+.site-models-filter-btn.is-active:hover { border-color: var(--brand); background: color-mix(in srgb, var(--brand) 16%, transparent); }
+
 .site-models-scroll { flex: 1 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 12px 16px 16px; }
 
 .site-models-state { min-height: 100%; padding: 48px 20px; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; color: var(--muted); }
@@ -1536,6 +1542,7 @@ kbd { padding: 3px 7px; border: 1px solid var(--line); border-radius: var(--r-xs
   .site-models-url { font-size: 11px; }
   .site-models-icon-btn { width: 32px; height: 32px; }
   .site-models-panel-top { flex-direction: column; align-items: stretch; gap: 8px; }
+  .site-models-panel-tools { flex: 1 1 auto; }
   .site-models-search { flex: 1 1 auto; width: 100%; }
   .site-models-scroll { padding: 10px 10px 12px; }
   .site-models-grid { grid-template-columns: 1fr; }

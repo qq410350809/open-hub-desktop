@@ -3,7 +3,7 @@ import { computed, ref, watch, nextTick } from "vue";
 import { runCommand, useLibrary } from "../../composables/useLibrary";
 import { icons } from "../../icons";
 import { useStore } from "../../composables/useStore";
-import { logoText, describeModelHealth, describeModelStatusStrip, describeModelStatusStripTitle, describeModelWindowLabel, MODEL_STATUS_SLOT_COUNT } from "../../utils";
+import { logoText, describeModelHealth, describeModelStatusStrip, describeModelStatusStripTitle, describeModelWindowLabel, modelHealthValue, MODEL_STATUS_SLOT_COUNT } from "../../utils";
 import type { ModelHealthBadge, ModelStatusSlot } from "../../utils";
 import { isUnknownSystemType, systemTypeLabel } from "../../types";
 import type { SiteModelHealth } from "../../types";
@@ -54,6 +54,12 @@ const { usageSites } = useLibrary();
 const { showToast } = useToast();
 const { confirm } = useConfirm();
 const closeBtnRef = ref<HTMLButtonElement>();
+/**
+ * 「无效模型」的成功率阈值：成功率低于该值即视为无效（含 0%）。
+ * 与健康度分级一致——<50% 就是最差的红档（level 1）。留一个极小余量，
+ * 让「有极少请求且全失败」的 0.x% 也归入无效。
+ */
+const UNHEALTHY_SUCCESS_RATE = 0.01;
 const searchQuery = ref("");
 const liveFetching = ref(false);
 /** 当前正在执行的同步类型；用于区分 Key/模型按钮各自的转圈状态。 */
@@ -160,8 +166,31 @@ const currentActiveModels = computed<LiveModelItem[]>(() => {
   return liveModels.value;
 });
 
+/** 隐藏「成功率极低」的模型开关。 */
+const hideUnhealthy = ref(false);
+
+/** 模型是否被视为「无效」：成功率为 0 或极低（低于阈值）。
+ *
+ *  口径只认「有实测成功率且极低」，不用「站点没上报健康度」判无效——
+ *  无数据只说明站点没有该模型的流量记录，不等于模型不可用（很多冷门模型
+ *  就是长期无人调用）。健康度数值与徽标同源（modelHealthValue）。 */
+function isUnhealthyModel(modelId: string): boolean {
+  const value = modelHealthValue(modelHealth.value[modelId]);
+  if (value === null) return false;
+  return value < UNHEALTHY_SUCCESS_RATE;
+}
+
+/** 被隐藏的无效模型数量，用于开关上的提示与空列表文案。 */
+const hiddenUnhealthyCount = computed(() => {
+  if (!hideUnhealthy.value) return 0;
+  return currentActiveModels.value.filter((model) => isUnhealthyModel(model.id)).length;
+});
+
 const filteredLiveModels = computed(() => {
-  const source = currentActiveModels.value;
+  let source = currentActiveModels.value;
+  if (hideUnhealthy.value) {
+    source = source.filter((model) => !isUnhealthyModel(model.id));
+  }
   const q = searchQuery.value.trim().toLowerCase();
   if (!q) return source;
   return source.filter(
@@ -172,8 +201,17 @@ const filteredLiveModels = computed(() => {
 const modelCountLabel = computed(() => {
   const source = currentActiveModels.value;
   const total = source.length;
-  const q = searchQuery.value.trim();
-  return q ? `${filteredLiveModels.value.length} / ${total}` : String(total);
+  // 有筛选（搜索或隐藏无效）时显示「命中 / 总数」，让用户知道过滤了多少。
+  const filtering = Boolean(searchQuery.value.trim()) || hideUnhealthy.value;
+  return filtering ? `${filteredLiveModels.value.length} / ${total}` : String(total);
+});
+
+/** 开关按钮标题：说明口径与当前隐藏了多少个模型。 */
+const hideUnhealthyTitle = computed(() => {
+  const base = `隐藏成功率极低（低于 ${Math.round(UNHEALTHY_SUCCESS_RATE * 100)}%，含 0%）的模型；站点未上报健康度（无数据）的模型不算无效，仍会保留`;
+  return hideUnhealthy.value && hiddenUnhealthyCount.value > 0
+    ? `${base}；当前已隐藏 ${hiddenUnhealthyCount.value} 个`
+    : base;
 });
 
 /** 站点是否上报过任何模型健康度；用于在面板上给出一次性的口径说明。 */
@@ -306,6 +344,8 @@ watch(
       modelHealth.value = {};
       liveError.value = "";
       searchQuery.value = "";
+      // 每次打开弹窗重置筛选开关：默认展示全部模型，「隐藏无效」由用户按需开启。
+      hideUnhealthy.value = false;
       apiSource.value = "none";
       selectedKeyId.value = null;
       addingKeyForProfile.value = null;
@@ -866,22 +906,39 @@ async function removeKey(account: LiveAccountKeys, key: string) {
                   <span class="site-models-count">{{ modelCountLabel }}</span>
                 </div>
 
-                <label class="site-models-search">
-                  <span v-html="icons.search" />
-                  <input
-                    v-model="searchQuery"
-                    type="text"
-                    placeholder="搜索模型标识或厂商…"
-                  />
+                <div class="site-models-panel-tools">
+                  <label class="site-models-search">
+                    <span v-html="icons.search" />
+                    <input
+                      v-model="searchQuery"
+                      type="text"
+                      placeholder="搜索模型标识或厂商…"
+                    />
+                    <button
+                      v-if="searchQuery"
+                      type="button"
+                      class="site-models-search-clear"
+                      aria-label="清除搜索"
+                      @click="searchQuery = ''"
+                      v-html="icons.close"
+                    />
+                  </label>
+
+                  <!-- 隐藏无效模型：成功率极低（含 0%）。
+                       开关态用眼睛图标区分（隐藏中＝划掉的眼睛）。 -->
                   <button
-                    v-if="searchQuery"
                     type="button"
-                    class="site-models-search-clear"
-                    aria-label="清除搜索"
-                    @click="searchQuery = ''"
-                    v-html="icons.close"
-                  />
-                </label>
+                    class="site-models-text-btn site-models-filter-btn"
+                    :class="{ 'is-active': hideUnhealthy }"
+                    :aria-pressed="hideUnhealthy"
+                    :aria-label="hideUnhealthyTitle"
+                    :title="hideUnhealthyTitle"
+                    @click="hideUnhealthy = !hideUnhealthy"
+                  >
+                    <span v-html="hideUnhealthy ? icons.eyeOff : icons.eye" />
+                    <span>隐藏无效{{ hideUnhealthy && hiddenUnhealthyCount > 0 ? `（${hiddenUnhealthyCount}）` : "" }}</span>
+                  </button>
+                </div>
               </div>
 
               <p v-if="hasModelHealth" class="site-models-health-note">
@@ -911,8 +968,11 @@ async function removeKey(account: LiveAccountKeys, key: string) {
 
               <div v-else-if="filteredLiveModels.length === 0" class="site-models-state">
                 <span class="site-models-state-icon" v-html="icons.search" />
-                <strong>未找到匹配模型</strong>
-                <p>试试其他关键词。</p>
+                <strong>{{ hideUnhealthy && !searchQuery.trim() ? "当前全部模型都无效" : "未找到匹配模型" }}</strong>
+                <p v-if="hideUnhealthy && !searchQuery.trim()">
+                  已隐藏 {{ currentActiveModels.length }} 个成功率极低的模型，关闭「隐藏无效」可查看。
+                </p>
+                <p v-else>试试其他关键词{{ hideUnhealthy ? "，或关闭「隐藏无效」扩大范围" : "" }}。</p>
               </div>
 
               <div v-else class="site-models-grid">
