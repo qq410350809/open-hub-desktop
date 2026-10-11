@@ -12,6 +12,7 @@ import type {
   SyncSitesProgress,
 } from "../../types";
 import {
+  hasCustomTokenFlow,
   isBaiheibaiSystem,
   isNewApiCompatible,
   isSub2ApiSystem,
@@ -90,6 +91,10 @@ function needsChromeAccountFallback(session: ChromeSessionInfo): boolean {
 
 function canSyncAccountViaChromeFor(site: any, session: ChromeSessionInfo): boolean {
   const systemType = site?.systemType ?? "";
+  // 直连令牌路由站点（如 42x）：令牌由后端直连 /api/user/token 换取，失败即报错，
+  // 不进浏览器兜底（自动批量循环与弹窗入口一并排除）——与 Rust 侧
+  // custom::token_flow 的判定保持一致。
+  if (hasCustomTokenFlow(site?.apiBaseUrl ?? "")) return false;
   // Sub2API 与 NewAPI 一样支持浏览器兜底：直连被 WAF 拦截时，页面内同源请求能过盾。
   const supportsChromeBridge = isNewApiCompatible(systemType) || isSub2ApiSystem(systemType);
   return supportsChromeBridge && needsChromeAccountFallback(session);

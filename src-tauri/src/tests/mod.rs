@@ -1798,6 +1798,58 @@ fn resolves_public_embed_health_host() {
 }
 
 #[test]
+fn resolves_site_custom_token_routes() {
+    // 42x：访问令牌走直连路由（含子域与 www），域名边界不被蒙混。
+    let url = |value: &str| url::Url::parse(value).unwrap();
+    let hit = |value: &str| {
+        matches!(
+            crate::site::library::custom::token_flow(&url(value)),
+            Some(crate::site::library::custom::TokenFlow::DirectUserToken)
+        )
+    };
+    assert!(hit("https://api.42x.shop"));
+    assert!(hit("https://42x.shop/"));
+    assert!(hit("https://www.42x.shop/"));
+    assert!(hit("https://a.b.42x.shop/"));
+    assert!(!hit("https://42x.shop.evil.com/"));
+    assert!(!hit("https://not42x.shop/"));
+    assert!(!hit("https://example.com/"));
+    // 平台提示：探测流水线优先采用注册提示（newapi2），不落进通用域名规则。
+    assert_eq!(
+        crate::site::library::custom::platform_hint(&url("https://api.42x.shop")),
+        Some("newapi2")
+    );
+    assert_eq!(
+        crate::site::library::platform::detect_platform_by_url_hint("https://api.42x.shop"),
+        Some("newapi2")
+    );
+    // 其它注册站点不带令牌路由与平台提示。
+    assert!(crate::site::library::custom::token_flow(&url("https://x666.me/")).is_none());
+    assert!(crate::site::library::custom::platform_hint(&url("https://x666.me/")).is_none());
+}
+
+#[test]
+fn parses_newapi_access_token_shapes() {
+    // /api/user/token 各发行版的大小写与包裹形态都要能取到令牌。
+    let parse = crate::site::sync::token::parse_newapi_access_token;
+    assert_eq!(parse(&serde_json::json!({ "data": { "token": "a" } })), "a");
+    assert_eq!(
+        parse(&serde_json::json!({ "data": { "access_token": "b" } })),
+        "b"
+    );
+    assert_eq!(
+        parse(&serde_json::json!({ "data": { "accessToken": "c" } })),
+        "c"
+    );
+    assert_eq!(parse(&serde_json::json!({ "token": "d" })), "d");
+    assert_eq!(parse(&serde_json::json!({ "access_token": "e" })), "e");
+    assert_eq!(parse(&serde_json::json!({ "data": "f" })), "f");
+    // 非字符串载荷与无令牌响应不产出令牌。
+    assert_eq!(parse(&serde_json::json!({ "data": { "token": 42 } })), "");
+    assert_eq!(parse(&serde_json::json!({ "success": true })), "");
+}
+
+#[test]
 fn parses_x666_public_embed_status() {
     // 取自「薄荷 API」(x666) 公开嵌入接口的真实形状：
     // data 是数组，每条 = 一个模型 × slot_data（1 小时格，success_rate 为 0~100）。

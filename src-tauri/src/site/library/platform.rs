@@ -147,6 +147,11 @@ pub(crate) fn detect_platform_by_url_hint(value: &str) -> Option<&'static str> {
         let Ok(parsed) = Url::parse(&candidate) else {
             continue;
         };
+        // 站点自定义路由注册的架构提示优先于通用域名规则
+        // （注册表与匹配逻辑见 site/library/custom.rs）。
+        if let Some(platform) = crate::site::library::custom::platform_hint(&parsed) {
+            return Some(platform);
+        }
         let host = parsed.host_str().unwrap_or("").to_ascii_lowercase();
         let port = parsed.port().unwrap_or_default();
         let path = parsed.path().to_ascii_lowercase();

@@ -1,4 +1,5 @@
 pub mod crud;
+pub mod custom;
 pub mod ops;
 pub mod platform;
 pub mod remote_sync;

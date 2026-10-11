@@ -2,9 +2,11 @@ use crate::context::{spawn_blocking, AppContext, EventBus, Managed};
 use crate::db::*;
 use crate::models::*;
 use crate::proxypool;
+use crate::site::library::custom;
 use crate::site::library::*;
 use crate::site::library::{is_newapi, is_newapi_refresh, is_sub2api};
 use crate::site::sync;
+use crate::site::sync::token::acquire_site_access_token;
 use rusqlite::{params, OptionalExtension};
 use serde_json;
 use std::collections::{HashMap, HashSet};
@@ -566,76 +568,9 @@ pub(crate) fn apply_newapi_auth(
     }
 }
 
-/// 刷新令牌模式下尝试调用 /api/user/token 获取可持久化的访问令牌。
-/// 传统 Cookie 模式没有访问令牌机制，调用方不得走到这里。
-/// 成功返回 `Some(token_string)`，遇盾返回 `Err(shield_error)`，其他失败返回 `None`。
-pub(crate) async fn try_acquire_newapi_token(
-    client: &wreq::Client,
-    base_url: &Url,
-    auth: &NewApiAuth,
-    user_agent: &str,
-) -> Result<Option<String>, String> {
-    let endpoint = match base_url.join("/api/user/token") {
-        Ok(url) => url,
-        Err(_) => return Ok(None),
-    };
-    let request = apply_newapi_auth(
-        chrome_request_headers(client.get(endpoint), base_url.as_str(), user_agent),
-        auth,
-    );
-    match request_json(request, "NewAPI Token 接口").await {
-        Ok(value) => {
-            let token = value
-                .pointer("/data/token")
-                .or_else(|| value.pointer("/data/access_token"))
-                .or_else(|| value.pointer("/data/accessToken"))
-                .or_else(|| value.pointer("/token"))
-                .or_else(|| value.pointer("/access_token"))
-                .and_then(serde_json::Value::as_str)
-                .or_else(|| value.pointer("/data").and_then(serde_json::Value::as_str))
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            if token.is_empty() {
-                Ok(None)
-            } else {
-                Ok(Some(token))
-            }
-        }
-        Err(error) => {
-            if error.contains("返回 HTML") || error.contains("Cloudflare") {
-                Err(error)
-            } else {
-                Ok(None)
-            }
-        }
-    }
-}
-
-/// 刷新令牌模式下用不轮换会话的方式获取 NewAPI 访问令牌。刻意不在浏览器外
-/// 调用 /api/user/auth/refresh——refresh 会轮换
-/// HttpOnly 刷新令牌，浏览器里的旧令牌随即作废，用户会被登出；旧会话失效时
-/// 返回 Ok(None)，由调用方转 Chrome 桥接在浏览器内完成刷新。
-/// 返回 Some(NewApiAuth::Token) 表示拿到了可用的访问令牌；
-/// Ok(None) 表示本地无可用令牌；Err 表示遇盾需要浏览器验证。
-pub(crate) async fn acquire_newapi_session_token(
-    client: &wreq::Client,
-    base_url: &Url,
-    legacy: &NewApiAuth,
-    user_agent: &str,
-) -> Result<Option<NewApiAuth>, String> {
-    let user_id = match legacy {
-        NewApiAuth::Legacy { user_id, .. } | NewApiAuth::Token { user_id, .. } => user_id.clone(),
-    };
-    match try_acquire_newapi_token(client, base_url, legacy, user_agent).await {
-        Ok(Some(token)) => Ok(Some(NewApiAuth::Token {
-            access_token: token,
-            user_id,
-        })),
-        Ok(None) => Ok(None),
-        Err(shield_error) => Err(shield_error),
-    }
-}
+// —— 「获取访问令牌」操作实现在 site/sync/token.rs ——
+// 入口 `acquire_site_access_token` 头部按 host 查自定义路由：命中站点
+// （api.42x.shop）直连 /api/user/token、失败零降级；未命中走通用换取逻辑。
 
 /// 识别签到"未启用"类提示。部分站点签到功能关闭时状态接口直接返回
 /// success:false + 提示语（如"签到功能未启用"），这并非数据异常，应视为
@@ -1170,7 +1105,19 @@ pub(crate) async fn refresh_newapi_checkin(
     current_month: &str,
     _previous: CheckinSnapshot,
 ) -> CheckinSnapshot {
-    let endpoint = match Url::parse(base_url).and_then(|url| url.join("/api/user/checkin")) {
+    let Ok(parsed_base) = Url::parse(base_url) else {
+        return CheckinSnapshot {
+            enabled: false,
+            checked_in_today: false,
+            error: String::new(),
+        };
+    };
+    // —— host 自定义路由检查点（签到操作）—— 暂无站点注册（CheckinFlow
+    // 无变体）；扩展时在此分派，未注册的站点走下方通用 NewAPI 签到逻辑。
+    if let Some(flow) = custom::checkin_flow(&parsed_base) {
+        match flow {}
+    }
+    let endpoint = match parsed_base.join("/api/user/checkin") {
         Ok(url) => url,
         Err(_) => {
             return CheckinSnapshot {
@@ -1615,6 +1562,16 @@ pub(crate) async fn fetch_site_account(
         let local_account = parse_newapi_local_account(local_values).ok();
         let base_url_parsed = Url::parse(base_url).map_err(|_| "站点 API 地址无效".to_string())?;
         let uses_refresh_auth = is_newapi_refresh(system_type);
+        // 该站点是否注册了「获取访问令牌」的自定义路由（如 42x 直连令牌）。
+        // 命中站点没有浏览器兜底通道：失败即最终结果，不做续期引导与兜底标记。
+        let direct_token_flow = custom::token_flow(&base_url_parsed).is_some();
+
+        // —— host 自定义路由检查点（账号额度操作）——
+        // 暂无站点注册专属账号流程（AccountFlow 无变体）；扩展时在此分派，
+        // 未注册的站点继续走下方通用 NewAPI 逻辑。
+        if let Some(flow) = custom::account_flow(&base_url_parsed) {
+            match flow {}
+        }
 
         // 读取当前模式所需的浏览器 Cookie。
         let cookie_header = match cookie_header {
@@ -1690,7 +1647,7 @@ pub(crate) async fn fetch_site_account(
         // （例如从别的 Profile 页面复用写进来的令牌）会让整站账号数据长期
         // 认成别人，这里按会话 ID 直接丢弃，改走本 Profile 的 Cookie 路径。
         let expected_session = newapi_refresh_session_id(&cookie_header);
-        let mut api_token = cached_newapi_token
+        let api_token = cached_newapi_token
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
@@ -1727,6 +1684,8 @@ pub(crate) async fn fetch_site_account(
 
         // 2. 如果请求失败（令牌过期、401、权限不足等），且不是盾拦截，进行自愈刷新
         let mut self_heal_failed = false;
+        // 直连令牌路由站点：换取令牌失败的原始报错（零降级，直接作为最终原因）。
+        let mut acquire_failure: Option<String> = None;
         if self_response.is_err()
             && !self_response
                 .as_ref()
@@ -1739,16 +1698,19 @@ pub(crate) async fn fetch_site_account(
             // 通道，轮换后浏览器里的旧令牌随即作废、用户被登出。会话彻底失效
             // 时交由错误提示引导用户在浏览器打开一次站点完成自动续期。
             if uses_refresh_auth {
-                if let Ok(Some(new_token)) =
-                    try_acquire_newapi_token(client, &base_url_parsed, &temp_auth, user_agent).await
+                // 「获取访问令牌」操作：host 自定义路由优先——42x 直连
+                // /api/user/token、失败零降级；未命中走通用换取逻辑。
+                match acquire_site_access_token(client, &base_url_parsed, &temp_auth, user_agent)
+                    .await
                 {
-                    api_token = new_token;
-                    auth = NewApiAuth::Token {
-                        access_token: api_token.clone(),
-                        user_id: user_id.clone(),
-                    };
-                } else {
-                    self_heal_failed = true;
+                    Ok(Some(new_auth)) => auth = new_auth,
+                    Ok(None) => self_heal_failed = true,
+                    Err(acquire_error) => {
+                        self_heal_failed = true;
+                        if direct_token_flow {
+                            acquire_failure = Some(acquire_error);
+                        }
+                    }
                 }
             }
             // 使用现有凭证重试 /api/user/self
@@ -1792,9 +1754,16 @@ pub(crate) async fn fetch_site_account(
         }) {
             Ok(result) => result,
             Err(mut error) => {
+                // 直连令牌路由站点：换取令牌失败就是最终原因，原样带出令牌接口
+                // 的报错，而不是重试账号接口后的次生错误。
+                if let Some(acquire_error) = acquire_failure {
+                    error = acquire_error;
+                }
                 // 非盾失败且自愈未取得新令牌：本地会话与访问令牌均已失效。
                 // 引导浏览器内自动续期，绝不代调轮换接口（会导致浏览器登出）。
-                if self_heal_failed && !requires_chrome_fallback(&error) {
+                // 直连令牌路由站点（42x）没有浏览器兜底通道：不追加续期引导，
+                // 失败原样报错。
+                if self_heal_failed && !direct_token_flow && !requires_chrome_fallback(&error) {
                     error = format!(
                         "{error}；本地会话与访问令牌均已失效。请在浏览器中打开一次该站点（会自动静默续期、不会登出），完成后重新同步"
                     );
@@ -1804,8 +1773,9 @@ pub(crate) async fn fetch_site_account(
                         account,
                         // 遇盾时直接通道已不可用，只有 Chrome 同源请求能恢复，
                         // 置 is_valid=false 让前端进入浏览器兜底；新取得的令牌已在
-                        // 下方字段返回保留，过盾后可直接复用。
-                        is_valid: !requires_chrome_fallback(&error),
+                        // 下方字段返回保留，过盾后可直接复用。直连令牌路由站点
+                        // （42x）不参与浏览器兜底，保留缓存展示、只报错。
+                        is_valid: direct_token_flow || !requires_chrome_fallback(&error),
                         sync_error: error,
                         checkin,
                         newapi_token: newapi_token.clone(),

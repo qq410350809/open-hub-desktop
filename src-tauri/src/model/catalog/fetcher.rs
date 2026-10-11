@@ -2,6 +2,7 @@ use crate::context::{home_dir, spawn, spawn_blocking, AppContext, Managed};
 use crate::db::*;
 use crate::models::*;
 use crate::proxypool;
+use crate::site::library::custom;
 use crate::site::library::{
     is_explicit_unknown, is_newapi, is_newapi_refresh, is_platform, is_sub2api, uses_access_token,
 };
@@ -1247,8 +1248,9 @@ pub(crate) async fn fetch_model_status_health(
 
 /// 模型健康度的统一入口：先要原生 perf-metrics（逐整点序列），站点没有这条
 /// 路由时依次回退「模型状态」增强模块、站点状态接口 `/api/user/model-status`
-/// （Agent Router 等），最后是站点自建监控站的公开嵌入接口（x666 等，见
-/// `PUBLIC_EMBED_STATUS_URLS`）。任一级都只是软失败，全空即「本站没有健康度」。
+/// （Agent Router 等），最后是站点自建监控站的公开嵌入接口（x666 等，注册表见
+/// `site/library/custom.rs` 的 `HealthFlow::PublicEmbed`）。任一级都只是软失败，
+/// 全空即「本站没有健康度」。
 pub(crate) async fn fetch_site_model_health(
     client: &wreq::Client,
     base_url: &Url,
@@ -1267,36 +1269,18 @@ pub(crate) async fn fetch_site_model_health(
     if !health.is_empty() {
         return health;
     }
-    match public_embed_health_url(base_url) {
-        Some(url) => {
+    match custom::health_flow(base_url) {
+        Some(custom::HealthFlow::PublicEmbed(url)) => {
             fetch_public_health_endpoint(client, url, user_agent, parse_model_status_health).await
         }
         None => HashMap::new(),
     }
 }
 
-/// 站点自建监控站的公开嵌入健康度接口：`站点 API 主机的注册域` → `接口地址`。
-///
-/// 这类站点的「模型状态」路由只在主域且要求登录（未登录回 401），逐模型 ×
-/// 逐时段状态由独立工具子域公开下发（实测 x666：主域 `/api/enhancements/
-/// model-status/status/all` 401，`tool.x666.me/api/model-status/embed/status/all`
-/// 匿名可读、11 个模型各带 24 格 slot_data）。响应形状与「模型状态」增强模块
-/// 一致，因此复用 `parse_model_status_health`。用 `all` 而不是 `batch`：
-/// batch 只回一个名为 "batch" 的聚合条目，没有逐模型数据。
-const PUBLIC_EMBED_STATUS_URLS: [(&str, &str); 1] = [(
-    "x666.me",
-    "https://tool.x666.me/api/model-status/embed/status/all?window=24h",
-)];
-
-/// 站点 API 主机（忽略 `www.`）对应的公开嵌入健康度接口。
-pub(crate) fn public_embed_health_url(base_url: &Url) -> Option<&'static str> {
-    let host = base_url.host_str()?.to_ascii_lowercase();
-    let host = host.strip_prefix("www.").unwrap_or(&host);
-    PUBLIC_EMBED_STATUS_URLS
-        .iter()
-        .find(|(domain, _)| host == *domain || host.ends_with(&format!(".{domain}")))
-        .map(|(_, url)| *url)
-}
+/// 站点 API 主机对应的公开嵌入健康度接口 —— 注册表（哪个域配哪个接口）与
+/// 匹配逻辑已收口到 `site/library/custom.rs`，此处 re-export 供本模块与
+/// catalog 调用（含测试）。
+pub(crate) use crate::site::library::custom::public_embed_health_url;
 
 /// 拉取公开嵌入接口（跨域子域，无需登录）。
 ///
@@ -2466,7 +2450,7 @@ pub(crate) async fn collect_site_model_health(
     // 时回退读 Chrome Cookie 走会话鉴权（实测健康度接口认会话），代价只在
     // 失败路径上多读一次浏览器 Cookie。
     // 站点自建监控站的公开嵌入接口（x666 等）匿名可读，不依赖令牌或会话，
-    // 任意架构的站点只要在 `PUBLIC_EMBED_STATUS_URLS` 里就能抓。
+    // 任意架构的站点只要注册了公开嵌入健康度路由（见 custom.rs）就能抓。
     //
     // Sub2API（fengwind 等）的健康度走它自己的「模型市场」接口，凭据是
     // Chrome Local Storage 里的会话令牌 auth_token（Key 会回 INVALID_TOKEN，
@@ -3484,6 +3468,11 @@ async fn fetch_site_models_json_inner(
             system_type.as_str()
         };
         if is_newapi(inferred_type) {
+            // —— host 自定义路由检查点（Key/模型操作）—— 暂无站点注册（KeysFlow
+            // 无变体）；扩展时在此分派，未注册的站点走下方通用 NewAPI 逻辑。
+            if let Some(flow) = custom::keys_flow(&base_url) {
+                match flow {}
+            }
             let use_refresh_auth = is_newapi_refresh(inferred_type);
             let token_url = base_url
                 .join("/api/token/?p=1&size=20")
@@ -3568,7 +3557,9 @@ async fn fetch_site_models_json_inner(
             if auth.is_none() {
                 let legacy_auth = require_legacy_auth!();
                 if use_refresh_auth {
-                    match acquire_newapi_session_token(
+                    // 「获取访问令牌」操作：host 自定义路由优先——42x 直连
+                    // /api/user/token、失败零降级；未命中走通用换取逻辑。
+                    match acquire_site_access_token(
                         &client,
                         &base_url,
                         &legacy_auth,
@@ -3604,7 +3595,12 @@ async fn fetch_site_models_json_inner(
             let mut remote_result = request_json(request, "NewAPI Key 接口").await;
 
             if let Err(error) = &remote_result {
-                if used_cached_token && !access_token_was_rejected(error) {
+                // 直连令牌路由站点（42x）没有浏览器兜底通道：缓存令牌失败直接
+                // 落到下方重新换取令牌重试，不做桥接与「不执行 refresh token」标记。
+                if used_cached_token
+                    && !access_token_was_rejected(error)
+                    && custom::token_flow(&base_url).is_none()
+                {
                     // 直连失败分两类：遇盾（HTML 挑战）与网络层不可用（超时/连接失败）。
                     // 两者都意味着桌面端直连通道已废，浏览器同源请求是唯一可行路径，
                     // 必须真的调起 Chrome 兜底——过去这里只写日志然后 continue，
@@ -3648,7 +3644,7 @@ async fn fetch_site_models_json_inner(
 
             if remote_result.is_err() && used_cached_token && use_refresh_auth {
                 let legacy_auth = require_legacy_auth!();
-                match acquire_newapi_session_token(&client, &base_url, &legacy_auth, &user_agent)
+                match acquire_site_access_token(&client, &base_url, &legacy_auth, &user_agent)
                     .await
                 {
                     Ok(Some(auth_value)) => auth = auth_value,

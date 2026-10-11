@@ -511,6 +511,31 @@ export function isSub2ApiSystem(raw: string): boolean {
   return normalizeSystemType(raw) === "sub2api";
 }
 
+/**
+ * 有站点级「获取访问令牌」自定义路由的注册域（与 Rust 侧
+ * site/library/custom.rs 的 SITE_ROUTES 保持一致）。
+ *
+ * 这些站点的访问令牌固定由 /api/user/token 直连换取（Cookie 鉴权），
+ * 换取失败即报错，不走浏览器兜底链——界面据此排除对应站点的 Chrome 同步入口。
+ */
+export const CUSTOM_TOKEN_FLOW_DOMAINS: readonly string[] = ["42x.shop"];
+
+/** 站点 API 地址是否命中「直连令牌」自定义路由（host 等于注册域或其子域，忽略 www.）。 */
+export function hasCustomTokenFlow(apiBaseUrl: string): boolean {
+  const raw = (apiBaseUrl ?? "").trim();
+  if (!raw) return false;
+  let host = "";
+  try {
+    host = new URL(raw.includes("://") ? raw : `https://${raw}`).hostname;
+  } catch {
+    return false;
+  }
+  host = host.toLocaleLowerCase().replace(/^www\./, "");
+  return CUSTOM_TOKEN_FLOW_DOMAINS.some(
+    (domain) => host === domain || host.endsWith(`.${domain}`),
+  );
+}
+
 export const emptySite = (): SiteRecord => ({
   id: "",
   name: "",
