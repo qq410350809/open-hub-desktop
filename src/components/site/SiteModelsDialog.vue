@@ -66,6 +66,8 @@ const liveFetching = ref(false);
 const liveFetchingKind = ref<"keys" | "models" | null>(null);
 const liveError = ref("");
 const liveModels = ref<LiveModelItem[]>([]);
+/** 正在单账号同步 Key 的 profileId；用于该账号行钥匙图标的转圈与禁用。 */
+const syncingKeyProfileId = ref<string>("");
 /** 全站模型健康度（模型 ID → 健康度），来自 NewAPI 的性能指标接口。 */
 const modelHealth = ref<Record<string, SiteModelHealth>>({});
 const liveAccountKeys = ref<LiveAccountKeys[]>([]);
@@ -371,6 +373,71 @@ function onBackdropClick(event: MouseEvent) {
   if (event.target === event.currentTarget) close();
 }
 
+/**
+ * 单账号同步 Key：只重拉一个账号的 Key 列表并就地更新它自己的缓存行。
+ *
+ * 与整站同步的区别：
+ * - 只请求该账号（profileId），后端按 profile_id 精确过滤，不会带上全站账号；
+ * - 不清除同站点其它账号的缓存行，失败也只写回当前账号的 error；
+ * - 不重建左侧账号树（readCachedModels 会把最新 Key 回读为选中状态保留）。
+ *
+ * 只有具备真实 Chrome profileId 的账号才显示这个按钮：无 profileId 的行
+ * （站点级同步残骸、历史空壳行）无法按账号精确请求，对它点同步会退回整站语义。
+ */
+async function syncSingleAccountKeys(siteId: string, baseUrl: string, account: LiveAccountKeys) {
+  const profileId = account.profileId.trim();
+  if (!profileId) {
+    showToast("该账号没有可精确同步的 Chrome 会话，请用顶栏「同步 Key」整站同步", true);
+    return;
+  }
+  syncingKeyProfileId.value = profileId;
+  try {
+    const result = await runCommand<FetchSiteModelsResult>("fetch_site_models_json", {
+      url: baseUrl,
+      siteId,
+      profileId,
+    });
+    const keys = result.keys ?? [];
+    // 单账号同步绝不丢已有 Key：
+    // - 成功拿到新 Key → 直接替换该账号缓存，反映站点当前 Key 列表；
+    // - 没拿到（站点接口失败 / 被盾 / 无返回）→ preserveKeys=true 保留旧 Key/分组，
+    //   只把本次失败原因写进 error，让界面既能说明原因、又不把账号已有的 Key 清空。
+    await runCommand("save_site_model_cache_for_account", {
+      siteId,
+      account: {
+        profileId,
+        profileName: account.profileName,
+        accountName: account.accountName,
+        username: account.username,
+        keys,
+        keyGroups: result.keyGroups ?? {},
+        keyModels: result.keyModels ?? {},
+        error: keys.length > 0 ? "" : result.errors?.join("\n") || "同步未返回 Key",
+      },
+      result: keys.length > 0 ? result : null,
+      preserveKeys: keys.length === 0,
+    });
+    // 只回读缓存刷新列表：保持选中 Key 与搜索/筛选状态，不重载左右两侧的加载态。
+    await store.loadLibrary();
+    await readCachedModels(siteId);
+    showToast(
+      keys.length > 0
+        ? `已同步 ${accountLabel(account)} 的 Key：${keys.length} 个`
+        : `同步 ${accountLabel(account)} 未返回 Key，已保留原有 ${account.keys.length} 个`,
+    );
+  } catch (error) {
+    showToast(`同步 ${accountLabel(account)} 的 Key 失败：${String(error)}`, true);
+  } finally {
+    syncingKeyProfileId.value = "";
+  }
+}
+
+/**
+ * 刷新模型的三种模式：
+ * - `cache`：只读本地缓存；
+ * - `keys`：重拉全部账号的 Key 列表并重建缓存（单账号同步走 syncSingleAccountKeys）；
+ * - `models`：按缓存 Key 逐个拉 /v1/models。
+ */
 async function refreshModels(mode: "cache" | "keys" | "models" = "cache") {
   const requestedSite = site.value;
   if (!requestedSite) return;
@@ -521,6 +588,7 @@ async function refreshModels(mode: "cache" | "keys" | "models" = "cache") {
     if (requestId === liveFetchRequestId) {
       liveFetching.value = false;
       liveFetchingKind.value = null;
+      syncingKeyProfileId.value = "";
     }
   }
 }
@@ -794,6 +862,23 @@ async function removeKey(account: LiveAccountKeys, key: string) {
                           >
                         </strong>
                         <small>{{ account.keys.length }}</small>
+                        <!-- 同步该账号的 Key：只针对当前账号精确同步（需要有真实
+                             Chrome profileId）；无 profileId 的行不显示此按钮，
+                             用顶栏「同步 Key」做整站同步。 -->
+                        <button
+                          v-if="account.profileId && account.profileId.trim()"
+                          type="button"
+                          class="site-models-key-manage"
+                          :disabled="Boolean(syncingKeyProfileId)"
+                          :aria-label="`同步 ${accountLabel(account)} 的 API Key`"
+                          title="同步该账号的 Key"
+                          @click.stop="syncSingleAccountKeys(site?.id ?? '', site?.apiBaseUrl ?? '', account)"
+                        >
+                          <span
+                            v-html="icons.key"
+                            :class="{ 'site-models-spin': syncingKeyProfileId === account.profileId }"
+                          />
+                        </button>
                         <button
                           type="button"
                           class="site-models-key-manage"
