@@ -23,8 +23,18 @@ pub(crate) enum TokenFlow {
 /// 「模型健康度」操作的自定义实现。
 #[derive(Clone, Copy)]
 pub(crate) enum HealthFlow {
-    /// 站点自建监控站的公开嵌入健康度接口（跨域子域，匿名可读）。
+    /// 站点自建监控站的公开嵌入健康度接口（跨域子域，匿名可读，JSON）。
     PublicEmbed(&'static str),
+    /// 站点自建监控站的公开 HTML 状态页（无 JSON 接口，从页面标记里解析
+    /// 模型状态；跨域子域，匿名可读）。
+    PublicEmbedHtml(&'static str),
+    /// 浏览器内刷新令牌后抓取：站点健康度只认短时效访问令牌，且刷新令牌
+    /// 只能在 Chrome 页面里轮换（直连 refresh 会让浏览器登出）。直连拿不到
+    /// 时由 Chrome 同源桥接完成「refresh → 抓健康度」。
+    BrowserRefresh,
+    /// Sub2API「渠道监控 v2」矩阵接口：按 platform_model 下发逐小时健康等级，
+    /// 需要登录令牌（Chrome LocalStorage 的 auth_token，Bearer 鉴权）。
+    Sub2ApiChannelMonitor(&'static str),
 }
 
 /// 「账号额度」操作的自定义实现。暂无站点注册——扩展示范点：
@@ -72,6 +82,37 @@ const SITE_ROUTES: &[SiteRoutes] = &[
             "https://tool.x666.me/api/model-status/embed/status/all?window=24h",
         )),
     },
+    // hyxware.com（HyxAPI）：健康度接口只认 15 分钟有效期的访问令牌；站点
+    // 没有标准的 `/api/user/token`（普通账号 403），且刷新令牌只能在 Chrome
+    // 页面里轮换（直连 refresh 会把浏览器登出）。直连因此永远 401、健康度
+    // 全灰，注册浏览器刷新流程兜底：页面内 refresh 后用临时令牌抓取。
+    SiteRoutes {
+        domain: "hyxware.com",
+        platform_hint: Some("newapi2"),
+        token: None,
+        health: Some(HealthFlow::BrowserRefresh),
+    },
+    // api.kunyou.asia（虾蹬王）：Sub2API 站点，健康度由站长自建的监控页
+    // 公开提供，页面是 HTML（无 JSON 接口），按模型状态 chip 解析。
+    SiteRoutes {
+        domain: "kunyou.asia",
+        platform_hint: Some("sub2api"),
+        token: None,
+        health: Some(HealthFlow::PublicEmbedHtml(
+            "https://account-doctor.woshikunyou.workers.dev/status",
+        )),
+    },
+    // api.daigua.icu（呆瓜 API）：Sub2API 站点的「渠道监控 v2」矩阵接口，
+    // 按 platform_model 分组下发逐小时健康等级；匿名 401，需带 Chrome
+    // LocalStorage 里的 auth_token（Bearer），与模型市场共用同一凭据。
+    SiteRoutes {
+        domain: "daigua.icu",
+        platform_hint: Some("sub2api"),
+        token: None,
+        health: Some(HealthFlow::Sub2ApiChannelMonitor(
+            "https://api.daigua.icu/api/v1/channel-monitor-v2/matrix?range=24h&group_by=platform_model&timezone=Asia%2FShanghai",
+        )),
+    },
 ];
 
 /// 按 host 匹配注册站点：等于注册域或其子域即命中（忽略 `www.`）。
@@ -103,7 +144,28 @@ pub(crate) fn platform_hint(base_url: &Url) -> Option<&'static str> {
 pub(crate) fn public_embed_health_url(base_url: &Url) -> Option<&'static str> {
     match health_flow(base_url) {
         Some(HealthFlow::PublicEmbed(url)) => Some(url),
-        None => None,
+        _ => None,
+    }
+}
+
+/// 站点 API 主机对应的公开 HTML 健康度页（`HealthFlow::PublicEmbedHtml` 的取值封装）。
+pub(crate) fn public_embed_html_health_url(base_url: &Url) -> Option<&'static str> {
+    match health_flow(base_url) {
+        Some(HealthFlow::PublicEmbedHtml(url)) => Some(url),
+        _ => None,
+    }
+}
+
+/// 站点健康度是否需要 Chrome 页面内刷新令牌后抓取（`HealthFlow::BrowserRefresh`）。
+pub(crate) fn health_flow_requires_browser_refresh(base_url: &Url) -> bool {
+    matches!(health_flow(base_url), Some(HealthFlow::BrowserRefresh))
+}
+
+/// Sub2API「渠道监控 v2」矩阵健康度接口（`HealthFlow::Sub2ApiChannelMonitor`）。
+pub(crate) fn sub2api_channel_monitor_health_url(base_url: &Url) -> Option<&'static str> {
+    match health_flow(base_url) {
+        Some(HealthFlow::Sub2ApiChannelMonitor(url)) => Some(url),
+        _ => None,
     }
 }
 
@@ -120,4 +182,55 @@ pub(crate) fn keys_flow(_base_url: &Url) -> Option<KeysFlow> {
 /// 「签到」路由：暂无站点注册，全部走通用逻辑。
 pub(crate) fn checkin_flow(_base_url: &Url) -> Option<CheckinFlow> {
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn daigua_health_flow_uses_channel_monitor_matrix() {
+        let base = Url::parse("https://api.daigua.icu/").unwrap();
+        assert_eq!(platform_hint(&base), Some("sub2api"));
+        assert!(sub2api_channel_monitor_health_url(&base).is_some());
+        assert!(public_embed_health_url(&base).is_none());
+        assert!(public_embed_html_health_url(&base).is_none());
+        assert!(!health_flow_requires_browser_refresh(&base));
+
+        let evil = Url::parse("https://daigua.icu.evil.com/").unwrap();
+        assert!(sub2api_channel_monitor_health_url(&evil).is_none());
+    }
+
+    #[test]
+    fn hyxware_health_flow_uses_browser_refresh() {
+        let base = Url::parse("https://hyxware.com/").unwrap();
+        assert_eq!(platform_hint(&base), Some("newapi2"));
+        assert!(health_flow_requires_browser_refresh(&base));
+        assert!(public_embed_health_url(&base).is_none());
+
+        // 子域命中；伪造后缀不得命中。
+        let sub = Url::parse("https://api.hyxware.com/").unwrap();
+        assert!(health_flow_requires_browser_refresh(&sub));
+        let evil = Url::parse("https://hyxware.com.evil.com/").unwrap();
+        assert!(!health_flow_requires_browser_refresh(&evil));
+    }
+
+    #[test]
+    fn x666_health_flow_uses_public_embed() {
+        let base = Url::parse("https://x666.me/").unwrap();
+        assert!(public_embed_health_url(&base).is_some());
+        assert!(!health_flow_requires_browser_refresh(&base));
+    }
+
+    #[test]
+    fn kunyou_health_flow_uses_public_html_embed() {
+        let base = Url::parse("https://api.kunyou.asia/").unwrap();
+        assert_eq!(platform_hint(&base), Some("sub2api"));
+        assert_eq!(
+            public_embed_html_health_url(&base),
+            Some("https://account-doctor.woshikunyou.workers.dev/status")
+        );
+        assert!(public_embed_health_url(&base).is_none());
+        assert!(!health_flow_requires_browser_refresh(&base));
+    }
 }

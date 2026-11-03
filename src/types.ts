@@ -337,6 +337,16 @@ export interface SiteModelItem {
 export interface SiteModelHealth {
   /** 近窗口请求成功率，0~1（已从站点的 0~100 归一化）。 */
   successRate?: number;
+  /**
+   * 站点直接给出的状态文案（自建监控页的「正常 / 限流 / 不可用」等）。
+   * 存在时徽标优先显示它，而不是把状态折算成的成功率数字。
+   */
+  statusLabel?: string;
+  /**
+   * 数据源只给「当前状态」、没有历史序列时为 true。
+   * 这类条目没有窗口起点与逐时段数据，界面显示固定尺寸状态灯，不铺时间轴。
+   */
+  snapshot?: boolean;
   /** 平均响应延迟（毫秒）。 */
   avgLatencyMs?: number;
   /** 平均出字速度（tokens/s）。 */
@@ -346,10 +356,16 @@ export interface SiteModelHealth {
   /** 近窗口请求总数。用于提示「成功率的分母是多少」，站点没下发时缺省。 */
   requests?: number;
   /**
-   * 窗口起点（Unix 秒）。界面按它与 `windowHours` 把窗口等分成
-   * `MODEL_STATUS_SLOT_COUNT` 格，对号入座后缺槽代表无流量。
+   * 窗口起点（Unix 秒）。界面按它、`windowHours` 与 `bucketSeconds`
+   * 把窗口切成格子，对号入座后缺槽代表无流量。
    */
   windowStart?: number;
+  /**
+   * `series` 与窗口的时间格宽（秒）：站点原生格宽（或解析侧按原生格宽
+   * 整数倍合并后的输出格宽）。条带的格宽与槽数跟它走——原生 1 小时 →
+   * 24 格、30 分钟 → 48 格；缺省（老缓存）回退「窗口 ÷ 24」的旧口径。
+   */
+  bucketSeconds?: number;
   /** 逐时段成功率（0~1）。只含窗口内确有流量的时段，缺槽代表无流量。 */
   series?: SiteModelHealthPoint[];
 }

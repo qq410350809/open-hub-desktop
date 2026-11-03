@@ -1740,8 +1740,10 @@ function siteHealthFallback(channel: ChannelConfig | null | undefined): SiteMode
   if (!siteId) return undefined;
   const map = siteModelHealth.value[siteId];
   if (!map) return undefined;
-  return Object.values(map).find(
-    (health) => typeof health.windowStart === "number" && (health.windowStart ?? 0) > 0,
+  return (
+    Object.values(map).find(
+      (health) => typeof health.windowStart === "number" && (health.windowStart ?? 0) > 0,
+    ) ?? Object.values(map)[0]
   );
 }
 
@@ -5196,7 +5198,7 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
                 <!-- 展开面板：一行一项低频配置（点击面板不触发行展开/收起与勾选） -->
                 <div v-if="isModelExpanded(model)" class="mp-mcm-detail" @click.stop>
                   <div v-if="siteHasModelHealth(selectedChannel)" class="mp-mcm-field">
-                    <span class="mp-mcm-field-label" title="站点上报的全站口径逐时段成功率（与具体 Key 无关，仅作健康度参考）">
+                    <span class="mp-mcm-field-label" title="站点上报的健康度（全站口径，与具体 Key 无关，仅作参考）">
                       健康度
                     </span>
                     <div class="mp-mcm-field-control">

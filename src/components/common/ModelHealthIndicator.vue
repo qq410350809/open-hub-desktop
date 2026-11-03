@@ -1,6 +1,7 @@
 <script setup lang="ts">
 /**
- * 模型健康度指示：成功率数值徽标 + 24 格时段状态条。
+ * 模型健康度指示：成功率数值徽标 + 自适应槽数时段状态条（站点原生
+ * 1 小时格 → 24 格，30 分钟格 → 48 格，更细按原生格宽整数倍合并）。
  *
  * 与站点模型弹窗、站点库抽屉用同一套口径（`utils.ts` 的 describeModelHealth /
  * describeModelStatusStrip / describeModelStatusStripTitle），色板沿用全局
@@ -12,10 +13,11 @@
 import { computed } from "vue";
 import {
   describeModelHealth,
+  describeModelSnapshot,
   describeModelStatusStrip,
   describeModelStatusStripTitle,
   describeModelWindowLabel,
-  MODEL_STATUS_SLOT_COUNT,
+  modelStatusStripGapPercent,
   type ModelHealthBadge,
   type ModelStatusSlot,
 } from "../../utils";
@@ -29,7 +31,7 @@ const props = withDefaults(
     fallback?: SiteModelHealth | null;
     /** 是否显示成功率数值徽标。 */
     badge?: boolean;
-    /** 是否显示 24 格时段状态条。 */
+    /** 是否显示时段状态条。 */
     strip?: boolean;
     /**
      * 竖排合并为一个块（窄卡片用）：徽标与状态条上下排列，并占满整行宽度。
@@ -49,14 +51,22 @@ const slots = computed<ModelStatusSlot[]>(() =>
   describeModelStatusStrip(props.health, props.fallback),
 );
 
+/** 快照源只有当前状态：用状态灯展示，不铺时间轴（无自身条目时沿用站点形态）。 */
+const snapshot = computed(() => describeModelSnapshot(props.health ?? props.fallback));
+
 const reference = computed(() => props.health ?? props.fallback);
 
 const stripTitle = computed(() => describeModelStatusStripTitle(reference.value));
 
 const stripLabel = computed(
   () =>
-    `${describeModelWindowLabel(reference.value)}成功率状态条，共 ${MODEL_STATUS_SLOT_COUNT} 个时段`,
+    `${describeModelWindowLabel(reference.value)}成功率状态条，共 ${slots.value.length} 个时段`,
 );
+
+/** 列间距随槽数缩放（缝 = 柱宽 × 0.375），全局条带样式读这个变量。 */
+const stripGap = computed(() => ({
+  "--health-strip-gap": modelStatusStripGapPercent(slots.value.length),
+}));
 </script>
 
 <style scoped>
@@ -75,10 +85,23 @@ const stripLabel = computed(
     >{{ badge.label }}</span>
     <span class="site-models-item-health">
       <span
+        v-if="snapshot"
+        class="site-models-item-health-snapshot"
+        :class="`is-lv${snapshot.level}`"
+        role="img"
+        :aria-label="`实时探测状态：${snapshot.label}`"
+        :title="snapshot.title"
+      >
+        <span class="site-models-item-health-snapshot-dot" />
+        <span v-if="!badge" class="site-models-item-health-snapshot-label">{{ snapshot.label }}</span>
+      </span>
+      <span
+        v-else
         class="site-models-item-health-strip"
         role="img"
         :aria-label="stripLabel"
         :title="stripTitle"
+        :style="stripGap"
       >
         <span
           v-for="slot in slots"
@@ -99,10 +122,23 @@ const stripLabel = computed(
     >{{ badge.label }}</span>
     <span v-if="strip" class="site-models-item-health">
       <span
+        v-if="snapshot"
+        class="site-models-item-health-snapshot"
+        :class="`is-lv${snapshot.level}`"
+        role="img"
+        :aria-label="`实时探测状态：${snapshot.label}`"
+        :title="snapshot.title"
+      >
+        <span class="site-models-item-health-snapshot-dot" />
+        <span v-if="!badge" class="site-models-item-health-snapshot-label">{{ snapshot.label }}</span>
+      </span>
+      <span
+        v-else
         class="site-models-item-health-strip"
         role="img"
         :aria-label="stripLabel"
         :title="stripTitle"
+        :style="stripGap"
       >
         <span
           v-for="slot in slots"

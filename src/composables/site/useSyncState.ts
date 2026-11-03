@@ -22,7 +22,7 @@ const { sites, usageSites, loadLibrary } = useLibrary();
 const { showToast } = useToast();
 const { filteredSites, runawayFilter, usageFilter } = useFilterState();
 const { syncDialogOpen } = useUIState();
-const { analyzeChromeUsage, syncSiteAccountBundles, closeChromeSyncTabs, cancelAllChromeAccountSyncs, chromeSessionSyncActive } = useChromeSession();
+const { analyzeChromeUsage, syncSiteAccountBundles, closeChromeSyncTabs, cancelAllChromeAccountSyncs, chromeSessionSyncActive, acquireChromeSessionSync, releaseChromeSessionSync, confirmCancelRunningSync, registerSyncAbortHandler } = useChromeSession();
 const { openExternal } = useSiteActions();
 
 /** 批量会话同步的站点级并发上限：Chrome AppleEvent 通道与可见标签焦点互相挤占，
@@ -50,10 +50,25 @@ let syncStartedAt = 0;
 let syncLastLogAt = 0;
 let syncTimer: number | null = null;
 let remoteUserRequestId = 0;
-/** 批量会话同步的强制停止标记：停止后不再取新站点/账号，并取消全部在途 run。 */
-let sessionSyncForceStopped = false;
-/** 批量额度同步的强制停止标记：与「会话同步」同款撤销语义（逐站点/逐账号边界生效）。 */
-let quotaSyncForceStopped = false;
+/**
+ * 批次停止代数（会话 / 额度各一份）。每轮批次开始时 +1 并捕获自己的代数，
+ * 停止时再 +1 让该轮判定为已停止。
+ * 这里不能用布尔标记：「取消旧批次 + 立刻开始新批次」时新一轮会把布尔标记复位，
+ * 旧批次随后就看不到停止信号，会继续跑完剩余站点与账号。
+ */
+const sessionSyncStop = { generation: 0 };
+const quotaSyncStop = { generation: 0 };
+
+/** 开始一轮批次同步，返回该轮的停止检查与停止函数。 */
+function beginSyncRun(state: { generation: number }) {
+  const generation = ++state.generation;
+  return {
+    shouldStop: () => state.generation !== generation,
+    stop: () => {
+      state.generation += 1;
+    },
+  };
+}
 
 const remoteLoginUrl = REMOTE_LOGIN_URL;
 
@@ -448,12 +463,13 @@ async function syncAllModelKeys(
  * - 每个账号的后端 runId 按 `syncRunId * 10000 + 序号` 分配，让嵌套的
  *   chrome-account-sync-progress 事件能按 floor(runId / 10000) === syncRunId
  *   路由回本弹窗日志（ChromeSessionDialog 的进度通道不受影响）。
- * - 停止走 stopBatchSync（sessionSyncForceStopped + cancelAllChromeAccountSyncs()）：
- *   不再取新站点/新账号，并在途请求在后端阶段边界立即失败。
+ * - 停止走 stopBatchSync（推进 sessionSyncStop 代数 + cancelAllChromeAccountSyncs()）：
+ *   不再取新站点/新账号，并在途请求在后端阶段边界立即失败；单站点同步接管时
+ *   由注册的撤销钩子置位同一标记。
  */
 async function runSessionSyncBatch(runId: number) {
-  // 与单站点弹窗同步共用 Chrome 桥接通道：一方在跑时另一方必须拒绝，
-  // 否则同源桥接标签会互相抢占。
+  // 与单站点弹窗同步共用 Chrome 桥接通道：接管确认已在 syncSites 里做过，
+  // 走到这里仍在跑说明并发窗口里又起了新的同步，保持原提示。
   if (chromeSessionSyncActive.value) {
     appendSyncLog({ stage: "session-busy", status: "error", message: "已有 Chrome 会话同步正在进行，请等待结束后重试" });
     showToast("已有 Chrome 会话同步正在进行", true);
@@ -461,16 +477,19 @@ async function runSessionSyncBatch(runId: number) {
     stopSyncTimer();
     return;
   }
-  chromeSessionSyncActive.value = true;
+  const syncToken = acquireChromeSessionSync();
+  const run = beginSyncRun(sessionSyncStop);
+  // 单站点同步要接管时通过钩子推进本批次的停止代数，否则旧批次会继续跑完站点。
+  const unregisterAbort = registerSyncAbortHandler(run.stop);
   try {
-    await runSessionSyncBatchInner(runId);
+    await runSessionSyncBatchInner(runId, run.shouldStop);
   } finally {
-    chromeSessionSyncActive.value = false;
-    sessionSyncForceStopped = false;
+    unregisterAbort();
+    releaseChromeSessionSync(syncToken);
   }
 }
 
-async function runSessionSyncBatchInner(runId: number) {
+async function runSessionSyncBatchInner(runId: number, shouldStop: () => boolean) {
   const siteIds = [...syncDialogSiteIds.value];
   appendSyncLog({
     stage: "session-scope",
@@ -499,8 +518,12 @@ async function runSessionSyncBatchInner(runId: number) {
   // 站点 id 是显式传入的：后端总会把它们并入账号刷新集合（refresh_pending
   // 只影响未显式指定的站点），因此这里固定 false 即可，归类保持不变。
   const scan = await analyzeChromeUsage(false, undefined, runId, siteIds, false, false);
-  if (!scan) throw new Error("Chrome 会话扫描失败");
-  if (sessionSyncForceStopped) {
+  if (!scan) {
+    // 扫描被接管时返回 null：本轮已被取消，不再覆盖新一轮的日志与状态。
+    if (shouldStop()) return;
+    throw new Error("Chrome 会话扫描失败");
+  }
+  if (shouldStop()) {
     appendSyncLog({ stage: "session-stopped", status: "error", message: "已强制停止：扫描完成后不再处理账号" });
     syncRunState.value = "complete";
     stopSyncTimer();
@@ -542,12 +565,12 @@ async function runSessionSyncBatchInner(runId: number) {
   const workerCount = Math.min(SESSION_SYNC_CONCURRENCY, originOrder.length);
   await Promise.all(
     Array.from({ length: workerCount }, async () => {
-      while (!sessionSyncForceStopped) {
+      while (!shouldStop()) {
         const groupIndex = nextGroupIndex++;
         if (groupIndex >= originOrder.length) return;
         // 同一 origin 组内按顺序处理，保证桥接标签不被并发复用。
         for (const site of groupsByOrigin.get(originOrder[groupIndex])!) {
-          if (sessionSyncForceStopped) return;
+          if (shouldStop()) return;
           const sessions = sessionsBySite.get(site.id) ?? [];
           if (sessions.length === 0) {
             skippedSites += 1;
@@ -571,7 +594,7 @@ async function runSessionSyncBatchInner(runId: number) {
                   stage: `session-${site.id}-${entry.stage}`,
                   message: `${site.name}｜${entry.message}`,
                 }),
-              shouldStop: () => sessionSyncForceStopped,
+              shouldStop,
               allocateRunId: () => runId * 10_000 + (++runSeq),
             });
             totals.total += summary.total;
@@ -597,7 +620,9 @@ async function runSessionSyncBatchInner(runId: number) {
   );
 
   await loadLibrary();
-  if (sessionSyncForceStopped) {
+  // 本轮已被新一轮同步取代：日志与状态已归新一轮所有，这里不能再写。
+  if (syncRunId !== runId) return;
+  if (shouldStop()) {
     appendSyncLog({
       stage: "session-stopped",
       status: "error",
@@ -625,11 +650,7 @@ async function runSessionSyncBatchInner(runId: number) {
 async function stopBatchSync() {
   const mode = syncDialogMode.value;
   if ((mode !== "session" && mode !== "quota") || !syncingSites.value) return;
-  if (mode === "quota") {
-    quotaSyncForceStopped = true;
-  } else {
-    sessionSyncForceStopped = true;
-  }
+  (mode === "quota" ? quotaSyncStop : sessionSyncStop).generation += 1;
   appendSyncLog({
     stage: `${mode}-stop`,
     status: "error",
@@ -646,6 +667,11 @@ async function stopBatchSync() {
 async function syncSites() {
   if (syncingSites.value || syncingModelKeys.value || (syncDialogMode.value === "remote" && !remoteUser.value)) return;
   const mode = syncDialogMode.value;
+  // 已有 Chrome 同步在跑时不再静默报错：先问用户是否取消它再开始本次同步。
+  // 必须在复位日志与状态之前询问——用户选择保留时，界面应保持原样。
+  if ((mode === "session" || mode === "quota") && chromeSessionSyncActive.value) {
+    if (!(await confirmCancelRunningSync())) return;
+  }
   const runId = ++syncRunId;
   resetSyncLog();
   syncRunState.value = "syncing";
@@ -676,6 +702,7 @@ async function syncSites() {
       // 与「提取 / 同步站点会话和额度」共用同一套管线：按选中站点顺序，
       // 逐个站点执行「扫描提取会话 + syncSiteAccountBundles 逐账号同步额度（浏览器兜底）」，
       // 站点之间不并发，避免桥接标签与站点接口互相抢占。
+      // 接管确认已在 syncSites 里做过；走到这里仍在跑说明并发窗口里又起了新的同步。
       if (chromeSessionSyncActive.value) {
         appendSyncLog({ stage: "quota-busy", status: "error", message: "已有 Chrome 会话同步正在进行，请等待结束后重试" });
         showToast("已有 Chrome 会话同步正在进行", true);
@@ -683,7 +710,10 @@ async function syncSites() {
         stopSyncTimer();
         return;
       }
-      chromeSessionSyncActive.value = true;
+      const syncToken = acquireChromeSessionSync();
+      const run = beginSyncRun(quotaSyncStop);
+      // 单站点同步接管时推进本批次的停止代数，避免旧批次继续处理剩余站点。
+      const unregisterAbort = registerSyncAbortHandler(run.stop);
       try {
         const siteMap = new Map(sites.value.map((site) => [site.id, site]));
         const targets = siteIds
@@ -695,7 +725,7 @@ async function syncSites() {
         let runSeq = 0;
 
         for (const [siteIndex, site] of targets.entries()) {
-          if (quotaSyncForceStopped) break;
+          if (run.shouldStop()) break;
           const progressLabel = `站点 ${siteIndex + 1}/${targets.length}`;
           appendSyncLog({
             stage: `quota-site-${site.id}`,
@@ -704,7 +734,7 @@ async function syncSites() {
           });
           try {
             const scan = await analyzeChromeUsage(false, site.id, runId, undefined, false, Boolean(site.isPending));
-            if (quotaSyncForceStopped) break;
+            if (run.shouldStop()) break;
             if (!scan) throw new Error("会话扫描失败");
             totalWarnings += scan.warnings;
             const sessions = scan.sites.find((item) => item.siteId === site.id)?.sessions ?? [];
@@ -724,7 +754,7 @@ async function syncSites() {
                   stage: `quota-${site.id}-${entry.stage}`,
                   message: `${site.name}｜${entry.message}`,
                 }),
-              shouldStop: () => quotaSyncForceStopped,
+              shouldStop: run.shouldStop,
               allocateRunId: () => runId * 10_000 + (++runSeq),
             });
             totals.total += summary.total;
@@ -756,7 +786,9 @@ async function syncSites() {
         }
 
         await loadLibrary();
-        if (quotaSyncForceStopped) {
+        // 本轮已被新一轮同步取代：日志与状态已归新一轮所有，这里不能再写。
+        if (syncRunId !== runId) return;
+        if (run.shouldStop()) {
           appendSyncLog({
             stage: "quota-stopped",
             status: "error",
@@ -780,8 +812,8 @@ async function syncSites() {
         stopSyncTimer();
         return;
       } finally {
-        chromeSessionSyncActive.value = false;
-        quotaSyncForceStopped = false;
+        unregisterAbort();
+        releaseChromeSessionSync(syncToken);
       }
     }
     const result = await runCommand<SyncSitesResult>("sync_remote_sites", { runId });

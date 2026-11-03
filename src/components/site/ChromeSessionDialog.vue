@@ -213,7 +213,6 @@ async function openSiteInBrowser(session: ChromeSessionInfo) {
                 type="button"
                 :aria-label="`使用 Chrome 同步 ${session.profileName}`"
                 title="使用 Chrome 同步"
-                :disabled="store.chromeSessionSyncActive.value"
                 @click="syncViaChrome(session)"
                 v-html="icons.restore"
               />

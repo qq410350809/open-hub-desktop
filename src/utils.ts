@@ -232,21 +232,72 @@ export interface ModelHealthBadge {
 }
 
 /**
- * 状态条槽数：解析侧与界面共用的常数——统计窗口被等分成这么多格。
- *
- * 站点的时间格粒度是可配的（NewAPI 原生逐整点；「模型状态」增强模块
- * 30 分钟起），固定槽数让不同粒度的站点落到界面上是同一根条带，
- * 也不会因为站点给了 48 个格就挤爆容器。
+ * 快照型健康度的展示信息：数据源只给当前状态（没有历史序列）时返回
+ * 徽标/状态灯所需的数据；时序源返回 null，继续走时间轴条带。
+ */
+export function describeModelSnapshot(health?: SiteModelHealth | null): ModelHealthBadge | null {
+  if (!health?.snapshot) return null;
+  return describeModelHealth(health);
+}
+
+/**
+ * 状态条默认槽数：站点没声明原生格宽（老缓存）时，统计窗口按它等分——
+ * 与格宽字段引入之前的显示效果一致。
  */
 export const MODEL_STATUS_SLOT_COUNT = 24;
 
-/** 状态条格宽（秒）：窗口小时数 ÷ 槽数，最小 1 分钟。 */
-function statusSlotSeconds(windowHours?: number): number {
+/** 状态条槽数上限：原生格宽更细时按原生格宽整数倍合并，槽数不超过它。 */
+export const MODEL_STATUS_SLOT_MAX = 48;
+
+/** 条带格宽方案：输出格宽（秒）与槽数。 */
+export interface ModelStatusStripPlan {
+  /** 输出格宽（秒）。 */
+  slotSeconds: number;
+  /** 输出槽数 = 窗口 ÷ 输出格宽（向上取整）。 */
+  slotCount: number;
+}
+
+/**
+ * 按站点声明的原生格宽（`bucketSeconds`）与窗口推出条带的格宽与槽数，
+ * 与后端 `clamp_health_bucket_width` 同一套规则：
+ *
+ * - 未声明格宽（老缓存 / 站点没给）→ 窗口 ÷ 24 的旧口径；
+ * - 原生格宽 ≥ 窗口 ÷ 24（格子本来就很粗）→ 原样保留，槽数 ≤ 24；
+ * - 更细 → 原生格宽整数倍 k 合并到槽数 ≤ `MODEL_STATUS_SLOT_MAX`
+ *   （整数倍保证输出槽仍对齐站点的原生边界）。
+ */
+export function planModelStatusStrip(
+  health?: SiteModelHealth | null,
+  fallback?: SiteModelHealth | null,
+): ModelStatusStripPlan {
+  const rawHours = health?.windowHours ?? fallback?.windowHours;
   const hours =
-    typeof windowHours === "number" && Number.isFinite(windowHours) && windowHours > 0
-      ? windowHours
-      : 24;
-  return Math.max(60, Math.round((hours * 3600) / MODEL_STATUS_SLOT_COUNT));
+    typeof rawHours === "number" && Number.isFinite(rawHours) && rawHours > 0 ? rawHours : 24;
+  const windowSeconds = hours * 3600;
+  const baseline = Math.max(60, Math.round(windowSeconds / MODEL_STATUS_SLOT_COUNT));
+  const rawNative = health?.bucketSeconds ?? fallback?.bucketSeconds;
+  const native =
+    typeof rawNative === "number" && Number.isFinite(rawNative) && rawNative > 0
+      ? Math.max(60, Math.round(rawNative))
+      : null;
+  let slotSeconds = baseline;
+  if (native !== null && native < baseline) {
+    slotSeconds = native * Math.ceil(windowSeconds / (native * MODEL_STATUS_SLOT_MAX));
+  } else if (native !== null) {
+    slotSeconds = native;
+  }
+  const slotCount = Math.max(1, Math.ceil(windowSeconds / slotSeconds));
+  return { slotSeconds, slotCount };
+}
+
+/**
+ * 条带列间距（占条带总宽的百分比）：沿用「缝 = 柱宽 × 0.375」的比例尺
+ * （24 格时正好是旧 CSS 写死的 1.149%），槽数变多时缝与柱等比变细，
+ * 不会把柱子挤没。
+ */
+export function modelStatusStripGapPercent(slotCount: number): string {
+  const count = Math.max(1, Math.floor(slotCount));
+  return `${(37.5 / (1.375 * count - 0.375)).toFixed(3)}%`;
 }
 
 /** 状态条上的一个槽位，对应窗口内一个时段。 */
@@ -285,33 +336,52 @@ interface ModelStatusBucket {
 }
 
 /**
- * 把逐时段健康度翻成固定 `MODEL_STATUS_SLOT_COUNT` 格的竖条状态条
- * （图片样式：六级配色——绿/浅绿/黄/橙/红逐级下降，灰 = 该时段无流量）。
+ * 把逐时段健康度翻成自适应槽数的竖条状态条（图片样式：六级配色——
+ * 绿/浅绿/黄/橙/红逐级下降，灰 = 该时段无流量）。
  *
  * 站点只为**有流量**的时段下发数据点，所以这里按 `windowStart` + 格宽
  * 对号入座：没有数据点的格子留 null（灰槽）。不允许用 0 填补——
  * 「无流量」和「成功率 0%」是完全不同的结论，前者是没数据、后者是全线失败。
  *
- * 格宽由 `windowHours / 槽位数` 推出：NewAPI 原生逐时数据（24h → 1h 格）
- * 的结果与按整点对号入座完全一致；「模型状态」增强模块这类窗口、格宽都
- * 可配的站点则按同一比例尺缩放，序列里比格宽更细的点按请求数加权合并。
+ * 格宽与槽数由 `planModelStatusStrip` 推出（站点声明的原生格宽优先：
+ * NewAPI 逐时 24h → 24 格；「模型状态」增强模块 30 分钟 → 48 格；更细的
+ * 按原生格宽整数倍合并）。四条解析通道都按 `windowStart` + 原生格宽对齐
+ * 铺点，所以整数倍合并不会把两个原生时段错位压进同一格；比格宽更细的
+ * 历史数据点则按请求数加权合并。
  *
  * 窗口起点的取值顺序：站点给的 `windowStart` → 最后一个数据点倒推
  * （老版本/魔改站点不给窗口时保证条带仍贴着最近的时段）→ 调用方给的
  * `fallback`（同站点其它模型的窗口与格宽，让无数据模型的全灰条带与
  * 有数据条带对齐）→ 当前时刻倒推。
  *
- * **永远返回 24 格**，没有序列数据时整条全灰：模型在窗口内没有流量也是
- * 一种状态，界面要能一眼看出「这条是空的」，而不是干脆不渲染。
+ * **槽数固定不随数据缺失变化**，没有序列数据时整条全灰：模型在窗口内
+ * 没有流量也是一种状态，界面要能一眼看出「这条是空的」，而不是干脆不渲染。
  */
 export function describeModelStatusStrip(
   health?: SiteModelHealth | null,
   fallback?: SiteModelHealth | null,
 ): ModelStatusSlot[] {
+  if (health?.snapshot) {
+    // 快照源只有当前状态：返回单槽供兜底渲染，正常界面走状态灯分支，
+    // 不会把它铺成时间轴，也不补「无流量」灰格。
+    const rate =
+      typeof health.successRate === "number" && Number.isFinite(health.successRate)
+        ? Math.min(1, Math.max(0, health.successRate))
+        : null;
+    const label = health.statusLabel?.trim();
+    return [
+      {
+        ts: health.windowStart ?? Math.floor(Date.now() / 1000),
+        level: rate === null ? null : modelHealthLevelOf(rate),
+        successRate: rate ?? undefined,
+        title: label ? `实时探测状态：${label}` : "实时探测状态",
+      },
+    ];
+  }
   const points = Array.isArray(health?.series) ? health.series : [];
   // 无自身数据的模型用同站点窗口的格宽，否则 7 天窗口的站点会退化成整点、
   // 全灰条带与有数据条带对不上时间轴。
-  const slotSeconds = statusSlotSeconds((health ?? fallback)?.windowHours);
+  const { slotSeconds, slotCount } = planModelStatusStrip(health, fallback);
 
   let lastTs = 0;
   for (const point of points) {
@@ -326,7 +396,7 @@ export function describeModelStatusStrip(
       return start;
     }
     if (lastTs > 0) {
-      return lastTs - (MODEL_STATUS_SLOT_COUNT - 1) * slotSeconds;
+      return lastTs - (slotCount - 1) * slotSeconds;
     }
     const fallbackStart = fallback?.windowStart;
     if (
@@ -337,7 +407,7 @@ export function describeModelStatusStrip(
       return fallbackStart;
     }
     const now = Math.floor(Date.now() / 1000);
-    return now - (MODEL_STATUS_SLOT_COUNT - 1) * slotSeconds;
+    return now - (slotCount - 1) * slotSeconds;
   })();
 
   const buckets = new Map<number, ModelStatusBucket>();
@@ -347,7 +417,7 @@ export function describeModelStatusStrip(
     const rate = point.successRate;
     if (typeof rate !== "number" || !Number.isFinite(rate)) continue;
     const index = Math.floor((rawTs - windowStart) / slotSeconds);
-    if (index < 0 || index >= MODEL_STATUS_SLOT_COUNT) continue;
+    if (index < 0 || index >= slotCount) continue;
     const requests =
       typeof point.requests === "number" && Number.isFinite(point.requests) && point.requests >= 0
         ? point.requests
@@ -363,7 +433,7 @@ export function describeModelStatusStrip(
     buckets.set(index, bucket);
   }
 
-  return Array.from({ length: MODEL_STATUS_SLOT_COUNT }, (_, index) => {
+  return Array.from({ length: slotCount }, (_, index) => {
     const ts = windowStart + index * slotSeconds;
     const label = formatSlotLabel(ts, slotSeconds);
     const bucket = buckets.get(index);
@@ -383,14 +453,16 @@ export function describeModelStatusStrip(
 }
 
 /** 状态条窗口口径的短描述，如「近 24 小时逐时」——说明文字、读屏 label
- * 与提示都要跟着站点实际窗口走：增强模块的窗口可以是 7 天、格宽 7 小时。
+ * 与提示都要跟着站点实际窗口与格宽走：增强模块的窗口可以是 7 天、
+ * 原生格宽可以是 30 分钟（48 格）甚至更细（整数倍合并后的格宽）。
  */
 export function describeModelWindowLabel(health?: SiteModelHealth | null): string {
+  if (health?.snapshot) return "实时探测状态";
+  const rawHours = health?.windowHours;
   const hours =
-    typeof health?.windowHours === "number" && Number.isFinite(health.windowHours)
-      ? health.windowHours
-      : 24;
-  const slotHours = hours / MODEL_STATUS_SLOT_COUNT;
+    typeof rawHours === "number" && Number.isFinite(rawHours) && rawHours > 0 ? rawHours : 24;
+  const { slotSeconds } = planModelStatusStrip(health, null);
+  const slotHours = slotSeconds / 3600;
   if (Math.abs(slotHours - 1) < 1e-9) return `近 ${hours} 小时逐时`;
   const minutes = Math.round(slotHours * 60);
   const span = minutes >= 60 ? `${+(minutes / 60).toFixed(2)} 小时` : `${minutes} 分钟`;
@@ -399,6 +471,12 @@ export function describeModelWindowLabel(health?: SiteModelHealth | null): strin
 
 /** 状态条容器的整体说明（口径 + 配色含义），绑到容器的 title/aria-label。 */
 export function describeModelStatusStripTitle(health?: SiteModelHealth | null): string {
+  if (health?.snapshot) {
+    return "站点实时探测状态（无历史序列，与当前 Key 无关）：绿色=正常、黄色=限流、红色=不可用。";
+  }
+  if (health?.statusLabel) {
+    return `${describeModelWindowLabel(health)}健康等级（站点渠道监控口径，与当前 Key 无关）：绿色=正常、黄色=警告、红色=异常，灰色为该时段无数据。悬停各格查看具体时段。`;
+  }
   return `${describeModelWindowLabel(health)}成功率（站点全站口径，与当前 Key 无关）：绿色 ≥95%，浅绿 85%~95%，黄色 70%~85%，橙色 50%~70%，红色 <50%，灰色为该时段无流量。悬停各格查看具体时段。`;
 }
 
@@ -431,7 +509,8 @@ function formatSuccessRate(rate: number): string {
  */
 export function describeModelHealth(health?: SiteModelHealth | null): ModelHealthBadge | null {
   if (!health) return null;
-  const hours = health.windowHours ?? 24;
+  const hours =
+    typeof health.windowHours === "number" && health.windowHours > 0 ? health.windowHours : 24;
   const scope = `站点全站口径（所有用户的流量），近 ${hours} 小时`;
   const slots = describeModelStatusStrip(health, null);
   let latestSlot: ModelStatusSlot | null = null;
@@ -442,7 +521,29 @@ export function describeModelHealth(health?: SiteModelHealth | null): ModelHealt
       break;
     }
   }
-  const rate = latestSlot?.successRate ?? health.successRate;
+  const statusLabel = health.statusLabel?.trim();
+  // 有状态文案时以条目自身的汇总值为准：渠道监控的「警告」不能因为最近
+  // 一个时段恰好正常就被染成绿色（反之亦然）。
+  const rate = statusLabel
+    ? health.successRate
+    : (latestSlot?.successRate ?? health.successRate);
+  if (statusLabel) {
+    // 自建监控页只给「正常 / 限流 / 不可用」这类状态，没有成功率窗口；
+    // 直接显示状态文案，宽度与配色仍按折算值走（绿=1、黄=0.7、红=0）。
+    const clamped =
+      typeof rate === "number" && Number.isFinite(rate)
+        ? Math.min(1, Math.max(0, rate))
+        : 0.5;
+    const title = health.snapshot
+      ? `站点实时探测状态：${statusLabel}（与当前 Key 无关，不能据此判断本 Key 是否可用）。`
+      : `站点渠道监控健康度：${statusLabel}（近 ${hours} 小时，与当前 Key 无关，不能据此判断本 Key 是否可用）。`;
+    return {
+      level: modelHealthLevelOf(clamped),
+      label: statusLabel,
+      width: Math.max(1, clamped * 100),
+      title,
+    };
+  }
   if (typeof rate !== "number" || !Number.isFinite(rate)) {
     return {
       level: 2,
@@ -494,6 +595,14 @@ export function describeModelHealth(health?: SiteModelHealth | null): ModelHealt
  */
 export function modelHealthValue(health?: SiteModelHealth | null): number | null {
   if (!health) return null;
+  // 有状态文案时以条目汇总值为准，与徽标口径一致（渠道监控的「警告」不能
+  // 因为最近一个时段正常就被当成健康）。
+  if (health.statusLabel?.trim()) {
+    const rate = health.successRate;
+    if (typeof rate === "number" && Number.isFinite(rate)) {
+      return Math.min(1, Math.max(0, rate));
+    }
+  }
   const slots = describeModelStatusStrip(health, null);
   for (let index = slots.length - 1; index >= 0; index -= 1) {
     const slot = slots[index];

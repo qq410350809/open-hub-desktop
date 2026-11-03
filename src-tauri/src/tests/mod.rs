@@ -1146,6 +1146,94 @@ fn sub2api_consolidated_errors_are_recognized_as_auth_rejection() {
 }
 
 #[test]
+fn key_sync_bridges_expired_access_token_only_for_refresh_auth() {
+    // newapi2：缓存访问令牌过期（401）必须转 Chrome 同源刷新，否则每次令牌
+    // 过期后「同步 Key」都必然失败——Cookie 换不回访问令牌，页面内 refresh
+    // 是唯一通道。
+    let expired = "NewAPI Key 接口 HTTP 401：无权进行此操作，access token 无效";
+    assert!(key_sync_needs_chrome_bridge(expired, true));
+    // Cookie 形态的 NewAPI 没有访问令牌可刷新：401 意味着浏览器会话也失效，
+    // 不该为了同一份 Cookie 反复打开 Chrome。
+    assert!(!key_sync_needs_chrome_bridge(expired, false));
+    // 遇盾与网络不可用两条通道对两种形态都成立。
+    let shield = "NewAPI Key 接口 HTTP 403 返回 HTML：Cloudflare 安全验证拦截了直接请求";
+    assert!(key_sync_needs_chrome_bridge(shield, true));
+    assert!(key_sync_needs_chrome_bridge(shield, false));
+    assert!(key_sync_needs_chrome_bridge(
+        "NewAPI Key 接口响应读取失败：operation timed out",
+        false
+    ));
+    // 普通业务错误不触发浏览器：避免每次接口 5xx 都弹出 Chrome 窗口。
+    assert!(!key_sync_needs_chrome_bridge(
+        "NewAPI Key 接口 HTTP 500：Internal Server Error",
+        true
+    ));
+}
+
+#[test]
+fn chrome_key_models_bridge_refreshes_token_in_refresh_mode() {
+    let script = chrome_key_models_bridge_script(
+        true,
+        "136",
+        "/api/token/?p=1&size=20",
+        true,
+        Some("dedc9057-a615-40a8-8c0b-57d1273dbc6e"),
+        "openhub-sync-test",
+    );
+    // 刷新模式下必须在 Key 列表之前换令牌，并把它带到后续请求上。
+    let refresh_fetch = script
+        .find("fetch(\"/api/user/auth/refresh\"")
+        .expect("刷新模式必须调用 /api/user/auth/refresh");
+    let token_fetch = script
+        .find("fetch(\"/api/token/?p=1&size=20\"")
+        .expect("缺少 Key 列表请求");
+    assert!(
+        refresh_fetch < token_fetch,
+        "刷新令牌必须发生在 Key 请求之前"
+    );
+    assert!(script.contains("method: \"POST\", credentials: \"include\""));
+    assert!(script.contains("requestHeaders.Authorization = `Bearer ${accessToken}`"));
+    // 令牌要随结果带回，调用方才能落库、下次同步直接复用。
+    assert!(script.contains("apiToken: accessToken"));
+    // 会话核对：复用到的其它 Profile 页面必须被判串号，而不是取走别人的 Key。
+    assert!(script
+        .contains("const expectedSession = \"dedc9057-a615-40a8-8c0b-57d1273dbc6e\";"));
+    assert!(script.contains("bridge.profileMismatch = true"));
+    // 结果缓存必须有时间上限，否则新令牌永远落不了库。
+    assert!(script.contains("Date.now() - previous.started < 60000"));
+    assert!(script.contains("previous.token === token"));
+    assert!(script.contains("const token = \"openhub-sync-test\";"));
+    // 上一次还没结束时返回 pending，避免并发刷新令牌互相作废。
+    assert!(script.contains("if (!previous.result && Date.now() - previous.started < 30000)"));
+
+    // 传统 Cookie 模式不进入刷新分支（模板里保留分支代码，由开关短路），
+    // 避免对不支持该路由的站点多发请求。
+    let legacy =
+        chrome_key_models_bridge_script(true, "42", "/api/token/?p=1&size=20", false, None, "openhub-sync-1");
+    assert!(legacy.contains("const useRefreshAuth = false;"));
+    assert!(legacy.contains("if (useRefreshAuth) {"));
+    assert!(legacy.contains("const expectedSession = \"\";"));
+}
+
+#[test]
+fn parses_refreshed_access_token_from_key_bridge_result() {
+    let parsed = parse_chrome_key_models_bridge_result(
+        r#"{"ok":true,"tokenList":{"data":[]},"models":null,"apiToken":"eyJhbGciOiJIUzI1NiJ9.eyJzaWQiOiJhYmMifQ.sig"}"#,
+    )
+    .expect("带令牌的桥接结果应解析成功");
+    assert_eq!(
+        parsed.api_token,
+        "eyJhbGciOiJIUzI1NiJ9.eyJzaWQiOiJhYmMifQ.sig"
+    );
+    // 老脚本 / Cookie 模式没有该字段：缺省为空串，不影响既有链路。
+    let legacy = parse_chrome_key_models_bridge_result(
+        r#"{"ok":true,"tokenList":{"data":[]},"models":null}"#,
+    )
+    .expect("缺少 apiToken 应能解析");
+    assert!(legacy.api_token.is_empty());
+}
+
+#[test]
 fn translates_json_parse_errors_to_friendly_hints() {
     let err = serde_json::from_slice::<serde_json::Value>(b"true;").unwrap_err();
     let message = friendly_json_parse_error(&err, b"true;");
@@ -2612,44 +2700,104 @@ fn parses_model_status_enhancement_into_model_health() {
 }
 
 #[test]
-fn model_status_slots_roll_up_into_fixed_strip_buckets() {
+fn model_status_slots_keep_native_30_minute_buckets() {
     let health = parse_model_status_health(&model_status_enhancement_payload());
     let grok = health.get("grok-4.7").expect("grok-4.7 缺少健康度");
     let series = &grok.series;
     let base = 1750003200;
 
-    // 30 分钟的时间格必须并进固定的 24 槽：第 1 槽 (100%×10 + 90%×10)/20 = 95%，
-    // 槽内按请求数加权而不是简单平均。
+    // 30 分钟原生格宽在 24h 窗口内恰好 48 槽（槽数上限内）→ 不合并，
+    // 每格原样下发：条带显示站点真实粒度，不再是「半小时压成一小时」。
+    assert_eq!(
+        grok.bucket_seconds,
+        Some(1800),
+        "输出格宽应是站点原生 30 分钟"
+    );
+    assert_eq!(grok.window_hours, 24);
     let first = series
         .iter()
         .find(|point| point.ts == base)
-        .expect("首个槽位应有数据");
-    assert!(
-        (first.success_rate.unwrap() - 0.95).abs() < 1e-9,
-        "槽内应按请求数加权，实际 {:?}",
+        .expect("首格应有数据");
+    assert_eq!(
+        first.success_rate,
+        Some(1.0),
+        "原生格宽保留时首格不应与第二格合并，实际 {:?}",
         first.success_rate
     );
-    assert_eq!(first.requests, Some(20));
-
-    // 全线失败的槽照实下发 0%——它与「无流量」必须是两回事。
+    assert_eq!(first.requests, Some(10));
     let second = series
         .iter()
-        .find(|point| point.ts == base + 3600)
-        .expect("第 2 槽应有数据");
-    assert_eq!(second.success_rate, Some(0.0));
-    assert_eq!(second.requests, Some(8));
+        .find(|point| point.ts == base + 1800)
+        .expect("第 2 格应有数据");
+    assert!((second.success_rate.unwrap() - 0.9).abs() < 1e-9);
+    assert_eq!(second.requests, Some(10));
 
-    // 显式 0 请求的两格所在槽不下发数据点 → 界面留灰，不能画成 0%。
+    // 全线失败的格照实下发 0%——它与「无流量」必须是两回事。
+    let third = series
+        .iter()
+        .find(|point| point.ts == base + 3600)
+        .expect("第 3 格应有数据");
+    assert_eq!(third.success_rate, Some(0.0));
+    assert_eq!(third.requests, Some(4));
+
+    // 显式 0 请求的两格不下发数据点 → 界面留灰，不能画成 0%。
     assert!(
-        !series.iter().any(|point| point.ts == base + 3 * 3600),
-        "无流量槽不该被补成 0%"
+        !series.iter().any(|point| point.ts == base + 6 * 1800),
+        "无流量格不该被补成 0%"
     );
-    assert_eq!(series.len(), 23, "24 槽里应恰好只有 1 个灰槽");
+    assert!(
+        !series.iter().any(|point| point.ts == base + 7 * 1800),
+        "无流量格不该被补成 0%"
+    );
+    assert_eq!(series.len(), 46, "48 格里应恰好只有 2 个灰格");
 
     let timestamps = series.iter().map(|point| point.ts).collect::<Vec<_>>();
     let mut sorted = timestamps.clone();
     sorted.sort();
     assert_eq!(timestamps, sorted, "序列必须按时间升序供界面按序铺槽");
+}
+
+#[test]
+fn finer_than_slot_max_merges_by_native_multiple() {
+    // 15 分钟原生格宽在 24h 窗口里是 96 格，超过 48 槽上限：按原生格宽的
+    // **整数倍**（这里 2 倍 = 30 分钟）合并，输出格宽仍对齐原生边界，
+    // 界面槽数恰为 48。
+    const WINDOW_START: i64 = 1750003200;
+    const NATIVE: i64 = 900;
+    let mut slots = Vec::new();
+    for index in 0..96 {
+        let start = WINDOW_START + index * NATIVE;
+        slots.push(serde_json::json!({
+            "slot": index,
+            "start_time": start,
+            "end_time": start + NATIVE,
+            "total_requests": 5,
+            "success_rate": 100.0
+        }));
+    }
+    let payload = serde_json::json!({
+        "success": true,
+        "data": [{
+            "model_name": "glm-5.3-flash",
+            "total_requests": 480,
+            "success_rate": 100.0,
+            "slot_data": slots
+        }]
+    });
+    let health = parse_model_status_health(&payload);
+    let model = health
+        .get("glm-5.3-flash")
+        .expect("glm-5.3-flash 缺少健康度");
+    assert_eq!(
+        model.bucket_seconds,
+        Some(1800),
+        "96 格应按 2 倍原生格宽合并成 30 分钟"
+    );
+    assert_eq!(model.series.len(), 48, "合并后应恰为 48 个输出槽");
+    assert!(
+        model.series.windows(2).all(|pair| pair[1].ts - pair[0].ts == 1800),
+        "输出序列间距应是合并后的格宽"
+    );
 }
 
 #[test]
@@ -2689,16 +2837,18 @@ fn model_status_window_follows_real_span_so_the_newest_slot_survives() {
         7,
         "7 个相隔一天的时间格应落在 7 个不同的槽"
     );
-    // 序列点的 ts 是**槽**起点而非时间格起点：最近一格落在第 20 槽，
-    // 只要它没被挤出 24 槽窗口，界面就能画出「现在」的状态。
-    let step = model.window_hours * 3600 / MODEL_STATUS_SLOT_COUNT;
+    // 原生格宽 1 天 ≥ 窗口/24（7 小时）：不合并、原样保留——条带是 7 格
+    // 「天级」而不是 24 格「半天挤一格」；最近一格（第 7 天）仍在窗口内，
+    // 界面才能画出「现在」的状态。
+    let step = model.bucket_seconds.expect("应声明输出格宽");
+    assert_eq!(step, DAY, "原生格宽 ≥ 窗口/24 时按原生格宽下发");
     assert!(
-        6 * DAY < 24 * step,
+        6 * DAY < model.window_hours * 3600,
         "窗口必须覆盖全部时间格，实际 step={step}"
     );
     assert_eq!(
         model.series.last().map(|point| point.ts),
-        Some(WINDOW_START + (6 * DAY / step) * step),
+        Some(WINDOW_START + 6 * DAY),
         "最近一格必须留在窗口内"
     );
 }
@@ -2727,7 +2877,7 @@ fn site_model_health_parser_picks_the_right_shape() {
 
 #[test]
 fn chrome_key_models_bridge_also_fetches_perf_metrics() {
-    let script = chrome_key_models_bridge_script(true, "10288", "/api/token/?p=1&size=20");
+    let script = chrome_key_models_bridge_script(true, "10288", "/api/token/?p=1&size=20", false, None, "openhub-sync-1");
     assert!(script.contains("fetch(\"/api/perf-metrics/summary?hours=24\""));
     // 健康度是纯附加信息：必须与 Key/模型分离，失败只把字段留 null。
     assert!(script.contains("health: null"));
@@ -2745,7 +2895,7 @@ fn chrome_key_models_bridge_also_fetches_perf_metrics() {
 
 #[test]
 fn chrome_key_models_bridge_falls_back_to_model_status_module() {
-    let script = chrome_key_models_bridge_script(true, "10288", "/api/token/?p=1&size=20");
+    let script = chrome_key_models_bridge_script(true, "10288", "/api/token/?p=1&size=20", false, None, "openhub-sync-1");
 
     // x666 这类魔改 NewAPI 没有 perf-metrics（404 Invalid URL），桥接必须在
     // 同一套会话里改拉「模型状态」增强模块，且顺序固定：先要登录态的全量接口
@@ -2781,7 +2931,7 @@ fn chrome_key_models_bridge_falls_back_to_model_status_module() {
 
 #[test]
 fn chrome_key_models_bridge_health_cannot_break_the_main_flow() {
-    let script = chrome_key_models_bridge_script(true, "10288", "/api/token/?p=1&size=20");
+    let script = chrome_key_models_bridge_script(true, "10288", "/api/token/?p=1&size=20", false, None, "openhub-sync-1");
     // 1) 桥接只有 10s/25s 预算，健康度必须与模型并发而不是串行多一个往返，
     //    并且自带一个远小于预算的超时。
     assert!(
@@ -3245,4 +3395,320 @@ async fn probe_fengwind_collect_health() {
     println!("PROBE 前 10: {:?}", &names[..names.len().min(10)]);
     assert!(!health.is_empty(), "sub2api 通道应抓到模型市场健康度");
     assert_ne!(stored, "{}", "健康度应写入 health_json");
+}
+
+
+#[test]
+fn save_bridged_model_health_writes_token_and_health_only_for_target_account() {
+    let connection = Connection::open_in_memory().unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE site_accounts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                site_id TEXT NOT NULL,
+                profile_id TEXT NOT NULL,
+                newapi_token TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT ''
+             );
+             CREATE TABLE site_model_cache (
+                site_id TEXT NOT NULL,
+                profile_id TEXT NOT NULL,
+                health_json TEXT NOT NULL DEFAULT '{}',
+                updated_at TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (site_id, profile_id)
+             );
+             INSERT INTO site_accounts (site_id, profile_id, newapi_token)
+                VALUES ('site-1', 'Profile 11', '');
+             INSERT INTO site_accounts (site_id, profile_id, newapi_token)
+                VALUES ('site-1', 'Profile 15', 'other-token');
+             INSERT INTO site_model_cache (site_id, profile_id)
+                VALUES ('site-1', 'Profile 11');
+             INSERT INTO site_model_cache (site_id, profile_id)
+                VALUES ('site-1', 'Profile 15');",
+        )
+        .unwrap();
+    let database = Database(std::sync::Mutex::new(connection));
+    let mut health = HashMap::new();
+    health.insert(
+        "gpt-x".to_string(),
+        SiteModelHealth {
+            success_rate: Some(0.9),
+            ..Default::default()
+        },
+    );
+
+    save_bridged_model_health(&database, "site-1", "Profile 11", " tok-1 ", &health);
+
+    let (token, other_token): (String, String) = database
+        .0
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT
+                (SELECT newapi_token FROM site_accounts WHERE site_id='site-1' AND profile_id='Profile 11'),
+                (SELECT newapi_token FROM site_accounts WHERE site_id='site-1' AND profile_id='Profile 15')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(token, "tok-1");
+    assert_eq!(other_token, "other-token", "不得写其它账号行");
+
+    let health_json: String = database
+        .0
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT health_json FROM site_model_cache WHERE site_id='site-1' AND profile_id='Profile 11'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let parsed: HashMap<String, SiteModelHealth> = serde_json::from_str(&health_json).unwrap();
+    assert_eq!(parsed["gpt-x"].success_rate, Some(0.9));
+
+    // 空健康度保持旧值，避免站点临时抽风覆盖已有数据；令牌仍会写回。
+    save_bridged_model_health(
+        &database,
+        "site-1",
+        "Profile 11",
+        "tok-2",
+        &HashMap::new(),
+    );
+    let (after_json, after_token): (String, String) = database
+        .0
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT
+                (SELECT health_json FROM site_model_cache WHERE site_id='site-1' AND profile_id='Profile 11'),
+                (SELECT newapi_token FROM site_accounts WHERE site_id='site-1' AND profile_id='Profile 11')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(after_json, health_json);
+    assert_eq!(after_token, "tok-2");
+}
+
+#[test]
+fn parse_public_health_html_maps_status_chips() {
+    let html = r#"
+      <div class="mgrid">
+      <div class="mchip red" title="HTTP 422"><span class="dot red"></span>qwen3.8-max<span class="mc">12/2</span></div>
+      <div class="mchip yellow"><span class="dot yellow"></span>glm-5.3-flash</div>
+      <div class="mchip green"><span class="dot green"></span>DeepSeek-V4-Flash</div>
+      <div class="mchip gray"><span class="dot gray"></span>hidden-model</div>
+      <div class="mchip green"><span class="dot green"></span>a&amp;b</div>
+      </div>"#;
+    let health = parse_public_health_html(html);
+    assert_eq!(health.len(), 4);
+    assert_eq!(health["qwen3.8-max"].status_label.as_deref(), Some("不可用"));
+    assert_eq!(health["qwen3.8-max"].success_rate, Some(0.0));
+    assert_eq!(health["glm-5.3-flash"].status_label.as_deref(), Some("限流"));
+    assert_eq!(health["DeepSeek-V4-Flash"].success_rate, Some(1.0));
+    assert_eq!(health["a&b"].success_rate, Some(1.0));
+    assert!(!health.contains_key("hidden-model"));
+    // 快照源只有当前状态：不合成窗口、不补逐时段序列，界面按状态灯展示。
+    let snapshot = &health["DeepSeek-V4-Flash"];
+    assert!(snapshot.snapshot);
+    assert_eq!(snapshot.window_hours, 0);
+    assert_eq!(snapshot.window_start, None);
+    assert!(snapshot.series.is_empty());
+    // 缓存契约：前端只认 snapshot 标记，不再依赖伪造的窗口/序列。
+    let json = serde_json::to_string(snapshot).unwrap();
+    assert!(json.contains("\"snapshot\":true"));
+    assert!(!json.contains("\"series\""));
+    assert!(!json.contains("\"windowStart\""));
+}
+
+/// 一次性探测（默认忽略）：kunyou 的公开 HTML 状态页。应用内未配置网络
+/// 代理时，直连 workers.dev 会超时，应自动回退系统代理。
+#[tokio::test]
+#[ignore = "依赖本机系统代理可访问 workers.dev"]
+async fn probe_kunyou_public_health_html() {
+    let connection = Connection::open_in_memory().unwrap();
+    connection
+        .execute_batch("CREATE TABLE app_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
+        .unwrap();
+    let database = Database(std::sync::Mutex::new(connection));
+    let client = build_site_http_client(
+        &database,
+        std::time::Duration::from_secs(8),
+        3,
+        "公开状态页探测",
+    )
+    .expect("probe client");
+    let health = fetch_public_health_html_endpoint(
+        &client,
+        "https://account-doctor.woshikunyou.workers.dev/status",
+        &crate::site::sync::chrome_user_agent(),
+    )
+    .await;
+    println!("PROBE kunyou models={}", health.len());
+    assert!(health.len() >= 30, "应解析出监控页的模型状态");
+    assert_eq!(
+        health["deepseek-v4.1-flash"].status_label.as_deref(),
+        Some("正常")
+    );
+    assert!(health["deepseek-v4.1-flash"].snapshot);
+}
+
+/// 一次性探测（默认忽略）：daigua 的 channel-monitor-v2 矩阵接口。
+/// 先读 Chrome LocalStorage 里的会话令牌，再试几种 Authorization 形态。
+#[tokio::test]
+#[ignore = "读取本机 Chrome LocalStorage，探测 daigua 健康度接口"]
+async fn probe_daigua_channel_monitor_matrix() {
+    let home = crate::context::home_dir().expect("home");
+    let origin = "https://api.daigua.icu".to_string();
+    let targets: Vec<_> = ["Profile 11", "Profile 15"]
+        .into_iter()
+        .map(|profile| crate::site::sync::LocalStorageTarget {
+            site_id: String::new(),
+            profile_id: profile.to_string(),
+            origin: origin.clone(),
+        })
+        .collect();
+    let items = crate::site::sync::read_local_storage_from_home(&home, &targets);
+    for item in &items {
+        let keys: Vec<_> = item.values.keys().cloned().collect();
+        println!("PROBE profile={} keys={keys:?}", item.profile_id);
+    }
+    let token = items
+        .iter()
+        .find_map(|item| item.values.get("auth_token").cloned())
+        .map(|value| value.trim().trim_matches('"').to_string())
+        .unwrap_or_default();
+    println!("PROBE auth_token len={}", token.len());
+
+    let connection = Connection::open_in_memory().unwrap();
+    connection
+        .execute_batch("CREATE TABLE app_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
+        .unwrap();
+    let database = Database(std::sync::Mutex::new(connection));
+    let client = build_site_http_client(
+        &database,
+        std::time::Duration::from_secs(20),
+        3,
+        "daigua probe",
+    )
+    .unwrap();
+    let url = "https://api.daigua.icu/api/v1/channel-monitor-v2/matrix?range=24h&group_by=platform_model&timezone=Asia%2FShanghai";
+    for (label, header) in [
+        ("bearer", format!("Bearer {token}")),
+        ("raw", token.clone()),
+    ] {
+        if token.is_empty() {
+            break;
+        }
+        let response = client
+            .get(url)
+            .header("Authorization", header)
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        println!(
+            "PROBE {label} status={status} body={}",
+            &body.chars().take(500).collect::<String>()
+        );
+        if label == "bearer" && status.is_success() {
+            std::fs::write("/tmp/daigua_matrix.json", &body).unwrap();
+            let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+            let parsed = parse_sub2api_channel_monitor_health(&value);
+            println!("PROBE parsed models={}", parsed.len());
+            assert!(!parsed.is_empty(), "应解析出模型健康度");
+            assert!(parsed.values().any(|health| health.status_label.is_some()));
+            let data = &value["data"];
+            let items = data["items"].as_array().cloned().unwrap_or_default();
+            println!("PROBE items={}", items.len());
+            let mut overall = std::collections::BTreeSet::new();
+            let mut with_model = 0usize;
+            for item in &items {
+                if let Some(model) = item.get("model").and_then(|v| v.as_str()) {
+                    if with_model < 8 {
+                        println!(
+                            "PROBE item platform={:?} model={:?} overall={:?} buckets={} metrics.request_count={:?}",
+                            item.get("platform"),
+                            model,
+                            item.pointer("/health/overall"),
+                            item["buckets"].as_array().map(Vec::len).unwrap_or(0),
+                            item.pointer("/metrics/request_count"),
+                        );
+                    }
+                    with_model += 1;
+                }
+                if let Some(level) = item.pointer("/health/overall").and_then(|v| v.as_str()) {
+                    overall.insert(level.to_string());
+                }
+            }
+            println!("PROBE with_model={with_model} overall={overall:?}");
+            if let Some(bucket) = items
+                .iter()
+                .find_map(|item| item["buckets"].as_array().and_then(|b| b.first()))
+            {
+                println!("PROBE bucket={bucket}");
+            }
+        }
+    }
+}
+
+/// 渠道监控 v2：以站点自己的 health.overall 为准，跳过平台汇总行与 unknown。
+#[test]
+fn parse_sub2api_channel_monitor_health_maps_overall_and_buckets() {
+    let value = serde_json::json!({
+        "data": {
+            "coverage": {
+                "requested_start": "2026-10-29T06:00:00Z",
+                "requested_end": "2026-10-30T06:00:00Z",
+                "coverage_start": "2026-10-29T06:00:00Z",
+                "bucket_seconds": 3600
+            },
+            "items": [
+                { "platform": "openai", "metrics": { "request_count": 0, "success_rate": 0 } },
+                {
+                    "platform": "openai",
+                    "model": "gpt-5.5",
+                    "metrics": { "request_count": 0, "success_rate": 0 },
+                    "health": { "overall": "healthy" },
+                    "buckets": [
+                        { "bucket_start": "2026-10-29T06:00:00Z", "health": { "overall": "healthy" }, "metrics": { "request_count": 0 } },
+                        { "bucket_start": "2026-10-29T07:00:00Z", "health": { "overall": "warning" }, "metrics": { "request_count": 12 } },
+                        { "bucket_start": "2026-10-29T08:00:00Z", "health": { "overall": "unknown" }, "metrics": { "request_count": 0 } }
+                    ]
+                },
+                {
+                    "platform": "openai",
+                    "model": "gpt-5.6",
+                    "metrics": { "request_count": 0 },
+                    "health": { "overall": "critical" },
+                    "buckets": []
+                },
+                {
+                    "platform": "openai",
+                    "model": "unknown",
+                    "health": { "overall": "healthy" },
+                    "buckets": []
+                }
+            ]
+        }
+    });
+    let health = parse_sub2api_channel_monitor_health(&value);
+    assert_eq!(health.len(), 2);
+    let healthy = &health["gpt-5.5"];
+    assert_eq!(healthy.status_label.as_deref(), Some("正常"));
+    assert_eq!(healthy.success_rate, Some(1.0));
+    assert_eq!(healthy.window_hours, 24);
+    assert_eq!(healthy.bucket_seconds, Some(3600));
+    assert!(healthy.window_start.is_some());
+    assert_eq!(healthy.series.len(), 2);
+    assert_eq!(healthy.series[1].success_rate, Some(0.7));
+    assert_eq!(healthy.series[1].requests, Some(12));
+    assert_eq!(healthy.requests, None);
+    let critical = &health["gpt-5.6"];
+    assert_eq!(critical.status_label.as_deref(), Some("异常"));
+    assert_eq!(critical.success_rate, Some(0.0));
+    assert!(critical.series.is_empty());
+    assert!(!health.contains_key("unknown"));
 }

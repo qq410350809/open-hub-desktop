@@ -242,6 +242,11 @@ pub struct ChromeUsageScanResult {
 /// 另注：站点**只为窗口内确有请求的模型**下发条目（上游 `QuerySummaryAll`
 /// 会跳过 requestCount==0 的模型）。所以「出现在列表里」本身就等于
 /// 「近 N 小时有流量」，不需要再单独找一个标志位来表达。
+/// serde 跳过 false：老缓存的 JSON 形状保持不变。
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SiteModelHealth {
@@ -252,6 +257,18 @@ pub struct SiteModelHealth {
     /// 被当成「大于 0.995」而显示成 100%，界面就只剩 0 和 100 两个值。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) success_rate: Option<f64>,
+    /// 站点直接给出的状态文案（自建监控页的「正常 / 限流 / 不可用」、
+    /// 渠道监控的「正常 / 警告 / 异常」等）。存在时界面优先显示它，
+    /// 而不是把状态折算成的成功率数字。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) status_label: Option<String>,
+    /// 数据源只给「当前状态」、没有历史序列时为 true。
+    ///
+    /// 这类来源（如自建监控页的模型状态灯）只有一个观测点，既没有窗口起点
+    /// 也没有逐时段数据。界面据此显示固定尺寸的状态灯，而不是铺一条时间轴：
+    /// 给快照补灰格等于断言「过去若干时段无流量」，是数据源没提供的事实。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(crate) snapshot: bool,
     /// 平均响应延迟（毫秒）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) avg_latency_ms: Option<i64>,
@@ -267,8 +284,8 @@ pub struct SiteModelHealth {
     /// 本身没有统计意义，读者需要知道分母。站点没下发就缺省，不影响判定。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) requests: Option<u64>,
-    /// 窗口起点（Unix 秒）。界面按它与 `window_hours` 把窗口等分成固定格数
-    /// （`MODEL_STATUS_SLOT_COUNT`），把序列对号入座：**没有流量的时段
+    /// 窗口起点（Unix 秒）。界面按它与 `window_hours`、`bucket_seconds`
+    /// 把窗口切成格子，把序列对号入座：**没有流量的时段
     /// 没有数据点**，界面据此留灰槽——序列本身不补零，否则无法区分
     /// 「无流量」与「0% 成功」。
     ///
@@ -277,6 +294,14 @@ pub struct SiteModelHealth {
     /// （起点 + 格宽）定位，不需要整点。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) window_start: Option<i64>,
+    /// `series` 与窗口的时间格宽（秒）：站点原生格宽，或解析侧为控制序列
+    /// 体积按原生格宽整数倍合并后的结果。界面条带的格宽与槽数跟它走——
+    /// 原生 1 小时 → 24 格，原生 30 分钟 → 48 格（上限，更细的先合并）。
+    ///
+    /// 缺省（老缓存 / 来源未声明格宽）时界面回退「窗口 ÷ 24」的旧口径，
+    /// 显示效果与没有这个字段之前一致。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) bucket_seconds: Option<i64>,
     /// 逐时段成功率（0~1），只含窗口内确有流量的时段。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) series: Vec<SiteModelHealthPoint>,

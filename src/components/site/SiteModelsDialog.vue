@@ -3,7 +3,7 @@ import { computed, ref, watch, nextTick } from "vue";
 import { runCommand, useLibrary } from "../../composables/useLibrary";
 import { icons } from "../../icons";
 import { useStore } from "../../composables/useStore";
-import { logoText, describeModelHealth, describeModelStatusStrip, describeModelStatusStripTitle, describeModelWindowLabel, modelHealthValue, MODEL_STATUS_SLOT_COUNT } from "../../utils";
+import { logoText, describeModelHealth, describeModelSnapshot, describeModelStatusStrip, describeModelStatusStripTitle, describeModelWindowLabel, modelHealthValue, MODEL_STATUS_SLOT_COUNT } from "../../utils";
 import type { ModelHealthBadge, ModelStatusSlot } from "../../utils";
 import { isUnknownSystemType, systemTypeLabel } from "../../types";
 import type { SiteModelHealth } from "../../types";
@@ -58,6 +58,8 @@ const closeBtnRef = ref<HTMLButtonElement>();
  * 「无效模型」的成功率阈值：成功率低于该值即视为无效（含 0%）。
  * 与健康度分级一致——<50% 就是最差的红档（level 1）。留一个极小余量，
  * 让「有极少请求且全失败」的 0.x% 也归入无效。
+ * 「站点已上报健康度但模型所有小方块都无数据」的情形也视为无效，
+ * 见 isUnhealthyModel。
  */
 const UNHEALTHY_SUCCESS_RATE = 0.01;
 const searchQuery = ref("");
@@ -168,18 +170,22 @@ const currentActiveModels = computed<LiveModelItem[]>(() => {
   return liveModels.value;
 });
 
+/** 站点是否上报过任何模型健康度；用于在面板上给出一次性的口径说明。 */
+const hasModelHealth = computed(() => Object.keys(modelHealth.value).length > 0);
+
 /** 隐藏「成功率极低」的模型开关。 */
 const hideUnhealthy = ref(false);
 
-/** 模型是否被视为「无效」：成功率为 0 或极低（低于阈值）。
+/** 模型是否被视为「无效」：成功率为 0 或极低（低于阈值），
+ *  或者站点已上报健康度、但该模型所有小方块都是无数据（条带全灰）。
  *
- *  口径只认「有实测成功率且极低」，不用「站点没上报健康度」判无效——
- *  无数据只说明站点没有该模型的流量记录，不等于模型不可用（很多冷门模型
- *  就是长期无人调用）。健康度数值与徽标同源（modelHealthValue）。 */
+ *  健康度数值与徽标同源（modelHealthValue）。站点整体没有健康度数据
+ *  （不支持该接口）时不按无数据判无效，否则开关一开整份列表都会被隐藏。 */
 function isUnhealthyModel(modelId: string): boolean {
   const value = modelHealthValue(modelHealth.value[modelId]);
-  if (value === null) return false;
-  return value < UNHEALTHY_SUCCESS_RATE;
+  if (value !== null) return value < UNHEALTHY_SUCCESS_RATE;
+  if (!hasModelHealth.value) return false;
+  return true;
 }
 
 /** 被隐藏的无效模型数量，用于开关上的提示与空列表文案。 */
@@ -210,14 +216,11 @@ const modelCountLabel = computed(() => {
 
 /** 开关按钮标题：说明口径与当前隐藏了多少个模型。 */
 const hideUnhealthyTitle = computed(() => {
-  const base = `隐藏成功率极低（低于 ${Math.round(UNHEALTHY_SUCCESS_RATE * 100)}%，含 0%）的模型；站点未上报健康度（无数据）的模型不算无效，仍会保留`;
+  const base = `隐藏成功率极低（低于 ${Math.round(UNHEALTHY_SUCCESS_RATE * 100)}%，含 0%）的模型；站点已上报健康度、但该模型所有时段都无数据（条带全灰）的模型同样视为无效；站点整体未上报健康度时保留全部模型`;
   return hideUnhealthy.value && hiddenUnhealthyCount.value > 0
     ? `${base}；当前已隐藏 ${hiddenUnhealthyCount.value} 个`
     : base;
 });
-
-/** 站点是否上报过任何模型健康度；用于在面板上给出一次性的口径说明。 */
-const hasModelHealth = computed(() => Object.keys(modelHealth.value).length > 0);
 
 /** 站点是否上报过任何模型健康度：上报过就画 24 格条带。
  *  只给汇总成功率、没给逐时段序列的（旧数据里连 series 字段都没有）条带是
@@ -237,6 +240,31 @@ const healthBadges = computed(() => {
 
 function healthBadgeOf(modelId: string) {
   return healthBadges.value.get(modelId);
+}
+
+/** 站点健康度是否为「只有当前状态」的快照源（自建监控页等）。 */
+const snapshotMode = computed(() =>
+  Object.values(modelHealth.value).some((health) => health.snapshot === true),
+);
+
+/** 渠道监控型：有状态文案且有逐小时序列（daigua 等），徽标是整体等级。 */
+const channelMonitorMode = computed(() =>
+  Object.values(modelHealth.value).some(
+    (health) => health.snapshot !== true && !!health.statusLabel?.trim(),
+  ),
+);
+
+const snapshotBadges = computed(() => {
+  const badges = new Map<string, ModelHealthBadge>();
+  for (const [modelId, health] of Object.entries(modelHealth.value)) {
+    const badge = describeModelSnapshot(health);
+    if (badge) badges.set(modelId, badge);
+  }
+  return badges;
+});
+
+function snapshotBadgeOf(modelId: string) {
+  return snapshotBadges.value.get(modelId);
 }
 
 // 状态条：每个模型都有一条 24 格条带——有流量的时段上色，没流量的留灰
@@ -1009,7 +1037,8 @@ async function removeKey(account: LiveAccountKeys, key: string) {
                     />
                   </label>
 
-                  <!-- 隐藏无效模型：成功率极低（含 0%）。
+                  <!-- 隐藏无效模型：成功率极低（含 0%），或站点已上报健康度
+                       但模型所有时段都无数据（条带全灰）。
                        开关态用眼睛图标区分（隐藏中＝划掉的眼睛）。 -->
                   <button
                     type="button"
@@ -1027,8 +1056,17 @@ async function removeKey(account: LiveAccountKeys, key: string) {
               </div>
 
               <p v-if="hasModelHealth" class="site-models-health-note">
-                数字徽标为<b>最近有流量时段</b>的成功率（与色条最后一个亮块一致）；色条为站点上报的<b>全站</b>口径{{ healthNoteWindow }}逐时段成功率（与当前 Key
-                无关，仅作健康度参考）：绿 ≥95%，浅绿 85%~95%，黄 70%~85%，橙 50%~70%，红 &lt;50%，灰 = 该时段无流量，悬停可看具体时段与请求量；能否使用以该 Key 的模型列表为准。
+                <template v-if="snapshotMode">
+                  状态灯为站点<b>实时探测</b>的当前状态（与当前 Key 无关，仅作健康度参考）：绿 = 正常，黄 = 限流，红 = 不可用；灰 = 站点未列出该模型（无账号或未放行）。能否使用以该 Key 的模型列表为准。
+                </template>
+                <template v-else-if="channelMonitorMode">
+                  数字徽标为站点渠道监控的<b>整体健康等级</b>；色条为{{ healthNoteWindow }}健康等级（与当前 Key
+                  无关，仅作健康度参考）：绿 = 正常，黄 = 警告，红 = 异常，灰 = 该时段无数据；能否使用以该 Key 的模型列表为准。
+                </template>
+                <template v-else>
+                  数字徽标为<b>最近有流量时段</b>的成功率（与色条最后一个亮块一致）；色条为站点上报的<b>全站</b>口径{{ healthNoteWindow }}逐时段成功率（与当前 Key
+                  无关，仅作健康度参考）：绿 ≥95%，浅绿 85%~95%，黄 70%~85%，橙 50%~70%，红 &lt;50%，灰 = 该时段无流量，悬停可看具体时段与请求量；能否使用以该 Key 的模型列表为准。
+                </template>
               </p>
             </div>
 
@@ -1055,7 +1093,7 @@ async function removeKey(account: LiveAccountKeys, key: string) {
                 <span class="site-models-state-icon" v-html="icons.search" />
                 <strong>{{ hideUnhealthy && !searchQuery.trim() ? "当前全部模型都无效" : "未找到匹配模型" }}</strong>
                 <p v-if="hideUnhealthy && !searchQuery.trim()">
-                  已隐藏 {{ currentActiveModels.length }} 个成功率极低的模型，关闭「隐藏无效」可查看。
+                  已隐藏 {{ currentActiveModels.length }} 个成功率极低或无数据的模型，关闭「隐藏无效」可查看。
                 </p>
                 <p v-else>试试其他关键词{{ hideUnhealthy ? "，或关闭「隐藏无效」扩大范围" : "" }}。</p>
               </div>
@@ -1085,7 +1123,19 @@ async function removeKey(account: LiveAccountKeys, key: string) {
                     <!-- 状态条：每个模型都画满 24 格——有流量的时段上色，
                          没流量的时段留灰（模型没有任何流量时整条全灰）。 -->
                     <span v-if="hasStatusStrip" class="site-models-item-health">
+                      <!-- 快照源：只显示当前状态灯，不补时间轴灰格。 -->
                       <span
+                        v-if="snapshotMode"
+                        class="site-models-item-health-snapshot"
+                        :class="snapshotBadgeOf(model.id) ? `is-lv${snapshotBadgeOf(model.id)!.level}` : 'is-idle'"
+                        role="img"
+                        :aria-label="snapshotBadgeOf(model.id)?.label ?? '站点实时状态未列出该模型'"
+                        :title="snapshotBadgeOf(model.id)?.title ?? '站点实时状态页未列出该模型（无账号或未放行）。'"
+                      >
+                        <span class="site-models-item-health-snapshot-dot" />
+                      </span>
+                      <span
+                        v-else
                         class="site-models-item-health-strip"
                         role="img"
                         :aria-label="statusStripLabel"

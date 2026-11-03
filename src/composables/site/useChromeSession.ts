@@ -49,11 +49,17 @@ let chromeBrowserSyncRunId = 0;
 let chromeBrowserSyncLogId = 0;
 let chromeBrowserSyncStartedAt = 0;
 let chromeBrowserSyncLastLogAt = 0;
-// 强制停止标记：用户在关闭确认里选择“强制停止并关闭”后置位。
-// 账号同步循环与单账号同步在拿到结果后据此放弃后续账号与提示；
-// 下一次发起同步时复位。后端通过 cancel_site_account_sync 按 runId
-// 在阶段边界停止打开新的 Chrome 标签页。
-let chromeSyncForceStopped = false;
+// 同步代数：每开始一轮同步 +1，每次强制停止/接管再 +1。各 run 捕获自己的代数，
+// 用「代数已变」作为停止检查。布尔标记在这里不够用——「取消旧同步并立刻开始新同步」
+// 时新一轮复位标记会把旧 run 的取消信号抹掉，旧 run 会继续跑完整个账号列表。
+let chromeSyncGeneration = 0;
+// 整轮同步占用的归属令牌：接管后旧 run 的 finally 不能把新同步的占用清掉。
+let chromeSessionSyncToken = 0;
+// 会话扫描代数：接管时让旧的扫描结果（可能晚到）不再覆盖新一轮的状态与缓存。
+let chromeUsageScanToken = 0;
+// 批量同步（useSyncState 的会话/额度批次）注册的撤销钩子：单站点同步接管时
+// 需要把它们的停止代数一并推进，否则旧批次会继续跑。
+const externalSyncAbortHandlers = new Set<() => void>();
 // 正在进行的账号同步 runId 集合（含批量会话同步的每个站点）。
 // 强制停止时逐个取消，避免批量并行下只取消了最后一个 run。
 const activeAccountSyncRunIds = new Set<number>();
@@ -186,7 +192,10 @@ async function runChromeAccountSync(
 ): Promise<ChromeSessionInfo | null> {
   const site = options.site ?? chromeSessionSite.value;
   const log = options.log ?? appendChromeBrowserSyncLog;
-  const shouldStop = options.shouldStop ?? (() => chromeSyncForceStopped);
+  // 未显式注入停止检查时，跟随「调用时刻的同步代数」：任何一次强制停止/接管
+  // 都会推进代数，本次请求随之作废。
+  const generationAtStart = chromeSyncGeneration;
+  const shouldStop = options.shouldStop ?? (() => chromeSyncGeneration !== generationAtStart);
   if (shouldStop()) return null;
   if (!site) return null;
   // 「白与黑」没有签到集成，日志文案不提签到，避免误导。
@@ -286,16 +295,95 @@ async function cancelAllChromeAccountSyncs() {
   );
 }
 
-async function syncAccountViaChrome(session: ChromeSessionInfo) {
-  if (chromeBrowserSyncingProfileId.value) return;
-  // 批量会话同步期间拒绝单账号手动同步：共用桥接通道，交错会互相抢占。
-  if (chromeSessionSyncActive.value) {
-    showToast("已有 Chrome 会话同步正在进行，请等待结束后重试", true);
-    return;
-  }
-  chromeSyncForceStopped = false;
-  startChromeBrowserSyncLog();
+/**
+ * 开始一轮同步：返回该轮的停止检查函数。
+ * 用代数而不是布尔标记，是为了让「取消旧同步并立刻开始新同步」时旧 run 依然
+ * 能看到自己被取消（新一轮复位布尔标记会把旧 run 的取消信号抹掉）。
+ */
+function beginChromeSyncRun(): () => boolean {
+  const generation = ++chromeSyncGeneration;
+  return () => chromeSyncGeneration !== generation;
+}
+
+/** 取得整轮同步的占用；返回的令牌交给 {@link releaseChromeSessionSync} 归还。 */
+function acquireChromeSessionSync(): number {
+  const token = ++chromeSessionSyncToken;
   chromeSessionSyncActive.value = true;
+  return token;
+}
+
+/** 归还整轮同步占用；只有当前持有者能归还，接管后旧 run 的 finally 不再生效。 */
+function releaseChromeSessionSync(token: number) {
+  if (token !== chromeSessionSyncToken) return;
+  chromeSessionSyncActive.value = false;
+}
+
+/**
+ * 强制停止当前所有同步（单账号 / 单站点 / 批量会话 / 批量额度），
+ * 并把占用释放给即将开始的新同步。语义与「强制停止」按钮一致：
+ * 在途请求在后端阶段边界失败，临时打开的桥接标签页被清理。
+ */
+async function forceStopRunningSync() {
+  // 代数 +1：所有在跑的 run（含旧批次）的停止检查立刻为真。
+  chromeSyncGeneration += 1;
+  for (const handler of externalSyncAbortHandlers) {
+    try {
+      handler();
+    } catch {
+      // 某个批次的撤销钩子异常不应阻塞接管
+    }
+  }
+  chromeSessionRequestId += 1;
+  chromeBrowserSyncRunId += 1;
+  await cancelAllChromeAccountSyncs();
+  try {
+    await runCommand("close_chrome_sync_tabs");
+  } catch {
+    // 标签清理失败不阻塞接管
+  }
+  chromeBrowserSyncingProfileId.value = "";
+  // 扫描也一并作废：旧扫描仍在途时，新一轮不能再拿到它的旧缓存。
+  chromeUsageScanToken += 1;
+  chromeUsageScanning.value = false;
+  chromeSessionSyncToken += 1;
+  chromeSessionSyncActive.value = false;
+  stopChromeBrowserSyncTimer();
+}
+
+/** 批量同步注册自己的撤销钩子（返回注销函数）；接管时会被 {@link forceStopRunningSync} 调用。 */
+function registerSyncAbortHandler(handler: () => void): () => void {
+  externalSyncAbortHandlers.add(handler);
+  return () => {
+    externalSyncAbortHandlers.delete(handler);
+  };
+}
+
+/**
+ * 已有同步在跑时不再静默阻断：问用户是否取消它并开始新的同步。
+ * 确认后按「强制停止」同一套语义撤销在途请求与占用，返回 true 让调用方继续。
+ */
+async function confirmCancelRunningSync(reason = "Chrome 会话同步"): Promise<boolean> {
+  const accepted = await confirm({
+    title: "已有同步正在进行",
+    message: `当前有${reason}正在进行。取消它并开始新的同步吗？取消后该次同步会立即中断，未完成的账号数据可能不完整，临时打开的 Chrome 标签页会被清理。`,
+    confirmText: "取消并重新同步",
+    cancelText: "保留当前同步",
+    danger: true,
+  });
+  if (!accepted) return false;
+  await forceStopRunningSync();
+  return true;
+}
+
+async function syncAccountViaChrome(session: ChromeSessionInfo) {
+  // 同一个账号正在同步：重复点击等同于同一件事，直接忽略，不必弹接管确认。
+  if (chromeBrowserSyncingProfileId.value === session.profileId) return;
+  // 其它同步在跑时允许接管：共用桥接通道，交错会互相抢占，
+  // 因此不静默阻断，而是让用户决定是否取消旧同步。
+  if (chromeSessionSyncActive.value && !(await confirmCancelRunningSync())) return;
+  const shouldStop = beginChromeSyncRun();
+  const syncToken = acquireChromeSessionSync();
+  startChromeBrowserSyncLog();
   const accountLabel = session.username || session.accountName || session.profileName;
   const stage = `manual-sync-${session.profileId}`;
   appendChromeBrowserSyncLog({
@@ -305,10 +393,10 @@ async function syncAccountViaChrome(session: ChromeSessionInfo) {
   });
   let accountSucceeded = false;
   try {
-    accountSucceeded = (await runChromeAccountSync(session)) !== null;
+    accountSucceeded = (await runChromeAccountSync(session, { shouldStop })) !== null;
   } finally {
     await closeChromeSyncTabs(accountLabel, session.profileId, chromeSessionSite.value?.apiBaseUrl);
-    chromeSessionSyncActive.value = false;
+    releaseChromeSessionSync(syncToken);
     stopChromeBrowserSyncTimer();
     chromeBrowserSyncingProfileId.value = "";
   }
@@ -321,7 +409,8 @@ async function syncAccountViaChrome(session: ChromeSessionInfo) {
   });
   if (accountSucceeded) {
     showToast(`已更新 ${accountLabel} 额度与账号资料`);
-  } else if (!chromeSyncForceStopped) {
+  } else if (!shouldStop()) {
+    // 被接管（取消后重新同步）时不再弹失败提示，避免打断新一轮同步。
     showToast(`Chrome 同步失败：${chromeBrowserSyncError.value}`, true);
   }
 }
@@ -360,19 +449,9 @@ async function closeChromeSessionDialog() {
       danger: true,
     });
     if (!accepted) return;
-    chromeSyncForceStopped = true;
-    chromeSessionRequestId += 1;
-    chromeBrowserSyncRunId += 1;
-    // 逐个取消全部活跃 run：批量并行时只取消最后一个会漏掉其它站点。
-    await cancelAllChromeAccountSyncs();
-    try {
-      await runCommand("close_chrome_sync_tabs");
-    } catch {
-      // 标签清理失败同样不阻塞关闭
-    }
-    chromeBrowserSyncingProfileId.value = "";
-    chromeSessionSyncActive.value = false;
-    stopChromeBrowserSyncTimer();
+    // 与「取消并重新同步」共用同一套撤销：推进同步代数、取消全部在途 run、
+    // 清理桥接标签并释放占用，避免两处各写一份不一致的停止逻辑。
+    await forceStopRunningSync();
   }
   chromeSessionRequestId += 1;
   chromeBrowserSyncRunId += 1;
@@ -395,6 +474,7 @@ async function analyzeChromeUsage(
   refreshPending = false,
 ): Promise<ChromeUsageScanResult | null> {
   if (chromeUsageScanning.value) return chromeUsageScanResult.value;
+  const scanToken = chromeUsageScanToken;
   if (chromeSessionDialogOpen.value) {
     appendChromeBrowserSyncLog({
       stage: "scan-running",
@@ -414,6 +494,8 @@ async function analyzeChromeUsage(
         refreshPending,
       },
     );
+    // 扫描已被新的同步接管：结果可能来自被取消的旧一轮，不覆盖缓存与状态。
+    if (scanToken !== chromeUsageScanToken) return null;
     chromeUsageScanResult.value = result;
     await loadLibrary();
     if (chromeSessionDialogOpen.value) {
@@ -430,6 +512,7 @@ async function analyzeChromeUsage(
     }
     return result;
   } catch (error) {
+    if (scanToken !== chromeUsageScanToken) return null;
     if (chromeSessionDialogOpen.value) {
       appendChromeBrowserSyncLog({
         stage: "scan-running",
@@ -440,7 +523,8 @@ async function analyzeChromeUsage(
     if (notify) showToast(`分析 Chrome 会话失败：${String(error)}`, true);
     return null;
   } finally {
-    chromeUsageScanning.value = false;
+    // 已被接管时把扫描标志留给新一轮，不能在这里清掉。
+    if (scanToken === chromeUsageScanToken) chromeUsageScanning.value = false;
   }
 }
 
@@ -615,18 +699,15 @@ async function syncSiteAccountBundles(
 }
 
 async function syncChromeSession(site: any, trigger: HTMLElement) {
-  // 与批量会话同步共用 Chrome 桥接通道：批量在跑时拒绝打开单站点同步，
-  // 避免同源桥接标签互相抢占。
-  if (chromeSessionSyncActive.value) {
-    showToast("已有 Chrome 会话同步正在进行，请等待结束后重试", true);
-    return;
-  }
+  // 与批量会话同步共用 Chrome 桥接通道：批量在跑时不能静默拒绝，
+  // 让用户决定是否取消旧同步并改用当前站点。
+  if (chromeSessionSyncActive.value && !(await confirmCancelRunningSync())) return;
   // 未知架构站点没有可识别的签到/余额接口：同步只建立 Chrome 账号会话关联，
   // 后端扫描会跳过账号接口探测，前端也不做单账号额度刷新。
   const accountOnly = isUnknownSystemType(site.systemType);
   const requestId = ++chromeSessionRequestId;
-  chromeSyncForceStopped = false;
-  chromeSessionSyncActive.value = true;
+  const shouldStop = beginChromeSyncRun();
+  const syncToken = acquireChromeSessionSync();
   chromeSessionSite.value = site;
   chromeSessionTrigger.value = trigger;
   chromeSessions.value = [];
@@ -674,9 +755,9 @@ async function syncChromeSession(site: any, trigger: HTMLElement) {
     // 扫描后站点记录可能已更新（如新标注的待定状态），用库中最新记录驱动同步。
     const summary = await syncSiteAccountBundles(chromeSessionSite.value ?? site, chromeSessions.value, {
       log: appendChromeBrowserSyncLog,
-      shouldStop: () => chromeSyncForceStopped,
+      shouldStop,
     });
-    if (chromeSyncForceStopped) return;
+    if (shouldStop()) return;
     // 收尾再按站点作用域清理一次：整轮中断或账号循环提前退出时，
     // 仍可能残留该站点的桥接标签（逐账号清理只覆盖已完成账号）。
     await closeChromeSyncTabs("站点收尾", `site-${site.id}`, site.apiBaseUrl);
@@ -695,7 +776,7 @@ async function syncChromeSession(site: any, trigger: HTMLElement) {
     });
   } finally {
     if (requestId === chromeSessionRequestId) {
-      chromeSessionSyncActive.value = false;
+      releaseChromeSessionSync(syncToken);
       stopChromeBrowserSyncTimer();
     }
   }
@@ -728,6 +809,12 @@ export function useChromeSession() {
     syncSiteAccountBundles,
     closeChromeSyncTabs,
     cancelAllChromeAccountSyncs,
+    beginChromeSyncRun,
+    acquireChromeSessionSync,
+    releaseChromeSessionSync,
+    forceStopRunningSync,
+    confirmCancelRunningSync,
+    registerSyncAbortHandler,
     syncAccountViaChrome,
     deleteSiteAccount,
     closeChromeSessionDialog,

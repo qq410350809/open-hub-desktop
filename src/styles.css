@@ -1493,18 +1493,28 @@ kbd { padding: 3px 7px; border: 1px solid var(--line); border-radius: var(--r-xs
 .site-models-item-vendor { min-width: 0; overflow: hidden; color: var(--faint); white-space: nowrap; text-overflow: ellipsis; font-size: 10.5px; }
 .site-models-item-health { display: block; margin-top: 6px; }
 .site-models-item-health-value { flex: 0 0 auto; min-width: 34px; text-align: right; font-size: 10.5px; font-weight: 600; font-variant-numeric: tabular-nums; }
-/* 逐时状态条：24 格竖条，比例 1:1 对齐参考图——高 = 条宽 × 3.0、缝 = 条宽 × 0.375、圆角 2px。
-   宽度铺满整行，高度由 aspect-ratio 等比换算（W = 24w + 23×0.375w = 32.625w，
-   h = 3w ⇒ W/h = 10.875，单缝 = 0.375/32.625 = 1.149%W），
-   因此无论卡片多宽，格子形状与图完全一致（宽度只是整体缩放）。
-   灰格 = 该整点无流量（不是 0%）。 */
-.site-models-item-health-strip { display: flex; align-items: stretch; aspect-ratio: 10.875; gap: 3px; column-gap: 1.149%; }
+/* 时段状态条：自适应槽数竖条（原生 1 小时 → 24 格、30 分钟 → 48 格），
+   比例 1:1 对齐参考图——高 = 条宽 × 3.0、缝 = 条宽 × 0.375、圆角 2px。
+   宽度铺满整行，高度由 aspect-ratio 等比换算；列间距用变量按槽数等比缩放
+   （缝/柱 = 0.375，24 格时即旧写死值 1.149%），槽数变多时缝与柱一起变细，
+   格子形状与参考图保持一致。JS 侧在条带上内联 --health-strip-gap。
+   灰格 = 该时段无流量（不是 0%）。 */
+.site-models-item-health-strip { display: flex; align-items: stretch; aspect-ratio: 10.875; gap: 3px; column-gap: var(--health-strip-gap, 1.149%); }
 .site-models-item-health-slot { flex: 1 1 0; min-width: 2px; border-radius: 2px; background: color-mix(in srgb, var(--faint) 26%, transparent); transition: background 0.15s var(--ease); }
 .site-models-item-health-slot.is-lv5 { background: var(--model-status-lv5); }
 .site-models-item-health-slot.is-lv4 { background: var(--model-status-lv4); }
 .site-models-item-health-slot.is-lv3 { background: var(--model-status-lv3); }
 .site-models-item-health-slot.is-lv2 { background: var(--model-status-lv2); }
 .site-models-item-health-slot.is-lv1 { background: var(--model-status-lv1); }
+/* 快照源状态灯：数据源只给当前状态，固定尺寸，不铺时间轴、不补灰格。 */
+.site-models-item-health-snapshot { display: inline-flex; align-items: center; gap: 5px; min-height: 12px; }
+.site-models-item-health-snapshot-dot { width: 10px; height: 10px; border-radius: 2px; background: color-mix(in srgb, var(--faint) 26%, transparent); transition: background 0.15s var(--ease); }
+.site-models-item-health-snapshot.is-lv5 .site-models-item-health-snapshot-dot { background: var(--model-status-lv5); }
+.site-models-item-health-snapshot.is-lv4 .site-models-item-health-snapshot-dot { background: var(--model-status-lv4); }
+.site-models-item-health-snapshot.is-lv3 .site-models-item-health-snapshot-dot { background: var(--model-status-lv3); }
+.site-models-item-health-snapshot.is-lv2 .site-models-item-health-snapshot-dot { background: var(--model-status-lv2); }
+.site-models-item-health-snapshot.is-lv1 .site-models-item-health-snapshot-dot { background: var(--model-status-lv1); }
+.site-models-item-health-snapshot-label { font-size: 10.5px; color: var(--faint); }
 /* 标题行：模型 ID 左侧省略，成功率贴右——状态条独占下一整行。 */
 /* 模型 ID 后面紧跟拷贝图标，成功率数值靠行尾对齐：ID 过长时先省略，
    图标与数值都不被挤掉。 */

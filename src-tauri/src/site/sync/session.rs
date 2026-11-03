@@ -286,6 +286,13 @@ const CHROME_BRIDGE_TAB_NOT_FOUND: &str = "__OPENHUB_TAB_NOT_FOUND__";
 const CHROME_BRIDGE_PENDING: &str = "__OPENHUB_PENDING__";
 const CHROME_BRIDGE_TAB_PENDING_PREFIX: &str = "__OPENHUB_TAB_PENDING__:";
 const CHROME_BRIDGE_PROFILE_MISMATCH: &str = "__OPENHUB_PROFILE_MISMATCH__";
+/// 桥接结果里表示「页面属于另一个 Chrome Profile 的登录会话」的哨兵值；
+/// Key/模型桥接也用它让调用方改开目标 Profile 的新标签，避免串号取 Key。
+pub(crate) const CHROME_BRIDGE_PROFILE_MISMATCH_RESULT: &str = CHROME_BRIDGE_PROFILE_MISMATCH;
+/// 可见桥接标签在超时预算内没有返回结果（页面加载慢、被休眠或验证未完成）。
+/// 复用遗留标签的路径据此改为新开标签重试，而不是直接判定整轮同步失败。
+pub(crate) const CHROME_BRIDGE_WAIT_TIMEOUT: &str =
+    "等待 Chrome 返回账号数据超时；请完成页面验证后重试";
 
 /// 可见 / 后台同步标签的 URL fragment 前缀，与 sync.rs 生成的 marker 保持一致。
 /// 用于识别“本应用此前同步遗留的标签”，复用而不是再开一个新标签。
@@ -495,6 +502,10 @@ pub(crate) fn run_javascript_in_chrome_profile(
                 .output();
             match run_javascript_in_marked_chrome_tab(marker, javascript, Some(&tab_id), timeout) {
                 Ok(value) if value == CHROME_BRIDGE_PROFILE_MISMATCH => {}
+                // 遗留标签可能已被 Chrome 休眠/冻结（execute javascript 一直
+                // -1712），不能把整个同步拖死在这个标签上：继续往下按 Profile
+                // 新开一个标签再试。
+                Err(error) if error == CHROME_BRIDGE_WAIT_TIMEOUT => {}
                 outcome => return outcome,
             }
         }
@@ -659,7 +670,7 @@ end run
         }
         thread::sleep(Duration::from_millis(200));
     }
-    Err("等待 Chrome 返回账号数据超时；请完成页面验证后重试".into())
+    Err(CHROME_BRIDGE_WAIT_TIMEOUT.into())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

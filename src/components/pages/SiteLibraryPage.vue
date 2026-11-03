@@ -2,7 +2,7 @@
 import { capabilities } from "../../composables/core/capabilities";
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { icons } from "../../icons";
-import { formatDate, formatRateLimit, logoText, describeModelHealth, describeModelStatusStrip, describeModelStatusStripTitle, describeModelWindowLabel, MODEL_STATUS_SLOT_COUNT } from "../../utils";
+import { formatDate, formatRateLimit, logoText, describeModelHealth, describeModelSnapshot, describeModelStatusStrip, describeModelStatusStripTitle, describeModelWindowLabel, modelStatusStripGapPercent, MODEL_STATUS_SLOT_COUNT } from "../../utils";
 import type { ModelHealthBadge, ModelStatusSlot } from "../../utils";
 import { useStore } from "../../composables/useStore";
 import { runCommand, isTauri } from "../../composables/useLibrary";
@@ -673,8 +673,9 @@ function drawerModelHealthBadge(modelId: string) {
   return drawerHealthBadges.value.get(modelId);
 }
 
-/** 状态条：与「支持的模型」弹窗同一套 24 格竖条；每个模型都画满 24 格，
- *  有流量的时段上色、没流量的留灰，无数据模型用同站点的窗口起点与格宽对齐。 */
+/** 状态条：与「支持的模型」弹窗同一套自适应槽数竖条（原生 1 小时 → 24 格、
+ *  30 分钟 → 48 格）；每个模型都画满整窗格子，有流量的时段上色、没流量的
+ *  留灰，无数据模型用同站点的窗口起点与格宽对齐。 */
 const drawerStatusStrips = computed(() => {
   const strips = new Map<string, ModelStatusSlot[]>();
   const healthMap = drawerModelCache.value?.modelHealth ?? {};
@@ -691,9 +692,36 @@ function drawerStatusStripOf(modelId: string) {
   return drawerStatusStrips.value.get(modelId) ?? [];
 }
 
-/** 站点是否上报过任何模型健康度：上报过就画 24 格条带。
+/** 站点健康度是否为「只有当前状态」的快照源（自建监控页等）。 */
+const drawerSnapshotMode = computed(() =>
+  Object.values(drawerModelCache.value?.modelHealth ?? {}).some(
+    (health) => health.snapshot === true,
+  ),
+);
+
+const drawerSnapshotBadges = computed(() => {
+  const badges = new Map<string, ModelHealthBadge>();
+  for (const [modelId, health] of Object.entries(drawerModelCache.value?.modelHealth ?? {})) {
+    const badge = describeModelSnapshot(health);
+    if (badge) badges.set(modelId, badge);
+  }
+  return badges;
+});
+
+function drawerSnapshotBadgeOf(modelId: string) {
+  return drawerSnapshotBadges.value.get(modelId);
+}
+
+/** 条带列间距随槽数缩放（缝 = 柱宽 × 0.375），全局条带样式读这个变量。 */
+function drawerStripGapStyle(count: number) {
+  return {
+    "--health-strip-gap": modelStatusStripGapPercent(count || MODEL_STATUS_SLOT_COUNT),
+  };
+}
+
+/** 站点是否上报过任何模型健康度：上报过就画条带。
  *  只给汇总成功率、没给逐时段序列的站点（旧数据里连 series 字段都没有）
- *  条带是 24 格灰，但那是「有健康度、只是没有时段分布」，不能连条带一起
+ *  条带是整窗灰格，但那是「有健康度、只是没有时段分布」，不能连条带一起
  *  藏掉——否则用户看到徽标有成功率、下面却什么都没有。 */
 const drawerHasStatusStrip = computed(
   () => Object.keys(drawerModelCache.value?.modelHealth ?? {}).length > 0,
@@ -703,14 +731,18 @@ const drawerStatusStripTitle = computed(() =>
   describeModelStatusStripTitle(Object.values(drawerModelCache.value?.modelHealth ?? {})[0]),
 );
 
-/** 窗口口径随站点走：原生 perf-metrics 是 24h 逐时，增强模块可配 7 天/每格 7 小时。 */
+/** 窗口口径随站点走：原生 perf-metrics 是 24h 逐时，增强模块可配 7 天/30 分钟格。 */
 const drawerWindowLabel = computed(() =>
   describeModelWindowLabel(Object.values(drawerModelCache.value?.modelHealth ?? {})[0]),
 );
 
-const drawerStatusStripLabel = computed(
-  () => `${drawerWindowLabel.value}成功率状态条，共 ${MODEL_STATUS_SLOT_COUNT} 个时段`,
-);
+const drawerStatusStripLabel = computed(() => {
+  // 同站点各模型共用一个窗口与格宽，取首条条带的槽数即可。
+  const first = Object.values(drawerStatusStrips.value)[0];
+  return `${drawerWindowLabel.value}成功率状态条，共 ${
+    first?.length ?? MODEL_STATUS_SLOT_COUNT
+  } 个时段`;
+});
 
 // —— 批量操作 ——
 async function batchSetUsage(state: "personal" | "pending" | "unused") {
@@ -2350,22 +2382,36 @@ onUnmounted(() => {
                         >{{ drawerModelHealthBadge(m.id)!.label }}</small
                       >
                       </div>
-                      <!-- 状态条：站点上报过健康度就整列画满 24 格，灰格 = 该时段无流量 -->
-                      <span
-                        v-if="drawerHasStatusStrip"
-                        class="sl-model-health-strip"
-                        role="img"
-                        :aria-label="drawerStatusStripLabel"
-                        :title="drawerStatusStripTitle"
-                      >
+                      <!-- 状态条：站点上报过健康度就整列画满整窗格子，灰格 = 该时段无流量；
+                           快照源只有当前状态，改画固定尺寸状态灯，不补时间轴。 -->
+                      <template v-if="drawerHasStatusStrip">
                         <span
-                          v-for="slot in drawerStatusStripOf(m.id)"
-                          :key="slot.ts"
-                          class="sl-model-health-slot"
-                          :class="slot.level ? `is-lv${slot.level}` : 'is-idle'"
-                          :title="slot.title"
-                        />
-                      </span>
+                          v-if="drawerSnapshotMode"
+                          class="sl-model-health-snapshot"
+                          :class="drawerSnapshotBadgeOf(m.id) ? `is-lv${drawerSnapshotBadgeOf(m.id)!.level}` : 'is-idle'"
+                          role="img"
+                          :aria-label="drawerSnapshotBadgeOf(m.id)?.label ?? '站点实时状态未列出该模型'"
+                          :title="drawerSnapshotBadgeOf(m.id)?.title ?? '站点实时状态页未列出该模型（无账号或未放行）。'"
+                        >
+                          <span class="sl-model-health-snapshot-dot" />
+                        </span>
+                        <span
+                          v-else
+                          class="sl-model-health-strip"
+                          role="img"
+                          :aria-label="drawerStatusStripLabel"
+                          :title="drawerStatusStripTitle"
+                          :style="drawerStripGapStyle(drawerStatusStripOf(m.id).length)"
+                        >
+                          <span
+                            v-for="slot in drawerStatusStripOf(m.id)"
+                            :key="slot.ts"
+                            class="sl-model-health-slot"
+                            :class="slot.level ? `is-lv${slot.level}` : 'is-idle'"
+                            :title="slot.title"
+                          />
+                        </span>
+                      </template>
                     </div>
                     <button type="button" class="sl-model-copy-btn" title="复制模型 ID">
                       <span v-html="icons.copy" />
@@ -5028,6 +5074,28 @@ onUnmounted(() => {
   background: color-mix(in srgb, var(--faint, #8b949e) 26%, transparent);
   transition: background 0.15s ease;
 }
+
+/* 快照源状态灯：固定尺寸，不随容器拉伸。 */
+.sl-model-health-snapshot {
+  margin-top: 4px;
+  display: inline-flex;
+  align-items: center;
+  min-height: 10px;
+}
+
+.sl-model-health-snapshot-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--faint, #8b949e) 26%, transparent);
+  transition: background 0.15s ease;
+}
+
+.sl-model-health-snapshot.is-lv5 .sl-model-health-snapshot-dot { background: var(--model-status-lv5, #63c469); }
+.sl-model-health-snapshot.is-lv4 .sl-model-health-snapshot-dot { background: var(--model-status-lv4, #9ed36a); }
+.sl-model-health-snapshot.is-lv3 .sl-model-health-snapshot-dot { background: var(--model-status-lv3, #f2ca4a); }
+.sl-model-health-snapshot.is-lv2 .sl-model-health-snapshot-dot { background: var(--model-status-lv2, #ffaf44); }
+.sl-model-health-snapshot.is-lv1 .sl-model-health-snapshot-dot { background: var(--model-status-lv1, #fc725a); }
 
 .sl-model-health-slot.is-lv5 { background: var(--model-status-lv5, #63c469); }
 .sl-model-health-slot.is-lv4 { background: var(--model-status-lv4, #9ed36a); }

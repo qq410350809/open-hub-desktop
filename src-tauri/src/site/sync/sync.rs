@@ -822,6 +822,12 @@ pub(crate) const SUB2API_API_KEY_FAILURE_HINT: &str =
 pub(crate) const NEWAPI_REFRESH_HANDOFF_MESSAGE: &str =
     "检测到 NewAPI refresh cookie 且本地会话已失效，将通过 Chrome 同源请求刷新并写回浏览器";
 
+/// newapi2 站点 Key 接口 401 的提示：访问令牌只有十几分钟有效期，过期是常态，
+/// 正常路径是浏览器内静默续期。这条提示只在自动续期也没成功时才会被用户看到，
+/// 因此直接指向「Chrome 账号是否仍登录」，避免误导用户去“重新登录后同步账号”。
+pub(crate) const NEWAPI_REFRESH_KEY_FAILURE_HINT: &str =
+    "（访问令牌已过期，浏览器自动续期未能恢复：请确认对应 Chrome 账号仍登录该站点后重试）";
+
 pub(crate) async fn request_json(
     request: wreq::RequestBuilder,
     label: &str,
@@ -1067,6 +1073,17 @@ pub(crate) fn is_direct_request_unavailable(error: &str) -> bool {
 /// 直连失败后是否应移交 Chrome 同源兜底：遇盾（HTML 挑战）或网络层不可用。
 pub(crate) fn needs_browser_bridge(error: &str) -> bool {
     is_cloudflare_shield_error(error) || is_direct_request_unavailable(error)
+}
+
+/// 同步 Key / 模型时，直连失败是否应移交 Chrome 同源兜底。
+///
+/// 除了遇盾与网络不可用，刷新令牌形态（newapi2）还多一类：访问令牌过期（401）。
+/// 该架构的 Key 接口只认短时效访问令牌，Cookie 换不回令牌，桌面端重试永远
+/// 401；页面内 `/api/user/auth/refresh` 是唯一能续期（并把轮换后的 HttpOnly
+/// 刷新 Cookie 写回浏览器）的通道。不把这类失败纳入兜底，表现为令牌一过期
+/// 「同步 Key」就必然失败。
+pub(crate) fn key_sync_needs_chrome_bridge(error: &str, use_refresh_auth: bool) -> bool {
+    needs_browser_bridge(error) || (use_refresh_auth && access_token_was_rejected(error))
 }
 
 pub(crate) fn chrome_request_headers(
@@ -1975,6 +1992,12 @@ pub(crate) fn chrome_account_bridge_url(
     if browser_url.path().is_empty() || browser_url.path() == "/" {
         browser_url = console_url()?;
     }
+    // Chrome 对「同一路径」的重复 open 常常只聚焦已有标签而不新建：只靠
+    // fragment 区分时，用户已经开着同路径页面（如 /profile、/console）就会
+    // 被吞掉，桥接随后找不到带 marker 的标签，浏览器明明弹到了前台、登录态
+    // 也正常，同步却报「等待 Chrome 返回账号数据超时」。唯一 query 强制
+    // 新开标签；fragment 供后续同步复用遗留的桥接标签。
+    browser_url.query_pairs_mut().append_pair("openhub_sync", marker);
     browser_url.set_fragment(Some(marker));
     Ok(browser_url)
 }
@@ -2531,16 +2554,58 @@ fn chrome_account_bridge_script_with_mode(
 ///
 /// Cloudflare 盾站点的直连请求全部被 403 挑战拦截，浏览器同源 fetch
 /// 带着已通过的 cf_clearance 才是唯一可行路径（与账号同步桥接同一机制）。
+///
+/// `use_refresh_auth`（newapi2）：站点只认短时效访问令牌，Cookie 不能直接换
+/// Key。桥接先在页面里 POST `/api/user/auth/refresh` 拿新令牌（HttpOnly 刷新
+/// Cookie 的轮换只有浏览器内请求能写回），再用它请求后续接口，并把令牌随
+/// 结果带回——调用方据此落库，下次同步不必再等 401。`expected_session`
+/// 用于拦下复用到的其它 Profile 页面（按令牌 `sid` 判定），防止串号。
 pub(crate) fn chrome_key_models_bridge_script(
     should_fetch_models: bool,
     user_id: &str,
     token_path: &str,
+    use_refresh_auth: bool,
+    expected_session: Option<&str>,
+    marker: &str,
 ) -> String {
+    let expected_session = serde_json::to_string(expected_session.unwrap_or_default())
+        .unwrap_or_else(|_| "\"\"".into());
+    let marker = serde_json::to_string(marker).unwrap_or_else(|_| "\"\"".into());
     r#"(() => {
   const pending = "__OPENHUB_PENDING__";
   // 传统 new-api 会话除了 Cookie 还必须带 New-Api-User 头；DB 缓存值优先，
   // 页面 localStorage 里能读到 id 时兜底（新版前端可能不写缓存值）。
   const legacyUserId = "__OPENHUB_USER_ID__";
+  const useRefreshAuth = __OPENHUB_USE_REFRESH_AUTH__;
+  const expectedSession = __OPENHUB_EXPECTED_SESSION__;
+  const token = __OPENHUB_MARKER__;
+  // 目标 Chrome Profile 自己的登录会话 ID：静默复用其它窗口的站点页面时，
+  // 页面所在的 Cookie 罐决定拿到谁的令牌，按 sid 判串号。
+  const sessionOf = (value) => {
+    if (!value || typeof value !== "string") return "";
+    const parts = value.split(".");
+    if (parts.length < 2) return "";
+    try {
+      const base64 = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+      const padded = base64 + "=".repeat((4 - (base64.length % 4)) % 4);
+      const text = atob(padded);
+      const bytes = Uint8Array.from(text, (character) => character.charCodeAt(0));
+      const payload = JSON.parse(new TextDecoder().decode(bytes));
+      return typeof payload?.sid === "string" ? payload.sid : "";
+    } catch (_) {
+      return "";
+    }
+  };
+  const messageOf = (value, fallback) => {
+    if (!value) return fallback;
+    if (typeof value === "string") return value;
+    if (typeof value === "object") {
+      if (typeof value.message === "string" && value.message) return value.message;
+      if (typeof value.error === "string" && value.error) return value.error;
+      try { return JSON.stringify(value); } catch (_) {}
+    }
+    return fallback;
+  };
   if (window.location.protocol !== "http:" && window.location.protocol !== "https:") {
     return pending;
   }
@@ -2559,8 +2624,21 @@ pub(crate) fn chrome_key_models_bridge_script(
     } catch (_) {}
   }
   const previous = window.__openHubKeySync;
-  if (previous && previous.result) return JSON.stringify(previous.result);
-  const bridge = { started: Date.now(), result: null };
+  // 只复用同一次同步的结果：静默路径会注入任意已打开的站点标签，
+  // 不按 marker 区分会把上一轮（可能已换过令牌）的旧结果当成本轮结果，
+  // 新令牌也就永远落不了库；无时限缓存还会让下一次同步直接拿到旧 Key。
+  if (previous && previous.token === token) {
+    if (previous.profileMismatch) return "__OPENHUB_PROFILE_MISMATCH__";
+    if (previous.result && Date.now() - previous.started < 60000) {
+      return JSON.stringify(previous.result);
+    }
+    // 上一次请求还在飞：直接返回 pending 等结果。重复执行会并发调用
+    // `/api/user/auth/refresh`，刷新令牌轮换后互相作废，反而制造 401。
+    if (!previous.result && Date.now() - previous.started < 30000) {
+      return pending;
+    }
+  }
+  const bridge = { token, started: Date.now(), result: null };
   window.__openHubKeySync = bridge;
   const readResponse = async (response) => {
     const contentType = (response.headers.get("content-type") || "").toLowerCase();
@@ -2583,8 +2661,69 @@ pub(crate) fn chrome_key_models_bridge_script(
   };
   const requestHeaders = { Accept: "application/json" };
   if (legacyUserId) requestHeaders["New-Api-User"] = legacyUserId;
+  let accessToken = "";
   (async () => {
     try {
+      if (useRefreshAuth) {
+        // 访问令牌只有 15 分钟，缓存值十有八九已过期；先在页面里换新令牌，
+        // 之后的 Key / 模型 / 健康度请求都带它。页面上下文里刷新才会把轮换后的
+        // HttpOnly 刷新 Cookie 写回浏览器，Rust 直连做不到这一点。
+        const refreshResponse = await readResponse(await fetch("/api/user/auth/refresh", {
+          method: "POST", credentials: "include", cache: "no-store", headers: requestHeaders,
+          signal: AbortSignal.timeout(15000)
+        }));
+        if (refreshResponse.challenge) {
+          bridge.result = { ok: false, error: "站点安全验证仍需要浏览器交互（Cloudflare / 阿里云 WAF）" };
+          return;
+        }
+        accessToken = refreshResponse.data?.data?.access_token ||
+          refreshResponse.data?.data?.accessToken || refreshResponse.data?.data?.token ||
+          refreshResponse.data?.access_token || refreshResponse.data?.accessToken ||
+          refreshResponse.data?.token || "";
+        if (!accessToken && typeof refreshResponse.data?.data === "string") {
+          accessToken = refreshResponse.data.data;
+        }
+        if (!accessToken) {
+          bridge.result = {
+            ok: false,
+            error: messageOf(
+              refreshResponse.data,
+              refreshResponse.error || `刷新认证接口 HTTP ${refreshResponse.status}`
+            )
+          };
+          return;
+        }
+        if (expectedSession && sessionOf(accessToken) &&
+            sessionOf(accessToken) !== expectedSession) {
+          // 复用到了其它 Chrome Profile 的站点页面：换来的令牌属于那个账号。
+          // 与账号桥接同一语义——先记下判定，下一次轮询由顶部返回哨兵值，
+          // 调用方据此改开目标 Profile 的新标签。
+          bridge.profileMismatch = true;
+          return;
+        }
+        requestHeaders.Authorization = `Bearer ${accessToken}`;
+        // 站点若提供长效访问令牌，优先用它（与账号桥接同一口径）。
+        try {
+          const permanent = await readResponse(await fetch("/api/user/token", {
+            method: "GET", credentials: "include", cache: "no-store", headers: requestHeaders,
+            signal: AbortSignal.timeout(8000)
+          }));
+          const permanentToken = permanent.data?.data?.token || permanent.data?.data?.access_token ||
+            permanent.data?.data?.accessToken || permanent.data?.token ||
+            permanent.data?.access_token || permanent.data?.accessToken ||
+            (typeof permanent.data?.data === "string" ? permanent.data.data : "");
+          if (permanentToken) {
+            // 长效令牌同样要核对会话：部分站点会返回与刷新令牌不同来源的值。
+            if (expectedSession && sessionOf(permanentToken) &&
+                sessionOf(permanentToken) !== expectedSession) {
+              bridge.profileMismatch = true;
+              return;
+            }
+            accessToken = permanentToken;
+            requestHeaders.Authorization = `Bearer ${permanentToken}`;
+          }
+        } catch (_) {}
+      }
       const tokenResponse = await readResponse(await fetch("__OPENHUB_TOKEN_PATH__", {
         method: "GET", credentials: "include", cache: "no-store", headers: requestHeaders,
         signal: AbortSignal.timeout(30000)
@@ -2600,7 +2739,13 @@ pub(crate) fn chrome_key_models_bridge_script(
         };
         return;
       }
-      bridge.result = { ok: true, tokenList: tokenResponse.data, models: null, health: null };
+      bridge.result = {
+        ok: true,
+        tokenList: tokenResponse.data,
+        models: null,
+        health: null,
+        apiToken: accessToken
+      };
       if (!__OPENHUB_FETCH_MODELS__) return;
       // Key 列表成功后再拉模型与健康度：失败不推翻 Key 结果，对应字段
       // 置 null 由调用方直连重试。
@@ -2662,10 +2807,166 @@ pub(crate) fn chrome_key_models_bridge_script(
 })()"#
         .replace("__OPENHUB_USER_ID__", user_id)
         .replace("__OPENHUB_TOKEN_PATH__", token_path)
+        .replace("__OPENHUB_USE_REFRESH_AUTH__",
+            if use_refresh_auth { "true" } else { "false" },
+        )
+        .replace("__OPENHUB_EXPECTED_SESSION__", &expected_session)
+        .replace("__OPENHUB_MARKER__", &marker)
         .replace(
             "__OPENHUB_FETCH_MODELS__",
             if should_fetch_models { "true" } else { "false" },
         )
+}
+
+/// NewAPI 模型健康度的 Chrome 同源桥接脚本（`HealthFlow::BrowserRefresh`）。
+///
+/// 适用于「健康度只认短时效访问令牌、且刷新令牌只能在浏览器里轮换」的站点
+/// （hyxware.com 等）：直连 refresh 会让浏览器登出，因此必须在页面上下文里
+/// POST `/api/user/auth/refresh` 拿新令牌，再依次尝试 perf-metrics 与
+/// 「模型状态」增强模块。结果里带回令牌，调用方据此写回 `newapi_token`，
+/// 后续同步在令牌有效期内可以直接走直连。
+pub(crate) fn chrome_model_health_bridge_script(
+    expected_session: Option<&str>,
+    marker: &str,
+) -> String {
+    let expected_session = serde_json::to_string(expected_session.unwrap_or_default())
+        .unwrap_or_else(|_| "\"\"".into());
+    let marker = serde_json::to_string(marker).unwrap_or_else(|_| "\"\"".into());
+    r#"(() => {
+  const pending = "__OPENHUB_PENDING__";
+  const expectedSession = __OPENHUB_EXPECTED_SESSION__;
+  const token = __OPENHUB_MARKER__;
+  const sessionOf = (value) => {
+    if (!value || typeof value !== "string") return "";
+    const parts = value.split(".");
+    if (parts.length < 2) return "";
+    try {
+      const base64 = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+      const padded = base64 + "=".repeat((4 - (base64.length % 4)) % 4);
+      const text = atob(padded);
+      const bytes = Uint8Array.from(text, (character) => character.charCodeAt(0));
+      const payload = JSON.parse(new TextDecoder().decode(bytes));
+      return typeof payload?.sid === "string" ? payload.sid : "";
+    } catch (_) {
+      return "";
+    }
+  };
+  const messageOf = (value, fallback) => {
+    if (!value) return fallback;
+    if (typeof value === "string") return value;
+    if (typeof value === "object") {
+      if (typeof value.message === "string" && value.message) return value.message;
+      if (typeof value.error === "string" && value.error) return value.error;
+      try { return JSON.stringify(value); } catch (_) {}
+    }
+    return fallback;
+  };
+  if (window.location.protocol !== "http:" && window.location.protocol !== "https:") {
+    return pending;
+  }
+  const previous = window.__openHubHealthSync;
+  // 与 Key 桥接同一语义：只复用同一次调用、同一 marker 的结果，避免把
+  // 上一轮（可能已换过令牌）的旧数据当成本轮结果。
+  if (previous && previous.token === token) {
+    if (previous.profileMismatch) return "__OPENHUB_PROFILE_MISMATCH__";
+    if (previous.result && Date.now() - previous.started < 60000) {
+      return JSON.stringify(previous.result);
+    }
+    if (!previous.result && Date.now() - previous.started < 30000) {
+      return pending;
+    }
+  }
+  const bridge = { token, started: Date.now(), result: null };
+  window.__openHubHealthSync = bridge;
+  const readResponse = async (response) => {
+    const contentType = (response.headers.get("content-type") || "").toLowerCase();
+    const text = await response.text();
+    const lower = text.slice(0, 100000).toLowerCase();
+    const isHtml = contentType.includes("text/html") || /^\s*<!doctype html|^\s*<html/i.test(text);
+    if (isHtml && ([403, 429, 503].includes(response.status) ||
+        lower.includes("cf-chl-") || lower.includes("challenge-platform") ||
+        lower.includes("just a moment") || lower.includes("attention required"))) {
+      return { challenge: true, status: response.status };
+    }
+    if (isHtml) {
+      return { status: response.status, error: "接口返回 HTML" };
+    }
+    try {
+      return { status: response.status, data: JSON.parse(text) };
+    } catch (_) {
+      return { status: response.status, error: "接口没有返回 JSON" };
+    }
+  };
+  const headers = { Accept: "application/json" };
+  (async () => {
+    try {
+      const refreshResponse = await readResponse(await fetch("/api/user/auth/refresh", {
+        method: "POST", credentials: "include", cache: "no-store", headers,
+        signal: AbortSignal.timeout(15000)
+      }));
+      if (refreshResponse.challenge) {
+        bridge.result = { ok: false, error: "站点安全验证仍需要浏览器交互（Cloudflare / 阿里云 WAF）" };
+        return;
+      }
+      let accessToken = refreshResponse.data?.data?.access_token ||
+        refreshResponse.data?.data?.accessToken || refreshResponse.data?.data?.token ||
+        refreshResponse.data?.access_token || refreshResponse.data?.accessToken ||
+        refreshResponse.data?.token || "";
+      if (!accessToken && typeof refreshResponse.data?.data === "string") {
+        accessToken = refreshResponse.data.data;
+      }
+      if (!accessToken) {
+        bridge.result = {
+          ok: false,
+          error: messageOf(
+            refreshResponse.data,
+            refreshResponse.error || `刷新认证接口 HTTP ${refreshResponse.status}`
+          )
+        };
+        return;
+      }
+      if (expectedSession && sessionOf(accessToken) &&
+          sessionOf(accessToken) !== expectedSession) {
+        // 复用到其它 Chrome Profile 的站点页面：令牌属于那个账号，
+        // 交给调用方切换目标 Profile，绝不把别人的健康度写进这一行。
+        bridge.profileMismatch = true;
+        return;
+      }
+      headers.Authorization = `Bearer ${accessToken}`;
+      // 健康度可能来自原生 perf-metrics，也可能来自把数据搬到「模型状态」
+      // 增强模块的魔改站；两条都软失败，命中一条即停。
+      const healthPaths = [
+        "/api/perf-metrics/summary?hours=24",
+        "/api/enhancements/model-status/status/all",
+        "/api/enhancements/model-status/embed/status/all"
+      ];
+      let health = null;
+      for (const path of healthPaths) {
+        try {
+          const healthResponse = await readResponse(await fetch(path, {
+            method: "GET", credentials: "include", cache: "no-store", headers,
+            signal: AbortSignal.timeout(8000)
+          }));
+          if (healthResponse.challenge || healthResponse.error ||
+              healthResponse.status < 200 || healthResponse.status >= 300) {
+            continue;
+          }
+          const payload = healthResponse.data;
+          if (payload && payload.success !== false) {
+            health = payload;
+            break;
+          }
+        } catch (_) {}
+      }
+      bridge.result = { ok: true, health, apiToken: accessToken };
+    } catch (error) {
+      bridge.result = { ok: false, error: String(error && error.message || error) };
+    }
+  })();
+  return pending;
+})()"#
+        .replace("__OPENHUB_EXPECTED_SESSION__", &expected_session)
+        .replace("__OPENHUB_MARKER__", &marker)
 }
 
 /// 桥接结果解析：按站点架构选择账号解析器。
@@ -2706,6 +3007,8 @@ pub(crate) struct ChromeKeyModelsBridgeResult {
     pub(crate) token_list: serde_json::Value,
     pub(crate) models: Option<serde_json::Value>,
     pub(crate) health: Option<serde_json::Value>,
+    /// newapi2 刷新令牌模式下桥接在页面内换到的访问令牌；其它模式为空。
+    pub(crate) api_token: String,
 }
 
 pub(crate) fn parse_chrome_key_models_bridge_result(
@@ -2723,6 +3026,8 @@ pub(crate) fn parse_chrome_key_models_bridge_result(
         models: Option<serde_json::Value>,
         #[serde(default)]
         health: Option<serde_json::Value>,
+        #[serde(default)]
+        api_token: String,
     }
     let payload = serde_json::from_str::<Payload>(value)
         .map_err(|error| format!("Chrome 返回的 Key 数据格式无效：{error}"))?;
@@ -2740,6 +3045,44 @@ pub(crate) fn parse_chrome_key_models_bridge_result(
         token_list: payload.token_list,
         models: payload.models,
         health: payload.health,
+        api_token: payload.api_token,
+    })
+}
+
+/// Chrome 健康度桥接结果：健康度原文（站点确实没有该接口时为 `None`）
+/// 与页面内换到的访问令牌。
+#[derive(Debug)]
+pub(crate) struct ChromeModelHealthBridgeResult {
+    pub(crate) health: Option<serde_json::Value>,
+    pub(crate) api_token: String,
+}
+
+pub(crate) fn parse_chrome_model_health_bridge_result(
+    value: &str,
+) -> Result<ChromeModelHealthBridgeResult, String> {
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Payload {
+        ok: bool,
+        #[serde(default)]
+        error: String,
+        #[serde(default)]
+        health: Option<serde_json::Value>,
+        #[serde(default)]
+        api_token: String,
+    }
+    let payload = serde_json::from_str::<Payload>(value)
+        .map_err(|error| format!("Chrome 返回的健康度数据格式无效：{error}"))?;
+    if !payload.ok {
+        return Err(if payload.error.is_empty() {
+            "Chrome 健康度请求失败".into()
+        } else {
+            payload.error
+        });
+    }
+    Ok(ChromeModelHealthBridgeResult {
+        health: payload.health.filter(|value| !value.is_null()),
+        api_token: payload.api_token,
     })
 }
 
@@ -4199,7 +4542,10 @@ mod tests {
         let url =
             chrome_account_bridge_url(&base, "https://anyrouter.top/", "new-api", "openhub-sync-1")
                 .unwrap();
-        assert_eq!(url.as_str(), "https://anyrouter.top/console#openhub-sync-1");
+        assert_eq!(
+            url.as_str(),
+            "https://anyrouter.top/console?openhub_sync=openhub-sync-1#openhub-sync-1"
+        );
         let slashless = chrome_account_bridge_url(
             &base,
             "https://anyrouter.top",
@@ -4209,12 +4555,12 @@ mod tests {
         .unwrap();
         assert_eq!(
             slashless.as_str(),
-            "https://anyrouter.top/console#openhub-background-2"
+            "https://anyrouter.top/console?openhub_sync=openhub-background-2#openhub-background-2"
         );
         let empty = chrome_account_bridge_url(&base, "", "new-api", "openhub-sync-3").unwrap();
         assert_eq!(
             empty.as_str(),
-            "https://anyrouter.top/console/personal#openhub-sync-3"
+            "https://anyrouter.top/console/personal?openhub_sync=openhub-sync-3#openhub-sync-3"
         );
         let personal = chrome_account_bridge_url(
             &base,
@@ -4225,7 +4571,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             personal.as_str(),
-            "https://anyrouter.top/console/personal#openhub-sync-4"
+            "https://anyrouter.top/console/personal?openhub_sync=openhub-sync-4#openhub-sync-4"
         );
         let foreign = chrome_account_bridge_url(
             &base,
@@ -4236,7 +4582,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             foreign.as_str(),
-            "https://anyrouter.top/console/personal#openhub-sync-5"
+            "https://anyrouter.top/console/personal?openhub_sync=openhub-sync-5#openhub-sync-5"
         );
     }
 
@@ -4247,17 +4593,17 @@ mod tests {
         let base = Url::parse("https://example.com/").unwrap();
         // 空签到地址 → 未知平台退回根路径 → 根路径会被首页跳转丢 marker → 再改试 /console
         let empty = chrome_account_bridge_url(&base, "", "openai", "m-1").unwrap();
-        assert_eq!(empty.as_str(), "https://example.com/console#m-1");
+        assert_eq!(empty.as_str(), "https://example.com/console?openhub_sync=m-1#m-1");
         let root =
             chrome_account_bridge_url(&base, "https://example.com", "openai", "m-2").unwrap();
-        assert_eq!(root.as_str(), "https://example.com/console#m-2");
+        assert_eq!(root.as_str(), "https://example.com/console?openhub_sync=m-2#m-2");
         let sub2api = chrome_account_bridge_url(&base, "", "sub2api", "m-3").unwrap();
-        assert_eq!(sub2api.as_str(), "https://example.com/dashboard#m-3");
+        assert_eq!(sub2api.as_str(), "https://example.com/dashboard?openhub_sync=m-3#m-3");
     }
 
     #[test]
     fn key_models_bridge_script_fetches_token_and_models() {
-        let script = chrome_key_models_bridge_script(true, "99", "/api/token/?p=1&size=20");
+        let script = chrome_key_models_bridge_script(true, "99", "/api/token/?p=1&size=20", false, None, "openhub-sync-1");
         // 同源凭证必须带上，cf_clearance 才能生效
         assert!(script.contains("credentials: \"include\""));
         assert!(script.contains("/api/token/?p=1&size=20"));
@@ -4266,7 +4612,7 @@ mod tests {
         // 传统 new-api 会话必须带 New-Api-User 头，否则 401「未提供 New-Api-User」
         assert!(script.contains("New-Api-User"));
         // 关闭模型拉取时不得包含 /v1/models 请求
-        let script_no_models = chrome_key_models_bridge_script(false, "", "/api/token/?p=1&size=20");
+        let script_no_models = chrome_key_models_bridge_script(false, "", "/api/token/?p=1&size=20", false, None, "openhub-sync-1");
         assert!(script_no_models.contains("if (!false) return;"));
         // 空用户 ID 也要是合法 JS（占位符替换后仍可为空串）
         assert!(script_no_models.contains("const legacyUserId = \"\";"));
@@ -4277,9 +4623,88 @@ mod tests {
             true,
             "99",
             "/api/token/?page=1&size=10&keyword=&order=-id",
+            false,
+            None,
+            "openhub-sync-1",
         );
         assert!(baiheibai_script.contains("/api/token/?page=1&size=10&keyword=&order=-id"));
         assert!(!baiheibai_script.contains("?p=1&size=20"));
+    }
+
+    #[test]
+    #[ignore = "需要本机 Chrome 已登录 hyxware.com"]
+    fn live_hyxware_health_bridge() {
+        let base = Url::parse("https://hyxware.com/").unwrap();
+        let target = base.join("/api/user/auth/refresh").unwrap().to_string();
+        let home = crate::context::home_dir().expect("用户目录");
+        let Ok(profile) = std::env::var("OPENHUB_TEST_CHROME_PROFILE") else {
+            println!("未设置 OPENHUB_TEST_CHROME_PROFILE，跳过真实桥接");
+            return;
+        };
+        let cookie =
+            crate::site::sync::session::read_chrome_cookie_header_from_home(&home, &target, &profile)
+                .expect("读取 Chrome Cookie");
+        let session = newapi_refresh_session_id(&cookie);
+        println!("refresh session: {session:?}");
+        assert!(session.is_some(), "应能读到 new_api_refresh 会话");
+        let marker = format!(
+            "openhub-sync-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let url = format!("https://hyxware.com/console/personal?openhub_sync={marker}#{marker}");
+        let script = chrome_model_health_bridge_script(session.as_deref(), &marker);
+        let raw = crate::site::sync::run_javascript_in_existing_chrome_tab(
+            &url,
+            &script,
+            Duration::from_secs(15),
+        )
+        .expect("注入 Chrome 标签")
+        .expect("应有同源 hyxware 标签");
+        println!("bridge raw: {raw}");
+        assert_ne!(raw, "__OPENHUB_PENDING__");
+        let parsed = parse_chrome_model_health_bridge_result(&raw).expect("解析桥接结果");
+        println!("token length: {}", parsed.api_token.len());
+        assert!(parsed.health.is_some(), "应拿到健康度原文");
+    }
+
+    #[test]
+    fn model_health_bridge_script_refreshes_then_fetches_health() {
+        let script = chrome_model_health_bridge_script(Some("sid-1"), "openhub-sync-9");
+        // 页面内刷新令牌是唯一不登出的续期方式，必须先调 refresh。
+        assert!(script.contains("/api/user/auth/refresh"));
+        assert!(script.contains("\"POST\""));
+        // 原生 perf-metrics 与魔改站的「模型状态」增强模块都要尝试。
+        assert!(script.contains("/api/perf-metrics/summary?hours=24"));
+        assert!(script.contains("/api/enhancements/model-status/status/all"));
+        // 会话核对以防串号，结果带回令牌供落库。
+        assert!(script.contains("const expectedSession = \"sid-1\";"));
+        assert!(script.contains("apiToken: accessToken"));
+        assert!(script.contains("__OPENHUB_PENDING__"));
+    }
+
+    #[test]
+    fn parse_chrome_model_health_bridge_result_accepts_empty_and_payload() {
+        let err = parse_chrome_model_health_bridge_result(
+            r#"{"ok":false,"error":"刷新认证接口 HTTP 401"}"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("401"));
+        // 站点确实没有健康度接口：ok=true + health=null，不算错误。
+        let empty = parse_chrome_model_health_bridge_result(
+            r#"{"ok":true,"health":null,"apiToken":"tok"}"#,
+        )
+        .expect("空健康度应解析成功");
+        assert!(empty.health.is_none());
+        assert_eq!(empty.api_token, "tok");
+        let ok = parse_chrome_model_health_bridge_result(
+            r#"{"ok":true,"health":{"success":true,"data":{"models":[]}},"apiToken":"tok-2"}"#,
+        )
+        .expect("合法结果应解析成功");
+        assert!(ok.health.is_some());
+        assert_eq!(ok.api_token, "tok-2");
     }
 
     #[test]

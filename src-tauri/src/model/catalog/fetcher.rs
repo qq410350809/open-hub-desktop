@@ -461,6 +461,35 @@ pub(crate) async fn chrome_bridge_fetch_keys_models(
     site_id: Option<&str>,
 ) -> Result<SiteModelsResult, String> {
     let should_fetch_models = true;
+    // newapi2：Key 接口只认短时效访问令牌，缓存令牌过期后直连必然 401。
+    // 必须在页面里调 `/api/user/auth/refresh`（轮换后的 HttpOnly Cookie 只有
+    // 浏览器能写回），因此桥接脚本要带上刷新模式与目标会话 ID。
+    let use_refresh_auth = is_newapi_refresh(system_type);
+    let expected_session = if use_refresh_auth {
+        match home_dir() {
+            Some(home) => {
+                // 必须用刷新接口的路径取 Cookie：`new_api_refresh` 的 Path 是
+                // `/api/user/auth`，按站点根路径读会被路径过滤掉，导致会话核对
+                // 直接失效（串号风险）。这里按实际请求路径读。
+                let target = base_url
+                    .join("/api/user/auth/refresh")
+                    .map(|url| url.to_string())
+                    .unwrap_or_else(|_| base_url.to_string());
+                let profile = profile_id.to_string();
+                let cookie_header = spawn_blocking(move || {
+                    sync::read_chrome_cookie_header_from_home(&home, &target, &profile)
+                })
+                .await
+                .ok()
+                .and_then(|value| value.ok())
+                .unwrap_or_default();
+                sync::newapi_refresh_session_id(&cookie_header)
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
     // 「白与黑」的 Key 列表参数与 NewAPI 系不同（page/size/keyword/order），
     // 页面内 fetch 必须用它自己的路径，否则站点按非法参数拒绝。
     let token_path = if is_platform(system_type, "baiheibai") {
@@ -468,7 +497,6 @@ pub(crate) async fn chrome_bridge_fetch_keys_models(
     } else {
         "/api/token/?p=1&size=20"
     };
-    let javascript = sync::chrome_key_models_bridge_script(should_fetch_models, user_id, token_path);
     let marker = format!(
         "openhub-sync-{}",
         SystemTime::now()
@@ -476,12 +504,26 @@ pub(crate) async fn chrome_bridge_fetch_keys_models(
             .map_err(|_| "系统时间异常")?
             .as_nanos()
     );
+    let javascript = sync::chrome_key_models_bridge_script(
+        should_fetch_models,
+        user_id,
+        token_path,
+        use_refresh_auth,
+        expected_session.as_deref(),
+        &marker,
+    );
     // 桥接页按平台分派（NewAPI → /console/personal，Sub2API → /dashboard），
     // 其余平台退回站点根路径 —— 有的站点根本没有 /console/personal。
     let console_path = crate::site::library::console_page_path(system_type).unwrap_or("/");
-    let browser_url = base_url
+    let mut browser_url = base_url
         .join(console_path)
         .map_err(|_| "无法生成 Chrome 验证地址")?;
+    // Chrome 对同一路径的重复 open 往往只聚焦已有标签而不新建，桥接随后
+    // 找不到带 marker 的标签只能干等到超时（用户看到浏览器弹到前台、登录态
+    // 正常，同步却报“等待 Chrome 返回账号数据超时”）。唯一 query 强制新开
+    // 标签；fragment 供后续同步复用遗留的桥接标签。
+    browser_url.query_pairs_mut().append_pair("openhub_sync", &marker);
+    browser_url.set_fragment(Some(&marker));
     let base_str = base_url.to_string();
     let user_id_owned = user_id.to_string();
     let profile_id_owned = profile_id.to_string();
@@ -491,6 +533,12 @@ pub(crate) async fn chrome_bridge_fetch_keys_models(
     // 的 90s 总超时。静默阶段未命中时转入可见标签；静默阶段报错时只有
     // 阻断性配置问题（JS 自动化开关 / macOS 授权）直接失败，其余与账号
     // 同步一致——降级打开可见标签再试，而不是整个兜底立即放弃。
+    //
+    // refresh 形态下没有可核验的会话 ID 时跳过静默阶段：静默注入会命中任意
+    // Chrome Profile 的同源标签，无法确认页面登录的是目标账号，可能把别人的
+    // Key 写进这一行。可见阶段按 Profile 打开新标签，身份由浏览器 Cookie 罐
+    // 保证。
+    let can_silent = !use_refresh_auth || expected_session.is_some();
     let bridge_result = {
         let javascript = javascript.clone();
         let browser_url = browser_url.to_string();
@@ -499,23 +547,27 @@ pub(crate) async fn chrome_bridge_fetch_keys_models(
         let user_id_for_silent = user_id_owned.clone();
         let profile_id_for_bridge = profile_id_owned.clone();
         spawn_blocking(move || {
+            let javascript_for_visible = javascript.clone();
+            let visible = move || {
+                sync::run_javascript_in_chrome_profile(
+                    &browser_url,
+                    &profile_id_for_bridge,
+                    &marker_for_silent,
+                    &javascript_for_visible,
+                    Duration::from_secs(25),
+                    None,
+                    !user_id_for_silent.is_empty(),
+                )
+            };
+            if !can_silent {
+                return visible();
+            }
             // 先扫一遍已打开的同源标签（含遗留桥接标签）做静默注入
             let silent = sync::run_javascript_in_existing_chrome_tab(
                 &base_for_silent,
                 &javascript,
                 Duration::from_secs(10),
             );
-            let visible = move || {
-                sync::run_javascript_in_chrome_profile(
-                    &browser_url,
-                    &profile_id_for_bridge,
-                    &marker_for_silent,
-                    &javascript,
-                    Duration::from_secs(25),
-                    None,
-                    !user_id_for_silent.is_empty(),
-                )
-            };
             match silent {
                 Ok(Some(value)) => Ok(value),
                 Ok(None) => visible(),
@@ -528,23 +580,52 @@ pub(crate) async fn chrome_bridge_fetch_keys_models(
         .await
         .map_err(|error| format!("Chrome 兜底任务失败：{error}"))?
     }?;
+    if bridge_result == sync::CHROME_BRIDGE_PROFILE_MISMATCH_RESULT {
+        return Err(
+            "Chrome 页面属于另一个账号的登录会话，已拒绝写入以免串号；请确认该 Chrome Profile 已登录此站点账号后重试"
+                .into(),
+        );
+    }
     let parsed = sync::parse_chrome_key_models_bridge_result(&bridge_result)?;
+
+    // newapi2 桥接在页面里换到了新访问令牌：直接落库，后续同步与账号额度
+    // 都能复用它，不必再等一次 401 才走兜底。令牌属于目标 Profile 的会话
+    // （脚本已按 sid 校验），可以安全写回。
+    if use_refresh_auth && !parsed.api_token.trim().is_empty() {
+        if let Some(site_id) = site_id {
+            if let Ok(connection) = database.lock_conn() {
+                let _ = connection.execute(
+                    "UPDATE site_accounts SET newapi_token = ?1 WHERE site_id = ?2 AND profile_id = ?3",
+                    params![parsed.api_token.trim(), site_id, profile_id],
+                );
+            }
+        }
+    }
 
     // 解析 Key 列表：明文 Key 直出；否则用 token id 走揭示接口
     // （页面已过盾，但揭示请求仍从 Rust 直连发出——部分站点仅拦首页，
-    // 失败则把错误带回给上层）
+    // 失败则把错误带回给上层）。newapi2 必须用桥接换到的新令牌，
+    // 否则揭示接口会拿空 Cookie 再吃一次 401。
     let mut keys = parse_api_keys(&parsed.token_list);
     let mut key_groups = parse_api_key_groups(&parsed.token_list);
     let mut errors = Vec::new();
     if keys.is_empty() {
         let client = build_site_http_client(database, Duration::from_secs(10), 3, "站点模型请求")?;
+        let reveal_auth = if parsed.api_token.trim().is_empty() {
+            NewApiAuth::Legacy {
+                cookie_header: String::new(),
+                user_id: user_id_owned.clone(),
+            }
+        } else {
+            NewApiAuth::Token {
+                access_token: parsed.api_token.trim().to_string(),
+                user_id: user_id_owned.clone(),
+            }
+        };
         match reveal_newapi_keys(
             &client,
             base_url,
-            &NewApiAuth::Legacy {
-                cookie_header: String::new(),
-                user_id: user_id_owned.clone(),
-            },
+            &reveal_auth,
             &sync::chrome_user_agent(),
             &parsed.token_list,
         )
@@ -628,6 +709,143 @@ pub(crate) async fn chrome_bridge_fetch_keys_models(
             .unwrap_or_else(|| "Chrome 兜底未取得任何 Key 或模型".into()));
     }
     Ok(result)
+}
+
+/// 读取目标 Chrome Profile 在刷新接口下的会话 ID，用于桥接结果防串号。
+/// `new_api_refresh` Cookie 的 Path 是 `/api/user/auth`，必须按该路径读取，
+/// 否则按站点根路径会被 Chrome 的路径过滤掉、核对直接失效。
+async fn refresh_session_id_for_profile(base_url: &Url, profile_id: &str) -> Option<String> {
+    let home = home_dir()?;
+    let target = base_url
+        .join("/api/user/auth/refresh")
+        .map(|url| url.to_string())
+        .unwrap_or_else(|_| base_url.to_string());
+    let profile = profile_id.to_string();
+    let cookie_header = spawn_blocking(move || {
+        sync::read_chrome_cookie_header_from_home(&home, &target, &profile)
+    })
+    .await
+    .ok()
+    .and_then(|value| value.ok())
+    .unwrap_or_default();
+    sync::newapi_refresh_session_id(&cookie_header)
+}
+
+/// 模型健康度的 Chrome 同源兜底（`HealthFlow::BrowserRefresh`）。
+///
+/// 适用于「健康度只认短时效访问令牌、且刷新令牌只能在浏览器页面里轮换」的
+/// 站点（hyxware.com 等）：Rust 直连 refresh 会把浏览器登出，所以直连拿不到
+/// 健康度时改由页面内桥接完成 `refresh → 抓健康度`，并把换到的临时令牌写回
+/// 账号行，后续同步在令牌有效期内可直接走直连。
+///
+/// 返回空映射表示站点确实没有健康度接口或页面没取到数据；桥接过程失败才
+/// 返回 `Err`。调用方按「健康度是辅助信息」处理，失败不该影响主流程。
+async fn chrome_bridge_fetch_model_health(
+    database: &Database,
+    base_url: &Url,
+    site_id: &str,
+    profile_id: &str,
+) -> Result<HashMap<String, SiteModelHealth>, String> {
+    let expected_session = refresh_session_id_for_profile(base_url, profile_id).await;
+    let marker = format!(
+        "openhub-sync-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| "系统时间异常")?
+            .as_nanos()
+    );
+    let javascript =
+        sync::chrome_model_health_bridge_script(expected_session.as_deref(), &marker);
+    let console_path =
+        crate::site::library::console_page_path("newapi2").unwrap_or("/console/personal");
+    let mut browser_url = base_url
+        .join(console_path)
+        .map_err(|_| "无法生成 Chrome 验证地址")?;
+    browser_url
+        .query_pairs_mut()
+        .append_pair("openhub_sync", &marker);
+    browser_url.set_fragment(Some(&marker));
+    // 静默注入已有标签必须能核对会话身份，否则可能读到其它 Chrome Profile
+    // 的账号数据；拿不到会话 ID 时只走可见标签（由 Profile 的 Cookie 罐保证）。
+    let can_silent = expected_session.is_some();
+    let browser_url = browser_url.to_string();
+    let profile_id_owned = profile_id.to_string();
+    let bridge_result = {
+        let javascript = javascript.clone();
+        let browser_url = browser_url.clone();
+        let marker_for_silent = marker.clone();
+        spawn_blocking(move || {
+            if can_silent {
+                match sync::run_javascript_in_existing_chrome_tab(
+                    &browser_url,
+                    &javascript,
+                    Duration::from_secs(10),
+                ) {
+                    Ok(Some(value)) => return Ok(value),
+                    Ok(None) => {}
+                    Err(error) if sync::is_blocking_chrome_automation_error(&error) => {
+                        return Err(error)
+                    }
+                    Err(_) => {}
+                }
+            }
+            sync::run_javascript_in_chrome_profile(
+                &browser_url,
+                &profile_id_owned,
+                &marker_for_silent,
+                &javascript,
+                Duration::from_secs(25),
+                None,
+                false,
+            )
+        })
+        .await
+        .map_err(|error| format!("Chrome 健康度兜底任务失败：{error}"))?
+    }?;
+    if bridge_result == sync::CHROME_BRIDGE_PROFILE_MISMATCH_RESULT {
+        return Err(
+            "Chrome 页面属于另一个账号的登录会话，已拒绝写入以免串号；请确认该 Chrome Profile 已登录此站点账号后重试"
+                .into(),
+        );
+    }
+    let parsed = sync::parse_chrome_model_health_bridge_result(&bridge_result)?;
+    let health = parsed
+        .health
+        .as_ref()
+        .map(parse_site_model_health)
+        .unwrap_or_default();
+    save_bridged_model_health(database, site_id, profile_id, &parsed.api_token, &health);
+    Ok(health)
+}
+
+/// 落库桥接换到的访问令牌与健康度。令牌即使健康度为空也要写回——它能让
+/// 后续同步在有效期内直接走直连；健康度为空则保持旧值不动，避免把站点
+/// 临时抽风当成「没有健康度」覆盖掉已有数据。
+pub(crate) fn save_bridged_model_health(
+    database: &Database,
+    site_id: &str,
+    profile_id: &str,
+    api_token: &str,
+    health: &HashMap<String, SiteModelHealth>,
+) {
+    let Ok(connection) = database.lock_conn() else {
+        return;
+    };
+    if !api_token.trim().is_empty() {
+        let _ = connection.execute(
+            "UPDATE site_accounts SET newapi_token = ?1 WHERE site_id = ?2 AND profile_id = ?3",
+            params![api_token.trim(), site_id, profile_id],
+        );
+    }
+    if health.is_empty() {
+        return;
+    }
+    let health_json = serde_json::to_string(health).unwrap_or_else(|_| "{}".to_string());
+    let _ = connection.execute(
+        "UPDATE site_model_cache SET health_json = ?3, updated_at = CURRENT_TIMESTAMP
+          WHERE site_id = ?1 AND profile_id = ?2",
+        params![site_id, profile_id, health_json],
+    );
 }
 
 pub(crate) async fn fetch_models_with_keys(
@@ -761,12 +979,18 @@ pub(crate) fn parse_perf_metrics_health(
                 SiteModelHealth {
                     success_rate: json_number(item, "/success_rate")
                         .map(|percent| (percent / 100.0).clamp(0.0, 1.0)),
+                    status_label: None,
+                    snapshot: false,
                     avg_latency_ms: json_number(item, "/avg_latency_ms")
                         .map(|value| value.round() as i64),
                     avg_tps: json_number(item, "/avg_tps"),
                     window_hours,
                     requests: read_request_count(item),
                     window_start,
+                    // 两种序列来源都是逐整点：`recent_success_series` 自带整点
+                    // 时间戳；`recent_success_rates` 没有时间戳、由本文件按 1 小时
+                    // 间距铺。接口不下发格宽，按 1 小时声明。
+                    bucket_seconds: Some(3600),
                     series: parse_perf_metrics_series(item),
                 },
             ))
@@ -848,10 +1072,36 @@ fn read_request_count(value: &serde_json::Value) -> Option<u64> {
         .map(|value| value.max(0.0).round() as u64)
 }
 
-/// 界面状态条的固定槽数。解析侧与界面共用这个数：站点的时间格粒度是
-/// 管理员可配的（30 分钟、1 小时…），把窗口等分成这么多格重新聚合，
-/// 「站点给半小时格」和「站点给整点」落到界面上才是同一根条带。
+/// 界面状态条的默认槽数：原生格宽不可知（老接口不带格宽）时，窗口按它
+/// 等分的旧口径——显示效果与格宽字段引入之前一致。
 pub(crate) const MODEL_STATUS_SLOT_COUNT: i64 = 24;
+
+/// 界面状态条的槽数上限。原生格宽比「窗口 ÷ 24」更细时按原生格宽画格，
+/// 槽数超过上限才以原生格宽的**整数倍**合并——整数倍保证输出槽仍对齐站点
+/// 的原生边界，不会把两段不同的原生时段压进同一个格子却错位；槽数再多
+/// 也只是颜色噪点，读不出信息，反而挤掉条带宽度。
+pub(crate) const MODEL_STATUS_SLOT_MAX: i64 = 48;
+
+/// 把站点原生格宽收敛成「界面可承受的输出格宽」，返回值即序列点的间距
+/// （`SiteModelHealth::bucket_seconds`），解析侧与界面按同一规则分桶：
+///
+/// - 原生格宽不可知（≤0）→ 回退「窗口 ÷ 24」的旧口径；
+/// - 原生格宽 ≥ 窗口 ÷ 24（格子本来就很粗）→ 原样保留，槽数 ≤ 24；
+/// - 更细 → 按原生格宽整数倍 k 合并到 `窗口/(原生×k) ≤ MODEL_STATUS_SLOT_MAX`。
+fn clamp_health_bucket_width(native: i64, window_hours: i64) -> i64 {
+    let window_seconds = window_hours.max(1) * 3600;
+    let baseline = (window_seconds / MODEL_STATUS_SLOT_COUNT).max(60);
+    if native <= 0 {
+        return baseline;
+    }
+    let native = native.max(60);
+    if native >= baseline {
+        return native;
+    }
+    let max_window = native * MODEL_STATUS_SLOT_MAX;
+    let merges = window_seconds / max_window + i64::from(window_seconds % max_window != 0);
+    native * merges.max(1)
+}
 
 /// 「模型状态」增强模块的数据接口，按优先级排列。
 ///
@@ -922,8 +1172,10 @@ fn read_model_status_slots(item: &serde_json::Value) -> Vec<ModelStatusSlot> {
 ///
 /// 与 perf-metrics 的两点关键差异，解析时必须抹平，否则界面画不出来：
 /// 1. **格宽不固定**：管理员可配 1~1440 分钟（x666 默认 30 分钟），窗口也可以
-///    是 24h/7d 等。所以按全部时间格覆盖的跨度算出窗口，再把窗口等分成
-///    `MODEL_STATUS_SLOT_COUNT` 格聚合——段内按请求数加权平均成功率。
+///    是 24h/7d 等。所以按全部时间格覆盖的跨度算出窗口，格宽探测原生时间格
+///    宽度后经 `clamp_health_bucket_width` 收敛（原生 1 小时 → 24 格、
+///    30 分钟 → 48 格，更细按原生格宽整数倍合并）——段内按请求数加权平均
+///    成功率，输出格宽随 `bucket_seconds` 落库，界面条带同源。
 /// 2. **显式空格**：`total_requests == 0` 是站点画灰的「无请求」，必须跳过，
 ///    不能当成成功率 0% 写进序列。
 ///
@@ -939,29 +1191,44 @@ pub(crate) fn parse_model_status_health(
     };
 
     // 窗口跨度跨所有模型取并集：单个模型缺时间格不影响别的模型对齐到同一
-    // 条时间轴（界面要用同站点任一窗口起点兜底全灰条带）。
+    // 条时间轴（界面要用同站点任一窗口起点兜底全灰条带）。顺带探测站点原生
+    // 时间格宽度（end - start，取全响应最大值——末格可能被「现在」截断而偏窄，
+    // 取最大值才是配置的原生格宽）：这是本站 `slot_minutes` 的实际值，条带格宽
+    // 以它为基准，30 分钟格的站点因此能画出 48 格而不是 24。
     let mut span_start = i64::MAX;
     let mut span_end = i64::MIN;
+    let mut native_width = 0i64;
     for item in items {
         for slot in read_model_status_slots(item) {
             span_start = span_start.min(slot.start);
             span_end = span_end.max(slot.end);
+            if slot.end > slot.start {
+                native_width = native_width.max(slot.end - slot.start);
+            }
         }
     }
 
     // 窗口 = 全部时间格覆盖的跨度，按小时**向上取整**（不能四舍五入：
     // 取整不足会把最近的那格挤出窗口，而它恰恰是用户最关心的「现在」）。
-    // 起点直接用最早时间格的起点、不做整点对齐——界面按「起点 + 等分格」
+    // 起点直接用最早时间格的起点、不做整点对齐——界面按「起点 + 格宽」
     // 相对定位，对齐反而会把末尾的格子推出窗口。站点一个时间格都没给时
     // 退化成 24h 窗口：序列为空、条带全灰，但徽标仍在。
     let (window_start, window_hours, step) = if span_end >= span_start {
         let span = (span_end - span_start).max(3600);
         let hours = ((span as f64 / 3600.0).ceil() as i64).max(1);
-        let step = (hours * 3600 / MODEL_STATUS_SLOT_COUNT).max(60);
+        let step = clamp_health_bucket_width(native_width, hours);
         (Some(span_start), hours, step)
     } else {
         let hours = PERF_METRICS_WINDOW_HOURS;
-        (None, hours, hours * 3600 / MODEL_STATUS_SLOT_COUNT)
+        (None, hours, clamp_health_bucket_width(0, hours))
+    };
+    // 输出槽数：窗口 ÷ 输出格宽向上取整。原生格宽不整除窗口时最后一格只
+    // 覆盖窗口尾部的一段，照常画，不需要补到整格。
+    let slot_count = if step > 0 {
+        let window_seconds = window_hours.max(1) * 3600;
+        (window_seconds / step + i64::from(window_seconds % step != 0)).max(1)
+    } else {
+        0
     };
 
     let mut health = HashMap::new();
@@ -979,11 +1246,11 @@ pub(crate) fn parse_model_status_health(
             continue;
         }
 
-        // 时间格 → 固定槽数序列；槽内多格按请求数加权，整格无流量就不出数据点。
+        // 时间格 → 输出槽序列；槽内多格按请求数加权，整格无流量就不出数据点。
         // 第三项累计段内请求量，站点没给过请求数时保持 false、整段留空。
-        let mut buckets: Vec<Option<(f64, f64, u64, bool)>> =
-            vec![None; MODEL_STATUS_SLOT_COUNT as usize];
+        let mut buckets: Vec<Option<(f64, f64, u64, bool)>> = vec![None; slot_count as usize];
         let origin = window_start.unwrap_or(0);
+        let window_seconds = window_hours.max(1) * 3600;
         for slot in &slots {
             if slot.is_idle() {
                 continue;
@@ -995,12 +1262,15 @@ pub(crate) fn parse_model_status_health(
                 continue;
             }
             let offset = slot.start - origin;
-            if !(0..MODEL_STATUS_SLOT_COUNT * step).contains(&offset) {
+            if !(0..window_seconds).contains(&offset) {
                 continue;
             }
             let index = (offset / step) as usize;
+            let Some(bucket) = buckets.get_mut(index) else {
+                continue;
+            };
             let weight = slot.requests.unwrap_or(1).max(1) as f64;
-            let bucket = buckets[index].get_or_insert((0.0, 0.0, 0, false));
+            let bucket = bucket.get_or_insert((0.0, 0.0, 0, false));
             bucket.0 += rate * weight;
             bucket.1 += weight;
             if let Some(requests) = slot.requests {
@@ -1045,12 +1315,15 @@ pub(crate) fn parse_model_status_health(
             model_name,
             SiteModelHealth {
                 success_rate,
+                status_label: None,
+                snapshot: false,
                 avg_latency_ms: json_number(item, "/recent_avg_first_response_time")
                     .map(|value| value.round() as i64),
                 avg_tps: json_number(item, "/recent_avg_output_token_speed"),
                 window_hours,
                 requests,
                 window_start,
+                bucket_seconds: Some(step),
                 series,
             },
         );
@@ -1273,14 +1546,23 @@ pub(crate) async fn fetch_site_model_health(
         Some(custom::HealthFlow::PublicEmbed(url)) => {
             fetch_public_health_endpoint(client, url, user_agent, parse_model_status_health).await
         }
-        None => HashMap::new(),
+        Some(custom::HealthFlow::PublicEmbedHtml(url)) => {
+            fetch_public_health_html_endpoint(client, url, user_agent).await
+        }
+        // 浏览器刷新流程只由「刷新健康度」入口按需调用（需要打开 Chrome），
+        // 直连通道不处理，避免批量同步时无谓地弹标签。
+        Some(custom::HealthFlow::Sub2ApiChannelMonitor(_))
+        | Some(custom::HealthFlow::BrowserRefresh)
+        | None => HashMap::new(),
     }
 }
 
 /// 站点 API 主机对应的公开嵌入健康度接口 —— 注册表（哪个域配哪个接口）与
 /// 匹配逻辑已收口到 `site/library/custom.rs`，此处 re-export 供本模块与
 /// catalog 调用（含测试）。
-pub(crate) use crate::site::library::custom::public_embed_health_url;
+pub(crate) use crate::site::library::custom::{
+    public_embed_health_url, public_embed_html_health_url, sub2api_channel_monitor_health_url,
+};
 
 /// 拉取公开嵌入接口（跨域子域，无需登录）。
 ///
@@ -1304,6 +1586,183 @@ async fn fetch_public_health_endpoint(
         Ok(Ok(value)) => parse(&value),
         Ok(Err(_)) | Err(_) => HashMap::new(),
     }
+}
+
+/// 拉取公开 HTML 状态页（跨域子域，无需登录）。
+///
+/// 与 JSON 版一样刻意不注入站点鉴权：请求发往另一个主机，主域的 Cookie /
+/// 访问令牌不该外带。页面可能是 Cloudflare 盾或非 200，一律软失败为空。
+///
+/// 监控页常放在 Cloudflare Workers 等第三方主机上，站点主域可直连不代表它
+/// 可达（kunyou 的 workers.dev 就属于这种）。直连失败时按系统代理重试一次，
+/// 免得用户为了一个辅助页面去配置全局代理池。
+pub(crate) async fn fetch_public_health_html_endpoint(
+    client: &wreq::Client,
+    url: &str,
+    user_agent: &str,
+) -> HashMap<String, SiteModelHealth> {
+    if let Some(html) = fetch_public_html(client, url, user_agent).await {
+        let health = parse_public_health_html(&html);
+        if !health.is_empty() {
+            return health;
+        }
+    }
+    let Some(proxy_url) = system_proxy_url() else {
+        return HashMap::new();
+    };
+    let Ok(fallback) = build_site_http_client_with_proxy(
+        &proxy_url,
+        "",
+        PERF_METRICS_TIMEOUT,
+        3,
+        "站点公开状态页",
+    ) else {
+        return HashMap::new();
+    };
+    match fetch_public_html(&fallback, url, user_agent).await {
+        Some(html) => parse_public_health_html(&html),
+        None => HashMap::new(),
+    }
+}
+
+/// 抓取公开 HTML 页面正文；网络错误、非 2xx、超时都收敛成 `None`。
+async fn fetch_public_html(
+    client: &wreq::Client,
+    url: &str,
+    user_agent: &str,
+) -> Option<String> {
+    let url = Url::parse(url).ok()?;
+    let request = chrome_request_headers(client.get(url.clone()), url.as_str(), user_agent);
+    let response = tokio::time::timeout(PERF_METRICS_TIMEOUT, request.send())
+        .await
+        .ok()?
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    tokio::time::timeout(PERF_METRICS_TIMEOUT, response.text())
+        .await
+        .ok()?
+        .ok()
+}
+
+/// 读取系统代理（macOS `scutil --proxy`；其它平台读环境变量）。
+///
+/// 只给公开监控页这类第三方辅助请求兜底用：站点主请求仍严格按应用内的
+/// 网络代理设置走，避免把用户没授权的系统代理带进业务流量。
+fn system_proxy_url() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        let output = std::process::Command::new("scutil")
+            .arg("--proxy")
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        let value = |key: &str| {
+            let prefix = format!("{key} : ");
+            text.lines()
+                .find_map(|line| line.trim().strip_prefix(&prefix).map(str::trim))
+        };
+        for (enable, host, port, scheme) in [
+            ("HTTPSEnable", "HTTPSProxy", "HTTPSPort", "http"),
+            ("HTTPEnable", "HTTPProxy", "HTTPPort", "http"),
+            ("SOCKSEnable", "SOCKSProxy", "SOCKSPort", "socks5"),
+        ] {
+            if value(enable) != Some("1") {
+                continue;
+            }
+            let (Some(host), Some(port)) = (value(host), value(port)) else {
+                continue;
+            };
+            if host.is_empty() || port.is_empty() {
+                continue;
+            }
+            return Some(format!("{scheme}://{host}:{port}"));
+        }
+        None
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        [
+            "HTTPS_PROXY",
+            "https_proxy",
+            "HTTP_PROXY",
+            "http_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+        ]
+        .iter()
+        .find_map(|key| {
+            std::env::var(key)
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
+    }
+}
+
+/// 解析自建监控页的模型状态（kunyou 的 account-doctor 等）。
+///
+/// 页面没有 JSON 接口，模型是
+/// `<div class="mchip green|yellow|red"><span class="dot ..."></span>模型名…`
+/// 这样的标记：绿=正常可用、黄=限流/响应慢、红=连续两轮不可用；灰/无账号的
+/// 模型不列出。没有时间序列，只标记 `snapshot` 并用 `status_label` 让界面
+/// 显示状态灯——绿=100%、黄=50%、红=0% 仅用于配色，不合成窗口与槽位。
+pub(crate) fn parse_public_health_html(html: &str) -> HashMap<String, SiteModelHealth> {
+    let mut health = HashMap::new();
+    let mut rest = html;
+    while let Some(index) = rest.find("class=\"mchip ") {
+        rest = &rest[index + "class=\"mchip ".len()..];
+        let Some(quote) = rest.find('"') else {
+            break;
+        };
+        let status = rest[..quote].trim();
+        let Some(status_class) = status.split_whitespace().next() else {
+            continue;
+        };
+        let (rate, label) = match status_class {
+            "green" => (1.0, "正常"),
+            "yellow" => (0.5, "限流"),
+            "red" => (0.0, "不可用"),
+            // gray（组未放行）/ noacct（无账号支持）不进入健康度表：界面按
+            // 「站点有健康度但该模型无数据」处理，正好归入无效模型。
+            _ => continue,
+        };
+        // 状态点 `<span class="dot …"></span>` 之后紧跟模型名，直到下一个标签。
+        let Some(dot_end) = rest.find("</span>") else {
+            continue;
+        };
+        let after_dot = &rest[dot_end + "</span>".len()..];
+        let name = decode_html_entities(after_dot.split('<').next().unwrap_or("").trim());
+        if name.is_empty() || name.len() > 200 {
+            continue;
+        }
+        health.insert(
+            name,
+            SiteModelHealth {
+                success_rate: Some(rate),
+                status_label: Some(label.to_string()),
+                // 监控页只给当前状态，没有窗口与逐时段序列：界面用状态灯展示，
+                // 不铺时间轴，也不补「无流量」灰格。
+                snapshot: true,
+                ..Default::default()
+            },
+        );
+    }
+    health
+}
+
+/// 监控页模型名可能带 HTML 实体（如 `&amp;`），做最小解码。
+fn decode_html_entities(value: &str) -> String {
+    value
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
 }
 
 /// Sub2API「模型市场」健康度接口（fengwind 等站点）。
@@ -1394,6 +1853,12 @@ pub(crate) fn parse_sub2api_model_market_health(
 
     let window_start = parse_iso_timestamp(&json_string(value, &["/data/window_start"]));
     let window_end = parse_iso_timestamp(&json_string(value, &["/data/window_end"]));
+    // 原生格宽随响应下发（实测 fengwind 5 分钟）。序列本身保持原生间距不合并：
+    // 条带渲染时由界面按 bucket_seconds 分桶、超过槽数上限的按原生格宽整数倍
+    // 合并；站点没给格宽就缺省，界面回退「窗口 ÷ 24」的旧口径。
+    let bucket_seconds = json_number(value, "/data/bucket_seconds")
+        .map(|value| value.round() as i64)
+        .filter(|value| *value > 0);
     let mut health = HashMap::new();
     for (model, buckets) in slots {
         if buckets.is_empty() {
@@ -1426,16 +1891,114 @@ pub(crate) fn parse_sub2api_model_market_health(
             SiteModelHealth {
                 success_rate: (total_sample > 0)
                     .then(|| (total_success as f64 / total_sample as f64).clamp(0.0, 1.0)),
+                status_label: None,
+                snapshot: false,
                 avg_latency_ms: latency.get(&model).map(|(_, value)| *value),
                 avg_tps: tps.get(&model).map(|(_, value)| *value),
                 window_hours: hours.max(1),
                 requests: Some(total_sample),
                 window_start: Some(start),
+                bucket_seconds,
                 series,
             },
         );
     }
     health
+}
+
+/// 解析 Sub2API「渠道监控 v2」矩阵健康度（daigua 等）。
+///
+/// 响应形如 `{ data: { coverage: { requested_start, requested_end,
+/// coverage_start, bucket_seconds }, items: [ { platform, model, metrics,
+/// health: { overall }, buckets: [ { bucket_start, health: { overall } } ] } ] } }`。
+///
+/// `group_by=platform_model` 会混入没有 `model` 的平台汇总行，跳过；模型名
+/// `unknown` 也跳过（对不上任何真实模型）。健康度以站点自己的
+/// `health.overall` 为准：healthy/warning/critical → 100%/70%/0%，unknown
+/// 视为该时段无数据。逐小时 bucket 只收有明确等级的，缺失时段由界面留灰。
+pub(crate) fn parse_sub2api_channel_monitor_health(
+    value: &serde_json::Value,
+) -> HashMap<String, SiteModelHealth> {
+    let Some(items) = json_array_at(value, &["/data/items"]) else {
+        return HashMap::new();
+    };
+    let coverage = value.pointer("/data/coverage");
+    let coverage_time = |key: &str| {
+        coverage
+            .and_then(|coverage| coverage.get(key))
+            .and_then(|value| value.as_str())
+            .and_then(parse_iso_timestamp)
+    };
+    let window_start = coverage_time("coverage_start").or_else(|| coverage_time("requested_start"));
+    let window_hours = coverage_time("requested_start")
+        .zip(coverage_time("requested_end"))
+        .map(|(start, end)| (((end - start).max(3600) as f64) / 3600.0).ceil() as i64)
+        .filter(|hours| *hours > 0)
+        .unwrap_or(PERF_METRICS_WINDOW_HOURS);
+    let bucket_seconds = coverage
+        .and_then(|coverage| coverage.get("bucket_seconds"))
+        .and_then(serde_json::Value::as_i64)
+        .filter(|seconds| *seconds > 0)
+        .unwrap_or(3600);
+    let mut health = HashMap::new();
+    for item in items {
+        let model = json_string(item, &["/model"]);
+        if model.is_empty() || model == "unknown" {
+            continue;
+        }
+        let Some((rate, label)) = channel_monitor_level(item.pointer("/health/overall")) else {
+            continue;
+        };
+        let mut series = Vec::new();
+        if let Some(buckets) = item.get("buckets").and_then(serde_json::Value::as_array) {
+            for bucket in buckets {
+                let ts = json_string(bucket, &["/bucket_start"]);
+                let Some(ts) = parse_iso_timestamp(&ts) else {
+                    continue;
+                };
+                let Some((bucket_rate, _)) =
+                    channel_monitor_level(bucket.pointer("/health/overall"))
+                else {
+                    continue;
+                };
+                let requests = json_number(bucket, "/metrics/request_count")
+                    .map(|value| value.max(0.0).round() as u64)
+                    .filter(|value| *value > 0);
+                series.push(SiteModelHealthPoint {
+                    ts,
+                    success_rate: Some(bucket_rate),
+                    requests,
+                });
+            }
+        }
+        let requests = json_number(item, "/metrics/request_count")
+            .map(|value| value.max(0.0).round() as u64)
+            .filter(|value| *value > 0);
+        health.insert(
+            model,
+            SiteModelHealth {
+                success_rate: Some(rate),
+                status_label: Some(label.to_string()),
+                window_hours,
+                requests,
+                window_start,
+                bucket_seconds: Some(bucket_seconds),
+                series,
+                ..Default::default()
+            },
+        );
+    }
+    health
+}
+
+/// 渠道监控 v2 的健康等级 → 界面折算值/文案；unknown 等无法判定的等级返回 None。
+fn channel_monitor_level(value: Option<&serde_json::Value>) -> Option<(f64, &'static str)> {
+    match value?.as_str()? {
+        "healthy" => Some((1.0, "正常")),
+        "warning" => Some((0.7, "警告")),
+        "critical" => Some((0.0, "异常")),
+        _ => None,
+    }
 }
 
 /// 用浏览器会话令牌分页拉取 Sub2API「模型市场」健康度（fengwind 等）。
@@ -1523,6 +2086,32 @@ pub(crate) async fn fetch_sub2api_model_market_health(
         }
     });
     parse_sub2api_model_market_health(&merged)
+}
+
+/// 用浏览器会话令牌拉取 Sub2API「渠道监控 v2」矩阵健康度（daigua 等）。
+async fn fetch_sub2api_channel_monitor_health(
+    client: &wreq::Client,
+    url: &str,
+    auth_token: &str,
+    user_agent: &str,
+) -> HashMap<String, SiteModelHealth> {
+    if auth_token.trim().is_empty() {
+        return HashMap::new();
+    }
+    let Ok(url) = Url::parse(url) else {
+        return HashMap::new();
+    };
+    let request = chrome_request_headers(client.get(url.clone()), url.as_str(), user_agent)
+        .bearer_auth(auth_token);
+    match tokio::time::timeout(
+        PERF_METRICS_TIMEOUT,
+        request_json_with_hint(request, "Sub2API 渠道监控", SUB2API_AUTH_FAILURE_HINT),
+    )
+    .await
+    {
+        Ok(Ok(value)) => parse_sub2api_channel_monitor_health(&value),
+        Ok(Err(_)) | Err(_) => HashMap::new(),
+    }
 }
 
 /// 读 Chrome Local Storage 里 Sub2API 的会话令牌 `auth_token`（模型市场接口凭据）。
@@ -1623,12 +2212,17 @@ pub(crate) fn parse_user_model_status_health(
             name,
             SiteModelHealth {
                 success_rate,
+                status_label: None,
+                snapshot: false,
                 avg_latency_ms: json_number(item, "/avg_latency_ms")
                     .map(|value| value.round() as i64),
                 avg_tps: None,
                 window_hours,
                 requests: None,
                 window_start: heartbeat_start,
+                // 心跳序列就是按响应给的 bucket_seconds 逐点铺的（实测
+                // Agent Router 20 分钟），界面据此画出比逐时更细的条带。
+                bucket_seconds: Some(bucket_seconds),
                 series,
             },
         );
@@ -2452,11 +3046,15 @@ pub(crate) async fn collect_site_model_health(
     // 站点自建监控站的公开嵌入接口（x666 等）匿名可读，不依赖令牌或会话，
     // 任意架构的站点只要注册了公开嵌入健康度路由（见 custom.rs）就能抓。
     //
-    // Sub2API（fengwind 等）的健康度走它自己的「模型市场」接口，凭据是
-    // Chrome Local Storage 里的会话令牌 auth_token（Key 会回 INVALID_TOKEN，
-    // Cookie 也不是它的鉴权方式），所以按 sub2api 单独开一条通道。
-    let public_embed = public_embed_health_url(base_url).is_some();
+    // Sub2API（fengwind 等）的健康度走它自己的「模型市场」接口；daigua 这类
+    // 装了「渠道监控 v2」的站点改走矩阵接口（同样是 Bearer auth_token）。
+    // 凭据都是 Chrome Local Storage 里的会话令牌 auth_token（Key 会回
+    // INVALID_TOKEN，Cookie 也不是它的鉴权方式），所以按 sub2api 单独开一条通道。
+    let public_embed_json = public_embed_health_url(base_url);
+    let public_embed_html = public_embed_html_health_url(base_url);
+    let public_embed = public_embed_json.is_some() || public_embed_html.is_some();
     let sub2api = is_sub2api(system_type);
+    let channel_monitor = sub2api_channel_monitor_health_url(base_url);
     let token_form = uses_access_token(system_type);
     let cookie_form = !token_form && is_newapi(system_type);
     if (!token_form && !cookie_form && !public_embed && !sub2api) || profile_ids.is_empty() {
@@ -2479,9 +3077,29 @@ pub(crate) async fn collect_site_model_health(
                 .unwrap_or_default()
             };
             if !auth_token.is_empty() {
-                let health =
-                    fetch_sub2api_model_market_health(client, base_url, &auth_token, &user_agent)
-                        .await;
+                let mut health = match channel_monitor {
+                    Some(url) => {
+                        fetch_sub2api_channel_monitor_health(
+                            client,
+                            url,
+                            &auth_token,
+                            &user_agent,
+                        )
+                        .await
+                    }
+                    None => HashMap::new(),
+                };
+                // 渠道监控接口失败时回退模型市场：两者共用 auth_token，多一次
+                // 软失败请求换一个可用数据源。
+                if health.is_empty() {
+                    health = fetch_sub2api_model_market_health(
+                        client,
+                        base_url,
+                        &auth_token,
+                        &user_agent,
+                    )
+                    .await;
+                }
                 if !health.is_empty() {
                     let health_json =
                         serde_json::to_string(&health).unwrap_or_else(|_| "{}".to_string());
@@ -2578,6 +3196,32 @@ pub(crate) async fn collect_site_model_health(
         // 多账号时保留先到的那份：口径相同，重复拉没有意义。
         if merged.is_empty() {
             merged = health;
+        }
+    }
+    // Sub2API 等不走 cookie 分支的架构不会在循环内碰到公开接口；公开监控页
+    // 匿名可读，最后统一兜底一次（kunyou 的 HTML 状态页就走这里）。
+    if merged.is_empty() && public_embed {
+        let public_health = if let Some(url) = public_embed_json {
+            fetch_public_health_endpoint(client, url, &user_agent, parse_model_status_health).await
+        } else if let Some(url) = public_embed_html {
+            fetch_public_health_html_endpoint(client, url, &user_agent).await
+        } else {
+            HashMap::new()
+        };
+        if !public_health.is_empty() {
+            let health_json =
+                serde_json::to_string(&public_health).unwrap_or_else(|_| "{}".to_string());
+            let connection = database.lock_conn()?;
+            // 全站口径：逐账号行各写一份，界面按账号行读取。
+            for profile_id in profile_ids {
+                let _ = connection.execute(
+                    "UPDATE site_model_cache SET health_json = ?3, updated_at = CURRENT_TIMESTAMP
+                      WHERE site_id = ?1 AND profile_id = ?2",
+                    params![site_id, profile_id, health_json],
+                );
+            }
+            drop(connection);
+            merged = public_health;
         }
     }
     Ok(merged)
@@ -2694,8 +3338,32 @@ pub async fn refresh_site_model_health(
     };
     let base_url = normalize_site_base_url(&base_raw)?;
     let client = build_site_http_client(database, SITE_PROBE_TIMEOUT, 3, "站点健康度")?;
-    collect_site_model_health(database, &client, &base_url, &site_id, &system_type, &profile_ids)
-        .await
+    let health = collect_site_model_health(
+        database,
+        &client,
+        &base_url,
+        &site_id,
+        &system_type,
+        &profile_ids,
+    )
+    .await?;
+    // 直连全空且站点注册了「浏览器刷新」健康度流程（hyxware.com 等：
+    // 健康度只认短时效令牌、刷新令牌只能在页面里轮换）时，用 Chrome 同源
+    // 桥接完成 refresh → 抓取。逐账号尝试，拿到第一份即返回（全站口径）。
+    if !health.is_empty() || !custom::health_flow_requires_browser_refresh(&base_url) {
+        return Ok(health);
+    }
+    for profile_id in &profile_ids {
+        if profile_id.trim().is_empty() {
+            continue;
+        }
+        match chrome_bridge_fetch_model_health(database, &base_url, &site_id, profile_id).await {
+            Ok(bridged) if !bridged.is_empty() => return Ok(bridged),
+            Ok(_) => {}
+            Err(_) => {}
+        }
+    }
+    Ok(health)
 }
 
 /// 手动管理 Key：向指定账号行追加一个 Key（去重）。账号行不存在时按
@@ -3592,7 +4260,15 @@ async fn fetch_site_models_json_inner(
                 &auth,
             );
 
-            let mut remote_result = request_json(request, "NewAPI Key 接口").await;
+            // newapi2 的访问令牌只有十几分钟寿命，过期是常态、不是登录失效：
+            // 提示必须指向浏览器自动续期，而不是让用户“重新登录后同步账号”。
+            let key_auth_hint = if use_refresh_auth {
+                sync::NEWAPI_REFRESH_KEY_FAILURE_HINT
+            } else {
+                "（账号令牌已失效或过期，请重新登录后同步账号）"
+            };
+            let mut remote_result =
+                request_json_with_hint(request, "NewAPI Key 接口", key_auth_hint).await;
 
             if let Err(error) = &remote_result {
                 // 直连令牌路由站点（42x）没有浏览器兜底通道：缓存令牌失败直接
@@ -3650,8 +4326,10 @@ async fn fetch_site_models_json_inner(
                     Ok(Some(auth_value)) => auth = auth_value,
                     Ok(None) => auth = legacy_auth,
                     Err(e) => {
+                        // 不在这里放弃：Cookie 换令牌失败时保留原始 401，让下方
+                        // 统一的浏览器兜底接手（页面内 refresh 是 newapi2 唯一
+                        // 能写回轮换 Cookie 的通道）。
                         errors.push(format!("{profile_id}：{e}"));
-                        continue;
                     }
                 }
                 used_cached_token = false;
@@ -3659,7 +4337,8 @@ async fn fetch_site_models_json_inner(
                     chrome_request_headers(client.get(token_url), base_url.as_str(), &user_agent),
                     &auth,
                 );
-                remote_result = request_json(request, "NewAPI Key 接口").await;
+                remote_result =
+                    request_json_with_hint(request, "NewAPI Key 接口", key_auth_hint).await;
             }
 
             // Save the newly acquired token to DB
@@ -3775,10 +4454,12 @@ async fn fetch_site_models_json_inner(
                 }
                 Err(error) => {
                     errors.push(format!("{profile_id}：{error}"));
-                    // 直连失败（Cloudflare 403 挑战，或超时/连接失败）时，浏览器同源
-                    // fetch 是唯一可行路径：复用账号同步的 Chrome 桥接，页面内拉
-                    // Key 列表 + 模型。仅遇盾判定会漏掉「直连超时」这类站点。
-                    if needs_browser_bridge(&error) {
+                    // 直连失败（Cloudflare 403 挑战、超时/连接失败，或 newapi2 的
+                    // 访问令牌过期 401）时，浏览器同源 fetch 是唯一可行路径：
+                    // 复用账号同步的 Chrome 桥接，页面内拉 Key 列表 + 模型。
+                    // 令牌过期分支必须单独纳入——缓存令牌只有十几分钟有效期，
+                    // Cookie 又换不回 Key，不桥接就等于过期后同步 Key 必然失败。
+                    if key_sync_needs_chrome_bridge(&error, use_refresh_auth) {
                         match chrome_bridge_fetch_keys_models(
                             database,
                             &base_url,
