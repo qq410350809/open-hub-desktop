@@ -2,13 +2,12 @@ use super::*;
 use serde_json::json;
 
 #[test]
-fn parses_opencode_proxy_default_config() {
+fn parses_model_proxy_default_config() {
     let cfg = ModelProxyConfig::default();
     assert!(cfg.enabled);
     assert_eq!(cfg.port, default_model_proxy_port());
-    assert_eq!(cfg.channels.len(), 1);
-    assert_eq!(cfg.channels[0].id, "opencode");
-    assert_eq!(cfg.channels[0].effective_alias(), "opencode");
+    // 不再内置任何上游渠道：渠道一律由用户显式创建或站点转换
+    assert!(cfg.channels.is_empty());
 }
 
 #[test]
@@ -71,16 +70,16 @@ fn resolves_channels_with_alias_prefix_or_model_whitelist() {
         api_key: "".to_string(),
         channels: vec![
             ChannelConfig {
-                id: "opencode".to_string(),
-                name: "OpenCode".to_string(),
+                id: "fallback".to_string(),
+                name: "Fallback".to_string(),
                 description: "".to_string(),
                 enabled: true,
                 protocol: "openai".to_string(),
-                base_url: "https://opencode.ai/zen/v1".to_string(),
+                base_url: "https://fallback.example/v1".to_string(),
                 api_key: "".to_string(),
                 api_keys: None,
                 use_proxy_pool: false,
-                alias: Some("opencode".to_string()),
+                alias: Some("fallback".to_string()),
                 site_id: None,
                 proxy_mode: None,
                 proxy_fixed_channel: None,
@@ -136,9 +135,9 @@ fn resolves_channels_with_alias_prefix_or_model_whitelist() {
     assert_eq!(ch.id, "vip");
     assert_eq!(model, "claude-3-5-sonnet-20241022");
 
-    // 3. 默认回退到 opencode
+    // 3. 无精确匹配时回退到首个已启用渠道
     let (ch, model) = resolve_channel(&cfg, "deepseek-chat").expect("should resolve");
-    assert_eq!(ch.id, "opencode");
+    assert_eq!(ch.id, "fallback");
     assert_eq!(model, "deepseek-chat");
 }
 
@@ -146,7 +145,7 @@ fn resolves_channels_with_alias_prefix_or_model_whitelist() {
 fn resolves_models_prefixed_by_openhub_local_provider() {
     let mut cfg = ModelProxyConfig::default();
     cfg.channels = vec![
-        order_test_channel("opencode", "opencode", true),
+        order_test_channel("fallback", "fallback", true),
         order_test_channel("site-a", "x666", true),
     ];
 
@@ -154,6 +153,11 @@ fn resolves_models_prefixed_by_openhub_local_provider() {
         .expect("OpenHub provider 前缀后仍应按 alias 路由");
     assert_eq!(ch.id, "site-a");
     assert_eq!(model, "claude-sonnet-5");
+}
+
+/// 测试用通用渠道（默认配置不再内置任何渠道）。
+fn generic_test_channel() -> ChannelConfig {
+    order_test_channel("generic", "generic", true)
 }
 
 /// 构造最小可用渠道：全暴露（白名单为 None）
@@ -190,7 +194,7 @@ fn model_channel_order_overrides_whitelist_array_order() {
     // a 与 b 同时提供 shared-model（白名单都包含），数组序 b 在前 → 默认选 b
     let mut cfg = ModelProxyConfig {
         channels: vec![
-            order_test_channel("opencode", "opencode", true),
+            order_test_channel("fallback", "fallback", true),
             {
                 let mut ch = order_test_channel("b", "b", true);
                 ch.enabled_models = Some(vec!["shared-model".to_string()]);
@@ -222,10 +226,10 @@ fn model_channel_order_overrides_whitelist_array_order() {
     let (ch, _) = resolve_channel(&cfg, "shared-model").expect("should resolve");
     assert_eq!(ch.id, "b");
 
-    // 首选渠道被禁用且其余不匹配时，回退原数组序逻辑（opencode 兜底仍可服务）
+    // 首选渠道被禁用且其余不匹配时，回退到首个已启用渠道
     cfg.channels[1].enabled = false;
     let (ch, _) = resolve_channel(&cfg, "shared-model").expect("should resolve");
-    assert_eq!(ch.id, "opencode");
+    assert_eq!(ch.id, "fallback");
 }
 
 #[test]
@@ -248,7 +252,7 @@ fn sanitize_trims_and_prunes_model_channel_order() {
     order.insert("blank".to_string(), vec![]);
     let mut config = ModelProxyConfig {
         channels: vec![
-            order_test_channel("opencode", "opencode", true),
+            order_test_channel("fallback", "fallback", true),
             order_test_channel("a", "a", true),
             order_test_channel("b", "b", true),
         ],
@@ -267,7 +271,7 @@ fn sanitize_trims_and_prunes_model_channel_order() {
 
     // 全部条目无效时清空为 None
     let mut config = ModelProxyConfig {
-        channels: vec![order_test_channel("opencode", "opencode", true)],
+        channels: vec![order_test_channel("fallback", "fallback", true)],
         model_channel_order: Some(HashMap::from([(
             "x".to_string(),
             vec!["ghost".to_string()],
@@ -563,7 +567,7 @@ fn key_group_mode_migration_rewrites_round_robin_once() {
             ]
         }]
     });
-    write_meta(&conn, "opencode_proxy_config", &legacy.to_string()).unwrap();
+    write_meta(&conn, "model_proxy_config", &legacy.to_string()).unwrap();
 
     // 首次加载：存量轮询迁移为独立，并落下一次性标记
     let cfg = load_model_proxy_config(&conn);
@@ -583,7 +587,7 @@ fn key_group_mode_migration_rewrites_round_robin_once() {
         .is_empty());
 
     // 迁移只执行一次：此后用户显式重选的轮询不再被改写
-    write_meta(&conn, "opencode_proxy_config", &legacy.to_string()).unwrap();
+    write_meta(&conn, "model_proxy_config", &legacy.to_string()).unwrap();
     let cfg2 = load_model_proxy_config(&conn);
     let channel2 = cfg2.channels.iter().find(|c| c.id == "site_x").unwrap();
     let groups2 = channel2.key_groups.as_ref().unwrap();
@@ -591,6 +595,54 @@ fn key_group_mode_migration_rewrites_round_robin_once() {
         groups2[0].mode, KEY_GROUP_MODE_ROUND_ROBIN,
         "二次加载不重复迁移"
     );
+}
+
+#[test]
+fn legacy_config_key_is_migrated_and_builtin_opencode_channel_removed() {
+    use crate::db::{read_meta_conn, write_meta};
+    use crate::model::gateway::config::load_model_proxy_config;
+
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    conn.execute_batch("CREATE TABLE app_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
+        .unwrap();
+
+    // 旧版本把配置写在 opencode_proxy_config，且内置渠道 id=opencode
+    let legacy = json!({
+        "enabled": true,
+        "port": 17996,
+        "apiKey": "sk-legacy",
+        "channels": [
+            {
+                "id": "opencode",
+                "name": "OpenCode 免费",
+                "enabled": true,
+                "protocol": "openai",
+                "upstreamUrl": "https://opencode.ai/zen/v1",
+                "alias": "opencode",
+                "statsId": 1
+            },
+            {
+                "id": "site_x",
+                "name": "X",
+                "enabled": true,
+                "protocol": "openai",
+                "upstreamUrl": "https://x.example/v1",
+                "alias": "x"
+            }
+        ]
+    });
+    write_meta(&conn, "opencode_proxy_config", &legacy.to_string()).unwrap();
+
+    let cfg = load_model_proxy_config(&conn);
+    // 用户自建渠道与其配置必须保留
+    assert!(cfg.channels.iter().any(|c| c.id == "site_x"));
+    assert_eq!(cfg.api_key, "sk-legacy");
+    // 内置 OpenCode 反代渠道被清除
+    assert!(!cfg.channels.iter().any(|c| c.id == "opencode"));
+    // 已迁移写入新键
+    let migrated = read_meta_conn(&conn, "model_proxy_config").unwrap();
+    assert!(migrated.contains("site_x"), "新键应包含迁移后的配置");
+    assert!(!migrated.contains("opencode.ai"), "内置渠道不得被写回新键");
 }
 
 #[test]
@@ -800,131 +852,16 @@ fn channel_config_upstream_url_serialization_roundtrip() {
 }
 
 #[test]
-fn opencode_channel_detection_covers_id_protocol_alias_url_and_name() {
-    let make =
-        |id: &str, protocol: &str, alias: Option<&str>, base_url: &str, name: &str| ChannelConfig {
-            id: id.to_string(),
-            name: name.to_string(),
-            description: "".to_string(),
-            enabled: true,
-            protocol: protocol.to_string(),
-            base_url: base_url.to_string(),
-            api_key: "sk-test".to_string(),
-            api_keys: None,
-            use_proxy_pool: false,
-            alias: alias.map(|s| s.to_string()),
-            site_id: None,
-            proxy_mode: None,
-            proxy_fixed_channel: None,
-            use_fixed_proxy: false,
-            fixed_proxy_node: None,
-            enabled_models: None,
-            model_redirects: None,
-            stats_id: None,
-            key_groups: None,
-            key_rules: None,
-            model_proxy_rules: None,
-        };
-
-    assert!(is_opencode_channel(&make(
-        "opencode",
-        "openai",
-        None,
-        "https://example.com/v1",
-        "任意名称"
-    )));
-    assert!(is_opencode_channel(&make(
-        "custom",
-        "opencode",
-        None,
-        "https://example.com/v1",
-        "任意名称"
-    )));
-    assert!(is_opencode_channel(&make(
-        "custom",
-        "openai",
-        Some("opencode"),
-        "https://example.com/v1",
-        "任意名称"
-    )));
-    assert!(is_opencode_channel(&make(
-        "custom",
-        "openai",
-        None,
-        "https://opencode.ai/zen/v1",
-        "任意名称"
-    )));
-    assert!(is_opencode_channel(&make(
-        "custom",
-        "openai",
-        None,
-        "https://example.com/v1",
-        "OpenCode 免费"
-    )));
-
-    // 非 OpenCode 渠道不应被过滤
-    assert!(!is_opencode_channel(&make(
-        "openai-main",
-        "openai",
-        Some("openai"),
-        "https://api.openai.com/v1",
-        "OpenAI 官方"
-    )));
-    assert!(!is_opencode_channel(&make(
-        "custom",
-        "openai",
-        None,
-        "https://api.deepseek.com/v1",
-        "DeepSeek"
-    )));
-}
-
-#[test]
-fn opencode_free_model_filter_keeps_only_free_models() {
-    // 与 OpenCode zen /v1/models 实际返回一致的抽样
-    let upstream = [
-        "claude-sonnet-5",
-        "gpt-5.1-codex-max",
-        "gemini-3.5-flash",
-        "grok-4.6",
-        "deepseek-v4-pro",
-        "kimi-k3",
-        "big-pickle",
-        "deepseek-v4-flash-free",
-        "mimo-v2.5-free",
-        "nemotron-3-ultra-free",
-        "laguna-s-2.1-free",
-        "muse-spark-1.2-contributor-free",
-    ];
-    let kept: Vec<&str> = upstream
-        .iter()
-        .copied()
-        .filter(|m| is_free_opencode_model(m))
-        .collect();
-    assert_eq!(
-        kept,
-        vec![
-            "big-pickle",
-            "deepseek-v4-flash-free",
-            "mimo-v2.5-free",
-            "nemotron-3-ultra-free",
-            "laguna-s-2.1-free",
-            "muse-spark-1.2-contributor-free",
-        ]
-    );
-}
-
-#[test]
-fn gateway_model_list_prefixes_opencode_ids_once() {
-    let config = ModelProxyConfig::default();
+fn gateway_model_list_prefixes_alias_ids_once() {
+    let config = ModelProxyConfig {
+        channels: vec![order_test_channel("preview", "preview", true)],
+        ..ModelProxyConfig::default()
+    };
     let cached = vec![ChannelModelList {
-        channel_id: "opencode".into(),
-        channel_name: "OpenCode".into(),
-        alias: "opencode".into(),
-        models: vec![
-            "big-pickle".into(),
-            "opencode/deepseek-v4-flash-free".into(),
-        ],
+        channel_id: "preview".into(),
+        channel_name: "Preview".into(),
+        alias: "preview".into(),
+        models: vec!["big-pickle".into(), "preview/deepseek-v4-flash-free".into()],
     }];
     let items = build_gateway_model_list(&config, &cached);
     let ids: Vec<&str> = items
@@ -933,29 +870,30 @@ fn gateway_model_list_prefixes_opencode_ids_once() {
         .collect();
     assert_eq!(
         ids,
-        vec!["opencode/big-pickle", "opencode/deepseek-v4-flash-free"]
+        vec!["preview/big-pickle", "preview/deepseek-v4-flash-free"]
     );
-    assert!(ids.iter().all(|id| id.starts_with("opencode/")));
+    assert!(ids.iter().all(|id| id.starts_with("preview/")));
     assert!(!ids.iter().any(|id| *id == "big-pickle"));
-    assert!(!ids.iter().any(|id| id.starts_with("opencode/opencode/")));
+    assert!(!ids.iter().any(|id| id.starts_with("preview/preview/")));
 }
 
 #[test]
 fn gateway_model_list_does_not_duplicate_prefixed_enabled_models() {
-    let mut config = ModelProxyConfig::default();
-    config.channels[0].enabled_models = Some(vec![
+    let mut ch = order_test_channel("preview", "preview", true);
+    ch.enabled_models = Some(vec![
         "big-pickle".into(),
-        "opencode/glm-4-flash-free".into(),
+        "preview/glm-4-flash-free".into(),
     ]);
+    let config = ModelProxyConfig {
+        channels: vec![ch],
+        ..ModelProxyConfig::default()
+    };
     let items = build_gateway_model_list(&config, &[]);
     let ids: Vec<&str> = items
         .iter()
         .filter_map(|item| item.get("id").and_then(|v| v.as_str()))
         .collect();
-    assert_eq!(
-        ids,
-        vec!["opencode/big-pickle", "opencode/glm-4-flash-free"]
-    );
+    assert_eq!(ids, vec!["preview/big-pickle", "preview/glm-4-flash-free"]);
 }
 
 #[tokio::test]
@@ -1154,7 +1092,7 @@ async fn logger_helper_records_failure_and_increments_metrics() {
         ProxyLogParams::new_failure(
             "req_test_999".to_string(),
             "/v1/chat/completions".to_string(),
-            "opencode".to_string(),
+            "fallback".to_string(),
             "gpt-4o".to_string(),
             false,
             429,
@@ -1192,88 +1130,6 @@ fn egress_request_meta_constructs_properly() {
     assert!(meta.stream);
 }
 
-#[test]
-fn opencode_free_and_non_free_model_classification() {
-    // 免费模型
-    assert!(is_free_opencode_model("deepseek-v4-flash-free"));
-    assert!(is_free_opencode_model("opencode/deepseek-v4-flash-free"));
-    assert!(is_free_opencode_model("big-pickle"));
-    assert!(is_free_opencode_model("opencode/big-pickle"));
-    assert!(is_free_opencode_model("mimo-v2.5-free"));
-    assert!(is_free_opencode_model("nemotron-3-ultra-free"));
-    assert!(is_free_opencode_model("x-preview-f-free"));
-
-    // 付费模型（需携带 Key）
-    assert!(!is_free_opencode_model("gpt-4o"));
-    assert!(!is_free_opencode_model("opencode/gpt-4o"));
-    assert!(!is_free_opencode_model("claude-3-7-sonnet"));
-    assert!(!is_free_opencode_model("claude-sonnet-5"));
-    assert!(!is_free_opencode_model("deepseek-v4-pro"));
-    assert!(!is_free_opencode_model("glm-5.2"));
-}
-
-#[tokio::test]
-async fn opencode_model_compatibility_and_anonymous_mode() {
-    let ch_no_key = ChannelConfig {
-        id: "opencode".to_string(),
-        name: "OpenCode".to_string(),
-        description: "".to_string(),
-        enabled: true,
-        protocol: "openai".to_string(),
-        base_url: "https://opencode.ai/zen/v1".to_string(),
-        api_key: "".to_string(),
-        api_keys: None,
-        use_proxy_pool: false,
-        alias: Some("opencode".to_string()),
-        site_id: None,
-        proxy_mode: None,
-        proxy_fixed_channel: None,
-        use_fixed_proxy: false,
-        fixed_proxy_node: None,
-        enabled_models: None,
-        model_redirects: None,
-        stats_id: None,
-        key_groups: None,
-        key_rules: None,
-        model_proxy_rules: None,
-    };
-
-    let state = ModelProxyState::new_with_app(None);
-    // 匿名模式：未配置 Key 时可用 Key 列表为空，出网 Key 为空字符串
-    assert!(resolve_channel_api_keys(&state.context, &ch_no_key)
-        .await
-        .is_empty());
-    let selected_key = String::new();
-
-    // 免费模型在无 Key 匿名模式下通过校验
-    assert!(
-        check_model_channel_compatibility(&ch_no_key, "deepseek-v4-flash-free", &selected_key)
-            .is_ok()
-    );
-    assert!(check_model_channel_compatibility(&ch_no_key, "big-pickle", &selected_key).is_ok());
-    assert!(check_model_channel_compatibility(&ch_no_key, "mimo-v2.5-free", &selected_key).is_ok());
-
-    // 付费模型在无 Key 匿名模式下前置拦截
-    assert!(check_model_channel_compatibility(&ch_no_key, "gpt-4o", &selected_key).is_err());
-    assert!(
-        check_model_channel_compatibility(&ch_no_key, "claude-3-7-sonnet", &selected_key).is_err()
-    );
-
-    // 配置了 Key 后付费模型通过校验
-    let ch_explicit_key = ChannelConfig {
-        api_key: "sk-custom-key".to_string(),
-        ..ch_no_key
-    };
-    assert_eq!(
-        resolve_channel_api_keys(&state.context, &ch_explicit_key).await,
-        vec!["sk-custom-key"]
-    );
-    let selected_explicit = "sk-custom-key";
-    assert!(
-        check_model_channel_compatibility(&ch_explicit_key, "gpt-4o", &selected_explicit).is_ok()
-    );
-}
-
 fn stats_channel(id: &str, alias: Option<&str>, stats_id: Option<u32>) -> ChannelConfig {
     ChannelConfig {
         id: id.to_string(),
@@ -1301,18 +1157,13 @@ fn stats_channel(id: &str, alias: Option<&str>, stats_id: Option<u32>) -> Channe
 }
 
 #[test]
-fn assigns_stable_stats_ids_with_reserved_builtin_band() {
+fn assigns_stable_stats_ids_from_reserved_band() {
     use crate::model::gateway::config::sanitize_model_proxy_config;
 
-    // opencode 固定为 1（即便被篡改），动态渠道从 101 起分配
+    // 动态渠道一律从 101 起分配（1-100 为历史内置渠道保留段，不再复用）
     let mut cfg = ModelProxyConfig {
         channels: vec![
             stats_channel("site_a", Some("alpha"), None),
-            {
-                let mut oc = stats_channel("opencode", Some("tampered"), Some(999));
-                oc.base_url = "https://opencode.ai/zen/v1".to_string();
-                oc
-            },
             stats_channel("site_b", Some("beta"), None),
         ],
         ..ModelProxyConfig::default()
@@ -1320,7 +1171,6 @@ fn assigns_stable_stats_ids_with_reserved_builtin_band() {
     sanitize_model_proxy_config(&mut cfg);
 
     let by_id = |id: &str| cfg.channels.iter().find(|c| c.id == id).unwrap();
-    assert_eq!(by_id("opencode").stats_id, Some(1));
     assert_eq!(by_id("site_a").stats_id, Some(101));
     assert_eq!(by_id("site_b").stats_id, Some(102));
     assert_eq!(cfg.next_channel_stats_id, 103);
@@ -1330,19 +1180,16 @@ fn assigns_stable_stats_ids_with_reserved_builtin_band() {
     // 改别名后 ID 不变；重复 sanitize 幂等，计数器不回退
     let mut renamed = cfg.clone();
     renamed.channels[0].alias = Some("renamed".to_string());
-    renamed.channels[0].stats_id = None;
-    renamed.channels.pop();
     sanitize_model_proxy_config(&mut renamed);
-    assert_eq!(renamed.channels[0].stats_id, Some(103));
-    assert_eq!(renamed.channels[0].stats_key(), "103");
-    assert_eq!(renamed.channels[1].stats_id, Some(1));
+    assert_eq!(renamed.channels[0].stats_id, Some(101));
+    assert_eq!(renamed.channels[0].stats_key(), "101");
     assert!(renamed.next_channel_stats_id >= 103);
 
-    // 已分配 ID 的渠道保持不变
-    let mut again = renamed.clone();
-    sanitize_model_proxy_config(&mut again);
-    assert_eq!(again.channels[0].stats_id, Some(103));
-    assert_eq!(again.channels[1].stats_id, Some(1));
+    // 新增渠道顺延分配，已分配 ID 的渠道保持不变
+    renamed.channels.push(stats_channel("site_c", Some("gamma"), None));
+    sanitize_model_proxy_config(&mut renamed);
+    assert_eq!(by_id("site_a").stats_id, Some(101));
+    assert_eq!(renamed.channels[2].stats_id, Some(103));
 }
 
 #[test]
@@ -1367,7 +1214,7 @@ fn legacy_config_json_without_stats_id_still_parses() {
 }
 
 // ---------------------------------------------------------------------------
-// OpenCode 503 同节点原地重试（不受 max_retries 名额约束）
+// 通用出网调度测试夹具（本地 mock 上游 / 脚本化应答）
 // ---------------------------------------------------------------------------
 
 /// 启动一个按脚本应答的本地 mock 上游：第 N 次请求返回 script[N]（越界时重复末项）。
@@ -1560,95 +1407,6 @@ async fn run_egress(
     .await
 }
 
-#[tokio::test]
-async fn opencode_503_retries_inplace_once_then_succeeds_without_consuming_retry_budget() {
-    use std::sync::atomic::Ordering;
-    use std::time::Duration;
-
-    // max_retries=0：常规预算只有 1 次尝试，503 原地重试必须独立于该预算生效
-    let (addr, counter, arrivals) = spawn_scripted_upstream_with_arrivals(vec![
-        (
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            r#"{"error":{"message":"upstream unavailable"}}"#,
-        ),
-        (axum::http::StatusCode::OK, valid_chat_payload()),
-    ])
-    .await;
-    let channel = egress_test_channel("opencode", format!("http://{addr}/v1"));
-
-    let success = run_egress(&channel, 0)
-        .await
-        .expect("首次 503 后原地重试应成功");
-
-    assert_eq!(success.status, 200);
-    assert_eq!(
-        counter.load(Ordering::SeqCst),
-        2,
-        "同一节点应恰好发送 2 次（首次 + 原地重试），且不切换节点"
-    );
-    // 退避时长用服务端到达间隔测量：间隔 >= 1 秒退避。该方向噪声免疫
-    // （调度延迟只会拉大间隔，不会缩短）。「退避没有变长」无法在并行满载
-    // 下用间隔可靠断言——调度延迟与退避增长不可区分（实测满载可达 4.6s），
-    // 行为契约由次数断言（恰好 2 次、不切节点）承载
-    let arrivals = arrivals.lock().unwrap().clone();
-    assert_eq!(arrivals.len(), 2);
-    let gap = arrivals[1].duration_since(arrivals[0]);
-    assert!(
-        gap >= Duration::from_millis(900),
-        "原地重试前必须等待 1 秒（服务端到达间隔 {gap:?}）"
-    );
-}
-
-#[tokio::test]
-async fn opencode_persistent_503_gets_one_inplace_retry_per_node_before_switching() {
-    use std::sync::atomic::Ordering;
-    use std::time::{Duration, Instant};
-
-    // max_retries=1：两轮尝试（两个候选位），每轮各享一次免费原地重试 → 共 4 次请求
-    let (addr, counter) = spawn_scripted_upstream(vec![(
-        axum::http::StatusCode::SERVICE_UNAVAILABLE,
-        r#"{"error":{"message":"upstream unavailable"}}"#,
-    )])
-    .await;
-    let channel = egress_test_channel("opencode", format!("http://{addr}/v1"));
-
-    let started = Instant::now();
-    let result = run_egress(&channel, 1).await;
-
-    assert!(result.is_err(), "持续 503 最终必须返回错误");
-    assert_eq!(
-        counter.load(Ordering::SeqCst),
-        4,
-        "每轮尝试应含一次 503 原地重试（2 轮 × 2 次），随后才切换节点"
-    );
-    assert!(started.elapsed() >= Duration::from_millis(2000));
-}
-
-#[tokio::test]
-async fn non_opencode_channel_does_not_inplace_retry_on_503() {
-    use std::sync::atomic::Ordering;
-
-    // 5xx 原地重试是 OpenCode 免 Key 渠道的专属容错。有 Key 的普通渠道失败后
-    // 由 pipeline 顺延到下一把 Key；max_retries=0 时同一把 Key 只发一次，直接返回错误。
-    let (addr, counter) = spawn_scripted_upstream(vec![
-        (
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            r#"{"error":{"message":"upstream unavailable"}}"#,
-        ),
-        (axum::http::StatusCode::OK, valid_chat_payload()),
-    ])
-    .await;
-    let channel = egress_test_channel("plain-upstream", format!("http://{addr}/v1"));
-
-    let result = run_egress(&channel, 0).await;
-    assert!(result.is_err(), "普通渠道 503 不做原地重试，直接返回错误");
-    assert_eq!(
-        counter.load(Ordering::SeqCst),
-        1,
-        "同一把 Key 只应发送 1 次"
-    );
-}
-
 /// 直连单出口的普通渠道：max_retries 是换节点预算，没有第二个出口时退化为 0，
 /// 同一把 Key 不会在同一条路上反复重发（换 Key 由 pipeline 负责）。
 #[tokio::test]
@@ -1668,220 +1426,6 @@ async fn direct_channel_ignores_node_retry_budget() {
         counter.load(Ordering::SeqCst),
         1,
         "直连渠道即便 max_retries=3 也只应发送 1 次"
-    );
-}
-
-#[tokio::test]
-async fn opencode_502_retries_inplace_once_then_succeeds() {
-    use std::sync::atomic::Ordering;
-    use std::time::{Duration, Instant};
-
-    // 502 与 503 同等对待：max_retries=0 时依然获得一次免费原地重试
-    let (addr, counter) = spawn_scripted_upstream(vec![
-        (
-            axum::http::StatusCode::BAD_GATEWAY,
-            r#"{"error":{"message":"bad gateway"}}"#,
-        ),
-        (axum::http::StatusCode::OK, valid_chat_payload()),
-    ])
-    .await;
-    let channel = egress_test_channel("opencode", format!("http://{addr}/v1"));
-
-    let started = Instant::now();
-    let success = run_egress(&channel, 0)
-        .await
-        .expect("首次 502 后原地重试应成功");
-    let elapsed = started.elapsed();
-
-    assert_eq!(success.status, 200);
-    assert_eq!(counter.load(Ordering::SeqCst), 2);
-    assert!(elapsed >= Duration::from_millis(1000));
-}
-
-#[tokio::test]
-async fn opencode_channel_egress_carries_upstream_accepted_cli_identity() {
-    use crate::model::gateway::policies::opencode::upstream_accepts_session_id;
-
-    // 上游免费层按 UA 版本 + 会话 ID 形状判定「请求来自 OpenCode 客户端」：
-    // 旧实现发的 sess_<hex> 会话前缀被 403 拦截（OpenCode's free tier ...）。
-    // 这里断言真实出网请求（经 dispatcher 完整链路）带齐可通过该校验的身份头。
-    let (addr, _counter, _arrivals, headers_log) =
-        spawn_mock_upstream_capturing(vec![(axum::http::StatusCode::OK, valid_chat_payload())])
-            .await;
-    let channel = egress_test_channel("opencode", format!("http://{addr}/v1"));
-
-    run_egress(&channel, 0).await.expect("mock 上游应返回成功");
-
-    let headers = headers_log.lock().unwrap();
-    let sent = headers.first().expect("mock 上游应收到一次请求");
-    let header = |name: &str| {
-        sent.get(name)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or_default()
-            .to_string()
-    };
-
-    let ua = header("user-agent");
-    assert!(
-        ua.starts_with("opencode/"),
-        "UA 必须带 opencode/ 前缀: {ua}"
-    );
-    let version = ua
-        .trim_start_matches("opencode/")
-        .split_whitespace()
-        .next()
-        .unwrap_or_default();
-    let segments: Vec<u32> = version.split('.').filter_map(|s| s.parse().ok()).collect();
-    assert!(
-        segments.len() >= 3 && (segments[0], segments[1]) >= (1, 17),
-        "UA 版本需 ≥ 1.17.0（上游下限）: {version}"
-    );
-
-    let session = header("x-opencode-session");
-    assert!(
-        upstream_accepts_session_id(&session),
-        "会话 ID 形状不被上游接受: {session}"
-    );
-    assert_eq!(header("x-opencode-client"), "cli");
-    assert_eq!(header("x-opencode-project"), "global");
-    assert!(header("x-opencode-request").starts_with("msg_"));
-}
-
-#[tokio::test]
-async fn opencode_empty_200_payload_retries_inplace_then_succeeds() {
-    use std::sync::atomic::Ordering;
-    use std::time::{Duration, Instant};
-
-    // OpenCode 官方缺陷：返回 200 但响应体为空内容 → 必须与 5xx 一样原地重试。
-    // 注意：仅有思考（reasoning_content）没有正文属于有效负载（P1-9），
-    // 纯推理模型可能整段只输出思考，不再按空内容处理。
-    for empty_payload in [
-        "",
-        r#"{"choices":[]}"#,
-        r#"{"choices":[{"index":0,"message":{"role":"assistant","content":null},"finish_reason":"stop"}],"usage":{"prompt_tokens":10}}"#,
-    ] {
-        let (addr, counter) = spawn_scripted_upstream(vec![
-            (axum::http::StatusCode::OK, empty_payload),
-            (axum::http::StatusCode::OK, valid_chat_payload()),
-        ])
-        .await;
-        let channel = egress_test_channel("opencode", format!("http://{addr}/v1"));
-
-        let started = Instant::now();
-        let success = run_egress(&channel, 0)
-            .await
-            .unwrap_or_else(|_| panic!("空内容「{empty_payload}」重试后应成功"));
-        let elapsed = started.elapsed();
-
-        assert_eq!(success.status, 200);
-        assert_eq!(
-            counter.load(Ordering::SeqCst),
-            2,
-            "空内容「{empty_payload}」应触发恰好一次原地重试"
-        );
-        assert!(elapsed >= Duration::from_millis(1000));
-        // 重试成功的响应体必须完好可读（预读打包回 Response 的链路不能丢数据）
-        let body = success.response.bytes().await.expect("响应体应可读取");
-        assert_eq!(body, valid_chat_payload().as_bytes());
-    }
-}
-
-#[tokio::test]
-async fn opencode_persistent_empty_payload_returns_400_after_budget_exhausted() {
-    use std::sync::atomic::Ordering;
-    use std::time::{Duration, Instant};
-
-    // max_retries=0：单节点一次机会 —— 空内容原地重试仍为空后直接以 400 返回客户端
-    let (addr, counter) =
-        spawn_scripted_upstream(vec![(axum::http::StatusCode::OK, r#"{"choices":[]}"#)]).await;
-    let channel = egress_test_channel("opencode", format!("http://{addr}/v1"));
-
-    let started = Instant::now();
-    let err = match run_egress(&channel, 0).await {
-        Ok(_) => panic!("持续空内容必须按错误返回"),
-        Err(resp) => resp,
-    };
-    let elapsed = started.elapsed();
-
-    assert_eq!(
-        err.status(),
-        axum::http::StatusCode::BAD_REQUEST,
-        "空返回最终必须以 400 状态码返回客户端"
-    );
-    assert_eq!(
-        counter.load(Ordering::SeqCst),
-        2,
-        "单节点应恰好发送 2 次（首次 + 原地重试）"
-    );
-    assert!(elapsed >= Duration::from_millis(1000));
-}
-
-#[tokio::test]
-async fn opencode_empty_payload_participates_in_node_rotation_before_400() {
-    use std::sync::atomic::Ordering;
-    use std::time::{Duration, Instant};
-
-    // max_retries=1：两轮候选位，每轮含一次免费原地重试 → 共 4 次请求后以 400 收尾
-    let (addr, counter) = spawn_scripted_upstream(vec![(axum::http::StatusCode::OK, "")]).await;
-    let channel = egress_test_channel("opencode", format!("http://{addr}/v1"));
-
-    let started = Instant::now();
-    let err = match run_egress(&channel, 1).await {
-        Ok(_) => panic!("持续空内容必须按错误返回"),
-        Err(resp) => resp,
-    };
-
-    assert_eq!(err.status(), axum::http::StatusCode::BAD_REQUEST);
-    assert_eq!(counter.load(Ordering::SeqCst), 4);
-    assert!(started.elapsed() >= Duration::from_millis(2000));
-}
-
-#[tokio::test]
-async fn opencode_valid_200_payload_does_not_retry() {
-    use std::sync::atomic::Ordering;
-
-    // 正常内容不得误判为空：仅发送 1 次。不设墙钟上限——请求次数断言已完整
-    // 承载「无重试」契约，而本机网络扩展冷启动下墙钟波动可达数秒，任何
-    // 紧上限都必然间歇性误报
-    let (addr, counter) =
-        spawn_scripted_upstream(vec![(axum::http::StatusCode::OK, valid_chat_payload())]).await;
-    let channel = egress_test_channel("opencode", format!("http://{addr}/v1"));
-
-    let success = run_egress(&channel, 0).await.expect("正常响应应直接成功");
-
-    assert_eq!(success.status, 200);
-    assert_eq!(counter.load(Ordering::SeqCst), 1, "有效内容不应重试");
-
-    // 纯文本/HTML 等 200 负载不属于「空内容」，同样不重试
-    let (addr, counter) =
-        spawn_scripted_upstream(vec![(axum::http::StatusCode::OK, "<html>ok</html>")]).await;
-    let channel = egress_test_channel("opencode", format!("http://{addr}/v1"));
-    let _ = run_egress(&channel, 0).await;
-    assert_eq!(counter.load(Ordering::SeqCst), 1);
-
-    // 正文 + 思考并存是完整有效响应，不得误判为空内容
-    let with_reasoning = r#"{"choices":[{"index":0,"message":{"role":"assistant","content":"最终答案","reasoning_content":"推理过程"},"finish_reason":"stop"}]}"#;
-    let (addr, counter) =
-        spawn_scripted_upstream(vec![(axum::http::StatusCode::OK, with_reasoning)]).await;
-    let channel = egress_test_channel("opencode", format!("http://{addr}/v1"));
-    let success = run_egress(&channel, 0).await.expect("正文+思考应直接成功");
-    assert_eq!(success.status, 200);
-    assert_eq!(
-        counter.load(Ordering::SeqCst),
-        1,
-        "有正文的响应（即便带思考）不应重试"
-    );
-
-    // 工具调用也是有效产出：无正文但有 tool_calls 不重试
-    let tool_only = r#"{"choices":[{"index":0,"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"a.rs\"}"}}]},"finish_reason":"tool_calls"}]}"#;
-    let (addr, counter) =
-        spawn_scripted_upstream(vec![(axum::http::StatusCode::OK, tool_only)]).await;
-    let channel = egress_test_channel("opencode", format!("http://{addr}/v1"));
-    let _ = run_egress(&channel, 0).await;
-    assert_eq!(
-        counter.load(Ordering::SeqCst),
-        1,
-        "tool_calls 属于有效负载，不应重试"
     );
 }
 
@@ -2138,7 +1682,7 @@ async fn resolve_channel_api_keys_reads_site_cache_and_dedupes() {
 /// 退回渠道级代理模式，用户设置的「强制直连」被无声忽略。
 #[test]
 fn model_proxy_rule_is_keyed_by_bare_model_not_prefixed() {
-    let mut channel = ModelProxyConfig::default().channels.remove(0);
+    let mut channel = generic_test_channel();
     channel.alias = Some("x666".to_string());
     channel.model_proxy_rules = Some(vec![ModelProxyRule {
         protocol: None,
@@ -2167,7 +1711,7 @@ fn model_proxy_rule_is_keyed_by_bare_model_not_prefixed() {
 /// 二者构成 EgressRequestMeta.rule_model 的完整链路。
 #[test]
 fn resolved_bare_model_matches_proxy_rule_after_prefix_strip() {
-    let mut channel = ModelProxyConfig::default().channels.remove(0);
+    let mut channel = generic_test_channel();
     channel.alias = Some("x666".to_string());
     channel.enabled = true;
     channel.model_proxy_rules = Some(vec![ModelProxyRule {
@@ -2204,7 +1748,7 @@ fn resolved_bare_model_matches_proxy_rule_after_prefix_strip() {
 /// 两种结果不会退化成同一个值，测试对接线错误保持判别力。
 #[tokio::test]
 async fn egress_candidates_honor_direct_rule_only_with_bare_model() {
-    let mut channel = ModelProxyConfig::default().channels.remove(0);
+    let mut channel = generic_test_channel();
     channel.alias = Some("x666".to_string());
     channel.proxy_mode = Some("fixed_channel".to_string());
     channel.proxy_fixed_channel = Some("lane-a".to_string());
@@ -2267,7 +1811,7 @@ fn candidate_list_head_matches_resolve_channel() {
 
     let mut cfg = ModelProxyConfig {
         channels: vec![
-            order_test_channel("opencode", "opencode", true),
+            order_test_channel("fallback", "fallback", true),
             {
                 let mut ch = order_test_channel("b", "b", true);
                 ch.enabled_models = Some(vec!["shared-model".to_string()]);
@@ -2290,10 +1834,10 @@ fn candidate_list_head_matches_resolve_channel() {
                 assert_eq!(c1.id, c2.id, "首项渠道应与 resolve_channel 一致: {model}");
                 assert_eq!(m1, &m2, "裸模型名应一致: {model}");
             }
-            // resolve_channel 落到 opencode/首个启用渠道兜底时，候选列表为空：
+            // resolve_channel 落到首个启用渠道兜底时，候选列表为空：
             // 兜底渠道并未声明提供该模型，不是故障转移候选
             (None, Some((c2, _))) => {
-                assert_eq!(c2.id, "opencode", "仅兜底解析允许候选列表为空: {model}");
+                assert_eq!(c2.id, "fallback", "仅兜底解析允许候选列表为空: {model}");
             }
             (None, None) => {}
             _ => panic!("候选列表与 resolve_channel 的可解析性不一致: {model}"),
@@ -2321,7 +1865,7 @@ fn aliased_request_does_not_expand_to_fallback_channels() {
 
     let cfg = ModelProxyConfig {
         channels: vec![
-            order_test_channel("opencode", "opencode", true),
+            order_test_channel("fallback", "fallback", true),
             order_test_channel("a", "a", true),
             order_test_channel("b", "b", true),
         ],
@@ -2744,7 +2288,7 @@ async fn node_cursor_is_sharded_per_channel() {
 // 定向路由不兜底 / 跨渠道转移默认关闭 / Key 级故障转移顺序
 // ---------------------------------------------------------------------------
 
-/// 定向指派命中已禁用渠道：绝不能兜底到 opencode 或其他渠道。
+/// 定向指派命中已禁用渠道：绝不能兜底到其他渠道。
 #[test]
 fn aliased_request_to_disabled_channel_never_falls_back() {
     use crate::model::gateway::balancer::{
@@ -2753,7 +2297,7 @@ fn aliased_request_to_disabled_channel_never_falls_back() {
 
     let cfg = ModelProxyConfig {
         channels: vec![
-            order_test_channel("opencode", "opencode", true),
+            order_test_channel("fallback", "fallback", true),
             order_test_channel("x666", "x666", false),
             order_test_channel("other", "other", true),
         ],
@@ -2776,7 +2320,7 @@ fn aliased_request_to_disabled_channel_never_falls_back() {
         "定向请求没有后备渠道"
     );
 
-    // opencode 也关掉时同样不得落到 other
+    // 兜底渠道也关掉时同样不得落到 other
     let mut cfg2 = cfg.clone();
     cfg2.channels[0].enabled = false;
     assert!(resolve_channel(&cfg2, "x666/claude-sonnet-5").is_none());
@@ -2786,7 +2330,7 @@ fn aliased_request_to_disabled_channel_never_falls_back() {
 #[test]
 fn unknown_prefix_is_treated_as_bare_model_name() {
     let cfg = ModelProxyConfig {
-        channels: vec![order_test_channel("opencode", "opencode", true), {
+        channels: vec![order_test_channel("fallback", "fallback", true), {
             let mut ch = order_test_channel("site", "site", true);
             ch.enabled_models = Some(vec!["deepseek-ai/DeepSeek-V3".to_string()]);
             ch
@@ -3163,37 +2707,3 @@ async fn rate_limit_failovers_to_healthy_key_and_skips_cooling_one() {
     );
 }
 
-#[tokio::test]
-async fn read_body_idle_passes_through_stream_and_times_out_on_stall() {
-    use futures_util::stream;
-    use futures_util::StreamExt;
-
-    // 正常流：全部块到达后原样返回
-    let body = reqwest::Body::wrap_stream(stream::iter(vec![
-        Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"hello ")),
-        Ok(bytes::Bytes::from_static(b"world")),
-    ]));
-    let resp = reqwest::Response::from(axum::http::Response::new(body));
-    let got = crate::model::gateway::dispatcher::read_body_idle(
-        resp,
-        std::time::Duration::from_secs(2),
-    )
-    .await
-    .expect("正常流不应报错");
-    assert_eq!(got, bytes::Bytes::from_static(b"hello world"));
-
-    // 停摆流：首块之后永不再有数据 → 连续空闲窗口触发超时（总时长不设限）
-    let stalled =
-        stream::iter(vec![Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"partial"))])
-            .chain(stream::pending());
-    let resp = reqwest::Response::from(axum::http::Response::new(reqwest::Body::wrap_stream(
-        stalled,
-    )));
-    let err = crate::model::gateway::dispatcher::read_body_idle(
-        resp,
-        std::time::Duration::from_millis(100),
-    )
-    .await
-    .expect_err("停摆流必须触发空闲超时");
-    assert!(err.contains("无数据"), "超时文案应说明无数据: {err}");
-}

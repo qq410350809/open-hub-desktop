@@ -227,7 +227,7 @@ pub fn run() {
             let gateway_state = crate::model::gateway::ModelProxyState::new();
             crate::context::block_on(gateway_state.attach_ctx(ctx.clone()));
             // 真正 listen 可以等代理恢复，但持久化渠道必须先灌入内存：
-            // 否则第一次 get_opencode_proxy_status 会返回 Default 的 1 条渠道。
+            // 否则第一次 get_model_proxy_status 会返回 Default 的空渠道列表。
             let persisted_proxy_cfg = {
                 let conn = ctx.database.0.lock().ok();
                 conn.map(|c| crate::model::gateway::load_model_proxy_config(&c))
@@ -447,6 +447,8 @@ pub fn run() {
             crate::model::gateway::start_model_proxy,
             crate::model::gateway::stop_model_proxy,
             crate::model::gateway::fetch_model_proxy_models,
+            crate::model::gateway::get_cached_channel_models,
+            crate::model::gateway::get_cached_channel_errors,
             crate::model::gateway::get_model_proxy_logs,
             crate::model::gateway::get_proxy_token_usage,
             crate::model::gateway::get_model_proxy_channel_stats,
@@ -454,18 +456,6 @@ pub fn run() {
             crate::model::gateway::get_model_proxy_overview_stats,
             crate::model::gateway::clear_model_proxy_logs,
             crate::model::gateway::sync_model_proxy_site_channels,
-            crate::model::gateway::get_opencode_proxy_config,
-            crate::model::gateway::save_opencode_proxy_config_cmd,
-            crate::model::gateway::get_opencode_proxy_status,
-            crate::model::gateway::start_opencode_proxy,
-            crate::model::gateway::stop_opencode_proxy,
-            crate::model::gateway::fetch_opencode_models,
-            crate::model::gateway::get_opencode_cached_channel_models,
-            crate::model::gateway::get_opencode_cached_channel_errors,
-            crate::model::gateway::get_opencode_proxy_logs,
-            crate::model::gateway::get_opencode_channel_stats,
-            crate::model::gateway::clear_opencode_proxy_logs,
-            crate::model::gateway::sync_opencode_site_channels,
             file_export::save_export_file,
             kernel::get_component_bootstrap_status,
             kernel::get_mihomo_kernel_status,

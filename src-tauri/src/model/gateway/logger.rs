@@ -166,7 +166,6 @@ const USER_AGENT_SOURCE_PREFIXES: &[(&str, &str)] = &[
     ("codex", "codex"),
     ("cursor", "cursor"),
     ("gemini", "gemini"),
-    ("opencode", "opencode"),
     ("kiro", "kiro"),
     ("copilot", "copilot"),
     ("goose", "goose"),
@@ -231,7 +230,7 @@ pub fn user_agent_from_headers(headers: &axum::http::HeaderMap) -> Option<String
 
 /// 从请求头提取客户端会话标识，供日志按会话聚合排查。
 /// 覆盖各客户端的常见约定头：通用 x-session-id、Anthropic 元数据、
-/// OpenAI Assistants、Codex 与 OpenCode 的会话头；长度钳制防滥用。
+/// OpenAI Assistants、Codex 的会话头；长度钳制防滥用。
 pub fn session_id_from_headers(headers: &axum::http::HeaderMap) -> Option<String> {
     const SESSION_HEADERS: &[&str] = &[
         "x-session-id",
@@ -239,7 +238,6 @@ pub fn session_id_from_headers(headers: &axum::http::HeaderMap) -> Option<String
         "anthropic-metadata-user-id",
         "x-assistant-session-id",
         "openai-conversation-id",
-        "x-opencode-session",
         "x-claude-session-id",
     ];
     for name in SESSION_HEADERS {
@@ -273,22 +271,13 @@ pub async fn record_auth_failure_log(
     session_id: Option<String>,
 ) {
     ctx.metrics.total_requests.fetch_add(1, Ordering::Relaxed);
-    // 鉴权失败发生在渠道解析前，沿用既有惯例计入 opencode 通道（含其统计 ID）
-    let opencode_stats_id = ctx
-        .config
-        .read()
-        .await
-        .channels
-        .iter()
-        .find(|c| c.id == "opencode")
-        .and_then(|c| c.stats_id)
-        .map(|v| v.to_string());
+    // 鉴权失败发生在渠道解析前，统一记到网关维度（不借用任何内置渠道）
     record_attempt_failure(
         ctx,
         ProxyLogParams::new_failure(
             req_id.to_string(),
             path.to_string(),
-            "opencode".to_string(),
+            "gateway".to_string(),
             model.to_string(),
             stream,
             401,
@@ -297,7 +286,7 @@ pub async fn record_auth_failure_log(
             req_body_str,
             None,
         )
-        .with_channel_stats_id(opencode_stats_id)
+        .with_channel_stats_id(None)
         .with_client_name(client_name)
         .with_user_agent(user_agent)
         .with_session_id(session_id),
@@ -350,7 +339,7 @@ mod logger_tests {
         let log = ProxyLogParams::new_failure(
             "req-1".into(),
             "/v1/chat/completions".into(),
-            "opencode".into(),
+            "fallback".into(),
             "gpt-4".into(),
             false,
             401,

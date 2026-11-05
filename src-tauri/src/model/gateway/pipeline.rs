@@ -17,7 +17,6 @@ use super::logger::{
     client_name_from_headers, record_attempt_failure, session_id_from_headers,
     user_agent_from_headers, ProxyLogParams,
 };
-use super::policies::opencode::check_model_channel_compatibility;
 use super::router::check_auth;
 use super::types::{
     current_timestamp, ChannelConfig, ModelProxyConfig, ModelProxyContext, ProxyRequestLog,
@@ -338,14 +337,9 @@ pub async fn resolve_channel_or_404<'a>(
             ),
         ),
         ChannelResolution::NotFound => (
-            // 404 无法归属到具体渠道，沿用既有惯例计入 opencode 通道（含其统计 ID）
-            "opencode".to_string(),
-            config
-                .channels
-                .iter()
-                .find(|c| c.id == "opencode")
-                .and_then(|c| c.stats_id)
-                .map(|v| v.to_string()),
+            // 404 无法归属到具体渠道：统一记到网关维度，不再借用某个内置渠道
+            "gateway".to_string(),
+            None,
             format!("未找到支持模型 '{raw_model}' 的可用渠道"),
         ),
     };
@@ -371,51 +365,6 @@ pub async fn resolve_channel_or_404<'a>(
     )
     .await;
     Err(model_not_found_response_with_message(err_msg, style))
-}
-
-/// 统一校验渠道与模型兼容性，未通过时记录日志并返回对应协议错误响应
-pub async fn validate_model_channel_request(
-    ctx: &ModelProxyContext,
-    channel: &ChannelConfig,
-    model_to_send: &str,
-    raw_model: &str,
-    channel_api_key: &str,
-    path: &str,
-    style: ClientProtocol,
-    req_id: &str,
-    is_stream: bool,
-    start_time: Instant,
-    req_body_str: &Option<String>,
-    client_name: Option<String>,
-    user_agent: Option<String>,
-    session_id: Option<String>,
-) -> Result<(), Response> {
-    if let Err(err_msg) = check_model_channel_compatibility(channel, model_to_send, channel_api_key)
-    {
-        let dur = start_time.elapsed().as_millis() as u64;
-        record_attempt_failure(
-            ctx,
-            ProxyLogParams::new_failure(
-                req_id.to_string(),
-                path.to_string(),
-                channel.effective_alias(),
-                raw_model.to_string(),
-                is_stream,
-                400,
-                dur,
-                Some(err_msg.clone()),
-                req_body_str.clone(),
-                None,
-            )
-            .with_channel_stats_id(channel.stats_id.map(|v| v.to_string()))
-            .with_client_name(client_name)
-            .with_user_agent(user_agent)
-            .with_session_id(session_id),
-        )
-        .await;
-        return Err(incompatible_model_response(err_msg, style));
-    }
-    Ok(())
 }
 
 /// 一次成功出网的全部产物
@@ -499,7 +448,7 @@ async fn dispatch_single_channel_egress(
 
     let attempts: Vec<KeyAttempt> = if key_groups.is_empty() {
         // 空分组有两种成因，必须区分处理：
-        // ① 渠道一个 Key 都没有（免 Key 渠道，如 opencode）：按原样空 Key 单次尝试；
+        // ① 渠道一个 Key 都没有（免 Key 渠道）：按原样空 Key 单次尝试；
         // ② 渠道有 Key，但没有任何 Key 声明支持该模型（或 Key/分组全部被禁用）：
         //    此时改用任意其他 Key 出网即构成越权 —— 该 Key 并未获得此模型的访问授权。
         //    必须判该渠道无候选并跳过，交由上层跨渠道故障转移，
@@ -591,28 +540,6 @@ async fn dispatch_single_channel_egress(
                 model_to_send,
                 remaining.as_millis()
             );
-            continue;
-        }
-
-        if let Err(err_resp) = validate_model_channel_request(
-            ctx,
-            channel,
-            model_to_send,
-            raw_model,
-            selected_key,
-            path,
-            style,
-            req_id,
-            is_stream,
-            start_time,
-            req_body_str,
-            client_name.clone(),
-            user_agent.clone(),
-            session_id.clone(),
-        )
-        .await
-        {
-            errors.push(err_resp);
             continue;
         }
 

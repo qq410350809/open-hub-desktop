@@ -66,7 +66,7 @@ export interface ChannelConfig {
   /** fixed_channel 模式的渠道级默认固定通道 ID（Key 规则可按 Key 覆盖） */
   proxyFixedChannel?: string | null;
   enabledModels?: string[] | null;
-  /** 统计维度稳定数字 ID：内置渠道占 1-100（opencode=1），动态渠道从 101 起；与别名解耦 */
+  /** 统计维度稳定数字 ID：动态渠道从 101 起分配（1-100 为历史内置渠道保留段，不再复用）；与别名解耦 */
   statsId?: number;
   /** 渠道内 Key 分组定义（按数组顺序由高到低进行故障转移；分组身份即 Key 的 groupName） */
   keyGroups?: KeyGroupItem[] | null;
@@ -76,7 +76,7 @@ export interface ChannelConfig {
   modelProxyRules?: ModelProxyRule[] | null;
 }
 
-export interface OpencodeProxyConfig {
+export interface ModelProxyConfig {
   enabled: boolean;
   listenHost: string;
   port: number;
@@ -85,7 +85,7 @@ export interface OpencodeProxyConfig {
   timeoutSeconds: number;
   recordRequestBody?: boolean;
   maxRetries?: number;
-  /** 动态渠道统计 ID 分配计数器（101 起，1-100 预留内置渠道） */
+  /** 动态渠道统计 ID 分配计数器（101 起，1-100 为历史内置渠道保留段） */
   nextChannelStatsId?: number;
   /** 请求明细保留天数：超期自动清理明细（统计聚合不受影响）；0 或缺省 = 永久保留 */
   logRetentionDays?: number;
@@ -95,7 +95,7 @@ export interface OpencodeProxyConfig {
   channelFailover?: boolean;
 }
 
-export interface OpencodeProxyStatus {
+export interface ModelProxyStatus {
   running: boolean;
   port: number;
   url: string;

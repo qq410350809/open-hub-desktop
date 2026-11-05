@@ -99,7 +99,7 @@ pub struct ChannelConfig {
     pub api_keys: Option<Vec<String>>,
     #[serde(default)]
     pub use_proxy_pool: bool,
-    /// 英文别名：网关模型前缀（如 opencode/*）；全渠道唯一。为空回退为渠道 id。
+    /// 英文别名：网关模型前缀（如 alias/*）；全渠道唯一。为空回退为渠道 id。
     #[serde(default)]
     pub alias: Option<String>,
     /// 通过「站点转换」创建时关联的站点库站点 id
@@ -127,7 +127,7 @@ pub struct ChannelConfig {
     /// 模型重定向映射表：例如 {"gpt-4": "gpt-4-turbo"}
     #[serde(default)]
     pub model_redirects: Option<HashMap<String, String>>,
-    /// 统计维度稳定数字 ID：内置固化渠道占用 1-100（opencode=1），动态渠道从 101 递增。
+    /// 统计维度稳定数字 ID：1-100 为历史内置渠道保留段（不再分配），动态渠道从 101 递增。
     /// 与可修改的英文别名解耦，改名/改编码后历史统计不错位。
     #[serde(default)]
     pub stats_id: Option<u32>,
@@ -229,11 +229,6 @@ impl ChannelConfig {
                 }
             }
         }
-        if crate::model::gateway::policies::opencode::is_opencode_channel(self) {
-            if let Some(proto) = crate::model::gateway::policies::opencode::target_protocol_for_opencode_model(model) {
-                return proto;
-            }
-        }
         crate::model::gateway::egress::TargetProtocol::from_channel(self)
     }
 
@@ -259,30 +254,7 @@ impl ChannelConfig {
 }
 
 pub fn default_channels() -> Vec<ChannelConfig> {
-    vec![ChannelConfig {
-        id: "opencode".to_string(),
-        name: "OpenCode 免费".to_string(),
-        description: "由 OpenCode 提供的公益推理加速通道，免 Key 访问多种 Coding/Chat 顶尖模型"
-            .to_string(),
-        enabled: true,
-        protocol: "openai".to_string(),
-        base_url: "https://opencode.ai/zen/v1".to_string(),
-        api_key: String::new(),
-        api_keys: None,
-        use_proxy_pool: false,
-        alias: Some("opencode".to_string()),
-        site_id: None,
-        proxy_mode: None,
-        proxy_fixed_channel: None,
-        use_fixed_proxy: false,
-        fixed_proxy_node: None,
-        enabled_models: None,
-        model_redirects: None,
-        stats_id: Some(1),
-        key_groups: None,
-        key_rules: None,
-        model_proxy_rules: None,
-    }]
+    Vec::new()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -328,7 +300,6 @@ impl ModelProxyConfig {
     }
 }
 
-pub type OpencodeProxyConfig = ModelProxyConfig;
 
 fn default_timeout_seconds() -> u64 {
     300
@@ -423,7 +394,6 @@ pub struct ModelProxyStatus {
     pub today_total_tokens: u64,
 }
 
-pub type OpencodeProxyStatus = ModelProxyStatus;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -719,14 +689,12 @@ impl ModelProxyContext {
     }
 }
 
-#[allow(dead_code)]
-pub type OpencodeProxyContext = ModelProxyContext;
+/// 网关出网请求的默认 User-Agent。
+pub const GATEWAY_USER_AGENT: &str = "OpenHub-Gateway/0.3.0";
 
 pub struct ModelProxyState {
     pub context: ModelProxyContext,
 }
-
-pub type OpencodeProxyState = ModelProxyState;
 
 pub fn generate_req_id() -> String {
     let now = std::time::SystemTime::now()

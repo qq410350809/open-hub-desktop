@@ -42,7 +42,7 @@ export function makeMockProxyLogs() {
       timestamp: new Date(now - i * 3_600_000).toLocaleString("sv-SE").replace("T", " ").slice(0, 19),
       method: "POST",
       path: "/v1/chat/completions",
-      channelId: "opencode",
+      channelId: "preview-channel",
       model: stream ? "claude-sonnet-4" : "gpt-4o",
       stream,
       statusCode: status,
@@ -680,7 +680,7 @@ export async function browserFallback<T>(
     site.updatedAt = new Date().toISOString();
     return site as T;
   }
-  if (command === "get_opencode_proxy_logs") {
+  if (command === "get_model_proxy_logs") {
     const mockLogs = makeMockProxyLogs();
     const filter = String(args.filter ?? "");
     const q = String(args.q ?? "").trim().toLowerCase();
@@ -717,7 +717,7 @@ export async function browserFallback<T>(
       errorTotal: list.filter((l) => l.statusCode >= 400).length,
     } as T;
   }
-  if (command === "get_opencode_proxy_status") {
+  if (command === "get_model_proxy_status") {
     const mockLogs = makeMockProxyLogs();
     const sum = (fn: (l: (typeof mockLogs)[number]) => number) => mockLogs.reduce((acc, l) => acc + fn(l), 0);
     return {
@@ -770,6 +770,115 @@ export async function browserFallback<T>(
       todayRequests: 0,
       todayTokens: 0,
     })) as T;
+  }
+  if (command === "get_model_proxy_config") {
+    return {
+      enabled: true,
+      listenHost: "127.0.0.1",
+      port: 0,
+      apiKey: "",
+      channels: [{
+        id: "preview-channel",
+        name: "预览渠道",
+        description: "浏览器静态预览用的示例上游渠道",
+        enabled: true,
+        protocol: "openai",
+        upstreamUrl: "https://api.example.com/v1",
+        apiKey: "",
+        apiKeys: [],
+        useProxyPool: false,
+        alias: "preview",
+        siteId: null,
+        useFixedProxy: false,
+        enabledModels: ["gpt-4o", "claude-sonnet-4"],
+        statsId: 101,
+      }],
+      timeoutSeconds: 300,
+      recordRequestBody: false,
+      maxRetries: 0,
+      nextChannelStatsId: 102,
+      logRetentionDays: 0,
+      modelChannelOrder: null,
+      channelFailover: false,
+    } as T;
+  }
+  if (command === "get_model_proxy_channel_stats") {
+    const mockLogs = makeMockProxyLogs();
+    const ok = mockLogs.filter((l) => l.statusCode >= 200 && l.statusCode < 300).length;
+    return [{
+      channelId: "preview-channel",
+      totalRequests: mockLogs.length,
+      successfulRequests: ok,
+      failedRequests: mockLogs.length - ok,
+      avgDurationMs: 2400,
+      avgTtftMs: 380,
+      totalPromptTokens: mockLogs.reduce((a, l) => a + (l.promptTokens || 0), 0),
+      totalCompletionTokens: mockLogs.reduce((a, l) => a + (l.completionTokens || 0), 0),
+      totalReasoningTokens: mockLogs.reduce((a, l) => a + (l.reasoningTokens || 0), 0),
+      totalCacheHitTokens: mockLogs.reduce((a, l) => a + (l.promptCacheHitTokens || 0), 0),
+      totalTokens: mockLogs.reduce((a, l) => a + l.totalTokens, 0),
+      todayTotalTokens: mockLogs.reduce((a, l) => a + l.totalTokens, 0),
+      todayRequests: mockLogs.length,
+      todaySuccessfulRequests: ok,
+      todayFailedRequests: mockLogs.length - ok,
+      todayAvgDurationMs: 2400,
+      todayAvgTtftMs: 380,
+      todayPromptTokens: mockLogs.reduce((a, l) => a + (l.promptTokens || 0), 0),
+      todayCompletionTokens: mockLogs.reduce((a, l) => a + (l.completionTokens || 0), 0),
+      todayCacheHitTokens: mockLogs.reduce((a, l) => a + (l.promptCacheHitTokens || 0), 0),
+    }] as T;
+  }
+  if (command === "get_cached_channel_models" || command === "fetch_model_proxy_models") {
+    const models = ["gpt-4o", "claude-sonnet-4"];
+    if (command === "fetch_model_proxy_models") {
+      return [[{ channelId: "preview-channel", channelName: "预览渠道", alias: "preview", models }], []] as T;
+    }
+    return [{ channelId: "preview-channel", channelName: "预览渠道", alias: "preview", models }] as T;
+  }
+  if (command === "save_model_proxy_config_cmd") {
+    return (args.config ?? {}) as T;
+  }
+  if (command === "start_model_proxy" || command === "stop_model_proxy") {
+    return {
+      running: command === "start_model_proxy",
+      port: 0,
+      url: buildProxyBaseUrl(),
+      totalRequests: 0,
+      successfulRequests: 0,
+      failedRequests: 0,
+      uptimeSeconds: 0,
+      modelsCount: 2,
+      channelsCount: 1,
+      totalTokens: 0,
+      todayTotalTokens: 0,
+    } as T;
+  }
+  if (command === "clear_model_proxy_logs") return 0 as T;
+  if (command === "get_model_proxy_overview_stats") {
+    const mockLogs = makeMockProxyLogs();
+    const ok = mockLogs.filter((l) => l.statusCode >= 200 && l.statusCode < 300).length;
+    const totals = {
+      totalRequests: mockLogs.length,
+      successfulRequests: ok,
+      failedRequests: mockLogs.length - ok,
+      avgDurationMs: 2400,
+      avgTtftMs: 380,
+      promptTokens: mockLogs.reduce((a, l) => a + (l.promptTokens || 0), 0),
+      completionTokens: mockLogs.reduce((a, l) => a + (l.completionTokens || 0), 0),
+      reasoningTokens: mockLogs.reduce((a, l) => a + (l.reasoningTokens || 0), 0),
+      cacheHitTokens: mockLogs.reduce((a, l) => a + (l.promptCacheHitTokens || 0), 0),
+      totalTokens: mockLogs.reduce((a, l) => a + l.totalTokens, 0),
+    };
+    const today = new Date().toISOString().slice(0, 10);
+    return {
+      days: 14,
+      daily: [{ date: today, ...totals }],
+      totals,
+      today: { date: today, ...totals },
+    } as T;
+  }
+  if (command === "get_proxy_token_usage") {
+    return { buckets: [], health: [], summary: {} } as T;
   }
   // 登录相关：纯静态预览（无内核）不设门禁。
   if (command === "get_login_state") {

@@ -809,38 +809,14 @@ function isModelChecked(model: string): boolean {
   return !!channelModelSelection.value[model];
 }
 
-/** OpenCode 渠道去重：后端可能同时返回 opencode/xxx 与 xxx，优先保留带前缀版本；
- * 上游只返回裸名时（当前实际行为）裸名必须保留，否则整个列表会被过滤为空 */
-function dedupeChannelModels(channel: ChannelConfig, models: string[]): string[] {
-  if (channel.id !== "opencode") return models;
-  const alias = channelAlias(channel);
-  const deduplicated = new Set<string>();
-  for (const m of models) {
-    if (m.startsWith(`${alias}/`)) {
-      deduplicated.add(m);
-    } else if (!m.includes("/")) {
-      // 裸名：仅当不存在带前缀的同名版本时保留
-      if (!models.includes(`${alias}/${m}`)) {
-        deduplicated.add(m);
-      }
-    } else {
-      // 其他命名空间的模型原样保留
-      deduplicated.add(m);
-    }
-  }
-  return Array.from(deduplicated);
-}
-
 /** 渠道已知模型列表（未应用白名单），供各弹窗作为勾选数据源 */
 function channelKnownModels(channel: ChannelConfig): string[] {
-  return dedupeChannelModels(channel, modelsForChannel(channel.id));
+  return modelsForChannel(channel.id);
 }
 
 /** 当前选中渠道的模型列表（弹窗数据源：优先取草稿） */
 function selectedChannelModels(): string[] {
-  const channel = selectedChannel.value;
-  if (!channel) return channelDraftModels.value;
-  return dedupeChannelModels(channel, channelDraftModels.value);
+  return channelDraftModels.value;
 }
 
 /** 当前勾选数量（按现有模型列表计算），用于头部计数与保存结果 */
@@ -1013,9 +989,6 @@ const channelSettingsDraft = ref<ChannelSettingsDraft>({
   proxyFixedChannel: "",
 });
 const channelSettingsError = ref("");
-const channelSettingsTargetIsBuiltin = computed(
-  () => channelSettingsTarget.value != null && isBuiltinChannel(channelSettingsTarget.value),
-);
 
 /** 上游协议四选项：决定网关向该渠道上游发请求时使用的协议格式 */
 const channelProtocolSelectOptions: { value: string; text: string }[] = [
@@ -1389,7 +1362,6 @@ function closeChannelSettingsDialog() {
   channelSettingsDialogOpen.value = false;
 }
 
-/** 内置固化渠道（后端保留 statsId 1-100，opencode=1；动态渠道从 101 起分配） */
 /** 出口路径是否与入口不同（相同则无需展示"出"行，默认都是 chat 路径） */
 const STANDARD_EGRESS_PATHS = ["/v1/chat/completions", "/v1/messages", "/v1/responses"];
 function upstreamPathDiffers(path: string, upstreamUrl: string | null | undefined): boolean {
@@ -1417,14 +1389,9 @@ function formatUpstreamUrl(url: string | null | undefined): string {
   }
 }
 
-function isBuiltinChannel(channel: ChannelConfig): boolean {
-  return channel.statsId != null && channel.statsId > 0 && channel.statsId < 101;
-}
-
 /**
  * 渠道有效 Key 数量：与后端 get_effective_keys 同口径——
  * apiKeys 非空时以其为准（多 Key 自动轮换），否则回退单 apiKey；空串不计。
- * opencode 匿名模式无 Key 时为 0。
  */
 function channelKeyCount(channel: ChannelConfig): number {
   const list = channel.apiKeys?.length
@@ -1478,7 +1445,7 @@ function channelInheritedKeyCount(channel: ChannelConfig): number {
   return siteInheritedKeyCounts.value[channel.siteId] ?? 0;
 }
 
-/** 校验别名：合法字符 + 全渠道唯一（含 opencode）。返回错误信息，空串表示通过。 */
+/** 校验别名：合法字符 + 全渠道唯一。返回错误信息，空串表示通过。 */
 function validateAlias(alias: string, excludeId?: string): string {
   const a = alias.trim().toLowerCase();
   if (!a) return "请填写英文别名";
@@ -1493,20 +1460,15 @@ function validateAlias(alias: string, excludeId?: string): string {
 async function saveChannelSettings() {
   const channel = channelSettingsTarget.value;
   if (!channel) return;
-  // 固化渠道别名固定（网关模型前缀依赖它），无论草稿值如何都保持原样
-  const nextAlias = isBuiltinChannel(channel)
-    ? channelAlias(channel)
-    : channelSettingsDraft.value.alias.trim().toLowerCase();
+  const nextAlias = channelSettingsDraft.value.alias.trim().toLowerCase();
   const err = validateAlias(nextAlias, channel.id);
   if (err) {
     channelSettingsError.value = err;
     return;
   }
   channel.alias = nextAlias;
-  // 上游协议落库：内置固化渠道（如 opencode）协议由后端固化，设置弹窗不覆盖
-  if (!isBuiltinChannel(channel)) {
-    channel.protocol = channelSettingsDraft.value.protocol;
-  }
+  // 上游协议落库
+  channel.protocol = channelSettingsDraft.value.protocol;
   // 四模式合一落库；旧布尔字段同步维护，兼容旧版读取方
   const mode = channelSettingsDraft.value.proxyMode;
   channel.proxyMode = mode;
@@ -2628,7 +2590,7 @@ function getErrorSuggestion(log: ProxyRequestLog): string {
     return "请求体参数格式不正确，或传入了上游不支持的模型名称与特殊参数。";
   }
   if (log.statusCode === 429) {
-    return "OpenCode 免费通道对未认证单出口 IP 存在频次限制。网关已自动注入官方 CLI 指纹并支持本地凭据探测。若仍遇频次限制：① 在渠道设置中配置 OpenCode API Key；② 开启「内部代理池轮询」自动多节点切换与动态退避重试；③ 切换其他可用免费模型（如 mimo-v2.5-free / deepseek-v4-flash-free / big-pickle / nemotron-3-ultra-free）；④ 稍候 30 秒后自动恢复。";
+    return "上游对当前出口 IP / API Key 存在频次限制。若仍遇频次限制：① 在渠道设置中配置或更换 API Key；② 开启「代理池轮询」自动多节点切换与动态退避重试；③ 稍候片刻后自动恢复。";
   }
   return "请根据下方原始错误响应体排查上游返回的具体原因。";
 }
@@ -3788,11 +3750,6 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
                 </div>
                 <span class="mp-card-tags">
                   <span
-                    v-if="isBuiltinChannel(channel)"
-                    class="mp-alias-tag is-builtin"
-                    title="内置固化渠道：官方维护，别名固定不可修改"
-                  >固化渠道</span>
-                  <span
                     v-if="channel.siteId"
                     class="mp-alias-tag is-site"
                     title="与站点库原纪录关联，使用该站点同步的原 Key"
@@ -3817,11 +3774,6 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
                         : '已配置 1 个 Key'
                     "
                   >Key ×{{ channelKeyCount(channel) }}</span>
-                  <span
-                    v-else-if="isBuiltinChannel(channel)"
-                    class="mp-alias-tag"
-                    title="未配置 Key：以匿名模式访问 OpenCode 免费模型"
-                  >免 Key</span>
                   <span
                     class="mp-alias-tag is-models"
                     :title="channelModelCountTitle(channel)"
@@ -3909,7 +3861,6 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
                 <span>设置</span>
               </button>
               <button
-                v-if="channel.siteId || channel.id !== 'opencode'"
                 type="button"
                 class="mp-action-btn is-danger"
                 title="删除此反代渠道"
@@ -5016,7 +4967,7 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
             </div>
             <div>
               <div class="mp-modal-title-wrap">
-                <h3 id="mp-channel-models-title">{{ selectedChannel?.name || 'OpenCode' }} · 管理可用模型</h3>
+                <h3 id="mp-channel-models-title">{{ selectedChannel?.name || '渠道' }} · 管理可用模型</h3>
                 <span class="mp-header-chip">{{ channelCheckedCount }} / {{ selectedChannelModels().length }} 个已启用</span>
                 <span class="mp-header-endpoint-chip font-mono">{{ selectedChannel?.upstreamUrl }}</span>
               </div>
@@ -5577,10 +5528,10 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
             </div>
             <div>
               <div class="mp-modal-title-wrap">
-                <h3 id="mp-channel-settings-title">{{ channelSettingsTarget?.name || 'OpenCode' }} · 渠道设置</h3>
+                <h3 id="mp-channel-settings-title">{{ channelSettingsTarget?.name || '渠道' }} · 渠道设置</h3>
                 <span class="mp-header-endpoint-chip font-mono">{{ channelSettingsTarget?.upstreamUrl }}</span>
               </div>
-              <small class="text-muted">{{ channelSettingsTarget?.siteId ? "站点转换渠道 · 配置代理池固定通道" : "官方免费通道 · 配置内部代理池轮询" }}</small>
+              <small class="text-muted">{{ channelSettingsTarget?.siteId ? "站点转换渠道 · 配置代理池固定通道" : "手动渠道 · 配置上游协议与出口策略" }}</small>
             </div>
           </div>
           <button
@@ -5609,13 +5560,10 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
               class="mp-settings-input"
               :class="{ 'has-error': channelSettingsError }"
               placeholder="仅限英文、数字、- 与 _"
-              :disabled="channelSettingsTargetIsBuiltin"
-              title="固化渠道的英文别名固定为 opencode，不可修改"
               @input="channelSettingsError = validateAlias(channelSettingsDraft.alias, channelSettingsTarget?.id)"
             />
             <p v-if="channelSettingsError" class="mp-settings-error">{{ channelSettingsError }}</p>
-            <p v-else-if="channelSettingsTargetIsBuiltin" class="mp-settings-hint">固化渠道的别名固定为 opencode（网关模型前缀依赖它），不可修改</p>
-            <p v-else class="mp-settings-hint">所有渠道别名不能重复（含 opencode）</p>
+            <p v-else class="mp-settings-hint">所有渠道别名不能重复</p>
           </div>
 
           <!-- 上游协议：决定网关出网到该渠道时使用的协议格式 -->

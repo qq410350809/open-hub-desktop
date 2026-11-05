@@ -54,8 +54,6 @@ export function buildProxyMessagesUrl(): string {
   return `${modelApiOrigin()}${API_PATH_MESSAGES}`;
 }
 
-/** OpenCode 官方上游 URL */
-export const OPENCODE_UPSTREAM_URL = "https://opencode.ai/zen/v1";
 
 // ── 代理池（Proxy Pool）──
 

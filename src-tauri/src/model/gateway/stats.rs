@@ -1,7 +1,7 @@
 use super::types::{
     ChannelUsageStats, GatewayDailyPoint, GatewayHourlyPoint, GatewayOverviewStats,
-    GatewayOverviewTotals, ModelProxyContext, ModelProxyState, ModelProxyStatus,
-    OpencodeProxyState, OpencodeProxyStatus, ProxyRequestLog, ProxyTokenUsageReport,
+    GatewayOverviewTotals, ModelProxyContext, ModelProxyState, ModelProxyStatus, ProxyRequestLog,
+    ProxyTokenUsageReport,
 };
 use chrono::Datelike;
 use rusqlite::params;
@@ -355,11 +355,6 @@ pub async fn get_model_proxy_status_summary(state: &ModelProxyState) -> ModelPro
         total_tokens: total_toks.max(db_total_all as u64),
         today_total_tokens: db_today_tokens as u64,
     }
-}
-
-#[allow(dead_code)]
-pub async fn get_opencode_proxy_status_summary(state: &OpencodeProxyState) -> OpencodeProxyStatus {
-    get_model_proxy_status_summary(state).await
 }
 
 pub async fn get_channel_usage_stats_summary(

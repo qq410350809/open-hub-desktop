@@ -7,12 +7,11 @@ import {
   API_PATH_GEMINI,
   API_PATH_MESSAGES,
   DEFAULT_SERVICE_PORT,
-  OPENCODE_UPSTREAM_URL,
 } from "../../constants";
 import type {
   ChannelConfig,
-  OpencodeProxyConfig,
-  OpencodeProxyStatus,
+  ModelProxyConfig,
+  ModelProxyStatus,
   ProxyRequestLog,
   ChannelUsageStats,
   ChannelModelUsageStats,
@@ -43,67 +42,25 @@ export function channelStatsKey(channel: ChannelConfig | null | undefined): stri
   return channel?.statsId != null ? String(channel.statsId) : channelAlias(channel);
 }
 
-export function isOpenCodeFreeChannel(channel: ChannelConfig | null | undefined): boolean {
-  if (!channel) return false;
-  const isOpencode =
-    channel.id === "opencode" ||
-    channel.protocol === "opencode" ||
-    channel.alias === "opencode" ||
-    (channel.upstreamUrl && channel.upstreamUrl.includes("opencode.ai")) ||
-    (channel.name && channel.name.toLowerCase().includes("opencode"));
-  if (!isOpencode) return false;
-  const hasKey = !!(channel.apiKey?.trim() || channel.apiKeys?.some((k) => k.trim()));
-  return !hasKey;
-}
-
-export function filterFreeModelsOnly(models: string[]): string[] {
-  return models.filter((m) => {
-    const lower = m.toLowerCase();
-    return lower.includes("free") || lower === "big-pickle";
-  });
-}
-
 export function filterChannelModels(
   channel: ChannelConfig | null | undefined,
   models: string[],
 ): string[] {
-  let list = models;
-  if (isOpenCodeFreeChannel(channel)) {
-    list = filterFreeModelsOnly(list);
-  }
   const allow = channel?.enabledModels;
-  if (!allow) return list;
-  return list.filter((m) => allow.includes(m));
+  if (!allow) return models;
+  return models.filter((m) => allow.includes(m));
 }
 
 export function isValidChannelAlias(alias: string): boolean {
   return /^[a-zA-Z0-9_-]+$/.test(alias.trim());
 }
 
-/** 内置 OpenCode 免费直连渠道：channels 为空时的默认渠道 */
-function defaultOpencodeChannel(): ChannelConfig {
-  return {
-    id: "opencode",
-    name: "OpenCode",
-    description: "OpenCode 官方 Public 免费直连通道，免 Key 访问在线优质编码与推理模型",
-    enabled: true,
-    protocol: "opencode",
-    upstreamUrl: OPENCODE_UPSTREAM_URL,
-    apiKey: "public",
-    useProxyPool: false,
-    alias: "opencode",
-    siteId: null,
-    useFixedProxy: false,
-    enabledModels: null,
-  };
-}
-
-export const proxyConfig = ref<OpencodeProxyConfig>({
+export const proxyConfig = ref<ModelProxyConfig>({
   enabled: true,
   listenHost: "127.0.0.1",
   port: DEFAULT_SERVICE_PORT,
   apiKey: "",
-  channels: [defaultOpencodeChannel()],
+  channels: [],
   timeoutSeconds: 300,
   maxRetries: 0,
   channelFailover: false,
@@ -125,11 +82,9 @@ export function isSiteProxied(siteId: string): boolean {
  */
 export async function refreshProxyConfig() {
   try {
-    const cfg = await runCommand<OpencodeProxyConfig>("get_opencode_proxy_config");
+    const cfg = await runCommand<ModelProxyConfig>("get_model_proxy_config");
     if (!cfg) return;
-    if (!cfg.channels || cfg.channels.length === 0) {
-      cfg.channels = [defaultOpencodeChannel()];
-    }
+    if (!cfg.channels) cfg.channels = [];
     proxyConfig.value = cfg;
     proxyConfigLoaded.value = true;
   } catch (e) {
@@ -182,7 +137,7 @@ export function uniqueChannelAlias(base: string): string {
 /** 配置已从后端灌入；侧栏徽标在此之前不展示占位的 1 */
 export const proxyConfigLoaded = ref(false);
 
-export const proxyStatus = ref<OpencodeProxyStatus>({
+export const proxyStatus = ref<ModelProxyStatus>({
   running: false,
   port: DEFAULT_SERVICE_PORT,
   url: `http://127.0.0.1:${DEFAULT_SERVICE_PORT}/v1`,
@@ -248,7 +203,7 @@ export function useModelProxy() {
 
   async function refreshStatus() {
     try {
-      const status = await runCommand<OpencodeProxyStatus>("get_opencode_proxy_status");
+      const status = await runCommand<ModelProxyStatus>("get_model_proxy_status");
       if (status) proxyStatus.value = status;
     } catch {
       // background polling
@@ -259,18 +214,16 @@ export function useModelProxy() {
     proxyLoading.value = true;
     try {
       const [cfg, status] = await Promise.all([
-        runCommand<OpencodeProxyConfig>("get_opencode_proxy_config"),
-        runCommand<OpencodeProxyStatus>("get_opencode_proxy_status"),
+        runCommand<ModelProxyConfig>("get_model_proxy_config"),
+        runCommand<ModelProxyStatus>("get_model_proxy_status"),
       ]);
       if (cfg) {
-        if (!cfg.channels || cfg.channels.length === 0) {
-          cfg.channels = [defaultOpencodeChannel()];
-        }
+        if (!cfg.channels) cfg.channels = [];
         proxyConfig.value = cfg;
         proxyConfigLoaded.value = true;
       }
       if (status) proxyStatus.value = status;
-      // 渠道统计与模型缓存并行加载；缓存映射需在配置应用后执行（免费渠道过滤依赖渠道配置）
+      // 渠道统计与模型缓存并行加载；缓存映射需在配置应用后执行
       await Promise.all([refreshChannelStats(), loadCachedModels()]);
     } catch (e) {
       console.error("加载模型反代配置失败:", e);
@@ -281,7 +234,7 @@ export function useModelProxy() {
 
   async function refreshChannelStats() {
     try {
-      const list = await runCommand<ChannelUsageStats[]>("get_opencode_channel_stats");
+      const list = await runCommand<ChannelUsageStats[]>("get_model_proxy_channel_stats");
       if (Array.isArray(list)) {
         const map: Record<string, ChannelUsageStats> = {};
         // 后端按渠道生效别名归集，这里同样以别名为键（channelAlias 回退 id，两端一致）
@@ -318,16 +271,16 @@ export function useModelProxy() {
     }
   }
 
-  async function saveConfig(newConfig: OpencodeProxyConfig, options: { silent?: boolean } = {}) {
+  async function saveConfig(newConfig: ModelProxyConfig, options: { silent?: boolean } = {}) {
     savingConfig.value = true;
     try {
       // 明细保留天数：空值归一为 0（= 永久保留），避免空串破坏后端反序列化
-      const normalized: OpencodeProxyConfig = {
+      const normalized: ModelProxyConfig = {
         ...newConfig,
         listenHost: newConfig.listenHost?.trim() || "127.0.0.1",
         logRetentionDays: Number(newConfig.logRetentionDays ?? 0) || 0,
       };
-      const status = await runCommand<OpencodeProxyStatus>("save_opencode_proxy_config_cmd", {
+      const status = await runCommand<ModelProxyStatus>("save_model_proxy_config_cmd", {
         config: normalized,
       });
       if (status) proxyStatus.value = status;
@@ -401,11 +354,11 @@ export function useModelProxy() {
     togglingServer.value = true;
     try {
       if (proxyStatus.value.running) {
-        const status = await runCommand<OpencodeProxyStatus>("stop_opencode_proxy");
+        const status = await runCommand<ModelProxyStatus>("stop_model_proxy");
         if (status) proxyStatus.value = status;
         showToast("模型反代服务已停止");
       } else {
-        const status = await runCommand<OpencodeProxyStatus>("start_opencode_proxy");
+        const status = await runCommand<ModelProxyStatus>("start_model_proxy");
         if (status) proxyStatus.value = status;
         showToast(`模型反代服务已在端口 ${proxyStatus.value.port} 启动`);
       }
@@ -422,7 +375,7 @@ export function useModelProxy() {
     }
     try {
       const res = await runCommand<any>(
-        "fetch_opencode_models",
+        "fetch_model_proxy_models",
         options.channelId ? { channelId: options.channelId } : {},
       );
       const list: ChannelModelList[] =
@@ -436,12 +389,7 @@ export function useModelProxy() {
         for (const item of list) {
           const cid = item.channelId || (item as any).channel_id;
           if (cid) {
-            let mList = item.models || [];
-            const channel = proxyConfig.value.channels.find((c) => c.id === cid);
-            if (isOpenCodeFreeChannel(channel)) {
-              mList = filterFreeModelsOnly(mList);
-            }
-            map[cid] = mList;
+            map[cid] = item.models || [];
           }
         }
       }
@@ -485,7 +433,7 @@ export function useModelProxy() {
 
   async function loadCachedModels() {
     try {
-      const res = await runCommand<any>("get_opencode_cached_channel_models");
+      const res = await runCommand<any>("get_cached_channel_models");
       const list: ChannelModelList[] =
         Array.isArray(res) && Array.isArray(res[0])
           ? res[0]
@@ -497,12 +445,7 @@ export function useModelProxy() {
         for (const item of list) {
           const cid = item.channelId || (item as any).channel_id;
           if (cid) {
-            let mList = item.models || [];
-            const channel = proxyConfig.value.channels.find((c) => c.id === cid);
-            if (isOpenCodeFreeChannel(channel)) {
-              mList = filterFreeModelsOnly(mList);
-            }
-            map[cid] = mList;
+            map[cid] = item.models || [];
           }
         }
       }
@@ -515,12 +458,7 @@ export function useModelProxy() {
   }
 
   function modelsForChannel(channelId: string): string[] {
-    let list = channelModels.value[channelId] ?? [];
-    const channel = proxyConfig.value.channels.find((c) => c.id === channelId);
-    if (isOpenCodeFreeChannel(channel)) {
-      list = filterFreeModelsOnly(list);
-    }
-    return list;
+    return channelModels.value[channelId] ?? [];
   }
 
   async function fetchLogs(options: {
@@ -565,7 +503,7 @@ export function useModelProxy() {
         globalError: number;
         successTotal: number;
         errorTotal: number;
-      }>("get_opencode_proxy_logs", payload);
+      }>("get_model_proxy_logs", payload);
 
       if (res && Array.isArray(res.items)) {
         proxyLogs.value = res.items;
@@ -616,7 +554,7 @@ export function useModelProxy() {
    */
   async function clearLogs(mode: "payload_only" | "all" = "all", before?: string) {
     try {
-      const removed = await runCommand<number>("clear_opencode_proxy_logs", {
+      const removed = await runCommand<number>("clear_model_proxy_logs", {
         mode,
         before: before || null,
       });

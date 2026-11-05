@@ -1,4 +1,3 @@
-use super::policies::opencode::strip_opencode_prefix;
 use super::types::{
     current_timestamp, default_key_group_mode, ChannelConfig, ModelProxyConfig, ModelProxyContext,
     ProxyRequestLog, KEY_GROUP_MODE_INDEPENDENT, KEY_GROUP_MODE_ROUND_ROBIN,
@@ -58,8 +57,7 @@ pub enum ChannelResolution<'a> {
 ///    `Disabled`，**绝不**落到后续兜底规则（否则定向请求会被悄悄换到别的渠道）；
 /// 2. 「多渠道共同提供的模型」按用户配置的路由顺序（model_channel_order）选取首个可用渠道；
 /// 3. 未配置顺序时，若某个启用渠道的白名单（enabled_models）中包含该模型，则优先分发给该渠道；
-/// 4. 若无匹配，回退至启用的默认 opencode 渠道；
-/// 5. 若默认 opencode 未启用，回退至首个已启用的自定义渠道。
+/// 4. 若无匹配，回退至首个已启用的渠道。
 pub fn resolve_channel_detailed<'a>(
     config: &'a ModelProxyConfig,
     raw_model: &str,
@@ -74,7 +72,7 @@ pub fn resolve_channel_detailed<'a>(
         };
     }
 
-    let stripped = strip_opencode_prefix(normalized);
+    let stripped = normalized;
 
     // 2. 用户配置的重叠模型路由顺序：按列表序找首个启用且暴露该模型的渠道。
     //    raw 与 stripped 双查，兼容白名单里同时存在带/不带前缀写法的情况。
@@ -106,16 +104,7 @@ pub fn resolve_channel_detailed<'a>(
         return ChannelResolution::Resolved(ch, stripped.to_string());
     }
 
-    // 4. 回退默认 opencode 渠道（如果已启用）
-    if let Some(ch) = config
-        .channels
-        .iter()
-        .find(|c| c.id == "opencode" && c.enabled)
-    {
-        return ChannelResolution::Resolved(ch, stripped.to_string());
-    }
-
-    // 5. 若 opencode 渠道未启用，回退到首个已启用的自定义渠道
+    // 4. 无更精确匹配时，回退到首个已启用的渠道
     if let Some(ch) = config.channels.iter().find(|c| c.enabled) {
         return ChannelResolution::Resolved(ch, stripped.to_string());
     }
@@ -138,14 +127,14 @@ pub fn resolve_channel<'a>(
 /// 解析该模型的跨渠道故障转移候选，按与 `resolve_channel` 一致的优先级排序。
 ///
 /// 只收录**明确声明提供该模型**的启用渠道：`model_channel_order` 列表项与白名单
-/// 显式包含该模型的渠道。opencode 兜底与「未设白名单」渠道不再视为候选 ——
+/// 显式包含该模型的渠道。「未设白名单」的兜底渠道不视为候选 ——
 /// 它们并未声明拥有该模型，转移过去只会把失败日志记到无关渠道头上。
 ///
 /// 显式带别名前缀（`alias/model`）的请求是用户的定向指派，不参与故障转移：
 /// 此时只返回该渠道自身（渠道已禁用时返回空）。
 ///
 /// 列表非空时首项恒等于 `resolve_channel` 的结果；`resolve_channel` 落到兜底规则
-/// （4/5）时本列表为空。
+/// （4）时本列表为空。
 pub fn resolve_channel_candidates<'a>(
     config: &'a ModelProxyConfig,
     raw_model: &str,
@@ -160,7 +149,7 @@ pub fn resolve_channel_candidates<'a>(
         };
     }
 
-    let stripped = strip_opencode_prefix(normalized);
+    let stripped = normalized;
     let mut ordered: Vec<&'a ChannelConfig> = Vec::new();
     let push = |ch: &'a ChannelConfig, out: &mut Vec<&'a ChannelConfig>| {
         if !out.iter().any(|c| c.id == ch.id) {
@@ -600,7 +589,7 @@ pub async fn get_sorted_egress_candidates(
     }
 
     match channel.effective_proxy_mode().as_str() {
-        // 代理池轮询（沿用 opencode 逻辑）：优先直连，失败按速度切换池内节点
+        // 代理池轮询：优先直连，失败按速度切换池内节点
         "pool" => {
             let mut candidates = vec!["__direct__".to_string()];
             candidates.extend(enabled_pool_nodes(ctx).await);

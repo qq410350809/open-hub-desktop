@@ -1,8 +1,6 @@
 use super::config::load_model_proxy_config;
 use super::router::fetch_upstream_models_inner;
-use super::types::{
-    ModelProxyConfig, ModelProxyContext, ModelProxyState, OpencodeProxyState, ProxyMetrics,
-};
+use super::types::{ModelProxyConfig, ModelProxyContext, ModelProxyState, ProxyMetrics};
 use crate::context::AppContext;
 use reqwest::Client;
 use std::collections::HashMap;
@@ -106,18 +104,8 @@ fn build_stream_http_client() -> Client {
     build_stream_http_client_checked().unwrap_or_default()
 }
 
-#[allow(dead_code)]
-pub async fn start_opencode_proxy_server(state: &OpencodeProxyState) -> Result<(), String> {
-    start_model_proxy_server(state).await
-}
-
 pub async fn stop_model_proxy_server(state: &ModelProxyState) -> Result<(), String> {
     state.context.route_enabled.store(false, Ordering::Release);
     *state.context.started_at.write().await = None;
     Ok(())
-}
-
-#[allow(dead_code)]
-pub async fn stop_opencode_proxy_server(state: &OpencodeProxyState) -> Result<(), String> {
-    stop_model_proxy_server(state).await
 }

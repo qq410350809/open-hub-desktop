@@ -13,7 +13,7 @@ use serde_json::{json, Value as JsonValue};
 /// 渠道上游目标协议
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TargetProtocol {
-    /// OpenAI · Chat Completions（默认，历史遗留值 opencode 也归入此类）
+    /// OpenAI · Chat Completions（默认；未知/历史遗留协议值也归入此类）
     OpenAiChat,
     /// OpenAI · Responses API
     OpenAiResponses,
@@ -144,36 +144,9 @@ fn prepare_egress_inner(
     // 模型级协议覆盖优先（「管理模型」中为单个模型选择的上游协议）
     let target = channel.target_protocol_for(model);
 
-    let mut universal = universal;
-    // 针对 OpenCode 官方推理模型（如 muse-spark、mimo、deepseek-v4）：
-    // 若客户端未显式传入思考参数（如经由 messages 协议接入），自动注入默认高档位思考与预算，
-    // 抹平 CLI 与反代差异；绝不影响非 OpenCode 渠道
-    if super::policies::opencode::is_opencode_channel(channel)
-        && super::policies::opencode::is_opencode_reasoning_model(model)
-    {
-        if let Some(ur) = universal.as_mut() {
-            if ur.reasoning.is_none() {
-                ur.reasoning = super::policies::opencode::default_reasoning_for_model(model);
-            }
-        }
-        if let Some(obj) = native.as_mut().and_then(|v| v.as_object_mut()) {
-            if target == TargetProtocol::OpenAiChat
-                && !obj.contains_key("reasoning_effort")
-                && !obj.contains_key("reasoningEffort")
-            {
-                obj.insert("reasoning_effort".to_string(), json!("high"));
-            } else if target == TargetProtocol::OpenAiResponses && !obj.contains_key("reasoning") {
-                obj.insert(
-                    "reasoning".to_string(),
-                    json!({ "effort": "high", "summary": "auto" }),
-                );
-                obj.entry("include".to_string())
-                    .or_insert_with(|| json!(["reasoning.encrypted_content"]));
-            }
-        }
-    }
+    let universal = universal;
 
-    let (url, mut egress_body) = match target {
+    let (url, egress_body) = match target {
         // Gemini 原生：模型名走 URL，key 走查询参数；跨协议时由 IR 序列化
         TargetProtocol::Gemini => {
             let egress_body = if let Some(ur) = universal {
@@ -208,22 +181,11 @@ fn prepare_egress_inner(
         // OpenAI Responses 原生：/v1/responses
         TargetProtocol::OpenAiResponses => {
             let url = normalize_versioned_base(base, "responses");
-            let mut egress_body = if let Some(ur) = universal {
+            let egress_body = if let Some(ur) = universal {
                 super::parsers::universal_to_responses(&ur)
             } else {
                 native.take().unwrap_or_else(|| json!({}))
             };
-            if super::policies::opencode::is_opencode_channel(channel)
-                && super::policies::opencode::is_opencode_reasoning_model(model)
-            {
-                if let Some(obj) = egress_body.as_object_mut() {
-                    if let Some(reasoning) = obj.get_mut("reasoning").and_then(|v| v.as_object_mut()) {
-                        reasoning.entry("summary".to_string()).or_insert_with(|| json!("auto"));
-                    }
-                    obj.entry("include".to_string())
-                        .or_insert_with(|| json!(["reasoning.encrypted_content"]));
-                }
-            }
             (url, egress_body)
         }
         // OpenAI Chat 统一出口（中枢格式原样）
@@ -238,13 +200,6 @@ fn prepare_egress_inner(
             (url, out)
         }
     };
-    // OpenCode 免费层请求体闸门（stream + 内建工具清单）；仅 Chat 出口体，
-    // Responses 出口的闸门形态未确认（上游该端点当前整体 500），维持原样。
-    if target == TargetProtocol::OpenAiChat
-        && super::policies::opencode::is_opencode_channel(channel)
-    {
-        super::policies::opencode::apply_chat_body_gate(&mut egress_body);
-    }
     (url, egress_body)
 }
 
@@ -340,8 +295,7 @@ pub fn detect_response_protocol_from_sse_data(data: &str) -> Option<TargetProtoc
 /// 先嗅探实际协议再分发解析器：配置与实际不一致时以实际为准；
 /// 嗅探失败回退配置值。判定为 Chat（已是中枢格式）或非 JSON 时原样透传。
 ///
-/// 上游回 SSE 而客户端是非流式时（OpenCode 免费层强制 `stream:true`，
-/// 见 `policies::opencode::apply_chat_body_gate`），先聚合为单个
+/// 上游回 SSE 而客户端是非流式时，先聚合为单个
 /// `chat.completion` JSON 再走归一化，使各协议入口的非流式路径无需感知该差异。
 pub fn normalize_response_bytes(target: TargetProtocol, model: &str, raw: &[u8]) -> Vec<u8> {
     let mut aggregated = false;
@@ -1177,52 +1131,6 @@ mod egress_tests {
         );
     }
 
-    #[test]
-    fn opencode_muse_spark_egress_automatically_routes_to_responses_with_reasoning_summary() {
-        use crate::model::gateway::egress::EgressBody;
-        let opencode_ch = serde_json::from_value::<ChannelConfig>(json!({
-            "id": "opencode",
-            "name": "OpenCode",
-            "enabled": true,
-            "protocol": "openai",
-            "upstreamUrl": "https://opencode.ai/zen/v1",
-        }))
-        .unwrap();
-
-        // 客户端经由 chat/completions 传入（未显式声明 reasoning）
-        let chat_body = json!({
-            "model": "muse-spark-1.3-contributor-free",
-            "messages": [{"role": "user", "content": "9.11和9.9哪个大？"}]
-        });
-        let ur = crate::model::gateway::parsers::chat_to_universal(
-            &chat_body,
-            "muse-spark-1.3-contributor-free",
-        );
-
-        let (url, egress_body) = prepare_egress_with(
-            &opencode_ch,
-            "",
-            "muse-spark-1.3-contributor-free",
-            EgressBody::Universal(ur),
-            true,
-        );
-
-        // 1. 自动路由到 Responses API 端点
-        assert_eq!(url, "https://opencode.ai/zen/v1/responses");
-        // 2. 自动注入思考与 summary: "auto"
-        assert_eq!(
-            egress_body.pointer("/reasoning/effort").and_then(JsonValue::as_str),
-            Some("high")
-        );
-        assert_eq!(
-            egress_body.pointer("/reasoning/summary").and_then(JsonValue::as_str),
-            Some("auto")
-        );
-        // 3. 自动注入 encrypted_content
-        let include = egress_body.pointer("/include").and_then(JsonValue::as_array).unwrap();
-        assert!(include.iter().any(|v| v == "reasoning.encrypted_content"));
-    }
-
     #[tokio::test]
     async fn anthropic_passthrough_preserves_signature_and_reports_usage() {
         // 同协议直通保真回归：thinking signature 等原生元素必须原样到达客户端，
@@ -1309,7 +1217,7 @@ mod egress_tests {
             TargetProtocol::OpenAiChat
         );
         assert_eq!(
-            TargetProtocol::from_channel(&channel_with_protocol("opencode")),
+            TargetProtocol::from_channel(&channel_with_protocol("legacy-unknown")),
             TargetProtocol::OpenAiChat
         );
         assert_eq!(
@@ -1916,76 +1824,8 @@ mod egress_tests {
     }
 
     #[test]
-    fn prepare_egress_opencode_chat_channel_applies_free_tier_gate() {
-        let opencode_ch = serde_json::from_value::<ChannelConfig>(json!({
-            "id": "opencode",
-            "name": "OpenCode",
-            "enabled": true,
-            "protocol": "openai",
-            "upstreamUrl": "https://opencode.ai/zen/v1",
-        }))
-        .unwrap();
-
-        // 客户端无 tools 的普通 chat 请求 → 强制流式 + 注入内建工具 stub + tool_choice none
-        let (url, body) = prepare_egress(
-            &opencode_ch,
-            "",
-            "mimo-v2.6-flash-free",
-            &json!({
-                "model": "mimo-v2.6-flash-free",
-                "messages": [{ "role": "user", "content": "hi" }],
-            }),
-            false,
-        );
-        assert!(url.ends_with("/chat/completions"));
-        assert_eq!(body["stream"], true);
-        assert_eq!(body["tool_choice"], "none");
-        let tools = body["tools"].as_array().expect("注入的 tools");
-        assert!(
-            tools.len() >= 5,
-            "内建工具 stub 必须凑够上游闸门数量线: {}",
-            tools.len()
-        );
-
-        // 客户端带工具 → 追加缺失 stub，保留客户端 tool_choice
-        let with_tools = json!({
-            "model": "mimo-v2.6-flash-free",
-            "messages": [{ "role": "user", "content": "hi" }],
-            "stream": true,
-            "tools": [{ "type": "function", "function": {
-                "name": "Bash", "description": "d",
-                "parameters": { "type": "object", "properties": {} } } }],
-            "tool_choice": "auto",
-        });
-        let (_, body) = prepare_egress(&opencode_ch, "", "mimo-v2.6-flash-free", &with_tools, true);
-        assert_eq!(body["stream"], true);
-        assert_eq!(body["tool_choice"], "auto");
-        let names: Vec<&str> = body["tools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|t| t.pointer("/function/name").and_then(JsonValue::as_str))
-            .collect();
-        assert!(names.contains(&"Bash"));
-        assert!(names.contains(&"bash"));
-
-        // 非 OpenCode 渠道不受影响
-        let mut other = channel_with_protocol("openai");
-        other.base_url = "https://other.example/v1".to_string();
-        let (_, body) = prepare_egress(&other, "sk-x", "gpt-4o", &json!({
-            "model": "gpt-4o",
-            "messages": [{ "role": "user", "content": "hi" }],
-        }), false);
-        assert!(body.get("tools").is_none(), "其他渠道不得注入工具");
-        assert_eq!(
-            body["stream"], false,
-            "其他渠道保持客户端流式语义"
-        );
-    }
-
-    #[test]
     fn normalize_aggregates_forced_sse_into_chat_json() {
-        // OpenCode 强制流式后，非流式客户端路径把 SSE 聚合成单个 chat.completion
+        // 上游强制流式返回时，非流式客户端路径把 SSE 聚合成单个 chat.completion
         let sse = concat!(
             "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1790000000,\"model\":\"big-pickle\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hel\"},\"finish_reason\":null}]}\n\n",
             "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1790000000,\"model\":\"big-pickle\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"lo\"},\"finish_reason\":\"stop\"}]}\n\n",

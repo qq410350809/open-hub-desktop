@@ -1,6 +1,6 @@
 use super::balancer::normalize_key_group_id;
 use super::types::{
-    default_channels, default_key_group_mode, ChannelConfig, ModelProxyConfig, OpencodeProxyConfig,
+    default_channels, default_key_group_mode, ChannelConfig, ModelProxyConfig,
     KEY_GROUP_MODE_INDEPENDENT, KEY_GROUP_MODE_ROUND_ROBIN,
 };
 use getrandom::fill as fill_random;
@@ -165,9 +165,11 @@ pub fn sanitize_channel_config(channel: &mut ChannelConfig) {
 /// 渠道上游目标协议白名单
 const VALID_CHANNEL_PROTOCOLS: [&str; 4] = ["openai", "openai-responses", "anthropic", "gemini"];
 
-/// 已下线的内置固化渠道：其 stats_id 落在 1-100 保留段，前端视为不可删除的
+/// 已下线的内置固化渠道：其 stats_id 落在 1-100 保留段，前端曾视为不可删除的
 /// 内置渠道，存量安装的配置中必须由后端在加载时自动清除。
-const RETIRED_BUILTIN_CHANNEL_IDS: [&str; 1] = ["alpha"];
+/// - `alpha`：更早下线的内置渠道
+/// - `opencode`：OpenCode 官方反代渠道（反代能力已移除）
+const RETIRED_BUILTIN_CHANNEL_IDS: [&str; 2] = ["alpha", "opencode"];
 
 pub fn sanitize_model_proxy_config(config: &mut ModelProxyConfig) {
     ensure_gateway_api_key(config);
@@ -180,8 +182,6 @@ pub fn sanitize_model_proxy_config(config: &mut ModelProxyConfig) {
         .retain(|ch| !RETIRED_BUILTIN_CHANNEL_IDS.contains(&ch.id.as_str()));
     let mut seen_aliases = std::collections::HashSet::new();
     for ch in &mut config.channels {
-        // OpenCode 官方渠道个性化固化策略见 policies/opencode.rs
-        super::policies::opencode::pin_channel_config(ch);
         // 目标协议白名单校验：非法/历史遗留值回退为 OpenAI 兼容
         let p = ch.protocol.trim().to_lowercase();
         ch.protocol = if VALID_CHANNEL_PROTOCOLS.contains(&p.as_str()) {
@@ -207,13 +207,10 @@ pub fn sanitize_model_proxy_config(config: &mut ModelProxyConfig) {
         seen_aliases.insert(ch.effective_alias());
     }
 
-    // 统计维度稳定数字 ID：opencode 固定为 1，动态渠道从 101 递增（1-100 预留给内置渠道）。
+    // 统计维度稳定数字 ID：动态渠道从 101 递增（1-100 为历史内置渠道保留段）。
     // 已分配的 ID 永不改动，改别名/改编码不影响历史统计；计数器只前进不回退。
     let mut next = config.next_channel_stats_id.max(101);
     for ch in &mut config.channels {
-        if ch.id == "opencode" {
-            continue;
-        }
         if ch.stats_id.is_none() {
             ch.stats_id = Some(next as u32);
             next += 1;
@@ -283,8 +280,22 @@ fn migrate_key_group_modes_to_independent(config: &mut ModelProxyConfig) -> bool
     changed
 }
 
+/// 模型网关配置的持久化键。
+const MODEL_PROXY_CONFIG_META_KEY: &str = "model_proxy_config";
+/// 历史持久化键（OpenCode 反代时期使用）：仅用于一次性迁移读取。
+const LEGACY_OPENCODE_PROXY_CONFIG_META_KEY: &str = "opencode_proxy_config";
+
 pub fn load_model_proxy_config(conn: &Connection) -> ModelProxyConfig {
-    let raw = crate::db::read_meta_conn(conn, "opencode_proxy_config").unwrap_or_default();
+    // 先读新键；缺失时回退历史键（OpenCode 反代时期的配置），随后迁移到新键。
+    let new_raw =
+        crate::db::read_meta_conn(conn, MODEL_PROXY_CONFIG_META_KEY).unwrap_or_default();
+    let legacy_raw =
+        crate::db::read_meta_conn(conn, LEGACY_OPENCODE_PROXY_CONFIG_META_KEY).unwrap_or_default();
+    let (raw, from_legacy_key) = if new_raw.trim().is_empty() && !legacy_raw.trim().is_empty() {
+        (legacy_raw, true)
+    } else {
+        (new_raw, false)
+    };
 
     let had_api_key = serde_json::from_str::<ModelProxyConfig>(&raw)
         .ok()
@@ -314,33 +325,24 @@ pub fn load_model_proxy_config(conn: &Connection) -> ModelProxyConfig {
         false
     };
 
+    // 渠道清洗会剔除已下线的内置 OpenCode 反代渠道
+    let channels_before = cfg.channels.len();
     sanitize_model_proxy_config(&mut cfg);
-    if migrated || !had_api_key {
+    let channels_pruned = cfg.channels.len() != channels_before;
+
+    if migrated || channels_pruned || from_legacy_key || !had_api_key {
         if let Ok(serialized) = serde_json::to_string(&cfg) {
-            let _ = crate::db::write_meta(conn, "opencode_proxy_config", &serialized);
+            let _ = crate::db::write_meta(conn, MODEL_PROXY_CONFIG_META_KEY, &serialized);
         }
     }
     cfg
-}
-
-#[allow(dead_code)]
-pub fn load_opencode_proxy_config(conn: &Connection) -> OpencodeProxyConfig {
-    load_model_proxy_config(conn)
 }
 
 pub fn save_model_proxy_config(conn: &Connection, config: &ModelProxyConfig) -> Result<(), String> {
     let mut c = config.clone();
     sanitize_model_proxy_config(&mut c);
     let json_str = serde_json::to_string(&c).map_err(|e| format!("序列化模型网关配置失败: {e}"))?;
-    crate::db::write_meta(conn, "opencode_proxy_config", &json_str)
-}
-
-#[allow(dead_code)]
-pub fn save_opencode_proxy_config(
-    conn: &Connection,
-    config: &OpencodeProxyConfig,
-) -> Result<(), String> {
-    save_model_proxy_config(conn, config)
+    crate::db::write_meta(conn, MODEL_PROXY_CONFIG_META_KEY, &json_str)
 }
 
 #[cfg(test)]
@@ -430,9 +432,13 @@ mod config_tests {
             !cfg.channels.iter().any(|c| c.id == "alpha"),
             "已下线内置渠道必须被自动清除"
         );
+        assert!(
+            !cfg.channels.iter().any(|c| c.id == "opencode"),
+            "OpenCode 反代内置渠道必须被自动清除"
+        );
         // 用户自建渠道不受清理影响
         assert!(cfg.channels.iter().any(|c| c.id == "site_a"));
-        assert_eq!(cfg.channels.len(), 2);
+        assert_eq!(cfg.channels.len(), 1);
     }
 
     #[test]

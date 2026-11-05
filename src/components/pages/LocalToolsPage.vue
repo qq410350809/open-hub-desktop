@@ -6,7 +6,6 @@ import {
   useModelProxy,
   refreshProxyConfig,
   channelAlias,
-  isOpenCodeFreeChannel,
   type ChannelConfig,
 } from "../../composables/proxy/useModelProxy";
 import { runCommand } from "../../composables/core/ipc";
@@ -213,8 +212,6 @@ interface ProxyInventoryRow {
   accountLabel: string;
   keyIndex: number;
   key: string;
-  /** OpenCode 免 Key 匿名模式：无真实 Key 但网关照常出网，视同有一路可用 Key。 */
-  anonymousKey: boolean;
   protocol: string;
   alias: string;
   siteId: string;
@@ -222,9 +219,9 @@ interface ProxyInventoryRow {
   models: string[];
 }
 
-/** 该行是否可参与生效：有真实 Key，或 OpenCode 匿名模式（匿名 Key 也是 Key）。 */
+/** 该行是否可参与生效：必须有真实 Key。 */
 function rowHasKey(row: ProxyInventoryRow) {
-  return !!row.key || row.anonymousKey;
+  return !!row.key;
 }
 
 function sanitizeIdPart(raw: string) {
@@ -250,9 +247,9 @@ function maskKey(key: string) {
   return `${value.slice(0, prefix)}••••••••${value.slice(-suffix)}`;
 }
 
-/** 无真实 Key 时的组副标题：OpenCode 匿名模式视同有 Key，其余才是真未同步。 */
-function anonymousGroupLabel(row: ProxyInventoryRow | undefined) {
-  return row?.anonymousKey ? "匿名模式（免 Key）" : "未同步 Key";
+/** 无真实 Key 时的组副标题。 */
+function anonymousGroupLabel(_row: ProxyInventoryRow | undefined) {
+  return "未同步 Key";
 }
 
 function protocolLabel(protocol: string) {
@@ -373,7 +370,6 @@ const inventoryRows = computed<ProxyInventoryRow[]>(() => {
               accountLabel: label,
               keyIndex,
               key,
-              anonymousKey: false,
               protocol,
               alias,
               siteId: channel.siteId || "",
@@ -390,7 +386,6 @@ const inventoryRows = computed<ProxyInventoryRow[]>(() => {
             accountLabel: label,
             keyIndex: 0,
             key: "",
-            anonymousKey: false,
             protocol,
             alias,
             siteId: channel.siteId || "",
@@ -401,10 +396,8 @@ const inventoryRows = computed<ProxyInventoryRow[]>(() => {
       }
     } else {
       const keys = channelKeys(channel);
-      // 内置 opencode 渠道未配 Key 时走匿名模式，匿名 Key 也算一路可用 Key
-      const anonymous = keys.length === 0 && isOpenCodeFreeChannel(channel);
-      // 手动渠道没有独立账号概念，内置渠道直接用渠道名当展示标识
-      const manualLabel = channel.statsId != null && channel.statsId > 0 && channel.statsId < 101 ? "" : "手动渠道";
+      // 手动渠道没有独立账号概念
+      const manualLabel = "手动渠道";
       if (keys.length) {
         keys.forEach((key, keyIndex) => {
           rows.push({
@@ -415,7 +408,6 @@ const inventoryRows = computed<ProxyInventoryRow[]>(() => {
             accountLabel: manualLabel,
             keyIndex,
             key,
-            anonymousKey: false,
             protocol,
             alias,
             siteId: "",
@@ -432,7 +424,6 @@ const inventoryRows = computed<ProxyInventoryRow[]>(() => {
           accountLabel: manualLabel,
           keyIndex: 0,
           key: "",
-          anonymousKey: anonymous,
           protocol,
           alias,
           siteId: "",

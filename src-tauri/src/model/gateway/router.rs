@@ -2,10 +2,10 @@ use super::balancer::resolve_channel_api_keys;
 use super::handlers::{
     handle_chat_completions, handle_gemini_generate, handle_messages, handle_responses,
 };
-use super::policies::opencode::{
-    apply_models_probe_identity, is_free_opencode_model, is_opencode_channel,
+use super::types::{
+    ChannelModelFetchError, ChannelModelList, ModelProxyConfig, ModelProxyContext,
+    GATEWAY_USER_AGENT,
 };
-use super::types::{ChannelModelFetchError, ChannelModelList, ModelProxyConfig, ModelProxyContext};
 use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode, Uri},
@@ -18,6 +18,7 @@ use std::collections::HashSet;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{error, info, warn};
 
+#[allow(dead_code)]
 pub fn create_model_proxy_router(ctx: ModelProxyContext) -> Router {
     let cors = CorsLayer::new()
         .allow_origin(Any)
@@ -86,11 +87,6 @@ pub fn create_shared_model_proxy_router(ctx: ModelProxyContext) -> Router {
         )
         .layer(cors)
         .with_state(ctx)
-}
-
-#[allow(dead_code)]
-pub fn create_opencode_proxy_router(ctx: ModelProxyContext) -> Router {
-    create_model_proxy_router(ctx)
 }
 
 /// 统一鉴权检查
@@ -298,7 +294,7 @@ fn push_listed_model(items: &mut Vec<JsonValue>, alias: &str, model: &str) {
     }));
 }
 
-/// 组装 GET /v1/models 列表。OpenCode 渠道也只暴露 `opencode/{model}`，不再附带裸 ID。
+/// 组装 GET /v1/models 列表：对外模型 ID 统一带渠道别名前缀。
 pub(crate) fn build_gateway_model_list(
     config: &ModelProxyConfig,
     channel_models: &[ChannelModelList],
@@ -330,18 +326,6 @@ pub(crate) fn build_gateway_model_list(
             for m in explicit_models {
                 push_listed_model(&mut model_items, &eff_alias, m);
             }
-        }
-    }
-
-    if model_items.is_empty() {
-        for m in [
-            "deepseek-v4-flash-free",
-            "glm-4-flash-free",
-            "qwen-2.5-coder-32b",
-            "claude-3-7-sonnet",
-            "gpt-4o",
-        ] {
-            push_listed_model(&mut model_items, "opencode", m);
         }
     }
 
@@ -485,7 +469,9 @@ pub async fn fetch_upstream_models_inner(
                     .get(key_index)
                     .map(String::as_str)
                     .unwrap_or_default();
-                let mut req = apply_models_probe_identity(client.get(&models_url), ch, base);
+                let mut req = client
+                    .get(&models_url)
+                    .header("User-Agent", GATEWAY_USER_AGENT);
                 if !api_key.is_empty() {
                     req = req.header("Authorization", format!("Bearer {api_key}"));
                 }
@@ -587,10 +573,6 @@ pub async fn fetch_upstream_models_inner(
                     if let Some(explicit) = &ch.enabled_models {
                         list.extend(explicit.clone());
                     }
-                }
-                // OpenCode 官方渠道模型列表过长（60+，绝大多数为非免费模型），仅保留免费模型
-                if is_opencode_channel(ch) {
-                    list.retain(|m| is_free_opencode_model(m));
                 }
                 channel_models.push(ChannelModelList {
                     channel_id: ch.id.clone(),
