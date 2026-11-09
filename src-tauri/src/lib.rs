@@ -375,6 +375,7 @@ pub fn run() {
             crate::site::sync::sync_site_account_via_chrome,
             crate::site::sync::cancel_site_account_sync,
             crate::site::library::sync_remote_sites,
+            crate::site::library::sync_public_library,
             crate::site::library::detect_site_system_types,
             crate::model::catalog::get_system_fonts,
             crate::model::catalog::fetch_site_models_json,

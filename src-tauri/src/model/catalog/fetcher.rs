@@ -60,9 +60,10 @@ pub(crate) struct SiteModelsResult {
     /// 被挂到 profile_id='' 的幽灵行、与真实账号脱钩。
     #[serde(default)]
     pub(crate) profile_id: String,
-    /// 全站模型健康度（模型 ID → 健康度），来自 NewAPI 的
-    /// `/api/perf-metrics/summary` 或「模型状态」增强模块
-    /// `/api/enhancements/model-status/status/all`。站点两条路由都没有时为空。
+    /// 站点模型健康度（模型 ID → 健康度），来自 NewAPI 的
+    /// `/api/perf-metrics/summary`（多分组时附 `groups` 拆分）或「模型状态」
+    /// 增强模块 `/api/enhancements/model-status/status/all`。站点两条路由都没有
+    /// 时为空。
     #[serde(default)]
     pub(crate) model_health: HashMap<String, SiteModelHealth>,
 }
@@ -992,6 +993,9 @@ pub(crate) fn parse_perf_metrics_health(
                     // 间距铺。接口不下发格宽，按 1 小时声明。
                     bucket_seconds: Some(3600),
                     series: parse_perf_metrics_series(item),
+                    group: None,
+                    groups: HashMap::new(),
+                    group_scoped: false,
                 },
             ))
         })
@@ -1325,6 +1329,9 @@ pub(crate) fn parse_model_status_health(
                 window_start,
                 bucket_seconds: Some(step),
                 series,
+                group: None,
+                groups: HashMap::new(),
+                group_scoped: false,
             },
         );
     }
@@ -1343,6 +1350,8 @@ pub(crate) async fn fetch_perf_metrics_health(
     base_url: &Url,
     auth: &NewApiAuth,
     user_agent: &str,
+    key_groups: &HashMap<String, String>,
+    split_hint: bool,
 ) -> HashMap<String, SiteModelHealth> {
     let health = fetch_health_endpoint(
         client,
@@ -1354,7 +1363,31 @@ pub(crate) async fn fetch_perf_metrics_health(
         |value| parse_perf_metrics_health(value, PERF_METRICS_WINDOW_HOURS),
     )
     .await;
-    enrich_series_from_model_detail(client, base_url, auth, user_agent, health).await
+    enrich_series_from_model_detail(
+        client,
+        base_url,
+        auth,
+        user_agent,
+        health,
+        key_groups,
+        split_hint,
+    )
+    .await
+}
+
+/// 从 Key → 分组表里提取去重、排序后的分组名。
+///
+/// 空值与纯空白不代表真实分组（手动 Key、旧缓存），不能拿它们去请求
+/// `/api/perf-metrics?group=`；它们也不该参与「多分组」判断。
+fn distinct_key_groups(key_groups: &HashMap<String, String>) -> Vec<String> {
+    let mut groups: Vec<String> = key_groups
+        .values()
+        .map(|group| group.trim().to_string())
+        .filter(|group| !group.is_empty())
+        .collect();
+    groups.sort();
+    groups.dedup();
+    groups
 }
 
 /// 逐模型明细请求的并发度与整体预算。
@@ -1366,13 +1399,18 @@ const MODEL_DETAIL_CONCURRENCY: usize = 6;
 const MODEL_DETAIL_BUDGET: Duration = Duration::from_secs(20);
 const MODEL_DETAIL_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// 汇总接口不带逐时段序列时，逐模型补明细（旧版/魔改 NewAPI，实测 CUN.AI）。
+/// 用逐模型明细补两样东西：缺失的逐时段序列，以及**按分组拆分的健康度**。
 ///
-/// 只在**整批汇总都没有序列**时触发：新版 NewAPI 的汇总自带
-/// `recent_success_series`，有序列的站点不产生任何额外请求。
-/// 每个模型打 `/api/perf-metrics?model=<name>&hours=24`，响应里的
-/// `data.groups[].series` 就是该模型的分组逐时段序列；补序列**不改汇总数字**
-/// （成功率/延迟/TPS 仍以汇总口径为准），条带与徽标因此同源可信。
+/// - 序列：整批汇总都没有序列时触发（旧版/魔改 NewAPI，实测 CUN.AI）；
+///   新版 NewAPI 的汇总自带 `recent_success_series`，单账号单分组站点不产生
+///   额外请求。
+/// - 分组：站点存在**多个 Key 分组**（或多账号站点可能分散在不同分组）时，
+///   汇总接口把所有分组揉成一个数字，必须逐模型打
+///   `/api/perf-metrics?model=X` 才能拿到 `data.groups[]`。明细里的分组数据
+///   全部挂到 `SiteModelHealth.groups`，界面选中某个 Key 时只取它所属分组的
+///   条目，不再跨 Key 借用别的分组。
+///
+/// 补序列/分组都不改顶层汇总数字（成功率/延迟/TPS 仍以 summary 口径为准）。
 /// 失败/超时的模型保持原样（只有汇总值、条带留灰），不影响已拿到的汇总数据。
 async fn enrich_series_from_model_detail(
     client: &wreq::Client,
@@ -1380,8 +1418,17 @@ async fn enrich_series_from_model_detail(
     auth: &NewApiAuth,
     user_agent: &str,
     health: HashMap<String, SiteModelHealth>,
+    key_groups: &HashMap<String, String>,
+    split_hint: bool,
 ) -> HashMap<String, SiteModelHealth> {
-    if health.is_empty() || health.values().any(|item| !item.series.is_empty()) {
+    let scoped_groups = distinct_key_groups(key_groups);
+    // 多分组必然拆分；多账号站点即使每个账号只有一组，也可能分散在不同分组，
+    // 由调用方给 hint 强制拆分一次，明细接口会把站点全部分组一起带回来。
+    let split_by_group = scoped_groups.len() > 1 || (split_hint && !scoped_groups.is_empty());
+    if health.is_empty() {
+        return health;
+    }
+    if !split_by_group && health.values().any(|item| !item.series.is_empty()) {
         return health;
     }
     let models: Vec<String> = health.keys().cloned().collect();
@@ -1394,15 +1441,15 @@ async fn enrich_series_from_model_detail(
                 let auth = auth.clone();
                 let user_agent = user_agent.to_string();
                 async move {
-                    let points = fetch_perf_metrics_model_detail(
+                    let groups = fetch_perf_metrics_model_detail(
                         &client, &base_url, &auth, &user_agent, &model,
                     )
                     .await;
-                    (model, points)
+                    (model, groups)
                 }
             })
             .buffer_unordered(MODEL_DETAIL_CONCURRENCY)
-            .collect::<Vec<(String, Vec<SiteModelHealthPoint>)>>(),
+            .collect::<Vec<(String, HashMap<String, SiteModelHealth>)>>(),
     )
     .await;
     let Ok(details) = details else {
@@ -1410,13 +1457,35 @@ async fn enrich_series_from_model_detail(
         return health;
     };
     let mut health = health;
-    for (model, points) in details {
-        if points.is_empty() {
+    for (model, groups) in details {
+        if groups.is_empty() {
             continue;
         }
+        let best_series = groups
+            .iter()
+            .filter(|(group, item)| {
+                !item.series.is_empty()
+                    && (!split_by_group
+                        || scoped_groups
+                            .iter()
+                            .any(|candidate| candidate.as_str() == group.trim()))
+            })
+            .map(|(_, item)| item.series.clone())
+            .max_by_key(Vec::len)
+            .unwrap_or_default();
         if let Some(item) = health.get_mut(&model) {
-            if item.series.is_empty() {
-                item.series = points;
+            if item.series.is_empty() && !best_series.is_empty() {
+                item.series = best_series;
+            }
+            if split_by_group {
+                // 明细接口不带 group 参数时会把站点全部活跃分组一起返回。
+                // 全部保留：多账号并发同步时，任何一个账号先拉到都能让其它
+                // 账号的分组 Key 在站点级合并视图里直接取到数据，不依赖
+                // 「先知道站点全部分组再逐个账号补拉」的时序。
+                item.groups = groups;
+                // 明细接口成功返回过分组数据，即使当前分组没流量也标记为
+                // 「已按分组拆分」：界面不能再回退站点聚合值。
+                item.group_scoped = true;
             }
         }
     }
@@ -1429,9 +1498,9 @@ async fn fetch_perf_metrics_model_detail(
     auth: &NewApiAuth,
     user_agent: &str,
     model: &str,
-) -> Vec<SiteModelHealthPoint> {
+) -> HashMap<String, SiteModelHealth> {
     let Ok(mut url) = base_url.join("/api/perf-metrics") else {
-        return Vec::new();
+        return HashMap::new();
     };
     url.query_pairs_mut()
         .append_pair("model", model)
@@ -1446,50 +1515,96 @@ async fn fetch_perf_metrics_model_detail(
     )
     .await
     {
-        Ok(Ok(value)) => parse_perf_metrics_model_detail(&value),
-        Ok(Err(_)) | Err(_) => Vec::new(),
+        Ok(Ok(value)) => parse_perf_metrics_model_detail_groups(&value),
+        Ok(Err(_)) | Err(_) => HashMap::new(),
     }
 }
 
-/// 解析逐模型明细 `/api/perf-metrics?model=X` 的响应，取一个分组的逐时段序列。
+/// 解析逐模型明细 `/api/perf-metrics?model=X` 的响应，按分组拆成健康度。
 ///
-/// 响应形如 `{ data: { model_name, groups: [ { group, success_rate,
-/// avg_latency_ms, avg_tps, series: [ { ts, success_rate, ... } ] } ] } }`。
-/// 站点按分组返回；这里取**序列最长**的分组代表该模型（单分组站点无歧义，
-/// 多分组时覆盖最完整的那条），成功率 0~100 归一化到 0~1。
-pub(crate) fn parse_perf_metrics_model_detail(value: &serde_json::Value) -> Vec<SiteModelHealthPoint> {
+/// 响应形如 `{ data: { model_name, window_start, groups: [ { group,
+/// success_rate, avg_latency_ms, avg_tps, series: [ { ts, success_rate, ... } ]
+/// } ] } }`。NewAPI 的 summary 接口把所有分组揉成一个模型级数字，只有这条
+/// 明细接口会给出 `groups[]`，所以多分组站点要按 Key 所属分组取数时必须以
+/// 这里为准。成功率 0~100 归一化到 0~1；没有 `groups` 时返回空映射。
+pub(crate) fn parse_perf_metrics_model_detail_groups(
+    value: &serde_json::Value,
+) -> HashMap<String, SiteModelHealth> {
     let Some(groups) = value
         .pointer("/data/groups")
         .and_then(serde_json::Value::as_array)
     else {
-        return Vec::new();
+        return HashMap::new();
     };
-    let mut best: Vec<SiteModelHealthPoint> = Vec::new();
+    let window_start = json_number(value, "/data/window_start")
+        .map(|value| value.round() as i64)
+        .filter(|value| *value > 0);
+    let mut health = HashMap::new();
     for group in groups {
-        let Some(points) = json_array_at(group, &["/series"]) else {
+        let name = json_string(group, &["/group", "/group_name", "/name"])
+            .trim()
+            .to_string();
+        if name.is_empty() {
             continue;
-        };
-        let mut series: Vec<SiteModelHealthPoint> = points
-            .iter()
-            .filter_map(|point| {
-                let ts = json_number(point, "/ts")?;
-                if !(ts > 0.0) {
-                    return None;
-                }
-                Some(SiteModelHealthPoint {
-                    ts: ts.round() as i64,
-                    success_rate: json_number(point, "/success_rate")
-                        .map(|percent| (percent / 100.0).clamp(0.0, 1.0)),
-                    requests: read_request_count(point),
-                })
-            })
-            .collect();
-        if series.len() > best.len() {
-            series.sort_by_key(|point| point.ts);
-            best = series;
         }
+        let mut series: Vec<SiteModelHealthPoint> = json_array_at(group, &["/series"])
+            .map(|points| {
+                points
+                    .iter()
+                    .filter_map(|point| {
+                        let ts = json_number(point, "/ts")?;
+                        if !(ts > 0.0) {
+                            return None;
+                        }
+                        Some(SiteModelHealthPoint {
+                            ts: ts.round() as i64,
+                            success_rate: json_number(point, "/success_rate")
+                                .map(|percent| (percent / 100.0).clamp(0.0, 1.0)),
+                            requests: read_request_count(point),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        series.sort_by_key(|point| point.ts);
+        health.insert(
+            name.clone(),
+            SiteModelHealth {
+                success_rate: json_number(group, "/success_rate")
+                    .map(|percent| (percent / 100.0).clamp(0.0, 1.0)),
+                status_label: None,
+                snapshot: false,
+                avg_latency_ms: json_number(group, "/avg_latency_ms")
+                    .map(|value| value.round() as i64),
+                avg_tps: json_number(group, "/avg_tps"),
+                window_hours: PERF_METRICS_WINDOW_HOURS,
+                requests: read_request_count(group),
+                window_start,
+                bucket_seconds: Some(3600),
+                series,
+                group: Some(name),
+                groups: HashMap::new(),
+                group_scoped: false,
+            },
+        );
     }
-    best
+    health
+}
+
+/// 兼容旧调用：取一个分组的逐时段序列（序列最长者）。
+///
+/// 单分组站点无歧义；多分组站点**不能**再用这个结果代表某个 Key——这正是
+/// 之前「跨分组取数」的根源，新代码走 `parse_perf_metrics_model_detail_groups`
+/// 按分组取。保留该函数只服务于历史测试与不含分组语义的展示兜底。
+#[cfg(test)]
+pub(crate) fn parse_perf_metrics_model_detail(
+    value: &serde_json::Value,
+) -> Vec<SiteModelHealthPoint> {
+    parse_perf_metrics_model_detail_groups(value)
+        .into_values()
+        .max_by_key(|item| item.series.len())
+        .map(|item| item.series)
+        .unwrap_or_default()
 }
 
 /// 拉取「模型状态」增强模块的数据（见 `MODEL_STATUS_ENHANCEMENT_PATHS`：
@@ -1529,8 +1644,11 @@ pub(crate) async fn fetch_site_model_health(
     base_url: &Url,
     auth: &NewApiAuth,
     user_agent: &str,
+    key_groups: &HashMap<String, String>,
+    split_hint: bool,
 ) -> HashMap<String, SiteModelHealth> {
-    let health = fetch_perf_metrics_health(client, base_url, auth, user_agent).await;
+    let health =
+        fetch_perf_metrics_health(client, base_url, auth, user_agent, key_groups, split_hint).await;
     if !health.is_empty() {
         return health;
     }
@@ -1900,6 +2018,9 @@ pub(crate) fn parse_sub2api_model_market_health(
                 window_start: Some(start),
                 bucket_seconds,
                 series,
+                group: None,
+                groups: HashMap::new(),
+                group_scoped: false,
             },
         );
     }
@@ -2224,6 +2345,9 @@ pub(crate) fn parse_user_model_status_health(
                 // Agent Router 20 分钟），界面据此画出比逐时更细的条带。
                 bucket_seconds: Some(bucket_seconds),
                 series,
+                group: None,
+                groups: HashMap::new(),
+                group_scoped: false,
             },
         );
     }
@@ -2304,9 +2428,10 @@ pub(crate) async fn fetch_user_model_status_models(
 /// `success_rate` 为 0~100 百分数、`total_requests` 为请求数），因此复用
 /// `parse_model_status_health`。与 NewAPI 的差异：该接口**必须**带 `group`
 /// 参数——不带会返回 `{"success":false,"message":"group is not accessible"}`，
-/// 所以按本账号 Key 覆盖的分组逐个查询再合并；同一模型出现在多个分组时保留
-/// 先到的条目（分组名先排序，结果稳定）。软失败语义与其它健康度通道一致：
-/// 超时、报错、形状不符都只丢健康度，不影响 Key 与模型同步。
+/// 所以按本账号 Key 覆盖的分组逐个查询，并把每个分组的结果挂到
+/// `SiteModelHealth.groups`；同一模型出现在多个分组时不再只用先到的那条
+/// 代表全部 Key。软失败语义与其它健康度通道一致：超时、报错、形状不符都
+/// 只丢健康度，不影响 Key 与模型同步。
 async fn fetch_baiheibai_model_health(
     client: &wreq::Client,
     base_url: &Url,
@@ -2341,8 +2466,25 @@ async fn fetch_baiheibai_model_health(
                 Ok(Ok(value)) => value,
                 Ok(Err(_)) | Err(_) => continue,
             };
-        for (model, item) in parse_model_status_health(&value) {
-            health.entry(model).or_insert(item);
+        for (model, mut item) in parse_model_status_health(&value) {
+            item.group = Some(group.clone());
+            item.groups = HashMap::new();
+            item.group_scoped = true;
+            match health.entry(model) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    // 顶层也保留第一组（未选中 Key 时的展示口径），同时把
+                    // 第一组自己放进 groups：否则选中该组 Key 时按 group 取
+                    // 会取不到——顶层不是任何分组条目。
+                    let mut top = item.clone();
+                    top.groups.insert(group.clone(), item);
+                    entry.insert(top);
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    // 顶层保留先到的分组（排序后稳定），其余分组完整挂在
+                    // groups 下；界面选中 Key 时按它的 group 精确取数。
+                    entry.get_mut().groups.insert(group.clone(), item);
+                }
+            }
         }
     }
     health
@@ -2963,23 +3105,14 @@ pub async fn sync_models_for_cached_keys(
                 .map_err(|error| error.to_string())?;
         }
     }
-    // 并发那轮抓到的健康度挂到结果上：它是站点全站口径，不依赖任何 Key，
-    // 模型成败都带着。不并进 errors——健康度缺失只是少一份辅助信息。
+    // 并发那轮抓到的健康度挂到结果上：顶层是站点汇总口径，多分组时还带
+    // `groups` 拆分；不并进 errors——健康度缺失只是少一份辅助信息。
     result.model_health = model_health;
     // 整体失败通过 result.errors 报给前端（库里已尽量保留旧数据），而不是
     // 抛 Err：同一轮并行抓到的健康度要跟着回到界面上，不能被一次失败吃掉。
     Ok(result)
 }
 
-/// 用各账号保存的访问令牌抓某站点的模型健康度，并写回各账号行的 `health_json`。
-///
-/// 健康度是**站点全站口径**的辅助信息（perf-metrics / 「模型状态」增强模块），
-/// 与具体 Key 无关，但接口要求鉴权。这段鉴权与逐 Key 拉 `/v1/models` 是两条独立
-/// 通道，所以「同步模型」在拿到模型列表后也要走一次这里，界面才不会是旧数据。
-///
-/// 取不到令牌、或该架构根本不用令牌时返回空映射——「这个站点没有健康度数据」
-/// 是常态，不算同步失败，界面按无数据处理。抓不到也绝不写站点/账号的 error：
-/// 健康度只是补偿信息，不该把一次成功的同步变成报错。
 /// 读取某账号缓存的分组表（Key → 分组），供按分组查询健康度使用。
 fn read_cached_key_groups(
     database: &Database,
@@ -3002,6 +3135,72 @@ fn read_cached_key_groups(
         .unwrap_or_default()
 }
 
+/// 读取整个站点全部账号的 Key → 分组表。
+///
+/// 多账号站点的分组可能分散在不同账号行里：健康度要按分组拆分，必须先把
+/// 全站分组并起来，否则只拿当前账号的分组会漏掉其它账号的分组。
+fn read_cached_site_key_groups(database: &Database, site_id: &str) -> HashMap<String, String> {
+    let Ok(connection) = database.lock_conn() else {
+        return HashMap::new();
+    };
+    let Ok(mut statement) =
+        connection.prepare("SELECT groups_json FROM site_model_cache WHERE site_id = ?1")
+    else {
+        return HashMap::new();
+    };
+    let mut groups = HashMap::new();
+    let rows = statement.query_map([site_id], |row| row.get::<_, String>(0));
+    if let Ok(rows) = rows {
+        for json in rows.flatten() {
+            if let Ok(map) = serde_json::from_str::<HashMap<String, String>>(&json) {
+                merge_api_key_groups(&mut groups, map);
+            }
+        }
+    }
+    groups
+}
+
+/// 把一条模型健康度并入站点级映射：顶层字段先到先得，`groups` 按分组深合并。
+///
+/// 同一站点的多个账号/多轮同步可能各自只拿到一部分分组；直接把整条覆盖会
+/// 丢掉别的账号已经取到的分组健康度。
+pub(crate) fn merge_model_health(
+    target: &mut HashMap<String, SiteModelHealth>,
+    model: String,
+    source: SiteModelHealth,
+) {
+    match target.entry(model) {
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            entry.insert(source);
+        }
+        std::collections::hash_map::Entry::Occupied(mut entry) => {
+            let current = entry.get_mut();
+            if current.series.is_empty() && !source.series.is_empty() {
+                current.series = source.series.clone();
+            }
+            if current.success_rate.is_none() {
+                current.success_rate = source.success_rate;
+            }
+            if source.group_scoped {
+                current.group_scoped = true;
+            }
+            for (group, group_health) in source.groups {
+                match current.groups.entry(group) {
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(group_health);
+                    }
+                    std::collections::hash_map::Entry::Occupied(mut entry) => {
+                        let existing = entry.get_mut();
+                        if existing.series.is_empty() && !group_health.series.is_empty() {
+                            *existing = group_health;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// 按平台抓一次健康度：NewAPI 系走通用通道，「白与黑」走专属的
 /// `/api/model_health/slot_status`（分组表随账号缓存传入）。
 async fn fetch_platform_model_health(
@@ -3011,14 +3210,28 @@ async fn fetch_platform_model_health(
     auth: &NewApiAuth,
     user_agent: &str,
     groups: &HashMap<String, String>,
+    split_hint: bool,
 ) -> HashMap<String, SiteModelHealth> {
     if is_platform(system_type, "baiheibai") {
         fetch_baiheibai_model_health(client, base_url, auth, user_agent, groups).await
     } else {
-        fetch_site_model_health(client, base_url, auth, user_agent).await
+        fetch_site_model_health(client, base_url, auth, user_agent, groups, split_hint).await
     }
 }
 
+/// 用各账号保存的访问令牌抓某站点的模型健康度，并写回各账号行的 `health_json`。
+///
+/// 健康度是辅助信息，但**不能把多分组的数字混在一起用**：站点有多个 Key 分组
+/// 时，同一个模型在不同分组是不同渠道，`/api/perf-metrics/summary` 的站点聚合
+/// 值只适合「全部模型」视图；按 Key 展示时必须走明细接口的 `groups[]`。这里
+/// 会把站点全部分组一起传给抓取通道，并逐分组深合并到 `health_json`。
+///
+/// 这段鉴权与逐 Key 拉 `/v1/models` 是两条独立通道，所以「同步模型」在拿到
+/// 模型列表后也要走一次这里，界面才不会是旧数据。
+///
+/// 取不到令牌、或该架构根本不用令牌时返回空映射——「这个站点没有健康度数据」
+/// 是常态，不算同步失败，界面按无数据处理。抓不到也绝不写站点/账号的 error：
+/// 健康度只是补偿信息，不该把一次成功的同步变成报错。
 pub(crate) async fn collect_site_model_health(
     database: &Database,
     client: &wreq::Client,
@@ -3062,6 +3275,20 @@ pub(crate) async fn collect_site_model_health(
     }
     let home = home_dir().ok_or("无法定位用户目录")?;
     let user_agent = sync::chrome_user_agent();
+    // 分组表按站点取全量：健康度拆分要覆盖所有账号的分组，不能让当前
+    // 账号的行数据决定别的账号能不能拿到自己的分组健康度。
+    let site_key_groups = read_cached_site_key_groups(database, site_id);
+    // 多账号站点即使当前这次只传了一个账号，也可能与其它账号分属不同分组：
+    // 让抓取通道按分组拆分一次，明细接口会带回站点全部分组。
+    let site_account_count: i64 = database
+        .lock_conn()?
+        .query_row(
+            "SELECT COUNT(DISTINCT profile_id) FROM site_accounts WHERE site_id = ?1",
+            [site_id],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    let split_hint = profile_ids.len() > 1 || site_account_count > 1;
     let mut merged: HashMap<String, SiteModelHealth> = HashMap::new();
     for profile_id in profile_ids {
         if sub2api {
@@ -3110,8 +3337,8 @@ pub(crate) async fn collect_site_model_health(
                         params![site_id, profile_id, health_json],
                     );
                     drop(connection);
-                    if merged.is_empty() {
-                        merged = health;
+                    for (model, item) in health {
+                        merge_model_health(&mut merged, model, item);
                     }
                 }
             }
@@ -3130,10 +3357,13 @@ pub(crate) async fn collect_site_model_health(
         };
         let token = token.trim().to_string();
         let groups = if is_platform(system_type, "baiheibai") {
-            // 「白与黑」的分组表随账号缓存（Key 同步时已落库）。
+            // 「白与黑」的接口必须带 group 参数，且分组表随账号缓存——
+            // 用本账号能访问的分组逐个查，避免拿到别的账号无权访问的分组报错。
             read_cached_key_groups(database, site_id, profile_id)
         } else {
-            HashMap::new()
+            // NewAPI 通用通道：summary 是全站聚合，只有明细接口能按分组拆分。
+            // 传站点全部分组，让每个账号拉到的明细都能覆盖全部分组。
+            site_key_groups.clone()
         };
         let mut health = HashMap::new();
         if !token.is_empty() {
@@ -3141,9 +3371,16 @@ pub(crate) async fn collect_site_model_health(
                 access_token: token,
                 user_id: user_id.clone(),
             };
-            health =
-                fetch_platform_model_health(client, base_url, system_type, &auth, &user_agent, &groups)
-                    .await;
+            health = fetch_platform_model_health(
+                client,
+                base_url,
+                system_type,
+                &auth,
+                &user_agent,
+                &groups,
+                split_hint,
+            )
+            .await;
         }
         if health.is_empty() {
             // 回退浏览器登录会话：读该 Chrome Profile 在站点 API 域下的 Cookie。
@@ -3177,6 +3414,7 @@ pub(crate) async fn collect_site_model_health(
                     &auth,
                     &user_agent,
                     &groups,
+                    split_hint,
                 )
                 .await;
             }
@@ -3184,7 +3422,8 @@ pub(crate) async fn collect_site_model_health(
         if health.is_empty() {
             continue;
         }
-        // 健康度是站点全站口径：同站点各账号一致，逐行写一份，界面按账号行读。
+        // 逐账号行的 health_json 保留该账号本次取到的全部分组；界面按账号行读，
+        // 选中 Key 时再按 Key 的 group 取对应条目，不再跨账号/跨分组混用。
         let health_json = serde_json::to_string(&health).unwrap_or_else(|_| "{}".to_string());
         let connection = database.lock_conn()?;
         let _ = connection.execute(
@@ -3193,9 +3432,10 @@ pub(crate) async fn collect_site_model_health(
             params![site_id, profile_id, health_json],
         );
         drop(connection);
-        // 多账号时保留先到的那份：口径相同，重复拉没有意义。
-        if merged.is_empty() {
-            merged = health;
+        // 多账号合并：顶层数字先到先得，groups 逐分组深合并，
+        // 保证每个账号独有的分组都不会被先到的账号覆盖掉。
+        for (model, item) in health {
+            merge_model_health(&mut merged, model, item);
         }
     }
     // Sub2API 等不走 cookie 分支的架构不会在循环内碰到公开接口；公开监控页
@@ -3618,17 +3858,12 @@ pub fn get_site_model_cache(
         .map_err(|error| error.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| error.to_string())?;
-    // 健康度是全站口径，同一站点各账号行拿到的是同一份数据；按「先到先得」
-    // 合并即可，不需要比较新旧。带逐时序列的行优先：部分账号可能是旧版本
-    // 落库的数据（只有聚合值），别用它把状态条的槽位挤掉。
+    // 顶层汇总数字先到先得；按分组拆分的 groups 逐分组深合并——多账号站点
+    // 每个账号可能只覆盖一部分分组，整条覆盖会丢掉别人的分组健康度。
+    // 带逐时序列的行优先：旧版本缓存只有聚合值，别用它把状态条槽位挤掉。
     for account in &accounts {
         for (model_id, health) in &account.model_health {
-            let entry = model_health
-                .entry(model_id.clone())
-                .or_insert_with(|| health.clone());
-            if entry.series.is_empty() && !health.series.is_empty() {
-                *entry = health.clone();
-            }
+            merge_model_health(&mut model_health, model_id.clone(), health.clone());
         }
     }
     models.sort_by(|left, right| left.id.cmp(&right.id));
@@ -3707,11 +3942,7 @@ pub fn get_all_site_model_caches(
             entry.cache.api_source = api_source;
         }
         for (model_id, health) in &account.model_health {
-            entry
-                .cache
-                .model_health
-                .entry(model_id.clone())
-                .or_insert_with(|| health.clone());
+            merge_model_health(&mut entry.cache.model_health, model_id.clone(), health.clone());
         }
         entry.cache.models.extend(account_models);
         entry.cache.accounts.push(account);
@@ -4032,8 +4263,8 @@ async fn fetch_site_models_json_inner(
     let base_url = Url::parse(&base).map_err(|_| "站点 API 地址无效".to_string())?;
     let user_agent = sync::chrome_user_agent();
     let requested_profile_id = profile_id.clone();
-    let (system_type, mut profile_ids, cached_model_keys) = if let Some(site_id) =
-        site_id.as_deref()
+    let (system_type, mut profile_ids, cached_model_keys, site_account_count) =
+        if let Some(site_id) = site_id.as_deref()
     {
         let connection = database.lock_conn()?;
         let system_type = connection
@@ -4077,13 +4308,30 @@ async fn fetch_site_models_json_inner(
             .map_err(|error| error.to_string())?
             .collect::<Result<HashMap<_, _>, _>>()
             .map_err(|error| error.to_string())?;
-        (system_type, profile_ids, cached_model_keys)
+        // 账号数独立统计：本次按 profile 过滤后只剩一个账号时，站点其它账号
+        // 仍可能存在并属于别的分组，健康度拆分与否不能只看本次请求范围。
+        let site_account_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(DISTINCT profile_id) FROM site_accounts WHERE site_id = ?1",
+                [site_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        (
+            system_type,
+            profile_ids,
+            cached_model_keys,
+            site_account_count.max(0) as usize,
+        )
     } else {
-        (String::new(), Vec::new(), HashMap::new())
+        (String::new(), Vec::new(), HashMap::new(), 0)
     };
     if let Some(requested_profile_id) = requested_profile_id.as_deref() {
         profile_ids.retain(|candidate| candidate == requested_profile_id);
     }
+    // 多账号站点即使每个账号各自只有一组，也可能分散在不同分组：让明细接口
+    // 把站点全部分组一次带回。单账号站点若本身多分组，则由 key_groups 触发。
+    let split_hint = site_account_count > 1;
     let home_dir = home_dir().ok_or("无法定位用户目录")?;
     let origin = base_url.origin().ascii_serialization();
     let local_targets = site_id
@@ -4374,6 +4622,16 @@ async fn fetch_site_models_json_inner(
                             // 留一份 Key 与分组给 /v1/models 全失败时的模型状态兜底。
                             let fallback_keys = keys.clone();
                             let fallback_groups = key_groups.clone();
+                            // 健康度按分组拆分要用「站点全部账号」的分组表：
+                            // 当前账号只覆盖其中一部分，单看它会漏掉别的账号
+                            // 才有的分组，缓存合并后就无法按 Key 精确取数。
+                            let mut health_groups = key_groups.clone();
+                            for (_, cached_groups) in cached_model_keys.values() {
+                                merge_api_key_groups(
+                                    &mut health_groups,
+                                    cached_groups.clone(),
+                                );
+                            }
                             // 模型逐 Key 拉取与全站健康度互不依赖，并发发起，
                             // 避免给站点的 90s 同步总预算再加一次串行往返。
                             let (models_outcome, health) = tokio::join!(
@@ -4390,7 +4648,14 @@ async fn fetch_site_models_json_inner(
                                 // perf-metrics 缺失（魔改 NewAPI）时自动回退到
                                 // 「模型状态」增强模块与站点状态接口，对模型拉取
                                 // 仍然只是并发的补偿信息。
-                                fetch_site_model_health(&client, &base_url, &auth, &user_agent),
+                                fetch_site_model_health(
+                                    &client,
+                                    &base_url,
+                                    &auth,
+                                    &user_agent,
+                                    &health_groups,
+                                    split_hint,
+                                ),
                             );
                             match models_outcome {
                                 Ok(mut result) => {

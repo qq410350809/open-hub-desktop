@@ -3,7 +3,7 @@ import { computed, ref, watch, nextTick } from "vue";
 import { runCommand, useLibrary } from "../../composables/useLibrary";
 import { icons } from "../../icons";
 import { useStore } from "../../composables/useStore";
-import { logoText, describeModelHealth, describeModelSnapshot, describeModelStatusStrip, describeModelStatusStripTitle, describeModelWindowLabel, modelHealthValue, MODEL_STATUS_SLOT_COUNT } from "../../utils";
+import { logoText, describeModelHealth, describeModelSnapshot, describeModelStatusStrip, describeModelStatusStripTitle, describeModelWindowLabel, modelHealthForGroup, modelHealthValue, MODEL_STATUS_SLOT_COUNT } from "../../utils";
 import type { ModelHealthBadge, ModelStatusSlot } from "../../utils";
 import { isUnknownSystemType, systemTypeLabel } from "../../types";
 import type { SiteModelHealth } from "../../types";
@@ -30,7 +30,7 @@ interface FetchSiteModelsResult {
   errors?: string[];
   /** 实际产出这批 Key 的账号（Chrome Profile）；空表示无归属。 */
   profileId?: string;
-  /** 全站模型健康度（模型 ID → 健康度）；站点无该接口时为空。 */
+  /** 站点模型健康度（模型 ID → 健康度；多分组时带 groups）；站点无该接口时为空。 */
   modelHealth?: Record<string, SiteModelHealth>;
 }
 
@@ -70,7 +70,7 @@ const liveError = ref("");
 const liveModels = ref<LiveModelItem[]>([]);
 /** 正在单账号同步 Key 的 profileId；用于该账号行钥匙图标的转圈与禁用。 */
 const syncingKeyProfileId = ref<string>("");
-/** 全站模型健康度（模型 ID → 健康度），来自 NewAPI 的性能指标接口。 */
+/** 站点模型健康度（模型 ID → 健康度），来自 NewAPI 的性能指标接口。 */
 const modelHealth = ref<Record<string, SiteModelHealth>>({});
 const liveAccountKeys = ref<LiveAccountKeys[]>([]);
 const apiSource = ref<ModelApiSource>("none");
@@ -170,6 +170,40 @@ const currentActiveModels = computed<LiveModelItem[]>(() => {
   return liveModels.value;
 });
 
+/**
+ * 当前选中 Key 所属的站点分组。
+ *
+ * 多分组站点必须按它取 `groups[group]`：同一个模型名在不同分组是不同渠道，
+ * 拿站点聚合值或别的分组的值来标这个 Key 就是跨 Key 串数据。
+ */
+const selectedKeyGroup = computed<string | null>(() => {
+  const keyId = selectedKeyId.value;
+  if (!keyId) return null;
+  for (const account of liveAccountKeys.value) {
+    if (account.keys.includes(keyId)) {
+      return account.keyGroups?.[keyId]?.trim() || null;
+    }
+  }
+  return null;
+});
+
+/**
+ * 按当前选中 Key 解析后的健康度视图；未选中 Key 时保持站点聚合口径。
+ *
+ * 分组数据存在但该分组没有条目时，模型会从视图里消失（按「该分组无数据」
+ * 处理），而不是回退到其它分组——跨分组回退正是要修掉的问题。
+ */
+const scopedModelHealth = computed<Record<string, SiteModelHealth>>(() => {
+  const group = selectedKeyGroup.value;
+  if (!group) return modelHealth.value;
+  const scoped: Record<string, SiteModelHealth> = {};
+  for (const [modelId, health] of Object.entries(modelHealth.value)) {
+    const item = modelHealthForGroup(health, group);
+    if (item) scoped[modelId] = item;
+  }
+  return scoped;
+});
+
 /** 站点是否上报过任何模型健康度；用于在面板上给出一次性的口径说明。 */
 const hasModelHealth = computed(() => Object.keys(modelHealth.value).length > 0);
 
@@ -182,9 +216,12 @@ const hideUnhealthy = ref(false);
  *  健康度数值与徽标同源（modelHealthValue）。站点整体没有健康度数据
  *  （不支持该接口）时不按无数据判无效，否则开关一开整份列表都会被隐藏。 */
 function isUnhealthyModel(modelId: string): boolean {
-  const value = modelHealthValue(modelHealth.value[modelId]);
+  const value = modelHealthValue(scopedModelHealth.value[modelId]);
   if (value !== null) return value < UNHEALTHY_SUCCESS_RATE;
+  // 站点完全没上报健康度、或当前分组的拆分数据整份缺失时不能判无效：
+  // 那不是「成功率 0%」，只是这一份数据没拿到。
   if (!hasModelHealth.value) return false;
+  if (Object.keys(scopedModelHealth.value).length === 0) return false;
   return true;
 }
 
@@ -216,7 +253,7 @@ const modelCountLabel = computed(() => {
 
 /** 开关按钮标题：说明口径与当前隐藏了多少个模型。 */
 const hideUnhealthyTitle = computed(() => {
-  const base = `隐藏成功率极低（低于 ${Math.round(UNHEALTHY_SUCCESS_RATE * 100)}%，含 0%）的模型；站点已上报健康度、但该模型所有时段都无数据（条带全灰）的模型同样视为无效；站点整体未上报健康度时保留全部模型`;
+  const base = `隐藏成功率极低（低于 ${Math.round(UNHEALTHY_SUCCESS_RATE * 100)}%，含 0%）的模型；${healthScopeLabel.value}已上报健康度、但该模型所有时段都无数据（条带全灰）的模型同样视为无效；当前口径整体未上报健康度时保留全部模型`;
   return hideUnhealthy.value && hiddenUnhealthyCount.value > 0
     ? `${base}；当前已隐藏 ${hiddenUnhealthyCount.value} 个`
     : base;
@@ -231,7 +268,7 @@ const hasStatusStrip = computed(() => Object.keys(modelHealth.value).length > 0)
 // 逐次调用会把同样的格式化跑三遍。
 const healthBadges = computed(() => {
   const badges = new Map<string, ModelHealthBadge>();
-  for (const [modelId, health] of Object.entries(modelHealth.value)) {
+  for (const [modelId, health] of Object.entries(scopedModelHealth.value)) {
     const badge = describeModelHealth(health);
     if (badge) badges.set(modelId, badge);
   }
@@ -243,20 +280,28 @@ function healthBadgeOf(modelId: string) {
 }
 
 /** 站点健康度是否为「只有当前状态」的快照源（自建监控页等）。 */
+// 数据源形态：选中分组有数据时看分组条目；整份缺失时退回站点级条目判断
+// 快照/渠道监控形态，不能把「无数据」画成一整条灰格时间轴。
+const sourceModelHealth = computed(() =>
+  Object.keys(scopedModelHealth.value).length > 0
+    ? scopedModelHealth.value
+    : modelHealth.value,
+);
+
 const snapshotMode = computed(() =>
-  Object.values(modelHealth.value).some((health) => health.snapshot === true),
+  Object.values(sourceModelHealth.value).some((health) => health.snapshot === true),
 );
 
 /** 渠道监控型：有状态文案且有逐小时序列（daigua 等），徽标是整体等级。 */
 const channelMonitorMode = computed(() =>
-  Object.values(modelHealth.value).some(
+  Object.values(sourceModelHealth.value).some(
     (health) => health.snapshot !== true && !!health.statusLabel?.trim(),
   ),
 );
 
 const snapshotBadges = computed(() => {
   const badges = new Map<string, ModelHealthBadge>();
-  for (const [modelId, health] of Object.entries(modelHealth.value)) {
+  for (const [modelId, health] of Object.entries(scopedModelHealth.value)) {
     const badge = describeModelSnapshot(health);
     if (badge) badges.set(modelId, badge);
   }
@@ -274,7 +319,7 @@ function snapshotBadgeOf(modelId: string) {
 // 7 天窗口的站点会错位）。
 const statusStrips = computed(() => {
   const strips = new Map<string, ModelStatusSlot[]>();
-  const healthMap = modelHealth.value;
+  const healthMap = scopedModelHealth.value;
   const fallbackHealth = Object.values(healthMap).find(
     (health) => typeof health.windowStart === "number" && (health.windowStart ?? 0) > 0,
   );
@@ -290,19 +335,29 @@ function statusStripOf(modelId: string) {
 
 /** 状态条容器口径说明；任一健康度条目即可提供窗口与格宽。 */
 const statusStripTitle = computed(() =>
-  describeModelStatusStripTitle(Object.values(modelHealth.value)[0]),
+  describeModelStatusStripTitle(Object.values(scopedModelHealth.value)[0], selectedKeyGroup.value),
 );
 
 /** 状态条可读性兜底：给 role=img 一句完整描述，供读屏而非鼠标悬停使用。 */
 const statusStripLabel = computed(
   () =>
-    `${describeModelWindowLabel(Object.values(modelHealth.value)[0])}成功率状态条，共 ${MODEL_STATUS_SLOT_COUNT} 个时段`,
+    `${describeModelWindowLabel(Object.values(scopedModelHealth.value)[0])}成功率状态条，共 ${MODEL_STATUS_SLOT_COUNT} 个时段`,
 );
 
 /** 说明段落里的窗口口径：站点窗口不是 24 小时时不能写死「近 24 小时逐时」。 */
 const healthNoteWindow = computed(() =>
-  describeModelWindowLabel(Object.values(modelHealth.value)[0]),
+  describeModelWindowLabel(Object.values(scopedModelHealth.value)[0]),
 );
+
+/** 健康度口径：选中 Key 时按它所属分组；未选中时若条目自带分组则按该分组。 */
+const healthScopeLabel = computed(() => {
+  const group = selectedKeyGroup.value;
+  if (group) return `该 Key 所属分组「${group}」`;
+  const firstGroup = Object.values(modelHealth.value)
+    .map((health) => health.group?.trim())
+    .find((value): value is string => Boolean(value));
+  return firstGroup ? `站点分组「${firstGroup}」` : "站点全站";
+});
 
 interface LocalSiteModelCache {
   models: LiveModelItem[];
@@ -1057,15 +1112,13 @@ async function removeKey(account: LiveAccountKeys, key: string) {
 
               <p v-if="hasModelHealth" class="site-models-health-note">
                 <template v-if="snapshotMode">
-                  状态灯为站点<b>实时探测</b>的当前状态（与当前 Key 无关，仅作健康度参考）：绿 = 正常，黄 = 限流，红 = 不可用；灰 = 站点未列出该模型（无账号或未放行）。能否使用以该 Key 的模型列表为准。
+                  状态灯为<b>{{ healthScopeLabel }}</b>的站点实时探测状态（仅作健康度参考）：绿 = 正常，黄 = 限流，红 = 不可用；灰 = 该口径未列出此模型（无账号或未放行）。能否使用以该 Key 的模型列表为准。
                 </template>
                 <template v-else-if="channelMonitorMode">
-                  数字徽标为站点渠道监控的<b>整体健康等级</b>；色条为{{ healthNoteWindow }}健康等级（与当前 Key
-                  无关，仅作健康度参考）：绿 = 正常，黄 = 警告，红 = 异常，灰 = 该时段无数据；能否使用以该 Key 的模型列表为准。
+                  数字徽标为<b>{{ healthScopeLabel }}</b>的渠道监控整体健康等级；色条为{{ healthNoteWindow }}健康等级（仅作健康度参考）：绿 = 正常，黄 = 警告，红 = 异常，灰 = 该时段无数据；能否使用以该 Key 的模型列表为准。
                 </template>
                 <template v-else>
-                  数字徽标为<b>最近有流量时段</b>的成功率（与色条最后一个亮块一致）；色条为站点上报的<b>全站</b>口径{{ healthNoteWindow }}逐时段成功率（与当前 Key
-                  无关，仅作健康度参考）：绿 ≥95%，浅绿 85%~95%，黄 70%~85%，橙 50%~70%，红 &lt;50%，灰 = 该时段无流量，悬停可看具体时段与请求量；能否使用以该 Key 的模型列表为准。
+                  数字徽标为<b>最近有流量时段</b>的成功率（与色条最后一个亮块一致）；色条为<b>{{ healthScopeLabel }}</b>口径{{ healthNoteWindow }}逐时段成功率（仅作健康度参考）：绿 ≥95%，浅绿 85%~95%，黄 70%~85%，橙 50%~70%，红 &lt;50%，灰 = 该时段无流量，悬停可看具体时段与请求量；能否使用以该 Key 的模型列表为准。
                 </template>
               </p>
             </div>

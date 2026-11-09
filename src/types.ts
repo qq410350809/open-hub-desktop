@@ -131,6 +131,32 @@ export interface SyncSitesResult {
   runaway: boolean;
   /** 仅包含本次新增的站点 id；类型检测只针对新增站点 */
   siteIds: string[];
+  /** 本次同步覆盖的来源（ldoh / baipiao） */
+  sources?: PublicLibrarySource[];
+}
+
+/** 「同步公共库」支持的来源。 */
+export type PublicLibrarySource = "ldoh" | "baipiao";
+
+/** 单个公共库来源的同步结果。 */
+export interface PublicSourceResult {
+  source: PublicLibrarySource;
+  label: string;
+  ok: boolean;
+  added: number;
+  updated: number;
+  total: number;
+  error: string;
+  /** 该来源本次新增的站点 id（仅供类型检测使用） */
+  siteIds: string[];
+}
+
+export interface PublicLibrarySourceOption {
+  id: PublicLibrarySource;
+  label: string;
+  /** 是否需要先在 Chrome 登录；不需要时即使没登录也能同步 */
+  requiresLogin: boolean;
+  hint: string;
 }
 
 export type SyncProgressStatus = "running" | "success" | "error" | "info";
@@ -325,13 +351,16 @@ export interface SiteModelItem {
 }
 
 /**
- * 模型健康度（NewAPI `/api/perf-metrics/summary`）。
+ * 模型健康度（NewAPI `/api/perf-metrics/summary` 与按模型明细）。
  *
- * 注意两点口径：
- * 1. 这是**全站聚合**数据，按模型统计所有用户近 windowHours 小时的
- *    成功/失败、延迟与出字速度，与当前用户、当前 Key 无关。它只是健康度
- *    标签，不代表「这个 Key 能用这个模型」——那要看该 Key 的 `/v1/models` 列表。
- * 2. 站点**只为窗口内确有请求的模型**下发条目，所以「有这条记录」本身就等于
+ * 注意三点口径：
+ * 1. 顶层字段是**站点级聚合**：NewAPI 的 summary 接口会把站点所有分组一起
+ *    统计，所以它不能直接代表某个 Key 所属分组的表现。多分组站点会用
+ *    `groups` 带一份按分组拆分的同一套字段，界面选中 Key 时按该 Key 的
+ *    `group` 取对应条目，取不到就按「该分组无数据」处理，绝不跨分组借用。
+ * 2. 它仍然只是健康度标签，不代表「这个 Key 能用这个模型」——那要看该 Key
+ *    的 `/v1/models` 列表。
+ * 3. 站点**只为窗口内确有请求的模型**下发条目，所以「有这条记录」本身就等于
  *    「近 windowHours 小时有流量」。模型不在这张表里就是没有数据，界面不显示徽标。
  */
 export interface SiteModelHealth {
@@ -368,6 +397,24 @@ export interface SiteModelHealth {
   bucketSeconds?: number;
   /** 逐时段成功率（0~1）。只含窗口内确有流量的时段，缺槽代表无流量。 */
   series?: SiteModelHealthPoint[];
+  /** 该条目所属的站点分组名；顶层站点聚合条目没有该字段。 */
+  group?: string;
+  /**
+   * 按站点分组拆分的健康度（模型 ID → 分组名 → 健康度）。
+   *
+   * 只有多分组站点（或多账号站点可能分散在不同分组）、且数据源能按分组
+   * 拆分时才存在；老缓存没有该字段时界面回退顶层站点聚合值。分组条目里
+   * 不会再嵌套 `groups`。
+   */
+  groups?: Record<string, SiteModelHealth>;
+  /**
+   * 是否已按分组拆分（哪怕 `groups` 为空）。
+   *
+   * 多分组站点在明细接口成功返回、但当前 Key 的分组没有流量时，`groups`
+   * 里不会出现该分组；界面必须按「该分组无数据」处理，不能回退顶层站点
+   * 聚合值。老缓存没有该字段时按 false 处理（照旧回退）。
+   */
+  groupScoped?: boolean;
 }
 
 /** 模型健康度逐时段采样点：一个时间格一条。 */
@@ -388,7 +435,7 @@ export interface SiteModelCacheAccount {
   keys: string[];
   keyGroups?: Record<string, string>;
   keyModels?: Record<string, SiteModelItem[]>;
-  /** 本账号同步时取到的全站模型健康度（模型 ID → 健康度）。 */
+  /** 本账号同步时取到的站点模型健康度（模型 ID → 健康度；多分组时带 groups）。 */
   modelHealth?: Record<string, SiteModelHealth>;
   error?: string;
 }
@@ -397,7 +444,7 @@ export interface SiteModelCache {
   models: SiteModelItem[];
   apiSource?: string;
   accounts: SiteModelCacheAccount[];
-  /** 各账号行合并后的站点级健康度视图（模型 ID → 健康度）。 */
+  /** 各账号行合并后的站点级健康度视图（模型 ID → 健康度；groups 已深合并）。 */
   modelHealth?: Record<string, SiteModelHealth>;
 }
 

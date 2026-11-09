@@ -157,7 +157,13 @@ Mihomo 代理内核与 GeoIP 数据库不随安装包分发（减小体积、规
 - 站点 CRUD、JSON 导入、种子数据初始化（`resources/sites.json`）
 - 30+ 字段：API 地址、系统类型（new-api/one-api 等）、注册限制、签到/福利链接、维护者、扩展链接、费率、状态页……
 - 多维标记：收藏、隐藏、个人站、待定、跑路（`is_runaway`）、假公益、待举报
-- 从远程目录源（ldoh）拉取/同步站点列表与用户信息
+- 从远程目录源拉取/同步站点列表与用户信息，支持多来源：
+  - `ldoh`（`https://ldoh.105117.xyz/`）：主来源，字段最全，复用本机 Chrome 登录会话；
+  - `白嫖公益站目录`（`https://baipiao.org/charity/`）：补充来源，公开可抓、无需登录。
+    列表页 `data-*` 卡片提供名称/简介/标签/状态（已关停映射为 `is_runaway`），
+    新增站点的 **API 基址**再从详情页正文提取（并发 4 路、90s 预算，失败退回入口域名）。
+    两来源按「地址键」（忽略协议与 `www.`、折掉 `/v1` 等接口前缀）合并，重合站点不会重复录入；
+    单个来源失败不影响其它来源，结果按来源逐条汇报（`sync_public_library` 命令）。
 - 关键词、分类、收藏状态筛选；系统默认浏览器打开
 
 ### Chrome 会话同步（site/sync）
@@ -301,6 +307,7 @@ OpenHub/
 │   │   │   ├── single_instance.rs   # 单实例互斥
 │   │   │   └── app_menu.rs file_export.rs
 │   │   ├── site/library/            # 站点 CRUD/导入/远程同步/平台识别
+│   │   │   └── baipiao.rs           #   白嫖公益站目录来源（列表卡片 + 详情页 API 基址解析）
 │   │   ├── site/sync/               # Chrome 会话检测/账号同步/用量
 │   │   ├── proxypool/               # parser/tester/rotator/runtime/geoip
 │   │   ├── kernel/                  # mihomo.rs / geoip.rs —— 组件按需下载引导

@@ -755,6 +755,31 @@ kbd { padding: 3px 7px; border: 1px solid var(--line); border-radius: var(--r-xs
 .sync-sites-state .sync-sites-error { color: var(--danger); overflow-wrap: anywhere; }
 .sync-sites-state-actions { margin-top: 20px; display: flex; flex-wrap: wrap; justify-content: center; gap: 9px; }
 .sync-sites-state-actions .primary-button, .sync-sites-state-actions .secondary-button, .sync-sites-footer .primary-button, .sync-sites-footer .secondary-button { min-width: 132px; }
+/* —— 同步公共库：来源多选 —— */
+.sync-source-picker { margin-bottom: 12px; padding: 14px 15px; border: 1px solid var(--line-soft); border-radius: var(--r-md); background: var(--surface); }
+.sync-source-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; }
+.sync-source-head strong { color: var(--text); font-size: 11.5px; }
+.sync-source-head span { color: var(--faint); font-size: 10px; line-height: 1.5; }
+.sync-source-options { margin-top: 10px; display: grid; grid-template-columns: repeat(auto-fit,minmax(210px,1fr)); gap: 8px; }
+.sync-source-option { min-width: 0; padding: 10px 11px; display: grid; grid-template-columns: 16px minmax(0,1fr); align-items: start; gap: 9px; border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--surface); color: var(--muted); text-align: left; cursor: pointer; transition: border-color .16s var(--ease),background .16s var(--ease); }
+.sync-source-option:hover:not(:disabled) { border-color: color-mix(in srgb,var(--brand) 30%,var(--line)); background: color-mix(in srgb,var(--brand) 4%,var(--surface)); }
+.sync-source-option:disabled { cursor: not-allowed; opacity: .6; }
+.sync-source-option.is-active { border-color: color-mix(in srgb,var(--brand) 42%,var(--line)); background: color-mix(in srgb,var(--brand) 7%,var(--surface)); }
+.sync-source-check { width: 16px; height: 16px; margin-top: 1px; display: grid; place-items: center; border: 1px solid var(--line); border-radius: var(--r-xs); background: var(--surface); }
+.sync-source-option.is-active .sync-source-check { border-color: var(--brand-deep); background: var(--brand-deep); }
+.sync-source-option.is-active .sync-source-check::after { content: ""; width: 8px; height: 4px; margin-top: -2px; border-left: 1.6px solid var(--surface); border-bottom: 1.6px solid var(--surface); transform: rotate(-45deg); }
+.sync-source-text { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.sync-source-text b { overflow: hidden; color: var(--text); white-space: nowrap; text-overflow: ellipsis; font-size: 11.5px; font-weight: 650; }
+.sync-source-text small { color: var(--faint); font-size: 10px; line-height: 1.5; }
+/* —— 同步公共库：逐来源结果 —— */
+.sync-source-results { margin-top: 12px; display: flex; flex-direction: column; gap: 6px; }
+.sync-source-result { padding: 9px 12px; display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; border: 1px solid var(--line-soft); border-radius: var(--r-sm); background: var(--surface); font-size: 10.5px; }
+.sync-source-result b { color: var(--text); font-size: 11px; }
+.sync-source-result span { color: var(--muted); }
+.sync-source-result.is-ok { border-color: color-mix(in srgb,var(--success) 22%,var(--line)); background: color-mix(in srgb,var(--success) 5%,var(--surface)); }
+.sync-source-result.is-ok span { color: var(--success); }
+.sync-source-result.is-error { border-color: color-mix(in srgb,var(--danger) 22%,var(--line)); background: color-mix(in srgb,var(--danger) 5%,var(--surface)); }
+.sync-source-result-error { color: var(--danger); overflow-wrap: anywhere; }
 .sync-user-card { min-height: 88px; padding: 15px; display: grid; grid-template-columns: 48px minmax(0,1fr) auto; align-items: center; gap: 13px; border: 1px solid var(--line); border-radius: var(--r-md); background: var(--surface); box-shadow: 0 8px 24px rgba(18,22,31,.04); }
 .sync-user-avatar { width: 48px; height: 48px; display: grid; place-items: center; border-radius: 15px; background: var(--brand-soft); color: var(--brand-deep); }
 .sync-user-avatar svg { width: 21px; height: 21px; }

@@ -5,6 +5,8 @@
  * 便于后续修改端口、URL 或默认配置时一处生效、处处生效。
  */
 
+import type { PublicLibrarySourceOption } from "./types";
+
 // ── 模型反代（同源 Web 服务端点）──
 
 /** dev 隔离形态端口（后端 debug 构建 / OPENHUB_PROFILE=dev 时使用）。 */
@@ -68,5 +70,27 @@ export const PROXY_SPEED_TEST_URL = "http://www.gstatic.com/generate_204";
 
 /** 远程登录地址 */
 export const REMOTE_LOGIN_URL = "https://ldoh.105117.xyz/";
+
+/**
+ * 「同步公共库」的来源清单。
+ *
+ * ldoh 是主来源（站点 id 稳定、字段最全，但要在 Chrome 登录）；
+ * 白嫖公益站目录是补充来源（公开可抓、无需登录，能从详情页补出 API 基址）。
+ * 顺序即同步顺序：先 ldoh 再白嫖，后者与前者重合的站点按地址键合并。
+ */
+export const PUBLIC_LIBRARY_SOURCES: PublicLibrarySourceOption[] = [
+  {
+    id: "ldoh",
+    label: "ldoh 公益站目录",
+    requiresLogin: true,
+    hint: "字段最全，需要在 Chrome 登录",
+  },
+  {
+    id: "baipiao",
+    label: "白嫖公益站目录",
+    requiresLogin: false,
+    hint: "公开目录，可从详情页补 API 基址",
+  },
+];
 
 // ── 远程访问 ──

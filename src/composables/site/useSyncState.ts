@@ -1,4 +1,4 @@
-import { ref } from "vue";
+import { computed, ref } from "vue";
 import { runCommand } from "../core/ipc";
 import { useLibrary } from "./useLibrary";
 import { useToast } from "../core/useToast";
@@ -6,14 +6,15 @@ import { useFilterState } from "./useFilterState";
 import { useUIState } from "../ui/useUIState";
 import { useChromeSession } from "./useChromeSession";
 import { useSiteActions } from "./useSiteActions";
-import { REMOTE_LOGIN_URL } from "../../constants";
+import { PUBLIC_LIBRARY_SOURCES, REMOTE_LOGIN_URL } from "../../constants";
 import type {
+  PublicLibrarySource,
+  PublicSourceResult,
   RemoteUserInfo,
   SyncLogEntry,
   SyncProgressStatus,
   SyncRunState,
   SyncSitesProgress,
-  SyncSitesResult,
 } from "../../types";
 import { isUnknownSystemType, supportsKeyDiscovery } from "../../types";
 import type { SiteModelHealth } from "../../types";
@@ -43,6 +44,15 @@ const syncDialogRunaway = ref(false);
 const syncDialogMode = ref<"remote" | "quota" | "session">("remote");
 const syncDialogUsage = ref<"personal" | "pending">("personal");
 const syncDialogSiteIds = ref<string[]>([]);
+/**
+ * 「同步公共库」本次选中的来源。
+ *
+ * 默认只勾 ldoh，保持旧行为；白嫖目录是补充来源，需要用户显式勾选才多打对方
+ * 一次列表 + 一轮详情页请求，避免默认行为悄悄变成两个上游。
+ */
+const syncDialogSources = ref<PublicLibrarySource[]>(["ldoh"]);
+/** 上一次「同步公共库」每个来源的成败，用于对话框里逐条展示。 */
+const syncSourceResults = ref<PublicSourceResult[]>([]);
 
 let syncRunId = 0;
 let syncLogId = 0;
@@ -71,6 +81,20 @@ function beginSyncRun(state: { generation: number }) {
 }
 
 const remoteLoginUrl = REMOTE_LOGIN_URL;
+
+/** 本次选中的来源里是否需要 Chrome 登录（ldoh 需要，白嫖目录不需要）。 */
+const needsRemoteLogin = computed(() =>
+  syncDialogSources.value.some((source) => (source === "ldoh")),
+);
+
+/** 切换公共库来源勾选；至少保留一个来源，全取消时自动回落到 ldoh。 */
+function toggleSyncSource(source: PublicLibrarySource) {
+  const current = syncDialogSources.value;
+  const next = current.includes(source)
+    ? current.filter((item) => item !== source)
+    : [...current, source];
+  syncDialogSources.value = next.length > 0 ? next : ["ldoh"];
+}
 
 async function refreshRemoteUser() {
   const requestId = ++remoteUserRequestId;
@@ -213,6 +237,7 @@ function openSyncDialog(
   syncRunId += 1;
   resetSyncLog();
   syncDialogRunaway.value = runawayFilter.value === "runaway";
+  syncSourceResults.value = [];
   const quotaMode = explicitMode
     ? explicitMode === "quota"
     : (usageFilter.value === "personal" || usageFilter.value === "pending");
@@ -665,7 +690,9 @@ async function stopBatchSync() {
 }
 
 async function syncSites() {
-  if (syncingSites.value || syncingModelKeys.value || (syncDialogMode.value === "remote" && !remoteUser.value)) return;
+  if (syncingSites.value || syncingModelKeys.value) return;
+  // 只勾了免登录来源（白嫖目录）时不需要 Chrome 会话，只有勾了 ldoh 才要求先登录。
+  if (syncDialogMode.value === "remote" && needsRemoteLogin.value && !remoteUser.value) return;
   const mode = syncDialogMode.value;
   // 已有 Chrome 同步在跑时不再静默报错：先问用户是否取消它再开始本次同步。
   // 必须在复位日志与状态之前询问——用户选择保留时，界面应保持原样。
@@ -816,13 +843,45 @@ async function syncSites() {
         releaseChromeSessionSync(syncToken);
       }
     }
-    const result = await runCommand<SyncSitesResult>("sync_remote_sites", { runId });
+    const selected = syncDialogSources.value.length > 0 ? [...syncDialogSources.value] : (["ldoh"] as PublicLibrarySource[]);
+    appendSyncLog({
+      stage: "sources",
+      status: "info",
+      message: `来源：${selected.map((source) => PUBLIC_LIBRARY_SOURCES.find((item) => item.id === source)?.label ?? source).join(" + ")}`,
+    });
+    const results = await runCommand<PublicSourceResult[]>("sync_public_library", { sources: selected, runId });
+    syncSourceResults.value = results;
     await loadLibrary();
-    const account = result.userName ? `账号 ${result.userName}` : `Chrome ${result.profileName}`;
-    showToast(`${account} 已同步 ${result.total} 个公共站点（新增 ${result.added}，更新 ${result.updated}）`);
+
+    const ok = results.filter((result) => result.ok);
+    const failed = results.filter((result) => !result.ok);
+    const totalAdded = ok.reduce((sum, result) => sum + result.added, 0);
+    const totalUpdated = ok.reduce((sum, result) => sum + result.updated, 0);
+    const summary = ok.map((result) => `${result.label}：新增 ${result.added}，更新 ${result.updated}`).join("；");
+    if (failed.length > 0) {
+      appendSyncLog({
+        stage: "source-failed",
+        status: "error",
+        message: `部分来源失败：${failed.map((result) => `${result.label}（${result.error}）`).join("；")}`,
+      });
+    }
+    showToast(
+      failed.length > 0
+        ? `已同步 ${ok.length} 个来源（新增 ${totalAdded}，更新 ${totalUpdated}），${failed.length} 个来源失败`
+        : `公共库同步完成：新增 ${totalAdded}，更新 ${totalUpdated}`,
+      failed.length > 0,
+    );
     syncRunState.value = "detecting";
-    appendSyncLog({ stage: "available", status: "success", message: `站点数据已可用，共 ${result.total} 条（存活与跑路全量同步）；仅新增 ${result.added} 个站点进入类型检测` });
-    void detectSyncedSiteTypes(result.siteIds, runId);
+    appendSyncLog({
+      stage: "available",
+      status: "success",
+      message: `站点数据已可用：${summary || "无变更"}；仅新增 ${totalAdded} 个站点进入类型检测`,
+    });
+    // 两个来源的新增站点合并去重后统一做一次类型检测。
+    void detectSyncedSiteTypes(
+      [...new Set(ok.flatMap((result) => result.siteIds ?? []))],
+      runId,
+    );
   } catch (error) {
     remoteUserError.value = `同步失败：${String(error)}`;
     syncRunState.value = "error";
@@ -850,6 +909,10 @@ export function useSyncState() {
     syncDialogMode,
     syncDialogUsage,
     syncDialogSiteIds,
+    syncDialogSources,
+    syncSourceResults,
+    needsRemoteLogin,
+    toggleSyncSource,
     refreshRemoteUser,
     openSyncDialog,
     closeSyncDialog,

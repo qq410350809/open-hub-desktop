@@ -1809,6 +1809,146 @@ fn parses_perf_metrics_model_detail_series() {
 }
 
 #[test]
+fn parses_perf_metrics_model_detail_into_group_health() {
+    // 多分组站点：同一个模型在 vip / default 两个分组的表现必须分开保存，
+    // 界面选中 Key 时按 Key 的 group 取，不能拿其中一个代表全部 Key。
+    let payload = serde_json::json!({
+        "data": {
+            "model_name": "glm-5.3",
+            "window_start": 1791097200,
+            "groups": [
+                {
+                    "group": "vip",
+                    "success_rate": 50,
+                    "avg_latency_ms": 180,
+                    "avg_tps": 12.5,
+                    "series": [{ "ts": 1791100800, "success_rate": 50 }]
+                },
+                {
+                    "group": "default",
+                    "success_rate": 76.49,
+                    "avg_latency_ms": 1200,
+                    "avg_tps": 30,
+                    "series": [
+                        { "ts": 1791097200, "success_rate": 87.5 },
+                        { "ts": 1791100800, "success_rate": 88.88 }
+                    ]
+                }
+            ]
+        },
+        "success": true
+    });
+    let groups = parse_perf_metrics_model_detail_groups(&payload);
+    assert_eq!(groups.len(), 2, "两个分组都要保留，实际 {:?}", groups);
+
+    let vip = groups.get("vip").expect("vip 分组缺失");
+    assert_eq!(vip.group.as_deref(), Some("vip"));
+    assert_eq!(vip.success_rate, Some(0.5));
+    assert_eq!(vip.avg_latency_ms, Some(180));
+    assert_eq!(vip.window_start, Some(1791097200));
+    assert_eq!(vip.series.len(), 1);
+
+    let default = groups.get("default").expect("default 分组缺失");
+    assert_eq!(default.group.as_deref(), Some("default"));
+    assert!(
+        (default.success_rate.unwrap() - 0.7649).abs() < 1e-9,
+        "76.49% 归一后是 0.7649，实际 {:?}",
+        default.success_rate
+    );
+    assert_eq!(default.avg_latency_ms, Some(1200));
+    assert_eq!(default.series.len(), 2);
+    assert!(
+        (default.series[0].success_rate.unwrap() - 0.875).abs() < 1e-9,
+        "分组序列同样按 0~1 归一"
+    );
+    assert!(default.groups.is_empty(), "分组条目里不应再嵌套 groups");
+}
+
+#[test]
+fn site_model_health_groups_round_trip_and_legacy_cache_deserializes() {
+    // 老缓存没有 groups / groupScoped：必须能正常反序列化，界面按旧口径回退。
+    let legacy: SiteModelHealth = serde_json::from_str(
+        r#"{"successRate":0.9,"windowHours":24,"bucketSeconds":3600}"#,
+    )
+    .expect("老缓存 JSON 必须可读");
+    assert!(legacy.groups.is_empty());
+    assert!(!legacy.group_scoped);
+    assert_eq!(legacy.success_rate, Some(0.9));
+
+    // 分组条目要能完整往返，不能把 group / groupScoped 丢掉。
+    let grouped = SiteModelHealth {
+        success_rate: Some(0.5),
+        group: Some("vip".to_string()),
+        groups: HashMap::from([(
+            "vip".to_string(),
+            SiteModelHealth {
+                success_rate: Some(0.5),
+                group: Some("vip".to_string()),
+                ..Default::default()
+            },
+        )]),
+        group_scoped: true,
+        ..Default::default()
+    };
+    let json = serde_json::to_string(&grouped).unwrap();
+    assert!(json.contains(r#""group":"vip""#));
+    assert!(json.contains(r#""groupScoped":true"#));
+    let back: SiteModelHealth = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.groups.len(), 1);
+    assert_eq!(
+        back.groups.get("vip").and_then(|item| item.success_rate),
+        Some(0.5)
+    );
+    assert!(back.group_scoped);
+}
+
+#[test]
+fn merge_model_health_keeps_groups_from_all_accounts() {
+    // 多账号站点每个账号可能只覆盖一部分分组：合并时必须深合并 groups，
+    // 否则先到的账号会把后到账号的分组健康度整条覆盖掉。
+    let mut merged = HashMap::new();
+    merge_model_health(
+        &mut merged,
+        "glm-5.3".to_string(),
+        SiteModelHealth {
+            success_rate: Some(0.9),
+            group: Some("vip".to_string()),
+            groups: HashMap::from([(
+                "vip".to_string(),
+                SiteModelHealth {
+                    success_rate: Some(0.9),
+                    group: Some("vip".to_string()),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        },
+    );
+    merge_model_health(
+        &mut merged,
+        "glm-5.3".to_string(),
+        SiteModelHealth {
+            success_rate: Some(0.6),
+            group: Some("default".to_string()),
+            groups: HashMap::from([(
+                "default".to_string(),
+                SiteModelHealth {
+                    success_rate: Some(0.6),
+                    group: Some("default".to_string()),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        },
+    );
+    let item = merged.get("glm-5.3").expect("模型缺失");
+    assert_eq!(item.success_rate, Some(0.9), "顶层汇总先到先得");
+    assert_eq!(item.groups.len(), 2, "两个账号的分组都要保留");
+    assert!(item.groups.contains_key("vip"));
+    assert!(item.groups.contains_key("default"));
+}
+
+#[test]
 fn parses_user_model_status_health_and_models() {
     // 取自「Agent Router」真实响应：/api/user/model-status
     // 心跳按等级映射槽位（ok→1.0、warn→0.6、none→留灰），

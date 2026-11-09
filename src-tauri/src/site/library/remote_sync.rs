@@ -178,34 +178,8 @@ pub async fn get_remote_user(ctx: Managed<'_, Arc<AppContext>>) -> Result<Remote
     })
 }
 
-pub(crate) fn normalize_url_key(url: &str) -> String {
-    let trimmed = url.trim();
-    if trimmed.is_empty() {
-        return String::new();
-    }
-    if let Ok(parsed) = url::Url::parse(trimmed) {
-        let scheme = parsed.scheme().to_lowercase();
-        let host = parsed.host_str().unwrap_or("").to_lowercase();
-        let port = parsed.port();
-        let path = parsed.path().trim_end_matches('/').to_string();
-        let port_str = match (scheme.as_str(), port) {
-            ("http", Some(80)) | ("https", Some(443)) | (_, None) => String::new(),
-            (_, Some(p)) => format!(":{}", p),
-        };
-        let query_str = parsed
-            .query()
-            .map(|q| format!("?{}", q))
-            .unwrap_or_default();
-        format!("{}://{}{}{}{}", scheme, host, port_str, path, query_str)
-    } else {
-        let mut s = trimmed.to_string();
-        while s.ends_with('/') {
-            s.pop();
-        }
-        s
-    }
-}
 
+#[derive(Clone)]
 struct ExistingLocalSite {
     id: String,
     favorite: bool,
@@ -217,10 +191,231 @@ struct ExistingLocalSite {
     system_type: String,
 }
 
+/// 一次合并的落库结果，供不同公共库来源各自上报。
+#[derive(Debug, Default)]
+pub(crate) struct MergeOutcome {
+    pub(crate) added: usize,
+    pub(crate) updated: usize,
+    /// 仅新增站点 id：站点类型检测只针对新增站点，更新站点的类型保持冻结。
+    pub(crate) added_ids: Vec<String>,
+}
+
+/// 站点地址的比对键：用于「同一站点被不同来源描述」时的去重。
+///
+/// 不区分协议、忽略 `www.` 前缀、且把常见的接口前缀（`/v1`、`/api` 等）折掉——
+/// 同一个站点在 ldoh 里往往记裸域名，在别的目录里记 `https://xxx/v1`，
+/// 按字面比对会重复插入。
+pub(crate) fn site_address_key(url: &str) -> String {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let Ok(parsed) = url::Url::parse(trimmed) else {
+        return trimmed.trim_end_matches('/').to_ascii_lowercase();
+    };
+    let host = parsed
+        .host_str()
+        .unwrap_or("")
+        .to_lowercase()
+        .trim_start_matches("www.")
+        .to_string();
+    if host.is_empty() {
+        return String::new();
+    }
+    let port = match parsed.port() {
+        Some(port) if !matches!(port, 80 | 443) => format!(":{port}"),
+        _ => String::new(),
+    };
+    let mut segments: Vec<&str> = parsed
+        .path()
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    // 折掉末尾的接口前缀段，让 `/v1`、`/anthropic`、`/v1beta` 与裸域名同键。
+    while let Some(last) = segments.last().copied() {
+        if matches!(
+            last.to_ascii_lowercase().as_str(),
+            "v1" | "v2" | "v3" | "v1beta" | "anthropic" | "openai" | "api"
+        ) {
+            segments.pop();
+        } else {
+            break;
+        }
+    }
+    let path = segments.join("/");
+    if path.is_empty() {
+        format!("{host}{port}")
+    } else {
+        format!("{host}{port}/{path}")
+    }
+}
+
+/// 把一批公共库站点并入本地站点库。
+///
+/// 匹配顺序：先按站点 id（ldoh 的站点 id 稳定）、再按 [`site_address_key`]。
+/// 命中已有记录时保留本地归类（收藏 / 隐藏 / 在用 / 待定 / 代理偏好）与已冻结的类型；
+/// 未命中则新建。`Use a transaction` 由本函数自行持有，调用方不要再包事务。
+pub(crate) fn merge_remote_sites(
+    database: &Database,
+    remote_sites: Vec<SiteRecord>,
+) -> Result<MergeOutcome, String> {
+    if remote_sites.is_empty() {
+        return Ok(MergeOutcome::default());
+    }
+    let mut connection = database.lock_conn()?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
+
+    let mut existing_map: std::collections::HashMap<String, ExistingLocalSite> =
+        std::collections::HashMap::new();
+    let mut existing_by_id: std::collections::HashMap<String, ExistingLocalSite> =
+        std::collections::HashMap::new();
+    let mut existing_ids: HashSet<String> = HashSet::new();
+
+    {
+        let mut statement = transaction
+            .prepare(
+                "SELECT id, api_base_url, favorite, hidden, is_personal, is_pending, use_system_proxy, use_proxy_pool, system_type FROM directory_sites",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)? != 0,
+                    row.get::<_, i64>(3)? != 0,
+                    row.get::<_, i64>(4)? != 0,
+                    row.get::<_, i64>(5)? != 0,
+                    row.get::<_, i64>(6)? != 0,
+                    row.get::<_, i64>(7)? != 0,
+                    row.get::<_, String>(8)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?;
+
+        for item in rows {
+            let (
+                id,
+                api_base_url,
+                favorite,
+                hidden,
+                is_personal,
+                is_pending,
+                use_system_proxy,
+                use_proxy_pool,
+                system_type,
+            ) = item.map_err(|error| error.to_string())?;
+            let existing = ExistingLocalSite {
+                id: id.clone(),
+                favorite,
+                hidden,
+                is_personal,
+                is_pending,
+                use_system_proxy,
+                use_proxy_pool,
+                system_type,
+            };
+            existing_ids.insert(id.clone());
+            existing_by_id.insert(id, existing.clone());
+            let key = site_address_key(&api_base_url);
+            if !key.is_empty() {
+                existing_map.insert(key, existing);
+            }
+        }
+    }
+
+    let mut outcome = MergeOutcome::default();
+    let mut synced_ids = HashSet::new();
+    let mut processed_url_keys = HashSet::new();
+
+    for mut site in remote_sites {
+        let url_key = site_address_key(&site.api_base_url);
+        if url_key.is_empty() && site.id.trim().is_empty() {
+            continue;
+        }
+        if !url_key.is_empty() && !processed_url_keys.insert(url_key.clone()) {
+            // 同一批次中重复出现的站点地址，跳过后续重复项
+            continue;
+        }
+
+        // 先按站点 id 命中（ldoh 下发的 id 稳定），再退回按地址命中。
+        let trimmed_id = site.id.trim().to_string();
+        let existing_match = if !trimmed_id.is_empty() {
+            existing_by_id.get(&trimmed_id).cloned()
+        } else {
+            None
+        }
+        .or_else(|| {
+            if !url_key.is_empty() {
+                existing_map.get(&url_key).cloned()
+            } else {
+                None
+            }
+        });
+
+        let mut is_new_site = false;
+        if let Some(existing) = existing_match {
+            site.id = existing.id.clone();
+            site.favorite = existing.favorite;
+            site.hidden = existing.hidden;
+            site.is_personal = existing.is_personal;
+            site.is_pending = existing.is_pending && !existing.is_personal;
+            site.use_system_proxy = existing.use_system_proxy;
+            site.use_proxy_pool = existing.use_proxy_pool;
+            // 已存在站点的类型一律冻结保留：本地类型可能来自用户手工调整或既有证据，
+            // 全量同步只允许为“新增站点”提供类型；本地非空时绝不改写，
+            // 本地为空（历史遗留缺类型）时才用远端值补齐。
+            if !existing.system_type.trim().is_empty() {
+                site.system_type = existing.system_type.clone();
+            }
+            outcome.updated += 1;
+        } else {
+            site.id = trimmed_id;
+            if site.id.is_empty() || existing_ids.contains(&site.id) {
+                site.id = generated_id();
+            }
+            existing_ids.insert(site.id.clone());
+            site.favorite = false;
+            site.hidden = false;
+            site.is_personal = false;
+            site.is_pending = false;
+            site.use_system_proxy = false;
+            site.use_proxy_pool = false;
+            outcome.added += 1;
+            is_new_site = true;
+        }
+
+        if !synced_ids.insert(site.id.clone()) {
+            continue;
+        }
+        if is_new_site {
+            outcome.added_ids.push(site.id.clone());
+        }
+
+        let site_name = site.name.clone();
+        let site = normalize_remote_site(site)
+            .map_err(|error| format!("同步站点「{site_name}」失败：{error}"))?;
+        insert_site_transaction(&transaction, &site)?;
+    }
+
+    transaction.commit().map_err(|error| error.to_string())?;
+    Ok(outcome)
+}
+
 #[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn sync_remote_sites(
     ctx: Managed<'_, Arc<AppContext>>,
     _runaway: Option<bool>,
+    run_id: u64,
+) -> Result<SyncSitesResult, String> {
+    sync_remote_sites_inner(&ctx, run_id).await
+}
+
+/// ldoh 同步的实际实现：不依赖 `Managed` 包装，方便被「同步公共库」多来源入口复用。
+pub(crate) async fn sync_remote_sites_inner(
+    ctx: &AppContext,
     run_id: u64,
 ) -> Result<SyncSitesResult, String> {
     let database = &*ctx.database;
@@ -359,139 +554,8 @@ pub async fn sync_remote_sites(
         "正在写入本地数据库并保留本地类型与在用状态".into(),
     );
 
-    let mut connection = database.lock_conn()?;
-    let transaction = connection
-        .transaction()
-        .map_err(|error| error.to_string())?;
-
-    let mut existing_map: std::collections::HashMap<String, ExistingLocalSite> =
-        std::collections::HashMap::new();
-    let mut existing_ids: HashSet<String> = HashSet::new();
-
-    {
-        let mut statement = transaction
-            .prepare(
-                "SELECT id, api_base_url, favorite, hidden, is_personal, is_pending, use_system_proxy, use_proxy_pool, system_type FROM directory_sites",
-            )
-            .map_err(|error| error.to_string())?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)? != 0,
-                    row.get::<_, i64>(3)? != 0,
-                    row.get::<_, i64>(4)? != 0,
-                    row.get::<_, i64>(5)? != 0,
-                    row.get::<_, i64>(6)? != 0,
-                    row.get::<_, i64>(7)? != 0,
-                    row.get::<_, String>(8)?,
-                ))
-            })
-            .map_err(|error| error.to_string())?;
-
-        for item in rows {
-            let (
-                id,
-                api_base_url,
-                favorite,
-                hidden,
-                is_personal,
-                is_pending,
-                use_system_proxy,
-                use_proxy_pool,
-                system_type,
-            ) = item.map_err(|error| error.to_string())?;
-            existing_ids.insert(id.clone());
-            let key = normalize_url_key(&api_base_url);
-            if !key.is_empty() {
-                existing_map.insert(
-                    key,
-                    ExistingLocalSite {
-                        id,
-                        favorite,
-                        hidden,
-                        is_personal,
-                        is_pending,
-                        use_system_proxy,
-                        use_proxy_pool,
-                        system_type,
-                    },
-                );
-            }
-        }
-    }
-
-    let mut added = 0_usize;
-    let mut updated = 0_usize;
-    // 类型检测只面向本次新增的站点：更新站点的类型已被冻结（本地为空时由
-    // 远端值补齐），不允许再被后台探测改写。
-    let mut added_ids: Vec<String> = Vec::new();
-    let mut synced_ids = HashSet::new();
-    let mut processed_url_keys = HashSet::new();
-
-    for mut site in all_remote_sites {
-        let url_key = normalize_url_key(&site.api_base_url);
-        if url_key.is_empty() && site.id.trim().is_empty() {
-            continue;
-        }
-        if !url_key.is_empty() && !processed_url_keys.insert(url_key.clone()) {
-            // 同一批次中重复出现的站点地址，跳过后续重复项
-            continue;
-        }
-
-        let existing_match = if !url_key.is_empty() {
-            existing_map.get(&url_key)
-        } else {
-            None
-        };
-
-        let mut is_new_site = false;
-        if let Some(existing) = existing_match {
-            site.id = existing.id.clone();
-            site.favorite = existing.favorite;
-            site.hidden = existing.hidden;
-            site.is_personal = existing.is_personal;
-            site.is_pending = existing.is_pending && !existing.is_personal;
-            site.use_system_proxy = existing.use_system_proxy;
-            site.use_proxy_pool = existing.use_proxy_pool;
-            // 已存在站点的类型一律冻结保留：本地类型可能来自用户手工调整或既有证据，
-            // 全量同步只允许为“新增站点”提供类型；本地非空时绝不改写，
-            // 本地为空（历史遗留缺类型）时才用远端值补齐。
-            if !existing.system_type.trim().is_empty() {
-                site.system_type = existing.system_type.clone();
-            }
-            updated += 1;
-        } else {
-            site.id = site.id.trim().to_string();
-            if site.id.is_empty() || existing_ids.contains(&site.id) {
-                site.id = generated_id();
-            }
-            existing_ids.insert(site.id.clone());
-            site.favorite = false;
-            site.hidden = false;
-            site.is_personal = false;
-            site.is_pending = false;
-            site.use_system_proxy = false;
-            site.use_proxy_pool = false;
-            added += 1;
-            is_new_site = true;
-        }
-
-        if !synced_ids.insert(site.id.clone()) {
-            continue;
-        }
-        if is_new_site {
-            added_ids.push(site.id.clone());
-        }
-
-        let site_name = site.name.clone();
-        let site = normalize_remote_site(site)
-            .map_err(|error| format!("同步站点「{site_name}」失败：{error}"))?;
-        insert_site_transaction(&transaction, &site)?;
-    }
-
-    transaction.commit().map_err(|error| error.to_string())?;
+    let outcome = merge_remote_sites(database, all_remote_sites)?;
+    let (added, updated) = (outcome.added, outcome.updated);
     emit_sync_progress(
         &bus,
         run_id,
@@ -510,7 +574,7 @@ pub async fn sync_remote_sites(
             session.profile_name.clone()
         }
     };
-    let site_ids = added_ids;
+    let site_ids = outcome.added_ids;
     Ok(SyncSitesResult {
         added,
         updated,
@@ -520,5 +584,105 @@ pub async fn sync_remote_sites(
         user_name,
         runaway: false,
         site_ids,
+        sources: vec![SOURCE_LDOH.to_string()],
     })
+}
+
+/// 公共库来源标识：ldoh（社区维护的公益站目录，需 Chrome 登录）。
+pub(crate) const SOURCE_LDOH: &str = "ldoh";
+/// 公共库来源标识：白嫖公益站目录（公开可抓，无需登录）。
+pub(crate) const SOURCE_BAIPIAO: &str = "baipiao";
+
+pub(crate) fn public_source_label(source: &str) -> &'static str {
+    match source {
+        SOURCE_BAIPIAO => "白嫖公益站目录",
+        _ => "ldoh 公益站目录",
+    }
+}
+
+/// 「同步公共库」的统一入口：按顺序跑完所选来源，单个来源失败不影响其它来源。
+///
+/// - 每个来源的成败都以 [`PublicSourceResult`] 逐条返回，前端据 `ok` 分别提示；
+/// - 只要至少一个来源成功，命令本身即成功（否则返回合并后的错误）；
+/// - `sources` 为空时退化为只同步 ldoh，保持旧调用方的行为不变。
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub async fn sync_public_library(
+    ctx: Managed<'_, Arc<AppContext>>,
+    sources: Option<Vec<String>>,
+    run_id: u64,
+) -> Result<Vec<PublicSourceResult>, String> {
+    let ctx: &AppContext = &ctx;
+    let database = &*ctx.database;
+    let bus: EventBus = ctx.event_bus.clone();
+
+    let mut selected: Vec<String> = Vec::new();
+    for source in sources.unwrap_or_default() {
+        let source = source.trim().to_ascii_lowercase();
+        if source.is_empty() || selected.contains(&source) {
+            continue;
+        }
+        if !matches!(source.as_str(), SOURCE_LDOH | SOURCE_BAIPIAO) {
+            return Err(format!("未知的公共库来源：{source}"));
+        }
+        selected.push(source);
+    }
+    if selected.is_empty() {
+        selected.push(SOURCE_LDOH.to_string());
+    }
+
+    let mut results = Vec::with_capacity(selected.len());
+    for source in selected {
+        let label = public_source_label(&source);
+        emit_sync_progress(
+            &bus,
+            run_id,
+            &format!("{source}-start"),
+            "info",
+            format!("开始同步{label}"),
+        );
+        let outcome = match source.as_str() {
+            SOURCE_BAIPIAO => sync_baipiao_sites(database, &bus, run_id).await,
+            _ => sync_remote_sites_inner(ctx, run_id).await,
+        };
+        results.push(match outcome {
+            Ok(result) => PublicSourceResult {
+                source: source.clone(),
+                label: label.to_string(),
+                ok: true,
+                added: result.added,
+                updated: result.updated,
+                total: result.total,
+                error: String::new(),
+                site_ids: result.site_ids,
+            },
+            Err(error) => {
+                emit_sync_progress(
+                    &bus,
+                    run_id,
+                    &format!("{source}-failed"),
+                    "error",
+                    format!("{label}同步失败：{error}"),
+                );
+                PublicSourceResult {
+                    source: source.clone(),
+                    label: label.to_string(),
+                    ok: false,
+                    added: 0,
+                    updated: 0,
+                    total: 0,
+                    error,
+                    site_ids: Vec::new(),
+                }
+            }
+        });
+    }
+
+    if results.iter().all(|result| !result.ok) {
+        let errors: Vec<String> = results
+            .iter()
+            .map(|result| format!("{}：{}", result.label, result.error))
+            .collect();
+        return Err(errors.join("；"));
+    }
+    Ok(results)
 }

@@ -291,6 +291,13 @@ macro_rules! rpc_arms {
                     crate::site::library::sync_remote_sites($ctx, runaway, run_id).await
                 ))
             }
+            "sync_public_library" => {
+                let sources: Option<Vec<String>> = take_opt($args, &["sources"])?;
+                let run_id: u64 = take($args, &["runId", "run_id"])?;
+                Ok(json!(
+                    crate::site::library::sync_public_library($ctx, sources, run_id).await
+                ))
+            }
             "detect_site_system_types" => {
                 let site_ids: Vec<String> = take($args, &["siteIds", "site_ids"])?;
                 let run_id: u64 = take($args, &["runId", "run_id"])?;

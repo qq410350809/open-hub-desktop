@@ -2,7 +2,7 @@
 import { capabilities } from "../../composables/core/capabilities";
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { icons } from "../../icons";
-import { formatDate, formatRateLimit, logoText, describeModelHealth, describeModelSnapshot, describeModelStatusStrip, describeModelStatusStripTitle, describeModelWindowLabel, modelStatusStripGapPercent, MODEL_STATUS_SLOT_COUNT } from "../../utils";
+import { formatDate, formatRateLimit, logoText, describeModelHealth, describeModelSnapshot, describeModelStatusStrip, describeModelStatusStripTitle, describeModelWindowLabel, modelHealthForGroup, modelStatusStripGapPercent, MODEL_STATUS_SLOT_COUNT } from "../../utils";
 import type { ModelHealthBadge, ModelStatusSlot } from "../../utils";
 import { useStore } from "../../composables/useStore";
 import { runCommand, isTauri } from "../../composables/useLibrary";
@@ -12,6 +12,7 @@ import SiteTokenEditor from "../site/SiteTokenEditor.vue";
 import type {
   ChromeSessionInfo,
   SiteModelCache,
+  SiteModelHealth,
   SiteModelItem,
   SiteRecord,
 } from "../../types";
@@ -659,10 +660,37 @@ const drawerFilteredModels = computed<SiteModelItem[]>(() => {
   return list.filter((m) => m.id.toLowerCase().includes(q) || (m.ownedBy && m.ownedBy.toLowerCase().includes(q)));
 });
 
-/** 抽屉里的模型健康度徽标。健康度是全站聚合口径，仅作参考。 */
+/** 抽屉当前选中 Key 的站点分组；未选中 Key 时为空（站点聚合口径）。 */
+const drawerSelectedKeyGroup = computed<string | null>(() => {
+  const key = drawerSelectedKey.value;
+  if (!key) return null;
+  for (const account of drawerModelCache.value?.accounts ?? []) {
+    if (account.keys.includes(key)) {
+      return account.keyGroups?.[key]?.trim() || null;
+    }
+  }
+  return null;
+});
+
+/**
+ * 抽屉当前生效的健康度视图：选中 Key 时按它所属分组取 `groups[group]`，
+ * 分组没有条目就按无数据处理；未选中 Key 时保持站点聚合口径。
+ */
+const drawerModelHealth = computed<Record<string, SiteModelHealth>>(() => {
+  const group = drawerSelectedKeyGroup.value;
+  if (!group) return drawerModelCache.value?.modelHealth ?? {};
+  const scoped: Record<string, SiteModelHealth> = {};
+  for (const [modelId, health] of Object.entries(drawerModelCache.value?.modelHealth ?? {})) {
+    const item = modelHealthForGroup(health, group);
+    if (item) scoped[modelId] = item;
+  }
+  return scoped;
+});
+
+/** 抽屉里的模型健康度徽标。选中 Key 时已按该 Key 的分组取数。 */
 const drawerHealthBadges = computed(() => {
   const badges = new Map<string, ModelHealthBadge>();
-  for (const [modelId, health] of Object.entries(drawerModelCache.value?.modelHealth ?? {})) {
+  for (const [modelId, health] of Object.entries(drawerModelHealth.value)) {
     const badge = describeModelHealth(health);
     if (badge) badges.set(modelId, badge);
   }
@@ -678,7 +706,7 @@ function drawerModelHealthBadge(modelId: string) {
  *  留灰，无数据模型用同站点的窗口起点与格宽对齐。 */
 const drawerStatusStrips = computed(() => {
   const strips = new Map<string, ModelStatusSlot[]>();
-  const healthMap = drawerModelCache.value?.modelHealth ?? {};
+  const healthMap = drawerModelHealth.value;
   const fallbackHealth = Object.values(healthMap).find(
     (health) => typeof health.windowStart === "number" && (health.windowStart ?? 0) > 0,
   );
@@ -693,15 +721,21 @@ function drawerStatusStripOf(modelId: string) {
 }
 
 /** 站点健康度是否为「只有当前状态」的快照源（自建监控页等）。 */
+const drawerSourceHealth = computed(() =>
+  Object.keys(drawerModelHealth.value).length > 0
+    ? drawerModelHealth.value
+    : (drawerModelCache.value?.modelHealth ?? {}),
+);
+
 const drawerSnapshotMode = computed(() =>
-  Object.values(drawerModelCache.value?.modelHealth ?? {}).some(
+  Object.values(drawerSourceHealth.value).some(
     (health) => health.snapshot === true,
   ),
 );
 
 const drawerSnapshotBadges = computed(() => {
   const badges = new Map<string, ModelHealthBadge>();
-  for (const [modelId, health] of Object.entries(drawerModelCache.value?.modelHealth ?? {})) {
+  for (const [modelId, health] of Object.entries(drawerModelHealth.value)) {
     const badge = describeModelSnapshot(health);
     if (badge) badges.set(modelId, badge);
   }
@@ -728,12 +762,12 @@ const drawerHasStatusStrip = computed(
 );
 
 const drawerStatusStripTitle = computed(() =>
-  describeModelStatusStripTitle(Object.values(drawerModelCache.value?.modelHealth ?? {})[0]),
+  describeModelStatusStripTitle(Object.values(drawerModelHealth.value)[0], drawerSelectedKeyGroup.value),
 );
 
 /** 窗口口径随站点走：原生 perf-metrics 是 24h 逐时，增强模块可配 7 天/30 分钟格。 */
 const drawerWindowLabel = computed(() =>
-  describeModelWindowLabel(Object.values(drawerModelCache.value?.modelHealth ?? {})[0]),
+  describeModelWindowLabel(Object.values(drawerModelHealth.value)[0]),
 );
 
 const drawerStatusStripLabel = computed(() => {

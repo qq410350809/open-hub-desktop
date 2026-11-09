@@ -147,6 +147,31 @@ pub struct SyncSitesResult {
     /// 仅包含本次新增站点的 id；站点类型检测只应针对新增站点，
     /// 更新站点的类型保持冻结。
     pub(crate) site_ids: Vec<String>,
+    /// 本次同步覆盖的来源（`ldoh` / `baipiao`）。公共库有两个上游时，
+    /// 前端据此区分「整轮同步结果」与单个来源的成败。
+    pub(crate) sources: Vec<String>,
+}
+
+/// 一次「同步公共库」里单个来源的执行结果。
+///
+/// 公共库允许多个来源：某个来源不可用（例如 Chrome 没登录 ldoh、白嫖目录临时
+/// 502）不应该让另一个来源已经拉到的数据作废，所以失败在来源维度被吞成
+/// `error`，由前端逐条汇报。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicSourceResult {
+    /// 来源标识：`ldoh` / `baipiao`。
+    pub(crate) source: String,
+    /// 来源展示名。
+    pub(crate) label: String,
+    pub(crate) ok: bool,
+    pub(crate) added: usize,
+    pub(crate) updated: usize,
+    pub(crate) total: usize,
+    /// 失败原因；成功时为空。
+    pub(crate) error: String,
+    /// 该来源本次新增的站点 id（仅供类型检测使用）。
+    pub(crate) site_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -234,10 +259,11 @@ pub struct ChromeUsageScanResult {
 /// - 「模型状态」增强模块 `/api/enhancements/model-status/status/all`
 ///   （x666 等魔改 NewAPI 只有它）：管理员可配窗口与时间格宽，附带请求总数。
 ///
-/// 口径提醒：这是**全站聚合**数据——按模型统计所有用户近 N 小时的
-/// 成功/失败、延迟与出字速度，与「当前用户」「当前 Key」无关。所以它只能
-/// 作为健康度标签，**不能**当作「这个 Key 能不能用这个模型」的判据
-/// （那由逐 Key 查询 `/v1/models` 决定）；站点侧未启用性能采集时它整体为空。
+/// 口径提醒：顶层字段是**站点级聚合**（NewAPI 的 summary 接口会把站点所有
+/// 分组一起统计），只能作为整站参考，**不能**当作「这个 Key 能不能用这个
+/// 模型」的判据（那由逐 Key 查询 `/v1/models` 决定）。站点有多个 Key 分组时，
+/// `groups` 会带着按分组拆分的同一套字段，界面按 Key 的 `group` 取对应条目，
+/// 不再把别的分组的流量算到当前 Key 头上。
 ///
 /// 另注：站点**只为窗口内确有请求的模型**下发条目（上游 `QuerySummaryAll`
 /// 会跳过 requestCount==0 的模型）。所以「出现在列表里」本身就等于
@@ -305,6 +331,30 @@ pub struct SiteModelHealth {
     /// 逐时段成功率（0~1），只含窗口内确有流量的时段。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) series: Vec<SiteModelHealthPoint>,
+    /// 该条目所属的站点分组名。顶层站点聚合条目为 `None`；按分组拆分的
+    /// 条目（`groups` 的值）为对应分组名。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) group: Option<String>,
+    /// 按站点分组拆分的健康度（模型 ID → 分组名 → 健康度）。
+    ///
+    /// 只有站点存在多个 Key 分组（或多账号可能分散在不同分组）、且数据源
+    /// 能按分组拆分时才填充（NewAPI `/api/perf-metrics?model=X` 的
+    /// `data.groups[]`，「白与黑」的 `/api/model_health/slot_status?group=X`）。
+    /// 老缓存没有该字段，界面回退顶层站点聚合值；分组条目里不会再嵌套 `groups`。
+    ///
+    /// 这张表的存在就是为了避免「多分组时拿 A 分组的健康度去标 B 分组的
+    /// Key」：界面选中某个 Key 时按它的 `group` 取对应条目，取不到就按
+    /// 「该分组无数据」处理，绝不回退到其它分组。
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub(crate) groups: HashMap<String, SiteModelHealth>,
+    /// 是否已按分组拆分（哪怕 `groups` 为空）。
+    ///
+    /// 多分组站点在明细接口成功返回、但当前 Key 的分组没有流量时，`groups`
+    /// 里不会出现该分组。界面必须把这种情况当成「该分组无数据」，不能回退
+    /// 到顶层站点聚合值——否则又把别的分组算进来了。老缓存没有该字段时为
+    /// false，界面照旧回退顶层值。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(crate) group_scoped: bool,
 }
 
 /// 模型健康度逐时段采样点：一个时间格一条。
@@ -347,7 +397,8 @@ pub struct SiteModelCache {
     pub(crate) api_source: String,
     pub(crate) accounts: Vec<SiteModelCacheAccount>,
     /// 各账号行 model_health 合并后的站点级视图（模型 ID → 健康度）。
-    /// 健康度本身是全站口径，合并只是为了避免界面逐账号各查一次。
+    /// 合并只避免界面逐账号各查一次；多分组时 `groups` 会逐分组深合并，
+    /// 界面按 Key 所属分组取数，不会把别的分组算进来。
     #[serde(default)]
     pub(crate) model_health: HashMap<String, SiteModelHealth>,
 }

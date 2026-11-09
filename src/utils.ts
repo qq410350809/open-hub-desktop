@@ -221,6 +221,35 @@ export function modelHealthLevelOf(successRate: number): ModelHealthLevel {
   return 5;
 }
 
+/**
+ * 取模型在某个 Key 分组下的健康度。
+ *
+ * 多分组站点后端会带 `groups`（分组名 → 健康度）；选中 Key 时必须取它所属
+ * 分组的那份，取不到就返回 `undefined`（该分组无数据），绝不回退到顶层
+ * 站点聚合值或别的分组——那正是「跨 Key 用健康度」的错。
+ * 老缓存没有 `groups` 字段时保持旧行为（退回顶层聚合）。
+ */
+export function modelHealthForGroup(
+  health?: SiteModelHealth | null,
+  group?: string | null,
+): SiteModelHealth | undefined {
+  if (!health) return undefined;
+  const scoped = health.groups;
+  const normalized = (group ?? "").trim();
+  if (!normalized) return health;
+  if (!scoped || Object.keys(scoped).length === 0) {
+    // 已经按分组拆分、但当前分组没有条目：该分组无数据，不能回退聚合值。
+    return health.groupScoped ? undefined : health;
+  }
+  // 手动添加的 Key 用「默认分组」当展示名，而 NewAPI 实际分组名是 default；
+  // 先按 default 找，找不到再按原串找（有的站点分组名就叫「默认分组」）。
+  const aliases = normalized === "默认分组" ? ["default", normalized] : [normalized];
+  for (const alias of aliases) {
+    if (scoped[alias]) return scoped[alias];
+  }
+  return undefined;
+}
+
 export interface ModelHealthBadge {
   level: ModelHealthLevel;
   /** 卡片上的一行短标签，如 `99.9%`。 */
@@ -470,14 +499,21 @@ export function describeModelWindowLabel(health?: SiteModelHealth | null): strin
 }
 
 /** 状态条容器的整体说明（口径 + 配色含义），绑到容器的 title/aria-label。 */
-export function describeModelStatusStripTitle(health?: SiteModelHealth | null): string {
+export function describeModelStatusStripTitle(
+  health?: SiteModelHealth | null,
+  scopeGroup?: string | null,
+): string {
+  const selectedGroup = (scopeGroup ?? "").trim();
   if (health?.snapshot) {
-    return "站点实时探测状态（无历史序列，与当前 Key 无关）：绿色=正常、黄色=限流、红色=不可用。";
+    const scope = selectedGroup ? `站点分组「${selectedGroup}」` : "站点实时探测状态";
+    return `${scope}（无历史序列${selectedGroup ? "" : "，与当前 Key 无关"}）：绿色=正常、黄色=限流、红色=不可用。`;
   }
+  const group = health?.group?.trim() || selectedGroup;
+  const scope = group ? `站点分组「${group}」口径` : "站点全站口径";
   if (health?.statusLabel) {
-    return `${describeModelWindowLabel(health)}健康等级（站点渠道监控口径，与当前 Key 无关）：绿色=正常、黄色=警告、红色=异常，灰色为该时段无数据。悬停各格查看具体时段。`;
+    return `${describeModelWindowLabel(health)}健康等级（${group ? scope : "站点渠道监控口径，与当前 Key 无关"}）：绿色=正常、黄色=警告、红色=异常，灰色为该时段无数据。悬停各格查看具体时段。`;
   }
-  return `${describeModelWindowLabel(health)}成功率（站点全站口径，与当前 Key 无关）：绿色 ≥95%，浅绿 85%~95%，黄色 70%~85%，橙色 50%~70%，红色 <50%，灰色为该时段无流量。悬停各格查看具体时段。`;
+  return `${describeModelWindowLabel(health)}成功率（${scope}${group ? "" : "，与当前 Key 无关"}）：绿色 ≥95%，浅绿 85%~95%，黄色 70%~85%，橙色 50%~70%，红色 <50%，灰色为该时段无流量。悬停各格查看具体时段。`;
 }
 
 /** 毫秒转人类可读时长：<1s 毫秒，<1min 秒，其余分钟。 */
@@ -502,8 +538,9 @@ function formatSuccessRate(rate: number): string {
  * 共用同一套分桶：条带最后一个亮块是红色、徽标却写窗口均值这类自相矛盾
  * 不会再出现。没有逐时段数据（旧缓存 / 站点不下发明细）时退回窗口汇总值。
  *
- * 这是**全站聚合**口径（所有用户的流量），与当前用户/当前 Key 无关，
- * 所以悬浮提示里必须点明，避免被当成「我的 Key 能不能用」的结论。
+ * 条目可能带 `group`（按 Key 分组拆分的数据）；有分组时提示明确写「按该
+ * 分组统计」，没有分组时退回站点聚合口径并注明「与当前 Key 无关」，
+ * 避免把别的分组的流量当成当前 Key 的结论。
  *
  * 站点只返回 0~100 的百分数，Rust 侧已归一化到 0~1；这里不再做二次换算。
  */
@@ -511,7 +548,13 @@ export function describeModelHealth(health?: SiteModelHealth | null): ModelHealt
   if (!health) return null;
   const hours =
     typeof health.windowHours === "number" && health.windowHours > 0 ? health.windowHours : 24;
-  const scope = `站点全站口径（所有用户的流量），近 ${hours} 小时`;
+  const group = health.group?.trim();
+  const scope = group
+    ? `站点分组「${group}」口径，近 ${hours} 小时`
+    : `站点全站口径（所有用户的流量），近 ${hours} 小时`;
+  const keyHint = group
+    ? `该数据按 Key 所属分组「${group}」统计，不能据此判断其它分组的 Key。`
+    : "该数据与当前 Key 无关，不能据此判断本 Key 是否可用。";
   const slots = describeModelStatusStrip(health, null);
   let latestSlot: ModelStatusSlot | null = null;
   for (let index = slots.length - 1; index >= 0; index -= 1) {
@@ -535,8 +578,8 @@ export function describeModelHealth(health?: SiteModelHealth | null): ModelHealt
         ? Math.min(1, Math.max(0, rate))
         : 0.5;
     const title = health.snapshot
-      ? `站点实时探测状态：${statusLabel}（与当前 Key 无关，不能据此判断本 Key 是否可用）。`
-      : `站点渠道监控健康度：${statusLabel}（近 ${hours} 小时，与当前 Key 无关，不能据此判断本 Key 是否可用）。`;
+      ? `站点实时探测状态：${statusLabel}（${group ? `分组「${group}」口径` : "与当前 Key 无关"}，不能据此判断其它 Key 是否可用）。`
+      : `站点渠道监控健康度：${statusLabel}（近 ${hours} 小时，${group ? `分组「${group}」口径` : "与当前 Key 无关"}）。`;
     return {
       level: modelHealthLevelOf(clamped),
       label: statusLabel,
@@ -580,7 +623,7 @@ export function describeModelHealth(health?: SiteModelHealth | null): ModelHealt
     label: formatSuccessRate(clamped),
     // 留 1% 底色，最差也看得见有一条槽。
     width: Math.max(1, clamped * 100),
-    title: `${scope}：${details.join("，")}。该数据与当前 Key 无关，不能据此判断本 Key 是否可用。`,
+    title: `${scope}：${details.join("，")}。${keyHint}`,
   };
 }
 

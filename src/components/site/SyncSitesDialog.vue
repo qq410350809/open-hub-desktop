@@ -3,7 +3,8 @@ import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import { listen } from "../../composables/core/events";
 import { icons } from "../../icons";
 import { useStore } from "../../composables/useStore";
-import type { SyncSitesProgress } from "../../types";
+import { PUBLIC_LIBRARY_SOURCES } from "../../constants";
+import type { PublicLibrarySource, SyncSitesProgress } from "../../types";
 import { formatElapsed } from "../../utils";
 
 const store = useStore();
@@ -13,6 +14,18 @@ const isTauri = "__TAURI_INTERNALS__" in window;
 let unlistenProgress: (() => void) | undefined;
 let unlistenChromeProgress: (() => void) | undefined;
 
+/** 已勾选来源的展示名，用 ` + ` 连接。 */
+const sourceScopeLabel = computed(() =>
+  PUBLIC_LIBRARY_SOURCES.filter((item) => store.syncDialogSources.value.includes(item.id))
+    .map((item) => item.label)
+    .join(" + "),
+);
+
+/** 只有 ldoh 需要登录；仅勾白嫖目录时应直接放行到同步按钮。 */
+const needsLogin = computed(() => store.needsRemoteLogin.value);
+/** 登录态阻塞：需要登录但还没拿到 ldoh 用户。 */
+const loginBlocked = computed(() => needsLogin.value && !store.remoteUser.value);
+
 const scopeLabel = computed(() => {
   if (store.syncDialogMode.value === "quota") {
     const usageLabel = store.syncDialogUsage.value === "pending" ? "待定" : "在用";
@@ -21,7 +34,7 @@ const scopeLabel = computed(() => {
   if (store.syncDialogMode.value === "session") {
     return `已选 ${store.syncDialogSiteIds.value.length} 个站点`;
   }
-  return "全量公共站点（存活与跑路）";
+  return sourceScopeLabel.value || "全量公共站点（存活与跑路）";
 });
 
 const dialogTitle = computed(() => {
@@ -120,7 +133,9 @@ function onBackdropClick(event: MouseEvent) {
         <header class="link-dialog-header">
           <div>
             <h2 id="sync-sites-title">{{ dialogTitle }}</h2>
-            <p v-if="store.syncDialogMode.value === 'remote'">验证 Chrome 登录状态后同步{{ scopeLabel }}</p>
+            <p v-if="store.syncDialogMode.value === 'remote'">
+              {{ needsLogin ? '验证 Chrome 登录状态后同步' : '无需登录，直接抓取' }}{{ scopeLabel }}
+            </p>
             <p v-else-if="store.syncDialogMode.value === 'quota'">按站点顺序逐个刷新所选站点的账号额度，站内账号按顺序处理；不改变全部 / 在用 / 待定归类</p>
             <p v-else>逐个站点同步 Chrome 账号会话与额度：站点之间最多 2 路并行，站内账号按顺序处理</p>
           </div>
@@ -136,13 +151,13 @@ function onBackdropClick(event: MouseEvent) {
         </header>
 
         <div class="sync-sites-content">
-          <div v-if="store.syncDialogMode.value === 'remote' && store.remoteUserLoading.value" class="sync-sites-state" aria-live="polite">
+          <div v-if="store.syncDialogMode.value === 'remote' && store.remoteUserLoading.value && needsLogin" class="sync-sites-state" aria-live="polite">
             <span class="sync-sites-state-icon is-loading" v-html="icons.restore" />
             <strong>正在读取 Chrome 登录状态…</strong>
             <p>正在从本机 Chrome 获取 ldoh 会话并验证当前用户。</p>
           </div>
 
-          <div v-else-if="store.syncDialogMode.value === 'remote' && !store.remoteUser.value" class="sync-sites-state" aria-live="polite">
+          <div v-else-if="store.syncDialogMode.value === 'remote' && loginBlocked" class="sync-sites-state" aria-live="polite">
             <span class="sync-sites-state-icon is-error" v-html="icons.user" />
             <strong>暂未获取到登录用户</strong>
             <p v-if="store.remoteUserError.value" class="sync-sites-error">
@@ -167,6 +182,32 @@ function onBackdropClick(event: MouseEvent) {
           </div>
 
           <template v-else>
+            <div v-if="store.syncDialogMode.value === 'remote'" class="sync-source-picker">
+              <div class="sync-source-head">
+                <strong>同步来源</strong>
+                <span>可多选；两处重合的站点按地址合并，不会重复录入</span>
+              </div>
+              <div class="sync-source-options" role="group" aria-label="公共库来源">
+                <button
+                  v-for="source in PUBLIC_LIBRARY_SOURCES"
+                  :key="source.id"
+                  class="sync-source-option"
+                  :class="{ 'is-active': store.syncDialogSources.value.includes(source.id) }"
+                  type="button"
+                  role="checkbox"
+                  :aria-checked="store.syncDialogSources.value.includes(source.id)"
+                  :disabled="store.syncingSites.value"
+                  @click="store.toggleSyncSource(source.id as PublicLibrarySource)"
+                >
+                  <span class="sync-source-check" aria-hidden="true" />
+                  <span class="sync-source-text">
+                    <b>{{ source.label }}</b>
+                    <small>{{ source.hint }}{{ source.requiresLogin && !store.remoteUser.value ? '（当前未登录，该来源会被跳过）' : '' }}</small>
+                  </span>
+                </button>
+              </div>
+            </div>
+
             <div v-if="store.syncDialogMode.value === 'remote' && store.remoteUser.value" class="sync-user-card">
               <span class="sync-user-avatar" v-html="icons.user" />
               <div class="sync-user-details">
@@ -246,16 +287,29 @@ function onBackdropClick(event: MouseEvent) {
               </ol>
             </section>
 
+            <div v-if="store.syncSourceResults.value.length > 0" class="sync-source-results" aria-label="来源同步结果">
+              <div
+                v-for="result in store.syncSourceResults.value"
+                :key="result.source"
+                class="sync-source-result"
+                :class="result.ok ? 'is-ok' : 'is-error'"
+              >
+                <b>{{ result.label }}</b>
+                <span v-if="result.ok">新增 {{ result.added }} · 更新 {{ result.updated }}</span>
+                <span v-else class="sync-source-result-error">{{ result.error }}</span>
+              </div>
+            </div>
+
             <p v-if="store.remoteUserError.value" class="sync-sites-inline-error" role="alert">
               {{ store.remoteUserError.value }}
             </p>
           </template>
         </div>
 
-        <footer v-if="store.syncDialogMode.value !== 'remote' || store.remoteUser.value" class="sync-sites-footer">
+        <footer v-if="store.syncDialogMode.value !== 'remote' || !loginBlocked" class="sync-sites-footer">
           <template v-if="store.syncRunState.value === 'idle'">
             <button
-              v-if="store.syncDialogMode.value === 'remote'"
+              v-if="store.syncDialogMode.value === 'remote' && needsLogin"
               class="secondary-button"
               type="button"
               :disabled="store.remoteUserLoading.value"
