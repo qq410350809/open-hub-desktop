@@ -24,7 +24,7 @@ pub fn default_key_group_mode() -> String {
 
 /// 渠道内的一个 Key 分组。分组身份直接取自 Key 自身的 groupName（站点同步下发），
 /// 同名 groupName 的 Key 天然落在同一组；`id` 即该 groupName。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KeyGroupItem {
     pub id: String,
@@ -36,7 +36,7 @@ pub struct KeyGroupItem {
     pub mode: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChannelKeyRule {
     pub key: String,
@@ -58,7 +58,7 @@ fn default_true() -> bool {
 
 /// 模型级代理出口覆盖规则：「管理可用模型」中为单个模型独立选择代理策略。
 /// 语义与渠道级 proxy_mode 一致，仅作用域缩小到单模型。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelProxyRule {
     /// 渠道内模型名（原始大小写保留，匹配时忽略大小写）
@@ -80,7 +80,7 @@ pub struct ModelProxyRule {
     pub protocol: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChannelConfig {
     pub id: String,
@@ -563,6 +563,10 @@ pub struct ModelProxyContext {
     pub current_port: Arc<RwLock<u16>>,
     pub cached_channel_models: Arc<RwLock<Vec<ChannelModelList>>>,
     pub cached_fetch_errors: Arc<RwLock<Vec<ChannelModelFetchError>>>,
+    /// Shared by startup, desktop IPC and Web RPC discovery jobs.
+    pub model_sync_slots: Arc<tokio::sync::Semaphore>,
+    /// Latest requested discovery per channel; older runs cannot overwrite newer results.
+    pub model_sync_versions: Arc<RwLock<HashMap<String, u64>>>,
     pub default_http_client: Arc<tokio::sync::RwLock<Client>>,
     /// 流式请求专用出网客户端：不带总超时（总超时会掐断长流任务），
     /// 仅保留连接超时；流式读写的存活判定由 stream.rs 的空闲超时负责。

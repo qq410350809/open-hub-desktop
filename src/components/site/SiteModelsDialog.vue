@@ -207,8 +207,8 @@ const scopedModelHealth = computed<Record<string, SiteModelHealth>>(() => {
 /** 站点是否上报过任何模型健康度；用于在面板上给出一次性的口径说明。 */
 const hasModelHealth = computed(() => Object.keys(modelHealth.value).length > 0);
 
-/** 隐藏「成功率极低」的模型开关。 */
-const hideUnhealthy = ref(false);
+/** 默认隐藏「成功率极低」的模型，可手动关闭。 */
+const hideUnhealthy = ref(true);
 
 /** 模型是否被视为「无效」：成功率为 0 或极低（低于阈值），
  *  或者站点已上报健康度、但该模型所有小方块都是无数据（条带全灰）。
@@ -429,8 +429,8 @@ watch(
       modelHealth.value = {};
       liveError.value = "";
       searchQuery.value = "";
-      // 每次打开弹窗重置筛选开关：默认展示全部模型，「隐藏无效」由用户按需开启。
-      hideUnhealthy.value = false;
+      // 每次打开弹窗默认开启「隐藏无效」，用户仍可手动关闭查看全部模型。
+      hideUnhealthy.value = true;
       apiSource.value = "none";
       selectedKeyId.value = null;
       addingKeyForProfile.value = null;

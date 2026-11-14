@@ -5,8 +5,8 @@
 //! 各入口文件只负责：入参解析、客户端协议 ↔ OpenAI 中枢转换、响应回转。
 
 use super::balancer::{
-    load_channel_all_keys_info, resolve_channel_candidates, resolve_channel_detailed,
-    resolve_channel_key_groups_for_model, ChannelResolution, ResolvedKeyGroup,
+    group_keys_for_model, load_channel_all_keys_info, resolve_channel_candidates,
+    resolve_channel_detailed, ChannelResolution, ResolvedKeyGroup,
 };
 use super::dispatcher::{
     execute_resilient_egress, parse_retry_after_value, rate_limit_backoff_ms, EgressRequestMeta,
@@ -31,6 +31,10 @@ use std::time::{Duration, Instant};
 /// 单个分组在单个请求内最多顺延尝试的 Key 数量上限。
 /// 组内会逐个 Key 故障转移，若组内有大量失效 Key，叠加上游超时会把单请求拖得过长。
 const MAX_ATTEMPTS_PER_GROUP: usize = 8;
+
+/// Local capability failure permits channel fallback; an upstream request-content 400 does not.
+#[derive(Clone)]
+struct ChannelModelUnavailable;
 
 /// 尝试队列中的一个候选：待用的 Key + 其所属分组名（仅用于日志）
 #[derive(Debug, PartialEq, Eq)]
@@ -444,7 +448,8 @@ async fn dispatch_single_channel_egress(
     let chan_stats_id = channel.stats_id;
 
     // 解析出按分组优先级排列的候选 Key 分组（分组身份 = Key 的 groupName）
-    let key_groups = resolve_channel_key_groups_for_model(ctx, channel, model_to_send).await;
+    let all_keys = load_channel_all_keys_info(ctx, channel).await;
+    let key_groups = group_keys_for_model(channel, model_to_send, &all_keys);
 
     let attempts: Vec<KeyAttempt> = if key_groups.is_empty() {
         // 空分组有两种成因，必须区分处理：
@@ -453,7 +458,6 @@ async fn dispatch_single_channel_egress(
         //    此时改用任意其他 Key 出网即构成越权 —— 该 Key 并未获得此模型的访问授权。
         //    必须判该渠道无候选并跳过，交由上层跨渠道故障转移，
         //    让真正有 Key 支持该模型的渠道按「分组顺序 + 组内轮询模式」编排。
-        let all_keys = load_channel_all_keys_info(ctx, channel).await;
         if !all_keys.is_empty() {
             let err_msg = if all_keys.iter().all(|k| !k.enabled) {
                 format!("渠道「{chan_alias}」的所有 API Key 均被禁用，已跳过该渠道")
@@ -482,7 +486,9 @@ async fn dispatch_single_channel_egress(
                 .with_session_id(session_id.clone()),
             )
             .await;
-            return Err(incompatible_model_response(err_msg, style));
+            let mut response = incompatible_model_response(err_msg, style);
+            response.extensions_mut().insert(ChannelModelUnavailable);
+            return Err(response);
         }
         vec![KeyAttempt {
             key: String::new(),
@@ -696,86 +702,139 @@ pub async fn dispatch_protocol_egress(
     user_agent: Option<String>,
     session_id: Option<String>,
 ) -> Result<EgressOutcome, Response> {
-    // 候选列表：定向请求最多只有被指派的渠道自身，裸模型名才可能有后备渠道
-    let fallbacks: Vec<&ChannelConfig> = if config.channel_failover {
-        resolve_channel_candidates(config, raw_model)
-            .iter()
-            .map(|(ch, _)| *ch)
-            .filter(|ch| ch.id != channel.id)
-            .take(MAX_CHANNEL_FAILOVER.saturating_sub(1))
-            .collect()
-    } else {
-        Vec::new()
-    };
-
-    let mut chain: Vec<&ChannelConfig> = vec![channel];
-    chain.extend(fallbacks);
-    let total = chain.len();
-
-    let mut errors = ErrorTrail::default();
-    for (idx, cand) in chain.into_iter().enumerate() {
-        // 后备渠道的请求 ID 加后缀，与首选渠道的日志区分开
-        let chan_req_id = if idx == 0 {
-            req_id.to_string()
+    // Shared budget across Key groups, nodes and channels. Once headers succeed the
+    // response leaves this future, so active streams retain their idle-timeout semantics.
+    let budget = super::balancer::egress_timeout(config).saturating_sub(start_time.elapsed());
+    let work = async {
+        // 候选列表：定向请求最多只有被指派的渠道自身，裸模型名才可能有后备渠道
+        let fallbacks: Vec<&ChannelConfig> = if config.channel_failover {
+            resolve_channel_candidates(config, raw_model)
+                .iter()
+                .map(|(ch, _)| *ch)
+                .filter(|ch| ch.id != channel.id)
+                .take(MAX_CHANNEL_FAILOVER.saturating_sub(1))
+                .collect()
         } else {
-            format!("{req_id}-c{}", idx + 1)
+            Vec::new()
         };
 
-        match dispatch_single_channel_egress(
-            ctx,
-            config,
-            cand,
-            model_to_send,
-            raw_model,
-            path,
-            &chan_req_id,
-            is_stream,
-            start_time,
-            req_body_str,
-            egress_payload.clone(),
-            style,
-            client_name.clone(),
-            user_agent.clone(),
-            session_id.clone(),
-        )
-        .await
-        {
-            Ok(outcome) => {
-                if idx > 0 {
-                    tracing::info!(
+        let mut chain: Vec<&ChannelConfig> = vec![channel];
+        chain.extend(fallbacks);
+        let total = chain.len();
+
+        let mut errors = ErrorTrail::default();
+        for (idx, cand) in chain.into_iter().enumerate() {
+            // 后备渠道的请求 ID 加后缀，与首选渠道的日志区分开
+            let chan_req_id = if idx == 0 {
+                req_id.to_string()
+            } else {
+                format!("{req_id}-c{}", idx + 1)
+            };
+
+            match dispatch_single_channel_egress(
+                ctx,
+                config,
+                cand,
+                model_to_send,
+                raw_model,
+                path,
+                &chan_req_id,
+                is_stream,
+                start_time,
+                req_body_str,
+                egress_payload.clone(),
+                style,
+                client_name.clone(),
+                user_agent.clone(),
+                session_id.clone(),
+            )
+            .await
+            {
+                Ok(outcome) => {
+                    if idx > 0 {
+                        tracing::info!(
                         "[ModelGateway] 模型「{}」经跨渠道故障转移由渠道「{}」成功承接（第 {}/{} 个候选）",
                         model_to_send,
                         cand.effective_alias(),
                         idx + 1,
                         total
                     );
+                    }
+                    return Ok(outcome);
                 }
-                return Ok(outcome);
-            }
-            Err(err_resp) => {
-                if idx + 1 < total {
-                    tracing::warn!(
+                Err(err_resp) => {
+                    // Request-content errors cannot improve on another channel either.
+                    if !should_failover_to_next_key(err_resp.status())
+                        && err_resp
+                            .extensions()
+                            .get::<ChannelModelUnavailable>()
+                            .is_none()
+                    {
+                        return Err(err_resp);
+                    }
+                    if idx + 1 < total {
+                        tracing::warn!(
                         "[ModelGateway] 渠道「{}」全部候选耗尽，模型「{}」转移到下一渠道（第 {}/{} 个候选）...",
                         cand.effective_alias(),
                         model_to_send,
                         idx + 2,
                         total
                     );
+                    }
+                    errors.push(err_resp);
                 }
-                errors.push(err_resp);
             }
         }
-    }
 
-    // 全部候选渠道均失败：返回最能说明失败原因的错误响应
-    Err(errors.finish().unwrap_or_else(|| {
-        gateway_error_response(
-            style,
-            StatusCode::BAD_GATEWAY,
-            "UPSTREAM_UNAVAILABLE",
-            format!("模型「{model_to_send}」的全部候选渠道均请求失败"),
-        )
-    }))
+        // 全部候选渠道均失败：返回最能说明失败原因的错误响应
+        Err(errors.finish().unwrap_or_else(|| {
+            gateway_error_response(
+                style,
+                StatusCode::BAD_GATEWAY,
+                "UPSTREAM_UNAVAILABLE",
+                format!("模型「{model_to_send}」的全部候选渠道均请求失败"),
+            )
+        }))
+    };
+    match if budget.is_zero() {
+        None
+    } else {
+        tokio::time::timeout(budget, work).await.ok()
+    } {
+        Some(result) => result,
+        None => {
+            let message = format!(
+                "请求调度超过 {} 秒，已停止后续 Key、节点与渠道重试",
+                super::balancer::egress_timeout(config).as_secs()
+            );
+            let params = ProxyLogParams::new_failure(
+                format!("{req_id}#deadline"),
+                path.to_string(),
+                channel.effective_alias(),
+                raw_model.to_string(),
+                is_stream,
+                504,
+                start_time.elapsed().as_millis() as u64,
+                Some(message.clone()),
+                req_body_str.clone(),
+                None,
+            )
+            .with_channel_stats_id(channel.stats_id.map(|id| id.to_string()))
+            .with_client_name(client_name.clone())
+            .with_user_agent(user_agent.clone())
+            .with_session_id(session_id.clone());
+            let log_ctx = ctx.clone();
+            crate::context::spawn(async move {
+                record_attempt_failure(&log_ctx, params).await;
+            });
+            Err(gateway_error_response(
+                style,
+                StatusCode::GATEWAY_TIMEOUT,
+                "UPSTREAM_TIMEOUT",
+                message,
+            ))
+        }
+    }
 }
 
 /// 鉴权失败 + 总请求数计数的公共入口封装；失败时已记录日志并返回错误响应

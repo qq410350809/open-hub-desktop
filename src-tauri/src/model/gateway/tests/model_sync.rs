@@ -1,5 +1,11 @@
 use super::*;
 use crate::model::gateway::types::ModelProxyState;
+use axum::{
+    http::{HeaderMap, Uri},
+    routing::get,
+    Json, Router,
+};
+use serde_json::json;
 use std::sync::{Arc, Mutex};
 
 type MockReply = (StatusCode, JsonValue, Duration);
@@ -10,7 +16,9 @@ struct MockUpstream {
     task: tokio::task::JoinHandle<()>,
 }
 impl Drop for MockUpstream {
-    fn drop(&mut self) { self.task.abort(); }
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 
 async fn upstream(reply: impl Fn(&str, &str) -> MockReply + Send + Sync + 'static) -> MockUpstream {
@@ -21,8 +29,14 @@ async fn upstream(reply: impl Fn(&str, &str) -> MockReply + Send + Sync + 'stati
         let reply = reply.clone();
         let capture = capture.clone();
         async move {
-            let key = headers.get("authorization").and_then(|value| value.to_str().ok()).unwrap_or_default();
-            capture.lock().unwrap().push((uri.path().to_string(), key.to_string()));
+            let key = headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default();
+            capture
+                .lock()
+                .unwrap()
+                .push((uri.path().to_string(), key.to_string()));
             let (status, body, delay) = reply(uri.path(), key);
             tokio::time::sleep(delay).await;
             (status, Json(body))
@@ -30,12 +44,19 @@ async fn upstream(reply: impl Fn(&str, &str) -> MockReply + Send + Sync + 'stati
     }));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
-    let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
-    MockUpstream { url, requests, task }
+    let task = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    MockUpstream {
+        url,
+        requests,
+        task,
+    }
 }
 
 fn channel(id: &str, base: &str) -> ChannelConfig {
-    serde_json::from_value(json!({"id": id, "name": id, "enabled": true, "upstreamUrl": base})).unwrap()
+    serde_json::from_value(json!({"id": id, "name": id, "enabled": true, "upstreamUrl": base}))
+        .unwrap()
 }
 
 async fn context(channels: Vec<ChannelConfig>) -> ModelProxyContext {
@@ -47,9 +68,27 @@ async fn context(channels: Vec<ChannelConfig>) -> ModelProxyContext {
 
 #[tokio::test]
 async fn model_sync_selected_channel_never_fetches_other_channels() {
-    let first = upstream(|_, _| (StatusCode::OK, json!({"data":[{"id":"first"}]}), Duration::ZERO)).await;
-    let other = upstream(|_, _| (StatusCode::OK, json!({"data":[{"id":"other"}]}), Duration::ZERO)).await;
-    let ctx = context(vec![channel("first", &first.url), channel("other", &other.url)]).await;
+    let first = upstream(|_, _| {
+        (
+            StatusCode::OK,
+            json!({"data":[{"id":"first"}]}),
+            Duration::ZERO,
+        )
+    })
+    .await;
+    let other = upstream(|_, _| {
+        (
+            StatusCode::OK,
+            json!({"data":[{"id":"other"}]}),
+            Duration::ZERO,
+        )
+    })
+    .await;
+    let ctx = context(vec![
+        channel("first", &first.url),
+        channel("other", &other.url),
+    ])
+    .await;
     let (models, errors) = fetch_upstream_models_inner(&ctx, Some("first"), Some("run-1")).await;
     assert!(errors.is_empty());
     assert_eq!(models.len(), 1);
@@ -61,9 +100,18 @@ async fn model_sync_selected_channel_never_fetches_other_channels() {
 #[tokio::test]
 async fn model_sync_unions_distinct_models_for_each_key() {
     let mock = upstream(|_, key| {
-        let model = if key == "Bearer key-a" { "model-a" } else { "model-b" };
-        (StatusCode::OK, json!({"data":[{"id":model},{"id":"shared"}]}), Duration::ZERO)
-    }).await;
+        let model = if key == "Bearer key-a" {
+            "model-a"
+        } else {
+            "model-b"
+        };
+        (
+            StatusCode::OK,
+            json!({"data":[{"id":model},{"id":"shared"}]}),
+            Duration::ZERO,
+        )
+    })
+    .await;
     let mut ch = channel("keys", &mock.url);
     ch.api_keys = Some(vec!["key-a".to_string(), "key-b".to_string()]);
     let ctx = context(vec![ch]).await;
@@ -76,27 +124,79 @@ async fn model_sync_unions_distinct_models_for_each_key() {
 }
 
 #[tokio::test]
+async fn model_sync_queue_wait_is_bounded_without_sending_a_request() {
+    let mock = upstream(|_, _| {
+        (
+            StatusCode::OK,
+            json!({"data":[{"id":"unexpected"}]}),
+            Duration::ZERO,
+        )
+    })
+    .await;
+    let ctx = context(vec![channel("queued", &mock.url)]).await;
+    let _slots = ctx.model_sync_slots.acquire_many(3).await.unwrap();
+    let (models, errors) =
+        fetch_upstream_models_with_timeout(&ctx, Some("queued"), None, Duration::from_millis(50))
+            .await;
+    assert!(models.is_empty());
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].error.contains("等待同步队列"));
+    assert!(mock.requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn model_sync_timeout_preserves_previous_cache() {
-    let mock = upstream(|_, _| (StatusCode::OK, json!({"data":[{"id":"new"}]}), Duration::from_secs(1))).await;
+    let mock = upstream(|_, _| {
+        (
+            StatusCode::OK,
+            json!({"data":[{"id":"new"}]}),
+            Duration::from_secs(1),
+        )
+    })
+    .await;
     let ctx = context(vec![channel("slow", &mock.url)]).await;
-    ctx.cached_channel_models.write().await.push(ChannelModelList {
-        channel_id: "slow".to_string(), channel_name: "slow".to_string(), alias: "slow".to_string(), models: vec!["cached".to_string()],
-    });
-    let (models, errors) = fetch_upstream_models_with_timeout(&ctx, Some("slow"), None, Duration::from_millis(80)).await;
+    ctx.cached_channel_models
+        .write()
+        .await
+        .push(ChannelModelList {
+            channel_id: "slow".to_string(),
+            channel_name: "slow".to_string(),
+            alias: "slow".to_string(),
+            models: vec!["cached".to_string()],
+        });
+    let (models, errors) =
+        fetch_upstream_models_with_timeout(&ctx, Some("slow"), None, Duration::from_millis(80))
+            .await;
     assert!(models.is_empty());
     assert_eq!(errors.len(), 1);
     assert!(errors[0].error.contains("超时"));
-    assert_eq!(ctx.cached_channel_models.read().await[0].models, vec!["cached"]);
+    assert_eq!(
+        ctx.cached_channel_models.read().await[0].models,
+        vec!["cached"]
+    );
 }
 
 #[tokio::test]
 async fn model_sync_reserves_time_for_aux_when_primary_stalls() {
     let main = upstream(|_, _| (StatusCode::OK, json!({"data":[]}), Duration::from_secs(2))).await;
-    let aux = upstream(|_, _| (StatusCode::OK, json!({"data":[{"id":"backup"}]}), Duration::ZERO)).await;
+    let aux = upstream(|_, _| {
+        (
+            StatusCode::OK,
+            json!({"data":[{"id":"backup"}]}),
+            Duration::ZERO,
+        )
+    })
+    .await;
     let mut ch = channel("fallback", &main.url);
     ch.aux_url = Some(aux.url.clone());
     let ctx = context(vec![ch]).await;
-    let (models, errors) = fetch_upstream_models_with_timeout(&ctx, Some("fallback"), None, Duration::from_millis(400)).await;
+    let (models, errors) = fetch_upstream_models_with_timeout(
+        &ctx,
+        Some("fallback"),
+        None,
+        Duration::from_millis(400),
+    )
+    .await;
     assert!(errors.is_empty(), "{errors:?}");
     assert_eq!(models[0].models, vec!["backup"]);
     assert_eq!(aux.requests.lock().unwrap().len(), 1);
@@ -106,18 +206,42 @@ async fn model_sync_reserves_time_for_aux_when_primary_stalls() {
 async fn model_sync_tries_legacy_endpoint_and_redacts_error_body() {
     let mock = upstream(|path, _| {
         if path == "/v1/models" {
-            (StatusCode::NOT_FOUND, json!({"error":"secret-token"}), Duration::ZERO)
+            (
+                StatusCode::NOT_FOUND,
+                json!({"error":"secret-token"}),
+                Duration::ZERO,
+            )
         } else {
-            (StatusCode::OK, json!({"models":[{"name":"models/gemini"}]}), Duration::ZERO)
+            (
+                StatusCode::OK,
+                json!({"models":[{"name":"models/gemini"}]}),
+                Duration::ZERO,
+            )
         }
-    }).await;
+    })
+    .await;
     let ctx = context(vec![channel("legacy", &mock.url)]).await;
     let (models, errors) = fetch_upstream_models_inner(&ctx, Some("legacy"), None).await;
     assert!(errors.is_empty());
     assert_eq!(models[0].models, vec!["gemini"]);
-    assert_eq!(mock.requests.lock().unwrap().iter().map(|item| item.0.as_str()).collect::<Vec<_>>(), vec!["/v1/models", "/models"]);
+    assert_eq!(
+        mock.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|item| item.0.as_str())
+            .collect::<Vec<_>>(),
+        vec!["/v1/models", "/models"]
+    );
 
-    let failed = upstream(|_, _| (StatusCode::UNAUTHORIZED, json!({"error":"secret-token"}), Duration::ZERO)).await;
+    let failed = upstream(|_, _| {
+        (
+            StatusCode::UNAUTHORIZED,
+            json!({"error":"secret-token"}),
+            Duration::ZERO,
+        )
+    })
+    .await;
     let ctx = context(vec![channel("invalid", &failed.url)]).await;
     let (_, errors) = fetch_upstream_models_inner(&ctx, Some("invalid"), None).await;
     assert!(errors[0].error.contains("401"));
@@ -128,11 +252,36 @@ async fn model_sync_tries_legacy_endpoint_and_redacts_error_body() {
 fn model_sync_aux_mirror_keeps_version_and_query_without_duplication() {
     use crate::model::gateway::egress::aux_upstream_for;
     let cases = [
-        ("https://main.example/v1", "https://aux.example", "https://main.example/v1/chat/completions", "https://aux.example/v1/chat/completions"),
-        ("https://main.example", "https://aux.example/v1", "https://main.example/v1/chat/completions", "https://aux.example/v1/chat/completions"),
-        ("https://main.example/v1", "https://aux.example/proxy/v1", "https://main.example/v1/messages", "https://aux.example/proxy/v1/messages"),
-        ("https://main.example/v1", "https://aux.example/proxy", "https://main.example/v1/responses", "https://aux.example/proxy/v1/responses"),
-        ("https://main.example", "https://aux.example", "https://main.example/v1beta/models/gemini:generateContent?key=test", "https://aux.example/v1beta/models/gemini:generateContent?key=test"),
+        (
+            "https://main.example/v1",
+            "https://aux.example",
+            "https://main.example/v1/chat/completions",
+            "https://aux.example/v1/chat/completions",
+        ),
+        (
+            "https://main.example",
+            "https://aux.example/v1",
+            "https://main.example/v1/chat/completions",
+            "https://aux.example/v1/chat/completions",
+        ),
+        (
+            "https://main.example/v1",
+            "https://aux.example/proxy/v1",
+            "https://main.example/v1/messages",
+            "https://aux.example/proxy/v1/messages",
+        ),
+        (
+            "https://main.example/v1",
+            "https://aux.example/proxy",
+            "https://main.example/v1/responses",
+            "https://aux.example/proxy/v1/responses",
+        ),
+        (
+            "https://main.example",
+            "https://aux.example",
+            "https://main.example/v1beta/models/gemini:generateContent?key=test",
+            "https://aux.example/v1beta/models/gemini:generateContent?key=test",
+        ),
     ];
     for (main, aux, upstream, expected) in cases {
         let mut ch = channel("aux", main);
@@ -142,12 +291,132 @@ fn model_sync_aux_mirror_keeps_version_and_query_without_duplication() {
     }
 }
 
+#[tokio::test]
+async fn model_sync_rejects_results_after_channel_configuration_changes() {
+    let started = Arc::new(tokio::sync::Semaphore::new(0));
+    let signal = started.clone();
+    let mock = upstream(move |_, _| {
+        signal.add_permits(1);
+        (
+            StatusCode::OK,
+            json!({"data":[{"id":"stale"}]}),
+            Duration::from_millis(150),
+        )
+    })
+    .await;
+    let ctx = context(vec![channel("changing", &mock.url)]).await;
+    let worker_ctx = ctx.clone();
+    let task = tokio::spawn(async move {
+        fetch_upstream_models_inner(&worker_ctx, Some("changing"), None).await
+    });
+    let _started = started.acquire().await.unwrap();
+    ctx.config.write().await.channels[0].api_key = "updated-key".into();
+    let (models, errors) = task.await.unwrap();
+    assert!(models.is_empty());
+    assert_eq!(errors.len(), 1);
+    assert!(ctx.cached_channel_models.read().await.is_empty());
+}
+
+#[tokio::test]
+async fn model_sync_older_run_cannot_overwrite_a_newer_run() {
+    let started = Arc::new(tokio::sync::Semaphore::new(0));
+    let signal = started.clone();
+    let count = std::sync::atomic::AtomicUsize::new(0);
+    let mock = upstream(move |_, _| {
+        let first = count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+        signal.add_permits(1);
+        (
+            StatusCode::OK,
+            json!({"data":[{"id":if first {"old"} else {"new"}}]}),
+            if first {
+                Duration::from_millis(200)
+            } else {
+                Duration::ZERO
+            },
+        )
+    })
+    .await;
+    let ctx = context(vec![channel("overlap", &mock.url)]).await;
+    let worker_ctx = ctx.clone();
+    let older = tokio::spawn(async move {
+        fetch_upstream_models_inner(&worker_ctx, Some("overlap"), None).await
+    });
+    let _started = started.acquire().await.unwrap();
+    let (models, errors) = fetch_upstream_models_inner(&ctx, Some("overlap"), None).await;
+    assert!(errors.is_empty());
+    assert_eq!(models[0].models, vec!["new"]);
+    assert!(older.await.unwrap().0.is_empty());
+    assert_eq!(
+        ctx.cached_channel_models.read().await[0].models,
+        vec!["new"]
+    );
+}
+
+#[tokio::test]
+async fn model_sync_bulk_and_single_requests_share_three_network_slots() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let started = Arc::new(tokio::sync::Semaphore::new(0));
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let active = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let (s, g, a, p) = (started.clone(), gate.clone(), active.clone(), peak.clone());
+    let router = Router::new().fallback(get(move || {
+        let (s, g, a, p) = (s.clone(), g.clone(), a.clone(), p.clone());
+        async move {
+            p.fetch_max(a.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
+            s.add_permits(1);
+            let permit = g.acquire().await.unwrap();
+            permit.forget();
+            a.fetch_sub(1, Ordering::SeqCst);
+            Json(json!({"data":[{"id":"model"}]}))
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    let _upstream = MockUpstream {
+        url: url.clone(),
+        requests: Arc::new(Mutex::new(Vec::new())),
+        task: server,
+    };
+    let ctx = context((0..6).map(|i| channel(&format!("ch-{i}"), &url)).collect()).await;
+    let worker = ctx.clone();
+    let bulk = tokio::spawn(async move { fetch_upstream_models_inner(&worker, None, None).await });
+    let permits = tokio::time::timeout(Duration::from_secs(5), started.acquire_many(3))
+        .await
+        .unwrap()
+        .unwrap();
+    permits.forget();
+    assert_eq!(active.load(Ordering::SeqCst), 3);
+    let worker = ctx.clone();
+    let single =
+        tokio::spawn(async move { fetch_upstream_models_inner(&worker, Some("ch-5"), None).await });
+    gate.add_permits(7);
+    let (bulk_models, bulk_errors) = bulk.await.unwrap();
+    let (single_models, single_errors) = single.await.unwrap();
+    assert!(single_errors.is_empty());
+    assert_eq!(single_models.len(), 1);
+    assert_eq!(bulk_models.len() + bulk_errors.len(), 6);
+    assert_eq!(peak.load(Ordering::SeqCst), 3);
+}
+
 #[test]
 fn model_sync_progress_correlates_requests_without_url_credentials() {
     let bus = crate::context::EventBus::new();
     let mut events = bus.subscribe();
-    let progress = SyncProgress { bus: Some(&bus), request_id: Some("run-123"), channel_id: "channel-1" };
-    progress.emit(ModelProxySyncStage::Request, "request", Some("https://user:pass@example.com/v1/models?key=secret#token"), Some((2, 3)));
+    let progress = SyncProgress {
+        bus: Some(&bus),
+        request_id: Some("run-123"),
+        channel_id: "channel-1",
+    };
+    progress.emit(
+        ModelProxySyncStage::Request,
+        "request",
+        Some("https://user:pass@example.com/v1/models?key=secret#token"),
+        Some((2, 3)),
+    );
     let event = events.try_recv().unwrap();
     assert_eq!(event.event, "model-proxy-sync-progress");
     assert_eq!(event.payload["requestId"], "run-123");

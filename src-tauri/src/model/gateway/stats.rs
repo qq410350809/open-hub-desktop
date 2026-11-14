@@ -8,6 +8,10 @@ use rusqlite::params;
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 
+#[cfg(test)]
+#[path = "tests/stats_atomicity.rs"]
+mod atomicity_tests;
+
 impl ModelProxyContext {
     /// 异步记录请求日志至本地数据库，并同步累加「渠道 × 模型 × 客户端 × 日/时」聚合统计。
     /// 明细日志按保留天数节流清理（默认永久保留）；统计聚合表独立持久化，不受清理影响。
@@ -20,7 +24,7 @@ impl ModelProxyContext {
         }
         let app_handle_opt = self.app_ctx.read().await.clone();
         if let Some(ctx) = app_handle_opt {
-            let database = &ctx.database;
+            let database = ctx.database.clone();
             let now_millis = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as i64)
@@ -48,8 +52,9 @@ impl ModelProxyContext {
             };
 
             let retention_clock = self.log_retention_last_run.clone();
-            let _ = (move || -> Result<(), rusqlite::Error> {
-                let conn = database.lock_db();
+            let result = tokio::task::spawn_blocking(move || -> Result<(), rusqlite::Error> {
+                let mut connection = database.lock_db();
+                let conn = connection.transaction()?;
                 conn.execute(
                     "INSERT OR REPLACE INTO model_proxy_logs (
                         id, timestamp, method, path, channel_id, model, stream, status_code,
@@ -89,12 +94,14 @@ impl ModelProxyContext {
                 )?;
 
                 // 明细保留期清理：删除保留窗口之外的明细（统计聚合表不受影响）
+                let retention_cutoff = retention_cutoff.filter(|_| {
+                    (now_millis.max(0) as u64).saturating_sub(retention_clock.load(Ordering::Relaxed)) >= RETENTION_CHECK_INTERVAL_MS
+                });
                 if let Some(cutoff) = &retention_cutoff {
                     conn.execute(
                         "DELETE FROM model_proxy_logs WHERE timestamp < ?1",
                         [cutoff.as_str()],
                     )?;
-                    retention_clock.store(now_millis.max(0) as u64, Ordering::Relaxed);
                 }
 
                 // 「渠道 × 模型 × 客户端 × 日」与「× 时」聚合：长期统计依赖这两表。
@@ -191,8 +198,17 @@ impl ModelProxyContext {
                         log.total_tokens.unwrap_or(0) as i64,
                     ],
                 )?;
+                conn.commit()?;
+                if retention_cutoff.is_some() {
+                    retention_clock.store(now_millis.max(0) as u64, Ordering::Relaxed);
+                }
                 Ok(())
-            })();
+            }).await;
+            match result {
+                Ok(Ok(())) => {},
+                Ok(Err(error)) => tracing::warn!("[ModelGateway] 日志与统计事务写入失败: {error}"),
+                Err(error) => tracing::warn!("[ModelGateway] 日志写入任务失败: {error}"),
+            }
         }
     }
 }

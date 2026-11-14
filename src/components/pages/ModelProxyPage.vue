@@ -21,6 +21,7 @@ import {
   type ProxyRequestLog,
 } from "../../composables/useModelProxy";
 import { useLibrary, runCommand } from "../../composables/useLibrary";
+import { useSiteActions } from "../../composables/site/useSiteActions";
 import { useToast } from "../../composables/useToast";
 import { sourceLabel } from "../../composables/token/tokenFormatters";
 import { usePreferences } from "../../composables/usePreferences";
@@ -59,6 +60,7 @@ const logPageSizeOptions = [
 ];
 
 const { showToast } = useToast();
+const { openSiteAddress } = useSiteActions();
 const {
   proxyConfig,
   proxyStatus,
@@ -142,6 +144,9 @@ async function handleClearLogs(mode: "payload_only" | "all") {
 }
 
 let uptimeTicker: number | null = null;
+let pageDisposed = false;
+let statusPollPending = false;
+let statsPollPending = false;
 let statusPollTimer: number | null = null;
 let channelStatsTimer: number | null = null;
 
@@ -171,11 +176,11 @@ watch(
 );
 
 onMounted(async () => {
-void refreshGatewayOverview();
-await loadProxyData();
-await loadCachedModels();
-void refreshSiteInheritedKeyCounts();
-await fetchLogs({ filter: logStatusFilter.value, q: logSearchQuery.value.trim() });
+  await loadProxyData();
+  if (pageDisposed) return;
+  void refreshSiteInheritedKeyCounts();
+  await fetchLogs({ filter: logStatusFilter.value, q: logSearchQuery.value.trim() });
+  if (pageDisposed) return;
 
   uptimeTicker = window.setInterval(() => {
     if (proxyStatus.value.running) {
@@ -184,23 +189,34 @@ await fetchLogs({ filter: logStatusFilter.value, q: logSearchQuery.value.trim() 
   }, 1000);
 
   statusPollTimer = window.setInterval(async () => {
-    if (proxyStatus.value.running) {
+    if (pageDisposed || statusPollPending || !proxyStatus.value.running) return;
+    statusPollPending = true;
+    try {
       await refreshStatus();
+    } finally {
+      statusPollPending = false;
     }
   }, 3000);
 
   // 每 5s 刷新当前标签页统计。总览/渠道统计读持久化日统计表，
   // 服务未运行（历史数据仍在）也需要刷新，故不再以 running 为前置条件
   channelStatsTimer = window.setInterval(async () => {
-    if (currentMainTab.value === "channels") {
-      await refreshChannelStats();
-    } else if (currentMainTab.value === "console") {
-      await refreshGatewayOverview();
+    if (pageDisposed || statsPollPending) return;
+    statsPollPending = true;
+    try {
+      if (currentMainTab.value === "channels") {
+        await refreshChannelStats();
+      } else if (currentMainTab.value === "console") {
+        await refreshGatewayOverview();
+      }
+    } finally {
+      statsPollPending = false;
     }
   }, 5000);
 });
 
 onUnmounted(() => {
+  pageDisposed = true;
   if (uptimeTicker !== null) {
     clearInterval(uptimeTicker);
     uptimeTicker = null;
@@ -1913,8 +1929,8 @@ interface AllModelsDraftState {
 
 const allModelsDialogOpen = ref(false);
 const allModelsSearch = ref("");
-/** 过滤健康度为 0% 的模型（无健康度数据不属于「0 健康度」，不受影响） */
-const allModelsHealthyOnly = ref(false);
+/** 过滤健康度为 0% 或没有请求健康度数据的模型。 */
+const allModelsHealthyOnly = ref(true);
 const allModelsDraft = ref<Record<string, AllModelsDraftState>>({});
 const savingAllModels = ref(false);
 const allModelsSyncing = ref(false);
@@ -2025,8 +2041,8 @@ const filteredAllModelsGroups = computed(() => {
         if (q && !m.toLowerCase().includes(q)) return false;
         if (healthyOnly) {
           const value = modelHealthValue(channelModelHealth(g.channel, m));
-          // 无健康度数据（null）≠ 0 健康度：保留；只隐藏确证 0% 的模型。
-          if (value !== null && value <= 0) return false;
+          // 开启过滤后仅展示有健康度数据且成功率大于 0 的模型。
+          if (value === null || value <= 0) return false;
         }
         return true;
       }),
@@ -3126,8 +3142,8 @@ const availableModelsCount = computed(() => {
 const channelModelSortMode = ref<"discovery" | "usage">("discovery");
 /** 仅看已启用的模型 */
 const channelModelEnabledOnly = ref(false);
-/** 过滤健康度为 0% 的模型（无健康度数据的模型不属于「0 健康度」，不受影响） */
-const channelModelHealthyOnly = ref(false);
+/** 过滤健康度为 0% 或没有请求健康度数据的模型。 */
+const channelModelHealthyOnly = ref(true);
 
 const filteredChannelModels = computed(() => {
   const q = channelSearchQuery.value.trim().toLowerCase();
@@ -3140,8 +3156,7 @@ const filteredChannelModels = computed(() => {
   if (channelModelHealthyOnly.value) {
     list = list.filter((m) => {
       const value = modelHealthValue(channelModelHealth(selectedChannel.value, m));
-      // 无健康度数据（null）≠ 0 健康度：保留；只有确证 0% 的模型才过滤掉。
-      return value == null || value > 0;
+      return value !== null && value > 0;
     });
   }
   if (channelModelSortMode.value === "usage") {
@@ -5173,7 +5188,7 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
               </label>
               <label
                 class="mp-toolbar-switch"
-                title="隐藏健康度为 0% 的模型（无健康度数据的模型不属于 0 健康度，不受影响）"
+                title="隐藏健康度为 0% 或没有请求健康度数据的模型"
               >
                 <input v-model="channelModelHealthyOnly" type="checkbox" />
                 <span>过滤 0 健康度</span>
@@ -6229,7 +6244,7 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
             </div>
             <label
               class="mp-toolbar-switch"
-              title="隐藏健康度为 0% 的模型（无健康度数据的模型不属于 0 健康度，不受影响）；只影响列表展示，不改动勾选状态"
+              title="隐藏健康度为 0% 或没有请求健康度数据的模型；只影响列表展示，不改动勾选状态"
             >
               <input v-model="allModelsHealthyOnly" type="checkbox" />
               <span>过滤 0 健康度</span>
@@ -6386,12 +6401,24 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
               <div class="mp-all-models-group-address">
                 <code :title="group.channel.upstreamUrl">{{ group.channel.upstreamUrl }}</code>
                 <span v-if="group.channel.auxUrl">辅：{{ group.channel.auxUrl }}</span>
-                <button
-                  class="mp-btn mp-btn-ghost mp-btn-sm"
-                  type="button"
-                  :disabled="allModelsAnySyncing"
-                  @click="handleOpenChannelSettingsDialog(group.channel)"
-                >{{ group.channel.auxUrl ? '编辑辅助地址' : '+ 辅助地址' }}</button>
+                <div class="mp-aux-actions">
+                  <button
+                    class="mp-btn mp-btn-ghost mp-btn-sm mp-aux-icon-btn"
+                    type="button"
+                    :title="group.channel.auxUrl?.trim() ? `复制辅助地址：${group.channel.auxUrl.trim()}` : '未配置辅助地址'"
+                    :aria-label="`${group.channel.name}：复制辅助地址`"
+                    :disabled="!group.channel.auxUrl?.trim()"
+                    @click="copyText(group.channel.auxUrl?.trim() ?? '', '辅助地址')"
+                  ><span aria-hidden="true" v-html="icons.copy" /></button>
+                  <button
+                    class="mp-btn mp-btn-ghost mp-btn-sm mp-aux-icon-btn"
+                    type="button"
+                    :title="group.channel.auxUrl?.trim() ? `在浏览器中打开辅助地址：${group.channel.auxUrl.trim()}` : '未配置辅助地址，可在渠道设置中添加'"
+                    :aria-label="`${group.channel.name}：在浏览器中打开辅助地址`"
+                    :disabled="!group.channel.auxUrl?.trim()"
+                    @click="openSiteAddress(group.channel.auxUrl?.trim() ?? '', group.channel.siteId ?? '')"
+                  ><span aria-hidden="true" v-html="icons.external" /></button>
+                </div>
               </div>
 
               <div v-if="group.models.length > 0" class="mp-all-models-grid">
@@ -10801,6 +10828,20 @@ button.mp-mec-check:focus-visible {
   margin-left: auto;
   color: var(--muted);
   font-variant-numeric: tabular-nums;
+}
+
+.mp-aux-actions {
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+  gap: 4px;
+}
+
+.mp-aux-icon-btn {
+  width: 28px;
+  height: 28px;
+  padding: 6px;
+  flex-shrink: 0;
 }
 
 .mp-all-models-group-address {

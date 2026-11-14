@@ -7,6 +7,7 @@ pub mod egress;
 pub mod handlers;
 pub mod ir;
 pub mod logger;
+mod model_sync;
 pub mod parsers;
 pub mod pipeline;
 pub mod router;

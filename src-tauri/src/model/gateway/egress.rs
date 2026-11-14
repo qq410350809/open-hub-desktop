@@ -1046,28 +1046,7 @@ mod egress_tests {
     }
 
     fn test_context() -> crate::model::gateway::types::ModelProxyContext {
-        use std::collections::HashMap;
-        use std::sync::Arc;
-        use tokio::sync::RwLock;
-        crate::model::gateway::types::ModelProxyContext {
-            route_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            config: Arc::new(RwLock::new(
-                crate::model::gateway::types::ModelProxyConfig::default(),
-            )),
-            metrics: Arc::new(crate::model::gateway::types::ProxyMetrics::default()),
-            started_at: Arc::new(RwLock::new(None)),
-            current_port: Arc::new(RwLock::new(0)),
-            cached_channel_models: Arc::new(RwLock::new(Vec::new())),
-            cached_fetch_errors: Arc::new(RwLock::new(Vec::new())),
-            default_http_client: Arc::new(RwLock::new(reqwest::Client::new())),
-            default_stream_client: Arc::new(RwLock::new(reqwest::Client::new())),
-            models_fetch_client: reqwest::Client::new(),
-            app_ctx: Arc::new(RwLock::new(None)),
-            key_round_robin: Arc::new(RwLock::new(HashMap::new())),
-            node_round_robin: Arc::new(RwLock::new(HashMap::new())),
-            log_retention_last_run: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            rate_limit_cooldowns: Arc::new(RwLock::new(HashMap::new())),
-        }
+        crate::model::gateway::types::ModelProxyState::new().context
     }
 
     #[tokio::test]

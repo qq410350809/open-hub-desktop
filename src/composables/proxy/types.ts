@@ -184,6 +184,13 @@ export interface ChannelUsageStats {
   todayCacheHitTokens?: number;
 }
 
+export interface ChannelModelFetchError {
+  channelId: string;
+  channelName: string;
+  alias: string;
+  error: string;
+}
+
 export interface ChannelModelList {
   channelId: string;
   models: string[];

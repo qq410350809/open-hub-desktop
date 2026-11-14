@@ -36,6 +36,8 @@ impl ModelProxyState {
             current_port: Arc::new(RwLock::new(0)),
             cached_channel_models: Arc::new(RwLock::new(Vec::new())),
             cached_fetch_errors: Arc::new(RwLock::new(Vec::new())),
+            model_sync_slots: Arc::new(tokio::sync::Semaphore::new(3)),
+            model_sync_versions: Arc::new(RwLock::new(HashMap::new())),
             default_http_client: Arc::new(tokio::sync::RwLock::new(http_client)),
             default_stream_client: Arc::new(tokio::sync::RwLock::new(stream_http_client)),
             models_fetch_client,

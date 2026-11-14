@@ -222,6 +222,26 @@ pub async fn load_channel_all_keys_info(
     ctx: &ModelProxyContext,
     channel: &ChannelConfig,
 ) -> Vec<ChannelKeyInfo> {
+    let app = ctx.app_ctx.read().await.clone();
+    if channel
+        .site_id
+        .as_deref()
+        .is_some_and(|id| !id.trim().is_empty())
+        && app.is_some()
+    {
+        let channel = channel.clone();
+        tokio::task::spawn_blocking(move || load_channel_keys_sync(app.as_deref(), &channel))
+            .await
+            .unwrap_or_default()
+    } else {
+        load_channel_keys_sync(None, channel)
+    }
+}
+
+fn load_channel_keys_sync(
+    app: Option<&crate::context::AppContext>,
+    channel: &ChannelConfig,
+) -> Vec<ChannelKeyInfo> {
     let mut raw_keys = Vec::new();
     let mut seen = HashSet::new();
 
@@ -230,7 +250,7 @@ pub async fn load_channel_all_keys_info(
         .as_deref()
         .filter(|id| !id.trim().is_empty())
     {
-        if let Some(app_ctx) = ctx.app_ctx.read().await.as_ref().cloned() {
+        if let Some(app_ctx) = app {
             if let Ok(connection) = app_ctx.database.0.lock() {
                 if let Ok(mut statement) = connection.prepare(
                     "SELECT keys_json, groups_json, key_models_json FROM site_model_cache WHERE site_id = ?1 ORDER BY profile_id",
@@ -355,6 +375,15 @@ pub async fn resolve_channel_key_groups_for_model(
     model: &str,
 ) -> Vec<ResolvedKeyGroup> {
     let all_keys = load_channel_all_keys_info(ctx, channel).await;
+    group_keys_for_model(channel, model, &all_keys)
+}
+
+/// Pure grouping step: callers that already loaded metadata need no second DB read.
+pub fn group_keys_for_model(
+    channel: &ChannelConfig,
+    model: &str,
+    all_keys: &[ChannelKeyInfo],
+) -> Vec<ResolvedKeyGroup> {
     if all_keys.is_empty() {
         return Vec::new();
     }
@@ -633,7 +662,10 @@ async fn enabled_pool_nodes(ctx: &ModelProxyContext) -> Vec<String> {
     let Some(app_ctx) = app_ctx_arc.as_ref() else {
         return Vec::new();
     };
-    query_enabled_pool_nodes(&app_ctx.database)
+    let database = app_ctx.database.clone();
+    tokio::task::spawn_blocking(move || query_enabled_pool_nodes(&database))
+        .await
+        .unwrap_or_default()
 }
 
 /// 在已持有数据库引用的前提下查询启用节点（避免跨 await 持锁借用）
@@ -699,13 +731,17 @@ pub async fn build_client_for_candidate(
     // 代理池固定通道候选：走该通道的专用 lane 监听端口（通道绑定节点由
     // ensure_channel_instance 保证就绪），不占用共享实例的 select 组。
     if let Some(channel_id) = candidate.strip_prefix("__proxy_channel__:") {
-        if let Some(app_ctx) = ctx.app_ctx.read().await.as_ref() {
-            let database = &app_ctx.database;
-            let runtime = &app_ctx.proxy_runtime;
-            let channel_id = channel_id.to_string();
-            let lane = tokio::task::block_in_place(|| {
-                crate::proxypool::ensure_channel_instance(database, runtime, &channel_id)
-            });
+        if let Some(app_ctx) = ctx.app_ctx.read().await.clone() {
+            let lane_id = channel_id.to_string();
+            let lane = tokio::task::spawn_blocking(move || {
+                crate::proxypool::ensure_channel_instance(
+                    &app_ctx.database,
+                    &app_ctx.proxy_runtime,
+                    &lane_id,
+                )
+            })
+            .await
+            .unwrap_or_else(|error| Err(format!("固定通道准备任务失败: {error}")));
             match lane {
                 Ok(port) => {
                     if let Ok(proxy) = reqwest::Proxy::all(format!("http://127.0.0.1:{port}")) {
@@ -770,51 +806,38 @@ pub async fn get_node_display_name(ctx: &ModelProxyContext, candidate: &str) -> 
         return "直连通道".to_string();
     }
 
-    // 代理池固定通道候选：显示通道名
-    if let Some(channel_id) = candidate.strip_prefix("__proxy_channel__:") {
-        if let Some(app_ctx) = ctx.app_ctx.read().await.as_ref() {
-            let name_opt: Option<String> = match app_ctx.database.0.lock() {
-                Ok(conn) => conn
-                    .query_row(
-                        "SELECT name FROM proxy_channels WHERE id = ?1",
-                        [channel_id],
-                        |row| row.get(0),
-                    )
-                    .ok(),
-                Err(_) => None,
-            };
-            if let Some(name) = name_opt {
-                if !name.trim().is_empty() {
-                    return format!("固定通道 · {name}");
-                }
-            }
-        }
-        return "代理池固定通道".to_string();
+    let app = ctx.app_ctx.read().await.clone();
+    let fallback = if candidate.starts_with("__proxy_channel__:") {
+        "代理池固定通道"
+    } else {
+        candidate
     }
-
-    if let Some(ctx) = ctx.app_ctx.read().await.as_ref() {
-        let database = &ctx.database;
-        let name_opt: Option<String> = {
-            match database.0.lock() {
-                Ok(conn) => {
-                    let res: Result<String, _> = conn.query_row(
-                        "SELECT name FROM proxy_pool_nodes WHERE id = ?1",
-                        [candidate],
-                        |row| row.get(0),
-                    );
-                    res.ok()
-                }
-                Err(_) => None,
-            }
+    .to_string();
+    let candidate = candidate.to_string();
+    let Some(app) = app else {
+        return fallback;
+    };
+    tokio::task::spawn_blocking(move || {
+        let (table, id, prefix) = if let Some(id) = candidate.strip_prefix("__proxy_channel__:") {
+            ("proxy_channels", id, "固定通道 · ")
+        } else {
+            ("proxy_pool_nodes", candidate.as_str(), "")
         };
-        if let Some(name) = name_opt {
-            if !name.trim().is_empty() {
-                return name;
-            }
-        }
-    }
-
-    candidate.to_string()
+        let name: Option<String> = app.database.0.lock().ok().and_then(|conn| {
+            conn.query_row(
+                &format!("SELECT name FROM {table} WHERE id = ?1"),
+                [id],
+                |row| row.get(0),
+            )
+            .ok()
+        });
+        name.filter(|name| !name.trim().is_empty())
+            .map(|name| format!("{prefix}{name}"))
+    })
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or(fallback)
 }
 
 #[cfg(test)]

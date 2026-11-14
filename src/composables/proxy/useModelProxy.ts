@@ -1,6 +1,7 @@
 import { ref, computed } from "vue";
 import { isTauri, runCommand } from "../core/ipc";
 import { withModelSyncDeadline } from "./modelSync";
+import { createLatestLoader, parseModelSyncResult, proxyLogSortColumns } from "./modelState";
 import { useToast } from "../core/useToast";
 import {
   API_PATH_V1,
@@ -16,7 +17,6 @@ import type {
   ProxyRequestLog,
   ChannelUsageStats,
   ChannelModelUsageStats,
-  ChannelModelList,
   GatewayOverviewStats,
 } from "./types";
 import type { SiteRecord } from "../../types";
@@ -199,13 +199,21 @@ function daysAgo(n: number): string {
 export const overviewDateFrom = ref(daysAgo(13));
 export const overviewDateTo = ref(today);
 
+// Shared refs require shared request ownership even when several components use the composable.
+const loadLatestStatus = createLatestLoader();
+const loadLatestChannelStats = createLatestLoader();
+const loadLatestOverview = createLatestLoader();
+const loadLatestLogs = createLatestLoader();
+let activeGlobalModelFetches = 0;
+
 export function useModelProxy() {
   const { showToast } = useToast();
 
   async function refreshStatus() {
     try {
-      const status = await runCommand<ModelProxyStatus>("get_model_proxy_status");
-      if (status) proxyStatus.value = status;
+      await loadLatestStatus(() => runCommand<ModelProxyStatus>("get_model_proxy_status"), (status) => {
+        if (status) proxyStatus.value = status;
+      });
     } catch {
       // background polling
     }
@@ -235,13 +243,14 @@ export function useModelProxy() {
 
   async function refreshChannelStats() {
     try {
-      const list = await runCommand<ChannelUsageStats[]>("get_model_proxy_channel_stats");
-      if (Array.isArray(list)) {
-        const map: Record<string, ChannelUsageStats> = {};
-        // 后端按渠道生效别名归集，这里同样以别名为键（channelAlias 回退 id，两端一致）
-        for (const item of list) map[item.channelId] = item;
-        channelStats.value = map;
-      }
+      await loadLatestChannelStats(() => runCommand<ChannelUsageStats[]>("get_model_proxy_channel_stats"), (list) => {
+        if (Array.isArray(list)) {
+          const map: Record<string, ChannelUsageStats> = {};
+          // 后端按渠道生效别名归集，这里同样以别名为键（channelAlias 回退 id，两端一致）
+          for (const item of list) map[item.channelId] = item;
+          channelStats.value = map;
+        }
+      });
     } catch (e) {
       console.warn("获取渠道使用统计失败:", e);
     }
@@ -266,7 +275,9 @@ export function useModelProxy() {
     if (overviewDateTo.value) payload.to = overviewDateTo.value;
     if (!payload.from && !payload.to) payload.days = 90;
     try {
-      gatewayOverview.value = await runCommand<GatewayOverviewStats>("get_model_proxy_overview_stats", payload);
+      await loadLatestOverview(() => runCommand<GatewayOverviewStats>("get_model_proxy_overview_stats", payload), (overview) => {
+        gatewayOverview.value = overview;
+      });
     } catch (e) {
       console.warn("获取全渠道数据总览失败:", e);
     }
@@ -373,42 +384,23 @@ export function useModelProxy() {
 
   async function fetchUpstreamModels(options: { setGlobalFetching?: boolean; channelId?: string; requestId?: string; silent?: boolean } = {}): Promise<Record<string, string[]>> {
     if (options.setGlobalFetching) {
+      activeGlobalModelFetches++;
       fetchingModels.value = true;
     }
     try {
-      const task = runCommand<any>("fetch_model_proxy_models", {
+      const task = runCommand<unknown>("fetch_model_proxy_models", {
         ...(options.channelId ? { channelId: options.channelId } : {}),
         ...(options.requestId ? { requestId: options.requestId } : {}),
       });
       const res = await (options.channelId ? withModelSyncDeadline(task) : task);
-      const list: ChannelModelList[] =
-        Array.isArray(res) && Array.isArray(res[0])
-          ? res[0]
-          : Array.isArray(res)
-          ? res
-          : [];
-      const map: Record<string, string[]> = {};
-      if (Array.isArray(list)) {
-        for (const item of list) {
-          const cid = item.channelId || (item as any).channel_id;
-          if (cid) {
-            map[cid] = item.models || [];
-          }
-        }
-      }
-      // 拉取失败的渠道必须可见，否则用户只会看到"列表不变"而无从排查（silent 时由调用方展示）
-      const errors: unknown[] =
-        Array.isArray(res) && Array.isArray(res[1]) ? res[1] : [];
-      if (errors.length > 0 && !options.silent) {
-        const names = errors
-          .map((e: any) => e?.channelName || e?.channel_name || e?.channelId || e?.channel_id || "未知渠道")
-          .join("、");
-        showToast(`以下渠道模型拉取失败：${names}`, true);
-      }
+      const { models: map, errors } = parseModelSyncResult(res);
       if (options.channelId) {
-        const failure = errors.find((e: any) => (e?.channelId || e?.channel_id) === options.channelId) as { error?: string } | undefined;
-        if (failure) throw new Error(failure.error || "上游模型拉取失败");
+        const failure = errors.find((error) => error.channelId === options.channelId);
+        if (failure) throw new Error(failure.error);
         if (!(options.channelId in map)) throw new Error("上游未返回该渠道的模型列表");
+      } else if (errors.length > 0 && !options.silent) {
+        const names = errors.map((error) => error.channelName || error.channelId).join("、");
+        showToast(`以下渠道模型拉取失败：${names}`, true);
       }
       return map;
     } catch (e) {
@@ -420,7 +412,7 @@ export function useModelProxy() {
       return {};
     } finally {
       if (options.setGlobalFetching) {
-        fetchingModels.value = false;
+        fetchingModels.value = --activeGlobalModelFetches > 0;
       }
     }
   }
@@ -442,22 +434,8 @@ export function useModelProxy() {
 
   async function loadCachedModels() {
     try {
-      const res = await runCommand<any>("get_cached_channel_models");
-      const list: ChannelModelList[] =
-        Array.isArray(res) && Array.isArray(res[0])
-          ? res[0]
-          : Array.isArray(res)
-          ? res
-          : [];
-      const map: Record<string, string[]> = {};
-      if (Array.isArray(list)) {
-        for (const item of list) {
-          const cid = item.channelId || (item as any).channel_id;
-          if (cid) {
-            map[cid] = item.models || [];
-          }
-        }
-      }
+      const res = await runCommand<unknown>("get_cached_channel_models");
+      const { models: map } = parseModelSyncResult(res);
       if (Object.keys(map).length > 0) {
         channelModels.value = map;
       }
@@ -480,7 +458,6 @@ export function useModelProxy() {
     sortBy?: "timestamp" | "status" | "tokens" | "duration" | null;
     sortOrder?: "asc" | "desc";
   } = {}) {
-    loadingLogs.value = true;
     try {
       const p = options.page ?? logPage.value;
       const ps = options.pageSize ?? logPageSize.value;
@@ -500,11 +477,11 @@ export function useModelProxy() {
       if (dateFrom) payload.from = dateFrom;
       if (dateTo) payload.to = dateTo;
       if (sortBy) {
-        payload.sortBy = sortBy;
+        payload.sortBy = proxyLogSortColumns[sortBy];
         payload.sortOrder = sortOrder;
       }
 
-      const res = await runCommand<{
+      await loadLatestLogs(() => runCommand<{
         items: ProxyRequestLog[];
         total: number;
         globalTotal: number;
@@ -512,27 +489,25 @@ export function useModelProxy() {
         globalError: number;
         successTotal: number;
         errorTotal: number;
-      }>("get_model_proxy_logs", payload);
-
-      if (res && Array.isArray(res.items)) {
-        proxyLogs.value = res.items;
-        logPage.value = p;
-        logPageSize.value = ps;
-        logTotal.value = res.total ?? res.items.length;
-        logSuccessTotal.value = res.successTotal ?? 0;
-        logErrorTotal.value = res.errorTotal ?? 0;
-        // 顶部标签计数由后端按当前日期区间统计（不受 filter/搜索影响），每次拉取都刷新
-        logGlobalTotal.value = res.globalTotal ?? logGlobalTotal.value;
-        logGlobalSuccess.value = res.globalSuccess ?? logGlobalSuccess.value;
-        logGlobalError.value = res.globalError ?? logGlobalError.value;
-      } else if (Array.isArray(res)) {
-        proxyLogs.value = res;
-        logTotal.value = (res as any).length;
-      }
+      }>("get_model_proxy_logs", payload), (res) => {
+        if (res && Array.isArray(res.items)) {
+          proxyLogs.value = res.items;
+          logPage.value = p;
+          logPageSize.value = ps;
+          logTotal.value = res.total ?? res.items.length;
+          logSuccessTotal.value = res.successTotal ?? 0;
+          logErrorTotal.value = res.errorTotal ?? 0;
+          // 顶部标签计数由后端按当前日期区间统计（不受 filter/搜索影响），每次拉取都刷新
+          logGlobalTotal.value = res.globalTotal ?? logGlobalTotal.value;
+          logGlobalSuccess.value = res.globalSuccess ?? logGlobalSuccess.value;
+          logGlobalError.value = res.globalError ?? logGlobalError.value;
+        } else if (Array.isArray(res)) {
+          proxyLogs.value = res;
+          logTotal.value = res.length;
+        }
+      }, (pending) => { loadingLogs.value = pending; });
     } catch (e) {
       console.warn("获取请求日志失败:", e);
-    } finally {
-      loadingLogs.value = false;
     }
   }
 
