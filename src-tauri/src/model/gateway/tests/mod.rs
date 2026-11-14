@@ -34,6 +34,7 @@ fn sanitize_always_provisions_gateway_api_key_and_shared_host() {
 #[test]
 fn channel_alias_fallback_and_normalization() {
     let mut ch = ChannelConfig {
+        aux_url: None,
         id: "MyChannel".to_string(),
         name: "Test".to_string(),
         description: "".to_string(),
@@ -70,6 +71,7 @@ fn resolves_channels_with_alias_prefix_or_model_whitelist() {
         api_key: "".to_string(),
         channels: vec![
             ChannelConfig {
+                aux_url: None,
                 id: "fallback".to_string(),
                 name: "Fallback".to_string(),
                 description: "".to_string(),
@@ -93,6 +95,7 @@ fn resolves_channels_with_alias_prefix_or_model_whitelist() {
                 model_proxy_rules: None,
             },
             ChannelConfig {
+                aux_url: None,
                 id: "vip".to_string(),
                 name: "VIP Channel".to_string(),
                 description: "".to_string(),
@@ -163,6 +166,7 @@ fn generic_test_channel() -> ChannelConfig {
 /// 构造最小可用渠道：全暴露（白名单为 None）
 fn order_test_channel(id: &str, alias: &str, enabled: bool) -> ChannelConfig {
     ChannelConfig {
+        aux_url: None,
         id: id.to_string(),
         name: id.to_string(),
         description: "".to_string(),
@@ -285,6 +289,7 @@ fn sanitize_trims_and_prunes_model_channel_order() {
 #[tokio::test]
 async fn multi_key_expansion_preserves_config_order() {
     let ch = ChannelConfig {
+        aux_url: None,
         id: "multi".to_string(),
         name: "Multi Key".to_string(),
         description: "".to_string(),
@@ -329,6 +334,7 @@ async fn channel_key_groups_failover_and_filtering() {
     };
 
     let ch = ChannelConfig {
+        aux_url: None,
         id: "grouped_channel".to_string(),
         name: "Grouped Channel".to_string(),
         description: "".to_string(),
@@ -470,6 +476,7 @@ async fn legacy_preset_key_groups_are_migrated_to_group_name() {
     };
 
     let mut ch = ChannelConfig {
+        aux_url: None,
         id: "legacy_channel".to_string(),
         name: "Legacy Channel".to_string(),
         description: String::new(),
@@ -1132,6 +1139,7 @@ fn egress_request_meta_constructs_properly() {
 
 fn stats_channel(id: &str, alias: Option<&str>, stats_id: Option<u32>) -> ChannelConfig {
     ChannelConfig {
+        aux_url: None,
         id: id.to_string(),
         name: format!("Channel {id}"),
         description: String::new(),
@@ -1339,6 +1347,7 @@ fn valid_chat_payload() -> &'static str {
 
 fn egress_test_channel(id: &str, base_url: String) -> ChannelConfig {
     ChannelConfig {
+        aux_url: None,
         id: id.to_string(),
         name: id.to_string(),
         description: String::new(),
@@ -1400,6 +1409,7 @@ async fn run_egress(
         &config,
         meta,
         &upstream_url,
+        None,
         "",
         &json!({ "model": "deepseek-v4-flash-free" }),
         crate::model::gateway::pipeline::ClientProtocol::OpenAi,
@@ -1482,6 +1492,7 @@ fn sanitize_clears_keys_for_site_linked_channels_only() {
     let mut cfg = ModelProxyConfig::default();
     // 站点关联渠道：历史配置中残留了站点 Key
     cfg.channels.push(ChannelConfig {
+        aux_url: None,
         id: "site_local-1".to_string(),
         name: "Fengwind API".to_string(),
         description: String::new(),
@@ -1506,6 +1517,7 @@ fn sanitize_clears_keys_for_site_linked_channels_only() {
     });
     // 手工渠道：Key 必须原样保留
     cfg.channels.push(ChannelConfig {
+        aux_url: None,
         id: "manual".to_string(),
         name: "Manual".to_string(),
         description: String::new(),
@@ -1605,6 +1617,7 @@ async fn resolve_channel_api_keys_reads_site_cache_and_dedupes() {
 
     // 站点渠道：配置中即使残留旧 Key，运行时也只从 site_model_cache 读取
     let site_channel = ChannelConfig {
+        aux_url: None,
         id: "site_local-1".to_string(),
         name: "Fengwind API".to_string(),
         description: String::new(),
@@ -1636,6 +1649,7 @@ async fn resolve_channel_api_keys_reads_site_cache_and_dedupes() {
 
     // 手工渠道：不受 site_model_cache 影响，仍使用自身配置 Key
     let manual_channel = ChannelConfig {
+        aux_url: None,
         id: "manual".to_string(),
         name: "Manual".to_string(),
         description: String::new(),
@@ -1664,6 +1678,7 @@ async fn resolve_channel_api_keys_reads_site_cache_and_dedupes() {
 
     // 站点缓存为空时不回退到渠道残留 Key
     let empty_site_channel = ChannelConfig {
+        aux_url: None,
         site_id: Some("non-existent".to_string()),
         ..manual_channel
     };

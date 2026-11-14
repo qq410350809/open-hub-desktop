@@ -189,6 +189,9 @@ struct ExistingLocalSite {
     use_system_proxy: bool,
     use_proxy_pool: bool,
     system_type: String,
+    /// 本地已保存的辅助站点地址。公共库上游不下发该字段，
+    /// 合并时用它保留用户手工登记的备用域名，防止同步洗掉。
+    aux_base_url: String,
 }
 
 /// 一次合并的落库结果，供不同公共库来源各自上报。
@@ -276,7 +279,7 @@ pub(crate) fn merge_remote_sites(
     {
         let mut statement = transaction
             .prepare(
-                "SELECT id, api_base_url, favorite, hidden, is_personal, is_pending, use_system_proxy, use_proxy_pool, system_type FROM directory_sites",
+                "SELECT id, api_base_url, favorite, hidden, is_personal, is_pending, use_system_proxy, use_proxy_pool, system_type, aux_base_url FROM directory_sites",
             )
             .map_err(|error| error.to_string())?;
         let rows = statement
@@ -291,6 +294,7 @@ pub(crate) fn merge_remote_sites(
                     row.get::<_, i64>(6)? != 0,
                     row.get::<_, i64>(7)? != 0,
                     row.get::<_, String>(8)?,
+                    row.get::<_, String>(9)?,
                 ))
             })
             .map_err(|error| error.to_string())?;
@@ -306,6 +310,7 @@ pub(crate) fn merge_remote_sites(
                 use_system_proxy,
                 use_proxy_pool,
                 system_type,
+                aux_base_url,
             ) = item.map_err(|error| error.to_string())?;
             let existing = ExistingLocalSite {
                 id: id.clone(),
@@ -316,6 +321,7 @@ pub(crate) fn merge_remote_sites(
                 use_system_proxy,
                 use_proxy_pool,
                 system_type,
+                aux_base_url,
             };
             existing_ids.insert(id.clone());
             existing_by_id.insert(id, existing.clone());
@@ -369,6 +375,10 @@ pub(crate) fn merge_remote_sites(
             // 本地为空（历史遗留缺类型）时才用远端值补齐。
             if !existing.system_type.trim().is_empty() {
                 site.system_type = existing.system_type.clone();
+            }
+            // 用户设置的辅助地址本地优先；远端只能补齐尚未配置的地址。
+            if !existing.aux_base_url.trim().is_empty() {
+                site.aux_base_url = existing.aux_base_url.clone();
             }
             outcome.updated += 1;
         } else {

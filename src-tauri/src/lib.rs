@@ -341,6 +341,7 @@ pub fn run() {
             crate::site::library::create_site,
             crate::site::library::import_site,
             crate::site::library::update_site,
+            crate::site::library::update_site_aux_address,
             crate::site::library::delete_site,
             crate::site::library::toggle_personal,
             crate::site::library::toggle_pending,

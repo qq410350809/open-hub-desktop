@@ -46,6 +46,16 @@ export interface ModelProxyRule {
  */
 export type ChannelProxyMode = "direct" | "pool" | "fixed_channel" | "custom_node";
 
+export interface ChannelModelSyncProgress {
+  requestId?: string | null;
+  channelId: string;
+  stage: "resolving" | "request" | "response" | "fallback" | "saving";
+  message: string;
+  endpoint?: string | null;
+  keyIndex?: number | null;
+  keyTotal?: number | null;
+}
+
 export interface ChannelConfig {
   id: string;
   name: string;
@@ -53,6 +63,8 @@ export interface ChannelConfig {
   enabled: boolean;
   protocol: string;
   upstreamUrl: string;
+  /** 辅助站点地址（备用域名/镜像站）：主地址不可达时反代自动改试该地址 */
+  auxUrl?: string | null;
   apiKey?: string;
   apiKeys?: string[];
   useProxyPool: boolean;

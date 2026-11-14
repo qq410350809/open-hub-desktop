@@ -90,8 +90,15 @@ pub async fn stop_model_proxy(
 #[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn fetch_model_proxy_models(
     state: Managed<'_, ModelProxyState>,
+    channel_id: Option<String>,
+    request_id: Option<String>,
 ) -> Result<(Vec<ChannelModelList>, Vec<ChannelModelFetchError>), String> {
-    let (models, errors) = fetch_upstream_models_inner(&state.context, None).await;
+    let (models, errors) = fetch_upstream_models_inner(
+        &state.context,
+        channel_id.as_deref(),
+        request_id.as_deref(),
+    )
+    .await;
     Ok((models, errors))
 }
 
@@ -470,7 +477,7 @@ pub async fn sync_model_proxy_site_channels(
         // 查询站点库数据
         let mut stmt = conn
             .prepare(
-                "SELECT ds.id, ds.name, ds.api_base_url, smc.models_json
+                "SELECT ds.id, ds.name, ds.api_base_url, ds.aux_base_url, smc.models_json
                  FROM directory_sites ds
                  LEFT JOIN site_model_cache smc ON smc.site_id = ds.id",
             )
@@ -481,8 +488,9 @@ pub async fn sync_model_proxy_site_channels(
                 let id: String = row.get(0)?;
                 let name: String = row.get(1)?;
                 let api_base_url: String = row.get(2)?;
-                let models_json: String = row.get::<_, Option<String>>(3)?.unwrap_or_default();
-                Ok((id, name, api_base_url, models_json))
+                let aux_base_url: String = row.get(3)?;
+                let models_json: String = row.get::<_, Option<String>>(4)?.unwrap_or_default();
+                Ok((id, name, api_base_url, aux_base_url, models_json))
             })
             .map_err(|e| format!("读取站点记录失败: {e}"))?;
 
@@ -490,10 +498,19 @@ pub async fn sync_model_proxy_site_channels(
             site_ids.map(|s| s.into_iter().collect());
 
         for item in rows.flatten() {
-            let (site_id, site_name, base_url, models_raw) = item;
+            let (site_id, site_name, base_url, site_aux_url, models_raw) = item;
             if base_url.trim().is_empty() {
                 continue;
             }
+            // 辅助站点地址随站点库同步：站点库是站点渠道主地址的源头，辅助地址同源。
+            let aux_url = {
+                let trimmed = site_aux_url.trim().trim_end_matches('/').to_string();
+                if trimmed.is_empty() || trimmed == base_url.trim().trim_end_matches('/') {
+                    None
+                } else {
+                    Some(trimmed)
+                }
+            };
             if let Some(ref set) = filter_set {
                 if !set.contains(&site_id) {
                     continue;
@@ -523,6 +540,7 @@ pub async fn sync_model_proxy_site_channels(
                 .find(|c| c.site_id.as_deref() == Some(&site_id) || c.id == site_id)
             {
                 existing.base_url = base_url;
+                existing.aux_url = aux_url;
                 existing.api_key.clear();
                 existing.api_keys = None;
                 if !parsed_models.is_empty() && existing.enabled_models.is_none() {
@@ -538,6 +556,7 @@ pub async fn sync_model_proxy_site_channels(
                     enabled: true,
                     protocol: "openai".to_string(),
                     base_url,
+                    aux_url,
                     api_key: String::new(),
                     api_keys: None,
                     use_proxy_pool: false,

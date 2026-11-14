@@ -4,6 +4,7 @@ import { icons } from "../../icons";
 import { formatDate, formatRateLimit, logoText } from "../../utils";
 import { useStore } from "../../composables/useStore";
 import TagList from "../common/TagList.vue";
+import SiteAuxAddressEditor from "./SiteAuxAddressEditor.vue";
 import SiteTokenEditor from "./SiteTokenEditor.vue";
 import type { ChromeSessionInfo, SiteRecord } from "../../types";
 import { isUnknownSystemType, normalizeSystemType, supportsKeyDiscovery, supportsSiteToken, systemTypeLabel } from "../../types";
@@ -59,7 +60,10 @@ function configuredLinkButton(
 }
 
 const linkButtons = computed(() => {
-  const api = configuredLinkButton(icons.link, "API 地址", [props.site.apiBaseUrl]);
+  // API 地址 + 辅助站点地址：辅助地址已配置时并入同一条目的提示与地址弹窗
+  const apiDetails = [props.site.apiBaseUrl];
+  if (props.site.auxBaseUrl?.trim()) apiDetails.push(`辅助：${props.site.auxBaseUrl.trim()}`);
+  const api = configuredLinkButton(icons.link, "API 地址", apiDetails);
   const checkin = configuredLinkButton(
     icons.calendar,
     "签到地址",
@@ -471,6 +475,7 @@ onUnmounted(() => {
           @click="store.openLinkDialog(site, 'api', $event.currentTarget as HTMLElement)"
           v-html="linkButtons.api.iconSvg"
         />
+        <SiteAuxAddressEditor :site="site" />
         <button
           v-if="linkButtons.checkin"
           class="round-feature link-feature active"

@@ -147,14 +147,14 @@ pub(crate) fn resolve_request_model(
     Ok(format!("{}/{}", channel.effective_alias(), model))
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn get_token_model_mappings(
     ctx: Managed<'_, Arc<AppContext>>,
 ) -> Result<Vec<ModelMapping>, String> {
     store::list_mappings(&ctx.database)
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn register_token_model_names(
     ctx: Managed<'_, Arc<AppContext>>,
     names: Vec<String>,
@@ -163,7 +163,7 @@ pub fn register_token_model_names(
 }
 
 /// 手工选择直接代表人工批准；传空串会清除当前映射并恢复为待识别。
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn set_token_model_mapping(
     ctx: Managed<'_, Arc<AppContext>>,
     raw_model: String,
@@ -172,7 +172,7 @@ pub fn set_token_model_mapping(
     store::set_mapping_manually(&ctx.database, &raw_model, &official_model)
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn approve_token_model_mapping(
     ctx: Managed<'_, Arc<AppContext>>,
     raw_model: String,
@@ -180,7 +180,7 @@ pub fn approve_token_model_mapping(
     store::approve_mapping(&ctx.database, &raw_model)
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn reject_token_model_mapping(
     ctx: Managed<'_, Arc<AppContext>>,
     raw_model: String,
@@ -188,7 +188,7 @@ pub fn reject_token_model_mapping(
     store::reject_mapping(&ctx.database, &raw_model)
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn reopen_token_model_mapping(
     ctx: Managed<'_, Arc<AppContext>>,
     raw_model: String,
@@ -197,7 +197,7 @@ pub fn reopen_token_model_mapping(
 }
 
 /// 获取 Token 统计的标准模型清单。
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn get_token_official_models(
     ctx: Managed<'_, Arc<AppContext>>,
 ) -> Result<Vec<TokenOfficialModel>, String> {
@@ -239,7 +239,7 @@ pub fn get_token_official_models(
 }
 
 /// 添加用户显式维护的正式模型。
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn add_token_official_model(
     ctx: Managed<'_, Arc<AppContext>>,
     id: String,
@@ -288,7 +288,7 @@ pub fn add_token_official_model(
 }
 
 /// 只允许删除用户手动创建的正式模型。AI 不会再自动创建目录项。
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn remove_token_official_model(
     ctx: Managed<'_, Arc<AppContext>>,
     id: String,
@@ -307,7 +307,7 @@ pub fn remove_token_official_model(
 }
 
 /// 从模型目录迁移数据到 token_official_models（一次性操作）。
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn migrate_token_official_models(ctx: Managed<'_, Arc<AppContext>>) -> Result<usize, String> {
     store::migrate_catalog_to_official_models(&ctx.database)
 }
@@ -334,7 +334,7 @@ fn emit_mapping_progress(
 ///
 /// AI 建议永远不会自动影响统计：仅人工批准的映射会进入聚合查表，也只有批准项会被
 /// 用作后续请求的标准答案。`force` 仅重跑未批准条目，手工和已批准映射都不会被覆盖。
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn analyze_token_model_mappings(
     ctx: Managed<'_, Arc<AppContext>>,
     gateway: Managed<'_, ModelProxyState>,

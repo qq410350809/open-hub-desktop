@@ -41,6 +41,7 @@ const importUsageOptions: Array<{ value: SiteUsageState; text: string; descripti
 interface FormState {
   name: string;
   apiBaseUrl: string;
+  auxBaseUrl: string;
   systemType: string;
   description: string;
   registrationLimit: number;
@@ -66,6 +67,7 @@ interface FormState {
 const form = reactive<FormState>({
   name: "",
   apiBaseUrl: "",
+  auxBaseUrl: "",
   systemType: "",
   description: "",
   registrationLimit: 0,
@@ -92,6 +94,7 @@ function resetForm(site?: SiteRecord) {
   const value = site ?? emptySite();
   form.name = value.name;
   form.apiBaseUrl = value.apiBaseUrl;
+  form.auxBaseUrl = value.auxBaseUrl ?? "";
   form.systemType = value.systemType;
   form.description = value.description;
   form.registrationLimit = value.registrationLimit;
@@ -211,6 +214,18 @@ async function handleSubmit() {
     activeTab.value = "basic";
     return;
   }
+  // 辅助站点地址选填；填写时同样必须是合法 http(s) URL
+  const auxBaseUrl = form.auxBaseUrl.trim();
+  if (auxBaseUrl) {
+    try {
+      const url = new URL(auxBaseUrl);
+      if (!["http:", "https:"].includes(url.protocol)) throw new Error();
+    } catch {
+      errorMessage.value = "辅助站点地址必须是完整的 http(s):// URL（留空表示不设置）";
+      activeTab.value = "basic";
+      return;
+    }
+  }
 
   const existing =
     store.editingId.value
@@ -237,6 +252,7 @@ async function handleSubmit() {
     ...existing,
     name: form.name.trim(),
     apiBaseUrl: form.apiBaseUrl.trim(),
+    auxBaseUrl: auxBaseUrl,
     systemType: form.systemType,
     description: form.description.trim(),
     registrationLimit: Number(form.registrationLimit),
@@ -385,6 +401,16 @@ function onBackdropClick(event: MouseEvent) {
                     required
                     placeholder="https://api.example.com"
                   />
+                </label>
+                <label class="field field-wide">
+                  <span>辅助站点地址</span>
+                  <input
+                    v-model="form.auxBaseUrl"
+                    name="auxBaseUrl"
+                    type="url"
+                    placeholder="https://backup.example.com（留空表示不设置）"
+                  />
+                  <small>备用域名/镜像站：反代渠道主地址不可达时自动改试该地址</small>
                 </label>
                 <label class="field field-wide">
                   <span>站点描述</span>

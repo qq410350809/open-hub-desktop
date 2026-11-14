@@ -58,6 +58,7 @@ impl Database {
                     registration_limit INTEGER NOT NULL,
                     icon TEXT NOT NULL,
                     api_base_url TEXT NOT NULL,
+                    aux_base_url TEXT NOT NULL DEFAULT '',
                     system_type TEXT NOT NULL DEFAULT '',
                     supports_immersive_translation INTEGER NOT NULL,
                     supports_ldc INTEGER NOT NULL,
@@ -465,6 +466,9 @@ impl Database {
                 )
                 .map_err(|error| error.to_string())?;
         }
+
+        // 辅助站点地址（备用域名）：存量库补列。
+        ensure_site_aux_address_column(&connection)?;
 
         seed_database(&mut connection)?;
         migrate_legacy_favorites_to_personal(&connection)?;
@@ -1580,28 +1584,53 @@ pub(crate) fn build_site_http_client_with_proxy(
         .map_err(|error| format!("无法初始化{purpose}：{error}"))
 }
 
+pub(crate) fn ensure_site_aux_address_column(connection: &Connection) -> Result<(), String> {
+    let has_column: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('directory_sites') WHERE name='aux_base_url'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if has_column == 0 {
+        connection
+            .execute(
+                "ALTER TABLE directory_sites ADD COLUMN aux_base_url TEXT NOT NULL DEFAULT ''",
+                [],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
 pub(crate) fn insert_site_transaction(
     transaction: &rusqlite::Transaction,
     site: &SiteRecord,
 ) -> Result<(), String> {
+    // Validate at the shared write boundary too: seed/import/remote upserts all pass here.
+    let aux_base_url = crate::site::library::validate_url(
+        &site.aux_base_url,
+        "辅助站点地址",
+        false,
+    )?;
     // 必须用 UPSERT 而不是 INSERT OR REPLACE：外键开启后 REPLACE 会先删除
     // 旧行，级联清空 site_accounts、site_model_cache 等子表（同步更新站点
     // 会把账号与额度缓存全部洗掉）。DO UPDATE 只改列值不触碰子表，
     // created_at 与 rowid 也得以保留。
     transaction.execute(
         "INSERT INTO directory_sites (
-            id, name, description, registration_limit, icon, api_base_url, system_type,
+            id, name, description, registration_limit, icon, api_base_url, aux_base_url, system_type,
             supports_immersive_translation, supports_ldc, supports_checkin, supports_nsfw,
             checkin_url, checkin_note, benefit_url, rate_limit, status_url,
             is_only_maintainer_visible, requires_invite_code, is_runaway, is_fake_charity,
             has_pending_report, is_personal, is_pending, use_system_proxy, use_proxy_pool, favorite, hidden, created_at, updated_at
         ) VALUES (
-            ?1, ?2, ?3, ?4, ?5, ?6, ?7,
-            ?8, ?9, ?10, ?11,
-            ?12, ?13, ?14, ?15, ?16,
-            ?17, ?18, ?19, ?20,
-            ?21, ?22, ?23, ?24, ?25, ?26, ?27,
-            COALESCE(NULLIF(?28, ''), CURRENT_TIMESTAMP), COALESCE(NULLIF(?28, ''), CURRENT_TIMESTAMP)
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
+            ?9, ?10, ?11, ?12,
+            ?13, ?14, ?15, ?16, ?17,
+            ?18, ?19, ?20, ?21,
+            ?22, ?23, ?24, ?25, ?26, ?27, ?28,
+            COALESCE(NULLIF(?29, ''), CURRENT_TIMESTAMP), COALESCE(NULLIF(?29, ''), CURRENT_TIMESTAMP)
         )
         ON CONFLICT(id) DO UPDATE SET
             name = excluded.name,
@@ -1609,6 +1638,7 @@ pub(crate) fn insert_site_transaction(
             registration_limit = excluded.registration_limit,
             icon = excluded.icon,
             api_base_url = excluded.api_base_url,
+            aux_base_url = excluded.aux_base_url,
             system_type = excluded.system_type,
             supports_immersive_translation = excluded.supports_immersive_translation,
             supports_ldc = excluded.supports_ldc,
@@ -1632,7 +1662,7 @@ pub(crate) fn insert_site_transaction(
             hidden = excluded.hidden,
             updated_at = excluded.updated_at",
         params![
-            site.id, site.name, site.description, site.registration_limit, site.icon, site.api_base_url, site.system_type,
+            site.id, site.name, site.description, site.registration_limit, site.icon, site.api_base_url, aux_base_url, site.system_type,
             site.supports_immersive_translation, site.supports_ldc, site.supports_checkin, site.supports_nsfw,
             site.checkin_url, site.checkin_note, site.benefit_url, site.rate_limit, site.status_url,
             site.is_only_maintainer_visible, site.requires_invite_code, site.is_runaway, site.is_fake_charity,
@@ -2272,6 +2302,30 @@ mod account_proxy_channel_tests {
 mod site_upsert_tests {
     use super::*;
 
+    #[test]
+    fn aux_migration_defaults_old_rows_and_preserves_saved_values() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(
+            "CREATE TABLE directory_sites (id TEXT PRIMARY KEY, api_base_url TEXT NOT NULL);
+             INSERT INTO directory_sites VALUES ('legacy', 'https://primary.example/');"
+        ).unwrap();
+        ensure_site_aux_address_column(&connection).unwrap();
+        let (main, aux): (String, String) = connection.query_row(
+            "SELECT api_base_url, aux_base_url FROM directory_sites WHERE id='legacy'",
+            [], |row| Ok((row.get(0)?, row.get(1)?))
+        ).unwrap();
+        assert_eq!(main, "https://primary.example/");
+        assert!(aux.is_empty());
+        connection.execute(
+            "UPDATE directory_sites SET aux_base_url='https://backup.example/' WHERE id='legacy'", []
+        ).unwrap();
+        ensure_site_aux_address_column(&connection).unwrap();
+        let aux: String = connection.query_row(
+            "SELECT aux_base_url FROM directory_sites WHERE id='legacy'", [], |row| row.get(0)
+        ).unwrap();
+        assert_eq!(aux, "https://backup.example/");
+    }
+
     fn upsert_test_connection() -> Connection {
         let connection = Connection::open_in_memory().unwrap();
         connection
@@ -2284,6 +2338,7 @@ mod site_upsert_tests {
                     registration_limit INTEGER NOT NULL DEFAULT 0,
                     icon TEXT NOT NULL DEFAULT '',
                     api_base_url TEXT NOT NULL DEFAULT '',
+                    aux_base_url TEXT NOT NULL DEFAULT '',
                     system_type TEXT NOT NULL DEFAULT '',
                     supports_immersive_translation INTEGER NOT NULL DEFAULT 0,
                     supports_ldc INTEGER NOT NULL DEFAULT 0,

@@ -25,6 +25,7 @@ impl ModelProxyState {
             .build()
             .unwrap_or_default();
         let stream_http_client = build_stream_http_client();
+        let models_fetch_client = build_models_fetch_client();
 
         let route_enabled = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let context = ModelProxyContext {
@@ -37,6 +38,7 @@ impl ModelProxyState {
             cached_fetch_errors: Arc::new(RwLock::new(Vec::new())),
             default_http_client: Arc::new(tokio::sync::RwLock::new(http_client)),
             default_stream_client: Arc::new(tokio::sync::RwLock::new(stream_http_client)),
+            models_fetch_client,
             app_ctx: Arc::new(RwLock::new(None)),
             key_round_robin: Arc::new(RwLock::new(HashMap::new())),
             node_round_robin: Arc::new(RwLock::new(HashMap::new())),
@@ -69,7 +71,7 @@ pub async fn start_model_proxy_server(state: &ModelProxyState) -> Result<(), Str
 
     let ctx_for_models = state.context.clone();
     crate::context::spawn(async move {
-        fetch_upstream_models_inner(&ctx_for_models, None).await;
+        fetch_upstream_models_inner(&ctx_for_models, None, None).await;
     });
 
     Ok(())
@@ -102,6 +104,16 @@ fn build_stream_http_client_checked() -> Result<Client, reqwest::Error> {
 
 fn build_stream_http_client() -> Client {
     build_stream_http_client_checked().unwrap_or_default()
+}
+
+/// 模型列表拉取专用客户端：短连接/总超时见 types 中的常量。
+/// 建造失败时回退默认客户端——比直接 panic 好，最坏情况是沿用旧行为。
+fn build_models_fetch_client() -> Client {
+    Client::builder()
+        .connect_timeout(super::types::MODELS_FETCH_CONNECT_TIMEOUT)
+        .timeout(super::types::MODELS_FETCH_TOTAL_TIMEOUT)
+        .build()
+        .unwrap_or_default()
 }
 
 pub async fn stop_model_proxy_server(state: &ModelProxyState) -> Result<(), String> {

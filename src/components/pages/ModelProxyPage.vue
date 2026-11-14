@@ -40,6 +40,9 @@ import CustomSelect from "../common/CustomSelect.vue";
 import DateRangeDropdown from "../common/DateRangeDropdown.vue";
 import { API_PATH_V1, API_PATH_GEMINI, API_PATH_MESSAGES, DEFAULT_SERVICE_PORT } from "../../constants";
 import { isTauri } from "../../composables/core/ipc";
+import { listen, type UnlistenFn } from "../../composables/core/events";
+import { runModelSyncQueue } from "../../composables/proxy/modelSync";
+import type { ChannelModelSyncProgress } from "../../composables/proxy/types";
 
 /** 模型 API Origin：桌面端访问本机内嵌服务（端口随实际监听顺延），浏览器端与 Web 服务同源。 */
 const serviceOrigin = computed(() =>
@@ -891,6 +894,8 @@ async function refreshChannelDraftModels() {
         [channel.id]: [...fetchedMap[channel.id]],
       };
     }
+  } catch {
+    // 错误提示由 fetchUpstreamModels 展示，保留弹窗里的已有模型。
   } finally {
     fetchingDraftModels.value = false;
   }
@@ -978,6 +983,8 @@ interface ChannelSettingsDraft {
   fixedProxyNode: string;
   /** fixed_channel 模式的渠道默认固定通道 ID */
   proxyFixedChannel: string;
+  /** 辅助站点地址（备用域名/镜像站）：主地址不可达时反代自动改试 */
+  auxUrl: string;
 }
 
 const channelSettingsTarget = ref<ChannelConfig | null>(null);
@@ -987,8 +994,11 @@ const channelSettingsDraft = ref<ChannelSettingsDraft>({
   proxyMode: "direct",
   fixedProxyNode: "",
   proxyFixedChannel: "",
+  auxUrl: "",
 });
 const channelSettingsError = ref("");
+/** 辅助站点地址输入的校验错误（与别名错误分开，各归各的字段下方展示） */
+const channelAuxError = ref("");
 
 /** 上游协议四选项：决定网关向该渠道上游发请求时使用的协议格式 */
 const channelProtocolSelectOptions: { value: string; text: string }[] = [
@@ -1343,8 +1353,10 @@ function handleOpenChannelSettingsDialog(channel: ChannelConfig) {
     proxyMode: channelProxyModeOf(channel),
     fixedProxyNode: channel.fixedProxyNode ?? "",
     proxyFixedChannel: channel.proxyFixedChannel ?? "",
+    auxUrl: channel.auxUrl?.trim() ?? "",
   };
   channelSettingsError.value = "";
+  channelAuxError.value = "";
   channelSettingsDialogOpen.value = true;
   // 通道候选加载完成后归一化已绑定通道引用（名称 → ID）；期间用户改动则跳过
   const original = channelSettingsDraft.value.proxyFixedChannel;
@@ -1466,7 +1478,29 @@ async function saveChannelSettings() {
     channelSettingsError.value = err;
     return;
   }
+  // 辅助站点地址选填：填写时须为合法 http(s) URL，且不与主地址相同
+  const nextAux = channelSettingsDraft.value.auxUrl.trim();
+  const primaryUrl = channel.upstreamUrl.trim();
+  if (nextAux) {
+    try {
+      const u = new URL(nextAux);
+      if (u.protocol !== "http:" && u.protocol !== "https:") {
+        channelAuxError.value = "辅助站点地址须以 http(s):// 开头";
+        return;
+      }
+      if (nextAux.replace(/\/+$/, "") === primaryUrl.replace(/\/+$/, "")) {
+        channelAuxError.value = "辅助站点地址与主地址相同，请清空或修改";
+        return;
+      }
+    } catch {
+      channelAuxError.value = "辅助站点地址不是合法 URL";
+      return;
+    }
+  }
+  channelAuxError.value = "";
   channel.alias = nextAlias;
+  // 辅助站点地址落库（清空 = 移除兜底地址）
+  channel.auxUrl = nextAux || null;
   // 上游协议落库
   channel.protocol = channelSettingsDraft.value.protocol;
   // 四模式合一落库；旧布尔字段同步维护，兼容旧版读取方
@@ -1539,12 +1573,13 @@ const manualChannelDraft = ref({
   name: "",
   alias: "",
   upstreamUrl: "",
+  auxUrl: "",
   protocol: "openai",
   apiKey: "",
 });
 
 function openManualChannelDialog() {
-  manualChannelDraft.value = { name: "", alias: "", upstreamUrl: "", protocol: "openai", apiKey: "" };
+  manualChannelDraft.value = { name: "", alias: "", upstreamUrl: "", auxUrl: "", protocol: "openai", apiKey: "" };
   manualChannelError.value = "";
   manualChannelDialogOpen.value = true;
 }
@@ -1564,6 +1599,17 @@ function validateManualChannel(): string {
     if (u.protocol !== "http:" && u.protocol !== "https:") return "上游地址须以 http(s):// 开头";
   } catch {
     return "上游地址不是合法 URL";
+  }
+  // 辅助站点地址选填；填写时校验为合法 http(s) URL，且不与主地址相同
+  const aux = d.auxUrl.trim();
+  if (aux) {
+    try {
+      const u = new URL(aux);
+      if (u.protocol !== "http:" && u.protocol !== "https:") return "辅助站点地址须以 http(s):// 开头";
+      if (aux.replace(/\/+$/, "") === url.replace(/\/+$/, "")) return "辅助站点地址与主地址相同，无需填写";
+    } catch {
+      return "辅助站点地址不是合法 URL";
+    }
   }
   const alias = d.alias.trim().toLowerCase() || uniqueChannelAlias(extractAliasFromUrl(url));
   return validateAlias(alias);
@@ -1597,6 +1643,7 @@ async function confirmManualChannel() {
     enabled: true,
     protocol: d.protocol,
     upstreamUrl: d.upstreamUrl.trim(),
+    auxUrl: d.auxUrl.trim() || null,
     apiKey,
     apiKeys: apiKey ? [apiKey] : [],
     useProxyPool: false,
@@ -1810,6 +1857,7 @@ async function confirmConvertSites() {
       enabled: true,
       protocol: "openai",
       upstreamUrl: site.apiBaseUrl.trim(),
+      auxUrl: site.auxBaseUrl?.trim() || null,
       apiKey: "",
       apiKeys: [],
       useProxyPool: false,
@@ -1879,18 +1927,82 @@ const allModelsAnySyncing = computed(
   () => allModelsSyncing.value || syncingChannelId.value !== null,
 );
 
-// —— 同步日志：折叠面板，同步开始时自动展开 ——
+// 同步日志保留每个渠道的排队、请求阶段和最终结果，关闭弹窗后仍可查看。
 interface AllModelsSyncLogEntry {
+  channelId: string;
   channel: string;
   ok: boolean;
   detail: string;
+  status: "waiting" | "running" | "success" | "error" | "stopped";
+  startedAt?: number;
+  elapsed?: number;
+  endpoint?: string;
 }
 const allModelsSyncLogs = ref<AllModelsSyncLogEntry[]>([]);
 const allModelsSyncLogOpen = ref(false);
+const allModelsSyncTotal = ref(0);
+const allModelsSyncDone = ref(0);
+const allModelsSyncStartedAt = ref(0);
+const allModelsSyncElapsed = ref(0);
+const allModelsSyncStopRequested = ref(false);
+const allModelsSyncNow = ref(Date.now());
+const allModelsSyncActive = computed(() => allModelsSyncLogs.value.filter((log) => log.status === "running"));
+const allModelsSyncFailed = computed(() => allModelsSyncLogs.value.filter((log) => log.status === "error"));
+const allModelsSyncSucceeded = computed(() => allModelsSyncLogs.value.filter((log) => log.status === "success").length);
+const allModelsSyncWaiting = computed(() => allModelsSyncLogs.value.filter((log) => log.status === "waiting").length);
+let allModelsSyncTicker: ReturnType<typeof setInterval> | null = null;
+let unlistenModelSync: UnlistenFn | null = null;
+let modelSyncDisposed = false;
+const activeModelSyncRequests = new Map<string, string>();
 
-function appendAllModelsSyncLog(entry: AllModelsSyncLogEntry) {
-  allModelsSyncLogs.value = [...allModelsSyncLogs.value, entry];
+onMounted(() => {
+  void listen<ChannelModelSyncProgress>("model-proxy-sync-progress", ({ payload }) => {
+    if (!payload.requestId || activeModelSyncRequests.get(payload.requestId) !== payload.channelId) return;
+    const log = allModelsSyncLogs.value.find((item) => item.channelId === payload.channelId && item.status === "running");
+    if (!log) return;
+    log.detail = payload.message + (payload.keyIndex && payload.keyTotal ? ` · Key ${payload.keyIndex}/${payload.keyTotal}` : "");
+    log.endpoint = payload.endpoint ?? undefined;
+  }).then((unlisten) => {
+    if (modelSyncDisposed) unlisten();
+    else unlistenModelSync = unlisten;
+  }).catch((error) => console.warn("模型同步进度监听失败", error));
+});
+
+function stopSyncTicker() {
+  if (allModelsSyncTicker !== null) {
+    clearInterval(allModelsSyncTicker);
+    allModelsSyncTicker = null;
+  }
 }
+
+function tickModelSync() {
+  allModelsSyncNow.value = Date.now();
+  allModelsSyncElapsed.value = Math.floor((allModelsSyncNow.value - allModelsSyncStartedAt.value) / 1000);
+}
+
+function syncLogElapsed(log: AllModelsSyncLogEntry): number {
+  return log.status === "running" && log.startedAt
+    ? Math.floor((allModelsSyncNow.value - log.startedAt) / 1000)
+    : log.elapsed ?? 0;
+}
+
+function isChannelModelsSyncing(channelId: string): boolean {
+  return allModelsSyncActive.value.some((log) => log.channelId === channelId);
+}
+
+onUnmounted(() => {
+  modelSyncDisposed = true;
+  allModelsSyncStopRequested.value = true;
+  activeModelSyncRequests.clear();
+  unlistenModelSync?.();
+  stopSyncTicker();
+});
+
+const allModelsSyncPercent = computed(() =>
+  allModelsSyncTotal.value > 0
+    ? Math.min(100, Math.round((allModelsSyncDone.value / allModelsSyncTotal.value) * 100))
+    : 0,
+);
 
 /** 各渠道勾选草稿的展示分组：渠道 + 已知模型列表（total = 全量已知模型数，不随搜索过滤变化） */
 const allModelsGroups = computed(() =>
@@ -1986,124 +2098,115 @@ function clearAllChannelModels(channelId: string) {
  * 批量同步与单渠道同步共用，保证两处的免费过滤口径与日志文案一致。 */
 async function pullChannelModels(
   channel: ChannelConfig,
+  requestId: string,
 ): Promise<{ ok: true; changed: boolean; count: number } | { ok: false; detail: string }> {
   try {
-    // fetchUpstreamModels 内部已处理免费渠道过滤，并把成功/失败写入后端缓存；
-    // silent 避免逐个渠道拉取时连弹 toast，失败详情由同步日志与调用方提示展示
     const map = await fetchUpstreamModels({
       setGlobalFetching: false,
       channelId: channel.id,
+      requestId,
       silent: true,
     });
     const fresh = map[channel.id];
     if (!fresh) return { ok: false, detail: "上游未返回模型列表" };
-    const previous = channelModels.value[channel.id];
-    const changed = JSON.stringify(previous) !== JSON.stringify(fresh);
-    channelModels.value = { ...channelModels.value, [channel.id]: fresh };
+    const previous = channelModels.value[channel.id] ?? [];
+    const changed = JSON.stringify([...previous].sort()) !== JSON.stringify([...fresh].sort());
+    if (!modelSyncDisposed) channelModels.value = { ...channelModels.value, [channel.id]: fresh };
     return { ok: true, changed, count: fresh.length };
   } catch (e) {
-    return { ok: false, detail: String(e) };
+    return { ok: false, detail: e instanceof Error ? e.message : String(e) };
   }
 }
 
-/** 逐渠道从上游拉取最新模型列表并写入全局缓存（弹窗顶部「同步模型」）。
- * 每完成一个渠道即写入一条同步日志，无需后端流式事件即可获得实时进度。 */
-async function syncAllChannelsModels() {
+/** 同时处理最多三个渠道；每次请求始终绑定渠道与任务 ID。 */
+async function runChannelsModelsSync(channels: ChannelConfig[], single = false) {
   if (allModelsAnySyncing.value) return;
-  const channels = proxyConfig.value.channels.filter((c) => c.enabled);
   if (channels.length === 0) {
     showToast("没有启用的渠道可同步", true);
     return;
   }
-  allModelsSyncing.value = true;
-  allModelsSyncLogs.value = [];
+  allModelsSyncing.value = !single;
+  syncingChannelId.value = single ? channels[0].id : null;
+  allModelsSyncStopRequested.value = false;
+  allModelsSyncLogs.value = channels.map((channel) => ({
+    channelId: channel.id, channel: channel.name, ok: true,
+    detail: "等待同步", status: "waiting",
+  }));
   allModelsSyncLogOpen.value = true;
-  const startedAt = Date.now();
+  allModelsSyncTotal.value = channels.length;
+  allModelsSyncDone.value = 0;
+  allModelsSyncStartedAt.value = Date.now();
+  tickModelSync();
+  stopSyncTicker();
+  allModelsSyncTicker = setInterval(tickModelSync, 1000);
+  const successful: ChannelConfig[] = [];
   let changed = 0;
-  let failed = 0;
   try {
-    for (const channel of channels) {
-      const result = await pullChannelModels(channel);
-      if (result.ok) {
-        if (result.changed) changed++;
-        appendAllModelsSyncLog({
-          channel: channel.name,
-          ok: true,
-          detail: result.changed
-            ? `成功 · ${result.count} 个模型（列表有变化）`
-            : `成功 · ${result.count} 个模型`,
-        });
-      } else {
-        failed++;
-        appendAllModelsSyncLog({
-          channel: channel.name,
-          ok: false,
-          detail: `拉取失败：${result.detail}`,
-        });
+    await runModelSyncQueue(channels, async (channel, index) => {
+      const log = allModelsSyncLogs.value[index];
+      log.status = "running";
+      log.startedAt = Date.now();
+      log.detail = "正在读取渠道 Key…";
+      const requestId = crypto.randomUUID();
+      activeModelSyncRequests.set(requestId, channel.id);
+      try {
+        const result = await pullChannelModels(channel, requestId);
+        log.elapsed = Math.floor((Date.now() - log.startedAt) / 1000);
+        log.ok = result.ok;
+        log.status = result.ok ? "success" : "error";
+        if (result.ok) {
+          successful.push(channel);
+          if (result.changed) changed++;
+          log.detail = `成功 · ${result.count} 个模型${result.changed ? "（列表有变化）" : ""}`;
+        } else {
+          log.detail = `失败：${result.detail} · 已保留原有模型`;
+        }
+      } finally {
+        activeModelSyncRequests.delete(requestId);
+        allModelsSyncDone.value++;
+      }
+    }, () => allModelsSyncStopRequested.value || modelSyncDisposed);
+    for (const log of allModelsSyncLogs.value) {
+      if (log.status === "waiting") {
+        log.status = "stopped";
+        log.detail = "已停止排队，尚未同步";
       }
     }
-    const seconds = ((Date.now() - startedAt) / 1000).toFixed(1);
-    appendAllModelsSyncLog({
-      channel: "汇总",
-      ok: failed === 0,
-      detail: `共 ${channels.length} 个渠道 · ${changed} 个渠道列表有变化 · ${failed} 个失败 · 耗时 ${seconds}s`,
-    });
-    showToast(
-      failed === 0
-        ? `已同步各渠道最新模型（${changed} 个渠道有变化）`
-        : `同步完成：${failed} 个渠道拉取失败，详见同步日志`,
-      failed > 0,
-    );
-    // 顺带刷新这些渠道所属站点的健康度，模型列表的成功率与时段条一起更新。
-    void refreshChannelHealth(channels);
+    tickModelSync();
+    if (!modelSyncDisposed) {
+      const failed = allModelsSyncFailed.value.length;
+      showToast(`${allModelsSyncStopRequested.value ? "已停止" : "同步完成"}：成功 ${successful.length}，失败 ${failed}，${changed} 个渠道有变化`, failed > 0);
+      if (successful.length > 0) void refreshChannelHealth(successful);
+    }
   } finally {
+    stopSyncTicker();
     allModelsSyncing.value = false;
+    syncingChannelId.value = null;
+    activeModelSyncRequests.clear();
   }
 }
 
-/** 单渠道同步（分组头「同步」按钮）：只拉取该渠道，结果写一条日志并即时提示 */
+async function syncAllChannelsModels() {
+  await runChannelsModelsSync(proxyConfig.value.channels.filter((c) => c.enabled));
+}
+
+async function retryFailedChannelModels() {
+  const failedIds = new Set(allModelsSyncFailed.value.map((log) => log.channelId));
+  await runChannelsModelsSync(proxyConfig.value.channels.filter((c) => c.enabled && failedIds.has(c.id)));
+}
+
 async function syncOneChannelModels(channel: ChannelConfig) {
-  if (allModelsAnySyncing.value) return;
   if (!channel.enabled) {
     showToast(`${channel.name} 已禁用，无法同步模型`, true);
     return;
   }
-  syncingChannelId.value = channel.id;
-  try {
-    const result = await pullChannelModels(channel);
-    if (!result.ok) {
-      appendAllModelsSyncLog({
-        channel: channel.name,
-        ok: false,
-        detail: `拉取失败：${result.detail}`,
-      });
-      showToast(`${channel.name} 同步失败：${result.detail}`, true);
-      return;
-    }
-    appendAllModelsSyncLog({
-      channel: channel.name,
-      ok: true,
-      detail: result.changed
-        ? `成功 · ${result.count} 个模型（列表有变化）`
-        : `成功 · ${result.count} 个模型`,
-    });
-    showToast(
-      result.changed
-        ? `${channel.name} 已同步：${result.count} 个模型（列表有变化）`
-        : `${channel.name} 已同步：${result.count} 个模型`,
-    );
-    // 顺带刷新该渠道所属站点的健康度。
-    void refreshChannelHealth([channel]);
-  } finally {
-    syncingChannelId.value = null;
-  }
+  await runChannelsModelsSync([channel], true);
 }
 
-/** 分组头「同步」按钮的悬停说明：把禁用原因与当前进度讲清楚 */
 function syncChannelButtonTitle(channel: ChannelConfig): string {
   if (!channel.enabled) return "该渠道已禁用，无法从上游同步模型";
-  if (syncingChannelId.value === channel.id) return "正在从上游拉取该渠道的模型列表…";
-  if (allModelsSyncing.value) return "正在批量同步全部渠道，请稍候";
+  if (isChannelModelsSyncing(channel.id)) return "正在同步该渠道，具体阶段见上方进度";
+  if (allModelsAnySyncing.value) return "已有同步任务在运行，可在上方停止后续排队";
   return "只同步该渠道：从上游拉取最新模型列表（不改动勾选状态）";
 }
 
@@ -2131,8 +2234,7 @@ function closeAllChannelsModelsDialog() {
   allModelsDialogOpen.value = false;
   allModelsSearch.value = "";
   allModelsDraft.value = {};
-  allModelsSyncLogs.value = [];
-  allModelsSyncLogOpen.value = false;
+  // 同步任务和日志在弹窗关闭后保留，重新打开即可继续查看。
 }
 
 /** 批量保存：按各渠道草稿写回 enabledModels 后统一落库 */
@@ -3744,9 +3846,14 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
               </div>
               <div>
                 <h3>{{ channel.name }}<span class="mp-title-alias">（{{ channelAlias(channel) }}）</span></h3>
-                <div class="mp-channel-upstream font-mono" :title="`${channelProtocolOf(channel)} · ${channel.upstreamUrl}`">
+                <div class="mp-channel-upstream font-mono" :title="`${channelProtocolOf(channel)} · ${channel.upstreamUrl}${channel.auxUrl?.trim() ? `\n辅助：${channel.auxUrl.trim()}（主地址不可达时自动改试）` : ''}`">
                   <span class="mp-proto-tag">{{ channelProtocolOf(channel) }}</span>
                   <code class="mp-upstream-code">{{ formatUpstreamUrl(channel.upstreamUrl) || channel.upstreamUrl }}</code>
+                  <code
+                    v-if="channel.auxUrl?.trim()"
+                    class="mp-upstream-code is-aux"
+                    title="辅助站点地址：主地址不可达时自动改试"
+                  >辅 {{ formatUpstreamUrl(channel.auxUrl.trim()) }}</code>
                 </div>
                 <span class="mp-card-tags">
                   <span
@@ -5514,7 +5621,7 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
     <!-- 弹窗 3: 渠道设置 - 内部代理池轮询开关 (Channel Settings Modal) -->
     <div
       v-if="channelSettingsDialogOpen"
-      class="mp-modal-backdrop"
+      class="mp-modal-backdrop mp-sub-backdrop"
       role="dialog"
       aria-modal="true"
       aria-labelledby="mp-channel-settings-title"
@@ -5530,6 +5637,11 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
               <div class="mp-modal-title-wrap">
                 <h3 id="mp-channel-settings-title">{{ channelSettingsTarget?.name || '渠道' }} · 渠道设置</h3>
                 <span class="mp-header-endpoint-chip font-mono">{{ channelSettingsTarget?.upstreamUrl }}</span>
+                <span
+                  v-if="channelSettingsTarget?.auxUrl?.trim()"
+                  class="mp-header-endpoint-chip font-mono"
+                  title="辅助站点地址：主地址不可达时自动改试"
+                >辅 · {{ channelSettingsTarget.auxUrl.trim() }}</span>
               </div>
               <small class="text-muted">{{ channelSettingsTarget?.siteId ? "站点转换渠道 · 配置代理池固定通道" : "手动渠道 · 配置上游协议与出口策略" }}</small>
             </div>
@@ -5564,6 +5676,27 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
             />
             <p v-if="channelSettingsError" class="mp-settings-error">{{ channelSettingsError }}</p>
             <p v-else class="mp-settings-hint">所有渠道别名不能重复</p>
+          </div>
+
+          <!-- 辅助站点地址：主地址不可达时的备用域名/镜像站 -->
+          <div class="mp-settings-field">
+            <div class="mp-settings-field-head">
+              <div class="mp-proxy-pool-label">
+                <span class="mp-pp-icon" v-html="icons.globe" />
+                <span>辅助站点地址（可选）</span>
+              </div>
+              <small class="text-muted">备用域名 / 镜像站</small>
+            </div>
+            <input
+              v-model="channelSettingsDraft.auxUrl"
+              type="text"
+              class="mp-settings-input"
+              :class="{ 'has-error': !!channelAuxError }"
+              placeholder="https://backup.example.com，留空表示不设置"
+              @input="channelAuxError = ''"
+            />
+            <p v-if="channelAuxError" class="mp-settings-error">{{ channelAuxError }}</p>
+            <p v-else class="mp-settings-hint">主地址连接失败时，模型拉取与对话转发自动改试该地址</p>
           </div>
 
           <!-- 上游协议：决定网关出网到该渠道时使用的协议格式 -->
@@ -5827,6 +5960,20 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
               @input="manualChannelError = ''"
             />
           </div>
+          <div class="mp-settings-field">
+            <div class="mp-settings-field-head">
+              <span>辅助站点地址（可选）</span>
+              <small class="text-muted">备用域名/镜像站</small>
+            </div>
+            <input
+              v-model="manualChannelDraft.auxUrl"
+              type="text"
+              class="mp-settings-input"
+              placeholder="https://backup.example.com，留空表示不设置"
+              @input="manualChannelError = ''"
+            />
+            <p class="mp-settings-hint">主地址连接失败时，模型拉取与对话转发自动改试该地址</p>
+          </div>
           <div class="mp-proxy-pool-box">
             <div class="mp-proxy-pool-row">
               <div class="mp-proxy-pool-label"><span>上游协议</span></div>
@@ -6059,6 +6206,7 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
         </div>
 
         <div class="mp-modal-body is-flush-top">
+          <div class="mp-sync-toolbar-stack">
           <!-- 模型搜索框 + 过滤 + 同步按钮 -->
           <div class="mp-models-modal-toolbar is-top-bar">
             <div class="mp-search-box flex-1">
@@ -6094,8 +6242,51 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
               @click="syncAllChannelsModels"
             >
               <span :class="{ 'mp-spin': allModelsSyncing }" v-html="icons.restore" />
-              <span>{{ allModelsSyncing ? "正在同步…" : "同步模型" }}</span>
+              <span>{{ allModelsSyncing ? `同步中 ${allModelsSyncDone}/${allModelsSyncTotal}` : "同步模型" }}</span>
             </button>
+          </div>
+
+          <!-- 同步进度条：同步进行中常驻显示，讲清「到第几个渠道、正在拉哪个、跑了多久」 -->
+          <div v-if="allModelsSyncTotal > 0" class="mp-sync-progress" role="status" aria-live="polite">
+            <div
+              class="mp-sync-progress-track"
+              role="progressbar"
+              aria-label="模型同步完成进度"
+              :aria-valuenow="allModelsSyncDone"
+              :aria-valuemax="allModelsSyncTotal"
+              aria-valuemin="0"
+            >
+              <div class="mp-sync-progress-fill" :style="{ width: `${allModelsSyncPercent}%` }" />
+            </div>
+            <span class="mp-sync-progress-text">
+              <strong>{{ allModelsAnySyncing ? (allModelsSyncStopRequested ? '正在停止排队' : '同步进行中') : (allModelsSyncStopRequested ? '已停止' : '同步结束') }}</strong>
+              · 已完成 {{ allModelsSyncDone }}/{{ allModelsSyncTotal }} · 成功 {{ allModelsSyncSucceeded }} · 失败 {{ allModelsSyncFailed.length }} · {{ allModelsSyncElapsed }}s
+            </span>
+            <button
+              v-if="allModelsAnySyncing"
+              class="mp-btn mp-btn-ghost mp-btn-sm"
+              type="button"
+              :disabled="allModelsSyncStopRequested"
+              title="停止后续排队；正在请求的渠道会在限时内结束"
+              @click="allModelsSyncStopRequested = true"
+            >{{ allModelsSyncStopRequested ? '等待当前任务结束…' : '停止排队' }}</button>
+            <button
+              v-else-if="allModelsSyncFailed.length > 0"
+              class="mp-btn mp-btn-ghost mp-btn-sm"
+              type="button"
+              @click="retryFailedChannelModels"
+            >重试失败（{{ allModelsSyncFailed.length }}）</button>
+            <div v-if="allModelsAnySyncing" class="mp-sync-active-list">
+              <div v-for="log in allModelsSyncActive" :key="log.channelId" class="mp-sync-active-row">
+                <strong>{{ log.channel }}</strong>
+                <span>{{ log.detail }}</span>
+                <span>{{ syncLogElapsed(log) }}s</span>
+                <code v-if="log.endpoint" :title="log.endpoint">{{ log.endpoint }}</code>
+              </div>
+              <span class="text-muted">等待 {{ allModelsSyncWaiting }} 个渠道 · 最多同时同步 3 个渠道 · 单渠道网络处理上限 60 秒</span>
+            </div>
+          </div>
+
           </div>
 
           <!-- 同步日志：可折叠，同步开始时自动展开 -->
@@ -6113,20 +6304,21 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
               />
               <span>同步日志</span>
               <span
-                v-if="allModelsSyncing"
+                v-if="allModelsAnySyncing"
                 class="mp-sync-log-status"
-              >同步中…</span>
+              >同步中 {{ allModelsSyncDone }}/{{ allModelsSyncTotal }} · {{ allModelsSyncElapsed }}s</span>
             </button>
             <div v-if="allModelsSyncLogOpen" class="mp-sync-log-body">
               <div
                 v-for="(log, i) in allModelsSyncLogs"
                 :key="i"
                 class="mp-sync-log-line"
-                :class="{ 'is-error': !log.ok }"
+                :class="{ 'is-error': !log.ok, 'is-running': log.status === 'running' }"
               >
-                <span class="mp-sync-log-mark">{{ log.ok ? "✓" : "✗" }}</span>
+                <span class="mp-sync-log-mark">{{ log.status === 'running' ? '◌' : log.status === 'waiting' ? '·' : log.status === 'stopped' ? '–' : log.ok ? '✓' : '✗' }}</span>
                 <span class="mp-sync-log-channel">{{ log.channel }}</span>
                 <span class="mp-sync-log-detail">{{ log.detail }}</span>
+                <span v-if="log.startedAt" class="mp-sync-log-duration">{{ syncLogElapsed(log) }}s</span>
               </div>
             </div>
           </div>
@@ -6183,13 +6375,23 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
                       @click="syncOneChannelModels(group.channel)"
                     >
                       <span
-                        :class="{ 'mp-spin': syncingChannelId === group.channel.id }"
+                        :class="{ 'mp-spin': isChannelModelsSyncing(group.channel.id) }"
                         v-html="icons.restore"
                       />
-                      <span>{{ syncingChannelId === group.channel.id ? "同步中…" : "同步" }}</span>
+                      <span>{{ isChannelModelsSyncing(group.channel.id) ? "同步中…" : "同步" }}</span>
                     </button>
                   </span>
                 </span>
+              </div>
+              <div class="mp-all-models-group-address">
+                <code :title="group.channel.upstreamUrl">{{ group.channel.upstreamUrl }}</code>
+                <span v-if="group.channel.auxUrl">辅：{{ group.channel.auxUrl }}</span>
+                <button
+                  class="mp-btn mp-btn-ghost mp-btn-sm"
+                  type="button"
+                  :disabled="allModelsAnySyncing"
+                  @click="handleOpenChannelSettingsDialog(group.channel)"
+                >{{ group.channel.auxUrl ? '编辑辅助地址' : '+ 辅助地址' }}</button>
               </div>
 
               <div v-if="group.models.length > 0" class="mp-all-models-grid">
@@ -7458,6 +7660,24 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
   overflow: hidden;
   text-overflow: ellipsis;
   min-width: 0;
+}
+
+/* 渠道卡片辅助站点地址：备用域名跟在主地址后，弱化展示 */
+.mp-channel-upstream .mp-upstream-code.is-aux {
+  flex-shrink: 0;
+  max-width: 40%;
+  color: var(--muted);
+  opacity: 0.75;
+}
+.mp-channel-upstream .mp-upstream-code.is-aux::before {
+  content: "";
+  display: inline-block;
+  width: 1px;
+  height: 10px;
+  margin-right: 6px;
+  background: currentColor;
+  opacity: 0.4;
+  vertical-align: -1px;
 }
 
 .mp-proto-tag {
@@ -10480,6 +10700,135 @@ button.mp-mec-check:focus-visible {
 
 .mp-sync-log-line.is-error .mp-sync-log-detail {
   color: var(--danger);
+}
+
+.mp-sync-log-line.is-running {
+  color: var(--muted);
+}
+
+.mp-sync-log-line.is-running .mp-sync-log-mark {
+  color: var(--muted);
+  animation: mp-sync-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes mp-sync-pulse {
+  0%, 100% { opacity: 0.35; }
+  50% { opacity: 1; }
+}
+
+.mp-sync-toolbar-stack {
+  position: sticky;
+  top: 0;
+  z-index: 3;
+  background: var(--surface);
+  padding-bottom: 8px;
+}
+
+.mp-sync-toolbar-stack > .mp-models-modal-toolbar {
+  position: static;
+}
+
+/* —— 同步进度条：常驻显示「第几个渠道、正在拉哪个、已用时」 —— */
+.mp-sync-progress {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-top: 10px;
+  padding: 8px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--surface-soft);
+  font-size: 12px;
+}
+
+.mp-sync-progress-track {
+  flex: none;
+  width: 140px;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  overflow: hidden;
+}
+
+.mp-sync-progress-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: var(--accent, #2563eb);
+  transition: width 0.3s ease;
+}
+
+.mp-sync-progress-text {
+  color: var(--text);
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.mp-sync-active-list {
+  display: grid;
+  gap: 8px;
+  flex: 0 0 100%;
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+}
+
+.mp-sync-active-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 12px;
+  min-width: 0;
+}
+
+.mp-sync-active-row strong {
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mp-sync-active-row code {
+  color: var(--muted);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mp-sync-log-duration {
+  flex: none;
+  margin-left: auto;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.mp-all-models-group-address {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+  color: var(--muted);
+  font-size: 11px;
+  margin: -2px 0 8px;
+}
+
+.mp-all-models-group-address code,
+.mp-all-models-group-address > span {
+  max-width: 40%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mp-sync-progress-text strong {
+  font-weight: 600;
+}
+
+.mp-sync-progress-slow {
+  color: var(--warning, #d97706);
+  font-size: 11.5px;
+  white-space: nowrap;
 }
 
 /* —— 全渠道「模型管理」弹窗 —— */

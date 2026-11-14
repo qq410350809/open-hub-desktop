@@ -151,6 +151,7 @@ pub async fn execute_resilient_egress(
     config: &ModelProxyConfig,
     meta: EgressRequestMeta,
     upstream_url: &str,
+    aux_upstream_url: Option<&str>,
     channel_api_key: &str,
     body: &JsonValue,
     client_protocol: ClientProtocol,
@@ -171,6 +172,7 @@ pub async fn execute_resilient_egress(
     let mut last_err_bytes = Bytes::new();
     let mut count_429: usize = 0;
     let mut last_retry_after_ms: Option<u64> = None;
+    let mut received_upstream_response = false;
 
     for attempt_idx in 0..total_attempts_allowed {
         let cand_id = if candidates.is_empty() {
@@ -200,6 +202,7 @@ pub async fn execute_resilient_egress(
 
         match send_result {
             Ok(resp) => {
+                received_upstream_response = true;
                 let status = resp.status();
                 if status.is_success() {
                     ctx.metrics
@@ -378,6 +381,71 @@ pub async fn execute_resilient_egress(
                     continue;
                 } else {
                     break;
+                }
+            }
+        }
+    }
+
+    // 主地址重试预算耗尽且从未收到任何上游 HTTP 响应（传输层失败：DNS 解析
+    // 失败 / 连接超时 / 建连被拒），配置了辅助站点地址时改试一次。
+    // 只兜传输层失败：若上游已返回 4xx/5xx，说明地址本身是通的，
+    // 换镜像域名改变不了请求侧问题，保留原始错误更可诊断。
+    // 只试一次：辅助地址也不通时立即把主地址的错误返回给客户端，不放大等待。
+    if !received_upstream_response {
+        if let Some(aux_url) = aux_upstream_url {
+            let cand_id = if candidates.is_empty() {
+                "__direct__"
+            } else {
+                &candidates[base_node_idx % candidates.len()]
+            };
+            let cand_start = Instant::now();
+            let client = build_client_for_candidate(ctx, cand_id, meta.stream).await;
+            let node_display = get_node_display_name(ctx, cand_id).await;
+            let attempt_req_id = format!("{}#aux", meta.req_id);
+            tracing::warn!(
+                "[ModelGateway] 渠道「{}」主地址不可达，改试辅助站点地址：{}",
+                channel.effective_alias(),
+                aux_url
+            );
+            let send_result = build_egress_request(
+                &client,
+                aux_url,
+                body,
+                channel_api_key,
+                TargetProtocol::from_channel(channel),
+            )
+            .send()
+            .await;
+            match send_result {
+                Ok(resp) => {
+                    let status = resp.status();
+                    if status.is_success() {
+                        ctx.metrics
+                            .successful_requests
+                            .fetch_add(1, Ordering::Relaxed);
+                        return Ok(EgressSuccess {
+                            status,
+                            response: resp,
+                            cand_id: cand_id.to_string(),
+                            node_display,
+                            cand_start,
+                            attempt_req_id,
+                            attempt_idx: total_attempts_allowed,
+                            upstream_url: aux_url.to_string(),
+                        });
+                    }
+                    tracing::warn!(
+                        "[ModelGateway] 渠道「{}」辅助站点地址返回 {}，保留主地址错误响应",
+                        channel.effective_alias(),
+                        status
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "[ModelGateway] 渠道「{}」辅助站点地址连接失败：{}",
+                        channel.effective_alias(),
+                        e
+                    );
                 }
             }
         }

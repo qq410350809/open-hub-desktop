@@ -623,6 +623,20 @@ export async function browserFallback<T>(
       sites: [],
     } as T;
   }
+  if (command === "update_site_aux_address") {
+    const site = browserData.sites.find((item) => item.id === String(args.id));
+    if (!site) throw new Error("站点不存在");
+    const aux = String(args.auxBaseUrl ?? "").trim();
+    if (aux) {
+      const url = new URL(aux);
+      if (!["http:", "https:"].includes(url.protocol) || url.username || url.password) {
+        throw new Error("辅助站点地址必须是无账号密码的 HTTP(S) 地址");
+      }
+    }
+    site.auxBaseUrl = aux;
+    site.updatedAt = new Date().toISOString();
+    return { ...site } as T;
+  }
   if (command === "update_site") {
     const id = String(args.id);
     const index = browserData!.sites.findIndex((site) => site.id === id);

@@ -11,7 +11,7 @@ use std::time::Duration;
 pub(crate) fn read_site(connection: &Connection, id: &str) -> Result<Option<SiteRecord>, String> {
     let mut stmt = connection
         .prepare(
-            "SELECT id, name, description, registration_limit, icon, api_base_url, system_type,
+            "SELECT id, name, description, registration_limit, icon, api_base_url, aux_base_url, system_type,
                 supports_immersive_translation, supports_ldc, supports_checkin, supports_nsfw,
                 checkin_url, checkin_note, benefit_url, rate_limit, status_url,
                 is_only_maintainer_visible, requires_invite_code, is_runaway, is_fake_charity,
@@ -29,28 +29,29 @@ pub(crate) fn read_site(connection: &Connection, id: &str) -> Result<Option<Site
                 registration_limit: row.get(3)?,
                 icon: row.get(4)?,
                 api_base_url: row.get(5)?,
-                system_type: row.get(6)?,
-                supports_immersive_translation: row.get::<_, i64>(7)? != 0,
-                supports_ldc: row.get::<_, i64>(8)? != 0,
-                supports_checkin: row.get::<_, i64>(9)? != 0,
-                supports_nsfw: row.get::<_, i64>(10)? != 0,
-                checkin_url: row.get(11)?,
-                checkin_note: row.get(12)?,
-                benefit_url: row.get(13)?,
-                rate_limit: row.get(14)?,
-                status_url: row.get(15)?,
-                is_only_maintainer_visible: row.get::<_, i64>(16)? != 0,
-                requires_invite_code: row.get::<_, i64>(17)? != 0,
-                is_runaway: row.get::<_, i64>(18)? != 0,
-                is_fake_charity: row.get::<_, i64>(19)? != 0,
-                has_pending_report: row.get::<_, i64>(20)? != 0,
-                is_personal: row.get::<_, i64>(21)? != 0,
-                is_pending: row.get::<_, i64>(22)? != 0,
-                use_system_proxy: row.get::<_, i64>(23)? != 0,
-                use_proxy_pool: row.get::<_, i64>(24)? != 0,
-                favorite: row.get::<_, i64>(25)? != 0,
-                hidden: row.get::<_, i64>(26)? != 0,
-                updated_at: row.get(27)?,
+                aux_base_url: row.get(6)?,
+                system_type: row.get(7)?,
+                supports_immersive_translation: row.get::<_, i64>(8)? != 0,
+                supports_ldc: row.get::<_, i64>(9)? != 0,
+                supports_checkin: row.get::<_, i64>(10)? != 0,
+                supports_nsfw: row.get::<_, i64>(11)? != 0,
+                checkin_url: row.get(12)?,
+                checkin_note: row.get(13)?,
+                benefit_url: row.get(14)?,
+                rate_limit: row.get(15)?,
+                status_url: row.get(16)?,
+                is_only_maintainer_visible: row.get::<_, i64>(17)? != 0,
+                requires_invite_code: row.get::<_, i64>(18)? != 0,
+                is_runaway: row.get::<_, i64>(19)? != 0,
+                is_fake_charity: row.get::<_, i64>(20)? != 0,
+                has_pending_report: row.get::<_, i64>(21)? != 0,
+                is_personal: row.get::<_, i64>(22)? != 0,
+                is_pending: row.get::<_, i64>(23)? != 0,
+                use_system_proxy: row.get::<_, i64>(24)? != 0,
+                use_proxy_pool: row.get::<_, i64>(25)? != 0,
+                favorite: row.get::<_, i64>(26)? != 0,
+                hidden: row.get::<_, i64>(27)? != 0,
+                updated_at: row.get(28)?,
                 tags: vec![],
                 maintainers: vec![],
                 extension_links: vec![],
@@ -109,7 +110,7 @@ pub fn list_library(ctx: Managed<'_, Arc<AppContext>>) -> Result<LibraryData, St
     let connection = database.lock_conn()?;
     let mut statement = connection
         .prepare(
-            "SELECT id, name, description, registration_limit, icon, api_base_url, system_type,
+            "SELECT id, name, description, registration_limit, icon, api_base_url, aux_base_url, system_type,
                 supports_immersive_translation, supports_ldc, supports_checkin, supports_nsfw,
                 checkin_url, checkin_note, benefit_url, rate_limit, status_url,
                 is_only_maintainer_visible, requires_invite_code, is_runaway, is_fake_charity,
@@ -128,28 +129,29 @@ pub fn list_library(ctx: Managed<'_, Arc<AppContext>>) -> Result<LibraryData, St
                 registration_limit: row.get(3)?,
                 icon: row.get(4)?,
                 api_base_url: row.get(5)?,
-                system_type: row.get(6)?,
-                supports_immersive_translation: row.get::<_, i64>(7)? != 0,
-                supports_ldc: row.get::<_, i64>(8)? != 0,
-                supports_checkin: row.get::<_, i64>(9)? != 0,
-                supports_nsfw: row.get::<_, i64>(10)? != 0,
-                checkin_url: row.get(11)?,
-                checkin_note: row.get(12)?,
-                benefit_url: row.get(13)?,
-                rate_limit: row.get(14)?,
-                status_url: row.get(15)?,
-                is_only_maintainer_visible: row.get::<_, i64>(16)? != 0,
-                requires_invite_code: row.get::<_, i64>(17)? != 0,
-                is_runaway: row.get::<_, i64>(18)? != 0,
-                is_fake_charity: row.get::<_, i64>(19)? != 0,
-                has_pending_report: row.get::<_, i64>(20)? != 0,
-                is_personal: row.get::<_, i64>(21)? != 0,
-                is_pending: row.get::<_, i64>(22)? != 0,
-                use_system_proxy: row.get::<_, i64>(23)? != 0,
-                use_proxy_pool: row.get::<_, i64>(24)? != 0,
-                favorite: row.get::<_, i64>(25)? != 0,
-                hidden: row.get::<_, i64>(26)? != 0,
-                updated_at: row.get(27)?,
+                aux_base_url: row.get(6)?,
+                system_type: row.get(7)?,
+                supports_immersive_translation: row.get::<_, i64>(8)? != 0,
+                supports_ldc: row.get::<_, i64>(9)? != 0,
+                supports_checkin: row.get::<_, i64>(10)? != 0,
+                supports_nsfw: row.get::<_, i64>(11)? != 0,
+                checkin_url: row.get(12)?,
+                checkin_note: row.get(13)?,
+                benefit_url: row.get(14)?,
+                rate_limit: row.get(15)?,
+                status_url: row.get(16)?,
+                is_only_maintainer_visible: row.get::<_, i64>(17)? != 0,
+                requires_invite_code: row.get::<_, i64>(18)? != 0,
+                is_runaway: row.get::<_, i64>(19)? != 0,
+                is_fake_charity: row.get::<_, i64>(20)? != 0,
+                has_pending_report: row.get::<_, i64>(21)? != 0,
+                is_personal: row.get::<_, i64>(22)? != 0,
+                is_pending: row.get::<_, i64>(23)? != 0,
+                use_system_proxy: row.get::<_, i64>(24)? != 0,
+                use_proxy_pool: row.get::<_, i64>(25)? != 0,
+                favorite: row.get::<_, i64>(26)? != 0,
+                hidden: row.get::<_, i64>(27)? != 0,
+                updated_at: row.get(28)?,
                 tags: vec![],
                 maintainers: vec![],
                 extension_links: vec![],
@@ -476,11 +478,15 @@ pub async fn import_site(
 pub fn update_site(
     ctx: Managed<'_, Arc<AppContext>>,
     id: String,
-    mut input: SiteRecord,
+    input: SiteRecord,
 ) -> Result<SiteRecord, String> {
-    let database = &*ctx.database;
+    update_site_inner(&ctx.database, id, input)
+}
+
+fn update_site_inner(database: &Database, id: String, mut input: SiteRecord) -> Result<SiteRecord, String> {
     input.id = id.clone();
     let mut input = normalize_site(input)?;
+    input.aux_base_url = validate_url(&input.aux_base_url, "辅助站点地址", false)?;
     let mut connection = database.lock_conn()?;
 
     let old_site = read_site(&connection, &id)?.ok_or_else(|| "找不到要更新的站点".to_string())?;
@@ -496,14 +502,15 @@ pub fn update_site(
             checkin_url=?10, checkin_note=?11, benefit_url=?12, rate_limit=?13, status_url=?14,
             is_only_maintainer_visible=?15, requires_invite_code=?16, is_runaway=?17, is_fake_charity=?18,
             has_pending_report=?19, is_personal=?20, is_pending=?21, use_system_proxy=?22,
-            use_proxy_pool=?23, system_type=?24, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
-         WHERE id=?25",
+            use_proxy_pool=?23, system_type=?24, aux_base_url=?25, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE id=?26",
         params![
             input.name, input.description, input.registration_limit, input.icon, input.api_base_url,
             input.supports_immersive_translation, input.supports_ldc, input.supports_checkin, input.supports_nsfw,
             input.checkin_url, input.checkin_note, input.benefit_url, input.rate_limit, input.status_url,
             input.is_only_maintainer_visible, input.requires_invite_code, input.is_runaway, input.is_fake_charity,
-            input.has_pending_report, input.is_personal, input.is_pending, input.use_system_proxy, input.use_proxy_pool, input.system_type, id
+            input.has_pending_report, input.is_personal, input.is_pending, input.use_system_proxy, input.use_proxy_pool, input.system_type,
+            input.aux_base_url.trim(), id
         ],
     ).map_err(|e| e.to_string())?;
 
@@ -544,6 +551,38 @@ pub fn update_site(
     transaction.commit().map_err(|e| e.to_string())?;
 
     read_site(&connection, &input.id)?.ok_or_else(|| "读取更新后的站点失败".into())
+}
+
+/// Only update the auxiliary address: callers may hold an older card/site object.
+/// Keep the connection lock through the write and read, without re-locking the database.
+fn update_aux_address(
+    connection: &Connection,
+    id: &str,
+    aux_base_url: &str,
+) -> Result<SiteRecord, String> {
+    let aux_base_url = validate_url(aux_base_url, "辅助站点地址", false)?;
+    let changed = connection
+        .execute(
+            &format!(
+                "UPDATE directory_sites SET aux_base_url = ?1, updated_at = {NOW_SQL} WHERE id = ?2"
+            ),
+            params![aux_base_url, id],
+        )
+        .map_err(|error| error.to_string())?;
+    if changed == 0 {
+        return Err("找不到要更新的站点".into());
+    }
+    read_site(connection, id)?.ok_or_else(|| "读取更新后的站点失败".into())
+}
+
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub fn update_site_aux_address(
+    ctx: Managed<'_, Arc<AppContext>>,
+    id: String,
+    aux_base_url: String,
+) -> Result<SiteRecord, String> {
+    let connection = ctx.database.lock_conn()?;
+    update_aux_address(&connection, &id, &aux_base_url)
 }
 
 #[cfg_attr(feature = "desktop", tauri::command)]
@@ -714,7 +753,130 @@ pub fn toggle_runaway(ctx: Managed<'_, Arc<AppContext>>, id: String) -> Result<S
 
 #[cfg(test)]
 mod tests {
-    use super::next_usage_state;
+    use super::*;
+
+    fn aux_database() -> Database {
+        Database::open(std::path::Path::new(":memory:")).unwrap()
+    }
+
+    fn aux_insert(database: &Database, aux: &str) -> SiteRecord {
+        let site = SiteRecord {
+            id: "aux-test-site".into(),
+            name: "Aux test".into(),
+            api_base_url: "https://primary.example/api".into(),
+            aux_base_url: aux.into(),
+            tags: vec!["preserve-tag".into()],
+            ..SiteRecord::default()
+        };
+        let mut connection = database.lock_conn().unwrap();
+        let transaction = connection.transaction().unwrap();
+        insert_site_transaction(&transaction, &site).unwrap();
+        transaction.commit().unwrap();
+        read_site(&connection, &site.id).unwrap().unwrap()
+    }
+
+    #[test]
+    fn aux_insert_update_and_read_roundtrip() {
+        let database = aux_database();
+        let mut site = aux_insert(&database, " https://backup.example/v1 ");
+        assert_eq!(site.aux_base_url, "https://backup.example/v1");
+        site.aux_base_url = "http://new-backup.example".into();
+        let updated = update_site_inner(&database, site.id.clone(), site).unwrap();
+        assert_eq!(updated.aux_base_url, "http://new-backup.example/");
+        let connection = database.lock_conn().unwrap();
+        let read = read_site(&connection, &updated.id).unwrap().unwrap();
+        assert_eq!(read.aux_base_url, updated.aux_base_url);
+        assert_eq!(read.api_base_url, "https://primary.example/api");
+    }
+
+    #[test]
+    fn aux_column_update_preserves_newer_primary_and_related_data() {
+        let database = aux_database();
+        let stale = aux_insert(&database, "https://backup.example");
+        let connection = database.lock_conn().unwrap();
+        connection.execute(
+            "UPDATE directory_sites SET api_base_url = 'https://new-primary.example/', name = 'New name', is_pending = 1 WHERE id = ?1",
+            [&stale.id],
+        ).unwrap();
+        let saved = update_aux_address(&connection, &stale.id, " https://aux.example/path ").unwrap();
+        assert_eq!(saved.api_base_url, "https://new-primary.example/");
+        assert_eq!(saved.name, "New name");
+        assert!(saved.is_pending);
+        assert_eq!(saved.tags, vec!["preserve-tag"]);
+        assert_eq!(saved.aux_base_url, "https://aux.example/path");
+        let cleared = update_aux_address(&connection, &stale.id, "  ").unwrap();
+        assert!(cleared.aux_base_url.is_empty());
+        assert!(update_aux_address(&connection, "missing-site", "").is_err());
+    }
+
+    #[test]
+    fn aux_invalid_urls_never_reach_any_write_path() {
+        let database = aux_database();
+        let site = aux_insert(&database, "https://saved-backup.example");
+        for invalid in ["javascript:alert(1)", "file:///tmp/aux", "ftp://aux.example", "not a URL", "https://"] {
+            let mut input = site.clone();
+            input.aux_base_url = invalid.into();
+            assert!(update_site_inner(&database, site.id.clone(), input.clone()).is_err());
+            let mut connection = database.lock_conn().unwrap();
+            assert!(update_aux_address(&connection, &site.id, invalid).is_err());
+            let transaction = connection.transaction().unwrap();
+            assert!(insert_site_transaction(&transaction, &input).is_err());
+            transaction.rollback().unwrap();
+            assert_eq!(read_site(&connection, &site.id).unwrap().unwrap().aux_base_url, site.aux_base_url);
+        }
+    }
+
+    #[test]
+    fn aux_old_import_defaults_and_export_roundtrip() {
+        let old: SiteRecord = serde_json::from_value(serde_json::json!({
+            "id": "old", "name": "Old site", "apiBaseUrl": "https://primary.example"
+        })).unwrap();
+        assert!(old.aux_base_url.is_empty());
+        let mut with_aux = old;
+        with_aux.aux_base_url = "https://backup.example/".into();
+        let exported = serde_json::to_value(&with_aux).unwrap();
+        assert_eq!(exported["auxBaseUrl"], "https://backup.example/");
+        let imported: SiteRecord = serde_json::from_value(exported).unwrap();
+        assert_eq!(imported.aux_base_url, with_aux.aux_base_url);
+        let snake_case: SiteRecord = serde_json::from_value(serde_json::json!({"aux_base_url":"https://snake.example/"})).unwrap();
+        assert_eq!(snake_case.aux_base_url, "https://snake.example/");
+    }
+
+    #[test]
+    fn aux_remote_merge_preserves_local_by_id_and_url() {
+        let database = aux_database();
+        let local = aux_insert(&database, "https://local-backup.example/");
+        for (id, remote_aux) in [
+            (local.id.as_str(), ""),
+            ("different-remote-id", "https://remote-backup.example/"),
+        ] {
+            let outcome = merge_remote_sites(&database, vec![SiteRecord {
+                id: id.into(), name: "Remote name".into(),
+                api_base_url: local.api_base_url.clone(), aux_base_url: remote_aux.into(),
+                ..SiteRecord::default()
+            }]).unwrap();
+            assert_eq!(outcome.updated, 1);
+            assert_eq!(outcome.added, 0);
+            let connection = database.lock_conn().unwrap();
+            let saved = read_site(&connection, &local.id).unwrap().unwrap();
+            assert_eq!(saved.aux_base_url, local.aux_base_url);
+            assert_eq!(saved.api_base_url, local.api_base_url);
+        }
+    }
+
+    #[test]
+    fn aux_remote_merge_rejects_invalid_new_address_atomically() {
+        let database = aux_database();
+        let result = merge_remote_sites(&database, vec![SiteRecord {
+            id: "invalid-remote-aux".into(), name: "Invalid".into(),
+            api_base_url: "https://remote-primary.example/".into(),
+            aux_base_url: "javascript:alert(1)".into(),
+            ..SiteRecord::default()
+        }]);
+        assert!(result.is_err());
+        let connection = database.lock_conn().unwrap();
+        assert!(read_site(&connection, "invalid-remote-aux").unwrap().is_none());
+    }
 
     #[test]
     fn cycles_unused_to_personal() {

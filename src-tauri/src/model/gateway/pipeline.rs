@@ -550,6 +550,9 @@ async fn dispatch_single_channel_egress(
             egress_payload.clone(),
             is_stream,
         );
+        // 辅助站点地址兜底：主地址在传输层不可达（DNS/连接/超时）时，
+        // 调度器会用该地址自动补一次尝试（仅在主地址整轮失败后）。
+        let aux_upstream_url = egress::aux_upstream_for(channel, &upstream_url);
 
         let group_req_id = if attempt_idx == 0 {
             req_id.to_string()
@@ -577,6 +580,7 @@ async fn dispatch_single_channel_egress(
             config,
             meta,
             &upstream_url,
+            aux_upstream_url.as_deref(),
             selected_key,
             &egress_body,
             style,

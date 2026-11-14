@@ -38,6 +38,18 @@ async function saveSite(input: SiteRecord): Promise<boolean> {
   }
 }
 
+async function saveAuxAddress(id: string, auxBaseUrl: string): Promise<SiteRecord> {
+  // Send only the edited column so a stale card cannot overwrite newer site data.
+  const saved = await runCommand<SiteRecord>("update_site_aux_address", {
+    id,
+    auxBaseUrl: auxBaseUrl.trim(),
+  });
+  const { sites } = useLibrary();
+  sites.value = sites.value.map((site) => site.id === saved.id ? saved : site);
+  showToast(saved.auxBaseUrl ? "辅助站点地址已保存" : "辅助站点地址已清除");
+  return saved;
+}
+
 async function importSite(
   siteUrl: string,
   usageState: SiteUsageState = "all",
@@ -245,7 +257,13 @@ async function copyAddress(url: string, label: string) {
 }
 
 function addressItems(site: SiteRecord, kind: SiteLinkKind): AddressItem[] {
-  if (kind === "api") return [{ label: "API 地址", url: site.apiBaseUrl }].filter((item) => item.url.trim());
+  if (kind === "api") {
+    // 主地址 + 辅助站点地址（备用域名）一起列出：辅助地址为空时不产生条目
+    return [
+      { label: "API 地址", url: site.apiBaseUrl },
+      { label: "辅助站点地址", url: site.auxBaseUrl ?? "" },
+    ].filter((item) => item.url.trim());
+  }
   if (kind === "checkin")
     return [{ label: "签到地址", url: site.checkinUrl, note: site.checkinNote }].filter((item) => item.url.trim());
   if (kind === "benefit") return [{ label: "福利站地址", url: site.benefitUrl }].filter((item) => item.url.trim());
@@ -264,6 +282,7 @@ function allAddressItems(site: SiteRecord): AddressItem[] {
 export function useSiteActions() {
   return {
     saveSite,
+    saveAuxAddress,
     importSite,
     deleteSite,
     togglePersonal,

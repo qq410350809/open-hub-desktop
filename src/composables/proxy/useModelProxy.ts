@@ -1,5 +1,6 @@
 import { ref, computed } from "vue";
 import { isTauri, runCommand } from "../core/ipc";
+import { withModelSyncDeadline } from "./modelSync";
 import { useToast } from "../core/useToast";
 import {
   API_PATH_V1,
@@ -301,7 +302,7 @@ export function useModelProxy() {
 
   /** 将站点导入为反代渠道（与反代页「站点转换」同构：运行时使用关联站点 Key） */
   async function addSiteProxyChannel(
-    site: Pick<SiteRecord, "id" | "name" | "apiBaseUrl">,
+    site: Pick<SiteRecord, "id" | "name" | "apiBaseUrl" | "auxBaseUrl">,
   ): Promise<boolean> {
     if (!site.id) return false;
     // 幂等：已存在 siteId 关联渠道时直接视为成功
@@ -313,6 +314,7 @@ export function useModelProxy() {
       enabled: true,
       protocol: "openai",
       upstreamUrl: site.apiBaseUrl.trim(),
+      auxUrl: site.auxBaseUrl?.trim() || null,
       apiKey: "",
       apiKeys: [],
       useProxyPool: false,
@@ -369,15 +371,16 @@ export function useModelProxy() {
     }
   }
 
-  async function fetchUpstreamModels(options: { setGlobalFetching?: boolean; channelId?: string; silent?: boolean } = {}): Promise<Record<string, string[]>> {
+  async function fetchUpstreamModels(options: { setGlobalFetching?: boolean; channelId?: string; requestId?: string; silent?: boolean } = {}): Promise<Record<string, string[]>> {
     if (options.setGlobalFetching) {
       fetchingModels.value = true;
     }
     try {
-      const res = await runCommand<any>(
-        "fetch_model_proxy_models",
-        options.channelId ? { channelId: options.channelId } : {},
-      );
+      const task = runCommand<any>("fetch_model_proxy_models", {
+        ...(options.channelId ? { channelId: options.channelId } : {}),
+        ...(options.requestId ? { requestId: options.requestId } : {}),
+      });
+      const res = await (options.channelId ? withModelSyncDeadline(task) : task);
       const list: ChannelModelList[] =
         Array.isArray(res) && Array.isArray(res[0])
           ? res[0]
@@ -402,12 +405,18 @@ export function useModelProxy() {
           .join("、");
         showToast(`以下渠道模型拉取失败：${names}`, true);
       }
+      if (options.channelId) {
+        const failure = errors.find((e: any) => (e?.channelId || e?.channel_id) === options.channelId) as { error?: string } | undefined;
+        if (failure) throw new Error(failure.error || "上游模型拉取失败");
+        if (!(options.channelId in map)) throw new Error("上游未返回该渠道的模型列表");
+      }
       return map;
     } catch (e) {
       console.warn("拉取模型失败:", e);
       if (!options.silent) {
         showToast(`模型列表拉取失败：${String(e)}`, true);
       }
+      if (options.channelId) throw e;
       return {};
     } finally {
       if (options.setGlobalFetching) {

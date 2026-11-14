@@ -22,6 +22,19 @@ fn ensure_gateway_api_key(config: &mut ModelProxyConfig) {
 }
 
 pub fn sanitize_channel_config(channel: &mut ChannelConfig) {
+    // 辅助站点地址：去空格；空值或与主地址相同（无意义）时清空
+    channel.aux_url = match &channel.aux_url {
+        Some(url) => {
+            let trimmed = url.trim().trim_end_matches('/').to_string();
+            if trimmed.is_empty() || trimmed == channel.base_url.trim().trim_end_matches('/') {
+                None
+            } else {
+                Some(trimmed)
+            }
+        }
+        None => None,
+    };
+
     if let Some(alias) = &channel.alias {
         let trimmed = alias.trim().to_lowercase();
         if trimmed.is_empty() {
@@ -356,6 +369,7 @@ mod config_tests {
         let mut cfg = ModelProxyConfig {
             channels: vec![
                 ChannelConfig {
+                    aux_url: None,
                     id: "opencode".to_string(),
                     name: "OpenCode".to_string(),
                     description: String::new(),
@@ -379,6 +393,7 @@ mod config_tests {
                     model_proxy_rules: None,
                 },
                 ChannelConfig {
+                    aux_url: None,
                     id: "alpha".to_string(),
                     name: "Ox Alpha 网页直连".to_string(),
                     description: String::new(),
@@ -402,6 +417,7 @@ mod config_tests {
                     model_proxy_rules: None,
                 },
                 ChannelConfig {
+                    aux_url: None,
                     id: "site_a".to_string(),
                     name: "Site A".to_string(),
                     description: String::new(),
@@ -445,6 +461,7 @@ mod config_tests {
     fn sanitize_model_proxy_rules_dedupes_and_validates_mode() {
         use super::super::types::ModelProxyRule;
         let mut ch = ChannelConfig {
+            aux_url: None,
             id: "ch".to_string(),
             name: "ch".to_string(),
             description: String::new(),
@@ -544,6 +561,7 @@ mod config_tests {
     fn empty_model_proxy_rules_normalized_to_none() {
         use super::super::types::ModelProxyRule;
         let mut ch = ChannelConfig {
+            aux_url: None,
             id: "ch".to_string(),
             name: "ch".to_string(),
             description: String::new(),

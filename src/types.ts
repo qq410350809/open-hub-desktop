@@ -25,6 +25,8 @@ export interface SiteRecord {
   registrationLimit: number;
   icon: string;
   apiBaseUrl: string;
+  /** 辅助站点地址（备用域名/镜像站）：主地址不可达时反代自动改试该地址 */
+  auxBaseUrl: string;
   systemType: string;
   tags: string[];
   supportsImmersiveTranslation: boolean;
@@ -606,6 +608,7 @@ export const emptySite = (): SiteRecord => ({
   registrationLimit: 0,
   icon: "",
   apiBaseUrl: "",
+  auxBaseUrl: "",
   systemType: "",
   tags: [],
   supportsImmersiveTranslation: false,

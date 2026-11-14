@@ -3,8 +3,9 @@ use super::handlers::{
     handle_chat_completions, handle_gemini_generate, handle_messages, handle_responses,
 };
 use super::types::{
-    ChannelModelFetchError, ChannelModelList, ModelProxyConfig, ModelProxyContext,
-    GATEWAY_USER_AGENT,
+    effective_aux_url, ChannelConfig, ChannelModelFetchError, ChannelModelList, ModelProxyConfig,
+    ModelProxyContext, ModelProxySyncProgress, ModelProxySyncStage, GATEWAY_USER_AGENT,
+    MODELS_FETCH_CHANNEL_TIMEOUT, MODELS_FETCH_TOTAL_TIMEOUT,
 };
 use axum::{
     extract::{Path, State},
@@ -15,8 +16,14 @@ use axum::{
 };
 use serde_json::{json, Value as JsonValue};
 use std::collections::HashSet;
+use std::time::Duration;
+use tokio::time::{timeout_at, Instant};
 use tower_http::cors::{Any, CorsLayer};
-use tracing::{error, info, warn};
+use tracing::warn;
+
+#[cfg(test)]
+#[path = "tests/model_sync.rs"]
+mod model_sync_tests;
 
 #[allow(dead_code)]
 pub fn create_model_proxy_router(ctx: ModelProxyContext) -> Router {
@@ -409,12 +416,25 @@ pub async fn handle_gemini_models(
     .into_response()
 }
 
-/// 从各个启用的上游渠道拉取可用的模型列表并存入内存缓存
+/// Fetch selected enabled channels. Omitted channel/request IDs retain startup/bulk behavior.
 pub async fn fetch_upstream_models_inner(
     ctx: &ModelProxyContext,
     channel_id: Option<&str>,
+    request_id: Option<&str>,
+) -> (Vec<ChannelModelList>, Vec<ChannelModelFetchError>) {
+    fetch_upstream_models_with_timeout(ctx, channel_id, request_id, MODELS_FETCH_CHANNEL_TIMEOUT).await
+}
+
+/// A single deadline covers key resolution and every endpoint/key/main/aux attempt.
+/// The smaller budget parameter also permits real HTTP timeout regression tests.
+pub(super) async fn fetch_upstream_models_with_timeout(
+    ctx: &ModelProxyContext,
+    channel_id: Option<&str>,
+    request_id: Option<&str>,
+    channel_timeout: Duration,
 ) -> (Vec<ChannelModelList>, Vec<ChannelModelFetchError>) {
     let config = ctx.config.read().await.clone();
+    let bus = ctx.app_ctx.read().await.as_ref().map(|app| app.event_bus.clone());
     let mut channel_models = Vec::new();
     let mut fetch_errors = Vec::new();
 
@@ -422,221 +442,245 @@ pub async fn fetch_upstream_models_inner(
         if !ch.enabled || channel_id.is_some_and(|id| id != ch.id) {
             continue;
         }
-
-        let api_keys = resolve_channel_api_keys(ctx, ch).await;
-        if ch
-            .site_id
-            .as_deref()
-            .is_some_and(|site_id| !site_id.trim().is_empty())
-        {
-            if api_keys.is_empty() {
-                warn!(
-                    "[ModelGateway] 站点渠道未找到运行时 API Key：channel_id={} site_id={}；请先同步该站点的模型/Key 数据",
-                    ch.id,
-                    ch.site_id.as_deref().unwrap_or_default()
-                );
-            } else {
-                info!(
-                    "[ModelGateway] 站点渠道使用运行时 API Key：channel_id={} site_id={} key_count={}",
-                    ch.id,
-                    ch.site_id.as_deref().unwrap_or_default(),
-                    api_keys.len()
-                );
-            }
-        }
-        let client = ctx.default_http_client.read().await.clone();
-        let base = ch.base_url.trim_end_matches('/');
-
-        // 优先探测标准 OpenAI 端点。裸域名的 /models 常被前端 SPA fallback 成 HTML，
-        // 只有 /v1/models 失败且不是鉴权失败时才回退到 /models。
-        let candidates = if base.ends_with("/v1") || base.ends_with("/vbeta") {
-            vec![format!("{base}/models")]
-        } else {
-            vec![format!("{base}/v1/models"), format!("{base}/models")]
+        let deadline = Instant::now() + channel_timeout;
+        let progress = SyncProgress {
+            bus: bus.as_ref(),
+            request_id,
+            channel_id: &ch.id,
+        };
+        progress.emit(ModelProxySyncStage::Resolving, "正在解析渠道 API Key", None, None);
+        // Site-key resolution takes a synchronous SQLite mutex. Keep that work off
+        // the async executor so contention cannot prevent the deadline from firing.
+        let key_ctx = ctx.clone();
+        let key_channel = ch.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let keys_task = tokio::task::spawn_blocking(move || {
+            runtime.block_on(resolve_channel_api_keys(&key_ctx, &key_channel))
+        });
+        let outcome = match timeout_at(deadline, keys_task).await {
+            Ok(Ok(api_keys)) => fetch_channel_models(ctx, ch, &api_keys, deadline, &progress).await,
+            Ok(Err(_)) => Err("解析渠道 API Key 失败".to_string()),
+            Err(_) => Err("渠道模型同步超时（解析 API Key）".to_string()),
         };
 
-        let mut outcome: Result<Vec<String>, String> = Err("未发起请求".to_string());
-        let key_attempts = api_keys.len().max(1);
-        for models_url in candidates {
-            let mut merged_models = Vec::new();
-            let mut seen_models = HashSet::new();
-            let mut candidate_error = "上游未返回可用模型".to_string();
-            let mut candidate_auth_failed = false;
-
-            // 同一端点必须遍历全部 Key：不同账号/Key 可能拥有不同模型权限。
-            for key_index in 0..key_attempts {
-                let api_key = api_keys
-                    .get(key_index)
-                    .map(String::as_str)
-                    .unwrap_or_default();
-                let mut req = client
-                    .get(&models_url)
-                    .header("User-Agent", GATEWAY_USER_AGENT);
-                if !api_key.is_empty() {
-                    req = req.header("Authorization", format!("Bearer {api_key}"));
-                }
-
-                match req.send().await {
-                    Ok(resp) => {
-                        let status = resp.status();
-                        if !status.is_success() {
-                            let body = resp.bytes().await.unwrap_or_default();
-                            let summary = model_fetch_body_summary(&body);
-                            warn!(
-                                "[ModelGateway] 模型列表拉取候选失败：channel_id={} channel={} url={} key_attempt={}/{} status={} response={}",
-                                ch.id,
-                                ch.name,
-                                models_url,
-                                key_index + 1,
-                                key_attempts,
-                                status,
-                                summary
-                            );
-                            candidate_error =
-                                format!("上游返回 HTTP 状态码: {status}; response: {summary}");
-                            if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
-                                candidate_auth_failed = true;
-                            }
-                            continue;
-                        }
-
-                        let bytes = resp.bytes().await.unwrap_or_default();
-                        match parse_models_payload(&bytes) {
-                            Some(list) if !list.is_empty() => {
-                                for model in list {
-                                    if seen_models.insert(model.clone()) {
-                                        merged_models.push(model);
-                                    }
-                                }
-                            }
-                            _ => {
-                                // HTML fallback 与 Key 无关，不必对同一端点重复请求剩余 Key；
-                                // 其他非标准响应仍继续遍历，尽量收集其余 Key 的模型。
-                                let snippet =
-                                    String::from_utf8_lossy(&bytes[..bytes.len().min(80)])
-                                        .trim()
-                                        .to_string();
-                                let looks_html = snippet.to_lowercase().starts_with("<!doctype")
-                                    || snippet.to_lowercase().starts_with("<html");
-                                let summary = model_fetch_body_summary(&bytes);
-                                warn!(
-                                    "[ModelGateway] 模型列表响应解析失败：channel_id={} channel={} url={} key_attempt={}/{} status={} response={}",
-                                    ch.id,
-                                    ch.name,
-                                    models_url,
-                                    key_index + 1,
-                                    key_attempts,
-                                    status,
-                                    summary
-                                );
-                                candidate_error = if looks_html {
-                                    "上游返回 HTML 页面而非模型列表（upstreamUrl 可能缺少 /v1 路径）"
-                                        .to_string()
-                                } else {
-                                    format!("上游响应中未解析到任何模型; response: {summary}")
-                                };
-                                if looks_html {
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        warn!(
-                            "[ModelGateway] 模型列表连接失败：channel_id={} channel={} url={} key_attempt={}/{} error={}",
-                            ch.id,
-                            ch.name,
-                            models_url,
-                            key_index + 1,
-                            key_attempts,
-                            e
-                        );
-                        candidate_error = format!("连接上游失败: {e}");
-                    }
-                }
-            }
-
-            if !merged_models.is_empty() {
-                outcome = Ok(merged_models);
-                break;
-            }
-            outcome = Err(candidate_error);
-            if candidate_auth_failed {
-                break;
-            }
-        }
-
         match outcome {
-            Ok(mut list) => {
-                // 上游返回空列表时以白名单兜底（兼容不支持列出模型的渠道）
-                if list.is_empty() {
-                    if let Some(explicit) = &ch.enabled_models {
-                        list.extend(explicit.clone());
-                    }
-                }
+            Ok(list) => {
                 channel_models.push(ChannelModelList {
                     channel_id: ch.id.clone(),
                     channel_name: ch.name.clone(),
                     alias: ch.effective_alias(),
                     models: list,
                 });
+                progress.emit(ModelProxySyncStage::Saving, "正在保存已获取的模型列表", None, None);
             }
-            Err(err_msg) => {
-                error!(
-                    "[ModelGateway] 模型列表拉取失败：channel_id={} channel={} base_url={} error={}",
-                    ch.id,
-                    ch.name,
-                    base,
-                    err_msg
-                );
+            Err(error) => {
+                warn!("[ModelGateway] 模型列表拉取失败：channel_id={} error={}", ch.id, error);
                 fetch_errors.push(ChannelModelFetchError {
                     channel_id: ch.id.clone(),
                     channel_name: ch.name.clone(),
                     alias: ch.effective_alias(),
-                    error: err_msg,
+                    error,
                 });
             }
         }
     }
 
-    if channel_id.is_some() {
-        let selected_id = channel_id.unwrap_or_default();
-        let mut cached_models = ctx.cached_channel_models.write().await;
-        cached_models.retain(|item| item.channel_id != selected_id);
-        cached_models.extend(channel_models.iter().cloned());
-        drop(cached_models);
-
-        let mut cached_errors = ctx.cached_fetch_errors.write().await;
-        cached_errors.retain(|item| item.channel_id != selected_id);
-        cached_errors.extend(fetch_errors.iter().cloned());
-    } else {
-        *ctx.cached_channel_models.write().await = channel_models.clone();
-        *ctx.cached_fetch_errors.write().await = fetch_errors.clone();
+    // Replace only successful channels. Failed refreshes must keep the last known models,
+    // including a bulk refresh where just some of the enabled channels failed.
+    {
+        let mut cached = ctx.cached_channel_models.write().await;
+        cached.retain(|entry| {
+            (channel_id.is_some() || config.channels.iter().any(|ch| ch.id == entry.channel_id))
+                && !channel_models.iter().any(|fresh| fresh.channel_id == entry.channel_id)
+        });
+        cached.extend(channel_models.iter().cloned());
+    }
+    {
+        let mut cached = ctx.cached_fetch_errors.write().await;
+        if let Some(selected_id) = channel_id {
+            cached.retain(|entry| entry.channel_id != selected_id);
+            cached.extend(fetch_errors.iter().cloned());
+        } else {
+            *cached = fetch_errors.clone();
+        }
     }
 
-    // 持久化到数据库
-    if let Err(e) = save_channel_models_to_db(ctx, &channel_models).await {
-        warn!("[ModelGateway] 保存渠道模型到数据库失败: {}", e);
+    if !channel_models.is_empty() {
+        if let Err(e) = save_channel_models_to_db(ctx, &channel_models).await {
+            warn!("[ModelGateway] 保存渠道模型到数据库失败: {}", e);
+        }
     }
-
     (channel_models, fetch_errors)
 }
 
-/// 生成模型探测响应的短摘要，便于后台定位鉴权/路径/格式问题，避免日志过长。
-fn model_fetch_body_summary(bytes: &[u8]) -> String {
-    let summary = String::from_utf8_lossy(bytes)
-        .chars()
-        .map(|ch| if ch.is_control() { ' ' } else { ch })
-        .collect::<String>();
-    let summary = summary.trim();
-    let max_chars = 240;
-    if summary.chars().count() > max_chars {
-        format!("{}…", summary.chars().take(max_chars).collect::<String>())
-    } else if summary.is_empty() {
-        "<empty>".to_string()
-    } else {
-        summary.to_string()
+struct SyncProgress<'a> {
+    bus: Option<&'a crate::context::EventBus>,
+    request_id: Option<&'a str>,
+    channel_id: &'a str,
+}
+
+impl SyncProgress<'_> {
+    fn emit(
+        &self,
+        stage: ModelProxySyncStage,
+        message: &str,
+        endpoint: Option<&str>,
+        key: Option<(usize, usize)>,
+    ) {
+        if let Some(bus) = self.bus {
+            // Configured URLs may include userinfo/query credentials. reqwest errors and
+            // upstream bodies are deliberately never interpolated into public messages.
+            let endpoint = endpoint.and_then(safe_model_fetch_endpoint);
+            bus.emit("model-proxy-sync-progress", ModelProxySyncProgress {
+                request_id: self.request_id,
+                channel_id: self.channel_id,
+                stage,
+                message,
+                endpoint: endpoint.as_deref(),
+                key_index: key.map(|(index, _)| index),
+                key_total: key.map(|(_, total)| total),
+            });
+        }
     }
+}
+
+fn safe_model_fetch_endpoint(raw: &str) -> Option<String> {
+    let mut url = url::Url::parse(raw).ok()?;
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.set_query(None);
+    url.set_fragment(None);
+    Some(url.to_string())
+}
+
+async fn fetch_channel_models(
+    ctx: &ModelProxyContext,
+    ch: &ChannelConfig,
+    api_keys: &[String],
+    deadline: Instant,
+    progress: &SyncProgress<'_>,
+) -> Result<Vec<String>, String> {
+    let base = ch.base_url.trim().trim_end_matches('/');
+    let aux = effective_aux_url(ch)
+        .map(|aux| aux.trim_end_matches('/').to_string())
+        .filter(|aux| aux != base);
+    // Reserve half the remaining channel budget for aux even if main keeps responding
+    // slowly for many keys. A transport failure ends that base immediately.
+    let main_deadline = if aux.is_some() {
+        let now = Instant::now();
+        now + deadline.saturating_duration_since(now) / 2
+    } else {
+        deadline
+    };
+    let main = fetch_models_from_base(ctx, api_keys, base, main_deadline, progress).await;
+    if main.is_ok() {
+        return main;
+    }
+    if let Some(aux) = aux {
+        progress.emit(ModelProxySyncStage::Fallback, "主地址失败，正在尝试辅助地址", Some(&aux), None);
+        return fetch_models_from_base(ctx, api_keys, &aux, deadline, progress)
+            .await
+            .map_err(|aux_error| format!("主地址：{}；辅助地址：{}", main.unwrap_err(), aux_error));
+    }
+    main
+}
+
+/// Probe endpoint candidates and union every successful key. Deadline/transport failures
+/// return any models already collected rather than discarding partial success.
+async fn fetch_models_from_base(
+    ctx: &ModelProxyContext,
+    api_keys: &[String],
+    base: &str,
+    deadline: Instant,
+    progress: &SyncProgress<'_>,
+) -> Result<Vec<String>, String> {
+    let candidates = if base.ends_with("/v1") || base.ends_with("/vbeta") {
+        vec![format!("{base}/models")]
+    } else {
+        vec![format!("{base}/v1/models"), format!("{base}/models")]
+    };
+    let key_total = api_keys.len().max(1);
+    let mut models = Vec::new();
+    let mut seen = HashSet::new();
+    let mut last_error = "上游未返回可用模型".to_string();
+    for (endpoint_index, models_url) in candidates.iter().enumerate() {
+        if endpoint_index > 0 {
+            progress.emit(ModelProxySyncStage::Fallback, "正在尝试备用模型端点", Some(models_url), None);
+        }
+        let mut auth_failed = false;
+        for key_index in 0..key_total {
+            if Instant::now() >= deadline {
+                return partial_models(models, "渠道模型同步超时".to_string());
+            }
+            let key = Some((key_index + 1, key_total));
+            progress.emit(ModelProxySyncStage::Request, "正在请求上游模型列表", Some(models_url), key);
+            let mut req = ctx.models_fetch_client
+                .get(models_url)
+                .header("User-Agent", GATEWAY_USER_AGENT);
+            if let Some(api_key) = api_keys.get(key_index).filter(|key| !key.is_empty()) {
+                req = req.header("Authorization", format!("Bearer {api_key}"));
+            }
+            let request_deadline = deadline.min(Instant::now() + MODELS_FETCH_TOTAL_TIMEOUT);
+            let response = timeout_at(request_deadline, async {
+                let resp = req.send().await?;
+                let status = resp.status();
+                progress.emit(
+                    ModelProxySyncStage::Response,
+                    &format!("已收到 HTTP {}，正在读取并解析模型列表", status.as_u16()),
+                    Some(models_url),
+                    key,
+                );
+                // Error bodies can echo credentials and are not needed for status diagnostics.
+                let bytes = if status.is_success() { resp.bytes().await? } else { bytes::Bytes::new() };
+                Ok::<_, reqwest::Error>((status, bytes))
+            }).await;
+            let (status, bytes) = match response {
+                Ok(Ok(response)) => response,
+                Ok(Err(error)) => {
+                    let message = if error.is_timeout() { "上游模型请求超时" } else { "连接上游失败" };
+                    progress.emit(ModelProxySyncStage::Response, message, Some(models_url), key);
+                    return partial_models(models, message.to_string());
+                }
+                Err(_) => {
+                    progress.emit(ModelProxySyncStage::Response, "上游模型请求超时", Some(models_url), key);
+                    return partial_models(models, "上游模型请求超时".to_string());
+                }
+            };
+            if !status.is_success() {
+                last_error = format!("上游返回 HTTP 状态码: {}", status.as_u16());
+                auth_failed |= matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN);
+                continue;
+            }
+            match parse_models_payload(&bytes) {
+                Some(list) if !list.is_empty() => {
+                    for model in list {
+                        if seen.insert(model.clone()) {
+                            models.push(model);
+                        }
+                    }
+                    progress.emit(ModelProxySyncStage::Response, "模型列表解析成功", Some(models_url), key);
+                }
+                _ => {
+                    let prefix = String::from_utf8_lossy(&bytes[..bytes.len().min(80)]).trim().to_lowercase();
+                    let html = prefix.starts_with("<!doctype") || prefix.starts_with("<html");
+                    last_error = if html {
+                        "上游返回 HTML 页面而非模型列表（请检查模型接口路径）".to_string()
+                    } else {
+                        "上游响应中未解析到任何模型".to_string()
+                    };
+                    progress.emit(ModelProxySyncStage::Response, &last_error, Some(models_url), key);
+                    if html { break; }
+                }
+            }
+        }
+        if !models.is_empty() { return Ok(models); }
+        if auth_failed { break; }
+    }
+    partial_models(models, last_error)
+}
+
+fn partial_models(models: Vec<String>, error: String) -> Result<Vec<String>, String> {
+    if models.is_empty() { Err(error) } else { Ok(models) }
 }
 
 /// 解析模型列表响应体：兼容 OpenAI（data[].id）与 Gemini（models[].name）两种格式。

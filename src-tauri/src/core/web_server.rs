@@ -199,6 +199,11 @@ macro_rules! rpc_arms {
                 let input: crate::models::SiteRecord = take($args, &["input"])?;
                 Ok(json!(crate::site::library::update_site($ctx, id, input)))
             }
+            "update_site_aux_address" => {
+                let id: String = take($args, &["id"])?;
+                let aux_base_url: String = take($args, &["auxBaseUrl", "aux_base_url"])?;
+                Ok(json!(crate::site::library::update_site_aux_address($ctx, id, aux_base_url)))
+            }
             "delete_site" => {
                 let id: String = take($args, &["id"])?;
                 Ok(json!(crate::site::library::delete_site($ctx, id)))
@@ -653,9 +658,13 @@ macro_rules! rpc_arms {
             )),
             "start_model_proxy" => Ok(json!(crate::model::gateway::start_model_proxy($gw).await)),
             "stop_model_proxy" => Ok(json!(crate::model::gateway::stop_model_proxy($gw).await)),
-            "fetch_model_proxy_models" => Ok(json!(
-                crate::model::gateway::fetch_model_proxy_models($gw).await
-            )),
+            "fetch_model_proxy_models" => {
+                let channel_id: Option<String> = take_opt($args, &["channelId", "channel_id"])?;
+                let request_id: Option<String> = take_opt($args, &["requestId", "request_id"])?;
+                Ok(json!(
+                    crate::model::gateway::fetch_model_proxy_models($gw, channel_id, request_id).await
+                ))
+            }
             "get_cached_channel_models" => Ok(json!(
                 crate::model::gateway::get_cached_channel_models($gw).await
             )),

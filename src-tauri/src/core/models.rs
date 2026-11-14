@@ -45,6 +45,10 @@ pub struct SiteRecord {
     pub(crate) registration_limit: i64,
     pub(crate) icon: String,
     pub(crate) api_base_url: String,
+    /// 辅助站点地址（备用域名/镜像站）：主地址不可达时，反代渠道的模型
+    /// 拉取与对话转发会自动改试该地址。站点转渠道时随主地址一起继承。
+    #[serde(alias = "aux_base_url")]
+    pub(crate) aux_base_url: String,
     #[serde(
         alias = "siteType",
         alias = "site_type",
@@ -91,6 +95,7 @@ impl Default for SiteRecord {
             registration_limit: 0,
             icon: String::new(),
             api_base_url: String::new(),
+            aux_base_url: String::new(),
             system_type: String::new(),
             tags: Vec::new(),
             supports_immersive_translation: false,

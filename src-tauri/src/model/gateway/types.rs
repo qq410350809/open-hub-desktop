@@ -92,6 +92,10 @@ pub struct ChannelConfig {
     pub protocol: String,
     #[serde(rename = "upstreamUrl", alias = "base_url", alias = "baseUrl")]
     pub base_url: String,
+    /// 辅助站点地址（备用域名/镜像站）：主地址整轮候选都失败时，模型列表
+    /// 拉取与对话转发会自动改试该地址。缺省/为空表示未配置，行为与旧版一致。
+    #[serde(default)]
+    pub aux_url: Option<String>,
     #[serde(default)]
     pub api_key: String,
     /// 站点转换继承的多个原 Key，请求时自动轮换尝试；为空时回退 apiKey
@@ -509,6 +513,33 @@ pub struct ChannelModelFetchError {
     pub error: String,
 }
 
+/// Live progress shared by desktop events and server SSE. Never contains API keys or bodies.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelProxySyncProgress<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<&'a str>,
+    pub channel_id: &'a str,
+    pub stage: ModelProxySyncStage,
+    pub message: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_index: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_total: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ModelProxySyncStage {
+    Resolving,
+    Request,
+    Response,
+    Fallback,
+    Saving,
+}
+
 #[derive(Default)]
 pub struct ProxyMetrics {
     pub total_requests: AtomicU64,
@@ -536,6 +567,10 @@ pub struct ModelProxyContext {
     /// 流式请求专用出网客户端：不带总超时（总超时会掐断长流任务），
     /// 仅保留连接超时；流式读写的存活判定由 stream.rs 的空闲超时负责。
     pub default_stream_client: Arc<tokio::sync::RwLock<Client>>,
+    /// 模型列表拉取专用客户端：轻量 GET，短超时（连接 10s / 总 20s）。
+    /// 不沿用对话出网的大超时（默认 300s）——批量同步逐渠道执行时，
+    /// 一个连不上的坏渠道会把整轮拖到数分钟，界面上表现为「卡死」。
+    pub models_fetch_client: Client,
     /// 平台无关的应用上下文（桌面与 server 共用）；启动后注入。
     pub app_ctx: StdArc<RwLock<Option<StdArc<AppContext>>>>,
     /// 轮询分组的 Key 起点游标，**按「渠道 + 分组」分片**。
@@ -687,6 +722,23 @@ impl ModelProxyContext {
             .or_insert_with(|| Arc::new(AtomicUsize::new(0)))
             .clone()
     }
+}
+
+/// 模型列表拉取客户端的连接超时：连不上的上游 10s 内就该判死。
+pub const MODELS_FETCH_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// 模型列表拉取客户端的总超时：/v1/models 是轻量 GET，20s 足够慢上游返回。
+pub const MODELS_FETCH_TOTAL_TIMEOUT: Duration = Duration::from_secs(20);
+/// Shared budget for key resolution and all main/aux endpoint/key attempts for one channel.
+pub const MODELS_FETCH_CHANNEL_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// 渠道辅助站点地址的生效值：去空格，空串归一为 None。
+pub fn effective_aux_url(channel: &ChannelConfig) -> Option<String> {
+    channel
+        .aux_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 /// 网关出网请求的默认 User-Agent。

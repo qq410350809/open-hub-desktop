@@ -117,6 +117,50 @@ impl EgressBody {
     }
 }
 
+/// 为同一站点的辅助域名构建出网 URL，保留协议路径与鉴权查询串。
+/// 仅填域名时保留完整路径；辅助基址自带 /v1 等版本时避免重复拼接。
+/// 主 URL 不属于已配置主基址时不生成回退地址。
+pub fn aux_upstream_for(channel: &ChannelConfig, upstream_url: &str) -> Option<String> {
+    let aux = super::types::effective_aux_url(channel)?;
+    let primary = url::Url::parse(channel.base_url.trim()).ok()?;
+    let upstream = url::Url::parse(upstream_url).ok()?;
+    let mut target = url::Url::parse(aux.trim()).ok()?;
+    let primary_path = primary.path().trim_end_matches('/');
+    let suffix = upstream.path().strip_prefix(primary_path)?;
+    if primary.origin() != upstream.origin() || (!suffix.is_empty() && !suffix.starts_with('/')) {
+        return None;
+    }
+    let aux_path = target.path().trim_end_matches('/');
+    let is_version = |part: &str| matches!(part, "v1" | "v2" | "vbeta" | "v1beta");
+    let path = if aux_path.is_empty() {
+        // A mirror origin keeps the complete API path, including /v1 on the main base.
+        upstream.path().to_string()
+    } else {
+        let source_version = primary_path.rsplit('/').next().filter(|part| is_version(part));
+        let suffix_version = suffix.trim_start_matches('/').split('/').next().filter(|part| is_version(part));
+        let route = if suffix_version.is_some() || source_version.is_none() {
+            suffix.to_string()
+        } else {
+            format!("/{}{suffix}", source_version.unwrap())
+        };
+        let route = if aux_path.rsplit('/').next().is_some_and(is_version) {
+            if let Some(version) = route.trim_start_matches('/').split('/').next().filter(|part| is_version(part)) {
+                &route[version.len() + 1..]
+            } else {
+                &route
+            }
+        } else {
+            &route
+        };
+        format!("{aux_path}{route}")
+    };
+    target.set_path(&path);
+    target.set_query(upstream.query());
+    target.set_fragment(None);
+    if target == upstream { return None; }
+    Some(target.to_string())
+}
+
 /// 按渠道目标协议把出网载荷转换为 URL 与原生请求体。
 pub fn prepare_egress_with(
     channel: &ChannelConfig,
@@ -1017,6 +1061,7 @@ mod egress_tests {
             cached_fetch_errors: Arc::new(RwLock::new(Vec::new())),
             default_http_client: Arc::new(RwLock::new(reqwest::Client::new())),
             default_stream_client: Arc::new(RwLock::new(reqwest::Client::new())),
+            models_fetch_client: reqwest::Client::new(),
             app_ctx: Arc::new(RwLock::new(None)),
             key_round_robin: Arc::new(RwLock::new(HashMap::new())),
             node_round_robin: Arc::new(RwLock::new(HashMap::new())),
@@ -1186,6 +1231,7 @@ mod egress_tests {
 
     fn channel_with_protocol(protocol: &str) -> ChannelConfig {
         ChannelConfig {
+            aux_url: None,
             id: "test".to_string(),
             name: "Test".to_string(),
             description: String::new(),
