@@ -35,7 +35,6 @@ import ProxyPoolPage from "./components/pages/ProxyPoolPage.vue";
 import TokenStatsPage from "./components/pages/TokenStatsPage.vue";
 import ModelCatalogPage from "./components/pages/ModelCatalogPage.vue";
 import ModelProxyPage from "./components/pages/ModelProxyPage.vue";
-import LocalToolsPage from "./components/pages/LocalToolsPage.vue";
 
 const store = useStore();
 const { preferences } = usePreferences();
@@ -103,6 +102,7 @@ function onNativeMenuNavigate(page: string) {
       store.openModelParams();
       break;
     case "modelproxy":
+    case "localtools": // Legacy navigation opens the gateway after Agent configuration retirement.
       store.openModelProxy();
       break;
     case "charity":
@@ -286,12 +286,11 @@ function onMenuNavigate(event: Event) {
   const page = detail?.page;
   if (page === "library") store.openLibrary();
   else if (page === "modelparams") store.openModelParams();
-  else if (page === "modelproxy") store.openModelProxy();
+  else if (page === "modelproxy" || page === "localtools") store.openModelProxy();
   else if (page === "charity") store.openCharityMonitor();
   else if (page === "proxy") store.openProxyPool();
   else if (page === "tokenstats") store.openTokenStats();
   else if (page === "gatewaystats") store.openGatewayStats();
-  else if (page === "localtools") store.openLocalTools();
   else if (page === "settings") store.openSettings();
 }
 
@@ -395,14 +394,6 @@ onUnmounted(() => {
           aria-labelledby="gatewaystats-nav"
         >
           <TokenStatsPage mode="proxy" />
-        </div>
-        <div
-          v-else-if="store.page.value === 'localtools'"
-          id="local-tools-panel"
-          class="local-tools-panel"
-          aria-labelledby="localtools-nav"
-        >
-          <LocalToolsPage />
         </div>
       </div>
     </div>

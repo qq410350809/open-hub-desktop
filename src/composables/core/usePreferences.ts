@@ -15,9 +15,6 @@ const defaultPreferences: Preferences = {
   proxyNodeViewMode: "list",
   proxyNodeSortMode: "latency",
   sidebarCollapsed: false,
-  accountAliases: {},
-  agentIdentityModes: {},
-  agentModelConfigs: {},
 };
 
 function loadPreferences(): Preferences {
@@ -33,6 +30,9 @@ function loadPreferences(): Preferences {
       ? (saved.proxyNodeSortMode as ProxySortMode)
       : defaultPreferences.proxyNodeSortMode;
     return {
+      // Preserve legacy and unknown fields on the next save; retired Agent preferences
+      // remain inert without deleting a user's previous configuration choices.
+      ...saved,
       theme: ["system", "light", "dark"].includes(String(saved.theme))
         ? (saved.theme as ThemePreference)
         : legacyTheme === "dark"
@@ -45,9 +45,6 @@ function loadPreferences(): Preferences {
       proxyNodeViewMode: proxyNodeViewMode as ProxyNodeViewModePreference,
       proxyNodeSortMode,
       sidebarCollapsed: Boolean(saved.sidebarCollapsed),
-      accountAliases: saved.accountAliases ?? {},
-      agentIdentityModes: saved.agentIdentityModes ?? {},
-      agentModelConfigs: saved.agentModelConfigs ?? {},
     };
   } catch {
     return { ...defaultPreferences };

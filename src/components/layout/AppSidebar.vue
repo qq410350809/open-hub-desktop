@@ -4,7 +4,6 @@ import { icons } from "../../icons";
 import { useStore } from "../../composables/useStore";
 import { usePreferences } from "../../composables/usePreferences";
 import { useModelProxy, refreshProxyConfig } from "../../composables/useModelProxy";
-import { useLocalTools } from "../../composables/localtools/useLocalTools";
 import { capabilities } from "../../composables/core/capabilities";
 import { formatCompact, localDateOf, toLocalDate } from "../../composables/tokenStatsAgg";
 
@@ -16,14 +15,12 @@ const {
   proxyStatus,
   refreshStatus: refreshProxyStatus,
 } = useModelProxy();
-const { visibleTools, loadToolList } = useLocalTools();
 
 // 状态与「今日 Token」徽标：挂载即取一次，此后每 60s 轻量刷新（后端为单行聚合查询）
 let proxyStatusTimer: number | null = null;
 onMounted(() => {
   void refreshProxyConfig();
   refreshProxyStatus();
-  if (capabilities.value.localTokenStats) void loadToolList();
   proxyStatusTimer = window.setInterval(() => refreshProxyStatus(), 60_000);
 });
 onUnmounted(() => {
@@ -55,15 +52,6 @@ const navItems = computed(() => [
     active: store.page.value === "gatewaystats",
     badge: gatewayTokenBadge.value,
     onClick: () => store.openGatewayStats(),
-  },
-  {
-    id: "localtools",
-    label: "Agent 配置",
-    icon: icons.sparkles,
-    active: store.page.value === "localtools",
-    // 菜单徽标：当前支持结构化配置的 Agent 种类数（含未检测到的）
-    badge: visibleTools.value.length ? String(visibleTools.value.length) : "",
-    onClick: () => store.openLocalTools(),
   },
   {
     id: "library",

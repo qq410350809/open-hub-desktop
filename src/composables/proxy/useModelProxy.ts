@@ -1,5 +1,5 @@
 import { ref, computed } from "vue";
-import { isTauri, runCommand } from "../core/ipc";
+import { isIntegratedClient, runCommand } from "../core/ipc";
 import { withModelSyncDeadline } from "./modelSync";
 import { createLatestLoader, parseModelSyncResult, proxyLogSortColumns } from "./modelState";
 import { useToast } from "../core/useToast";
@@ -28,7 +28,7 @@ export * from "./types";
  * 浏览器/瘦客户端与 Web 服务同源。
  */
 function modelApiOrigin(): string {
-  return isTauri
+  return isIntegratedClient
     ? `http://127.0.0.1:${proxyStatus.value.port || DEFAULT_SERVICE_PORT}`
     : window.location.origin;
 }

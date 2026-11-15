@@ -8,7 +8,7 @@
     "dev": "vite",
     "build": "vue-tsc && vite build",
     "check:version": "node scripts/check-version.mjs",
-    "test:agent-model-params": "node scripts/test-agent-model-params.mjs",
+    "test:client-access": "node scripts/test-client-access.mjs",
     "test:model-sync": "node scripts/test-model-sync.mjs",
     "test:site-sync": "node scripts/test-site-sync.mjs",
     "package:server": "node scripts/package-server.mjs",

@@ -40,14 +40,15 @@ import ModelHealthIndicator from "../common/ModelHealthIndicator.vue";
 import CustomSelect from "../common/CustomSelect.vue";
 import DateRangeDropdown from "../common/DateRangeDropdown.vue";
 import { API_PATH_V1, API_PATH_GEMINI, API_PATH_MESSAGES, DEFAULT_SERVICE_PORT } from "../../constants";
-import { isTauri } from "../../composables/core/ipc";
+import { isIntegratedClient } from "../../composables/core/ipc";
+import ProxyClientAccessDialog from "../proxy/ProxyClientAccessDialog.vue";
 import { listen, type UnlistenFn } from "../../composables/core/events";
 import { runModelSyncQueue } from "../../composables/proxy/modelSync";
 import type { ChannelModelSyncProgress } from "../../composables/proxy/types";
 
 /** 模型 API Origin：桌面端访问本机内嵌服务（端口随实际监听顺延），浏览器端与 Web 服务同源。 */
 const serviceOrigin = computed(() =>
-  isTauri
+  isIntegratedClient
     ? `http://127.0.0.1:${proxyStatus.value.port || DEFAULT_SERVICE_PORT}`
     : window.location.origin,
 );
@@ -120,6 +121,7 @@ const channelListSearch = ref("");
 const channelListStatusFilter = ref<"all" | "enabled" | "disabled">("all");
 const channelListSort = ref<"default" | "name" | "requests" | "tokens" | "success">("default");
 const configModalOpen = ref(false);
+const clientAccessOpen = ref(false);
 const gatewayModelsModalOpen = ref(false);
 const currentMainTab = ref<"console" | "channels" | "logs">("console");
 const channelModelsModalOpen = ref(false);
@@ -2742,7 +2744,7 @@ function formatSec(ms?: number | null): string {
 
 // —— 控制台端点快速复制与指标聚合 ——
 const openAiBaseUrl = computed(
-  () => (isTauri && proxyStatus.value.url) || `${serviceOrigin.value}${API_PATH_V1}`
+  () => (isIntegratedClient && proxyStatus.value.url) || `${serviceOrigin.value}${API_PATH_V1}`
 );
 const claudeMessagesUrl = computed(
   () => `${serviceOrigin.value}${API_PATH_MESSAGES}`
@@ -3331,6 +3333,10 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
       </div>
 
       <div class="mp-header-actions">
+        <button type="button" class="mp-btn mp-btn-ghost" title="复制第三方客户端接入信息与请求示例" @click="clientAccessOpen = true">
+          <span v-html="icons.external" />
+          <span>客户端接入</span>
+        </button>
         <!-- 服务配置弹窗触发按钮 -->
         <button
           type="button"
@@ -6597,6 +6603,15 @@ async function copyModel(modelId: string, channel: ChannelConfig) {
       </div>
     </div>
   </div>
+  <ProxyClientAccessDialog
+    v-if="clientAccessOpen"
+    :origin="serviceOrigin"
+    :api-key="proxyConfig.apiKey"
+    :running="proxyStatus.running"
+    @close="clientAccessOpen = false"
+    @configure="clientAccessOpen = false; configModalOpen = true"
+    @models="clientAccessOpen = false; handleOpenGatewayModelsModal()"
+  />
 </template>
 
 <style scoped>
