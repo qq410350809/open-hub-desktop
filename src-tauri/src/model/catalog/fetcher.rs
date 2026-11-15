@@ -17,6 +17,10 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use url::Url;
 
+#[cfg(test)]
+#[path = "site_cache_tests.rs"]
+mod site_cache_tests;
+
 #[cfg_attr(feature = "desktop", tauri::command)]
 pub fn get_system_fonts() -> Vec<String> {
     #[cfg(feature = "desktop")]
@@ -2556,6 +2560,9 @@ pub(crate) fn cache_profile_api_counts(
     profile_id: Option<&str>,
     result: SiteModelsResult,
 ) -> Result<SiteModelsResult, String> {
+    if !result.errors.is_empty() && result.keys.is_empty() && result.models.is_empty() {
+        return Ok(result);
+    }
     let should_cache_keys =
         !result.keys.is_empty() || matches!(result.source.as_str(), "newapi-key" | "sub2api-key");
     if let (Some(site_id), Some(profile_id)) = (site_id, profile_id) {
@@ -2636,12 +2643,17 @@ pub(crate) fn save_site_model_cache(
                 .unwrap_or(cached_name)
         }
     };
-    // 同步模型（preserve_keys）时：保留库中已有 Key/分组；拉取失败时模型数据也一并保留，
-    // 只更新错误信息，避免把左侧 Key 树或右侧模型列表清空。
-    let existing = if preserve_keys {
+    // Failure must never be interpreted as an explicit deletion, even by legacy callers.
+    let failed_without_keys = result.map_or(account.keys.is_empty() && !account.error.is_empty(), |item| {
+        item.keys.is_empty() && (!item.errors.is_empty() || !account.error.is_empty())
+    });
+    let preserve_keys = preserve_keys || failed_without_keys;
+    // Always read the core cache so missing mappings can survive a successful Key refresh.
+    // Optional health is read separately: old schemas may not have its column yet.
+    let existing = {
         connection
             .query_row(
-                "SELECT keys_json, groups_json, models_json, key_models_json, health_json, api_source
+                "SELECT keys_json, groups_json, models_json, key_models_json, api_source
                  FROM site_model_cache WHERE site_id = ?1 AND profile_id = ?2",
                 params![site_id, account.profile_id],
                 |row| {
@@ -2651,13 +2663,11 @@ pub(crate) fn save_site_model_cache(
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
                         row.get::<_, String>(4)?,
-                        row.get::<_, String>(5)?,
                     ))
                 },
             )
-            .ok()
-    } else {
-        None
+            .optional()
+            .map_err(|error| format!("读取站点模型缓存失败：{error}"))?
     };
     let keys = if preserve_keys {
         existing
@@ -2680,64 +2690,72 @@ pub(crate) fn save_site_model_cache(
             .filter(|groups| !groups.is_empty())
             .unwrap_or_else(|| account.key_groups.clone())
     };
-    let models = result
-        .map(|item| item.models.clone())
-        .or_else(|| {
-            existing
-                .as_ref()
-                .and_then(|(_, _, models_json, ..)| serde_json::from_str(models_json).ok())
-        })
+    let mut key_models: HashMap<String, Vec<SiteModelItem>> = existing
+        .as_ref()
+        .and_then(|(_, _, _, json, ..)| serde_json::from_str(json).ok())
         .unwrap_or_default();
-    let mut key_models = result
-        .map(|item| item.key_models.clone())
-        .filter(|map| !map.is_empty())
-        .or_else(|| {
-            existing
-                .as_ref()
-                .and_then(|(_, _, _, key_models_json, ..)| {
-                    serde_json::from_str(key_models_json).ok()
-                })
-        })
-        .unwrap_or_default();
+    if let Some(item) = result.filter(|_| !failed_without_keys) {
+        // Missing mappings in a partial response are not deletions.
+        key_models.extend(item.key_models.clone());
+    } else if result.is_none() && !preserve_keys {
+        key_models = account.key_models.clone();
+    }
 
     // 关键清理：移除已经不在 keys 中的旧 Key（保证删除的 Key 彻底从分组与模型映射中移除）
     let key_set: HashSet<&str> = keys.iter().map(String::as_str).collect();
     key_groups.retain(|k, _| key_set.contains(k.as_str()));
     key_models.retain(|k, _| key_set.contains(k.as_str()));
+    let mut models: Vec<SiteModelItem> = result.filter(|_| !failed_without_keys)
+        .map(|item| item.models.clone()).unwrap_or_default();
+    let mut seen: HashSet<String> = models.iter().map(|item| item.id.clone()).collect();
+    let mut ordered_keys: Vec<_> = key_models.keys().collect();
+    ordered_keys.sort();
+    for key in ordered_keys {
+        for item in &key_models[key] {
+            if seen.insert(item.id.clone()) { models.push(item.clone()); }
+        }
+    }
+    if models.is_empty() && key_models.is_empty() && (preserve_keys || existing.as_ref().is_some_and(|(old_keys, ..)| {
+        serde_json::from_str::<Vec<String>>(old_keys).unwrap_or_default().iter().any(|key| key_set.contains(key.as_str()))
+    })) {
+        models = existing.as_ref().and_then(|(_, _, json, ..)| serde_json::from_str(json).ok()).unwrap_or_default();
+    }
 
     // 全站模型健康度：只在本次真的取到时覆盖，否则保留旧值。
     // 「同步模型」（preserve_keys）不回带健康度，若一并清空会把上一次
     // 「同步 Key」拉到的标签抹掉，界面上模型健康度就变成时有时无。
-    let model_health = [
-        result.map(|item| item.model_health.clone()),
-        Some(account.model_health.clone()),
-        existing
-            .as_ref()
-            .and_then(|(_, _, _, _, health_json, _)| serde_json::from_str(health_json).ok()),
-    ]
-    .into_iter()
-    .flatten()
-    .find(|health| !health.is_empty())
-    .unwrap_or_default();
+    let model_health = result
+        .map(|item| item.model_health.clone())
+        .filter(|health| !health.is_empty())
+        .or_else(|| (!account.model_health.is_empty()).then(|| account.model_health.clone()))
+        .or_else(|| {
+            connection
+                .query_row(
+                    "SELECT health_json FROM site_model_cache WHERE site_id = ?1 AND profile_id = ?2",
+                    params![site_id, account.profile_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .ok()
+                .and_then(|json| serde_json::from_str(&json).ok())
+        })
+        .unwrap_or_default();
 
     let api_source = result
+        .filter(|_| !failed_without_keys)
         .map(|item| item.source.clone())
+        .filter(|source| !source.is_empty() && source != "none")
         .or_else(|| {
             existing
                 .as_ref()
-                .and_then(|(_, _, _, _, _, source)| (!source.is_empty()).then(|| source.clone()))
+                .and_then(|(_, _, _, _, source)| (!source.is_empty()).then(|| source.clone()))
         })
         .unwrap_or_default();
     // 同步失败原因落库：调用方传入的 account.error 常为空，而后端收集的
     // result.errors 是唯一能说明“为什么 0 个 Key”的信息，不能丢弃。
-    let persisted_error = if !keys.is_empty() || !models.is_empty() {
-        String::new()
-    } else if !account.error.is_empty() {
+    let persisted_error = if !account.error.is_empty() {
         account.error.clone()
     } else {
-        result
-            .map(|item| item.errors.join("\n"))
-            .unwrap_or_default()
+        result.map(|item| item.errors.join("\n")).unwrap_or_default()
     };
     connection
         .execute(
@@ -2790,7 +2808,7 @@ pub(crate) fn save_site_model_cache(
     // 计算（见 read_cached_usage_sites），已在上方 persisted_error='' 清掉；
     // site_accounts 表没有 api_sync_error 列，这里写它会整条 UPDATE 报
     // no such column 被静默吞掉，sync_error 反而永远清不掉。
-    if result.is_some() && account.error.is_empty() {
+    if result.is_some_and(|item| !item.keys.is_empty() || !item.models.is_empty()) && persisted_error.is_empty() {
         let _ = connection.execute(
             "UPDATE site_accounts
              SET is_valid = 1,

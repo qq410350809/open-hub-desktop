@@ -1,6 +1,9 @@
 <script setup lang="ts">
-import { computed, ref, watch, nextTick } from "vue";
+import { computed, ref, watch, nextTick, onUnmounted } from "vue";
 import { runCommand, useLibrary } from "../../composables/useLibrary";
+import { syncSiteAccountKeys } from "../../composables/site/useSiteModelSync";
+import { createScopedLoader } from "../../composables/site/siteRequestState";
+import type { SiteModelsResult as FetchSiteModelsResult } from "../../composables/site/siteModelSync";
 import { icons } from "../../icons";
 import { useStore } from "../../composables/useStore";
 import { logoText, describeModelHealth, describeModelSnapshot, describeModelStatusStrip, describeModelStatusStripTitle, describeModelWindowLabel, modelHealthForGroup, modelHealthValue, MODEL_STATUS_SLOT_COUNT } from "../../utils";
@@ -21,19 +24,6 @@ interface LiveModelItem {
   ownedBy?: string;
 }
 
-interface FetchSiteModelsResult {
-  models: LiveModelItem[];
-  source: string;
-  keys: string[];
-  keyGroups?: Record<string, string>;
-  keyModels?: Record<string, LiveModelItem[]>;
-  errors?: string[];
-  /** 实际产出这批 Key 的账号（Chrome Profile）；空表示无归属。 */
-  profileId?: string;
-  /** 站点模型健康度（模型 ID → 健康度；多分组时带 groups）；站点无该接口时为空。 */
-  modelHealth?: Record<string, SiteModelHealth>;
-}
-
 type ModelApiSource = "newapi-key" | "sub2api-key" | "pricing" | "models" | "none";
 
 interface LiveAccountKeys {
@@ -48,7 +38,6 @@ interface LiveAccountKeys {
   error: string;
 }
 
-const isTauri = "__TAURI_INTERNALS__" in window;
 const store = useStore();
 const { usageSites } = useLibrary();
 const { showToast } = useToast();
@@ -77,6 +66,8 @@ const apiSource = ref<ModelApiSource>("none");
 /** 当前选中的 API Key；选中后右侧只显示该 Key 对应的模型。 */
 const selectedKeyId = ref<string | null>(null);
 let liveFetchRequestId = 0;
+let accountSyncRevision = 0;
+const cacheReader = createScopedLoader();
 
 const site = computed(() => store.siteModelsSite.value);
 const liveKeyCount = computed(() =>
@@ -366,61 +357,67 @@ interface LocalSiteModelCache {
   modelHealth?: Record<string, SiteModelHealth>;
 }
 
-async function readCachedModels(siteId: string): Promise<boolean> {
-  if (!isTauri) return false;
+async function readCachedModels(siteId: string, revision = liveFetchRequestId): Promise<boolean> {
   try {
-    const data = await runCommand<LocalSiteModelCache>("get_site_model_cache", { siteId });
-    if (!data || !Array.isArray(data.models)) return false;
-    liveModels.value = (data.models as LiveModelItem[]).map((model: LiveModelItem) => ({
-      ...model,
-      owned_by: model.owned_by || model.ownedBy,
-    }));
-    // 同步 Key 时顺带抓的全站健康度。站点没有该接口时为空，
-    // 界面只是不显示徽标，模型列表本身不受影响。
-    modelHealth.value = data.modelHealth ?? {};
-    apiSource.value = data.apiSource || "none";
-    const cachedAccounts = (Array.isArray(data.accounts) ? data.accounts : []).filter(
-      // 历史遗留的空壳行：既无账号归属（profileId 空）又没有任何 Key，
-      // 只是一次失败的站点级同步落下的残骸，没有「账号」可言，直接忽略。
-      (account: LiveAccountKeys) => Boolean(account.profileId) || (account.keys?.length ?? 0) > 0,
+    let hasData = false;
+    await cacheReader.load(
+      () => runCommand<LocalSiteModelCache>("get_site_model_cache", { siteId }),
+      () => store.siteModelsDialogOpen.value && site.value?.id === siteId && revision === liveFetchRequestId,
+      (data) => {
+        if (!data || !Array.isArray(data.models)) return;
+        liveModels.value = (data.models as LiveModelItem[]).map((model: LiveModelItem) => ({
+          ...model,
+          owned_by: model.owned_by || model.ownedBy,
+        }));
+        // 同步 Key 时顺带抓的全站健康度。站点没有该接口时为空，
+        // 界面只是不显示徽标，模型列表本身不受影响。
+        modelHealth.value = data.modelHealth ?? {};
+        apiSource.value = data.apiSource || "none";
+        const cachedAccounts = (Array.isArray(data.accounts) ? data.accounts : []).filter(
+          // 历史遗留的空壳行：既无账号归属（profileId 空）又没有任何 Key，
+          // 只是一次失败的站点级同步落下的残骸，没有「账号」可言，直接忽略。
+          (account: LiveAccountKeys) => Boolean(account.profileId) || (account.keys?.length ?? 0) > 0,
+        );
+        // 账号来源 = Chrome 会话账号 ∪ 模型缓存账号，按 profileId 合并：
+        // Chrome 上检测到的账号（含未同步过 Key 的）默认就展示，缓存账号
+        // 则把已同步的 Key/分组/模型映射带上，覆盖同 profileId 的占位账号。
+        const chromeAccounts =
+          usageSites.value.find((item) => item.siteId === siteId)?.sessions ?? [];
+        const byProfile = new Map<string, LiveAccountKeys>();
+        for (const session of chromeAccounts) {
+          byProfile.set(session.profileId || session.accountName || session.profileName, {
+            profileId: session.profileId,
+            profileName: session.profileName,
+            accountName: session.accountName,
+            username: session.username,
+            keys: [],
+            keyGroups: {},
+            keyModels: {},
+            error: "",
+          });
+        }
+        for (const account of cachedAccounts) {
+          byProfile.set(account.profileId || account.accountName || account.profileName, account);
+        }
+        liveAccountKeys.value = [...byProfile.values()].sort((a, b) =>
+          (a.username || a.accountName || a.profileName || "").localeCompare(
+            b.username || b.accountName || b.profileName || "",
+            undefined,
+            { numeric: true, sensitivity: "base" }
+          )
+        );
+        hasData = liveAccountKeys.value.length > 0 || liveModels.value.length > 0;
+      },
     );
-    // 账号来源 = Chrome 会话账号 ∪ 模型缓存账号，按 profileId 合并：
-    // Chrome 上检测到的账号（含未同步过 Key 的）默认就展示，缓存账号
-    // 则把已同步的 Key/分组/模型映射带上，覆盖同 profileId 的占位账号。
-    const chromeAccounts =
-      usageSites.value.find((item) => item.siteId === siteId)?.sessions ?? [];
-    const byProfile = new Map<string, LiveAccountKeys>();
-    for (const session of chromeAccounts) {
-      byProfile.set(session.profileId || session.accountName || session.profileName, {
-        profileId: session.profileId,
-        profileName: session.profileName,
-        accountName: session.accountName,
-        username: session.username,
-        keys: [],
-        keyGroups: {},
-        keyModels: {},
-        error: "",
-      });
-    }
-    for (const account of cachedAccounts) {
-      byProfile.set(account.profileId || account.accountName || account.profileName, account);
-    }
-    liveAccountKeys.value = [...byProfile.values()].sort((a, b) =>
-      (a.username || a.accountName || a.profileName || "").localeCompare(
-        b.username || b.accountName || b.profileName || "",
-        undefined,
-        { numeric: true, sensitivity: "base" }
-      )
-    );
-    return liveAccountKeys.value.length > 0 || liveModels.value.length > 0;
-  } catch {
-    return false;
+    return hasData;
+  } catch (error) {
+    throw new Error(`读取本地模型缓存失败：${String(error)}`);
   }
 }
 
 watch(
-  () => store.siteModelsDialogOpen.value,
-  (open) => {
+  () => [store.siteModelsDialogOpen.value, site.value?.id] as const,
+  ([open]) => {
     if (open) {
       nextTick(() => closeBtnRef.value?.focus());
       document.body.classList.add("modal-open");
@@ -429,6 +426,8 @@ watch(
       modelHealth.value = {};
       liveError.value = "";
       searchQuery.value = "";
+      accountSyncRevision++;
+      syncingKeyProfileId.value = "";
       // 每次打开弹窗默认开启「隐藏无效」，用户仍可手动关闭查看全部模型。
       hideUnhealthy.value = true;
       apiSource.value = "none";
@@ -441,12 +440,21 @@ watch(
       void refreshProxyConfig();
     } else {
       liveFetchRequestId += 1;
+      accountSyncRevision++;
+      syncingKeyProfileId.value = "";
+      cacheReader.invalidate();
       liveFetching.value = false;
       liveFetchingKind.value = null;
       document.body.classList.remove("modal-open");
     }
   },
 );
+
+onUnmounted(() => {
+  liveFetchRequestId++;
+  accountSyncRevision++;
+  cacheReader.invalidate();
+});
 
 function close() {
   store.closeSiteModelsDialog();
@@ -468,171 +476,66 @@ function onBackdropClick(event: MouseEvent) {
  * （站点级同步残骸、历史空壳行）无法按账号精确请求，对它点同步会退回整站语义。
  */
 async function syncSingleAccountKeys(siteId: string, baseUrl: string, account: LiveAccountKeys) {
+  if (liveFetching.value || syncingKeyProfileId.value) return;
   const profileId = account.profileId.trim();
   if (!profileId) {
     showToast("该账号没有可精确同步的 Chrome 会话，请用顶栏「同步 Key」整站同步", true);
     return;
   }
+  const accountRun = ++accountSyncRevision;
+  const revision = liveFetchRequestId;
+  const current = () => accountRun === accountSyncRevision && revision === liveFetchRequestId &&
+    store.siteModelsDialogOpen.value && site.value?.id === siteId;
   syncingKeyProfileId.value = profileId;
   try {
-    const result = await runCommand<FetchSiteModelsResult>("fetch_site_models_json", {
-      url: baseUrl,
-      siteId,
-      profileId,
-    });
-    const keys = result.keys ?? [];
-    // 单账号同步绝不丢已有 Key：
-    // - 成功拿到新 Key → 直接替换该账号缓存，反映站点当前 Key 列表；
-    // - 没拿到（站点接口失败 / 被盾 / 无返回）→ preserveKeys=true 保留旧 Key/分组，
-    //   只把本次失败原因写进 error，让界面既能说明原因、又不把账号已有的 Key 清空。
-    await runCommand("save_site_model_cache_for_account", {
-      siteId,
-      account: {
-        profileId,
-        profileName: account.profileName,
-        accountName: account.accountName,
-        username: account.username,
-        keys,
-        keyGroups: result.keyGroups ?? {},
-        keyModels: result.keyModels ?? {},
-        error: keys.length > 0 ? "" : result.errors?.join("\n") || "同步未返回 Key",
-      },
-      result: keys.length > 0 ? result : null,
-      preserveKeys: keys.length === 0,
-    });
-    // 只回读缓存刷新列表：保持选中 Key 与搜索/筛选状态，不重载左右两侧的加载态。
+    const outcome = await syncSiteAccountKeys({ id: siteId, apiBaseUrl: baseUrl }, account);
     await store.loadLibrary();
-    await readCachedModels(siteId);
-    showToast(
-      keys.length > 0
-        ? `已同步 ${accountLabel(account)} 的 Key：${keys.length} 个`
-        : `同步 ${accountLabel(account)} 未返回 Key，已保留原有 ${account.keys.length} 个`,
-    );
+    if (!current()) return;
+    await readCachedModels(siteId, revision);
+    if (!current()) return;
+    showToast(outcome.status === "success"
+      ? `已同步 ${accountLabel(account)} 的 Key：${outcome.keyCount} 个`
+      : `${accountLabel(account)} ${outcome.status === "partial" ? "部分完成" : "同步失败"}：${outcome.error}；原有缓存已保留`,
+      outcome.status !== "success");
   } catch (error) {
-    showToast(`同步 ${accountLabel(account)} 的 Key 失败：${String(error)}`, true);
+    if (current()) showToast(`同步 ${accountLabel(account)} 的 Key 失败：${String(error)}`, true);
   } finally {
-    syncingKeyProfileId.value = "";
+    if (accountRun === accountSyncRevision) syncingKeyProfileId.value = "";
   }
 }
 
 /**
  * 刷新模型的三种模式：
  * - `cache`：只读本地缓存；
- * - `keys`：重拉全部账号的 Key 列表并重建缓存（单账号同步走 syncSingleAccountKeys）；
+ * - `keys`：按账号更新 Key 列表，失败保留缓存（单账号同步走 syncSingleAccountKeys）；
  * - `models`：按缓存 Key 逐个拉 /v1/models。
  */
 async function refreshModels(mode: "cache" | "keys" | "models" = "cache") {
   const requestedSite = site.value;
-  if (!requestedSite) return;
+  if (!requestedSite || (mode !== "cache" && (liveFetching.value || syncingKeyProfileId.value))) return;
   const requestId = ++liveFetchRequestId;
   liveFetching.value = true;
   liveFetchingKind.value = mode === "keys" ? "keys" : mode === "models" ? "models" : null;
   liveError.value = "";
-  liveModels.value = [];
-  // 同步模型只刷新右侧模型列表：保留左侧 Key 树、来源标签与选中 Key，不重置它们。
-  if (mode !== "models") {
-    liveAccountKeys.value = [];
-    apiSource.value = "none";
-    selectedKeyId.value = null;
-  }
   try {
     if (mode === "keys") {
-      // 重新拉取各账号的 Key 列表并重建缓存（含模型映射）；
-      // 仅已知架构站点提供该入口，未知站点无 Key 提取能力。
       const siteUsage = usageSites.value.find((item) => item.siteId === requestedSite.id);
-      // 不按 isValid 过滤：isValid=0 只说明上次账号刷新没拿到登录凭据，账号行与
-      // Chrome profile 都还在，逐账号同步仍能借缓存凭据取 Key，失败原因也会按
-      // 账号落到各自的 error 上。过滤掉等于让这些账号彻底没有同步机会。
       const sessions = siteUsage?.sessions ?? [];
-      let baseUrl = requestedSite.apiBaseUrl.trim();
-      if (!baseUrl.endsWith("/")) baseUrl += "/";
-      if (sessions.length === 0) {
-        // 站点上还没有任何账号记录，尝试不带 profileId 请求。后端会借有效账号的
-        // 会话抓取，并在 result.profileId 标注 Key 的真实归属：按它落库，避免 Key
-        // 脱离账号挂到无名行；后端没给出归属（profileId 为空）或一个 Key
-        // 都没取到时，就当作「没有」——不落库。后端已把每个账号的失败原因写回
-        // 它自己的缓存行，界面在账号下方显示「读取失败」，顶层不再挂诊断。
+      const targets = sessions.length > 0 ? sessions : [undefined];
+      const failures: string[] = [];
+      for (const account of targets) {
+        if (requestId !== liveFetchRequestId) return;
         try {
-          const result = await runCommand<FetchSiteModelsResult>("fetch_site_models_json", {
-            url: baseUrl,
-            siteId: requestedSite.id,
-          });
-          const ownerId = result.profileId || "";
-          const keys = result.keys ?? [];
-          // 「没有」就不落库，但也不能提前 return：还得往下读缓存，
-          // 否则刚写回各账号的失败原因没机会渲染成账号下方的「读取失败」。
-          if (ownerId && keys.length > 0) {
-            // 同步 Key 成功获取数据后，保存前清理掉这个站点原来的对应旧数据，避免数据冲突与旧 Key 残留
-            await runCommand("clear_site_model_cache_for_site", { siteId: requestedSite.id });
-            await runCommand("save_site_model_cache_for_account", {
-              siteId: requestedSite.id,
-              account: {
-                profileId: ownerId,
-                profileName: "",
-                accountName: "",
-                username: "",
-                keys,
-                keyGroups: result.keyGroups ?? {},
-                keyModels: result.keyModels ?? {},
-                error: "",
-              },
-              result,
-              preserveKeys: false,
-            });
+          const outcome = await syncSiteAccountKeys(requestedSite, account);
+          if (outcome.status !== "success") {
+            failures.push(`${account ? accountLabel(account) : requestedSite.name}：${outcome.error}`);
           }
-        } catch {
-          // 不在顶层提示：单个账号的读取失败由后端写回各账号行、在账号下方显示。
-          // 这里只是「没取到 Key」，不额外弹一条全局诊断。
-        }
-      } else {
-        let clearedOldSiteData = false;
-        for (const session of sessions) {
-          if (requestId !== liveFetchRequestId) return;
-          try {
-            const result = await runCommand<FetchSiteModelsResult>("fetch_site_models_json", {
-              url: baseUrl,
-              siteId: requestedSite.id,
-              profileId: session.profileId,
-            });
-            // 同步 Key 成功获取数据后，首次保存前清理掉这个站点原来的对应旧数据，避免数据冲突与旧 Key 残留
-            if (!clearedOldSiteData) {
-              await runCommand("clear_site_model_cache_for_site", { siteId: requestedSite.id });
-              clearedOldSiteData = true;
-            }
-            await runCommand("save_site_model_cache_for_account", {
-              siteId: requestedSite.id,
-              account: {
-                profileId: session.profileId,
-                profileName: session.profileName,
-                accountName: session.accountName,
-                username: session.username,
-                keys: result.keys ?? [],
-                keyGroups: result.keyGroups ?? {},
-                keyModels: result.keyModels ?? {},
-                error: "",
-              },
-              result,
-              preserveKeys: false,
-            });
-          } catch (error) {
-            await runCommand("save_site_model_cache_for_account", {
-              siteId: requestedSite.id,
-              account: {
-                profileId: session.profileId,
-                profileName: session.profileName,
-                accountName: session.accountName,
-                username: session.username,
-                keys: [],
-                keyGroups: {},
-                keyModels: {},
-                error: String(error),
-              },
-              result: null,
-              preserveKeys: false,
-            });
-          }
+        } catch (error) {
+          failures.push(`${account ? accountLabel(account) : requestedSite.name}：${String(error)}`);
         }
       }
+      if (requestId !== liveFetchRequestId) return;
+      if (failures.length) liveError.value = failures.join("\n");
     } else if (mode === "models") {
       // 以缓存中的 Key 集合为准逐 Key 拉取 /v1/models（含手动添加的 Key，
       // 与其它入口的「同步 Key」语义一致：不重建 Key 列表，只刷新模型映射）。
@@ -644,12 +547,13 @@ async function refreshModels(mode: "cache" | "keys" | "models" = "cache") {
       if (requestId !== liveFetchRequestId) return;
       // 模型拉失败时后端仍会返回结果（错误在 errors 里），健康度照样跟着回来；
       // 只有下面这行报错提示，不能因此中断后面的读缓存。
-      if (result.errors?.length && liveKeyCount.value === 0) {
+      if (result.errors?.length) {
         liveError.value = result.errors.join("\n");
       }
     }
     await store.loadLibrary();
-    const cached = await readCachedModels(requestedSite.id);
+    if (requestId !== liveFetchRequestId) return;
+    const cached = await readCachedModels(requestedSite.id, requestId);
     if (requestId !== liveFetchRequestId) return;
     // 已经报出具体原因（同步失败 / 无可用账号）时不再用通用文案盖掉。
     if (!liveError.value && !cached) {
@@ -684,7 +588,7 @@ async function copyApiKey(key: string, index: number, accountName: string) {
   await store.copyAddress(key, `${accountName} API Key ${index + 1}`);
 }
 
-function accountLabel(account: LiveAccountKeys): string {
+function accountLabel(account: Pick<LiveAccountKeys, "username" | "accountName" | "profileName">): string {
   return account.username || account.accountName || account.profileName || "未命名账号";
 }
 
@@ -880,7 +784,7 @@ async function removeKey(account: LiveAccountKeys, key: string) {
               v-if="site && !isUnknownSystemType(site.systemType)"
               type="button"
               class="site-models-text-btn"
-              :disabled="liveFetching"
+              :disabled="liveFetching || Boolean(syncingKeyProfileId)"
               :aria-label="liveFetchingKind === 'keys' ? '正在同步 Key' : '同步 Key：拉取站点 API Key 列表'"
               title="同步 Key：拉取站点 API Key 列表"
               @click="refreshModels('keys')"
@@ -891,7 +795,7 @@ async function removeKey(account: LiveAccountKeys, key: string) {
             <button
               type="button"
               class="site-models-text-btn"
-              :disabled="liveFetching"
+              :disabled="liveFetching || Boolean(syncingKeyProfileId)"
               :aria-label="liveFetchingKind === 'models' ? '正在同步模型' : '同步模型：按 Key 逐个拉取 /v1/models 并保存'"
               title="同步模型：按 Key 逐个拉取 /v1/models 并保存"
               @click="refreshModels('models')"
@@ -952,7 +856,7 @@ async function removeKey(account: LiveAccountKeys, key: string) {
                           v-if="account.profileId && account.profileId.trim()"
                           type="button"
                           class="site-models-key-manage"
-                          :disabled="Boolean(syncingKeyProfileId)"
+                          :disabled="liveFetching || Boolean(syncingKeyProfileId)"
                           :aria-label="`同步 ${accountLabel(account)} 的 API Key`"
                           title="同步该账号的 Key"
                           @click.stop="syncSingleAccountKeys(site?.id ?? '', site?.apiBaseUrl ?? '', account)"
@@ -1124,13 +1028,16 @@ async function removeKey(account: LiveAccountKeys, key: string) {
             </div>
 
             <div class="site-models-scroll">
-              <div v-if="liveFetching" class="site-models-state">
+              <p v-if="liveError && currentActiveModels.length > 0" class="site-models-health-note" role="status">
+                同步未完整完成，以下保留已有模型：{{ liveError }}
+              </p>
+              <div v-if="liveFetching && currentActiveModels.length === 0" class="site-models-state">
                 <span class="site-models-state-icon site-models-spin" v-html="icons.restore" />
                 <strong>正在读取本地数据</strong>
                 <p>读取 {{ site?.name }} 的 Key 与模型信息…</p>
               </div>
 
-              <div v-else-if="liveError" class="site-models-state site-models-state-error">
+              <div v-else-if="liveError && currentActiveModels.length === 0" class="site-models-state site-models-state-error">
                 <span class="site-models-state-icon" v-html="icons.info" />
                 <strong>读取失败</strong>
                 <p>{{ liveError }}</p>

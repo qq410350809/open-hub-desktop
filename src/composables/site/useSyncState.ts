@@ -6,6 +6,7 @@ import { useFilterState } from "./useFilterState";
 import { useUIState } from "../ui/useUIState";
 import { useChromeSession } from "./useChromeSession";
 import { useSiteActions } from "./useSiteActions";
+import { syncSiteAccountKeys } from "./useSiteModelSync";
 import { PUBLIC_LIBRARY_SOURCES, REMOTE_LOGIN_URL } from "../../constants";
 import type {
   PublicLibrarySource,
@@ -17,7 +18,6 @@ import type {
   SyncSitesProgress,
 } from "../../types";
 import { isUnknownSystemType, supportsKeyDiscovery } from "../../types";
-import type { SiteModelHealth } from "../../types";
 
 const { sites, usageSites, loadLibrary } = useLibrary();
 const { showToast } = useToast();
@@ -314,25 +314,6 @@ async function detectSyncedSiteTypes(siteIds: string[], runId: number) {
   }
 }
 
-interface SyncedSiteModelsResult {
-  models: Array<{ id: string; owned_by?: string; ownedBy?: string }>;
-  source: string;
-  keys: string[];
-  keyGroups?: Record<string, string>;
-  /** 全站模型健康度（模型 ID → 健康度）；站点无该接口时为空。 */
-  modelHealth?: Record<string, SiteModelHealth>;
-}
-
-interface SyncedModelCacheAccount {
-  profileId: string;
-  profileName: string;
-  accountName: string;
-  username: string;
-  keys: string[];
-  keyGroups?: Record<string, string>;
-  error: string;
-}
-
 interface ModelSyncSummary {
   succeeded: number;
   failed: number;
@@ -378,10 +359,7 @@ async function syncAllModelKeys(
       ) === index,
     );
   if (targets.length === 0) {
-    for (const siteId of siteIds) {
-      await runCommand("clear_site_model_cache_for_site", { siteId });
-    }
-    appendSyncLog({ stage: "models-empty", status: "info", message: "当前列表没有可同步 Key 与模型的合法账号" });
+    appendSyncLog({ stage: "models-empty", status: "info", message: "当前列表没有可同步 Key 与模型的合法账号，已保留全部缓存" });
     if (finalize) {
       syncRunState.value = "complete";
       stopSyncTimer();
@@ -399,15 +377,6 @@ async function syncAllModelKeys(
   let keyCount = 0;
   let modelCount = 0;
   try {
-    // 先清空本次要同步站点的旧 Key/模型缓存，再开始逐账号拉取。
-    // 必须集中在并发池之前做：clear_site_model_cache_for_site 按 site_id 删除
-    // 该站点【全部账号】的缓存行，如果放进池里"每个站点清一次"，同一站点的两个
-    // 账号被不同 worker 并发处理时就会互相踩：后一个 worker 的 clear 会把前一个
-    // 已经写入的账号行删掉，表现为"每次同步总有一个账号成功、另一个失败/为空"。
-    const targetSiteIds = [...new Set(targets.map((target) => target.site.id))];
-    for (const siteId of targetSiteIds) {
-      await runCommand("clear_site_model_cache_for_site", { siteId });
-    }
     let nextTargetIndex = 0;
     const workerCount = Math.min(3, targets.length);
     await Promise.all(Array.from({ length: workerCount }, async () => {
@@ -417,42 +386,19 @@ async function syncAllModelKeys(
         const accountLabel = session.username || session.accountName || session.profileName;
         appendSyncLog({ stage, status: "running", message: `正在同步 ${site.name} · ${accountLabel} 的 Key 与模型` });
         try {
-          let baseUrl = site.apiBaseUrl.trim();
-          if (!baseUrl.endsWith("/")) baseUrl += "/";
-          const result = await runCommand<SyncedSiteModelsResult>("fetch_site_models_json", { url: baseUrl, siteId: site.id, profileId: session.profileId });
-          await runCommand("save_site_model_cache_for_account", {
-            siteId: site.id,
-            account: {
-              profileId: session.profileId,
-              profileName: session.profileName,
-              accountName: session.accountName,
-              username: session.username,
-              keys: result.keys ?? [],
-              keyGroups: result.keyGroups ?? {},
-              error: "",
-            } satisfies SyncedModelCacheAccount,
-            result,
-          });
-          keyCount += result.keys?.length ?? 0;
-          modelCount += result.models?.length ?? 0;
-          succeeded += 1;
-          appendSyncLog({ stage, status: "success", message: `${site.name} · ${accountLabel} 同步成功：${result.keys?.length ?? 0} 个 Key，${result.models?.length ?? 0} 个模型` });
+          const result = await syncSiteAccountKeys(site, session);
+          keyCount += result.keyCount;
+          modelCount += result.modelCount;
+          if (result.status === "success") {
+            succeeded += 1;
+            appendSyncLog({ stage, status: "success", message: `${site.name} · ${accountLabel} 同步成功：${result.keyCount} 个 Key，${result.modelCount} 个模型` });
+          } else {
+            failed += 1;
+            appendSyncLog({ stage, status: "error", message: `${site.name} · ${accountLabel} ${result.status === "partial" ? "部分完成" : "同步失败"}：${result.error}；未获取的数据已保留原缓存` });
+          }
         } catch (error) {
           failed += 1;
-          await runCommand("save_site_model_cache_for_account", {
-            siteId: site.id,
-            account: {
-              profileId: session.profileId,
-              profileName: session.profileName,
-              accountName: session.accountName,
-              username: session.username,
-              keys: [],
-              keyGroups: {},
-              error: String(error),
-            } satisfies SyncedModelCacheAccount,
-            result: null,
-          });
-          appendSyncLog({ stage, status: "error", message: `${site.name} · ${accountLabel} 同步失败：${String(error)}` });
+          appendSyncLog({ stage, status: "error", message: `${site.name} · ${accountLabel} 同步或缓存保存失败：${String(error)}` });
         } finally {
           modelKeySyncCompleted.value += 1;
         }

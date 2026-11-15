@@ -6,6 +6,9 @@ import { formatDate, formatRateLimit, logoText, describeModelHealth, describeMod
 import type { ModelHealthBadge, ModelStatusSlot } from "../../utils";
 import { useStore } from "../../composables/useStore";
 import { runCommand, isTauri } from "../../composables/useLibrary";
+import { syncSiteAccountKeys } from "../../composables/site/useSiteModelSync";
+import type { SiteModelsResult } from "../../composables/site/siteModelSync";
+import { createScopedLoader } from "../../composables/site/siteRequestState";
 import AppTable, { type AppTableColumn } from "../common/AppTable.vue";
 import LinkAccountPicker from "../common/LinkAccountPicker.vue";
 import SiteTokenEditor from "../site/SiteTokenEditor.vue";
@@ -512,7 +515,13 @@ function resetAllFilters() {
 }
 
 // —— 抽屉交互逻辑 ——
+const drawerCacheReader = createScopedLoader();
+let drawerSyncRun = 0;
+let pageDisposed = false;
 async function openModelDetail(site: SiteRecord) {
+  drawerSyncRun++;
+  drawerCacheReader.invalidate();
+  drawerLiveFetchingKind.value = null;
   selectedSiteId.value = site.id;
   activeDetailTab.value = "overview";
   drawerModelSearch.value = "";
@@ -523,99 +532,74 @@ async function openModelDetail(site: SiteRecord) {
 }
 
 function closeDetail() {
+  drawerSyncRun++;
+  drawerCacheReader.invalidate();
   selectedSiteId.value = "";
   drawerModelCache.value = null;
+  drawerModelsLoading.value = false;
+  drawerLiveFetchingKind.value = null;
 }
 
-async function readDrawerModelCache(siteId: string) {
-  if (!isTauri) return;
-  drawerModelsLoading.value = true;
+async function readDrawerModelCache(siteId: string, throwOnError = false) {
   try {
-    const data = await runCommand<SiteModelCache>("get_site_model_cache", { siteId });
-    if (data) {
-      drawerModelCache.value = data;
-    }
+    await drawerCacheReader.load(
+      () => runCommand<SiteModelCache>("get_site_model_cache", { siteId }),
+      () => !pageDisposed && selectedSiteId.value === siteId,
+      (data) => { drawerModelCache.value = data; drawerModelsError.value = ""; },
+      (pending) => { drawerModelsLoading.value = pending; },
+    );
   } catch (err) {
     drawerModelsError.value = String(err);
-  } finally {
-    drawerModelsLoading.value = false;
+    if (throwOnError) throw err;
   }
 }
 
 async function triggerDrawerSync(mode: "keys" | "models") {
-  if (!selectedSite.value) return;
+  if (!selectedSite.value || drawerLiveFetchingKind.value) return;
   const site = selectedSite.value;
+  const run = ++drawerSyncRun;
+  const current = () => run === drawerSyncRun && !pageDisposed && selectedSiteId.value === site.id;
   drawerLiveFetchingKind.value = mode;
+  drawerModelsError.value = "";
   try {
-    const sessions = getSiteSessions(site.id);
-    let baseUrl = site.apiBaseUrl.trim();
-    if (!baseUrl.endsWith("/")) baseUrl += "/";
-
-    if (sessions.length === 0) {
-      const result = await runCommand<any>("fetch_site_models_json", {
-        url: baseUrl,
-        siteId: site.id,
-      });
-      // 同步 Key 成功获取数据后，保存前清理掉这个站点原来的对应旧数据，避免数据冲突
-      if (mode === "keys") {
-        await runCommand("clear_site_model_cache_for_site", { siteId: site.id });
-      }
-      await runCommand("save_site_model_cache_for_account", {
-        siteId: site.id,
-        account: {
-          profileId: "",
-          profileName: "",
-          accountName: "",
-          username: "",
-          keys: result.keys ?? [],
-          keyGroups: result.keyGroups ?? {},
-          keyModels: result.keyModels ?? {},
-          error: "",
-        },
-        result,
-        preserveKeys: mode === "models",
-      });
+    const failures: string[] = [];
+    let succeeded = 0;
+    if (mode === "models") {
+      // Model-only refresh uses the existing Key set, including manually added Keys.
+      const result = await runCommand<SiteModelsResult>("sync_models_for_cached_keys", { siteId: site.id });
+      failures.push(...(result.errors ?? []));
+      if (!result.models?.length && failures.length === 0) failures.push("未返回可用模型");
     } else {
-      let clearedOldSiteData = false;
-      for (const session of sessions) {
-        if (mode === "models" && (!session.apiKeyCount || session.apiKeyCount === 0)) continue;
+      const sessions = getSiteSessions(site.id);
+      const targets = sessions.length ? sessions : [undefined];
+      for (const account of targets) {
+        if (!current()) return;
         try {
-          const result = await runCommand<any>("fetch_site_models_json", {
-            url: baseUrl,
-            siteId: site.id,
-            profileId: session.profileId,
-          });
-          // 同步 Key 成功获取数据后，首次保存前清理掉这个站点原来的对应旧数据，避免数据冲突
-          if (mode === "keys" && !clearedOldSiteData) {
-            await runCommand("clear_site_model_cache_for_site", { siteId: site.id });
-            clearedOldSiteData = true;
-          }
-          await runCommand("save_site_model_cache_for_account", {
-            siteId: site.id,
-            account: {
-              profileId: session.profileId,
-              profileName: session.profileName,
-              accountName: session.accountName,
-              username: session.username,
-              keys: result.keys ?? [],
-              keyGroups: result.keyGroups ?? {},
-              keyModels: result.keyModels ?? {},
-              error: "",
-            },
-            result,
-            preserveKeys: mode === "models",
-          });
-        } catch (err) {
-          console.warn("同步账号模型失败:", err);
+          const outcome = await syncSiteAccountKeys(site, account);
+          if (outcome.status === "success") succeeded++;
+          else failures.push(`${account?.username || account?.accountName || account?.profileName || site.name}：${outcome.error}`);
+        } catch (error) {
+          failures.push(String(error));
         }
       }
     }
-    await readDrawerModelCache(site.id);
-    store.showToast(mode === "keys" ? "Key 与支持模型已同步完成" : "模型列表已同步完成");
-  } catch (err) {
-    store.showToast(`同步失败：${String(err)}`, true);
+    await store.loadLibrary();
+    if (!current()) return;
+    await readDrawerModelCache(site.id, true);
+    if (!current()) return;
+    if (failures.length) {
+      drawerModelsError.value = failures.join("\n");
+      store.showToast(`${mode === "keys" ? `Key 同步：${succeeded} 个账号成功，${failures.length} 个未完整完成` : "模型同步未完整完成"}；失败部分已保留原有缓存`, true);
+    } else {
+      store.showToast(mode === "keys" ? `Key 与支持模型已同步：${succeeded} 个账号` : "模型列表已同步完成");
+    }
+  } catch (error) {
+    if (current()) {
+      drawerModelsError.value = String(error);
+      store.showToast(`同步失败：${String(error)}`, true);
+    }
   } finally {
-    drawerLiveFetchingKind.value = null;
+    if (current()) drawerLiveFetchingKind.value = null;
   }
 }
 
@@ -860,6 +844,9 @@ onMounted(() => {
 });
 
 onUnmounted(() => {
+  pageDisposed = true;
+  drawerSyncRun++;
+  drawerCacheReader.invalidate();
   window.removeEventListener("keydown", handleGlobalKeydown);
 });
 </script>
@@ -2379,6 +2366,8 @@ onUnmounted(() => {
                     </template>
                   </div>
                 </div>
+
+                <p v-if="drawerModelsError" class="sl-drawer-acc-error" role="status">{{ drawerModelsError }}</p>
 
                 <div v-if="drawerModelsLoading" class="sl-loading-state">
                   <span class="is-spinning" v-html="icons.restore" />

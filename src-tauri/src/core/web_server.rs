@@ -189,7 +189,7 @@ macro_rules! rpc_arms {
     ($ctx:expr, $gw:expr, $command:expr, $args:expr) => {
         match $command {
             // —— 站点库 ——
-            "list_library" => Ok(json!(crate::site::library::list_library($ctx))),
+            "list_library" => Ok(json!(crate::site::library::list_library($ctx).await)),
             "create_site" => {
                 let input: crate::models::SiteRecord = take($args, &["input"])?;
                 Ok(json!(crate::site::library::create_site($ctx, input)))
@@ -474,6 +474,37 @@ macro_rules! rpc_arms {
                         preserve_keys
                     )
                 ))
+            }
+            "sync_models_for_cached_keys" => {
+                let site_id: String = take($args, &["siteId", "site_id"])?;
+                Ok(json!(
+                    crate::model::catalog::sync_models_for_cached_keys($ctx, site_id).await
+                ))
+            }
+            "refresh_site_model_health" => {
+                let site_id: String = take($args, &["siteId", "site_id"])?;
+                Ok(json!(
+                    crate::model::catalog::refresh_site_model_health($ctx, site_id).await
+                ))
+            }
+            "add_site_model_cache_key" => {
+                let site_id: String = take($args, &["siteId", "site_id"])?;
+                let profile_id: String = take($args, &["profileId", "profile_id"])?;
+                let key: String = take($args, &["key"])?;
+                let group_name: Option<String> = take_opt($args, &["groupName", "group_name"])?;
+                let profile_name: Option<String> = take_opt($args, &["profileName", "profile_name"])?;
+                let username: Option<String> = take_opt($args, &["username"])?;
+                Ok(json!(crate::model::catalog::add_site_model_cache_key(
+                    $ctx, site_id, profile_id, key, group_name, profile_name, username
+                )))
+            }
+            "remove_site_model_cache_key" => {
+                let site_id: String = take($args, &["siteId", "site_id"])?;
+                let profile_id: String = take($args, &["profileId", "profile_id"])?;
+                let key: String = take($args, &["key"])?;
+                Ok(json!(crate::model::catalog::remove_site_model_cache_key(
+                    $ctx, site_id, profile_id, key
+                )))
             }
             "get_model_catalog" => Ok(json!(crate::model::catalog::get_model_catalog($ctx))),
             "get_model_capabilities" => {
@@ -1102,6 +1133,10 @@ fn safe_join(base: &Path, relative: &str) -> Option<PathBuf> {
         .is_ok()
         .then_some(candidate)
 }
+
+#[cfg(all(test, not(feature = "desktop")))]
+#[path = "web_server_site_tests.rs"]
+mod site_rpc_tests;
 
 // 该测试组依赖 server 形态的 ServerShared 构造（desktop 形态需要 Tauri AppHandle，单测无法提供）
 #[cfg(all(test, not(feature = "desktop")))]

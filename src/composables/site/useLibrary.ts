@@ -1,6 +1,7 @@
 import { ref } from "vue";
 import { emptySite, type ChromeUsageSite, type LibraryData, type SiteRecord } from "../../types";
 import { runCommand } from "../core/ipc";
+import { createScopedLoader } from "./siteRequestState";
 
 // —— 全局单例状态 ——
 const sites = ref<SiteRecord[]>([]);
@@ -8,20 +9,24 @@ const suggestedTags = ref<string[]>([]);
 const usageSites = ref<ChromeUsageSite[]>([]);
 const loading = ref(false);
 let dailyRefreshTimer: number | null = null;
+let dailyRefreshEnabled = false;
+const libraryLoader = createScopedLoader();
 
 export async function loadLibrary() {
-  loading.value = true;
-  try {
-    const data = await runCommand<LibraryData>("list_library");
-    sites.value = data.sites.map((site) => ({ ...emptySite(), ...site }));
-    suggestedTags.value = data.suggestedTags;
-    usageSites.value = data.usageSites ?? [];
-  } finally {
-    loading.value = false;
-  }
+  await libraryLoader.load(
+    () => runCommand<LibraryData>("list_library"),
+    () => true,
+    (data) => {
+      sites.value = data.sites.map((site) => ({ ...emptySite(), ...site }));
+      suggestedTags.value = data.suggestedTags;
+      usageSites.value = data.usageSites ?? [];
+    },
+    (pending) => { loading.value = pending; },
+  );
 }
 
 function scheduleDailyRefresh() {
+  if (!dailyRefreshEnabled) return;
   if (dailyRefreshTimer !== null) {
     window.clearTimeout(dailyRefreshTimer);
   }
@@ -35,6 +40,8 @@ function scheduleDailyRefresh() {
   dailyRefreshTimer = window.setTimeout(async () => {
     try {
       await loadLibrary();
+    } catch (error) {
+      console.warn("每日站点缓存刷新失败:", error);
     } finally {
       scheduleDailyRefresh();
     }
@@ -42,10 +49,12 @@ function scheduleDailyRefresh() {
 }
 
 export function startDailyRefresh() {
+  dailyRefreshEnabled = true;
   scheduleDailyRefresh();
 }
 
 export function stopDailyRefresh() {
+  dailyRefreshEnabled = false;
   if (dailyRefreshTimer !== null) {
     window.clearTimeout(dailyRefreshTimer);
     dailyRefreshTimer = null;

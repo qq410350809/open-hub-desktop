@@ -278,6 +278,9 @@ impl Database {
                 CREATE INDEX IF NOT EXISTS idx_directory_sites_favorite ON directory_sites(favorite);
                 CREATE INDEX IF NOT EXISTS idx_directory_sites_hidden ON directory_sites(hidden);
                 CREATE INDEX IF NOT EXISTS idx_directory_sites_updated ON directory_sites(updated_at);
+                CREATE INDEX IF NOT EXISTS idx_site_tags_site ON site_tags(site_id);
+                CREATE INDEX IF NOT EXISTS idx_site_maintainers_site ON site_maintainers(site_id);
+                CREATE INDEX IF NOT EXISTS idx_site_extensions_site ON site_extensions(site_id);
                 CREATE INDEX IF NOT EXISTS idx_site_accounts_site ON site_accounts(site_id);
                 -- 同一站点同一 Chrome Profile 只允许一条账号缓存，杜绝重复/串行账号行。
                 DELETE FROM site_accounts
@@ -1307,12 +1310,9 @@ pub(crate) fn read_cached_usage_sites(
                     sa.checkin_error, sa.updated_at, sa.newapi_token, sa.newapi_user_id,
                     sa.browser_fallback_failed_at, sa.browser_fallback_fail_count,
                     CASE WHEN smc.profile_id IS NULL THEN 0 ELSE 1 END,
-                    CASE 
-                        WHEN (smc.keys_json IS NOT NULL AND smc.keys_json NOT IN ('', '[]'))
-                          OR (smc.models_json IS NOT NULL AND smc.models_json NOT IN ('', '[]'))
-                        THEN ''
-                        ELSE COALESCE(smc.error, '')
-                    END,
+                    -- Cached data and the last refresh failure are independent: keeping
+                    -- old Keys must not suppress the current synchronization error.
+                    COALESCE(smc.error, ''),
                     COALESCE(smc.keys_json, ''),
                     COALESCE(smc.models_json, '')
              FROM site_accounts sa
@@ -1428,7 +1428,8 @@ pub(crate) fn read_cached_usage_sites(
 
     let mut sites: Vec<sync::ChromeSiteSessionMatch> = Vec::new();
     for (site_id, session) in rows {
-        if let Some(site) = sites.iter_mut().find(|site| site.site_id == site_id) {
+        // ORDER BY site_id, profile_id above keeps a site's sessions adjacent.
+        if let Some(site) = sites.last_mut().filter(|site| site.site_id == site_id) {
             site.sessions.push(session);
         } else {
             sites.push(sync::ChromeSiteSessionMatch {
