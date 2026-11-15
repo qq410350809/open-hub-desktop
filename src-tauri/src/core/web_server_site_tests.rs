@@ -181,6 +181,42 @@ async fn site_model_rpc_uses_domain_errors_and_validates_parameters() {
 }
 
 #[tokio::test]
+async fn catalog_sync_failure_publishes_terminal_progress_to_other_clients() {
+    let shared = service();
+    let token = shared.ctx.login.create_session().unwrap();
+    // Fail during HTTP client setup, before any network request can be made.
+    shared
+        .ctx
+        .database
+        .lock_conn()
+        .unwrap()
+        .execute("DROP TABLE app_meta", [])
+        .unwrap();
+    let mut events = shared.ctx.event_bus.subscribe();
+    let (_, response) = rpc(
+        &shared,
+        Some(&token),
+        "sync_model_catalog",
+        json!({"force":true}),
+    )
+    .await;
+    assert!(response["data"]["Err"]
+        .as_str()
+        .unwrap()
+        .contains("app_meta"));
+    let started = events.try_recv().unwrap();
+    let ended = events.try_recv().unwrap();
+    assert_eq!(started.event, "model-catalog-sync-status");
+    assert_eq!(started.payload["status"], "syncing");
+    assert_eq!(ended.event, "model-catalog-sync-status");
+    assert_eq!(ended.payload["status"], "error");
+    assert!(ended.payload["message"]
+        .as_str()
+        .unwrap()
+        .contains("app_meta"));
+}
+
+#[tokio::test]
 async fn site_cache_rpc_requires_a_valid_management_session() {
     let shared = service();
     for command in [

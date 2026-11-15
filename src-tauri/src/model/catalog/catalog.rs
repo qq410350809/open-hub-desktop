@@ -2043,7 +2043,18 @@ pub async fn sync_model_catalog(
     ctx: Managed<'_, Arc<AppContext>>,
     force: Option<bool>,
 ) -> Result<ModelCatalogSyncResult, String> {
-    sync_model_catalog_inner(&ctx, force.unwrap_or(false)).await
+    let result = sync_model_catalog_inner(&ctx, force.unwrap_or(false)).await;
+    // A failed source request must also end the progress state in other Web/desktop clients.
+    // A rejected concurrent caller must not end another client's active synchronization.
+    if let Err(message) = &result {
+        if !ctx.model_catalog_runtime.syncing.load(Ordering::Acquire) {
+            ctx.event_bus.emit(
+                "model-catalog-sync-status",
+                json!({ "status": "error", "message": message }),
+            );
+        }
+    }
+    result
 }
 
 pub(crate) async fn sync_model_catalog_inner(

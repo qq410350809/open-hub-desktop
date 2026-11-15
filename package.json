@@ -10,6 +10,7 @@
     "check:version": "node scripts/check-version.mjs",
     "test:client-access": "node scripts/test-client-access.mjs",
     "test:model-sync": "node scripts/test-model-sync.mjs",
+    "test:model-catalog": "node scripts/test-model-catalog.mjs && node scripts/test-model-catalog-components.mjs",
     "test:site-sync": "node scripts/test-site-sync.mjs",
     "package:server": "node scripts/package-server.mjs",
     "preview": "vite preview",
